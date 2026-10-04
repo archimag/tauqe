@@ -1,0 +1,28 @@
+# Cargo build artifacts
+/target/
+
+# Cargo backup files
+*.rs.bk
+
+# MSVC Windows build artifacts
+*.pdb
+
+# Environment & secrets
+.env
+.env.*
+!.env.example
+
+# Editor & IDE artifacts
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+\#*#
+
+# OS artifacts
+.DS_Store
+Thumbs.db
+
+# AI assistant artifacts
+.aider*
