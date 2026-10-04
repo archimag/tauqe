@@ -11,6 +11,8 @@
 .env
 .env.*
 !.env.example
+workbench.toml
+.workbench.toml
 
 # Editor & IDE artifacts
 .idea/

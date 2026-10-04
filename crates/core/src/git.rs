@@ -54,3 +54,19 @@ fn run_git(dir: Option<&Path>, args: &[&str]) -> anyhow::Result<String> {
         );
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_get_repository_state_no_panic() {
+        // Этот тест запускается в директории крейта, которая должна быть внутри git-репозитория.
+        // Мы просто проверяем, что функция не падает и возвращает заполненную структуру.
+        let state = get_repository_state(None);
+        
+        assert!(!state.root.is_empty(), "Repository root should not be empty");
+        assert!(!state.branch.is_empty(), "Branch name should not be empty");
+        assert!(!state.head.is_empty(), "HEAD hash should not be empty");
+    }
+}
