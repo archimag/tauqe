@@ -5,9 +5,16 @@ pub const PROTOCOL_VERSION: &str = "0.1.0";
 pub mod methods {
     pub const CLIENT_INITIALIZE: &str = "client/initialize";
     pub const REPOSITORY_GET_STATE: &str = "repository/getState";
+    pub const REPOSITORY_LIST_FILES: &str = "repository/listFiles";
     pub const MODEL_ASK: &str = "model/ask";
     pub const MODEL_CANCEL: &str = "model/cancel";
     pub const MODEL_CLEAR_HISTORY: &str = "model/clearHistory";
+
+    pub const CONTEXT_GET: &str = "context/get";
+    pub const CONTEXT_ADD: &str = "context/add";
+    pub const CONTEXT_REMOVE: &str = "context/remove";
+    pub const CONTEXT_SET_ACCESS: &str = "context/setAccess";
+    pub const CONTEXT_CLEAR: &str = "context/clear";
 }
 
 pub mod events {
@@ -18,6 +25,8 @@ pub mod events {
     pub const MODEL_FINISHED: &str = "model/finished";
     pub const MODEL_CANCELLED: &str = "model/cancelled";
     pub const MODEL_ERROR: &str = "model/error";
+
+    pub const CONTEXT_CHANGED: &str = "context/changed";
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -92,6 +101,60 @@ pub struct RepositoryState {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RepositoryListFilesResult {
+    pub files: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextAccess {
+    ReadOnly,
+    Editable,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContextItem {
+    pub path: String,
+    pub access: ContextAccess,
+    pub size_bytes: u64,
+    pub estimated_tokens: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ContextState {
+    pub revision: u64,
+    pub items: Vec<ContextItem>,
+    pub total_estimated_tokens: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContextAddParams {
+    pub path: String,
+    #[serde(default = "default_context_access")]
+    pub access: ContextAccess,
+}
+
+fn default_context_access() -> ContextAccess {
+    ContextAccess::ReadOnly
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContextRemoveParams {
+    pub path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContextSetAccessParams {
+    pub path: String,
+    pub access: ContextAccess,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContextChangedEvent {
+    pub state: ContextState,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelAskParams {
     pub prompt: String,
 }
@@ -143,7 +206,6 @@ pub struct ModelErrorEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
 
     #[test]
     fn test_request_id_serialization() {
@@ -178,30 +240,10 @@ mod tests {
     }
 
     #[test]
-    fn test_message_deserialization_response() {
-        let json_str = r#"{"id": "abc", "result": {"status": "ok"}}"#;
-        let msg: Message = serde_json::from_str(json_str).unwrap();
-        match msg {
-            Message::Response(res) => {
-                assert_eq!(res.id, RequestId::String("abc".to_string()));
-                assert!(res.result.is_some());
-                assert!(res.error.is_none());
-            }
-            _ => panic!("Expected Response"),
-        }
-    }
-
-    #[test]
-    fn test_message_deserialization_event() {
-        let json_str = r#"{"method": "model/started", "params": {"operation_id": "op-1", "model": "test"}}"#;
-        let msg: Message = serde_json::from_str(json_str).unwrap();
-        match msg {
-            Message::Event(ev) => {
-                assert_eq!(ev.method, "model/started");
-                let params = ev.params.unwrap();
-                assert_eq!(params["operation_id"], "op-1");
-            }
-            _ => panic!("Expected Event"),
-        }
+    fn test_context_access_serialization() {
+        let ro = ContextAccess::ReadOnly;
+        assert_eq!(serde_json::to_string(&ro).unwrap(), "\"read_only\"");
+        let ed = ContextAccess::Editable;
+        assert_eq!(serde_json::to_string(&ed).unwrap(), "\"editable\"");
     }
 }

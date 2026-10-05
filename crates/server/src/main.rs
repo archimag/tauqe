@@ -1,21 +1,24 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{watch, Mutex};
 use workbench_core::config::{load_config, AppConfig};
+use workbench_core::context::ContextManager;
 use workbench_core::model::gateway::{ChatMessage, StreamEvent};
 use workbench_core::model::openrouter::OpenRouterClient;
+use workbench_core::prompt::PromptAssembly;
 use workbench_protocol::{
-    events, methods, Event, InitializeResult, ModelAskParams, Request, RequestId, Response,
+    events, methods, ContextAddParams, ContextRemoveParams, ContextSetAccessParams, Event,
+    InitializeResult, ModelAskParams, RepositoryListFilesResult, Request, RequestId, Response,
     ResponseError, PROTOCOL_VERSION,
 };
 
-#[derive(Default)]
 struct ModelSession {
     history: Vec<ChatMessage>,
     active_cancel: Option<watch::Sender<bool>>,
     total_cost: f64,
+    context_manager: ContextManager,
 }
 
 struct AppState {
@@ -28,10 +31,17 @@ async fn main() -> anyhow::Result<()> {
     workbench_core::init();
 
     let config = load_config(None);
+    let repo_state = workbench_core::git::get_repository_state(None);
+    let repo_path = PathBuf::from(repo_state.root);
 
     let state = Arc::new(AppState {
         config,
-        session: Mutex::new(ModelSession::default()),
+        session: Mutex::new(ModelSession {
+            history: Vec::new(),
+            active_cancel: None,
+            total_cost: 0.0,
+            context_manager: ContextManager::new(repo_path),
+        }),
     });
 
     let stdin = tokio::io::stdin();
@@ -67,8 +77,6 @@ async fn main() -> anyhow::Result<()> {
         let resp_str = serde_json::to_string(&response)? + "\n";
         stdout.write_all(resp_str.as_bytes()).await?;
         stdout.flush().await?;
-
-        // Events are sent asynchronously by model streaming task.
     }
 
     Ok(())
@@ -82,6 +90,8 @@ async fn handle_request(req: Request, state: &Arc<AppState>) -> Response {
             let mut config = state.config.clone();
             if !repo_path.as_os_str().is_empty() {
                 config = load_config(Some(repo_path));
+                let mut session = state.session.lock().await;
+                session.context_manager.set_repo_root(repo_path.to_path_buf());
             }
 
             let result = InitializeResult {
@@ -102,6 +112,193 @@ async fn handle_request(req: Request, state: &Arc<AppState>) -> Response {
             Response {
                 id: req.id,
                 result: Some(serde_json::to_value(repo_state).unwrap()),
+                error: None,
+            }
+        }
+        methods::REPOSITORY_LIST_FILES => {
+            let repo_state = workbench_core::git::get_repository_state(None);
+            let repo_dir = Path::new(&repo_state.root);
+            match workbench_core::git::list_repository_files(Some(repo_dir)) {
+                Ok(files) => Response {
+                    id: req.id,
+                    result: Some(
+                        serde_json::to_value(RepositoryListFilesResult { files }).unwrap(),
+                    ),
+                    error: None,
+                },
+                Err(err) => Response {
+                    id: req.id,
+                    result: None,
+                    error: Some(ResponseError {
+                        code: "LIST_FILES_FAILED".to_string(),
+                        message: err.to_string(),
+                        data: None,
+                    }),
+                },
+            }
+        }
+        methods::CONTEXT_GET => {
+            let session = state.session.lock().await;
+            let ctx_state = session.context_manager.get_state();
+            Response {
+                id: req.id,
+                result: Some(serde_json::to_value(ctx_state).unwrap()),
+                error: None,
+            }
+        }
+        methods::CONTEXT_ADD => {
+            let params: ContextAddParams = match req.params.and_then(|p| serde_json::from_value(p).ok())
+            {
+                Some(p) => p,
+                None => {
+                    return Response {
+                        id: req.id,
+                        result: None,
+                        error: Some(ResponseError {
+                            code: "INVALID_PARAMS".to_string(),
+                            message: "Missing or invalid path/access".to_string(),
+                            data: None,
+                        }),
+                    };
+                }
+            };
+
+            let ctx_state = {
+                let mut session = state.session.lock().await;
+                match session.context_manager.add_file(&params.path, params.access) {
+                    Ok(_) => session.context_manager.get_state(),
+                    Err(err) => {
+                        return Response {
+                            id: req.id,
+                            result: None,
+                            error: Some(ResponseError {
+                                code: "ADD_FAILED".to_string(),
+                                message: err.to_string(),
+                                data: None,
+                            }),
+                        };
+                    }
+                }
+            };
+
+            send_event(&Event {
+                method: events::CONTEXT_CHANGED.to_string(),
+                params: Some(serde_json::json!({ "state": ctx_state })),
+            }).await;
+
+            Response {
+                id: req.id,
+                result: Some(serde_json::to_value(ctx_state).unwrap()),
+                error: None,
+            }
+        }
+        methods::CONTEXT_REMOVE => {
+            let params: ContextRemoveParams = match req.params.and_then(|p| serde_json::from_value(p).ok())
+            {
+                Some(p) => p,
+                None => {
+                    return Response {
+                        id: req.id,
+                        result: None,
+                        error: Some(ResponseError {
+                            code: "INVALID_PARAMS".to_string(),
+                            message: "Missing or invalid path".to_string(),
+                            data: None,
+                        }),
+                    };
+                }
+            };
+
+            let ctx_state = {
+                let mut session = state.session.lock().await;
+                match session.context_manager.remove_file(&params.path) {
+                    Ok(_) => session.context_manager.get_state(),
+                    Err(err) => {
+                        return Response {
+                            id: req.id,
+                            result: None,
+                            error: Some(ResponseError {
+                                code: "REMOVE_FAILED".to_string(),
+                                message: err.to_string(),
+                                data: None,
+                            }),
+                        };
+                    }
+                }
+            };
+
+            send_event(&Event {
+                method: events::CONTEXT_CHANGED.to_string(),
+                params: Some(serde_json::json!({ "state": ctx_state })),
+            }).await;
+
+            Response {
+                id: req.id,
+                result: Some(serde_json::to_value(ctx_state).unwrap()),
+                error: None,
+            }
+        }
+        methods::CONTEXT_SET_ACCESS => {
+            let params: ContextSetAccessParams = match req.params.and_then(|p| serde_json::from_value(p).ok())
+            {
+                Some(p) => p,
+                None => {
+                    return Response {
+                        id: req.id,
+                        result: None,
+                        error: Some(ResponseError {
+                            code: "INVALID_PARAMS".to_string(),
+                            message: "Missing or invalid parameters".to_string(),
+                            data: None,
+                        }),
+                    };
+                }
+            };
+
+            let ctx_state = {
+                let mut session = state.session.lock().await;
+                match session.context_manager.set_access(&params.path, params.access) {
+                    Ok(_) => session.context_manager.get_state(),
+                    Err(err) => {
+                        return Response {
+                            id: req.id,
+                            result: None,
+                            error: Some(ResponseError {
+                                code: "SET_ACCESS_FAILED".to_string(),
+                                message: err.to_string(),
+                                data: None,
+                            }),
+                        };
+                    }
+                }
+            };
+
+            send_event(&Event {
+                method: events::CONTEXT_CHANGED.to_string(),
+                params: Some(serde_json::json!({ "state": ctx_state })),
+            }).await;
+
+            Response {
+                id: req.id,
+                result: Some(serde_json::to_value(ctx_state).unwrap()),
+                error: None,
+            }
+        }
+        methods::CONTEXT_CLEAR => {
+            let ctx_state = {
+                let mut session = state.session.lock().await;
+                session.context_manager.clear();
+                session.context_manager.get_state()
+            };
+
+            send_event(&Event {
+                method: events::CONTEXT_CHANGED.to_string(),
+                params: Some(serde_json::json!({ "state": ctx_state })),
+            }).await;
+
+            Response {
+                id: req.id,
+                result: Some(serde_json::to_value(ctx_state).unwrap()),
                 error: None,
             }
         }
@@ -153,20 +350,9 @@ async fn handle_request(req: Request, state: &Arc<AppState>) -> Response {
             };
 
             let model = state.config.models.default.clone();
-
             let op_id = format!("op-{}", next_operation_id().await);
             let op_id_event = op_id.clone();
 
-            // Record user message in history
-            {
-                let mut session = state.session.lock().await;
-                session.history.push(ChatMessage {
-                    role: "user".to_string(),
-                    content: params.prompt.clone(),
-                });
-            }
-
-            // Send model/started event
             let started_event = Event {
                 method: events::MODEL_STARTED.to_string(),
                 params: Some(serde_json::json!({
@@ -176,7 +362,6 @@ async fn handle_request(req: Request, state: &Arc<AppState>) -> Response {
             };
             send_event(&started_event).await;
 
-            // Create cancellation channel
             let (cancel_tx, cancel_rx) = watch::channel(false);
             {
                 let mut session = state.session.lock().await;
@@ -184,11 +369,24 @@ async fn handle_request(req: Request, state: &Arc<AppState>) -> Response {
             }
 
             let client = OpenRouterClient::new(api_key);
-            let history = {
+
+            // Assemble layered prompt with context snapshot & history
+            let assembled_messages = {
                 let session = state.session.lock().await;
-                session.history.clone()
+                let repo_state = workbench_core::git::get_repository_state(None);
+                let ctx_state = session.context_manager.get_state();
+                let context_files = session.context_manager.read_context_files();
+
+                let assembly = PromptAssembly::new(
+                    Some(repo_state),
+                    ctx_state.revision,
+                    context_files,
+                );
+
+                assembly.assemble_chat_messages(&session.history, &params.prompt)
             };
 
+            let prompt_for_history = params.prompt.clone();
             let state_for_spawn = Arc::clone(state);
             let op_id_for_spawn = op_id.clone();
             let model_for_spawn = model.clone();
@@ -198,7 +396,7 @@ async fn handle_request(req: Request, state: &Arc<AppState>) -> Response {
 
             tokio::spawn(async move {
                 let result = client
-                    .stream_chat(&model_for_spawn, history, tx_for_spawn, cancel_rx)
+                    .stream_chat(&model_for_spawn, assembled_messages, tx_for_spawn, cancel_rx)
                     .await;
 
                 let mut session = state_for_spawn.session.lock().await;
@@ -213,11 +411,10 @@ async fn handle_request(req: Request, state: &Arc<AppState>) -> Response {
                     send_event(&err_event).await;
                 }
 
-                // Finalize history with assistant message if we received any text
                 let mut assistant_text = String::new();
                 let mut usage_info = None;
                 let mut cancelled = false;
-                
+
                 while let Some(event) = rx.recv().await {
                     match event {
                         StreamEvent::ReasoningDelta(delta) => {
@@ -242,9 +439,7 @@ async fn handle_request(req: Request, state: &Arc<AppState>) -> Response {
                             send_event(&ev).await;
                         }
                         StreamEvent::Usage(usage) => usage_info = Some(usage),
-                        StreamEvent::Done => {
-                            break;
-                        }
+                        StreamEvent::Done => break,
                         StreamEvent::Cancelled => {
                             cancelled = true;
                             break;
@@ -270,7 +465,6 @@ async fn handle_request(req: Request, state: &Arc<AppState>) -> Response {
                     };
                     send_event(&cancelled_event).await;
                 } else {
-                    // Send usage if we received it before Done, otherwise send a zero usage event
                     let usage_to_send = usage_info.unwrap_or_default();
                     let cost = usage_to_send.cost.unwrap_or(0.0);
                     session.total_cost += cost;
@@ -285,6 +479,12 @@ async fn handle_request(req: Request, state: &Arc<AppState>) -> Response {
                         })),
                     };
                     send_event(&usage_event).await;
+
+                    // Append user query and assistant response to session dialogue history
+                    session.history.push(ChatMessage {
+                        role: "user".to_string(),
+                        content: prompt_for_history,
+                    });
 
                     if !assistant_text.is_empty() {
                         session.history.push(ChatMessage {
@@ -303,11 +503,9 @@ async fn handle_request(req: Request, state: &Arc<AppState>) -> Response {
                     send_event(&finished_event).await;
                 }
 
-                // Clear active cancel
                 session.active_cancel = None;
             });
 
-            // Response with operation_id
             Response {
                 id: req.id,
                 result: Some(serde_json::json!({ "operation_id": op_id })),

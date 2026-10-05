@@ -39,6 +39,16 @@ pub fn get_repository_state(dir: Option<&Path>) -> RepositoryState {
     }
 }
 
+pub fn list_repository_files(dir: Option<&Path>) -> anyhow::Result<Vec<String>> {
+    let output = run_git(dir, &["ls-files"])?;
+    let files = output
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect();
+    Ok(files)
+}
+
 fn run_git(dir: Option<&Path>, args: &[&str]) -> anyhow::Result<String> {
     let mut command = Command::new("git");
     if let Some(d) = dir {
@@ -61,12 +71,16 @@ mod tests {
 
     #[test]
     fn test_get_repository_state_no_panic() {
-        // Этот тест запускается в директории крейта, которая должна быть внутри git-репозитория.
-        // Мы просто проверяем, что функция не падает и возвращает заполненную структуру.
         let state = get_repository_state(None);
         
         assert!(!state.root.is_empty(), "Repository root should not be empty");
         assert!(!state.branch.is_empty(), "Branch name should not be empty");
         assert!(!state.head.is_empty(), "HEAD hash should not be empty");
+    }
+
+    #[test]
+    fn test_list_repository_files() {
+        let files = list_repository_files(None).unwrap();
+        assert!(!files.is_empty(), "Git repository should contain tracked files");
     }
 }
