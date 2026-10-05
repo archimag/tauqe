@@ -6,17 +6,20 @@ use tokio::sync::{watch, Mutex};
 use workbench_core::config::{load_config, AppConfig};
 use workbench_core::context::ContextManager;
 use workbench_core::edits::{
-    EditProtocol, WholeFileEditProtocol, XmlEditProtocol,
+    EditProtocol, EditProtocolFactory, XmlEditProtocol,
 };
 use workbench_core::model::gateway::{ChatMessage, StreamEvent};
 use workbench_core::model::openrouter::OpenRouterClient;
-use workbench_core::workflow::{EditWorkflow, NaiveEditWorkflow};
+use workbench_core::workflow::{
+    EditWorkflow, ToolchainEditWorkflow, WorkflowFactory,
+};
 use workbench_protocol::{
-    events, methods, ContextAddParams, ContextAddPatternParams, ContextAddPatternResult,
-    ContextRemoveParams, ContextSetAccessParams, EditFileDoneEvent, EditFileStartedEvent,
-    EditFinishedEvent, EditHunkEvent, EditStartedEvent, Event, InitializeResult, ModelAskParams,
+    events, methods, ConfigSetParams, ConfigState, ContextAddParams, ContextAddPatternParams,
+    ContextAddPatternResult, ContextRemoveParams, ContextSetAccessParams, EditFileDoneEvent,
+    EditFileStartedEvent, EditFinishedEvent, EditHunkEvent, EditStartedEvent, Event,
+    GitCommitCreatedEvent, GitDiffParams, GitDiffResult, InitializeResult, ModelAskParams,
     ModelResultEvent, RepositoryListFilesResult, Request, RequestId, Response, ResponseError,
-    PROTOCOL_VERSION,
+    ToolchainResultEvent, ToolchainStartedEvent, PROTOCOL_VERSION,
 };
 
 struct ModelSession {
@@ -105,6 +108,10 @@ async fn handle_request(req: Request, state: &Arc<AppState>) -> Response {
                 server_version: env!("CARGO_PKG_VERSION").to_string(),
                 repository: Some(repo_state),
                 model: Some(cfg.models.default.clone()),
+                workflow: Some(cfg.edit.workflow.clone()),
+                edit_protocol: Some(cfg.edit.protocol.clone()),
+                available_workflows: WorkflowFactory::available_workflows(),
+                available_edit_protocols: EditProtocolFactory::available_protocols(),
             };
             Response {
                 id: req.id,
@@ -140,6 +147,196 @@ async fn handle_request(req: Request, state: &Arc<AppState>) -> Response {
                         data: None,
                     }),
                 },
+            }
+        }
+        methods::GIT_UNDO => {
+            {
+                let session = state.session.lock().await;
+                if session.active_cancel.is_some() {
+                    return Response {
+                        id: req.id,
+                        result: None,
+                        error: Some(ResponseError {
+                            code: "OPERATION_IN_PROGRESS".to_string(),
+                            message: "Cannot undo while a model operation is in progress".to_string(),
+                            data: None,
+                        }),
+                    };
+                }
+            }
+
+            let repo_state = workbench_core::git::get_repository_state(None);
+            let repo_dir = Path::new(&repo_state.root);
+
+            match workbench_core::git::undo_last_ai_commit(repo_dir) {
+                Ok(undo_result) => {
+                    let ctx_state = {
+                        let mut session = state.session.lock().await;
+                        session.context_manager.prune_missing_files();
+                        session.context_manager.get_state()
+                    };
+
+                    let new_repo_state = workbench_core::git::get_repository_state(Some(repo_dir));
+                    send_event(&Event {
+                        method: events::GIT_STATE_CHANGED.to_string(),
+                        params: Some(serde_json::json!({ "repository": new_repo_state })),
+                    }).await;
+
+                    send_event(&Event {
+                        method: events::CONTEXT_CHANGED.to_string(),
+                        params: Some(serde_json::json!({ "state": ctx_state })),
+                    }).await;
+
+                    send_event(&Event {
+                        method: events::GIT_UNDO_COMPLETED.to_string(),
+                        params: Some(serde_json::to_value(&undo_result).unwrap()),
+                    }).await;
+
+                    Response {
+                        id: req.id,
+                        result: Some(serde_json::to_value(undo_result).unwrap()),
+                        error: None,
+                    }
+                }
+                Err(err) => Response {
+                    id: req.id,
+                    result: None,
+                    error: Some(ResponseError {
+                        code: "UNDO_FAILED".to_string(),
+                        message: err.to_string(),
+                        data: None,
+                    }),
+                },
+            }
+        }
+        methods::GIT_GET_DIFF => {
+            let params: Option<GitDiffParams> = req.params.and_then(|p| serde_json::from_value(p).ok());
+            let target_path = params.as_ref().and_then(|p| p.path.as_deref());
+
+            let repo_state = workbench_core::git::get_repository_state(None);
+            let repo_dir = Path::new(&repo_state.root);
+
+            match workbench_core::git::get_diff(repo_dir, target_path) {
+                Ok(diff) => Response {
+                    id: req.id,
+                    result: Some(serde_json::to_value(GitDiffResult { diff }).unwrap()),
+                    error: None,
+                },
+                Err(err) => Response {
+                    id: req.id,
+                    result: None,
+                    error: Some(ResponseError {
+                        code: "GET_DIFF_FAILED".to_string(),
+                        message: err.to_string(),
+                        data: None,
+                    }),
+                },
+            }
+        }
+        methods::CONFIG_GET => {
+            let cfg = state.config.lock().await;
+            let result = ConfigState {
+                workflow: cfg.edit.workflow.clone(),
+                edit_protocol: cfg.edit.protocol.clone(),
+                available_workflows: WorkflowFactory::available_workflows(),
+                available_edit_protocols: EditProtocolFactory::available_protocols(),
+            };
+            Response {
+                id: req.id,
+                result: Some(serde_json::to_value(result).unwrap()),
+                error: None,
+            }
+        }
+        methods::CONFIG_SET => {
+            {
+                let session = state.session.lock().await;
+                if session.active_cancel.is_some() {
+                    return Response {
+                        id: req.id,
+                        result: None,
+                        error: Some(ResponseError {
+                            code: "OPERATION_IN_PROGRESS".to_string(),
+                            message: "Cannot change workflow or edit protocol while a model operation is in progress".to_string(),
+                            data: None,
+                        }),
+                    };
+                }
+            }
+
+            let params: ConfigSetParams = match req.params.and_then(|p| serde_json::from_value(p).ok()) {
+                Some(p) => p,
+                None => {
+                    return Response {
+                        id: req.id,
+                        result: None,
+                        error: Some(ResponseError {
+                            code: "INVALID_PARAMS".to_string(),
+                            message: "Missing or invalid parameters".to_string(),
+                            data: None,
+                        }),
+                    };
+                }
+            };
+
+            let updated_state = {
+                let mut cfg = state.config.lock().await;
+                if let Some(wf) = params.workflow {
+                    if !WorkflowFactory::is_valid(&wf) {
+                        return Response {
+                            id: req.id,
+                            result: None,
+                            error: Some(ResponseError {
+                                code: "INVALID_WORKFLOW".to_string(),
+                                message: format!(
+                                    "Unknown workflow '{}'. Available workflows: {}",
+                                    wf,
+                                    WorkflowFactory::available_workflows().join(", ")
+                                ),
+                                data: None,
+                            }),
+                        };
+                    }
+                    cfg.edit.workflow = wf;
+                }
+                if let Some(proto) = params.edit_protocol {
+                    match EditProtocolFactory::canonical_name(&proto) {
+                        Some(canonical) => {
+                            cfg.edit.protocol = canonical;
+                        }
+                        None => {
+                            return Response {
+                                id: req.id,
+                                result: None,
+                                error: Some(ResponseError {
+                                    code: "INVALID_PROTOCOL".to_string(),
+                                    message: format!(
+                                        "Unknown edit protocol '{}'. Available protocols: {}",
+                                        proto,
+                                        EditProtocolFactory::available_protocols().join(", ")
+                                    ),
+                                    data: None,
+                                }),
+                            };
+                        }
+                    }
+                }
+                ConfigState {
+                    workflow: cfg.edit.workflow.clone(),
+                    edit_protocol: cfg.edit.protocol.clone(),
+                    available_workflows: WorkflowFactory::available_workflows(),
+                    available_edit_protocols: EditProtocolFactory::available_protocols(),
+                }
+            };
+
+            send_event(&Event {
+                method: events::CONFIG_CHANGED.to_string(),
+                params: Some(serde_json::to_value(&updated_state).unwrap()),
+            }).await;
+
+            Response {
+                id: req.id,
+                result: Some(serde_json::to_value(updated_state).unwrap()),
+                error: None,
             }
         }
         methods::CONTEXT_GET => {
@@ -387,7 +584,7 @@ async fn handle_request(req: Request, state: &Arc<AppState>) -> Response {
                 }
             };
 
-            let (api_key, model, edit_config) = {
+            let (api_key, model, edit_config, toolchain_config) = {
                 let cfg = state.config.lock().await;
                 let provider_cfg = match cfg.providers.openrouter.clone() {
                     Some(c) => c,
@@ -419,7 +616,7 @@ async fn handle_request(req: Request, state: &Arc<AppState>) -> Response {
                     }
                 };
 
-                (key, cfg.models.default.clone(), cfg.edit.clone())
+                (key, cfg.models.default.clone(), cfg.edit.clone(), cfg.toolchain.clone())
             };
 
             let op_id = format!("op-{}", next_operation_id().await);
@@ -449,18 +646,18 @@ async fn handle_request(req: Request, state: &Arc<AppState>) -> Response {
             let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamEvent>(100);
 
             tokio::spawn(async move {
-                // Select edit protocol according to configuration
-                let protocol: Box<dyn EditProtocol> = match edit_config.protocol.as_str() {
-                    "whole_file" => Box::new(WholeFileEditProtocol),
-                    _ => Box::new(XmlEditProtocol),
-                };
+                let protocol = EditProtocolFactory::create_protocol(&edit_config.protocol)
+                    .unwrap_or_else(|_| Box::new(XmlEditProtocol));
 
-                // Select workflow (defaulting to NaiveEditWorkflow)
-                let workflow: Box<dyn EditWorkflow> = match edit_config.workflow.as_str() {
-                    _ => Box::new(NaiveEditWorkflow),
-                };
+                let workflow = WorkflowFactory::create_workflow(&edit_config.workflow, &toolchain_config)
+                    .unwrap_or_else(|_| {
+                        Box::new(ToolchainEditWorkflow::new(
+                            toolchain_config.check_command,
+                            toolchain_config.max_retries,
+                            toolchain_config.auto_heal,
+                        ))
+                    });
 
-                // Run workflow task concurrently with draining streaming events
                 let (wf_tx, wf_rx) = (tx.clone(), cancel_rx.clone());
                 let state_clone = Arc::clone(&state_for_spawn);
                 let model_clone = model_for_spawn.clone();
@@ -487,7 +684,6 @@ async fn handle_request(req: Request, state: &Arc<AppState>) -> Response {
 
                 let mut usage_info = None;
 
-                // Drain events concurrently as they arrive
                 while let Some(event) = rx.recv().await {
                     match event {
                         StreamEvent::ReasoningDelta(delta) => {
@@ -556,6 +752,28 @@ async fn handle_request(req: Request, state: &Arc<AppState>) -> Response {
                             };
                             send_event(&ev).await;
                         }
+                        StreamEvent::ToolchainStarted { command } => {
+                            let ev = Event {
+                                method: events::TOOLCHAIN_STARTED.to_string(),
+                                params: Some(serde_json::to_value(ToolchainStartedEvent {
+                                    operation_id: op_id_for_spawn.clone(),
+                                    command,
+                                }).unwrap()),
+                            };
+                            send_event(&ev).await;
+                        }
+                        StreamEvent::ToolchainResult { command, success, output } => {
+                            let ev = Event {
+                                method: events::TOOLCHAIN_RESULT.to_string(),
+                                params: Some(serde_json::to_value(ToolchainResultEvent {
+                                    operation_id: op_id_for_spawn.clone(),
+                                    command,
+                                    success,
+                                    output,
+                                }).unwrap()),
+                            };
+                            send_event(&ev).await;
+                        }
                         StreamEvent::Usage(usage) => {
                             usage_info = Some(usage);
                         }
@@ -605,11 +823,12 @@ async fn handle_request(req: Request, state: &Arc<AppState>) -> Response {
                         };
                         send_event(&usage_event).await;
 
-                        // Emit EDIT_FINISHED if edits were part of the result
                         if let workbench_protocol::ModelResult::Edit {
                             applied,
                             ref error,
                             ref changed_files,
+                            ref commit_hash,
+                            ref summary,
                             ..
                         } = wf_result.result
                         {
@@ -620,12 +839,29 @@ async fn handle_request(req: Request, state: &Arc<AppState>) -> Response {
                                     applied,
                                     error: error.clone(),
                                     changed_files: changed_files.clone(),
+                                    commit_hash: commit_hash.clone(),
                                 }).unwrap()),
                             };
                             send_event(&finished_edit_event).await;
+
+                            if let Some(hash) = commit_hash {
+                                send_event(&Event {
+                                    method: events::GIT_COMMIT_CREATED.to_string(),
+                                    params: Some(serde_json::to_value(GitCommitCreatedEvent {
+                                        commit_hash: hash.clone(),
+                                        summary: summary.clone(),
+                                        changed_files: changed_files.clone(),
+                                    }).unwrap()),
+                                }).await;
+
+                                let repo_state = workbench_core::git::get_repository_state(None);
+                                send_event(&Event {
+                                    method: events::GIT_STATE_CHANGED.to_string(),
+                                    params: Some(serde_json::json!({ "repository": repo_state })),
+                                }).await;
+                            }
                         }
 
-                        // Notify context changed if edits were applied to disk
                         let ctx_state = session.context_manager.get_state();
                         send_event(&Event {
                             method: events::CONTEXT_CHANGED.to_string(),

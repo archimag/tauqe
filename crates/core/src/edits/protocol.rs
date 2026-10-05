@@ -1,11 +1,82 @@
 use workbench_protocol::{EditOperation, ModelResult};
 
+use crate::model::gateway::{FunctionDefinition, ToolCall, ToolDefinition};
+
 pub trait EditProtocol: Send + Sync {
+    /// Identifier name of the edit protocol (e.g. "xml", "whole_file", "tool_call")
+    fn name(&self) -> &'static str;
+
     /// Returns system prompt instructions tailored for this edit protocol.
     fn system_instructions(&self, editable_paths: &[String]) -> String;
 
     /// Parses the model text output into a ModelResult.
     fn parse_output(&self, raw_text: &str, editable_paths: &[String]) -> ModelResult;
+
+    /// Returns tool definitions if this protocol operates via native LLM tool calling.
+    fn tools(&self, _editable_paths: &[String]) -> Option<Vec<ToolDefinition>> {
+        None
+    }
+
+    /// Parses tool calls returned by the model into a ModelResult.
+    fn parse_tool_calls(
+        &self,
+        _tool_calls: &[ToolCall],
+        _editable_paths: &[String],
+    ) -> Option<ModelResult> {
+        None
+    }
+}
+
+/// Factory responsible for discovering, validating, and creating EditProtocol instances.
+pub struct EditProtocolFactory;
+
+impl EditProtocolFactory {
+    /// Returns the list of standard supported edit protocol names.
+    pub fn available_protocols() -> Vec<String> {
+        vec![
+            "xml".to_string(),
+            "whole_file".to_string(),
+            "tool_call".to_string(),
+        ]
+    }
+
+    /// Validates whether an edit protocol name is recognized.
+    pub fn is_valid(name: &str) -> bool {
+        Self::canonical_name(name).is_some()
+    }
+
+    /// Resolves aliases to a canonical edit protocol name.
+    pub fn canonical_name(name: &str) -> Option<String> {
+        match name.trim().to_lowercase().as_str() {
+            "xml" => Some("xml".to_string()),
+            "whole_file" => Some("whole_file".to_string()),
+            "tool_call" | "tool_calling" | "tools" | "tool" | "function_calling" | "functions" => {
+                Some("tool_call".to_string())
+            }
+            _ => None,
+        }
+    }
+
+    /// Creates an EditProtocol instance by name or alias.
+    pub fn create_protocol(name: &str) -> Result<Box<dyn EditProtocol>, String> {
+        match name.trim().to_lowercase().as_str() {
+            "tool_call" | "tool_calling" | "tools" | "tool" | "function_calling" | "functions" => {
+                Ok(Box::new(ToolCallEditProtocol))
+            }
+            "whole_file" => Ok(Box::new(WholeFileEditProtocol)),
+            "xml" => Ok(Box::new(XmlEditProtocol)),
+            other => Err(format!(
+                "Unknown edit protocol '{}'. Available protocols: {}",
+                other,
+                Self::available_protocols().join(", ")
+            )),
+        }
+    }
+}
+
+/// Factory function to create an EditProtocol by identifier name.
+pub fn create_edit_protocol(name: &str) -> Box<dyn EditProtocol> {
+    EditProtocolFactory::create_protocol(name).unwrap_or_else(|_| Box::new(XmlEditProtocol))
 }
 
 /// Backward compatibility shim for any external references
@@ -20,15 +91,22 @@ pub type CustomSearchReplaceEditProtocol = XmlEditProtocol;
 pub struct XmlEditProtocol;
 
 impl EditProtocol for XmlEditProtocol {
+    fn name(&self) -> &'static str {
+        "xml"
+    }
+
     fn system_instructions(&self, editable_paths: &[String]) -> String {
         let mut prompt = String::new();
         prompt.push_str("## Code Modification Protocol (XML Edits)\n");
-        prompt.push_str("When proposing changes, modify ONLY files listed in <editable_files> using structured XML blocks.\n\n");
+        prompt.push_str("When proposing changes, use structured XML blocks:\n");
+        prompt.push_str("- Existing files: modify ONLY files listed in <editable_files> via <edit path=\"...\">.\n");
+        prompt.push_str("- New files: create new files using <create path=\"...\"> with a valid repository-relative path. Created files are automatically added to context.\n");
+        prompt.push_str("- File deletions: delete obsolete files using <delete path=\"...\" />.\n\n");
 
         if editable_paths.is_empty() {
-            prompt.push_str("NOTE: No files are currently marked as editable. You must answer questions or explain code without proposing edits.\n\n");
+            prompt.push_str("NOTE: No existing files are currently marked as editable. You may answer questions, explain code, or create new files with <create path=\"...\"> if requested.\n\n");
         } else {
-            prompt.push_str("Currently permitted target files for modification:\n");
+            prompt.push_str("Currently permitted existing target files for modification:\n");
             for path in editable_paths {
                 prompt.push_str(&format!("- {}\n", path));
             }
@@ -41,8 +119,8 @@ impl EditProtocol for XmlEditProtocol {
             .unwrap_or("example_file.rs");
 
         prompt.push_str("Format for proposing changes:\n");
-        prompt.push_str("<workbench_edits>\n");
-        prompt.push_str(&format!("  <!-- To modify an existing file: -->\n"));
+        prompt.push_str("<workbench_edits summary=\"Concise commit message in imperative mood, e.g. Add validation helper and update context manager\">\n");
+        prompt.push_str("  <!-- To modify an existing file: -->\n");
         prompt.push_str(&format!("  <edit path=\"{}\">\n", sample_path));
         prompt.push_str("    <search>\n");
         prompt.push_str("exact lines from target file to be replaced\n");
@@ -60,11 +138,13 @@ impl EditProtocol for XmlEditProtocol {
         prompt.push_str("</workbench_edits>\n\n");
 
         prompt.push_str("CRITICAL INVARIANTS:\n");
-        prompt.push_str("1. The 'path' attribute MUST EXACTLY match one of the paths listed in <editable_files>.\n");
-        prompt.push_str("2. The <search> block must match EXACTLY ONE location in the target file, including whitespace and line breaks.\n");
-        prompt.push_str("3. Keep <search> blocks as concise as possible while maintaining uniqueness.\n");
-        prompt.push_str("4. You may include multiple <edit>, <create>, or <delete> blocks inside <workbench_edits>.\n");
-        prompt.push_str("5. If no code changes are needed (e.g. conversational answer or explanation), output plain text without any XML edit tags.\n\n");
+        prompt.push_str("1. Specify 'summary=\"...\"' on <workbench_edits> with a high-quality Git commit message.\n");
+        prompt.push_str("2. For <edit>, the 'path' attribute MUST EXACTLY match one of the paths listed in <editable_files>.\n");
+        prompt.push_str("3. For <create>, specify a valid relative path within the repository.\n");
+        prompt.push_str("4. The <search> block must match EXACTLY ONE location in the target file, including whitespace and line breaks.\n");
+        prompt.push_str("5. Keep <search> blocks as concise as possible while maintaining uniqueness.\n");
+        prompt.push_str("6. You may include multiple <edit>, <create>, or <delete> blocks inside <workbench_edits>.\n");
+        prompt.push_str("7. If no code changes are needed (e.g. conversational answer or explanation), output plain text without any XML edit tags.\n\n");
 
         prompt
     }
@@ -81,6 +161,8 @@ impl EditProtocol for XmlEditProtocol {
             };
         }
 
+        let extracted_summary = extract_summary_from_xml(raw_text);
+
         match parse_xml_edits(raw_text, editable_paths) {
             Ok(edits) => {
                 if edits.is_empty() {
@@ -88,12 +170,15 @@ impl EditProtocol for XmlEditProtocol {
                         text: raw_text.to_string(),
                     }
                 } else {
+                    let summary = extracted_summary
+                        .unwrap_or_else(|| "Apply AI code changes".to_string());
                     ModelResult::Edit {
-                        summary: "Applied XML code edits".to_string(),
+                        summary,
                         edits,
                         applied: false,
                         error: None,
                         changed_files: Vec::new(),
+                        commit_hash: None,
                     }
                 }
             }
@@ -103,9 +188,34 @@ impl EditProtocol for XmlEditProtocol {
                 applied: false,
                 error: Some(err_msg),
                 changed_files: Vec::new(),
+                commit_hash: None,
             },
         }
     }
+}
+
+fn extract_summary_from_xml(text: &str) -> Option<String> {
+    // 1. Try finding attribute summary="..." in <workbench_edits ...>
+    if let Some(idx) = text.find("<workbench_edits") {
+        if let Some(end) = text[idx..].find('>') {
+            let header = &text[idx..idx + end];
+            if let Some(s) = extract_attribute(header, "summary") {
+                if !s.trim().is_empty() {
+                    return Some(s.trim().to_string());
+                }
+            }
+        }
+    }
+
+    // 2. Try finding <summary>...</summary> tag
+    if let Some((content, _)) = find_tag(text, "summary") {
+        let clean = content.trim();
+        if !clean.is_empty() {
+            return Some(clean.to_string());
+        }
+    }
+
+    None
 }
 
 fn has_xml_edit_tags(text: &str) -> bool {
@@ -123,7 +233,6 @@ fn parse_xml_edits(text: &str, editable_paths: &[String]) -> Result<Vec<EditOper
     while pos < text.len() {
         let remaining = &text[pos..];
 
-        // Find the next tag candidate
         let next_tag = find_next_edit_tag(remaining);
         let (tag_type, offset) = match next_tag {
             Some(res) => res,
@@ -156,7 +265,6 @@ fn parse_xml_edits(text: &str, editable_paths: &[String]) -> Result<Vec<EditOper
 
                 let inner = &tag_slice[open_tag_end + 1..close_idx];
 
-                // Parse search/replace pairs inside inner
                 let mut inner_pos = 0;
                 let mut found_any = false;
 
@@ -257,7 +365,6 @@ fn find_next_edit_tag(text: &str) -> Option<(TagType, usize)> {
         candidates.push((TagType::Edit, idx));
     }
     if let Some(idx) = find_tag_start(text, "replace") {
-        // Only treat as top-level if it has a 'path' attribute
         if let Some(end_bracket) = text[idx..].find('>') {
             let header = &text[idx..idx + end_bracket];
             if header.contains("path") {
@@ -386,14 +493,18 @@ fn normalize_content(raw: &str) -> String {
 pub struct WholeFileEditProtocol;
 
 impl EditProtocol for WholeFileEditProtocol {
+    fn name(&self) -> &'static str {
+        "whole_file"
+    }
+
     fn system_instructions(&self, editable_paths: &[String]) -> String {
         let mut prompt = String::new();
         prompt.push_str("## Code Modification Protocol (Whole File Replacement)\n");
-        prompt.push_str("When proposing changes, provide the COMPLETE updated content of each modified file.\n");
-        prompt.push_str("Only files listed in <editable_files> may be modified.\n\n");
+        prompt.push_str("When proposing changes, provide the COMPLETE updated content of each modified or newly created file.\n");
+        prompt.push_str("Existing files must be listed in <editable_files>. You may also create new files by specifying their relative path.\n\n");
 
         if editable_paths.is_empty() {
-            prompt.push_str("NOTE: No files are currently marked as editable. Answer questions or explain code without proposing edits.\n\n");
+            prompt.push_str("NOTE: No existing files are currently marked as editable. Answer questions or create new files if requested.\n\n");
         } else {
             prompt.push_str("Permitted target files:\n");
             for path in editable_paths {
@@ -407,7 +518,7 @@ impl EditProtocol for WholeFileEditProtocol {
             .map(|s| s.as_str())
             .unwrap_or("example_file.rs");
 
-        prompt.push_str("Format for specifying file replacements:\n");
+        prompt.push_str("Format for specifying file replacements or new files:\n");
         prompt.push_str(&format!("FILE: {}\n", sample_path));
         prompt.push_str("```\n");
         prompt.push_str("// Complete file contents from first line to last line\n");
@@ -415,7 +526,7 @@ impl EditProtocol for WholeFileEditProtocol {
 
         prompt.push_str("CRITICAL INVARIANTS:\n");
         prompt.push_str("1. Specify 'FILE: <exact_relative_path>' before the code block.\n");
-        prompt.push_str("2. Target path MUST match a file listed under <editable_files>.\n");
+        prompt.push_str("2. For existing files, target path MUST match a file listed under <editable_files>.\n");
         prompt.push_str("3. Inside the fenced block, include the ENTIRE file content. Never truncate with comments like '... rest of code ...'.\n");
         prompt.push_str("4. If no code changes are needed, reply with normal conversational text.\n\n");
 
@@ -423,7 +534,6 @@ impl EditProtocol for WholeFileEditProtocol {
     }
 
     fn parse_output(&self, raw_text: &str, editable_paths: &[String]) -> ModelResult {
-        // Fallback check for workbench_edit JSON block
         if let Some(json_res) = crate::edits::parse_workbench_edit_json(raw_text) {
             return json_res;
         }
@@ -486,9 +596,437 @@ impl EditProtocol for WholeFileEditProtocol {
                 applied: false,
                 error: None,
                 changed_files: Vec::new(),
+                commit_hash: None,
             }
         }
     }
+}
+
+/// Native LLM Tool Calling (Function Calling) edit protocol
+#[derive(Debug, Default, Clone)]
+pub struct ToolCallEditProtocol;
+
+pub type FunctionCallingEditProtocol = ToolCallEditProtocol;
+
+impl EditProtocol for ToolCallEditProtocol {
+    fn name(&self) -> &'static str {
+        "tool_call"
+    }
+
+    fn system_instructions(&self, editable_paths: &[String]) -> String {
+        let mut prompt = String::new();
+        prompt.push_str("## Code Modification Protocol (Native Tool Calling)\n");
+        prompt.push_str("You have access to tools for modifying files: `edit_file`, `create_file`, and `delete_file`.\n");
+        prompt.push_str("When proposing changes, invoke the appropriate tool calls:\n");
+        prompt.push_str("- `edit_file`: Replace an exact block of text in an existing file. Specify `path`, `old_text` (exact match), and `new_text`.\n");
+        prompt.push_str("- `create_file`: Create a new file with `path` and `content`.\n");
+        prompt.push_str("- `delete_file`: Delete an obsolete file with `path`.\n\n");
+
+        if editable_paths.is_empty() {
+            prompt.push_str("NOTE: No existing files are currently marked as editable. Answer questions, explain code, or create new files with `create_file` if requested.\n\n");
+        } else {
+            prompt.push_str("Currently permitted existing target files for modification:\n");
+            for path in editable_paths {
+                prompt.push_str(&format!("- {}\n", path));
+            }
+            prompt.push_str("\n");
+        }
+
+        prompt.push_str("CRITICAL INVARIANTS:\n");
+        prompt.push_str("1. For `edit_file`, `path` MUST EXACTLY match one of the paths listed in permitted files.\n");
+        prompt.push_str("2. For `edit_file`, `old_text` must match EXACTLY ONE location in the target file, including indentation and whitespace.\n");
+        prompt.push_str("3. Keep `old_text` as concise as possible while remaining unique.\n");
+        prompt.push_str("4. For `create_file`, specify the complete file content.\n");
+        prompt.push_str("5. If no code changes are needed, answer conversationally without invoking tool calls.\n\n");
+
+        prompt
+    }
+
+    fn tools(&self, editable_paths: &[String]) -> Option<Vec<ToolDefinition>> {
+        let mut path_schema = serde_json::json!({
+            "type": "string",
+            "description": "Relative path to the permitted file to modify"
+        });
+
+        if !editable_paths.is_empty() {
+            path_schema["enum"] = serde_json::json!(editable_paths);
+        }
+
+        Some(vec![
+            ToolDefinition {
+                tool_type: "function".to_string(),
+                function: FunctionDefinition {
+                    name: "edit_file".to_string(),
+                    description: "Replace an exact block of code in an existing permitted file with new code.".to_string(),
+                    parameters: serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "path": path_schema,
+                            "old_text": {
+                                "type": "string",
+                                "description": "Exact lines or code block from the target file to be replaced. Indentation and whitespace must match uniquely (exactly 1 occurrence)."
+                            },
+                            "new_text": {
+                                "type": "string",
+                                "description": "New replacement code"
+                            },
+                            "summary": {
+                                "type": "string",
+                                "description": "Optional concise commit-style summary of the change"
+                            }
+                        },
+                        "required": ["path", "old_text", "new_text"],
+                        "additionalProperties": false
+                    }),
+                },
+            },
+            ToolDefinition {
+                tool_type: "function".to_string(),
+                function: FunctionDefinition {
+                    name: "create_file".to_string(),
+                    description: "Create a new file with the specified content.".to_string(),
+                    parameters: serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "path": {
+                                "type": "string",
+                                "description": "Relative path for the new file to create"
+                            },
+                            "content": {
+                                "type": "string",
+                                "description": "Complete file content from first line to last line"
+                            },
+                            "summary": {
+                                "type": "string",
+                                "description": "Optional concise explanation of why the file was created"
+                            }
+                        },
+                        "required": ["path", "content"],
+                        "additionalProperties": false
+                    }),
+                },
+            },
+            ToolDefinition {
+                tool_type: "function".to_string(),
+                function: FunctionDefinition {
+                    name: "delete_file".to_string(),
+                    description: "Delete an existing file from the repository.".to_string(),
+                    parameters: serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "path": {
+                                "type": "string",
+                                "description": "Relative path to the file to delete"
+                            },
+                            "summary": {
+                                "type": "string",
+                                "description": "Optional concise explanation of why the file was deleted"
+                            }
+                        },
+                        "required": ["path"],
+                        "additionalProperties": false
+                    }),
+                },
+            },
+        ])
+    }
+
+    fn parse_tool_calls(
+        &self,
+        tool_calls: &[ToolCall],
+        editable_paths: &[String],
+    ) -> Option<ModelResult> {
+        if tool_calls.is_empty() {
+            return None;
+        }
+
+        let mut edits = Vec::new();
+        let mut summaries = Vec::new();
+
+        for call in tool_calls {
+            let fn_name = call.function.name.as_str();
+            let args_str = &call.function.arguments;
+
+            let args: serde_json::Value = match serde_json::from_str(args_str) {
+                Ok(v) => v,
+                Err(err) => {
+                    return Some(ModelResult::Edit {
+                        summary: "Malformed tool call arguments".to_string(),
+                        edits: Vec::new(),
+                        applied: false,
+                        error: Some(format!(
+                            "Invalid JSON in arguments for tool '{}': {}",
+                            fn_name, err
+                        )),
+                        changed_files: Vec::new(),
+                        commit_hash: None,
+                    });
+                }
+            };
+
+            if let Some(s) = args.get("summary").and_then(|v| v.as_str()) {
+                let clean = s.trim();
+                if !clean.is_empty() {
+                    summaries.push(clean.to_string());
+                }
+            }
+
+            match fn_name {
+                "edit_file" | "replace_in_file" | "str_replace" | "replace" => {
+                    let path_raw = match extract_path_arg(&args) {
+                        Some(p) => p,
+                        None => {
+                            return Some(ModelResult::Edit {
+                                summary: "Missing 'path' argument in edit_file".to_string(),
+                                edits: Vec::new(),
+                                applied: false,
+                                error: Some(
+                                    "Schema mismatch: missing required 'path' property in edit_file"
+                                        .to_string(),
+                                ),
+                                changed_files: Vec::new(),
+                                commit_hash: None,
+                            });
+                        }
+                    };
+
+                    let old_text = match extract_string_arg(
+                        &args,
+                        &["old_text", "search", "old_str", "target", "original"],
+                    ) {
+                        Some(t) => t,
+                        None => {
+                            return Some(ModelResult::Edit {
+                                summary: "Missing 'old_text' argument in edit_file".to_string(),
+                                edits: Vec::new(),
+                                applied: false,
+                                error: Some(
+                                    "Schema mismatch: missing required 'old_text' property in edit_file"
+                                        .to_string(),
+                                ),
+                                changed_files: Vec::new(),
+                                commit_hash: None,
+                            });
+                        }
+                    };
+
+                    let new_text = match extract_string_arg(
+                        &args,
+                        &["new_text", "replace", "new_str", "replacement", "content"],
+                    ) {
+                        Some(t) => t,
+                        None => {
+                            return Some(ModelResult::Edit {
+                                summary: "Missing 'new_text' argument in edit_file".to_string(),
+                                edits: Vec::new(),
+                                applied: false,
+                                error: Some(
+                                    "Schema mismatch: missing required 'new_text' property in edit_file"
+                                        .to_string(),
+                                ),
+                                changed_files: Vec::new(),
+                                commit_hash: None,
+                            });
+                        }
+                    };
+
+                    let target_path = resolve_target_path(&path_raw, editable_paths);
+
+                    if !editable_paths.is_empty() && !editable_paths.contains(&target_path) {
+                        return Some(ModelResult::Edit {
+                            summary: format!("File '{}' is not editable", target_path),
+                            edits: Vec::new(),
+                            applied: false,
+                            error: Some(format!(
+                                "Permission error: file '{}' is not marked as editable in context. Permitted files: {}",
+                                target_path,
+                                editable_paths.join(", ")
+                            )),
+                            changed_files: Vec::new(),
+                            commit_hash: None,
+                        });
+                    }
+
+                    edits.push(EditOperation::Replace {
+                        path: target_path,
+                        old_text: normalize_content(&old_text),
+                        new_text: normalize_content(&new_text),
+                    });
+                }
+                "create_file" | "write_file" | "new_file" => {
+                    let path_raw = match extract_path_arg(&args) {
+                        Some(p) => p,
+                        None => {
+                            return Some(ModelResult::Edit {
+                                summary: "Missing 'path' argument in create_file".to_string(),
+                                edits: Vec::new(),
+                                applied: false,
+                                error: Some(
+                                    "Schema mismatch: missing required 'path' property in create_file"
+                                        .to_string(),
+                                ),
+                                changed_files: Vec::new(),
+                                commit_hash: None,
+                            });
+                        }
+                    };
+
+                    let content = match extract_string_arg(&args, &["content", "text", "body", "file_text"]) {
+                        Some(c) => c,
+                        None => {
+                            return Some(ModelResult::Edit {
+                                summary: "Missing 'content' argument in create_file".to_string(),
+                                edits: Vec::new(),
+                                applied: false,
+                                error: Some(
+                                    "Schema mismatch: missing required 'content' property in create_file"
+                                        .to_string(),
+                                ),
+                                changed_files: Vec::new(),
+                                commit_hash: None,
+                            });
+                        }
+                    };
+
+                    let target_path = resolve_target_path(&path_raw, editable_paths);
+                    edits.push(EditOperation::Create {
+                        path: target_path,
+                        content: normalize_content(&content),
+                    });
+                }
+                "delete_file" | "remove_file" => {
+                    let path_raw = match extract_path_arg(&args) {
+                        Some(p) => p,
+                        None => {
+                            return Some(ModelResult::Edit {
+                                summary: "Missing 'path' argument in delete_file".to_string(),
+                                edits: Vec::new(),
+                                applied: false,
+                                error: Some(
+                                    "Schema mismatch: missing required 'path' property in delete_file"
+                                        .to_string(),
+                                ),
+                                changed_files: Vec::new(),
+                                commit_hash: None,
+                            });
+                        }
+                    };
+
+                    let target_path = resolve_target_path(&path_raw, editable_paths);
+                    edits.push(EditOperation::Delete { path: target_path });
+                }
+                "apply_edits" | "workbench_edits" | "batch_edits" => {
+                    if let Some(edits_arr) = args.get("edits").and_then(|v| v.as_array()) {
+                        for edit_val in edits_arr {
+                            if let Some(path_raw) = extract_path_arg(edit_val) {
+                                let target_path = resolve_target_path(&path_raw, editable_paths);
+                                let op_type = edit_val
+                                    .get("type")
+                                    .or_else(|| edit_val.get("op"))
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("replace");
+
+                                match op_type {
+                                    "create" => {
+                                        let content = extract_string_arg(edit_val, &["content", "text"]).unwrap_or_default();
+                                        edits.push(EditOperation::Create {
+                                            path: target_path,
+                                            content: normalize_content(&content),
+                                        });
+                                    }
+                                    "delete" => {
+                                        edits.push(EditOperation::Delete { path: target_path });
+                                    }
+                                    _ => {
+                                        let old_text = extract_string_arg(edit_val, &["old_text", "search"]).unwrap_or_default();
+                                        let new_text = extract_string_arg(edit_val, &["new_text", "replace"]).unwrap_or_default();
+                                        edits.push(EditOperation::Replace {
+                                            path: target_path,
+                                            old_text: normalize_content(&old_text),
+                                            new_text: normalize_content(&new_text),
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                unknown => {
+                    return Some(ModelResult::Edit {
+                        summary: format!("Unknown tool '{}'", unknown),
+                        edits: Vec::new(),
+                        applied: false,
+                        error: Some(format!(
+                            "Unknown tool '{}'. Expected 'edit_file', 'create_file', or 'delete_file'",
+                            unknown
+                        )),
+                        changed_files: Vec::new(),
+                        commit_hash: None,
+                    });
+                }
+            }
+        }
+
+        if edits.is_empty() {
+            return None;
+        }
+
+        let summary = if !summaries.is_empty() {
+            summaries.join("; ")
+        } else if edits.len() == 1 {
+            match &edits[0] {
+                EditOperation::Replace { path, .. } => format!("Update {}", path),
+                EditOperation::Create { path, .. } => format!("Create {}", path),
+                EditOperation::Delete { path } => format!("Delete {}", path),
+            }
+        } else {
+            format!("Apply {} code edits via tool call", edits.len())
+        };
+
+        Some(ModelResult::Edit {
+            summary,
+            edits,
+            applied: false,
+            error: None,
+            changed_files: Vec::new(),
+            commit_hash: None,
+        })
+    }
+
+    fn parse_output(&self, raw_text: &str, editable_paths: &[String]) -> ModelResult {
+        if let Some(json_res) = crate::edits::parse_workbench_edit_json(raw_text) {
+            return json_res;
+        }
+
+        if has_xml_edit_tags(raw_text) {
+            return XmlEditProtocol.parse_output(raw_text, editable_paths);
+        }
+
+        ModelResult::Answer {
+            text: raw_text.to_string(),
+        }
+    }
+}
+
+fn extract_path_arg(args: &serde_json::Value) -> Option<String> {
+    for key in &["path", "file", "filepath", "file_path", "filename"] {
+        if let Some(val) = args.get(*key).and_then(|v| v.as_str()) {
+            let trimmed = val.trim().trim_matches('`').trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn extract_string_arg(args: &serde_json::Value, keys: &[&str]) -> Option<String> {
+    for key in keys {
+        if let Some(val) = args.get(*key).and_then(|v| v.as_str()) {
+            return Some(val.to_string());
+        }
+    }
+    None
 }
 
 fn extract_whole_file_header(line: &str, editable_paths: &[String]) -> Option<String> {
@@ -520,13 +1058,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_xml_protocol_edit_single_block() {
+    fn test_xml_protocol_edit_with_summary_attribute() {
         let proto = XmlEditProtocol;
         let editable = vec!["crates/core/src/lib.rs".to_string()];
 
         let output = r#"I have updated the code:
 
-<workbench_edits>
+<workbench_edits summary="Refactor core initialization">
   <edit path="crates/core/src/lib.rs">
     <search>
 pub fn old_fn() {}
@@ -540,15 +1078,57 @@ pub fn new_fn() {}
 
         let res = proto.parse_output(output, &editable);
         match res {
-            ModelResult::Edit { edits, .. } => {
+            ModelResult::Edit { summary, edits, .. } => {
+                assert_eq!(summary, "Refactor core initialization");
+                assert_eq!(edits.len(), 1);
+            }
+            _ => panic!("Expected ModelResult::Edit"),
+        }
+    }
+
+    #[test]
+    fn test_tool_call_protocol_edit_file() {
+        use crate::model::gateway::FunctionCall;
+
+        let proto = ToolCallEditProtocol;
+        let editable = vec!["crates/core/src/main.rs".to_string()];
+
+        let tools = proto.tools(&editable).expect("Expected tool definitions");
+        assert_eq!(tools.len(), 3);
+        assert_eq!(tools[0].function.name, "edit_file");
+
+        let tool_calls = vec![ToolCall {
+            id: "call_1".to_string(),
+            tool_type: "function".to_string(),
+            function: FunctionCall {
+                name: "edit_file".to_string(),
+                arguments: serde_json::json!({
+                    "path": "crates/core/src/main.rs",
+                    "old_text": "fn old() {}",
+                    "new_text": "fn new() {}"
+                })
+                .to_string(),
+            },
+        }];
+
+        let res = proto
+            .parse_tool_calls(&tool_calls, &editable)
+            .expect("Expected ModelResult");
+        match res {
+            ModelResult::Edit { summary, edits, .. } => {
+                assert_eq!(summary, "Update crates/core/src/main.rs");
                 assert_eq!(edits.len(), 1);
                 match &edits[0] {
-                    EditOperation::Replace { path, old_text, new_text } => {
-                        assert_eq!(path, "crates/core/src/lib.rs");
-                        assert_eq!(old_text, "pub fn old_fn() {}\n");
-                        assert_eq!(new_text, "pub fn new_fn() {}\n");
+                    EditOperation::Replace {
+                        path,
+                        old_text,
+                        new_text,
+                    } => {
+                        assert_eq!(path, "crates/core/src/main.rs");
+                        assert_eq!(old_text, "fn old() {}");
+                        assert_eq!(new_text, "fn new() {}");
                     }
-                    _ => panic!("Expected Replace"),
+                    _ => panic!("Expected Replace operation"),
                 }
             }
             _ => panic!("Expected ModelResult::Edit"),
@@ -556,108 +1136,155 @@ pub fn new_fn() {}
     }
 
     #[test]
-    fn test_xml_protocol_multiple_operations() {
-        let proto = XmlEditProtocol;
-        let editable = vec![
-            "src/main.rs".to_string(),
-            "src/utils.rs".to_string(),
-            "src/old.rs".to_string(),
+    fn test_tool_call_protocol_create_and_delete() {
+        use crate::model::gateway::FunctionCall;
+
+        let proto = ToolCallEditProtocol;
+        let editable = vec![];
+
+        let tool_calls = vec![
+            ToolCall {
+                id: "call_c".to_string(),
+                tool_type: "function".to_string(),
+                function: FunctionCall {
+                    name: "create_file".to_string(),
+                    arguments: serde_json::json!({
+                        "path": "crates/core/src/foo.rs",
+                        "content": "pub struct Foo;\n"
+                    })
+                    .to_string(),
+                },
+            },
+            ToolCall {
+                id: "call_d".to_string(),
+                tool_type: "function".to_string(),
+                function: FunctionCall {
+                    name: "delete_file".to_string(),
+                    arguments: serde_json::json!({
+                        "path": "crates/core/src/bar.rs"
+                    })
+                    .to_string(),
+                },
+            },
         ];
 
-        let output = r#"Here are all the requested changes:
+        let res = proto
+            .parse_tool_calls(&tool_calls, &editable)
+            .expect("Expected ModelResult");
+        match res {
+            ModelResult::Edit { edits, .. } => {
+                assert_eq!(edits.len(), 2);
+                assert!(matches!(&edits[0], EditOperation::Create { path, .. } if path == "crates/core/src/foo.rs"));
+                assert!(matches!(&edits[1], EditOperation::Delete { path } if path == "crates/core/src/bar.rs"));
+            }
+            _ => panic!("Expected ModelResult::Edit"),
+        }
+    }
 
-<workbench_edits>
-  <edit path="src/main.rs">
-    <search>
-    let x = 1;
-    </search>
-    <replace>
-    let x = 42;
-    </replace>
-  </edit>
+    #[test]
+    fn test_tool_call_protocol_permission_validation() {
+        use crate::model::gateway::FunctionCall;
 
-  <create path="src/utils.rs">
-pub fn helper() -> bool { true }
+        let proto = ToolCallEditProtocol;
+        let editable = vec!["src/main.rs".to_string()];
+
+        let tool_calls = vec![ToolCall {
+            id: "call_err".to_string(),
+            tool_type: "function".to_string(),
+            function: FunctionCall {
+                name: "edit_file".to_string(),
+                arguments: serde_json::json!({
+                    "path": "secret/config.rs",
+                    "old_text": "old",
+                    "new_text": "new"
+                })
+                .to_string(),
+            },
+        }];
+
+        let res = proto.parse_tool_calls(&tool_calls, &editable).unwrap();
+        match res {
+            ModelResult::Edit { error, applied, .. } => {
+                assert!(!applied);
+                assert!(error.expect("expected error").contains("Permission error"));
+            }
+            _ => panic!("Expected ModelResult::Edit with error"),
+        }
+    }
+
+    #[test]
+    fn test_tool_call_protocol_schema_mismatch() {
+        use crate::model::gateway::FunctionCall;
+
+        let proto = ToolCallEditProtocol;
+        let editable = vec!["src/main.rs".to_string()];
+
+        // Missing required old_text
+        let tool_calls = vec![ToolCall {
+            id: "call_bad".to_string(),
+            tool_type: "function".to_string(),
+            function: FunctionCall {
+                name: "edit_file".to_string(),
+                arguments: serde_json::json!({
+                    "path": "src/main.rs",
+                    "new_text": "new"
+                })
+                .to_string(),
+            },
+        }];
+
+        let res = proto.parse_tool_calls(&tool_calls, &editable).unwrap();
+        match res {
+            ModelResult::Edit { error, .. } => {
+                assert!(error.expect("expected error").contains("Schema mismatch"));
+            }
+            _ => panic!("Expected ModelResult::Edit with error"),
+        }
+    }
+
+    #[test]
+    fn test_create_edit_protocol_factory() {
+        let p1 = create_edit_protocol("tool_call");
+        assert_eq!(p1.name(), "tool_call");
+
+        let p2 = create_edit_protocol("tools");
+        assert_eq!(p2.name(), "tool_call");
+
+        let p3 = create_edit_protocol("function_calling");
+        assert_eq!(p3.name(), "tool_call");
+
+        let p4 = create_edit_protocol("xml");
+        assert_eq!(p4.name(), "xml");
+    }
+
+    #[test]
+    fn test_xml_protocol_create_new_file() {
+        let proto = XmlEditProtocol;
+        let editable = vec![];
+
+        let output = r#"I will create a helper module:
+
+<workbench_edits summary="Add helper module">
+  <create path="crates/core/src/helper.rs">
+pub fn help() -> bool { true }
   </create>
-
-  <delete path="src/old.rs" />
 </workbench_edits>
 "#;
 
         let res = proto.parse_output(output, &editable);
         match res {
-            ModelResult::Edit { edits, .. } => {
-                assert_eq!(edits.len(), 3);
-                assert_eq!(
-                    edits[0],
-                    EditOperation::Replace {
-                        path: "src/main.rs".to_string(),
-                        old_text: "    let x = 1;\n".to_string(),
-                        new_text: "    let x = 42;\n".to_string(),
-                    }
-                );
-                assert_eq!(
-                    edits[1],
-                    EditOperation::Create {
-                        path: "src/utils.rs".to_string(),
-                        content: "pub fn helper() -> bool { true }\n".to_string(),
-                    }
-                );
-                assert_eq!(
-                    edits[2],
-                    EditOperation::Delete {
-                        path: "src/old.rs".to_string(),
-                    }
-                );
-            }
-            _ => panic!("Expected ModelResult::Edit"),
-        }
-    }
-
-    #[test]
-    fn test_xml_protocol_code_with_generics_does_not_break() {
-        let proto = XmlEditProtocol;
-        let editable = vec!["src/lib.rs".to_string()];
-
-        let output = r#"
-<edit path="src/lib.rs">
-  <search>
-fn parse<T: Clone>(item: Option<T>) -> Result<Vec<T>, Error> {
-  </search>
-  <replace>
-fn parse<T: Clone + Send>(item: Option<T>) -> Result<Vec<T>, Error> {
-  </replace>
-</edit>
-"#;
-
-        let res = proto.parse_output(output, &editable);
-        match res {
-            ModelResult::Edit { edits, .. } => {
+            ModelResult::Edit { summary, edits, .. } => {
+                assert_eq!(summary, "Add helper module");
                 assert_eq!(edits.len(), 1);
                 match &edits[0] {
-                    EditOperation::Replace { old_text, new_text, .. } => {
-                        assert!(old_text.contains("<T: Clone>"));
-                        assert!(new_text.contains("<T: Clone + Send>"));
+                    EditOperation::Create { path, content } => {
+                        assert_eq!(path, "crates/core/src/helper.rs");
+                        assert!(content.contains("pub fn help()"));
                     }
-                    _ => panic!("Expected Replace"),
+                    _ => panic!("Expected Create operation"),
                 }
             }
             _ => panic!("Expected ModelResult::Edit"),
-        }
-    }
-
-    #[test]
-    fn test_xml_protocol_plain_conversational_answer() {
-        let proto = XmlEditProtocol;
-        let editable = vec!["src/main.rs".to_string()];
-
-        let output = "Sure, you can implement this by creating a struct and implementing the Display trait.";
-        let res = proto.parse_output(output, &editable);
-        match res {
-            ModelResult::Answer { text } => {
-                assert_eq!(text, output);
-            }
-            _ => panic!("Expected ModelResult::Answer"),
         }
     }
 }

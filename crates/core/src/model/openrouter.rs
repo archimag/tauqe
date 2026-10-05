@@ -6,7 +6,7 @@ use tokio::sync::mpsc;
 use tokio::sync::watch;
 use workbench_protocol::ModelUsageInfo;
 
-use super::gateway::{ChatMessage, StreamEvent};
+use super::gateway::{ChatMessage, FunctionCall, StreamEvent, ToolCall, ToolDefinition};
 
 pub struct OpenRouterClient {
     api_key: String,
@@ -23,6 +23,12 @@ struct ChatCompletionRequest {
     stream_options: Option<StreamOptions>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning: Option<ReasoningOption>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<Vec<ToolDefinition>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_choice: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parallel_tool_calls: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -81,6 +87,10 @@ pub struct GenerationStats {
 struct StreamingChoice {
     #[serde(default)]
     delta: Option<StreamingDelta>,
+    #[serde(default)]
+    finish_reason: Option<String>,
+    #[serde(default)]
+    error: Option<OpenRouterError>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -89,6 +99,28 @@ struct StreamingDelta {
     content: Option<String>,
     #[serde(default)]
     reasoning: Option<String>,
+    #[serde(default)]
+    tool_calls: Option<Vec<StreamingToolCallDelta>>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct StreamingToolCallDelta {
+    #[serde(default)]
+    index: usize,
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(rename = "type", default)]
+    tool_type: Option<String>,
+    #[serde(default)]
+    function: Option<StreamingFunctionDelta>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct StreamingFunctionDelta {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    arguments: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -199,8 +231,22 @@ impl OpenRouterClient {
         model: &str,
         messages: Vec<ChatMessage>,
         tx: mpsc::Sender<StreamEvent>,
-        mut cancel_rx: watch::Receiver<bool>,
+        cancel_rx: watch::Receiver<bool>,
     ) -> Result<()> {
+        let _ = self
+            .stream_chat_with_tools(model, messages, None, tx, cancel_rx)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn stream_chat_with_tools(
+        &self,
+        model: &str,
+        messages: Vec<ChatMessage>,
+        tools: Option<Vec<ToolDefinition>>,
+        tx: mpsc::Sender<StreamEvent>,
+        mut cancel_rx: watch::Receiver<bool>,
+    ) -> Result<Vec<ToolCall>> {
         let mut headers = HeaderMap::new();
         headers.insert(
             AUTHORIZATION,
@@ -213,6 +259,7 @@ impl OpenRouterClient {
         );
         headers.insert("X-Title", HeaderValue::from_static("Workbench"));
 
+        let has_tools = tools.as_ref().map_or(false, |t| !t.is_empty());
         let payload = ChatCompletionRequest {
             model: model.to_string(),
             messages,
@@ -221,6 +268,13 @@ impl OpenRouterClient {
                 include_usage: true,
             }),
             reasoning: Some(ReasoningOption { enabled: true }),
+            tools: if has_tools { tools } else { None },
+            tool_choice: if has_tools {
+                Some(serde_json::Value::String("auto".to_string()))
+            } else {
+                None
+            },
+            parallel_tool_calls: None,
         };
 
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
@@ -239,6 +293,15 @@ impl OpenRouterClient {
             bail!("OpenRouter HTTP error {}: {}", status, err_text);
         }
 
+        struct InProgressCall {
+            id: Option<String>,
+            tool_type: String,
+            name: Option<String>,
+            arguments: String,
+        }
+
+        let mut in_progress_calls: std::collections::BTreeMap<usize, InProgressCall> =
+            std::collections::BTreeMap::new();
         let mut byte_stream = response.bytes_stream();
         let mut buffer = String::new();
         let mut finished = false;
@@ -250,7 +313,7 @@ impl OpenRouterClient {
                 _ = cancel_rx.changed() => {
                     if *cancel_rx.borrow() {
                         let _ = tx.send(StreamEvent::Cancelled).await;
-                        return Ok(());
+                        return Ok(Vec::new());
                     }
                 }
                 chunk_res = byte_stream.next() => {
@@ -285,7 +348,7 @@ impl OpenRouterClient {
 
                                                 if let Some(err) = chunk.error {
                                                     let _ = tx.send(StreamEvent::Error(err.message)).await;
-                                                    return Ok(());
+                                                    return Ok(Vec::new());
                                                 }
 
                                                 if let Some(usage) = chunk.usage {
@@ -323,6 +386,19 @@ impl OpenRouterClient {
                                                 }
 
                                                 for choice in chunk.choices {
+                                                    if let Some(err) = choice.error {
+                                                        let _ = tx.send(StreamEvent::Error(err.message)).await;
+                                                        return Ok(Vec::new());
+                                                    }
+                                                    if choice.finish_reason.as_deref() == Some("error") {
+                                                        let _ = tx
+                                                            .send(StreamEvent::Error(
+                                                                "Generation ended with finish_reason: error".to_string(),
+                                                            ))
+                                                            .await;
+                                                        return Ok(Vec::new());
+                                                    }
+
                                                     if let Some(delta) = choice.delta {
                                                         if let Some(content) = delta.content {
                                                             if !content.is_empty() {
@@ -332,6 +408,48 @@ impl OpenRouterClient {
                                                         if let Some(reasoning) = delta.reasoning {
                                                             if !reasoning.is_empty() {
                                                                 let _ = tx.send(StreamEvent::ReasoningDelta(reasoning)).await;
+                                                            }
+                                                        }
+                                                        if let Some(tool_call_deltas) = delta.tool_calls {
+                                                            for tc in tool_call_deltas {
+                                                                let entry = in_progress_calls
+                                                                    .entry(tc.index)
+                                                                    .or_insert_with(|| InProgressCall {
+                                                                        id: None,
+                                                                        tool_type: tc
+                                                                            .tool_type
+                                                                            .clone()
+                                                                            .unwrap_or_else(|| "function".to_string()),
+                                                                        name: None,
+                                                                        arguments: String::new(),
+                                                                    });
+
+                                                                if let Some(id) = tc.id {
+                                                                    if !id.is_empty() {
+                                                                        entry.id = Some(id);
+                                                                    }
+                                                                }
+                                                                if let Some(tt) = tc.tool_type {
+                                                                    if !tt.is_empty() {
+                                                                        entry.tool_type = tt;
+                                                                    }
+                                                                }
+
+                                                                if let Some(func) = tc.function {
+                                                                    if let Some(name) = func.name {
+                                                                        if !name.is_empty() {
+                                                                            match &mut entry.name {
+                                                                                Some(existing) => existing.push_str(&name),
+                                                                                None => entry.name = Some(name),
+                                                                            }
+                                                                        }
+                                                                    }
+                                                                    if let Some(args) = func.arguments {
+                                                                        if !args.is_empty() {
+                                                                            entry.arguments.push_str(&args);
+                                                                        }
+                                                                    }
+                                                                }
                                                             }
                                                         }
                                                     }
@@ -347,13 +465,29 @@ impl OpenRouterClient {
                         }
                         Some(Err(err)) => {
                             let _ = tx.send(StreamEvent::Error(err.to_string())).await;
-                            return Ok(());
+                            return Ok(Vec::new());
                         }
                         None => {
                             finished = true;
                         }
                     }
                 }
+            }
+        }
+
+        let mut completed_calls = Vec::new();
+        for (idx, in_progress) in in_progress_calls {
+            let name = in_progress.name.unwrap_or_default();
+            if !name.is_empty() {
+                let call = ToolCall {
+                    id: in_progress.id.unwrap_or_else(|| format!("call_{}", idx)),
+                    tool_type: in_progress.tool_type,
+                    function: FunctionCall {
+                        name,
+                        arguments: in_progress.arguments,
+                    },
+                };
+                completed_calls.push(call);
             }
         }
 
@@ -385,7 +519,7 @@ impl OpenRouterClient {
         }
 
         let _ = tx.send(StreamEvent::Done).await;
-        Ok(())
+        Ok(completed_calls)
     }
 }
 
@@ -421,10 +555,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(10);
         let (_cancel_tx, cancel_rx) = watch::channel(false);
 
-        let messages = vec![ChatMessage {
-            role: "user".to_string(),
-            content: "Ping".to_string(),
-        }];
+        let messages = vec![ChatMessage::user("Ping")];
 
         let client_task = tokio::spawn(async move {
             client.stream_chat("test-model", messages, tx, cancel_rx).await
@@ -491,10 +622,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(10);
         let (_cancel_tx, cancel_rx) = watch::channel(false);
 
-        let messages = vec![ChatMessage {
-            role: "user".to_string(),
-            content: "Hi".to_string(),
-        }];
+        let messages = vec![ChatMessage::user("Hi")];
 
         let client_task = tokio::spawn(async move {
             client.stream_chat("test-model", messages, tx, cancel_rx).await
@@ -514,6 +642,61 @@ mod tests {
         assert_eq!(usage.prompt_tokens, 10);
         assert_eq!(usage.completion_tokens, 5);
         assert_eq!(usage.cost, Some(0.00045));
+    }
+
+    #[tokio::test]
+    async fn test_stream_chat_with_tools_emits_tool_calls() {
+        use super::super::gateway::{FunctionDefinition, ToolDefinition};
+
+        let mock_server = MockServer::start().await;
+
+        let sse_body = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_abc\",\"type\":\"function\",\"function\":{\"name\":\"edit_file\",\"arguments\":\"{\\\"path\\\":\\\"main.rs\\\"\"}}]}}]}\n\n\
+                        data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\",\\\"old_text\\\":\\\"a\\\",\\\"new_text\\\":\\\"b\\\"}\"}}]}}]}\n\n\
+                        data: [DONE]\n\n";
+
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(sse_body, "text/event-stream"),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let client = OpenRouterClient::new("test-api-key".to_string())
+            .with_base_url(mock_server.uri());
+
+        let (tx, mut rx) = mpsc::channel(20);
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+
+        let tools = vec![ToolDefinition {
+            tool_type: "function".to_string(),
+            function: FunctionDefinition {
+                name: "edit_file".to_string(),
+                description: "edit".to_string(),
+                parameters: serde_json::json!({}),
+            },
+        }];
+
+        let client_task = tokio::spawn(async move {
+            client
+                .stream_chat_with_tools("test-model", vec![], Some(tools), tx, cancel_rx)
+                .await
+        });
+
+        while let Some(_event) = rx.recv().await {}
+
+        let res = client_task.await.expect("task join failed");
+        let completed_calls = res.expect("stream_chat_with_tools should succeed");
+
+        assert_eq!(completed_calls.len(), 1);
+        assert_eq!(completed_calls[0].id, "call_abc");
+        assert_eq!(completed_calls[0].function.name, "edit_file");
+        assert_eq!(
+            completed_calls[0].function.arguments,
+            "{\"path\":\"main.rs\",\"old_text\":\"a\",\"new_text\":\"b\"}"
+        );
     }
 
     #[tokio::test]

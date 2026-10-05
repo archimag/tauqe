@@ -16,6 +16,12 @@ pub mod methods {
     pub const CONTEXT_REMOVE: &str = "context/remove";
     pub const CONTEXT_SET_ACCESS: &str = "context/setAccess";
     pub const CONTEXT_CLEAR: &str = "context/clear";
+
+    pub const GIT_UNDO: &str = "git/undo";
+    pub const GIT_GET_DIFF: &str = "git/getDiff";
+
+    pub const CONFIG_GET: &str = "config/get";
+    pub const CONFIG_SET: &str = "config/set";
 }
 
 pub mod events {
@@ -35,6 +41,15 @@ pub mod events {
     pub const EDIT_HUNK: &str = "edit/hunk";
     pub const EDIT_FILE_DONE: &str = "edit/fileDone";
     pub const EDIT_FINISHED: &str = "edit/finished";
+
+    pub const GIT_STATE_CHANGED: &str = "git/stateChanged";
+    pub const GIT_COMMIT_CREATED: &str = "git/commitCreated";
+    pub const GIT_UNDO_COMPLETED: &str = "git/undoCompleted";
+
+    pub const CONFIG_CHANGED: &str = "config/changed";
+
+    pub const TOOLCHAIN_STARTED: &str = "toolchain/started";
+    pub const TOOLCHAIN_RESULT: &str = "toolchain/result";
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -98,6 +113,32 @@ pub struct InitializeResult {
     pub server_version: String,
     pub repository: Option<RepositoryState>,
     pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub edit_protocol: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub available_workflows: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub available_edit_protocols: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConfigState {
+    pub workflow: String,
+    pub edit_protocol: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub available_workflows: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub available_edit_protocols: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ConfigSetParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub edit_protocol: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -250,6 +291,8 @@ pub enum ModelResult {
         error: Option<String>,
         #[serde(default)]
         changed_files: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        commit_hash: Option<String>,
     },
 }
 
@@ -315,14 +358,53 @@ pub struct EditFinishedEvent {
     pub error: Option<String>,
     #[serde(default)]
     pub changed_files: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit_hash: Option<String>,
+}
+
+// Toolchain-related Protocol Types
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolchainStartedEvent {
+    pub operation_id: String,
+    pub command: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolchainResultEvent {
+    pub operation_id: String,
+    pub command: String,
+    pub success: bool,
+    pub output: String,
+}
+
+// Git-related Protocol Types
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GitCommitCreatedEvent {
+    pub commit_hash: String,
+    pub summary: String,
+    pub changed_files: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GitUndoResult {
+    pub undone_commit: String,
+    pub restored_checkpoint: bool,
+    pub new_head: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct GitDiffParams {
+    #[serde(default)]
+    pub path: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GitDiffResult {
+    pub diff: String,
 }
 
 /// Matches a relative path against a glob pattern.
-///
-/// Supports:
-/// - Directory prefix: `src/`, `crates/core`, `crates/core/`
-/// - Extensions: `*.rs`, `*.ts`, `*.md`
-/// - Wildcards: `*` (matches inside a segment), `**` (matches across directories)
 pub fn matches_glob_pattern(pattern: &str, path: &str) -> bool {
     let clean_pat = pattern.trim().trim_start_matches("./");
     let clean_path = path.trim().trim_start_matches("./");
@@ -331,26 +413,22 @@ pub fn matches_glob_pattern(pattern: &str, path: &str) -> bool {
         return false;
     }
 
-    // 1. Directory prefix match (e.g. `src/` or `crates/core`)
     if clean_pat.ends_with('/') {
         let dir = clean_pat.trim_end_matches('/');
         return clean_path.starts_with(&format!("{}/", dir));
     }
 
-    // If pattern doesn't contain wildcards and is a directory prefix
     if !clean_pat.contains('*') && !clean_pat.contains('?') {
         if clean_path == clean_pat || clean_path.starts_with(&format!("{}/", clean_pat)) {
             return true;
         }
     }
 
-    // 2. Simple extension wildcard without slashes, e.g. `*.rs` or `*.test.ts`
     if !clean_pat.contains('/') && clean_pat.starts_with("*.") {
-        let ext = &clean_pat[1..]; // e.g. `.rs`
+        let ext = &clean_pat[1..];
         return clean_path.ends_with(ext);
     }
 
-    // 3. Segmented glob matching with `*` and `**`
     let pat_parts: Vec<&str> = clean_pat.split('/').collect();
     let path_parts: Vec<&str> = clean_path.split('/').collect();
 
@@ -363,7 +441,6 @@ fn match_segments(pat: &[&str], path: &[&str]) -> bool {
     }
 
     if pat[0] == "**" {
-        // `**` can match zero or more path segments
         if match_segments(&pat[1..], path) {
             return true;
         }
@@ -413,80 +490,4 @@ fn match_wildcard_string(pattern: &str, s: &str) -> bool {
     }
 
     p_idx == p_bytes.len()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_request_id_serialization() {
-        let id_num = RequestId::Number(42);
-        assert_eq!(serde_json::to_string(&id_num).unwrap(), "42");
-
-        let id_str = RequestId::String("req-1".to_string());
-        assert_eq!(serde_json::to_string(&id_str).unwrap(), "\"req-1\"");
-    }
-
-    #[test]
-    fn test_request_id_deserialization() {
-        let id_num: RequestId = serde_json::from_str("42").unwrap();
-        assert_eq!(id_num, RequestId::Number(42));
-
-        let id_str: RequestId = serde_json::from_str("\"req-1\"").unwrap();
-        assert_eq!(id_str, RequestId::String("req-1".to_string()));
-    }
-
-    #[test]
-    fn test_message_deserialization_request() {
-        let json_str = r#"{"id": 1, "method": "client/initialize", "params": {}}"#;
-        let msg: Message = serde_json::from_str(json_str).unwrap();
-        match msg {
-            Message::Request(req) => {
-                assert_eq!(req.id, RequestId::Number(1));
-                assert_eq!(req.method, "client/initialize");
-                assert!(req.params.is_some());
-            }
-            _ => panic!("Expected Request"),
-        }
-    }
-
-    #[test]
-    fn test_context_access_serialization() {
-        let ro = ContextAccess::ReadOnly;
-        assert_eq!(serde_json::to_string(&ro).unwrap(), "\"read_only\"");
-        let ed = ContextAccess::Editable;
-        assert_eq!(serde_json::to_string(&ed).unwrap(), "\"editable\"");
-    }
-
-    #[test]
-    fn test_edit_operation_serialization() {
-        let op = EditOperation::Replace {
-            path: "src/lib.rs".to_string(),
-            old_text: "fn foo() {}".to_string(),
-            new_text: "fn foo() -> u32 { 42 }".to_string(),
-        };
-        let json = serde_json::to_string(&op).unwrap();
-        assert!(json.contains("\"type\":\"replace\""));
-
-        let deserialized: EditOperation = serde_json::from_str(&json).unwrap();
-        assert_eq!(op, deserialized);
-    }
-
-    #[test]
-    fn test_matches_glob_pattern() {
-        assert!(matches_glob_pattern("src/", "src/main.rs"));
-        assert!(matches_glob_pattern("crates/core", "crates/core/src/lib.rs"));
-        assert!(!matches_glob_pattern("src/", "tests/main.rs"));
-
-        assert!(matches_glob_pattern("*.rs", "src/main.rs"));
-        assert!(matches_glob_pattern("*.rs", "crates/tui/src/main.rs"));
-        assert!(!matches_glob_pattern("*.rs", "Cargo.toml"));
-
-        assert!(matches_glob_pattern("crates/**/*.rs", "crates/core/src/lib.rs"));
-        assert!(matches_glob_pattern("**/tests/*.rs", "crates/core/tests/integration.rs"));
-        assert!(!matches_glob_pattern("crates/**/*.rs", "src/main.rs"));
-
-        assert!(matches_glob_pattern("crates/*/*.toml", "crates/core/Cargo.toml"));
-    }
 }

@@ -158,12 +158,16 @@ impl XmlStreamFilter {
                         let content = self.buffer[..close_pos].to_string();
                         self.buffer.drain(..close_pos + close_tag.len());
 
+                        let norm_content = normalize_hunk(&content);
+
                         events.push(StreamEvent::EditHunk {
                             path: curr_path.clone(),
                             hunk_index: 0,
                             old_text: String::new(),
-                            new_text: content,
+                            new_text: norm_content.clone(),
                         });
+
+                        self.staged_contents.insert(curr_path.clone(), norm_content);
 
                         events.push(StreamEvent::EditFileDone {
                             path: curr_path,

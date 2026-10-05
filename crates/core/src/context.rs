@@ -185,7 +185,30 @@ impl ContextManager {
         }
     }
 
-    fn normalize_path(&self, p: &str) -> Result<String> {
+    /// Prunes files from context that no longer exist on disk (e.g. after undoing AI creation).
+    pub fn prune_missing_files(&mut self) -> Vec<String> {
+        let mut removed = Vec::new();
+        let to_remove: Vec<String> = self
+            .items
+            .keys()
+            .filter(|p| !self.repo_root.join(p).is_file())
+            .cloned()
+            .collect();
+
+        for path in to_remove {
+            if self.items.remove(&path).is_some() {
+                removed.push(path);
+            }
+        }
+
+        if !removed.is_empty() {
+            self.revision += 1;
+        }
+
+        removed
+    }
+
+    pub fn normalize_path(&self, p: &str) -> Result<String> {
         let path = Path::new(p);
         let mut components = Vec::new();
 
@@ -259,5 +282,25 @@ mod tests {
         assert!(cm.contains("src/lib.rs").unwrap());
         assert!(cm.contains("src/main.rs").unwrap());
         assert!(!cm.contains("docs/Readme.md").unwrap());
+    }
+
+    #[test]
+    fn test_prune_missing_files() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+
+        let file_path = root.join("test.rs");
+        std::fs::write(&file_path, "fn hello() {}").unwrap();
+
+        let mut cm = ContextManager::new(root);
+        cm.add_file("test.rs", ContextAccess::Editable).unwrap();
+        assert!(cm.contains("test.rs").unwrap());
+
+        // Delete file from disk
+        std::fs::remove_file(&file_path).unwrap();
+
+        let pruned = cm.prune_missing_files();
+        assert_eq!(pruned, vec!["test.rs".to_string()]);
+        assert!(!cm.contains("test.rs").unwrap());
     }
 }

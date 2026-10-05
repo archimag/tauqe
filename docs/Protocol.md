@@ -99,8 +99,8 @@ Event
 {
   "id": 42,
   "error": {
-    "code": "ACTION_NOT_PERMITTED",
-    "message": "Action 'check' is not permitted for the current task."
+    "code": "OPERATION_IN_PROGRESS",
+    "message": "Cannot change workflow or edit protocol while a model operation is in progress"
   }
 }
 ```
@@ -125,278 +125,146 @@ Client и server выполняют handshake через `client/initialize`.
 
 Client сообщает:
 
-```text
-protocolVersion
-clientName
-clientVersion
-capabilities
+```json
+{
+  "protocol_version": "0.1.0",
+  "client_name": "workbench-tui",
+  "client_version": "0.1.0"
+}
 ```
 
 Server отвечает:
 
-```text
-protocolVersion
-serverVersion
-capabilities
-session/workspace state
+```json
+{
+  "protocol_version": "0.1.0",
+  "server_name": "workbench-server",
+  "server_version": "0.1.0",
+  "repository": {
+    "root": "/path/to/repo",
+    "branch": "main",
+    "head": "abc1234",
+    "dirty": false
+  },
+  "model": "anthropic/claude-3.5-sonnet",
+  "workflow": "toolchain",
+  "edit_protocol": "xml",
+  "available_workflows": ["toolchain", "git", "naive"],
+  "available_edit_protocols": ["xml", "whole_file", "tool_call"]
+}
 ```
 
 До `1.0` protocol может intentionally break compatibility.
 
-## 9. Client capabilities
+## 9. Configuration methods & events
 
-Пример:
-
-```text
-supportsAudioCapture
-supportsAudioStreaming
-supportsTTS
-supportsOpenFile
-supportsOpenSymbol
-supportsDiffView
-supportsRichText
-supportsNotifications
-```
-
-## 10. Server capabilities
-
-Пример:
-
-```text
-voice.serverCapture
-voice.clientStreaming
-voice.transcriptInput
-
-project.plans
-project.symbolIndex
-project.repoMap
-
-git.undo
-git.history
-
-models.streaming
-edits.streaming
-```
-
-## 11. Session model
-
-Client подключается к server и открывает repository/session.
-
-```text
-repository/open
-session/create
-session/attach
-session/close
-```
-
-Server может поддерживать несколько clients на одну session.
-
-## 12. Repository methods
-
-```text
-repository/open
-repository/getState
-repository/refresh
-repository/listFiles
-repository/findFiles
-repository/findSymbols
-repository/findReferences
-```
-
-`repository/getState` возвращает минимум:
-
-```text
-root
-branch
-HEAD
-dirty state
-changed files
-trust state
-active task/plan
-```
-
-## 13. Workspace trust
-
-```text
-workspace/getTrust
-workspace/setTrust
-```
-
-Trust изменяется только explicit user action.
-
-Model не может вызвать `workspace/setTrust`.
-
-## 14. Project model methods
-
-```text
-project/getModel
-project/listPackages
-project/getPackage
-project/listActions
-project/getAction
-project/listPlans
-project/getPlan
-project/activatePlan
-project/getInstructions
-```
-
-## 15. ProjectAction protocol
-
-### List
-
-```text
-project/listActions
-```
-
-### Run
-
+### 9.1 config/get
+Возвращает текущие настройки выполнения и поддерживаемые списки:
 ```json
 {
-  "method": "project/runAction",
+  "workflow": "toolchain",
+  "edit_protocol": "xml",
+  "available_workflows": ["toolchain", "git", "naive"],
+  "available_edit_protocols": ["xml", "whole_file", "tool_call"]
+}
+```
+
+### 9.2 config/set
+Изменяет текущий рабочий процесс или протокол редактирования:
+```json
+{
+  "method": "config/set",
   "params": {
-    "action": "check",
-    "target": {
-      "type": "package",
-      "id": "core"
+    "workflow": "git",
+    "edit_protocol": "tool_call"
+  }
+}
+```
+*Инвариант:* если в данный момент выполняется генерация модели, сервер возвращает ошибку `OPERATION_IN_PROGRESS`.
+
+### 9.3 config/changed
+Событие рассылается всем клиентам при изменении настроек:
+```json
+{
+  "method": "config/changed",
+  "params": {
+    "workflow": "git",
+    "edit_protocol": "tool_call",
+    "available_workflows": ["toolchain", "git", "naive"],
+    "available_edit_protocols": ["xml", "whole_file", "tool_call"]
+  }
+}
+```
+
+## 10. Repository methods
+
+```text
+repository/getState
+repository/listFiles
+```
+
+`repository/getState` возвращает:
+- `root`: абсолютный путь к корню;
+- `branch`: имя текущей ветки;
+- `head`: сокращенный хэш HEAD;
+- `dirty`: boolean-признак наличия незакоммиченных изменений.
+
+`repository/listFiles` возвращает плоский список всех отслеживаемых файлов репозитория.
+
+## 11. Context methods & events
+
+```text
+context/get
+context/add
+context/addPattern
+context/remove
+context/setAccess
+context/clear
+```
+
+### 11.1 context/addPattern
+Пакетное добавление файлов по glob-маске или префиксу директории:
+```json
+{
+  "method": "context/addPattern",
+  "params": {
+    "pattern": "crates/core/src/*.rs",
+    "access": "read_only"
+  }
+}
+```
+Ответ:
+```json
+{
+  "added_count": 8,
+  "added_tokens": 12450,
+  "state": { ... }
+}
+```
+
+### 11.2 context/changed
+Событие рассылается клиентам при любом изменении состава или прав файлов контекста:
+```json
+{
+  "method": "context/changed",
+  "params": {
+    "state": {
+      "revision": 5,
+      "total_estimated_tokens": 14200,
+      "items": [
+        {
+          "path": "crates/core/src/lib.rs",
+          "access": "editable",
+          "size_bytes": 1024,
+          "estimated_tokens": 256
+        }
+      ]
     }
   }
 }
 ```
 
-Server проверяет:
-
-- action существует;
-- project trusted;
-- action разрешён;
-- target допустим.
-
-## 16. В protocol нет agent shell
-
-Это намеренный invariant.
-
-Не должно существовать методов:
-
-```text
-agent/runShell
-model/runCommand
-agent/exec
-```
-
-Model layer не получает arbitrary shell.
-
-Если человек явно хочет выполнить command:
-
-```text
-user/runCommand
-```
-
-это отдельный user-authorized method с отдельной policy.
-
-## 17. Context methods
-
-```text
-context/get
-context/add
-context/remove
-context/setAccess
-context/clear
-context/pin
-context/getRevision
-```
-
-Пример:
-
-```json
-{
-  "method": "context/add",
-  "params": {
-    "path": "crates/core/src/task.rs",
-    "access": "editable"
-  }
-}
-```
-
-## 18. Context item types
-
-Начальный набор:
-
-```text
-File
-Symbol
-SourceRange
-Plan
-Instruction
-Run
-DiagnosticSet
-GitDiff
-CommitDiff
-UserText
-```
-
-Access modes:
-- `read_only`
-- `editable`
-
-## 19. Context events
-
-```text
-context/changed
-context/budgetChanged
-context/itemInvalidated
-```
-
-`context/changed` содержит актуальный `ContextState` и новую revision.
-
-## 20. Task methods
-
-```text
-task/create
-task/get
-task/list
-task/activate
-task/updateTitle
-task/close
-```
-
-Task является logical work boundary.
-
-## 21. Intent methods
-
-Два основных semantic entry points:
-
-```text
-intent/submitText
-intent/submitTranscript
-```
-
-Пример:
-
-```json
-{
-  "method": "intent/submitText",
-  "params": {
-    "text": "Добавь architecture read-only и запусти check."
-  }
-}
-```
-
-Server сам:
-
-- резолвит references;
-- классифицирует intents;
-- исполняет deterministic части;
-- вызывает coding model при необходимости.
-
-## 22. Resolved intent events
-
-```text
-intent/resolved
-intent/ambiguous
-intent/executed
-intent/failed
-```
-
-## 23. Model operation methods
+## 12. Model operation methods
 
 ```text
 model/ask
@@ -404,7 +272,17 @@ model/cancel
 model/clearHistory
 ```
 
-## 24. Model & Reasoning events
+### model/ask
+```json
+{
+  "method": "model/ask",
+  "params": {
+    "prompt": "Добавь валидацию путей в context manager"
+  }
+}
+```
+
+## 13. Model & Reasoning events
 
 ```text
 model/started
@@ -417,16 +295,18 @@ model/cancelled
 model/error
 ```
 
-Текстовые дельты передают исключительно естественный язык модели (объяснения, рассуждения, ответы на вопросы). Блоки правок кода перехватываются потоковым фильтром сервера и транслируются в семантические события редактирования.
+- `model/reasoningDelta`: стриминг рассуждений модели (thinking/reasoning).
+- `model/textDelta`: чистый текст ответа без сырых тегов разметки правок.
+- `model/usage`: оперативные данные о токенах и точной стоимости (`cost` в USD) за запрос и суммарно за сессию (`session_total_cost`).
 
-## 25. Structured Edit Streaming events
+## 14. Structured Edit Streaming events
 
-Во время генерации кода сервером клиенту отправляются события жизненного цикла изменений файлов:
+Во время генерации кода сервером клиенту отправляются семантические события:
 
-### 25.1 edit/started
+### 14.1 edit/started
 Сигнализирует о начале блока правок в ответе модели.
 
-### 25.2 edit/fileStarted
+### 14.2 edit/fileStarted
 Начало генерации изменений конкретного файла.
 ```json
 {
@@ -440,8 +320,8 @@ model/error
 ```
 `op_type`: `"replace"`, `"create"`, `"delete"`.
 
-### 25.3 edit/hunk
-Потоковое получение готового чанка search/replace.
+### 14.3 edit/hunk
+Потоковое получение готового чанка search/replace:
 ```json
 {
   "method": "edit/hunk",
@@ -455,8 +335,8 @@ model/error
 }
 ```
 
-### 25.4 edit/fileDone
-Завершение обработки файла и результат промежуточной валидации в памяти сервера.
+### 14.4 edit/fileDone
+Завершение обработки файла и результат промежуточной валидации в памяти сервера:
 ```json
 {
   "method": "edit/fileDone",
@@ -468,110 +348,74 @@ model/error
   }
 }
 ```
-При ошибке сопоставления `search` (не найден или неоднозначен) передаются `status: "error"` и `error: "..."`.
+При ошибке сопоставления передаются `status: "error"` и `error: "..."`.
 
-### 25.5 edit/finished
-Финальное событие атомарного применения всех изменений на диск.
+### 14.5 edit/finished
+Финальное событие атомарного применения изменений:
 ```json
 {
   "method": "edit/finished",
   "params": {
     "operation_id": "op-42",
     "applied": true,
-    "changed_files": ["crates/core/src/edits.rs"]
+    "changed_files": ["crates/core/src/edits.rs"],
+    "commit_hash": "a1b2c3d"
   }
 }
 ```
 
-## 26. Git methods
+## 15. Toolchain events
 
-```text
-git/getStatus
-git/getDiff
-git/getCommitDiff
-git/listHistory
-git/commit
-git/undo
+В воркфлоу `toolchain` транслируются события детерминированной проектной проверки:
+
+### 15.1 toolchain/started
+```json
+{
+  "method": "toolchain/started",
+  "params": {
+    "operation_id": "op-42",
+    "command": "cargo check"
+  }
+}
 ```
 
-Branch-changing operations не входят в начальный protocol.
-
-## 27. Git events
-
-```text
-git/stateChanged
-git/commitCreated
-git/undoCompleted
-git/externalChangeDetected
+### 15.2 toolchain/result
+```json
+{
+  "method": "toolchain/result",
+  "params": {
+    "operation_id": "op-42",
+    "command": "cargo check",
+    "success": true,
+    "output": "   Compiling workbench-core v0.1.0\n    Finished dev [unoptimized + debuginfo] target(s) in 1.42s"
+  }
+}
 ```
 
-## 28. Runs
+## 16. Git methods & events
 
-Methods:
+### Methods:
+- `git/getDiff`: получение unified diff между коммитами или рабочего дерева.
+- `git/undo`: детерминированный откат последнего AI-коммита.
+  *Инвариант:* если в данный момент выполняется генерация модели, возвращается ошибка `OPERATION_IN_PROGRESS`.
 
-```text
-run/get
-run/list
-run/cancel
+Ответ `git/undo`:
+```json
+{
+  "undone_commit": "a1b2c3d",
+  "restored_checkpoint": true,
+  "new_head": "e4f5a6b",
+  "message": "Undid AI commit a1b2c3d and restored original uncommitted changes."
+}
 ```
 
-Events:
+### Events:
+- `git/stateChanged`: обновление статуса репозитория (ветка, HEAD, dirty).
+- `git/commitCreated`: фиксация AI-коммита (`commit_hash`, `summary`, `changed_files`).
+- `git/undoCompleted`: уведомление об успешном откате коммита и восстановлении чекпоинта.
 
-```text
-run/started
-run/stdout
-run/stderr
-run/diagnostic
-run/finished
-```
+## 17. В protocol нет agent shell
 
-## 29. Voice architecture
-
-Voice — first-class protocol subsystem.
-
-Protocol поддерживает три режима:
-- Server capture (`voice/startCapture`, `voice/stopCapture`);
-- Client audio stream (`voice/startStream`, `voice/audioChunk`, `voice/stopStream`);
-- Client transcript (`voice/submitTranscript`).
-
-## 30. Spoken output
-
-Server генерирует semantic events:
-
-```text
-speech/question
-speech/notification
-speech/error
-speech/completion
-```
-
-Client решает показать text, произнести через TTS или проигнорировать.
-
-## 31. Active object / focus context
-
-```text
-client/setFocus
-```
-
-Позволяет разрешать анафорические ссылки («это», «его», «эти ошибки»).
-
-## 32. Open-in-editor requests
-
-```text
-client/openLocation
-client/openSymbol
-client/showDiff
-```
-
-## 33. Cancellation
-
-```text
-operation/cancel
-```
-
-Применимо к model calls, actions/runs, voice capture и indexing. При отмене частичные правки никогда не применяются.
-
-## 34. Conformance & Compatibility
-
-TUI является reference client и conformance implementation.
-До `1.0` protocol может вносить breaking changes с обязательным bump версии.
+Это фундаментальный инвариант архитектуры.
+В протоколе намеренно отсутствуют методы вида `agent/runShell`, `model/runCommand`, `agent/exec`.
+Модель может действовать исключительно через семантические правки файлов и зарегистрированные проектные действия.

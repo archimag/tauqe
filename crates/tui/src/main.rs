@@ -5,7 +5,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
-use crossterm::event::{self, KeyCode, KeyModifiers};
+use crossterm::event::{
+    self, KeyCode, KeyModifiers, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+    PushKeyboardEnhancementFlags,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -20,12 +23,13 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::Mutex;
 use workbench_protocol::matches_glob_pattern;
 use workbench_protocol::{
-    events, methods, ContextAccess, ContextAddParams, ContextAddPatternParams,
-    ContextAddPatternResult, ContextRemoveParams, ContextSetAccessParams, ContextState,
-    EditFileDoneEvent, EditFileStartedEvent, EditFinishedEvent, EditHunkEvent, Event,
-    InitializeParams, InitializeResult, Message, ModelAskParams, ModelDeltaEvent,
-    ModelErrorEvent, ModelFinishedEvent, ModelResult, ModelResultEvent, ModelStartedEvent,
-    ModelUsageEvent, RepositoryListFilesResult, RepositoryState, Request, RequestId, Response,
+    events, methods, ConfigSetParams, ConfigState, ContextAccess, ContextAddParams,
+    ContextAddPatternParams, ContextAddPatternResult, ContextRemoveParams, ContextSetAccessParams,
+    ContextState, EditFileDoneEvent, EditFileStartedEvent, EditFinishedEvent, EditHunkEvent, Event,
+    GitCommitCreatedEvent, GitUndoResult, InitializeParams, InitializeResult, Message,
+    ModelAskParams, ModelDeltaEvent, ModelErrorEvent, ModelFinishedEvent, ModelResult,
+    ModelResultEvent, ModelStartedEvent, ModelUsageEvent, RepositoryListFilesResult,
+    RepositoryState, Request, RequestId, Response, ToolchainResultEvent, ToolchainStartedEvent,
     PROTOCOL_VERSION,
 };
 
@@ -33,8 +37,8 @@ struct TerminalGuard;
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
+        let _ = execute!(stdout(), PopKeyboardEnhancementFlags, LeaveAlternateScreen);
         let _ = disable_raw_mode();
-        let _ = execute!(stdout(), LeaveAlternateScreen);
     }
 }
 
@@ -69,19 +73,24 @@ struct ModelView {
     usage: Option<ModelUsageEvent>,
     last_op_cost: Option<f64>,
     session_total_cost: f64,
-    status: String, // "idle", "starting", "streaming", "done", "cancelled", "error"
+    status: String,
     error: Option<String>,
     result: Option<ModelResult>,
     scroll: u16,
     show_reasoning: bool,
     auto_scroll: bool,
 
-    // Structured Org-Mode Edits State
+    // Structured Org-Mode Edits & Git State
     edits_active: bool,
     files: Vec<StreamingFileEdit>,
     selected_file_index: usize,
     edit_final_applied: Option<bool>,
     edit_final_error: Option<String>,
+    last_commit_hash: Option<String>,
+    last_commit_summary: Option<String>,
+    git_notification: Option<String>,
+    toolchain_command: Option<String>,
+    toolchain_status: Option<String>,
     spinner_frame: usize,
 }
 
@@ -106,6 +115,11 @@ impl Default for ModelView {
             selected_file_index: 0,
             edit_final_applied: None,
             edit_final_error: None,
+            last_commit_hash: None,
+            last_commit_summary: None,
+            git_notification: None,
+            toolchain_command: None,
+            toolchain_status: None,
             spinner_frame: 0,
         }
     }
@@ -150,19 +164,358 @@ impl Default for ContextViewState {
     }
 }
 
+#[derive(Debug, Clone, Default)]
+struct InputEditor {
+    text: String,
+    cursor: usize, // byte offset in text, guaranteed to be on a UTF-8 char boundary
+    kill_ring: String,
+}
+
+impl InputEditor {
+    fn is_empty(&self) -> bool {
+        self.text.is_empty()
+    }
+
+    fn clear(&mut self) {
+        self.text.clear();
+        self.cursor = 0;
+    }
+
+    fn get_text(&self) -> &str {
+        &self.text
+    }
+
+    fn line_count(&self) -> usize {
+        if self.text.is_empty() {
+            1
+        } else {
+            let count = self.text.split('\n').count();
+            count.max(1)
+        }
+    }
+
+    fn cursor_line_col(&self) -> (usize, usize) {
+        let mut line = 0;
+        let mut col = 0;
+        for (i, c) in self.text.char_indices() {
+            if i >= self.cursor {
+                break;
+            }
+            if c == '\n' {
+                line += 1;
+                col = 0;
+            } else {
+                col += 1;
+            }
+        }
+        (line, col)
+    }
+
+    fn get_lines(&self) -> Vec<&str> {
+        if self.text.is_empty() {
+            vec![""]
+        } else {
+            self.text.split('\n').collect()
+        }
+    }
+
+    fn insert_char(&mut self, c: char) {
+        self.text.insert(self.cursor, c);
+        self.cursor += c.len_utf8();
+    }
+
+    fn insert_str(&mut self, s: &str) {
+        self.text.insert_str(self.cursor, s);
+        self.cursor += s.len();
+    }
+
+    fn delete_backward(&mut self) {
+        if self.cursor > 0 {
+            let prev_char = self.text[..self.cursor].chars().next_back().unwrap();
+            let prev_len = prev_char.len_utf8();
+            let new_cursor = self.cursor - prev_len;
+            self.text.drain(new_cursor..self.cursor);
+            self.cursor = new_cursor;
+        }
+    }
+
+    fn delete_forward(&mut self) {
+        if self.cursor < self.text.len() {
+            let next_char = self.text[self.cursor..].chars().next().unwrap();
+            let next_len = next_char.len_utf8();
+            self.text.drain(self.cursor..self.cursor + next_len);
+        }
+    }
+
+    fn move_backward(&mut self) {
+        if self.cursor > 0 {
+            let prev_char = self.text[..self.cursor].chars().next_back().unwrap();
+            self.cursor -= prev_char.len_utf8();
+        }
+    }
+
+    fn move_forward(&mut self) {
+        if self.cursor < self.text.len() {
+            let next_char = self.text[self.cursor..].chars().next().unwrap();
+            let next_char_len = next_char.len_utf8();
+            self.cursor += next_char_len;
+        }
+    }
+
+    fn current_line_start(&self) -> usize {
+        self.text[..self.cursor].rfind('\n').map(|idx| idx + 1).unwrap_or(0)
+    }
+
+    fn current_line_end(&self) -> usize {
+        self.text[self.cursor..]
+            .find('\n')
+            .map(|idx| self.cursor + idx)
+            .unwrap_or(self.text.len())
+    }
+
+    fn move_beginning_of_line(&mut self) {
+        self.cursor = self.current_line_start();
+    }
+
+    fn move_end_of_line(&mut self) {
+        self.cursor = self.current_line_end();
+    }
+
+    fn kill_line(&mut self) {
+        let line_end = self.current_line_end();
+        if self.cursor == line_end {
+            if self.cursor < self.text.len() {
+                let removed = self.text.remove(self.cursor);
+                self.kill_ring = removed.to_string();
+            }
+        } else {
+            let killed: String = self.text.drain(self.cursor..line_end).collect();
+            self.kill_ring = killed;
+        }
+    }
+
+    fn kill_to_beginning_of_line(&mut self) {
+        let line_start = self.current_line_start();
+        if self.cursor > line_start {
+            let killed: String = self.text.drain(line_start..self.cursor).collect();
+            self.kill_ring = killed;
+            self.cursor = line_start;
+        } else if self.cursor > 0 {
+            self.delete_backward();
+        }
+    }
+
+    fn yank(&mut self) {
+        if !self.kill_ring.is_empty() {
+            let s = self.kill_ring.clone();
+            self.insert_str(&s);
+        }
+    }
+
+    fn kill_word_forward(&mut self) {
+        if self.cursor >= self.text.len() {
+            return;
+        }
+        let after = &self.text[self.cursor..];
+        let mut chars = after.char_indices();
+        let mut first_word_idx = None;
+        for (idx, c) in chars.by_ref() {
+            if !c.is_whitespace() {
+                first_word_idx = Some(idx);
+                break;
+            }
+        }
+        if first_word_idx.is_none() {
+            let killed: String = self.text.drain(self.cursor..).collect();
+            self.kill_ring = killed;
+            return;
+        }
+        let mut end_idx = after.len();
+        for (idx, c) in chars {
+            if c.is_whitespace() {
+                end_idx = idx;
+                break;
+            }
+        }
+        let killed: String = self.text.drain(self.cursor..self.cursor + end_idx).collect();
+        self.kill_ring = killed;
+    }
+
+    fn kill_word_backward(&mut self) {
+        if self.cursor == 0 {
+            return;
+        }
+        let before = &self.text[..self.cursor];
+        let mut char_indices: Vec<(usize, char)> = before.char_indices().collect();
+        while let Some(&(_, c)) = char_indices.last() {
+            if c.is_whitespace() {
+                char_indices.pop();
+            } else {
+                break;
+            }
+        }
+        while let Some(&(_, c)) = char_indices.last() {
+            if !c.is_whitespace() {
+                char_indices.pop();
+            } else {
+                break;
+            }
+        }
+        let target_pos = char_indices.last().map(|&(idx, c)| idx + c.len_utf8()).unwrap_or(0);
+        let killed: String = self.text.drain(target_pos..self.cursor).collect();
+        self.kill_ring = killed;
+        self.cursor = target_pos;
+    }
+
+    fn move_word_backward(&mut self) {
+        if self.cursor == 0 {
+            return;
+        }
+        let before = &self.text[..self.cursor];
+        let mut char_indices: Vec<(usize, char)> = before.char_indices().collect();
+        while let Some(&(_, c)) = char_indices.last() {
+            if c.is_whitespace() {
+                char_indices.pop();
+            } else {
+                break;
+            }
+        }
+        while let Some(&(_, c)) = char_indices.last() {
+            if !c.is_whitespace() {
+                char_indices.pop();
+            } else {
+                break;
+            }
+        }
+        self.cursor = char_indices.last().map(|&(idx, c)| idx + c.len_utf8()).unwrap_or(0);
+    }
+
+    fn move_word_forward(&mut self) {
+        if self.cursor >= self.text.len() {
+            return;
+        }
+        let after = &self.text[self.cursor..];
+        let mut chars = after.char_indices();
+        let mut first_word_idx = None;
+        for (idx, c) in chars.by_ref() {
+            if !c.is_whitespace() {
+                first_word_idx = Some(idx);
+                break;
+            }
+        }
+        if first_word_idx.is_none() {
+            self.cursor = self.text.len();
+            return;
+        }
+        let mut end_idx = after.len();
+        for (idx, c) in chars {
+            if c.is_whitespace() {
+                end_idx = idx;
+                break;
+            }
+        }
+        self.cursor += end_idx;
+    }
+
+    fn move_line_up(&mut self) -> bool {
+        let line_start = self.current_line_start();
+        if line_start == 0 {
+            return false;
+        }
+        let col = self.text[line_start..self.cursor].chars().count();
+        let prev_line_end = line_start - 1;
+        let prev_line_start = self.text[..prev_line_end].rfind('\n').map(|idx| idx + 1).unwrap_or(0);
+        let prev_line_chars: Vec<usize> = self.text[prev_line_start..prev_line_end]
+            .char_indices()
+            .map(|(idx, _)| prev_line_start + idx)
+            .collect();
+
+        if col < prev_line_chars.len() {
+            self.cursor = prev_line_chars[col];
+        } else {
+            self.cursor = prev_line_end;
+        }
+        true
+    }
+
+    fn move_line_down(&mut self) -> bool {
+        let line_end = self.current_line_end();
+        if line_end >= self.text.len() {
+            return false;
+        }
+        let line_start = self.current_line_start();
+        let col = self.text[line_start..self.cursor].chars().count();
+        let next_line_start = line_end + 1;
+        let next_line_end = self.text[next_line_start..]
+            .find('\n')
+            .map(|idx| next_line_start + idx)
+            .unwrap_or(self.text.len());
+
+        let next_line_chars: Vec<usize> = self.text[next_line_start..next_line_end]
+            .char_indices()
+            .map(|(idx, _)| next_line_start + idx)
+            .collect();
+
+        if col < next_line_chars.len() {
+            self.cursor = next_line_chars[col];
+        } else {
+            self.cursor = next_line_end;
+        }
+        true
+    }
+}
+
 struct AppState {
     view_mode: ViewMode,
     protocol_version: String,
     repo_state: Option<RepositoryState>,
     all_repo_files: Vec<String>,
+    workflow: String,
+    edit_protocol: String,
+    available_workflows: Vec<String>,
+    available_edit_protocols: Vec<String>,
     model: ModelView,
     context: ContextState,
     context_view: ContextViewState,
+    input_editor: InputEditor,
     show_help: bool,
+    confirm_undo: bool,
     last_model_height: u16,
 }
 
 impl AppState {
+    fn take_prompt(&mut self) -> Option<String> {
+        if self.input_editor.is_empty() {
+            return None;
+        }
+        let prompt = self.input_editor.get_text().trim().to_string();
+        self.input_editor.clear();
+        if prompt.is_empty() {
+            return None;
+        }
+
+        self.model.reasoning.clear();
+        self.model.text.clear();
+        self.model.error = None;
+        self.model.result = None;
+        self.model.usage = None;
+        self.model.scroll = 0;
+        self.model.status = "starting".to_string();
+        self.model.show_reasoning = true;
+        self.model.auto_scroll = true;
+
+        self.model.edits_active = false;
+        self.model.files.clear();
+        self.model.selected_file_index = 0;
+        self.model.edit_final_applied = None;
+        self.model.edit_final_error = None;
+        self.model.git_notification = None;
+        self.model.toolchain_command = None;
+        self.model.toolchain_status = None;
+
+        Some(prompt)
+    }
+
     fn update_filtered_candidates(&mut self) {
         let query = self.context_view.add_input.trim();
         let existing: std::collections::HashSet<&str> = self
@@ -175,7 +528,6 @@ impl AppState {
         let mut candidates = Vec::new();
 
         if !query.is_empty() {
-            // Check if query behaves as pattern or directory prefix
             let is_pattern_query = query.contains('*')
                 || query.contains('?')
                 || query.ends_with('/')
@@ -326,6 +678,18 @@ async fn main() -> anyhow::Result<()> {
 
     let repo_state = init_result.repository;
     let protocol_version = init_result.protocol_version.clone();
+    let workflow = init_result.workflow.unwrap_or_else(|| "toolchain".to_string());
+    let edit_protocol = init_result.edit_protocol.unwrap_or_else(|| "xml".to_string());
+    let available_workflows = if init_result.available_workflows.is_empty() {
+        vec!["toolchain".to_string(), "git".to_string(), "naive".to_string()]
+    } else {
+        init_result.available_workflows
+    };
+    let available_edit_protocols = if init_result.available_edit_protocols.is_empty() {
+        vec!["xml".to_string(), "whole_file".to_string(), "tool_call".to_string()]
+    } else {
+        init_result.available_edit_protocols
+    };
 
     // Initial context fetch
     let ctx_req = Request {
@@ -376,23 +740,25 @@ async fn main() -> anyhow::Result<()> {
         _ => Vec::new(),
     };
 
-    // Shared UI state
     let state = Arc::new(Mutex::new(AppState {
         view_mode: ViewMode::Model,
         protocol_version,
         repo_state,
         all_repo_files: initial_files,
+        workflow,
+        edit_protocol,
+        available_workflows,
+        available_edit_protocols,
         model: ModelView::default(),
         context: initial_context,
         context_view: ContextViewState::default(),
+        input_editor: InputEditor::default(),
         show_help: false,
+        confirm_undo: false,
         last_model_height: 10,
     }));
 
-    // Channel for incoming server messages
     let (msg_tx, mut msg_rx) = tokio::sync::mpsc::channel::<Message>(100);
-
-    // Spawn background reader
     {
         let msg_tx = msg_tx.clone();
         tokio::spawn(async move {
@@ -412,7 +778,6 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    // Channel for key events
     let (key_tx, mut key_rx) = tokio::sync::mpsc::channel::<event::KeyEvent>(100);
     {
         tokio::spawn(async move {
@@ -430,29 +795,48 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    // Terminal initialization
     enable_raw_mode()?;
-    execute!(stdout(), EnterAlternateScreen)?;
+    execute!(
+        stdout(),
+        EnterAlternateScreen,
+        PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES),
+    )?;
     let _guard = TerminalGuard;
 
     let backend = CrosstermBackend::new(stdout());
     let mut terminal = Terminal::new(backend)?;
 
-    let mut input_buffer = String::new();
-
-    // Main UI loop
     loop {
         {
             let mut st = state.lock().await;
             st.model.spinner_frame = (st.model.spinner_frame + 1) % SPINNER_FRAMES.len();
-            terminal.draw(|f| render_ui(f, &mut st, &input_buffer))?;
+            terminal.draw(|f| render_ui(f, &mut st))?;
         }
 
         tokio::select! {
             Some(key) = key_rx.recv() => {
+                if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('q') {
+                    break;
+                }
+
                 let mut st = state.lock().await;
 
-                // Help overlay toggle / dismissal
+                // Handle active undo confirmation modal
+                if st.confirm_undo {
+                    match key.code {
+                        KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                            st.confirm_undo = false;
+                            drop(st);
+                            send_request(&mut server_writer, methods::GIT_UNDO, serde_json::json!({})).await?;
+                        }
+                        KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                            st.confirm_undo = false;
+                        }
+                        _ => {}
+                    }
+                    continue;
+                }
+
                 if st.show_help {
                     match key.code {
                         KeyCode::Char('?') | KeyCode::Esc | KeyCode::Char('q') => {
@@ -498,18 +882,160 @@ async fn main() -> anyhow::Result<()> {
                             st.model.clamp_scroll(h);
                             continue;
                         }
+                        KeyCode::Char('w') => {
+                            let is_busy = st.model.status == "streaming" || st.model.status == "starting";
+                            if is_busy {
+                                st.model.git_notification = Some("Cannot change workflow while model is generating".to_string());
+                                continue;
+                            }
+                            if !st.available_workflows.is_empty() {
+                                let cur_idx = st
+                                    .available_workflows
+                                    .iter()
+                                    .position(|w| w == &st.workflow)
+                                    .unwrap_or(0);
+                                let next_idx = (cur_idx + 1) % st.available_workflows.len();
+                                let next_wf = st.available_workflows[next_idx].clone();
+                                st.workflow = next_wf.clone();
+                                let params = ConfigSetParams {
+                                    workflow: Some(next_wf),
+                                    edit_protocol: None,
+                                };
+                                drop(st);
+                                send_request(&mut server_writer, methods::CONFIG_SET, serde_json::to_value(params)?).await?;
+                                continue;
+                            }
+                        }
+                        KeyCode::Char('p') => {
+                            let is_busy = st.model.status == "streaming" || st.model.status == "starting";
+                            if is_busy {
+                                st.model.git_notification = Some("Cannot change edit protocol while model is generating".to_string());
+                                continue;
+                            }
+                            if !st.available_edit_protocols.is_empty() {
+                                let cur_idx = st
+                                    .available_edit_protocols
+                                    .iter()
+                                    .position(|p| p == &st.edit_protocol)
+                                    .unwrap_or(0);
+                                let next_idx = (cur_idx + 1) % st.available_edit_protocols.len();
+                                let next_proto = st.available_edit_protocols[next_idx].clone();
+                                st.edit_protocol = next_proto.clone();
+                                let params = ConfigSetParams {
+                                    workflow: None,
+                                    edit_protocol: Some(next_proto),
+                                };
+                                drop(st);
+                                send_request(&mut server_writer, methods::CONFIG_SET, serde_json::to_value(params)?).await?;
+                                continue;
+                            }
+                        }
+                        KeyCode::Char('a') if st.view_mode == ViewMode::Model => {
+                            st.input_editor.move_beginning_of_line();
+                            continue;
+                        }
+                        KeyCode::Char('e') if st.view_mode == ViewMode::Model => {
+                            st.input_editor.move_end_of_line();
+                            continue;
+                        }
+                        KeyCode::Char('k') if st.view_mode == ViewMode::Model => {
+                            st.input_editor.kill_line();
+                            continue;
+                        }
+                        KeyCode::Char('u') if st.view_mode == ViewMode::Model => {
+                            st.input_editor.kill_to_beginning_of_line();
+                            continue;
+                        }
+                        KeyCode::Char('y') if st.view_mode == ViewMode::Model => {
+                            st.input_editor.yank();
+                            continue;
+                        }
+                        KeyCode::Char('d') if st.view_mode == ViewMode::Model => {
+                            st.input_editor.delete_forward();
+                            continue;
+                        }
+                        KeyCode::Char('b') if st.view_mode == ViewMode::Model => {
+                            st.input_editor.move_backward();
+                            continue;
+                        }
+                        KeyCode::Char('f') if st.view_mode == ViewMode::Model => {
+                            st.input_editor.move_forward();
+                            continue;
+                        }
+                        KeyCode::Left if st.view_mode == ViewMode::Model => {
+                            st.input_editor.move_word_backward();
+                            continue;
+                        }
+                        KeyCode::Right if st.view_mode == ViewMode::Model => {
+                            st.input_editor.move_word_forward();
+                            continue;
+                        }
+                        // Submit prompt via Ctrl+Enter
+                        KeyCode::Enter if st.view_mode == ViewMode::Model => {
+                            if let Some(prompt) = st.take_prompt() {
+                                drop(st);
+                                let params = ModelAskParams { prompt };
+                                send_request(&mut server_writer, methods::MODEL_ASK, serde_json::to_value(params)?).await?;
+                            }
+                            continue;
+                        }
+                        // Ctrl+J inserts newline just like regular Enter
+                        KeyCode::Char('j') if st.view_mode == ViewMode::Model => {
+                            if !st.input_editor.is_empty() {
+                                st.input_editor.insert_char('\n');
+                            } else if !st.model.files.is_empty() {
+                                let sel_idx = st.model.selected_file_index;
+                                if let Some(file) = st.model.files.get_mut(sel_idx) {
+                                    file.expanded = !file.expanded;
+                                    let h = st.last_model_height;
+                                    st.model.clamp_scroll(h);
+                                }
+                            } else {
+                                st.input_editor.insert_char('\n');
+                            }
+                            continue;
+                        }
                         _ => {}
                     }
                 }
 
-                // Global Help toggle
-                if key.code == KeyCode::Char('?') && !st.context_view.adding_file && (st.view_mode != ViewMode::Model || input_buffer.is_empty()) {
+                if key.modifiers.contains(KeyModifiers::ALT) && st.view_mode == ViewMode::Model {
+                    match key.code {
+                        KeyCode::Char('b') | KeyCode::Left => {
+                            st.input_editor.move_word_backward();
+                            continue;
+                        }
+                        KeyCode::Char('f') | KeyCode::Right => {
+                            st.input_editor.move_word_forward();
+                            continue;
+                        }
+                        KeyCode::Char('d') => {
+                            st.input_editor.kill_word_forward();
+                            continue;
+                        }
+                        KeyCode::Backspace => {
+                            st.input_editor.kill_word_backward();
+                            continue;
+                        }
+                        // Submit prompt also via Alt+Enter as a universal shortcut
+                        KeyCode::Enter => {
+                            if let Some(prompt) = st.take_prompt() {
+                                drop(st);
+                                let params = ModelAskParams { prompt };
+                                send_request(&mut server_writer, methods::MODEL_ASK, serde_json::to_value(params)?).await?;
+                            }
+                            continue;
+                        }
+                        _ => {}
+                    }
+                }
+
+                if key.code == KeyCode::Char('?') && !st.context_view.adding_file && (st.view_mode != ViewMode::Model || st.input_editor.is_empty()) {
                     st.show_help = true;
                     continue;
                 }
 
-                // View Mode switching via Tab (when not typing in add input or intent prompt)
-                if key.code == KeyCode::Tab && !st.context_view.adding_file && (input_buffer.is_empty() || st.view_mode == ViewMode::Context) {
+                if key.code == KeyCode::Tab && !st.context_view.adding_file && (st.input_editor.is_empty() || st.view_mode == ViewMode::Context) {
                     st.view_mode = match st.view_mode {
                         ViewMode::Model => ViewMode::Context,
                         ViewMode::Context => ViewMode::Model,
@@ -526,21 +1052,29 @@ async fn main() -> anyhow::Result<()> {
                                 if st.model.status == "streaming" || st.model.status == "starting" {
                                     drop(st);
                                     send_request(&mut server_writer, methods::MODEL_CANCEL, serde_json::json!({})).await?;
-                                } else {
-                                    break;
+                                } else if !st.input_editor.is_empty() {
+                                    st.input_editor.clear();
                                 }
                             }
-                            KeyCode::Char('[') => {
+                            KeyCode::Char('u') if st.input_editor.is_empty() => {
+                                let is_busy = st.model.status == "streaming" || st.model.status == "starting";
+                                if is_busy {
+                                    st.model.git_notification = Some("Cannot undo while model is generating".to_string());
+                                } else {
+                                    st.confirm_undo = true;
+                                }
+                            }
+                            KeyCode::Char('[') if st.input_editor.is_empty() => {
                                 if !st.model.files.is_empty() {
                                     st.model.selected_file_index = st.model.selected_file_index.saturating_sub(1);
                                 }
                             }
-                            KeyCode::Char(']') => {
+                            KeyCode::Char(']') if st.input_editor.is_empty() => {
                                 if !st.model.files.is_empty() && st.model.selected_file_index + 1 < st.model.files.len() {
                                     st.model.selected_file_index += 1;
                                 }
                             }
-                            KeyCode::Char(' ') if input_buffer.is_empty() => {
+                            KeyCode::Char(' ') if st.input_editor.is_empty() => {
                                 let sel_idx = st.model.selected_file_index;
                                 if let Some(file) = st.model.files.get_mut(sel_idx) {
                                     file.expanded = !file.expanded;
@@ -548,31 +1082,15 @@ async fn main() -> anyhow::Result<()> {
                                     st.model.clamp_scroll(h);
                                 }
                             }
+                            KeyCode::Tab => {
+                                st.input_editor.insert_str("  ");
+                            }
                             KeyCode::Enter => {
-                                if !input_buffer.trim().is_empty() {
-                                    let prompt = input_buffer.clone();
-                                    input_buffer.clear();
-
-                                    st.model.reasoning.clear();
-                                    st.model.text.clear();
-                                    st.model.error = None;
-                                    st.model.result = None;
-                                    st.model.usage = None;
-                                    st.model.scroll = 0;
-                                    st.model.status = "starting".to_string();
-                                    st.model.show_reasoning = true;
-                                    st.model.auto_scroll = true;
-
-                                    st.model.edits_active = false;
-                                    st.model.files.clear();
-                                    st.model.selected_file_index = 0;
-                                    st.model.edit_final_applied = None;
-                                    st.model.edit_final_error = None;
-
-                                    let params = ModelAskParams { prompt };
-                                    drop(st);
-                                    send_request(&mut server_writer, methods::MODEL_ASK, serde_json::to_value(params)?).await?;
+                                if !st.input_editor.is_empty() {
+                                    // Enter inserts newline in multi-line prompt mode
+                                    st.input_editor.insert_char('\n');
                                 } else if !st.model.files.is_empty() {
+                                    // Enter toggles selected diff when input is empty
                                     let sel_idx = st.model.selected_file_index;
                                     if let Some(file) = st.model.files.get_mut(sel_idx) {
                                         file.expanded = !file.expanded;
@@ -582,10 +1100,35 @@ async fn main() -> anyhow::Result<()> {
                                 }
                             }
                             KeyCode::Char(c) => {
-                                input_buffer.push(c);
+                                st.input_editor.insert_char(c);
                             }
                             KeyCode::Backspace => {
-                                input_buffer.pop();
+                                st.input_editor.delete_backward();
+                            }
+                            KeyCode::Delete => {
+                                st.input_editor.delete_forward();
+                            }
+                            KeyCode::Left => {
+                                st.input_editor.move_backward();
+                            }
+                            KeyCode::Right => {
+                                st.input_editor.move_forward();
+                            }
+                            KeyCode::Home => {
+                                if !st.input_editor.is_empty() {
+                                    st.input_editor.move_beginning_of_line();
+                                } else {
+                                    st.model.auto_scroll = false;
+                                    st.model.scroll = 0;
+                                }
+                            }
+                            KeyCode::End => {
+                                if !st.input_editor.is_empty() {
+                                    st.input_editor.move_end_of_line();
+                                } else {
+                                    st.model.auto_scroll = true;
+                                    st.model.scroll = st.model.max_scroll(view_height);
+                                }
                             }
                             KeyCode::PageUp => {
                                 st.model.auto_scroll = false;
@@ -599,7 +1142,9 @@ async fn main() -> anyhow::Result<()> {
                                 }
                             }
                             KeyCode::Up => {
-                                if input_buffer.is_empty() && !st.model.files.is_empty() {
+                                if !st.input_editor.is_empty() {
+                                    st.input_editor.move_line_up();
+                                } else if !st.model.files.is_empty() {
                                     st.model.selected_file_index = st.model.selected_file_index.saturating_sub(1);
                                 } else {
                                     st.model.auto_scroll = false;
@@ -607,7 +1152,9 @@ async fn main() -> anyhow::Result<()> {
                                 }
                             }
                             KeyCode::Down => {
-                                if input_buffer.is_empty() && !st.model.files.is_empty() && st.model.selected_file_index + 1 < st.model.files.len() {
+                                if !st.input_editor.is_empty() {
+                                    st.input_editor.move_line_down();
+                                } else if !st.model.files.is_empty() && st.model.selected_file_index + 1 < st.model.files.len() {
                                     st.model.selected_file_index += 1;
                                 } else {
                                     let max = st.model.max_scroll(view_height);
@@ -616,14 +1163,6 @@ async fn main() -> anyhow::Result<()> {
                                         st.model.auto_scroll = true;
                                     }
                                 }
-                            }
-                            KeyCode::Home => {
-                                st.model.auto_scroll = false;
-                                st.model.scroll = 0;
-                            }
-                            KeyCode::End => {
-                                st.model.auto_scroll = true;
-                                st.model.scroll = st.model.max_scroll(view_height);
                             }
                             _ => {}
                         }
@@ -752,7 +1291,6 @@ async fn main() -> anyhow::Result<()> {
                                     st.context_view.status_message = None;
                                     st.update_filtered_candidates();
 
-                                    // Refresh repository files list in background
                                     drop(st);
                                     send_request(
                                         &mut server_writer,
@@ -838,11 +1376,25 @@ async fn handle_response(resp: Response, state: &Arc<Mutex<AppState>>) {
     if let Some(err) = resp.error {
         st.context_view.status_message = Some(format!("Error: {}", err.message));
         if st.view_mode == ViewMode::Model {
-            st.model.status = "error".to_string();
-            st.model.error = Some(format!("{}: {}", err.code, err.message));
+            st.model.git_notification = Some(format!("Error: {}", err.message));
         }
     } else if let Some(val) = resp.result {
-        if let Ok(pattern_res) = serde_json::from_value::<ContextAddPatternResult>(val.clone()) {
+        if let Ok(cfg) = serde_json::from_value::<ConfigState>(val.clone()) {
+            st.workflow = cfg.workflow;
+            st.edit_protocol = cfg.edit_protocol;
+            if !cfg.available_workflows.is_empty() {
+                st.available_workflows = cfg.available_workflows;
+            }
+            if !cfg.available_edit_protocols.is_empty() {
+                st.available_edit_protocols = cfg.available_edit_protocols;
+            }
+        } else if let Ok(undo_res) = serde_json::from_value::<GitUndoResult>(val.clone()) {
+            st.model.git_notification = Some(undo_res.message.clone());
+            st.model.last_commit_hash = None;
+            st.model.last_commit_summary = None;
+            st.model.edit_final_applied = None;
+            st.model.files.clear();
+        } else if let Ok(pattern_res) = serde_json::from_value::<ContextAddPatternResult>(val.clone()) {
             st.context = pattern_res.state;
             st.context_view.status_message = Some(format!(
                 "Added {} files (~{} tokens)",
@@ -873,6 +1425,44 @@ async fn handle_response(resp: Response, state: &Arc<Mutex<AppState>>) {
 async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>) {
     let mut st = state.lock().await;
     match ev.method.as_str() {
+        events::GIT_STATE_CHANGED => {
+            if let Some(params) = ev.params {
+                if let Some(val) = params.get("repository") {
+                    if let Ok(repo) = serde_json::from_value::<RepositoryState>(val.clone()) {
+                        st.repo_state = Some(repo);
+                    }
+                }
+            }
+        }
+        events::GIT_COMMIT_CREATED => {
+            if let Some(params) = ev.params {
+                if let Ok(data) = serde_json::from_value::<GitCommitCreatedEvent>(params) {
+                    st.model.last_commit_hash = Some(data.commit_hash);
+                    st.model.last_commit_summary = Some(data.summary);
+                }
+            }
+        }
+        events::GIT_UNDO_COMPLETED => {
+            if let Some(params) = ev.params {
+                if let Ok(data) = serde_json::from_value::<GitUndoResult>(params) {
+                    st.model.git_notification = Some(data.message);
+                }
+            }
+        }
+        events::CONFIG_CHANGED => {
+            if let Some(params) = ev.params {
+                if let Ok(cfg) = serde_json::from_value::<ConfigState>(params) {
+                    st.workflow = cfg.workflow;
+                    st.edit_protocol = cfg.edit_protocol;
+                    if !cfg.available_workflows.is_empty() {
+                        st.available_workflows = cfg.available_workflows;
+                    }
+                    if !cfg.available_edit_protocols.is_empty() {
+                        st.available_edit_protocols = cfg.available_edit_protocols;
+                    }
+                }
+            }
+        }
         events::CONTEXT_CHANGED => {
             if let Some(params) = ev.params {
                 if let Some(val) = params.get("state") {
@@ -979,6 +1569,29 @@ async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>) {
                 if let Ok(data) = serde_json::from_value::<EditFinishedEvent>(params) {
                     st.model.edit_final_applied = Some(data.applied);
                     st.model.edit_final_error = data.error;
+                    if let Some(hash) = data.commit_hash {
+                        st.model.last_commit_hash = Some(hash);
+                    }
+                }
+            }
+        }
+        events::TOOLCHAIN_STARTED => {
+            if let Some(params) = ev.params {
+                if let Ok(data) = serde_json::from_value::<ToolchainStartedEvent>(params) {
+                    st.model.toolchain_command = Some(data.command.clone());
+                    st.model.toolchain_status = Some(format!("Running toolchain verification: {}...", data.command));
+                }
+            }
+        }
+        events::TOOLCHAIN_RESULT => {
+            if let Some(params) = ev.params {
+                if let Ok(data) = serde_json::from_value::<ToolchainResultEvent>(params) {
+                    st.model.toolchain_command = None;
+                    if data.success {
+                        st.model.toolchain_status = Some(format!("Toolchain check passed ({})", data.command));
+                    } else {
+                        st.model.toolchain_status = Some(format!("Toolchain check failed ({})", data.command));
+                    }
                 }
             }
         }
@@ -1080,6 +1693,32 @@ fn compute_model_lines(model: &ModelView) -> Vec<Line<'static>> {
         ]));
     }
 
+    if let Some(notif) = &model.git_notification {
+        model_lines.push(Line::from(vec![
+            Span::styled(" [GIT] ", Style::default().bg(Color::Cyan).fg(Color::Black).bold()),
+            Span::raw(" "),
+            Span::styled(notif.clone(), Style::default().fg(Color::Cyan).bold()),
+        ]));
+    }
+
+    if let Some(toolchain_info) = &model.toolchain_status {
+        let is_running = model.toolchain_command.is_some();
+        let badge = if is_running {
+            let spin = SPINNER_FRAMES[model.spinner_frame % SPINNER_FRAMES.len()];
+            Span::styled(format!(" [{}] TOOLCHAIN ", spin), Style::default().bg(Color::Cyan).fg(Color::Black).bold())
+        } else if toolchain_info.contains("passed") {
+            Span::styled(" [TOOLCHAIN: OK] ", Style::default().bg(Color::Green).fg(Color::Black).bold())
+        } else {
+            Span::styled(" [TOOLCHAIN: FAILED] ", Style::default().bg(Color::Red).fg(Color::White).bold())
+        };
+
+        model_lines.push(Line::from(vec![
+            badge,
+            Span::raw(" "),
+            Span::styled(toolchain_info.clone(), Style::default().bold().fg(Color::White)),
+        ]));
+    }
+
     if !model.reasoning.is_empty() {
         if model.show_reasoning {
             model_lines.push(Line::from(Span::styled(
@@ -1114,7 +1753,13 @@ fn compute_model_lines(model: &ModelView) -> Vec<Line<'static>> {
         let ok_files = model.files.iter().filter(|f| f.status == "ok").count();
 
         let header_badge = match model.edit_final_applied {
-            Some(true) => Span::styled(" [APPLIED] ", Style::default().bg(Color::Green).fg(Color::Black).bold()),
+            Some(true) => {
+                if let Some(hash) = &model.last_commit_hash {
+                    Span::styled(format!(" [COMMITTED: {}] ", hash), Style::default().bg(Color::Green).fg(Color::Black).bold())
+                } else {
+                    Span::styled(" [APPLIED] ", Style::default().bg(Color::Green).fg(Color::Black).bold())
+                }
+            }
             Some(false) => Span::styled(" [REJECTED] ", Style::default().bg(Color::Red).fg(Color::White).bold()),
             None => {
                 let spin = SPINNER_FRAMES[model.spinner_frame % SPINNER_FRAMES.len()];
@@ -1122,14 +1767,28 @@ fn compute_model_lines(model: &ModelView) -> Vec<Line<'static>> {
             }
         };
 
-        model_lines.push(Line::from(vec![
+        let mut header_spans = vec![
             header_badge,
             Span::raw(" "),
             Span::styled(
                 format!("Proposed Edits ({}/{} files) - [ / ] Navigate, Space/Enter to Fold/Unfold", ok_files, total_files),
                 Style::default().bold().fg(Color::Cyan),
             ),
-        ]));
+        ];
+
+        if model.last_commit_hash.is_some() {
+            header_spans.push(Span::raw(" | "));
+            header_spans.push(Span::styled("Press 'u' to Undo AI commit", Style::default().fg(Color::Yellow)));
+        }
+
+        model_lines.push(Line::from(header_spans));
+
+        if let Some(summary) = &model.last_commit_summary {
+            model_lines.push(Line::from(vec![
+                Span::raw("  Summary: "),
+                Span::styled(summary.clone(), Style::default().bold().fg(Color::White)),
+            ]));
+        }
 
         for (idx, file) in model.files.iter().enumerate() {
             let is_selected = idx == model.selected_file_index;
@@ -1145,14 +1804,25 @@ fn compute_model_lines(model: &ModelView) -> Vec<Line<'static>> {
                 ),
             };
 
-            let op_label = match file.op_type.as_str() {
-                "create" => "[NEW] ",
-                "delete" => "[DEL] ",
-                _ => "",
+            let (op_label, op_style) = match file.op_type.as_str() {
+                "create" => ("[NEW] ", Style::default().fg(Color::Green).bold()),
+                "delete" => ("[DEL] ", Style::default().fg(Color::Red).bold()),
+                _ => ("[EDIT] ", Style::default().fg(Color::Magenta).bold()),
             };
 
             let hunk_count = file.hunks.len();
-            let hunk_label = if hunk_count == 1 {
+            let hunk_label = if file.op_type == "create" {
+                let line_count = file
+                    .hunks
+                    .first()
+                    .map(|h| h.new_text.lines().count())
+                    .unwrap_or(0);
+                if line_count == 1 {
+                    "1 line".to_string()
+                } else {
+                    format!("{} lines", line_count)
+                }
+            } else if hunk_count == 1 {
                 "1 hunk".to_string()
             } else {
                 format!("{} hunks", hunk_count)
@@ -1169,7 +1839,7 @@ fn compute_model_lines(model: &ModelView) -> Vec<Line<'static>> {
                     Span::raw("  "),
                     Span::styled(cursor_prefix, Style::default().fg(Color::Cyan)),
                     Span::styled(fold_icon, Style::default().fg(Color::DarkGray)),
-                    Span::styled(op_label, Style::default().fg(Color::Magenta).bold()),
+                    Span::styled(op_label, op_style),
                     Span::styled(file.path.clone(), Style::default().bold()),
                     Span::raw(" "),
                     Span::styled(format!("({})", hunk_label), Style::default().fg(Color::DarkGray)),
@@ -1189,13 +1859,23 @@ fn compute_model_lines(model: &ModelView) -> Vec<Line<'static>> {
 
             if file.expanded {
                 for hunk in &file.hunks {
-                    model_lines.push(Line::from(vec![
-                        Span::raw("      "),
-                        Span::styled(
-                            format!("@@ hunk {} @@", hunk.hunk_index + 1),
-                            Style::default().fg(Color::DarkGray).italic(),
-                        ),
-                    ]));
+                    if file.op_type == "create" {
+                        model_lines.push(Line::from(vec![
+                            Span::raw("      "),
+                            Span::styled(
+                                "@@ new file @@",
+                                Style::default().fg(Color::Green).italic(),
+                            ),
+                        ]));
+                    } else {
+                        model_lines.push(Line::from(vec![
+                            Span::raw("      "),
+                            Span::styled(
+                                format!("@@ hunk {} @@", hunk.hunk_index + 1),
+                                Style::default().fg(Color::DarkGray).italic(),
+                            ),
+                        ]));
+                    }
 
                     for line in hunk.old_text.lines() {
                         model_lines.push(Line::from(vec![
@@ -1274,13 +1954,19 @@ fn compute_model_lines(model: &ModelView) -> Vec<Line<'static>> {
     model_lines
 }
 
-fn render_ui(frame: &mut ratatui::Frame, state: &mut AppState, input_buffer: &str) {
+fn render_ui(frame: &mut ratatui::Frame, state: &mut AppState) {
+    let term_height = frame.area().height;
+    // Multi-line editor dynamically grows from 3 lines up to 40% of terminal height (between 6 and 16)
+    let max_input_height = (term_height * 4 / 10).clamp(6, 16);
+    let needed_input_height = (state.input_editor.line_count() as u16 + 2).max(3);
+    let input_height = needed_input_height.min(max_input_height);
+
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3),
             Constraint::Min(5),
-            Constraint::Length(3),
+            Constraint::Length(input_height),
             Constraint::Length(3),
         ])
         .split(frame.area());
@@ -1330,6 +2016,10 @@ fn render_ui(frame: &mut ratatui::Frame, state: &mut AppState, input_buffer: &st
         Span::raw("  HEAD: "),
         Span::styled(head, Style::default().fg(Color::Magenta)),
         dirty_status,
+        Span::raw("  | Wf: "),
+        Span::styled(&state.workflow, Style::default().fg(Color::Cyan).bold()),
+        Span::raw("  Proto: "),
+        Span::styled(&state.edit_protocol, Style::default().fg(Color::Magenta).bold()),
         Span::raw("  | Session: "),
         Span::styled(
             format!("${:.5}", state.model.session_total_cost),
@@ -1383,23 +2073,96 @@ fn render_ui(frame: &mut ratatui::Frame, state: &mut AppState, input_buffer: &st
                 .scroll((state.model.scroll, 0));
             frame.render_widget(model_paragraph, chunks[1]);
 
-            let input_line = Line::from(vec![
-                Span::styled(" > ", Style::default().fg(Color::Cyan).bold()),
-                Span::raw(input_buffer),
-            ]);
-            let input_paragraph = Paragraph::new(input_line)
-                .block(Block::default().title(" Intent ").borders(Borders::ALL));
+            let editor = &state.input_editor;
+            let text = editor.get_text();
+            let mut input_lines = Vec::new();
+            let (cur_line_idx, cur_col) = editor.cursor_line_col();
+
+            if text.is_empty() {
+                input_lines.push(Line::from(vec![
+                    Span::styled(" > ", Style::default().fg(Color::Cyan).bold()),
+                    Span::styled("█", Style::default().fg(Color::Yellow)),
+                    Span::styled(
+                        " Type your prompt (Ctrl+Enter to send, Enter or Ctrl+J for newline, '?' for help)...",
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                ]));
+            } else {
+                let lines = editor.get_lines();
+
+                for (l_idx, line_str) in lines.iter().enumerate() {
+                    let prefix = if l_idx == 0 { " > " } else { "   " };
+                    let mut spans = vec![Span::styled(prefix, Style::default().fg(Color::Cyan).bold())];
+
+                    if l_idx == cur_line_idx {
+                        let char_indices: Vec<(usize, char)> = line_str.char_indices().collect();
+                        if cur_col >= char_indices.len() {
+                            spans.push(Span::raw(line_str.to_string()));
+                            spans.push(Span::styled("█", Style::default().fg(Color::Yellow)));
+                        } else {
+                            let (byte_offset, c) = char_indices[cur_col];
+                            let before = &line_str[..byte_offset];
+                            let char_len = c.len_utf8();
+                            let after = &line_str[byte_offset + char_len..];
+
+                            if !before.is_empty() {
+                                spans.push(Span::raw(before.to_string()));
+                            }
+                            spans.push(Span::styled(
+                                c.to_string(),
+                                Style::default().bg(Color::White).fg(Color::Black).bold(),
+                            ));
+                            if !after.is_empty() {
+                                spans.push(Span::raw(after.to_string()));
+                            }
+                        }
+                    } else {
+                        spans.push(Span::raw(line_str.to_string()));
+                    }
+                    input_lines.push(Line::from(spans));
+                }
+            }
+
+            // Scroll the input editor so the cursor line is always visible
+            let visible_input_lines = chunks[2].height.saturating_sub(2);
+            let input_scroll = if visible_input_lines > 0 && cur_line_idx >= visible_input_lines as usize {
+                (cur_line_idx + 1 - visible_input_lines as usize) as u16
+            } else {
+                0
+            };
+
+            let input_title = if editor.line_count() > 1 {
+                format!(
+                    " Intent (Line {}/{}, Ctrl+Enter to send) ",
+                    cur_line_idx + 1,
+                    editor.line_count()
+                )
+            } else {
+                " Intent (Ctrl+Enter to send, Enter/Ctrl+J for newline) ".to_string()
+            };
+
+            let input_paragraph = Paragraph::new(input_lines)
+                .block(Block::default().title(input_title).borders(Borders::ALL))
+                .scroll((input_scroll, 0));
             frame.render_widget(input_paragraph, chunks[2]);
 
             let footer_line = Line::from(vec![
                 Span::styled(" Ctrl+1/2 ", Style::default().bg(Color::DarkGray).fg(Color::White).bold()),
                 Span::raw(" Switch  "),
-                Span::styled(" Enter ", Style::default().bg(Color::DarkGray).fg(Color::White).bold()),
+                Span::styled(" Ctrl+W ", Style::default().bg(Color::DarkGray).fg(Color::White).bold()),
+                Span::raw(" Wf  "),
+                Span::styled(" Ctrl+P ", Style::default().bg(Color::DarkGray).fg(Color::White).bold()),
+                Span::raw(" Proto  "),
+                Span::styled(" Ctrl+Enter ", Style::default().bg(Color::DarkGray).fg(Color::White).bold()),
                 Span::raw(" Send  "),
+                Span::styled(" Enter / Ctrl+J ", Style::default().bg(Color::DarkGray).fg(Color::White).bold()),
+                Span::raw(" Newline  "),
                 Span::styled(" [/] ", Style::default().bg(Color::DarkGray).fg(Color::White).bold()),
                 Span::raw(" Files  "),
                 Span::styled(" Space ", Style::default().bg(Color::DarkGray).fg(Color::White).bold()),
-                Span::raw(" Fold/Unfold  "),
+                Span::raw(" Diff  "),
+                Span::styled(" u ", Style::default().bg(Color::DarkGray).fg(Color::White).bold()),
+                Span::raw(" Undo  "),
                 Span::styled(" Esc ", Style::default().bg(Color::DarkGray).fg(Color::White).bold()),
                 Span::raw(" Cancel  "),
                 Span::styled(" ? ", Style::default().bg(Color::DarkGray).fg(Color::White).bold()),
@@ -1498,9 +2261,60 @@ fn render_ui(frame: &mut ratatui::Frame, state: &mut AppState, input_buffer: &st
         }
     }
 
-    if state.show_help {
+    if state.confirm_undo {
+        render_confirm_undo_popup(frame, state);
+    } else if state.show_help {
         render_help_popup(frame, state.view_mode);
     }
+}
+
+fn render_confirm_undo_popup(frame: &mut ratatui::Frame, state: &AppState) {
+    let area = centered_rect(55, 30, frame.area());
+    frame.render_widget(Clear, area);
+
+    let mut lines = Vec::new();
+    lines.push(Line::raw(""));
+    lines.push(Line::from(Span::styled(
+        "Are you sure you want to undo the last AI commit?",
+        Style::default().bold().fg(Color::Yellow),
+    )));
+    lines.push(Line::raw(""));
+
+    if let Some(hash) = &state.model.last_commit_hash {
+        lines.push(Line::from(vec![
+            Span::raw("Commit: "),
+            Span::styled(hash.clone(), Style::default().bold().fg(Color::Cyan)),
+        ]));
+    }
+    if let Some(summary) = &state.model.last_commit_summary {
+        lines.push(Line::from(vec![
+            Span::raw("Summary: "),
+            Span::styled(summary.clone(), Style::default().fg(Color::White)),
+        ]));
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::from(Span::styled(
+        "Any uncommitted changes from the pre-edit checkpoint will be restored.",
+        Style::default().fg(Color::DarkGray),
+    )));
+    lines.push(Line::raw(""));
+    lines.push(Line::from(vec![
+        Span::styled(" [Y] / Enter ", Style::default().bg(Color::Red).fg(Color::White).bold()),
+        Span::raw(" Confirm Undo    "),
+        Span::styled(" [N] / Esc ", Style::default().bg(Color::DarkGray).fg(Color::White).bold()),
+        Span::raw(" Cancel"),
+    ]));
+
+    let block = Paragraph::new(lines)
+        .block(
+            Block::default()
+                .title(" Confirm Undo ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Red)),
+        )
+        .alignment(ratatui::layout::Alignment::Center);
+
+    frame.render_widget(block, area);
 }
 
 fn render_add_file_picker(frame: &mut ratatui::Frame, state: &AppState) {
@@ -1559,7 +2373,7 @@ fn render_add_file_picker(frame: &mut ratatui::Frame, state: &AppState) {
                 ])
             } else {
                 Line::from(vec![
-                    Span::styled(prefix, Style::default().fg(Color::Cyan).bold()),
+                    Span::styled(prefix, Style::default().fg(Color::Cyan)).bold(),
                     Span::styled(candidate, style),
                 ])
             };
@@ -1592,15 +2406,31 @@ fn render_help_popup(frame: &mut ratatui::Frame, mode: ViewMode) {
                 Line::from("  Esc / q       Close help / Cancel operation / Exit"),
                 Line::from("  ?             Toggle this help popup"),
                 Line::raw(""),
+                Line::from(Span::styled("Workflow & Settings", Style::default().fg(Color::Green).bold())),
+                Line::from("  Ctrl+W        Cycle workflow (disabled while generating)"),
+                Line::from("  Ctrl+P        Cycle edit protocol (disabled while generating)"),
+                Line::raw(""),
+                Line::from(Span::styled("Editor & Prompt", Style::default().fg(Color::Yellow).bold())),
+                Line::from("  Ctrl+Enter    Send prompt (also Alt+Enter)"),
+                Line::from("  Enter / Ctrl+J Insert newline in prompt (or toggle diff if empty)"),
+                Line::from("  ← / →         Move cursor left / right"),
+                Line::from("  ↑ / ↓         Move cursor up / down across lines in prompt"),
+                Line::from("  Ctrl+A / E    Move cursor to line start / end"),
+                Line::from("  Alt+B / F     Move cursor word backward / forward"),
+                Line::from("  Ctrl+K / U    Kill to line end / beginning"),
+                Line::from("  Alt+D / Alt+Bksp Kill word forward / backward"),
+                Line::from("  Ctrl+Y        Yank (paste) killed text"),
+                Line::from("  Tab           Insert 2 spaces in prompt"),
+                Line::from("  Esc           Clear prompt / Cancel streaming / Exit"),
+                Line::raw(""),
                 Line::from(Span::styled("Model & File Review", Style::default().fg(Color::Yellow).bold())),
-                Line::from("  Enter         Send prompt / Toggle selected file diff"),
-                Line::from("  Space         Fold / Unfold selected file diff"),
-                Line::from("  [ / ]         Navigate between modified files"),
+                Line::from("  Space / Enter Fold / Unfold selected file diff (when input empty)"),
+                Line::from("  [ / ]         Navigate modified files (when input empty)"),
+                Line::from("  u             Undo last AI commit (asks confirmation)"),
                 Line::from("  Ctrl+C        Cancel active streaming / thinking"),
                 Line::from("  Ctrl+L        Clear conversation history & model view"),
                 Line::from("  Ctrl+R        Toggle reasoning / thinking visibility"),
-                Line::from("  ↑/↓           Scroll output / Navigate files if input empty"),
-                Line::from("  PgUp/PgDn     Scroll output by page"),
+                Line::from("  PgUp / PgDn   Scroll output by page"),
             ],
         ),
         ViewMode::Context => (

@@ -6,6 +6,7 @@ pub mod edits;
 pub mod git;
 pub mod model;
 pub mod prompt;
+pub mod toolchain;
 pub mod workflow;
 
 pub fn init() {

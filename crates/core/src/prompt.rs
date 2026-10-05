@@ -7,6 +7,8 @@ pub struct PromptAssembly {
     pub repo_state: Option<RepositoryState>,
     pub context_revision: u64,
     pub context_files: Vec<ContextFileContent>,
+    pub workflow: String,
+    pub edit_protocol: String,
 }
 
 impl PromptAssembly {
@@ -14,11 +16,15 @@ impl PromptAssembly {
         repo_state: Option<RepositoryState>,
         context_revision: u64,
         context_files: Vec<ContextFileContent>,
+        workflow: impl Into<String>,
+        edit_protocol: impl Into<String>,
     ) -> Self {
         Self {
             repo_state,
             context_revision,
             context_files,
+            workflow: workflow.into(),
+            edit_protocol: edit_protocol.into(),
         }
     }
 
@@ -28,7 +34,7 @@ impl PromptAssembly {
         prompt.push_str("## Core System Contract\n");
         prompt.push_str("1. Authoritative Source: The files provided in <context> represent the authoritative current state of the project. Do not invent missing code.\n");
         prompt.push_str("2. Read-Only Scope: Files inside <read_only_files> are strictly for reference and understanding. Do NOT propose edits to them.\n");
-        prompt.push_str("3. Editable Scope: Only files inside <editable_files> are permitted for modification.\n");
+        prompt.push_str("3. Editable Scope: Files inside <editable_files> are permitted for modification. You may also create new files using <create path=\"...\"> when required by the task.\n");
         prompt.push_str("4. No Arbitrary Shell: You do not have shell execution capabilities. Work strictly through the context and actions provided.\n");
         prompt.push_str("5. Minimal Coherent Change: Prefer the smallest coherent modification necessary to complete the task.\n\n");
 
@@ -42,8 +48,8 @@ impl PromptAssembly {
         // Delegate edit protocol specific instructions
         prompt.push_str(&protocol.system_instructions(&editable_paths));
 
+        prompt.push_str("## Project Metadata\n");
         if let Some(repo) = &self.repo_state {
-            prompt.push_str("## Project Metadata\n");
             prompt.push_str(&format!("- Root: {}\n", repo.root));
             prompt.push_str(&format!("- Branch: {}\n", repo.branch));
             prompt.push_str(&format!("- HEAD: {}\n", repo.head));
@@ -52,8 +58,10 @@ impl PromptAssembly {
             } else {
                 "clean"
             };
-            prompt.push_str(&format!("- Status: {}\n\n", dirty_str));
+            prompt.push_str(&format!("- Status: {}\n", dirty_str));
         }
+        prompt.push_str(&format!("- Workflow: {}\n", self.workflow));
+        prompt.push_str(&format!("- Edit Protocol: {}\n\n", self.edit_protocol));
 
         prompt
     }
@@ -124,10 +132,7 @@ impl PromptAssembly {
             system_text.push_str("\n\n");
         }
 
-        messages.push(ChatMessage {
-            role: "system".to_string(),
-            content: system_text,
-        });
+        messages.push(ChatMessage::system(system_text));
 
         // Layer 5: Conversation history
         for msg in conversation_history {
@@ -135,10 +140,7 @@ impl PromptAssembly {
         }
 
         // Layer 10: Current user request
-        messages.push(ChatMessage {
-            role: "user".to_string(),
-            content: current_prompt.to_string(),
-        });
+        messages.push(ChatMessage::user(current_prompt));
 
         messages
     }
@@ -164,7 +166,7 @@ mod tests {
             },
         ];
 
-        let assembly = PromptAssembly::new(None, 42, files);
+        let assembly = PromptAssembly::new(None, 42, files, "toolchain", "xml");
         let block = assembly.format_context_block().unwrap();
 
         assert!(block.contains("<context revision=\"42\">"));
@@ -176,7 +178,7 @@ mod tests {
 
     #[test]
     fn test_assemble_chat_messages() {
-        let assembly = PromptAssembly::new(None, 1, Vec::new());
+        let assembly = PromptAssembly::new(None, 1, Vec::new(), "toolchain", "xml");
         let proto = XmlEditProtocol::default();
         let messages = assembly.assemble_chat_messages(&[], "Hello!", &proto);
 
@@ -184,5 +186,7 @@ mod tests {
         assert_eq!(messages[0].role, "system");
         assert_eq!(messages[1].role, "user");
         assert_eq!(messages[1].content, "Hello!");
+        assert!(messages[0].content.contains("- Workflow: toolchain"));
+        assert!(messages[0].content.contains("- Edit Protocol: xml"));
     }
 }

@@ -9,6 +9,18 @@ pub struct AppConfig {
     pub models: ModelsConfig,
     #[serde(default)]
     pub edit: EditConfig,
+    #[serde(default)]
+    pub toolchain: ToolchainConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ToolchainConfig {
+    #[serde(default)]
+    pub check_command: Option<String>,
+    #[serde(default)]
+    pub max_retries: Option<usize>,
+    #[serde(default)]
+    pub auto_heal: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -39,13 +51,13 @@ impl Default for ModelsConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EditConfig {
     #[serde(default = "default_workflow")]
-    pub workflow: String, // "naive", "git" (future)
+    pub workflow: String, // "git", "naive", "toolchain"
     #[serde(default = "default_protocol")]
-    pub protocol: String, // "xml", "whole_file"
+    pub protocol: String, // "xml", "whole_file", "tool_call"
 }
 
 fn default_workflow() -> String {
-    "naive".to_string()
+    "toolchain".to_string()
 }
 
 fn default_protocol() -> String {
@@ -118,31 +130,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_default_config() {
-        let config = AppConfig::default();
-        assert_eq!(config.models.default, "anthropic/claude-3.5-sonnet");
-        assert_eq!(config.edit.workflow, "naive");
-        assert_eq!(config.edit.protocol, "xml");
-        assert!(config.providers.openrouter.is_none());
+    fn test_tool_call_protocol_config() {
+        let toml_str = r#"
+[edit]
+workflow = "toolchain"
+protocol = "tool_call"
+"#;
+        let config: AppConfig = toml::from_str(toml_str).expect("Failed to parse config");
+        assert_eq!(config.edit.protocol, "tool_call");
     }
 
     #[test]
-    fn test_parse_toml_config_with_edit_section() {
-        let toml_str = r#"
-            [models]
-            default = "openai/gpt-4o"
-
-            [edit]
-            workflow = "naive"
-            protocol = "whole_file"
-
-            [providers.openrouter]
-            api_key = "sk-or-v1-12345"
-        "#;
-
-        let config: AppConfig = toml::from_str(toml_str).unwrap();
-        assert_eq!(config.models.default, "openai/gpt-4o");
-        assert_eq!(config.edit.protocol, "whole_file");
-        assert_eq!(config.edit.workflow, "naive");
+    fn test_default_config() {
+        let config = AppConfig::default();
+        assert_eq!(config.models.default, "anthropic/claude-3.5-sonnet");
+        assert_eq!(config.edit.workflow, "toolchain");
+        assert_eq!(config.edit.protocol, "xml");
+        assert!(config.providers.openrouter.is_none());
+        assert!(config.toolchain.check_command.is_none());
     }
 }

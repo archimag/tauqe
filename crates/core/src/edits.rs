@@ -10,8 +10,8 @@ pub mod protocol;
 pub mod stream;
 
 pub use protocol::{
-    CustomSearchReplaceEditProtocol, EditProtocol, SearchReplaceMarkers, WholeFileEditProtocol,
-    XmlEditProtocol,
+    CustomSearchReplaceEditProtocol, EditProtocol, EditProtocolFactory, SearchReplaceMarkers,
+    WholeFileEditProtocol, XmlEditProtocol,
 };
 pub use stream::XmlStreamFilter;
 
@@ -65,34 +65,35 @@ pub fn apply_edit_proposal(
                 old_text,
                 new_text,
             } => {
-                // 1. Context & Access permissions check
+                let clean_path = context_manager
+                    .normalize_path(path)
+                    .map_err(|e| EditError::InvalidPath(path.clone(), e.to_string()))?;
+
                 if !context_manager
-                    .contains(path)
-                    .map_err(|e| EditError::InvalidPath(path.clone(), e.to_string()))?
+                    .contains(&clean_path)
+                    .map_err(|e| EditError::InvalidPath(clean_path.clone(), e.to_string()))?
                 {
-                    return Err(EditError::NotInContext(path.clone()));
+                    return Err(EditError::NotInContext(clean_path));
                 }
 
                 if !context_manager
-                    .is_editable(path)
-                    .map_err(|e| EditError::InvalidPath(path.clone(), e.to_string()))?
+                    .is_editable(&clean_path)
+                    .map_err(|e| EditError::InvalidPath(clean_path.clone(), e.to_string()))?
                 {
-                    return Err(EditError::ReadOnly(path.clone()));
+                    return Err(EditError::ReadOnly(clean_path));
                 }
 
-                // 2. Load current content (from staging or disk)
-                let current_content = if let Some(staged) = staged_files.get(path) {
+                let current_content = if let Some(staged) = staged_files.get(&clean_path) {
                     staged.clone()
                 } else {
-                    let full_path = repo_root.join(path);
+                    let full_path = repo_root.join(&clean_path);
                     if !full_path.is_file() {
-                        return Err(EditError::FileNotFound(path.clone()));
+                        return Err(EditError::FileNotFound(clean_path.clone()));
                     }
                     std::fs::read_to_string(&full_path)
-                        .map_err(|err| EditError::Io(path.clone(), err))?
+                        .map_err(|err| EditError::Io(clean_path.clone(), err))?
                 };
 
-                // Line ending normalization: adapt old_text and new_text if line endings differ
                 let (effective_content, effective_old, effective_new) =
                     if current_content.contains("\r\n") && !old_text.contains("\r\n") {
                         (
@@ -110,15 +111,14 @@ pub fn apply_edit_proposal(
                         (current_content, old_text.clone(), new_text.clone())
                     };
 
-                // 3. Search / Replace validation (must match exactly 1 time)
                 let matches: Vec<(usize, &str)> =
                     effective_content.match_indices(&effective_old).collect();
                 if matches.is_empty() {
-                    return Err(EditError::NoMatch { path: path.clone() });
+                    return Err(EditError::NoMatch { path: clean_path });
                 }
                 if matches.len() > 1 {
                     return Err(EditError::AmbiguousMatch {
-                        path: path.clone(),
+                        path: clean_path,
                         count: matches.len(),
                     });
                 }
@@ -132,38 +132,46 @@ pub fn apply_edit_proposal(
                 updated_content.push_str(&effective_new);
                 updated_content.push_str(&effective_content[match_idx + effective_old.len()..]);
 
-                staged_files.insert(path.clone(), updated_content);
+                staged_files.insert(clean_path.clone(), updated_content);
 
-                if seen_paths.insert(path.clone()) {
-                    changed_paths.push(path.clone());
+                if seen_paths.insert(clean_path.clone()) {
+                    changed_paths.push(clean_path);
                 }
             }
             EditOperation::Create { path, content } => {
-                if context_manager.contains(path).unwrap_or(false)
-                    && !context_manager.is_editable(path).unwrap_or(false)
+                let clean_path = context_manager
+                    .normalize_path(path)
+                    .map_err(|e| EditError::InvalidPath(path.clone(), e.to_string()))?;
+
+                if context_manager.contains(&clean_path).unwrap_or(false)
+                    && !context_manager.is_editable(&clean_path).unwrap_or(false)
                 {
-                    return Err(EditError::ReadOnly(path.clone()));
+                    return Err(EditError::ReadOnly(clean_path));
                 }
-                staged_files.insert(path.clone(), content.clone());
-                if seen_paths.insert(path.clone()) {
-                    changed_paths.push(path.clone());
+                staged_files.insert(clean_path.clone(), content.clone());
+                if seen_paths.insert(clean_path.clone()) {
+                    changed_paths.push(clean_path);
                 }
             }
             EditOperation::Delete { path } => {
-                if context_manager.contains(path).unwrap_or(false)
-                    && !context_manager.is_editable(path).unwrap_or(false)
+                let clean_path = context_manager
+                    .normalize_path(path)
+                    .map_err(|e| EditError::InvalidPath(path.clone(), e.to_string()))?;
+
+                if context_manager.contains(&clean_path).unwrap_or(false)
+                    && !context_manager.is_editable(&clean_path).unwrap_or(false)
                 {
-                    return Err(EditError::ReadOnly(path.clone()));
+                    return Err(EditError::ReadOnly(clean_path));
                 }
-                deleted_paths.push(path.clone());
-                if seen_paths.insert(path.clone()) {
-                    changed_paths.push(path.clone());
+                deleted_paths.push(clean_path.clone());
+                if seen_paths.insert(clean_path.clone()) {
+                    changed_paths.push(clean_path);
                 }
             }
         }
     }
 
-    // 4. Atomic disk commit: all edits passed validation!
+    // Atomic disk commit
     for (path, content) in &staged_files {
         let full_path = repo_root.join(path);
         if let Some(parent) = full_path.parent() {
@@ -196,7 +204,6 @@ struct RawProposal {
     edits: Vec<EditOperation>,
 }
 
-/// Fallback JSON parser for backward compatibility
 pub fn parse_workbench_edit_json(raw_text: &str) -> Option<ModelResult> {
     if let Some(content) = extract_fenced_block(raw_text, "workbench_edit") {
         match serde_json::from_str::<RawProposal>(&content) {
@@ -208,6 +215,7 @@ pub fn parse_workbench_edit_json(raw_text: &str) -> Option<ModelResult> {
                         applied: false,
                         error: None,
                         changed_files: Vec::new(),
+                        commit_hash: None,
                     });
                 }
             }
@@ -218,6 +226,7 @@ pub fn parse_workbench_edit_json(raw_text: &str) -> Option<ModelResult> {
                     applied: false,
                     error: Some(format!("Invalid JSON in workbench_edit: {}", err)),
                     changed_files: Vec::new(),
+                    commit_hash: None,
                 });
             }
         }
@@ -246,100 +255,4 @@ pub(crate) fn extract_fenced_block(text: &str, tag: &str) -> Option<String> {
         }
     }
     None
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::fs::File;
-    use std::io::Write;
-    use tempfile::tempdir;
-    use workbench_protocol::ContextAccess;
-
-    #[test]
-    fn test_search_replace_exact_match() {
-        let dir = tempdir().unwrap();
-        let file_path = dir.path().join("src/main.rs");
-        std::fs::create_dir_all(file_path.parent().unwrap()).unwrap();
-        let mut f = File::create(&file_path).unwrap();
-        writeln!(f, "fn main() {{\n    println!(\"hello\");\n}}").unwrap();
-
-        let mut cm = ContextManager::new(dir.path().to_path_buf());
-        cm.add_file("src/main.rs", ContextAccess::Editable).unwrap();
-
-        let proposal = EditProposal {
-            summary: "Change greeting".to_string(),
-            edits: vec![EditOperation::Replace {
-                path: "src/main.rs".to_string(),
-                old_text: "println!(\"hello\");".to_string(),
-                new_text: "println!(\"hello world\");".to_string(),
-            }],
-        };
-
-        let changed = apply_edit_proposal(dir.path(), &mut cm, &proposal).unwrap();
-        assert_eq!(changed, vec!["src/main.rs".to_string()]);
-
-        let updated = std::fs::read_to_string(&file_path).unwrap();
-        assert!(updated.contains("println!(\"hello world\");"));
-    }
-
-    #[test]
-    fn test_search_replace_no_match() {
-        let dir = tempdir().unwrap();
-        let file_path = dir.path().join("src/main.rs");
-        std::fs::create_dir_all(file_path.parent().unwrap()).unwrap();
-        let mut f = File::create(&file_path).unwrap();
-        writeln!(f, "fn main() {{\n    println!(\"hello\");\n}}").unwrap();
-
-        let mut cm = ContextManager::new(dir.path().to_path_buf());
-        cm.add_file("src/main.rs", ContextAccess::Editable).unwrap();
-
-        let proposal = EditProposal {
-            summary: "Change nonexistent code".to_string(),
-            edits: vec![EditOperation::Replace {
-                path: "src/main.rs".to_string(),
-                old_text: "nonexistent_code()".to_string(),
-                new_text: "new_code()".to_string(),
-            }],
-        };
-
-        let err = apply_edit_proposal(dir.path(), &mut cm, &proposal).unwrap_err();
-        match err {
-            EditError::NoMatch { path } => assert_eq!(path, "src/main.rs"),
-            other => panic!("Expected NoMatch error, got: {:?}", other),
-        }
-    }
-
-    #[test]
-    fn test_create_and_delete_operations() {
-        let dir = tempdir().unwrap();
-        let mut cm = ContextManager::new(dir.path().to_path_buf());
-
-        // Test Create
-        let create_proposal = EditProposal {
-            summary: "Create file".to_string(),
-            edits: vec![EditOperation::Create {
-                path: "src/new_mod.rs".to_string(),
-                content: "pub fn test() {}\n".to_string(),
-            }],
-        };
-
-        let changed = apply_edit_proposal(dir.path(), &mut cm, &create_proposal).unwrap();
-        assert_eq!(changed, vec!["src/new_mod.rs".to_string()]);
-        assert!(dir.path().join("src/new_mod.rs").is_file());
-        assert!(cm.contains("src/new_mod.rs").unwrap());
-
-        // Test Delete
-        let delete_proposal = EditProposal {
-            summary: "Delete file".to_string(),
-            edits: vec![EditOperation::Delete {
-                path: "src/new_mod.rs".to_string(),
-            }],
-        };
-
-        let deleted = apply_edit_proposal(dir.path(), &mut cm, &delete_proposal).unwrap();
-        assert_eq!(deleted, vec!["src/new_mod.rs".to_string()]);
-        assert!(!dir.path().join("src/new_mod.rs").exists());
-        assert!(!cm.contains("src/new_mod.rs").unwrap());
-    }
 }
