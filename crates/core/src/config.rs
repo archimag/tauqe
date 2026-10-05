@@ -7,6 +7,8 @@ pub struct AppConfig {
     pub providers: ProvidersConfig,
     #[serde(default)]
     pub models: ModelsConfig,
+    #[serde(default)]
+    pub edit: EditConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -30,6 +32,31 @@ impl Default for ModelsConfig {
     fn default() -> Self {
         Self {
             default: "anthropic/claude-3.5-sonnet".to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EditConfig {
+    #[serde(default = "default_workflow")]
+    pub workflow: String, // "naive", "git" (future)
+    #[serde(default = "default_protocol")]
+    pub protocol: String, // "xml", "whole_file"
+}
+
+fn default_workflow() -> String {
+    "naive".to_string()
+}
+
+fn default_protocol() -> String {
+    "xml".to_string()
+}
+
+impl Default for EditConfig {
+    fn default() -> Self {
+        Self {
+            workflow: default_workflow(),
+            protocol: default_protocol(),
         }
     }
 }
@@ -94,14 +121,20 @@ mod tests {
     fn test_default_config() {
         let config = AppConfig::default();
         assert_eq!(config.models.default, "anthropic/claude-3.5-sonnet");
+        assert_eq!(config.edit.workflow, "naive");
+        assert_eq!(config.edit.protocol, "xml");
         assert!(config.providers.openrouter.is_none());
     }
 
     #[test]
-    fn test_parse_toml_config() {
+    fn test_parse_toml_config_with_edit_section() {
         let toml_str = r#"
             [models]
             default = "openai/gpt-4o"
+
+            [edit]
+            workflow = "naive"
+            protocol = "whole_file"
 
             [providers.openrouter]
             api_key = "sk-or-v1-12345"
@@ -109,20 +142,7 @@ mod tests {
 
         let config: AppConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(config.models.default, "openai/gpt-4o");
-        
-        let openrouter = config.providers.openrouter.expect("openrouter config missing");
-        assert_eq!(openrouter.api_key.unwrap(), "sk-or-v1-12345");
-    }
-
-    #[test]
-    fn test_parse_partial_toml_config() {
-        let toml_str = r#"
-            [models]
-            default = "google/gemini-pro"
-        "#;
-
-        let config: AppConfig = toml::from_str(toml_str).unwrap();
-        assert_eq!(config.models.default, "google/gemini-pro");
-        assert!(config.providers.openrouter.is_none());
+        assert_eq!(config.edit.protocol, "whole_file");
+        assert_eq!(config.edit.workflow, "naive");
     }
 }

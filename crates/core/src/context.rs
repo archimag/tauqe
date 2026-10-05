@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use anyhow::{bail, Result};
+pub use workbench_protocol::matches_glob_pattern;
 use workbench_protocol::{ContextAccess, ContextItem, ContextState};
 
 #[derive(Debug, Clone)]
@@ -24,6 +25,10 @@ impl ContextManager {
             revision: 1,
             items: BTreeMap::new(),
         }
+    }
+
+    pub fn repo_root(&self) -> &Path {
+        &self.repo_root
     }
 
     pub fn set_repo_root(&mut self, repo_root: PathBuf) {
@@ -56,6 +61,19 @@ impl ContextManager {
         files
     }
 
+    pub fn contains(&self, relative_path: &str) -> Result<bool> {
+        let clean_path = self.normalize_path(relative_path)?;
+        Ok(self.items.contains_key(&clean_path))
+    }
+
+    pub fn is_editable(&self, relative_path: &str) -> Result<bool> {
+        let clean_path = self.normalize_path(relative_path)?;
+        match self.items.get(&clean_path) {
+            Some(item) => Ok(item.access == ContextAccess::Editable),
+            None => Ok(false),
+        }
+    }
+
     pub fn add_file(&mut self, relative_path: &str, access: ContextAccess) -> Result<ContextItem> {
         let clean_path = self.normalize_path(relative_path)?;
         let full_path = self.repo_root.join(&clean_path);
@@ -66,7 +84,6 @@ impl ContextManager {
 
         let metadata = std::fs::metadata(&full_path)?;
         let size_bytes = metadata.len();
-        // Heuristic: ~4 characters or bytes per token
         let estimated_tokens = (size_bytes + 3) / 4;
 
         let item = ContextItem {
@@ -80,6 +97,63 @@ impl ContextManager {
         self.revision += 1;
 
         Ok(item)
+    }
+
+    /// Adds all repository files matching a glob pattern or directory prefix.
+    ///
+    /// Skips files already present in context.
+    /// Returns (list of newly added items, total added estimated tokens).
+    pub fn add_files_by_pattern(
+        &mut self,
+        pattern: &str,
+        access: ContextAccess,
+        available_files: &[String],
+    ) -> Result<(Vec<ContextItem>, u64)> {
+        let trimmed_pat = pattern.trim();
+        if trimmed_pat.is_empty() {
+            bail!("Empty pattern is not allowed");
+        }
+
+        let mut matched_files: Vec<String> = available_files
+            .iter()
+            .filter(|path| matches_glob_pattern(trimmed_pat, path))
+            .filter(|path| !self.items.contains_key(*path))
+            .cloned()
+            .collect();
+
+        // Sort for deterministic addition order
+        matched_files.sort();
+
+        // Safety cap: max 150 files per batch
+        const MAX_BATCH_LIMIT: usize = 150;
+        if matched_files.len() > MAX_BATCH_LIMIT {
+            matched_files.truncate(MAX_BATCH_LIMIT);
+        }
+
+        let mut added_items = Vec::new();
+        let mut total_added_tokens = 0u64;
+
+        for path in matched_files {
+            if let Ok(item) = self.add_file(&path, access) {
+                total_added_tokens += item.estimated_tokens;
+                added_items.push(item);
+            }
+        }
+
+        Ok((added_items, total_added_tokens))
+    }
+
+    pub fn update_file_metadata(&mut self, relative_path: &str) -> Result<()> {
+        let clean_path = self.normalize_path(relative_path)?;
+        let full_path = self.repo_root.join(&clean_path);
+        if let Some(item) = self.items.get_mut(&clean_path) {
+            if let Ok(metadata) = std::fs::metadata(&full_path) {
+                item.size_bytes = metadata.len();
+                item.estimated_tokens = (item.size_bytes + 3) / 4;
+                self.revision += 1;
+            }
+        }
+        Ok(())
     }
 
     pub fn remove_file(&mut self, relative_path: &str) -> Result<bool> {
@@ -141,6 +215,7 @@ impl ContextManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::tempdir;
 
     #[test]
     fn test_normalize_path() {
@@ -155,5 +230,34 @@ mod tests {
         );
         assert!(cm.normalize_path("../outside.rs").is_err());
         assert!(cm.normalize_path("/abs/path.rs").is_err());
+    }
+
+    #[test]
+    fn test_add_files_by_pattern() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join("docs")).unwrap();
+        std::fs::write(root.join("src/lib.rs"), "pub fn test() {}").unwrap();
+        std::fs::write(root.join("src/main.rs"), "fn main() {}").unwrap();
+        std::fs::write(root.join("docs/Readme.md"), "# Docs").unwrap();
+
+        let repo_files = vec![
+            "src/lib.rs".to_string(),
+            "src/main.rs".to_string(),
+            "docs/Readme.md".to_string(),
+        ];
+
+        let mut cm = ContextManager::new(root);
+        let (added, tokens) = cm
+            .add_files_by_pattern("src/*.rs", ContextAccess::ReadOnly, &repo_files)
+            .unwrap();
+
+        assert_eq!(added.len(), 2);
+        assert!(tokens > 0);
+        assert!(cm.contains("src/lib.rs").unwrap());
+        assert!(cm.contains("src/main.rs").unwrap());
+        assert!(!cm.contains("docs/Readme.md").unwrap());
     }
 }

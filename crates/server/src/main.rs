@@ -5,13 +5,18 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{watch, Mutex};
 use workbench_core::config::{load_config, AppConfig};
 use workbench_core::context::ContextManager;
+use workbench_core::edits::{
+    EditProtocol, WholeFileEditProtocol, XmlEditProtocol,
+};
 use workbench_core::model::gateway::{ChatMessage, StreamEvent};
 use workbench_core::model::openrouter::OpenRouterClient;
-use workbench_core::prompt::PromptAssembly;
+use workbench_core::workflow::{EditWorkflow, NaiveEditWorkflow};
 use workbench_protocol::{
-    events, methods, ContextAddParams, ContextRemoveParams, ContextSetAccessParams, Event,
-    InitializeResult, ModelAskParams, RepositoryListFilesResult, Request, RequestId, Response,
-    ResponseError, PROTOCOL_VERSION,
+    events, methods, ContextAddParams, ContextAddPatternParams, ContextAddPatternResult,
+    ContextRemoveParams, ContextSetAccessParams, EditFileDoneEvent, EditFileStartedEvent,
+    EditFinishedEvent, EditHunkEvent, EditStartedEvent, Event, InitializeResult, ModelAskParams,
+    ModelResultEvent, RepositoryListFilesResult, Request, RequestId, Response, ResponseError,
+    PROTOCOL_VERSION,
 };
 
 struct ModelSession {
@@ -22,7 +27,7 @@ struct ModelSession {
 }
 
 struct AppState {
-    config: AppConfig,
+    config: Mutex<AppConfig>,
     session: Mutex<ModelSession>,
 }
 
@@ -35,7 +40,7 @@ async fn main() -> anyhow::Result<()> {
     let repo_path = PathBuf::from(repo_state.root);
 
     let state = Arc::new(AppState {
-        config,
+        config: Mutex::new(config),
         session: Mutex::new(ModelSession {
             history: Vec::new(),
             active_cancel: None,
@@ -87,9 +92,9 @@ async fn handle_request(req: Request, state: &Arc<AppState>) -> Response {
         methods::CLIENT_INITIALIZE => {
             let repo_state = workbench_core::git::get_repository_state(None);
             let repo_path = Path::new(&repo_state.root);
-            let mut config = state.config.clone();
+            let mut cfg = state.config.lock().await;
             if !repo_path.as_os_str().is_empty() {
-                config = load_config(Some(repo_path));
+                *cfg = load_config(Some(repo_path));
                 let mut session = state.session.lock().await;
                 session.context_manager.set_repo_root(repo_path.to_path_buf());
             }
@@ -99,7 +104,7 @@ async fn handle_request(req: Request, state: &Arc<AppState>) -> Response {
                 server_name: "workbench-server".to_string(),
                 server_version: env!("CARGO_PKG_VERSION").to_string(),
                 repository: Some(repo_state),
-                model: Some(config.models.default),
+                model: Some(cfg.models.default.clone()),
             };
             Response {
                 id: req.id,
@@ -189,6 +194,69 @@ async fn handle_request(req: Request, state: &Arc<AppState>) -> Response {
             Response {
                 id: req.id,
                 result: Some(serde_json::to_value(ctx_state).unwrap()),
+                error: None,
+            }
+        }
+        methods::CONTEXT_ADD_PATTERN => {
+            let params: ContextAddPatternParams = match req.params.and_then(|p| serde_json::from_value(p).ok())
+            {
+                Some(p) => p,
+                None => {
+                    return Response {
+                        id: req.id,
+                        result: None,
+                        error: Some(ResponseError {
+                            code: "INVALID_PARAMS".to_string(),
+                            message: "Missing or invalid pattern/access".to_string(),
+                            data: None,
+                        }),
+                    };
+                }
+            };
+
+            let (added_count, added_tokens, ctx_state) = {
+                let repo_state = workbench_core::git::get_repository_state(None);
+                let repo_dir = Path::new(&repo_state.root);
+                let available_files = workbench_core::git::list_repository_files(Some(repo_dir))
+                    .unwrap_or_default();
+
+                let mut session = state.session.lock().await;
+                match session
+                    .context_manager
+                    .add_files_by_pattern(&params.pattern, params.access, &available_files)
+                {
+                    Ok((items, tokens)) => {
+                        let state = session.context_manager.get_state();
+                        (items.len(), tokens, state)
+                    }
+                    Err(err) => {
+                        return Response {
+                            id: req.id,
+                            result: None,
+                            error: Some(ResponseError {
+                                code: "ADD_PATTERN_FAILED".to_string(),
+                                message: err.to_string(),
+                                data: None,
+                            }),
+                        };
+                    }
+                }
+            };
+
+            send_event(&Event {
+                method: events::CONTEXT_CHANGED.to_string(),
+                params: Some(serde_json::json!({ "state": ctx_state })),
+            }).await;
+
+            let result = ContextAddPatternResult {
+                added_count,
+                added_tokens,
+                state: ctx_state,
+            };
+
+            Response {
+                id: req.id,
+                result: Some(serde_json::to_value(result).unwrap()),
                 error: None,
             }
         }
@@ -319,37 +387,41 @@ async fn handle_request(req: Request, state: &Arc<AppState>) -> Response {
                 }
             };
 
-            let provider_cfg = match state.config.providers.openrouter.clone() {
-                Some(cfg) => cfg,
-                None => {
-                    return Response {
-                        id: req.id,
-                        result: None,
-                        error: Some(ResponseError {
-                            code: "NO_PROVIDER".to_string(),
-                            message: "No OpenRouter provider configured".to_string(),
-                            data: None,
-                        }),
-                    };
-                }
+            let (api_key, model, edit_config) = {
+                let cfg = state.config.lock().await;
+                let provider_cfg = match cfg.providers.openrouter.clone() {
+                    Some(c) => c,
+                    None => {
+                        return Response {
+                            id: req.id,
+                            result: None,
+                            error: Some(ResponseError {
+                                code: "NO_PROVIDER".to_string(),
+                                message: "No OpenRouter provider configured".to_string(),
+                                data: None,
+                            }),
+                        };
+                    }
+                };
+
+                let key = match provider_cfg.api_key {
+                    Some(k) if !k.trim().is_empty() => k,
+                    _ => {
+                        return Response {
+                            id: req.id,
+                            result: None,
+                            error: Some(ResponseError {
+                                code: "NO_API_KEY".to_string(),
+                                message: "OpenRouter API key is not set".to_string(),
+                                data: None,
+                            }),
+                        };
+                    }
+                };
+
+                (key, cfg.models.default.clone(), cfg.edit.clone())
             };
 
-            let api_key = match provider_cfg.api_key {
-                Some(key) if !key.trim().is_empty() => key,
-                _ => {
-                    return Response {
-                        id: req.id,
-                        result: None,
-                        error: Some(ResponseError {
-                            code: "NO_API_KEY".to_string(),
-                            message: "OpenRouter API key is not set".to_string(),
-                            data: None,
-                        }),
-                    };
-                }
-            };
-
-            let model = state.config.models.default.clone();
             let op_id = format!("op-{}", next_operation_id().await);
             let op_id_event = op_id.clone();
 
@@ -369,52 +441,53 @@ async fn handle_request(req: Request, state: &Arc<AppState>) -> Response {
             }
 
             let client = OpenRouterClient::new(api_key);
-
-            // Assemble layered prompt with context snapshot & history
-            let assembled_messages = {
-                let session = state.session.lock().await;
-                let repo_state = workbench_core::git::get_repository_state(None);
-                let ctx_state = session.context_manager.get_state();
-                let context_files = session.context_manager.read_context_files();
-
-                let assembly = PromptAssembly::new(
-                    Some(repo_state),
-                    ctx_state.revision,
-                    context_files,
-                );
-
-                assembly.assemble_chat_messages(&session.history, &params.prompt)
-            };
-
-            let prompt_for_history = params.prompt.clone();
+            let prompt_for_spawn = params.prompt.clone();
             let state_for_spawn = Arc::clone(state);
             let op_id_for_spawn = op_id.clone();
             let model_for_spawn = model.clone();
 
             let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamEvent>(100);
-            let tx_for_spawn = tx.clone();
 
             tokio::spawn(async move {
-                let result = client
-                    .stream_chat(&model_for_spawn, assembled_messages, tx_for_spawn, cancel_rx)
-                    .await;
+                // Select edit protocol according to configuration
+                let protocol: Box<dyn EditProtocol> = match edit_config.protocol.as_str() {
+                    "whole_file" => Box::new(WholeFileEditProtocol),
+                    _ => Box::new(XmlEditProtocol),
+                };
 
-                let mut session = state_for_spawn.session.lock().await;
-                if let Err(err) = result {
-                    let err_event = Event {
-                        method: events::MODEL_ERROR.to_string(),
-                        params: Some(serde_json::json!({
-                            "operation_id": op_id_for_spawn,
-                            "message": err.to_string(),
-                        })),
-                    };
-                    send_event(&err_event).await;
-                }
+                // Select workflow (defaulting to NaiveEditWorkflow)
+                let workflow: Box<dyn EditWorkflow> = match edit_config.workflow.as_str() {
+                    _ => Box::new(NaiveEditWorkflow),
+                };
 
-                let mut assistant_text = String::new();
+                // Run workflow task concurrently with draining streaming events
+                let (wf_tx, wf_rx) = (tx.clone(), cancel_rx.clone());
+                let state_clone = Arc::clone(&state_for_spawn);
+                let model_clone = model_for_spawn.clone();
+                let prompt_clone = prompt_for_spawn.clone();
+
+                let workflow_future = async move {
+                    let mut session = state_clone.session.lock().await;
+                    let history = session.history.clone();
+                    workflow
+                        .execute(
+                            &prompt_clone,
+                            &client,
+                            &model_clone,
+                            &mut session.context_manager,
+                            &history,
+                            protocol.as_ref(),
+                            wf_tx,
+                            wf_rx,
+                        )
+                        .await
+                };
+
+                let wf_task = tokio::spawn(workflow_future);
+
                 let mut usage_info = None;
-                let mut cancelled = false;
 
+                // Drain events concurrently as they arrive
                 while let Some(event) = rx.recv().await {
                     match event {
                         StreamEvent::ReasoningDelta(delta) => {
@@ -428,7 +501,6 @@ async fn handle_request(req: Request, state: &Arc<AppState>) -> Response {
                             send_event(&ev).await;
                         }
                         StreamEvent::TextDelta(delta) => {
-                            assistant_text.push_str(&delta);
                             let ev = Event {
                                 method: events::MODEL_TEXT_DELTA.to_string(),
                                 params: Some(serde_json::json!({
@@ -438,11 +510,65 @@ async fn handle_request(req: Request, state: &Arc<AppState>) -> Response {
                             };
                             send_event(&ev).await;
                         }
-                        StreamEvent::Usage(usage) => usage_info = Some(usage),
+                        StreamEvent::EditStarted => {
+                            let ev = Event {
+                                method: events::EDIT_STARTED.to_string(),
+                                params: Some(serde_json::to_value(EditStartedEvent {
+                                    operation_id: op_id_for_spawn.clone(),
+                                }).unwrap()),
+                            };
+                            send_event(&ev).await;
+                        }
+                        StreamEvent::EditFileStarted { path, op_type } => {
+                            let ev = Event {
+                                method: events::EDIT_FILE_STARTED.to_string(),
+                                params: Some(serde_json::to_value(EditFileStartedEvent {
+                                    operation_id: op_id_for_spawn.clone(),
+                                    path,
+                                    op_type,
+                                }).unwrap()),
+                            };
+                            send_event(&ev).await;
+                        }
+                        StreamEvent::EditHunk { path, hunk_index, old_text, new_text } => {
+                            let ev = Event {
+                                method: events::EDIT_HUNK.to_string(),
+                                params: Some(serde_json::to_value(EditHunkEvent {
+                                    operation_id: op_id_for_spawn.clone(),
+                                    path,
+                                    hunk_index,
+                                    old_text,
+                                    new_text,
+                                }).unwrap()),
+                            };
+                            send_event(&ev).await;
+                        }
+                        StreamEvent::EditFileDone { path, status, error, hunks_count } => {
+                            let ev = Event {
+                                method: events::EDIT_FILE_DONE.to_string(),
+                                params: Some(serde_json::to_value(EditFileDoneEvent {
+                                    operation_id: op_id_for_spawn.clone(),
+                                    path,
+                                    status,
+                                    error,
+                                    hunks_count,
+                                }).unwrap()),
+                            };
+                            send_event(&ev).await;
+                        }
+                        StreamEvent::Usage(usage) => {
+                            usage_info = Some(usage);
+                        }
                         StreamEvent::Done => break,
                         StreamEvent::Cancelled => {
-                            cancelled = true;
-                            break;
+                            let cancelled_event = Event {
+                                method: events::MODEL_CANCELLED.to_string(),
+                                params: Some(serde_json::json!({ "operation_id": op_id_for_spawn })),
+                            };
+                            send_event(&cancelled_event).await;
+                            let mut session = state_for_spawn.session.lock().await;
+                            session.active_cancel = None;
+                            return;
                         }
                         StreamEvent::Error(err) => {
                             let err_event = Event {
@@ -453,56 +579,109 @@ async fn handle_request(req: Request, state: &Arc<AppState>) -> Response {
                                 })),
                             };
                             send_event(&err_event).await;
+                            let mut session = state_for_spawn.session.lock().await;
+                            session.active_cancel = None;
                             return;
                         }
                     }
                 }
 
-                if cancelled {
-                    let cancelled_event = Event {
-                        method: events::MODEL_CANCELLED.to_string(),
-                        params: Some(serde_json::json!({ "operation_id": op_id_for_spawn })),
-                    };
-                    send_event(&cancelled_event).await;
-                } else {
-                    let usage_to_send = usage_info.unwrap_or_default();
-                    let cost = usage_to_send.cost.unwrap_or(0.0);
-                    session.total_cost += cost;
-                    let total_cost = session.total_cost;
+                match wf_task.await {
+                    Ok(Ok(wf_result)) => {
+                        let mut session = state_for_spawn.session.lock().await;
 
-                    let usage_event = Event {
-                        method: events::MODEL_USAGE.to_string(),
-                        params: Some(serde_json::json!({
-                            "operation_id": op_id_for_spawn,
-                            "usage": usage_to_send,
-                            "session_total_cost": total_cost,
-                        })),
-                    };
-                    send_event(&usage_event).await;
+                        let usage_to_send = usage_info.unwrap_or_default();
+                        let cost = usage_to_send.cost.unwrap_or(0.0);
+                        session.total_cost += cost;
+                        let total_cost = session.total_cost;
 
-                    // Append user query and assistant response to session dialogue history
-                    session.history.push(ChatMessage {
-                        role: "user".to_string(),
-                        content: prompt_for_history,
-                    });
+                        let usage_event = Event {
+                            method: events::MODEL_USAGE.to_string(),
+                            params: Some(serde_json::json!({
+                                "operation_id": op_id_for_spawn,
+                                "usage": usage_to_send,
+                                "session_total_cost": total_cost,
+                            })),
+                        };
+                        send_event(&usage_event).await;
 
-                    if !assistant_text.is_empty() {
-                        session.history.push(ChatMessage {
-                            role: "assistant".to_string(),
-                            content: assistant_text.clone(),
-                        });
+                        // Emit EDIT_FINISHED if edits were part of the result
+                        if let workbench_protocol::ModelResult::Edit {
+                            applied,
+                            ref error,
+                            ref changed_files,
+                            ..
+                        } = wf_result.result
+                        {
+                            let finished_edit_event = Event {
+                                method: events::EDIT_FINISHED.to_string(),
+                                params: Some(serde_json::to_value(EditFinishedEvent {
+                                    operation_id: op_id_for_spawn.clone(),
+                                    applied,
+                                    error: error.clone(),
+                                    changed_files: changed_files.clone(),
+                                }).unwrap()),
+                            };
+                            send_event(&finished_edit_event).await;
+                        }
+
+                        // Notify context changed if edits were applied to disk
+                        let ctx_state = session.context_manager.get_state();
+                        send_event(&Event {
+                            method: events::CONTEXT_CHANGED.to_string(),
+                            params: Some(serde_json::json!({ "state": ctx_state })),
+                        }).await;
+
+                        let result_event = Event {
+                            method: events::MODEL_RESULT.to_string(),
+                            params: Some(serde_json::json!(ModelResultEvent {
+                                operation_id: op_id_for_spawn.clone(),
+                                result: wf_result.result,
+                                usage: Some(usage_to_send),
+                                session_total_cost: Some(total_cost),
+                            })),
+                        };
+                        send_event(&result_event).await;
+
+                        if let Some((user_msg, asst_msg)) = wf_result.session_history_update {
+                            session.history.push(user_msg);
+                            if !asst_msg.content.is_empty() {
+                                session.history.push(asst_msg);
+                            }
+                        }
+
+                        let finished_event = Event {
+                            method: events::MODEL_FINISHED.to_string(),
+                            params: Some(serde_json::json!({
+                                "operation_id": op_id_for_spawn,
+                                "full_text": wf_result.assistant_text,
+                            })),
+                        };
+                        send_event(&finished_event).await;
                     }
-
-                    let finished_event = Event {
-                        method: events::MODEL_FINISHED.to_string(),
-                        params: Some(serde_json::json!({
-                            "operation_id": op_id_for_spawn,
-                            "full_text": assistant_text,
-                        })),
-                    };
-                    send_event(&finished_event).await;
+                    Ok(Err(err)) => {
+                        let err_event = Event {
+                            method: events::MODEL_ERROR.to_string(),
+                            params: Some(serde_json::json!({
+                                "operation_id": op_id_for_spawn,
+                                "message": err.to_string(),
+                            })),
+                        };
+                        send_event(&err_event).await;
+                    }
+                    Err(join_err) => {
+                        let err_event = Event {
+                            method: events::MODEL_ERROR.to_string(),
+                            params: Some(serde_json::json!({
+                                "operation_id": op_id_for_spawn,
+                                "message": join_err.to_string(),
+                            })),
+                        };
+                        send_event(&err_event).await;
+                    }
                 }
 
+                let mut session = state_for_spawn.session.lock().await;
                 session.active_cancel = None;
             });
 

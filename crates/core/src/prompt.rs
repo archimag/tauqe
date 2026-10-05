@@ -1,4 +1,5 @@
 use crate::context::ContextFileContent;
+use crate::edits::EditProtocol;
 use crate::model::gateway::ChatMessage;
 use workbench_protocol::{ContextAccess, RepositoryState};
 
@@ -21,7 +22,7 @@ impl PromptAssembly {
         }
     }
 
-    pub fn build_system_prompt(&self) -> String {
+    pub fn build_system_prompt(&self, protocol: &dyn EditProtocol) -> String {
         let mut prompt = String::new();
         prompt.push_str("You are Workbench AI, an expert programming assistant operating inside the Workbench development environment.\n\n");
         prompt.push_str("## Core System Contract\n");
@@ -30,6 +31,16 @@ impl PromptAssembly {
         prompt.push_str("3. Editable Scope: Only files inside <editable_files> are permitted for modification.\n");
         prompt.push_str("4. No Arbitrary Shell: You do not have shell execution capabilities. Work strictly through the context and actions provided.\n");
         prompt.push_str("5. Minimal Coherent Change: Prefer the smallest coherent modification necessary to complete the task.\n\n");
+
+        let editable_paths: Vec<String> = self
+            .context_files
+            .iter()
+            .filter(|f| f.access == ContextAccess::Editable)
+            .map(|f| f.path.clone())
+            .collect();
+
+        // Delegate edit protocol specific instructions
+        prompt.push_str(&protocol.system_instructions(&editable_paths));
 
         if let Some(repo) = &self.repo_state {
             prompt.push_str("## Project Metadata\n");
@@ -101,11 +112,12 @@ impl PromptAssembly {
         &self,
         conversation_history: &[ChatMessage],
         current_prompt: &str,
+        protocol: &dyn EditProtocol,
     ) -> Vec<ChatMessage> {
         let mut messages = Vec::new();
 
-        // Layer 1-3: System prompt + Project metadata + Authoritative context
-        let mut system_text = self.build_system_prompt();
+        // Layer 1-3: System prompt + Project metadata + Authoritative context + Protocol instructions
+        let mut system_text = self.build_system_prompt(protocol);
         if let Some(context_block) = self.format_context_block() {
             system_text.push_str("## Project Context\n");
             system_text.push_str(&context_block);
@@ -135,6 +147,7 @@ impl PromptAssembly {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::edits::XmlEditProtocol;
 
     #[test]
     fn test_context_block_formatting() {
@@ -164,7 +177,8 @@ mod tests {
     #[test]
     fn test_assemble_chat_messages() {
         let assembly = PromptAssembly::new(None, 1, Vec::new());
-        let messages = assembly.assemble_chat_messages(&[], "Hello!");
+        let proto = XmlEditProtocol::default();
+        let messages = assembly.assemble_chat_messages(&[], "Hello!", &proto);
 
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0].role, "system");

@@ -14,7 +14,7 @@ Protocol определяет публичную границу между serve
 
 Protocol не должен содержать TUI/Emacs-specific concepts. Он описывает domain operations и events.
 
-## 2. Архитектурный принцип
+## 2. Архитектурный принцип: модель SLIME (Swank)
 
 ```text
 Client
@@ -29,6 +29,12 @@ Core
 Client owns interaction.
 
 Server owns semantics.
+
+Ключевым концептуальным источником вдохновения для протокола является **SLIME (Swank)**:
+- **Никакого скрейпинга текста (No text/terminal scraping):** клиент никогда не парсит сырой консольный вывод, ANSI-коды или смешанный текстовый поток модели в поисках путей к файлам или диффов. Вся коммуникация ведется строго типизированными семантическими сообщениями.
+- **Презентационные потоки (Presentation Streams):** объекты в ответе (файлы, чанки изменений, ошибки, диагностики, запуски) передаются клиенту как первоклассные сущности предметной области со своим состоянием и доступными операциями.
+- **Out-of-band и асинхронные события:** долгие операции (генерация LLM, фоновая компиляция, валидация правок) транслируют промежуточные события в реальном времени, не блокируя канал управления.
+- **Сервер как независимый рантайм:** сервер держит сессию проекта независимо от клиентов; клиенты могут переподключаться или работать параллельно.
 
 Client не собирает prompts, не вызывает LLM напрямую, не управляет Git lifecycle и не принимает semantic решения о project model.
 
@@ -62,7 +68,7 @@ Response
 Event
 ```
 
-Можно использовать JSON-RPC 2.0 или близкую модель. Необязательно буквально копировать LSP.
+Используется модель JSON-RPC 2.0.
 
 ## 5. Request envelope
 
@@ -169,6 +175,7 @@ git.undo
 git.history
 
 models.streaming
+edits.streaming
 ```
 
 ## 11. Session model
@@ -303,10 +310,7 @@ context/getRevision
 {
   "method": "context/add",
   "params": {
-    "item": {
-      "type": "file",
-      "path": "crates/core/src/task.rs"
-    },
+    "path": "crates/core/src/task.rs",
     "access": "editable"
   }
 }
@@ -329,16 +333,9 @@ CommitDiff
 UserText
 ```
 
-Representation может быть:
-
-```text
-full
-symbol
-range
-summary
-```
-
-MVP может реализовать не все варианты.
+Access modes:
+- `read_only`
+- `editable`
 
 ## 19. Context events
 
@@ -348,7 +345,7 @@ context/budgetChanged
 context/itemInvalidated
 ```
 
-`context/changed` должен содержать новую revision.
+`context/changed` содержит актуальный `ContextState` и новую revision.
 
 ## 20. Task methods
 
@@ -399,63 +396,92 @@ intent/executed
 intent/failed
 ```
 
-Пример ambiguity:
+## 23. Model operation methods
 
+```text
+model/ask
+model/cancel
+model/clearHistory
+```
+
+## 24. Model & Reasoning events
+
+```text
+model/started
+model/reasoningDelta
+model/textDelta
+model/usage
+model/result
+model/finished
+model/cancelled
+model/error
+```
+
+Текстовые дельты передают исключительно естественный язык модели (объяснения, рассуждения, ответы на вопросы). Блоки правок кода перехватываются потоковым фильтром сервера и транслируются в семантические события редактирования.
+
+## 25. Structured Edit Streaming events
+
+Во время генерации кода сервером клиенту отправляются события жизненного цикла изменений файлов:
+
+### 25.1 edit/started
+Сигнализирует о начале блока правок в ответе модели.
+
+### 25.2 edit/fileStarted
+Начало генерации изменений конкретного файла.
 ```json
 {
-  "method": "intent/ambiguous",
+  "method": "edit/fileStarted",
   "params": {
-    "requestId": "intent-88",
-    "question": "Which auth file?",
-    "options": [
-      { "id": "frontend", "label": "frontend/auth.ts" },
-      { "id": "backend", "label": "backend/auth.ts" }
-    ]
+    "operation_id": "op-42",
+    "path": "crates/core/src/edits.rs",
+    "op_type": "replace"
+  }
+}
+```
+`op_type`: `"replace"`, `"create"`, `"delete"`.
+
+### 25.3 edit/hunk
+Потоковое получение готового чанка search/replace.
+```json
+{
+  "method": "edit/hunk",
+  "params": {
+    "operation_id": "op-42",
+    "path": "crates/core/src/edits.rs",
+    "hunk_index": 0,
+    "old_text": "fn old() {}\n",
+    "new_text": "fn new() {}\n"
   }
 }
 ```
 
-Client может ответить через `intent/resolveAmbiguity`.
-
-## 23. Model operation methods
-
-Clients обычно используют intents, но protocol может экспонировать explicit semantic methods:
-
-```text
-model/ask
-model/requestEdit
-model/cancel
+### 25.4 edit/fileDone
+Завершение обработки файла и результат промежуточной валидации в памяти сервера.
+```json
+{
+  "method": "edit/fileDone",
+  "params": {
+    "operation_id": "op-42",
+    "path": "crates/core/src/edits.rs",
+    "status": "ok",
+    "hunks_count": 1
+  }
+}
 ```
+При ошибке сопоставления `search` (не найден или неоднозначен) передаются `status: "error"` и `error: "..."`.
 
-Это полезно для rich clients.
-
-## 24. Model events
-
-```text
-model/started
-model/textDelta
-model/result
-model/usage
-model/finished
-model/cancelled
-model/failed
+### 25.5 edit/finished
+Финальное событие атомарного применения всех изменений на диск.
+```json
+{
+  "method": "edit/finished",
+  "params": {
+    "operation_id": "op-42",
+    "applied": true,
+    "changed_files": ["crates/core/src/edits.rs"]
+  }
+}
 ```
-
-Structured edit не применяется из partial stream.
-
-## 25. Context request from model
-
-Когда модель требует additional context:
-
-```text
-model/contextRequested
-```
-
-Payload содержит operation ID, requested items, reason и preferred access.
-
-Client policy может показать запрос пользователю, auto-add read-only или reject.
-
-Server остаётся authority.
 
 ## 26. Git methods
 
@@ -503,57 +529,14 @@ run/finished
 
 Voice — first-class protocol subsystem.
 
-Protocol поддерживает три режима.
+Protocol поддерживает три режима:
+- Server capture (`voice/startCapture`, `voice/stopCapture`);
+- Client audio stream (`voice/startStream`, `voice/audioChunk`, `voice/stopStream`);
+- Client transcript (`voice/submitTranscript`).
 
-### 29.1 Server capture
+## 30. Spoken output
 
-Подходит local server.
-
-```text
-voice/startCapture
-voice/stopCapture
-```
-
-Server сам захватывает microphone.
-
-### 29.2 Client audio stream
-
-Подходит remote server или client-controlled audio.
-
-```text
-voice/startStream
-voice/audioChunk
-voice/stopStream
-```
-
-Audio format negotiated during start.
-
-### 29.3 Client transcript
-
-Если client уже имеет STT:
-
-```text
-voice/submitTranscript
-```
-
-Server всё равно выполняет project-aware normalization, reference resolution, discourse resolution и intent resolution.
-
-## 30. Voice events
-
-```text
-voice/listeningStarted
-voice/partialTranscript
-voice/finalTranscript
-voice/normalizedTranscript
-voice/stopped
-voice/error
-```
-
-## 31. Spoken output
-
-Server не обязан генерировать raw audio.
-
-Предпочтительно server генерирует semantic events:
+Server генерирует semantic events:
 
 ```text
 speech/question
@@ -564,60 +547,15 @@ speech/completion
 
 Client решает показать text, произнести через TTS или проигнорировать.
 
-Это сохраняет разделение semantics/presentation.
-
-## 32. Example voice flow
-
-```text
-TUI → voice/startCapture
-
-Server → voice/listeningStarted
-
-Server → voice/partialTranscript
-        "запусти те..."
-
-Server → voice/finalTranscript
-        "запусти те тесты"
-
-Server → voice/normalizedTranscript
-
-Server → intent/resolved
-        RunProjectAction(protocol-tests)
-
-Server → run/started
-Server → run/stdout ...
-Server → run/finished
-        exitCode=1
-
-Server → speech/error
-        "Two tests failed."
-```
-
-## 33. Active object / focus context
-
-Rich clients могут сообщать server semantic focus:
+## 31. Active object / focus context
 
 ```text
 client/setFocus
 ```
 
-Например:
+Позволяет разрешать анафорические ссылки («это», «его», «эти ошибки»).
 
-```text
-Run #184
-Diagnostic #3
-Context item auth.rs
-Plan voice-protocol
-Git change protocol.rs
-```
-
-Это помогает разрешать слова «это», «его», «эти ошибки», «этот файл».
-
-Focus — hint, а не authority.
-
-## 34. Open-in-editor requests
-
-Server может отправлять client request/event:
+## 32. Open-in-editor requests
 
 ```text
 client/openLocation
@@ -625,159 +563,15 @@ client/openSymbol
 client/showDiff
 ```
 
-Client capability negotiation определяет поддержку.
-
-## 35. Subscription model
-
-Для multi-client server полезна подписка:
-
-```text
-subscribe
-unsubscribe
-```
-
-Categories:
-
-```text
-repository
-context
-git
-runs
-model
-voice
-tasks
-plans
-```
-
-MVP может отправлять все events attached client без explicit subscriptions.
-
-## 36. Cancellation
-
-Все long-running operations должны иметь operation ID и cancellation:
+## 33. Cancellation
 
 ```text
 operation/cancel
 ```
 
-Применимо к model calls, actions/runs, voice capture и indexing.
+Применимо к model calls, actions/runs, voice capture и indexing. При отмене частичные правки никогда не применяются.
 
-Cancellation partial edit никогда не применяется.
-
-## 37. Error classes
-
-Разделять:
-
-### Protocol errors
-Malformed messages, unsupported version.
-
-### Authorization/policy errors
-Action not permitted, workspace untrusted.
-
-### Domain errors
-Context item missing, stale edit.
-
-### Operation results
-Failed tests, compiler errors — не protocol errors.
-
-## 38. Serialization
-
-Начальная рекомендация — JSON.
-
-Причины:
-
-- легко отлаживать;
-- легко реализовать Emacs client;
-- human-readable;
-- достаточно для local protocol.
-
-Binary audio chunks можно сначала передавать base64 или вынести в отдельный framed channel позднее.
-
-## 39. stdio transport
-
-Подходит для child server, editor integration и debugging.
-
-Framing options:
-
-- JSON lines;
-- Content-Length framing как LSP.
-
-Для streaming events Content-Length framing надёжнее, JSON lines проще для MVP.
-
-## 40. Unix socket transport
-
-Основной local daemon transport.
-
-Плюсы:
-
-- несколько clients;
-- server живёт независимо;
-- reconnect;
-- TUI и Emacs могут подключаться к одной session.
-
-## 41. WebSocket transport
-
-Future option для remote/browser-like clients.
-
-Не должен влиять на domain protocol.
-
-## 42. Protocol conformance
+## 34. Conformance & Compatibility
 
 TUI является reference client и conformance implementation.
-
-Нужны protocol-level integration tests:
-
-- initialize;
-- open repository;
-- add context;
-- run action;
-- submit intent;
-- receive model events;
-- receive Git events;
-- voice flow;
-- cancellation.
-
-## 43. Compatibility philosophy
-
-До `1.0`:
-
-- semantic correctness важнее compatibility;
-- breaking protocol changes допустимы;
-- version bump обязателен;
-- server должен явно отклонять incompatible clients.
-
-После `1.0` можно ввести стабильные guarantees.
-
-## 44. Security principles
-
-Повторяются намеренно.
-
-- Protocol не предоставляет model-controlled arbitrary shell.
-- Project actions проходят trust и permission checks.
-- Client не может обойти core invariants.
-- Newly modified executable project definitions не становятся trusted автоматически.
-- External paths запрещены без explicit read-only grant.
-- Secret files не попадают в context автоматически.
-
-## 45. Основной принцип protocol
-
-Protocol должен описывать **объекты проекта и операции над ними**, а не низкоуровневые UI-команды.
-
-Хорошо:
-
-```text
-context/add
-project/runAction
-git/getDiff
-plan/activate
-intent/submitText
-```
-
-Плохо:
-
-```text
-ui/openLeftPane
-terminal/sendKeys
-emacs/showBuffer
-```
-
-> **Protocol — extension point всей системы.**
+До `1.0` protocol может вносить breaking changes с обязательным bump версии.

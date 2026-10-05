@@ -18,11 +18,15 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use ratatui::Terminal;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::Mutex;
+use workbench_protocol::matches_glob_pattern;
 use workbench_protocol::{
-    events, methods, ContextAccess, ContextAddParams, ContextRemoveParams, ContextSetAccessParams,
-    ContextState, Event, InitializeParams, InitializeResult, Message, ModelAskParams,
-    ModelDeltaEvent, ModelErrorEvent, ModelFinishedEvent, ModelStartedEvent, ModelUsageEvent,
-    RepositoryListFilesResult, RepositoryState, Request, RequestId, Response, PROTOCOL_VERSION,
+    events, methods, ContextAccess, ContextAddParams, ContextAddPatternParams,
+    ContextAddPatternResult, ContextRemoveParams, ContextSetAccessParams, ContextState,
+    EditFileDoneEvent, EditFileStartedEvent, EditFinishedEvent, EditHunkEvent, Event,
+    InitializeParams, InitializeResult, Message, ModelAskParams, ModelDeltaEvent,
+    ModelErrorEvent, ModelFinishedEvent, ModelResult, ModelResultEvent, ModelStartedEvent,
+    ModelUsageEvent, RepositoryListFilesResult, RepositoryState, Request, RequestId, Response,
+    PROTOCOL_VERSION,
 };
 
 struct TerminalGuard;
@@ -40,17 +44,45 @@ enum ViewMode {
     Context,
 }
 
+#[derive(Debug, Clone)]
+struct StreamingHunk {
+    hunk_index: usize,
+    old_text: String,
+    new_text: String,
+}
+
+#[derive(Debug, Clone)]
+struct StreamingFileEdit {
+    path: String,
+    op_type: String, // "replace", "create", "delete"
+    status: String,  // "running", "ok", "error"
+    error: Option<String>,
+    hunks: Vec<StreamingHunk>,
+    expanded: bool,
+}
+
 struct ModelView {
     operation_id: Option<String>,
     model: Option<String>,
     reasoning: String,
     text: String,
     usage: Option<ModelUsageEvent>,
+    last_op_cost: Option<f64>,
     session_total_cost: f64,
     status: String, // "idle", "starting", "streaming", "done", "cancelled", "error"
     error: Option<String>,
+    result: Option<ModelResult>,
     scroll: u16,
     show_reasoning: bool,
+    auto_scroll: bool,
+
+    // Structured Org-Mode Edits State
+    edits_active: bool,
+    files: Vec<StreamingFileEdit>,
+    selected_file_index: usize,
+    edit_final_applied: Option<bool>,
+    edit_final_error: Option<String>,
+    spinner_frame: usize,
 }
 
 impl Default for ModelView {
@@ -61,11 +93,37 @@ impl Default for ModelView {
             reasoning: String::new(),
             text: String::new(),
             usage: None,
+            last_op_cost: None,
             session_total_cost: 0.0,
             status: String::new(),
             error: None,
+            result: None,
             scroll: 0,
             show_reasoning: true,
+            auto_scroll: true,
+            edits_active: false,
+            files: Vec::new(),
+            selected_file_index: 0,
+            edit_final_applied: None,
+            edit_final_error: None,
+            spinner_frame: 0,
+        }
+    }
+}
+
+const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+impl ModelView {
+    fn max_scroll(&self, view_height: u16) -> u16 {
+        let lines = compute_model_lines(self);
+        let count = lines.len() as u16;
+        count.saturating_sub(view_height)
+    }
+
+    fn clamp_scroll(&mut self, view_height: u16) {
+        let max = self.max_scroll(view_height);
+        if self.scroll > max {
+            self.scroll = max;
         }
     }
 }
@@ -101,11 +159,12 @@ struct AppState {
     context: ContextState,
     context_view: ContextViewState,
     show_help: bool,
+    last_model_height: u16,
 }
 
 impl AppState {
     fn update_filtered_candidates(&mut self) {
-        let query = self.context_view.add_input.trim().to_lowercase();
+        let query = self.context_view.add_input.trim();
         let existing: std::collections::HashSet<&str> = self
             .context
             .items
@@ -113,19 +172,58 @@ impl AppState {
             .map(|it| it.path.as_str())
             .collect();
 
-        self.context_view.filtered_candidates = self
-            .all_repo_files
-            .iter()
-            .filter(|f| !existing.contains(f.as_str()))
-            .filter(|f| query.is_empty() || f.to_lowercase().contains(&query))
-            .take(15)
-            .cloned()
-            .collect();
+        let mut candidates = Vec::new();
+
+        if !query.is_empty() {
+            // Check if query behaves as pattern or directory prefix
+            let is_pattern_query = query.contains('*')
+                || query.contains('?')
+                || query.ends_with('/')
+                || !query.contains('.');
+
+            let matching_pattern_count = self
+                .all_repo_files
+                .iter()
+                .filter(|f| !existing.contains(f.as_str()) && matches_glob_pattern(query, f))
+                .count();
+
+            if matching_pattern_count > 0 && is_pattern_query {
+                candidates.push(format!(
+                    "[+] Add all matching '{}' ({} files)",
+                    query, matching_pattern_count
+                ));
+            }
+
+            let query_lower = query.to_lowercase();
+            let file_candidates: Vec<String> = self
+                .all_repo_files
+                .iter()
+                .filter(|f| !existing.contains(f.as_str()))
+                .filter(|f| {
+                    f.to_lowercase().contains(&query_lower) || matches_glob_pattern(query, f)
+                })
+                .take(15)
+                .cloned()
+                .collect();
+
+            candidates.extend(file_candidates);
+        } else {
+            candidates = self
+                .all_repo_files
+                .iter()
+                .filter(|f| !existing.contains(f.as_str()))
+                .take(15)
+                .cloned()
+                .collect();
+        }
+
+        self.context_view.filtered_candidates = candidates;
 
         if self.context_view.filtered_candidates.is_empty() {
             self.context_view.selected_candidate_index = 0;
         } else if self.context_view.selected_candidate_index >= self.context_view.filtered_candidates.len() {
-            self.context_view.selected_candidate_index = self.context_view.filtered_candidates.len() - 1;
+            self.context_view.selected_candidate_index =
+                self.context_view.filtered_candidates.len() - 1;
         }
     }
 }
@@ -288,6 +386,7 @@ async fn main() -> anyhow::Result<()> {
         context: initial_context,
         context_view: ContextViewState::default(),
         show_help: false,
+        last_model_height: 10,
     }));
 
     // Channel for incoming server messages
@@ -344,8 +443,9 @@ async fn main() -> anyhow::Result<()> {
     // Main UI loop
     loop {
         {
-            let st = state.lock().await;
-            terminal.draw(|f| render_ui(f, &st, &input_buffer))?;
+            let mut st = state.lock().await;
+            st.model.spinner_frame = (st.model.spinner_frame + 1) % SPINNER_FRAMES.len();
+            terminal.draw(|f| render_ui(f, &mut st, &input_buffer))?;
         }
 
         tokio::select! {
@@ -365,6 +465,16 @@ async fn main() -> anyhow::Result<()> {
 
                 if key.modifiers.contains(KeyModifiers::CONTROL) {
                     match key.code {
+                        KeyCode::Char('1') => {
+                            st.view_mode = ViewMode::Model;
+                            st.context_view.status_message = None;
+                            continue;
+                        }
+                        KeyCode::Char('2') => {
+                            st.view_mode = ViewMode::Context;
+                            st.context_view.status_message = None;
+                            continue;
+                        }
                         KeyCode::Char('c') => {
                             drop(st);
                             send_request(&mut server_writer, methods::MODEL_CANCEL, serde_json::json!({})).await?;
@@ -372,8 +482,10 @@ async fn main() -> anyhow::Result<()> {
                         }
                         KeyCode::Char('l') => {
                             let cost = st.model.session_total_cost;
+                            let last_cost = st.model.last_op_cost;
                             st.model = ModelView {
                                 session_total_cost: cost,
+                                last_op_cost: last_cost,
                                 ..Default::default()
                             };
                             drop(st);
@@ -382,6 +494,8 @@ async fn main() -> anyhow::Result<()> {
                         }
                         KeyCode::Char('r') => {
                             st.model.show_reasoning = !st.model.show_reasoning;
+                            let h = st.last_model_height;
+                            st.model.clamp_scroll(h);
                             continue;
                         }
                         _ => {}
@@ -394,8 +508,8 @@ async fn main() -> anyhow::Result<()> {
                     continue;
                 }
 
-                // View Mode switching via Tab (when not typing in add input)
-                if key.code == KeyCode::Tab && !st.context_view.adding_file {
+                // View Mode switching via Tab (when not typing in add input or intent prompt)
+                if key.code == KeyCode::Tab && !st.context_view.adding_file && (input_buffer.is_empty() || st.view_mode == ViewMode::Context) {
                     st.view_mode = match st.view_mode {
                         ViewMode::Model => ViewMode::Context,
                         ViewMode::Context => ViewMode::Model,
@@ -406,6 +520,7 @@ async fn main() -> anyhow::Result<()> {
 
                 match st.view_mode {
                     ViewMode::Model => {
+                        let view_height = st.last_model_height;
                         match key.code {
                             KeyCode::Esc => {
                                 if st.model.status == "streaming" || st.model.status == "starting" {
@@ -413,6 +528,24 @@ async fn main() -> anyhow::Result<()> {
                                     send_request(&mut server_writer, methods::MODEL_CANCEL, serde_json::json!({})).await?;
                                 } else {
                                     break;
+                                }
+                            }
+                            KeyCode::Char('[') => {
+                                if !st.model.files.is_empty() {
+                                    st.model.selected_file_index = st.model.selected_file_index.saturating_sub(1);
+                                }
+                            }
+                            KeyCode::Char(']') => {
+                                if !st.model.files.is_empty() && st.model.selected_file_index + 1 < st.model.files.len() {
+                                    st.model.selected_file_index += 1;
+                                }
+                            }
+                            KeyCode::Char(' ') if input_buffer.is_empty() => {
+                                let sel_idx = st.model.selected_file_index;
+                                if let Some(file) = st.model.files.get_mut(sel_idx) {
+                                    file.expanded = !file.expanded;
+                                    let h = st.last_model_height;
+                                    st.model.clamp_scroll(h);
                                 }
                             }
                             KeyCode::Enter => {
@@ -423,14 +556,29 @@ async fn main() -> anyhow::Result<()> {
                                     st.model.reasoning.clear();
                                     st.model.text.clear();
                                     st.model.error = None;
+                                    st.model.result = None;
                                     st.model.usage = None;
                                     st.model.scroll = 0;
                                     st.model.status = "starting".to_string();
                                     st.model.show_reasoning = true;
+                                    st.model.auto_scroll = true;
+
+                                    st.model.edits_active = false;
+                                    st.model.files.clear();
+                                    st.model.selected_file_index = 0;
+                                    st.model.edit_final_applied = None;
+                                    st.model.edit_final_error = None;
 
                                     let params = ModelAskParams { prompt };
                                     drop(st);
                                     send_request(&mut server_writer, methods::MODEL_ASK, serde_json::to_value(params)?).await?;
+                                } else if !st.model.files.is_empty() {
+                                    let sel_idx = st.model.selected_file_index;
+                                    if let Some(file) = st.model.files.get_mut(sel_idx) {
+                                        file.expanded = !file.expanded;
+                                        let h = st.last_model_height;
+                                        st.model.clamp_scroll(h);
+                                    }
                                 }
                             }
                             KeyCode::Char(c) => {
@@ -440,16 +588,42 @@ async fn main() -> anyhow::Result<()> {
                                 input_buffer.pop();
                             }
                             KeyCode::PageUp => {
+                                st.model.auto_scroll = false;
                                 st.model.scroll = st.model.scroll.saturating_sub(10);
                             }
                             KeyCode::PageDown => {
-                                st.model.scroll = st.model.scroll.saturating_add(10);
+                                let max = st.model.max_scroll(view_height);
+                                st.model.scroll = (st.model.scroll.saturating_add(10)).min(max);
+                                if st.model.scroll >= max {
+                                    st.model.auto_scroll = true;
+                                }
                             }
                             KeyCode::Up => {
-                                st.model.scroll = st.model.scroll.saturating_sub(1);
+                                if input_buffer.is_empty() && !st.model.files.is_empty() {
+                                    st.model.selected_file_index = st.model.selected_file_index.saturating_sub(1);
+                                } else {
+                                    st.model.auto_scroll = false;
+                                    st.model.scroll = st.model.scroll.saturating_sub(1);
+                                }
                             }
                             KeyCode::Down => {
-                                st.model.scroll = st.model.scroll.saturating_add(1);
+                                if input_buffer.is_empty() && !st.model.files.is_empty() && st.model.selected_file_index + 1 < st.model.files.len() {
+                                    st.model.selected_file_index += 1;
+                                } else {
+                                    let max = st.model.max_scroll(view_height);
+                                    st.model.scroll = (st.model.scroll.saturating_add(1)).min(max);
+                                    if st.model.scroll >= max {
+                                        st.model.auto_scroll = true;
+                                    }
+                                }
+                            }
+                            KeyCode::Home => {
+                                st.model.auto_scroll = false;
+                                st.model.scroll = 0;
+                            }
+                            KeyCode::End => {
+                                st.model.auto_scroll = true;
+                                st.model.scroll = st.model.max_scroll(view_height);
                             }
                             _ => {}
                         }
@@ -482,35 +656,65 @@ async fn main() -> anyhow::Result<()> {
                                         .filtered_candidates
                                         .get(st.context_view.selected_candidate_index)
                                     {
-                                        st.context_view.add_input = candidate.clone();
-                                        st.update_filtered_candidates();
+                                        if !candidate.starts_with("[+] Add all matching '") {
+                                            st.context_view.add_input = candidate.clone();
+                                            st.update_filtered_candidates();
+                                        }
                                     }
                                 }
                                 KeyCode::Enter => {
-                                    let target_path = if let Some(candidate) = st
+                                    let selected_candidate = st
                                         .context_view
                                         .filtered_candidates
                                         .get(st.context_view.selected_candidate_index)
-                                    {
-                                        candidate.clone()
-                                    } else {
-                                        st.context_view.add_input.trim().to_string()
-                                    };
+                                        .cloned();
 
-                                    if !target_path.is_empty() {
+                                    let is_pattern_entry = selected_candidate.as_ref().map_or(false, |c| {
+                                        c.starts_with("[+] Add all matching '")
+                                    });
+
+                                    let raw_input = st.context_view.add_input.trim().to_string();
+                                    let is_glob_direct = raw_input.contains('*')
+                                        || raw_input.contains('?')
+                                        || raw_input.ends_with('/');
+
+                                    if is_pattern_entry || is_glob_direct {
                                         st.context_view.adding_file = false;
                                         st.context_view.add_input.clear();
                                         drop(st);
-                                        let params = ContextAddParams {
-                                            path: target_path,
+
+                                        let params = ContextAddPatternParams {
+                                            pattern: raw_input,
                                             access: ContextAccess::ReadOnly,
                                         };
                                         send_request(
                                             &mut server_writer,
-                                            methods::CONTEXT_ADD,
+                                            methods::CONTEXT_ADD_PATTERN,
                                             serde_json::to_value(params)?,
                                         )
                                         .await?;
+                                    } else {
+                                        let target_path = if let Some(candidate) = selected_candidate {
+                                            candidate
+                                        } else {
+                                            raw_input
+                                        };
+
+                                        if !target_path.is_empty() {
+                                            st.context_view.adding_file = false;
+                                            st.context_view.add_input.clear();
+                                            drop(st);
+                                            let params = ContextAddParams {
+                                                path: target_path,
+                                                access: ContextAccess::ReadOnly,
+                                            };
+                                            send_request(
+                                                &mut server_writer,
+                                                methods::CONTEXT_ADD,
+                                                serde_json::to_value(params)?,
+                                            )
+                                            .await?;
+                                        }
                                     }
                                 }
                                 KeyCode::Char(c) => {
@@ -638,7 +842,16 @@ async fn handle_response(resp: Response, state: &Arc<Mutex<AppState>>) {
             st.model.error = Some(format!("{}: {}", err.code, err.message));
         }
     } else if let Some(val) = resp.result {
-        if let Ok(file_res) = serde_json::from_value::<RepositoryListFilesResult>(val.clone()) {
+        if let Ok(pattern_res) = serde_json::from_value::<ContextAddPatternResult>(val.clone()) {
+            st.context = pattern_res.state;
+            st.context_view.status_message = Some(format!(
+                "Added {} files (~{} tokens)",
+                pattern_res.added_count, pattern_res.added_tokens
+            ));
+            if st.context_view.adding_file {
+                st.update_filtered_candidates();
+            }
+        } else if let Ok(file_res) = serde_json::from_value::<RepositoryListFilesResult>(val.clone()) {
             st.all_repo_files = file_res.files;
             if st.context_view.adding_file {
                 st.update_filtered_candidates();
@@ -683,6 +896,7 @@ async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>) {
                     st.model.operation_id = Some(data.operation_id);
                     st.model.model = Some(data.model);
                     st.model.status = "streaming".to_string();
+                    st.model.auto_scroll = true;
                 }
             }
         }
@@ -690,6 +904,10 @@ async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>) {
             if let Some(params) = ev.params {
                 if let Ok(data) = serde_json::from_value::<ModelDeltaEvent>(params) {
                     st.model.reasoning.push_str(&data.delta);
+                    if st.model.auto_scroll {
+                        let h = st.last_model_height;
+                        st.model.scroll = st.model.max_scroll(h);
+                    }
                 }
             }
         }
@@ -698,8 +916,69 @@ async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>) {
                 if let Ok(data) = serde_json::from_value::<ModelDeltaEvent>(params) {
                     if st.model.text.is_empty() && !data.delta.is_empty() {
                         st.model.show_reasoning = false;
+                        let h = st.last_model_height;
+                        st.model.clamp_scroll(h);
                     }
                     st.model.text.push_str(&data.delta);
+                    if st.model.auto_scroll {
+                        let h = st.last_model_height;
+                        st.model.scroll = st.model.max_scroll(h);
+                    }
+                }
+            }
+        }
+        events::EDIT_STARTED => {
+            st.model.edits_active = true;
+        }
+        events::EDIT_FILE_STARTED => {
+            if let Some(params) = ev.params {
+                if let Ok(data) = serde_json::from_value::<EditFileStartedEvent>(params) {
+                    st.model.edits_active = true;
+                    if let Some(existing) = st.model.files.iter_mut().find(|f| f.path == data.path) {
+                        existing.status = "running".to_string();
+                        existing.op_type = data.op_type;
+                    } else {
+                        st.model.files.push(StreamingFileEdit {
+                            path: data.path,
+                            op_type: data.op_type,
+                            status: "running".to_string(),
+                            error: None,
+                            hunks: Vec::new(),
+                            expanded: false,
+                        });
+                        st.model.selected_file_index = st.model.files.len() - 1;
+                    }
+                }
+            }
+        }
+        events::EDIT_HUNK => {
+            if let Some(params) = ev.params {
+                if let Ok(data) = serde_json::from_value::<EditHunkEvent>(params) {
+                    if let Some(f) = st.model.files.iter_mut().find(|f| f.path == data.path) {
+                        f.hunks.push(StreamingHunk {
+                            hunk_index: data.hunk_index,
+                            old_text: data.old_text,
+                            new_text: data.new_text,
+                        });
+                    }
+                }
+            }
+        }
+        events::EDIT_FILE_DONE => {
+            if let Some(params) = ev.params {
+                if let Ok(data) = serde_json::from_value::<EditFileDoneEvent>(params) {
+                    if let Some(f) = st.model.files.iter_mut().find(|f| f.path == data.path) {
+                        f.status = data.status;
+                        f.error = data.error;
+                    }
+                }
+            }
+        }
+        events::EDIT_FINISHED => {
+            if let Some(params) = ev.params {
+                if let Ok(data) = serde_json::from_value::<EditFinishedEvent>(params) {
+                    st.model.edit_final_applied = Some(data.applied);
+                    st.model.edit_final_error = data.error;
                 }
             }
         }
@@ -707,26 +986,57 @@ async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>) {
             if let Some(params) = ev.params {
                 if let Ok(data) = serde_json::from_value::<ModelUsageEvent>(params) {
                     st.model.session_total_cost = data.session_total_cost;
+                    if let Some(c) = data.usage.cost {
+                        st.model.last_op_cost = Some(c);
+                    }
                     st.model.usage = Some(data);
+                }
+            }
+        }
+        events::MODEL_RESULT => {
+            if let Some(params) = ev.params {
+                if let Ok(data) = serde_json::from_value::<ModelResultEvent>(params) {
+                    st.model.result = Some(data.result);
+                    if let Some(usage) = data.usage {
+                        let total_cost = data.session_total_cost.unwrap_or(st.model.session_total_cost);
+                        st.model.session_total_cost = total_cost;
+                        if let Some(c) = usage.cost {
+                            st.model.last_op_cost = Some(c);
+                        }
+                        st.model.usage = Some(ModelUsageEvent {
+                            operation_id: data.operation_id.clone(),
+                            usage,
+                            session_total_cost: total_cost,
+                        });
+                    }
+                    if st.model.auto_scroll {
+                        let h = st.last_model_height;
+                        st.model.scroll = st.model.max_scroll(h);
+                    }
                 }
             }
         }
         events::MODEL_FINISHED => {
             if let Some(params) = ev.params {
-                if let Ok(data) = serde_json::from_value::<ModelFinishedEvent>(params) {
-                    st.model.text = data.full_text;
+                if let Ok(_data) = serde_json::from_value::<ModelFinishedEvent>(params) {
                     st.model.status = "done".to_string();
+                    let h = st.last_model_height;
+                    st.model.clamp_scroll(h);
                 }
             }
         }
         events::MODEL_CANCELLED => {
             st.model.status = "cancelled".to_string();
+            let h = st.last_model_height;
+            st.model.clamp_scroll(h);
         }
         events::MODEL_ERROR => {
             if let Some(params) = ev.params {
                 if let Ok(data) = serde_json::from_value::<ModelErrorEvent>(params) {
                     st.model.status = "error".to_string();
                     st.model.error = Some(data.message);
+                    let h = st.last_model_height;
+                    st.model.clamp_scroll(h);
                 }
             }
         }
@@ -734,7 +1044,237 @@ async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>) {
     }
 }
 
-fn render_ui(frame: &mut ratatui::Frame, state: &AppState, input_buffer: &str) {
+fn compute_model_lines(model: &ModelView) -> Vec<Line<'static>> {
+    let mut model_lines: Vec<Line<'static>> = Vec::new();
+
+    model_lines.push(Line::from(Span::styled(
+        match model.status.as_str() {
+            "starting" => "Starting...",
+            "streaming" => "Streaming...",
+            "done" => "Done",
+            "cancelled" => "Cancelled",
+            "error" => "Error",
+            _ => "Idle",
+        },
+        Style::default().bold().fg(match model.status.as_str() {
+            "starting" => Color::Yellow,
+            "streaming" => Color::Yellow,
+            "done" => Color::Green,
+            "cancelled" => Color::Red,
+            "error" => Color::Red,
+            _ => Color::Gray,
+        }),
+    )));
+
+    if let Some(m) = &model.model {
+        model_lines.push(Line::from(vec![
+            Span::raw("Model: "),
+            Span::styled(m.clone(), Style::default().fg(Color::Cyan)),
+        ]));
+    }
+
+    if let Some(err) = &model.error {
+        model_lines.push(Line::from(vec![
+            Span::raw("Error: "),
+            Span::styled(err.clone(), Style::default().fg(Color::Red)),
+        ]));
+    }
+
+    if !model.reasoning.is_empty() {
+        if model.show_reasoning {
+            model_lines.push(Line::from(Span::styled(
+                "Reasoning (Ctrl+R to hide):",
+                Style::default().bold().fg(Color::Magenta),
+            )));
+            for line in model.reasoning.lines() {
+                model_lines.push(Line::from(Span::styled(
+                    line.to_string(),
+                    Style::default().fg(Color::Magenta),
+                )));
+            }
+        } else {
+            model_lines.push(Line::from(Span::styled(
+                "[+] Reasoning hidden (Ctrl+R to show)",
+                Style::default().bold().fg(Color::DarkGray),
+            )));
+        }
+    }
+
+    if !model.text.is_empty() {
+        model_lines.push(Line::raw(""));
+        for line in model.text.lines() {
+            model_lines.push(Line::from(Span::raw(line.to_string())));
+        }
+    }
+
+    if model.edits_active || !model.files.is_empty() {
+        model_lines.push(Line::raw(""));
+
+        let total_files = model.files.len();
+        let ok_files = model.files.iter().filter(|f| f.status == "ok").count();
+
+        let header_badge = match model.edit_final_applied {
+            Some(true) => Span::styled(" [APPLIED] ", Style::default().bg(Color::Green).fg(Color::Black).bold()),
+            Some(false) => Span::styled(" [REJECTED] ", Style::default().bg(Color::Red).fg(Color::White).bold()),
+            None => {
+                let spin = SPINNER_FRAMES[model.spinner_frame % SPINNER_FRAMES.len()];
+                Span::styled(format!(" [{}] Modifying ", spin), Style::default().bg(Color::Yellow).fg(Color::Black).bold())
+            }
+        };
+
+        model_lines.push(Line::from(vec![
+            header_badge,
+            Span::raw(" "),
+            Span::styled(
+                format!("Proposed Edits ({}/{} files) - [ / ] Navigate, Space/Enter to Fold/Unfold", ok_files, total_files),
+                Style::default().bold().fg(Color::Cyan),
+            ),
+        ]));
+
+        for (idx, file) in model.files.iter().enumerate() {
+            let is_selected = idx == model.selected_file_index;
+            let fold_icon = if file.expanded { "▼ " } else { "▶ " };
+            let cursor_prefix = if is_selected { "● " } else { "  " };
+
+            let (status_icon, status_style) = match file.status.as_str() {
+                "ok" => ("✓", Style::default().fg(Color::Green).bold()),
+                "error" => ("✗", Style::default().fg(Color::Red).bold()),
+                _ => (
+                    SPINNER_FRAMES[model.spinner_frame % SPINNER_FRAMES.len()],
+                    Style::default().fg(Color::Yellow).bold(),
+                ),
+            };
+
+            let op_label = match file.op_type.as_str() {
+                "create" => "[NEW] ",
+                "delete" => "[DEL] ",
+                _ => "",
+            };
+
+            let hunk_count = file.hunks.len();
+            let hunk_label = if hunk_count == 1 {
+                "1 hunk".to_string()
+            } else {
+                format!("{} hunks", hunk_count)
+            };
+
+            let file_line_style = if is_selected {
+                Style::default().bg(Color::DarkGray).bold()
+            } else {
+                Style::default()
+            };
+
+            model_lines.push(
+                Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled(cursor_prefix, Style::default().fg(Color::Cyan)),
+                    Span::styled(fold_icon, Style::default().fg(Color::DarkGray)),
+                    Span::styled(op_label, Style::default().fg(Color::Magenta).bold()),
+                    Span::styled(file.path.clone(), Style::default().bold()),
+                    Span::raw(" "),
+                    Span::styled(format!("({})", hunk_label), Style::default().fg(Color::DarkGray)),
+                    Span::raw(" "),
+                    Span::styled(status_icon, status_style),
+                ])
+                .style(file_line_style),
+            );
+
+            if let Some(err_msg) = &file.error {
+                model_lines.push(Line::from(vec![
+                    Span::raw("      "),
+                    Span::styled("Validation Error: ", Style::default().fg(Color::Red).bold()),
+                    Span::styled(err_msg.clone(), Style::default().fg(Color::Yellow)),
+                ]));
+            }
+
+            if file.expanded {
+                for hunk in &file.hunks {
+                    model_lines.push(Line::from(vec![
+                        Span::raw("      "),
+                        Span::styled(
+                            format!("@@ hunk {} @@", hunk.hunk_index + 1),
+                            Style::default().fg(Color::DarkGray).italic(),
+                        ),
+                    ]));
+
+                    for line in hunk.old_text.lines() {
+                        model_lines.push(Line::from(vec![
+                            Span::raw("      "),
+                            Span::styled(format!("- {}", line), Style::default().fg(Color::Red)),
+                        ]));
+                    }
+                    for line in hunk.new_text.lines() {
+                        model_lines.push(Line::from(vec![
+                            Span::raw("      "),
+                            Span::styled(format!("+ {}", line), Style::default().fg(Color::Green)),
+                        ]));
+                    }
+                }
+            }
+        }
+    }
+
+    if let Some(usage) = &model.usage {
+        model_lines.push(Line::raw(""));
+        let cost_val = usage.usage.cost.unwrap_or(0.0);
+        let cost_str = format!("${:.5}", cost_val);
+        let cost_style = if cost_val > 0.0 {
+            Style::default().fg(Color::Yellow).bold()
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+
+        let mut usage_spans = vec![
+            Span::styled("Tokens: ", Style::default().fg(Color::DarkGray).bold()),
+            Span::styled(
+                format!(
+                    "{} prompt, {} completion",
+                    usage.usage.prompt_tokens,
+                    usage.usage.completion_tokens,
+                ),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ];
+
+        if let Some(reason_tokens) = usage.usage.reasoning_tokens {
+            if reason_tokens > 0 {
+                usage_spans.push(Span::styled(
+                    format!(", {} reasoning", reason_tokens),
+                    Style::default().fg(Color::Magenta),
+                ));
+            }
+        }
+
+        if let Some(cached_tokens) = usage.usage.cached_tokens {
+            if cached_tokens > 0 {
+                usage_spans.push(Span::styled(
+                    format!(", {} cached", cached_tokens),
+                    Style::default().fg(Color::Cyan),
+                ));
+            }
+        }
+
+        usage_spans.push(Span::raw(" | "));
+        usage_spans.push(Span::styled("Operation cost: ", Style::default().fg(Color::Yellow).bold()));
+        usage_spans.push(Span::styled(cost_str, cost_style));
+
+        model_lines.push(Line::from(usage_spans));
+    }
+
+    if model.session_total_cost > 0.0 {
+        model_lines.push(Line::from(vec![
+            Span::styled("Session total cost: ", Style::default().fg(Color::Yellow).bold()),
+            Span::styled(
+                format!("${:.5}", model.session_total_cost),
+                Style::default().fg(Color::Yellow).bold(),
+            ),
+        ]));
+    }
+
+    model_lines
+}
+
+fn render_ui(frame: &mut ratatui::Frame, state: &mut AppState, input_buffer: &str) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -790,6 +1330,27 @@ fn render_ui(frame: &mut ratatui::Frame, state: &AppState, input_buffer: &str) {
         Span::raw("  HEAD: "),
         Span::styled(head, Style::default().fg(Color::Magenta)),
         dirty_status,
+        Span::raw("  | Session: "),
+        Span::styled(
+            format!("${:.5}", state.model.session_total_cost),
+            if state.model.session_total_cost > 0.0 {
+                Style::default().fg(Color::Yellow).bold()
+            } else {
+                Style::default().fg(Color::DarkGray)
+            },
+        ),
+        Span::raw("  Last: "),
+        Span::styled(
+            match state.model.last_op_cost {
+                Some(cost) => format!("${:.5}", cost),
+                None => "-".to_string(),
+            },
+            if state.model.last_op_cost.unwrap_or(0.0) > 0.0 {
+                Style::default().fg(Color::Yellow).bold()
+            } else {
+                Style::default().fg(Color::DarkGray)
+            },
+        ),
         Span::raw("  | v"),
         Span::raw(&state.protocol_version),
     ]);
@@ -799,104 +1360,29 @@ fn render_ui(frame: &mut ratatui::Frame, state: &AppState, input_buffer: &str) {
 
     match state.view_mode {
         ViewMode::Model => {
-            // Main Output
-            let mut model_lines: Vec<Line> = Vec::new();
-            model_lines.push(Line::from(Span::styled(
-                match state.model.status.as_str() {
-                    "starting" => "Starting...",
-                    "streaming" => "Streaming...",
-                    "done" => "Done",
-                    "cancelled" => "Cancelled",
-                    "error" => "Error",
-                    _ => "Idle",
-                },
-                Style::default().bold().fg(match state.model.status.as_str() {
-                    "starting" => Color::Yellow,
-                    "streaming" => Color::Yellow,
-                    "done" => Color::Green,
-                    "cancelled" => Color::Red,
-                    "error" => Color::Red,
-                    _ => Color::Gray,
-                }),
-            )));
+            let content_height = chunks[1].height.saturating_sub(2);
+            state.last_model_height = content_height;
 
-            if let Some(model) = &state.model.model {
-                model_lines.push(Line::from(vec![
-                    Span::raw("Model: "),
-                    Span::styled(model, Style::default().fg(Color::Cyan)),
-                ]));
+            let model_lines = compute_model_lines(&state.model);
+            let total_lines = model_lines.len() as u16;
+            let max_scroll = total_lines.saturating_sub(content_height);
+            if state.model.scroll > max_scroll {
+                state.model.scroll = max_scroll;
             }
 
-            if let Some(err) = &state.model.error {
-                model_lines.push(Line::from(vec![
-                    Span::raw("Error: "),
-                    Span::styled(err, Style::default().fg(Color::Red)),
-                ]));
-            }
+            let scroll_indicator = if max_scroll > 0 {
+                format!(" [{}/{}]", state.model.scroll + 1, total_lines)
+            } else {
+                String::new()
+            };
 
-            if !state.model.reasoning.is_empty() {
-                if state.model.show_reasoning {
-                    model_lines.push(Line::from(Span::styled(
-                        "Reasoning (Ctrl+R to hide):",
-                        Style::default().bold().fg(Color::Magenta),
-                    )));
-                    for line in state.model.reasoning.lines() {
-                        model_lines.push(Line::from(Span::styled(
-                            line.to_string(),
-                            Style::default().fg(Color::Magenta),
-                        )));
-                    }
-                } else {
-                    model_lines.push(Line::from(Span::styled(
-                        "[+] Reasoning hidden (Ctrl+R to show)",
-                        Style::default().bold().fg(Color::DarkGray),
-                    )));
-                }
-            }
-
-            if !state.model.text.is_empty() {
-                model_lines.push(Line::from(Span::styled(
-                    "Answer:",
-                    Style::default().bold().fg(Color::Green),
-                )));
-                for line in state.model.text.lines() {
-                    model_lines.push(Line::from(Span::raw(line.to_string())));
-                }
-            }
-
-            if let Some(usage) = &state.model.usage {
-                model_lines.push(Line::from(vec![
-                    Span::raw("Usage: "),
-                    Span::styled(
-                        format!(
-                            "prompt {} tokens, completion {} tokens, reason {} tokens, cost ${:.5}",
-                            usage.usage.prompt_tokens,
-                            usage.usage.completion_tokens,
-                            usage.usage.reasoning_tokens.unwrap_or(0),
-                            usage.usage.cost.unwrap_or(0.0)
-                        ),
-                        Style::default().fg(Color::DarkGray),
-                    ),
-                ]));
-            }
-
-            if state.model.session_total_cost > 0.0 {
-                model_lines.push(Line::from(vec![
-                    Span::raw("Session total cost: "),
-                    Span::styled(
-                        format!("${:.5}", state.model.session_total_cost),
-                        Style::default().fg(Color::DarkGray),
-                    ),
-                ]));
-            }
-
+            let title = format!(" Model View{} ", scroll_indicator);
             let model_paragraph = Paragraph::new(model_lines)
-                .block(Block::default().title(" Model View ").borders(Borders::ALL))
+                .block(Block::default().title(title).borders(Borders::ALL))
                 .wrap(Wrap { trim: true })
                 .scroll((state.model.scroll, 0));
             frame.render_widget(model_paragraph, chunks[1]);
 
-            // Input buffer display
             let input_line = Line::from(vec![
                 Span::styled(" > ", Style::default().fg(Color::Cyan).bold()),
                 Span::raw(input_buffer),
@@ -905,12 +1391,15 @@ fn render_ui(frame: &mut ratatui::Frame, state: &AppState, input_buffer: &str) {
                 .block(Block::default().title(" Intent ").borders(Borders::ALL));
             frame.render_widget(input_paragraph, chunks[2]);
 
-            // Footer
             let footer_line = Line::from(vec![
-                Span::styled(" Tab ", Style::default().bg(Color::DarkGray).fg(Color::White).bold()),
-                Span::raw(" Context  "),
+                Span::styled(" Ctrl+1/2 ", Style::default().bg(Color::DarkGray).fg(Color::White).bold()),
+                Span::raw(" Switch  "),
                 Span::styled(" Enter ", Style::default().bg(Color::DarkGray).fg(Color::White).bold()),
                 Span::raw(" Send  "),
+                Span::styled(" [/] ", Style::default().bg(Color::DarkGray).fg(Color::White).bold()),
+                Span::raw(" Files  "),
+                Span::styled(" Space ", Style::default().bg(Color::DarkGray).fg(Color::White).bold()),
+                Span::raw(" Fold/Unfold  "),
                 Span::styled(" Esc ", Style::default().bg(Color::DarkGray).fg(Color::White).bold()),
                 Span::raw(" Cancel  "),
                 Span::styled(" ? ", Style::default().bg(Color::DarkGray).fg(Color::White).bold()),
@@ -920,7 +1409,6 @@ fn render_ui(frame: &mut ratatui::Frame, state: &AppState, input_buffer: &str) {
             frame.render_widget(footer, chunks[3]);
         }
         ViewMode::Context => {
-            // Context View
             let mut context_lines: Vec<Line> = Vec::new();
 
             context_lines.push(Line::from(vec![
@@ -936,7 +1424,7 @@ fn render_ui(frame: &mut ratatui::Frame, state: &AppState, input_buffer: &str) {
 
             if state.context.items.is_empty() {
                 context_lines.push(Line::from(Span::styled(
-                    "No files in context yet. Press 'a' to add a file from repository.",
+                    "No files in context yet. Press 'a' to add files or glob patterns.",
                     Style::default().fg(Color::DarkGray),
                 )));
             } else {
@@ -956,7 +1444,7 @@ fn render_ui(frame: &mut ratatui::Frame, state: &AppState, input_buffer: &str) {
                     };
 
                     let item_line = Line::from(vec![
-                        Span::styled(cursor_prefix, Style::default().fg(Color::Cyan).bold()),
+                        Span::styled(cursor_prefix, Style::default().fg(Color::Cyan)).bold(),
                         Span::styled(access_badge, access_style),
                         Span::raw(" "),
                         Span::styled(&item.path, Style::default().bold()),
@@ -975,12 +1463,11 @@ fn render_ui(frame: &mut ratatui::Frame, state: &AppState, input_buffer: &str) {
                 .wrap(Wrap { trim: false });
             frame.render_widget(ctx_paragraph, chunks[1]);
 
-            // Status message / Info in lower area
             let info_line = if let Some(msg) = &state.context_view.status_message {
-                Line::from(Span::styled(msg, Style::default().fg(Color::Red)))
+                Line::from(Span::styled(msg, Style::default().fg(Color::Green).bold()))
             } else {
                 Line::from(Span::styled(
-                    "Press 'a' to add file with autocomplete, 'e' for editable, 'r' for read-only, 'd'/'x' to remove",
+                    "Press 'a' to add file or glob pattern (e.g. *.rs, src/), 'e' for editable, 'r' for read-only, 'd'/'x' to remove",
                     Style::default().fg(Color::DarkGray),
                 ))
             };
@@ -988,10 +1475,9 @@ fn render_ui(frame: &mut ratatui::Frame, state: &AppState, input_buffer: &str) {
                 .block(Block::default().title(" Context Actions ").borders(Borders::ALL));
             frame.render_widget(prompt_widget, chunks[2]);
 
-            // Context Footer
             let footer_line = Line::from(vec![
-                Span::styled(" Tab ", Style::default().bg(Color::DarkGray).fg(Color::White).bold()),
-                Span::raw(" Model  "),
+                Span::styled(" Ctrl+1/2 ", Style::default().bg(Color::DarkGray).fg(Color::White).bold()),
+                Span::raw(" Switch  "),
                 Span::styled(" a ", Style::default().bg(Color::DarkGray).fg(Color::White).bold()),
                 Span::raw(" Add  "),
                 Span::styled(" e ", Style::default().bg(Color::DarkGray).fg(Color::White).bold()),
@@ -1006,14 +1492,12 @@ fn render_ui(frame: &mut ratatui::Frame, state: &AppState, input_buffer: &str) {
             let footer = Paragraph::new(footer_line).block(Block::default().borders(Borders::ALL));
             frame.render_widget(footer, chunks[3]);
 
-            // Modal Autocomplete File Picker
             if state.context_view.adding_file {
                 render_add_file_picker(frame, state);
             }
         }
     }
 
-    // Modal Help Popup (Magit Dispatch style)
     if state.show_help {
         render_help_popup(frame, state.view_mode);
     }
@@ -1029,13 +1513,13 @@ fn render_add_file_picker(frame: &mut ratatui::Frame, state: &AppState) {
         .split(area);
 
     let input_line = Line::from(vec![
-        Span::styled(" File: ", Style::default().fg(Color::Cyan).bold()),
+        Span::styled(" File / Pattern: ", Style::default().fg(Color::Cyan).bold()),
         Span::raw(&state.context_view.add_input),
         Span::styled("█", Style::default().fg(Color::Yellow)),
     ]);
     let input_block = Paragraph::new(input_line).block(
         Block::default()
-            .title(" Add File to Context (Read-Only) ")
+            .title(" Add to Context (Path, directory or glob like *.rs) ")
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::Cyan)),
     );
@@ -1059,17 +1543,34 @@ fn render_add_file_picker(frame: &mut ratatui::Frame, state: &AppState) {
                 ("   ", Style::default().fg(Color::Gray))
             };
 
-            let line = Line::from(vec![
-                Span::styled(prefix, Style::default().fg(Color::Cyan).bold()),
-                Span::styled(candidate, style),
-            ]);
+            let is_pattern_entry = candidate.starts_with("[+] Add all matching '");
+
+            let line = if is_pattern_entry {
+                Line::from(vec![
+                    Span::styled(prefix, Style::default().fg(Color::Green).bold()),
+                    Span::styled(
+                        candidate,
+                        if is_sel {
+                            Style::default().bg(Color::Green).fg(Color::Black).bold()
+                        } else {
+                            Style::default().fg(Color::Green).bold()
+                        },
+                    ),
+                ])
+            } else {
+                Line::from(vec![
+                    Span::styled(prefix, Style::default().fg(Color::Cyan).bold()),
+                    Span::styled(candidate, style),
+                ])
+            };
+
             candidate_lines.push(line);
         }
     }
 
     let list_block = Paragraph::new(candidate_lines).block(
         Block::default()
-            .title(" Matching Files (Enter: Add, Tab: Complete, ↑/↓: Navigate, Esc: Cancel) ")
+            .title(" Matching Files / Actions (Enter: Add, Tab: Complete, ↑/↓: Navigate, Esc: Cancel) ")
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::DarkGray)),
     );
@@ -1085,16 +1586,20 @@ fn render_help_popup(frame: &mut ratatui::Frame, mode: ViewMode) {
             " Help: Model View ",
             vec![
                 Line::from(Span::styled("Global Navigation", Style::default().fg(Color::Cyan).bold())),
-                Line::from("  Tab           Switch between Model and Context views"),
+                Line::from("  Ctrl+1        Switch directly to Model view"),
+                Line::from("  Ctrl+2        Switch directly to Context view (preserves input)"),
+                Line::from("  Tab           Switch between Model and Context views (if input empty)"),
                 Line::from("  Esc / q       Close help / Cancel operation / Exit"),
                 Line::from("  ?             Toggle this help popup"),
                 Line::raw(""),
-                Line::from(Span::styled("Model Actions", Style::default().fg(Color::Yellow).bold())),
-                Line::from("  Enter         Send prompt to model"),
+                Line::from(Span::styled("Model & File Review", Style::default().fg(Color::Yellow).bold())),
+                Line::from("  Enter         Send prompt / Toggle selected file diff"),
+                Line::from("  Space         Fold / Unfold selected file diff"),
+                Line::from("  [ / ]         Navigate between modified files"),
                 Line::from("  Ctrl+C        Cancel active streaming / thinking"),
                 Line::from("  Ctrl+L        Clear conversation history & model view"),
                 Line::from("  Ctrl+R        Toggle reasoning / thinking visibility"),
-                Line::from("  ↑/↓           Scroll output line by line"),
+                Line::from("  ↑/↓           Scroll output / Navigate files if input empty"),
                 Line::from("  PgUp/PgDn     Scroll output by page"),
             ],
         ),
@@ -1102,22 +1607,24 @@ fn render_help_popup(frame: &mut ratatui::Frame, mode: ViewMode) {
             " Help: Context View ",
             vec![
                 Line::from(Span::styled("Global Navigation", Style::default().fg(Color::Cyan).bold())),
+                Line::from("  Ctrl+1        Switch directly to Model view"),
+                Line::from("  Ctrl+2        Switch directly to Context view"),
                 Line::from("  Tab           Switch between Model and Context views"),
                 Line::from("  Esc / q       Back to Model view / Close help"),
                 Line::from("  ?             Toggle this help popup"),
                 Line::raw(""),
                 Line::from(Span::styled("Context Management", Style::default().fg(Color::Yellow).bold())),
                 Line::from("  ↑/↓ or k/j    Navigate through context files"),
-                Line::from("  a             Open autocomplete file picker"),
+                Line::from("  a             Open autocomplete file & glob pattern picker"),
                 Line::from("  e             Make selected file EDITABLE (write permissions)"),
                 Line::from("  r             Make selected file READ-ONLY"),
                 Line::from("  d / x / Del   Remove selected file from context"),
                 Line::raw(""),
-                Line::from(Span::styled("Add File Autocomplete Picker", Style::default().fg(Color::Cyan).bold())),
-                Line::from("  Type letters  Filter repository files by substring"),
-                Line::from("  ↑ / ↓         Select matching file"),
+                Line::from(Span::styled("Add File / Pattern Picker", Style::default().fg(Color::Cyan).bold())),
+                Line::from("  Type pattern  Filter by substring or glob (e.g. *.rs, src/)"),
+                Line::from("  ↑ / ↓         Select matching file or '[+] Add all' action"),
                 Line::from("  Tab           Autocomplete path into input"),
-                Line::from("  Enter         Add highlighted file to context"),
+                Line::from("  Enter         Add highlighted file or all matching files"),
                 Line::from("  Esc           Cancel picker"),
             ],
         ),
