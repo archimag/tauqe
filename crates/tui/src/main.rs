@@ -27,12 +27,12 @@ use tokio::sync::Mutex;
 use workbench_protocol::{
     events, methods, ConfigSetParams, ConfigState, ContextAccess, ContextAddParams,
     ContextAddPatternParams, ContextAddPatternResult, ContextRemoveParams, ContextSetAccessParams,
-    ContextState, EditFileDoneEvent, EditFileStartedEvent, EditFinishedEvent, EditHunkEvent, Event,
-    GitCommitCreatedEvent, GitUndoResult, InitializeParams, InitializeResult,
-    Message, ModelAskParams, ModelDeltaEvent, ModelErrorEvent, ModelFinishedEvent,
-    ModelResultEvent, ModelStartedEvent, ModelUsageEvent, RepositoryListFilesResult,
-    RepositoryState, Request, RequestId, Response, ToolchainResultEvent, ToolchainStartedEvent,
-    PROTOCOL_VERSION,
+    ContextState, EditFileDoneEvent, EditFileRetryingEvent, EditFileStartedEvent, EditFinishedEvent,
+    EditHunkEvent, Event, GitCommitCreatedEvent, GitUndoResult, HistoryEntryAddedEvent,
+    HistoryGetParams, HistoryGetResult, InitializeParams, InitializeResult, Message, ModelAskParams,
+    ModelDeltaEvent, ModelErrorEvent, ModelFinishedEvent, ModelResultEvent, ModelStartedEvent,
+    ModelUsageEvent, RepositoryListFilesResult, RepositoryState, Request, RequestId, Response,
+    ToolchainResultEvent, ToolchainStartedEvent, PROTOCOL_VERSION,
 };
 
 use crate::app::{AppState, ViewMode};
@@ -153,10 +153,18 @@ async fn main() -> anyhow::Result<()> {
 
     let repo_state = init_result.repository;
     let protocol_version = init_result.protocol_version.clone();
-    let workflow = init_result.workflow.unwrap_or_else(|| "toolchain".to_string());
-    let edit_protocol = init_result.edit_protocol.unwrap_or_else(|| "xml".to_string());
+    let workflow = init_result
+        .workflow
+        .unwrap_or_else(|| "toolchain".to_string());
+    let edit_protocol = init_result
+        .edit_protocol
+        .unwrap_or_else(|| "xml".to_string());
     let available_workflows = if init_result.available_workflows.is_empty() {
-        vec!["toolchain".to_string(), "git".to_string(), "naive".to_string()]
+        vec![
+            "toolchain".to_string(),
+            "git".to_string(),
+            "naive".to_string(),
+        ]
     } else {
         init_result.available_workflows
     };
@@ -239,12 +247,25 @@ async fn main() -> anyhow::Result<()> {
         model: ModelView::default(),
         context: initial_context,
         context_view: ContextViewState::default(),
+        history_view: crate::app::HistoryViewState::default(),
         input_editor: InputEditor::default(),
         show_help: false,
         confirm_undo: false,
+        confirm_clear_history: false,
         selection_dialog: None,
         last_model_height: 10,
     }));
+
+    // Initial history fetch
+    send_request(
+        &mut server_writer,
+        methods::HISTORY_GET,
+        serde_json::to_value(HistoryGetParams {
+            limit: Some(10),
+            before_id: None,
+        })?,
+    )
+    .await?;
 
     let (msg_tx, mut msg_rx) = tokio::sync::mpsc::channel::<Message>(100);
     {
@@ -314,6 +335,7 @@ async fn main() -> anyhow::Result<()> {
                         if st.view_mode == ViewMode::Model
                             && !st.show_help
                             && !st.confirm_undo
+                            && !st.confirm_clear_history
                             && st.selection_dialog.is_none()
                         {
                             st.input_editor.insert_paste(&text);
@@ -340,6 +362,30 @@ async fn main() -> anyhow::Result<()> {
                         }
                         KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
                             st.confirm_undo = false;
+                        }
+                        _ => {}
+                    }
+                    continue;
+                }
+
+                // Handle active clear history confirmation modal
+                if st.confirm_clear_history {
+                    match key.code {
+                        KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                            st.confirm_clear_history = false;
+                            let cost = st.model.session_total_cost;
+                            let last_cost = st.model.last_op_cost;
+                            st.model = ModelView {
+                                session_total_cost: cost,
+                                last_op_cost: last_cost,
+                                ..Default::default()
+                            };
+                            st.history_view = crate::app::HistoryViewState::default();
+                            drop(st);
+                            send_request(&mut server_writer, methods::MODEL_CLEAR_HISTORY, serde_json::json!({})).await?;
+                        }
+                        KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                            st.confirm_clear_history = false;
                         }
                         _ => {}
                     }
@@ -430,21 +476,23 @@ async fn main() -> anyhow::Result<()> {
                             st.context_view.status_message = None;
                             continue;
                         }
+                        KeyCode::Char('3') => {
+                            st.view_mode = ViewMode::History;
+                            st.context_view.status_message = None;
+                            continue;
+                        }
                         KeyCode::Char('c') => {
                             drop(st);
                             send_request(&mut server_writer, methods::MODEL_CANCEL, serde_json::json!({})).await?;
                             continue;
                         }
                         KeyCode::Char('l') => {
-                            let cost = st.model.session_total_cost;
-                            let last_cost = st.model.last_op_cost;
-                            st.model = ModelView {
-                                session_total_cost: cost,
-                                last_op_cost: last_cost,
-                                ..Default::default()
-                            };
-                            drop(st);
-                            send_request(&mut server_writer, methods::MODEL_CLEAR_HISTORY, serde_json::json!({})).await?;
+                            let is_busy = st.model.status == "streaming" || st.model.status == "starting";
+                            if is_busy {
+                                st.model.git_notification = Some("Cannot clear history while model is generating".to_string());
+                            } else {
+                                st.confirm_clear_history = true;
+                            }
                             continue;
                         }
                         KeyCode::Char('r') => {
@@ -609,7 +657,8 @@ async fn main() -> anyhow::Result<()> {
                 if key.code == KeyCode::Tab && !st.context_view.adding_file && (st.input_editor.is_empty() || st.view_mode != ViewMode::Model) {
                     st.view_mode = match st.view_mode {
                         ViewMode::Model => ViewMode::Context,
-                        ViewMode::Context => ViewMode::Model,
+                        ViewMode::Context => ViewMode::History,
+                        ViewMode::History => ViewMode::Model,
                     };
                     st.context_view.status_message = None;
                     continue;
@@ -921,6 +970,89 @@ async fn main() -> anyhow::Result<()> {
                             }
                         }
                     }
+                    ViewMode::History => {
+                        let view_height = st.last_model_height;
+                        let total_lines = st.history_view.rendered_lines_count as u16;
+                        let max_scroll = total_lines.saturating_sub(view_height);
+
+                        match key.code {
+                            KeyCode::Esc | KeyCode::Char('q') => {
+                                st.view_mode = ViewMode::Model;
+                            }
+                            KeyCode::Up | KeyCode::Char('k') => {
+                                st.history_view.auto_scroll = false;
+                                if st.history_view.scroll > 0 {
+                                    st.history_view.scroll = st.history_view.scroll.saturating_sub(1);
+                                } else if st.history_view.has_more && !st.history_view.loading {
+                                    if let Some(first_item) = st.history_view.items.first() {
+                                        let before_id = first_item.id;
+                                        st.history_view.loading = true;
+                                        st.history_view.pending_before_id = Some(before_id);
+                                        drop(st);
+                                        let params = HistoryGetParams {
+                                            limit: Some(10),
+                                            before_id: Some(before_id),
+                                        };
+                                        send_request(&mut server_writer, methods::HISTORY_GET, serde_json::to_value(params)?).await?;
+                                    }
+                                }
+                            }
+                            KeyCode::PageUp => {
+                                st.history_view.auto_scroll = false;
+                                if st.history_view.scroll > 0 {
+                                    st.history_view.scroll = st.history_view.scroll.saturating_sub(10);
+                                } else if st.history_view.has_more && !st.history_view.loading {
+                                    if let Some(first_item) = st.history_view.items.first() {
+                                        let before_id = first_item.id;
+                                        st.history_view.loading = true;
+                                        st.history_view.pending_before_id = Some(before_id);
+                                        drop(st);
+                                        let params = HistoryGetParams {
+                                            limit: Some(10),
+                                            before_id: Some(before_id),
+                                        };
+                                        send_request(&mut server_writer, methods::HISTORY_GET, serde_json::to_value(params)?).await?;
+                                    }
+                                }
+                            }
+                            KeyCode::Down | KeyCode::Char('j') => {
+                                if st.history_view.scroll < max_scroll {
+                                    st.history_view.scroll = st.history_view.scroll.saturating_add(1);
+                                }
+                                if st.history_view.scroll >= max_scroll {
+                                    st.history_view.auto_scroll = true;
+                                }
+                            }
+                            KeyCode::PageDown => {
+                                st.history_view.scroll = (st.history_view.scroll.saturating_add(10)).min(max_scroll);
+                                if st.history_view.scroll >= max_scroll {
+                                    st.history_view.auto_scroll = true;
+                                }
+                            }
+                            KeyCode::Home => {
+                                st.history_view.auto_scroll = false;
+                                st.history_view.scroll = 0;
+                                if st.history_view.has_more && !st.history_view.loading {
+                                    if let Some(first_item) = st.history_view.items.first() {
+                                        let before_id = first_item.id;
+                                        st.history_view.loading = true;
+                                        st.history_view.pending_before_id = Some(before_id);
+                                        drop(st);
+                                        let params = HistoryGetParams {
+                                            limit: Some(10),
+                                            before_id: Some(before_id),
+                                        };
+                                        send_request(&mut server_writer, methods::HISTORY_GET, serde_json::to_value(params)?).await?;
+                                    }
+                                }
+                            }
+                            KeyCode::End => {
+                                st.history_view.auto_scroll = true;
+                                st.history_view.scroll = max_scroll;
+                            }
+                            _ => {}
+                        }
+                    }
                 }
             }
             Some(msg) = msg_rx.recv() => {
@@ -1004,7 +1136,26 @@ async fn handle_response(resp: Response, state: &Arc<Mutex<AppState>>) {
             st.model.last_commit_summary = None;
             st.model.edit_final_applied = None;
             st.model.files.clear();
-        } else if let Ok(pattern_res) = serde_json::from_value::<ContextAddPatternResult>(val.clone()) {
+        } else if let Ok(history_res) = serde_json::from_value::<HistoryGetResult>(val.clone()) {
+            st.history_view.loading = false;
+            st.history_view.has_more = history_res.has_more;
+            st.history_view.total_count = history_res.total_count;
+
+            if st.history_view.pending_before_id.take().is_some() && !st.history_view.items.is_empty() {
+                // Pagination prepend: calculate number of lines added to adjust scroll smoothly
+                let added_lines = crate::ui::compute_history_items_line_count(&history_res.items);
+                let mut combined = history_res.items;
+                combined.extend(st.history_view.items.drain(..));
+                st.history_view.items = combined;
+                st.history_view.scroll = st.history_view.scroll.saturating_add(added_lines as u16);
+            } else {
+                // Initial load or replacement
+                st.history_view.items = history_res.items;
+                st.history_view.auto_scroll = true;
+            }
+        } else if let Ok(pattern_res) =
+            serde_json::from_value::<ContextAddPatternResult>(val.clone())
+        {
             st.context = pattern_res.state;
             st.context_view.status_message = Some(format!(
                 "Added {} files (~{} tokens)",
@@ -1013,7 +1164,9 @@ async fn handle_response(resp: Response, state: &Arc<Mutex<AppState>>) {
             if st.context_view.adding_file {
                 st.update_filtered_candidates();
             }
-        } else if let Ok(file_res) = serde_json::from_value::<RepositoryListFilesResult>(val.clone()) {
+        } else if let Ok(file_res) =
+            serde_json::from_value::<RepositoryListFilesResult>(val.clone())
+        {
             st.all_repo_files = file_res.files;
             if st.context_view.adding_file {
                 st.update_filtered_candidates();
@@ -1056,6 +1209,19 @@ async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>) {
             if let Some(params) = ev.params {
                 if let Ok(data) = serde_json::from_value::<GitUndoResult>(params) {
                     st.model.git_notification = Some(data.message);
+                }
+            }
+        }
+        events::HISTORY_ENTRY_ADDED => {
+            if let Some(params) = ev.params {
+                if let Ok(data) = serde_json::from_value::<HistoryEntryAddedEvent>(params) {
+                    st.history_view.items.push(data.item);
+                    st.history_view.total_count += 1;
+                    if st.history_view.auto_scroll {
+                        let view_height = st.last_model_height;
+                        let total_lines = crate::ui::compute_history_items_line_count(&st.history_view.items) as u16;
+                        st.history_view.scroll = total_lines.saturating_sub(view_height);
+                    }
                 }
             }
         }
@@ -1149,9 +1315,11 @@ async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>) {
             if let Some(params) = ev.params {
                 if let Ok(data) = serde_json::from_value::<EditFileStartedEvent>(params) {
                     st.model.edits_active = true;
-                    if let Some(existing) = st.model.files.iter_mut().find(|f| f.path == data.path) {
+                    if let Some(existing) = st.model.files.iter_mut().find(|f| f.path == data.path)
+                    {
                         existing.status = "running".to_string();
                         existing.op_type = data.op_type;
+                        existing.retry_info = None;
                     } else {
                         st.model.files.push(StreamingFileEdit {
                             path: data.path,
@@ -1160,6 +1328,7 @@ async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>) {
                             error: None,
                             hunks: Vec::new(),
                             expanded: false,
+                            retry_info: None,
                         });
                         st.model.selected_file_index = st.model.files.len() - 1;
                     }
@@ -1170,6 +1339,7 @@ async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>) {
             if let Some(params) = ev.params {
                 if let Ok(data) = serde_json::from_value::<EditHunkEvent>(params) {
                     if let Some(f) = st.model.files.iter_mut().find(|f| f.path == data.path) {
+                        f.retry_info = None;
                         f.hunks.push(StreamingHunk {
                             hunk_index: data.hunk_index,
                             old_text: data.old_text,
@@ -1185,6 +1355,33 @@ async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>) {
                     if let Some(f) = st.model.files.iter_mut().find(|f| f.path == data.path) {
                         f.status = data.status;
                         f.error = data.error;
+                        if f.status == "ok" {
+                            f.retry_info = None;
+                            f.error = None;
+                        }
+                    }
+                }
+            }
+        }
+        events::EDIT_FILE_RETRYING => {
+            if let Some(params) = ev.params {
+                if let Ok(data) = serde_json::from_value::<EditFileRetryingEvent>(params) {
+                    let retry_msg = format!("{}/{} retrying: {}", data.attempt, data.max_retries, data.reason);
+                    if let Some(f) = st.model.files.iter_mut().find(|f| f.path == data.path) {
+                        f.status = "retrying".to_string();
+                        f.retry_info = Some(retry_msg);
+                        f.error = None;
+                    } else {
+                        st.model.files.push(StreamingFileEdit {
+                            path: data.path,
+                            op_type: "replace".to_string(),
+                            status: "retrying".to_string(),
+                            error: None,
+                            hunks: Vec::new(),
+                            expanded: false,
+                            retry_info: Some(retry_msg),
+                        });
+                        st.model.selected_file_index = st.model.files.len() - 1;
                     }
                 }
             }
@@ -1204,7 +1401,10 @@ async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>) {
             if let Some(params) = ev.params {
                 if let Ok(data) = serde_json::from_value::<ToolchainStartedEvent>(params) {
                     st.model.toolchain_command = Some(data.command.clone());
-                    st.model.toolchain_status = Some(format!("Running toolchain verification: {}...", data.command));
+                    st.model.toolchain_status = Some(format!(
+                        "Running toolchain verification: {}...",
+                        data.command
+                    ));
                 }
             }
         }
@@ -1213,9 +1413,11 @@ async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>) {
                 if let Ok(data) = serde_json::from_value::<ToolchainResultEvent>(params) {
                     st.model.toolchain_command = None;
                     if data.success {
-                        st.model.toolchain_status = Some(format!("Toolchain check passed ({})", data.command));
+                        st.model.toolchain_status =
+                            Some(format!("Toolchain check passed ({})", data.command));
                     } else {
-                        st.model.toolchain_status = Some(format!("Toolchain check failed ({})", data.command));
+                        st.model.toolchain_status =
+                            Some(format!("Toolchain check failed ({})", data.command));
                     }
                 }
             }
@@ -1236,7 +1438,9 @@ async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>) {
                 if let Ok(data) = serde_json::from_value::<ModelResultEvent>(params) {
                     st.model.result = Some(data.result);
                     if let Some(usage) = data.usage {
-                        let total_cost = data.session_total_cost.unwrap_or(st.model.session_total_cost);
+                        let total_cost = data
+                            .session_total_cost
+                            .unwrap_or(st.model.session_total_cost);
                         st.model.session_total_cost = total_cost;
                         if let Some(c) = usage.cost {
                             st.model.last_op_cost = Some(c);
@@ -1270,7 +1474,10 @@ async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>) {
         }
         events::MODEL_CANCELLED => {
             st.model.status = "cancelled".to_string();
-            fail_safe_reject_edits(&mut st.model, "Operation cancelled before edits were applied");
+            fail_safe_reject_edits(
+                &mut st.model,
+                "Operation cancelled before edits were applied",
+            );
             let h = st.last_model_height;
             st.model.clamp_scroll(h);
         }
@@ -1278,7 +1485,10 @@ async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>) {
             if let Some(params) = ev.params {
                 if let Ok(data) = serde_json::from_value::<ModelErrorEvent>(params) {
                     st.model.status = "error".to_string();
-                    fail_safe_reject_edits(&mut st.model, "Operation failed before edits were applied");
+                    fail_safe_reject_edits(
+                        &mut st.model,
+                        "Operation failed before edits were applied",
+                    );
                     st.model.error = Some(data.message);
                     let h = st.last_model_height;
                     st.model.clamp_scroll(h);

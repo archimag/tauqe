@@ -5,7 +5,7 @@ pub mod utils;
 pub mod xml;
 
 pub use structured::StructuredEditProtocol;
-pub use utils::{normalize_content, resolve_target_path};
+pub use utils::{normalize_content, resolve_target_path, resolve_target_path_for_op};
 pub use xml::{has_xml_edit_tags, XmlEditProtocol};
 
 pub trait EditProtocol: Send + Sync {

@@ -17,6 +17,8 @@ pub mod methods {
     pub const CONTEXT_SET_ACCESS: &str = "context/setAccess";
     pub const CONTEXT_CLEAR: &str = "context/clear";
 
+    pub const HISTORY_GET: &str = "history/get";
+
     pub const GIT_UNDO: &str = "git/undo";
     pub const GIT_GET_DIFF: &str = "git/getDiff";
 
@@ -36,10 +38,13 @@ pub mod events {
 
     pub const CONTEXT_CHANGED: &str = "context/changed";
 
+    pub const HISTORY_ENTRY_ADDED: &str = "history/entryAdded";
+
     pub const EDIT_STARTED: &str = "edit/started";
     pub const EDIT_FILE_STARTED: &str = "edit/fileStarted";
     pub const EDIT_HUNK: &str = "edit/hunk";
     pub const EDIT_FILE_DONE: &str = "edit/fileDone";
+    pub const EDIT_FILE_RETRYING: &str = "edit/fileRetrying";
     pub const EDIT_FINISHED: &str = "edit/finished";
 
     pub const GIT_STATE_CHANGED: &str = "git/stateChanged";
@@ -223,6 +228,47 @@ pub struct ContextSetAccessParams {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContextChangedEvent {
     pub state: ContextState,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum UiHistoryKind {
+    User,
+    Assistant,
+    System,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UiHistoryItem {
+    pub id: u64,
+    pub kind: UiHistoryKind,
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub files: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct HistoryGetParams {
+    #[serde(default)]
+    pub limit: Option<usize>,
+    #[serde(default)]
+    pub before_id: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HistoryGetResult {
+    pub items: Vec<UiHistoryItem>,
+    pub has_more: bool,
+    pub total_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HistoryEntryAddedEvent {
+    pub item: UiHistoryItem,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -410,6 +456,15 @@ pub struct EditFileDoneEvent {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     pub hunks_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EditFileRetryingEvent {
+    pub operation_id: String,
+    pub path: String,
+    pub attempt: usize,
+    pub max_retries: usize,
+    pub reason: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -6,21 +6,22 @@ use tokio::sync::{watch, Mutex};
 use workbench_core::config::{load_config, AppConfig};
 use workbench_core::context::ContextManager;
 use workbench_core::edits::{EditProtocolFactory, XmlEditProtocol};
-use workbench_core::model::gateway::{ChatMessage, StreamEvent};
+use workbench_core::history::HistoryManager;
+use workbench_core::model::gateway::StreamEvent;
 use workbench_core::model::openrouter::OpenRouterClient;
 use workbench_core::workflow::{ToolchainEditWorkflow, WorkflowFactory};
 use workbench_protocol::{
     events, methods, ConfigSetParams, ConfigState, ContextAddParams, ContextAddPatternParams,
     ContextAddPatternResult, ContextRemoveParams, ContextSetAccessParams, EditFileDoneEvent,
-    EditFileStartedEvent, EditFinishedEvent, EditHunkEvent, EditStartedEvent, Event,
-    GitCommitCreatedEvent, GitDiffParams, GitDiffResult, InitializeResult,
-    ModelAskParams, ModelResultEvent, RepositoryListFilesResult, Request,
-    RequestId, Response, ResponseError, ToolchainResultEvent, ToolchainStartedEvent,
-    PROTOCOL_VERSION,
+    EditFileRetryingEvent, EditFileStartedEvent, EditFinishedEvent, EditHunkEvent, EditStartedEvent,
+    Event, GitCommitCreatedEvent, GitDiffParams, GitDiffResult, HistoryEntryAddedEvent,
+    HistoryGetParams, HistoryGetResult, InitializeResult, ModelAskParams, ModelResultEvent,
+    RepositoryListFilesResult, Request, RequestId, Response, ResponseError, ToolchainResultEvent,
+    ToolchainStartedEvent, UiHistoryItem, PROTOCOL_VERSION,
 };
 
 struct ModelSession {
-    history: Vec<ChatMessage>,
+    history_manager: HistoryManager,
     active_cancel: Option<watch::Sender<bool>>,
     total_cost: f64,
     context_manager: ContextManager,
@@ -29,6 +30,7 @@ struct ModelSession {
 struct AppState {
     config: Mutex<AppConfig>,
     session: Mutex<ModelSession>,
+    history_sender: tokio::sync::mpsc::UnboundedSender<UiHistoryItem>,
 }
 
 #[tokio::main]
@@ -37,16 +39,34 @@ async fn main() -> anyhow::Result<()> {
 
     let config = load_config(None);
     let repo_state = workbench_core::git::get_repository_state(None);
-    let repo_path = PathBuf::from(repo_state.root);
+    let repo_path = PathBuf::from(&repo_state.root);
+
+    let (history_tx, mut history_rx) = tokio::sync::mpsc::unbounded_channel::<UiHistoryItem>();
+    let history_sender_init = history_tx.clone();
+    let mut initial_history_manager = HistoryManager::new(repo_path.clone());
+    initial_history_manager.set_listener(move |item| {
+        let _ = history_sender_init.send(item);
+    });
 
     let state = Arc::new(AppState {
         config: Mutex::new(config),
         session: Mutex::new(ModelSession {
-            history: Vec::new(),
+            history_manager: initial_history_manager,
             active_cancel: None,
             total_cost: 0.0,
             context_manager: ContextManager::new(repo_path),
         }),
+        history_sender: history_tx,
+    });
+
+    tokio::spawn(async move {
+        while let Some(item) = history_rx.recv().await {
+            let ev = Event {
+                method: events::HISTORY_ENTRY_ADDED.to_string(),
+                params: Some(serde_json::to_value(HistoryEntryAddedEvent { item }).unwrap()),
+            };
+            send_event(&ev).await;
+        }
     });
 
     let stdin = tokio::io::stdin();
@@ -96,7 +116,15 @@ async fn handle_request(req: Request, state: &Arc<AppState>) -> Response {
             if !repo_path.as_os_str().is_empty() {
                 *cfg = load_config(Some(repo_path));
                 let mut session = state.session.lock().await;
-                session.context_manager.set_repo_root(repo_path.to_path_buf());
+                session
+                    .context_manager
+                    .set_repo_root(repo_path.to_path_buf());
+                let mut hm = HistoryManager::new(repo_path.to_path_buf());
+                let sender = state.history_sender.clone();
+                hm.set_listener(move |item| {
+                    let _ = sender.send(item);
+                });
+                session.history_manager = hm;
             }
 
             let result = InitializeResult {
@@ -147,6 +175,37 @@ async fn handle_request(req: Request, state: &Arc<AppState>) -> Response {
                 },
             }
         }
+        methods::HISTORY_GET => {
+            let params: HistoryGetParams = req
+                .params
+                .and_then(|p| serde_json::from_value(p).ok())
+                .unwrap_or_default();
+            let limit = params.limit.unwrap_or(10);
+            let session = state.session.lock().await;
+            match session.history_manager.get_ui_slice(limit, params.before_id) {
+                Ok((items, has_more, total_count)) => {
+                    let result = HistoryGetResult {
+                        items,
+                        has_more,
+                        total_count,
+                    };
+                    Response {
+                        id: req.id,
+                        result: Some(serde_json::to_value(result).unwrap()),
+                        error: None,
+                    }
+                }
+                Err(err) => Response {
+                    id: req.id,
+                    result: None,
+                    error: Some(ResponseError {
+                        code: "HISTORY_GET_FAILED".to_string(),
+                        message: err.to_string(),
+                        data: None,
+                    }),
+                },
+            }
+        }
         methods::GIT_UNDO => {
             {
                 let session = state.session.lock().await;
@@ -156,7 +215,8 @@ async fn handle_request(req: Request, state: &Arc<AppState>) -> Response {
                         result: None,
                         error: Some(ResponseError {
                             code: "OPERATION_IN_PROGRESS".to_string(),
-                            message: "Cannot undo while a model operation is in progress".to_string(),
+                            message: "Cannot undo while a model operation is in progress"
+                                .to_string(),
                             data: None,
                         }),
                     };
@@ -170,6 +230,10 @@ async fn handle_request(req: Request, state: &Arc<AppState>) -> Response {
                 Ok(undo_result) => {
                     let ctx_state = {
                         let mut session = state.session.lock().await;
+                        let _ = session.history_manager.record_undo(
+                            &undo_result.undone_commit,
+                            undo_result.restored_checkpoint,
+                        );
                         session.context_manager.prune_missing_files();
                         session.context_manager.get_state()
                     };
@@ -178,17 +242,20 @@ async fn handle_request(req: Request, state: &Arc<AppState>) -> Response {
                     send_event(&Event {
                         method: events::GIT_STATE_CHANGED.to_string(),
                         params: Some(serde_json::json!({ "repository": new_repo_state })),
-                    }).await;
+                    })
+                    .await;
 
                     send_event(&Event {
                         method: events::CONTEXT_CHANGED.to_string(),
                         params: Some(serde_json::json!({ "state": ctx_state })),
-                    }).await;
+                    })
+                    .await;
 
                     send_event(&Event {
                         method: events::GIT_UNDO_COMPLETED.to_string(),
                         params: Some(serde_json::to_value(&undo_result).unwrap()),
-                    }).await;
+                    })
+                    .await;
 
                     Response {
                         id: req.id,
@@ -208,7 +275,8 @@ async fn handle_request(req: Request, state: &Arc<AppState>) -> Response {
             }
         }
         methods::GIT_GET_DIFF => {
-            let params: Option<GitDiffParams> = req.params.and_then(|p| serde_json::from_value(p).ok());
+            let params: Option<GitDiffParams> =
+                req.params.and_then(|p| serde_json::from_value(p).ok());
             let target_path = params.as_ref().and_then(|p| p.path.as_deref());
 
             let repo_state = workbench_core::git::get_repository_state(None);
@@ -256,20 +324,21 @@ async fn handle_request(req: Request, state: &Arc<AppState>) -> Response {
                 }
             }
 
-            let params: ConfigSetParams = match req.params.and_then(|p| serde_json::from_value(p).ok()) {
-                Some(p) => p,
-                None => {
-                    return Response {
-                        id: req.id,
-                        result: None,
-                        error: Some(ResponseError {
-                            code: "INVALID_PARAMS".to_string(),
-                            message: "Missing or invalid parameters".to_string(),
-                            data: None,
-                        }),
-                    };
-                }
-            };
+            let params: ConfigSetParams =
+                match req.params.and_then(|p| serde_json::from_value(p).ok()) {
+                    Some(p) => p,
+                    None => {
+                        return Response {
+                            id: req.id,
+                            result: None,
+                            error: Some(ResponseError {
+                                code: "INVALID_PARAMS".to_string(),
+                                message: "Missing or invalid parameters".to_string(),
+                                data: None,
+                            }),
+                        };
+                    }
+                };
 
             let updated_state = {
                 let mut cfg = state.config.lock().await;
@@ -340,7 +409,8 @@ async fn handle_request(req: Request, state: &Arc<AppState>) -> Response {
             send_event(&Event {
                 method: events::CONFIG_CHANGED.to_string(),
                 params: Some(serde_json::to_value(&updated_state).unwrap()),
-            }).await;
+            })
+            .await;
 
             Response {
                 id: req.id,
@@ -358,25 +428,28 @@ async fn handle_request(req: Request, state: &Arc<AppState>) -> Response {
             }
         }
         methods::CONTEXT_ADD => {
-            let params: ContextAddParams = match req.params.and_then(|p| serde_json::from_value(p).ok())
-            {
-                Some(p) => p,
-                None => {
-                    return Response {
-                        id: req.id,
-                        result: None,
-                        error: Some(ResponseError {
-                            code: "INVALID_PARAMS".to_string(),
-                            message: "Missing or invalid path/access".to_string(),
-                            data: None,
-                        }),
-                    };
-                }
-            };
+            let params: ContextAddParams =
+                match req.params.and_then(|p| serde_json::from_value(p).ok()) {
+                    Some(p) => p,
+                    None => {
+                        return Response {
+                            id: req.id,
+                            result: None,
+                            error: Some(ResponseError {
+                                code: "INVALID_PARAMS".to_string(),
+                                message: "Missing or invalid path/access".to_string(),
+                                data: None,
+                            }),
+                        };
+                    }
+                };
 
             let ctx_state = {
                 let mut session = state.session.lock().await;
-                match session.context_manager.add_file(&params.path, params.access) {
+                match session
+                    .context_manager
+                    .add_file(&params.path, params.access)
+                {
                     Ok(_) => session.context_manager.get_state(),
                     Err(err) => {
                         return Response {
@@ -395,7 +468,8 @@ async fn handle_request(req: Request, state: &Arc<AppState>) -> Response {
             send_event(&Event {
                 method: events::CONTEXT_CHANGED.to_string(),
                 params: Some(serde_json::json!({ "state": ctx_state })),
-            }).await;
+            })
+            .await;
 
             Response {
                 id: req.id,
@@ -404,33 +478,34 @@ async fn handle_request(req: Request, state: &Arc<AppState>) -> Response {
             }
         }
         methods::CONTEXT_ADD_PATTERN => {
-            let params: ContextAddPatternParams = match req.params.and_then(|p| serde_json::from_value(p).ok())
-            {
-                Some(p) => p,
-                None => {
-                    return Response {
-                        id: req.id,
-                        result: None,
-                        error: Some(ResponseError {
-                            code: "INVALID_PARAMS".to_string(),
-                            message: "Missing or invalid pattern/access".to_string(),
-                            data: None,
-                        }),
-                    };
-                }
-            };
+            let params: ContextAddPatternParams =
+                match req.params.and_then(|p| serde_json::from_value(p).ok()) {
+                    Some(p) => p,
+                    None => {
+                        return Response {
+                            id: req.id,
+                            result: None,
+                            error: Some(ResponseError {
+                                code: "INVALID_PARAMS".to_string(),
+                                message: "Missing or invalid pattern/access".to_string(),
+                                data: None,
+                            }),
+                        };
+                    }
+                };
 
             let (added_count, added_tokens, ctx_state) = {
                 let repo_state = workbench_core::git::get_repository_state(None);
                 let repo_dir = Path::new(&repo_state.root);
-                let available_files = workbench_core::git::list_repository_files(Some(repo_dir))
-                    .unwrap_or_default();
+                let available_files =
+                    workbench_core::git::list_repository_files(Some(repo_dir)).unwrap_or_default();
 
                 let mut session = state.session.lock().await;
-                match session
-                    .context_manager
-                    .add_files_by_pattern(&params.pattern, params.access, &available_files)
-                {
+                match session.context_manager.add_files_by_pattern(
+                    &params.pattern,
+                    params.access,
+                    &available_files,
+                ) {
                     Ok((items, tokens)) => {
                         let state = session.context_manager.get_state();
                         (items.len(), tokens, state)
@@ -452,7 +527,8 @@ async fn handle_request(req: Request, state: &Arc<AppState>) -> Response {
             send_event(&Event {
                 method: events::CONTEXT_CHANGED.to_string(),
                 params: Some(serde_json::json!({ "state": ctx_state })),
-            }).await;
+            })
+            .await;
 
             let result = ContextAddPatternResult {
                 added_count,
@@ -467,21 +543,21 @@ async fn handle_request(req: Request, state: &Arc<AppState>) -> Response {
             }
         }
         methods::CONTEXT_REMOVE => {
-            let params: ContextRemoveParams = match req.params.and_then(|p| serde_json::from_value(p).ok())
-            {
-                Some(p) => p,
-                None => {
-                    return Response {
-                        id: req.id,
-                        result: None,
-                        error: Some(ResponseError {
-                            code: "INVALID_PARAMS".to_string(),
-                            message: "Missing or invalid path".to_string(),
-                            data: None,
-                        }),
-                    };
-                }
-            };
+            let params: ContextRemoveParams =
+                match req.params.and_then(|p| serde_json::from_value(p).ok()) {
+                    Some(p) => p,
+                    None => {
+                        return Response {
+                            id: req.id,
+                            result: None,
+                            error: Some(ResponseError {
+                                code: "INVALID_PARAMS".to_string(),
+                                message: "Missing or invalid path".to_string(),
+                                data: None,
+                            }),
+                        };
+                    }
+                };
 
             let ctx_state = {
                 let mut session = state.session.lock().await;
@@ -504,7 +580,8 @@ async fn handle_request(req: Request, state: &Arc<AppState>) -> Response {
             send_event(&Event {
                 method: events::CONTEXT_CHANGED.to_string(),
                 params: Some(serde_json::json!({ "state": ctx_state })),
-            }).await;
+            })
+            .await;
 
             Response {
                 id: req.id,
@@ -513,25 +590,28 @@ async fn handle_request(req: Request, state: &Arc<AppState>) -> Response {
             }
         }
         methods::CONTEXT_SET_ACCESS => {
-            let params: ContextSetAccessParams = match req.params.and_then(|p| serde_json::from_value(p).ok())
-            {
-                Some(p) => p,
-                None => {
-                    return Response {
-                        id: req.id,
-                        result: None,
-                        error: Some(ResponseError {
-                            code: "INVALID_PARAMS".to_string(),
-                            message: "Missing or invalid parameters".to_string(),
-                            data: None,
-                        }),
-                    };
-                }
-            };
+            let params: ContextSetAccessParams =
+                match req.params.and_then(|p| serde_json::from_value(p).ok()) {
+                    Some(p) => p,
+                    None => {
+                        return Response {
+                            id: req.id,
+                            result: None,
+                            error: Some(ResponseError {
+                                code: "INVALID_PARAMS".to_string(),
+                                message: "Missing or invalid parameters".to_string(),
+                                data: None,
+                            }),
+                        };
+                    }
+                };
 
             let ctx_state = {
                 let mut session = state.session.lock().await;
-                match session.context_manager.set_access(&params.path, params.access) {
+                match session
+                    .context_manager
+                    .set_access(&params.path, params.access)
+                {
                     Ok(_) => session.context_manager.get_state(),
                     Err(err) => {
                         return Response {
@@ -550,7 +630,8 @@ async fn handle_request(req: Request, state: &Arc<AppState>) -> Response {
             send_event(&Event {
                 method: events::CONTEXT_CHANGED.to_string(),
                 params: Some(serde_json::json!({ "state": ctx_state })),
-            }).await;
+            })
+            .await;
 
             Response {
                 id: req.id,
@@ -568,7 +649,8 @@ async fn handle_request(req: Request, state: &Arc<AppState>) -> Response {
             send_event(&Event {
                 method: events::CONTEXT_CHANGED.to_string(),
                 params: Some(serde_json::json!({ "state": ctx_state })),
-            }).await;
+            })
+            .await;
 
             Response {
                 id: req.id,
@@ -577,21 +659,21 @@ async fn handle_request(req: Request, state: &Arc<AppState>) -> Response {
             }
         }
         methods::MODEL_ASK => {
-            let params: ModelAskParams = match req.params.and_then(|p| serde_json::from_value(p).ok())
-            {
-                Some(p) => p,
-                None => {
-                    return Response {
-                        id: req.id,
-                        result: None,
-                        error: Some(ResponseError {
-                            code: "INVALID_PARAMS".to_string(),
-                            message: "Missing or invalid prompt".to_string(),
-                            data: None,
-                        }),
-                    };
-                }
-            };
+            let params: ModelAskParams =
+                match req.params.and_then(|p| serde_json::from_value(p).ok()) {
+                    Some(p) => p,
+                    None => {
+                        return Response {
+                            id: req.id,
+                            result: None,
+                            error: Some(ResponseError {
+                                code: "INVALID_PARAMS".to_string(),
+                                message: "Missing or invalid prompt".to_string(),
+                                data: None,
+                            }),
+                        };
+                    }
+                };
 
             let (api_key, model, edit_config, toolchain_config) = {
                 let cfg = state.config.lock().await;
@@ -625,7 +707,12 @@ async fn handle_request(req: Request, state: &Arc<AppState>) -> Response {
                     }
                 };
 
-                (key, cfg.models.default.clone(), cfg.edit.clone(), cfg.toolchain.clone())
+                (
+                    key,
+                    cfg.models.default.clone(),
+                    cfg.edit.clone(),
+                    cfg.toolchain.clone(),
+                )
             };
 
             let op_id = format!("op-{}", next_operation_id().await);
@@ -658,14 +745,18 @@ async fn handle_request(req: Request, state: &Arc<AppState>) -> Response {
                 let protocol = EditProtocolFactory::create_protocol(&edit_config.protocol)
                     .unwrap_or_else(|_| Box::new(XmlEditProtocol));
 
-                let workflow = WorkflowFactory::create_workflow(&edit_config.workflow, &toolchain_config)
-                    .unwrap_or_else(|_| {
-                        Box::new(ToolchainEditWorkflow::new(
-                            toolchain_config.check_command,
-                            toolchain_config.max_retries,
-                            toolchain_config.auto_heal,
-                        ))
-                    });
+                let workflow = WorkflowFactory::create_workflow_with_edit_config(
+                    &edit_config.workflow,
+                    &toolchain_config,
+                    Some(&edit_config),
+                )
+                .unwrap_or_else(|_| {
+                    Box::new(ToolchainEditWorkflow::new(
+                        toolchain_config.check_command,
+                        Some(edit_config.max_retries).or(toolchain_config.max_retries),
+                        toolchain_config.auto_heal,
+                    ))
+                });
 
                 let (wf_tx, wf_rx) = (tx.clone(), cancel_rx.clone());
                 drop(tx); // Drop local tx clone so rx closes when wf_task finishes
@@ -676,14 +767,18 @@ async fn handle_request(req: Request, state: &Arc<AppState>) -> Response {
 
                 let workflow_future = async move {
                     let mut session = state_clone.session.lock().await;
-                    let history = session.history.clone();
+                    let ModelSession {
+                        ref mut context_manager,
+                        ref mut history_manager,
+                        ..
+                    } = *session;
                     workflow
                         .execute(
                             &prompt_clone,
                             &client,
                             &model_clone,
-                            &mut session.context_manager,
-                            &history,
+                            context_manager,
+                            history_manager,
                             protocol.as_ref(),
                             wf_tx,
                             wf_rx,
@@ -723,9 +818,12 @@ async fn handle_request(req: Request, state: &Arc<AppState>) -> Response {
                             edit_events_sent = true;
                             let ev = Event {
                                 method: events::EDIT_STARTED.to_string(),
-                                params: Some(serde_json::to_value(EditStartedEvent {
-                                    operation_id: op_id_for_spawn.clone(),
-                                }).unwrap()),
+                                params: Some(
+                                    serde_json::to_value(EditStartedEvent {
+                                        operation_id: op_id_for_spawn.clone(),
+                                    })
+                                    .unwrap(),
+                                ),
                             };
                             send_event(&ev).await;
                         }
@@ -733,59 +831,109 @@ async fn handle_request(req: Request, state: &Arc<AppState>) -> Response {
                             edit_events_sent = true;
                             let ev = Event {
                                 method: events::EDIT_FILE_STARTED.to_string(),
-                                params: Some(serde_json::to_value(EditFileStartedEvent {
-                                    operation_id: op_id_for_spawn.clone(),
-                                    path,
-                                    op_type,
-                                }).unwrap()),
+                                params: Some(
+                                    serde_json::to_value(EditFileStartedEvent {
+                                        operation_id: op_id_for_spawn.clone(),
+                                        path,
+                                        op_type,
+                                    })
+                                    .unwrap(),
+                                ),
                             };
                             send_event(&ev).await;
                         }
-                        StreamEvent::EditHunk { path, hunk_index, old_text, new_text } => {
+                        StreamEvent::EditHunk {
+                            path,
+                            hunk_index,
+                            old_text,
+                            new_text,
+                        } => {
                             let ev = Event {
                                 method: events::EDIT_HUNK.to_string(),
-                                params: Some(serde_json::to_value(EditHunkEvent {
-                                    operation_id: op_id_for_spawn.clone(),
-                                    path,
-                                    hunk_index,
-                                    old_text,
-                                    new_text,
-                                }).unwrap()),
+                                params: Some(
+                                    serde_json::to_value(EditHunkEvent {
+                                        operation_id: op_id_for_spawn.clone(),
+                                        path,
+                                        hunk_index,
+                                        old_text,
+                                        new_text,
+                                    })
+                                    .unwrap(),
+                                ),
                             };
                             send_event(&ev).await;
                         }
-                        StreamEvent::EditFileDone { path, status, error, hunks_count } => {
+                        StreamEvent::EditFileDone {
+                            path,
+                            status,
+                            error,
+                            hunks_count,
+                        } => {
                             let ev = Event {
                                 method: events::EDIT_FILE_DONE.to_string(),
-                                params: Some(serde_json::to_value(EditFileDoneEvent {
-                                    operation_id: op_id_for_spawn.clone(),
-                                    path,
-                                    status,
-                                    error,
-                                    hunks_count,
-                                }).unwrap()),
+                                params: Some(
+                                    serde_json::to_value(EditFileDoneEvent {
+                                        operation_id: op_id_for_spawn.clone(),
+                                        path,
+                                        status,
+                                        error,
+                                        hunks_count,
+                                    })
+                                    .unwrap(),
+                                ),
+                            };
+                            send_event(&ev).await;
+                        }
+                        StreamEvent::EditFileRetrying {
+                            path,
+                            attempt,
+                            max_retries,
+                            reason,
+                        } => {
+                            let ev = Event {
+                                method: events::EDIT_FILE_RETRYING.to_string(),
+                                params: Some(
+                                    serde_json::to_value(EditFileRetryingEvent {
+                                        operation_id: op_id_for_spawn.clone(),
+                                        path,
+                                        attempt,
+                                        max_retries,
+                                        reason,
+                                    })
+                                    .unwrap(),
+                                ),
                             };
                             send_event(&ev).await;
                         }
                         StreamEvent::ToolchainStarted { command } => {
                             let ev = Event {
                                 method: events::TOOLCHAIN_STARTED.to_string(),
-                                params: Some(serde_json::to_value(ToolchainStartedEvent {
-                                    operation_id: op_id_for_spawn.clone(),
-                                    command,
-                                }).unwrap()),
+                                params: Some(
+                                    serde_json::to_value(ToolchainStartedEvent {
+                                        operation_id: op_id_for_spawn.clone(),
+                                        command,
+                                    })
+                                    .unwrap(),
+                                ),
                             };
                             send_event(&ev).await;
                         }
-                        StreamEvent::ToolchainResult { command, success, output } => {
+                        StreamEvent::ToolchainResult {
+                            command,
+                            success,
+                            output,
+                        } => {
                             let ev = Event {
                                 method: events::TOOLCHAIN_RESULT.to_string(),
-                                params: Some(serde_json::to_value(ToolchainResultEvent {
-                                    operation_id: op_id_for_spawn.clone(),
-                                    command,
-                                    success,
-                                    output,
-                                }).unwrap()),
+                                params: Some(
+                                    serde_json::to_value(ToolchainResultEvent {
+                                        operation_id: op_id_for_spawn.clone(),
+                                        command,
+                                        success,
+                                        output,
+                                    })
+                                    .unwrap(),
+                                ),
                             };
                             send_event(&ev).await;
                         }
@@ -797,11 +945,17 @@ async fn handle_request(req: Request, state: &Arc<AppState>) -> Response {
                         }
                         StreamEvent::Cancelled => {
                             if edit_events_sent && !edit_finished_sent {
-                                send_edit_aborted(&op_id_for_spawn, "Operation cancelled before edits were applied".to_string()).await;
+                                send_edit_aborted(
+                                    &op_id_for_spawn,
+                                    "Operation cancelled before edits were applied".to_string(),
+                                )
+                                .await;
                             }
                             let cancelled_event = Event {
                                 method: events::MODEL_CANCELLED.to_string(),
-                                params: Some(serde_json::json!({ "operation_id": op_id_for_spawn })),
+                                params: Some(
+                                    serde_json::json!({ "operation_id": op_id_for_spawn }),
+                                ),
                             };
                             send_event(&cancelled_event).await;
                             let mut session = state_for_spawn.session.lock().await;
@@ -810,7 +964,11 @@ async fn handle_request(req: Request, state: &Arc<AppState>) -> Response {
                         }
                         StreamEvent::Error(err) => {
                             if edit_events_sent && !edit_finished_sent {
-                                send_edit_aborted(&op_id_for_spawn, format!("Operation failed before edits were applied: {}", err)).await;
+                                send_edit_aborted(
+                                    &op_id_for_spawn,
+                                    format!("Operation failed before edits were applied: {}", err),
+                                )
+                                .await;
                             }
                             let err_event = Event {
                                 method: events::MODEL_ERROR.to_string(),
@@ -857,13 +1015,16 @@ async fn handle_request(req: Request, state: &Arc<AppState>) -> Response {
                         {
                             let finished_edit_event = Event {
                                 method: events::EDIT_FINISHED.to_string(),
-                                params: Some(serde_json::to_value(EditFinishedEvent {
-                                    operation_id: op_id_for_spawn.clone(),
-                                    applied,
-                                    error: error.clone(),
-                                    changed_files: changed_files.clone(),
-                                    commit_hash: commit_hash.clone(),
-                                }).unwrap()),
+                                params: Some(
+                                    serde_json::to_value(EditFinishedEvent {
+                                        operation_id: op_id_for_spawn.clone(),
+                                        applied,
+                                        error: error.clone(),
+                                        changed_files: changed_files.clone(),
+                                        commit_hash: commit_hash.clone(),
+                                    })
+                                    .unwrap(),
+                                ),
                             };
                             send_event(&finished_edit_event).await;
                             edit_finished_sent = true;
@@ -871,18 +1032,23 @@ async fn handle_request(req: Request, state: &Arc<AppState>) -> Response {
                             if let Some(hash) = commit_hash {
                                 send_event(&Event {
                                     method: events::GIT_COMMIT_CREATED.to_string(),
-                                    params: Some(serde_json::to_value(GitCommitCreatedEvent {
-                                        commit_hash: hash.clone(),
-                                        summary: summary.clone(),
-                                        changed_files: changed_files.clone(),
-                                    }).unwrap()),
-                                }).await;
+                                    params: Some(
+                                        serde_json::to_value(GitCommitCreatedEvent {
+                                            commit_hash: hash.clone(),
+                                            summary: summary.clone(),
+                                            changed_files: changed_files.clone(),
+                                        })
+                                        .unwrap(),
+                                    ),
+                                })
+                                .await;
 
                                 let repo_state = workbench_core::git::get_repository_state(None);
                                 send_event(&Event {
                                     method: events::GIT_STATE_CHANGED.to_string(),
                                     params: Some(serde_json::json!({ "repository": repo_state })),
-                                }).await;
+                                })
+                                .await;
                             }
                         }
 
@@ -890,7 +1056,8 @@ async fn handle_request(req: Request, state: &Arc<AppState>) -> Response {
                         send_event(&Event {
                             method: events::CONTEXT_CHANGED.to_string(),
                             params: Some(serde_json::json!({ "state": ctx_state })),
-                        }).await;
+                        })
+                        .await;
 
                         if edit_events_sent && !edit_finished_sent {
                             send_edit_aborted(
@@ -911,13 +1078,6 @@ async fn handle_request(req: Request, state: &Arc<AppState>) -> Response {
                         };
                         send_event(&result_event).await;
 
-                        if let Some((user_msg, asst_msg)) = wf_result.session_history_update {
-                            session.history.push(user_msg);
-                            if !asst_msg.content.is_empty() {
-                                session.history.push(asst_msg);
-                            }
-                        }
-
                         let finished_event = Event {
                             method: events::MODEL_FINISHED.to_string(),
                             params: Some(serde_json::json!({
@@ -929,7 +1089,11 @@ async fn handle_request(req: Request, state: &Arc<AppState>) -> Response {
                     }
                     Ok(Err(err)) => {
                         if edit_events_sent && !edit_finished_sent {
-                            send_edit_aborted(&op_id_for_spawn, format!("Workflow failed: {}", err)).await;
+                            send_edit_aborted(
+                                &op_id_for_spawn,
+                                format!("Workflow failed: {}", err),
+                            )
+                            .await;
                         }
                         let err_event = Event {
                             method: events::MODEL_ERROR.to_string(),
@@ -942,7 +1106,11 @@ async fn handle_request(req: Request, state: &Arc<AppState>) -> Response {
                     }
                     Err(join_err) => {
                         if edit_events_sent && !edit_finished_sent {
-                            send_edit_aborted(&op_id_for_spawn, format!("Workflow task failed: {}", join_err)).await;
+                            send_edit_aborted(
+                                &op_id_for_spawn,
+                                format!("Workflow task failed: {}", join_err),
+                            )
+                            .await;
                         }
                         let err_event = Event {
                             method: events::MODEL_ERROR.to_string(),
@@ -981,7 +1149,7 @@ async fn handle_request(req: Request, state: &Arc<AppState>) -> Response {
         }
         methods::MODEL_CLEAR_HISTORY => {
             let mut session = state.session.lock().await;
-            session.history.clear();
+            let _ = session.history_manager.clear();
             Response {
                 id: req.id,
                 result: Some(serde_json::json!({ "cleared": true })),

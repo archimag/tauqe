@@ -123,9 +123,7 @@ pub struct FunctionDefinition {
 pub enum ResponseFormat {
     Text,
     JsonObject,
-    JsonSchema {
-        json_schema: JsonSchemaDefinition,
-    },
+    JsonSchema { json_schema: JsonSchemaDefinition },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -160,6 +158,12 @@ pub enum StreamEvent {
         status: String,
         error: Option<String>,
         hunks_count: usize,
+    },
+    EditFileRetrying {
+        path: String,
+        attempt: usize,
+        max_retries: usize,
+        reason: String,
     },
 
     // Toolchain validation streaming events

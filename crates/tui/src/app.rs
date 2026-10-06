@@ -1,4 +1,4 @@
-use workbench_protocol::{matches_glob_pattern, ContextState, RepositoryState};
+use workbench_protocol::{matches_glob_pattern, ContextState, RepositoryState, UiHistoryItem};
 
 use crate::context_view::ContextViewState;
 use crate::editor::InputEditor;
@@ -22,6 +22,34 @@ pub struct SelectionDialogState {
 pub enum ViewMode {
     Model,
     Context,
+    History,
+}
+
+#[derive(Debug, Clone)]
+pub struct HistoryViewState {
+    pub items: Vec<UiHistoryItem>,
+    pub scroll: u16,
+    pub auto_scroll: bool,
+    pub has_more: bool,
+    pub total_count: usize,
+    pub loading: bool,
+    pub rendered_lines_count: usize,
+    pub pending_before_id: Option<u64>,
+}
+
+impl Default for HistoryViewState {
+    fn default() -> Self {
+        Self {
+            items: Vec::new(),
+            scroll: 0,
+            auto_scroll: true,
+            has_more: false,
+            total_count: 0,
+            loading: false,
+            rendered_lines_count: 0,
+            pending_before_id: None,
+        }
+    }
 }
 
 pub struct AppState {
@@ -38,9 +66,11 @@ pub struct AppState {
     pub model: ModelView,
     pub context: ContextState,
     pub context_view: ContextViewState,
+    pub history_view: HistoryViewState,
     pub input_editor: InputEditor,
     pub show_help: bool,
     pub confirm_undo: bool,
+    pub confirm_clear_history: bool,
     pub selection_dialog: Option<SelectionDialogState>,
     pub last_model_height: u16,
 }
@@ -52,6 +82,7 @@ impl AppState {
         }
         let prompt = self.input_editor.get_text().trim().to_string();
         self.input_editor.clear();
+        self.confirm_clear_history = false;
         if prompt.is_empty() {
             return None;
         }
@@ -139,7 +170,9 @@ impl AppState {
 
         if self.context_view.filtered_candidates.is_empty() {
             self.context_view.selected_candidate_index = 0;
-        } else if self.context_view.selected_candidate_index >= self.context_view.filtered_candidates.len() {
+        } else if self.context_view.selected_candidate_index
+            >= self.context_view.filtered_candidates.len()
+        {
             self.context_view.selected_candidate_index =
                 self.context_view.filtered_candidates.len() - 1;
         }

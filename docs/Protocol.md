@@ -368,7 +368,22 @@ model/error
 ```
 При ошибке сопоставления передаются `status: "error"` и `error: "..."`.
 
-### 15.5 edit/finished
+### 15.5 edit/fileRetrying
+Сигнализирует о повторной попытке исправления несошедшихся правок для конкретного файла (Patch Retry Loop):
+```json
+{
+  "method": "edit/fileRetrying",
+  "params": {
+    "operation_id": "op-42",
+    "path": "crates/core/src/edits.rs",
+    "attempt": 1,
+    "max_retries": 2,
+    "reason": "Search block not found (0 matches). Check indentation and line endings."
+  }
+}
+```
+
+### 15.6 edit/finished
 Финальное событие атомарного применения изменений:
 ```json
 {
@@ -432,7 +447,54 @@ model/error
 - `git/commitCreated`: фиксация AI-коммита (`commit_hash`, `summary`, `changed_files`).
 - `git/undoCompleted`: уведомление об успешном откате коммита и восстановлении чекпоинта.
 
-## 18. В protocol нет agent shell
+## 18. History methods & events
+
+### 18.1 history/get
+Запрос семантических записей истории с поддержкой пагинации:
+```json
+{
+  "method": "history/get",
+  "params": {
+    "limit": 10,
+    "before_id": 42
+  }
+}
+```
+Ответ:
+```json
+{
+  "items": [
+    {
+      "id": 41,
+      "kind": "assistant",
+      "text": "Добавил поддержку тега delete в парсер.",
+      "commit_hash": "a1b2c3d",
+      "summary": "Support delete tag in XML parser",
+      "files": ["crates/core/src/edits.rs"]
+    }
+  ],
+  "total_count": 50,
+  "has_more": true
+}
+```
+
+### 18.2 history/entryAdded
+Событие рассылается клиентам при добавлении новой семантической записи (сообщения пользователя, ответа модели, отката коммита или резюме):
+```json
+{
+  "method": "history/entryAdded",
+  "params": {
+    "item": {
+      "id": 43,
+      "kind": "user",
+      "text": "Добавь валидацию путей",
+      "files": ["crates/core/src/context.rs"]
+    }
+  }
+}
+```
+
+## 19. В protocol нет agent shell
 
 Это фундаментальный инвариант архитектуры.
 В протоколе намеренно отсутствуют методы вида `agent/runShell`, `model/runCommand`, `agent/exec`.

@@ -4,6 +4,7 @@ pub mod config;
 pub mod context;
 pub mod edits;
 pub mod git;
+pub mod history;
 pub mod model;
 pub mod prompt;
 pub mod toolchain;

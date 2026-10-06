@@ -1,10 +1,8 @@
-use workbench_protocol::{
-    EditOperation, ModelResult, ModelResultProposal,
-};
+use workbench_protocol::{EditOperation, ModelResult, ModelResultProposal};
 
 use crate::model::gateway::{JsonSchemaDefinition, ResponseFormat};
 
-use super::utils::{normalize_content, resolve_target_path};
+use super::utils::{normalize_content, resolve_target_path_for_op};
 use super::EditProtocol;
 
 /// Structured Output JSON-schema edit protocol
@@ -86,10 +84,24 @@ impl StructuredEditProtocol {
         let mut edits = Vec::new();
 
         for change in &proposal.changes {
-            let target_path = resolve_target_path(&change.path, editable_paths);
+            let is_create = change.op == "create";
+            let target_path = match resolve_target_path_for_op(&change.path, editable_paths, is_create) {
+                Ok(p) => p,
+                Err(ambiguity_err) => {
+                    return ModelResult::Edit {
+                        summary: "Ambiguous file path".to_string(),
+                        edits: Vec::new(),
+                        proposal: Some(proposal),
+                        applied: false,
+                        error: Some(ambiguity_err),
+                        changed_files: Vec::new(),
+                        commit_hash: None,
+                    };
+                }
+            };
 
             if !editable_paths.is_empty()
-                && change.op != "create"
+                && !is_create
                 && !editable_paths.contains(&target_path)
             {
                 return ModelResult::Edit {
@@ -182,7 +194,9 @@ impl EditProtocol for StructuredEditProtocol {
         prompt.push_str("- `message`: Your conversational explanation or answer to the user.\n");
         prompt.push_str("- `changes`: Array of code edit operations (`op`: 'replace'|'create'|'delete', `path`, `old_text`, `new_text`, `content`).\n");
         prompt.push_str("- `context_requests`: Optional list of file paths to request adding to context for subsequent turns.\n");
-        prompt.push_str("- `suggested_actions`: Optional list of suggested follow-up options for the user.\n");
+        prompt.push_str(
+            "- `suggested_actions`: Optional list of suggested follow-up options for the user.\n",
+        );
         prompt.push_str("Every field of a change is required: use an empty string \"\" for fields that do not apply to the operation (e.g. `old_text`/`new_text` for 'create'/'delete', `content` for 'replace').\n\n");
 
         if editable_paths.is_empty() {
@@ -197,7 +211,9 @@ impl EditProtocol for StructuredEditProtocol {
 
         prompt.push_str("CRITICAL INVARIANTS:\n");
         prompt.push_str("1. Output MUST be valid JSON adhering to the specified schema.\n");
-        prompt.push_str("2. For 'replace', `path` MUST match one of the permitted files in <editable_files>.\n");
+        prompt.push_str(
+            "2. For 'replace', `path` MUST match one of the permitted files in <editable_files>.\n",
+        );
         prompt.push_str("3. For 'replace', `old_text` must match EXACTLY ONE location in the target file, including indentation and whitespace.\n");
         prompt.push_str("4. For 'create', `content` must contain the complete file content from first to last line.\n");
         prompt.push_str("5. If no code changes are needed, set `changes: []` and provide your answer in `message`.\n\n");
@@ -372,7 +388,8 @@ mod tests {
             ],
             "context_requests": [],
             "suggested_actions": []
-        }).to_string();
+        })
+        .to_string();
 
         let res = proto.parse_output(&json, &editable);
         match res {

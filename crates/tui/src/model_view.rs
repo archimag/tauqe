@@ -14,11 +14,12 @@ pub struct StreamingHunk {
 #[derive(Debug, Clone)]
 pub struct StreamingFileEdit {
     pub path: String,
-    pub op_type: String, // "replace", "create", "delete"
-    pub status: String,  // "running", "ok", "error"
+    pub op_type: String, // "replace", "create", "delete", "retrying"
+    pub status: String,  // "running", "ok", "error", "retrying"
     pub error: Option<String>,
     pub hunks: Vec<StreamingHunk>,
     pub expanded: bool,
+    pub retry_info: Option<String>,
 }
 
 pub struct ModelView {
@@ -87,11 +88,15 @@ impl Default for ModelView {
 
 impl ModelView {
     pub fn update_markdown(&mut self) {
-        self.markdown_lines = crate::markdown::render_markdown(&self.text, &crate::markdown::MarkdownTheme::answer());
+        self.markdown_lines =
+            crate::markdown::render_markdown(&self.text, &crate::markdown::MarkdownTheme::answer());
     }
 
     pub fn update_reasoning_markdown(&mut self) {
-        self.reasoning_lines = crate::markdown::render_markdown(&self.reasoning, &crate::markdown::MarkdownTheme::reasoning());
+        self.reasoning_lines = crate::markdown::render_markdown(
+            &self.reasoning,
+            &crate::markdown::MarkdownTheme::reasoning(),
+        );
     }
 
     pub fn max_scroll(&self, view_height: u16) -> u16 {
@@ -111,8 +116,6 @@ impl ModelView {
 pub fn compute_model_lines(model: &ModelView) -> Vec<Line<'static>> {
     let mut model_lines: Vec<Line<'static>> = Vec::new();
 
-
-
     if let Some(err) = &model.error {
         model_lines.push(Line::from(vec![
             Span::raw("Error: "),
@@ -122,7 +125,10 @@ pub fn compute_model_lines(model: &ModelView) -> Vec<Line<'static>> {
 
     if let Some(notif) = &model.git_notification {
         model_lines.push(Line::from(vec![
-            Span::styled(" [GIT] ", Style::default().bg(Color::Cyan).fg(Color::Black).bold()),
+            Span::styled(
+                " [GIT] ",
+                Style::default().bg(Color::Cyan).fg(Color::Black).bold(),
+            ),
             Span::raw(" "),
             Span::styled(notif.clone(), Style::default().fg(Color::Cyan).bold()),
         ]));
@@ -132,17 +138,29 @@ pub fn compute_model_lines(model: &ModelView) -> Vec<Line<'static>> {
         let is_running = model.toolchain_command.is_some();
         let badge = if is_running {
             let spin = SPINNER_FRAMES[model.spinner_frame % SPINNER_FRAMES.len()];
-            Span::styled(format!(" [{}] TOOLCHAIN ", spin), Style::default().bg(Color::Cyan).fg(Color::Black).bold())
+            Span::styled(
+                format!(" [{}] TOOLCHAIN ", spin),
+                Style::default().bg(Color::Cyan).fg(Color::Black).bold(),
+            )
         } else if toolchain_info.contains("passed") {
-            Span::styled(" [TOOLCHAIN: OK] ", Style::default().bg(Color::Green).fg(Color::Black).bold())
+            Span::styled(
+                " [TOOLCHAIN: OK] ",
+                Style::default().bg(Color::Green).fg(Color::Black).bold(),
+            )
         } else {
-            Span::styled(" [TOOLCHAIN: FAILED] ", Style::default().bg(Color::Red).fg(Color::White).bold())
+            Span::styled(
+                " [TOOLCHAIN: FAILED] ",
+                Style::default().bg(Color::Red).fg(Color::White).bold(),
+            )
         };
 
         model_lines.push(Line::from(vec![
             badge,
             Span::raw(" "),
-            Span::styled(toolchain_info.clone(), Style::default().bold().fg(Color::White)),
+            Span::styled(
+                toolchain_info.clone(),
+                Style::default().bold().fg(Color::White),
+            ),
         ]));
     }
 
@@ -157,7 +175,9 @@ pub fn compute_model_lines(model: &ModelView) -> Vec<Line<'static>> {
             if !model.reasoning_lines.is_empty() {
                 model_lines.extend(model.reasoning_lines.iter().cloned());
             } else {
-                let text_style = Style::default().fg(Color::Rgb(125, 160, 205)).add_modifier(ratatui::style::Modifier::DIM);
+                let text_style = Style::default()
+                    .fg(Color::Rgb(125, 160, 205))
+                    .add_modifier(ratatui::style::Modifier::DIM);
                 for line in model.reasoning.lines() {
                     model_lines.push(Line::from(Span::styled(line.to_string(), text_style)));
                 }
@@ -189,15 +209,27 @@ pub fn compute_model_lines(model: &ModelView) -> Vec<Line<'static>> {
         let header_badge = match model.edit_final_applied {
             Some(true) => {
                 if let Some(hash) = &model.last_commit_hash {
-                    Span::styled(format!(" [COMMITTED: {}] ", hash), Style::default().bg(Color::Green).fg(Color::Black).bold())
+                    Span::styled(
+                        format!(" [COMMITTED: {}] ", hash),
+                        Style::default().bg(Color::Green).fg(Color::Black).bold(),
+                    )
                 } else {
-                    Span::styled(" [APPLIED] ", Style::default().bg(Color::Green).fg(Color::Black).bold())
+                    Span::styled(
+                        " [APPLIED] ",
+                        Style::default().bg(Color::Green).fg(Color::Black).bold(),
+                    )
                 }
             }
-            Some(false) => Span::styled(" [REJECTED] ", Style::default().bg(Color::Red).fg(Color::White).bold()),
+            Some(false) => Span::styled(
+                " [REJECTED] ",
+                Style::default().bg(Color::Red).fg(Color::White).bold(),
+            ),
             None => {
                 let spin = SPINNER_FRAMES[model.spinner_frame % SPINNER_FRAMES.len()];
-                Span::styled(format!(" [{}] Modifying ", spin), Style::default().bg(Color::Yellow).fg(Color::Black).bold())
+                Span::styled(
+                    format!(" [{}] Modifying ", spin),
+                    Style::default().bg(Color::Yellow).fg(Color::Black).bold(),
+                )
             }
         };
 
@@ -205,14 +237,20 @@ pub fn compute_model_lines(model: &ModelView) -> Vec<Line<'static>> {
             header_badge,
             Span::raw(" "),
             Span::styled(
-                format!("Proposed Edits ({}/{} files) - [ / ] Navigate, Space/Enter to Fold/Unfold", ok_files, total_files),
+                format!(
+                    "Proposed Edits ({}/{} files) - [ / ] Navigate, Space/Enter to Fold/Unfold",
+                    ok_files, total_files
+                ),
                 Style::default().bold().fg(Color::Cyan),
             ),
         ];
 
         if model.last_commit_hash.is_some() {
             header_spans.push(Span::raw(" | "));
-            header_spans.push(Span::styled("Press 'u' to Undo AI commit", Style::default().fg(Color::Yellow)));
+            header_spans.push(Span::styled(
+                "Press 'u' to Undo AI commit",
+                Style::default().fg(Color::Yellow),
+            ));
         }
 
         model_lines.push(Line::from(header_spans));
@@ -229,13 +267,21 @@ pub fn compute_model_lines(model: &ModelView) -> Vec<Line<'static>> {
             let fold_icon = if file.expanded { "▼ " } else { "▶ " };
             let cursor_prefix = if is_selected { "> " } else { "  " };
 
-            let (status_icon, status_style) = match file.status.as_str() {
-                "ok" => ("✓", Style::default().fg(Color::Green).bold()),
-                "error" => ("✗", Style::default().fg(Color::Red).bold()),
-                _ => (
+            let is_retrying = file.status == "retrying" || (file.status != "ok" && file.retry_info.is_some());
+            let (status_icon, status_style) = if file.status == "ok" {
+                ("✓", Style::default().fg(Color::Green).bold())
+            } else if is_retrying {
+                (
                     SPINNER_FRAMES[model.spinner_frame % SPINNER_FRAMES.len()],
                     Style::default().fg(Color::Yellow).bold(),
-                ),
+                )
+            } else if file.status == "error" {
+                ("✗", Style::default().fg(Color::Red).bold())
+            } else {
+                (
+                    SPINNER_FRAMES[model.spinner_frame % SPINNER_FRAMES.len()],
+                    Style::default().fg(Color::Yellow).bold(),
+                )
             };
 
             let (op_label, op_style) = match file.op_type.as_str() {
@@ -268,27 +314,41 @@ pub fn compute_model_lines(model: &ModelView) -> Vec<Line<'static>> {
                 Style::default()
             };
 
-            model_lines.push(
-                Line::from(vec![
-                    Span::raw("  "),
-                    Span::styled(cursor_prefix, Style::default().fg(Color::Cyan)),
-                    Span::styled(fold_icon, Style::default().fg(Color::DarkGray)),
-                    Span::styled(op_label, op_style),
-                    Span::styled(file.path.clone(), Style::default().bold()),
-                    Span::raw(" "),
-                    Span::styled(format!("({})", hunk_label), Style::default().fg(Color::DarkGray)),
-                    Span::raw(" "),
-                    Span::styled(status_icon, status_style),
-                ])
-                .style(file_line_style),
-            );
+            let mut file_spans = vec![
+                Span::raw("  "),
+                Span::styled(cursor_prefix, Style::default().fg(Color::Cyan)),
+                Span::styled(fold_icon, Style::default().fg(Color::DarkGray)),
+                Span::styled(op_label, op_style),
+                Span::styled(file.path.clone(), Style::default().bold()),
+                Span::raw(" "),
+                Span::styled(
+                    format!("({})", hunk_label),
+                    Style::default().fg(Color::DarkGray),
+                ),
+                Span::raw(" "),
+                Span::styled(status_icon, status_style),
+            ];
 
-            if let Some(err_msg) = &file.error {
-                model_lines.push(Line::from(vec![
-                    Span::raw("      "),
-                    Span::styled("Validation Error: ", Style::default().fg(Color::Red).bold()),
-                    Span::styled(err_msg.clone(), Style::default().fg(Color::Yellow)),
-                ]));
+            if file.status != "ok" {
+                if let Some(retry) = &file.retry_info {
+                    file_spans.push(Span::raw(" "));
+                    file_spans.push(Span::styled(
+                        format!("(Retrying {})", retry),
+                        Style::default().fg(Color::Yellow).bold(),
+                    ));
+                }
+            }
+
+            model_lines.push(Line::from(file_spans).style(file_line_style));
+
+            if file.status != "ok" {
+                if let Some(err_msg) = &file.error {
+                    model_lines.push(Line::from(vec![
+                        Span::raw("      "),
+                        Span::styled("Validation Error: ", Style::default().fg(Color::Red).bold()),
+                        Span::styled(err_msg.clone(), Style::default().fg(Color::Yellow)),
+                    ]));
+                }
             }
 
             if file.expanded {
@@ -343,8 +403,7 @@ pub fn compute_model_lines(model: &ModelView) -> Vec<Line<'static>> {
             Span::styled(
                 format!(
                     "{} prompt, {} completion",
-                    usage.usage.prompt_tokens,
-                    usage.usage.completion_tokens,
+                    usage.usage.prompt_tokens, usage.usage.completion_tokens,
                 ),
                 Style::default().fg(Color::DarkGray),
             ),
@@ -369,7 +428,10 @@ pub fn compute_model_lines(model: &ModelView) -> Vec<Line<'static>> {
         }
 
         usage_spans.push(Span::raw(" | "));
-        usage_spans.push(Span::styled("Operation cost: ", Style::default().fg(Color::Yellow).bold()));
+        usage_spans.push(Span::styled(
+            "Operation cost: ",
+            Style::default().fg(Color::Yellow).bold(),
+        ));
         usage_spans.push(Span::styled(cost_str, cost_style));
 
         model_lines.push(Line::from(usage_spans));

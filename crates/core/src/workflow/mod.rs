@@ -14,14 +14,14 @@ use workbench_protocol::ModelResult;
 
 use crate::context::ContextManager;
 use crate::edits::EditProtocol;
-use crate::model::gateway::{ChatMessage, StreamEvent};
+use crate::history::HistoryManager;
+use crate::model::gateway::StreamEvent;
 use crate::model::openrouter::OpenRouterClient;
 
 #[derive(Debug, Clone)]
 pub struct WorkflowExecutionResult {
     pub result: ModelResult,
     pub assistant_text: String,
-    pub session_history_update: Option<(ChatMessage, ChatMessage)>,
 }
 
 #[async_trait]
@@ -34,7 +34,7 @@ pub trait EditWorkflow: Send + Sync {
         client: &OpenRouterClient,
         model_name: &str,
         context_manager: &mut ContextManager,
-        session_history: &[ChatMessage],
+        history_manager: &mut HistoryManager,
         protocol: &dyn EditProtocol,
         stream_tx: mpsc::Sender<StreamEvent>,
         cancel_rx: watch::Receiver<bool>,
@@ -66,14 +66,27 @@ impl WorkflowFactory {
         name: &str,
         toolchain_config: &crate::config::ToolchainConfig,
     ) -> Result<Box<dyn EditWorkflow>, String> {
+        Self::create_workflow_with_edit_config(name, toolchain_config, None)
+    }
+
+    /// Creates an EditWorkflow instance with optional EditConfig overrides.
+    pub fn create_workflow_with_edit_config(
+        name: &str,
+        toolchain_config: &crate::config::ToolchainConfig,
+        edit_config: Option<&crate::config::EditConfig>,
+    ) -> Result<Box<dyn EditWorkflow>, String> {
+        let max_retries = toolchain_config
+            .max_retries
+            .or_else(|| edit_config.map(|e| e.max_retries));
+
         match name.trim().to_lowercase().as_str() {
             "toolchain" => Ok(Box::new(ToolchainEditWorkflow::new(
                 toolchain_config.check_command.clone(),
-                toolchain_config.max_retries,
+                max_retries,
                 toolchain_config.auto_heal,
             ))),
-            "git" => Ok(Box::new(GitEditWorkflow)),
-            "naive" => Ok(Box::new(NaiveEditWorkflow)),
+            "git" => Ok(Box::new(GitEditWorkflow::new(max_retries))),
+            "naive" => Ok(Box::new(NaiveEditWorkflow::new(max_retries))),
             other => Err(format!(
                 "Unknown workflow '{}'. Available workflows: {}",
                 other,

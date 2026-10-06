@@ -17,6 +17,7 @@ pub struct PromptAssembly {
     pub context_files: Vec<ContextFileContent>,
     pub workflow: String,
     pub edit_protocol: String,
+    pub history_tag: Option<String>,
 }
 
 impl PromptAssembly {
@@ -26,6 +27,7 @@ impl PromptAssembly {
         context_files: Vec<ContextFileContent>,
         workflow: impl Into<String>,
         edit_protocol: impl Into<String>,
+        history_tag: Option<String>,
     ) -> Self {
         Self {
             repo_state,
@@ -33,6 +35,7 @@ impl PromptAssembly {
             context_files,
             workflow: workflow.into(),
             edit_protocol: edit_protocol.into(),
+            history_tag,
         }
     }
 
@@ -81,7 +84,10 @@ impl PromptAssembly {
         }
 
         let mut out = String::new();
-        out.push_str(&format!("<context revision=\"{}\">\n", self.context_revision));
+        out.push_str(&format!(
+            "<context revision=\"{}\">\n",
+            self.context_revision
+        ));
 
         let ro_files: Vec<_> = self
             .context_files
@@ -125,15 +131,25 @@ impl PromptAssembly {
         Some(out)
     }
 
+    pub fn format_history_block(&self) -> Option<String> {
+        self.history_tag.as_ref().and_then(|tag| {
+            let trimmed = tag.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        })
+    }
+
     pub fn assemble_chat_messages(
         &self,
-        conversation_history: &[ChatMessage],
         current_prompt: &str,
         protocol: &dyn EditProtocol,
     ) -> Vec<ChatMessage> {
         let mut messages = Vec::new();
 
-        // System prompt + Project metadata + Authoritative context + Protocol instructions
+        // System prompt + Project metadata + Authoritative context + Session history + Protocol instructions
         let mut system_text = self.build_system_prompt(protocol);
         if let Some(context_block) = self.format_context_block() {
             system_text.push_str("## Project Context\n");
@@ -141,14 +157,15 @@ impl PromptAssembly {
             system_text.push_str("\n\n");
         }
 
-        messages.push(ChatMessage::system(system_text));
-
-        // Layer 5: Conversation history
-        for msg in conversation_history {
-            messages.push(msg.clone());
+        if let Some(history_block) = self.format_history_block() {
+            system_text.push_str("## Session History\n");
+            system_text.push_str(&history_block);
+            system_text.push_str("\n\n");
         }
 
-        // Layer 10: Current user request
+        messages.push(ChatMessage::system(system_text));
+
+        // Current user request
         messages.push(ChatMessage::user(current_prompt));
 
         messages
@@ -167,15 +184,19 @@ mod tests {
             access: ContextAccess::Editable,
             content: "fn main() {}\n".to_string(),
         }];
-        let assembly = PromptAssembly::new(None, 1, files, "toolchain", "xml");
+        let history = Some("<history>\n{\"type\":\"summary\",\"text\":\"Initial\"}\n</history>".to_string());
+        let assembly = PromptAssembly::new(None, 1, files, "toolchain", "xml", history);
         let proto = XmlEditProtocol::default();
-        let messages = assembly.assemble_chat_messages(&[], "Explain this code", &proto);
+        let messages = assembly.assemble_chat_messages("Explain this code", &proto);
 
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0].role, "system");
         assert!(messages[0].content.contains("Core System Contract"));
         assert!(messages[0].content.contains("src/main.rs"));
         assert!(messages[0].content.contains("fn main() {}"));
+        assert!(messages[0].content.contains("## Session History"));
+        assert!(messages[0].content.contains("<history>"));
+        assert!(messages[0].content.contains("{\"type\":\"summary\",\"text\":\"Initial\"}"));
         assert_eq!(messages[1], ChatMessage::user("Explain this code"));
     }
 

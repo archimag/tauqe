@@ -6,7 +6,9 @@ use tokio::sync::mpsc;
 use tokio::sync::watch;
 use workbench_protocol::ModelUsageInfo;
 
-use super::gateway::{ChatMessage, FunctionCall, ResponseFormat, StreamEvent, ToolCall, ToolDefinition};
+use super::gateway::{
+    ChatMessage, FunctionCall, ResponseFormat, StreamEvent, ToolCall, ToolDefinition,
+};
 
 pub struct OpenRouterClient {
     api_key: String,
@@ -183,7 +185,10 @@ impl OpenRouterClient {
     }
 
     /// Queries OpenRouter generation stats for the given generation ID.
-    pub async fn get_generation_stats(&self, generation_id: &str) -> Result<Option<GenerationStats>> {
+    pub async fn get_generation_stats(
+        &self,
+        generation_id: &str,
+    ) -> Result<Option<GenerationStats>> {
         let url = format!(
             "{}/generation?id={}",
             self.base_url.trim_end_matches('/'),
@@ -225,7 +230,9 @@ impl OpenRouterClient {
                             return Ok(Some(GenerationStats {
                                 total_cost: data.total_cost,
                                 prompt_tokens: data.tokens_prompt.or(data.native_tokens_prompt),
-                                completion_tokens: data.tokens_completion.or(data.native_tokens_completion),
+                                completion_tokens: data
+                                    .tokens_completion
+                                    .or(data.native_tokens_completion),
                             }));
                         }
                     }
@@ -577,8 +584,8 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let client = OpenRouterClient::new("test-api-key".to_string())
-            .with_base_url(mock_server.uri());
+        let client =
+            OpenRouterClient::new("test-api-key".to_string()).with_base_url(mock_server.uri());
 
         let (tx, mut rx) = mpsc::channel(10);
         let (_cancel_tx, cancel_rx) = watch::channel(false);
@@ -586,7 +593,9 @@ mod tests {
         let messages = vec![ChatMessage::user("Ping")];
 
         let client_task = tokio::spawn(async move {
-            client.stream_chat("test-model", messages, tx, cancel_rx).await
+            client
+                .stream_chat("test-model", messages, tx, cancel_rx)
+                .await
         });
 
         let mut text_chunks = Vec::new();
@@ -644,8 +653,8 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let client = OpenRouterClient::new("test-api-key".to_string())
-            .with_base_url(mock_server.uri());
+        let client =
+            OpenRouterClient::new("test-api-key".to_string()).with_base_url(mock_server.uri());
 
         let (tx, mut rx) = mpsc::channel(10);
         let (_cancel_tx, cancel_rx) = watch::channel(false);
@@ -653,7 +662,9 @@ mod tests {
         let messages = vec![ChatMessage::user("Hi")];
 
         let client_task = tokio::spawn(async move {
-            client.stream_chat("test-model", messages, tx, cancel_rx).await
+            client
+                .stream_chat("test-model", messages, tx, cancel_rx)
+                .await
         });
 
         let mut received_usage = None;
@@ -692,8 +703,8 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let client = OpenRouterClient::new("test-api-key".to_string())
-            .with_base_url(mock_server.uri());
+        let client =
+            OpenRouterClient::new("test-api-key".to_string()).with_base_url(mock_server.uri());
 
         let (tx, mut rx) = mpsc::channel(20);
         let (_cancel_tx, cancel_rx) = watch::channel(false);
@@ -745,8 +756,8 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let client = OpenRouterClient::new("test-api-key".to_string())
-            .with_base_url(mock_server.uri());
+        let client =
+            OpenRouterClient::new("test-api-key".to_string()).with_base_url(mock_server.uri());
 
         let (tx, mut rx) = mpsc::channel(10);
         let (_cancel_tx, cancel_rx) = watch::channel(false);
@@ -770,7 +781,14 @@ mod tests {
 
         let client_task = tokio::spawn(async move {
             client
-                .stream_chat_with_tools("test-model", vec![], Some(tools), response_format, tx, cancel_rx)
+                .stream_chat_with_tools(
+                    "test-model",
+                    vec![],
+                    Some(tools),
+                    response_format,
+                    tx,
+                    cancel_rx,
+                )
                 .await
         });
 
@@ -796,8 +814,8 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let client = OpenRouterClient::new("invalid-key".to_string())
-            .with_base_url(mock_server.uri());
+        let client =
+            OpenRouterClient::new("invalid-key".to_string()).with_base_url(mock_server.uri());
 
         let (tx, _rx) = mpsc::channel(10);
         let (_cancel_tx, cancel_rx) = watch::channel(false);
@@ -829,8 +847,8 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let client = OpenRouterClient::new("test-api-key".to_string())
-            .with_base_url(mock_server.uri());
+        let client =
+            OpenRouterClient::new("test-api-key".to_string()).with_base_url(mock_server.uri());
 
         let (tx, mut rx) = mpsc::channel(10);
         let (_cancel_tx, cancel_rx) = watch::channel(false);
@@ -851,7 +869,11 @@ mod tests {
         assert_eq!(requests.len(), 1);
         let req_json: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
         assert_eq!(
-            req_json.get("response_format").unwrap().get("type").unwrap(),
+            req_json
+                .get("response_format")
+                .unwrap()
+                .get("type")
+                .unwrap(),
             "json_object"
         );
     }

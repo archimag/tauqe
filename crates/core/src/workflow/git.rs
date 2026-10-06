@@ -3,17 +3,34 @@ use tokio::sync::mpsc;
 use tokio::sync::watch;
 use workbench_protocol::{EditProposal, ModelResult};
 
-use super::common::execute_edit_pipeline;
+use super::common::{execute_edit_pipeline, record_workflow_response};
 use super::{EditWorkflow, WorkflowExecutionResult};
 use crate::context::ContextManager;
 use crate::edits::{apply_edit_proposal, EditProtocol};
 use crate::git::{create_ai_commit, create_checkpoint, restore_checkpoint};
-use crate::model::gateway::{ChatMessage, StreamEvent};
+use crate::history::HistoryManager;
+use crate::model::gateway::StreamEvent;
 use crate::model::openrouter::OpenRouterClient;
 
 /// Git-native workflow providing pre-edit checkpoints and atomic AI commits.
-#[derive(Debug, Default, Clone)]
-pub struct GitEditWorkflow;
+#[derive(Debug, Clone)]
+pub struct GitEditWorkflow {
+    pub max_retries: usize,
+}
+
+impl Default for GitEditWorkflow {
+    fn default() -> Self {
+        Self { max_retries: 3 }
+    }
+}
+
+impl GitEditWorkflow {
+    pub fn new(max_retries: Option<usize>) -> Self {
+        Self {
+            max_retries: max_retries.unwrap_or(3),
+        }
+    }
+}
 
 #[async_trait]
 impl EditWorkflow for GitEditWorkflow {
@@ -27,7 +44,7 @@ impl EditWorkflow for GitEditWorkflow {
         client: &OpenRouterClient,
         model_name: &str,
         context_manager: &mut ContextManager,
-        session_history: &[ChatMessage],
+        history_manager: &mut HistoryManager,
         protocol: &dyn EditProtocol,
         stream_tx: mpsc::Sender<StreamEvent>,
         cancel_rx: watch::Receiver<bool>,
@@ -37,11 +54,12 @@ impl EditWorkflow for GitEditWorkflow {
             client,
             model_name,
             context_manager,
-            session_history,
+            history_manager,
             protocol,
             self.name(),
             stream_tx,
             cancel_rx,
+            self.max_retries,
         )
         .await?;
 
@@ -49,7 +67,6 @@ impl EditWorkflow for GitEditWorkflow {
             return Ok(WorkflowExecutionResult {
                 result: pipeline_out.parsed_result,
                 assistant_text: pipeline_out.assistant_text,
-                session_history_update: None,
             });
         }
 
@@ -95,14 +112,15 @@ impl EditWorkflow for GitEditWorkflow {
                     match apply_edit_proposal(&repo_root, context_manager, &proposal) {
                         Ok(changed_files) => {
                             // 3. Create isolated AI commit with author metadata and model's summary
-                            let commit_hash = match create_ai_commit(&repo_root, &changed_files, &summary) {
-                                Ok(hash) => Some(hash),
-                                Err(err) => {
-                                    // Non-fatal if git commit fails (e.g. not a git repo), keep edits
-                                    tracing::warn!("Failed to create AI commit: {}", err);
-                                    None
-                                }
-                            };
+                            let commit_hash =
+                                match create_ai_commit(&repo_root, &changed_files, &summary) {
+                                    Ok(hash) => Some(hash),
+                                    Err(err) => {
+                                        // Non-fatal if git commit fails (e.g. not a git repo), keep edits
+                                        tracing::warn!("Failed to create AI commit: {}", err);
+                                        None
+                                    }
+                                };
 
                             ModelResult::Edit {
                                 summary,
@@ -136,10 +154,11 @@ impl EditWorkflow for GitEditWorkflow {
             ModelResult::Answer { text } => ModelResult::Answer { text },
         };
 
+        record_workflow_response(history_manager, &final_result, &pipeline_out.assistant_text);
+
         Ok(WorkflowExecutionResult {
             result: final_result,
             assistant_text: pipeline_out.assistant_text,
-            session_history_update: pipeline_out.session_history_update,
         })
     }
 }

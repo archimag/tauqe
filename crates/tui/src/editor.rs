@@ -103,7 +103,10 @@ impl InputEditor {
     }
 
     pub fn current_line_start(&self) -> usize {
-        self.text[..self.cursor].rfind('\n').map(|idx| idx + 1).unwrap_or(0)
+        self.text[..self.cursor]
+            .rfind('\n')
+            .map(|idx| idx + 1)
+            .unwrap_or(0)
     }
 
     pub fn current_line_end(&self) -> usize {
@@ -177,7 +180,10 @@ impl InputEditor {
                 break;
             }
         }
-        let killed: String = self.text.drain(self.cursor..self.cursor + end_idx).collect();
+        let killed: String = self
+            .text
+            .drain(self.cursor..self.cursor + end_idx)
+            .collect();
         self.kill_ring = killed;
     }
 
@@ -201,7 +207,10 @@ impl InputEditor {
                 break;
             }
         }
-        let target_pos = char_indices.last().map(|&(idx, c)| idx + c.len_utf8()).unwrap_or(0);
+        let target_pos = char_indices
+            .last()
+            .map(|&(idx, c)| idx + c.len_utf8())
+            .unwrap_or(0);
         let killed: String = self.text.drain(target_pos..self.cursor).collect();
         self.kill_ring = killed;
         self.cursor = target_pos;
@@ -227,7 +236,10 @@ impl InputEditor {
                 break;
             }
         }
-        self.cursor = char_indices.last().map(|&(idx, c)| idx + c.len_utf8()).unwrap_or(0);
+        self.cursor = char_indices
+            .last()
+            .map(|&(idx, c)| idx + c.len_utf8())
+            .unwrap_or(0);
     }
 
     pub fn move_word_forward(&mut self) {
@@ -264,7 +276,10 @@ impl InputEditor {
         }
         let col = self.text[line_start..self.cursor].chars().count();
         let prev_line_end = line_start - 1;
-        let prev_line_start = self.text[..prev_line_end].rfind('\n').map(|idx| idx + 1).unwrap_or(0);
+        let prev_line_start = self.text[..prev_line_end]
+            .rfind('\n')
+            .map(|idx| idx + 1)
+            .unwrap_or(0);
         let prev_line_chars: Vec<usize> = self.text[prev_line_start..prev_line_end]
             .char_indices()
             .map(|(idx, _)| prev_line_start + idx)

@@ -1,5 +1,5 @@
-use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AppConfig {
@@ -89,6 +89,8 @@ pub struct EditConfig {
     pub workflow: String, // "git", "naive", "toolchain"
     #[serde(default = "default_protocol")]
     pub protocol: String, // "xml", "structured"
+    #[serde(default = "default_max_retries")]
+    pub max_retries: usize,
 }
 
 fn default_workflow() -> String {
@@ -99,11 +101,16 @@ fn default_protocol() -> String {
     "xml".to_string()
 }
 
+fn default_max_retries() -> usize {
+    3
+}
+
 impl Default for EditConfig {
     fn default() -> Self {
         Self {
             workflow: default_workflow(),
             protocol: default_protocol(),
+            max_retries: default_max_retries(),
         }
     }
 }
@@ -129,8 +136,21 @@ pub fn load_config(repo_root: Option<&Path>) -> AppConfig {
     let mut config = candidates
         .into_iter()
         .find(|p| p.is_file())
-        .and_then(|p| std::fs::read_to_string(p).ok())
-        .and_then(|content| toml::from_str::<AppConfig>(&content).ok())
+        .and_then(|p| {
+            match std::fs::read_to_string(&p) {
+                Ok(content) => match toml::from_str::<AppConfig>(&content) {
+                    Ok(cfg) => Some(cfg),
+                    Err(err) => {
+                        tracing::warn!("Failed to parse config file {:?}: {}", p, err);
+                        None
+                    }
+                },
+                Err(err) => {
+                    tracing::warn!("Failed to read config file {:?}: {}", p, err);
+                    None
+                }
+            }
+        })
         .unwrap_or_default();
 
     // Fallback to environment variables
@@ -175,6 +195,13 @@ protocol = "structured"
 "#;
         let config: AppConfig = toml::from_str(toml_str).expect("Failed to parse config");
         assert_eq!(config.edit.protocol, "structured");
+        assert_eq!(config.edit.max_retries, 3);
+    }
+
+    #[test]
+    fn test_edit_max_retries_override() {
+        let config: AppConfig = toml::from_str("[edit]\nmax_retries = 0\n").unwrap();
+        assert_eq!(config.edit.max_retries, 0);
     }
 
     #[test]
@@ -223,6 +250,7 @@ available = ["x/y", "z/w"]
         assert_eq!(config.models.default, "anthropic/claude-3.5-sonnet");
         assert_eq!(config.edit.workflow, "toolchain");
         assert_eq!(config.edit.protocol, "xml");
+        assert_eq!(config.edit.max_retries, 3);
         assert!(config.providers.openrouter.is_none());
         assert!(config.toolchain.check_command.is_none());
     }

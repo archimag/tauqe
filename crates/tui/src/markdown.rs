@@ -1,6 +1,4 @@
-use pulldown_cmark::{
-    Alignment, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd,
-};
+use pulldown_cmark::{Alignment, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
@@ -43,26 +41,46 @@ impl MarkdownTheme {
             text_style: Style::default().fg(Color::White),
             bold_style: Style::default().add_modifier(Modifier::BOLD),
             italic_style: Style::default().add_modifier(Modifier::ITALIC),
-            h1: Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-            h2: Style::default().fg(Color::LightBlue).add_modifier(Modifier::BOLD),
-            h3: Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD),
-            h4: Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
-            h5: Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
-            h6: Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD),
+            h1: Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+            h2: Style::default()
+                .fg(Color::LightBlue)
+                .add_modifier(Modifier::BOLD),
+            h3: Style::default()
+                .fg(Color::Magenta)
+                .add_modifier(Modifier::BOLD),
+            h4: Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+            h5: Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+            h6: Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
             inline_code: Style::default()
                 .bg(Color::DarkGray)
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
             code_border: Style::default().fg(Color::DarkGray),
-            code_lang: Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            code_lang: Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
             code_text: Style::default().fg(Color::White),
             blockquote_bar: Style::default().fg(Color::Cyan),
             blockquote_text: Style::default().fg(Color::Gray),
-            list_bullet: Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-            link: Style::default().fg(Color::Cyan).add_modifier(Modifier::UNDERLINED),
+            list_bullet: Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+            link: Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::UNDERLINED),
             hr: Style::default().fg(Color::DarkGray),
             table_border: Style::default().fg(Color::DarkGray),
-            table_head: Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            table_head: Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
             table_cell: Style::default().fg(Color::White),
             compact: false,
             line_prefix: None,
@@ -87,15 +105,25 @@ impl MarkdownTheme {
             inline_code: Style::default()
                 .fg(Color::Rgb(165, 200, 240))
                 .bg(Color::Rgb(30, 42, 60)),
-            code_border: Style::default().fg(Color::Rgb(60, 85, 120)).add_modifier(Modifier::DIM),
-            code_lang: Style::default().fg(Color::Rgb(130, 170, 220)).add_modifier(Modifier::DIM),
+            code_border: Style::default()
+                .fg(Color::Rgb(60, 85, 120))
+                .add_modifier(Modifier::DIM),
+            code_lang: Style::default()
+                .fg(Color::Rgb(130, 170, 220))
+                .add_modifier(Modifier::DIM),
             code_text: base_blue,
             blockquote_bar: Style::default().fg(Color::Rgb(70, 95, 130)),
             blockquote_text: base_blue,
             list_bullet: Style::default().fg(Color::Rgb(100, 145, 195)),
-            link: Style::default().fg(Color::Rgb(130, 170, 225)).add_modifier(Modifier::UNDERLINED),
-            hr: Style::default().fg(Color::Rgb(60, 85, 120)).add_modifier(Modifier::DIM),
-            table_border: Style::default().fg(Color::Rgb(60, 85, 120)).add_modifier(Modifier::DIM),
+            link: Style::default()
+                .fg(Color::Rgb(130, 170, 225))
+                .add_modifier(Modifier::UNDERLINED),
+            hr: Style::default()
+                .fg(Color::Rgb(60, 85, 120))
+                .add_modifier(Modifier::DIM),
+            table_border: Style::default()
+                .fg(Color::Rgb(60, 85, 120))
+                .add_modifier(Modifier::DIM),
             table_head: Style::default().fg(Color::Rgb(145, 185, 230)),
             table_cell: base_blue,
             compact: true,
@@ -152,7 +180,11 @@ struct TableState {
     in_head: bool,
 }
 
-fn push_styled_line(theme: &MarkdownTheme, out_lines: &mut Vec<Line<'static>>, mut spans: Vec<Span<'static>>) {
+fn push_styled_line(
+    theme: &MarkdownTheme,
+    out_lines: &mut Vec<Line<'static>>,
+    mut spans: Vec<Span<'static>>,
+) {
     if let Some(prefix) = &theme.line_prefix {
         spans.insert(0, prefix.clone());
     }
@@ -187,10 +219,7 @@ fn ensure_line_prefix(
 ) {
     if current_spans.is_empty() {
         if quote_depth > 0 {
-            current_spans.push(Span::styled(
-                "▌ ".repeat(quote_depth),
-                theme.blockquote_bar,
-            ));
+            current_spans.push(Span::styled("▌ ".repeat(quote_depth), theme.blockquote_bar));
         }
         if *item_started {
             let depth = list_stack.len().saturating_sub(1);
@@ -625,10 +654,7 @@ pub fn render_markdown(text: &str, theme: &MarkdownTheme) -> Vec<Line<'static>> 
             }
             Event::End(TagEnd::Link) => {
                 if let Some(url) = link_url.take() {
-                    let span = Span::styled(
-                        format!(" ({})", url),
-                        theme.code_border,
-                    );
+                    let span = Span::styled(format!(" ({})", url), theme.code_border);
                     if let Some(ts) = table_state.as_mut() {
                         ts.current_cell_len += span.content.chars().count();
                         ts.current_cell_spans.push(span);
@@ -638,10 +664,7 @@ pub fn render_markdown(text: &str, theme: &MarkdownTheme) -> Vec<Line<'static>> 
                 }
             }
             Event::Code(code) => {
-                let code_span = Span::styled(
-                    format!(" {} ", code),
-                    theme.inline_code,
-                );
+                let code_span = Span::styled(format!(" {} ", code), theme.inline_code);
                 if let Some(ts) = table_state.as_mut() {
                     ts.current_cell_len += code_span.content.chars().count();
                     ts.current_cell_spans.push(code_span);
@@ -686,7 +709,12 @@ pub fn render_markdown(text: &str, theme: &MarkdownTheme) -> Vec<Line<'static>> 
             }
             Event::TaskListMarker(checked) => {
                 let marker = if checked {
-                    Span::styled("✔ ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))
+                    Span::styled(
+                        "✔ ",
+                        Style::default()
+                            .fg(Color::Green)
+                            .add_modifier(Modifier::BOLD),
+                    )
                 } else {
                     Span::styled("☐ ", theme.code_border)
                 };
@@ -741,9 +769,10 @@ pub fn render_markdown(text: &str, theme: &MarkdownTheme) -> Vec<Line<'static>> 
         let is_empty = last.spans.is_empty()
             || (last.spans.len() == 1
                 && (last.spans[0].content.trim().is_empty()
-                    || theme.line_prefix.as_ref().is_some_and(|prefix| {
-                        last.spans[0].content == prefix.content
-                    })));
+                    || theme
+                        .line_prefix
+                        .as_ref()
+                        .is_some_and(|prefix| last.spans[0].content == prefix.content)));
         if is_empty {
             out_lines.pop();
         } else {
@@ -760,10 +789,18 @@ mod tests {
 
     #[test]
     fn reasoning_paragraphs_have_a_separator_without_trailing_blank_lines() {
-        let lines = render_markdown("Первый абзац.\n\nВторой абзац.", &MarkdownTheme::reasoning());
+        let lines = render_markdown(
+            "Первый абзац.\n\nВторой абзац.",
+            &MarkdownTheme::reasoning(),
+        );
         let text: Vec<String> = lines
             .iter()
-            .map(|line| line.spans.iter().map(|span| span.content.as_ref()).collect())
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect()
+            })
             .collect();
 
         assert_eq!(text, vec!["Первый абзац.", "", "Второй абзац."]);
@@ -774,7 +811,12 @@ mod tests {
         let lines = render_markdown("Первый абзац.\n\nВторой абзац.", &MarkdownTheme::answer());
         let text: Vec<String> = lines
             .iter()
-            .map(|line| line.spans.iter().map(|span| span.content.as_ref()).collect())
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect()
+            })
             .collect();
 
         assert_eq!(text, vec!["Первый абзац.", "", "Второй абзац."]);

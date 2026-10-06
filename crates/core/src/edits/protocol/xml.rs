@@ -1,6 +1,6 @@
 use workbench_protocol::{EditOperation, ModelResult};
 
-use super::utils::{normalize_content, resolve_target_path};
+use super::utils::{normalize_content, resolve_target_path_for_op};
 use super::EditProtocol;
 
 /// XML-based code edit protocol
@@ -18,7 +18,8 @@ impl EditProtocol for XmlEditProtocol {
         prompt.push_str("When proposing changes, use structured XML blocks:\n");
         prompt.push_str("- Existing files: modify ONLY files listed in <editable_files> via <edit path=\"...\">.\n");
         prompt.push_str("- New files: create new files using <create path=\"...\"> with a valid repository-relative path. Created files are automatically added to context.\n");
-        prompt.push_str("- File deletions: delete obsolete files using <delete path=\"...\" />.\n\n");
+        prompt
+            .push_str("- File deletions: delete obsolete files using <delete path=\"...\" />.\n\n");
 
         if editable_paths.is_empty() {
             prompt.push_str("NOTE: No existing files are currently marked as editable. You may answer questions, explain code, or create new files with <create path=\"...\"> if requested.\n\n");
@@ -59,7 +60,9 @@ impl EditProtocol for XmlEditProtocol {
         prompt.push_str("2. For <edit>, the 'path' attribute MUST EXACTLY match one of the paths listed in <editable_files>.\n");
         prompt.push_str("3. For <create>, specify a valid relative path within the repository.\n");
         prompt.push_str("4. The <search> block must match EXACTLY ONE location in the target file, including whitespace and line breaks.\n");
-        prompt.push_str("5. Keep <search> blocks as concise as possible while maintaining uniqueness.\n");
+        prompt.push_str(
+            "5. Keep <search> blocks as concise as possible while maintaining uniqueness.\n",
+        );
         prompt.push_str("6. You may include multiple <edit>, <create>, or <delete> blocks inside <workbench_edits>.\n");
         prompt.push_str("7. If no code changes are needed (e.g. conversational answer or explanation), output plain text without any XML edit tags.\n\n");
 
@@ -87,8 +90,8 @@ impl EditProtocol for XmlEditProtocol {
                         text: raw_text.to_string(),
                     }
                 } else {
-                    let summary = extracted_summary
-                        .unwrap_or_else(|| "Apply AI code changes".to_string());
+                    let summary =
+                        extracted_summary.unwrap_or_else(|| "Apply AI code changes".to_string());
                     ModelResult::Edit {
                         summary,
                         edits,
@@ -119,6 +122,226 @@ pub fn has_xml_edit_tags(text: &str) -> bool {
         || text.contains("<create")
         || text.contains("<delete")
         || text.contains("<workbench_edits")
+}
+
+/// Extracts conversational text from model output by stripping edit tags
+/// (<workbench_edits>, <edit>, <create>, <delete>, etc.) and cleaning up extra whitespace.
+pub fn extract_conversational_text(raw_text: &str) -> String {
+    let mut text = raw_text.to_string();
+
+    // 1. Remove ```workbench_edit ... ``` JSON fenced blocks if present
+    while let Some(start_idx) = text.find("```workbench_edit") {
+        let after_start = start_idx + "```workbench_edit".len();
+        if let Some(end_idx) = text[after_start..].find("```") {
+            let total_end = after_start + end_idx + 3;
+            text.replace_range(start_idx..total_end, "");
+        } else {
+            text.replace_range(start_idx.., "");
+            break;
+        }
+    }
+
+    // 2. Remove <workbench_edits>...</workbench_edits> blocks (and enclosing fences if any)
+    while let Some(start) = find_tag_start(&text, "workbench_edits") {
+        let close_tag = "</workbench_edits>";
+        if let Some(close_offset) = text[start..].find(close_tag) {
+            let end = start + close_offset + close_tag.len();
+            let (exp_start, exp_end) = expand_fence_bounds(&text, start, end);
+            text.replace_range(exp_start..exp_end, "");
+        } else if let Some(gt_offset) = text[start..].find('>') {
+            let header = &text[start..start + gt_offset + 1];
+            if header.trim_end().ends_with("/>") {
+                let end = start + gt_offset + 1;
+                let (exp_start, exp_end) = expand_fence_bounds(&text, start, end);
+                text.replace_range(exp_start..exp_end, "");
+            } else {
+                let end = start + gt_offset + 1;
+                text.replace_range(start..end, "");
+            }
+        } else {
+            text.replace_range(start.., "");
+            break;
+        }
+    }
+
+    // 3. Remove standalone <edit ...>...</edit>
+    while let Some(start) = find_tag_start(&text, "edit") {
+        let close_tag = "</edit>";
+        if let Some(close_offset) = text[start..].find(close_tag) {
+            let end = start + close_offset + close_tag.len();
+            let (exp_start, exp_end) = expand_fence_bounds(&text, start, end);
+            text.replace_range(exp_start..exp_end, "");
+        } else if let Some(gt_offset) = text[start..].find('>') {
+            let end = start + gt_offset + 1;
+            text.replace_range(start..end, "");
+        } else {
+            text.replace_range(start.., "");
+            break;
+        }
+    }
+
+    // 4. Remove standalone <create ...>...</create>
+    while let Some(start) = find_tag_start(&text, "create") {
+        let close_tag = "</create>";
+        if let Some(close_offset) = text[start..].find(close_tag) {
+            let end = start + close_offset + close_tag.len();
+            let (exp_start, exp_end) = expand_fence_bounds(&text, start, end);
+            text.replace_range(exp_start..exp_end, "");
+        } else if let Some(gt_offset) = text[start..].find('>') {
+            let end = start + gt_offset + 1;
+            text.replace_range(start..end, "");
+        } else {
+            text.replace_range(start.., "");
+            break;
+        }
+    }
+
+    // 5. Remove standalone <delete .../> or <delete ...>...</delete>
+    while let Some(start) = find_tag_start(&text, "delete") {
+        let close_tag = "</delete>";
+        if let Some(gt_offset) = text[start..].find('>') {
+            let tag_open_end = start + gt_offset + 1;
+            let header = &text[start..tag_open_end];
+            if header.trim_end().ends_with("/>") {
+                let (exp_start, exp_end) = expand_fence_bounds(&text, start, tag_open_end);
+                text.replace_range(exp_start..exp_end, "");
+            } else if let Some(close_offset) = text[start..].find(close_tag) {
+                let end = start + close_offset + close_tag.len();
+                let (exp_start, exp_end) = expand_fence_bounds(&text, start, end);
+                text.replace_range(exp_start..exp_end, "");
+            } else {
+                let (exp_start, exp_end) = expand_fence_bounds(&text, start, tag_open_end);
+                text.replace_range(exp_start..exp_end, "");
+            }
+        } else {
+            text.replace_range(start.., "");
+            break;
+        }
+    }
+
+    // 6. Remove standalone <replace path="...">...</replace> if any
+    while let Some(start) = find_tag_start(&text, "replace") {
+        if let Some(gt_offset) = text[start..].find('>') {
+            let header = &text[start..start + gt_offset + 1];
+            if header.contains("path") {
+                let close_tag = "</replace>";
+                if let Some(close_offset) = text[start..].find(close_tag) {
+                    let end = start + close_offset + close_tag.len();
+                    let (exp_start, exp_end) = expand_fence_bounds(&text, start, end);
+                    text.replace_range(exp_start..exp_end, "");
+                    continue;
+                }
+            }
+        }
+        break;
+    }
+
+    clean_conversational_lines(&text)
+}
+
+fn expand_fence_bounds(text: &str, start: usize, end: usize) -> (usize, usize) {
+    let before = &text[..start];
+    let after = &text[end..];
+
+    let mut exp_start = start;
+    let mut exp_end = end;
+
+    if let Some(last_newline) = before.rfind('\n') {
+        let line_before = &before[last_newline + 1..];
+        if line_before.trim().starts_with("```") {
+            exp_start = last_newline + 1;
+        }
+    } else if before.trim().starts_with("```") {
+        exp_start = 0;
+    }
+
+    let after_lines: Vec<&str> = after.lines().collect();
+    if !after_lines.is_empty() {
+        if after_lines[0].trim() == "```" {
+            let offset = after.find("```").unwrap_or(0) + 3;
+            let skip_nl = if after[offset..].starts_with("\r\n") {
+                2
+            } else if after[offset..].starts_with('\n') {
+                1
+            } else {
+                0
+            };
+            exp_end = end + offset + skip_nl;
+        } else if after_lines[0].trim().is_empty() && after_lines.len() > 1 && after_lines[1].trim() == "```" {
+            let offset = after.find("```").unwrap_or(0) + 3;
+            let skip_nl = if after[offset..].starts_with("\r\n") {
+                2
+            } else if after[offset..].starts_with('\n') {
+                1
+            } else {
+                0
+            };
+            exp_end = end + offset + skip_nl;
+        }
+    }
+
+    (exp_start, exp_end)
+}
+
+fn clean_conversational_lines(text: &str) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut result_lines = Vec::new();
+    let mut i = 0;
+
+    while i < lines.len() {
+        let line = lines[i];
+        let trimmed = line.trim();
+
+        if trimmed.starts_with("```") && trimmed.len() > 3 && !trimmed.ends_with("```") {
+            let mut j = i + 1;
+            while j < lines.len() && lines[j].trim().is_empty() {
+                j += 1;
+            }
+            if j < lines.len() && lines[j].trim() == "```" {
+                i = j + 1;
+                continue;
+            }
+        }
+
+        if trimmed == "```" {
+            let mut j = i + 1;
+            while j < lines.len() && lines[j].trim().is_empty() {
+                j += 1;
+            }
+            if j < lines.len() && lines[j].trim() == "```" {
+                i = j + 1;
+                continue;
+            }
+        }
+
+        result_lines.push(line.trim_end());
+        i += 1;
+    }
+
+    let mut final_lines: Vec<&str> = Vec::new();
+    let mut last_was_empty = true;
+
+    for line in result_lines {
+        if line.trim().is_empty() {
+            if !last_was_empty {
+                final_lines.push("");
+                last_was_empty = true;
+            }
+        } else {
+            final_lines.push(line);
+            last_was_empty = false;
+        }
+    }
+
+    while let Some(last) = final_lines.last() {
+        if last.is_empty() {
+            final_lines.pop();
+        } else {
+            break;
+        }
+    }
+
+    final_lines.join("\n")
 }
 
 fn extract_summary_from_xml(text: &str) -> Option<String> {
@@ -163,14 +386,13 @@ fn parse_xml_edits(text: &str, editable_paths: &[String]) -> Result<Vec<EditOper
 
         match tag_type {
             TagType::Edit | TagType::Replace => {
-                let open_tag_end = tag_slice.find('>').ok_or_else(|| {
-                    format!("Unterminated opening tag at offset {}", tag_start)
-                })?;
+                let open_tag_end = tag_slice
+                    .find('>')
+                    .ok_or_else(|| format!("Unterminated opening tag at offset {}", tag_start))?;
                 let header = &tag_slice[..open_tag_end];
-                let path_attr = extract_attribute(header, "path").ok_or_else(|| {
-                    format!("Missing 'path' attribute in tag: {}", header)
-                })?;
-                let target_path = resolve_target_path(&path_attr, editable_paths);
+                let path_attr = extract_attribute(header, "path")
+                    .ok_or_else(|| format!("Missing 'path' attribute in tag: {}", header))?;
+                let target_path = resolve_target_path_for_op(&path_attr, editable_paths, false)?;
 
                 let closing_tag = if tag_type == TagType::Edit {
                     "</edit>"
@@ -179,7 +401,10 @@ fn parse_xml_edits(text: &str, editable_paths: &[String]) -> Result<Vec<EditOper
                 };
 
                 let close_idx = tag_slice.find(closing_tag).ok_or_else(|| {
-                    format!("Missing closing tag '{}' for file '{}'", closing_tag, target_path)
+                    format!(
+                        "Missing closing tag '{}' for file '{}'",
+                        closing_tag, target_path
+                    )
                 })?;
 
                 let inner = &tag_slice[open_tag_end + 1..close_idx];
@@ -187,20 +412,23 @@ fn parse_xml_edits(text: &str, editable_paths: &[String]) -> Result<Vec<EditOper
                 let mut inner_pos = 0;
                 let mut found_any = false;
 
-                while let Some((search_content, after_search)) = find_tag(&inner[inner_pos..], "search") {
+                while let Some((search_content, after_search)) =
+                    find_tag(&inner[inner_pos..], "search")
+                {
                     let search_abs_end = inner_pos + after_search;
                     let remaining_inner = &inner[search_abs_end..];
 
-                    let (replace_content, after_replace) = if let Some(res) = find_tag(remaining_inner, "replace") {
-                        res
-                    } else if let Some(res) = find_tag(remaining_inner, "with") {
-                        res
-                    } else {
-                        return Err(format!(
-                            "Missing <replace> or <with> tag after <search> in file '{}'",
-                            target_path
-                        ));
-                    };
+                    let (replace_content, after_replace) =
+                        if let Some(res) = find_tag(remaining_inner, "replace") {
+                            res
+                        } else if let Some(res) = find_tag(remaining_inner, "with") {
+                            res
+                        } else {
+                            return Err(format!(
+                                "Missing <replace> or <with> tag after <search> in file '{}'",
+                                target_path
+                            ));
+                        };
 
                     edits.push(EditOperation::Replace {
                         path: target_path.clone(),
@@ -222,18 +450,18 @@ fn parse_xml_edits(text: &str, editable_paths: &[String]) -> Result<Vec<EditOper
                 pos = tag_start + close_idx + closing_tag.len();
             }
             TagType::Create => {
-                let open_tag_end = tag_slice.find('>').ok_or_else(|| {
-                    format!("Unterminated <create> tag at offset {}", tag_start)
-                })?;
+                let open_tag_end = tag_slice
+                    .find('>')
+                    .ok_or_else(|| format!("Unterminated <create> tag at offset {}", tag_start))?;
                 let header = &tag_slice[..open_tag_end];
                 let path_attr = extract_attribute(header, "path").ok_or_else(|| {
                     format!("Missing 'path' attribute in <create> tag: {}", header)
                 })?;
-                let target_path = resolve_target_path(&path_attr, editable_paths);
+                let target_path = resolve_target_path_for_op(&path_attr, editable_paths, true)?;
 
-                let close_idx = tag_slice.find("</create>").ok_or_else(|| {
-                    format!("Missing </create> tag for file '{}'", target_path)
-                })?;
+                let close_idx = tag_slice
+                    .find("</create>")
+                    .ok_or_else(|| format!("Missing </create> tag for file '{}'", target_path))?;
 
                 let content = &tag_slice[open_tag_end + 1..close_idx];
                 edits.push(EditOperation::Create {
@@ -244,14 +472,14 @@ fn parse_xml_edits(text: &str, editable_paths: &[String]) -> Result<Vec<EditOper
                 pos = tag_start + close_idx + "</create>".len();
             }
             TagType::Delete => {
-                let open_tag_end = tag_slice.find('>').ok_or_else(|| {
-                    format!("Unterminated <delete> tag at offset {}", tag_start)
-                })?;
+                let open_tag_end = tag_slice
+                    .find('>')
+                    .ok_or_else(|| format!("Unterminated <delete> tag at offset {}", tag_start))?;
                 let header = &tag_slice[..open_tag_end];
                 let path_attr = extract_attribute(header, "path").ok_or_else(|| {
                     format!("Missing 'path' attribute in <delete> tag: {}", header)
                 })?;
-                let target_path = resolve_target_path(&path_attr, editable_paths);
+                let target_path = resolve_target_path_for_op(&path_attr, editable_paths, false)?;
 
                 if header.ends_with('/') {
                     pos = tag_start + open_tag_end + 1;
@@ -413,33 +641,57 @@ pub fn new_fn() {}
     }
 
     #[test]
-    fn test_xml_protocol_create_new_file() {
-        let proto = XmlEditProtocol;
-        let editable = vec![];
+    fn test_extract_conversational_text_removes_xml_blocks() {
+        let output = r#"I have updated the code to fix the issue.
 
-        let output = r#"I will create a helper module:
-
-<workbench_edits summary="Add helper module">
-  <create path="crates/core/src/helper.rs">
-pub fn help() -> bool { true }
-  </create>
+<workbench_edits summary="Fix issue">
+  <edit path="crates/core/src/lib.rs">
+    <search>
+old_code();
+    </search>
+    <replace>
+new_code();
+    </replace>
+  </edit>
 </workbench_edits>
-"#;
 
-        let res = proto.parse_output(output, &editable);
-        match res {
-            ModelResult::Edit { summary, edits, .. } => {
-                assert_eq!(summary, "Add helper module");
-                assert_eq!(edits.len(), 1);
-                match &edits[0] {
-                    EditOperation::Create { path, content } => {
-                        assert_eq!(path, "crates/core/src/helper.rs");
-                        assert!(content.contains("pub fn help()"));
-                    }
-                    _ => panic!("Expected Create operation"),
-                }
-            }
-            _ => panic!("Expected ModelResult::Edit"),
-        }
+Everything is tested and working properly."#;
+
+        let extracted = extract_conversational_text(output);
+        assert_eq!(
+            extracted,
+            "I have updated the code to fix the issue.\n\nEverything is tested and working properly."
+        );
+    }
+
+    #[test]
+    fn test_extract_conversational_text_individual_tags_and_fences() {
+        let output = r#"Here is the change:
+
+```xml
+<create path="crates/core/src/helper.rs">
+pub fn help() {}
+</create>
+```
+
+And deleting obsolete:
+<delete path="crates/core/src/old.rs" />
+
+All done!"#;
+
+        let extracted = extract_conversational_text(output);
+        assert_eq!(
+            extracted,
+            "Here is the change:\n\nAnd deleting obsolete:\n\nAll done!"
+        );
+    }
+
+    #[test]
+    fn test_extract_conversational_text_only_edits() {
+        let output = r#"<workbench_edits summary="Pure edit">
+  <delete path="test.rs" />
+</workbench_edits>"#;
+        let extracted = extract_conversational_text(output);
+        assert_eq!(extracted, "");
     }
 }

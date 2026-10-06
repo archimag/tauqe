@@ -1,6 +1,6 @@
+use anyhow::{bail, Result};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use anyhow::{bail, Result};
 pub use workbench_protocol::matches_glob_pattern;
 use workbench_protocol::{ContextAccess, ContextItem, ContextState};
 
@@ -248,7 +248,8 @@ mod tests {
             "crates/core/src/lib.rs"
         );
         assert_eq!(
-            cm.normalize_path("./crates/core/../core/src/lib.rs").unwrap(),
+            cm.normalize_path("./crates/core/../core/src/lib.rs")
+                .unwrap(),
             "crates/core/src/lib.rs"
         );
         assert!(cm.normalize_path("../outside.rs").is_err());

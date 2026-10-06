@@ -3,12 +3,13 @@ use tokio::sync::mpsc;
 use tokio::sync::watch;
 use workbench_protocol::{EditOperation, EditProposal, ModelResult};
 
-use super::common::execute_edit_pipeline;
+use super::common::{execute_edit_pipeline_with_turn, record_workflow_response};
 use super::{EditWorkflow, WorkflowExecutionResult};
 use crate::context::ContextManager;
 use crate::edits::{apply_edit_proposal, EditProtocol};
 use crate::git::{create_ai_commit, create_checkpoint, restore_checkpoint, CheckpointInfo};
-use crate::model::gateway::{ChatMessage, StreamEvent};
+use crate::history::HistoryManager;
+use crate::model::gateway::StreamEvent;
 use crate::model::openrouter::OpenRouterClient;
 use crate::toolchain::{detect_toolchain, run_toolchain_check};
 
@@ -63,34 +64,36 @@ impl EditWorkflow for ToolchainEditWorkflow {
         client: &OpenRouterClient,
         model_name: &str,
         context_manager: &mut ContextManager,
-        session_history: &[ChatMessage],
+        history_manager: &mut HistoryManager,
         protocol: &dyn EditProtocol,
         stream_tx: mpsc::Sender<StreamEvent>,
         cancel_rx: watch::Receiver<bool>,
     ) -> anyhow::Result<WorkflowExecutionResult> {
         let repo_root = context_manager.repo_root().to_path_buf();
-        let mut accumulated_history = session_history.to_vec();
         let mut current_prompt = prompt.to_string();
         let mut attempt = 0;
         let max_heal_attempts = if self.auto_heal { self.max_retries } else { 0 };
 
-        let mut last_assistant_text;
+        #[allow(unused_assignments)]
+        let mut last_assistant_text = String::new();
         let mut checkpoint: Option<CheckpointInfo> = None;
         let mut all_changed_files: Vec<String> = Vec::new();
         let mut final_summary = String::new();
         let mut final_edits: Vec<EditOperation> = Vec::new();
 
         loop {
-            let pipeline_out = execute_edit_pipeline(
+            let pipeline_out = execute_edit_pipeline_with_turn(
                 &current_prompt,
                 client,
                 model_name,
                 context_manager,
-                &accumulated_history,
+                history_manager,
                 protocol,
                 self.name(),
                 stream_tx.clone(),
                 cancel_rx.clone(),
+                self.max_retries,
+                attempt == 0,
             )
             .await?;
 
@@ -101,7 +104,6 @@ impl EditWorkflow for ToolchainEditWorkflow {
                 return Ok(WorkflowExecutionResult {
                     result: pipeline_out.parsed_result,
                     assistant_text: pipeline_out.assistant_text,
-                    session_history_update: None,
                 });
             }
 
@@ -110,10 +112,11 @@ impl EditWorkflow for ToolchainEditWorkflow {
             match pipeline_out.parsed_result {
                 ModelResult::Answer { text } => {
                     if attempt == 0 {
+                        let final_result = ModelResult::Answer { text };
+                        record_workflow_response(history_manager, &final_result, &last_assistant_text);
                         return Ok(WorkflowExecutionResult {
-                            result: ModelResult::Answer { text },
+                            result: final_result,
                             assistant_text: last_assistant_text,
-                            session_history_update: pipeline_out.session_history_update,
                         });
                     } else {
                         // In repair loop, conversational answer without edits implies aborting repairs
@@ -128,36 +131,41 @@ impl EditWorkflow for ToolchainEditWorkflow {
                 } => {
                     if let Some(err_msg) = error {
                         if attempt == 0 {
+                            let final_result = ModelResult::Edit {
+                                summary,
+                                edits: Vec::new(),
+                                proposal: None,
+                                applied: false,
+                                error: Some(err_msg),
+                                changed_files: Vec::new(),
+                                commit_hash: None,
+                            };
+                            record_workflow_response(history_manager, &final_result, &last_assistant_text);
                             return Ok(WorkflowExecutionResult {
-                                result: ModelResult::Edit {
-                                    summary,
-                                    edits: Vec::new(),
-                                    proposal: None,
-                                    applied: false,
-                                    error: Some(err_msg),
-                                    changed_files: Vec::new(),
-                                    commit_hash: None,
-                                },
+                                result: final_result,
                                 assistant_text: last_assistant_text,
-                                session_history_update: pipeline_out.session_history_update,
                             });
                         } else {
                             break;
                         }
                     } else if edits.is_empty() {
                         if attempt == 0 {
+                            let final_result = ModelResult::Edit {
+                                summary,
+                                edits: Vec::new(),
+                                proposal: None,
+                                applied: false,
+                                error: Some(
+                                    "No valid edit operations found in model output"
+                                        .to_string(),
+                                ),
+                                changed_files: Vec::new(),
+                                commit_hash: None,
+                            };
+                            record_workflow_response(history_manager, &final_result, &last_assistant_text);
                             return Ok(WorkflowExecutionResult {
-                                result: ModelResult::Edit {
-                                    summary,
-                                    edits: Vec::new(),
-                                    proposal: None,
-                                    applied: false,
-                                    error: Some("No valid edit operations found in model output".to_string()),
-                                    changed_files: Vec::new(),
-                                    commit_hash: None,
-                                },
+                                result: final_result,
                                 assistant_text: last_assistant_text,
-                                session_history_update: pipeline_out.session_history_update,
                             });
                         } else {
                             break;
@@ -166,8 +174,12 @@ impl EditWorkflow for ToolchainEditWorkflow {
 
                     if final_summary.is_empty() {
                         final_summary = summary.clone();
+                    } else if !summary.is_empty() && summary != "Apply AI code changes" {
+                        final_summary = summary.clone();
                     }
-                    final_edits = edits.clone();
+                    for edit in edits.clone() {
+                        final_edits.push(edit);
+                    }
 
                     // Create checkpoint on the first edit batch
                     if checkpoint.is_none() {
@@ -191,18 +203,19 @@ impl EditWorkflow for ToolchainEditWorkflow {
                             if let Some(cp) = &checkpoint {
                                 let _ = restore_checkpoint(&repo_root, cp);
                             }
+                            let final_result = ModelResult::Edit {
+                                summary,
+                                edits,
+                                proposal: None,
+                                applied: false,
+                                error: Some(err.to_string()),
+                                changed_files: Vec::new(),
+                                commit_hash: None,
+                            };
+                            record_workflow_response(history_manager, &final_result, &last_assistant_text);
                             return Ok(WorkflowExecutionResult {
-                                result: ModelResult::Edit {
-                                    summary,
-                                    edits,
-                                    proposal: None,
-                                    applied: false,
-                                    error: Some(err.to_string()),
-                                    changed_files: Vec::new(),
-                                    commit_hash: None,
-                                },
+                                result: final_result,
                                 assistant_text: last_assistant_text,
-                                session_history_update: pipeline_out.session_history_update,
                             });
                         }
                     }
@@ -241,43 +254,33 @@ impl EditWorkflow for ToolchainEditWorkflow {
                                 }
                             };
 
+                            let final_result = ModelResult::Edit {
+                                summary: final_summary,
+                                edits: final_edits,
+                                proposal: None,
+                                applied: true,
+                                error: None,
+                                changed_files: all_changed_files,
+                                commit_hash,
+                            };
+                            record_workflow_response(history_manager, &final_result, &last_assistant_text);
                             return Ok(WorkflowExecutionResult {
-                                result: ModelResult::Edit {
-                                    summary: final_summary.clone(),
-                                    edits: final_edits,
-                                    proposal: None,
-                                    applied: true,
-                                    error: None,
-                                    changed_files: all_changed_files,
-                                    commit_hash,
-                                },
-                                assistant_text: last_assistant_text.clone(),
-                                session_history_update: Some((
-                                    ChatMessage::user(prompt),
-                                    ChatMessage::assistant(if !last_assistant_text.trim().is_empty() {
-                                        last_assistant_text
-                                    } else {
-                                        final_summary
-                                    }),
-                                )),
+                                result: final_result,
+                                assistant_text: last_assistant_text,
                             });
                         } else {
                             if attempt < max_heal_attempts {
                                 attempt += 1;
 
-                                if let Some((u, a)) = pipeline_out.session_history_update {
-                                    accumulated_history.push(u);
-                                    accumulated_history.push(a);
-                                }
-
-                                let err_preview = if check_result.combined_output.chars().count() > 2500 {
-                                    format!(
-                                        "{}\n... (truncated)",
-                                        truncate_chars(&check_result.combined_output, 2500)
-                                    )
-                                } else {
-                                    check_result.combined_output.clone()
-                                };
+                                let err_preview =
+                                    if check_result.combined_output.chars().count() > 2500 {
+                                        format!(
+                                            "{}\n... (truncated)",
+                                            truncate_chars(&check_result.combined_output, 2500)
+                                        )
+                                    } else {
+                                        check_result.combined_output.clone()
+                                    };
 
                                 current_prompt = format!(
                                     "The toolchain verification command `{}` failed with the following errors:\n```\n{}\n```\nPlease fix the compilation/verification errors by proposing updated edits.",
@@ -297,18 +300,19 @@ impl EditWorkflow for ToolchainEditWorkflow {
                                     truncate_chars(&check_result.combined_output, 1000)
                                 );
 
+                                let final_result = ModelResult::Edit {
+                                    summary: final_summary,
+                                    edits: final_edits,
+                                    proposal: None,
+                                    applied: false,
+                                    error: Some(err_msg),
+                                    changed_files: Vec::new(),
+                                    commit_hash: None,
+                                };
+                                record_workflow_response(history_manager, &final_result, &last_assistant_text);
                                 return Ok(WorkflowExecutionResult {
-                                    result: ModelResult::Edit {
-                                        summary: final_summary,
-                                        edits: final_edits,
-                                        proposal: None,
-                                        applied: false,
-                                        error: Some(err_msg),
-                                        changed_files: Vec::new(),
-                                        commit_hash: None,
-                                    },
+                                    result: final_result,
                                     assistant_text: last_assistant_text,
-                                    session_history_update: pipeline_out.session_history_update,
                                 });
                             }
                         }
@@ -326,25 +330,19 @@ impl EditWorkflow for ToolchainEditWorkflow {
                             }
                         };
 
+                        let final_result = ModelResult::Edit {
+                            summary: final_summary,
+                            edits: final_edits,
+                            proposal: None,
+                            applied: true,
+                            error: None,
+                            changed_files: all_changed_files,
+                            commit_hash,
+                        };
+                        record_workflow_response(history_manager, &final_result, &last_assistant_text);
                         return Ok(WorkflowExecutionResult {
-                            result: ModelResult::Edit {
-                                summary: final_summary.clone(),
-                                edits: final_edits,
-                                proposal: None,
-                                applied: true,
-                                error: None,
-                                changed_files: all_changed_files,
-                                commit_hash,
-                            },
-                            assistant_text: last_assistant_text.clone(),
-                            session_history_update: Some((
-                                ChatMessage::user(prompt),
-                                ChatMessage::assistant(if !last_assistant_text.trim().is_empty() {
-                                    last_assistant_text
-                                } else {
-                                    final_summary
-                                }),
-                            )),
+                            result: final_result,
+                            assistant_text: last_assistant_text,
                         });
                     }
                 }
@@ -357,18 +355,19 @@ impl EditWorkflow for ToolchainEditWorkflow {
         }
         context_manager.prune_missing_files();
 
+        let final_result = ModelResult::Edit {
+            summary: final_summary,
+            edits: final_edits,
+            proposal: None,
+            applied: false,
+            error: Some("Toolchain verification failed and could not be resolved.".to_string()),
+            changed_files: Vec::new(),
+            commit_hash: None,
+        };
+        record_workflow_response(history_manager, &final_result, &last_assistant_text);
         Ok(WorkflowExecutionResult {
-            result: ModelResult::Edit {
-                summary: final_summary,
-                edits: final_edits,
-                proposal: None,
-                applied: false,
-                error: Some("Toolchain verification failed and could not be resolved.".to_string()),
-                changed_files: Vec::new(),
-                commit_hash: None,
-            },
+            result: final_result,
             assistant_text: last_assistant_text,
-            session_history_update: None,
         })
     }
 }

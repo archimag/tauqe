@@ -1,5 +1,5 @@
-use std::path::Path;
 use serde::{Deserialize, Serialize};
+use std::path::Path;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ToolchainKind {
@@ -97,11 +97,7 @@ pub async fn run_toolchain_check(repo_root: &Path, command_str: &str) -> Toolcha
     cmd.args(args);
     cmd.current_dir(repo_root);
 
-    let output_res = tokio::time::timeout(
-        std::time::Duration::from_secs(60),
-        cmd.output(),
-    )
-    .await;
+    let output_res = tokio::time::timeout(std::time::Duration::from_secs(60), cmd.output()).await;
 
     match output_res {
         Ok(Ok(output)) => {

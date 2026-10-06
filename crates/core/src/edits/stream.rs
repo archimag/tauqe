@@ -41,6 +41,11 @@ impl JsonStreamFilter {
         }
     }
 
+    pub fn with_staged_contents(mut self, staged_contents: HashMap<String, String>) -> Self {
+        self.staged_contents = staged_contents;
+        self
+    }
+
     /// Process an incoming chunk of model text and generate corresponding `StreamEvent`s.
     pub fn push_chunk(&mut self, chunk: &str) -> Vec<StreamEvent> {
         self.buffer.push_str(chunk);
@@ -133,7 +138,9 @@ impl JsonStreamFilter {
             }
         }
 
-        let start_processed = self.processed_changes_count.saturating_sub(new_changes.len());
+        let start_processed = self
+            .processed_changes_count
+            .saturating_sub(new_changes.len());
         for (i, change) in new_changes.into_iter().enumerate() {
             let change_idx = start_processed + i;
             let already_started = self.started_change_index == Some(change_idx);
@@ -152,7 +159,8 @@ impl JsonStreamFilter {
                     events.push(StreamEvent::EditStarted);
                     self.has_emitted_edit_started = true;
                 }
-                let resolved_path = resolve_path(&path, &self.editable_paths);
+                let is_create = op.eq_ignore_ascii_case("create");
+                let resolved_path = resolve_path(&path, &self.editable_paths, is_create);
                 events.push(StreamEvent::EditFileStarted {
                     path: resolved_path,
                     op_type: op.to_lowercase(),
@@ -171,8 +179,7 @@ impl JsonStreamFilter {
             return events;
         }
         if !self.message_finished {
-            let (delta, _, _) =
-                extract_streamed_message(&self.buffer, self.message_streamed_bytes);
+            let (delta, _, _) = extract_streamed_message(&self.buffer, self.message_streamed_bytes);
             if let Some(d) = delta {
                 if !d.is_empty() {
                     events.push(StreamEvent::TextDelta(d));
@@ -193,7 +200,8 @@ impl JsonStreamFilter {
             self.has_emitted_edit_started = true;
         }
 
-        let resolved_path = resolve_path(&change.path, &self.editable_paths);
+        let is_create = change.op.eq_ignore_ascii_case("create");
+        let resolved_path = resolve_path(&change.path, &self.editable_paths, is_create);
         let op_type = change.op.to_lowercase();
 
         if !already_started {
@@ -246,8 +254,7 @@ impl JsonStreamFilter {
                     new_text: new_text.clone(),
                 });
 
-                let val_res =
-                    self.validate_hunk_in_memory(&resolved_path, &old_text, &new_text);
+                let val_res = self.validate_hunk_in_memory(&resolved_path, &old_text, &new_text);
                 match val_res {
                     Ok(()) => {
                         events.push(StreamEvent::EditFileDone {
@@ -554,6 +561,11 @@ impl XmlStreamFilter {
         }
     }
 
+    pub fn with_staged_contents(mut self, staged_contents: HashMap<String, String>) -> Self {
+        self.staged_contents = staged_contents;
+        self
+    }
+
     /// Process incoming chunk of model text and generate corresponding `StreamEvent`s.
     pub fn push_chunk(&mut self, chunk: &str) -> Vec<StreamEvent> {
         self.buffer.push_str(chunk);
@@ -615,7 +627,8 @@ impl XmlStreamFilter {
                         let is_self_closing = header.ends_with("/>");
 
                         if let Some(path_attr) = extract_attr(header, "path") {
-                            let resolved = resolve_path(&path_attr, &self.editable_paths);
+                            let is_create = tag_name == "create";
+                            let resolved = resolve_path(&path_attr, &self.editable_paths, is_create);
                             let op_type = match tag_name.as_str() {
                                 "create" => "create".to_string(),
                                 "delete" => "delete".to_string(),
@@ -707,7 +720,8 @@ impl XmlStreamFilter {
                         self.file_hunks_count += 1;
 
                         // Memory validation of this hunk against target file content
-                        let val_res = self.validate_hunk_in_memory(&curr_path, &old_text, &new_text);
+                        let val_res =
+                            self.validate_hunk_in_memory(&curr_path, &old_text, &new_text);
 
                         events.push(StreamEvent::EditHunk {
                             path: curr_path.clone(),
@@ -790,7 +804,10 @@ impl XmlStreamFilter {
             return Err("Search block not found in file".to_string());
         }
         if matches.len() > 1 {
-            return Err(format!("Search block matches {} times (ambiguous)", matches.len()));
+            return Err(format!(
+                "Search block matches {} times (ambiguous)",
+                matches.len()
+            ));
         }
 
         let (idx, _) = matches[0];
@@ -853,7 +870,8 @@ fn find_next_hunk(buf: &str) -> Option<(String, String, usize)> {
     let search_end_pat = "</search>";
     let s_start = buf.find(search_start_pat)?;
     let s_end = buf[s_start + search_start_pat.len()..].find(search_end_pat)?;
-    let old_text_raw = &buf[s_start + search_start_pat.len()..s_start + search_start_pat.len() + s_end];
+    let old_text_raw =
+        &buf[s_start + search_start_pat.len()..s_start + search_start_pat.len() + s_end];
 
     let after_search = s_start + search_start_pat.len() + s_end + search_end_pat.len();
     let rest = &buf[after_search..];
@@ -868,7 +886,8 @@ fn find_next_hunk(buf: &str) -> Option<(String, String, usize)> {
 
     let r_start = rest.find(replace_start_pat)?;
     let r_end = rest[r_start + replace_start_pat.len()..].find(replace_end_pat)?;
-    let new_text_raw = &rest[r_start + replace_start_pat.len()..r_start + replace_start_pat.len() + r_end];
+    let new_text_raw =
+        &rest[r_start + replace_start_pat.len()..r_start + replace_start_pat.len() + r_end];
 
     let abs_end = after_search + r_start + replace_start_pat.len() + r_end + replace_end_pat.len();
 
@@ -899,21 +918,16 @@ fn extract_attr(header: &str, attr: &str) -> Option<String> {
     None
 }
 
-fn resolve_path(candidate: &str, editable_paths: &[String]) -> String {
-    let cleaned = candidate.trim().trim_matches('`');
-    let cleaned = cleaned.strip_prefix("./").unwrap_or(cleaned);
-    let cleaned = cleaned.strip_prefix('/').unwrap_or(cleaned);
-
-    for ed in editable_paths {
-        let ed_clean = ed.strip_prefix("./").unwrap_or(ed);
-        if cleaned == ed_clean
-            || cleaned.ends_with(&format!("/{}", ed_clean))
-            || ed_clean.ends_with(&format!("/{}", cleaned))
-        {
-            return ed.clone();
-        }
-    }
-    cleaned.to_string()
+fn resolve_path(candidate: &str, editable_paths: &[String], is_create: bool) -> String {
+    crate::edits::protocol::utils::resolve_target_path_for_op(candidate, editable_paths, is_create)
+        .unwrap_or_else(|_| {
+            candidate
+                .trim()
+                .trim_matches('`')
+                .trim_start_matches("./")
+                .trim_start_matches('/')
+                .to_string()
+        })
 }
 
 fn normalize_hunk(raw: &str) -> String {
@@ -944,14 +958,22 @@ mod tests {
         let mut filter = JsonStreamFilter::new(vec!["crates/foo.rs".to_string()], root);
         let chunk1 = r#"{"message":"Hello","changes":[{"op":"replace","path":"crates/foo.rs""#;
         let events1 = filter.push_chunk(chunk1);
-        assert!(events1.iter().any(|e| matches!(e, StreamEvent::EditStarted)));
+        assert!(events1
+            .iter()
+            .any(|e| matches!(e, StreamEvent::EditStarted)));
         assert!(events1.iter().any(|e| matches!(e, StreamEvent::EditFileStarted { path, op_type } if path == "crates/foo.rs" && op_type == "replace")));
-        assert!(!events1.iter().any(|e| matches!(e, StreamEvent::EditFileDone { .. })));
+        assert!(!events1
+            .iter()
+            .any(|e| matches!(e, StreamEvent::EditFileDone { .. })));
 
         let chunk2 = r#", "old_text":"", "new_text":"", "content":""}]}"#;
         let events2 = filter.push_chunk(chunk2);
-        assert!(!events2.iter().any(|e| matches!(e, StreamEvent::EditFileStarted { .. })));
-        assert!(events2.iter().any(|e| matches!(e, StreamEvent::EditFileDone { .. })));
+        assert!(!events2
+            .iter()
+            .any(|e| matches!(e, StreamEvent::EditFileStarted { .. })));
+        assert!(events2
+            .iter()
+            .any(|e| matches!(e, StreamEvent::EditFileDone { .. })));
     }
 
     #[test]

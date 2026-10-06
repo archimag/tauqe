@@ -1,19 +1,56 @@
 /// Resolves a candidate file path against a list of permitted editable paths.
-pub fn resolve_target_path(candidate: &str, editable_paths: &[String]) -> String {
+/// For `create` operations, suffix matching is disabled to prevent accidental overwrites.
+/// For `replace`/`delete`, exact match is preferred; ambiguous suffix matches return an error.
+pub fn resolve_target_path_for_op(
+    candidate: &str,
+    editable_paths: &[String],
+    is_create: bool,
+) -> Result<String, String> {
     let cleaned = candidate.trim().trim_matches('`').trim();
     let cleaned = cleaned.strip_prefix("./").unwrap_or(cleaned);
     let cleaned = cleaned.strip_prefix('/').unwrap_or(cleaned);
 
+    if is_create {
+        return Ok(cleaned.to_string());
+    }
+
+    // 1. Exact match
     for ed in editable_paths {
         let ed_clean = ed.strip_prefix("./").unwrap_or(ed);
-        if cleaned == ed_clean
-            || cleaned.ends_with(&format!("/{}", ed_clean))
-            || ed_clean.ends_with(&format!("/{}", cleaned))
-        {
-            return ed.clone();
+        if cleaned == ed_clean {
+            return Ok(ed.clone());
         }
     }
-    cleaned.to_string()
+
+    // 2. Suffix match
+    let mut matches = Vec::new();
+    for ed in editable_paths {
+        let ed_clean = ed.strip_prefix("./").unwrap_or(ed);
+        if ed_clean.ends_with(&format!("/{}", cleaned))
+            || cleaned.ends_with(&format!("/{}", ed_clean))
+        {
+            matches.push(ed.clone());
+        }
+    }
+
+    match matches.len() {
+        0 => Ok(cleaned.to_string()),
+        1 => Ok(matches.remove(0)),
+        _ => Err(format!(
+            "Path '{}' is ambiguous and matches multiple editable files: {}",
+            cleaned,
+            matches.join(", ")
+        )),
+    }
+}
+
+/// Resolves a candidate file path against editable paths (defaulting to non-create semantics).
+pub fn resolve_target_path(candidate: &str, editable_paths: &[String]) -> String {
+    resolve_target_path_for_op(candidate, editable_paths, false).unwrap_or_else(|_| {
+        let cleaned = candidate.trim().trim_matches('`').trim();
+        let cleaned = cleaned.strip_prefix("./").unwrap_or(cleaned);
+        cleaned.strip_prefix('/').unwrap_or(cleaned).to_string()
+    })
 }
 
 /// Normalizes line breaks and whitespace around content.
@@ -40,20 +77,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_resolve_target_path() {
+    fn test_resolve_target_path_for_op_create_does_not_suffix_match() {
         let editable = vec!["crates/core/src/lib.rs".to_string()];
-        assert_eq!(
-            resolve_target_path("crates/core/src/lib.rs", &editable),
-            "crates/core/src/lib.rs"
-        );
-        assert_eq!(
-            resolve_target_path("src/lib.rs", &editable),
-            "crates/core/src/lib.rs"
-        );
-        assert_eq!(
-            resolve_target_path("other/file.rs", &editable),
-            "other/file.rs"
-        );
+        let resolved = resolve_target_path_for_op("lib.rs", &editable, true).unwrap();
+        assert_eq!(resolved, "lib.rs");
+    }
+
+    #[test]
+    fn test_resolve_target_path_for_op_ambiguity_returns_err() {
+        let editable = vec!["crates/a/src/lib.rs".to_string(), "crates/b/src/lib.rs".to_string()];
+        let res = resolve_target_path_for_op("lib.rs", &editable, false);
+        assert!(res.is_err());
     }
 
     #[test]

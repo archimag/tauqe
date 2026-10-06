@@ -1,6 +1,6 @@
+use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use anyhow::{bail, Context, Result};
 use workbench_protocol::{GitUndoResult, RepositoryState};
 
 pub fn get_repository_state(dir: Option<&Path>) -> RepositoryState {
@@ -203,8 +203,7 @@ pub fn undo_last_ai_commit(dir: &Path) -> Result<GitUndoResult> {
     }
 
     // 2. Hard reset the AI commit
-    run_git(Some(dir), &["reset", "--hard", "HEAD~1"])
-        .context("Failed to reset AI commit")?;
+    run_git(Some(dir), &["reset", "--hard", "HEAD~1"]).context("Failed to reset AI commit")?;
 
     // 3. Check if previous commit was a checkpoint commit
     let prev_subject = run_git(Some(dir), &["log", "-1", "--format=%s"])
