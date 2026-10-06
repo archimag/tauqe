@@ -17,6 +17,10 @@ pub mod methods {
     pub const CONTEXT_SET_ACCESS: &str = "context/setAccess";
     pub const CONTEXT_CLEAR: &str = "context/clear";
 
+    pub const INTENT_GET: &str = "intent/get";
+    pub const INTENT_SET: &str = "intent/set";
+    pub const INTENT_CLEAR: &str = "intent/clear";
+
     pub const GIT_UNDO: &str = "git/undo";
     pub const GIT_GET_DIFF: &str = "git/getDiff";
 
@@ -35,6 +39,7 @@ pub mod events {
     pub const MODEL_ERROR: &str = "model/error";
 
     pub const CONTEXT_CHANGED: &str = "context/changed";
+    pub const INTENT_CHANGED: &str = "intent/changed";
 
     pub const EDIT_STARTED: &str = "edit/started";
     pub const EDIT_FILE_STARTED: &str = "edit/fileStarted";
@@ -121,16 +126,24 @@ pub struct InitializeResult {
     pub available_workflows: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub available_edit_protocols: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub available_models: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intent: Option<IntentState>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConfigState {
     pub workflow: String,
     pub edit_protocol: String,
+    #[serde(default)]
+    pub model: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub available_workflows: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub available_edit_protocols: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub available_models: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -139,6 +152,8 @@ pub struct ConfigSetParams {
     pub workflow: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub edit_protocol: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -217,6 +232,27 @@ pub struct ContextChangedEvent {
     pub state: ContextState,
 }
 
+// Intent Memory Types
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct IntentState {
+    pub content: String,
+    pub estimated_tokens: u64,
+    pub max_tokens: usize,
+    pub file_path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IntentSetParams {
+    pub content: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IntentChangedEvent {
+    pub state: IntentState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub explanation: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelAskParams {
     pub prompt: String,
@@ -278,6 +314,58 @@ pub struct EditProposal {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StructuredChangeProposal {
+    #[serde(default = "default_change_op")]
+    pub op: String,
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub old_text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub new_text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+}
+
+fn default_change_op() -> String {
+    "replace".to_string()
+}
+
+impl StructuredChangeProposal {
+    pub fn to_edit_operation(&self) -> EditOperation {
+        match self.op.as_str() {
+            "create" => EditOperation::Create {
+                path: self.path.clone(),
+                content: self.content.clone().unwrap_or_default(),
+            },
+            "delete" => EditOperation::Delete {
+                path: self.path.clone(),
+            },
+            _ => EditOperation::Replace {
+                path: self.path.clone(),
+                old_text: self.old_text.clone().unwrap_or_default(),
+                new_text: self
+                    .new_text
+                    .clone()
+                    .or_else(|| self.content.clone())
+                    .unwrap_or_default(),
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ModelResultProposal {
+    #[serde(default)]
+    pub message: String,
+    #[serde(default)]
+    pub changes: Vec<StructuredChangeProposal>,
+    #[serde(default)]
+    pub context_requests: Vec<String>,
+    #[serde(default)]
+    pub suggested_actions: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ModelResult {
     Answer {
@@ -286,6 +374,8 @@ pub enum ModelResult {
     Edit {
         summary: String,
         edits: Vec<EditOperation>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        proposal: Option<ModelResultProposal>,
         applied: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<String>,

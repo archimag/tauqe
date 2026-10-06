@@ -6,7 +6,7 @@ use tokio::sync::mpsc;
 use tokio::sync::watch;
 use workbench_protocol::ModelUsageInfo;
 
-use super::gateway::{ChatMessage, FunctionCall, StreamEvent, ToolCall, ToolDefinition};
+use super::gateway::{ChatMessage, FunctionCall, ResponseFormat, StreamEvent, ToolCall, ToolDefinition};
 
 pub struct OpenRouterClient {
     api_key: String,
@@ -24,11 +24,21 @@ struct ChatCompletionRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning: Option<ReasoningOption>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    response_format: Option<ResponseFormat>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<Vec<ToolDefinition>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_choice: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     parallel_tool_calls: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provider: Option<ProviderPreferences>,
+}
+
+/// OpenRouter provider routing preferences.
+#[derive(Debug, Serialize)]
+struct ProviderPreferences {
+    require_parameters: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -234,7 +244,7 @@ impl OpenRouterClient {
         cancel_rx: watch::Receiver<bool>,
     ) -> Result<()> {
         let _ = self
-            .stream_chat_with_tools(model, messages, None, tx, cancel_rx)
+            .stream_chat_with_tools(model, messages, None, None, tx, cancel_rx)
             .await?;
         Ok(())
     }
@@ -244,6 +254,7 @@ impl OpenRouterClient {
         model: &str,
         messages: Vec<ChatMessage>,
         tools: Option<Vec<ToolDefinition>>,
+        response_format: Option<ResponseFormat>,
         tx: mpsc::Sender<StreamEvent>,
         mut cancel_rx: watch::Receiver<bool>,
     ) -> Result<Vec<ToolCall>> {
@@ -259,7 +270,11 @@ impl OpenRouterClient {
         );
         headers.insert("X-Title", HeaderValue::from_static("Workbench"));
 
-        let has_tools = tools.as_ref().map_or(false, |t| !t.is_empty());
+        // Structured Outputs (json_schema) and function calling are mutually exclusive:
+        // when a schema is requested, tools are never sent, and routing is restricted
+        // to providers that support every requested parameter.
+        let uses_json_schema = matches!(&response_format, Some(ResponseFormat::JsonSchema { .. }));
+        let has_tools = !uses_json_schema && tools.as_ref().map_or(false, |t| !t.is_empty());
         let payload = ChatCompletionRequest {
             model: model.to_string(),
             messages,
@@ -267,14 +282,27 @@ impl OpenRouterClient {
             stream_options: Some(StreamOptions {
                 include_usage: true,
             }),
-            reasoning: Some(ReasoningOption { enabled: true }),
+            // Avoid over-constraining provider routing under require_parameters.
+            reasoning: if uses_json_schema {
+                None
+            } else {
+                Some(ReasoningOption { enabled: true })
+            },
+            provider: if uses_json_schema {
+                Some(ProviderPreferences {
+                    require_parameters: true,
+                })
+            } else {
+                None
+            },
+            response_format,
             tools: if has_tools { tools } else { None },
             tool_choice: if has_tools {
                 Some(serde_json::Value::String("auto".to_string()))
             } else {
                 None
             },
-            parallel_tool_calls: None,
+            parallel_tool_calls: if has_tools { Some(true) } else { None },
         };
 
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
@@ -681,7 +709,7 @@ mod tests {
 
         let client_task = tokio::spawn(async move {
             client
-                .stream_chat_with_tools("test-model", vec![], Some(tools), tx, cancel_rx)
+                .stream_chat_with_tools("test-model", vec![], Some(tools), None, tx, cancel_rx)
                 .await
         });
 
@@ -697,6 +725,65 @@ mod tests {
             completed_calls[0].function.arguments,
             "{\"path\":\"main.rs\",\"old_text\":\"a\",\"new_text\":\"b\"}"
         );
+    }
+
+    #[tokio::test]
+    async fn test_stream_chat_json_schema_requires_parameters_and_drops_tools() {
+        use super::super::gateway::{FunctionDefinition, JsonSchemaDefinition, ToolDefinition};
+
+        let mock_server = MockServer::start().await;
+
+        let sse_body = "data: {\"choices\":[{\"delta\":{\"content\":\"{}\"}}]}\n\ndata: [DONE]\n\n";
+
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(sse_body, "text/event-stream"),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let client = OpenRouterClient::new("test-api-key".to_string())
+            .with_base_url(mock_server.uri());
+
+        let (tx, mut rx) = mpsc::channel(10);
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+
+        let tools = vec![ToolDefinition {
+            tool_type: "function".to_string(),
+            function: FunctionDefinition {
+                name: "edit_file".to_string(),
+                description: "edit".to_string(),
+                parameters: serde_json::json!({}),
+            },
+        }];
+        let response_format = Some(ResponseFormat::JsonSchema {
+            json_schema: JsonSchemaDefinition {
+                name: "model_result".to_string(),
+                description: None,
+                schema: serde_json::json!({"type": "object"}),
+                strict: Some(true),
+            },
+        });
+
+        let client_task = tokio::spawn(async move {
+            client
+                .stream_chat_with_tools("test-model", vec![], Some(tools), response_format, tx, cancel_rx)
+                .await
+        });
+
+        while let Some(_event) = rx.recv().await {}
+        assert!(client_task.await.expect("task join failed").is_ok());
+
+        let requests = mock_server.received_requests().await.unwrap();
+        let req_json: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(req_json["provider"]["require_parameters"], true);
+        assert_eq!(req_json["response_format"]["type"], "json_schema");
+        assert!(req_json.get("tools").is_none());
+        assert!(req_json.get("tool_choice").is_none());
+        assert!(req_json.get("parallel_tool_calls").is_none());
     }
 
     #[tokio::test]
@@ -723,5 +810,49 @@ mod tests {
         let err_msg = res.unwrap_err().to_string();
         assert!(err_msg.contains("OpenRouter HTTP error 401"));
         assert!(err_msg.contains("Unauthorized API key"));
+    }
+
+    #[tokio::test]
+    async fn test_stream_chat_with_response_format() {
+        let mock_server = MockServer::start().await;
+
+        let sse_body = "data: {\"choices\":[{\"delta\":{\"content\":\"{\\\"message\\\":\\\"hi\\\"}\"}}]}\n\ndata: [DONE]\n\n";
+
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(header("Authorization", "Bearer test-api-key"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(sse_body, "text/event-stream"),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let client = OpenRouterClient::new("test-api-key".to_string())
+            .with_base_url(mock_server.uri());
+
+        let (tx, mut rx) = mpsc::channel(10);
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+
+        let response_format = Some(ResponseFormat::JsonObject);
+        let client_task = tokio::spawn(async move {
+            client
+                .stream_chat_with_tools("test-model", vec![], None, response_format, tx, cancel_rx)
+                .await
+        });
+
+        while let Some(_event) = rx.recv().await {}
+
+        let res = client_task.await.expect("task join failed");
+        assert!(res.is_ok());
+
+        let requests = mock_server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        let req_json: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(
+            req_json.get("response_format").unwrap().get("type").unwrap(),
+            "json_object"
+        );
     }
 }

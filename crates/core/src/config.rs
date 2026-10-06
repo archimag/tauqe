@@ -11,6 +11,33 @@ pub struct AppConfig {
     pub edit: EditConfig,
     #[serde(default)]
     pub toolchain: ToolchainConfig,
+    #[serde(default)]
+    pub intent: IntentConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IntentConfig {
+    #[serde(default = "default_intent_file")]
+    pub file_path: String,
+    #[serde(default = "default_intent_max_tokens")]
+    pub max_tokens: usize,
+}
+
+fn default_intent_file() -> String {
+    ".workbench/intent.md".to_string()
+}
+
+fn default_intent_max_tokens() -> usize {
+    2000
+}
+
+impl Default for IntentConfig {
+    fn default() -> Self {
+        Self {
+            file_path: default_intent_file(),
+            max_tokens: default_intent_max_tokens(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -37,14 +64,49 @@ pub struct OpenRouterConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelsConfig {
+    /// Active (default) model. Empty means "take first of `available`, or built-in default".
+    #[serde(default)]
     pub default: String,
+    /// Models the user may switch between. Always contains `default` after `normalize()`.
+    #[serde(default)]
+    pub available: Vec<String>,
 }
+
+pub const BUILTIN_DEFAULT_MODEL: &str = "anthropic/claude-3.5-sonnet";
 
 impl Default for ModelsConfig {
     fn default() -> Self {
         Self {
-            default: "anthropic/claude-3.5-sonnet".to_string(),
+            default: BUILTIN_DEFAULT_MODEL.to_string(),
+            available: vec![BUILTIN_DEFAULT_MODEL.to_string()],
         }
+    }
+}
+
+impl ModelsConfig {
+    /// Trims, de-duplicates and guarantees that `default` is non-empty and listed in `available`.
+    pub fn normalize(&mut self) {
+        let mut cleaned: Vec<String> = Vec::new();
+        for m in self.available.drain(..) {
+            let m = m.trim().to_string();
+            if !m.is_empty() && !cleaned.contains(&m) {
+                cleaned.push(m);
+            }
+        }
+
+        let mut default = self.default.trim().to_string();
+        if default.is_empty() {
+            default = cleaned
+                .first()
+                .cloned()
+                .unwrap_or_else(|| BUILTIN_DEFAULT_MODEL.to_string());
+        }
+        if !cleaned.contains(&default) {
+            cleaned.insert(0, default.clone());
+        }
+
+        self.default = default;
+        self.available = cleaned;
     }
 }
 
@@ -115,6 +177,8 @@ pub fn load_config(repo_root: Option<&Path>) -> AppConfig {
         }
     }
 
+    config.models.normalize();
+
     config
 }
 
@@ -141,11 +205,53 @@ protocol = "tool_call"
     }
 
     #[test]
+    fn test_single_model_backward_compat() {
+        let toml_str = r#"
+[models]
+default = "openai/gpt-4o"
+"#;
+        let mut config: AppConfig = toml::from_str(toml_str).expect("Failed to parse config");
+        config.models.normalize();
+        assert_eq!(config.models.default, "openai/gpt-4o");
+        assert_eq!(config.models.available, vec!["openai/gpt-4o".to_string()]);
+    }
+
+    #[test]
+    fn test_available_models_include_default() {
+        let toml_str = r#"
+[models]
+default = "a/b"
+available = ["c/d", "e/f", "c/d"]
+"#;
+        let mut config: AppConfig = toml::from_str(toml_str).expect("Failed to parse config");
+        config.models.normalize();
+        assert_eq!(config.models.default, "a/b");
+        assert_eq!(
+            config.models.available,
+            vec!["a/b".to_string(), "c/d".to_string(), "e/f".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_available_without_default_uses_first() {
+        let toml_str = r#"
+[models]
+available = ["x/y", "z/w"]
+"#;
+        let mut config: AppConfig = toml::from_str(toml_str).expect("Failed to parse config");
+        config.models.normalize();
+        assert_eq!(config.models.default, "x/y");
+        assert_eq!(config.models.available.len(), 2);
+    }
+
+    #[test]
     fn test_default_config() {
         let config = AppConfig::default();
         assert_eq!(config.models.default, "anthropic/claude-3.5-sonnet");
         assert_eq!(config.edit.workflow, "toolchain");
         assert_eq!(config.edit.protocol, "xml");
+        assert_eq!(config.intent.file_path, ".workbench/intent.md");
+        assert_eq!(config.intent.max_tokens, 2000);
         assert!(config.providers.openrouter.is_none());
         assert!(config.toolchain.check_command.is_none());
     }

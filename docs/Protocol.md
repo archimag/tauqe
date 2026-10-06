@@ -150,9 +150,12 @@ Server отвечает:
   "workflow": "toolchain",
   "edit_protocol": "xml",
   "available_workflows": ["toolchain", "git", "naive"],
-  "available_edit_protocols": ["xml", "whole_file", "tool_call"]
+  "available_edit_protocols": ["xml", "whole_file", "tool_call"],
+  "available_models": ["anthropic/claude-3.5-sonnet", "openai/gpt-4o"]
 }
 ```
+
+Поле `model` — текущая активная модель, `available_models` — список моделей, между которыми можно переключаться (`[models].available` в конфигурации; если не задан — состоит из `default`).
 
 До `1.0` protocol может intentionally break compatibility.
 
@@ -162,6 +165,8 @@ Server отвечает:
 Возвращает текущие настройки выполнения и поддерживаемые списки:
 ```json
 {
+  "model": "anthropic/claude-3.5-sonnet",
+  "available_models": ["anthropic/claude-3.5-sonnet", "openai/gpt-4o"],
   "workflow": "toolchain",
   "edit_protocol": "xml",
   "available_workflows": ["toolchain", "git", "naive"],
@@ -176,11 +181,13 @@ Server отвечает:
   "method": "config/set",
   "params": {
     "workflow": "git",
-    "edit_protocol": "tool_call"
+    "edit_protocol": "tool_call",
+    "model": "openai/gpt-4o"
   }
 }
 ```
 *Инвариант:* если в данный момент выполняется генерация модели, сервер возвращает ошибку `OPERATION_IN_PROGRESS`.
+Значение `model` валидируется по `available_models`; неизвестная модель приводит к ошибке `INVALID_MODEL`. Выбранная модель используется последующими вызовами `model/ask`.
 
 ### 9.3 config/changed
 Событие рассылается всем клиентам при изменении настроек:
@@ -190,6 +197,8 @@ Server отвечает:
   "params": {
     "workflow": "git",
     "edit_protocol": "tool_call",
+    "model": "openai/gpt-4o",
+    "available_models": ["anthropic/claude-3.5-sonnet", "openai/gpt-4o"],
     "available_workflows": ["toolchain", "git", "naive"],
     "available_edit_protocols": ["xml", "whole_file", "tool_call"]
   }

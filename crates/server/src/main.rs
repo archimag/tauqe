@@ -5,21 +5,19 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{watch, Mutex};
 use workbench_core::config::{load_config, AppConfig};
 use workbench_core::context::ContextManager;
-use workbench_core::edits::{
-    EditProtocol, EditProtocolFactory, XmlEditProtocol,
-};
+use workbench_core::edits::{EditProtocolFactory, XmlEditProtocol};
 use workbench_core::model::gateway::{ChatMessage, StreamEvent};
 use workbench_core::model::openrouter::OpenRouterClient;
-use workbench_core::workflow::{
-    EditWorkflow, ToolchainEditWorkflow, WorkflowFactory,
-};
+use workbench_core::prompt::IntentManager;
+use workbench_core::workflow::{ToolchainEditWorkflow, WorkflowFactory};
 use workbench_protocol::{
     events, methods, ConfigSetParams, ConfigState, ContextAddParams, ContextAddPatternParams,
     ContextAddPatternResult, ContextRemoveParams, ContextSetAccessParams, EditFileDoneEvent,
     EditFileStartedEvent, EditFinishedEvent, EditHunkEvent, EditStartedEvent, Event,
-    GitCommitCreatedEvent, GitDiffParams, GitDiffResult, InitializeResult, ModelAskParams,
-    ModelResultEvent, RepositoryListFilesResult, Request, RequestId, Response, ResponseError,
-    ToolchainResultEvent, ToolchainStartedEvent, PROTOCOL_VERSION,
+    GitCommitCreatedEvent, GitDiffParams, GitDiffResult, InitializeResult, IntentChangedEvent,
+    IntentSetParams, ModelAskParams, ModelResultEvent, RepositoryListFilesResult, Request,
+    RequestId, Response, ResponseError, ToolchainResultEvent, ToolchainStartedEvent,
+    PROTOCOL_VERSION,
 };
 
 struct ModelSession {
@@ -27,6 +25,7 @@ struct ModelSession {
     active_cancel: Option<watch::Sender<bool>>,
     total_cost: f64,
     context_manager: ContextManager,
+    intent_manager: IntentManager,
 }
 
 struct AppState {
@@ -42,6 +41,12 @@ async fn main() -> anyhow::Result<()> {
     let repo_state = workbench_core::git::get_repository_state(None);
     let repo_path = PathBuf::from(repo_state.root);
 
+    let intent_mgr = IntentManager::new(
+        repo_path.clone(),
+        config.intent.file_path.clone(),
+        config.intent.max_tokens,
+    );
+
     let state = Arc::new(AppState {
         config: Mutex::new(config),
         session: Mutex::new(ModelSession {
@@ -49,6 +54,7 @@ async fn main() -> anyhow::Result<()> {
             active_cancel: None,
             total_cost: 0.0,
             context_manager: ContextManager::new(repo_path),
+            intent_manager: intent_mgr,
         }),
     });
 
@@ -100,7 +106,13 @@ async fn handle_request(req: Request, state: &Arc<AppState>) -> Response {
                 *cfg = load_config(Some(repo_path));
                 let mut session = state.session.lock().await;
                 session.context_manager.set_repo_root(repo_path.to_path_buf());
+                session.intent_manager.set_repo_root(repo_path.to_path_buf());
             }
+
+            let intent_state = {
+                let session = state.session.lock().await;
+                session.intent_manager.get_state()
+            };
 
             let result = InitializeResult {
                 protocol_version: PROTOCOL_VERSION.to_string(),
@@ -110,8 +122,10 @@ async fn handle_request(req: Request, state: &Arc<AppState>) -> Response {
                 model: Some(cfg.models.default.clone()),
                 workflow: Some(cfg.edit.workflow.clone()),
                 edit_protocol: Some(cfg.edit.protocol.clone()),
+                available_models: cfg.models.available.clone(),
                 available_workflows: WorkflowFactory::available_workflows(),
                 available_edit_protocols: EditProtocolFactory::available_protocols(),
+                intent: Some(intent_state),
             };
             Response {
                 id: req.id,
@@ -147,6 +161,83 @@ async fn handle_request(req: Request, state: &Arc<AppState>) -> Response {
                         data: None,
                     }),
                 },
+            }
+        }
+        methods::INTENT_GET => {
+            let mut session = state.session.lock().await;
+            let _ = session.intent_manager.load();
+            let state_val = session.intent_manager.get_state();
+            Response {
+                id: req.id,
+                result: Some(serde_json::to_value(state_val).unwrap()),
+                error: None,
+            }
+        }
+        methods::INTENT_SET => {
+            let params: IntentSetParams = match req.params.and_then(|p| serde_json::from_value(p).ok()) {
+                Some(p) => p,
+                None => {
+                    return Response {
+                        id: req.id,
+                        result: None,
+                        error: Some(ResponseError {
+                            code: "INVALID_PARAMS".to_string(),
+                            message: "Missing or invalid content parameter".to_string(),
+                            data: None,
+                        }),
+                    };
+                }
+            };
+
+            let intent_state = {
+                let mut session = state.session.lock().await;
+                if let Err(e) = session.intent_manager.set_content(params.content) {
+                    return Response {
+                        id: req.id,
+                        result: None,
+                        error: Some(ResponseError {
+                            code: "INTENT_SAVE_FAILED".to_string(),
+                            message: e.to_string(),
+                            data: None,
+                        }),
+                    };
+                }
+                session.intent_manager.get_state()
+            };
+
+            send_event(&Event {
+                method: events::INTENT_CHANGED.to_string(),
+                params: Some(serde_json::to_value(IntentChangedEvent {
+                    state: intent_state.clone(),
+                    explanation: Some("Updated manually by user".to_string()),
+                }).unwrap()),
+            }).await;
+
+            Response {
+                id: req.id,
+                result: Some(serde_json::to_value(intent_state).unwrap()),
+                error: None,
+            }
+        }
+        methods::INTENT_CLEAR => {
+            let intent_state = {
+                let mut session = state.session.lock().await;
+                let _ = session.intent_manager.clear();
+                session.intent_manager.get_state()
+            };
+
+            send_event(&Event {
+                method: events::INTENT_CHANGED.to_string(),
+                params: Some(serde_json::to_value(IntentChangedEvent {
+                    state: intent_state.clone(),
+                    explanation: Some("Cleared by user".to_string()),
+                }).unwrap()),
+            }).await;
+
+            Response {
+                id: req.id,
+                result: Some(serde_json::to_value(intent_state).unwrap()),
+                error: None,
             }
         }
         methods::GIT_UNDO => {
@@ -235,12 +326,7 @@ async fn handle_request(req: Request, state: &Arc<AppState>) -> Response {
         }
         methods::CONFIG_GET => {
             let cfg = state.config.lock().await;
-            let result = ConfigState {
-                workflow: cfg.edit.workflow.clone(),
-                edit_protocol: cfg.edit.protocol.clone(),
-                available_workflows: WorkflowFactory::available_workflows(),
-                available_edit_protocols: EditProtocolFactory::available_protocols(),
-            };
+            let result = config_state(&cfg);
             Response {
                 id: req.id,
                 result: Some(serde_json::to_value(result).unwrap()),
@@ -256,7 +342,7 @@ async fn handle_request(req: Request, state: &Arc<AppState>) -> Response {
                         result: None,
                         error: Some(ResponseError {
                             code: "OPERATION_IN_PROGRESS".to_string(),
-                            message: "Cannot change workflow or edit protocol while a model operation is in progress".to_string(),
+                            message: "Cannot change workflow, edit protocol or model while a model operation is in progress".to_string(),
                             data: None,
                         }),
                     };
@@ -280,6 +366,24 @@ async fn handle_request(req: Request, state: &Arc<AppState>) -> Response {
 
             let updated_state = {
                 let mut cfg = state.config.lock().await;
+                if let Some(requested_model) = params.model.as_ref() {
+                    let requested = requested_model.trim();
+                    if !cfg.models.available.iter().any(|m| m == requested) {
+                        return Response {
+                            id: req.id,
+                            result: None,
+                            error: Some(ResponseError {
+                                code: "INVALID_MODEL".to_string(),
+                                message: format!(
+                                    "Unknown model '{}'. Available models: {}",
+                                    requested,
+                                    cfg.models.available.join(", ")
+                                ),
+                                data: None,
+                            }),
+                        };
+                    }
+                }
                 if let Some(wf) = params.workflow {
                     if !WorkflowFactory::is_valid(&wf) {
                         return Response {
@@ -320,12 +424,10 @@ async fn handle_request(req: Request, state: &Arc<AppState>) -> Response {
                         }
                     }
                 }
-                ConfigState {
-                    workflow: cfg.edit.workflow.clone(),
-                    edit_protocol: cfg.edit.protocol.clone(),
-                    available_workflows: WorkflowFactory::available_workflows(),
-                    available_edit_protocols: EditProtocolFactory::available_protocols(),
+                if let Some(requested_model) = params.model {
+                    cfg.models.default = requested_model.trim().to_string();
                 }
+                config_state(&cfg)
             };
 
             send_event(&Event {
@@ -659,6 +761,8 @@ async fn handle_request(req: Request, state: &Arc<AppState>) -> Response {
                     });
 
                 let (wf_tx, wf_rx) = (tx.clone(), cancel_rx.clone());
+                drop(tx); // Drop local tx clone so rx closes when wf_task finishes
+
                 let state_clone = Arc::clone(&state_for_spawn);
                 let model_clone = model_for_spawn.clone();
                 let prompt_clone = prompt_for_spawn.clone();
@@ -683,6 +787,8 @@ async fn handle_request(req: Request, state: &Arc<AppState>) -> Response {
                 let wf_task = tokio::spawn(workflow_future);
 
                 let mut usage_info = None;
+                let mut edit_events_sent = false;
+                let mut edit_finished_sent = false;
 
                 while let Some(event) = rx.recv().await {
                     match event {
@@ -706,7 +812,24 @@ async fn handle_request(req: Request, state: &Arc<AppState>) -> Response {
                             };
                             send_event(&ev).await;
                         }
+                        StreamEvent::IntentUpdated { content, explanation } => {
+                            let intent_state = {
+                                let mut session = state_for_spawn.session.lock().await;
+                                let _ = session.intent_manager.set_content(content);
+                                session.intent_manager.get_state()
+                            };
+
+                            let ev = Event {
+                                method: events::INTENT_CHANGED.to_string(),
+                                params: Some(serde_json::to_value(IntentChangedEvent {
+                                    state: intent_state,
+                                    explanation,
+                                }).unwrap()),
+                            };
+                            send_event(&ev).await;
+                        }
                         StreamEvent::EditStarted => {
+                            edit_events_sent = true;
                             let ev = Event {
                                 method: events::EDIT_STARTED.to_string(),
                                 params: Some(serde_json::to_value(EditStartedEvent {
@@ -716,6 +839,7 @@ async fn handle_request(req: Request, state: &Arc<AppState>) -> Response {
                             send_event(&ev).await;
                         }
                         StreamEvent::EditFileStarted { path, op_type } => {
+                            edit_events_sent = true;
                             let ev = Event {
                                 method: events::EDIT_FILE_STARTED.to_string(),
                                 params: Some(serde_json::to_value(EditFileStartedEvent {
@@ -777,8 +901,13 @@ async fn handle_request(req: Request, state: &Arc<AppState>) -> Response {
                         StreamEvent::Usage(usage) => {
                             usage_info = Some(usage);
                         }
-                        StreamEvent::Done => break,
+                        StreamEvent::Done => {
+                            // Single stream done; do not break, wait until all pipeline events are received
+                        }
                         StreamEvent::Cancelled => {
+                            if edit_events_sent && !edit_finished_sent {
+                                send_edit_aborted(&op_id_for_spawn, "Operation cancelled before edits were applied".to_string()).await;
+                            }
                             let cancelled_event = Event {
                                 method: events::MODEL_CANCELLED.to_string(),
                                 params: Some(serde_json::json!({ "operation_id": op_id_for_spawn })),
@@ -789,6 +918,9 @@ async fn handle_request(req: Request, state: &Arc<AppState>) -> Response {
                             return;
                         }
                         StreamEvent::Error(err) => {
+                            if edit_events_sent && !edit_finished_sent {
+                                send_edit_aborted(&op_id_for_spawn, format!("Operation failed before edits were applied: {}", err)).await;
+                            }
                             let err_event = Event {
                                 method: events::MODEL_ERROR.to_string(),
                                 params: Some(serde_json::json!({
@@ -843,6 +975,7 @@ async fn handle_request(req: Request, state: &Arc<AppState>) -> Response {
                                 }).unwrap()),
                             };
                             send_event(&finished_edit_event).await;
+                            edit_finished_sent = true;
 
                             if let Some(hash) = commit_hash {
                                 send_event(&Event {
@@ -867,6 +1000,14 @@ async fn handle_request(req: Request, state: &Arc<AppState>) -> Response {
                             method: events::CONTEXT_CHANGED.to_string(),
                             params: Some(serde_json::json!({ "state": ctx_state })),
                         }).await;
+
+                        if edit_events_sent && !edit_finished_sent {
+                            send_edit_aborted(
+                                &op_id_for_spawn,
+                                "Edits were streamed but no edit result was produced".to_string(),
+                            )
+                            .await;
+                        }
 
                         let result_event = Event {
                             method: events::MODEL_RESULT.to_string(),
@@ -896,6 +1037,9 @@ async fn handle_request(req: Request, state: &Arc<AppState>) -> Response {
                         send_event(&finished_event).await;
                     }
                     Ok(Err(err)) => {
+                        if edit_events_sent && !edit_finished_sent {
+                            send_edit_aborted(&op_id_for_spawn, format!("Workflow failed: {}", err)).await;
+                        }
                         let err_event = Event {
                             method: events::MODEL_ERROR.to_string(),
                             params: Some(serde_json::json!({
@@ -906,6 +1050,9 @@ async fn handle_request(req: Request, state: &Arc<AppState>) -> Response {
                         send_event(&err_event).await;
                     }
                     Err(join_err) => {
+                        if edit_events_sent && !edit_finished_sent {
+                            send_edit_aborted(&op_id_for_spawn, format!("Workflow task failed: {}", join_err)).await;
+                        }
                         let err_event = Event {
                             method: events::MODEL_ERROR.to_string(),
                             params: Some(serde_json::json!({
@@ -960,6 +1107,35 @@ async fn handle_request(req: Request, state: &Arc<AppState>) -> Response {
             }),
         },
     }
+}
+
+fn config_state(cfg: &AppConfig) -> ConfigState {
+    ConfigState {
+        workflow: cfg.edit.workflow.clone(),
+        edit_protocol: cfg.edit.protocol.clone(),
+        model: cfg.models.default.clone(),
+        available_workflows: WorkflowFactory::available_workflows(),
+        available_edit_protocols: EditProtocolFactory::available_protocols(),
+        available_models: cfg.models.available.clone(),
+    }
+}
+
+/// Emits a failed `edit/finished` so clients never keep an edit block in a pending state.
+async fn send_edit_aborted(op_id: &str, error: String) {
+    send_event(&Event {
+        method: events::EDIT_FINISHED.to_string(),
+        params: Some(
+            serde_json::to_value(EditFinishedEvent {
+                operation_id: op_id.to_string(),
+                applied: false,
+                error: Some(error),
+                changed_files: Vec::new(),
+                commit_hash: None,
+            })
+            .unwrap(),
+        ),
+    })
+    .await;
 }
 
 async fn send_event(event: &Event) {

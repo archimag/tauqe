@@ -12,3 +12,4 @@ ratatui.workspace = true
 crossterm.workspace = true
 tokio.workspace = true
 anyhow.workspace = true
+pulldown-cmark = { version = "0.12", default-features = false }

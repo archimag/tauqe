@@ -42,6 +42,15 @@ impl ToolchainEditWorkflow {
     }
 }
 
+fn truncate_chars(s: &str, max_chars: usize) -> String {
+    if s.chars().count() > max_chars {
+        let prefix: String = s.chars().take(max_chars).collect();
+        format!("{}...", prefix)
+    } else {
+        s.to_string()
+    }
+}
+
 #[async_trait]
 impl EditWorkflow for ToolchainEditWorkflow {
     fn name(&self) -> &'static str {
@@ -123,6 +132,7 @@ impl EditWorkflow for ToolchainEditWorkflow {
                                 result: ModelResult::Edit {
                                     summary,
                                     edits: Vec::new(),
+                                    proposal: None,
                                     applied: false,
                                     error: Some(err_msg),
                                     changed_files: Vec::new(),
@@ -140,6 +150,7 @@ impl EditWorkflow for ToolchainEditWorkflow {
                                 result: ModelResult::Edit {
                                     summary,
                                     edits: Vec::new(),
+                                    proposal: None,
                                     applied: false,
                                     error: Some("No valid edit operations found in model output".to_string()),
                                     changed_files: Vec::new(),
@@ -184,6 +195,7 @@ impl EditWorkflow for ToolchainEditWorkflow {
                                 result: ModelResult::Edit {
                                     summary,
                                     edits,
+                                    proposal: None,
                                     applied: false,
                                     error: Some(err.to_string()),
                                     changed_files: Vec::new(),
@@ -233,6 +245,7 @@ impl EditWorkflow for ToolchainEditWorkflow {
                                 result: ModelResult::Edit {
                                     summary: final_summary.clone(),
                                     edits: final_edits,
+                                    proposal: None,
                                     applied: true,
                                     error: None,
                                     changed_files: all_changed_files,
@@ -257,10 +270,10 @@ impl EditWorkflow for ToolchainEditWorkflow {
                                     accumulated_history.push(a);
                                 }
 
-                                let err_preview = if check_result.combined_output.len() > 2500 {
+                                let err_preview = if check_result.combined_output.chars().count() > 2500 {
                                     format!(
                                         "{}\n... (truncated)",
-                                        &check_result.combined_output[..2500]
+                                        truncate_chars(&check_result.combined_output, 2500)
                                     )
                                 } else {
                                     check_result.combined_output.clone()
@@ -281,17 +294,14 @@ impl EditWorkflow for ToolchainEditWorkflow {
                                 let err_msg = format!(
                                     "Toolchain check '{}' failed. Changes rolled back.\nErrors:\n{}",
                                     check_cmd,
-                                    if check_result.combined_output.len() > 1000 {
-                                        format!("{}...", &check_result.combined_output[..1000])
-                                    } else {
-                                        check_result.combined_output
-                                    }
+                                    truncate_chars(&check_result.combined_output, 1000)
                                 );
 
                                 return Ok(WorkflowExecutionResult {
                                     result: ModelResult::Edit {
                                         summary: final_summary,
                                         edits: final_edits,
+                                        proposal: None,
                                         applied: false,
                                         error: Some(err_msg),
                                         changed_files: Vec::new(),
@@ -320,6 +330,7 @@ impl EditWorkflow for ToolchainEditWorkflow {
                             result: ModelResult::Edit {
                                 summary: final_summary.clone(),
                                 edits: final_edits,
+                                proposal: None,
                                 applied: true,
                                 error: None,
                                 changed_files: all_changed_files,
@@ -350,6 +361,7 @@ impl EditWorkflow for ToolchainEditWorkflow {
             result: ModelResult::Edit {
                 summary: final_summary,
                 edits: final_edits,
+                proposal: None,
                 applied: false,
                 error: Some("Toolchain verification failed and could not be resolved.".to_string()),
                 changed_files: Vec::new(),

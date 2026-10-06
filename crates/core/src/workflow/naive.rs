@@ -63,6 +63,7 @@ impl EditWorkflow for NaiveEditWorkflow {
                     ModelResult::Edit {
                         summary,
                         edits: Vec::new(),
+                        proposal: None,
                         applied: false,
                         error: Some(err_msg),
                         changed_files: Vec::new(),
@@ -72,6 +73,7 @@ impl EditWorkflow for NaiveEditWorkflow {
                     ModelResult::Edit {
                         summary,
                         edits: Vec::new(),
+                        proposal: None,
                         applied: false,
                         error: Some("No valid edit operations found in model output".to_string()),
                         changed_files: Vec::new(),
@@ -88,6 +90,7 @@ impl EditWorkflow for NaiveEditWorkflow {
                         Ok(changed_files) => ModelResult::Edit {
                             summary,
                             edits,
+                            proposal: None,
                             applied: true,
                             error: None,
                             changed_files,
@@ -96,6 +99,7 @@ impl EditWorkflow for NaiveEditWorkflow {
                         Err(err) => ModelResult::Edit {
                             summary,
                             edits,
+                            proposal: None,
                             applied: false,
                             error: Some(err.to_string()),
                             changed_files: Vec::new(),

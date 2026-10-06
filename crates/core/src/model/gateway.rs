@@ -118,10 +118,36 @@ pub struct FunctionDefinition {
     pub parameters: serde_json::Value,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ResponseFormat {
+    Text,
+    JsonObject,
+    JsonSchema {
+        json_schema: JsonSchemaDefinition,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct JsonSchemaDefinition {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    pub schema: serde_json::Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strict: Option<bool>,
+}
+
 #[derive(Debug, Clone)]
 pub enum StreamEvent {
     ReasoningDelta(String),
     TextDelta(String),
+
+    // Intent memory update streaming event
+    IntentUpdated {
+        content: String,
+        explanation: Option<String>,
+    },
 
     // Semantic edit streaming events
     EditStarted,

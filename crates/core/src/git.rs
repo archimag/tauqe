@@ -107,16 +107,36 @@ pub fn create_checkpoint(dir: &Path) -> Result<CheckpointInfo> {
 /// Restores working tree back to pre-checkpoint state (used on workflow failure/cancellation).
 pub fn restore_checkpoint(dir: &Path, checkpoint: &CheckpointInfo) -> Result<()> {
     if checkpoint.created_checkpoint_commit {
-        // Soft reset: uncommits the checkpoint, leaving user modifications in working tree
-        run_git(Some(dir), &["reset", "HEAD~1"])?;
+        let head_subject = run_git(Some(dir), &["log", "-1", "--format=%s"])
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        if head_subject.starts_with("workbench-checkpoint:") {
+            // Mixed reset: uncommits the checkpoint, leaving user modifications in working tree
+            run_git(Some(dir), &["reset", "HEAD~1"])?;
+        }
     }
     Ok(())
 }
 
 /// Creates an isolated AI commit containing only the files modified by the model.
+///
+/// If a temporary checkpoint commit exists at HEAD, it is unwound (mixed reset)
+/// prior to staging changed files, ensuring user uncommitted files remain in the
+/// working tree and only `changed_files` are recorded into the AI commit.
 pub fn create_ai_commit(dir: &Path, changed_files: &[String], summary: &str) -> Result<String> {
     if changed_files.is_empty() {
         bail!("No changed files to commit");
+    }
+
+    // If HEAD is a temporary checkpoint commit, unwind it so user dirty changes remain in working tree
+    let head_subject = run_git(Some(dir), &["log", "-1", "--format=%s"])
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    if head_subject.starts_with("workbench-checkpoint:") {
+        run_git(Some(dir), &["reset", "HEAD~1"])
+            .context("Failed to unwind temporary checkpoint before creating AI commit")?;
     }
 
     // Stage touched files

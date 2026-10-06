@@ -1,6 +1,438 @@
 use std::collections::HashMap;
 
+use serde::Deserialize;
+use struson::reader::{JsonReader, JsonStreamReader};
+use workbench_protocol::StructuredChangeProposal;
+
 use crate::model::gateway::StreamEvent;
+
+/// State-machine streaming parser for Structured Output JSON edits using struson.
+///
+/// It streams the `message` field on the fly as `StreamEvent::TextDelta` while
+/// deserializing and memory-validating completed `changes[i]` elements, emitting
+/// `EditFileStarted`, `EditHunk`, and `EditFileDone`. Arbitrary field order is supported.
+pub struct JsonStreamFilter {
+    /// None = undecided; Some(true) = provider returned plain text (not JSON), stream as-is.
+    passthrough: Option<bool>,
+    buffer: String,
+    message_streamed_bytes: usize,
+    message_finished: bool,
+    processed_changes_count: usize,
+    has_emitted_edit_started: bool,
+    editable_paths: Vec<String>,
+    repo_root: std::path::PathBuf,
+    staged_contents: HashMap<String, String>,
+}
+
+impl JsonStreamFilter {
+    pub fn new(editable_paths: Vec<String>, repo_root: std::path::PathBuf) -> Self {
+        Self {
+            passthrough: None,
+            buffer: String::new(),
+            message_streamed_bytes: 0,
+            message_finished: false,
+            processed_changes_count: 0,
+            has_emitted_edit_started: false,
+            editable_paths,
+            repo_root,
+            staged_contents: HashMap::new(),
+        }
+    }
+
+    /// Process an incoming chunk of model text and generate corresponding `StreamEvent`s.
+    pub fn push_chunk(&mut self, chunk: &str) -> Vec<StreamEvent> {
+        self.buffer.push_str(chunk);
+        let mut events = Vec::new();
+
+        // 0. Decide whether the model actually produced JSON; if the provider ignored
+        // the schema and returned plain text, stream it to the user unchanged.
+        if self.passthrough.is_none() {
+            match self.buffer.chars().find(|c| !c.is_whitespace()) {
+                None => return events,
+                Some(c) => {
+                    let plain = c != '{' && c != '`';
+                    self.passthrough = Some(plain);
+                    if plain {
+                        events.push(StreamEvent::TextDelta(self.buffer.clone()));
+                        return events;
+                    }
+                }
+            }
+        } else if self.passthrough == Some(true) {
+            if !chunk.is_empty() {
+                events.push(StreamEvent::TextDelta(chunk.to_string()));
+            }
+            return events;
+        }
+
+        // 1. Stream message field deltas on the fly
+        if !self.message_finished {
+            let (delta, new_streamed, finished) =
+                extract_streamed_message(&self.buffer, self.message_streamed_bytes);
+            if let Some(d) = delta {
+                if !d.is_empty() {
+                    events.push(StreamEvent::TextDelta(d));
+                }
+            }
+            self.message_streamed_bytes = new_streamed;
+            self.message_finished = finished;
+        }
+
+        // 2. Parse top-level JSON and extract completed changes[i] via struson
+        let mut new_changes = Vec::new();
+        if let Some(brace_idx) = self.buffer.find('{') {
+            let json_bytes = &self.buffer.as_bytes()[brace_idx..];
+            let mut reader = JsonStreamReader::new(json_bytes);
+            if reader.begin_object().is_ok() {
+                'outer: while let Ok(true) = reader.has_next() {
+                    let name = match reader.next_name() {
+                        Ok(n) => n.to_string(),
+                        Err(_) => break 'outer,
+                    };
+
+                    if name == "changes" {
+                        if reader.begin_array().is_ok() {
+                            let mut current_idx = 0;
+                            while let Ok(true) = reader.has_next() {
+                                if current_idx < self.processed_changes_count {
+                                    if reader.skip_value().is_err() {
+                                        break 'outer;
+                                    }
+                                    current_idx += 1;
+                                } else {
+                                    let mut de =
+                                        struson::serde::JsonReaderDeserializer::new(&mut reader);
+                                    match StructuredChangeProposal::deserialize(&mut de) {
+                                        Ok(change) => {
+                                            self.processed_changes_count += 1;
+                                            current_idx += 1;
+                                            new_changes.push(change);
+                                        }
+                                        Err(_) => {
+                                            // Incomplete element in stream; wait for more data
+                                            break 'outer;
+                                        }
+                                    }
+                                }
+                            }
+                            if let Ok(false) = reader.has_next() {
+                                let _ = reader.end_array();
+                            }
+                        } else {
+                            break 'outer;
+                        }
+                    } else if reader.skip_value().is_err() {
+                        // Value for this property is not fully received yet
+                        break 'outer;
+                    }
+                }
+                // Do not explicitly call reader.end_object() as the streaming document
+                // may still be incomplete; JsonStreamReader drops safely without panicking.
+            }
+        }
+
+        for change in new_changes {
+            self.handle_completed_change(&change, &mut events);
+        }
+
+        events
+    }
+
+    /// Flush any remaining buffered message text when stream ends.
+    pub fn finish(self) -> Vec<StreamEvent> {
+        let mut events = Vec::new();
+        if self.passthrough == Some(true) {
+            return events;
+        }
+        if !self.message_finished {
+            let (delta, _, _) =
+                extract_streamed_message(&self.buffer, self.message_streamed_bytes);
+            if let Some(d) = delta {
+                if !d.is_empty() {
+                    events.push(StreamEvent::TextDelta(d));
+                }
+            }
+        }
+        events
+    }
+
+    fn handle_completed_change(
+        &mut self,
+        change: &StructuredChangeProposal,
+        events: &mut Vec<StreamEvent>,
+    ) {
+        if !self.has_emitted_edit_started {
+            events.push(StreamEvent::EditStarted);
+            self.has_emitted_edit_started = true;
+        }
+
+        let resolved_path = resolve_path(&change.path, &self.editable_paths);
+        let op_type = change.op.to_lowercase();
+
+        match op_type.as_str() {
+            "create" => {
+                let content = normalize_hunk(change.content.as_deref().unwrap_or_default());
+                events.push(StreamEvent::EditFileStarted {
+                    path: resolved_path.clone(),
+                    op_type: "create".to_string(),
+                });
+                events.push(StreamEvent::EditHunk {
+                    path: resolved_path.clone(),
+                    hunk_index: 0,
+                    old_text: String::new(),
+                    new_text: content.clone(),
+                });
+                self.staged_contents.insert(resolved_path.clone(), content);
+                events.push(StreamEvent::EditFileDone {
+                    path: resolved_path,
+                    status: "ok".to_string(),
+                    error: None,
+                    hunks_count: 1,
+                });
+            }
+            "delete" => {
+                events.push(StreamEvent::EditFileStarted {
+                    path: resolved_path.clone(),
+                    op_type: "delete".to_string(),
+                });
+                events.push(StreamEvent::EditFileDone {
+                    path: resolved_path,
+                    status: "ok".to_string(),
+                    error: None,
+                    hunks_count: 0,
+                });
+            }
+            _ => {
+                let old_text = normalize_hunk(change.old_text.as_deref().unwrap_or_default());
+                let new_text = normalize_hunk(
+                    change
+                        .new_text
+                        .as_deref()
+                        .filter(|s| !s.is_empty())
+                        .or(change.content.as_deref())
+                        .unwrap_or_default(),
+                );
+
+                events.push(StreamEvent::EditFileStarted {
+                    path: resolved_path.clone(),
+                    op_type: "replace".to_string(),
+                });
+
+                events.push(StreamEvent::EditHunk {
+                    path: resolved_path.clone(),
+                    hunk_index: 0,
+                    old_text: old_text.clone(),
+                    new_text: new_text.clone(),
+                });
+
+                let val_res =
+                    self.validate_hunk_in_memory(&resolved_path, &old_text, &new_text);
+                match val_res {
+                    Ok(()) => {
+                        events.push(StreamEvent::EditFileDone {
+                            path: resolved_path,
+                            status: "ok".to_string(),
+                            error: None,
+                            hunks_count: 1,
+                        });
+                    }
+                    Err(err_msg) => {
+                        events.push(StreamEvent::EditFileDone {
+                            path: resolved_path,
+                            status: "error".to_string(),
+                            error: Some(err_msg),
+                            hunks_count: 1,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    fn validate_hunk_in_memory(
+        &mut self,
+        path: &str,
+        old_text: &str,
+        new_text: &str,
+    ) -> Result<(), String> {
+        let current_content = if let Some(content) = self.staged_contents.get(path) {
+            content.clone()
+        } else {
+            let full_path = self.repo_root.join(path);
+            std::fs::read_to_string(&full_path)
+                .map_err(|e| format!("Cannot read file '{}': {}", path, e))?
+        };
+
+        let matches: Vec<(usize, &str)> = current_content.match_indices(old_text).collect();
+        if matches.is_empty() {
+            return Err("Search block not found in file".to_string());
+        }
+        if matches.len() > 1 {
+            return Err(format!(
+                "Search block matches {} times (ambiguous)",
+                matches.len()
+            ));
+        }
+
+        let (idx, _) = matches[0];
+        let mut updated = String::new();
+        updated.push_str(&current_content[..idx]);
+        updated.push_str(new_text);
+        updated.push_str(&current_content[idx + old_text.len()..]);
+        self.staged_contents.insert(path.to_string(), updated);
+
+        Ok(())
+    }
+}
+
+/// Locates the byte offset right after the opening quote of the top-level `"message"`
+/// string value. The scan is depth- and string-aware, so `"message"` occurrences nested
+/// inside `changes` (or inside string values) are ignored and key order does not matter.
+fn find_message_value_start(buffer: &str) -> Option<usize> {
+    let bytes = buffer.as_bytes();
+    let start = buffer.find('{')?;
+    let len = bytes.len();
+    let mut i = start;
+    let mut depth = 0usize;
+    let mut expect_key = false;
+
+    while i < len {
+        match bytes[i] {
+            b'{' | b'[' => {
+                depth += 1;
+                if depth == 1 {
+                    expect_key = true;
+                }
+                i += 1;
+            }
+            b'}' | b']' => {
+                depth = depth.saturating_sub(1);
+                i += 1;
+                if depth == 0 {
+                    return None;
+                }
+            }
+            b',' => {
+                if depth == 1 {
+                    expect_key = true;
+                }
+                i += 1;
+            }
+            b'"' => {
+                let str_start = i + 1;
+                let mut j = str_start;
+                let mut closed = false;
+                while j < len {
+                    match bytes[j] {
+                        b'\\' => j += 2,
+                        b'"' => {
+                            closed = true;
+                            break;
+                        }
+                        _ => j += 1,
+                    }
+                }
+                if !closed {
+                    return None;
+                }
+                if depth == 1 && expect_key {
+                    expect_key = false;
+                    if &bytes[str_start..j] == b"message" {
+                        let mut k = j + 1;
+                        while k < len && bytes[k].is_ascii_whitespace() {
+                            k += 1;
+                        }
+                        if k >= len || bytes[k] != b':' {
+                            return None;
+                        }
+                        k += 1;
+                        while k < len && bytes[k].is_ascii_whitespace() {
+                            k += 1;
+                        }
+                        if k < len && bytes[k] == b'"' {
+                            return Some(k + 1);
+                        }
+                        return None;
+                    }
+                }
+                i = j + 1;
+            }
+            _ => i += 1,
+        }
+    }
+    None
+}
+
+/// Helper function to scan unescaped characters of the "message" string property in raw JSON.
+fn extract_streamed_message(
+    buffer: &str,
+    already_streamed: usize,
+) -> (Option<String>, usize, bool) {
+    let value_start = match find_message_value_start(buffer) {
+        Some(idx) => idx,
+        None => return (None, already_streamed, false),
+    };
+
+    let content_slice = &buffer[value_start..];
+    let mut decoded = String::new();
+    let mut chars = content_slice.char_indices().peekable();
+    let mut is_finished = false;
+
+    while let Some((_, c)) = chars.next() {
+        if c == '\\' {
+            if let Some((_, next_c)) = chars.next() {
+                match next_c {
+                    '"' => decoded.push('"'),
+                    '\\' => decoded.push('\\'),
+                    '/' => decoded.push('/'),
+                    'b' => decoded.push('\x08'),
+                    'f' => decoded.push('\x0c'),
+                    'n' => decoded.push('\n'),
+                    'r' => decoded.push('\r'),
+                    't' => decoded.push('\t'),
+                    'u' => {
+                        let mut hex = String::new();
+                        for _ in 0..4 {
+                            if let Some((_, h)) = chars.next() {
+                                hex.push(h);
+                            }
+                        }
+                        if hex.len() == 4 {
+                            if let Ok(code) = u32::from_str_radix(&hex, 16) {
+                                if let Some(ch) = char::from_u32(code) {
+                                    decoded.push(ch);
+                                }
+                            }
+                        }
+                    }
+                    other => decoded.push(other),
+                }
+            } else {
+                break;
+            }
+        } else if c == '"' {
+            is_finished = true;
+            break;
+        } else {
+            decoded.push(c);
+        }
+    }
+
+    if decoded.len() > already_streamed && decoded.is_char_boundary(already_streamed) {
+        let delta = decoded[already_streamed..].to_string();
+        (Some(delta), decoded.len(), is_finished)
+    } else if decoded.len() > already_streamed {
+        let valid_idx = decoded
+            .char_indices()
+            .map(|(idx, _)| idx)
+            .find(|&idx| idx >= already_streamed)
+            .unwrap_or(decoded.len());
+        let delta = decoded[valid_idx..].to_string();
+        (Some(delta), decoded.len(), is_finished)
+    } else {
+        (None, already_streamed, is_finished)
+    }
+}
 
 /// State-machine streaming parser for XML edits.
 ///
@@ -382,8 +814,15 @@ fn extract_attr(header: &str, attr: &str) -> Option<String> {
 
 fn resolve_path(candidate: &str, editable_paths: &[String]) -> String {
     let cleaned = candidate.trim().trim_matches('`');
+    let cleaned = cleaned.strip_prefix("./").unwrap_or(cleaned);
+    let cleaned = cleaned.strip_prefix('/').unwrap_or(cleaned);
+
     for ed in editable_paths {
-        if cleaned == ed || cleaned.ends_with(ed) {
+        let ed_clean = ed.strip_prefix("./").unwrap_or(ed);
+        if cleaned == ed_clean
+            || cleaned.ends_with(&format!("/{}", ed_clean))
+            || ed_clean.ends_with(&format!("/{}", cleaned))
+        {
             return ed.clone();
         }
     }
@@ -406,4 +845,70 @@ fn normalize_hunk(raw: &str) -> String {
         }
     }
     s.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_json_stream_filter_partial_chunks_no_panic() {
+        let root = std::env::temp_dir();
+        let mut filter = JsonStreamFilter::new(vec!["test.rs".to_string()], root);
+
+        // Feed chunks byte by byte / token by token without crashing
+        let full_json = r#"{"message":"Rust is great","changes":[],"context_requests":[],"suggested_actions":[]}"#;
+        for c in full_json.chars() {
+            let s = c.to_string();
+            let _ = filter.push_chunk(&s);
+        }
+        let finish_events = filter.finish();
+        let mut text = String::new();
+        for ev in finish_events {
+            if let StreamEvent::TextDelta(d) = ev {
+                text.push_str(&d);
+            }
+        }
+    }
+
+    #[test]
+    fn test_message_after_changes_streams_both() {
+        let root = std::env::temp_dir();
+        let mut filter = JsonStreamFilter::new(vec![], root);
+        let json = r#"{"changes":[{"op":"create","path":"a.rs","old_text":"","new_text":"","content":"let m = \"message\";\n"}],"message":"Done here","context_requests":[],"suggested_actions":[]}"#;
+        let mut events = Vec::new();
+        for c in json.chars() {
+            events.extend(filter.push_chunk(&c.to_string()));
+        }
+        events.extend(filter.finish());
+        let text: String = events
+            .iter()
+            .filter_map(|e| {
+                if let StreamEvent::TextDelta(d) = e {
+                    Some(d.as_str())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(text, "Done here");
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, StreamEvent::EditFileStarted { .. })));
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, StreamEvent::EditFileDone { .. })));
+    }
+
+    #[test]
+    fn test_json_stream_filter_markdown_wrapper_no_panic() {
+        let root = std::env::temp_dir();
+        let mut filter = JsonStreamFilter::new(vec!["test.rs".to_string()], root);
+
+        let wrapped = "```json\n{\"message\": \"Hello!\", \"changes\": []}\n```";
+        let events = filter.push_chunk(wrapped);
+        assert!(!events.is_empty());
+        let finish_events = filter.finish();
+        assert!(finish_events.is_empty() || matches!(&finish_events[0], StreamEvent::TextDelta(_)));
+    }
 }

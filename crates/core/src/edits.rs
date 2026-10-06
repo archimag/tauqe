@@ -212,6 +212,7 @@ pub fn parse_workbench_edit_json(raw_text: &str) -> Option<ModelResult> {
                     return Some(ModelResult::Edit {
                         summary: raw.summary.unwrap_or_else(|| "Applied code edits".to_string()),
                         edits: raw.edits,
+                        proposal: None,
                         applied: false,
                         error: None,
                         changed_files: Vec::new(),
@@ -223,6 +224,7 @@ pub fn parse_workbench_edit_json(raw_text: &str) -> Option<ModelResult> {
                 return Some(ModelResult::Edit {
                     summary: "Malformed workbench_edit JSON".to_string(),
                     edits: Vec::new(),
+                    proposal: None,
                     applied: false,
                     error: Some(format!("Invalid JSON in workbench_edit: {}", err)),
                     changed_files: Vec::new(),
