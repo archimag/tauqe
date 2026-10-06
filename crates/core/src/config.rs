@@ -11,33 +11,6 @@ pub struct AppConfig {
     pub edit: EditConfig,
     #[serde(default)]
     pub toolchain: ToolchainConfig,
-    #[serde(default)]
-    pub intent: IntentConfig,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct IntentConfig {
-    #[serde(default = "default_intent_file")]
-    pub file_path: String,
-    #[serde(default = "default_intent_max_tokens")]
-    pub max_tokens: usize,
-}
-
-fn default_intent_file() -> String {
-    ".workbench/intent.md".to_string()
-}
-
-fn default_intent_max_tokens() -> usize {
-    2000
-}
-
-impl Default for IntentConfig {
-    fn default() -> Self {
-        Self {
-            file_path: default_intent_file(),
-            max_tokens: default_intent_max_tokens(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -115,7 +88,7 @@ pub struct EditConfig {
     #[serde(default = "default_workflow")]
     pub workflow: String, // "git", "naive", "toolchain"
     #[serde(default = "default_protocol")]
-    pub protocol: String, // "xml", "whole_file", "tool_call"
+    pub protocol: String, // "xml", "structured"
 }
 
 fn default_workflow() -> String {
@@ -194,14 +167,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_tool_call_protocol_config() {
+    fn test_structured_protocol_config() {
         let toml_str = r#"
 [edit]
 workflow = "toolchain"
-protocol = "tool_call"
+protocol = "structured"
 "#;
         let config: AppConfig = toml::from_str(toml_str).expect("Failed to parse config");
-        assert_eq!(config.edit.protocol, "tool_call");
+        assert_eq!(config.edit.protocol, "structured");
     }
 
     #[test]
@@ -250,8 +223,6 @@ available = ["x/y", "z/w"]
         assert_eq!(config.models.default, "anthropic/claude-3.5-sonnet");
         assert_eq!(config.edit.workflow, "toolchain");
         assert_eq!(config.edit.protocol, "xml");
-        assert_eq!(config.intent.file_path, ".workbench/intent.md");
-        assert_eq!(config.intent.max_tokens, 2000);
         assert!(config.providers.openrouter.is_none());
         assert!(config.toolchain.check_command.is_none());
     }

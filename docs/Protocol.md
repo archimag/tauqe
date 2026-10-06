@@ -38,7 +38,16 @@ Server owns semantics.
 
 Client не собирает prompts, не вызывает LLM напрямую, не управляет Git lifecycle и не принимает semantic решения о project model.
 
-## 3. Transport independence
+## 3. Концепция семантического протокола взаимодействия
+
+Протокол взаимодействия строится вокруг идеи **семантического шага (Semantic Turn)**:
+1. **Типизированный исход вместо слепого текста:** каждый ответ модели воспринимается средой как структурированный исход (`Answer`, `Edit`, а в дальнейшем — запрос контекста `NeedContext`, `Review`, `Clarification`).
+2. **Отказ от Tool Calling для кода:** нативные вызовы функций (`tool_call`) показали себя хрупкими при стриминге правок, конфликтуют с reasoning/thinking-режимами современных моделей (DeepSeek R1, Claude thinking) и нестабильно поддерживаются провайдерами через API. Протокол взаимодействия консолидируется вокруг двух надежных форматов:
+   - **`xml` (основной):** потоковый псевдо-XML, естественно совмещающий свободные рассуждения модели и структурированные блоки (`<workbench_edits>`, `<edit>`, `<create>`, `<delete>`, `<search>`, `<replace>`). Валидируется на лету без блокировки вывода.
+   - **`structured` (схемный):** строгий JSON Schema (Structured Output), потоково парсимый через токенизатор без буферизации всего ответа.
+3. **Целостность и идемпотентность:** среда транслирует клиенту семантические события по мере их распознавания в потоке, но фиксация на диск и в Git происходит атомарно только после полной успешной валидации всех изменений.
+
+## 4. Transport independence
 
 Protocol types не зависят от transport.
 
@@ -56,7 +65,7 @@ Protocol types не зависят от transport.
 
 Semantic protocol должен оставаться одинаковым.
 
-## 4. Message model
+## 5. Message model
 
 Protocol строится как request/response + events.
 
@@ -70,7 +79,7 @@ Event
 
 Используется модель JSON-RPC 2.0.
 
-## 5. Request envelope
+## 6. Request envelope
 
 ```json
 {
@@ -82,7 +91,7 @@ Event
 }
 ```
 
-## 6. Response envelope
+## 7. Response envelope
 
 ```json
 {
@@ -100,14 +109,14 @@ Event
   "id": 42,
   "error": {
     "code": "OPERATION_IN_PROGRESS",
-    "message": "Cannot change workflow or edit protocol while a model operation is in progress"
+    "message": "Cannot change workflow, edit protocol or model while a model operation is in progress"
   }
 }
 ```
 
 Domain failure, например failed tests, не является protocol error.
 
-## 7. Event envelope
+## 8. Event envelope
 
 ```json
 {
@@ -119,7 +128,7 @@ Domain failure, например failed tests, не является protocol er
 }
 ```
 
-## 8. Versioning and initialize
+## 9. Versioning and initialize
 
 Client и server выполняют handshake через `client/initialize`.
 
@@ -150,7 +159,7 @@ Server отвечает:
   "workflow": "toolchain",
   "edit_protocol": "xml",
   "available_workflows": ["toolchain", "git", "naive"],
-  "available_edit_protocols": ["xml", "whole_file", "tool_call"],
+  "available_edit_protocols": ["xml", "structured"],
   "available_models": ["anthropic/claude-3.5-sonnet", "openai/gpt-4o"]
 }
 ```
@@ -159,9 +168,9 @@ Server отвечает:
 
 До `1.0` protocol может intentionally break compatibility.
 
-## 9. Configuration methods & events
+## 10. Configuration methods & events
 
-### 9.1 config/get
+### 10.1 config/get
 Возвращает текущие настройки выполнения и поддерживаемые списки:
 ```json
 {
@@ -170,18 +179,18 @@ Server отвечает:
   "workflow": "toolchain",
   "edit_protocol": "xml",
   "available_workflows": ["toolchain", "git", "naive"],
-  "available_edit_protocols": ["xml", "whole_file", "tool_call"]
+  "available_edit_protocols": ["xml", "structured"]
 }
 ```
 
-### 9.2 config/set
-Изменяет текущий рабочий процесс или протокол редактирования:
+### 10.2 config/set
+Изменяет текущий рабочий процесс, протокол редактирования или активную модель:
 ```json
 {
   "method": "config/set",
   "params": {
     "workflow": "git",
-    "edit_protocol": "tool_call",
+    "edit_protocol": "structured",
     "model": "openai/gpt-4o"
   }
 }
@@ -189,23 +198,23 @@ Server отвечает:
 *Инвариант:* если в данный момент выполняется генерация модели, сервер возвращает ошибку `OPERATION_IN_PROGRESS`.
 Значение `model` валидируется по `available_models`; неизвестная модель приводит к ошибке `INVALID_MODEL`. Выбранная модель используется последующими вызовами `model/ask`.
 
-### 9.3 config/changed
+### 10.3 config/changed
 Событие рассылается всем клиентам при изменении настроек:
 ```json
 {
   "method": "config/changed",
   "params": {
     "workflow": "git",
-    "edit_protocol": "tool_call",
+    "edit_protocol": "structured",
     "model": "openai/gpt-4o",
     "available_models": ["anthropic/claude-3.5-sonnet", "openai/gpt-4o"],
     "available_workflows": ["toolchain", "git", "naive"],
-    "available_edit_protocols": ["xml", "whole_file", "tool_call"]
+    "available_edit_protocols": ["xml", "structured"]
   }
 }
 ```
 
-## 10. Repository methods
+## 11. Repository methods
 
 ```text
 repository/getState
@@ -220,7 +229,7 @@ repository/listFiles
 
 `repository/listFiles` возвращает плоский список всех отслеживаемых файлов репозитория.
 
-## 11. Context methods & events
+## 12. Context methods & events
 
 ```text
 context/get
@@ -231,7 +240,7 @@ context/setAccess
 context/clear
 ```
 
-### 11.1 context/addPattern
+### 12.1 context/addPattern
 Пакетное добавление файлов по glob-маске или префиксу директории:
 ```json
 {
@@ -251,7 +260,7 @@ context/clear
 }
 ```
 
-### 11.2 context/changed
+### 12.2 context/changed
 Событие рассылается клиентам при любом изменении состава или прав файлов контекста:
 ```json
 {
@@ -273,7 +282,7 @@ context/clear
 }
 ```
 
-## 12. Model operation methods
+## 13. Model operation methods
 
 ```text
 model/ask
@@ -291,7 +300,7 @@ model/clearHistory
 }
 ```
 
-## 13. Model & Reasoning events
+## 14. Model & Reasoning events
 
 ```text
 model/started
@@ -305,17 +314,17 @@ model/error
 ```
 
 - `model/reasoningDelta`: стриминг рассуждений модели (thinking/reasoning).
-- `model/textDelta`: чистый текст ответа без сырых тегов разметки правок.
+- `model/textDelta`: чистый текст ответа без служебной разметки правок.
 - `model/usage`: оперативные данные о токенах и точной стоимости (`cost` в USD) за запрос и суммарно за сессию (`session_total_cost`).
 
-## 14. Structured Edit Streaming events
+## 15. Structured Edit Streaming events
 
 Во время генерации кода сервером клиенту отправляются семантические события:
 
-### 14.1 edit/started
+### 15.1 edit/started
 Сигнализирует о начале блока правок в ответе модели.
 
-### 14.2 edit/fileStarted
+### 15.2 edit/fileStarted
 Начало генерации изменений конкретного файла.
 ```json
 {
@@ -329,7 +338,7 @@ model/error
 ```
 `op_type`: `"replace"`, `"create"`, `"delete"`.
 
-### 14.3 edit/hunk
+### 15.3 edit/hunk
 Потоковое получение готового чанка search/replace:
 ```json
 {
@@ -344,7 +353,7 @@ model/error
 }
 ```
 
-### 14.4 edit/fileDone
+### 15.4 edit/fileDone
 Завершение обработки файла и результат промежуточной валидации в памяти сервера:
 ```json
 {
@@ -359,7 +368,7 @@ model/error
 ```
 При ошибке сопоставления передаются `status: "error"` и `error: "..."`.
 
-### 14.5 edit/finished
+### 15.5 edit/finished
 Финальное событие атомарного применения изменений:
 ```json
 {
@@ -373,11 +382,11 @@ model/error
 }
 ```
 
-## 15. Toolchain events
+## 16. Toolchain events
 
 В воркфлоу `toolchain` транслируются события детерминированной проектной проверки:
 
-### 15.1 toolchain/started
+### 16.1 toolchain/started
 ```json
 {
   "method": "toolchain/started",
@@ -388,7 +397,7 @@ model/error
 }
 ```
 
-### 15.2 toolchain/result
+### 16.2 toolchain/result
 ```json
 {
   "method": "toolchain/result",
@@ -401,7 +410,7 @@ model/error
 }
 ```
 
-## 16. Git methods & events
+## 17. Git methods & events
 
 ### Methods:
 - `git/getDiff`: получение unified diff между коммитами или рабочего дерева.
@@ -423,7 +432,7 @@ model/error
 - `git/commitCreated`: фиксация AI-коммита (`commit_hash`, `summary`, `changed_files`).
 - `git/undoCompleted`: уведомление об успешном откате коммита и восстановлении чекпоинта.
 
-## 17. В protocol нет agent shell
+## 18. В protocol нет agent shell
 
 Это фундаментальный инвариант архитектуры.
 В протоколе намеренно отсутствуют методы вида `agent/runShell`, `model/runCommand`, `agent/exec`.

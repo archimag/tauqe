@@ -143,12 +143,6 @@ pub enum StreamEvent {
     ReasoningDelta(String),
     TextDelta(String),
 
-    // Intent memory update streaming event
-    IntentUpdated {
-        content: String,
-        explanation: Option<String>,
-    },
-
     // Semantic edit streaming events
     EditStarted,
     EditFileStarted {

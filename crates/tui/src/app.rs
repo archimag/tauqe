@@ -1,6 +1,4 @@
-use workbench_protocol::{
-    matches_glob_pattern, ContextState, IntentState, RepositoryState,
-};
+use workbench_protocol::{matches_glob_pattern, ContextState, RepositoryState};
 
 use crate::context_view::ContextViewState;
 use crate::editor::InputEditor;
@@ -24,7 +22,6 @@ pub struct SelectionDialogState {
 pub enum ViewMode {
     Model,
     Context,
-    Intent,
 }
 
 pub struct AppState {
@@ -41,8 +38,6 @@ pub struct AppState {
     pub model: ModelView,
     pub context: ContextState,
     pub context_view: ContextViewState,
-    pub intent: IntentState,
-    pub intent_scroll: u16,
     pub input_editor: InputEditor,
     pub show_help: bool,
     pub confirm_undo: bool,
@@ -78,8 +73,9 @@ impl AppState {
         self.model.selected_file_index = 0;
         self.model.edit_final_applied = None;
         self.model.edit_final_error = None;
+        self.model.last_commit_hash = None;
+        self.model.last_commit_summary = None;
         self.model.git_notification = None;
-        self.model.intent_notification = None;
         self.model.toolchain_command = None;
         self.model.toolchain_status = None;
 

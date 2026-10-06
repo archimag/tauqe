@@ -11,7 +11,7 @@ pub mod stream;
 
 pub use protocol::{
     CustomSearchReplaceEditProtocol, EditProtocol, EditProtocolFactory, SearchReplaceMarkers,
-    WholeFileEditProtocol, XmlEditProtocol,
+    XmlEditProtocol,
 };
 pub use stream::XmlStreamFilter;
 

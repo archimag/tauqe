@@ -28,8 +28,8 @@ use workbench_protocol::{
     events, methods, ConfigSetParams, ConfigState, ContextAccess, ContextAddParams,
     ContextAddPatternParams, ContextAddPatternResult, ContextRemoveParams, ContextSetAccessParams,
     ContextState, EditFileDoneEvent, EditFileStartedEvent, EditFinishedEvent, EditHunkEvent, Event,
-    GitCommitCreatedEvent, GitUndoResult, InitializeParams, InitializeResult, IntentChangedEvent,
-    IntentState, Message, ModelAskParams, ModelDeltaEvent, ModelErrorEvent, ModelFinishedEvent,
+    GitCommitCreatedEvent, GitUndoResult, InitializeParams, InitializeResult,
+    Message, ModelAskParams, ModelDeltaEvent, ModelErrorEvent, ModelFinishedEvent,
     ModelResultEvent, ModelStartedEvent, ModelUsageEvent, RepositoryListFilesResult,
     RepositoryState, Request, RequestId, Response, ToolchainResultEvent, ToolchainStartedEvent,
     PROTOCOL_VERSION,
@@ -161,7 +161,7 @@ async fn main() -> anyhow::Result<()> {
         init_result.available_workflows
     };
     let available_edit_protocols = if init_result.available_edit_protocols.is_empty() {
-        vec!["xml".to_string(), "whole_file".to_string(), "tool_call".to_string()]
+        vec!["xml".to_string(), "structured".to_string()]
     } else {
         init_result.available_edit_protocols
     };
@@ -175,7 +175,6 @@ async fn main() -> anyhow::Result<()> {
     } else {
         init_result.available_models
     };
-    let initial_intent = init_result.intent.unwrap_or_default();
 
     // Initial context fetch
     let ctx_req = Request {
@@ -240,8 +239,6 @@ async fn main() -> anyhow::Result<()> {
         model: ModelView::default(),
         context: initial_context,
         context_view: ContextViewState::default(),
-        intent: initial_intent,
-        intent_scroll: 0,
         input_editor: InputEditor::default(),
         show_help: false,
         confirm_undo: false,
@@ -433,11 +430,6 @@ async fn main() -> anyhow::Result<()> {
                             st.context_view.status_message = None;
                             continue;
                         }
-                        KeyCode::Char('3') => {
-                            st.view_mode = ViewMode::Intent;
-                            st.context_view.status_message = None;
-                            continue;
-                        }
                         KeyCode::Char('c') => {
                             drop(st);
                             send_request(&mut server_writer, methods::MODEL_CANCEL, serde_json::json!({})).await?;
@@ -617,8 +609,7 @@ async fn main() -> anyhow::Result<()> {
                 if key.code == KeyCode::Tab && !st.context_view.adding_file && (st.input_editor.is_empty() || st.view_mode != ViewMode::Model) {
                     st.view_mode = match st.view_mode {
                         ViewMode::Model => ViewMode::Context,
-                        ViewMode::Context => ViewMode::Intent,
-                        ViewMode::Intent => ViewMode::Model,
+                        ViewMode::Context => ViewMode::Model,
                     };
                     st.context_view.status_message = None;
                     continue;
@@ -930,30 +921,6 @@ async fn main() -> anyhow::Result<()> {
                             }
                         }
                     }
-                    ViewMode::Intent => {
-                        match key.code {
-                            KeyCode::Esc | KeyCode::Char('q') => {
-                                st.view_mode = ViewMode::Model;
-                            }
-                            KeyCode::Up | KeyCode::Char('k') => {
-                                st.intent_scroll = st.intent_scroll.saturating_sub(1);
-                            }
-                            KeyCode::Down | KeyCode::Char('j') => {
-                                st.intent_scroll = st.intent_scroll.saturating_add(1);
-                            }
-                            KeyCode::PageUp => {
-                                st.intent_scroll = st.intent_scroll.saturating_sub(10);
-                            }
-                            KeyCode::PageDown => {
-                                st.intent_scroll = st.intent_scroll.saturating_add(10);
-                            }
-                            KeyCode::Char('c') => {
-                                drop(st);
-                                send_request(&mut server_writer, methods::INTENT_CLEAR, serde_json::json!({})).await?;
-                            }
-                            _ => {}
-                        }
-                    }
                 }
             }
             Some(msg) = msg_rx.recv() => {
@@ -1031,8 +998,6 @@ async fn handle_response(resp: Response, state: &Arc<Mutex<AppState>>) {
             if !cfg.available_edit_protocols.is_empty() {
                 st.available_edit_protocols = cfg.available_edit_protocols;
             }
-        } else if let Ok(intent_state) = serde_json::from_value::<IntentState>(val.clone()) {
-            st.intent = intent_state;
         } else if let Ok(undo_res) = serde_json::from_value::<GitUndoResult>(val.clone()) {
             st.model.git_notification = Some(undo_res.message.clone());
             st.model.last_commit_hash = None;
@@ -1114,16 +1079,6 @@ async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>) {
                 }
             }
         }
-        events::INTENT_CHANGED => {
-            if let Some(params) = ev.params {
-                if let Ok(data) = serde_json::from_value::<IntentChangedEvent>(params) {
-                    st.intent = data.state;
-                    if let Some(expl) = data.explanation {
-                        st.model.intent_notification = Some(format!("Intent updated: {}", expl));
-                    }
-                }
-            }
-        }
         events::CONTEXT_CHANGED => {
             if let Some(params) = ev.params {
                 if let Some(val) = params.get("state") {
@@ -1152,6 +1107,8 @@ async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>) {
                     st.model.selected_file_index = 0;
                     st.model.edit_final_applied = None;
                     st.model.edit_final_error = None;
+                    st.model.last_commit_hash = None;
+                    st.model.last_commit_summary = None;
                     st.model.auto_scroll = true;
                 }
             }

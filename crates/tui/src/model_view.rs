@@ -47,7 +47,6 @@ pub struct ModelView {
     pub last_commit_hash: Option<String>,
     pub last_commit_summary: Option<String>,
     pub git_notification: Option<String>,
-    pub intent_notification: Option<String>,
     pub toolchain_command: Option<String>,
     pub toolchain_status: Option<String>,
     pub spinner_frame: usize,
@@ -79,7 +78,6 @@ impl Default for ModelView {
             last_commit_hash: None,
             last_commit_summary: None,
             git_notification: None,
-            intent_notification: None,
             toolchain_command: None,
             toolchain_status: None,
             spinner_frame: 0,
@@ -119,14 +117,6 @@ pub fn compute_model_lines(model: &ModelView) -> Vec<Line<'static>> {
         model_lines.push(Line::from(vec![
             Span::raw("Error: "),
             Span::styled(err.clone(), Style::default().fg(Color::Red)),
-        ]));
-    }
-
-    if let Some(intent_notif) = &model.intent_notification {
-        model_lines.push(Line::from(vec![
-            Span::styled(" [INTENT MEMORY] ", Style::default().bg(Color::Blue).fg(Color::White).bold()),
-            Span::raw(" "),
-            Span::styled(intent_notif.clone(), Style::default().fg(Color::Cyan)),
         ]));
     }
 
@@ -237,7 +227,7 @@ pub fn compute_model_lines(model: &ModelView) -> Vec<Line<'static>> {
         for (idx, file) in model.files.iter().enumerate() {
             let is_selected = idx == model.selected_file_index;
             let fold_icon = if file.expanded { "▼ " } else { "▶ " };
-            let cursor_prefix = if is_selected { "● " } else { "  " };
+            let cursor_prefix = if is_selected { "> " } else { "  " };
 
             let (status_icon, status_style) = match file.status.as_str() {
                 "ok" => ("✓", Style::default().fg(Color::Green).bold()),

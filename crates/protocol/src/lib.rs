@@ -17,10 +17,6 @@ pub mod methods {
     pub const CONTEXT_SET_ACCESS: &str = "context/setAccess";
     pub const CONTEXT_CLEAR: &str = "context/clear";
 
-    pub const INTENT_GET: &str = "intent/get";
-    pub const INTENT_SET: &str = "intent/set";
-    pub const INTENT_CLEAR: &str = "intent/clear";
-
     pub const GIT_UNDO: &str = "git/undo";
     pub const GIT_GET_DIFF: &str = "git/getDiff";
 
@@ -39,7 +35,6 @@ pub mod events {
     pub const MODEL_ERROR: &str = "model/error";
 
     pub const CONTEXT_CHANGED: &str = "context/changed";
-    pub const INTENT_CHANGED: &str = "intent/changed";
 
     pub const EDIT_STARTED: &str = "edit/started";
     pub const EDIT_FILE_STARTED: &str = "edit/fileStarted";
@@ -128,8 +123,6 @@ pub struct InitializeResult {
     pub available_edit_protocols: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub available_models: Vec<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub intent: Option<IntentState>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -230,27 +223,6 @@ pub struct ContextSetAccessParams {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContextChangedEvent {
     pub state: ContextState,
-}
-
-// Intent Memory Types
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct IntentState {
-    pub content: String,
-    pub estimated_tokens: u64,
-    pub max_tokens: usize,
-    pub file_path: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct IntentSetParams {
-    pub content: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct IntentChangedEvent {
-    pub state: IntentState,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub explanation: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

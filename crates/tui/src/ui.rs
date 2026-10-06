@@ -54,12 +54,6 @@ pub fn render_ui(frame: &mut ratatui::Frame, state: &mut AppState) {
         Style::default().fg(Color::DarkGray)
     };
 
-    let intent_tab_style = if state.view_mode == ViewMode::Intent {
-        Style::default().bg(Color::Blue).fg(Color::White).bold()
-    } else {
-        Style::default().fg(Color::DarkGray)
-    };
-
     let header_line = Line::from(vec![
         Span::styled(" WORKBENCH ", Style::default().bg(Color::Cyan).fg(Color::Black).bold()),
         Span::raw("  "),
@@ -68,11 +62,6 @@ pub fn render_ui(frame: &mut ratatui::Frame, state: &mut AppState) {
         Span::styled(
             format!(" 2: Context ({}) ", state.context.items.len()),
             context_tab_style,
-        ),
-        Span::raw(" "),
-        Span::styled(
-            format!(" 3: Intent (~{} t) ", state.intent.estimated_tokens),
-            intent_tab_style,
         ),
         Span::raw(" | Project: "),
         Span::styled(project_name, Style::default().bold()),
@@ -225,7 +214,7 @@ pub fn render_ui(frame: &mut ratatui::Frame, state: &mut AppState) {
             frame.render_widget(input_paragraph, chunks[2]);
 
             let footer_line = Line::from(vec![
-                Span::styled(" Ctrl+1/2/3 ", Style::default().bg(Color::DarkGray).fg(Color::White).bold()),
+                Span::styled(" Ctrl+1/2 ", Style::default().bg(Color::DarkGray).fg(Color::White).bold()),
                 Span::raw(" Switch  "),
                 Span::styled(" Ctrl+W ", Style::default().bg(Color::DarkGray).fg(Color::White).bold()),
                 Span::raw(" Wf  "),
@@ -319,7 +308,7 @@ pub fn render_ui(frame: &mut ratatui::Frame, state: &mut AppState) {
             frame.render_widget(prompt_widget, chunks[2]);
 
             let footer_line = Line::from(vec![
-                Span::styled(" Ctrl+1/2/3 ", Style::default().bg(Color::DarkGray).fg(Color::White).bold()),
+                Span::styled(" Ctrl+1/2 ", Style::default().bg(Color::DarkGray).fg(Color::White).bold()),
                 Span::raw(" Switch  "),
                 Span::styled(" e ", Style::default().bg(Color::DarkGray).fg(Color::White).bold()),
                 Span::raw(" Add Edit  "),
@@ -338,91 +327,6 @@ pub fn render_ui(frame: &mut ratatui::Frame, state: &mut AppState) {
             if state.context_view.adding_file {
                 render_add_file_picker(frame, state);
             }
-        }
-        ViewMode::Intent => {
-            let mut intent_lines: Vec<Line> = Vec::new();
-
-            intent_lines.push(Line::from(vec![
-                Span::raw("File: "),
-                Span::styled(
-                    if state.intent.file_path.is_empty() {
-                        ".workbench/intent.md".to_string()
-                    } else {
-                        state.intent.file_path.clone()
-                    },
-                    Style::default().bold().fg(Color::Cyan),
-                ),
-                Span::raw(" | Tokens: "),
-                Span::styled(
-                    format!("~{} / {} tokens", state.intent.estimated_tokens, state.intent.max_tokens),
-                    if (state.intent.estimated_tokens as usize) > state.intent.max_tokens {
-                        Style::default().fg(Color::Red).bold()
-                    } else {
-                        Style::default().fg(Color::Green).bold()
-                    },
-                ),
-            ]));
-            intent_lines.push(Line::raw(""));
-
-            if state.intent.content.trim().is_empty() {
-                intent_lines.push(Line::from(Span::styled(
-                    "No intent memory recorded yet.",
-                    Style::default().bold().fg(Color::DarkGray),
-                )));
-                intent_lines.push(Line::raw(""));
-                intent_lines.push(Line::from(Span::styled(
-                    "How Intent Memory works:",
-                    Style::default().fg(Color::Yellow).bold(),
-                )));
-                intent_lines.push(Line::from("  • The model automatically updates this memory during chat via tool call `update_intent_memory`."));
-                intent_lines.push(Line::from("  • It records tacit developer preferences, rejected alternatives, active task vectors, and conventions."));
-                intent_lines.push(Line::from("  • It does NOT duplicate code or documentation already in the repository."));
-                intent_lines.push(Line::from("  • When items are completed or codified into docs, they are pruned automatically."));
-            } else {
-                for line in state.intent.content.lines() {
-                    if line.starts_with('#') {
-                        intent_lines.push(Line::from(Span::styled(line.to_string(), Style::default().bold().fg(Color::Yellow))));
-                    } else if line.trim_start().starts_with('-') || line.trim_start().starts_with('*') {
-                        intent_lines.push(Line::from(vec![
-                            Span::styled("  • ", Style::default().fg(Color::Cyan)),
-                            Span::raw(line.trim_start_matches(|c: char| c == '-' || c == '*' || c.is_whitespace()).to_string()),
-                        ]));
-                    } else {
-                        intent_lines.push(Line::from(Span::raw(line.to_string())));
-                    }
-                }
-            }
-
-            let intent_paragraph = Paragraph::new(intent_lines)
-                .block(Block::default().title(" Persistent Intent Memory (Between Sessions) ").borders(Borders::ALL))
-                .wrap(Wrap { trim: false })
-                .scroll((state.intent_scroll, 0));
-            frame.render_widget(intent_paragraph, chunks[1]);
-
-            let hint_line = Line::from(vec![
-                Span::styled(" Auto-updated by LLM tool ", Style::default().fg(Color::Cyan).bold()),
-                Span::raw(" | Press "),
-                Span::styled(" 'c' ", Style::default().bg(Color::Red).fg(Color::White).bold()),
-                Span::raw(" to Clear Intent Memory | "),
-                Span::styled(" ↑/↓, PgUp/PgDn ", Style::default().bold()),
-                Span::raw(" to Scroll"),
-            ]);
-            let hint_widget = Paragraph::new(hint_line)
-                .block(Block::default().title(" Actions ").borders(Borders::ALL));
-            frame.render_widget(hint_widget, chunks[2]);
-
-            let footer_line = Line::from(vec![
-                Span::styled(" Ctrl+1/2/3 ", Style::default().bg(Color::DarkGray).fg(Color::White).bold()),
-                Span::raw(" Switch  "),
-                Span::styled(" c ", Style::default().bg(Color::DarkGray).fg(Color::White).bold()),
-                Span::raw(" Clear Memory  "),
-                Span::styled(" Esc / q ", Style::default().bg(Color::DarkGray).fg(Color::White).bold()),
-                Span::raw(" Back to Model  "),
-                Span::styled(" ? ", Style::default().bg(Color::DarkGray).fg(Color::White).bold()),
-                Span::raw(" Help"),
-            ]);
-            let footer = Paragraph::new(footer_line).block(Block::default().borders(Borders::ALL));
-            frame.render_widget(footer, chunks[3]);
         }
     }
 
@@ -621,7 +525,6 @@ pub fn render_help_popup(frame: &mut ratatui::Frame, mode: ViewMode) {
                 Line::from(Span::styled("Global Navigation", Style::default().fg(Color::Cyan).bold())),
                 Line::from("  Ctrl+1        Switch directly to Model view"),
                 Line::from("  Ctrl+2        Switch directly to Context view (preserves input)"),
-                Line::from("  Ctrl+3        Switch directly to Intent Memory view"),
                 Line::from("  Tab           Switch between views (if input empty)"),
                 Line::from("  Esc / q       Close help / Cancel operation / Exit"),
                 Line::from("  ?             Toggle this help popup"),
@@ -660,7 +563,6 @@ pub fn render_help_popup(frame: &mut ratatui::Frame, mode: ViewMode) {
                 Line::from(Span::styled("Global Navigation", Style::default().fg(Color::Cyan).bold())),
                 Line::from("  Ctrl+1        Switch directly to Model view"),
                 Line::from("  Ctrl+2        Switch directly to Context view"),
-                Line::from("  Ctrl+3        Switch directly to Intent Memory view"),
                 Line::from("  Tab           Switch between views"),
                 Line::from("  Esc / q       Back to Model view / Close help"),
                 Line::from("  ?             Toggle this help popup"),
@@ -678,24 +580,6 @@ pub fn render_help_popup(frame: &mut ratatui::Frame, mode: ViewMode) {
                 Line::from("  Tab           Autocomplete path into input"),
                 Line::from("  Enter         Add highlighted file or all matching files"),
                 Line::from("  Esc           Cancel picker"),
-            ],
-        ),
-        ViewMode::Intent => (
-            " Help: Intent Memory View ",
-            vec![
-                Line::from(Span::styled("Global Navigation", Style::default().fg(Color::Cyan).bold())),
-                Line::from("  Ctrl+1        Switch directly to Model view"),
-                Line::from("  Ctrl+2        Switch directly to Context view"),
-                Line::from("  Ctrl+3        Switch directly to Intent Memory view"),
-                Line::from("  Tab           Switch between views"),
-                Line::from("  Esc / q       Back to Model view / Close help"),
-                Line::from("  ?             Toggle this help popup"),
-                Line::raw(""),
-                Line::from(Span::styled("Intent Memory Management", Style::default().fg(Color::Yellow).bold())),
-                Line::from("  ↑ / ↓ (k / j) Scroll intent content line by line"),
-                Line::from("  PgUp / PgDn   Scroll intent content by page"),
-                Line::from("  c             Clear intent memory (deletes .workbench/intent.md)"),
-                Line::from("  Tool calling  The model updates this automatically via `update_intent_memory`"),
             ],
         ),
     };

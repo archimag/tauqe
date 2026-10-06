@@ -8,14 +8,13 @@ use workbench_core::context::ContextManager;
 use workbench_core::edits::{EditProtocolFactory, XmlEditProtocol};
 use workbench_core::model::gateway::{ChatMessage, StreamEvent};
 use workbench_core::model::openrouter::OpenRouterClient;
-use workbench_core::prompt::IntentManager;
 use workbench_core::workflow::{ToolchainEditWorkflow, WorkflowFactory};
 use workbench_protocol::{
     events, methods, ConfigSetParams, ConfigState, ContextAddParams, ContextAddPatternParams,
     ContextAddPatternResult, ContextRemoveParams, ContextSetAccessParams, EditFileDoneEvent,
     EditFileStartedEvent, EditFinishedEvent, EditHunkEvent, EditStartedEvent, Event,
-    GitCommitCreatedEvent, GitDiffParams, GitDiffResult, InitializeResult, IntentChangedEvent,
-    IntentSetParams, ModelAskParams, ModelResultEvent, RepositoryListFilesResult, Request,
+    GitCommitCreatedEvent, GitDiffParams, GitDiffResult, InitializeResult,
+    ModelAskParams, ModelResultEvent, RepositoryListFilesResult, Request,
     RequestId, Response, ResponseError, ToolchainResultEvent, ToolchainStartedEvent,
     PROTOCOL_VERSION,
 };
@@ -25,7 +24,6 @@ struct ModelSession {
     active_cancel: Option<watch::Sender<bool>>,
     total_cost: f64,
     context_manager: ContextManager,
-    intent_manager: IntentManager,
 }
 
 struct AppState {
@@ -41,12 +39,6 @@ async fn main() -> anyhow::Result<()> {
     let repo_state = workbench_core::git::get_repository_state(None);
     let repo_path = PathBuf::from(repo_state.root);
 
-    let intent_mgr = IntentManager::new(
-        repo_path.clone(),
-        config.intent.file_path.clone(),
-        config.intent.max_tokens,
-    );
-
     let state = Arc::new(AppState {
         config: Mutex::new(config),
         session: Mutex::new(ModelSession {
@@ -54,7 +46,6 @@ async fn main() -> anyhow::Result<()> {
             active_cancel: None,
             total_cost: 0.0,
             context_manager: ContextManager::new(repo_path),
-            intent_manager: intent_mgr,
         }),
     });
 
@@ -106,13 +97,7 @@ async fn handle_request(req: Request, state: &Arc<AppState>) -> Response {
                 *cfg = load_config(Some(repo_path));
                 let mut session = state.session.lock().await;
                 session.context_manager.set_repo_root(repo_path.to_path_buf());
-                session.intent_manager.set_repo_root(repo_path.to_path_buf());
             }
-
-            let intent_state = {
-                let session = state.session.lock().await;
-                session.intent_manager.get_state()
-            };
 
             let result = InitializeResult {
                 protocol_version: PROTOCOL_VERSION.to_string(),
@@ -125,7 +110,6 @@ async fn handle_request(req: Request, state: &Arc<AppState>) -> Response {
                 available_models: cfg.models.available.clone(),
                 available_workflows: WorkflowFactory::available_workflows(),
                 available_edit_protocols: EditProtocolFactory::available_protocols(),
-                intent: Some(intent_state),
             };
             Response {
                 id: req.id,
@@ -161,83 +145,6 @@ async fn handle_request(req: Request, state: &Arc<AppState>) -> Response {
                         data: None,
                     }),
                 },
-            }
-        }
-        methods::INTENT_GET => {
-            let mut session = state.session.lock().await;
-            let _ = session.intent_manager.load();
-            let state_val = session.intent_manager.get_state();
-            Response {
-                id: req.id,
-                result: Some(serde_json::to_value(state_val).unwrap()),
-                error: None,
-            }
-        }
-        methods::INTENT_SET => {
-            let params: IntentSetParams = match req.params.and_then(|p| serde_json::from_value(p).ok()) {
-                Some(p) => p,
-                None => {
-                    return Response {
-                        id: req.id,
-                        result: None,
-                        error: Some(ResponseError {
-                            code: "INVALID_PARAMS".to_string(),
-                            message: "Missing or invalid content parameter".to_string(),
-                            data: None,
-                        }),
-                    };
-                }
-            };
-
-            let intent_state = {
-                let mut session = state.session.lock().await;
-                if let Err(e) = session.intent_manager.set_content(params.content) {
-                    return Response {
-                        id: req.id,
-                        result: None,
-                        error: Some(ResponseError {
-                            code: "INTENT_SAVE_FAILED".to_string(),
-                            message: e.to_string(),
-                            data: None,
-                        }),
-                    };
-                }
-                session.intent_manager.get_state()
-            };
-
-            send_event(&Event {
-                method: events::INTENT_CHANGED.to_string(),
-                params: Some(serde_json::to_value(IntentChangedEvent {
-                    state: intent_state.clone(),
-                    explanation: Some("Updated manually by user".to_string()),
-                }).unwrap()),
-            }).await;
-
-            Response {
-                id: req.id,
-                result: Some(serde_json::to_value(intent_state).unwrap()),
-                error: None,
-            }
-        }
-        methods::INTENT_CLEAR => {
-            let intent_state = {
-                let mut session = state.session.lock().await;
-                let _ = session.intent_manager.clear();
-                session.intent_manager.get_state()
-            };
-
-            send_event(&Event {
-                method: events::INTENT_CHANGED.to_string(),
-                params: Some(serde_json::to_value(IntentChangedEvent {
-                    state: intent_state.clone(),
-                    explanation: Some("Cleared by user".to_string()),
-                }).unwrap()),
-            }).await;
-
-            Response {
-                id: req.id,
-                result: Some(serde_json::to_value(intent_state).unwrap()),
-                error: None,
             }
         }
         methods::GIT_UNDO => {
@@ -809,22 +716,6 @@ async fn handle_request(req: Request, state: &Arc<AppState>) -> Response {
                                     "operation_id": op_id_for_spawn,
                                     "delta": delta,
                                 })),
-                            };
-                            send_event(&ev).await;
-                        }
-                        StreamEvent::IntentUpdated { content, explanation } => {
-                            let intent_state = {
-                                let mut session = state_for_spawn.session.lock().await;
-                                let _ = session.intent_manager.set_content(content);
-                                session.intent_manager.get_state()
-                            };
-
-                            let ev = Event {
-                                method: events::INTENT_CHANGED.to_string(),
-                                params: Some(serde_json::to_value(IntentChangedEvent {
-                                    state: intent_state,
-                                    explanation,
-                                }).unwrap()),
                             };
                             send_event(&ev).await;
                         }

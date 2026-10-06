@@ -19,6 +19,7 @@ pub struct JsonStreamFilter {
     message_finished: bool,
     processed_changes_count: usize,
     has_emitted_edit_started: bool,
+    started_change_index: Option<usize>,
     editable_paths: Vec<String>,
     repo_root: std::path::PathBuf,
     staged_contents: HashMap<String, String>,
@@ -33,6 +34,7 @@ impl JsonStreamFilter {
             message_finished: false,
             processed_changes_count: 0,
             has_emitted_edit_started: false,
+            started_change_index: None,
             editable_paths,
             repo_root,
             staged_contents: HashMap::new(),
@@ -131,8 +133,32 @@ impl JsonStreamFilter {
             }
         }
 
-        for change in new_changes {
-            self.handle_completed_change(&change, &mut events);
+        let start_processed = self.processed_changes_count.saturating_sub(new_changes.len());
+        for (i, change) in new_changes.into_iter().enumerate() {
+            let change_idx = start_processed + i;
+            let already_started = self.started_change_index == Some(change_idx);
+            self.handle_completed_change(&change, already_started, &mut events);
+            if already_started {
+                self.started_change_index = None;
+            }
+        }
+
+        // 3. Early detection of active file in incomplete change
+        if self.started_change_index != Some(self.processed_changes_count) {
+            if let Some((op, path)) =
+                extract_incomplete_change_op_and_path(&self.buffer, self.processed_changes_count)
+            {
+                if !self.has_emitted_edit_started {
+                    events.push(StreamEvent::EditStarted);
+                    self.has_emitted_edit_started = true;
+                }
+                let resolved_path = resolve_path(&path, &self.editable_paths);
+                events.push(StreamEvent::EditFileStarted {
+                    path: resolved_path,
+                    op_type: op.to_lowercase(),
+                });
+                self.started_change_index = Some(self.processed_changes_count);
+            }
         }
 
         events
@@ -159,6 +185,7 @@ impl JsonStreamFilter {
     fn handle_completed_change(
         &mut self,
         change: &StructuredChangeProposal,
+        already_started: bool,
         events: &mut Vec<StreamEvent>,
     ) {
         if !self.has_emitted_edit_started {
@@ -169,13 +196,16 @@ impl JsonStreamFilter {
         let resolved_path = resolve_path(&change.path, &self.editable_paths);
         let op_type = change.op.to_lowercase();
 
+        if !already_started {
+            events.push(StreamEvent::EditFileStarted {
+                path: resolved_path.clone(),
+                op_type: op_type.clone(),
+            });
+        }
+
         match op_type.as_str() {
             "create" => {
                 let content = normalize_hunk(change.content.as_deref().unwrap_or_default());
-                events.push(StreamEvent::EditFileStarted {
-                    path: resolved_path.clone(),
-                    op_type: "create".to_string(),
-                });
                 events.push(StreamEvent::EditHunk {
                     path: resolved_path.clone(),
                     hunk_index: 0,
@@ -191,10 +221,6 @@ impl JsonStreamFilter {
                 });
             }
             "delete" => {
-                events.push(StreamEvent::EditFileStarted {
-                    path: resolved_path.clone(),
-                    op_type: "delete".to_string(),
-                });
                 events.push(StreamEvent::EditFileDone {
                     path: resolved_path,
                     status: "ok".to_string(),
@@ -212,11 +238,6 @@ impl JsonStreamFilter {
                         .or(change.content.as_deref())
                         .unwrap_or_default(),
                 );
-
-                events.push(StreamEvent::EditFileStarted {
-                    path: resolved_path.clone(),
-                    op_type: "replace".to_string(),
-                });
 
                 events.push(StreamEvent::EditHunk {
                     path: resolved_path.clone(),
@@ -283,6 +304,72 @@ impl JsonStreamFilter {
 
         Ok(())
     }
+}
+
+/// Extracts `(op, path)` for an incomplete element at `target_idx` in `changes` array.
+fn extract_incomplete_change_op_and_path(
+    buffer: &str,
+    target_idx: usize,
+) -> Option<(String, String)> {
+    let brace_idx = buffer.find('{')?;
+    let json_bytes = &buffer.as_bytes()[brace_idx..];
+    let mut reader = JsonStreamReader::new(json_bytes);
+    reader.begin_object().ok()?;
+    while let Ok(true) = reader.has_next() {
+        let name = reader.next_name().ok()?;
+        if name == "changes" {
+            reader.begin_array().ok()?;
+            let mut current_idx = 0;
+            while let Ok(true) = reader.has_next() {
+                if current_idx < target_idx {
+                    reader.skip_value().ok()?;
+                    current_idx += 1;
+                } else if current_idx == target_idx {
+                    reader.begin_object().ok()?;
+                    let mut op: Option<String> = None;
+                    let mut path: Option<String> = None;
+                    while let Ok(true) = reader.has_next() {
+                        let field_name = match reader.next_name() {
+                            Ok(n) => n.to_string(),
+                            Err(_) => break,
+                        };
+                        match field_name.as_str() {
+                            "op" => {
+                                if let Ok(val) = reader.next_str() {
+                                    op = Some(val.to_string());
+                                } else {
+                                    break;
+                                }
+                            }
+                            "path" => {
+                                if let Ok(val) = reader.next_str() {
+                                    path = Some(val.to_string());
+                                } else {
+                                    break;
+                                }
+                            }
+                            _ => {
+                                if reader.skip_value().is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    if let (Some(op), Some(path)) = (op, path) {
+                        let trimmed_path = path.trim().to_string();
+                        if !trimmed_path.is_empty() {
+                            return Some((op, trimmed_path));
+                        }
+                    }
+                    return None;
+                }
+            }
+            return None;
+        } else {
+            reader.skip_value().ok()?;
+        }
+    }
+    None
 }
 
 /// Locates the byte offset right after the opening quote of the top-level `"message"`
@@ -850,6 +937,22 @@ fn normalize_hunk(raw: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_early_detection_active_file_streaming() {
+        let root = std::env::temp_dir();
+        let mut filter = JsonStreamFilter::new(vec!["crates/foo.rs".to_string()], root);
+        let chunk1 = r#"{"message":"Hello","changes":[{"op":"replace","path":"crates/foo.rs""#;
+        let events1 = filter.push_chunk(chunk1);
+        assert!(events1.iter().any(|e| matches!(e, StreamEvent::EditStarted)));
+        assert!(events1.iter().any(|e| matches!(e, StreamEvent::EditFileStarted { path, op_type } if path == "crates/foo.rs" && op_type == "replace")));
+        assert!(!events1.iter().any(|e| matches!(e, StreamEvent::EditFileDone { .. })));
+
+        let chunk2 = r#", "old_text":"", "new_text":"", "content":""}]}"#;
+        let events2 = filter.push_chunk(chunk2);
+        assert!(!events2.iter().any(|e| matches!(e, StreamEvent::EditFileStarted { .. })));
+        assert!(events2.iter().any(|e| matches!(e, StreamEvent::EditFileDone { .. })));
+    }
 
     #[test]
     fn test_json_stream_filter_partial_chunks_no_panic() {

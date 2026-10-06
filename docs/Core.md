@@ -102,17 +102,20 @@ Undo не генерируется LLM, а выполняется детерми
 
 Смена workflow блокируется во время активной генерации модели.
 
-## 7. Протоколы редактирования (Edit Protocols)
+## 7. Протоколы взаимодействия и модификации кода (Interaction & Edit Protocols)
 
 Ядро абстрагирует формат взаимодействия с моделью через фабрику `EditProtocol`:
 
 1. **`xml` (по умолчанию):**
-   - Строгий структурированный протокол тегов `<workbench_edits>`, `<edit>`, `<create>`, `<delete>`, `<search>`, `<replace>`.
+   - Строгий структурированный псевдо-XML протокол тегов `<workbench_edits>`, `<edit>`, `<create>`, `<delete>`, `<search>`, `<replace>`.
    - Потоковая фильтрация и валидация единственности сопоставления (`Search/Replace`) на сервере в реальном времени.
-2. **`whole_file`:**
-   - Передача полного обновленного содержимого файлов в markdown-блоках `FILE: path/to/file.rs`.
-3. **`tool_call`:**
-   - Нативные вызовы инструментов модели (Function Calling / Tool Calling: `edit_file`, `create_file`, `delete_file`).
+   - Естественно поддерживает свободный текст и рассуждения модели (reasoning) до и между тегами.
+   - Создание и полная замена файлов покрываются тегом `<create path="...">`.
+2. **`structured`:**
+   - Строгий JSON Schema (Structured Output), задающий контракт `ModelResultProposal` (`message`, `changes`, `context_requests`, `suggested_actions`).
+   - Потоковый парсинг через конечный автомат `struson` без ожидания полного завершения ответа.
+
+*Отказ от Tool Calling для кода:* нативные tool calls (Function Calling) исключены из протоколов модификации кода из-за нестабильности стриминга аргументов у провайдеров и их конфликта с режимами рассуждений (thinking/reasoning).
 
 Смена протокола блокируется во время активной генерации модели.
 
@@ -159,7 +162,7 @@ fn new_implementation() {
     </replace>
   </edit>
 
-  <!-- Создание нового файла: -->
+  <!-- Создание нового файла или полная перезапись: -->
   <create path="crates/core/src/new_mod.rs">
 pub fn helper() -> bool { true }
   </create>
