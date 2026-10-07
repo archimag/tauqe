@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use workbench_protocol::ModelUsageInfo;
+use tauqe_protocol::ModelUsageInfo;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ChatMessage {
@@ -140,6 +140,9 @@ pub struct JsonSchemaDefinition {
 pub enum StreamEvent {
     ReasoningDelta(String),
     TextDelta(String),
+
+    // Context streaming events
+    ContextChanged(tauqe_protocol::ContextState),
 
     // Semantic edit streaming events
     EditStarted,

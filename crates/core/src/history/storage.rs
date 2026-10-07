@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use super::entry::HistoryEntry;
 
-/// Manages persistent JSONL session history in `.workbench/history.jsonl`.
+/// Manages persistent JSONL session history in `.tauqe/history.jsonl`.
 #[derive(Debug, Clone)]
 pub struct SessionStorage {
     repo_root: PathBuf,
@@ -22,19 +22,19 @@ impl SessionStorage {
         &self.repo_root
     }
 
-    pub fn workbench_dir(&self) -> PathBuf {
-        self.repo_root.join(".workbench")
+    pub fn tauqe_dir(&self) -> PathBuf {
+        self.repo_root.join(".tauqe")
     }
 
     pub fn history_path(&self) -> PathBuf {
-        self.workbench_dir().join("history.jsonl")
+        self.tauqe_dir().join("history.jsonl")
     }
 
     pub fn append_entry(&self, entry: &HistoryEntry) -> Result<()> {
         let line = entry.to_jsonl_line()?;
-        let dir = self.workbench_dir();
+        let dir = self.tauqe_dir();
         create_dir_all(&dir)
-            .with_context(|| format!("Failed to create .workbench directory: {:?}", dir))?;
+            .with_context(|| format!("Failed to create .tauqe directory: {:?}", dir))?;
 
         let file_path = self.history_path();
         let mut file = OpenOptions::new()
@@ -83,9 +83,9 @@ impl SessionStorage {
 
     /// Atomically rewrites the history file with the provided entries.
     pub fn rewrite_entries(&self, entries: &[HistoryEntry]) -> Result<()> {
-        let dir = self.workbench_dir();
+        let dir = self.tauqe_dir();
         create_dir_all(&dir)
-            .with_context(|| format!("Failed to create .workbench directory: {:?}", dir))?;
+            .with_context(|| format!("Failed to create .tauqe directory: {:?}", dir))?;
 
         let target_path = self.history_path();
         let temp_filename = format!(
@@ -144,10 +144,12 @@ mod tests {
         assert!(storage.read_entries().unwrap().is_empty());
 
         let entry1 = HistoryEntry::Turn {
+            id: Some(1),
             prompt: "Implement auth".to_string(),
             context: vec!["auth.rs".to_string()],
         };
         let entry2 = HistoryEntry::Response {
+            id: Some(2),
             message: "Added token auth".to_string(),
             commit: Some("c123456".to_string()),
             summary: Some("Add token auth".to_string()),
@@ -164,6 +166,7 @@ mod tests {
 
         // Test rewrite
         let entry_summary = HistoryEntry::Summary {
+            id: Some(1),
             text: "Compacted auth task".to_string(),
         };
         storage.rewrite_entries(&[entry_summary.clone(), entry2.clone()]).unwrap();

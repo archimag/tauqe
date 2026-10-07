@@ -3,8 +3,8 @@ default: dev
 
 # Собрать сервер и запустить TUI для разработки
 dev *args="":
-    cargo build -p workbench-server
-    cargo run -p workbench-tui -- {{args}}
+    cargo build -p tauqe-server
+    cargo run -p tauqe-tui -- {{args}}
 
 # Быстрая проверка всех пакетов воркспейса
 check:
@@ -30,9 +30,9 @@ fmt-check:
 build:
     cargo build --workspace
 
-# Сборка релизных бинарников workbench-server и workbench-tui
+# Сборка релизных бинарников tauqe-server и tauqe-tui
 release:
-    cargo build --release -p workbench-server -p workbench-tui
+    cargo build --release -p tauqe-server -p tauqe-tui
 
 # Очистка артефактов сборки
 clean:

@@ -4,7 +4,7 @@ use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio::sync::watch;
-use workbench_protocol::ModelUsageInfo;
+use tauqe_protocol::ModelUsageInfo;
 
 use super::gateway::{
     ChatMessage, FunctionCall, ResponseFormat, StreamEvent, ToolCall, ToolDefinition,
@@ -273,15 +273,15 @@ impl OpenRouterClient {
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
         headers.insert(
             "HTTP-Referer",
-            HeaderValue::from_static("https://github.com/workbench/workbench"),
+            HeaderValue::from_static("https://github.com/tauqe/tauqe"),
         );
-        headers.insert("X-Title", HeaderValue::from_static("Workbench"));
+        headers.insert("X-Title", HeaderValue::from_static("Tauqe"));
 
         // Structured Outputs (json_schema) and function calling are mutually exclusive:
         // when a schema is requested, tools are never sent, and routing is restricted
         // to providers that support every requested parameter.
         let uses_json_schema = matches!(&response_format, Some(ResponseFormat::JsonSchema { .. }));
-        let has_tools = !uses_json_schema && tools.as_ref().map_or(false, |t| !t.is_empty());
+        let has_tools = !uses_json_schema && tools.as_ref().is_some_and(|t| !t.is_empty());
         let payload = ChatCompletionRequest {
             model: model.to_string(),
             messages,
@@ -528,7 +528,7 @@ impl OpenRouterClient {
 
         // If cost was not present in the SSE stream, fetch actual generation stats from OpenRouter
         if let Some(gen_id) = generation_id {
-            let needs_cost = latest_usage.as_ref().map_or(true, |u| u.cost.is_none());
+            let needs_cost = latest_usage.as_ref().is_none_or(|u| u.cost.is_none());
             if needs_cost {
                 if let Ok(Some(stats)) = self.get_generation_stats(&gen_id).await {
                     let mut usage = latest_usage.unwrap_or_default();

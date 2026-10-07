@@ -21,6 +21,8 @@ pub mod methods {
 
     pub const GIT_UNDO: &str = "git/undo";
     pub const GIT_GET_DIFF: &str = "git/getDiff";
+    pub const GIT_SQUASH_PREVIEW: &str = "git/squashPreview";
+    pub const GIT_SQUASH_APPLY: &str = "git/squashApply";
 
     pub const CONFIG_GET: &str = "config/get";
     pub const CONFIG_SET: &str = "config/set";
@@ -50,6 +52,7 @@ pub mod events {
     pub const GIT_STATE_CHANGED: &str = "git/stateChanged";
     pub const GIT_COMMIT_CREATED: &str = "git/commitCreated";
     pub const GIT_UNDO_COMPLETED: &str = "git/undoCompleted";
+    pub const GIT_SQUASH_COMPLETED: &str = "git/squashCompleted";
 
     pub const CONFIG_CHANGED: &str = "config/changed";
 
@@ -174,15 +177,26 @@ pub enum ContextAccess {
     Editable,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextLayer {
+    Pinned,
+    #[default]
+    User,
+    Auto,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContextItem {
     pub path: String,
     pub access: ContextAccess,
     pub size_bytes: u64,
     pub estimated_tokens: u64,
+    #[serde(default)]
+    pub layer: ContextLayer,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct ContextState {
     pub revision: u64,
     pub items: Vec<ContextItem>,
@@ -194,6 +208,8 @@ pub struct ContextAddParams {
     pub path: String,
     #[serde(default = "default_context_access")]
     pub access: ContextAccess,
+    #[serde(default)]
+    pub layer: Option<ContextLayer>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -306,6 +322,8 @@ pub struct ModelUsageEvent {
     pub operation_id: String,
     pub usage: ModelUsageInfo,
     pub session_total_cost: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_cost: Option<f64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -323,6 +341,10 @@ pub enum EditOperation {
     Delete {
         path: String,
     },
+    Move {
+        from: String,
+        to: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -336,6 +358,8 @@ pub struct StructuredChangeProposal {
     #[serde(default = "default_change_op")]
     pub op: String,
     pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub old_text: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -357,6 +381,10 @@ impl StructuredChangeProposal {
             },
             "delete" => EditOperation::Delete {
                 path: self.path.clone(),
+            },
+            "move" => EditOperation::Move {
+                from: self.path.clone(),
+                to: self.to.clone().unwrap_or_default(),
             },
             _ => EditOperation::Replace {
                 path: self.path.clone(),
@@ -412,6 +440,8 @@ pub struct ModelResultEvent {
     pub usage: Option<ModelUsageInfo>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_total_cost: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_cost: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -521,6 +551,41 @@ pub struct GitDiffResult {
     pub diff: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct GitSquashPreviewParams {
+    #[serde(default)]
+    pub base_ref: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitSquashCommitItem {
+    pub hash: String,
+    pub author: String,
+    pub date: String,
+    pub subject: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GitSquashPreviewResult {
+    pub base_ref: String,
+    pub commits: Vec<GitSquashCommitItem>,
+    pub suggested_message: String,
+    pub diff_stat: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GitSquashApplyParams {
+    pub base_ref: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GitSquashApplyResult {
+    pub squashed_commit: String,
+    pub message: String,
+    pub base_ref: String,
+}
+
 /// Matches a relative path against a glob pattern.
 pub fn matches_glob_pattern(pattern: &str, path: &str) -> bool {
     let clean_pat = pattern.trim().trim_start_matches("./");
@@ -535,10 +600,11 @@ pub fn matches_glob_pattern(pattern: &str, path: &str) -> bool {
         return clean_path.starts_with(&format!("{}/", dir));
     }
 
-    if !clean_pat.contains('*') && !clean_pat.contains('?') {
-        if clean_path == clean_pat || clean_path.starts_with(&format!("{}/", clean_pat)) {
-            return true;
-        }
+    if !clean_pat.contains('*')
+        && !clean_pat.contains('?')
+        && (clean_path == clean_pat || clean_path.starts_with(&format!("{}/", clean_pat)))
+    {
+        return true;
     }
 
     if !clean_pat.contains('/') && clean_pat.starts_with("*.") {

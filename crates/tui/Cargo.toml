@@ -1,11 +1,11 @@
 [package]
-name = "workbench-tui"
+name = "tauqe-tui"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
-workbench-protocol.workspace = true
+tauqe-protocol.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 ratatui.workspace = true
@@ -13,3 +13,6 @@ crossterm.workspace = true
 tokio.workspace = true
 anyhow.workspace = true
 pulldown-cmark = { version = "0.12", default-features = false }
+syntect = { version = "5.2", default-features = false, features = ["default-syntaxes", "default-themes", "parsing", "regex-fancy"] }
+similar = "2.6"
+arboard = "3.4"

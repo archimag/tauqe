@@ -1,9 +1,9 @@
-use workbench_protocol::{EditOperation, ModelResult, ModelResultProposal};
+use tauqe_protocol::{EditOperation, ModelResult, ModelResultProposal};
 
 use crate::model::gateway::{JsonSchemaDefinition, ResponseFormat};
 
-use super::utils::{normalize_content, resolve_target_path_for_op};
-use super::EditProtocol;
+use super::utils::{normalize_content, parse_context_request_spec, resolve_target_path_for_op};
+use super::{ContextRequest, EditProtocol};
 
 /// Structured Output JSON-schema edit protocol
 #[derive(Debug, Default, Clone)]
@@ -26,12 +26,16 @@ impl StructuredEditProtocol {
                         "properties": {
                             "op": {
                                 "type": "string",
-                                "enum": ["replace", "create", "delete"],
-                                "description": "Operation type: 'replace' for modifying existing files, 'create' for new files, 'delete' for deleting files"
+                                "enum": ["replace", "create", "delete", "move"],
+                                "description": "Operation type: 'replace' for modifying existing files, 'create' for new files, 'delete' for deleting files, 'move' for moving or renaming files"
                             },
                             "path": {
                                 "type": "string",
-                                "description": "Relative repository path to the target file"
+                                "description": "Relative repository path to the target file (source file for 'move')"
+                            },
+                            "to": {
+                                "type": "string",
+                                "description": "Target repository path for 'move' operation (empty string otherwise)"
                             },
                             "old_text": {
                                 "type": "string",
@@ -46,13 +50,13 @@ impl StructuredEditProtocol {
                                 "description": "Complete file content (required for 'create', empty string otherwise)"
                             }
                         },
-                        "required": ["op", "path", "old_text", "new_text", "content"],
+                        "required": ["op", "path", "to", "old_text", "new_text", "content"],
                         "additionalProperties": false
                     }
                 },
                 "context_requests": {
                     "type": "array",
-                    "description": "Optional list of file paths or glob patterns to request adding to context for subsequent turns",
+                    "description": "Files to add to context before editing. Each entry is a repository-relative path (read-only) or a path prefixed with 'editable:' (e.g. 'editable:src/lib.rs')",
                     "items": {
                         "type": "string"
                     }
@@ -130,6 +134,27 @@ impl StructuredEditProtocol {
                 "delete" => {
                     edits.push(EditOperation::Delete { path: target_path });
                 }
+                "move" => {
+                    let dest_raw = change.to.as_deref().unwrap_or_default();
+                    let target_to = match resolve_target_path_for_op(dest_raw, editable_paths, true) {
+                        Ok(p) => p,
+                        Err(ambiguity_err) => {
+                            return ModelResult::Edit {
+                                summary: "Ambiguous destination file path".to_string(),
+                                edits: Vec::new(),
+                                proposal: Some(proposal),
+                                applied: false,
+                                error: Some(ambiguity_err),
+                                changed_files: Vec::new(),
+                                commit_hash: None,
+                            };
+                        }
+                    };
+                    edits.push(EditOperation::Move {
+                        from: target_path,
+                        to: target_to,
+                    });
+                }
                 _ => {
                     edits.push(EditOperation::Replace {
                         path: target_path,
@@ -165,6 +190,7 @@ impl StructuredEditProtocol {
                 EditOperation::Replace { path, .. } => format!("Update {}", path),
                 EditOperation::Create { path, .. } => format!("Create {}", path),
                 EditOperation::Delete { path } => format!("Delete {}", path),
+                EditOperation::Move { from, to } => format!("Move {} to {}", from, to),
             }
         } else {
             format!("Apply {} structured edits", edits.len())
@@ -192,8 +218,8 @@ impl EditProtocol for StructuredEditProtocol {
         prompt.push_str("## Code Modification Protocol (Structured Output JSON)\n");
         prompt.push_str("You must respond with a JSON object conforming to the structured output schema with the following fields:\n");
         prompt.push_str("- `message`: Your conversational explanation or answer to the user.\n");
-        prompt.push_str("- `changes`: Array of code edit operations (`op`: 'replace'|'create'|'delete', `path`, `old_text`, `new_text`, `content`).\n");
-        prompt.push_str("- `context_requests`: Optional list of file paths to request adding to context for subsequent turns.\n");
+        prompt.push_str("- `changes`: Array of code edit operations (`op`: 'replace'|'create'|'delete'|'move', `path`, `to`, `old_text`, `new_text`, `content`).\n");
+        prompt.push_str("- `context_requests`: Files to add to context. Each entry is a repository-relative path (read-only) or `editable:<path>` for files you need to modify.\n");
         prompt.push_str(
             "- `suggested_actions`: Optional list of suggested follow-up options for the user.\n",
         );
@@ -206,7 +232,7 @@ impl EditProtocol for StructuredEditProtocol {
             for path in editable_paths {
                 prompt.push_str(&format!("- {}\n", path));
             }
-            prompt.push_str("\n");
+            prompt.push('\n');
         }
 
         prompt.push_str("CRITICAL INVARIANTS:\n");
@@ -216,7 +242,8 @@ impl EditProtocol for StructuredEditProtocol {
         );
         prompt.push_str("3. For 'replace', `old_text` must match EXACTLY ONE location in the target file, including indentation and whitespace.\n");
         prompt.push_str("4. For 'create', `content` must contain the complete file content from first to last line.\n");
-        prompt.push_str("5. If no code changes are needed, set `changes: []` and provide your answer in `message`.\n\n");
+        prompt.push_str("5. If no code changes are needed, set `changes: []` and provide your answer in `message`.\n");
+        prompt.push_str("6. If the task requires files listed in <repo_map> that are not present in the editable or read-only files, request them FIRST: set `changes: []` and list them in `context_requests`. You will be called again with the full file contents added to context. Never request files that are already in context.\n\n");
 
         prompt
     }
@@ -224,7 +251,7 @@ impl EditProtocol for StructuredEditProtocol {
     fn response_format(&self, editable_paths: &[String]) -> Option<ResponseFormat> {
         Some(ResponseFormat::JsonSchema {
             json_schema: JsonSchemaDefinition {
-                name: "workbench_edit_proposal".to_string(),
+                name: "tauqe_edit_proposal".to_string(),
                 description: Some("Structured code modification proposal and response".to_string()),
                 schema: Self::schema(editable_paths),
                 strict: Some(true),
@@ -232,12 +259,23 @@ impl EditProtocol for StructuredEditProtocol {
         })
     }
 
+    fn parse_context_requests(&self, raw_text: &str) -> Vec<ContextRequest> {
+        parse_proposal(raw_text)
+            .map(|p| {
+                p.context_requests
+                    .iter()
+                    .filter_map(|spec| parse_context_request_spec(spec))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     fn parse_output(&self, raw_text: &str, editable_paths: &[String]) -> ModelResult {
         if let Some(proposal) = parse_proposal(raw_text) {
             return self.proposal_to_model_result(proposal, editable_paths);
         }
 
-        if let Some(json_res) = crate::edits::parse_workbench_edit_json(raw_text) {
+        if let Some(json_res) = crate::edits::parse_tauqe_edit_json(raw_text) {
             return json_res;
         }
 
@@ -322,6 +360,18 @@ fn extract_json_str(raw: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tauqe_protocol::ContextAccess;
+
+    #[test]
+    fn test_structured_protocol_context_requests() {
+        let proto = StructuredEditProtocol;
+        let json = r#"{"message":"Need files","changes":[],"context_requests":["src/a.rs","editable:src/b.rs"],"suggested_actions":[]}"#;
+        let reqs = proto.parse_context_requests(json);
+        assert_eq!(reqs.len(), 2);
+        assert_eq!(reqs[0].access, ContextAccess::ReadOnly);
+        assert_eq!(reqs[1].path, "src/b.rs");
+        assert_eq!(reqs[1].access, ContextAccess::Editable);
+    }
 
     #[test]
     fn test_structured_protocol_parse_replace() {
@@ -409,7 +459,7 @@ mod tests {
         let required = schema["properties"]["changes"]["items"]["required"]
             .as_array()
             .unwrap();
-        assert_eq!(required.len(), 5);
+        assert_eq!(required.len(), 6);
     }
 
     #[test]

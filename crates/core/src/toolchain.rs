@@ -20,6 +20,113 @@ pub struct ToolchainCheckResult {
     pub combined_output: String,
 }
 
+use crate::edits::protocol::xml::VerifyTarget;
+
+/// Returns the sequence of command strings to execute for the given verification target and toolchain.
+pub fn resolve_verification_commands(
+    repo_root: &Path,
+    kind: &ToolchainKind,
+    target: &VerifyTarget,
+) -> Vec<String> {
+    match kind {
+        ToolchainKind::Cargo => match target {
+            VerifyTarget::Check => vec!["cargo check --all-targets".to_string()],
+            VerifyTarget::Clippy => vec!["cargo clippy --all-targets -- -D warnings".to_string()],
+            VerifyTarget::Test => vec!["cargo test".to_string()],
+            VerifyTarget::All => vec![
+                "cargo check --all-targets".to_string(),
+                "cargo clippy --all-targets -- -D warnings".to_string(),
+                "cargo test".to_string(),
+            ],
+        },
+        ToolchainKind::Npm => {
+            let mut cmds = Vec::new();
+            if repo_root.join("package.json").is_file() {
+                if let Ok(content) = std::fs::read_to_string(repo_root.join("package.json")) {
+                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
+                        let scripts = json.get("scripts").and_then(|s| s.as_object());
+                        let has_check = scripts.is_some_and(|s| s.contains_key("check"));
+                        let has_lint = scripts.is_some_and(|s| s.contains_key("lint"));
+                        let has_test = scripts.is_some_and(|s| s.contains_key("test"));
+
+                        match target {
+                            VerifyTarget::Check => {
+                                if has_check {
+                                    cmds.push("npm run check".to_string());
+                                } else if repo_root.join("tsconfig.json").is_file() {
+                                    cmds.push("npx tsc --noEmit".to_string());
+                                }
+                            }
+                            VerifyTarget::Clippy => {
+                                if has_lint {
+                                    cmds.push("npm run lint".to_string());
+                                }
+                            }
+                            VerifyTarget::Test => {
+                                if has_test {
+                                    cmds.push("npm test".to_string());
+                                }
+                            }
+                            VerifyTarget::All => {
+                                if has_check {
+                                    cmds.push("npm run check".to_string());
+                                } else if repo_root.join("tsconfig.json").is_file() {
+                                    cmds.push("npx tsc --noEmit".to_string());
+                                }
+                                if has_lint {
+                                    cmds.push("npm run lint".to_string());
+                                }
+                                if has_test {
+                                    cmds.push("npm test".to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if cmds.is_empty() {
+                cmds.push("npm test".to_string());
+            }
+            cmds
+        }
+        ToolchainKind::Go => match target {
+            VerifyTarget::Check => vec!["go vet ./...".to_string()],
+            VerifyTarget::Clippy => vec!["go vet ./...".to_string()],
+            VerifyTarget::Test => vec!["go test ./...".to_string()],
+            VerifyTarget::All => vec!["go vet ./...".to_string(), "go test ./...".to_string()],
+        },
+        ToolchainKind::Python => match target {
+            VerifyTarget::Check => vec!["python3 -m py_compile".to_string()],
+            VerifyTarget::Clippy => vec!["flake8".to_string()],
+            VerifyTarget::Test => vec!["pytest".to_string()],
+            VerifyTarget::All => vec!["pytest".to_string()],
+        },
+        ToolchainKind::Custom(cmd) => vec![cmd.clone()],
+        ToolchainKind::None => Vec::new(),
+    }
+}
+
+/// Runs verification pipeline for the given target, stopping on first failure (fail-fast).
+pub async fn run_verification_pipeline(
+    repo_root: &Path,
+    target: &VerifyTarget,
+) -> (bool, Vec<ToolchainCheckResult>) {
+    let (kind, _) = detect_toolchain(repo_root, None);
+    let commands = resolve_verification_commands(repo_root, &kind, target);
+    let mut results = Vec::new();
+
+    for cmd in commands {
+        let res = run_toolchain_check(repo_root, &cmd).await;
+        let success = res.success;
+        results.push(res);
+        if !success {
+            return (false, results);
+        }
+    }
+
+    (true, results)
+}
+
 /// Deterministically detects the build/validation toolchain from project files in repo root.
 pub fn detect_toolchain(
     repo_root: &Path,
@@ -177,6 +284,17 @@ mod tests {
         let (kind, cmd) = detect_toolchain(dir.path(), None);
         assert_eq!(kind, ToolchainKind::None);
         assert_eq!(cmd, None);
+    }
+
+    #[test]
+    fn test_resolve_verification_commands_cargo() {
+        let dir = tempdir().unwrap();
+        let cmds = resolve_verification_commands(
+            dir.path(),
+            &ToolchainKind::Cargo,
+            &VerifyTarget::Clippy,
+        );
+        assert_eq!(cmds, vec!["cargo clippy --all-targets -- -D warnings"]);
     }
 
     #[tokio::test]

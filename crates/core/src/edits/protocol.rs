@@ -1,12 +1,21 @@
-use workbench_protocol::ModelResult;
+use tauqe_protocol::{ContextAccess, ModelResult};
 
 pub mod structured;
 pub mod utils;
 pub mod xml;
 
 pub use structured::StructuredEditProtocol;
-pub use utils::{normalize_content, resolve_target_path, resolve_target_path_for_op};
-pub use xml::{has_xml_edit_tags, XmlEditProtocol};
+pub use utils::{
+    normalize_content, parse_context_request_spec, resolve_target_path, resolve_target_path_for_op,
+};
+pub use xml::{generate_turn_marker, has_xml_edit_tags, MarkedXmlEditProtocol, XmlEditProtocol};
+
+/// A file the model asks to be added to the context before it proposes edits.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContextRequest {
+    pub path: String,
+    pub access: ContextAccess,
+}
 
 pub trait EditProtocol: Send + Sync {
     /// Identifier name of the edit protocol (e.g. "xml", "structured")
@@ -17,6 +26,20 @@ pub trait EditProtocol: Send + Sync {
 
     /// Parses the model text output into a ModelResult.
     fn parse_output(&self, raw_text: &str, editable_paths: &[String]) -> ModelResult;
+
+    /// Extracts context requests (files the model wants added to context) from raw output.
+    fn parse_context_requests(&self, _raw_text: &str) -> Vec<ContextRequest> {
+        Vec::new()
+    }
+
+    /// Binds a protocol to a per-request marker; non-XML protocols stay unchanged.
+    fn with_turn_marker(&self, _marker: &str) -> Option<Box<dyn EditProtocol>> {
+        None
+    }
+
+    fn turn_marker(&self) -> Option<&str> {
+        None
+    }
 
     /// Returns response format if this protocol operates via Structured Output (json_schema).
     fn response_format(

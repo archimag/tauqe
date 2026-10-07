@@ -1,6 +1,14 @@
+use std::sync::LazyLock;
+
 use pulldown_cmark::{Alignment, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
+use syntect::easy::HighlightLines;
+use syntect::highlighting::{Style as SynStyle, ThemeSet};
+use syntect::parsing::SyntaxSet;
+
+static SYNTAX_SET: LazyLock<SyntaxSet> = LazyLock::new(SyntaxSet::load_defaults_newlines);
+static THEME_SET: LazyLock<ThemeSet> = LazyLock::new(ThemeSet::load_defaults);
 
 #[derive(Debug, Clone)]
 pub struct MarkdownTheme {
@@ -17,6 +25,7 @@ pub struct MarkdownTheme {
     pub code_border: Style,
     pub code_lang: Style,
     pub code_text: Style,
+    pub code_bg: Color,
     pub blockquote_bar: Style,
     pub blockquote_text: Style,
     pub list_bullet: Style,
@@ -60,14 +69,15 @@ impl MarkdownTheme {
                 .fg(Color::DarkGray)
                 .add_modifier(Modifier::BOLD),
             inline_code: Style::default()
-                .bg(Color::DarkGray)
-                .fg(Color::Yellow)
+                .bg(Color::Rgb(36, 40, 52))
+                .fg(Color::Rgb(240, 205, 120))
                 .add_modifier(Modifier::BOLD),
-            code_border: Style::default().fg(Color::DarkGray),
+            code_border: Style::default().fg(Color::Rgb(75, 90, 115)),
             code_lang: Style::default()
-                .fg(Color::Yellow)
+                .fg(Color::Rgb(245, 205, 100))
                 .add_modifier(Modifier::BOLD),
-            code_text: Style::default().fg(Color::White),
+            code_text: Style::default().fg(Color::Rgb(220, 225, 235)),
+            code_bg: Color::Rgb(24, 27, 36),
             blockquote_bar: Style::default().fg(Color::Cyan),
             blockquote_text: Style::default().fg(Color::Gray),
             list_bullet: Style::default()
@@ -112,6 +122,7 @@ impl MarkdownTheme {
                 .fg(Color::Rgb(130, 170, 220))
                 .add_modifier(Modifier::DIM),
             code_text: base_blue,
+            code_bg: Color::Rgb(18, 25, 38),
             blockquote_bar: Style::default().fg(Color::Rgb(70, 95, 130)),
             blockquote_text: base_blue,
             list_bullet: Style::default().fg(Color::Rgb(100, 145, 195)),
@@ -163,6 +174,15 @@ struct ListState {
 struct CodeBlockState {
     lang: String,
     content: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ExtractedCodeBlock {
+    pub id: usize,
+    pub lang: String,
+    pub content: String,
+    pub start_line: usize,
+    pub end_line: usize,
 }
 
 struct TableCellData {
@@ -248,65 +268,201 @@ fn ensure_line_prefix(
     }
 }
 
+fn resolve_syntax(token: &str) -> &'static syntect::parsing::SyntaxReference {
+    let token_trimmed = token.trim();
+    let token_lower = token_trimmed.to_lowercase();
+    let lookup_candidates: &[&str] = match token_lower.as_str() {
+        "ts" | "typescript" | "tsx" => &["JavaScript", "js", "ts"],
+        "js" | "javascript" | "jsx" | "node" => &["JavaScript", "js"],
+        "rs" | "rust" => &["Rust", "rust", "rs"],
+        "py" | "python" | "python3" => &["Python", "python", "py"],
+        "sh" | "bash" | "zsh" | "shell" => &["Bourne Again Shell (bash)", "bash", "sh"],
+        "yml" | "yaml" => &["YAML", "yaml", "yml"],
+        "json" => &["JSON", "json"],
+        "toml" => &["TOML", "toml"],
+        "md" | "markdown" => &["Markdown", "markdown", "md"],
+        "c" => &["C", "c"],
+        "cpp" | "c++" | "cc" | "cxx" => &["C++", "cpp", "c++"],
+        "cs" | "c#" | "csharp" => &["C#", "cs"],
+        "go" | "golang" => &["Go", "go"],
+        "html" | "htm" => &["HTML", "html"],
+        "css" => &["CSS", "css"],
+        "sql" => &["SQL", "sql"],
+        "xml" => &["XML", "xml"],
+        _ => &[],
+    };
+
+    for &cand in lookup_candidates {
+        if let Some(s) = SYNTAX_SET
+            .find_syntax_by_name(cand)
+            .or_else(|| SYNTAX_SET.find_syntax_by_token(cand))
+            .or_else(|| SYNTAX_SET.find_syntax_by_extension(cand))
+        {
+            return s;
+        }
+    }
+
+    if !token_trimmed.is_empty() {
+        if let Some(s) = SYNTAX_SET
+            .find_syntax_by_token(token_trimmed)
+            .or_else(|| SYNTAX_SET.find_syntax_by_name(token_trimmed))
+            .or_else(|| SYNTAX_SET.find_syntax_by_extension(token_trimmed))
+        {
+            return s;
+        }
+    }
+
+    SYNTAX_SET.find_syntax_plain_text()
+}
+
+fn syntect_style_to_ratatui(style: SynStyle, fallback_bg: Color) -> Style {
+    let mut s = Style::default().fg(Color::Rgb(
+        style.foreground.r,
+        style.foreground.g,
+        style.foreground.b,
+    ));
+    s = s.bg(fallback_bg);
+    if style.font_style.contains(syntect::highlighting::FontStyle::BOLD) {
+        s = s.add_modifier(Modifier::BOLD);
+    }
+    if style.font_style.contains(syntect::highlighting::FontStyle::ITALIC) {
+        s = s.add_modifier(Modifier::ITALIC);
+    }
+    if style.font_style.contains(syntect::highlighting::FontStyle::UNDERLINE) {
+        s = s.add_modifier(Modifier::UNDERLINED);
+    }
+    s
+}
+
 fn render_code_block(
     theme: &MarkdownTheme,
     cb: &CodeBlockState,
     out_lines: &mut Vec<Line<'static>>,
     is_streaming: bool,
+    _block_id: usize,
+    is_flashing: bool,
 ) {
-    let lines: Vec<&str> = cb.content.lines().collect();
-    let max_len = lines.iter().map(|l| l.chars().count()).max().unwrap_or(0);
-    let box_width = max_len.clamp(32, 76);
-
-    let lang_display = if cb.lang.trim().is_empty() {
-        "code".to_string()
+    let raw_lines: Vec<&str> = cb.content.lines().collect();
+    let lines: Vec<&str> = if raw_lines.is_empty() {
+        vec![""]
     } else {
-        cb.lang.trim().to_string()
+        raw_lines
     };
-    let prefix = format!("┌─ {} ", lang_display);
-    let border_len = box_width.saturating_sub(prefix.chars().count() + 1);
-    let top_border = "─".repeat(border_len.max(4));
+    let max_len = lines.iter().map(|l| l.chars().count()).max().unwrap_or(0);
 
+    let lang_trimmed = cb.lang.trim();
+    let content_width = max_len.max(36);
+    let block_width = content_width + 4;
+
+    let lang_label = if lang_trimmed.is_empty() {
+        "code"
+    } else {
+        lang_trimmed
+    };
+
+    let mut header_spans = Vec::new();
+    header_spans.push(Span::styled(format!("  {} ", lang_label), theme.code_lang));
+
+    if is_streaming {
+        header_spans.push(Span::styled("⠋ streaming", theme.code_lang));
+    } else if is_flashing {
+        header_spans.push(Span::styled(
+            " [✓ Copied!] ",
+            Style::default().bg(Color::Green).fg(Color::Black).bold(),
+        ));
+    } else {
+        header_spans.push(Span::styled(
+            " [📋 Copy] ",
+            Style::default()
+                .bg(Color::Rgb(35, 45, 65))
+                .fg(Color::Rgb(170, 200, 240))
+                .bold(),
+        ));
+    }
+
+    push_styled_line(theme, out_lines, header_spans);
+
+    // Top vertical padding line with background
     push_styled_line(
         theme,
         out_lines,
-        vec![
-            Span::styled("┌─ ", theme.code_border),
-            Span::styled(lang_display, theme.code_lang),
-            Span::styled(format!(" {}┐", top_border), theme.code_border),
-        ],
+        vec![Span::styled(
+            " ".repeat(block_width),
+            Style::default().bg(theme.code_bg),
+        )],
     );
 
+    let syntax = resolve_syntax(lang_trimmed);
+
+    let syn_theme = THEME_SET
+        .themes
+        .get("base16-ocean.dark")
+        .or_else(|| THEME_SET.themes.values().next());
+
+    let mut highlighter = syn_theme.map(|t| HighlightLines::new(syntax, t));
+
     for line in &lines {
-        push_styled_line(
-            theme,
-            out_lines,
-            vec![
-                Span::styled("│ ", theme.code_border),
-                Span::styled(line.to_string(), theme.code_text),
-            ],
-        );
+        let mut spans = vec![Span::styled("  ", Style::default().bg(theme.code_bg))];
+        let mut line_char_count = 0;
+
+        if line.is_empty() {
+            spans.push(Span::styled(
+                " ".repeat(content_width + 2),
+                Style::default().bg(theme.code_bg),
+            ));
+            push_styled_line(theme, out_lines, spans);
+            continue;
+        }
+
+        if let Some(h) = highlighter.as_mut() {
+            let line_with_nl = format!("{}\n", line);
+            if let Ok(ranges) = h.highlight_line(&line_with_nl, &SYNTAX_SET) {
+                for (syn_style, text) in ranges {
+                    let clean = text.trim_end_matches(['\r', '\n']);
+                    if !clean.is_empty() {
+                        line_char_count += clean.chars().count();
+                        spans.push(Span::styled(
+                            clean.to_string(),
+                            syntect_style_to_ratatui(syn_style, theme.code_bg),
+                        ));
+                    }
+                }
+            } else {
+                line_char_count += line.chars().count();
+                spans.push(Span::styled(
+                    line.to_string(),
+                    theme.code_text.bg(theme.code_bg),
+                ));
+            }
+        } else {
+            line_char_count += line.chars().count();
+            spans.push(Span::styled(
+                line.to_string(),
+                theme.code_text.bg(theme.code_bg),
+            ));
+        }
+
+        let pad_len = content_width.saturating_sub(line_char_count) + 2;
+        spans.push(Span::styled(
+            " ".repeat(pad_len),
+            Style::default().bg(theme.code_bg),
+        ));
+
+        push_styled_line(theme, out_lines, spans);
     }
 
-    if is_streaming {
-        push_styled_line(
-            theme,
-            out_lines,
-            vec![
-                Span::styled("│ ", theme.code_border),
-                Span::styled("⠋ ...", theme.code_lang),
-            ],
-        );
-    } else {
-        let bottom = format!("└{}┘", "─".repeat(box_width.max(10)));
-        push_styled_line(
-            theme,
-            out_lines,
-            vec![Span::styled(bottom, theme.code_border)],
-        );
-        if !theme.compact {
-            push_empty_line(theme, out_lines);
-        }
+    // Bottom vertical padding line with background
+    push_styled_line(
+        theme,
+        out_lines,
+        vec![Span::styled(
+            " ".repeat(block_width),
+            Style::default().bg(theme.code_bg),
+        )],
+    );
+
+    if !theme.compact && !is_streaming {
+        push_empty_line(theme, out_lines);
     }
 }
 
@@ -461,8 +617,16 @@ fn render_table(
 }
 
 pub fn render_markdown(text: &str, theme: &MarkdownTheme) -> Vec<Line<'static>> {
+    render_markdown_with_blocks(text, theme, None).0
+}
+
+pub fn render_markdown_with_blocks(
+    text: &str,
+    theme: &MarkdownTheme,
+    flashing_block_id: Option<usize>,
+) -> (Vec<Line<'static>>, Vec<ExtractedCodeBlock>) {
     if text.is_empty() {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     }
 
     let mut options = Options::empty();
@@ -474,6 +638,8 @@ pub fn render_markdown(text: &str, theme: &MarkdownTheme) -> Vec<Line<'static>> 
     let parser = Parser::new_ext(text, options);
 
     let mut out_lines: Vec<Line<'static>> = Vec::new();
+    let mut extracted_blocks = Vec::new();
+    let mut block_counter = 0;
     let mut style_mod = StyleModifier::default();
     let mut link_url: Option<String> = None;
     let mut current_heading: Option<HeadingLevel> = None;
@@ -536,7 +702,19 @@ pub fn render_markdown(text: &str, theme: &MarkdownTheme) -> Vec<Line<'static>> 
             }
             Event::End(TagEnd::CodeBlock) => {
                 if let Some(cb) = code_block.take() {
-                    render_code_block(theme, &cb, &mut out_lines, false);
+                    let id = block_counter;
+                    block_counter += 1;
+                    let is_flashing = flashing_block_id == Some(id);
+                    let start_line = out_lines.len();
+                    render_code_block(theme, &cb, &mut out_lines, false, id, is_flashing);
+                    let end_line = out_lines.len().saturating_sub(1);
+                    extracted_blocks.push(ExtractedCodeBlock {
+                        id,
+                        lang: cb.lang,
+                        content: cb.content,
+                        start_line,
+                        end_line,
+                    });
                 }
             }
             Event::Start(Tag::List(start_num)) => {
@@ -758,7 +936,18 @@ pub fn render_markdown(text: &str, theme: &MarkdownTheme) -> Vec<Line<'static>> 
     }
 
     if let Some(cb) = code_block {
-        render_code_block(theme, &cb, &mut out_lines, true);
+        let id = block_counter;
+        let is_flashing = flashing_block_id == Some(id);
+        let start_line = out_lines.len();
+        render_code_block(theme, &cb, &mut out_lines, true, id, is_flashing);
+        let end_line = out_lines.len().saturating_sub(1);
+        extracted_blocks.push(ExtractedCodeBlock {
+            id,
+            lang: cb.lang,
+            content: cb.content,
+            start_line,
+            end_line,
+        });
     }
     if let Some(ts) = table_state {
         render_table(theme, ts, &mut out_lines, true);
@@ -767,12 +956,13 @@ pub fn render_markdown(text: &str, theme: &MarkdownTheme) -> Vec<Line<'static>> 
 
     while let Some(last) = out_lines.last() {
         let is_empty = last.spans.is_empty()
-            || (last.spans.len() == 1
-                && (last.spans[0].content.trim().is_empty()
-                    || theme
-                        .line_prefix
-                        .as_ref()
-                        .is_some_and(|prefix| last.spans[0].content == prefix.content)));
+            || (last.spans.iter().all(|s| s.style.bg.is_none())
+                && (last.spans.iter().all(|s| s.content.trim().is_empty())
+                    || (last.spans.len() == 1
+                        && theme
+                            .line_prefix
+                            .as_ref()
+                            .is_some_and(|prefix| last.spans[0].content == prefix.content))));
         if is_empty {
             out_lines.pop();
         } else {
@@ -780,7 +970,7 @@ pub fn render_markdown(text: &str, theme: &MarkdownTheme) -> Vec<Line<'static>> 
         }
     }
 
-    out_lines
+    (out_lines, extracted_blocks)
 }
 
 #[cfg(test)]
@@ -820,5 +1010,69 @@ mod tests {
             .collect();
 
         assert_eq!(text, vec!["Первый абзац.", "", "Второй абзац."]);
+    }
+
+    #[test]
+    fn test_code_block_empty_lines_and_typescript_highlighting() {
+        let ts_code = "```typescript\nconst x: number = 42;\n\nfunction test(): void {}\n```";
+        let lines = render_markdown(ts_code, &MarkdownTheme::answer());
+        let has_highlighting = lines.iter().any(|l| {
+            l.spans.iter().any(|s| {
+                if let Some(Color::Rgb(r, g, b)) = s.style.fg {
+                    !(r == 220 && g == 225 && b == 235)
+                } else {
+                    false
+                }
+            })
+        });
+        assert!(has_highlighting, "TypeScript code must have syntax highlighting");
+
+        let code_bg = MarkdownTheme::answer().code_bg;
+        // lines[0] is lang header ("typescript")
+        // lines[1] is top padding
+        assert_eq!(lines[1].spans[0].style.bg, Some(code_bg), "Top padding must have code_bg");
+        // lines[2] is const x: number = 42;
+        assert_eq!(lines[2].spans[0].style.bg, Some(code_bg), "Code line must have code_bg");
+        // lines[3] is the empty line inside the code block
+        assert_eq!(lines[3].spans[0].style.bg, Some(code_bg), "Empty line inside code block must have code_bg");
+        // lines[4] is function test(): void {}
+        assert_eq!(lines[4].spans[0].style.bg, Some(code_bg), "Code line must have code_bg");
+        // lines[5] is bottom padding
+        assert_eq!(lines[5].spans[0].style.bg, Some(code_bg), "Bottom padding must have code_bg");
+    }
+
+    #[test]
+    fn code_block_renders_borderless_with_padding_and_background() {
+        let md = "```rust\nfn main() {}\n```";
+        let lines = render_markdown(md, &MarkdownTheme::answer());
+        assert!(lines.len() >= 4);
+
+        let lang_line = &lines[0];
+        let top_pad = &lines[1];
+        let code_line = &lines[2];
+        let bot_pad = &lines[3];
+
+        let lang_text: String = lang_line.spans.iter().map(|s| s.content.as_ref()).collect();
+        let top_text: String = top_pad.spans.iter().map(|s| s.content.as_ref()).collect();
+        let code_text: String = code_line.spans.iter().map(|s| s.content.as_ref()).collect();
+        let bot_text: String = bot_pad.spans.iter().map(|s| s.content.as_ref()).collect();
+
+        assert!(lang_text.contains("rust"));
+        assert!(code_text.contains("fn main() {}"));
+
+        // Frame characters should not be present
+        for text in [&lang_text, &top_text, &code_text, &bot_text] {
+            assert!(!text.contains('┌') && !text.contains('┐') && !text.contains('│') && !text.contains('└') && !text.contains('┘'));
+        }
+
+        // Top, code, and bottom padding lines must have identical uniform block width
+        assert_eq!(top_text.chars().count(), bot_text.chars().count());
+        assert_eq!(top_text.chars().count(), code_text.chars().count());
+
+        // Background should be applied across the entire block
+        assert_eq!(top_pad.spans[0].style.bg, Some(MarkdownTheme::answer().code_bg));
+        assert_eq!(code_line.spans[0].style.bg, Some(MarkdownTheme::answer().code_bg));
+        assert_eq!(code_line.spans.last().unwrap().style.bg, Some(MarkdownTheme::answer().code_bg));
+        assert_eq!(bot_pad.spans[0].style.bg, Some(MarkdownTheme::answer().code_bg));
     }
 }

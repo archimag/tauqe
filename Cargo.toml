@@ -13,8 +13,8 @@ edition = "2021"
 license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
-workbench-protocol = { path = "crates/protocol" }
-workbench-core = { path = "crates/core" }
+tauqe-protocol = { path = "crates/protocol" }
+tauqe-core = { path = "crates/core" }
 
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

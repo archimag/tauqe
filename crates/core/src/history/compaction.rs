@@ -14,7 +14,7 @@ pub fn estimate_entries_tokens(entries: &[HistoryEntry]) -> u64 {
             total_bytes += (line.len() + 1) as u64; // + 1 for newline
         }
     }
-    (total_bytes + 3) / 4
+    total_bytes.div_ceil(4)
 }
 
 /// Partitions entries into `(head, tail)` based on preserving the last `keep_tail_turns` user turns.

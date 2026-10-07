@@ -5,7 +5,7 @@ pub mod storage;
 use anyhow::Result;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use workbench_protocol::{UiHistoryItem, UiHistoryKind};
+use tauqe_protocol::{UiHistoryItem, UiHistoryKind};
 
 pub use compaction::{
     build_compacted_history, estimate_entries_tokens, partition_head_tail,
@@ -29,6 +29,7 @@ pub struct HistoryManager {
     storage: SessionStorage,
     listener: Option<HistoryEntryListener>,
     current_max_id: u64,
+    detected_language: Option<String>,
 }
 
 impl HistoryManager {
@@ -50,7 +51,16 @@ impl HistoryManager {
             storage,
             listener: None,
             current_max_id,
+            detected_language: None,
         }
+    }
+
+    pub fn detected_language(&self) -> Option<&str> {
+        self.detected_language.as_deref()
+    }
+
+    pub fn set_detected_language(&mut self, lang: impl Into<String>) {
+        self.detected_language = Some(lang.into());
     }
 
     pub fn set_listener<F>(&mut self, listener: F)
@@ -305,8 +315,8 @@ mod tests {
         let tag = hm.format_history_tag().unwrap();
         assert!(tag.starts_with("<history>\n"));
         assert!(tag.ends_with("\n</history>"));
-        assert!(tag.contains(r#"{"type":"turn","prompt":"Check git status","context":["src/git.rs"]}"#));
-        assert!(tag.contains(r#"{"type":"undo","commit":"f1a2b3c","restored_checkpoint":true}"#));
+        assert!(tag.contains(r#"{"type":"turn","id":1,"prompt":"Check git status","context":["src/git.rs"]}"#));
+        assert!(tag.contains(r#"{"type":"undo","id":3,"commit":"f1a2b3c","restored_checkpoint":true}"#));
 
         // Clear
         hm.clear().unwrap();

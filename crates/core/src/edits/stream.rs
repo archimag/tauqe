@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use serde::Deserialize;
 use struson::reader::{JsonReader, JsonStreamReader};
-use workbench_protocol::StructuredChangeProposal;
+use tauqe_protocol::StructuredChangeProposal;
 
 use crate::model::gateway::StreamEvent;
 
@@ -231,6 +231,25 @@ impl JsonStreamFilter {
             "delete" => {
                 events.push(StreamEvent::EditFileDone {
                     path: resolved_path,
+                    status: "ok".to_string(),
+                    error: None,
+                    hunks_count: 0,
+                });
+            }
+            "move" => {
+                let to_raw = change.to.as_deref().unwrap_or_default();
+                let resolved_to = resolve_path(to_raw, &self.editable_paths, true);
+                let display_path = format!("{} -> {}", resolved_path, resolved_to);
+                if let Some(content) = self.staged_contents.remove(&resolved_path) {
+                    self.staged_contents.insert(resolved_to.clone(), content);
+                } else {
+                    let full_from = self.repo_root.join(&resolved_path);
+                    if let Ok(content) = std::fs::read_to_string(&full_from) {
+                        self.staged_contents.insert(resolved_to.clone(), content);
+                    }
+                }
+                events.push(StreamEvent::EditFileDone {
+                    path: display_path,
                     status: "ok".to_string(),
                     error: None,
                     hunks_count: 0,
@@ -534,6 +553,9 @@ fn extract_streamed_message(
 /// while forwarding regular conversational text as `StreamEvent::TextDelta`.
 pub struct XmlStreamFilter {
     buffer: String,
+    marker: Option<String>,
+    raw_buffer: String,
+    normalized_bytes: usize,
     in_edits_block: bool,
     current_file: Option<CurrentStreamingFile>,
     file_hunks_count: usize,
@@ -552,6 +574,9 @@ impl XmlStreamFilter {
     pub fn new(editable_paths: Vec<String>, repo_root: std::path::PathBuf) -> Self {
         Self {
             buffer: String::new(),
+            marker: None,
+            raw_buffer: String::new(),
+            normalized_bytes: 0,
             in_edits_block: false,
             current_file: None,
             file_hunks_count: 0,
@@ -566,13 +591,80 @@ impl XmlStreamFilter {
         self
     }
 
+    /// Sets the active XML marker before any chunks are processed.
+    /// None preserves the classic unsuffixed protocol.
+    pub fn with_marker(mut self, marker: Option<String>) -> Self {
+        assert!(self.raw_buffer.is_empty() && self.buffer.is_empty());
+        if let Some(value) = &marker {
+            assert!(!value.is_empty() && value.bytes().all(|b| b.is_ascii_alphanumeric()));
+        }
+        self.marker = marker;
+        self
+    }
+
+    fn restore_content(&self, text: &str) -> String {
+        match &self.marker {
+            Some(marker) => crate::edits::protocol::xml::restore_xml_literals(text, marker),
+            None => text.to_string(),
+        }
+    }
+
+    fn restore_events(&self, events: &mut [StreamEvent]) {
+        for event in events {
+            match event {
+                StreamEvent::TextDelta(text) => *text = self.restore_content(text),
+                StreamEvent::EditFileStarted { path, .. }
+                | StreamEvent::EditFileDone { path, .. } => {
+                    *path = self.restore_content(path);
+                }
+                StreamEvent::EditHunk { path, old_text, new_text, .. } => {
+                    *path = self.restore_content(path);
+                    *old_text = self.restore_content(old_text);
+                    *new_text = self.restore_content(new_text);
+                }
+                _ => {}
+            }
+        }
+    }
+
     /// Process incoming chunk of model text and generate corresponding `StreamEvent`s.
     pub fn push_chunk(&mut self, chunk: &str) -> Vec<StreamEvent> {
+        let normalized = if let Some(marker) = &self.marker {
+            self.raw_buffer.push_str(chunk);
+            let prefix = crate::edits::protocol::xml::normalize_marked_xml(
+                &self.raw_buffer, marker, false,
+            );
+            let delta = prefix[self.normalized_bytes..].to_string();
+            self.normalized_bytes = prefix.len();
+            delta
+        } else {
+            chunk.to_string()
+        };
+        let mut events = self.push_normalized_chunk(&normalized);
+        self.restore_events(&mut events);
+        events
+    }
+
+    fn push_normalized_chunk(&mut self, chunk: &str) -> Vec<StreamEvent> {
         self.buffer.push_str(chunk);
         let mut events = Vec::new();
 
         loop {
             if !self.in_edits_block {
+                // Control tags (context_request, user_language, verify) are never user-visible text
+                if let Some((ctl_start, ctl_end)) = find_next_control_tag(&self.buffer) {
+                    let edit_first = find_any_edit_start(&self.buffer)
+                        .is_some_and(|edit_idx| edit_idx < ctl_start);
+                    if !edit_first {
+                        let text_part = self.buffer[..ctl_start].to_string();
+                        self.buffer.drain(..ctl_end);
+                        if !text_part.is_empty() {
+                            events.push(StreamEvent::TextDelta(text_part));
+                        }
+                        continue;
+                    }
+                }
+
                 // Check if an edit block starts
                 if let Some(tag_idx) = find_any_edit_start(&self.buffer) {
                     if tag_idx > 0 {
@@ -581,8 +673,8 @@ impl XmlStreamFilter {
                         self.buffer.drain(..tag_idx);
                     }
 
-                    if self.buffer.starts_with("<workbench_edits>")
-                        || self.buffer.starts_with("<workbench_edits")
+                    if self.buffer.starts_with("<tauqe_edits>")
+                        || self.buffer.starts_with("<tauqe_edits")
                     {
                         if let Some(close_tag_bracket) = self.buffer.find('>') {
                             self.buffer.drain(..=close_tag_bracket);
@@ -613,18 +705,56 @@ impl XmlStreamFilter {
 
             // Inside edit block
             if self.current_file.is_none() {
-                // Check if closing whole workbench_edits block
-                if let Some(close_wb) = self.buffer.find("</workbench_edits>") {
-                    self.buffer.drain(..close_wb + "</workbench_edits>".len());
-                    self.in_edits_block = false;
-                    continue;
+                // A complete chunk can contain both file tags and the wrapper's
+                // closing tag. Process the earliest structural tag first.
+                let next_file = find_file_tag_start(&self.buffer);
+                if let Some(close_wb) = self.buffer.find("</tauqe_edits>") {
+                    if next_file.as_ref().is_none_or(|(_, start)| close_wb < *start) {
+                        self.buffer.drain(..close_wb + "</tauqe_edits>".len());
+                        self.in_edits_block = false;
+                        continue;
+                    }
                 }
 
-                // Look for start of a file tag: <edit, <create, <delete
-                if let Some((tag_name, tag_start)) = find_file_tag_start(&self.buffer) {
+                // Look for start of a file tag: <edit, <create, <delete, <move
+                if let Some((tag_name, tag_start)) = next_file {
                     if let Some(close_bracket) = self.buffer[tag_start..].find('>') {
                         let header = &self.buffer[tag_start..tag_start + close_bracket + 1];
                         let is_self_closing = header.ends_with("/>");
+
+                        if tag_name == "move" {
+                            let from_attr = extract_attr(header, "from")
+                                .or_else(|| extract_attr(header, "path"));
+                            let to_attr = extract_attr(header, "to");
+                            if let (Some(from), Some(to)) = (from_attr, to_attr) {
+                                let resolved_from = resolve_path(&from, &self.editable_paths, false);
+                                let resolved_to = resolve_path(&to, &self.editable_paths, true);
+                                let display_path = format!("{} -> {}", resolved_from, resolved_to);
+                                events.push(StreamEvent::EditFileStarted {
+                                    path: display_path.clone(),
+                                    op_type: "move".to_string(),
+                                });
+                                self.buffer.drain(..tag_start + close_bracket + 1);
+                                if let Some(content) = self.staged_contents.remove(&resolved_from) {
+                                    self.staged_contents.insert(resolved_to.clone(), content);
+                                } else {
+                                    let full_from = self.repo_root.join(&resolved_from);
+                                    if let Ok(content) = std::fs::read_to_string(&full_from) {
+                                        self.staged_contents.insert(resolved_to.clone(), content);
+                                    }
+                                }
+                                events.push(StreamEvent::EditFileDone {
+                                    path: display_path,
+                                    status: "ok".to_string(),
+                                    error: None,
+                                    hunks_count: 0,
+                                });
+                                continue;
+                            } else {
+                                self.buffer.drain(..tag_start + close_bracket + 1);
+                                continue;
+                            }
+                        }
 
                         if let Some(path_attr) = extract_attr(header, "path") {
                             let is_create = tag_name == "create";
@@ -690,7 +820,7 @@ impl XmlStreamFilter {
                         let content = self.buffer[..close_pos].to_string();
                         self.buffer.drain(..close_pos + close_tag.len());
 
-                        let norm_content = normalize_hunk(&content);
+                        let norm_content = self.restore_content(&normalize_hunk(&content));
 
                         events.push(StreamEvent::EditHunk {
                             path: curr_path.clone(),
@@ -716,6 +846,10 @@ impl XmlStreamFilter {
                 } else {
                     // Replace mode: check for completed <search>...</search> <replace>...</replace>
                     if let Some((old_text, new_text, hunk_end)) = find_next_hunk(&self.buffer) {
+                        // Restore literal source tags before validation and staging,
+                        // not just when forwarding the hunk to the client.
+                        let old_text = self.restore_content(&old_text);
+                        let new_text = self.restore_content(&new_text);
                         let hunk_idx = self.file_hunks_count;
                         self.file_hunks_count += 1;
 
@@ -766,9 +900,16 @@ impl XmlStreamFilter {
         events
     }
 
-    /// Flush any remaining buffered text when stream ends
+    /// Flush any remaining buffered text when stream ends.
     pub fn finish(mut self) -> Vec<StreamEvent> {
         let mut events = Vec::new();
+        if let Some(marker) = &self.marker {
+            let normalized = crate::edits::protocol::xml::normalize_marked_xml(
+                &self.raw_buffer, marker, true,
+            );
+            let remaining = normalized[self.normalized_bytes..].to_string();
+            events.extend(self.push_normalized_chunk(&remaining));
+        }
         if !self.buffer.is_empty() {
             if let Some(curr) = self.current_file.take() {
                 events.push(StreamEvent::EditFileDone {
@@ -778,10 +919,13 @@ impl XmlStreamFilter {
                     hunks_count: self.file_hunks_count,
                 });
             }
-            if !self.buffer.trim().is_empty() && !self.buffer.contains('<') {
-                events.push(StreamEvent::TextDelta(self.buffer));
+            if !self.buffer.trim().is_empty()
+                && (!self.in_edits_block || !self.buffer.contains('<'))
+            {
+                events.push(StreamEvent::TextDelta(std::mem::take(&mut self.buffer)));
             }
         }
+        self.restore_events(&mut events);
         events
     }
 
@@ -821,23 +965,67 @@ impl XmlStreamFilter {
     }
 }
 
+fn find_next_control_tag(buf: &str) -> Option<(usize, usize)> {
+    let mut candidates = Vec::new();
+    if let Some(cr) = crate::edits::protocol::xml::next_context_request_tag(buf) {
+        candidates.push(cr);
+    }
+    if let Some(ul) = crate::edits::protocol::xml::next_user_language_tag(buf) {
+        candidates.push(ul);
+    }
+    if let Some(vf) = crate::edits::protocol::xml::next_verify_tag(buf) {
+        candidates.push(vf);
+    }
+    candidates.into_iter().min_by_key(|(start, _)| *start)
+}
+
 fn safe_text_emit_len(buf: &str) -> usize {
+    const CONTROL_PREFIXES: &[&str] = &[
+        "<tauqe_edits",
+        "<edit",
+        "<create",
+        "<delete",
+        "<move",
+        "<context_request",
+        "<user_language",
+        "<verify",
+    ];
+    let mut limit = buf.len();
     if let Some(last_lt) = buf.rfind('<') {
         let trailing = &buf[last_lt..];
-        if "<workbench_edits>".starts_with(trailing)
-            || "<edit".starts_with(trailing)
-            || "<create".starts_with(trailing)
-            || "<delete".starts_with(trailing)
-        {
-            return last_lt;
+        for prefix in CONTROL_PREFIXES {
+            if prefix.starts_with(trailing) {
+                limit = limit.min(last_lt);
+            }
         }
     }
-    buf.len()
+    // Hold an opened but not yet terminated control tag
+    for prefix in CONTROL_PREFIXES {
+        if let Some(idx) = buf.rfind(prefix) {
+            let rest = &buf[idx + prefix.len()..];
+            let boundary = rest
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_whitespace() || c == '>' || c == '/' || c == '_' || c == '-');
+            if boundary {
+                let is_closed = match *prefix {
+                    "<user_language" => crate::edits::protocol::xml::next_user_language_tag(&buf[idx..]).is_some(),
+                    "<verify" => crate::edits::protocol::xml::next_verify_tag(&buf[idx..]).is_some(),
+                    "<context_request" => crate::edits::protocol::xml::next_context_request_tag(&buf[idx..]).is_some(),
+                    _ => rest.contains('>'),
+                };
+                if !is_closed {
+                    limit = limit.min(idx);
+                }
+            }
+        }
+    }
+    limit
 }
 
 fn find_any_edit_start(buf: &str) -> Option<usize> {
     let mut min_idx = None;
-    for prefix in &["<workbench_edits", "<edit", "<create", "<delete"] {
+    for prefix in &["<tauqe_edits", "<edit", "<create", "<delete", "<move"] {
         if let Some(idx) = buf.find(prefix) {
             min_idx = Some(min_idx.map_or(idx, |m: usize| m.min(idx)));
         }
@@ -847,7 +1035,7 @@ fn find_any_edit_start(buf: &str) -> Option<usize> {
 
 fn find_file_tag_start(buf: &str) -> Option<(String, usize)> {
     let mut candidates = Vec::new();
-    for tag in &["edit", "create", "delete", "replace"] {
+    for tag in &["edit", "create", "delete", "replace", "move"] {
         let pat = format!("<{}", tag);
         let mut from = 0;
         while let Some(idx) = buf[from..].find(&pat) {
@@ -904,8 +1092,8 @@ fn extract_attr(header: &str, attr: &str) -> Option<String> {
         let abs_pos = search_from + pos;
         let after_attr = &header[abs_pos + attr.len()..];
         let trimmed = after_attr.trim_start();
-        if trimmed.starts_with('=') {
-            let after_eq = trimmed[1..].trim_start();
+        if let Some(after_eq) = trimmed.strip_prefix('=') {
+            let after_eq = after_eq.trim_start();
             let quote = after_eq.chars().next()?;
             if quote == '"' || quote == '\'' {
                 let rest = &after_eq[quote.len_utf8()..];
@@ -951,6 +1139,149 @@ fn normalize_hunk(raw: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_context_request_tags_hidden_from_stream_text() {
+        let input = "Need files.\n<context_request path=\"a.rs\" access=\"editable\" />\nDone";
+        let mut filter = XmlStreamFilter::new(vec![], std::env::temp_dir());
+        let mut events = Vec::new();
+        for ch in input.chars() {
+            events.extend(filter.push_chunk(&ch.to_string()));
+        }
+        events.extend(filter.finish());
+        let text: String = events
+            .iter()
+            .filter_map(|event| match event {
+                StreamEvent::TextDelta(delta) => Some(delta.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text, "Need files.\n\nDone");
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, StreamEvent::EditStarted)));
+    }
+
+    #[test]
+    fn test_user_language_and_verify_tags_hidden_from_stream_text() {
+        let marker = "M456";
+        let input = "Hello!\n<user_language_M456>Russian</user_language_M456>\n<verify_M456 target=\"all\" on_success=\"silent\" />\nHere is my explanation.";
+        let mut filter = XmlStreamFilter::new(vec![], std::env::temp_dir())
+            .with_marker(Some(marker.to_string()));
+        let mut events = Vec::new();
+        for ch in input.chars() {
+            events.extend(filter.push_chunk(&ch.to_string()));
+        }
+        events.extend(filter.finish());
+        let text: String = events
+            .iter()
+            .filter_map(|event| match event {
+                StreamEvent::TextDelta(delta) => Some(delta.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text, "Hello!\n\n\nHere is my explanation.");
+        assert!(!text.contains("user_language"));
+        assert!(!text.contains("verify"));
+    }
+
+    #[test]
+    fn test_xml_marker_preserves_source_and_matches_final_parser() {
+        let marker = "K7Q2ZX";
+        let input = "Hi\n<tauqe_edits_K7Q2ZX summary=\"Update\">\n<edit_K7Q2ZX path=\"xml.rs\">\n<search_K7Q2ZX>\nlet s = \"</search>\";\n</search_K7Q2ZX>\n<replace_K7Q2ZX>\nlet s = \"<create>\";\n</replace_K7Q2ZX>\n</edit_K7Q2ZX>\n</tauqe_edits_K7Q2ZX>\nBye";
+        let paths = vec!["xml.rs".to_string()];
+        let proto = crate::edits::protocol::MarkedXmlEditProtocol::new(marker);
+        let parsed = crate::edits::EditProtocol::parse_output(&proto, input, &paths);
+        let (expected_old, expected_new) = match parsed {
+            tauqe_protocol::ModelResult::Edit { edits, error: None, .. } => {
+                match edits.into_iter().next().unwrap() {
+                    tauqe_protocol::EditOperation::Replace { old_text, new_text, .. } => {
+                        (old_text, new_text)
+                    }
+                    _ => panic!("Expected replacement"),
+                }
+            }
+            _ => panic!("Expected valid edit"),
+        };
+
+        // Every character boundary, including inside marked tags, must behave
+        // identically to receiving the complete response in a single chunk.
+        for split in input.char_indices().map(|(idx, _)| idx).chain(std::iter::once(input.len())) {
+            let mut filter = XmlStreamFilter::new(paths.clone(), std::env::temp_dir())
+                .with_marker(Some(marker.to_string()))
+                .with_staged_contents(HashMap::from([
+                    ("xml.rs".to_string(), expected_old.clone()),
+                ]));
+            let mut events = filter.push_chunk(&input[..split]);
+            events.extend(filter.push_chunk(&input[split..]));
+            events.extend(filter.finish());
+            let hunks: Vec<_> = events.iter().filter_map(|event| match event {
+                StreamEvent::EditHunk { old_text, new_text, .. } => Some((old_text, new_text)),
+                _ => None,
+            }).collect();
+            assert_eq!(hunks, vec![(&expected_old, &expected_new)], "split {split}");
+            assert!(events.iter().any(|event| matches!(event,
+                StreamEvent::EditFileDone { status, .. } if status == "ok"
+            )));
+            assert!(!events.iter().any(|event| matches!(event,
+                StreamEvent::EditFileDone { status, .. } if status == "error"
+            )));
+            let text: String = events.iter().filter_map(|event| match event {
+                StreamEvent::TextDelta(delta) => Some(delta.as_str()),
+                _ => None,
+            }).collect();
+            assert_eq!(text, "Hi\n\nBye");
+        }
+    }
+
+    #[test]
+    fn test_xml_marker_soft_matching() {
+        let input = "<tauqe_edits-k7q2zy>\n<create_k7q2zx path=\"new.rs\">\nliteral <edit> and </search>\n</create_k7q2zx>\n</tauqe_edits-k7q2zy>";
+        let mut filter = XmlStreamFilter::new(vec![], std::env::temp_dir())
+            .with_marker(Some("K7Q2ZX".to_string()));
+        let mut events = Vec::new();
+        for ch in input.chars() {
+            events.extend(filter.push_chunk(&ch.to_string()));
+        }
+        events.extend(filter.finish());
+        assert_eq!(events.iter().filter(|event| matches!(event,
+            StreamEvent::EditFileStarted { .. }
+        )).count(), 1);
+        assert!(events.iter().any(|event| matches!(event,
+            StreamEvent::EditHunk { new_text, .. }
+                if new_text == "literal <edit> and </search>\n"
+        )));
+    }
+
+    #[test]
+    fn test_xml_without_marker_keeps_legacy_tags() {
+        let mut filter = XmlStreamFilter::new(vec![], std::env::temp_dir());
+        let mut events = filter.push_chunk(
+            "<tauqe_edits><create path=\"new.rs\">hello</create></tauqe_edits>",
+        );
+        events.extend(filter.finish());
+        assert!(events.iter().any(|event| matches!(event,
+            StreamEvent::EditHunk { new_text, .. } if new_text == "hello"
+        )));
+    }
+
+    #[test]
+    fn test_xml_marker_ignores_unsuffixed_edit_tags_in_conversation() {
+        let input = "Literal <edit path=\"a.rs\"> and </edit>, then <";
+        let mut filter = XmlStreamFilter::new(vec![], std::env::temp_dir())
+            .with_marker(Some("K7Q2ZX".to_string()));
+        let mut events = Vec::new();
+        for ch in input.chars() {
+            events.extend(filter.push_chunk(&ch.to_string()));
+        }
+        events.extend(filter.finish());
+        let text: String = events.iter().filter_map(|event| match event {
+            StreamEvent::TextDelta(delta) => Some(delta.as_str()),
+            _ => None,
+        }).collect();
+        assert_eq!(text, input);
+        assert!(!events.iter().any(|event| matches!(event, StreamEvent::EditStarted)));
+    }
 
     #[test]
     fn test_early_detection_active_file_streaming() {

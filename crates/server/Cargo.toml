@@ -1,12 +1,12 @@
 [package]
-name = "workbench-server"
+name = "tauqe-server"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
-workbench-protocol.workspace = true
-workbench-core.workspace = true
+tauqe-protocol.workspace = true
+tauqe-core.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true

@@ -1,3 +1,30 @@
+use super::ContextRequest;
+use tauqe_protocol::ContextAccess;
+
+/// Parses a structured `context_requests` entry: `path` (read-only),
+/// `read_only:path` or `editable:path`. Returns None for empty paths.
+pub fn parse_context_request_spec(spec: &str) -> Option<ContextRequest> {
+    let spec = spec.trim();
+    let (access, rest) = if let Some(rest) = spec.strip_prefix("editable:") {
+        (ContextAccess::Editable, rest)
+    } else if let Some(rest) = spec.strip_prefix("read_only:") {
+        (ContextAccess::ReadOnly, rest)
+    } else {
+        (ContextAccess::ReadOnly, spec)
+    };
+    let cleaned = rest.trim().trim_matches('`').trim();
+    let cleaned = cleaned.strip_prefix("./").unwrap_or(cleaned);
+    let cleaned = cleaned.strip_prefix('/').unwrap_or(cleaned);
+    if cleaned.is_empty() {
+        None
+    } else {
+        Some(ContextRequest {
+            path: cleaned.to_string(),
+            access,
+        })
+    }
+}
+
 /// Resolves a candidate file path against a list of permitted editable paths.
 /// For `create` operations, suffix matching is disabled to prevent accidental overwrites.
 /// For `replace`/`delete`, exact match is preferred; ambiguous suffix matches return an error.
@@ -75,6 +102,17 @@ pub fn normalize_content(raw: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_parse_context_request_spec() {
+        let ro = parse_context_request_spec(" ./src/a.rs ").unwrap();
+        assert_eq!(ro.path, "src/a.rs");
+        assert_eq!(ro.access, ContextAccess::ReadOnly);
+        let ed = parse_context_request_spec("editable:src/b.rs").unwrap();
+        assert_eq!(ed.path, "src/b.rs");
+        assert_eq!(ed.access, ContextAccess::Editable);
+        assert!(parse_context_request_spec("editable:").is_none());
+    }
 
     #[test]
     fn test_resolve_target_path_for_op_create_does_not_suffix_match() {

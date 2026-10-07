@@ -2,7 +2,7 @@ use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use thiserror::Error;
-use workbench_protocol::{EditOperation, EditProposal, ModelResult};
+use tauqe_protocol::{EditOperation, EditProposal, ModelResult};
 
 use crate::context::ContextManager;
 
@@ -25,6 +25,9 @@ pub enum EditError {
 
     #[error("File '{0}' does not exist on disk.")]
     FileNotFound(String),
+
+    #[error("Target path '{0}' already exists.")]
+    DestinationExists(String),
 
     #[error("Target path '{0}' is invalid: {1}")]
     InvalidPath(String, String),
@@ -89,55 +92,167 @@ pub fn stage_and_validate_edits(
     let mut grouped: HashMap<String, Vec<&EditOperation>> = HashMap::new();
     let mut invalid_paths = HashSet::new();
 
+    let flush_grouped = |grouped: &mut HashMap<String, Vec<&EditOperation>>,
+                         file_order: &mut Vec<String>,
+                         res: &mut StageEditsResult| {
+        for path in file_order.drain(..) {
+            if let Some(operations) = grouped.remove(&path) {
+                match stage_file_edits(
+                    repo_root,
+                    context_manager,
+                    &path,
+                    &operations,
+                    &res.staged_state,
+                ) {
+                    Ok(Some(content)) => {
+                        res.staged_state.deleted_paths.remove(&path);
+                        res.staged_state.staged_files.insert(path.clone(), content);
+                    }
+                    Ok(None) => {
+                        res.staged_state.staged_files.remove(&path);
+                        res.staged_state.deleted_paths.insert(path.clone());
+                    }
+                    Err(error) => {
+                        res.failed_files.push(FailedFileEdit { path, error });
+                        continue;
+                    }
+                }
+                if !res.successful_paths.contains(&path) {
+                    res.successful_paths.push(path);
+                }
+                res.successful_edits
+                    .extend(operations.into_iter().cloned());
+            }
+        }
+    };
+
     for edit in edits {
-        let path = match edit {
+        match edit {
+            EditOperation::Move { from, to } => {
+                flush_grouped(&mut grouped, &mut file_order, &mut result);
+
+                let clean_from = match context_manager.normalize_path(from) {
+                    Ok(p) => p,
+                    Err(err) => {
+                        result.failed_files.push(FailedFileEdit {
+                            path: from.clone(),
+                            error: EditError::InvalidPath(from.clone(), err.to_string()),
+                        });
+                        continue;
+                    }
+                };
+
+                let clean_to = match context_manager.normalize_path(to) {
+                    Ok(p) => p,
+                    Err(err) => {
+                        result.failed_files.push(FailedFileEdit {
+                            path: to.clone(),
+                            error: EditError::InvalidPath(to.clone(), err.to_string()),
+                        });
+                        continue;
+                    }
+                };
+
+                if clean_from == clean_to {
+                    result.failed_files.push(FailedFileEdit {
+                        path: clean_to.clone(),
+                        error: EditError::InvalidPath(clean_to, "Source and destination are identical".to_string()),
+                    });
+                    continue;
+                }
+
+                let in_context = context_manager.contains(&clean_from).unwrap_or(false);
+                let editable = context_manager.is_editable(&clean_from).unwrap_or(false);
+                let newly_created = !repo_root.join(&clean_from).exists()
+                    && result.staged_state.staged_files.contains_key(&clean_from);
+
+                if in_context && !editable {
+                    result.failed_files.push(FailedFileEdit {
+                        path: clean_from.clone(),
+                        error: EditError::ReadOnly(clean_from),
+                    });
+                    continue;
+                }
+
+                if !in_context && !newly_created {
+                    result.failed_files.push(FailedFileEdit {
+                        path: clean_from.clone(),
+                        error: EditError::NotInContext(clean_from),
+                    });
+                    continue;
+                }
+
+                let content = if let Some(c) = result.staged_state.staged_files.get(&clean_from) {
+                    Some(c.clone())
+                } else if result.staged_state.deleted_paths.contains(&clean_from) {
+                    None
+                } else {
+                    let full = repo_root.join(&clean_from);
+                    if full.is_file() {
+                        std::fs::read_to_string(&full).ok()
+                    } else {
+                        None
+                    }
+                };
+
+                let Some(content) = content else {
+                    result.failed_files.push(FailedFileEdit {
+                        path: clean_from.clone(),
+                        error: EditError::FileNotFound(clean_from),
+                    });
+                    continue;
+                };
+
+                let full_to = repo_root.join(&clean_to);
+                let dest_exists = (full_to.exists()
+                    && !result.staged_state.deleted_paths.contains(&clean_to))
+                    || result.staged_state.staged_files.contains_key(&clean_to);
+
+                if dest_exists {
+                    result.failed_files.push(FailedFileEdit {
+                        path: clean_to.clone(),
+                        error: EditError::DestinationExists(clean_to),
+                    });
+                    continue;
+                }
+
+                result.staged_state.staged_files.remove(&clean_from);
+                result.staged_state.deleted_paths.insert(clean_from.clone());
+                result.staged_state.staged_files.insert(clean_to.clone(), content);
+                result.staged_state.deleted_paths.remove(&clean_to);
+
+                if !result.successful_paths.contains(&clean_from) {
+                    result.successful_paths.push(clean_from);
+                }
+                if !result.successful_paths.contains(&clean_to) {
+                    result.successful_paths.push(clean_to);
+                }
+                result.successful_edits.push(edit.clone());
+            }
             EditOperation::Replace { path, .. }
             | EditOperation::Create { path, .. }
-            | EditOperation::Delete { path } => path,
-        };
-        match context_manager.normalize_path(path) {
-            Ok(clean_path) => {
-                if !grouped.contains_key(&clean_path) {
-                    file_order.push(clean_path.clone());
-                }
-                grouped.entry(clean_path).or_default().push(edit);
-            }
-            Err(err) => {
-                if invalid_paths.insert(path.clone()) {
-                    result.failed_files.push(FailedFileEdit {
-                        path: path.clone(),
-                        error: EditError::InvalidPath(path.clone(), err.to_string()),
-                    });
+            | EditOperation::Delete { path } => {
+                match context_manager.normalize_path(path) {
+                    Ok(clean_path) => {
+                        if !grouped.contains_key(&clean_path) {
+                            file_order.push(clean_path.clone());
+                        }
+                        grouped.entry(clean_path).or_default().push(edit);
+                    }
+                    Err(err) => {
+                        if invalid_paths.insert(path.clone()) {
+                            result.failed_files.push(FailedFileEdit {
+                                path: path.clone(),
+                                error: EditError::InvalidPath(path.clone(), err.to_string()),
+                            });
+                        }
+                    }
                 }
             }
         }
     }
 
-    for path in file_order {
-        let operations = &grouped[&path];
-        match stage_file_edits(
-            repo_root,
-            context_manager,
-            &path,
-            operations,
-            &result.staged_state,
-        ) {
-            Ok(Some(content)) => {
-                result.staged_state.deleted_paths.remove(&path);
-                result.staged_state.staged_files.insert(path.clone(), content);
-            }
-            Ok(None) => {
-                result.staged_state.staged_files.remove(&path);
-                result.staged_state.deleted_paths.insert(path.clone());
-            }
-            Err(error) => {
-                result.failed_files.push(FailedFileEdit { path, error });
-                continue;
-            }
-        }
-        result.successful_paths.push(path);
-        result.successful_edits.extend(operations.iter().map(|edit| (**edit).clone()));
-    }
+    flush_grouped(&mut grouped, &mut file_order, &mut result);
     result
 }
 
@@ -223,6 +338,9 @@ fn stage_file_edits(
                 content = None;
                 loaded = true;
             }
+            EditOperation::Move { .. } => {
+                unreachable!("Move operations are handled directly in stage_and_validate_edits");
+            }
         }
     }
     Ok(content)
@@ -242,6 +360,18 @@ pub fn apply_edit_proposal(
         return Err(failed.error);
     }
 
+    // Update context layer for moved files
+    for edit in &proposal.edits {
+        if let EditOperation::Move { from, to } = edit {
+            if let (Ok(clean_from), Ok(clean_to)) = (
+                context_manager.normalize_path(from),
+                context_manager.normalize_path(to),
+            ) {
+                let _ = context_manager.rename_file(&clean_from, &clean_to);
+            }
+        }
+    }
+
     // Commit only after all files have passed validation.
     for path in &result.successful_paths {
         let full_path = repo_root.join(path);
@@ -256,7 +386,7 @@ pub fn apply_edit_proposal(
             if context_manager.contains(path).unwrap_or(false) {
                 let _ = context_manager.update_file_metadata(path);
             } else {
-                let _ = context_manager.add_file(path, workbench_protocol::ContextAccess::Editable);
+                let _ = context_manager.add_file(path, tauqe_protocol::ContextAccess::Editable);
             }
         } else {
             match std::fs::remove_file(&full_path) {
@@ -274,7 +404,7 @@ pub fn apply_edit_proposal(
 mod staging_tests {
     use super::*;
     use tempfile::tempdir;
-    use workbench_protocol::ContextAccess;
+    use tauqe_protocol::ContextAccess;
 
     fn replace(path: &str, old_text: &str, new_text: &str) -> EditOperation {
         EditOperation::Replace {
@@ -345,14 +475,14 @@ mod staging_tests {
         let mut cm = ContextManager::new(root.to_path_buf());
         let create = EditOperation::Create { path: "new.rs".into(), content: "one".into() };
         let delete = EditOperation::Delete { path: "new.rs".into() };
-        let first = stage_and_validate_edits(root, &cm, &[create.clone()], None);
+        let first = stage_and_validate_edits(root, &cm, std::slice::from_ref(&create), None);
         let second = stage_and_validate_edits(
             root, &cm, &[replace("new.rs", "one", "two")], Some(&first.staged_state),
         );
         assert!(second.is_success());
         assert_eq!(second.staged_state.staged_files["new.rs"], "two");
         let deleted = stage_and_validate_edits(
-            root, &cm, &[delete.clone()], Some(&second.staged_state),
+            root, &cm, std::slice::from_ref(&delete), Some(&second.staged_state),
         );
         assert!(deleted.is_success());
         assert!(deleted.staged_state.deleted_paths.contains("new.rs"));
@@ -413,6 +543,35 @@ mod staging_tests {
     }
 
     #[test]
+    fn test_move_file_stages_and_applies() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("old.rs"), "fn hello() {}").unwrap();
+        let mut cm = ContextManager::new(root.to_path_buf());
+        cm.add_file("old.rs", ContextAccess::Editable).unwrap();
+
+        let move_op = EditOperation::Move {
+            from: "old.rs".into(),
+            to: "new.rs".into(),
+        };
+
+        let result = stage_and_validate_edits(root, &cm, std::slice::from_ref(&move_op), None);
+        assert!(result.is_success());
+        assert_eq!(result.staged_state.staged_files["new.rs"], "fn hello() {}");
+        assert!(result.staged_state.deleted_paths.contains("old.rs"));
+
+        let proposal = EditProposal {
+            summary: "rename".into(),
+            edits: vec![move_op],
+        };
+        apply_edit_proposal(root, &mut cm, &proposal).unwrap();
+        assert!(!root.join("old.rs").exists());
+        assert_eq!(std::fs::read_to_string(root.join("new.rs")).unwrap(), "fn hello() {}");
+        assert!(cm.is_editable("new.rs").unwrap());
+        assert!(!cm.contains("old.rs").unwrap());
+    }
+
+    #[test]
     fn staging_preserves_crlf_and_empty_attempt_preserves_state() {
         let dir = tempdir().unwrap();
         let root = dir.path();
@@ -436,8 +595,8 @@ struct RawProposal {
     edits: Vec<EditOperation>,
 }
 
-pub fn parse_workbench_edit_json(raw_text: &str) -> Option<ModelResult> {
-    if let Some(content) = extract_fenced_block(raw_text, "workbench_edit") {
+pub fn parse_tauqe_edit_json(raw_text: &str) -> Option<ModelResult> {
+    if let Some(content) = extract_fenced_block(raw_text, "tauqe_edit") {
         match serde_json::from_str::<RawProposal>(&content) {
             Ok(raw) => {
                 if !raw.edits.is_empty() {
@@ -456,11 +615,11 @@ pub fn parse_workbench_edit_json(raw_text: &str) -> Option<ModelResult> {
             }
             Err(err) => {
                 return Some(ModelResult::Edit {
-                    summary: "Malformed workbench_edit JSON".to_string(),
+                    summary: "Malformed tauqe_edit JSON".to_string(),
                     edits: Vec::new(),
                     proposal: None,
                     applied: false,
-                    error: Some(format!("Invalid JSON in workbench_edit: {}", err)),
+                    error: Some(format!("Invalid JSON in tauqe_edit: {}", err)),
                     changed_files: Vec::new(),
                     commit_hash: None,
                 });

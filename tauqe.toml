@@ -1,0 +1,31 @@
+[models]
+default = "~google/gemini-flash-latest"
+available = [
+  "~google/gemini-flash-latest",
+  "~openai/gpt-luna-latest",
+  "~openai/gpt-sol-latest",
+  "~anthropic/claude-opus-latest",
+  "~anthropic/claude-sonnet-latest",
+  "~anthropic/claude-haiku-latest"
+]
+
+[edit]
+max_retries = 3  # число повторных попыток исправления неудачных правок
+workflow = "git"  # варианты: "toolchain", "git", "naive"
+protocol = "xml"        # активный протокол правок: "xml"
+
+[toolchain]
+# check_command = ""  # своя команда проверки; по умолчанию определяется автоматически
+# max_retries = 3     # по умолчанию не задано
+# auto_heal = false   # по умолчанию не задано
+
+[providers.openrouter]
+# api_key = ""        # лучше хранить в .tauqe/credentials.toml или в OPENROUTER_API_KEY
+
+[context]
+max_discovery_rounds = 6  # максимум раундов автоматического поиска файлов
+# max_auto_files_per_round = 15  # по умолчанию без ограничения
+pinned = [
+    "docs/Conventions.md",
+    "docs/Vision.md"
+]

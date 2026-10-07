@@ -1,8 +1,19 @@
 use ratatui::style::{Color, Style, Stylize};
 use ratatui::text::{Line, Span};
-use workbench_protocol::{ModelResult, ModelUsageEvent};
+use tauqe_protocol::{ModelResult, ModelUsageEvent};
 
 pub const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+#[derive(Debug, Clone)]
+pub struct ModelCodeBlock {
+    pub id: usize,
+    pub lang: String,
+    pub code: String,
+    pub raw_start_line: usize,
+    pub raw_end_line: usize,
+    pub visual_start_line: usize,
+    pub visual_end_line: usize,
+}
 
 #[derive(Debug, Clone)]
 pub struct StreamingHunk {
@@ -30,8 +41,10 @@ pub struct ModelView {
     pub markdown_lines: Vec<Line<'static>>,
     pub reasoning_lines: Vec<Line<'static>>,
     pub usage: Option<ModelUsageEvent>,
-    pub last_op_cost: Option<f64>,
+    pub prev_cost: Option<f64>,
+    pub current_cost: Option<f64>,
     pub session_total_cost: f64,
+    pub round_usage_received: bool,
     pub status: String,
     pub error: Option<String>,
     pub result: Option<ModelResult>,
@@ -51,6 +64,11 @@ pub struct ModelView {
     pub toolchain_command: Option<String>,
     pub toolchain_status: Option<String>,
     pub spinner_frame: usize,
+    pub rendered_lines_count: usize,
+    pub copy_flash: Option<(usize, std::time::Instant)>,
+    pub copy_notification: Option<(String, std::time::Instant)>,
+    pub code_blocks: Vec<ModelCodeBlock>,
+    pub content_rect: (u16, u16, u16, u16),
 }
 
 impl Default for ModelView {
@@ -63,8 +81,10 @@ impl Default for ModelView {
             markdown_lines: Vec::new(),
             reasoning_lines: Vec::new(),
             usage: None,
-            last_op_cost: None,
+            prev_cost: None,
+            current_cost: None,
             session_total_cost: 0.0,
+            round_usage_received: false,
             status: String::new(),
             error: None,
             result: None,
@@ -82,14 +102,44 @@ impl Default for ModelView {
             toolchain_command: None,
             toolchain_status: None,
             spinner_frame: 0,
+            rendered_lines_count: 0,
+            copy_flash: None,
+            copy_notification: None,
+            code_blocks: Vec::new(),
+            content_rect: (0, 0, 0, 0),
         }
     }
 }
 
 impl ModelView {
+    pub fn start_new_round_if_needed(&mut self) {
+        if self.round_usage_received {
+            self.prev_cost = self.current_cost;
+            self.current_cost = Some(0.0);
+            self.round_usage_received = false;
+        }
+    }
+
     pub fn update_markdown(&mut self) {
-        self.markdown_lines =
-            crate::markdown::render_markdown(&self.text, &crate::markdown::MarkdownTheme::answer());
+        let flashing_id = self.copy_flash.as_ref().map(|(id, _)| *id);
+        let (lines, blocks) = crate::markdown::render_markdown_with_blocks(
+            &self.text,
+            &crate::markdown::MarkdownTheme::answer(),
+            flashing_id,
+        );
+        self.markdown_lines = lines;
+        self.code_blocks = blocks
+            .into_iter()
+            .map(|b| ModelCodeBlock {
+                id: b.id,
+                lang: b.lang,
+                code: b.content,
+                raw_start_line: b.start_line,
+                raw_end_line: b.end_line,
+                visual_start_line: b.start_line,
+                visual_end_line: b.end_line,
+            })
+            .collect();
     }
 
     pub fn update_reasoning_markdown(&mut self) {
@@ -100,8 +150,11 @@ impl ModelView {
     }
 
     pub fn max_scroll(&self, view_height: u16) -> u16 {
-        let lines = compute_model_lines(self);
-        let count = lines.len() as u16;
+        let count = if self.rendered_lines_count > 0 {
+            self.rendered_lines_count as u16
+        } else {
+            compute_model_lines(self).len() as u16
+        };
         count.saturating_sub(view_height)
     }
 
@@ -110,6 +163,118 @@ impl ModelView {
         if self.scroll > max {
             self.scroll = max;
         }
+    }
+
+    pub fn expanded_file_lines_count(&self, file: &StreamingFileEdit) -> usize {
+        let mut count = 0;
+        for hunk in &file.hunks {
+            if file.op_type == "create" {
+                count += 1 + hunk.new_text.lines().count();
+            } else if file.op_type == "delete" {
+                count += 1 + hunk.old_text.lines().count();
+            } else {
+                let diff = similar::TextDiff::from_lines(&hunk.old_text, &hunk.new_text);
+                count += 1;
+                for op in diff.ops() {
+                    count += diff.iter_changes(op).count();
+                }
+            }
+        }
+        count
+    }
+
+    pub fn file_line_offset(&self, target_idx: usize) -> usize {
+        let mut line_idx = 0;
+        if self.error.is_some() {
+            line_idx += 1;
+        }
+        if self.git_notification.is_some() {
+            line_idx += 1;
+        }
+        if self.toolchain_status.is_some() {
+            line_idx += 1;
+        }
+
+        if !self.markdown_lines.is_empty() {
+            line_idx += self.markdown_lines.len();
+        } else if !self.text.is_empty() {
+            line_idx += self.text.lines().count();
+        }
+
+        if !self.reasoning.is_empty() {
+            if !self.text.is_empty() || line_idx > 0 {
+                line_idx += 1;
+            }
+            line_idx += 1;
+            if self.show_reasoning {
+                if !self.reasoning_lines.is_empty() {
+                    line_idx += self.reasoning_lines.len();
+                } else {
+                    line_idx += self.reasoning.lines().count();
+                }
+            }
+        }
+
+        if self.edits_active || !self.files.is_empty() {
+            line_idx += 1;
+            line_idx += 1;
+            if self.last_commit_summary.is_some() {
+                line_idx += 1;
+            }
+
+            for (idx, file) in self.files.iter().enumerate() {
+                if idx == target_idx {
+                    return line_idx;
+                }
+                line_idx += 1;
+                if file.status != "ok" && file.error.is_some() {
+                    line_idx += 1;
+                }
+                if file.expanded {
+                    line_idx += self.expanded_file_lines_count(file);
+                }
+            }
+        }
+        line_idx
+    }
+
+    pub fn scroll_to_selected_file(&mut self, view_height: u16) {
+        if self.files.is_empty() || view_height == 0 {
+            return;
+        }
+        let target_line = self.file_line_offset(self.selected_file_index) as u16;
+        let is_expanded = self
+            .files
+            .get(self.selected_file_index)
+            .map(|f| f.expanded)
+            .unwrap_or(false);
+
+        if target_line < self.scroll {
+            self.auto_scroll = false;
+            self.scroll = target_line;
+        } else if is_expanded {
+            if target_line + 4 >= self.scroll + view_height {
+                self.auto_scroll = false;
+                self.scroll = target_line.saturating_sub(1);
+            }
+        } else if target_line >= self.scroll + view_height {
+            self.auto_scroll = false;
+            self.scroll = (target_line + 1).saturating_sub(view_height);
+        }
+        self.clamp_scroll(view_height);
+    }
+
+    pub fn is_busy(&self) -> bool {
+        matches!(
+            self.status.as_str(),
+            "awaiting"
+                | "thinking"
+                | "responding"
+                | "editing"
+                | "verifying"
+                | "starting"
+                | "streaming"
+        )
     }
 }
 
@@ -164,39 +329,55 @@ pub fn compute_model_lines(model: &ModelView) -> Vec<Line<'static>> {
         ]));
     }
 
+    // 1. Model response text is always displayed at the top
+    if !model.markdown_lines.is_empty() {
+        model_lines.extend(model.markdown_lines.iter().cloned());
+    } else if !model.text.is_empty() {
+        for line in model.text.lines() {
+            model_lines.push(Line::from(Span::raw(line.to_string())));
+        }
+    }
+
+    // 2. Reasoning stream is displayed below the response text
     if !model.reasoning.is_empty() {
+        if !model.text.is_empty() || !model_lines.is_empty() {
+            model_lines.push(Line::raw(""));
+        }
+
+        let reasoning_badge = Span::styled(
+            " [REASONING] ",
+            Style::default().bg(Color::Rgb(60, 90, 140)).fg(Color::White).bold(),
+        );
+
         if model.show_reasoning {
-            model_lines.push(Line::from(Span::styled(
-                "Thinking (Ctrl+R to hide):",
-                Style::default()
-                    .fg(Color::Rgb(100, 140, 190))
-                    .add_modifier(ratatui::style::Modifier::DIM),
-            )));
+            model_lines.push(Line::from(vec![
+                reasoning_badge,
+                Span::raw(" "),
+                Span::styled(
+                    "Thinking (Ctrl+R to fold)",
+                    Style::default().fg(Color::Rgb(130, 170, 220)).bold(),
+                ),
+            ]));
+
             if !model.reasoning_lines.is_empty() {
                 model_lines.extend(model.reasoning_lines.iter().cloned());
             } else {
                 let text_style = Style::default()
-                    .fg(Color::Rgb(125, 160, 205))
+                    .fg(Color::Rgb(130, 165, 210))
                     .add_modifier(ratatui::style::Modifier::DIM);
                 for line in model.reasoning.lines() {
                     model_lines.push(Line::from(Span::styled(line.to_string(), text_style)));
                 }
             }
         } else {
-            model_lines.push(Line::from(Span::styled(
-                "[+] Thinking hidden (Ctrl+R to show)",
-                Style::default().bold().fg(Color::DarkGray),
-            )));
-        }
-    }
-
-    if !model.markdown_lines.is_empty() {
-        model_lines.push(Line::raw(""));
-        model_lines.extend(model.markdown_lines.iter().cloned());
-    } else if !model.text.is_empty() {
-        model_lines.push(Line::raw(""));
-        for line in model.text.lines() {
-            model_lines.push(Line::from(Span::raw(line.to_string())));
+            model_lines.push(Line::from(vec![
+                reasoning_badge,
+                Span::raw(" "),
+                Span::styled(
+                    "▶ Thinking hidden (Ctrl+R to expand)",
+                    Style::default().fg(Color::DarkGray).bold(),
+                ),
+            ]));
         }
     }
 
@@ -287,11 +468,16 @@ pub fn compute_model_lines(model: &ModelView) -> Vec<Line<'static>> {
             let (op_label, op_style) = match file.op_type.as_str() {
                 "create" => ("[NEW] ", Style::default().fg(Color::Green).bold()),
                 "delete" => ("[DEL] ", Style::default().fg(Color::Red).bold()),
+                "move" => ("[MOVE] ", Style::default().fg(Color::Cyan).bold()),
                 _ => ("[EDIT] ", Style::default().fg(Color::Magenta).bold()),
             };
 
             let hunk_count = file.hunks.len();
-            let hunk_label = if file.op_type == "create" {
+            let hunk_label = if file.op_type == "move" {
+                "renamed".to_string()
+            } else if file.op_type == "delete" {
+                "deleted".to_string()
+            } else if file.op_type == "create" {
                 let line_count = file
                     .hunks
                     .first()
@@ -355,33 +541,66 @@ pub fn compute_model_lines(model: &ModelView) -> Vec<Line<'static>> {
                 for hunk in &file.hunks {
                     if file.op_type == "create" {
                         model_lines.push(Line::from(vec![
-                            Span::raw("      "),
                             Span::styled(
-                                "@@ new file @@",
-                                Style::default().fg(Color::Green).italic(),
+                                "  @@ new file @@",
+                                Style::default().fg(Color::Green).bold(),
                             ),
                         ]));
+                        for line in hunk.new_text.lines() {
+                            model_lines.push(Line::from(vec![
+                                Span::styled("  + ", Style::default().fg(Color::Rgb(120, 240, 120)).bold()),
+                                Span::styled(line.to_string(), Style::default().fg(Color::Rgb(140, 240, 140))),
+                            ]));
+                        }
+                    } else if file.op_type == "delete" {
+                        model_lines.push(Line::from(vec![
+                            Span::styled(
+                                "  @@ deleted file @@",
+                                Style::default().fg(Color::Red).bold(),
+                            ),
+                        ]));
+                        for line in hunk.old_text.lines() {
+                            model_lines.push(Line::from(vec![
+                                Span::styled("  - ", Style::default().fg(Color::Rgb(255, 120, 120)).bold()),
+                                Span::styled(line.to_string(), Style::default().fg(Color::Rgb(255, 140, 140))),
+                            ]));
+                        }
                     } else {
+                        let diff = similar::TextDiff::from_lines(&hunk.old_text, &hunk.new_text);
+                        let header_text = if file.hunks.len() > 1 {
+                            format!("  @@ hunk {} @@", hunk.hunk_index + 1)
+                        } else {
+                            "  @@ diff @@".to_string()
+                        };
                         model_lines.push(Line::from(vec![
-                            Span::raw("      "),
-                            Span::styled(
-                                format!("@@ hunk {} @@", hunk.hunk_index + 1),
-                                Style::default().fg(Color::DarkGray).italic(),
-                            ),
+                            Span::styled(header_text, Style::default().fg(Color::Cyan).bold()),
                         ]));
-                    }
 
-                    for line in hunk.old_text.lines() {
-                        model_lines.push(Line::from(vec![
-                            Span::raw("      "),
-                            Span::styled(format!("- {}", line), Style::default().fg(Color::Red)),
-                        ]));
-                    }
-                    for line in hunk.new_text.lines() {
-                        model_lines.push(Line::from(vec![
-                            Span::raw("      "),
-                            Span::styled(format!("+ {}", line), Style::default().fg(Color::Green)),
-                        ]));
+                        for op in diff.ops() {
+                            for change in diff.iter_changes(op) {
+                                let line_str = change.value().trim_end_matches(['\r', '\n']);
+                                match change.tag() {
+                                    similar::ChangeTag::Delete => {
+                                        model_lines.push(Line::from(vec![
+                                            Span::styled("  - ", Style::default().fg(Color::Rgb(255, 120, 120)).bold()),
+                                            Span::styled(line_str.to_string(), Style::default().fg(Color::Rgb(255, 140, 140))),
+                                        ]));
+                                    }
+                                    similar::ChangeTag::Insert => {
+                                        model_lines.push(Line::from(vec![
+                                            Span::styled("  + ", Style::default().fg(Color::Rgb(120, 240, 120)).bold()),
+                                            Span::styled(line_str.to_string(), Style::default().fg(Color::Rgb(140, 240, 140))),
+                                        ]));
+                                    }
+                                    similar::ChangeTag::Equal => {
+                                        model_lines.push(Line::from(vec![
+                                            Span::styled("    ", Style::default().fg(Color::DarkGray)),
+                                            Span::styled(line_str.to_string(), Style::default().fg(Color::Rgb(170, 175, 185))),
+                                        ]));
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }

@@ -1,14 +1,70 @@
 use crate::context::ContextFileContent;
 use crate::edits::EditProtocol;
 use crate::model::gateway::ChatMessage;
-use workbench_protocol::{ContextAccess, RepositoryState};
+use tauqe_protocol::{ContextAccess, RepositoryState};
+
+pub fn build_squash_commit_prompt(
+    commits: &[crate::git::CommitSummary],
+    cumulative_diff: &str,
+    pinned_files: &[ContextFileContent],
+    target_language: Option<&str>,
+) -> String {
+    let mut prompt = String::new();
+    prompt.push_str("You are an expert developer assistant. Your task is to write a single high-quality commit message for squashing a series of commits into one.\n\n");
+
+    if !pinned_files.is_empty() {
+        prompt.push_str("## Project Guidelines & Context\n");
+        prompt.push_str("Follow any commit message conventions, scopes, and guidelines specified below:\n");
+        for file in pinned_files {
+            prompt.push_str(&format!(
+                "<file path=\"{}\">\n{}\n</file>\n",
+                file.path, file.content
+            ));
+        }
+        prompt.push('\n');
+    }
+
+    prompt.push_str("## Commits to Squash\n");
+    for c in commits {
+        prompt.push_str(&format!(
+            "- {} {} ({}, {})\n",
+            c.hash, c.subject, c.author, c.date
+        ));
+    }
+    prompt.push('\n');
+
+    prompt.push_str("## Cumulative Diff\n");
+    prompt.push_str("```diff\n");
+    const MAX_DIFF_CHARS: usize = 30_000;
+    if cumulative_diff.len() > MAX_DIFF_CHARS {
+        prompt.push_str(&cumulative_diff[..MAX_DIFF_CHARS]);
+        prompt.push_str("\n... [diff truncated for length] ...\n");
+    } else {
+        prompt.push_str(cumulative_diff);
+    }
+    if !cumulative_diff.ends_with('\n') {
+        prompt.push('\n');
+    }
+    prompt.push_str("```\n\n");
+
+    prompt.push_str("## Instructions\n");
+    prompt.push_str("1. Write a Conventional Commit header: `<type>(<scope>): <description>` (max 72 chars, imperative mood, lowercase, no trailing period).\n");
+    prompt.push_str("2. If helpful, provide a concise blank-line separated body with bullet points summarizing key architectural or functional changes.\n");
+    prompt.push_str("3. Output ONLY the commit message text itself. Do NOT include markdown code block fences (no ```), explanations, tags, or conversational fluff.\n");
+
+    if let Some(_lang) = target_language {
+        prompt.push_str("4. Follow project conventions for language (typically English commit messages conforming to repository guidelines).\n");
+    }
+
+    prompt
+}
 
 pub fn estimate_tokens(text: &str) -> usize {
     if text.is_empty() {
         return 0;
     }
     // Heuristic: ~4 characters per token
-    (text.chars().count() + 3) / 4
+    text.chars().count().div_ceil(4)
 }
 
 pub struct PromptAssembly {
@@ -18,6 +74,8 @@ pub struct PromptAssembly {
     pub workflow: String,
     pub edit_protocol: String,
     pub history_tag: Option<String>,
+    pub repo_map: Option<String>,
+    pub target_language: Option<String>,
 }
 
 impl PromptAssembly {
@@ -28,6 +86,7 @@ impl PromptAssembly {
         workflow: impl Into<String>,
         edit_protocol: impl Into<String>,
         history_tag: Option<String>,
+        repo_map: Option<String>,
     ) -> Self {
         Self {
             repo_state,
@@ -36,19 +95,43 @@ impl PromptAssembly {
             workflow: workflow.into(),
             edit_protocol: edit_protocol.into(),
             history_tag,
+            repo_map,
+            target_language: None,
         }
     }
 
     pub fn build_system_prompt(&self, protocol: &dyn EditProtocol) -> String {
         let mut prompt = String::new();
-        prompt.push_str("You are Workbench AI, an expert programming assistant operating inside the Workbench development environment.\n\n");
+        prompt.push_str("You are Tauqe AI, an expert programming assistant operating inside the Tauqe development environment.\n\n");
         prompt.push_str("## Core System Contract\n");
         prompt.push_str("1. Authoritative Source: The files provided in <context> represent the authoritative current state of the project. Do not invent missing code.\n");
         prompt.push_str("2. Read-Only Scope: Files inside <read_only_files> are strictly for reference and understanding. Do NOT propose edits to them.\n");
-        prompt.push_str("3. Editable Scope: Files inside <editable_files> are permitted for modification. You may also create new files using <create path=\"...\"> when required by the task.\n");
+        prompt.push_str("3. Editable Scope: Files inside <editable_files> are permitted for modification. You may also create new files using <create path=\"...\"> or move/rename files using <move from=\"...\" to=\"...\" /> when required by the task.\n");
         prompt.push_str("4. No Arbitrary Shell: You do not have shell execution capabilities. Work strictly through the context and actions provided.\n");
         prompt.push_str("5. Minimal Coherent Change: Prefer the smallest coherent modification necessary to complete the task.\n");
-        prompt.push_str("6. Always Explain Changes: Whenever you propose file edits, you MUST precede them with a concise conversational explanation (1-3 sentences) explaining what changes were made, why, and how they achieve the user's intent. Never output edits alone without an accompanying explanation.\n\n");
+        prompt.push_str("6. Always Explain Changes: Whenever you propose file edits, you MUST precede them with a concise conversational explanation (1-3 sentences) explaining what changes were made, why, and how they achieve the user's intent. Never output edits alone without an accompanying explanation.\n");
+        prompt.push_str("7. Reasoning in English: Always conduct internal reasoning, planning, and thinking strictly in English to preserve token budget and maximize reasoning quality.\n");
+
+        let marker_suffix = protocol
+            .turn_marker()
+            .map(|m| format!("_{}", m))
+            .unwrap_or_default();
+
+        if let Some(lang) = &self.target_language {
+            prompt.push_str(&format!(
+                "8. Language Consistency: The user's language is {}. All conversational explanations, answers, and messages MUST be in {}. Do NOT switch to English for conversational responses unless requested.\n",
+                lang, lang
+            ));
+        } else {
+            prompt.push_str(&format!(
+                "8. Language Consistency: Always formulate conversational explanations and user-facing answers in the same language as the user's request. Identify the user's language using <user_language{}>language_name</user_language{}> (e.g. <user_language{}>Russian</user_language{}>). Do NOT switch to English for conversational responses unless requested.\n",
+                marker_suffix, marker_suffix, marker_suffix, marker_suffix
+            ));
+        }
+        prompt.push_str(&format!(
+            "9. Code Verification: You can trigger deterministic code verification (check, clippy, test) using <verify{} target=\"all|check|test|clippy\" on_success=\"silent|report\" />. Always use on_success=\"silent\" unless the user explicitly requested to see raw command logs or test output. Verification is primarily for self-checking; never dump or quote full test/build logs if verification succeeds. A concise confirmation that the code is verified is sufficient.\n\n",
+            marker_suffix
+        ));
 
         let editable_paths: Vec<String> = self
             .context_files
@@ -142,6 +225,17 @@ impl PromptAssembly {
         })
     }
 
+    pub fn format_repo_map_block(&self) -> Option<String> {
+        self.repo_map.as_ref().and_then(|map| {
+            let trimmed = map.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(format!("<repo_map>\n{}\n</repo_map>", trimmed))
+            }
+        })
+    }
+
     pub fn assemble_chat_messages(
         &self,
         current_prompt: &str,
@@ -149,7 +243,7 @@ impl PromptAssembly {
     ) -> Vec<ChatMessage> {
         let mut messages = Vec::new();
 
-        // System prompt + Project metadata + Authoritative context + Session history + Protocol instructions
+        // System prompt + Project metadata + Authoritative context + Repo map + Session history + Protocol instructions
         let mut system_text = self.build_system_prompt(protocol);
         if let Some(context_block) = self.format_context_block() {
             system_text.push_str("## Project Context\n");
@@ -157,10 +251,22 @@ impl PromptAssembly {
             system_text.push_str("\n\n");
         }
 
+        if let Some(repo_map_block) = self.format_repo_map_block() {
+            system_text.push_str("## Repository Map\n");
+            system_text.push_str(&repo_map_block);
+            system_text.push_str("\n\n");
+        }
+
         if let Some(history_block) = self.format_history_block() {
             system_text.push_str("## Session History\n");
             system_text.push_str(&history_block);
             system_text.push_str("\n\n");
+        }
+
+        if let Some(target_lang) = &self.target_language {
+            system_text.push_str("## Language Directive\n");
+            system_text.push_str(&format!("- Target Response Language: {} (all conversational explanations, answers, and messages MUST be in {})\n", target_lang, target_lang));
+            system_text.push_str("- Reasoning / Thoughts: Strictly in English.\n\n");
         }
 
         messages.push(ChatMessage::system(system_text));
@@ -178,6 +284,48 @@ mod tests {
     use crate::edits::XmlEditProtocol;
 
     #[test]
+    fn test_build_squash_commit_prompt() {
+        let commits = vec![
+            crate::git::CommitSummary {
+                hash: "abc1234".to_string(),
+                author: "Dev".to_string(),
+                date: "2025-01-01".to_string(),
+                subject: "part 1".to_string(),
+            },
+            crate::git::CommitSummary {
+                hash: "def5678".to_string(),
+                author: "Dev".to_string(),
+                date: "2025-01-01".to_string(),
+                subject: "part 2".to_string(),
+            },
+        ];
+        let pinned = vec![ContextFileContent {
+            path: "docs/Conventions.md".to_string(),
+            access: ContextAccess::ReadOnly,
+            content: "# Conventions\nUse Conventional Commits.\n".to_string(),
+        }];
+
+        let prompt = build_squash_commit_prompt(&commits, "+new_code", &pinned, Some("Russian"));
+        assert!(prompt.contains("## Commits to Squash"));
+        assert!(prompt.contains("abc1234 part 1"));
+        assert!(prompt.contains("docs/Conventions.md"));
+        assert!(prompt.contains("Use Conventional Commits."));
+        assert!(prompt.contains("+new_code"));
+        assert!(prompt.contains("Conventional Commit header"));
+    }
+
+    #[test]
+    fn test_prompt_assembly_with_target_language() {
+        let mut assembly = PromptAssembly::new(None, 1, vec![], "git", "xml", None, None);
+        assembly.target_language = Some("Russian".to_string());
+        let proto = XmlEditProtocol;
+        let messages = assembly.assemble_chat_messages("Привет", &proto);
+        assert!(messages[0].content.contains("## Language Directive"));
+        assert!(messages[0].content.contains("Target Response Language: Russian"));
+        assert!(messages[0].content.contains("Reasoning / Thoughts: Strictly in English."));
+    }
+
+    #[test]
     fn test_prompt_assembly() {
         let files = vec![ContextFileContent {
             path: "src/main.rs".to_string(),
@@ -185,8 +333,9 @@ mod tests {
             content: "fn main() {}\n".to_string(),
         }];
         let history = Some("<history>\n{\"type\":\"summary\",\"text\":\"Initial\"}\n</history>".to_string());
-        let assembly = PromptAssembly::new(None, 1, files, "toolchain", "xml", history);
-        let proto = XmlEditProtocol::default();
+        let repo_map = Some("crates/core/src/git.rs\n  pub fn get_repository_state()".to_string());
+        let assembly = PromptAssembly::new(None, 1, files, "git", "xml", history, repo_map);
+        let proto = XmlEditProtocol;
         let messages = assembly.assemble_chat_messages("Explain this code", &proto);
 
         assert_eq!(messages.len(), 2);
@@ -194,6 +343,9 @@ mod tests {
         assert!(messages[0].content.contains("Core System Contract"));
         assert!(messages[0].content.contains("src/main.rs"));
         assert!(messages[0].content.contains("fn main() {}"));
+        assert!(messages[0].content.contains("## Repository Map"));
+        assert!(messages[0].content.contains("<repo_map>"));
+        assert!(messages[0].content.contains("crates/core/src/git.rs"));
         assert!(messages[0].content.contains("## Session History"));
         assert!(messages[0].content.contains("<history>"));
         assert!(messages[0].content.contains("{\"type\":\"summary\",\"text\":\"Initial\"}"));
@@ -204,6 +356,7 @@ mod tests {
     fn test_estimate_tokens() {
         assert_eq!(estimate_tokens(""), 0);
         assert_eq!(estimate_tokens("abcd"), 1);
+        assert_eq!(estimate_tokens("abcde"), 2);
         assert_eq!(estimate_tokens("abcde"), 2);
         assert_eq!(estimate_tokens("абвг"), 1);
     }

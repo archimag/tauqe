@@ -28,6 +28,35 @@ impl InputEditor {
         }
     }
 
+    /// Computes the total visual line count and the visual line of the cursor
+    /// given a specific content width (columns available inside the widget).
+    pub fn visual_lines_and_cursor(&self, width: usize) -> (usize, usize) {
+        let width = width.max(10);
+        let mut total_visual_lines = 0;
+        let mut cursor_visual_line = 0;
+        let (cur_line, cur_col) = self.cursor_line_col();
+
+        for (l_idx, line) in self.get_lines().iter().enumerate() {
+            let prefix_len = 3; // " > " or "   "
+            let available_width = width.saturating_sub(prefix_len).max(1);
+            let char_count = line.chars().count();
+            let visual_lines_for_this = if char_count == 0 {
+                1
+            } else {
+                char_count.div_ceil(available_width)
+            };
+
+            if l_idx == cur_line {
+                let offset_in_line = cur_col / available_width;
+                cursor_visual_line = total_visual_lines + offset_in_line.min(visual_lines_for_this.saturating_sub(1));
+            }
+
+            total_visual_lines += visual_lines_for_this;
+        }
+
+        (total_visual_lines.max(1), cursor_visual_line)
+    }
+
     pub fn cursor_line_col(&self) -> (usize, usize) {
         let mut line = 0;
         let mut col = 0;
