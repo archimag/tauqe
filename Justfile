@@ -34,6 +34,20 @@ build:
 release:
     cargo build --release -p tauqe-server -p tauqe-tui
 
+# Установка tauqe-server и tauqe в систему (~/.cargo/bin)
+install:
+    cargo install --path crates/server --locked
+    cargo install --path crates/tui --locked
+    @echo "Tauqe успешно установлен! Доступна команда 'tauqe'."
+
 # Очистка артефактов сборки
 clean:
     cargo clean
+
+# Build mdBook documentation
+book-build:
+    mdbook build book
+
+# Serve mdBook documentation with live reload
+book-serve *args="":
+    mdbook serve book {{args}}

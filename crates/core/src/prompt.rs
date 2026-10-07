@@ -1,13 +1,12 @@
 use crate::context::ContextFileContent;
 use crate::edits::EditProtocol;
-use crate::model::gateway::ChatMessage;
+use crate::providers::ChatMessage;
 use tauqe_protocol::{ContextAccess, RepositoryState};
 
 pub fn build_squash_commit_prompt(
     commits: &[crate::git::CommitSummary],
     cumulative_diff: &str,
     pinned_files: &[ContextFileContent],
-    target_language: Option<&str>,
 ) -> String {
     let mut prompt = String::new();
     prompt.push_str("You are an expert developer assistant. Your task is to write a single high-quality commit message for squashing a series of commits into one.\n\n");
@@ -37,7 +36,13 @@ pub fn build_squash_commit_prompt(
     prompt.push_str("```diff\n");
     const MAX_DIFF_CHARS: usize = 30_000;
     if cumulative_diff.len() > MAX_DIFF_CHARS {
-        prompt.push_str(&cumulative_diff[..MAX_DIFF_CHARS]);
+        let truncate_index = cumulative_diff
+            .char_indices()
+            .map(|(idx, _)| idx)
+            .take_while(|&idx| idx <= MAX_DIFF_CHARS)
+            .last()
+            .unwrap_or(0);
+        prompt.push_str(&cumulative_diff[..truncate_index]);
         prompt.push_str("\n... [diff truncated for length] ...\n");
     } else {
         prompt.push_str(cumulative_diff);
@@ -48,13 +53,8 @@ pub fn build_squash_commit_prompt(
     prompt.push_str("```\n\n");
 
     prompt.push_str("## Instructions\n");
-    prompt.push_str("1. Write a Conventional Commit header: `<type>(<scope>): <description>` (max 72 chars, imperative mood, lowercase, no trailing period).\n");
-    prompt.push_str("2. If helpful, provide a concise blank-line separated body with bullet points summarizing key architectural or functional changes.\n");
-    prompt.push_str("3. Output ONLY the commit message text itself. Do NOT include markdown code block fences (no ```), explanations, tags, or conversational fluff.\n");
-
-    if let Some(_lang) = target_language {
-        prompt.push_str("4. Follow project conventions for language (typically English commit messages conforming to repository guidelines).\n");
-    }
+    prompt.push_str("1. Write a concise commit message summarizing the squashed commits and cumulative changes according to project guidelines.\n");
+    prompt.push_str("2. Output ONLY the commit message text itself. Do NOT include markdown code block fences (no ```), explanations, tags, or conversational fluff.\n");
 
     prompt
 }
@@ -98,6 +98,11 @@ impl PromptAssembly {
             repo_map,
             target_language: None,
         }
+    }
+
+    pub fn with_target_language(mut self, target_language: Option<String>) -> Self {
+        self.target_language = target_language;
+        self
     }
 
     pub fn build_system_prompt(&self, protocol: &dyn EditProtocol) -> String {
@@ -305,13 +310,26 @@ mod tests {
             content: "# Conventions\nUse Conventional Commits.\n".to_string(),
         }];
 
-        let prompt = build_squash_commit_prompt(&commits, "+new_code", &pinned, Some("Russian"));
+        let prompt = build_squash_commit_prompt(&commits, "+new_code", &pinned);
         assert!(prompt.contains("## Commits to Squash"));
         assert!(prompt.contains("abc1234 part 1"));
         assert!(prompt.contains("docs/Conventions.md"));
         assert!(prompt.contains("Use Conventional Commits."));
         assert!(prompt.contains("+new_code"));
-        assert!(prompt.contains("Conventional Commit header"));
+        assert!(prompt.contains("Instructions"));
+    }
+
+    #[test]
+    fn test_build_squash_commit_prompt_truncation_utf8_safety() {
+        let commits = vec![];
+        let pinned = vec![];
+        // Multi-byte characters (Cyrillic chars are 2 bytes each)
+        let multi_byte_text = "Тестовая строка для проверки обрезки по границе UTF-8. ".repeat(700);
+        assert!(multi_byte_text.len() > 30_000);
+
+        // Must not panic on truncation:
+        let prompt = build_squash_commit_prompt(&commits, &multi_byte_text, &pinned);
+        assert!(prompt.contains("diff truncated for length"));
     }
 
     #[test]

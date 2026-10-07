@@ -1,6 +1,9 @@
-[models]
-default = "~google/gemini-flash-latest"
-available = [
+[models.default]
+provider = "openrouter"
+name = "~google/gemini-flash-latest"
+
+[providers.openrouter]
+models = [
   "~google/gemini-flash-latest",
   "~openai/gpt-luna-latest",
   "~openai/gpt-sol-latest",
@@ -8,24 +11,31 @@ available = [
   "~anthropic/claude-sonnet-latest",
   "~anthropic/claude-haiku-latest"
 ]
+# api_key = ""        # лучше хранить в .tauqe/credentials.toml или в OPENROUTER_API_KEY
 
 [edit]
-max_retries = 3  # число повторных попыток исправления неудачных правок
+max_retries = 5  # число повторных попыток исправления неудачных правок
 workflow = "git"  # варианты: "toolchain", "git", "naive"
 protocol = "xml"        # активный протокол правок: "xml"
 
 [toolchain]
 # check_command = ""  # своя команда проверки; по умолчанию определяется автоматически
-# max_retries = 3     # по умолчанию не задано
+# max_retries = 5     # по умолчанию не задано
 # auto_heal = false   # по умолчанию не задано
 
-[providers.openrouter]
-# api_key = ""        # лучше хранить в .tauqe/credentials.toml или в OPENROUTER_API_KEY
+[git]
+# upstream = "origin/master"  # базовая upstream-ветка для расчета диффов (по умолчанию определяется автоматически)
+
+[history]
+# budget_tokens = 64000  # бюджет истории сессии в токенах до запуска компактификации (по умолчанию 64000)
+# tail_turns = 10        # количество последних ходов, сохраняемых без сжатия в детальном виде (по умолчанию 10)
 
 [context]
-max_discovery_rounds = 6  # максимум раундов автоматического поиска файлов
-# max_auto_files_per_round = 15  # по умолчанию без ограничения
+max_discovery_rounds = 8  # максимум раундов автоматического поиска файлов
+max_auto_files_per_round = 5  # максимум файлов за один раунд авто-добавления
+# repomap_token_budget = 4000  # бюджет токенов для карты репозитория (по умолчанию 4000)
 pinned = [
     "docs/Conventions.md",
-    "docs/Vision.md"
+    "docs/Vision.md",
+    "book/src/SUMMARY.md"
 ]

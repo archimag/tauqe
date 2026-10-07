@@ -99,35 +99,29 @@ impl InputEditor {
     }
 
     pub fn delete_backward(&mut self) {
-        if self.cursor > 0 {
-            let prev_char = self.text[..self.cursor].chars().next_back().unwrap();
-            let prev_len = prev_char.len_utf8();
-            let new_cursor = self.cursor - prev_len;
+        if let Some(prev_char) = self.text[..self.cursor].chars().next_back() {
+            let new_cursor = self.cursor - prev_char.len_utf8();
             self.text.drain(new_cursor..self.cursor);
             self.cursor = new_cursor;
         }
     }
 
     pub fn delete_forward(&mut self) {
-        if self.cursor < self.text.len() {
-            let next_char = self.text[self.cursor..].chars().next().unwrap();
-            let next_len = next_char.len_utf8();
-            self.text.drain(self.cursor..self.cursor + next_len);
+        if let Some(next_char) = self.text[self.cursor..].chars().next() {
+            self.text
+                .drain(self.cursor..self.cursor + next_char.len_utf8());
         }
     }
 
     pub fn move_backward(&mut self) {
-        if self.cursor > 0 {
-            let prev_char = self.text[..self.cursor].chars().next_back().unwrap();
+        if let Some(prev_char) = self.text[..self.cursor].chars().next_back() {
             self.cursor -= prev_char.len_utf8();
         }
     }
 
     pub fn move_forward(&mut self) {
-        if self.cursor < self.text.len() {
-            let next_char = self.text[self.cursor..].chars().next().unwrap();
-            let next_char_len = next_char.len_utf8();
-            self.cursor += next_char_len;
+        if let Some(next_char) = self.text[self.cursor..].chars().next() {
+            self.cursor += next_char.len_utf8();
         }
     }
 

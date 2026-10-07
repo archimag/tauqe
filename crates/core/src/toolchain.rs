@@ -6,7 +6,6 @@ pub enum ToolchainKind {
     Cargo,
     Npm,
     Go,
-    Python,
     Custom(String),
     None,
 }
@@ -95,12 +94,6 @@ pub fn resolve_verification_commands(
             VerifyTarget::Test => vec!["go test ./...".to_string()],
             VerifyTarget::All => vec!["go vet ./...".to_string(), "go test ./...".to_string()],
         },
-        ToolchainKind::Python => match target {
-            VerifyTarget::Check => vec!["python3 -m py_compile".to_string()],
-            VerifyTarget::Clippy => vec!["flake8".to_string()],
-            VerifyTarget::Test => vec!["pytest".to_string()],
-            VerifyTarget::All => vec!["pytest".to_string()],
-        },
         ToolchainKind::Custom(cmd) => vec![cmd.clone()],
         ToolchainKind::None => Vec::new(),
     }
@@ -169,16 +162,6 @@ pub fn detect_toolchain(
 
     if repo_root.join("go.mod").is_file() {
         return (ToolchainKind::Go, Some("go vet ./...".to_string()));
-    }
-
-    if repo_root.join("pyproject.toml").is_file()
-        || repo_root.join("setup.py").is_file()
-        || repo_root.join("requirements.txt").is_file()
-    {
-        return (
-            ToolchainKind::Python,
-            Some("python3 -m py_compile".to_string()),
-        );
     }
 
     (ToolchainKind::None, None)

@@ -1,9 +1,10 @@
 use tauqe_protocol::{EditOperation, ModelResult, ModelResultProposal};
 
-use crate::model::gateway::{JsonSchemaDefinition, ResponseFormat};
+use crate::providers::{JsonSchemaDefinition, ResponseFormat};
 
 use super::utils::{normalize_content, parse_context_request_spec, resolve_target_path_for_op};
-use super::{ContextRequest, EditProtocol};
+use super::{ContextRequest, EditProtocol, VerifyRequest};
+use crate::edits::stream::{EditStreamFilter, JsonStreamFilter};
 
 /// Structured Output JSON-schema edit protocol
 #[derive(Debug, Default, Clone)]
@@ -191,6 +192,7 @@ impl StructuredEditProtocol {
                 EditOperation::Create { path, .. } => format!("Create {}", path),
                 EditOperation::Delete { path } => format!("Delete {}", path),
                 EditOperation::Move { from, to } => format!("Move {} to {}", from, to),
+                EditOperation::Overwrite { path, .. } => format!("Overwrite {}", path),
             }
         } else {
             format!("Apply {} structured edits", edits.len())
@@ -270,13 +272,24 @@ impl EditProtocol for StructuredEditProtocol {
             .unwrap_or_default()
     }
 
+    fn parse_verify_request(&self, raw_text: &str) -> Option<VerifyRequest> {
+        if super::xml::has_xml_edit_tags(raw_text) {
+            return super::xml::tags::extract_verify_request(raw_text);
+        }
+        None
+    }
+
+    fn parse_user_language(&self, raw_text: &str) -> Option<String> {
+        super::xml::tags::extract_user_language(raw_text)
+    }
+
+    fn clean_assistant_text(&self, raw_text: &str) -> String {
+        clean_raw_json_or_text(raw_text)
+    }
+
     fn parse_output(&self, raw_text: &str, editable_paths: &[String]) -> ModelResult {
         if let Some(proposal) = parse_proposal(raw_text) {
             return self.proposal_to_model_result(proposal, editable_paths);
-        }
-
-        if let Some(json_res) = crate::edits::parse_tauqe_edit_json(raw_text) {
-            return json_res;
         }
 
         if super::xml::has_xml_edit_tags(raw_text) {
@@ -286,6 +299,18 @@ impl EditProtocol for StructuredEditProtocol {
         ModelResult::Answer {
             text: raw_text.to_string(),
         }
+    }
+
+    fn create_stream_filter(
+        &self,
+        editable_paths: Vec<String>,
+        repo_root: std::path::PathBuf,
+        staged_contents: std::collections::HashMap<String, String>,
+    ) -> Box<dyn EditStreamFilter> {
+        Box::new(
+            JsonStreamFilter::new(editable_paths, repo_root)
+                .with_staged_contents(staged_contents),
+        )
     }
 }
 
@@ -355,6 +380,67 @@ fn extract_json_str(raw: &str) -> &str {
         }
     }
     trimmed
+}
+
+/// Cleans raw text or JSON into conversational text without raw schema markup.
+pub fn clean_raw_json_or_text(raw: &str) -> String {
+    let msgs = extract_json_messages(raw);
+    if !msgs.is_empty() {
+        let joined = msgs.join("\n\n");
+        return super::xml::tags::strip_verify_tags(
+            &super::xml::tags::strip_user_language_tags(
+                &super::xml::tags::strip_context_request_tags(&joined),
+            ),
+        );
+    }
+
+    if let Some(proposal) = parse_proposal(raw) {
+        if !proposal.message.trim().is_empty() {
+            return super::xml::tags::strip_verify_tags(
+                &super::xml::tags::strip_user_language_tags(
+                    &super::xml::tags::strip_context_request_tags(&proposal.message),
+                ),
+            );
+        }
+    }
+
+    if super::xml::has_xml_edit_tags(raw) {
+        return super::xml::extract_conversational_text(raw);
+    }
+
+    super::xml::tags::strip_verify_tags(
+        &super::xml::tags::strip_user_language_tags(
+            &super::xml::tags::strip_context_request_tags(raw),
+        ),
+    )
+}
+
+/// Extracts conversational "message" strings from structured JSON output blocks.
+pub fn extract_json_messages(raw: &str) -> Vec<String> {
+    let mut messages = Vec::new();
+    let mut from = 0;
+    while let Some(rel) = raw[from..].find('{') {
+        let start = from + rel;
+        if let Some(end) = balanced_object_end(raw, start) {
+            let slice = &raw[start..end];
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(slice) {
+                if let Some(msg) = val.get("message").and_then(|m| m.as_str()) {
+                    let trimmed = msg.trim();
+                    if !trimmed.is_empty()
+                        && (val.get("changes").is_some()
+                            || val.get("context_requests").is_some()
+                            || val.get("suggested_actions").is_some())
+                    {
+                        messages.push(trimmed.to_string());
+                    }
+                }
+            }
+            from = end;
+        } else {
+            from = start + 1;
+        }
+    }
+    messages
 }
 
 #[cfg(test)]

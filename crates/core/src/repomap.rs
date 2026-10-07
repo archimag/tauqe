@@ -4,10 +4,18 @@ use std::path::Path;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
-pub mod rustdoc;
 pub mod treesitter;
 
-pub const DEFAULT_REPOMAP_TOKEN_BUDGET: usize = 2500;
+pub use treesitter::TreeSitterExtractor;
+
+pub const DEFAULT_REPOMAP_TOKEN_BUDGET: usize = 4000;
+
+/// Trait defining a strategy for extracting symbols from repository files.
+///
+/// Allows pluggable implementations (Tree-sitter, language servers, precomputed indices).
+pub trait SymbolExtractor: Send + Sync {
+    fn extract_symbols(&self, repo_root: &Path, files: &[String]) -> Result<Vec<RepoFileSymbols>>;
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum SymbolKind {
@@ -27,8 +35,6 @@ pub struct Symbol {
     pub signature: Option<String>,
     pub is_public: bool,
     pub line: usize,
-    #[serde(default)]
-    pub docs: Option<String>,
     pub children: Vec<Symbol>,
 }
 
@@ -46,7 +52,6 @@ impl Symbol {
             signature,
             is_public,
             line,
-            docs: None,
             children: Vec::new(),
         }
     }
@@ -75,16 +80,34 @@ pub enum DetailLevel {
     TopLevelOnly,
 }
 
-/// Generates a semantic repository map outline formatted within `token_budget`.
-///
-/// 1. Excludes files already in active context (`context_files`).
-/// 2. Queries rustdoc extractor first; falls back transparently to tree-sitter.
-/// 3. Formats symbols into high-density hierarchical outline with token budgeting.
+/// Generates a semantic repository map outline formatted within `token_budget` using the default Tree-sitter extractor.
 pub fn generate_repo_map(
     repo_root: &Path,
     available_files: &[String],
     context_files: &[String],
     token_budget: usize,
+) -> Result<String> {
+    let extractor = TreeSitterExtractor;
+    generate_repo_map_with_extractor(
+        repo_root,
+        available_files,
+        context_files,
+        token_budget,
+        &extractor,
+    )
+}
+
+/// Generates a semantic repository map outline formatted within `token_budget` using a custom extractor.
+///
+/// 1. Excludes files already in active context (`context_files`).
+/// 2. Queries the provided `SymbolExtractor`.
+/// 3. Formats symbols into a hierarchical outline with adaptive token budgeting.
+pub fn generate_repo_map_with_extractor(
+    repo_root: &Path,
+    available_files: &[String],
+    context_files: &[String],
+    token_budget: usize,
+    extractor: &dyn SymbolExtractor,
 ) -> Result<String> {
     let context_set: HashSet<&str> = context_files.iter().map(|s| s.as_str()).collect();
 
@@ -102,12 +125,7 @@ pub fn generate_repo_map(
         return Ok(String::new());
     }
 
-    // Try rustdoc JSON extractor first, fallback to tree-sitter
-    let symbols = match rustdoc::extract_rustdoc_symbols(repo_root, &eligible_files) {
-        Ok(syms) if !syms.is_empty() => syms,
-        Ok(_) | Err(_) => treesitter::extract_treesitter_symbols(repo_root, &eligible_files)?,
-    };
-
+    let symbols = extractor.extract_symbols(repo_root, &eligible_files)?;
     let outline = format_symbols_with_budget(&symbols, token_budget);
     Ok(outline)
 }
@@ -130,19 +148,26 @@ pub fn format_symbols_with_budget(files: &[RepoFileSymbols], token_budget: usize
 
     // If even TopLevelOnly exceeds budget, greedily include files until budget is reached
     let mut accumulated: Vec<String> = Vec::new();
+    let mut current_tokens = 0;
+    let separator_tokens = crate::prompt::estimate_tokens("\n\n");
+
     for file in files {
         let block = format_file_symbols(file, DetailLevel::TopLevelOnly);
         if block.is_empty() {
             continue;
         }
-        let candidate = if accumulated.is_empty() {
-            block.clone()
+        let block_tokens = crate::prompt::estimate_tokens(&block);
+        let needed_tokens = if accumulated.is_empty() {
+            block_tokens
         } else {
-            format!("{}\n\n{}", accumulated.join("\n\n"), block)
+            block_tokens + separator_tokens
         };
-        if crate::prompt::estimate_tokens(&candidate) > token_budget {
+
+        if current_tokens + needed_tokens > token_budget {
             break;
         }
+
+        current_tokens += needed_tokens;
         accumulated.push(block);
     }
 
@@ -231,10 +256,11 @@ fn format_symbol_into_lines(
             }
         }
         SymbolKind::Impl => {
+            let is_trait_impl = sym.name.contains(" for ");
             let methods: Vec<_> = sym
                 .children
                 .iter()
-                .filter(|m| level == DetailLevel::Full || m.is_public)
+                .filter(|m| level == DetailLevel::Full || is_trait_impl || m.is_public)
                 .collect();
 
             if methods.is_empty() && level != DetailLevel::Full {
@@ -317,7 +343,6 @@ mod tests {
                     signature: Some("pub struct PublicStruct {\n    pub id: u64,\n    pub name: String,\n}".to_string()),
                     is_public: true,
                     line: 1,
-                    docs: None,
                     children: Vec::new(),
                 },
                 Symbol {
@@ -326,7 +351,6 @@ mod tests {
                     signature: Some("fn private_func()".to_string()),
                     is_public: false,
                     line: 6,
-                    docs: None,
                     children: Vec::new(),
                 },
                 Symbol {
@@ -335,7 +359,6 @@ mod tests {
                     signature: Some("pub fn public_func() -> bool".to_string()),
                     is_public: true,
                     line: 8,
-                    docs: None,
                     children: Vec::new(),
                 },
             ],
@@ -385,5 +408,31 @@ mod tests {
         let formatted = format_symbols_with_budget(&syms, 10);
         assert!(formatted.contains("src/a.rs"));
         assert!(!formatted.contains("src/b.rs"));
+    }
+
+    #[test]
+    fn test_format_trait_impl_methods_retention() {
+        let syms = vec![RepoFileSymbols {
+            path: "src/sample.rs".to_string(),
+            symbols: vec![Symbol {
+                name: "impl Greeter for User".to_string(),
+                kind: SymbolKind::Impl,
+                signature: Some("impl Greeter for User".to_string()),
+                is_public: true,
+                line: 1,
+                children: vec![Symbol {
+                    name: "greet".to_string(),
+                    kind: SymbolKind::Method,
+                    signature: Some("fn greet(&self) -> String".to_string()),
+                    is_public: true,
+                    line: 2,
+                    children: Vec::new(),
+                }],
+            }],
+        }];
+
+        let outline = format_symbols_with_budget(&syms, 100);
+        assert!(outline.contains("impl Greeter for User"));
+        assert!(outline.contains("fn greet(&self) -> String"));
     }
 }

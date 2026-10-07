@@ -419,6 +419,43 @@ impl ContextManager {
         removed
     }
 
+    /// Merges updates produced by a workflow run into the current context manager.
+    /// Preserves user layer changes made concurrently. Updates the auto layer,
+    /// syncs file renames/removals, and refreshes metadata.
+    pub fn merge_turn_context(&mut self, turn_context: &ContextManager) {
+        // 1. Sync auto layer: replace with turn_context.auto (excluding any path already in user layer)
+        self.auto.clear();
+        for (path, item) in &turn_context.auto {
+            if !self.user.contains_key(path) {
+                self.auto.insert(path.clone(), item.clone());
+            }
+        }
+
+        // 2. Remove files that no longer exist on disk (prunes deleted files)
+        self.prune_missing_files();
+
+        // 3. Mirror any file renamed/moved into user layer by the turn
+        for (path, item) in &turn_context.user {
+            if !self.user.contains_key(path) && self.repo_root.join(path).is_file() {
+                self.user.insert(path.clone(), item.clone());
+            }
+        }
+
+        // 4. Refresh metadata for all files in context
+        for layer in [&mut self.pinned, &mut self.user, &mut self.auto] {
+            for (path, item) in layer.iter_mut() {
+                let full_path = self.repo_root.join(path);
+                if let Ok(meta) = std::fs::metadata(&full_path) {
+                    let size = meta.len();
+                    item.size_bytes = size;
+                    item.estimated_tokens = size.div_ceil(4);
+                }
+            }
+        }
+
+        self.revision += 1;
+    }
+
     pub fn normalize_path(&self, p: &str) -> Result<String> {
         let path = Path::new(p);
         let mut components = Vec::new();
@@ -522,6 +559,35 @@ mod tests {
         let state = cm.get_state();
         let auto_item = state.items.iter().find(|i| i.path == "auto.rs").unwrap();
         assert_eq!(auto_item.layer, ContextLayer::User);
+    }
+
+    #[test]
+    fn test_merge_turn_context_preserves_concurrent_user_additions() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        std::fs::write(root.join("base.rs"), "fn base() {}").unwrap();
+        std::fs::write(root.join("auto.rs"), "fn auto() {}").unwrap();
+        std::fs::write(root.join("user_added.rs"), "fn user_added() {}").unwrap();
+
+        let mut primary = ContextManager::new(root.clone());
+        primary.add_file("base.rs", ContextAccess::Editable).unwrap();
+
+        // Turn starts with a snapshot
+        let mut turn_snapshot = primary.clone();
+        turn_snapshot.add_auto_file("auto.rs", ContextAccess::ReadOnly).unwrap();
+
+        // While turn is running, user adds a new file to primary
+        primary.add_file("user_added.rs", ContextAccess::Editable).unwrap();
+
+        // Turn completes and merges back
+        primary.merge_turn_context(&turn_snapshot);
+
+        // Verify user_added is still present
+        assert!(primary.contains("user_added.rs").unwrap());
+        assert!(primary.is_editable("user_added.rs").unwrap());
+        // Verify auto file from turn was merged
+        assert!(primary.contains("auto.rs").unwrap());
+        assert!(!primary.is_editable("auto.rs").unwrap());
     }
 
     #[test]

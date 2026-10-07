@@ -7,6 +7,10 @@ use syntect::easy::HighlightLines;
 use syntect::highlighting::{Style as SynStyle, ThemeSet};
 use syntect::parsing::SyntaxSet;
 
+mod latex;
+pub use latex::convert_latex_to_unicode;
+use latex::render_text_spans;
+
 static SYNTAX_SET: LazyLock<SyntaxSet> = LazyLock::new(SyntaxSet::load_defaults_newlines);
 static THEME_SET: LazyLock<ThemeSet> = LazyLock::new(ThemeSet::load_defaults);
 
@@ -34,6 +38,7 @@ pub struct MarkdownTheme {
     pub table_border: Style,
     pub table_head: Style,
     pub table_cell: Style,
+    pub math_style: Style,
     pub compact: bool,
     pub line_prefix: Option<Span<'static>>,
 }
@@ -92,6 +97,9 @@ impl MarkdownTheme {
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
             table_cell: Style::default().fg(Color::White),
+            math_style: Style::default()
+                .fg(Color::LightCyan)
+                .add_modifier(Modifier::ITALIC),
             compact: false,
             line_prefix: None,
         }
@@ -137,6 +145,7 @@ impl MarkdownTheme {
                 .add_modifier(Modifier::DIM),
             table_head: Style::default().fg(Color::Rgb(145, 185, 230)),
             table_cell: base_blue,
+            math_style: base_blue.add_modifier(Modifier::ITALIC),
             compact: true,
             line_prefix: None,
         }
@@ -144,14 +153,14 @@ impl MarkdownTheme {
 }
 
 #[derive(Debug, Clone, Copy, Default)]
-struct StyleModifier {
-    bold: bool,
-    italic: bool,
-    strikethrough: bool,
+pub(crate) struct StyleModifier {
+    pub(crate) bold: bool,
+    pub(crate) italic: bool,
+    pub(crate) strikethrough: bool,
 }
 
 impl StyleModifier {
-    fn to_style(self, base: Style, theme: &MarkdownTheme) -> Style {
+    pub(crate) fn to_style(self, base: Style, theme: &MarkdownTheme) -> Style {
         let mut s = base;
         if self.bold {
             s = s.patch(theme.bold_style);
@@ -868,11 +877,13 @@ pub fn render_markdown_with_blocks(
                     if link_url.is_some() {
                         base_style = theme.link;
                     }
-                    let span = Span::styled(t.to_string(), style_mod.to_style(base_style, theme));
+                    let spans = render_text_spans(&t, base_style, theme, style_mod);
 
                     if let Some(ts) = table_state.as_mut() {
-                        ts.current_cell_len += span.content.chars().count();
-                        ts.current_cell_spans.push(span);
+                        for span in spans {
+                            ts.current_cell_len += span.content.chars().count();
+                            ts.current_cell_spans.push(span);
+                        }
                     } else {
                         ensure_line_prefix(
                             theme,
@@ -881,7 +892,7 @@ pub fn render_markdown_with_blocks(
                             &mut list_stack,
                             &mut item_started,
                         );
-                        current_spans.push(span);
+                        current_spans.extend(spans);
                     }
                 }
             }

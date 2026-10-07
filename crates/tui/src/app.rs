@@ -1,26 +1,25 @@
-use tauqe_protocol::{matches_glob_pattern, ContextState, RepositoryState, UiHistoryItem};
+use tauqe_protocol::{ContextState, ModelRef, RepositoryState};
 
-use crate::context_view::ContextViewState;
 use crate::editor::InputEditor;
-use crate::model_view::ModelView;
+use crate::ui::context::ContextViewState;
+use crate::ui::develop::DevelopView;
+use crate::ui::history::HistoryViewState;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SelectionDialogKind {
-    Workflow,
-    EditProtocol,
     Model,
 }
 
 #[derive(Debug, Clone)]
 pub struct SelectionDialogState {
     pub kind: SelectionDialogKind,
-    pub items: Vec<String>,
+    pub items: Vec<ModelRef>,
     pub selected_index: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ViewMode {
-    Model,
+    Develop,
     Context,
     History,
     Onboarding,
@@ -28,6 +27,7 @@ pub enum ViewMode {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OnboardingStep {
+    Git,
     Config,
     Credentials,
     Ready,
@@ -37,6 +37,7 @@ pub enum OnboardingStep {
 #[derive(Debug, Clone)]
 pub struct OnboardingState {
     pub step: OnboardingStep,
+    pub has_git: bool,
     pub has_config: bool,
     pub config_path: Option<String>,
     pub default_config_path: String,
@@ -46,6 +47,7 @@ pub struct OnboardingState {
     pub selected_index: usize,
     pub input_buffer: String,
     pub input_active: bool,
+    pub show_key: bool,
     pub status_message: Option<String>,
     pub error_message: Option<String>,
     pub selected_model: String,
@@ -56,6 +58,7 @@ impl Default for OnboardingState {
     fn default() -> Self {
         Self {
             step: OnboardingStep::Config,
+            has_git: true,
             has_config: false,
             config_path: None,
             default_config_path: "tauqe.toml".to_string(),
@@ -65,6 +68,7 @@ impl Default for OnboardingState {
             selected_index: 0,
             input_buffer: String::new(),
             input_active: false,
+            show_key: false,
             status_message: None,
             error_message: None,
             selected_model: "anthropic/claude-3.7-sonnet".to_string(),
@@ -78,39 +82,83 @@ impl Default for OnboardingState {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct HeaderClickAreas {
+    pub develop_tab: (u16, u16),
+    pub context_tab: (u16, u16),
+    pub history_tab: (u16, u16),
+    pub model_select: (u16, u16),
+    pub squash_button: (u16, u16),
+    pub help_button: (u16, u16),
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FooterClickAreas {
+    pub help_button: (u16, u16),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SquashBaseMode {
+    #[default]
+    Session,
+    Upstream,
+    Custom,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SquashDialogFocus {
+    #[default]
+    FileList,
+    DiffView,
+    MessageEditor,
+}
+
 #[derive(Debug, Clone)]
-pub struct HistoryViewState {
-    pub items: Vec<UiHistoryItem>,
-    pub scroll: u16,
-    pub auto_scroll: bool,
-    pub has_more: bool,
-    pub total_count: usize,
-    pub loading: bool,
-    pub rendered_lines_count: usize,
-    pub pending_before_id: Option<u64>,
+pub struct SquashFileItem {
+    pub path: String,
+    pub diff: String,
+    pub expanded: bool,
 }
 
 #[derive(Debug, Clone)]
 pub struct SquashDialogState {
     pub loading: bool,
+    pub generating_message: bool,
+    pub base_mode: SquashBaseMode,
     pub base_ref: String,
+    pub session_base: Option<String>,
+    pub upstream_base: Option<String>,
+    pub custom_input: String,
+    pub custom_input_active: bool,
     pub commits: Vec<tauqe_protocol::GitSquashCommitItem>,
     pub diff_stat: String,
+    pub files: Vec<SquashFileItem>,
+    pub selected_file_index: usize,
+    pub diff_scroll: u16,
     pub message_buffer: String,
     pub status_message: Option<String>,
+    pub focus: SquashDialogFocus,
 }
 
-impl Default for HistoryViewState {
+impl Default for SquashDialogState {
     fn default() -> Self {
         Self {
-            items: Vec::new(),
-            scroll: 0,
-            auto_scroll: true,
-            has_more: false,
-            total_count: 0,
-            loading: false,
-            rendered_lines_count: 0,
-            pending_before_id: None,
+            loading: true,
+            generating_message: false,
+            base_mode: SquashBaseMode::Session,
+            base_ref: String::new(),
+            session_base: None,
+            upstream_base: None,
+            custom_input: String::new(),
+            custom_input_active: false,
+            commits: Vec::new(),
+            diff_stat: String::new(),
+            files: Vec::new(),
+            selected_file_index: 0,
+            diff_scroll: 0,
+            message_buffer: String::new(),
+            status_message: Some("Inspecting repository history...".to_string()),
+            focus: SquashDialogFocus::FileList,
         }
     }
 }
@@ -122,11 +170,11 @@ pub struct AppState {
     pub all_repo_files: Vec<String>,
     pub workflow: String,
     pub edit_protocol: String,
-    pub active_model: String,
-    pub available_models: Vec<String>,
+    pub active_model: ModelRef,
+    pub available_models: Vec<ModelRef>,
     pub available_workflows: Vec<String>,
     pub available_edit_protocols: Vec<String>,
-    pub model: ModelView,
+    pub model: DevelopView,
     pub context: ContextState,
     pub context_view: ContextViewState,
     pub history_view: HistoryViewState,
@@ -139,6 +187,8 @@ pub struct AppState {
     pub selection_dialog: Option<SelectionDialogState>,
     pub squash_dialog: Option<SquashDialogState>,
     pub last_model_height: u16,
+    pub header_clicks: HeaderClickAreas,
+    pub footer_clicks: FooterClickAreas,
 }
 
 impl AppState {
@@ -150,9 +200,6 @@ impl AppState {
             self.model.git_notification = Some(
                 "Model is generating. Press Esc to cancel or wait until done.".to_string(),
             );
-            if let Some(file) = self.model.files.get_mut(self.model.selected_file_index) {
-                file.expanded = !file.expanded;
-            }
             return None;
         }
         let prompt = self.input_editor.get_text().trim().to_string();
@@ -175,7 +222,6 @@ impl AppState {
         self.model.show_reasoning = true;
         self.model.auto_scroll = true;
         self.model.current_cost = Some(0.0);
-        self.model.round_usage_received = false;
 
         self.model.edits_active = false;
         self.model.files.clear();
@@ -195,68 +241,8 @@ impl AppState {
     }
 
     pub fn update_filtered_candidates(&mut self) {
-        let query = self.context_view.add_input.trim();
-        let existing: std::collections::HashSet<&str> = self
-            .context
-            .items
-            .iter()
-            .map(|it| it.path.as_str())
-            .collect();
-
-        let mut candidates = Vec::new();
-
-        if !query.is_empty() {
-            let is_pattern_query = query.contains('*')
-                || query.contains('?')
-                || query.ends_with('/')
-                || !query.contains('.');
-
-            let matching_pattern_count = self
-                .all_repo_files
-                .iter()
-                .filter(|f| !existing.contains(f.as_str()) && matches_glob_pattern(query, f))
-                .count();
-
-            if matching_pattern_count > 0 && is_pattern_query {
-                candidates.push(format!(
-                    "[+] Add all matching '{}' ({} files)",
-                    query, matching_pattern_count
-                ));
-            }
-
-            let query_lower = query.to_lowercase();
-            let file_candidates: Vec<String> = self
-                .all_repo_files
-                .iter()
-                .filter(|f| !existing.contains(f.as_str()))
-                .filter(|f| {
-                    f.to_lowercase().contains(&query_lower) || matches_glob_pattern(query, f)
-                })
-                .take(15)
-                .cloned()
-                .collect();
-
-            candidates.extend(file_candidates);
-        } else {
-            candidates = self
-                .all_repo_files
-                .iter()
-                .filter(|f| !existing.contains(f.as_str()))
-                .take(15)
-                .cloned()
-                .collect();
-        }
-
-        self.context_view.filtered_candidates = candidates;
-
-        if self.context_view.filtered_candidates.is_empty() {
-            self.context_view.selected_candidate_index = 0;
-        } else if self.context_view.selected_candidate_index
-            >= self.context_view.filtered_candidates.len()
-        {
-            self.context_view.selected_candidate_index =
-                self.context_view.filtered_candidates.len() - 1;
-        }
+        self.context_view
+            .update_filtered_candidates(&self.context.items, &self.all_repo_files);
     }
 }
 
@@ -267,17 +253,17 @@ mod tests {
     #[test]
     fn test_take_prompt_when_busy_preserves_input() {
         let mut state = AppState {
-            view_mode: ViewMode::Model,
+            view_mode: ViewMode::Develop,
             protocol_version: "1.0".to_string(),
             repo_state: None,
             all_repo_files: Vec::new(),
             workflow: "git".to_string(),
             edit_protocol: "xml".to_string(),
-            active_model: "test-model".to_string(),
+            active_model: ModelRef::openrouter("test-model"),
             available_models: Vec::new(),
             available_workflows: Vec::new(),
             available_edit_protocols: Vec::new(),
-            model: ModelView {
+            model: DevelopView {
                 status: "thinking".to_string(),
                 ..Default::default()
             },
@@ -293,6 +279,8 @@ mod tests {
             selection_dialog: None,
             squash_dialog: None,
             last_model_height: 10,
+            header_clicks: HeaderClickAreas::default(),
+            footer_clicks: FooterClickAreas::default(),
         };
 
         state.input_editor.insert_str("next planned prompt");

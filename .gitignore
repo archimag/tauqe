@@ -1,30 +1,28 @@
 # Cargo build artifacts
 /target/
 
-# Cargo backup files
+# Temporary & build artifacts
 *.rs.bk
-
-# MSVC Windows build artifacts
 *.pdb
 
 # Environment & secrets
 .env
 .env.*
 !.env.example
-workbench.toml
-.workbench.toml
+credentials.toml
+.credentials.toml
+tauqe.toml
+.tauqe.toml
 
-# Editor & IDE artifacts
+# Editor & OS artifacts
 .idea/
 .vscode/
 *.swp
 *.swo
 *~
 \#*#
-
-# OS artifacts
 .DS_Store
 Thumbs.db
 
-# AI assistant artifacts
-.aider*
+# Tauqe runtime artifacts
+.tauqe/

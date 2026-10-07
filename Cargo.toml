@@ -12,6 +12,16 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 
+[workspace.lints.clippy]
+panic_in_result_fn = "warn"
+fallible_impl_from = "warn"
+todo = "warn"
+unimplemented = "warn"
+panicking_unwrap = "warn"
+manual_assert = "warn"
+unreachable = "warn"
+dbg_macro = "warn"
+
 [workspace.dependencies]
 tauqe-protocol = { path = "crates/protocol" }
 tauqe-core = { path = "crates/core" }

@@ -8,7 +8,10 @@ pub use structured::StructuredEditProtocol;
 pub use utils::{
     normalize_content, parse_context_request_spec, resolve_target_path, resolve_target_path_for_op,
 };
-pub use xml::{generate_turn_marker, has_xml_edit_tags, MarkedXmlEditProtocol, XmlEditProtocol};
+pub use xml::{
+    generate_turn_marker, has_xml_edit_tags, MarkedXmlEditProtocol, VerifyOnSuccess, VerifyRequest,
+    VerifyTarget, XmlEditProtocol,
+};
 
 /// A file the model asks to be added to the context before it proposes edits.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -32,6 +35,21 @@ pub trait EditProtocol: Send + Sync {
         Vec::new()
     }
 
+    /// Extracts code verification request (check/clippy/test) from raw output if supported.
+    fn parse_verify_request(&self, _raw_text: &str) -> Option<VerifyRequest> {
+        None
+    }
+
+    /// Extracts detected user language from raw output if supported.
+    fn parse_user_language(&self, _raw_text: &str) -> Option<String> {
+        None
+    }
+
+    /// Cleans model output for presentation and history by stripping edit blocks and protocol control tags.
+    fn clean_assistant_text(&self, raw_text: &str) -> String {
+        raw_text.to_string()
+    }
+
     /// Binds a protocol to a per-request marker; non-XML protocols stay unchanged.
     fn with_turn_marker(&self, _marker: &str) -> Option<Box<dyn EditProtocol>> {
         None
@@ -45,9 +63,17 @@ pub trait EditProtocol: Send + Sync {
     fn response_format(
         &self,
         _editable_paths: &[String],
-    ) -> Option<crate::model::gateway::ResponseFormat> {
+    ) -> Option<crate::providers::ResponseFormat> {
         None
     }
+
+    /// Creates a streaming filter for processing model output in real time.
+    fn create_stream_filter(
+        &self,
+        editable_paths: Vec<String>,
+        repo_root: std::path::PathBuf,
+        staged_contents: std::collections::HashMap<String, String>,
+    ) -> Box<dyn crate::edits::stream::EditStreamFilter>;
 }
 
 /// Factory responsible for discovering, validating, and creating EditProtocol instances.
@@ -95,13 +121,6 @@ impl EditProtocolFactory {
 pub fn create_edit_protocol(name: &str) -> Box<dyn EditProtocol> {
     EditProtocolFactory::create_protocol(name).unwrap_or_else(|_| Box::new(XmlEditProtocol))
 }
-
-/// Backward compatibility shim for any external references
-#[derive(Debug, Clone, Default)]
-pub struct SearchReplaceMarkers;
-
-/// Backward compatibility alias
-pub type CustomSearchReplaceEditProtocol = XmlEditProtocol;
 
 #[cfg(test)]
 mod tests {

@@ -2,7 +2,17 @@ use std::path::Path;
 use anyhow::Result;
 use tree_sitter::{Node, Parser};
 
-use crate::repomap::{RepoFileSymbols, Symbol, SymbolKind};
+use crate::repomap::{RepoFileSymbols, Symbol, SymbolExtractor, SymbolKind};
+
+/// Default repository symbol extractor backed by Tree-sitter.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct TreeSitterExtractor;
+
+impl SymbolExtractor for TreeSitterExtractor {
+    fn extract_symbols(&self, repo_root: &Path, files: &[String]) -> Result<Vec<RepoFileSymbols>> {
+        extract_treesitter_symbols(repo_root, files)
+    }
+}
 
 /// Extracts symbols from multiple repository files using Tree-sitter.
 pub fn extract_treesitter_symbols(
@@ -240,7 +250,6 @@ fn extract_struct_symbol(node: Node, source: &[u8]) -> Symbol {
         signature: Some(signature),
         is_public: is_pub,
         line,
-        docs: None,
         children: Vec::new(),
     }
 }
@@ -313,7 +322,6 @@ fn extract_enum_symbol(node: Node, source: &[u8]) -> Symbol {
         signature: Some(signature),
         is_public: is_pub,
         line,
-        docs: None,
         children: Vec::new(),
     }
 }
@@ -354,7 +362,6 @@ fn extract_trait_symbol(node: Node, source: &[u8]) -> Symbol {
                                 signature: Some(collapse_whitespace(&m_sig)),
                                 is_public: true,
                                 line: m_line,
-                                docs: None,
                                 children: Vec::new(),
                             });
                         }
@@ -377,7 +384,6 @@ fn extract_trait_symbol(node: Node, source: &[u8]) -> Symbol {
         signature: Some(header),
         is_public: is_pub,
         line,
-        docs: None,
         children: methods,
     }
 }
@@ -394,6 +400,9 @@ fn extract_impl_symbol(node: Node, source: &[u8]) -> Symbol {
         }
     }
 
+    let is_trait_impl = node.child_by_field_name("trait").is_some()
+        || (0..node.child_count()).any(|i| node.child(i).map(|c| c.kind() == "for").unwrap_or(false));
+
     let mut header_end = node.end_byte();
     let mut methods = Vec::new();
 
@@ -404,7 +413,7 @@ fn extract_impl_symbol(node: Node, source: &[u8]) -> Symbol {
                 for j in 0..child.child_count() {
                     if let Some(item) = child.child(j) {
                         if item.kind() == "function_item" {
-                            let m_is_pub = has_visibility(item);
+                            let m_is_pub = is_trait_impl || has_visibility(item);
                             let m_name = get_node_name(item, source).unwrap_or("anon");
                             let m_line = item.start_position().row + 1;
                             let m_sig = extract_fn_signature(item, source);
@@ -414,7 +423,6 @@ fn extract_impl_symbol(node: Node, source: &[u8]) -> Symbol {
                                 signature: Some(collapse_whitespace(&m_sig)),
                                 is_public: m_is_pub,
                                 line: m_line,
-                                docs: None,
                                 children: Vec::new(),
                             });
                         }
@@ -437,7 +445,6 @@ fn extract_impl_symbol(node: Node, source: &[u8]) -> Symbol {
         signature: Some(header),
         is_public: true,
         line,
-        docs: None,
         children: methods,
     }
 }
@@ -485,7 +492,6 @@ fn extract_mod_symbol(node: Node, source: &[u8]) -> Symbol {
         signature: Some(header),
         is_public: is_pub,
         line,
-        docs: None,
         children,
     }
 }
@@ -502,7 +508,6 @@ fn extract_function_symbol(node: Node, source: &[u8]) -> Symbol {
         signature: Some(collapse_whitespace(&sig)),
         is_public: is_pub,
         line,
-        docs: None,
         children: Vec::new(),
     }
 }
@@ -532,7 +537,7 @@ pub trait Greeter {
 }
 
 impl Greeter for User {
-    pub fn greet(&self) -> String {
+    fn greet(&self) -> String {
         format!("Hello {}", self.name)
     }
 }
@@ -568,6 +573,7 @@ pub fn create_user(name: &str) -> User {
         assert!(impl_sym.name.contains("Greeter for User"));
         assert_eq!(impl_sym.children.len(), 1);
         assert_eq!(impl_sym.children[0].name, "greet");
+        assert!(impl_sym.children[0].is_public);
 
         let fn_sym = res.symbols.iter().find(|s| s.kind == SymbolKind::Function).unwrap();
         assert_eq!(fn_sym.name, "create_user");

@@ -1,7 +1,22 @@
-use tauqe_protocol::{ContextAccess, EditOperation, ModelResult};
+use tauqe_protocol::{EditOperation, ModelResult};
 
 use super::utils::{normalize_content, resolve_target_path_for_op};
 use super::{ContextRequest, EditProtocol};
+use crate::edits::stream::{EditStreamFilter, XmlStreamFilter};
+
+mod marker;
+pub(crate) mod tags;
+
+use marker::XML_TAG_BASES;
+use tags::parse_context_request_tags;
+
+pub use marker::generate_turn_marker;
+pub use tags::{
+    extract_user_language, extract_verify_request, strip_context_request_tags,
+    strip_user_language_tags, strip_verify_tags, VerifyOnSuccess, VerifyRequest, VerifyTarget,
+};
+pub(crate) use marker::{normalize_marked_xml, restore_xml_literals};
+pub(crate) use tags::{next_context_request_tag, next_user_language_tag, next_verify_tag};
 
 /// XML-based code edit protocol
 #[derive(Debug, Default, Clone)]
@@ -20,6 +35,18 @@ impl EditProtocol for XmlEditProtocol {
         parse_context_request_tags(raw_text)
     }
 
+    fn parse_verify_request(&self, raw_text: &str) -> Option<VerifyRequest> {
+        tags::extract_verify_request(raw_text)
+    }
+
+    fn parse_user_language(&self, raw_text: &str) -> Option<String> {
+        tags::extract_user_language(raw_text)
+    }
+
+    fn clean_assistant_text(&self, raw_text: &str) -> String {
+        extract_conversational_text(raw_text)
+    }
+
     fn system_instructions(&self, editable_paths: &[String]) -> String {
         let mut prompt = String::new();
         prompt.push_str("## Code Modification Protocol (XML Edits)\n");
@@ -27,6 +54,7 @@ impl EditProtocol for XmlEditProtocol {
         prompt.push_str("- Existing files: modify ONLY files listed in <editable_files> via <edit path=\"...\">.\n");
         prompt.push_str("- New files: create new files using <create path=\"...\"> with a valid repository-relative path. Created files are automatically added to context.\n");
         prompt.push_str("- Move or rename files: move existing editable files using <move from=\"...\" to=\"...\" />.\n");
+        prompt.push_str("- Full rewrite: replace the entire content of an existing editable file using <overwrite path=\"...\">.\n");
         prompt
             .push_str("- File deletions: delete obsolete files using <delete path=\"...\" />.\n\n");
 
@@ -60,6 +88,10 @@ impl EditProtocol for XmlEditProtocol {
         prompt.push_str("  <create path=\"path/to/new_file.rs\">\n");
         prompt.push_str("// Complete file content\n");
         prompt.push_str("  </create>\n\n");
+        prompt.push_str("  <!-- To replace the whole content of an existing editable file: -->\n");
+        prompt.push_str("  <overwrite path=\"path/to/existing_file.rs\">\n");
+        prompt.push_str("// Complete new file content\n");
+        prompt.push_str("  </overwrite>\n\n");
         prompt.push_str("  <!-- To move or rename a file: -->\n");
         prompt.push_str("  <move from=\"path/to/old_file.rs\" to=\"path/to/new_file.rs\" />\n\n");
         prompt.push_str("  <!-- To delete a file: -->\n");
@@ -78,17 +110,13 @@ impl EditProtocol for XmlEditProtocol {
         prompt.push_str("7. If no code changes are needed (e.g. conversational answer or explanation), output plain text without any XML edit tags.\n");
         prompt.push_str("8. If the task requires files listed in <repo_map> that are not yet present in the context files, request them FIRST instead of guessing: output only a short note plus one tag per file, e.g. <context_request path=\"path/to/file.rs\" access=\"read_only\" /> (use access=\"editable\" for files you need to modify). You will be called again with the full file contents added to context. Never request files that are already in context.\n");
         prompt.push_str("9. Code Verification: You may request code verification using <verify target=\"all|check|test|clippy\" on_success=\"silent|report\" />. Use target=\"all\" (or check, test, clippy). Always use on_success=\"silent\" unless the user explicitly asked to see the raw test/build logs or command output. Do not quote or output raw logs when verification succeeds; concise confirmation that all checks passed is sufficient.\n");
-        prompt.push_str("10. Detect User Language: Identify the primary language of the user's prompt and output a <user_language>language</user_language> tag (e.g. <user_language>Russian</user_language>). All conversational explanations MUST be in this detected language. Internal thoughts and reasoning MUST be strictly in English.\n\n");
+        prompt.push_str("10. Detect User Language: Identify the primary language of the user's prompt and output a <user_language>language</user_language> tag (e.g. <user_language>Russian</user_language>). All conversational explanations MUST be in this detected language. Internal thoughts and reasoning MUST be strictly in English.\n");
+        prompt.push_str("11. Choosing <edit> vs <overwrite>: use <edit> by default for local changes. Use <overwrite path=\"...\"> with the COMPLETE new file content when most of an existing editable file changes (roughly more than half), when the file is small, or when many fragile search blocks would be needed. Never use <create> for a path that already exists; use <create> only for new files.\n\n");
 
         prompt
     }
 
     fn parse_output(&self, raw_text: &str, editable_paths: &[String]) -> ModelResult {
-        // Fallback check for tauqe_edit JSON block
-        if let Some(json_res) = crate::edits::parse_tauqe_edit_json(raw_text) {
-            return json_res;
-        }
-
         if !has_xml_edit_tags(raw_text) {
             return ModelResult::Answer {
                 text: strip_verify_tags(&strip_user_language_tags(&strip_context_request_tags(raw_text))),
@@ -109,7 +137,10 @@ impl EditProtocol for XmlEditProtocol {
                     ModelResult::Edit {
                         summary,
                         edits,
-                        proposal: None,
+                        proposal: Some(tauqe_protocol::ModelResultProposal {
+                            message: extract_conversational_text(raw_text),
+                            ..Default::default()
+                        }),
                         applied: false,
                         error: None,
                         changed_files: Vec::new(),
@@ -128,23 +159,18 @@ impl EditProtocol for XmlEditProtocol {
             },
         }
     }
-}
 
-/// Generates a process-unique alphanumeric marker without an additional dependency.
-pub fn generate_turn_marker() -> String {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::sync::OnceLock;
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    static SEQUENCE: OnceLock<AtomicU64> = OnceLock::new();
-    let sequence = SEQUENCE.get_or_init(|| {
-        let seed = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos() as u64;
-        AtomicU64::new(seed)
-    });
-    format!("{:016X}", sequence.fetch_add(1, Ordering::Relaxed))
+    fn create_stream_filter(
+        &self,
+        editable_paths: Vec<String>,
+        repo_root: std::path::PathBuf,
+        staged_contents: std::collections::HashMap<String, String>,
+    ) -> Box<dyn EditStreamFilter> {
+        Box::new(
+            XmlStreamFilter::new(editable_paths, repo_root)
+                .with_staged_contents(staged_contents),
+        )
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -166,6 +192,21 @@ impl EditProtocol for MarkedXmlEditProtocol {
 
     fn parse_context_requests(&self, raw_text: &str) -> Vec<ContextRequest> {
         parse_context_request_tags(&normalize_marked_xml(raw_text, &self.marker, true))
+    }
+
+    fn parse_verify_request(&self, raw_text: &str) -> Option<VerifyRequest> {
+        let normalized = normalize_marked_xml(raw_text, &self.marker, true);
+        tags::extract_verify_request(&normalized)
+    }
+
+    fn parse_user_language(&self, raw_text: &str) -> Option<String> {
+        let normalized = normalize_marked_xml(raw_text, &self.marker, true);
+        tags::extract_user_language(&normalized)
+    }
+
+    fn clean_assistant_text(&self, raw_text: &str) -> String {
+        let normalized = normalize_marked_xml(raw_text, &self.marker, true);
+        restore_xml_literals(&extract_conversational_text(&normalized), &self.marker)
     }
 
     fn with_turn_marker(&self, marker: &str) -> Option<Box<dyn EditProtocol>> {
@@ -206,6 +247,10 @@ impl EditProtocol for MarkedXmlEditProtocol {
                             *path = restore_xml_literals(path, &self.marker);
                             *content = restore_xml_literals(content, &self.marker);
                         }
+                        EditOperation::Overwrite { path, content } => {
+                            *path = restore_xml_literals(path, &self.marker);
+                            *content = restore_xml_literals(content, &self.marker);
+                        }
                         EditOperation::Delete { path } => {
                             *path = restore_xml_literals(path, &self.marker);
                         }
@@ -224,381 +269,19 @@ impl EditProtocol for MarkedXmlEditProtocol {
         }
         result
     }
-}
 
-const XML_TAG_BASES: &[&str] = &[
-    "tauqe_edits", "edit", "search", "replace", "create", "delete", "move", "with", "summary",
-    "context_request", "user_language", "verify",
-];
-
-fn literal_prefix(marker: &str) -> String {
-    format!("\u{e000}{}\u{e001}", marker)
-}
-
-pub(crate) fn restore_xml_literals(text: &str, marker: &str) -> String {
-    text.replace(&literal_prefix(marker), "<")
-}
-
-/// Case-insensitive marker matching with at most one insertion, deletion or substitution.
-/// Base tag names remain exact: fuzziness must not turn arbitrary source tags into edits.
-fn marker_matches(candidate: &str, marker: &str) -> bool {
-    let a = candidate.to_ascii_lowercase();
-    let b = marker.to_ascii_lowercase();
-    if a == b { return true; }
-    if a.len().abs_diff(b.len()) > 1 || b.len() < 4 { return false; }
-    let (a, b) = (a.as_bytes(), b.as_bytes());
-    let (mut i, mut j, mut errors) = (0, 0, 0);
-    while i < a.len() && j < b.len() {
-        if a[i] == b[j] {
-            i += 1;
-            j += 1;
-        } else {
-            errors += 1;
-            if errors > 1 { return false; }
-            if a.len() >= b.len() { i += 1; }
-            if b.len() >= a.len() { j += 1; }
-        }
+    fn create_stream_filter(
+        &self,
+        editable_paths: Vec<String>,
+        repo_root: std::path::PathBuf,
+        staged_contents: std::collections::HashMap<String, String>,
+    ) -> Box<dyn EditStreamFilter> {
+        Box::new(
+            XmlStreamFilter::new(editable_paths, repo_root)
+                .with_marker(Some(self.marker.clone()))
+                .with_staged_contents(staged_contents),
+        )
     }
-    errors + (a.len() - i) + (b.len() - j) <= 1
-}
-
-/// Converts only active structural tags to the legacy parser's dialect, protecting
-/// literal '<' characters from its delimiter searches. Used by BOTH final and stream
-/// parsing. An incomplete trailing token is withheld so the returned prefix is stable.
-/// Unsuffixed tags in source code are protected as literal content, never closing active blocks.
-pub(crate) fn normalize_marked_xml(text: &str, marker: &str, finished: bool) -> String {
-    let mut output = String::new();
-    let mut stack: Vec<&str> = Vec::new();
-    let protection = literal_prefix(marker);
-    let mut pos = 0;
-    while pos < text.len() {
-        let Some(offset) = text[pos..].find('<') else {
-            output.push_str(&text[pos..]);
-            break;
-        };
-        let start = pos + offset;
-        output.push_str(&text[pos..start]);
-        let closing = text[start..].starts_with("</");
-        let name_start = start + if closing { 2 } else { 1 };
-        let name_len = text[name_start..].bytes()
-            .take_while(|b| b.is_ascii_alphanumeric() || *b == b'_' || *b == b'-')
-            .count();
-        let name_end = name_start + name_len;
-        if name_end == text.len() && !finished { break; }
-        let name = &text[name_start..name_end];
-        let active = XML_TAG_BASES.iter().copied().find(|base| {
-            name.strip_prefix(base)
-                .and_then(|rest| rest.strip_prefix('_').or_else(|| rest.strip_prefix('-')))
-                .map(|suffix| marker_matches(suffix, marker))
-                .unwrap_or(false)
-        });
-        let boundary = text[name_end..].chars().next()
-            .map(|c| c.is_whitespace() || c == '>' || c == '/')
-            .unwrap_or(false);
-        if let (true, Some(base)) = (boundary, active) {
-            // Find the end of the header without mistaking quoted '>' for its delimiter.
-            let mut quote = None;
-            let mut end = None;
-            for (idx, ch) in text[name_end..].char_indices() {
-                if let Some(q) = quote {
-                    if ch == q { quote = None; }
-                } else if ch == '\'' || ch == '"' {
-                    quote = Some(ch);
-                } else if ch == '>' {
-                    end = Some(name_end + idx + 1);
-                    break;
-                }
-            }
-            let Some(end) = end else {
-                if !finished { break; }
-                output.push_str(&protection);
-                pos = start + 1;
-                continue;
-            };
-            let accepted = !closing || stack.last().copied() == Some(base);
-            if accepted {
-                output.push('<');
-                if closing { output.push('/'); }
-                output.push_str(base);
-                output.push_str(&text[name_end..end]);
-                if closing {
-                    stack.pop();
-                } else if !text[name_end..end].trim_end().ends_with("/>") {
-                    stack.push(base);
-                }
-                pos = end;
-                continue;
-            }
-        }
-        output.push_str(&protection);
-        pos = start + 1;
-    }
-    output
-}
-
-/// Locates the next complete `<context_request .../>` tag (unsuffixed dialect).
-/// Returns the byte range `(start, end)` including an immediately following
-/// `</context_request>` for the paired form. Incomplete tags yield None.
-pub(crate) fn next_context_request_tag(text: &str) -> Option<(usize, usize)> {
-    const OPEN: &str = "<context_request";
-    let mut from = 0;
-    while let Some(rel) = text[from..].find(OPEN) {
-        let start = from + rel;
-        let after = start + OPEN.len();
-        let bytes = &text.as_bytes()[after..];
-        let mut idx = 0;
-        if idx < bytes.len() && (bytes[idx] == b'_' || bytes[idx] == b'-') {
-            idx += 1;
-            while idx < bytes.len()
-                && (bytes[idx].is_ascii_alphanumeric() || bytes[idx] == b'_' || bytes[idx] == b'-')
-            {
-                idx += 1;
-            }
-        }
-        let tag_name = &text[start + 1..after + idx];
-        let rest = &text[after + idx..];
-        let boundary = rest
-            .chars()
-            .next()
-            .is_some_and(|c| c.is_whitespace() || c == '>' || c == '/');
-        if boundary {
-            let gt = rest.find('>')?;
-            let mut end = after + idx + gt + 1;
-            if !rest[..gt].trim_end().ends_with('/') {
-                let close_tag = format!("</{}>", tag_name);
-                let after_open = &text[end..];
-                let trimmed = after_open.trim_start();
-                if trimmed.starts_with(&close_tag) {
-                    end += (after_open.len() - trimmed.len()) + close_tag.len();
-                }
-            }
-            return Some((start, end));
-        }
-        from = after;
-    }
-    None
-}
-
-/// Locates the next complete `<user_language>...</user_language>` or self-closing tag.
-pub(crate) fn next_user_language_tag(text: &str) -> Option<(usize, usize)> {
-    const OPEN: &str = "<user_language";
-    let mut from = 0;
-    while let Some(rel) = text[from..].find(OPEN) {
-        let start = from + rel;
-        let after = start + OPEN.len();
-        let bytes = &text.as_bytes()[after..];
-        let mut idx = 0;
-        if idx < bytes.len() && (bytes[idx] == b'_' || bytes[idx] == b'-') {
-            idx += 1;
-            while idx < bytes.len()
-                && (bytes[idx].is_ascii_alphanumeric() || bytes[idx] == b'_' || bytes[idx] == b'-')
-            {
-                idx += 1;
-            }
-        }
-        let tag_name = &text[start + 1..after + idx];
-        let rest = &text[after + idx..];
-        let boundary = rest
-            .chars()
-            .next()
-            .is_some_and(|c| c.is_whitespace() || c == '>' || c == '/');
-        if boundary {
-            let gt = rest.find('>')?;
-            let end_open = after + idx + gt + 1;
-            if rest[..gt].trim_end().ends_with('/') {
-                return Some((start, end_open));
-            }
-            let close_tag = format!("</{}>", tag_name);
-            let close_offset = text[end_open..].find(&close_tag)?;
-            let end = end_open + close_offset + close_tag.len();
-            return Some((start, end));
-        }
-        from = after;
-    }
-    None
-}
-
-/// Extracts user language tag content if present (e.g. `<user_language>Russian</user_language>`
-/// or `<user_language lang="ru"/>`).
-pub fn extract_user_language(text: &str) -> Option<String> {
-    let (start, tag_name) = find_base_tag_start(text, "user_language")?;
-    let slice = &text[start..];
-    let open_end = slice.find('>')?;
-    let header = &slice[..open_end + 1];
-    if let Some(val) = extract_attribute(header, "value")
-        .or_else(|| extract_attribute(header, "lang"))
-    {
-        let trimmed = val.trim();
-        if !trimmed.is_empty() && trimmed.len() < 50 && !trimmed.contains('\n') {
-            return Some(trimmed.to_string());
-        }
-    }
-    let close_tag = format!("</{}>", tag_name);
-    let close_start = slice.find(&close_tag)?;
-    if close_start >= open_end {
-        let content = slice[open_end + 1..close_start].trim();
-        if !content.is_empty() && content.len() < 50 && !content.contains('\n') {
-            return Some(content.to_string());
-        }
-    }
-    None
-}
-
-/// Removes all user_language tags from text.
-pub fn strip_user_language_tags(text: &str) -> String {
-    let mut result = text.to_string();
-    while let Some((start, tag_name)) = find_base_tag_start(&result, "user_language") {
-        let close_tag = format!("</{}>", tag_name);
-        if let Some(close_offset) = result[start..].find(&close_tag) {
-            let end = start + close_offset + close_tag.len();
-            result.replace_range(start..end, "");
-        } else if let Some(gt_offset) = result[start..].find('>') {
-            let end = start + gt_offset + 1;
-            result.replace_range(start..end, "");
-        } else {
-            result.replace_range(start.., "");
-            break;
-        }
-    }
-    result
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum VerifyTarget {
-    All,
-    Check,
-    Test,
-    Clippy,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum VerifyOnSuccess {
-    Silent,
-    Report,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct VerifyRequest {
-    pub target: VerifyTarget,
-    pub on_success: VerifyOnSuccess,
-}
-
-/// Locates the next complete `<verify .../>` or `<verify>...</verify>` tag.
-pub(crate) fn next_verify_tag(text: &str) -> Option<(usize, usize)> {
-    const OPEN: &str = "<verify";
-    let mut from = 0;
-    while let Some(rel) = text[from..].find(OPEN) {
-        let start = from + rel;
-        let after = start + OPEN.len();
-        let bytes = &text.as_bytes()[after..];
-        let mut idx = 0;
-        if idx < bytes.len() && (bytes[idx] == b'_' || bytes[idx] == b'-') {
-            idx += 1;
-            while idx < bytes.len()
-                && (bytes[idx].is_ascii_alphanumeric() || bytes[idx] == b'_' || bytes[idx] == b'-')
-            {
-                idx += 1;
-            }
-        }
-        let tag_name = &text[start + 1..after + idx];
-        let rest = &text[after + idx..];
-        let boundary = rest
-            .chars()
-            .next()
-            .is_some_and(|c| c.is_whitespace() || c == '>' || c == '/');
-        if boundary {
-            let gt = rest.find('>')?;
-            let mut end = after + idx + gt + 1;
-            if !rest[..gt].trim_end().ends_with('/') {
-                let close_tag = format!("</{}>", tag_name);
-                let after_open = &text[end..];
-                let trimmed = after_open.trim_start();
-                if trimmed.starts_with(&close_tag) {
-                    end += (after_open.len() - trimmed.len()) + close_tag.len();
-                }
-            }
-            return Some((start, end));
-        }
-        from = after;
-    }
-    None
-}
-
-/// Extracts verification request if specified by the model.
-pub fn extract_verify_request(text: &str) -> Option<VerifyRequest> {
-    let (start, end) = next_verify_tag(text)?;
-    let tag = &text[start..end];
-    let header_end = tag.find('>').unwrap_or(tag.len());
-    let header = &tag[..header_end];
-
-    let target = match extract_attribute(header, "target").as_deref() {
-        Some("check") => VerifyTarget::Check,
-        Some("test") => VerifyTarget::Test,
-        Some("clippy") => VerifyTarget::Clippy,
-        _ => VerifyTarget::All,
-    };
-
-    let on_success = match extract_attribute(header, "on_success").as_deref() {
-        Some("silent") => VerifyOnSuccess::Silent,
-        _ => VerifyOnSuccess::Report,
-    };
-
-    Some(VerifyRequest { target, on_success })
-}
-
-/// Removes all verify tags from text.
-pub fn strip_verify_tags(text: &str) -> String {
-    let mut out = String::new();
-    let mut rest = text;
-    while let Some((start, end)) = next_verify_tag(rest) {
-        out.push_str(&rest[..start]);
-        rest = &rest[end..];
-    }
-    out.push_str(rest);
-    out
-}
-
-/// Removes all context request tags from text.
-pub fn strip_context_request_tags(text: &str) -> String {
-    let mut out = String::new();
-    let mut rest = text;
-    while let Some((start, end)) = next_context_request_tag(rest) {
-        out.push_str(&rest[..start]);
-        rest = &rest[end..];
-    }
-    out.push_str(rest);
-    out
-}
-
-fn parse_context_request_tags(text: &str) -> Vec<ContextRequest> {
-    let mut requests = Vec::new();
-    let mut pos = 0;
-    while let Some((start, end)) = next_context_request_tag(&text[pos..]) {
-        let tag = &text[pos + start..pos + end];
-        let header_end = tag.find('>').unwrap_or(tag.len());
-        let header = &tag[..header_end];
-        if let Some(path) = extract_attribute(header, "path") {
-            let path = path
-                .trim()
-                .trim_start_matches("./")
-                .trim_start_matches('/')
-                .to_string();
-            if !path.is_empty() {
-                let editable = extract_attribute(header, "access")
-                    .is_some_and(|a| a.trim().eq_ignore_ascii_case("editable"));
-                requests.push(ContextRequest {
-                    path,
-                    access: if editable {
-                        ContextAccess::Editable
-                    } else {
-                        ContextAccess::ReadOnly
-                    },
-                });
-            }
-        }
-        pos += end;
-    }
-    requests
 }
 
 pub fn has_xml_edit_tags(text: &str) -> bool {
@@ -607,6 +290,7 @@ pub fn has_xml_edit_tags(text: &str) -> bool {
         || text.contains("<create")
         || text.contains("<delete")
         || text.contains("<move")
+        || text.contains("<overwrite")
         || text.contains("<tauqe_edits")
 }
 
@@ -668,6 +352,22 @@ pub fn extract_conversational_text(raw_text: &str) -> String {
 
     // 4. Remove standalone <create ...>...</create>
     while let Some((start, tag_name)) = find_base_tag_start(&text, "create") {
+        let close_tag = format!("</{}>", tag_name);
+        if let Some(close_offset) = text[start..].find(&close_tag) {
+            let end = start + close_offset + close_tag.len();
+            let (exp_start, exp_end) = expand_fence_bounds(&text, start, end);
+            text.replace_range(exp_start..exp_end, "");
+        } else if let Some(gt_offset) = text[start..].find('>') {
+            let end = start + gt_offset + 1;
+            text.replace_range(start..end, "");
+        } else {
+            text.replace_range(start.., "");
+            break;
+        }
+    }
+
+    // 4b. Remove standalone <overwrite ...>...</overwrite>
+    while let Some((start, tag_name)) = find_base_tag_start(&text, "overwrite") {
         let close_tag = format!("</{}>", tag_name);
         if let Some(close_offset) = text[start..].find(&close_tag) {
             let end = start + close_offset + close_tag.len();
@@ -986,6 +686,28 @@ fn parse_xml_edits(text: &str, editable_paths: &[String]) -> Result<Vec<EditOper
 
                 pos = tag_start + close_idx + "</create>".len();
             }
+            TagType::Overwrite => {
+                let open_tag_end = tag_slice.find('>').ok_or_else(|| {
+                    format!("Unterminated <overwrite> tag at offset {}", tag_start)
+                })?;
+                let header = &tag_slice[..open_tag_end];
+                let path_attr = extract_attribute(header, "path").ok_or_else(|| {
+                    format!("Missing 'path' attribute in <overwrite> tag: {}", header)
+                })?;
+                let target_path = resolve_target_path_for_op(&path_attr, editable_paths, false)?;
+
+                let close_idx = tag_slice.find("</overwrite>").ok_or_else(|| {
+                    format!("Missing </overwrite> tag for file '{}'", target_path)
+                })?;
+
+                let content = &tag_slice[open_tag_end + 1..close_idx];
+                edits.push(EditOperation::Overwrite {
+                    path: target_path,
+                    content: normalize_content(content),
+                });
+
+                pos = tag_start + close_idx + "</overwrite>".len();
+            }
             TagType::Move => {
                 let open_tag_end = tag_slice
                     .find('>')
@@ -1046,6 +768,7 @@ enum TagType {
     Create,
     Delete,
     Move,
+    Overwrite,
 }
 
 fn find_next_edit_tag(text: &str) -> Option<(TagType, usize)> {
@@ -1064,6 +787,9 @@ fn find_next_edit_tag(text: &str) -> Option<(TagType, usize)> {
     }
     if let Some(idx) = find_tag_start(text, "create") {
         candidates.push((TagType::Create, idx));
+    }
+    if let Some(idx) = find_tag_start(text, "overwrite") {
+        candidates.push((TagType::Overwrite, idx));
     }
     if let Some(idx) = find_tag_start(text, "delete") {
         candidates.push((TagType::Delete, idx));
@@ -1316,6 +1042,25 @@ Everything is tested and working properly."#;
         let suffixed = "Hi\n<user_language_ABC123>en</user_language_ABC123>\nDone.";
         assert_eq!(extract_user_language(suffixed), Some("en".to_string()));
         assert_eq!(strip_user_language_tags(suffixed).trim(), "Hi\n\nDone.");
+    }
+
+    #[test]
+    fn test_xml_protocol_overwrite_parse() {
+        let editable = vec!["src/lib.rs".to_string()];
+        let output = "Rewriting.\n<tauqe_edits summary=\"Rewrite lib\">\n<overwrite path=\"src/lib.rs\">\npub fn all_new() {}\n</overwrite>\n</tauqe_edits>";
+        match XmlEditProtocol.parse_output(output, &editable) {
+            ModelResult::Edit { edits, error: None, .. } => {
+                assert_eq!(edits.len(), 1);
+                match &edits[0] {
+                    EditOperation::Overwrite { path, content } => {
+                        assert_eq!(path, "src/lib.rs");
+                        assert!(content.contains("pub fn all_new() {}"));
+                    }
+                    _ => panic!("Expected Overwrite"),
+                }
+            }
+            _ => panic!("Expected valid edit"),
+        }
     }
 
     #[test]

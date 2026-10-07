@@ -1,8 +1,16 @@
 [package]
 name = "tauqe-tui"
+default-run = "tauqe"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "tauqe"
+path = "src/main.rs"
 
 [dependencies]
 tauqe-protocol.workspace = true

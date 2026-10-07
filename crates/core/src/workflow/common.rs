@@ -5,128 +5,69 @@ use tokio::sync::mpsc;
 use tokio::sync::watch;
 use tauqe_protocol::{ContextAccess, EditOperation, ModelResult};
 
+use tauqe_protocol::ModelRef;
+
 use crate::context::{ContextFileContent, ContextManager};
-use crate::edits::protocol::{generate_turn_marker, ContextRequest};
-use crate::edits::stream::JsonStreamFilter;
-use crate::edits::{
-    stage_and_validate_edits, EditError, EditProtocol, StagedEditsState, XmlStreamFilter,
-};
+use crate::edits::protocol::generate_turn_marker;
+use crate::edits::{stage_and_validate_edits, EditError, EditProtocol, StagedEditsState};
 use crate::history::{HistoryManager, DEFAULT_HISTORY_BUDGET_TOKENS, DEFAULT_TAIL_TURNS_COUNT};
-use crate::model::gateway::{ChatMessage, StreamEvent};
-use crate::model::openrouter::OpenRouterClient;
 use crate::prompt::PromptAssembly;
+use crate::providers::{ChatMessage, LlmProvider, StreamEvent};
+
+pub use super::discovery::*;
+pub use super::retry::*;
+pub use super::verification::*;
+
+use super::lifecycle::WorkflowOptions;
 
 pub struct ParsedPipelineOutput {
     pub assistant_text: String,
     pub parsed_result: ModelResult,
-    pub completed_tool_calls: Vec<crate::model::gateway::ToolCall>,
     pub is_cancelled: bool,
+    pub detected_language: Option<String>,
 }
 
-pub struct VerificationOutcome {
-    pub success: bool,
-    pub report: String,
+/// Options controlling a single invocation step of the LLM pipeline.
+#[derive(Debug, Default, Clone)]
+pub struct StepParams<'a> {
+    pub record_turn: bool,
+    pub emit_done: bool,
+    pub staged_state: Option<&'a StagedEditsState>,
+    pub target_language: Option<&'a str>,
 }
 
-/// Executes project verification pipeline according to model's `<verify .../>` request.
-/// When `stream_output` is false (e.g. during automated edit validation), failure logs are not
-/// emitted directly to the user's stream, giving the auto-healing loop a chance to fix them first.
-pub async fn run_workflow_verification(
-    repo_root: &std::path::Path,
-    verify_req: &crate::edits::protocol::xml::VerifyRequest,
-    stream_tx: &mpsc::Sender<StreamEvent>,
-    stream_output: bool,
-) -> VerificationOutcome {
-    let target_str = match verify_req.target {
-        crate::edits::protocol::xml::VerifyTarget::Check => "check",
-        crate::edits::protocol::xml::VerifyTarget::Clippy => "clippy",
-        crate::edits::protocol::xml::VerifyTarget::Test => "test",
-        crate::edits::protocol::xml::VerifyTarget::All => "all",
-    };
-
-    if stream_output {
-        let start_msg = format!("\n\n🔍 Running verification (`{}`)...\n", target_str);
-        let _ = stream_tx.send(StreamEvent::TextDelta(start_msg)).await;
-    }
-
-    let (ok, results) = crate::toolchain::run_verification_pipeline(repo_root, &verify_req.target).await;
-
-    if results.is_empty() {
-        let note = "⚠️ No build/test toolchain detected in repository for verification.\n".to_string();
-        if stream_output {
-            let _ = stream_tx.send(StreamEvent::TextDelta(note.clone())).await;
-        }
-        return VerificationOutcome {
-            success: true,
-            report: note,
-        };
-    }
-
-    let mut report = String::new();
-    if ok {
-        let success_msg = format!("✅ Code verification (`{}`) passed.\n", target_str);
-        if stream_output || verify_req.on_success == crate::edits::protocol::xml::VerifyOnSuccess::Report {
-            let _ = stream_tx.send(StreamEvent::TextDelta(success_msg.clone())).await;
-        }
-
-        if verify_req.on_success == crate::edits::protocol::xml::VerifyOnSuccess::Report {
-            for r in &results {
-                if !r.combined_output.trim().is_empty() {
-                    report.push_str(&format!("`{}` output:\n```\n{}\n```\n\n", r.command, r.combined_output.trim()));
-                }
-            }
-            if report.is_empty() {
-                report = success_msg;
-            } else {
-                report = format!("{}\n{}", success_msg, report);
-            }
-        }
-    } else {
-        report.push_str(&format!("❌ Code verification (`{}`) failed:\n\n", target_str));
-        for r in results.iter().filter(|r| !r.success) {
-            report.push_str(&format!("Command `{}` failed:\n```\n{}\n```\n\n", r.command, r.combined_output.trim()));
-        }
-        if stream_output {
-            let _ = stream_tx.send(StreamEvent::TextDelta(report.clone())).await;
-        }
-    }
-
-    VerificationOutcome {
-        success: ok,
-        report,
-    }
-}
-
-/// Constructs a prompt asking the model to fix compiler, clippy, or test failures.
-pub fn build_verification_retry_prompt(
-    report: &str,
-    target_language: Option<&str>,
-) -> String {
-    let mut prompt = String::new();
-    prompt.push_str("Code verification failed with the following errors:\n\n```\n");
-    prompt.push_str(report.trim());
-    prompt.push_str("\n```\n\nPlease fix the errors by proposing corrected edits.");
-    if let Some(lang) = target_language {
-        prompt.push_str(&format!(
-            "\n\nNote: Formulate your explanations in {} (the language of the user's request), while conducting all reasoning strictly in English.",
-            lang
-        ));
-    }
-    prompt
-}
-
-/// Compacts session history if estimated tokens exceed the configured threshold.
+/// Compacts session history if estimated tokens exceed the configured threshold using default budgets.
 pub async fn compact_history_if_needed(
     history_manager: &mut HistoryManager,
-    client: &OpenRouterClient,
-    model_name: &str,
+    provider: &dyn LlmProvider,
+    model: &ModelRef,
     cancel_rx: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
-    if !history_manager.needs_compaction(DEFAULT_HISTORY_BUDGET_TOKENS)? {
+    compact_history_if_needed_with_budget(
+        history_manager,
+        provider,
+        model,
+        cancel_rx,
+        DEFAULT_HISTORY_BUDGET_TOKENS,
+        DEFAULT_TAIL_TURNS_COUNT,
+    )
+    .await
+}
+
+/// Compacts session history if estimated tokens exceed a specific budget threshold.
+pub async fn compact_history_if_needed_with_budget(
+    history_manager: &mut HistoryManager,
+    provider: &dyn LlmProvider,
+    model: &ModelRef,
+    cancel_rx: watch::Receiver<bool>,
+    budget_tokens: u64,
+    tail_turns: usize,
+) -> anyhow::Result<()> {
+    if !history_manager.needs_compaction(budget_tokens)? {
         return Ok(());
     }
 
-    let Some((head, tail)) = history_manager.prepare_compaction(DEFAULT_TAIL_TURNS_COUNT)? else {
+    let Some((head, tail)) = history_manager.prepare_compaction(tail_turns)? else {
         return Ok(());
     };
 
@@ -149,10 +90,9 @@ pub async fn compact_history_if_needed(
     ];
 
     let (tx, mut rx) = mpsc::channel(100);
-    let client_call = client.stream_chat_with_tools(
-        model_name,
+    let client_call = provider.stream_chat(
+        &model.name,
         messages,
-        None,
         None,
         tx,
         cancel_rx,
@@ -184,82 +124,6 @@ pub async fn compact_history_if_needed(
     Ok(())
 }
 
-/// Extracts conversational "message" strings from structured JSON output blocks.
-fn extract_json_messages(raw: &str) -> Vec<String> {
-    let mut messages = Vec::new();
-    let mut from = 0;
-    while let Some(rel) = raw[from..].find('{') {
-        let start = from + rel;
-        if let Some(end) = balanced_object_end(raw, start) {
-            let slice = &raw[start..end];
-            if let Ok(val) = serde_json::from_str::<serde_json::Value>(slice) {
-                if let Some(msg) = val.get("message").and_then(|m| m.as_str()) {
-                    let trimmed = msg.trim();
-                    if !trimmed.is_empty()
-                        && (val.get("changes").is_some()
-                            || val.get("context_requests").is_some()
-                            || val.get("suggested_actions").is_some())
-                    {
-                        messages.push(trimmed.to_string());
-                    }
-                }
-            }
-            from = end;
-        } else {
-            from = start + 1;
-        }
-    }
-    messages
-}
-
-fn balanced_object_end(raw: &str, start: usize) -> Option<usize> {
-    let bytes = raw.as_bytes();
-    let mut depth = 0usize;
-    let mut in_string = false;
-    let mut i = start;
-    while i < bytes.len() {
-        let b = bytes[i];
-        if in_string {
-            match b {
-                b'\\' => i += 1,
-                b'"' => in_string = false,
-                _ => {}
-            }
-        } else {
-            match b {
-                b'"' => in_string = true,
-                b'{' | b'[' => depth += 1,
-                b'}' | b']' => {
-                    depth = depth.saturating_sub(1);
-                    if depth == 0 {
-                        return Some(i + 1);
-                    }
-                }
-                _ => {}
-            }
-        }
-        i += 1;
-    }
-    None
-}
-
-fn is_raw_json(s: &str) -> bool {
-    let trimmed = s.trim();
-    if (trimmed.starts_with('{') && trimmed.ends_with('}'))
-        || (trimmed.starts_with('[') && trimmed.ends_with(']'))
-    {
-        serde_json::from_str::<serde_json::Value>(trimmed).is_ok()
-    } else if let Some(stripped) = trimmed.strip_prefix("```json") {
-        if let Some(inner) = stripped.strip_suffix("```") {
-            serde_json::from_str::<serde_json::Value>(inner.trim()).is_ok()
-        } else {
-            false
-        }
-    } else {
-        false
-    }
-}
-
 /// Records workflow response into HistoryManager based on the final execution result.
 pub fn record_workflow_response(
     history_manager: &mut HistoryManager,
@@ -268,28 +132,18 @@ pub fn record_workflow_response(
 ) {
     match result {
         ModelResult::Answer { text } => {
-            let json_msgs = extract_json_messages(text);
-            let candidate = if !json_msgs.is_empty() {
-                json_msgs.join("\n\n")
-            } else if !text.trim().is_empty() {
+            let candidate = if !text.trim().is_empty() {
                 text.clone()
-            } else {
-                let json_from_ast = extract_json_messages(assistant_text);
-                if !json_from_ast.is_empty() {
-                    json_from_ast.join("\n\n")
-                } else if !assistant_text.trim().is_empty() {
-                    assistant_text.to_string()
-                } else {
-                    "Answered.".to_string()
-                }
-            };
-            let cleaned = crate::edits::protocol::xml::extract_conversational_text(&candidate);
-            let msg = if !cleaned.trim().is_empty() && !is_raw_json(&cleaned) {
-                cleaned
-            } else if !candidate.trim().is_empty() && !is_raw_json(&candidate) {
-                candidate
+            } else if !assistant_text.trim().is_empty() {
+                assistant_text.to_string()
             } else {
                 "Answered.".to_string()
+            };
+            let msg = crate::edits::protocol::structured::clean_raw_json_or_text(&candidate);
+            let msg = if msg.trim().is_empty() {
+                "Answered.".to_string()
+            } else {
+                msg
             };
             let _ = history_manager.record_response(msg, None, None, vec![]);
         }
@@ -301,23 +155,16 @@ pub fn record_workflow_response(
             commit_hash,
             ..
         } => {
-            let json_msgs = extract_json_messages(assistant_text);
-            let msg = if !json_msgs.is_empty() {
-                json_msgs.join("\n\n")
-            } else if let Some(m) = proposal
+            let msg = if let Some(m) = proposal
                 .as_ref()
                 .map(|p| p.message.trim())
                 .filter(|m| !m.is_empty())
             {
                 m.to_string()
+            } else if !assistant_text.trim().is_empty() {
+                crate::edits::protocol::structured::clean_raw_json_or_text(assistant_text)
             } else {
-                let extracted =
-                    crate::edits::protocol::xml::extract_conversational_text(assistant_text);
-                if !extracted.trim().is_empty() && !is_raw_json(&extracted) {
-                    extracted
-                } else {
-                    summary.clone()
-                }
+                summary.clone()
             };
 
             let mut seen = std::collections::HashSet::new();
@@ -327,6 +174,7 @@ pub fn record_workflow_response(
                     EditOperation::Create { path, .. } => format!("[NEW] {}", path),
                     EditOperation::Delete { path } => format!("[DEL] {}", path),
                     EditOperation::Replace { path, .. } => format!("[EDIT] {}", path),
+                    EditOperation::Overwrite { path, .. } => format!("[OVERWRITE] {}", path),
                     EditOperation::Move { from, to } => format!("[MOVE] {} -> {}", from, to),
                 };
                 if seen.insert(entry.clone()) {
@@ -350,305 +198,45 @@ pub fn record_workflow_response(
     }
 }
 
-/// Filters out failed files that the model chose not to retry in the current set of edits.
-pub fn retain_retried_failed_files(
-    last_failed_errors: &mut std::collections::HashMap<String, EditError>,
-    context_manager: &ContextManager,
-    edits: &[EditOperation],
-) {
-    let mut retried_paths = std::collections::HashSet::new();
-    for edit in edits {
-        match edit {
-            EditOperation::Replace { path, .. }
-            | EditOperation::Create { path, .. }
-            | EditOperation::Delete { path } => {
-                let clean = context_manager.normalize_path(path).unwrap_or_else(|_| path.clone());
-                retried_paths.insert(clean);
-            }
-            EditOperation::Move { from, to } => {
-                let clean_from = context_manager.normalize_path(from).unwrap_or_else(|_| from.clone());
-                let clean_to = context_manager.normalize_path(to).unwrap_or_else(|_| to.clone());
-                retried_paths.insert(clean_from);
-                retried_paths.insert(clean_to);
-            }
-        }
-    }
-    last_failed_errors.retain(|path, _| retried_paths.contains(path));
-}
-
-/// Evicts any files that are being re-edited in the current retry from previously staged state
-/// and cumulative edits, so they can be freshly staged and validated against their clean base.
-pub fn prepare_staged_for_retry(
-    staged_state: &mut StagedEditsState,
-    cumulative_edits: &mut Vec<EditOperation>,
-    succeeded_files: &mut std::collections::HashSet<String>,
-    context_manager: &ContextManager,
-    new_edits: &[EditOperation],
-) {
-    let mut touched_paths = std::collections::HashSet::new();
-    for edit in new_edits {
-        match edit {
-            EditOperation::Replace { path, .. }
-            | EditOperation::Create { path, .. }
-            | EditOperation::Delete { path } => {
-                let clean = context_manager
-                    .normalize_path(path)
-                    .unwrap_or_else(|_| path.clone());
-                touched_paths.insert(clean);
-            }
-            EditOperation::Move { from, to } => {
-                let clean_from = context_manager
-                    .normalize_path(from)
-                    .unwrap_or_else(|_| from.clone());
-                let clean_to = context_manager
-                    .normalize_path(to)
-                    .unwrap_or_else(|_| to.clone());
-                touched_paths.insert(clean_from);
-                touched_paths.insert(clean_to);
-            }
-        }
-    }
-
-    for path in &touched_paths {
-        staged_state.staged_files.remove(path);
-        staged_state.deleted_paths.remove(path);
-        succeeded_files.remove(path);
-    }
-
-    cumulative_edits.retain(|op| {
-        let op_path = match op {
-            EditOperation::Replace { path, .. }
-            | EditOperation::Create { path, .. }
-            | EditOperation::Delete { path } => context_manager
-                .normalize_path(path)
-                .unwrap_or_else(|_| path.clone()),
-            EditOperation::Move { from, to } => {
-                let clean_from = context_manager
-                    .normalize_path(from)
-                    .unwrap_or_else(|_| from.clone());
-                let clean_to = context_manager
-                    .normalize_path(to)
-                    .unwrap_or_else(|_| to.clone());
-                if touched_paths.contains(&clean_from) || touched_paths.contains(&clean_to) {
-                    return false;
-                }
-                return true;
-            }
-        };
-        !touched_paths.contains(&op_path)
-    });
-}
-
-fn access_satisfies(current: Option<ContextAccess>, requested: ContextAccess) -> bool {
-    match current {
-        Some(ContextAccess::Editable) => true,
-        Some(ContextAccess::ReadOnly) => requested == ContextAccess::ReadOnly,
-        None => false,
-    }
-}
-
-/// Registers model-requested repository files in the Auto layer.
-/// Returns the paths that actually widened the effective context.
-pub fn apply_context_requests(
-    context_manager: &mut ContextManager,
-    requests: &[ContextRequest],
-    available_files: &[String],
-    max_auto_files: Option<usize>,
-) -> Vec<String> {
-    let mut added = Vec::new();
-    for request in requests {
-        if let Some(limit) = max_auto_files {
-            if added.len() >= limit {
-                break;
-            }
-        }
-        let Ok(path) = context_manager.normalize_path(&request.path) else {
-            continue;
-        };
-        if !available_files.contains(&path) {
-            continue;
-        }
-        if access_satisfies(context_manager.effective_access_for(&path), request.access) {
-            continue;
-        }
-        if context_manager.add_auto_file(&path, request.access).is_ok()
-            && access_satisfies(context_manager.effective_access_for(&path), request.access)
-        {
-            added.push(path);
-        }
-    }
-    added
-}
-
-fn has_proposed_edits(result: &ModelResult) -> bool {
-    matches!(result, ModelResult::Edit { edits, .. } if !edits.is_empty())
-}
-
-/// Formats a human-readable failure reason for `EditFileRetrying` event and prompts.
-pub fn format_patch_retry_reason(err: &EditError) -> String {
-    match err {
-        EditError::NoMatch { .. } => {
-            "Search block not found (0 matches). Check indentation and line endings.".to_string()
-        }
-        EditError::AmbiguousMatch { count, .. } => {
-            format!(
-                "Search block matches {} times. Provide more unique context.",
-                count
-            )
-        }
-        other => other.to_string(),
-    }
-}
-
-/// Constructs a specialized prompt asking the model to fix failed edit blocks.
-pub fn build_patch_retry_prompt(
-    succeeded_files: &std::collections::HashSet<String>,
-    failed_files: &std::collections::HashMap<String, EditError>,
-    target_language: Option<&str>,
-) -> String {
-    let mut prompt = String::new();
-    prompt.push_str("Some of the proposed edits failed to apply.\n\n");
-
-    if !succeeded_files.is_empty() {
-        let mut succ_sorted: Vec<&String> = succeeded_files.iter().collect();
-        succ_sorted.sort();
-        prompt.push_str("Successfully applied edits for:\n");
-        for path in succ_sorted {
-            prompt.push_str(&format!("- {}\n", path));
-        }
-        prompt.push_str("(Do NOT regenerate changes for the above files; their updated versions are already present in <context>).\n\n");
-    }
-
-    prompt.push_str("Failed files and errors:\n");
-    let mut failed_sorted: Vec<(&String, &EditError)> = failed_files.iter().collect();
-    failed_sorted.sort_by_key(|(p, _)| *p);
-    for (path, err) in failed_sorted {
-        let explanation = match err {
-            EditError::NoMatch { .. } => {
-                "Search block not found (0 matches). Verify exact line content, indentation, and context."
-            }
-            EditError::AmbiguousMatch { count, .. } => {
-                &format!(
-                    "Search block matches {} times. Include more surrounding lines to make the match uniquely identifiable.",
-                    count
-                )
-            }
-            other => &other.to_string(),
-        };
-        prompt.push_str(&format!("- `{}`: {}\n", path, explanation));
-    }
-
-    prompt.push_str("\nPlease provide corrected edit blocks ONLY for the failed files listed above.");
-    if let Some(lang) = target_language {
-        prompt.push_str(&format!(
-            "\n\nNote: Formulate your explanations in {} (the language of the user's request), while conducting all reasoning strictly in English.",
-            lang
-        ));
-    }
-    prompt
-}
-
-/// Common execution pipeline for streaming, XML filtering, parsing model response,
-/// and automatically recovering from failed search/replace blocks using an in-memory retry loop.
+/// Unified execution pipeline for context discovery, model reasoning, streaming,
+/// patch staging, and auto-repair retry loop with explicit budgets.
 #[allow(clippy::too_many_arguments)]
 pub async fn execute_edit_pipeline(
     prompt: &str,
-    client: &OpenRouterClient,
-    model_name: &str,
+    provider: &dyn LlmProvider,
+    model: &ModelRef,
     context_manager: &mut ContextManager,
     history_manager: &mut HistoryManager,
     protocol: &dyn EditProtocol,
     workflow_name: &str,
     stream_tx: mpsc::Sender<StreamEvent>,
     cancel_rx: watch::Receiver<bool>,
-    max_retries: usize,
-) -> anyhow::Result<ParsedPipelineOutput> {
-    execute_edit_pipeline_full(
-        prompt,
-        client,
-        model_name,
-        context_manager,
-        history_manager,
-        protocol,
-        workflow_name,
-        stream_tx,
-        cancel_rx,
-        max_retries,
-        crate::config::DEFAULT_MAX_DISCOVERY_ROUNDS,
-        None,
-        true,
-    )
-    .await
-}
-
-/// Execution pipeline with configurable turn recording, using default discovery settings.
-#[allow(clippy::too_many_arguments)]
-pub async fn execute_edit_pipeline_with_turn(
-    prompt: &str,
-    client: &OpenRouterClient,
-    model_name: &str,
-    context_manager: &mut ContextManager,
-    history_manager: &mut HistoryManager,
-    protocol: &dyn EditProtocol,
-    workflow_name: &str,
-    stream_tx: mpsc::Sender<StreamEvent>,
-    cancel_rx: watch::Receiver<bool>,
-    max_retries: usize,
-    record_turn: bool,
-) -> anyhow::Result<ParsedPipelineOutput> {
-    execute_edit_pipeline_full(
-        prompt,
-        client,
-        model_name,
-        context_manager,
-        history_manager,
-        protocol,
-        workflow_name,
-        stream_tx,
-        cancel_rx,
-        max_retries,
-        crate::config::DEFAULT_MAX_DISCOVERY_ROUNDS,
-        None,
-        record_turn,
-    )
-    .await
-}
-
-/// Full execution pipeline with configurable discovery rounds, auto file limits, and patch retry loop.
-#[allow(clippy::too_many_arguments)]
-pub async fn execute_edit_pipeline_full(
-    prompt: &str,
-    client: &OpenRouterClient,
-    model_name: &str,
-    context_manager: &mut ContextManager,
-    history_manager: &mut HistoryManager,
-    protocol: &dyn EditProtocol,
-    workflow_name: &str,
-    stream_tx: mpsc::Sender<StreamEvent>,
-    cancel_rx: watch::Receiver<bool>,
-    max_retries: usize,
-    max_discovery_rounds: usize,
-    max_auto_files_per_round: Option<usize>,
-    record_turn: bool,
+    options: &WorkflowOptions,
 ) -> anyhow::Result<ParsedPipelineOutput> {
     let marker = generate_turn_marker();
     let marked_protocol = protocol.with_turn_marker(&marker);
     let protocol: &dyn EditProtocol = marked_protocol.as_deref().unwrap_or(protocol);
 
+    let mut turn_detected_language: Option<String> = None;
+
     // 1. Initial attempt
-    let mut pipeline_out = execute_edit_pipeline_step_opt(
+    let mut pipeline_out = execute_edit_pipeline_step(
         prompt,
-        client,
-        model_name,
+        provider,
+        model,
         context_manager,
         history_manager,
         protocol,
         workflow_name,
         stream_tx.clone(),
         cancel_rx.clone(),
-        record_turn,
-        false,
-        None,
+        options,
+        StepParams {
+            record_turn: true,
+            emit_done: false,
+            staged_state: None,
+            target_language: turn_detected_language.as_deref(),
+        },
     )
     .await?;
 
@@ -657,17 +245,16 @@ pub async fn execute_edit_pipeline_full(
         return Ok(pipeline_out);
     }
 
-    if let Some(lang) = crate::edits::protocol::xml::extract_user_language(&pipeline_out.assistant_text) {
-        history_manager.set_detected_language(lang);
+    if let Some(lang) = protocol.parse_user_language(&pipeline_out.assistant_text) {
+        turn_detected_language = Some(lang);
     }
-    pipeline_out.assistant_text = crate::edits::protocol::xml::strip_user_language_tags(&pipeline_out.assistant_text);
+    pipeline_out.detected_language = turn_detected_language.clone();
 
     let repo_root = context_manager.repo_root().to_path_buf();
 
     // Discovery loop: the model may ask for files from the repo map before proposing edits.
-    // Fast path: a response with edits, or without any context request, needs no extra LLM call.
     let mut discovery_round = 0;
-    while discovery_round < max_discovery_rounds
+    while discovery_round < options.max_discovery_rounds
         && !has_proposed_edits(&pipeline_out.parsed_result)
     {
         let requests = protocol.parse_context_requests(&pipeline_out.assistant_text);
@@ -680,7 +267,7 @@ pub async fn execute_edit_pipeline_full(
             context_manager,
             &requests,
             &available_files,
-            max_auto_files_per_round,
+            options.max_auto_files_per_round,
         );
         if added.is_empty() {
             break;
@@ -705,26 +292,30 @@ pub async fn execute_edit_pipeline_full(
         );
         let _ = stream_tx.send(StreamEvent::TextDelta(round_banner.clone())).await;
 
-        pipeline_out = execute_edit_pipeline_step_opt(
+        pipeline_out = execute_edit_pipeline_step(
             prompt,
-            client,
-            model_name,
+            provider,
+            model,
             context_manager,
             history_manager,
             protocol,
             workflow_name,
             stream_tx.clone(),
             cancel_rx.clone(),
-            false,
-            false,
-            None,
+            options,
+            StepParams {
+                record_turn: false,
+                emit_done: false,
+                staged_state: None,
+                target_language: turn_detected_language.as_deref(),
+            },
         )
         .await?;
 
-        if let Some(lang) = crate::edits::protocol::xml::extract_user_language(&pipeline_out.assistant_text) {
-            history_manager.set_detected_language(lang);
+        if let Some(lang) = protocol.parse_user_language(&pipeline_out.assistant_text) {
+            turn_detected_language = Some(lang);
         }
-        pipeline_out.assistant_text = crate::edits::protocol::xml::strip_user_language_tags(&pipeline_out.assistant_text);
+        pipeline_out.detected_language = turn_detected_language.clone();
 
         if !prev_text.trim().is_empty() {
             let combined = format!("{}{}", prev_text.trim_end(), round_banner);
@@ -745,14 +336,13 @@ pub async fn execute_edit_pipeline_full(
         }
     }
 
-    // If discovery exhausted without producing edits, check if model was still requesting files
-    if discovery_round >= max_discovery_rounds && !has_proposed_edits(&pipeline_out.parsed_result) {
+    if discovery_round >= options.max_discovery_rounds && !has_proposed_edits(&pipeline_out.parsed_result) {
         let remaining_requests = protocol.parse_context_requests(&pipeline_out.assistant_text);
         if !remaining_requests.is_empty() {
             let requested_paths: Vec<String> = remaining_requests.into_iter().map(|r| r.path).collect();
             let warn_msg = format!(
                 "Reached maximum context discovery rounds limit ({}). The model requested more files: [{}], but the limit was reached. You can add them to context manually or increase `max_discovery_rounds` in config.",
-                max_discovery_rounds,
+                options.max_discovery_rounds,
                 requested_paths.join(", ")
             );
             tracing::warn!("{}", warn_msg);
@@ -772,7 +362,6 @@ pub async fn execute_edit_pipeline_full(
         }
     }
 
-    // Check if initial output has edits to validate
     let (mut current_summary, mut current_edits, initial_proposal) = match &pipeline_out.parsed_result {
         ModelResult::Edit {
             summary,
@@ -806,7 +395,6 @@ pub async fn execute_edit_pipeline_full(
         succeeded_files.extend(stage_res.successful_paths);
         cumulative_successful_edits.extend(stage_res.successful_edits);
 
-        // Remove any files that succeeded in this attempt from failed list
         for path in &succeeded_files {
             last_failed_errors.remove(path);
         }
@@ -822,8 +410,8 @@ pub async fn execute_edit_pipeline_full(
                     parsed_result: ModelResult::Answer {
                         text: pipeline_out.assistant_text,
                     },
-                    completed_tool_calls: pipeline_out.completed_tool_calls,
                     is_cancelled: false,
+                    detected_language: turn_detected_language,
                 });
             }
             return Ok(ParsedPipelineOutput {
@@ -837,25 +425,24 @@ pub async fn execute_edit_pipeline_full(
                     changed_files: Vec::new(),
                     commit_hash: None,
                 },
-                completed_tool_calls: pipeline_out.completed_tool_calls,
                 is_cancelled: false,
+                detected_language: turn_detected_language,
             });
         }
 
-        if attempt >= max_retries {
+        if attempt >= options.max_retries {
             break;
         }
 
         attempt += 1;
 
-        // Emit EditFileRetrying for each failing file
         for (path, err) in &last_failed_errors {
             let reason = format_patch_retry_reason(err);
             let _ = stream_tx
                 .send(StreamEvent::EditFileRetrying {
                     path: path.clone(),
                     attempt,
-                    max_retries,
+                    max_retries: options.max_retries,
                     reason,
                 })
                 .await;
@@ -863,29 +450,33 @@ pub async fn execute_edit_pipeline_full(
 
         let retry_banner = format!(
             "\n\n---\n**[Patch Retry {}/{}]** Correcting failed edits...\n\n",
-            attempt, max_retries
+            attempt, options.max_retries
         );
         let _ = stream_tx.send(StreamEvent::TextDelta(retry_banner.clone())).await;
 
         let repair_prompt = build_patch_retry_prompt(
             &succeeded_files,
             &last_failed_errors,
-            history_manager.detected_language(),
+            turn_detected_language.as_deref(),
         );
 
-        let step_out = execute_edit_pipeline_step_opt(
+        let step_out = execute_edit_pipeline_step(
             &repair_prompt,
-            client,
-            model_name,
+            provider,
+            model,
             context_manager,
             history_manager,
             protocol,
             workflow_name,
             stream_tx.clone(),
             cancel_rx.clone(),
-            false,
-            false,
-            staged_state.as_ref(),
+            options,
+            StepParams {
+                record_turn: false,
+                emit_done: false,
+                staged_state: staged_state.as_ref(),
+                target_language: turn_detected_language.as_deref(),
+            },
         )
         .await?;
 
@@ -894,10 +485,10 @@ pub async fn execute_edit_pipeline_full(
             return Ok(step_out);
         }
 
-        if let Some(lang) = crate::edits::protocol::xml::extract_user_language(&step_out.assistant_text) {
-            history_manager.set_detected_language(lang);
+        if let Some(lang) = protocol.parse_user_language(&step_out.assistant_text) {
+            turn_detected_language = Some(lang);
         }
-        let step_assistant_text = crate::edits::protocol::xml::strip_user_language_tags(&step_out.assistant_text);
+        let step_assistant_text = protocol.clean_assistant_text(&step_out.assistant_text);
 
         let prev_assistant = std::mem::take(&mut pipeline_out.assistant_text);
         pipeline_out.assistant_text = format!(
@@ -906,7 +497,6 @@ pub async fn execute_edit_pipeline_full(
             retry_banner,
             step_assistant_text.trim_start()
         );
-        pipeline_out.completed_tool_calls = step_out.completed_tool_calls;
 
         match step_out.parsed_result {
             ModelResult::Edit { summary, edits, .. } => {
@@ -920,7 +510,6 @@ pub async fn execute_edit_pipeline_full(
             }
         }
 
-        // Failed files that the model chose not to touch in this retry are retracted/dropped
         retain_retried_failed_files(&mut last_failed_errors, context_manager, &current_edits);
 
         if let Some(ref mut st) = staged_state {
@@ -934,7 +523,6 @@ pub async fn execute_edit_pipeline_full(
         }
     }
 
-    // Exhausted retries with remaining errors
     let mut err_lines = Vec::new();
     let mut failed_sorted: Vec<(&String, &EditError)> = last_failed_errors.iter().collect();
     failed_sorted.sort_by_key(|(p, _)| *p);
@@ -943,7 +531,7 @@ pub async fn execute_edit_pipeline_full(
     }
     let error_desc = format!(
         "Failed to apply edits after {} retries:\n{}",
-        max_retries,
+        options.max_retries,
         err_lines.join("\n")
     );
 
@@ -960,63 +548,31 @@ pub async fn execute_edit_pipeline_full(
             changed_files: Vec::new(),
             commit_hash: None,
         },
-        completed_tool_calls: pipeline_out.completed_tool_calls,
         is_cancelled: false,
+        detected_language: turn_detected_language,
     })
 }
 
-/// Execution pipeline step with optional user turn recording (used by auto-healing loops).
+/// Executes a single atomic model interaction step with token budgets applied from `WorkflowOptions`.
 #[allow(clippy::too_many_arguments)]
-pub async fn execute_edit_pipeline_step(
+pub async fn execute_edit_pipeline_step<'a>(
     prompt: &str,
-    client: &OpenRouterClient,
-    model_name: &str,
+    provider: &dyn LlmProvider,
+    model: &ModelRef,
     context_manager: &mut ContextManager,
     history_manager: &mut HistoryManager,
     protocol: &dyn EditProtocol,
     workflow_name: &str,
     stream_tx: mpsc::Sender<StreamEvent>,
     cancel_rx: watch::Receiver<bool>,
-    record_turn: bool,
-) -> anyhow::Result<ParsedPipelineOutput> {
-    execute_edit_pipeline_step_opt(
-        prompt,
-        client,
-        model_name,
-        context_manager,
-        history_manager,
-        protocol,
-        workflow_name,
-        stream_tx,
-        cancel_rx,
-        record_turn,
-        true,
-        None,
-    )
-    .await
-}
-
-/// Internal pipeline step with control over emitting the final StreamEvent::Done and staged context overlay.
-#[allow(clippy::too_many_arguments)]
-pub async fn execute_edit_pipeline_step_opt(
-    prompt: &str,
-    client: &OpenRouterClient,
-    model_name: &str,
-    context_manager: &mut ContextManager,
-    history_manager: &mut HistoryManager,
-    protocol: &dyn EditProtocol,
-    workflow_name: &str,
-    stream_tx: mpsc::Sender<StreamEvent>,
-    cancel_rx: watch::Receiver<bool>,
-    record_turn: bool,
-    emit_done: bool,
-    staged_state: Option<&StagedEditsState>,
+    options: &WorkflowOptions,
+    params: StepParams<'a>,
 ) -> anyhow::Result<ParsedPipelineOutput> {
     let repo_state = crate::git::get_repository_state(Some(context_manager.repo_root()));
     let ctx_state = context_manager.get_state();
     let mut context_files = context_manager.read_context_files();
 
-    if let Some(staged) = staged_state {
+    if let Some(staged) = params.staged_state {
         for (path, content) in &staged.staged_files {
             if let Some(f) = context_files.iter_mut().find(|cf| &cf.path == path) {
                 f.content = content.clone();
@@ -1032,8 +588,16 @@ pub async fn execute_edit_pipeline_step_opt(
         context_files.sort_by(|a, b| a.path.cmp(&b.path));
     }
 
-    if record_turn {
-        let _ = compact_history_if_needed(history_manager, client, model_name, cancel_rx.clone()).await;
+    if params.record_turn {
+        let _ = compact_history_if_needed_with_budget(
+            history_manager,
+            provider,
+            model,
+            cancel_rx.clone(),
+            options.history_budget_tokens,
+            options.history_tail_turns,
+        )
+        .await;
         let context_paths: Vec<String> = ctx_state.items.iter().map(|it| it.path.clone()).collect();
         let _ = history_manager.record_turn(prompt, context_paths);
     }
@@ -1048,19 +612,17 @@ pub async fn execute_edit_pipeline_step_opt(
 
     let repo_root = context_manager.repo_root().to_path_buf();
 
-    // Generate semantic repo map excluding files already in context
     let available_files = crate::git::list_repository_files(Some(&repo_root)).unwrap_or_default();
     let context_paths: Vec<String> = context_files.iter().map(|f| f.path.clone()).collect();
     let repo_map = crate::repomap::generate_repo_map(
         &repo_root,
         &available_files,
         &context_paths,
-        crate::repomap::DEFAULT_REPOMAP_TOKEN_BUDGET,
+        options.repomap_token_budget,
     )
     .ok()
     .filter(|m| !m.trim().is_empty());
 
-    // 1. Build prompt layering
     let mut assembly = PromptAssembly::new(
         Some(repo_state),
         ctx_state.revision,
@@ -1070,35 +632,32 @@ pub async fn execute_edit_pipeline_step_opt(
         history_tag,
         repo_map,
     );
-    assembly.target_language = history_manager.detected_language().map(|s| s.to_string());
+    assembly.target_language = params.target_language.map(|s| s.to_string());
 
     let assembled_messages = assembly.assemble_chat_messages(prompt, protocol);
 
-    // 2. Stream response from model
     let (llm_tx, mut llm_rx) = mpsc::channel::<StreamEvent>(100);
-
-    // Code edits are no longer delivered via native tool calls; no protocol-specific tools.
-    let tools: Option<Vec<crate::model::gateway::ToolDefinition>> = None;
-
     let response_format = protocol.response_format(&editable_paths);
-    let is_structured = protocol.name() == "structured";
 
-    let model_str = model_name.to_string();
-    let client_call = client.stream_chat_with_tools(
-        &model_str,
+    let client_call = provider.stream_chat(
+        &model.name,
         assembled_messages.clone(),
-        tools.clone(),
         response_format,
         llm_tx,
         cancel_rx.clone(),
     );
 
     let editable_paths_for_filter = editable_paths.clone();
-    let staged_for_filter = staged_state
+    let staged_for_filter = params
+        .staged_state
         .map(|s| s.staged_files.clone())
         .unwrap_or_default();
     let forward_stream_tx = stream_tx.clone();
-    let turn_marker = protocol.turn_marker().map(|m| m.to_string());
+    let mut stream_filter = protocol.create_stream_filter(
+        editable_paths_for_filter,
+        repo_root,
+        staged_for_filter,
+    );
     let has_emitted_edits = Arc::new(AtomicBool::new(false));
     let has_emitted_edits_forward = has_emitted_edits.clone();
 
@@ -1106,118 +665,56 @@ pub async fn execute_edit_pipeline_step_opt(
         let mut assistant_text = String::new();
         let mut cancelled = false;
 
-        if is_structured {
-            let mut json_filter = JsonStreamFilter::new(editable_paths_for_filter, repo_root)
-                .with_staged_contents(staged_for_filter);
-            while let Some(event) = llm_rx.recv().await {
-                match event {
-                    StreamEvent::TextDelta(ref delta) => {
-                        assistant_text.push_str(delta);
-                        let filtered_events = json_filter.push_chunk(delta);
-                        for ev in filtered_events {
-                            if matches!(
-                                ev,
-                                StreamEvent::EditStarted
-                                    | StreamEvent::EditFileStarted { .. }
-                                    | StreamEvent::EditHunk { .. }
-                            ) {
-                                has_emitted_edits_forward.store(true, Ordering::SeqCst);
-                            }
-                            if forward_stream_tx.send(ev).await.is_err() {
-                                break;
-                            }
-                        }
-                    }
-                    StreamEvent::Cancelled => {
-                        cancelled = true;
-                        let _ = forward_stream_tx.send(StreamEvent::Cancelled).await;
-                    }
-                    StreamEvent::Done => {}
-                    other => {
+        while let Some(event) = llm_rx.recv().await {
+            match event {
+                StreamEvent::TextDelta(ref delta) => {
+                    assistant_text.push_str(delta);
+                    let filtered_events = stream_filter.push_chunk(delta);
+                    for ev in filtered_events {
                         if matches!(
-                            other,
+                            ev,
                             StreamEvent::EditStarted
                                 | StreamEvent::EditFileStarted { .. }
                                 | StreamEvent::EditHunk { .. }
                         ) {
                             has_emitted_edits_forward.store(true, Ordering::SeqCst);
                         }
-                        if forward_stream_tx.send(other).await.is_err() {
+                        if forward_stream_tx.send(ev).await.is_err() {
                             break;
                         }
                     }
                 }
-            }
-            for ev in json_filter.finish() {
-                if matches!(
-                    ev,
-                    StreamEvent::EditStarted
-                        | StreamEvent::EditFileStarted { .. }
-                        | StreamEvent::EditHunk { .. }
-                ) {
-                    has_emitted_edits_forward.store(true, Ordering::SeqCst);
+                StreamEvent::Cancelled => {
+                    cancelled = true;
+                    let _ = forward_stream_tx.send(StreamEvent::Cancelled).await;
                 }
-                let _ = forward_stream_tx.send(ev).await;
+                StreamEvent::Done => {}
+                other => {
+                    if matches!(
+                        other,
+                        StreamEvent::EditStarted
+                            | StreamEvent::EditFileStarted { .. }
+                            | StreamEvent::EditHunk { .. }
+                    ) {
+                        has_emitted_edits_forward.store(true, Ordering::SeqCst);
+                    }
+                    if forward_stream_tx.send(other).await.is_err() {
+                        break;
+                    }
+                }
             }
-        } else {
-            let mut stream_filter = XmlStreamFilter::new(editable_paths_for_filter, repo_root)
-                .with_marker(turn_marker)
-                .with_staged_contents(staged_for_filter);
+        }
 
-            while let Some(event) = llm_rx.recv().await {
-                match event {
-                    StreamEvent::TextDelta(ref delta) => {
-                        assistant_text.push_str(delta);
-                        let filtered_events = stream_filter.push_chunk(delta);
-                        for ev in filtered_events {
-                            if matches!(
-                                ev,
-                                StreamEvent::EditStarted
-                                    | StreamEvent::EditFileStarted { .. }
-                                    | StreamEvent::EditHunk { .. }
-                            ) {
-                                has_emitted_edits_forward.store(true, Ordering::SeqCst);
-                            }
-                            if forward_stream_tx.send(ev).await.is_err() {
-                                break;
-                            }
-                        }
-                    }
-                    StreamEvent::Cancelled => {
-                        cancelled = true;
-                        let _ = forward_stream_tx.send(StreamEvent::Cancelled).await;
-                    }
-                    StreamEvent::Done => {
-                        // Suppress early Done from the first call so receiver does not terminate early
-                    }
-                    other => {
-                        if matches!(
-                            other,
-                            StreamEvent::EditStarted
-                                | StreamEvent::EditFileStarted { .. }
-                                | StreamEvent::EditHunk { .. }
-                        ) {
-                            has_emitted_edits_forward.store(true, Ordering::SeqCst);
-                        }
-                        if forward_stream_tx.send(other).await.is_err() {
-                            break;
-                        }
-                    }
-                }
+        for ev in stream_filter.finish() {
+            if matches!(
+                ev,
+                StreamEvent::EditStarted
+                    | StreamEvent::EditFileStarted { .. }
+                    | StreamEvent::EditHunk { .. }
+            ) {
+                has_emitted_edits_forward.store(true, Ordering::SeqCst);
             }
-
-            // Flush remaining events
-            for ev in stream_filter.finish() {
-                if matches!(
-                    ev,
-                    StreamEvent::EditStarted
-                        | StreamEvent::EditFileStarted { .. }
-                        | StreamEvent::EditHunk { .. }
-                ) {
-                    has_emitted_edits_forward.store(true, Ordering::SeqCst);
-                }
-                let _ = forward_stream_tx.send(ev).await;
-            }
+            let _ = forward_stream_tx.send(ev).await;
         }
 
         (assistant_text, cancelled)
@@ -1226,7 +723,7 @@ pub async fn execute_edit_pipeline_step_opt(
     let client_res = client_call.await;
     let (assistant_text, cancelled) = forward_task.await.unwrap_or_default();
 
-    let completed_tool_calls = client_res?;
+    client_res?;
 
     if cancelled {
         return Ok(ParsedPipelineOutput {
@@ -1234,16 +731,13 @@ pub async fn execute_edit_pipeline_step_opt(
             parsed_result: ModelResult::Answer {
                 text: assistant_text,
             },
-            completed_tool_calls,
             is_cancelled: true,
+            detected_language: params.target_language.map(|s| s.to_string()),
         });
     }
 
-    // 3. Parse output according to active protocol
     let parsed_result = protocol.parse_output(&assistant_text, &editable_paths);
 
-    // Invariant: once edit events were streamed to the client, the result must never
-    // degrade to a plain Answer; surface it as a failed Edit so workflows/clients finalize it.
     let parsed_result = if has_emitted_edits.load(Ordering::SeqCst) {
         match parsed_result {
             ModelResult::Answer { .. } => ModelResult::Edit {
@@ -1264,23 +758,24 @@ pub async fn execute_edit_pipeline_step_opt(
         parsed_result
     };
 
-    // If streaming parser did not emit edit events in real time, emit fallback events now
     if !has_emitted_edits.load(Ordering::SeqCst) {
         if let ModelResult::Edit { ref edits, .. } = parsed_result {
             emit_semantic_events_for_edits(edits, &stream_tx).await;
         }
     }
 
-    // Emit final Done event for this execution if requested
-    if emit_done {
+    if params.emit_done {
         let _ = stream_tx.send(StreamEvent::Done).await;
     }
+
+    let detected_language = protocol.parse_user_language(&assistant_text)
+        .or_else(|| params.target_language.map(|s| s.to_string()));
 
     Ok(ParsedPipelineOutput {
         assistant_text,
         parsed_result,
-        completed_tool_calls,
         is_cancelled: false,
+        detected_language,
     })
 }
 
@@ -1312,6 +807,30 @@ async fn emit_semantic_events_for_edits(
                         })
                         .await;
                 }
+                let _ = stream_tx
+                    .send(StreamEvent::EditFileDone {
+                        path: path.clone(),
+                        status: "ok".to_string(),
+                        error: None,
+                        hunks_count: 1,
+                    })
+                    .await;
+            }
+            EditOperation::Overwrite { path, content } => {
+                let _ = stream_tx
+                    .send(StreamEvent::EditFileStarted {
+                        path: path.clone(),
+                        op_type: "overwrite".to_string(),
+                    })
+                    .await;
+                let _ = stream_tx
+                    .send(StreamEvent::EditHunk {
+                        path: path.clone(),
+                        hunk_index: idx,
+                        old_text: String::new(),
+                        new_text: content.clone(),
+                    })
+                    .await;
                 let _ = stream_tx
                     .send(StreamEvent::EditFileDone {
                         path: path.clone(),
@@ -1389,97 +908,6 @@ async fn emit_semantic_events_for_edits(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::{HashMap, HashSet};
-
-    #[test]
-    fn test_apply_context_requests_adds_existing_files_to_auto_layer() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("a.rs"), "fn a() {}").unwrap();
-        let mut cm = ContextManager::new(dir.path().to_path_buf());
-        let available = vec!["a.rs".to_string()];
-        let requests = vec![
-            ContextRequest {
-                path: "a.rs".to_string(),
-                access: ContextAccess::Editable,
-            },
-            ContextRequest {
-                path: "missing.rs".to_string(),
-                access: ContextAccess::ReadOnly,
-            },
-        ];
-
-        let added = apply_context_requests(&mut cm, &requests, &available, None);
-        assert_eq!(added, vec!["a.rs".to_string()]);
-        assert!(cm.is_editable("a.rs").unwrap());
-
-        // Already satisfied: no further changes.
-        assert!(apply_context_requests(&mut cm, &requests, &available, None).is_empty());
-
-        cm.clear_auto();
-        assert!(!cm.contains("a.rs").unwrap());
-    }
-
-    #[test]
-    fn test_apply_context_requests_respects_max_limit() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("a.rs"), "fn a() {}").unwrap();
-        std::fs::write(dir.path().join("b.rs"), "fn b() {}").unwrap();
-        let mut cm = ContextManager::new(dir.path().to_path_buf());
-        let available = vec!["a.rs".to_string(), "b.rs".to_string()];
-        let requests = vec![
-            ContextRequest {
-                path: "a.rs".to_string(),
-                access: ContextAccess::ReadOnly,
-            },
-            ContextRequest {
-                path: "b.rs".to_string(),
-                access: ContextAccess::ReadOnly,
-            },
-        ];
-
-        let added = apply_context_requests(&mut cm, &requests, &available, Some(1));
-        assert_eq!(added.len(), 1);
-        assert_eq!(added[0], "a.rs");
-    }
-
-    #[test]
-    fn test_build_patch_retry_prompt_format() {
-        let mut succeeded = HashSet::new();
-        succeeded.insert("crates/core/src/lib.rs".to_string());
-
-        let mut failed = HashMap::new();
-        failed.insert(
-            "crates/core/src/main.rs".to_string(),
-            EditError::NoMatch {
-                path: "crates/core/src/main.rs".to_string(),
-            },
-        );
-        failed.insert(
-            "crates/core/src/utils.rs".to_string(),
-            EditError::AmbiguousMatch {
-                path: "crates/core/src/utils.rs".to_string(),
-                count: 3,
-            },
-        );
-
-        let prompt = build_patch_retry_prompt(&succeeded, &failed, Some("Russian"));
-
-        assert!(prompt.contains("Russian"));
-        assert!(prompt.contains("Successfully applied edits for:"));
-        assert!(prompt.contains("- crates/core/src/lib.rs"));
-        assert!(prompt.contains("(Do NOT regenerate changes for the above files; their updated versions are already present in <context>)."));
-
-        assert!(prompt.contains("Failed files and errors:"));
-        assert!(prompt.contains("crates/core/src/main.rs"));
-        assert!(prompt.contains("Search block not found (0 matches)"));
-
-        assert!(prompt.contains("crates/core/src/utils.rs"));
-        assert!(prompt.contains("Search block matches 3 times"));
-
-        assert!(prompt.contains(
-            "Please provide corrected edit blocks ONLY for the failed files listed above."
-        ));
-    }
 
     #[test]
     fn test_record_workflow_response_structured_strips_edits() {
@@ -1536,81 +964,6 @@ mod tests {
     }
 
     #[test]
-    fn test_retain_retried_failed_files_drops_unretried_paths() {
-        let dir = tempfile::tempdir().unwrap();
-        let cm = ContextManager::new(dir.path().to_path_buf());
-        let mut failed = HashMap::new();
-        failed.insert("a.rs".to_string(), EditError::ReadOnly("a.rs".to_string()));
-        failed.insert("b.rs".to_string(), EditError::NoMatch { path: "b.rs".to_string() });
-
-        // If retry only provides edits for b.rs, a.rs must be dropped from failed errors
-        let edits = vec![EditOperation::Replace {
-            path: "b.rs".to_string(),
-            old_text: "old".to_string(),
-            new_text: "new".to_string(),
-        }];
-
-        retain_retried_failed_files(&mut failed, &cm, &edits);
-        assert!(!failed.contains_key("a.rs"));
-        assert!(failed.contains_key("b.rs"));
-
-        // If retry provides no edits at all (model retracted all remaining changes), all are cleared
-        retain_retried_failed_files(&mut failed, &cm, &[]);
-        assert!(failed.is_empty());
-    }
-
-    #[test]
-    fn test_prepare_staged_for_retry_evicts_modified_paths() {
-        let dir = tempfile::tempdir().unwrap();
-        let cm = ContextManager::new(dir.path().to_path_buf());
-        let mut staged = StagedEditsState::default();
-        staged
-            .staged_files
-            .insert("a.rs".to_string(), "staged a".to_string());
-        staged
-            .staged_files
-            .insert("b.rs".to_string(), "staged b".to_string());
-
-        let mut cumulative = vec![
-            EditOperation::Replace {
-                path: "a.rs".to_string(),
-                old_text: "old a".to_string(),
-                new_text: "staged a".to_string(),
-            },
-            EditOperation::Replace {
-                path: "b.rs".to_string(),
-                old_text: "old b".to_string(),
-                new_text: "staged b".to_string(),
-            },
-        ];
-
-        let mut succeeded = std::collections::HashSet::new();
-        succeeded.insert("a.rs".to_string());
-        succeeded.insert("b.rs".to_string());
-
-        let retry_edits = vec![EditOperation::Replace {
-            path: "a.rs".to_string(),
-            old_text: "old a".to_string(),
-            new_text: "fresh a".to_string(),
-        }];
-
-        prepare_staged_for_retry(
-            &mut staged,
-            &mut cumulative,
-            &mut succeeded,
-            &cm,
-            &retry_edits,
-        );
-
-        assert!(!staged.staged_files.contains_key("a.rs"));
-        assert!(staged.staged_files.contains_key("b.rs"));
-        assert_eq!(cumulative.len(), 1);
-        assert!(matches!(&cumulative[0], EditOperation::Replace { path, .. } if path == "b.rs"));
-        assert!(!succeeded.contains("a.rs"));
-        assert!(succeeded.contains("b.rs"));
-    }
-
-    #[test]
     fn test_record_workflow_response_discovery_concatenation_no_raw_json() {
         let dir = tempfile::tempdir().unwrap();
         let mut hm = HistoryManager::new(dir.path().to_path_buf());
@@ -1647,5 +1000,18 @@ mod tests {
             }
             _ => panic!("Expected Response entry"),
         }
+    }
+
+    #[test]
+    fn test_context_request_preserved_before_clean() {
+        let proto = crate::edits::XmlEditProtocol;
+        let raw = "I need files.\n<context_request path=\"crates/tui/src/markdown.rs\" access=\"read_only\" />\n";
+        let reqs = proto.parse_context_requests(raw);
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(reqs[0].path, "crates/tui/src/markdown.rs");
+
+        let cleaned = proto.clean_assistant_text(raw);
+        assert!(!cleaned.contains("<context_request"));
+        assert!(proto.parse_context_requests(&cleaned).is_empty());
     }
 }

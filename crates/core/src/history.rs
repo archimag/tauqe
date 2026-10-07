@@ -29,7 +29,6 @@ pub struct HistoryManager {
     storage: SessionStorage,
     listener: Option<HistoryEntryListener>,
     current_max_id: u64,
-    detected_language: Option<String>,
 }
 
 impl HistoryManager {
@@ -51,16 +50,7 @@ impl HistoryManager {
             storage,
             listener: None,
             current_max_id,
-            detected_language: None,
         }
-    }
-
-    pub fn detected_language(&self) -> Option<&str> {
-        self.detected_language.as_deref()
-    }
-
-    pub fn set_detected_language(&mut self, lang: impl Into<String>) {
-        self.detected_language = Some(lang.into());
     }
 
     pub fn set_listener<F>(&mut self, listener: F)

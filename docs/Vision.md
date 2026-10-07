@@ -1,143 +1,110 @@
-# Vision
+# Vision: TAUQE
 
-## 1. Purpose
+## 1. Mission and Paradigm: The Literal Harness
 
-The project builds an **AI-native development environment** where the developer retains full control over the project, and the model acts as a powerful semantic executor within strictly defined boundaries.
+TAUQE is an **AI-native engineering control environment** designed around the concept of a **semantic harness** for large language models.
 
-The system is neither an IDE, an IDE plugin, nor an autonomous coding agent. It is an **intelligent project control environment**, where:
+The term *harness* is used here not in the metaphorical sense of a test framework (*eval harness*) or an autonomous agent framework, but in its **original, literal sense: bridle, bit, reins, and blinkers**.
 
-- Git defines current state and change history;
-- Project files define project capabilities;
-- Explicit context defines what the model knows;
-- Write scope defines what the model is permitted to modify;
-- Task/plan scope defines what problem the model is solving;
-- Project actions define what operations are allowed to run;
-- The user controls this with low friction via voice or text;
-- The model executes work strictly inside these boundaries.
+A large language model is a fast, capable, but blind workhorse. If given unrestricted access to an operating system shell, it will drift aimlessly, break system environments, and get trapped in generative hallucinations. Conversely, if a human developer is forced to spoon-feed it every file manually, the tool becomes a cognitive liability.
 
-The ultimate goal is not to remove the developer from the loop, but to remove **friction** between developer intent and the system.
+TAUQE holds the model in a firm grip:
+- **Blinkers (Repo Map):** The model perceives codebase contours and symbols through Tree-sitter, sufficient for architectural comprehension without context window bloat.
+- **Bit & Bridle (Strict Protocol):** The model has no arbitrary shell or bash access. It interacts with the world solely through typed protocol operations (virtual in-memory staging, declarative file discovery requests, deterministic toolchain verification).
+- **Reins (Git Transactions):** The developer steers the objective, while Git ensures an instant, atomic rollback if the model deviates from course.
 
-> Not human-out-of-the-loop, but friction-out-of-the-loop.
+> **TAUQE is not an agent. It is an environment where the model is autonomous within a strictly bounded turn, yet completely stripped of agentic drift.**
 
-## 2. Problem Statement
+---
 
-A typical modern agent-first model works as follows:
+## 2. Three Paradigms of AI-Assisted Development
 
-```text
-user request
-    ↓
-agent
-    ↓
-filesystem + search + shell + git + browser
-    ↓
-agent gathers context on its own
-    ↓
-agent decides what to do
-    ↓
-agent executes autonomously
-    ↓
-developer review
-```
+Modern software engineering is caught between two ineffective extremes:
 
-This approach burdens the model with simultaneously serving as requirements interpreter, codebase explorer, shell operator, context manager, executor, planner, and test runner.
+### 2.1. Context Micromanagement (The Aider Way)
+The developer manually manages files: `/add`, `/drop`, `/read-only`. The human acts as a "context logistician", counting tokens and guessing which types the model will need.
+- **The flaw:** Cognitive load on the developer increases rather than decreases.
 
-Tauqe is built on the opposite premise:
+### 2.2. Uncontrolled Agentic Loops (Devin / Bash Agents)
+The model is granted a shell terminal, file system access, and an open-ended goal. The agent runs in an infinite loop: running grep across the disk, installing packages, breaking system libraries, and spinning in circles.
+- **The flaw:** Loss of determinism, shell hallucinations, zero safety guarantees, and broken trust.
 
-> **If any part of a task can be resolved deterministically, it must not be delegated to an LLM.**
+### 2.3. The Semantic Harness (The TAUQE Paradigm)
+The developer states the engineering task in natural language without spending time manually assembling files. The system executes an **autonomous bounded turn**:
+- Autonomously discovers and requests missing files via multi-round `Discovery`;
+- Applies and validates patches in memory (`Staging`);
+- Automatically repairs pattern-matching discrepancies (`Patch Retry`);
+- Runs deterministic project compilers and linters (`cargo check`, `tsc`, `pytest`);
+- Undergoes a targeted self-healing cycle on compiler errors (`Verification Healing`);
+- Records the result in an isolated Git commit or executes a clean rollback.
 
-Examples:
+**The moment the turn concludes, control returns immediately to the developer.** The model has no persistent background daemon and no shell access.
 
-- Git knows what changed — the model should not guess it.
-- `Cargo.toml` knows workspace structure — the model should not re-infer it.
-- `package.json` knows scripts — the model should not invent commands.
-- Parser/LSP knows definitions — the model should not visually scan for them.
-- Project plan defines scope — the model should not expand the scope on its own.
-- Permission model defines what can be changed — the model should not decide write targets autonomously.
+---
 
-The model should be applied specifically where true semantic reasoning is required: understanding intent, comprehending code, proposing localized diffs, explaining issues, resolving ambiguous human references, and performing bounded transformations.
+## 3. Anatomy of an Autonomous Bounded Turn
 
-## 3. Conceptual Inspirations: Magit and SLIME
-
-The project draws inspiration from two foundational pillars of the Emacs ecosystem:
-
-1. **Magit (User Interface Inspiration):**
-   - The interface is a **living structured status document**, not a chat box or text editor.
-   - Information density, keyboard-driven navigation, context actions on the item under cursor (`Object under cursor`), collapsible sections.
-
-2. **SLIME / Swank (Protocol and Interaction Inspiration):**
-   - **No text scraping:** communication relies on structured semantic objects (presentation streams), never parsing raw console stdout via regexes.
-   - **Server as an independent runtime:** the server maintains project state and executes semantic work; clients are thin interactive projections.
-   - **Parallel out-of-band channels:** the model streams text and edits asynchronously; verification occurs on the fly without blocking user interaction.
-
-## 4. Core Principles
-
-### 4.1 Git defines reality
-Git is the formal source of truth for repository state: branch, HEAD, working tree, diff, commits, checkpoints, and undo.
-
-### 4.2 Project files define capabilities
-Project configuration files define the operational model: packages/workspaces, dependencies, scripts, build actions, tests, and linters.
-
-### 4.3 Context defines knowledge
-Context is first-class state. The user explicitly controls editable files, read-only files, evidence, plans, and the repo map.
-
-### 4.4 Permissions define power
-> **The agent has no arbitrary shell execution.**
-The model can only invoke registered, authorized project actions.
-
-### 4.5 Never use reasoning where a deterministic abstraction exists
-If information can be retrieved deterministically, it must be computed by code.
-
-### 4.6 Minimal coherent change
-Changes must be minimal and targeted (Search/Replace blocks and explicit Create/Delete), avoiding unrelated refactoring.
-
-## 5. Server-First Architecture
-
-The primary product is the server/core. Clients are interchangeable:
+Instead of an unbounded `while true` loop, TAUQE implements a deterministic finite-state turn machine:
 
 ```text
-TUI ──────┐
-Emacs ────┼── Protocol (SLIME-style) ── Server ── Core
-Other ────┘
+               User Prompt
+                    ↓
+        ┌─► [Discovery Phase] ──── (requests missing files via <context_request>)
+        │           ↓
+        │   [Proposal Generation] ─ (generates minimal coherent patches)
+        │           ↓
+        │   [In-Memory Staging] ── (validates patches in memory with fuzzy matching)
+        │       ├── Match Error → [Patch Retry Loop] (up to N retries)
+        │       └── Success → Apply to disk
+        │           ↓
+        │   [Toolchain Verification] ── (executes cargo check / npm test)
+        │       ├── Compiler Errors → [Verification Healing Loop] ────┐
+        │       │                                                     │
+        │       └── Clean Build                                       │
+        │           ↓                                                 │
+        └────── Rollback on Failure / Squash into Final Commit ◄──────┘
 ```
 
-> **Server owns semantics. Client owns interaction.**
+Every phase in the turn is deterministic:
+1. **Discovery:** The model inspects the Tree-sitter Repo Map, identifies required definitions, and requests them via protocol tags. The server adds files to the `auto` context layer and iterates. No manual `/add` required.
+2. **Staging:** No byte touches disk until the entire set of edits converges cleanly in virtual staging.
+3. **Healing:** If the compiler detects an error, the model receives clean toolchain output and fixes only the offending lines without touching unrelated code.
+4. **Git Transaction:** The turn is transactional. Pressing `u` rolls back the working tree to its exact pre-turn state.
 
-## 6. Clients
+---
 
-### Stage 1 — TUI
-The initial client is a full-featured terminal application (reference implementation), combining Magit-style state display with org-mode turn blocks.
+## 4. Fundamental Architectural Invariants
 
-### Stage 2 — Emacs
-The Emacs client follows the same principles: direct connection to the server, live state buffers, and seamless navigation to source code.
+1. **Git Defines Reality**  
+   Git is the single source of truth for repository state. Uncommitted user work is protected by pre-edit checkpoints. The system recovers cleanly on abnormal terminations (Crash Recovery on startup).
+2. **Never Guess What Is Deterministically Known**  
+   If an answer can be derived from Git, AST parsers (Tree-sitter), build manifests, or compiler output, it is computed by deterministic code, not generative reasoning.
+3. **No Arbitrary Shell**  
+   The model cannot run arbitrary OS commands. Compiler and test invocations are governed strictly by the project action registry.
+4. **Minimal Coherent Change**  
+   Modifications are made via localized search/replace blocks and atomic file operations. Gratuitous reformatting and unrelated refactoring are strictly avoided.
 
-## 7. Formula
+---
+
+## 5. Architectural Heritage: Magit and SLIME
+
+- **Magit UX Heritage:**  
+  The interface is not a chat stream with bubbles, but a **structured, live document of state**. High density, fully keyboard-driven, with collapsible sections, contextual cursor operations, and rich interactive diffs.
+- **SLIME / Swank Protocol:**  
+  Clean decoupling of client and server. The server encapsulates the project model, Git transactions, and model orchestration; clients (TUI, future Emacs package) are lightweight interactive frontends communicating via typed RPC.
+
+---
+
+## 6. Synthesis
 
 ```text
-Git
-    → reality
-
-Project files
-    → capabilities
-
-Project model
-    → deterministic understanding
-
-Plans
-    → intended scope
-
-Context
-    → model knowledge
-
-Permissions
-    → model power
-
-Voice & TUI
-    → low-friction human control
-
-LLM
-    → semantic transformation
+Git                   → Reality and transactional safety
+Project Files         → Manifests and toolchain capabilities
+Tree-sitter Repo Map  → Deterministic symbol awareness
+Bounded Turn          → Autonomous turn lifecycle (Discovery + Staging + Healing)
+Strict Harness        → Enforcing boundaries without shell access
+Developer             → Task specification and absolute control
+LLM                   → Semantic transformation engine
 ```
 
-Summary:
-
-> **An intelligent Git-native development environment that strengthens developer control and leverages LLMs exclusively where generative semantic reasoning is truly valuable.**
+> **Eliminating cognitive burden from the developer without stripping away control.**

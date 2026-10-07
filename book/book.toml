@@ -1,0 +1,9 @@
+[book]
+authors = ["Tauqe Contributors"]
+description = "The Tauqe Guide: user documentation and semantic harness concepts"
+language = "en"
+src = "src"
+title = "The Tauqe Guide"
+
+[output.html]
+git-repository-url = "https://github.com/archimag/tauqe"
