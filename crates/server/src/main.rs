@@ -39,11 +39,20 @@ async fn main() -> anyhow::Result<()> {
 
     // Forward UI history items to out channel as events
     let out_for_history = state.out.clone();
+    let state_for_history = Arc::clone(&state);
     tokio::spawn(async move {
         while let Some(item) = history_rx.recv().await {
+            let estimated_tokens = {
+                let h = state_for_history.history.lock().await;
+                h.estimated_tokens().ok()
+            };
             let ev = Event {
                 method: events::HISTORY_ENTRY_ADDED.to_string(),
-                params: serde_json::to_value(HistoryEntryAddedEvent { item }).ok(),
+                params: serde_json::to_value(HistoryEntryAddedEvent {
+                    item,
+                    estimated_tokens,
+                })
+                .ok(),
             };
             out_for_history.send_event(&ev);
         }

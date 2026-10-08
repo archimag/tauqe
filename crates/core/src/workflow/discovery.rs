@@ -29,7 +29,7 @@ pub fn apply_context_requests(
         let Ok(path) = context_manager.normalize_path(&request.path) else {
             continue;
         };
-        if !available_files.contains(&path) {
+        if !available_files.contains(&path) && !context_manager.contains(&path).unwrap_or(false) {
             continue;
         }
         if access_satisfies(context_manager.effective_access_for(&path), request.access) {
@@ -101,5 +101,24 @@ mod tests {
         let added = apply_context_requests(&mut cm, &requests, &available, Some(1));
         assert_eq!(added.len(), 1);
         assert_eq!(added[0], "a.rs");
+    }
+
+    #[test]
+    fn test_apply_context_requests_upgrades_user_readonly_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("user.rs"), "fn user() {}").unwrap();
+        let mut cm = ContextManager::new(dir.path().to_path_buf());
+        cm.add_file("user.rs", ContextAccess::ReadOnly).unwrap();
+        assert!(!cm.is_editable("user.rs").unwrap());
+
+        let available = vec!["user.rs".to_string()];
+        let requests = vec![ContextRequest {
+            path: "user.rs".to_string(),
+            access: ContextAccess::Editable,
+        }];
+
+        let added = apply_context_requests(&mut cm, &requests, &available, None);
+        assert_eq!(added, vec!["user.rs".to_string()]);
+        assert!(cm.is_editable("user.rs").unwrap());
     }
 }

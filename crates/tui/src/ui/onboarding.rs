@@ -107,17 +107,13 @@ pub fn render_onboarding_view(
             )));
             lines.push(Line::raw(""));
             lines.push(Line::from(Span::styled(
-                "Select default model for the project (arrows ↑/↓, then Enter):",
+                "Select configuration option (arrows ↑/↓, then Enter):",
                 Style::default().bold().fg(Color::White),
             )));
             lines.push(Line::raw(""));
 
             let options = [
-                format!("Create tauqe.toml with model {} (Recommended)", ob.models_list[0]),
-                format!("Create tauqe.toml with model {}", ob.models_list[1]),
-                format!("Create tauqe.toml with model {}", ob.models_list[2]),
-                format!("Create tauqe.toml with model {}", ob.models_list[3]),
-                "Enter custom model identifier manually...".to_string(),
+                "Create default tauqe.toml (recommended configuration)".to_string(),
                 "Skip (use built-in defaults without creating tauqe.toml)".to_string(),
             ];
 
@@ -244,33 +240,22 @@ pub fn render_onboarding_view(
 
     if ob.input_active {
         lines.push(Line::raw(""));
-        let (prompt, masked) = match ob.step {
-            crate::app::OnboardingStep::Config => ("Enter model identifier: ", false),
-            _ => ("Enter OpenRouter API Key: ", true),
-        };
+        let prompt = "Enter OpenRouter API Key: ";
 
-        let displayed = if masked {
-            if ob.show_key {
-                if ob.input_buffer.is_empty() {
-                    String::new()
-                } else {
-                    format!("{} ({} chars)", ob.input_buffer, ob.input_buffer.chars().count())
-                }
+        let displayed = if ob.show_key {
+            if ob.input_buffer.is_empty() {
+                String::new()
             } else {
-                format_masked_key(&ob.input_buffer)
+                format!("{} ({} chars)", ob.input_buffer, ob.input_buffer.chars().count())
             }
         } else {
-            ob.input_buffer.clone()
+            format_masked_key(&ob.input_buffer)
         };
 
-        let hint = if masked {
-            if ob.show_key {
-                "  (Ctrl+R: Hide, Ctrl+V: Paste, Enter: Save, Esc: Cancel)"
-            } else {
-                "  (Ctrl+R: Show, Ctrl+V: Paste, Enter: Save, Esc: Cancel)"
-            }
+        let hint = if ob.show_key {
+            "  (Ctrl+R: Hide, Ctrl+V: Paste, Enter: Save, Esc: Cancel)"
         } else {
-            "  (Enter: Save, Esc: Cancel)"
+            "  (Ctrl+R: Show, Ctrl+V: Paste, Enter: Save, Esc: Cancel)"
         };
 
         lines.push(Line::from(vec![
@@ -307,7 +292,7 @@ pub fn render_onboarding_view(
 
     let info_text = match ob.step {
         crate::app::OnboardingStep::Git => "Tauqe relies on Git for checkpoints, atomic step commits, and safe undo.",
-        crate::app::OnboardingStep::Config => "Use ↑/↓ arrow keys to select a model and Enter to confirm.",
+        crate::app::OnboardingStep::Config => "Create default tauqe.toml or skip to use built-in defaults.",
         crate::app::OnboardingStep::Credentials => "Secure credential storage: created with 0600 file permissions (owner-only read/write).",
         crate::app::OnboardingStep::Gatekeeper => "OpenRouter API key is required for LLM calls. Select an action.",
         crate::app::OnboardingStep::Ready => "All parameters verified. Press Enter to start.",

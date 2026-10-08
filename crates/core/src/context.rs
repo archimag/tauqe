@@ -203,8 +203,15 @@ impl ContextManager {
                 self.user.insert(clean_path, item.clone());
             }
             ContextLayer::Auto => {
-                // If already in user, do not demote to auto
-                if !self.user.contains_key(&clean_path) {
+                if let Some(user_item) = self.user.get_mut(&clean_path) {
+                    if access == ContextAccess::Editable {
+                        user_item.access = ContextAccess::Editable;
+                    }
+                } else if let Some(pinned_item) = self.pinned.get_mut(&clean_path) {
+                    if access == ContextAccess::Editable {
+                        pinned_item.access = ContextAccess::Editable;
+                    }
+                } else {
                     self.auto.insert(clean_path, item.clone());
                 }
             }
@@ -374,8 +381,12 @@ impl ContextManager {
                 item.access = access;
                 changed = true;
             }
+        } else if let Some(item) = self.pinned.get_mut(&clean_path) {
+            if item.access != access {
+                item.access = access;
+                changed = true;
+            }
         }
-        // Pinned files are protected: read-only access cannot be changed via set_access
         if changed {
             self.revision += 1;
             Ok(true)
@@ -434,10 +445,22 @@ impl ContextManager {
         // 2. Remove files that no longer exist on disk (prunes deleted files)
         self.prune_missing_files();
 
-        // 3. Mirror any file renamed/moved into user layer by the turn
+        // 3. Mirror any file renamed/moved into user layer by the turn,
+        // and sync access upgrades from the turn.
         for (path, item) in &turn_context.user {
-            if !self.user.contains_key(path) && self.repo_root.join(path).is_file() {
+            if let Some(existing) = self.user.get_mut(path) {
+                if existing.access == ContextAccess::ReadOnly && item.access == ContextAccess::Editable {
+                    existing.access = ContextAccess::Editable;
+                }
+            } else if self.repo_root.join(path).is_file() {
                 self.user.insert(path.clone(), item.clone());
+            }
+        }
+        for (path, item) in &turn_context.pinned {
+            if let Some(existing) = self.pinned.get_mut(path) {
+                if existing.access == ContextAccess::ReadOnly && item.access == ContextAccess::Editable {
+                    existing.access = ContextAccess::Editable;
+                }
             }
         }
 
@@ -608,5 +631,68 @@ mod tests {
         let pruned = cm.prune_missing_files();
         assert_eq!(pruned, vec!["test.rs".to_string()]);
         assert!(!cm.contains("test.rs").unwrap());
+    }
+
+    #[test]
+    fn test_add_auto_file_upgrades_user_layer_to_editable() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        std::fs::write(root.join("file.rs"), "fn test() {}").unwrap();
+
+        let mut cm = ContextManager::new(root);
+        cm.add_file("file.rs", ContextAccess::ReadOnly).unwrap();
+        assert!(!cm.is_editable("file.rs").unwrap());
+
+        cm.add_auto_file("file.rs", ContextAccess::Editable).unwrap();
+        assert!(cm.is_editable("file.rs").unwrap());
+    }
+
+    #[test]
+    fn test_merge_turn_context_syncs_upgraded_user_access() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        std::fs::write(root.join("file.rs"), "fn test() {}").unwrap();
+
+        let mut primary = ContextManager::new(root);
+        primary.add_file("file.rs", ContextAccess::ReadOnly).unwrap();
+
+        let mut turn_snapshot = primary.clone();
+        turn_snapshot.add_auto_file("file.rs", ContextAccess::Editable).unwrap();
+        assert!(turn_snapshot.is_editable("file.rs").unwrap());
+
+        primary.merge_turn_context(&turn_snapshot);
+        assert!(primary.is_editable("file.rs").unwrap());
+    }
+
+    #[test]
+    fn test_add_auto_file_upgrades_pinned_layer_to_editable() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        std::fs::write(root.join("pinned.rs"), "fn pinned() {}").unwrap();
+
+        let mut cm = ContextManager::new(root);
+        cm.load_pinned(&["pinned.rs".to_string()]);
+        assert!(!cm.is_editable("pinned.rs").unwrap());
+
+        cm.add_auto_file("pinned.rs", ContextAccess::Editable).unwrap();
+        assert!(cm.is_editable("pinned.rs").unwrap());
+    }
+
+    #[test]
+    fn test_merge_turn_context_syncs_upgraded_pinned_access() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        std::fs::write(root.join("pinned.rs"), "fn pinned() {}").unwrap();
+
+        let mut primary = ContextManager::new(root);
+        primary.load_pinned(&["pinned.rs".to_string()]);
+        assert!(!primary.is_editable("pinned.rs").unwrap());
+
+        let mut turn_snapshot = primary.clone();
+        turn_snapshot.add_auto_file("pinned.rs", ContextAccess::Editable).unwrap();
+        assert!(turn_snapshot.is_editable("pinned.rs").unwrap());
+
+        primary.merge_turn_context(&turn_snapshot);
+        assert!(primary.is_editable("pinned.rs").unwrap());
     }
 }

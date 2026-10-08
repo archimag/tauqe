@@ -12,9 +12,10 @@ use crate::state::AppState;
 
 pub fn config_state(cfg: &AppConfig) -> ConfigState {
     ConfigState {
-        workflow: cfg.edit.workflow.clone(),
-        edit_protocol: cfg.edit.protocol.clone(),
+        workflow: cfg.develop.workflow.clone(),
+        edit_protocol: cfg.develop.protocol.clone(),
         model: cfg.active_model(),
+        history_model: Some(cfg.history_model()),
         available_workflows: WorkflowFactory::available_workflows(),
         available_edit_protocols: EditProtocolFactory::available_protocols(),
         available_models: cfg.available_models(),
@@ -85,6 +86,28 @@ pub async fn handle_config_set(req: Request, state: &Arc<AppState>) -> Response 
                 };
             }
         }
+        if let Some(hist_model) = params.history_model.as_ref() {
+            let available = cfg.available_models();
+            if !available.contains(hist_model) {
+                return Response {
+                    id: req.id,
+                    result: None,
+                    error: Some(ResponseError {
+                        code: "INVALID_MODEL".to_string(),
+                        message: format!(
+                            "Unknown history model '{}'. Available models: {}",
+                            hist_model,
+                            available
+                                .iter()
+                                .map(ToString::to_string)
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ),
+                        data: None,
+                    }),
+                };
+            }
+        }
         if let Some(wf) = params.workflow {
             if !WorkflowFactory::is_valid(&wf) {
                 return Response {
@@ -101,12 +124,12 @@ pub async fn handle_config_set(req: Request, state: &Arc<AppState>) -> Response 
                     }),
                 };
             }
-            cfg.edit.workflow = wf;
+            cfg.develop.workflow = wf;
         }
         if let Some(proto) = params.edit_protocol {
             match EditProtocolFactory::canonical_name(&proto) {
                 Some(canonical) => {
-                    cfg.edit.protocol = canonical;
+                    cfg.develop.protocol = canonical;
                 }
                 None => {
                     return Response {
@@ -127,6 +150,9 @@ pub async fn handle_config_set(req: Request, state: &Arc<AppState>) -> Response 
         }
         if let Some(requested_model) = params.model {
             cfg.set_active_model(requested_model);
+        }
+        if let Some(hist_model) = params.history_model {
+            cfg.history.model = Some(hist_model);
         }
         config_state(&cfg)
     };
@@ -180,6 +206,7 @@ pub async fn handle_system_status(req: Request, state: &Arc<AppState>) -> Respon
         "default_credentials_path": default_credentials_path,
         "ready": ready,
         "model": cfg.active_model(),
+        "history_model": cfg.history_model(),
         "available_models": cfg.available_models(),
     });
 
@@ -239,6 +266,7 @@ pub async fn handle_config_reload(req: Request, state: &Arc<AppState>) -> Respon
         "default_credentials_path": default_credentials_path,
         "ready": ready,
         "model": cfg.active_model(),
+        "history_model": cfg.history_model(),
         "available_models": cfg.available_models(),
     });
 
@@ -258,15 +286,8 @@ pub async fn handle_config_create(req: Request, state: &Arc<AppState>) -> Respon
         None
     };
 
-    let model = req
-        .params
-        .as_ref()
-        .and_then(|p| p.get("model"))
-        .and_then(|m| m.as_str())
-        .unwrap_or("anthropic/claude-3.7-sonnet");
-
     let target_path = tauqe_core::config::default_config_path(repo_opt);
-    if let Err(err) = tauqe_core::config::write_default_config(&target_path, model) {
+    if let Err(err) = tauqe_core::config::write_default_config(&target_path) {
         return Response {
             id: req.id,
             result: None,
@@ -312,6 +333,7 @@ pub async fn handle_config_create(req: Request, state: &Arc<AppState>) -> Respon
             "default_credentials_path": default_credentials_path,
             "ready": has_api_key,
             "model": cfg.active_model(),
+            "history_model": cfg.history_model(),
             "available_models": cfg.available_models(),
         })),
         error: None,
@@ -398,6 +420,7 @@ pub async fn handle_credentials_save(req: Request, state: &Arc<AppState>) -> Res
             "default_credentials_path": default_credentials_path,
             "ready": has_api_key,
             "model": cfg.active_model(),
+            "history_model": cfg.history_model(),
             "available_models": cfg.available_models(),
         })),
         error: None,
@@ -453,6 +476,7 @@ pub async fn handle_credentials_create_stub(req: Request, state: &Arc<AppState>)
             "default_credentials_path": default_credentials_path,
             "ready": has_api_key,
             "model": cfg.active_model(),
+            "history_model": cfg.history_model(),
             "available_models": cfg.available_models(),
         })),
         error: None,

@@ -2,14 +2,67 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use tauqe_protocol::ModelRef;
 
+pub fn parse_model_ref(s: &str) -> Result<ModelRef, String> {
+    let s = s.trim();
+    if let Some((provider_str, model_name)) = s.split_once(':') {
+        let provider_str = provider_str.trim().to_lowercase();
+        let model_name = model_name.trim();
+        if provider_str == "openrouter" {
+            if model_name.is_empty() {
+                return Err("Model name cannot be empty".to_string());
+            }
+            Ok(ModelRef::openrouter(model_name))
+        } else {
+            Err(format!("Unsupported provider '{}'", provider_str))
+        }
+    } else if !s.is_empty() {
+        Ok(ModelRef::openrouter(s))
+    } else {
+        Err("Model specification cannot be empty".to_string())
+    }
+}
+
+pub fn deserialize_model_ref_opt<'de, D>(deserializer: D) -> Result<Option<ModelRef>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum ModelRefRaw {
+        Str(String),
+        Struct(ModelRef),
+    }
+
+    match Option::<ModelRefRaw>::deserialize(deserializer)? {
+        None => Ok(None),
+        Some(ModelRefRaw::Str(s)) => {
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                Ok(None)
+            } else {
+                parse_model_ref(trimmed).map(Some).map_err(serde::de::Error::custom)
+            }
+        }
+        Some(ModelRefRaw::Struct(m)) => Ok(Some(m)),
+    }
+}
+
+pub fn serialize_model_ref_opt<S>(opt: &Option<ModelRef>, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    match opt {
+        Some(m) => serializer.serialize_str(&m.to_string()),
+        None => serializer.serialize_none(),
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AppConfig {
     #[serde(default)]
     pub providers: ProvidersConfig,
-    #[serde(default)]
-    pub models: ModelsConfig,
-    #[serde(default)]
-    pub edit: EditConfig,
+    #[serde(default, alias = "edit")]
+    pub develop: DevelopConfig,
     #[serde(default)]
     pub toolchain: ToolchainConfig,
     #[serde(default)]
@@ -30,6 +83,13 @@ fn default_tail_turns() -> usize {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HistoryConfig {
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_model_ref_opt",
+        serialize_with = "serialize_model_ref_opt"
+    )]
+    pub model: Option<ModelRef>,
     #[serde(default = "default_history_budget_tokens")]
     pub budget_tokens: u64,
     #[serde(default = "default_tail_turns")]
@@ -39,6 +99,7 @@ pub struct HistoryConfig {
 impl Default for HistoryConfig {
     fn default() -> Self {
         Self {
+            model: None,
             budget_tokens: default_history_budget_tokens(),
             tail_turns: default_tail_turns(),
         }
@@ -155,7 +216,9 @@ pub struct ProvidersConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct OpenRouterConfig {
-    #[serde(default)]
+    /// In-memory API key loaded exclusively from credentials or environment.
+    /// Never deserialized from or serialized into tauqe.toml.
+    #[serde(skip)]
     pub api_key: Option<String>,
     /// Native OpenRouter model identifiers the user may switch between.
     #[serde(default)]
@@ -172,13 +235,6 @@ pub struct Credentials {
 pub struct OpenRouterCredentials {
     #[serde(default)]
     pub api_key: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct ModelsConfig {
-    /// Active model. `None` means "first configured model, or the built-in default".
-    #[serde(default)]
-    pub default: Option<ModelRef>,
 }
 
 pub const BUILTIN_DEFAULT_MODEL: &str = "anthropic/claude-3.5-sonnet";
@@ -208,11 +264,19 @@ impl AppConfig {
 
     /// The model used for new requests.
     pub fn active_model(&self) -> ModelRef {
-        self.models
-            .default
+        self.develop
+            .model
             .clone()
             .or_else(|| self.configured_models().into_iter().next())
             .unwrap_or_else(|| ModelRef::openrouter(BUILTIN_DEFAULT_MODEL))
+    }
+
+    /// The model used for history summarization and squash commit message generation.
+    pub fn history_model(&self) -> ModelRef {
+        self.history
+            .model
+            .clone()
+            .unwrap_or_else(|| self.active_model())
     }
 
     /// Models the user may switch between. Always contains the active model.
@@ -226,12 +290,19 @@ impl AppConfig {
     }
 
     pub fn set_active_model(&mut self, model: ModelRef) {
-        self.models.default = Some(model);
+        self.develop.model = Some(model);
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EditConfig {
+pub struct DevelopConfig {
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_model_ref_opt",
+        serialize_with = "serialize_model_ref_opt"
+    )]
+    pub model: Option<ModelRef>,
     #[serde(default = "default_workflow")]
     pub workflow: String, // "git", "naive"
     #[serde(default = "default_protocol")]
@@ -239,6 +310,8 @@ pub struct EditConfig {
     #[serde(default = "default_max_retries")]
     pub max_retries: usize,
 }
+
+pub type EditConfig = DevelopConfig;
 
 fn default_workflow() -> String {
     "git".to_string()
@@ -252,9 +325,10 @@ fn default_max_retries() -> usize {
     3
 }
 
-impl Default for EditConfig {
+impl Default for DevelopConfig {
     fn default() -> Self {
         Self {
+            model: None,
             workflow: default_workflow(),
             protocol: default_protocol(),
             max_retries: default_max_retries(),
@@ -417,7 +491,9 @@ pub fn write_default_conventions(path: &Path) -> std::io::Result<()> {
     std::fs::write(path, content)
 }
 
-pub fn write_default_config(path: &Path, model: &str) -> std::io::Result<()> {
+pub const DEFAULT_CONFIG_TEMPLATE: &str = include_str!("../../../tauqe.toml");
+
+pub fn write_default_config(path: &Path) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent)?;
@@ -432,56 +508,7 @@ pub fn write_default_config(path: &Path, model: &str) -> std::io::Result<()> {
         let _ = write_default_conventions(Path::new("Conventions.md"));
     }
 
-    let trimmed_model = model.trim();
-    let chosen_model = if trimmed_model.is_empty() {
-        BUILTIN_DEFAULT_MODEL
-    } else {
-        trimmed_model
-    };
-
-    let available = vec![
-        chosen_model.to_string(),
-        "anthropic/claude-3.7-sonnet".to_string(),
-        "anthropic/claude-3.5-sonnet".to_string(),
-        "openai/gpt-4o".to_string(),
-        "deepseek/deepseek-chat".to_string(),
-    ];
-    let mut deduped = Vec::new();
-    for m in available {
-        if !deduped.contains(&m) {
-            deduped.push(m);
-        }
-    }
-
-    let available_toml = deduped
-        .iter()
-        .map(|m| format!("    \"{}\",", m))
-        .collect::<Vec<_>>()
-        .join("\n");
-
-    let content = format!(
-        r#"[models.default]
-provider = "openrouter"
-name = "{}"
-
-[providers.openrouter]
-models = [
-{}
-]
-
-[context]
-pinned = [
-    "Conventions.md",
-]
-
-[edit]
-workflow = "git"
-protocol = "xml"
-"#,
-        chosen_model, available_toml
-    );
-
-    std::fs::write(path, content)
+    std::fs::write(path, DEFAULT_CONFIG_TEMPLATE)
 }
 
 pub fn write_credentials_file(path: &Path, api_key: &str) -> std::io::Result<()> {
@@ -571,6 +598,23 @@ pub fn load_config_with_options(opts: ConfigLoadOptions) -> AppConfig {
                     or_cfg.api_key = Some(trimmed.to_string());
                     config.providers.openrouter = Some(or_cfg);
                 }
+            }
+        }
+    }
+
+    if config
+        .providers
+        .openrouter
+        .as_ref()
+        .and_then(|o| o.api_key.as_deref())
+        .is_none()
+    {
+        if let Ok(env_key) = std::env::var("OPENROUTER_API_KEY") {
+            let trimmed = env_key.trim();
+            if !trimmed.is_empty() {
+                let mut or_cfg = config.providers.openrouter.unwrap_or_default();
+                or_cfg.api_key = Some(trimmed.to_string());
+                config.providers.openrouter = Some(or_cfg);
             }
         }
     }
@@ -720,28 +764,81 @@ mod tests {
     #[test]
     fn test_structured_protocol_config() {
         let toml_str = r#"
-[edit]
+[develop]
 workflow = "git"
 protocol = "structured"
 "#;
         let config: AppConfig = toml::from_str(toml_str).expect("Failed to parse config");
-        assert_eq!(config.edit.workflow, "git");
-        assert_eq!(config.edit.protocol, "structured");
-        assert_eq!(config.edit.max_retries, 3);
+        assert_eq!(config.develop.workflow, "git");
+        assert_eq!(config.develop.protocol, "structured");
+        assert_eq!(config.develop.max_retries, 3);
+    }
+
+    #[test]
+    fn test_edit_alias_compatibility() {
+        let toml_str = r#"
+[edit]
+workflow = "naive"
+protocol = "xml"
+max_retries = 1
+"#;
+        let config: AppConfig = toml::from_str(toml_str).expect("Failed to parse config");
+        assert_eq!(config.develop.workflow, "naive");
+        assert_eq!(config.develop.protocol, "xml");
+        assert_eq!(config.develop.max_retries, 1);
     }
 
     #[test]
     fn test_edit_max_retries_override() {
-        let config: AppConfig = toml::from_str("[edit]\nmax_retries = 0\n").unwrap();
-        assert_eq!(config.edit.max_retries, 0);
+        let config: AppConfig = toml::from_str("[develop]\nmax_retries = 0\n").unwrap();
+        assert_eq!(config.develop.max_retries, 0);
+    }
+
+    #[test]
+    fn test_develop_model_and_history_model() {
+        let toml_str = r#"
+[develop]
+model = "openrouter:anthropic/claude-3.7-sonnet"
+
+[history]
+model = "openrouter:anthropic/claude-haiku-latest"
+
+[providers.openrouter]
+models = ["deepseek/deepseek-chat"]
+"#;
+        let config: AppConfig = toml::from_str(toml_str).expect("Failed to parse config");
+        assert_eq!(
+            config.active_model(),
+            ModelRef::openrouter("anthropic/claude-3.7-sonnet")
+        );
+        assert_eq!(
+            config.history_model(),
+            ModelRef::openrouter("anthropic/claude-haiku-latest")
+        );
+    }
+
+    #[test]
+    fn test_history_model_fallback_to_develop_model() {
+        let toml_str = r#"
+[develop]
+model = "openrouter:anthropic/claude-3.7-sonnet"
+"#;
+        let config: AppConfig = toml::from_str(toml_str).expect("Failed to parse config");
+        assert_eq!(
+            config.active_model(),
+            ModelRef::openrouter("anthropic/claude-3.7-sonnet")
+        );
+        assert_eq!(
+            config.history_model(),
+            ModelRef::openrouter("anthropic/claude-3.7-sonnet")
+        );
     }
 
     #[test]
     fn test_available_models_include_default() {
         let toml_str = r#"
-[models.default]
-provider = "openrouter"
-name = "a/b"
+[develop]
+model = "openrouter:a/b"
 
 [providers.openrouter]
 models = ["c/d", "e/f", "c/d"]
@@ -805,7 +902,7 @@ upstream = "origin/master"
     #[test]
     fn test_history_config_defaults_and_override() {
         let default_cfg = HistoryConfig::default();
-        assert_eq!(default_cfg.budget_tokens, 64_000);
+        assert_eq!(default_cfg.budget_tokens, 20_000);
         assert_eq!(default_cfg.tail_turns, 10);
 
         let toml_str = r#"
@@ -850,9 +947,8 @@ max_auto_files_per_round = 15
     #[test]
     fn test_typed_provider_models_config() {
         let toml_str = r#"
-[models.default]
-provider = "openrouter"
-name = "openai/gpt-4o"
+[develop]
+model = "openrouter:openai/gpt-4o"
 
 [providers.openrouter]
 models = ["deepseek/deepseek-chat", " ", "openai/gpt-4o"]
@@ -875,9 +971,9 @@ models = ["deepseek/deepseek-chat", " ", "openai/gpt-4o"]
             config.active_model(),
             ModelRef::openrouter("anthropic/claude-3.5-sonnet")
         );
-        assert_eq!(config.edit.workflow, "git");
-        assert_eq!(config.edit.protocol, "xml");
-        assert_eq!(config.edit.max_retries, 3);
+        assert_eq!(config.develop.workflow, "git");
+        assert_eq!(config.develop.protocol, "xml");
+        assert_eq!(config.develop.max_retries, 3);
         assert!(config.providers.openrouter.is_none());
         assert!(config.toolchain.check_command.is_none());
     }
@@ -971,7 +1067,7 @@ api_key = "sk-or-v1-secret-token"
         let temp_dir = tempfile::tempdir().unwrap();
         std::fs::write(
             temp_dir.path().join("tauqe.toml"),
-            "[models.default]\nprovider = \"openrouter\"\nname = \"anthropic/claude-3.5-sonnet\"\n",
+            "[develop]\nmodel = \"openrouter:anthropic/claude-3.5-sonnet\"\n",
         )
         .unwrap();
 
@@ -1000,7 +1096,7 @@ api_key = "sk-or-v1-secret-token"
         let custom_cfg = temp_dir.path().join("my-custom.toml");
         std::fs::write(
             &custom_cfg,
-            "[models.default]\nprovider = \"openrouter\"\nname = \"deepseek/deepseek-chat\"\n",
+            "[develop]\nmodel = \"openrouter:deepseek/deepseek-chat\"\n",
         )
         .unwrap();
 
@@ -1038,16 +1134,16 @@ api_key = "sk-or-v1-secret-token"
         assert_eq!(cfg_path, temp_dir.path().join("tauqe.toml"));
 
         assert!(find_config_file(Some(temp_dir.path())).is_none());
-        write_default_config(&cfg_path, "deepseek/deepseek-chat").unwrap();
+        write_default_config(&cfg_path).unwrap();
 
         let found = find_config_file(Some(temp_dir.path()));
         assert_eq!(found, Some(cfg_path));
 
         let loaded = load_config(Some(temp_dir.path()));
-        let expected = ModelRef::openrouter("deepseek/deepseek-chat");
+        let expected = ModelRef::openrouter("~google/gemini-flash-latest");
         assert_eq!(loaded.active_model(), expected);
         assert!(loaded.available_models().contains(&expected));
-        assert_eq!(loaded.context.pinned, vec!["Conventions.md".to_string()]);
+        assert!(loaded.context.pinned.contains(&"Conventions.md".to_string()));
         assert!(temp_dir.path().join("Conventions.md").is_file());
     }
 
@@ -1097,30 +1193,20 @@ api_key = "sk-or-v1-secret-token"
     }
 
     #[test]
-    fn test_credentials_override_tauqe_toml_api_key() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        std::fs::write(
-            temp_dir.path().join("tauqe.toml"),
-            "[providers.openrouter]\napi_key = \"old-insecure-key\"\n",
-        )
-        .unwrap();
-
-        let dot_wb = temp_dir.path().join(".tauqe");
-        std::fs::create_dir_all(&dot_wb).unwrap();
-        std::fs::write(
-            dot_wb.join("credentials.toml"),
-            "[openrouter]\napi_key = \"new-secure-key\"\n",
-        )
-        .unwrap();
-
-        let config = load_config(Some(temp_dir.path()));
+    fn test_tauqe_toml_cannot_set_api_key() {
+        let toml_str = r#"
+[providers.openrouter]
+api_key = "insecure-key-in-repo"
+models = ["deepseek/deepseek-chat"]
+"#;
+        let config: AppConfig = toml::from_str(toml_str).expect("Failed to parse config");
         assert_eq!(
             config
                 .providers
                 .openrouter
                 .as_ref()
                 .and_then(|o| o.api_key.as_deref()),
-            Some("new-secure-key")
+            None
         );
     }
 }

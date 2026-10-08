@@ -34,9 +34,13 @@ pub struct HistoryGetResult {
     pub items: Vec<UiHistoryItem>,
     pub has_more: bool,
     pub total_count: usize,
+    #[serde(default)]
+    pub estimated_tokens: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HistoryEntryAddedEvent {
     pub item: UiHistoryItem,
+    #[serde(default)]
+    pub estimated_tokens: Option<u64>,
 }

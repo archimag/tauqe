@@ -204,12 +204,6 @@ pub async fn initialize_connection(
                 let credentials_path = val.get("credentials_path").and_then(|v| v.as_str()).map(|s| s.to_string());
                 let default_cfg = val.get("default_config_path").and_then(|v| v.as_str()).unwrap_or("tauqe.toml").to_string();
                 let default_creds = val.get("default_credentials_path").and_then(|v| v.as_str()).unwrap_or("~/.config/tauqe/credentials.toml").to_string();
-                let model = val
-                    .get("model")
-                    .and_then(|v| serde_json::from_value::<ModelRef>(v.clone()).ok())
-                    .map(|m| m.name)
-                    .unwrap_or_else(|| "anthropic/claude-3.7-sonnet".to_string());
-
                 onboarding_state.has_git = has_git;
                 onboarding_state.has_config = has_config;
                 onboarding_state.has_api_key = has_api_key;
@@ -217,7 +211,6 @@ pub async fn initialize_connection(
                 onboarding_state.credentials_path = credentials_path;
                 onboarding_state.default_config_path = default_cfg;
                 onboarding_state.default_credentials_path = default_creds;
-                onboarding_state.selected_model = model;
 
                 if !has_git || !has_config || !has_api_key {
                     initial_view_mode = ViewMode::Onboarding;
@@ -312,7 +305,6 @@ fn apply_system_status_response(st: &mut AppState, val: &serde_json::Value) {
         .get("model")
         .and_then(|v| serde_json::from_value::<ModelRef>(v.clone()).ok())
     {
-        st.onboarding.selected_model = m.name.clone();
         st.active_model = m;
     }
     if let Some(av) = val
@@ -651,22 +643,41 @@ pub async fn handle_response(resp: Response, state: &Arc<Mutex<AppState>>) {
                     st.history_view.loading = false;
                     st.history_view.has_more = history_res.has_more;
                     st.history_view.total_count = history_res.total_count;
+                    st.history_view.estimated_tokens = history_res.estimated_tokens;
+
+                    let select_prev = st.history_view.select_prev_after_load;
+                    st.history_view.select_prev_after_load = false;
 
                     if st.history_view.pending_before_id.take().is_some()
                         && !st.history_view.items.is_empty()
                     {
+                        let fetched_count = history_res.items.len();
                         let added_lines = crate::ui::history::compute_history_items_line_count(
                             &history_res.items,
-                            None,
+                            Some(st.history_view.content_width),
                         );
                         let mut combined = history_res.items;
                         combined.append(&mut st.history_view.items);
                         st.history_view.items = combined;
                         st.history_view.scroll =
                             st.history_view.scroll.saturating_add(added_lines as u16);
+
+                        if select_prev && fetched_count > 0 {
+                            st.history_view.selected_item_index = fetched_count - 1;
+                            let h = st.last_model_height;
+                            let w = st.history_view.content_width;
+                            st.history_view.scroll_to_selected_item(h, Some(w));
+                        } else {
+                            st.history_view.selected_item_index =
+                                st.history_view.selected_item_index.saturating_add(fetched_count);
+                        }
                     } else {
                         st.history_view.items = history_res.items;
                         st.history_view.auto_scroll = true;
+                        if !st.history_view.items.is_empty() {
+                            st.history_view.selected_item_index =
+                                st.history_view.items.len().saturating_sub(1);
+                        }
                     }
                 }
                 return;
@@ -828,12 +839,22 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
         events::HISTORY_ENTRY_ADDED => {
             if let Some(params) = ev.params {
                 if let Ok(data) = serde_json::from_value::<HistoryEntryAddedEvent>(params) {
+                    let item_tokens = data.estimated_tokens.unwrap_or_else(|| {
+                        data.item.text.chars().count().div_ceil(4) as u64
+                    });
+                    if data.estimated_tokens.is_some() {
+                        st.history_view.estimated_tokens = item_tokens;
+                    } else {
+                        st.history_view.estimated_tokens += item_tokens;
+                    }
                     st.history_view.items.push(data.item);
                     st.history_view.total_count += 1;
                     if st.history_view.auto_scroll {
                         let view_height = st.last_model_height;
                         let total_lines = crate::ui::history::compute_history_items_line_count(&st.history_view.items, None) as u16;
                         st.history_view.scroll = total_lines.saturating_sub(view_height);
+                        st.history_view.selected_item_index =
+                            st.history_view.items.len().saturating_sub(1);
                     }
                 }
             }

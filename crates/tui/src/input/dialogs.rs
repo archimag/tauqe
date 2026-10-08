@@ -333,9 +333,8 @@ pub async fn handle_dialog_event(
                 if let Some(chosen) = dialog.items.get(dialog.selected_index).cloned() {
                     st.active_model = chosen.clone();
                     let params = ConfigSetParams {
-                        workflow: None,
-                        edit_protocol: None,
                         model: Some(chosen),
+                        ..Default::default()
                     };
                     drop(st);
                     send_request(server_writer, methods::CONFIG_SET, serde_json::to_value(params)?).await?;

@@ -4,6 +4,7 @@ use std::sync::Mutex;
 static CLIPBOARD: Mutex<Option<arboard::Clipboard>> = Mutex::new(None);
 
 pub fn copy_to_clipboard(text: &str) -> bool {
+    let clean_text = text.trim_end_matches(['\r', '\n']);
     let mut ok = false;
 
     if let Ok(mut guard) = CLIPBOARD.lock() {
@@ -11,21 +12,46 @@ pub fn copy_to_clipboard(text: &str) -> bool {
             *guard = arboard::Clipboard::new().ok();
         }
 
+        let mut needs_reinit = false;
         if let Some(clipboard) = guard.as_mut() {
-            if clipboard.set_text(text.to_string()).is_ok() {
+            if clipboard.set_text(clean_text.to_string()).is_ok() {
                 ok = true;
-            } else if let Ok(mut new_cb) = arboard::Clipboard::new() {
-                if new_cb.set_text(text.to_string()).is_ok() {
-                    ok = true;
-                    *guard = Some(new_cb);
+                #[cfg(all(unix, not(target_os = "macos"), not(target_os = "android"), not(target_os = "emscripten")))]
+                {
+                    use arboard::SetExtLinux;
+                    let _ = clipboard
+                        .set()
+                        .clipboard(arboard::LinuxClipboardKind::Primary)
+                        .text(clean_text.to_string());
                 }
+            } else {
+                needs_reinit = true;
+            }
+        } else {
+            needs_reinit = true;
+        }
+
+        if needs_reinit {
+            if let Ok(mut new_cb) = arboard::Clipboard::new() {
+                if new_cb.set_text(clean_text.to_string()).is_ok() {
+                    ok = true;
+                    #[cfg(all(unix, not(target_os = "macos"), not(target_os = "android"), not(target_os = "emscripten")))]
+                    {
+                        use arboard::SetExtLinux;
+                        let _ = new_cb
+                            .set()
+                            .clipboard(arboard::LinuxClipboardKind::Primary)
+                            .text(clean_text.to_string());
+                    }
+                }
+                *guard = Some(new_cb);
             }
         }
     }
 
-    // OSC 52 fallback for terminal multiplexers and SSH sessions
-    let b64 = base64_encode(text.as_bytes());
-    let osc52 = format!("\x1b]52;c;{}\x07", b64);
+    // OSC 52 for terminal multiplexers, ssh and terminal primary/clipboard paste
+    let b64 = base64_encode(clean_text.as_bytes());
+    let osc52 = format!("\x1b]52;c;{b64}\x07\x1b]52;p;{b64}\x07");
     let mut out = std::io::stdout();
     let _ = out.write_all(osc52.as_bytes());
     let _ = out.flush();

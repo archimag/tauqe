@@ -79,11 +79,11 @@ pub async fn handle_model_ask(req: Request, state: &Arc<AppState>) -> Response {
     let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamEvent>(100);
 
     tokio::spawn(async move {
-        let protocol = EditProtocolFactory::create_protocol(&app_config.edit.protocol)
+        let protocol = EditProtocolFactory::create_protocol(&app_config.develop.protocol)
             .unwrap_or_else(|_| Box::new(XmlEditProtocol));
 
         let workflow = WorkflowFactory::create_workflow_from_app_config(
-            &app_config.edit.workflow,
+            &app_config.develop.workflow,
             &app_config,
         )
         .unwrap_or_else(|_| {

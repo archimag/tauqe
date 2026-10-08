@@ -12,6 +12,8 @@ use crate::rpc::send_request;
 pub const HISTORY_COMMANDS: &[KeyCommand] = &[
     KeyCommand { key: "Tab / Space", description: "Fold / unfold active history item" },
     KeyCommand { key: "[ / ] or p / n", description: "Navigate between history items" },
+    KeyCommand { key: "l", description: "Recenter active item (Emacs C-l style)" },
+    KeyCommand { key: "Alt+C", description: "Copy code block from active item" },
     KeyCommand { key: "c / y / Enter", description: "Copy selected item text to clipboard" },
     KeyCommand { key: "↑/↓ or k/j", description: "Scroll history (fetches older turns)" },
     KeyCommand { key: "Alt+↑ / Alt+↓", description: "Select previous / next item" },
@@ -33,11 +35,60 @@ pub async fn handle_history_key(
 
     if key.modifiers.contains(crossterm::event::KeyModifiers::ALT) {
         match key.code {
+            KeyCode::Char('c') | KeyCode::Char('C') | KeyCode::Char('y') | KeyCode::Char('Y') => {
+                let sel = st.history_view.selected_item_index;
+                if let Some(item) = st.history_view.items.get(sel) {
+                    let item_id = item.id;
+                    if let Some(block) = st
+                        .history_view
+                        .code_blocks
+                        .iter()
+                        .find(|b| b.item_id == item_id)
+                        .cloned()
+                    {
+                        crate::clipboard::copy_to_clipboard(&block.code);
+                        st.history_view.copy_flash =
+                            Some(((block.item_id, block.block_id), std::time::Instant::now()));
+                        let lines_count = block.code.lines().count().max(1);
+                        st.model.copy_notification = Some((
+                            format!("Copied {} lines of code to clipboard", lines_count),
+                            std::time::Instant::now(),
+                        ));
+                    } else if !item.text.is_empty() {
+                        crate::clipboard::copy_to_clipboard(&item.text);
+                        st.model.copy_notification = Some((
+                            format!("History item #{} copied to clipboard", item.id),
+                            std::time::Instant::now(),
+                        ));
+                    }
+                }
+                return Ok(InputResult::Continue);
+            }
             KeyCode::Up => {
                 if !st.history_view.items.is_empty() {
-                    st.history_view.selected_item_index =
-                        st.history_view.selected_item_index.saturating_sub(1);
-                    st.history_view.scroll_to_selected_item(view_height, Some(content_width));
+                    if st.history_view.selected_item_index > 0 {
+                        st.history_view.selected_item_index -= 1;
+                        st.history_view.scroll_to_selected_item(view_height, Some(content_width));
+                    } else if st.history_view.has_more && !st.history_view.loading {
+                        if let Some(first_item) = st.history_view.items.first() {
+                            let before_id = first_item.id;
+                            st.history_view.loading = true;
+                            st.history_view.pending_before_id = Some(before_id);
+                            st.history_view.select_prev_after_load = true;
+                            drop(st);
+                            let params = HistoryGetParams {
+                                limit: Some(10),
+                                before_id: Some(before_id),
+                            };
+                            send_request(
+                                server_writer,
+                                methods::HISTORY_GET,
+                                serde_json::to_value(params)?,
+                            )
+                            .await?;
+                            return Ok(InputResult::Continue);
+                        }
+                    }
                 }
                 return Ok(InputResult::Continue);
             }
@@ -65,11 +116,34 @@ pub async fn handle_history_key(
                 st.history_view.scroll_to_selected_item(view_height, Some(content_width));
             }
         }
+        KeyCode::Char('l') | KeyCode::Char('L') => {
+            st.history_view.recenter_selected_item(view_height, Some(content_width));
+        }
         KeyCode::Char('[') | KeyCode::Char('p') | KeyCode::Char('P') => {
             if !st.history_view.items.is_empty() {
-                st.history_view.selected_item_index =
-                    st.history_view.selected_item_index.saturating_sub(1);
-                st.history_view.scroll_to_selected_item(view_height, Some(content_width));
+                if st.history_view.selected_item_index > 0 {
+                    st.history_view.selected_item_index -= 1;
+                    st.history_view.scroll_to_selected_item(view_height, Some(content_width));
+                } else if st.history_view.has_more && !st.history_view.loading {
+                    if let Some(first_item) = st.history_view.items.first() {
+                        let before_id = first_item.id;
+                        st.history_view.loading = true;
+                        st.history_view.pending_before_id = Some(before_id);
+                        st.history_view.select_prev_after_load = true;
+                        drop(st);
+                        let params = HistoryGetParams {
+                            limit: Some(10),
+                            before_id: Some(before_id),
+                        };
+                        send_request(
+                            server_writer,
+                            methods::HISTORY_GET,
+                            serde_json::to_value(params)?,
+                        )
+                        .await?;
+                        return Ok(InputResult::Continue);
+                    }
+                }
             }
         }
         KeyCode::Char(']') | KeyCode::Char('n') | KeyCode::Char('N') => {
@@ -122,6 +196,7 @@ pub async fn handle_history_key(
             st.history_view.auto_scroll = false;
             if st.history_view.scroll > 0 {
                 st.history_view.scroll = st.history_view.scroll.saturating_sub(1);
+                st.history_view.update_selected_item_from_scroll(view_height, Some(content_width));
             } else if st.history_view.has_more && !st.history_view.loading {
                 if let Some(first_item) = st.history_view.items.first() {
                     let before_id = first_item.id;
@@ -145,6 +220,7 @@ pub async fn handle_history_key(
             st.history_view.auto_scroll = false;
             if st.history_view.scroll > 0 {
                 st.history_view.scroll = st.history_view.scroll.saturating_sub(10);
+                st.history_view.update_selected_item_from_scroll(view_height, Some(content_width));
             } else if st.history_view.has_more && !st.history_view.loading {
                 if let Some(first_item) = st.history_view.items.first() {
                     let before_id = first_item.id;
@@ -167,6 +243,7 @@ pub async fn handle_history_key(
         KeyCode::Down | KeyCode::Char('j') => {
             if st.history_view.scroll < max_scroll {
                 st.history_view.scroll = st.history_view.scroll.saturating_add(1);
+                st.history_view.update_selected_item_from_scroll(view_height, Some(content_width));
             }
             if st.history_view.scroll >= max_scroll {
                 st.history_view.auto_scroll = true;
@@ -174,6 +251,7 @@ pub async fn handle_history_key(
         }
         KeyCode::PageDown => {
             st.history_view.scroll = (st.history_view.scroll.saturating_add(10)).min(max_scroll);
+            st.history_view.update_selected_item_from_scroll(view_height, Some(content_width));
             if st.history_view.scroll >= max_scroll {
                 st.history_view.auto_scroll = true;
             }
@@ -181,6 +259,7 @@ pub async fn handle_history_key(
         KeyCode::Home => {
             st.history_view.auto_scroll = false;
             st.history_view.scroll = 0;
+            st.history_view.update_selected_item_from_scroll(view_height, Some(content_width));
             if st.history_view.has_more && !st.history_view.loading {
                 if let Some(first_item) = st.history_view.items.first() {
                     let before_id = first_item.id;
@@ -203,6 +282,7 @@ pub async fn handle_history_key(
         KeyCode::End => {
             st.history_view.auto_scroll = true;
             st.history_view.scroll = max_scroll;
+            st.history_view.update_selected_item_from_scroll(view_height, Some(content_width));
         }
         _ => {}
     }

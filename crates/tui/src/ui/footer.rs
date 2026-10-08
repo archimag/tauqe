@@ -126,6 +126,30 @@ pub fn render_footer(frame: &mut ratatui::Frame, state: &AppState, area: Rect) {
         footer_spans.push(Span::styled(status_lbl, status_style));
     }
 
+    let inner_width = area.width.saturating_sub(2) as usize;
+
+    if state.view_mode == ViewMode::History {
+        let tokens = state.history_view.get_estimated_tokens();
+        let total = state.history_view.total_count;
+        let hist_stats = format!(" {} entries (~{} tokens) ", total, tokens);
+        let left_len: usize = footer_spans.iter().map(|s| s.content.chars().count()).sum();
+        let right_len = hist_stats.chars().count();
+        if left_len + right_len < inner_width {
+            let padding = inner_width - left_len - right_len;
+            footer_spans.push(Span::raw(" ".repeat(padding)));
+            footer_spans.push(Span::styled(
+                hist_stats,
+                Style::default().fg(Color::Cyan).bold(),
+            ));
+        } else {
+            footer_spans.push(Span::styled(" │ ", Style::default().fg(Color::DarkGray)));
+            footer_spans.push(Span::styled(
+                hist_stats,
+                Style::default().fg(Color::Cyan).bold(),
+            ));
+        }
+    }
+
     let footer_line = Line::from(footer_spans);
     let footer = Paragraph::new(footer_line).block(Block::default().borders(Borders::ALL));
     frame.render_widget(footer, area);

@@ -8,7 +8,7 @@ mod marker;
 pub(crate) mod tags;
 
 use marker::XML_TAG_BASES;
-use tags::parse_context_request_tags;
+use tags::{parse_context_request_tags, parse_doc_request_tags, strip_doc_request_tags};
 
 pub use marker::generate_turn_marker;
 pub use tags::{
@@ -33,6 +33,10 @@ impl EditProtocol for XmlEditProtocol {
 
     fn parse_context_requests(&self, raw_text: &str) -> Vec<ContextRequest> {
         parse_context_request_tags(raw_text)
+    }
+
+    fn parse_doc_requests(&self, raw_text: &str) -> Vec<String> {
+        parse_doc_request_tags(raw_text)
     }
 
     fn parse_verify_request(&self, raw_text: &str) -> Option<VerifyRequest> {
@@ -108,7 +112,7 @@ impl EditProtocol for XmlEditProtocol {
         );
         prompt.push_str("6. You may include multiple <edit>, <create>, or <delete> blocks inside <tauqe_edits>.\n");
         prompt.push_str("7. If no code changes are needed (e.g. conversational answer or explanation), output plain text without any XML edit tags.\n");
-        prompt.push_str("8. If the task requires files listed in <repo_map> that are not yet present in the context files, request them FIRST instead of guessing: output only a short note plus one tag per file, e.g. <context_request path=\"path/to/file.rs\" access=\"read_only\" /> (use access=\"editable\" for files you need to modify). You will be called again with the full file contents added to context. Never request files that are already in context.\n");
+        prompt.push_str("8. If the task requires files listed in <repo_map> that are not yet present in context, or if a file currently in <read_only_files> needs to be modified, request them FIRST instead of guessing: output only a short note plus one tag per file, e.g. <context_request path=\"path/to/file.rs\" access=\"read_only\" /> (use access=\"editable\" to add or upgrade a file to editable). You will be called again with the updated context. Do not request files that are already present with the required access level.\n");
         prompt.push_str("9. Code Verification: You may request code verification using <verify target=\"all|check|test|clippy\" on_success=\"silent|report\" />. Use target=\"all\" (or check, test, clippy). Always use on_success=\"silent\" unless the user explicitly asked to see the raw test/build logs or command output. Do not quote or output raw logs when verification succeeds; concise confirmation that all checks passed is sufficient.\n");
         prompt.push_str("10. Detect User Language: Identify the primary language of the user's prompt and output a <user_language>language</user_language> tag (e.g. <user_language>Russian</user_language>). All conversational explanations MUST be in this detected language. Internal thoughts and reasoning MUST be strictly in English.\n");
         prompt.push_str("11. Choosing <edit> vs <overwrite>: use <edit> by default for local changes. Use <overwrite path=\"...\"> with the COMPLETE new file content when most of an existing editable file changes (roughly more than half), when the file is small, or when many fragile search blocks would be needed. Never use <create> for a path that already exists; use <create> only for new files.\n\n");
@@ -119,7 +123,9 @@ impl EditProtocol for XmlEditProtocol {
     fn parse_output(&self, raw_text: &str, editable_paths: &[String]) -> ModelResult {
         if !has_xml_edit_tags(raw_text) {
             return ModelResult::Answer {
-                text: strip_verify_tags(&strip_user_language_tags(&strip_context_request_tags(raw_text))),
+                text: strip_verify_tags(&strip_user_language_tags(&strip_doc_request_tags(
+                    &strip_context_request_tags(raw_text),
+                ))),
             };
         }
 
@@ -192,6 +198,10 @@ impl EditProtocol for MarkedXmlEditProtocol {
 
     fn parse_context_requests(&self, raw_text: &str) -> Vec<ContextRequest> {
         parse_context_request_tags(&normalize_marked_xml(raw_text, &self.marker, true))
+    }
+
+    fn parse_doc_requests(&self, raw_text: &str) -> Vec<String> {
+        parse_doc_request_tags(&normalize_marked_xml(raw_text, &self.marker, true))
     }
 
     fn parse_verify_request(&self, raw_text: &str) -> Option<VerifyRequest> {
@@ -448,6 +458,7 @@ pub fn extract_conversational_text(raw_text: &str) -> String {
     let text = strip_user_language_tags(&text);
     let text = strip_verify_tags(&text);
     let text = strip_context_request_tags(&text);
+    let text = strip_doc_request_tags(&text);
     clean_conversational_lines(&text)
 }
 

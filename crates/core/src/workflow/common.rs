@@ -254,46 +254,78 @@ pub async fn execute_edit_pipeline(
 
     // Discovery loop: the model may ask for files from the repo map before proposing edits.
     let mut discovery_round = 0;
+    let mut round_prompt = prompt.to_string();
+    let mut provided_docs: std::collections::HashSet<&'static str> =
+        std::collections::HashSet::new();
     while discovery_round < options.max_discovery_rounds
         && !has_proposed_edits(&pipeline_out.parsed_result)
     {
         let requests = protocol.parse_context_requests(&pipeline_out.assistant_text);
-        if requests.is_empty() {
+        let mut new_topics: Vec<&'static str> = Vec::new();
+        for topic in protocol.parse_doc_requests(&pipeline_out.assistant_text) {
+            let topic = crate::docs::resolve_topic(&topic);
+            if provided_docs.insert(topic) {
+                new_topics.push(topic);
+            }
+        }
+        if requests.is_empty() && new_topics.is_empty() {
             break;
         }
-        let available_files =
-            crate::git::list_repository_files(Some(&repo_root)).unwrap_or_default();
-        let added = apply_context_requests(
-            context_manager,
-            &requests,
-            &available_files,
-            options.max_auto_files_per_round,
-        );
-        if added.is_empty() {
+        let added = if requests.is_empty() {
+            Vec::new()
+        } else {
+            let available_files =
+                crate::git::list_repository_files(Some(&repo_root)).unwrap_or_default();
+            apply_context_requests(
+                context_manager,
+                &requests,
+                &available_files,
+                options.max_auto_files_per_round,
+            )
+        };
+        if added.is_empty() && new_topics.is_empty() {
             break;
         }
         discovery_round += 1;
         tracing::info!(
-            "Discovery round {}: added {} file(s) to auto context: {}",
+            "Discovery round {}: added {} file(s) to auto context: [{}]; documentation topics: [{}]",
             discovery_round,
             added.len(),
-            added.join(", ")
+            added.join(", "),
+            new_topics.join(", ")
         );
+        for topic in &new_topics {
+            round_prompt.push_str(&format!(
+                "\n\n<system_documentation topic=\"{}\">\n{}\n</system_documentation>",
+                topic,
+                crate::docs::get_documentation(topic)
+            ));
+        }
 
         let ctx_state = context_manager.get_state();
         let _ = stream_tx.send(StreamEvent::ContextChanged(ctx_state)).await;
 
         let prev_text = std::mem::take(&mut pipeline_out.assistant_text);
+        let mut notes = Vec::new();
+        if !added.is_empty() {
+            notes.push(format!(
+                "Added {} file(s) to context: {}",
+                added.len(),
+                added.join(", ")
+            ));
+        }
+        if !new_topics.is_empty() {
+            notes.push(format!("Loaded documentation: {}", new_topics.join(", ")));
+        }
         let round_banner = format!(
-            "\n\n---\n**[Round {}]** Added {} file(s) to context: {}\n\n",
+            "\n\n---\n**[Round {}]** {}\n\n",
             discovery_round + 1,
-            added.len(),
-            added.join(", ")
+            notes.join("; ")
         );
         let _ = stream_tx.send(StreamEvent::TextDelta(round_banner.clone())).await;
 
         pipeline_out = execute_edit_pipeline_step(
-            prompt,
+            &round_prompt,
             provider,
             model,
             context_manager,

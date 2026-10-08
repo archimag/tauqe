@@ -7,6 +7,8 @@ pub struct ConfigState {
     pub workflow: String,
     pub edit_protocol: String,
     pub model: ModelRef,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history_model: Option<ModelRef>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub available_workflows: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -23,6 +25,8 @@ pub struct ConfigSetParams {
     pub edit_protocol: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<ModelRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history_model: Option<ModelRef>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -49,5 +53,7 @@ pub struct SystemStatusResult {
     pub default_credentials_path: String,
     pub ready: bool,
     pub model: ModelRef,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history_model: Option<ModelRef>,
     pub available_models: Vec<ModelRef>,
 }

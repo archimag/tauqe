@@ -7,6 +7,7 @@ pub use tauqe_protocol as protocol;
 
 pub mod config;
 pub mod context;
+pub(crate) mod docs;
 pub mod edits;
 pub mod git;
 pub mod history;

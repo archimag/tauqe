@@ -35,6 +35,11 @@ pub trait EditProtocol: Send + Sync {
         Vec::new()
     }
 
+    /// Extracts requested documentation topics (lowercase; `all` when unspecified) from raw output.
+    fn parse_doc_requests(&self, _raw_text: &str) -> Vec<String> {
+        Vec::new()
+    }
+
     /// Extracts code verification request (check/clippy/test) from raw output if supported.
     fn parse_verify_request(&self, _raw_text: &str) -> Option<VerifyRequest> {
         None

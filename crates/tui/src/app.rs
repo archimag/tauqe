@@ -67,8 +67,6 @@ pub struct OnboardingState {
     pub show_key: bool,
     pub status_message: Option<String>,
     pub error_message: Option<String>,
-    pub selected_model: String,
-    pub models_list: Vec<String>,
 }
 
 impl Default for OnboardingState {
@@ -88,13 +86,6 @@ impl Default for OnboardingState {
             show_key: false,
             status_message: None,
             error_message: None,
-            selected_model: "anthropic/claude-3.7-sonnet".to_string(),
-            models_list: vec![
-                "anthropic/claude-3.7-sonnet".to_string(),
-                "anthropic/claude-3.5-sonnet".to_string(),
-                "openai/gpt-4o".to_string(),
-                "deepseek/deepseek-chat".to_string(),
-            ],
         }
     }
 }

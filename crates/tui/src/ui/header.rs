@@ -72,10 +72,10 @@ pub fn render_header(frame: &mut ratatui::Frame, state: &mut AppState, area: Rec
     state.header_clicks.review_tab = (review_start, review_start + review_len.saturating_sub(1));
     current_col += review_len + 1;
 
-    let tab_hist_text = format!(" 4: History ({}) ", state.history_view.total_count);
+    let tab_hist_text = " 4: History ";
     let hist_start = current_col;
     let hist_len = tab_hist_text.chars().count() as u16;
-    header_spans.push(Span::styled(&tab_hist_text, history_tab_style));
+    header_spans.push(Span::styled(tab_hist_text, history_tab_style));
     state.header_clicks.history_tab = (hist_start, hist_start + hist_len.saturating_sub(1));
     current_col += hist_len;
 

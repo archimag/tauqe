@@ -122,4 +122,4 @@ All commits must follow the **Conventional Commits** specification:
 ## 8. Subsystem Conventions
 
 - **Terminal UI (`crates/tui`):**
-  When modifying or extending code inside `crates/tui/`, the directives specified in `crates/tui/Conventions.md` are mandatory and must be observed.
+  The directives specified in `crates/tui/Conventions.md` are mandatory and strictly enforced. Whenever a task involves inspecting, modifying, or extending code inside `crates/tui/`, the model MUST explicitly request `crates/tui/Conventions.md` into context (via `<context_request>`) before proposing any modifications, unless it is already loaded in the active context. Proposing or making changes to `crates/tui/` without having `crates/tui/Conventions.md` loaded into context is strictly prohibited.

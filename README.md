@@ -3,6 +3,8 @@
 > **T**he **A**nswer to the **U**ltimate **Q**uestion of **E**ngineering.  
 > *(pronounced /tɔːk/ or /taʊk/)*
 
+Legend has it that a developer once tasked an autonomous agent with solving their codebase and, after 7.5 million years of background execution, was handed the answer **42**—with no recollection of the question and a broken environment. TAUQE exists to make sure we never repeat that fate.
+
 **TAUQE** is an AI-native engineering control environment built on transactional Git principles, deterministic symbolic analysis, and a **literal harness** for large language models.
 
 Inspired by the interactive heritage of **Magit** and **SLIME**.
@@ -10,6 +12,18 @@ Inspired by the interactive heritage of **Magit** and **SLIME**.
 ---
 
 ## Philosophy: The Literal Harness
+
+### The Two Questions: "What" and "How"
+
+Software engineering has always revolved around two fundamental questions: **What** to build and **How** to implement it.
+
+Large language models excel at answering *How*—generating idioms, navigating language syntax, and managing implementation details. But they only succeed when posed the right question and directed within rigid operational boundaries. Set adrift into open-ended autonomous bash loops, models inevitably hallucinate and wander off course.
+
+TAUQE constrains and steers the model within an autonomous bounded turn, liberating the developer's cognitive bandwidth to focus entirely on **What**.
+
+---
+
+### Escaping the Two Extremes
 
 Modern AI-assisted engineering is trapped between two flawed extremes:
 
@@ -109,9 +123,13 @@ On first launch in a repository, the built-in **interactive onboarding wizard** 
 - **Review (`Ctrl+3`):** Interactive code review with model selection, reasoning inspection, and actionable findings (`TODO`/`DONE`/`REJECTED`).
 - **History (`Ctrl+4`):** Collapsible chronological session log and commit audit trail.
 
-### 3. Deep Dive Documentation
+### 3. Deep Dive Documentation & Asking TAUQE Directly
 
-For in-depth architectural walkthroughs and user guides, explore the interactive documentation in `docs/` or run `just docs-serve`.
+- **Ask TAUQE Directly:**  
+  Want to know more about the system, its architecture, workflows, or keybindings? Simply launch TAUQE and ask it directly (e.g., *"Who are you and what can you do?"* or *"How does the bounded turn work?"*). Armed with embedded authoritative documentation, TAUQE consults its own manual on demand and explains any concept on the fly in your language.
+
+- **Interactive Book:**  
+  For in-depth architectural walkthroughs and user guides, explore the mdBook documentation in `docs/` or run `just docs-serve`.
 
 ---
 

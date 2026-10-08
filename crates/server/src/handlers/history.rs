@@ -11,12 +11,14 @@ pub async fn handle_history_get(req: Request, state: &Arc<AppState>) -> Response
         .unwrap_or_default();
     let limit = params.limit.unwrap_or(10);
     let history = state.history.lock().await;
+    let estimated_tokens = history.estimated_tokens().unwrap_or(0);
     match history.get_ui_slice(limit, params.before_id) {
         Ok((items, has_more, total_count)) => {
             let result = HistoryGetResult {
                 items,
                 has_more,
                 total_count,
+                estimated_tokens,
             };
             Response {
                 id: req.id,

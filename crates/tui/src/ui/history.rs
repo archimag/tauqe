@@ -10,18 +10,35 @@ use crate::app::AppState;
 use crate::ui::wrap_lines;
 
 #[derive(Debug, Clone)]
+pub struct HistoryCodeBlock {
+    pub item_id: u64,
+    pub block_id: usize,
+    pub lang: String,
+    pub code: String,
+    pub visual_start_line: usize,
+    pub visual_end_line: usize,
+}
+
+#[derive(Debug, Clone)]
 pub struct HistoryViewState {
     pub items: Vec<UiHistoryItem>,
     pub scroll: u16,
     pub auto_scroll: bool,
     pub has_more: bool,
     pub total_count: usize,
+    pub estimated_tokens: u64,
     pub loading: bool,
     pub rendered_lines_count: usize,
     pub pending_before_id: Option<u64>,
+    pub select_prev_after_load: bool,
+    pub recenter_cycle: u8,
+    pub last_recenter_index: Option<usize>,
     pub selected_item_index: usize,
     pub content_width: usize,
     pub expanded_items: HashSet<u64>,
+    pub code_blocks: Vec<HistoryCodeBlock>,
+    pub content_rect: (u16, u16, u16, u16),
+    pub copy_flash: Option<((u64, usize), std::time::Instant)>,
 }
 
 impl Default for HistoryViewState {
@@ -32,12 +49,19 @@ impl Default for HistoryViewState {
             auto_scroll: true,
             has_more: false,
             total_count: 0,
+            estimated_tokens: 0,
             loading: false,
             rendered_lines_count: 0,
             pending_before_id: None,
+            select_prev_after_load: false,
+            recenter_cycle: 0,
+            last_recenter_index: None,
             selected_item_index: 0,
             content_width: 80,
             expanded_items: HashSet::new(),
+            code_blocks: Vec::new(),
+            content_rect: (0, 0, 0, 0),
+            copy_flash: None,
         }
     }
 }
@@ -55,6 +79,15 @@ impl HistoryViewState {
         }
     }
 
+    pub fn get_estimated_tokens(&self) -> u64 {
+        if self.estimated_tokens > 0 {
+            self.estimated_tokens
+        } else {
+            let total_chars: usize = self.items.iter().map(|it| it.text.chars().count()).sum();
+            total_chars.div_ceil(4) as u64
+        }
+    }
+
     pub fn scroll_to_selected_item(&mut self, view_height: u16, max_width: Option<usize>) {
         if self.items.is_empty() || view_height == 0 {
             return;
@@ -68,25 +101,109 @@ impl HistoryViewState {
             Some(&self.expanded_items),
         );
         let total_lines = lines.len();
+        let max_scroll = (total_lines as u16).saturating_sub(view_height);
 
         if let Some(&start_offset) = offsets.get(sel) {
             let header_line = start_offset + if sel > 0 { 1 } else { 0 };
             let next_offset = offsets.get(sel + 1).copied().unwrap_or(total_lines);
-            let item_lines_count = next_offset.saturating_sub(header_line);
 
-            if (header_line as u16) < self.scroll {
+            let vis_top = self.scroll as usize;
+            let vis_bottom = vis_top + view_height as usize;
+
+            if header_line < vis_top {
                 self.auto_scroll = false;
-                self.scroll = (start_offset as u16).min(header_line as u16);
-            } else if (header_line as u16) >= self.scroll.saturating_add(view_height) {
+                self.scroll = (start_offset as u16).min(max_scroll);
+            } else if next_offset > vis_bottom {
                 self.auto_scroll = false;
-                let visible_target = header_line + item_lines_count.min(view_height as usize);
-                let needed_scroll = (visible_target as u16).saturating_sub(view_height);
-                self.scroll = needed_scroll.clamp(
-                    (header_line as u16 + 1).saturating_sub(view_height),
-                    header_line as u16,
-                );
+                let item_height = next_offset.saturating_sub(start_offset);
+                if item_height <= view_height as usize {
+                    let target = next_offset.saturating_sub(view_height as usize);
+                    self.scroll = (target as u16).min(max_scroll);
+                } else {
+                    self.scroll = (start_offset as u16).min(max_scroll);
+                }
             }
         }
+    }
+
+    pub fn recenter_selected_item(&mut self, view_height: u16, max_width: Option<usize>) {
+        if self.items.is_empty() || view_height == 0 {
+            return;
+        }
+        let sel = self.selected_item_index.min(self.items.len().saturating_sub(1));
+        self.selected_item_index = sel;
+        let (lines, offsets) = compute_history_lines_with_offsets(
+            &self.items,
+            max_width,
+            Some(sel),
+            Some(&self.expanded_items),
+        );
+        let total_lines = lines.len();
+        let max_scroll = (total_lines as u16).saturating_sub(view_height);
+
+        if let Some(&start_offset) = offsets.get(sel) {
+            let next_offset = offsets.get(sel + 1).copied().unwrap_or(total_lines);
+            let item_height = next_offset.saturating_sub(start_offset);
+
+            if self.last_recenter_index == Some(sel) {
+                self.recenter_cycle = (self.recenter_cycle + 1) % 3;
+            } else {
+                self.recenter_cycle = 0;
+                self.last_recenter_index = Some(sel);
+            }
+
+            self.auto_scroll = false;
+            match self.recenter_cycle {
+                0 => {
+                    // Center in window
+                    let center_scroll = (start_offset as isize + (item_height as isize / 2)
+                        - (view_height as isize / 2))
+                        .clamp(0, max_scroll as isize) as u16;
+                    self.scroll = center_scroll;
+                }
+                1 => {
+                    // Align to top
+                    self.scroll = (start_offset as u16).min(max_scroll);
+                }
+                _ => {
+                    // Align to bottom
+                    let bottom_scroll = (next_offset as isize - view_height as isize)
+                        .clamp(0, max_scroll as isize) as u16;
+                    self.scroll = bottom_scroll;
+                }
+            }
+        }
+    }
+
+    pub fn update_selected_item_from_scroll(
+        &mut self,
+        view_height: u16,
+        max_width: Option<usize>,
+    ) {
+        if self.items.is_empty() {
+            return;
+        }
+        let (_, offsets) = compute_history_lines_with_offsets(
+            &self.items,
+            max_width,
+            None,
+            Some(&self.expanded_items),
+        );
+        if offsets.is_empty() {
+            return;
+        }
+
+        let target_line = self.scroll as usize
+            + (view_height as usize / 3).min((view_height as usize).saturating_sub(1));
+        let mut selected = 0;
+        for (idx, &start) in offsets.iter().enumerate() {
+            if start <= target_line {
+                selected = idx;
+            } else {
+                break;
+            }
+        }
+        self.selected_item_index = selected.min(self.items.len().saturating_sub(1));
     }
 }
 
@@ -110,8 +227,21 @@ pub fn compute_history_lines_with_offsets(
     selected_index: Option<usize>,
     expanded_items: Option<&HashSet<u64>>,
 ) -> (Vec<Line<'static>>, Vec<usize>) {
+    let (lines, offsets, _) =
+        compute_history_lines_full(items, max_width, selected_index, expanded_items, None);
+    (lines, offsets)
+}
+
+pub fn compute_history_lines_full(
+    items: &[UiHistoryItem],
+    max_width: Option<usize>,
+    selected_index: Option<usize>,
+    expanded_items: Option<&HashSet<u64>>,
+    flashing_block: Option<(u64, usize)>,
+) -> (Vec<Line<'static>>, Vec<usize>, Vec<HistoryCodeBlock>) {
     let mut all_lines = Vec::new();
     let mut offsets = Vec::with_capacity(items.len());
+    let mut code_blocks = Vec::new();
     let div_width = max_width.unwrap_or(80).max(10);
     const COLLAPSED_PREVIEW_LINES: usize = 3;
 
@@ -190,7 +320,7 @@ pub fn compute_history_lines_with_offsets(
         if is_selected {
             header_spans.push(Span::raw(" "));
             let fold_hint = if is_expanded {
-                "◄ [Tab: fold, c: copy]"
+                "◄ [Tab: fold, c: copy, Alt+C: copy code]"
             } else {
                 "◄ [Tab: expand, c: copy]"
             };
@@ -207,11 +337,27 @@ pub fn compute_history_lines_with_offsets(
             UiHistoryKind::System => Style::default().fg(Color::Yellow),
         };
 
+        let mut extracted_blocks = Vec::new();
+        let mut md_start_idx = 0;
+
         if is_expanded {
             if item.kind == UiHistoryKind::Assistant {
                 let mut history_theme = crate::markdown::MarkdownTheme::answer();
                 history_theme.line_prefix = Some(Span::raw("  "));
-                let md_lines = crate::markdown::render_markdown(&item.text, &history_theme);
+                let flash_id = flashing_block.and_then(|(i_id, b_id)| {
+                    if i_id == item.id {
+                        Some(b_id)
+                    } else {
+                        None
+                    }
+                });
+                let (md_lines, blocks) = crate::markdown::render_markdown_with_blocks(
+                    &item.text,
+                    &history_theme,
+                    flash_id,
+                );
+                md_start_idx = item_lines.len();
+                extracted_blocks = blocks;
                 if md_lines.is_empty() {
                     for line in item.text.lines() {
                         item_lines.push(Line::from(Span::styled(format!("  {}", line), text_style)));
@@ -295,17 +441,42 @@ pub fn compute_history_lines_with_offsets(
             }
         }
 
-        let wrapped = if let Some(width) = max_width {
-            wrap_lines(item_lines, width)
-        } else {
-            item_lines
-        };
-
         offsets.push(all_lines.len());
-        all_lines.extend(wrapped);
+
+        let base_visual = all_lines.len();
+        let mut raw_to_visual = Vec::with_capacity(item_lines.len());
+        let mut current_visual = base_visual;
+
+        for line in item_lines {
+            let line_start = current_visual;
+            let wrapped = if let Some(width) = max_width {
+                wrap_lines(vec![line], width)
+            } else {
+                vec![line]
+            };
+            let count = wrapped.len();
+            current_visual += count;
+            raw_to_visual.push((line_start, current_visual.saturating_sub(1)));
+            all_lines.extend(wrapped);
+        }
+
+        for block in extracted_blocks {
+            let raw_start = md_start_idx + block.start_line;
+            let raw_end = md_start_idx + block.end_line;
+            if raw_start < raw_to_visual.len() && raw_end < raw_to_visual.len() {
+                code_blocks.push(HistoryCodeBlock {
+                    item_id: item.id,
+                    block_id: block.id,
+                    lang: block.lang,
+                    code: block.content,
+                    visual_start_line: raw_to_visual[raw_start].0,
+                    visual_end_line: raw_to_visual[raw_end].1,
+                });
+            }
+        }
     }
 
-    (all_lines, offsets)
+    (all_lines, offsets, code_blocks)
 }
 
 pub fn render_history_view(
@@ -327,14 +498,29 @@ pub fn render_history_view(
         state.history_view.selected_item_index = state.history_view.items.len().saturating_sub(1);
     }
 
-    let (history_lines, _) = compute_history_lines_with_offsets(
+    if let Some((_, inst)) = state.history_view.copy_flash {
+        if inst.elapsed().as_secs_f32() >= 2.0 {
+            state.history_view.copy_flash = None;
+        }
+    }
+
+    let flash_target = state.history_view.copy_flash.map(|(pair, _)| pair);
+    let (history_lines, _, code_blocks) = compute_history_lines_full(
         &state.history_view.items,
         Some(content_width),
         Some(state.history_view.selected_item_index),
         Some(&state.history_view.expanded_items),
+        flash_target,
     );
     let total_lines = history_lines.len();
     state.history_view.rendered_lines_count = total_lines;
+    state.history_view.code_blocks = code_blocks;
+    state.history_view.content_rect = (
+        inner.x,
+        inner.y,
+        inner.width,
+        content_height,
+    );
 
     let max_scroll = (total_lines as u16).saturating_sub(content_height);
     if state.history_view.auto_scroll || state.history_view.scroll > max_scroll {
@@ -366,14 +552,16 @@ pub fn render_history_view(
             Style::default().bold().fg(Color::Yellow),
         ),
         Span::raw(", "),
-        Span::styled("[ / ]", Style::default().bold().fg(Color::White)),
+        Span::styled("[ / ] / p / n", Style::default().bold().fg(Color::White)),
         Span::raw(" Item, "),
+        Span::styled("l", Style::default().bold().fg(Color::Cyan)),
+        Span::raw(" Recenter, "),
         Span::styled("c / y", Style::default().bold().fg(Color::Yellow)),
         Span::raw(" Copy, "),
         Span::styled("↑/↓/k/j", Style::default().bold().fg(Color::White)),
         Span::raw(" Scroll. "),
         Span::styled(
-            format!("[Item {}/{} | Total {}] ", sel_idx, total_shown, state.history_view.total_count),
+            format!("[Item {}/{}] ", sel_idx, total_shown),
             Style::default().fg(Color::DarkGray),
         ),
         Span::styled(

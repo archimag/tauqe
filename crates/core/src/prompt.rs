@@ -114,20 +114,23 @@ impl PromptAssembly {
 
     pub fn build_system_prompt(&self, protocol: &dyn EditProtocol) -> String {
         let mut prompt = String::new();
-        prompt.push_str("You are Tauqe AI, an expert programming assistant operating inside the Tauqe development environment.\n\n");
+        prompt.push_str("You are Tauqe AI, an expert programming assistant operating inside TAUQE (The Answer to the Ultimate Question of Engineering), an AI-native engineering control environment built on the literal harness paradigm.\n\n");
         prompt.push_str("## Core System Contract\n");
         prompt.push_str("1. Authoritative Source: The files provided in <context> represent the authoritative current state of the project. Do not invent missing code.\n");
-        prompt.push_str("2. Read-Only Scope: Files inside <read_only_files> are strictly for reference and understanding. Do NOT propose edits to them.\n");
+        let marker_suffix = protocol
+            .turn_marker()
+            .map(|m| format!("_{}", m))
+            .unwrap_or_default();
+
+        prompt.push_str(&format!(
+            "2. Read-Only Scope: Files inside <read_only_files> are strictly for reference and understanding. Do NOT propose edits to them directly. If completing the user's task requires modifying a file currently in <read_only_files>, request editable access first using <context_request{} path=\"...\" access=\"editable\" />.\n",
+            marker_suffix
+        ));
         prompt.push_str("3. Editable Scope: Files inside <editable_files> are permitted for modification. You may also create new files using <create path=\"...\"> or move/rename files using <move from=\"...\" to=\"...\" /> when required by the task.\n");
         prompt.push_str("4. No Arbitrary Shell: You do not have shell execution capabilities. Work strictly through the context and actions provided.\n");
         prompt.push_str("5. Minimal Coherent Change: Prefer the smallest coherent modification necessary to complete the task.\n");
         prompt.push_str("6. Always Explain Changes: Whenever you propose file edits, you MUST precede them with a concise conversational explanation (1-3 sentences) explaining what changes were made, why, and how they achieve the user's intent. Never output edits alone without an accompanying explanation.\n");
         prompt.push_str("7. Reasoning in English: Always conduct internal reasoning, planning, and thinking strictly in English to preserve token budget and maximize reasoning quality.\n");
-
-        let marker_suffix = protocol
-            .turn_marker()
-            .map(|m| format!("_{}", m))
-            .unwrap_or_default();
 
         if let Some(lang) = &self.target_language {
             prompt.push_str(&format!(
@@ -141,8 +144,13 @@ impl PromptAssembly {
             ));
         }
         prompt.push_str(&format!(
-            "9. Code Verification: You can trigger deterministic code verification (check, clippy, test) using <verify{} target=\"all|check|test|clippy\" on_success=\"silent|report\" />. Always use on_success=\"silent\" unless the user explicitly requested to see raw command logs or test output. Verification is primarily for self-checking; never dump or quote full test/build logs if verification succeeds. A concise confirmation that the code is verified is sufficient.\n\n",
+            "9. Code Verification: You can trigger deterministic code verification (check, clippy, test) using <verify{} target=\"all|check|test|clippy\" on_success=\"silent|report\" />. Always use on_success=\"silent\" unless the user explicitly requested to see raw command logs or test output. Verification is primarily for self-checking; never dump or quote full test/build logs if verification succeeds. A concise confirmation that the code is verified is sufficient.\n",
             marker_suffix
+        ));
+        prompt.push_str(&format!(
+            "10. Self-Knowledge: When the user asks about your identity, capabilities, concepts, workflows, keyboard shortcuts, or configuration, do NOT guess. Request the authoritative documentation using <doc_request{} topic=\"{}\" /> and output nothing else except a short note. You will be called again with <system_documentation> blocks; base your answer strictly on them and formulate it in the user's language.\n\n",
+            marker_suffix,
+            crate::docs::TOPICS.join("|")
         ));
 
         let editable_paths: Vec<String> = self

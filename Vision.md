@@ -2,7 +2,7 @@
 
 ## 1. Mission and Paradigm: The Literal Harness
 
-TAUQE is an **AI-native engineering control environment** designed around the concept of a **semantic harness** for large language models.
+TAUQE (**T**he **A**nswer to the **U**ltimate **Q**uestion of **E**ngineering, pronounced */tɔːk/* or */taʊk/*) is an **AI-native engineering control environment** designed around the concept of a **semantic harness** for large language models.
 
 The term *harness* is used here not in the metaphorical sense of a test framework (*eval harness*) or an autonomous agent framework, but in its **original, literal sense: bridle, bit, reins, and blinkers**.
 
@@ -14,6 +14,14 @@ TAUQE holds the model in a firm grip:
 - **Reins (Git Transactions):** The developer steers the objective, while Git ensures an instant, atomic rollback if the model deviates from course.
 
 > **TAUQE is not an agent. It is an environment where the model is autonomous within a strictly bounded turn, yet completely stripped of agentic drift.**
+
+### 1.1. The Fundamental Duality: "What" versus "How"
+
+Software engineering has always hinged upon two foundational questions: **What** to build and **How** to build it.
+
+Large language models are remarkably adept at answering *How*—synthesizing boilerplate, applying idioms, refactoring data pipelines, and implementing concrete routines. Yet they excel only when provided with a well-posed question and guided within disciplined structural boundaries. When released into open-ended, autonomous bash loops without guardrails, an LLM quickly drifts into generative hallucinations and speculative bloat.
+
+TAUQE's primary objective is to **liberate the developer's cognitive bandwidth so they can concentrate entirely on 'What'.** The engineer determines the objective, architectural intent, and requirements; the harness firmly steers and confines the model through a bounded turn to solve the *How*, deterministically and safely.
 
 ---
 
@@ -49,8 +57,8 @@ Instead of an unbounded `while true` loop, TAUQE implements a deterministic fini
 ```text
                User Prompt
                     ↓
-        ┌─► [Discovery Phase] ──── (requests missing files via <context_request>)
-        │           ↓
+        ┌─► [Discovery Phase] ──── (requests missing files via <context_request>
+        │           ↓               or system docs via <doc_request>)
         │   [Proposal Generation] ─ (generates minimal coherent patches)
         │           ↓
         │   [In-Memory Staging] ── (validates patches in memory with fuzzy matching)
@@ -66,7 +74,7 @@ Instead of an unbounded `while true` loop, TAUQE implements a deterministic fini
 ```
 
 Every phase in the turn is deterministic:
-1. **Discovery:** The model inspects the Tree-sitter Repo Map, identifies required definitions, and requests them via protocol tags. The server adds files to the `auto` context layer and iterates. No manual `/add` required.
+1. **Discovery:** The model inspects the Tree-sitter Repo Map, identifies required definitions or system documentation, and requests them via protocol tags (`<context_request>`, `<doc_request>`). The server adds files to the `auto` context layer or injects documentation blocks and iterates. No manual `/add` required.
 2. **Staging:** No byte touches disk until the entire set of edits converges cleanly in virtual staging.
 3. **Healing:** If the compiler detects an error, the model receives clean toolchain output and fixes only the offending lines without touching unrelated code.
 4. **Git Transaction:** The turn is transactional. Pressing `u` rolls back the working tree to its exact pre-turn state.
@@ -83,6 +91,8 @@ Every phase in the turn is deterministic:
    The model cannot run arbitrary OS commands. Compiler and test invocations are governed strictly by the project action registry.
 4. **Minimal Coherent Change**  
    Modifications are made via localized search/replace blocks and atomic file operations. Gratuitous reformatting and unrelated refactoring are strictly avoided.
+5. **Dual-Use Documentation as Concept Ontology**  
+   Documentation serves a dual purpose: authoritative technical reference for developers and high-density semantic concept ontology for the AI model. When asked about system architecture, shortcuts, or workflows, the model requests authoritative documentation via `<doc_request>` rather than hallucinating.
 
 ---
 

@@ -1,7 +1,7 @@
 use super::entry::HistoryEntry;
 
 /// Default estimated tokens budget before compaction is triggered (raised for modern LLMs).
-pub const DEFAULT_HISTORY_BUDGET_TOKENS: u64 = 64_000;
+pub const DEFAULT_HISTORY_BUDGET_TOKENS: u64 = 20_000;
 
 /// Default count of user turns to preserve in detailed form in the tail.
 pub const DEFAULT_TAIL_TURNS_COUNT: usize = 10;

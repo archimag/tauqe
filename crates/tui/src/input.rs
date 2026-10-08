@@ -105,6 +105,24 @@ async fn handle_global_shortcuts(
             KeyCode::Char('4') => {
                 st.view_mode = ViewMode::History;
                 st.history_view.auto_scroll = true;
+                if !st.history_view.items.is_empty() {
+                    st.history_view.selected_item_index =
+                        st.history_view.items.len().saturating_sub(1);
+                } else if !st.history_view.loading {
+                    st.history_view.loading = true;
+                    drop(st);
+                    let params = tauqe_protocol::HistoryGetParams {
+                        limit: Some(20),
+                        before_id: None,
+                    };
+                    send_request(
+                        server_writer,
+                        methods::HISTORY_GET,
+                        serde_json::to_value(params)?,
+                    )
+                    .await?;
+                    return Ok(Some(InputResult::Continue));
+                }
                 st.context_view.status_message = None;
                 return Ok(Some(InputResult::Continue));
             }

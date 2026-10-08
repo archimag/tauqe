@@ -1,7 +1,3 @@
-[models.default]
-provider = "openrouter"
-name = "~google/gemini-flash-latest"
-
 [providers.openrouter]
 models = [
   "~google/gemini-flash-latest",
@@ -11,29 +7,30 @@ models = [
   "~anthropic/claude-sonnet-latest",
   "~anthropic/claude-haiku-latest"
 ]
-# api_key = ""        # лучше хранить в .tauqe/credentials.toml или в OPENROUTER_API_KEY
 
-[edit]
-max_retries = 5  # число повторных попыток исправления неудачных правок
-# workflow = "git"   # варианты: "toolchain", "git", "naive" (по умолчанию "git")
-# protocol = "xml"   # активный протокол правок: "xml" (по умолчанию "xml")
+[develop]
+model = "openrouter:~google/gemini-flash-latest"  # primary development model (format: provider:model)
+max_retries = 5  # maximum retry attempts for failed edit staging
+# workflow = "git"   # edit workflow: "toolchain", "git", "naive" (default: "git")
+# protocol = "xml"   # active edit protocol: "xml" (default: "xml")
 
 [toolchain]
-# check_command = ""  # своя команда проверки; по умолчанию определяется автоматически
-# max_retries = 5     # по умолчанию не задано
-# auto_heal = false   # по умолчанию не задано
+# check_command = ""  # custom project verification command (auto-detected by default)
+# max_retries = 5     # maximum retry attempts for compiler/linter self-healing
+# auto_heal = false   # automatically trigger verification healing loop on check failures
 
 [git]
-# upstream = "origin/master"  # базовая upstream-ветка для расчета диффов (по умолчанию определяется автоматически)
+# upstream = "origin/master"  # base upstream branch for calculating diffs (auto-detected by default)
 
 [history]
-# budget_tokens = 64000  # бюджет истории сессии в токенах до запуска компактификации (по умолчанию 64000)
-# tail_turns = 10        # количество последних ходов, сохраняемых без сжатия в детальном виде (по умолчанию 10)
+model = "openrouter:~anthropic/claude-haiku-latest"  # model for history compaction and squash commits (defaults to develop.model)
+budget_tokens = 20000  # session history token budget before compaction is triggered (default: 20000)
+# tail_turns = 10        # number of recent turns kept uncompressed in original form (default: 10)
 
 [context]
-max_discovery_rounds = 8  # максимум раундов автоматического поиска файлов
-max_auto_files_per_round = 5  # максимум файлов за один раунд авто-добавления
-# repomap_token_budget = 4000  # бюджет токенов для карты репозитория (по умолчанию 4000)
+max_discovery_rounds = 8  # maximum rounds for autonomous context discovery
+max_auto_files_per_round = 5  # maximum files automatically added per discovery round
+# repomap_token_budget = 4000  # token budget for the repository map (default: 4000)
 pinned = [
     "Conventions.md",
     "Vision.md",

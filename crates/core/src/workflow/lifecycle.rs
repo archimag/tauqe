@@ -23,6 +23,7 @@ pub struct WorkflowOptions {
     pub history_budget_tokens: u64,
     pub history_tail_turns: usize,
     pub repomap_token_budget: usize,
+    pub history_model: ModelRef,
 }
 
 impl Default for WorkflowOptions {
@@ -34,6 +35,7 @@ impl Default for WorkflowOptions {
             history_budget_tokens: crate::history::DEFAULT_HISTORY_BUDGET_TOKENS,
             history_tail_turns: crate::history::DEFAULT_TAIL_TURNS_COUNT,
             repomap_token_budget: crate::repomap::DEFAULT_REPOMAP_TOKEN_BUDGET,
+            history_model: ModelRef::openrouter(crate::config::BUILTIN_DEFAULT_MODEL),
         }
     }
 }
@@ -44,7 +46,7 @@ impl WorkflowOptions {
         let max_retries = config
             .toolchain
             .max_retries
-            .unwrap_or(config.edit.max_retries);
+            .unwrap_or(config.develop.max_retries);
         Self {
             max_retries,
             max_discovery_rounds: config.context.max_discovery_rounds,
@@ -52,6 +54,7 @@ impl WorkflowOptions {
             history_budget_tokens: config.history.budget_tokens,
             history_tail_turns: config.history.tail_turns,
             repomap_token_budget: config.context.repomap_token_budget,
+            history_model: config.history_model(),
         }
     }
 }
@@ -115,6 +118,16 @@ pub(crate) async fn execute_workflow_lifecycle<T: WorkflowTransaction>(
     stream_tx: mpsc::Sender<StreamEvent>,
     cancel_rx: watch::Receiver<bool>,
 ) -> anyhow::Result<WorkflowExecutionResult> {
+    let _ = super::common::compact_history_if_needed_with_budget(
+        history_manager,
+        provider,
+        &options.history_model,
+        cancel_rx.clone(),
+        options.history_budget_tokens,
+        options.history_tail_turns,
+    )
+    .await;
+
     let mut pipeline_out = execute_edit_pipeline(
         prompt,
         provider,

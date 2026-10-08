@@ -57,16 +57,6 @@ pub async fn handle_onboarding_key(
                 st.onboarding.input_buffer.clear();
 
                 match st.onboarding.step {
-                    OnboardingStep::Config if !input.is_empty() => {
-                        st.onboarding.selected_model = input.clone();
-                        drop(st);
-                        send_request(
-                            server_writer,
-                            methods::CONFIG_CREATE,
-                            serde_json::json!({ "model": input }),
-                        )
-                        .await?;
-                    }
                     OnboardingStep::Credentials if !input.is_empty() => {
                         drop(st);
                         send_request(
@@ -84,7 +74,7 @@ pub async fn handle_onboarding_key(
     } else {
         let total_options = match st.onboarding.step {
             OnboardingStep::Git => 3,
-            OnboardingStep::Config => 6,
+            OnboardingStep::Config => 2,
             OnboardingStep::Credentials => 4,
             OnboardingStep::Gatekeeper => 3,
             OnboardingStep::Ready => 1,
@@ -144,25 +134,14 @@ pub async fn handle_onboarding_key(
                         }
                     },
                     OnboardingStep::Config => match sel {
-                        0..=3 => {
-                            let model = st
-                                .onboarding
-                                .models_list
-                                .get(sel)
-                                .cloned()
-                                .unwrap_or_else(|| "anthropic/claude-3.7-sonnet".to_string());
-                            st.onboarding.selected_model = model.clone();
+                        0 => {
                             drop(st);
                             send_request(
                                 server_writer,
                                 methods::CONFIG_CREATE,
-                                serde_json::json!({ "model": model }),
+                                serde_json::json!({}),
                             )
                             .await?;
-                        }
-                        4 => {
-                            st.onboarding.input_active = true;
-                            st.onboarding.input_buffer.clear();
                         }
                         _ => {
                             if !st.onboarding.has_api_key {
