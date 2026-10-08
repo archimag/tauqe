@@ -38,6 +38,9 @@ pub async fn handle_mouse_event(
                             st.context_view.cursor_index.saturating_sub(1);
                     }
                 }
+                ViewMode::Review => {
+                    st.review.scroll = st.review.scroll.saturating_sub(3);
+                }
                 ViewMode::Onboarding => {}
             }
             Ok(InputResult::Continue)
@@ -72,6 +75,10 @@ pub async fn handle_mouse_event(
                     if rows_len > 0 && st.context_view.cursor_index + 1 < rows_len {
                         st.context_view.cursor_index += 1;
                     }
+                }
+                ViewMode::Review => {
+                    let max = (st.review.rendered_lines as u16).saturating_sub(st.review.view_height);
+                    st.review.scroll = st.review.scroll.saturating_add(3).min(max);
                 }
                 ViewMode::Onboarding => {}
             }
@@ -132,6 +139,10 @@ pub async fn handle_mouse_event(
                     return Ok(InputResult::Continue);
                 } else if mouse.column >= areas.context_tab.0 && mouse.column <= areas.context_tab.1 {
                     st.view_mode = ViewMode::Context;
+                    st.context_view.status_message = None;
+                    return Ok(InputResult::Continue);
+                } else if mouse.column >= areas.review_tab.0 && mouse.column <= areas.review_tab.1 {
+                    st.view_mode = ViewMode::Review;
                     st.context_view.status_message = None;
                     return Ok(InputResult::Continue);
                 } else if mouse.column >= areas.history_tab.0 && mouse.column <= areas.history_tab.1 {

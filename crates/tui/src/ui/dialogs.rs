@@ -410,72 +410,142 @@ pub fn render_selection_dialog(
     frame.render_widget(block, area);
 }
 
-pub fn render_help_popup(frame: &mut ratatui::Frame, mode: ViewMode) {
-    let area = centered_rect(64, 50, frame.area());
+pub fn render_review_dialog(frame: &mut ratatui::Frame, dialog: &crate::app::ReviewDialogState) {
+    let area = centered_rect(64, 52, frame.area());
     frame.render_widget(Clear, area);
 
-    let (title, specific_lines) = match mode {
-        ViewMode::Develop => (
-            " Help: Develop ",
-            vec![
-                Line::from("  u             Undo last AI commit"),
-                Line::from("  Space / Tab   Fold / unfold diff (when prompt is empty)"),
-                Line::from("  [ / ]         Navigate between modified files"),
-                Line::from("  Ctrl+C        Interrupt active model generation"),
-                Line::from("  Ctrl+R        Toggle reasoning block (thinking)"),
-                Line::from("  Ctrl+L        Clear conversation history and screen"),
-                Line::from("  Click on code Copy code block to clipboard"),
-            ],
-        ),
-        ViewMode::Context => (
-            " Help: Context ",
-            vec![
-                Line::from("  e             Add file to context as editable"),
-                Line::from("  r             Add file to context as read-only"),
-                Line::from("  t             Toggle access (Editable ↔ Read-Only)"),
-                Line::from("  p / u         Promote Auto file to persistent User file"),
-                Line::from("  c             Clear all auto-requested files (Auto)"),
-                Line::from("  d / x / Del   Remove file from context"),
-                Line::from("  Space         Fold / unfold section"),
-            ],
-        ),
-        ViewMode::History => (
-            " Help: History ",
-            vec![
-                Line::from("  ↑ / k         Scroll up (dynamically fetches older turns)"),
-                Line::from("  ↓ / j         Scroll down (resumes auto-scroll)"),
-                Line::from("  Home / End    Jump to top / latest message"),
-                Line::from("  Ctrl+L        Clear session history on disk and screen"),
-            ],
-        ),
-        ViewMode::Onboarding => (
-            " Help: Setup ",
-            vec![
-                Line::from("  Ctrl+V        Paste API key from clipboard"),
-                Line::from("  Ctrl+R        Show / hide entered key"),
-                Line::from("  Ctrl+U        Clear key input buffer"),
-                Line::from("  Ctrl+O        Reload configuration from disk"),
-            ],
-        ),
-    };
+    let model = dialog
+        .models
+        .get(dialog.model_index)
+        .map(|m| m.to_string())
+        .unwrap_or_else(|| "(none)".to_string());
+    let dim = Style::default().fg(Color::DarkGray);
+
+    let lines = vec![
+        Line::raw(""),
+        Line::from(Span::styled(
+            "Run a code review on the current context?",
+            Style::default().bold().fg(Color::Yellow),
+        )),
+        Line::raw(""),
+        Line::from(vec![
+            Span::styled("  Files: ", dim),
+            Span::styled(
+                dialog.files_count.to_string(),
+                Style::default().fg(Color::White).bold(),
+            ),
+            Span::styled("    Estimated tokens: ", dim),
+            Span::styled(
+                format!("~{}", dialog.estimated_tokens),
+                Style::default().fg(Color::White).bold(),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("  Model: ", dim),
+            Span::styled(
+                format!("◄ {} ►", model),
+                Style::default().fg(Color::Green).bold(),
+            ),
+            Span::styled("  (Up/Down or Tab to change)", dim),
+        ]),
+        Line::from(Span::styled(
+            "  Only file contents are sent: no history, no repo map.",
+            dim,
+        )),
+        Line::raw(""),
+        Line::from(Span::styled(
+            "  Extra instructions (optional):",
+            Style::default().fg(Color::Cyan).bold(),
+        )),
+        Line::from(vec![
+            Span::raw("  > "),
+            Span::styled(dialog.prompt.clone(), Style::default().fg(Color::White)),
+            Span::styled("█", Style::default().fg(Color::Yellow)),
+        ]),
+        Line::raw(""),
+        Line::from(vec![
+            Span::styled(
+                " Enter ",
+                Style::default().bg(Color::Green).fg(Color::Black).bold(),
+            ),
+            Span::raw(" Start review    "),
+            Span::styled(
+                " Esc ",
+                Style::default().bg(Color::DarkGray).fg(Color::White).bold(),
+            ),
+            Span::raw(" Cancel"),
+        ]),
+    ];
+
+    let widget = Paragraph::new(lines)
+        .block(
+            Block::default()
+                .title(" Code Review ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Magenta)),
+        )
+        .wrap(Wrap { trim: false });
+    frame.render_widget(widget, area);
+}
+
+pub const GLOBAL_COMMANDS: &[crate::app::KeyCommand] = &[
+    crate::app::KeyCommand { key: "Ctrl+1 / 2 / 3 / 4", description: "Switch views: Develop │ Context │ History │ Review" },
+    crate::app::KeyCommand { key: "Ctrl+M", description: "Select active model" },
+    crate::app::KeyCommand { key: "F6 / Ctrl+S", description: "Squash commits dialog" },
+    crate::app::KeyCommand { key: "Ctrl+O", description: "Reload configuration from disk" },
+    crate::app::KeyCommand { key: "? / Esc", description: "Open / close this help dialog" },
+];
+
+pub const ONBOARDING_COMMANDS: &[crate::app::KeyCommand] = &[
+    crate::app::KeyCommand { key: "Ctrl+V", description: "Paste API key from clipboard" },
+    crate::app::KeyCommand { key: "Ctrl+R", description: "Show / hide entered key" },
+    crate::app::KeyCommand { key: "Ctrl+U", description: "Clear key input buffer" },
+    crate::app::KeyCommand { key: "Ctrl+O", description: "Reload configuration from disk" },
+    crate::app::KeyCommand { key: "Enter", description: "Execute selected onboarding action" },
+    crate::app::KeyCommand { key: "Esc", description: "Exit help dialog" },
+];
+
+pub fn get_mode_key_commands(mode: ViewMode) -> (&'static str, &'static [crate::app::KeyCommand]) {
+    match mode {
+        ViewMode::Develop => (" Help: Develop ", crate::input::develop::DEVELOP_COMMANDS),
+        ViewMode::Context => (" Help: Context ", crate::input::context::CONTEXT_COMMANDS),
+        ViewMode::History => (" Help: History ", crate::input::history::HISTORY_COMMANDS),
+        ViewMode::Review => (" Help: Review ", crate::input::review::REVIEW_COMMANDS),
+        ViewMode::Onboarding => (" Help: Setup ", ONBOARDING_COMMANDS),
+    }
+}
+
+pub fn render_help_popup(frame: &mut ratatui::Frame, mode: ViewMode) {
+    let (title, mode_commands) = get_mode_key_commands(mode);
+    let area = centered_rect(72, 70, frame.area());
+    frame.render_widget(Clear, area);
 
     let mut help_lines = vec![
         Line::from(Span::styled(
             "Global Navigation",
             Style::default().fg(Color::Cyan).bold(),
         )),
-        Line::from("  Ctrl+1 / 2 / 3  Tabs: 1:Develop │ 2:Context │ 3:History"),
-        Line::from("  Ctrl+M          Select active model (or click header)"),
-        Line::from("  F6 / Ctrl+S     Squash commits dialog"),
-        Line::from("  Ctrl+O          Reload configuration from disk"),
-        Line::from("  ? / Esc         Close this help dialog"),
-        Line::raw(""),
-        Line::from(Span::styled(
-            "Active Mode Shortcuts",
-            Style::default().fg(Color::Yellow).bold(),
-        )),
     ];
-    help_lines.extend(specific_lines);
+
+    for cmd in GLOBAL_COMMANDS {
+        help_lines.push(Line::from(vec![
+            Span::styled(format!("  {:<20}", cmd.key), Style::default().fg(Color::White).bold()),
+            Span::styled(cmd.description, Style::default().fg(Color::Gray)),
+        ]));
+    }
+
+    help_lines.push(Line::raw(""));
+    help_lines.push(Line::from(Span::styled(
+        "Active Mode Shortcuts",
+        Style::default().fg(Color::Yellow).bold(),
+    )));
+
+    for cmd in mode_commands {
+        help_lines.push(Line::from(vec![
+            Span::styled(format!("  {:<20}", cmd.key), Style::default().fg(Color::White).bold()),
+            Span::styled(cmd.description, Style::default().fg(Color::Gray)),
+        ]));
+    }
 
     let popup_block = Paragraph::new(help_lines)
         .block(

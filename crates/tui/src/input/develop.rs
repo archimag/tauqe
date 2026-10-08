@@ -5,9 +5,24 @@ use tokio::process::ChildStdin;
 use tokio::sync::Mutex;
 use tauqe_protocol::{methods, GitSquashPreviewParams, ModelAskParams};
 
-use crate::app::AppState;
+use crate::app::{AppState, KeyCommand};
 use crate::input::InputResult;
 use crate::rpc::send_request;
+
+pub const DEVELOP_COMMANDS: &[KeyCommand] = &[
+    KeyCommand { key: "Enter", description: "Send prompt or expand diff" },
+    KeyCommand { key: "Shift+Enter / Ctrl+J", description: "Insert newline into prompt" },
+    KeyCommand { key: "Alt+C / c / y", description: "Copy model response to clipboard" },
+    KeyCommand { key: "u", description: "Undo last AI commit (when prompt empty)" },
+    KeyCommand { key: "F6 / Ctrl+S / s", description: "Squash commits dialog" },
+    KeyCommand { key: "[ / ]", description: "Navigate between modified files" },
+    KeyCommand { key: "Space / Tab", description: "Fold / unfold diff (when prompt empty)" },
+    KeyCommand { key: "Esc", description: "Interrupt generation or clear prompt" },
+    KeyCommand { key: "Alt+↑ / Alt+↓", description: "Scroll model response up / down" },
+    KeyCommand { key: "PgUp / PgDn", description: "Page scroll response view" },
+    KeyCommand { key: "Home / End", description: "Jump to beginning / end of response" },
+    KeyCommand { key: "Ctrl+A/E/K/U/Y", description: "Emacs editor line navigation" },
+];
 
 pub async fn handle_develop_key(
     key: KeyEvent,
@@ -134,6 +149,32 @@ pub async fn handle_develop_key(
                 }
                 return Ok(InputResult::Continue);
             }
+            KeyCode::Char('c') | KeyCode::Char('C') | KeyCode::Char('y') | KeyCode::Char('Y') => {
+                if st.model.is_busy() {
+                    st.model.git_notification = Some(
+                        "Cannot copy while model is generating".to_string(),
+                    );
+                } else if st.model.text.trim().is_empty() {
+                    st.model.copy_notification = Some((
+                        "No model response to copy".to_string(),
+                        std::time::Instant::now(),
+                    ));
+                } else {
+                    let text = st.model.text.clone();
+                    if crate::clipboard::copy_to_clipboard(&text) {
+                        st.model.copy_notification = Some((
+                            "Model response copied to clipboard".to_string(),
+                            std::time::Instant::now(),
+                        ));
+                    } else {
+                        st.model.copy_notification = Some((
+                            "Failed to copy to clipboard".to_string(),
+                            std::time::Instant::now(),
+                        ));
+                    }
+                }
+                return Ok(InputResult::Continue);
+            }
             _ => {}
         }
     }
@@ -147,6 +188,31 @@ pub async fn handle_develop_key(
                 st.confirm_cancel = true;
             } else if !st.input_editor.is_empty() {
                 st.input_editor.clear();
+            }
+        }
+        KeyCode::Char('c') | KeyCode::Char('y') if st.input_editor.is_empty() => {
+            if st.model.is_busy() {
+                st.model.git_notification = Some(
+                    "Cannot copy while model is generating".to_string(),
+                );
+            } else if st.model.text.trim().is_empty() {
+                st.input_editor.insert_char(match key.code {
+                    KeyCode::Char(ch) => ch,
+                    _ => 'c',
+                });
+            } else {
+                let text = st.model.text.clone();
+                if crate::clipboard::copy_to_clipboard(&text) {
+                    st.model.copy_notification = Some((
+                        "Model response copied to clipboard".to_string(),
+                        std::time::Instant::now(),
+                    ));
+                } else {
+                    st.model.copy_notification = Some((
+                        "Failed to copy to clipboard".to_string(),
+                        std::time::Instant::now(),
+                    ));
+                }
             }
         }
         KeyCode::Char('u') if st.input_editor.is_empty() => {

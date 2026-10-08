@@ -634,6 +634,19 @@ pub async fn execute_edit_pipeline_step<'a>(
     );
     assembly.target_language = params.target_language.map(|s| s.to_string());
 
+    let active_findings = crate::review::ReviewStorage::load_latest(&repo_root)
+        .ok()
+        .flatten()
+        .map(|session| {
+            session
+                .items
+                .into_iter()
+                .filter(|it| it.is_checked)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    assembly = assembly.with_active_review_findings(active_findings);
+
     let assembled_messages = assembly.assemble_chat_messages(prompt, protocol);
 
     let (llm_tx, mut llm_rx) = mpsc::channel::<StreamEvent>(100);

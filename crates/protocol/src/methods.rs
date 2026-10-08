@@ -30,3 +30,9 @@ pub const CREDENTIALS_SAVE: &str = "credentials/save";
 pub const CREDENTIALS_CREATE_STUB: &str = "credentials/create_stub";
 
 pub const SYSTEM_STATUS: &str = "system/status";
+
+pub const REVIEW_START: &str = "review/start";
+pub const REVIEW_CANCEL: &str = "review/cancel";
+pub const REVIEW_GET: &str = "review/get";
+pub const REVIEW_UPDATE_ITEM: &str = "review/updateItem";
+pub const REVIEW_CLEAR: &str = "review/clear";

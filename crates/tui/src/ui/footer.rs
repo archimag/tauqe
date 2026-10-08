@@ -32,7 +32,13 @@ pub fn render_footer(frame: &mut ratatui::Frame, state: &AppState, area: Rect) {
     }
 
     // 3. Status, Round, Retry, Current file indicators
-    if state.model.is_busy() {
+    if state.review.running {
+        let spin = SPINNER_FRAMES[state.model.spinner_frame % SPINNER_FRAMES.len()];
+        footer_spans.push(Span::styled(
+            format!("{} Reviewing", spin),
+            Style::default().fg(Color::Magenta).bold(),
+        ));
+    } else if state.model.is_busy() {
         let spin = SPINNER_FRAMES[state.model.spinner_frame % SPINNER_FRAMES.len()];
 
         let (status_name, status_color) = match state.model.status.as_str() {

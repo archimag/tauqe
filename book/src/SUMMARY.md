@@ -7,3 +7,4 @@
 - [3. The Autonomous Bounded Turn](ch03-bounded-turn/lifecycle.md)
 - [4. Git Safety & Transactions](ch04-git-safety/checkpoints-and-undo.md)
 - [5. Keyboard-First Interface](ch05-interface/tui-ux.md)
+- [6. Code Review](ch06-review/review.md)

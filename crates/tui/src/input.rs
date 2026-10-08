@@ -14,6 +14,7 @@ pub mod dialogs;
 pub mod history;
 pub mod mouse;
 pub mod onboarding;
+pub mod review;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InputResult {
@@ -29,7 +30,9 @@ pub async fn handle_terminal_event(
     match terminal_event {
         crossterm::event::Event::Paste(text) => {
             let mut st = state.lock().await;
-            if st.view_mode == ViewMode::Develop
+            if let Some(dialog) = st.review_dialog.as_mut() {
+                dialog.prompt.push_str(&text.replace(['\n', '\r'], " "));
+            } else if st.view_mode == ViewMode::Develop
                 && !st.show_help
                 && !st.confirm_undo
                 && !st.confirm_clear_history
@@ -68,6 +71,7 @@ pub async fn handle_terminal_event(
                 ViewMode::Context => context::handle_context_key(key, state, server_writer).await,
                 ViewMode::Onboarding => onboarding::handle_onboarding_key(key, state, server_writer).await,
                 ViewMode::History => history::handle_history_key(key, state, server_writer).await,
+                ViewMode::Review => review::handle_review_key(key, state, server_writer).await,
             }
         }
         _ => Ok(InputResult::Continue),
@@ -94,6 +98,11 @@ async fn handle_global_shortcuts(
                 return Ok(Some(InputResult::Continue));
             }
             KeyCode::Char('3') => {
+                st.view_mode = ViewMode::Review;
+                st.context_view.status_message = None;
+                return Ok(Some(InputResult::Continue));
+            }
+            KeyCode::Char('4') => {
                 st.view_mode = ViewMode::History;
                 st.history_view.auto_scroll = true;
                 st.context_view.status_message = None;
@@ -122,9 +131,16 @@ async fn handle_global_shortcuts(
                 return Ok(Some(InputResult::Continue));
             }
             KeyCode::Char('r') => {
-                st.model.show_reasoning = !st.model.show_reasoning;
-                let h = st.last_model_height;
-                st.model.clamp_scroll(h);
+                match st.view_mode {
+                    ViewMode::Review => {
+                        st.review.reasoning.toggle_fold();
+                    }
+                    _ => {
+                        st.model.reasoning.toggle_fold();
+                        let h = st.last_model_height;
+                        st.model.clamp_scroll(h);
+                    }
+                }
                 return Ok(Some(InputResult::Continue));
             }
             KeyCode::Char('m') => {

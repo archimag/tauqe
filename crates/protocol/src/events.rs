@@ -24,3 +24,11 @@ pub const GIT_UNDO_COMPLETED: &str = "git/undoCompleted";
 pub const GIT_SQUASH_COMPLETED: &str = "git/squashCompleted";
 
 pub const CONFIG_CHANGED: &str = "config/changed";
+
+pub const REVIEW_STARTED: &str = "review/started";
+pub const REVIEW_REASONING_DELTA: &str = "review/reasoningDelta";
+pub const REVIEW_CONTENT_DELTA: &str = "review/contentDelta";
+pub const REVIEW_FINISHED: &str = "review/finished";
+pub const REVIEW_CANCELLED: &str = "review/cancelled";
+pub const REVIEW_ERROR: &str = "review/error";
+pub const REVIEW_STATE_CHANGED: &str = "review/stateChanged";

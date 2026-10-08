@@ -35,13 +35,106 @@ pub struct StreamingFileEdit {
     pub retry_info: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct ReasoningState {
+    pub text: String,
+    pub lines: Vec<Line<'static>>,
+    pub show: bool,
+}
+
+impl Default for ReasoningState {
+    fn default() -> Self {
+        Self {
+            text: String::new(),
+            lines: Vec::new(),
+            show: true,
+        }
+    }
+}
+
+impl ReasoningState {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn clear(&mut self) {
+        self.text.clear();
+        self.lines.clear();
+        self.show = true;
+    }
+
+    pub fn append_delta(&mut self, delta: &str) {
+        self.text.push_str(delta);
+        self.update_markdown();
+    }
+
+    pub fn update_markdown(&mut self) {
+        self.lines = crate::markdown::render_markdown(
+            &self.text,
+            &crate::markdown::MarkdownTheme::reasoning(),
+        );
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.text.is_empty()
+    }
+
+    pub fn toggle_fold(&mut self) {
+        self.show = !self.show;
+    }
+
+    pub fn render_lines(&self) -> Vec<Line<'static>> {
+        if self.text.is_empty() {
+            return Vec::new();
+        }
+
+        let mut lines = Vec::new();
+        let reasoning_badge = Span::styled(
+            " [REASONING] ",
+            Style::default().bg(Color::Rgb(60, 90, 140)).fg(Color::White).bold(),
+        );
+
+        if self.show {
+            lines.push(Line::from(vec![
+                reasoning_badge,
+                Span::raw(" "),
+                Span::styled(
+                    "Thinking (Ctrl+R to fold)",
+                    Style::default().fg(Color::Rgb(130, 170, 220)).bold(),
+                ),
+            ]));
+
+            if !self.lines.is_empty() {
+                lines.extend(self.lines.iter().cloned());
+            } else {
+                let text_style = Style::default()
+                    .fg(Color::Rgb(130, 165, 210))
+                    .add_modifier(ratatui::style::Modifier::DIM);
+                for line in self.text.lines() {
+                    lines.push(Line::from(Span::styled(line.to_string(), text_style)));
+                }
+            }
+        } else {
+            lines.push(Line::from(vec![
+                reasoning_badge,
+                Span::raw(" "),
+                Span::styled(
+                    "▶ Thinking hidden (Ctrl+R to expand)",
+                    Style::default().fg(Color::DarkGray).bold(),
+                ),
+            ]));
+        }
+
+        lines
+    }
+}
+
 pub struct DevelopView {
     pub operation_id: Option<String>,
     pub model: Option<String>,
-    pub reasoning: String,
+    pub reasoning: ReasoningState,
     pub text: String,
     pub markdown_lines: Vec<Line<'static>>,
-    pub reasoning_lines: Vec<Line<'static>>,
     pub usage: Option<ModelUsageEvent>,
     pub prev_cost: Option<f64>,
     pub current_cost: Option<f64>,
@@ -50,7 +143,6 @@ pub struct DevelopView {
     pub error: Option<String>,
     pub result: Option<ModelResult>,
     pub scroll: u16,
-    pub show_reasoning: bool,
     pub auto_scroll: bool,
 
     // Structured Org-Mode Edits & Git State
@@ -77,10 +169,9 @@ impl Default for DevelopView {
         Self {
             operation_id: None,
             model: None,
-            reasoning: String::new(),
+            reasoning: ReasoningState::default(),
             text: String::new(),
             markdown_lines: Vec::new(),
-            reasoning_lines: Vec::new(),
             usage: None,
             prev_cost: None,
             current_cost: None,
@@ -89,7 +180,6 @@ impl Default for DevelopView {
             error: None,
             result: None,
             scroll: 0,
-            show_reasoning: true,
             auto_scroll: true,
             edits_active: false,
             files: Vec::new(),
@@ -135,10 +225,7 @@ impl DevelopView {
     }
 
     pub fn update_reasoning_markdown(&mut self) {
-        self.reasoning_lines = crate::markdown::render_markdown(
-            &self.reasoning,
-            &crate::markdown::MarkdownTheme::reasoning(),
-        );
+        self.reasoning.update_markdown();
     }
 
     pub fn max_scroll(&self, view_height: u16) -> u16 {
@@ -198,11 +285,11 @@ impl DevelopView {
                 line_idx += 1;
             }
             line_idx += 1;
-            if self.show_reasoning {
-                if !self.reasoning_lines.is_empty() {
-                    line_idx += self.reasoning_lines.len();
+            if self.reasoning.show {
+                if !self.reasoning.lines.is_empty() {
+                    line_idx += self.reasoning.lines.len();
                 } else {
-                    line_idx += self.reasoning.lines().count();
+                    line_idx += self.reasoning.text.lines().count();
                 }
             }
         }
@@ -335,42 +422,7 @@ pub fn compute_model_lines(model: &DevelopView) -> Vec<Line<'static>> {
         if !model.text.is_empty() || !model_lines.is_empty() {
             model_lines.push(Line::raw(""));
         }
-
-        let reasoning_badge = Span::styled(
-            " [REASONING] ",
-            Style::default().bg(Color::Rgb(60, 90, 140)).fg(Color::White).bold(),
-        );
-
-        if model.show_reasoning {
-            model_lines.push(Line::from(vec![
-                reasoning_badge,
-                Span::raw(" "),
-                Span::styled(
-                    "Thinking (Ctrl+R to fold)",
-                    Style::default().fg(Color::Rgb(130, 170, 220)).bold(),
-                ),
-            ]));
-
-            if !model.reasoning_lines.is_empty() {
-                model_lines.extend(model.reasoning_lines.iter().cloned());
-            } else {
-                let text_style = Style::default()
-                    .fg(Color::Rgb(130, 165, 210))
-                    .add_modifier(ratatui::style::Modifier::DIM);
-                for line in model.reasoning.lines() {
-                    model_lines.push(Line::from(Span::styled(line.to_string(), text_style)));
-                }
-            }
-        } else {
-            model_lines.push(Line::from(vec![
-                reasoning_badge,
-                Span::raw(" "),
-                Span::styled(
-                    "▶ Thinking hidden (Ctrl+R to expand)",
-                    Style::default().fg(Color::DarkGray).bold(),
-                ),
-            ]));
-        }
+        model_lines.extend(model.reasoning.render_lines());
     }
 
     if model.edits_active || !model.files.is_empty() {

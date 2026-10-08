@@ -3,6 +3,7 @@ pub mod context;
 pub mod git;
 pub mod history;
 pub mod model;
+pub mod review;
 
 use std::path::Path;
 use std::sync::Arc;
@@ -42,6 +43,11 @@ pub async fn handle_request(req: Request, state: &Arc<AppState>) -> Response {
         methods::MODEL_ASK => model::handle_model_ask(req, state).await,
         methods::MODEL_CANCEL => model::handle_model_cancel(req, state).await,
         methods::MODEL_CLEAR_HISTORY => model::handle_model_clear_history(req, state).await,
+
+        methods::REVIEW_START => review::handle_review_start(req, state).await,
+        methods::REVIEW_CANCEL => review::handle_review_cancel(req, state).await,
+        methods::REVIEW_GET => review::handle_review_get(req, state).await,
+        methods::REVIEW_UPDATE_ITEM => review::handle_review_update_item(req, state).await,
 
         methods::CONFIG_GET => config::handle_config_get(req, state).await,
         methods::CONFIG_SET => config::handle_config_set(req, state).await,

@@ -13,6 +13,7 @@ pub mod history;
 pub mod prompt;
 pub mod providers;
 pub mod repomap;
+pub mod review;
 pub mod toolchain;
 pub mod workflow;
 

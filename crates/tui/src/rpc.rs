@@ -14,7 +14,8 @@ use tauqe_protocol::{
     HistoryEntryAddedEvent, HistoryGetResult, InitializeParams, InitializeResult, Message,
     ModelDeltaEvent, ModelErrorEvent, ModelFinishedEvent, ModelRef, ModelResultEvent,
     ModelStartedEvent, ModelUsageEvent, RepositoryListFilesResult, RepositoryState, Request,
-    RequestId, Response, PROTOCOL_VERSION,
+    RequestId, Response, ReviewContentDeltaEvent, ReviewErrorEvent, ReviewFinishedEvent,
+    ReviewGetResult, ReviewReasoningDeltaEvent, ReviewUpdateItemResult, PROTOCOL_VERSION,
 };
 
 static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(10);
@@ -541,6 +542,11 @@ pub async fn handle_response(resp: Response, state: &Arc<Mutex<AppState>>) {
 
     let mut st = state.lock().await;
     if let Some(err) = resp.error {
+        if method.as_deref() == Some(methods::REVIEW_START) {
+            st.review.running = false;
+            st.review.error = Some(err.message);
+            return;
+        }
         if let Some(ref mut dialog) = st.squash_dialog {
             dialog.loading = false;
             dialog.status_message = Some(format!("Error: {}", err.message));
@@ -732,6 +738,23 @@ pub async fn handle_response(resp: Response, state: &Arc<Mutex<AppState>>) {
                 }
                 return;
             }
+            methods::REVIEW_GET => {
+                if let Ok(res) = serde_json::from_value::<ReviewGetResult>(val.clone()) {
+                    if let Some(session) = res.session {
+                        st.review.set_session(session);
+                    }
+                }
+                return;
+            }
+            methods::REVIEW_UPDATE_ITEM => {
+                if let Ok(res) = serde_json::from_value::<ReviewUpdateItemResult>(val.clone()) {
+                    st.review.apply_item(res.item);
+                }
+                return;
+            }
+            methods::REVIEW_START | methods::REVIEW_CANCEL => {
+                return;
+            }
             methods::SYSTEM_STATUS
             | methods::CONFIG_RELOAD
             | methods::CONFIG_CREATE
@@ -863,16 +886,15 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
                         st.model.status = "thinking".to_string();
                         if !*is_reasoning {
                             *is_reasoning = true;
-                            st.model.show_reasoning = true;
-                            if !st.model.reasoning.is_empty() && !st.model.reasoning.ends_with("\n\n") {
-                                st.model.reasoning.push_str("\n\n---\n\n");
+                            st.model.reasoning.show = true;
+                            if !st.model.reasoning.is_empty() && !st.model.reasoning.text.ends_with("\n\n") {
+                                st.model.reasoning.text.push_str("\n\n---\n\n");
                             }
                             let h = st.last_model_height;
                             st.model.clamp_scroll(h);
                         }
                     }
-                    st.model.reasoning.push_str(&data.delta);
-                    st.model.update_reasoning_markdown();
+                    st.model.reasoning.append_delta(&data.delta);
                     if st.model.auto_scroll {
                         let h = st.last_model_height;
                         st.model.scroll = st.model.max_scroll(h);
@@ -891,7 +913,7 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
                         }
                         if *is_reasoning {
                             *is_reasoning = false;
-                            st.model.show_reasoning = false;
+                            st.model.reasoning.show = false;
                             let h = st.last_model_height;
                             st.model.clamp_scroll(h);
                         }
@@ -1090,6 +1112,48 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
                     st.model.error = Some(data.message);
                     let h = st.last_model_height;
                     st.model.clamp_scroll(h);
+                }
+            }
+        }
+        events::REVIEW_STARTED => {
+            st.review.running = true;
+        }
+        events::REVIEW_REASONING_DELTA => {
+            if let Some(params) = ev.params {
+                if let Ok(data) = serde_json::from_value::<ReviewReasoningDeltaEvent>(params) {
+                    st.review.reasoning.append_delta(&data.delta);
+                }
+            }
+        }
+        events::REVIEW_CONTENT_DELTA => {
+            if let Some(params) = ev.params {
+                if let Ok(data) = serde_json::from_value::<ReviewContentDeltaEvent>(params) {
+                    st.review.content.push_str(&data.delta);
+                }
+            }
+        }
+        events::REVIEW_FINISHED => {
+            if let Some(params) = ev.params {
+                if let Ok(data) = serde_json::from_value::<ReviewFinishedEvent>(params) {
+                    if let Some(total) = data.session_total_cost {
+                        st.model.session_total_cost = total;
+                    }
+                    if let Some(cost) = data.current_cost {
+                        st.model.prev_cost = Some(cost);
+                    }
+                    st.review.set_session(data.session);
+                }
+            }
+        }
+        events::REVIEW_CANCELLED => {
+            st.review.running = false;
+            st.review.error = Some("Review cancelled".to_string());
+        }
+        events::REVIEW_ERROR => {
+            if let Some(params) = ev.params {
+                if let Ok(data) = serde_json::from_value::<ReviewErrorEvent>(params) {
+                    st.review.running = false;
+                    st.review.error = Some(data.message);
                 }
             }
         }

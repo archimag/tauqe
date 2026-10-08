@@ -35,6 +35,16 @@ pub enum HistoryEntry {
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         restored_checkpoint: bool,
     },
+    Review {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<u64>,
+        model: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        user_prompt: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        files: Vec<String>,
+        findings_count: usize,
+    },
 }
 
 impl HistoryEntry {
@@ -43,7 +53,8 @@ impl HistoryEntry {
             HistoryEntry::Summary { id, .. }
             | HistoryEntry::Turn { id, .. }
             | HistoryEntry::Response { id, .. }
-            | HistoryEntry::Undo { id, .. } => *id,
+            | HistoryEntry::Undo { id, .. }
+            | HistoryEntry::Review { id, .. } => *id,
         }
     }
 
@@ -136,5 +147,24 @@ mod tests {
 
         let parsed_false = HistoryEntry::from_jsonl_line(&json_false).unwrap();
         assert_eq!(parsed_false, entry_false);
+    }
+
+    #[test]
+    fn test_review_serialization() {
+        let entry = HistoryEntry::Review {
+            id: Some(5),
+            model: "anthropic/claude-3.7-sonnet".to_string(),
+            user_prompt: Some("Focus on security".to_string()),
+            files: vec!["crates/server/src/main.rs".to_string()],
+            findings_count: 3,
+        };
+        let json = entry.to_jsonl_line().unwrap();
+        assert_eq!(
+            json,
+            r#"{"type":"review","id":5,"model":"anthropic/claude-3.7-sonnet","user_prompt":"Focus on security","files":["crates/server/src/main.rs"],"findings_count":3}"#
+        );
+
+        let parsed = HistoryEntry::from_jsonl_line(&json).unwrap();
+        assert_eq!(parsed, entry);
     }
 }

@@ -16,6 +16,7 @@ pub mod history;
 pub mod message;
 pub mod methods;
 pub mod model;
+pub mod review;
 
 pub use config::*;
 pub use context::*;
@@ -26,3 +27,4 @@ pub use glob::*;
 pub use history::*;
 pub use message::*;
 pub use model::*;
+pub use review::*;

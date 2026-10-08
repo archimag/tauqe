@@ -4,6 +4,13 @@ use crate::editor::InputEditor;
 use crate::ui::context::ContextViewState;
 use crate::ui::develop::DevelopView;
 use crate::ui::history::HistoryViewState;
+use crate::ui::review::ReviewViewState;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KeyCommand {
+    pub key: &'static str,
+    pub description: &'static str,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SelectionDialogKind {
@@ -22,7 +29,17 @@ pub enum ViewMode {
     Develop,
     Context,
     History,
+    Review,
     Onboarding,
+}
+
+#[derive(Debug, Clone)]
+pub struct ReviewDialogState {
+    pub files_count: usize,
+    pub estimated_tokens: usize,
+    pub models: Vec<ModelRef>,
+    pub model_index: usize,
+    pub prompt: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -87,6 +104,7 @@ pub struct HeaderClickAreas {
     pub develop_tab: (u16, u16),
     pub context_tab: (u16, u16),
     pub history_tab: (u16, u16),
+    pub review_tab: (u16, u16),
     pub model_select: (u16, u16),
     pub squash_button: (u16, u16),
     pub help_button: (u16, u16),
@@ -178,6 +196,7 @@ pub struct AppState {
     pub context: ContextState,
     pub context_view: ContextViewState,
     pub history_view: HistoryViewState,
+    pub review: ReviewViewState,
     pub onboarding: OnboardingState,
     pub input_editor: InputEditor,
     pub show_help: bool,
@@ -186,6 +205,7 @@ pub struct AppState {
     pub confirm_clear_history: bool,
     pub selection_dialog: Option<SelectionDialogState>,
     pub squash_dialog: Option<SquashDialogState>,
+    pub review_dialog: Option<ReviewDialogState>,
     pub last_model_height: u16,
     pub header_clicks: HeaderClickAreas,
     pub footer_clicks: FooterClickAreas,
@@ -196,7 +216,7 @@ impl AppState {
         if self.input_editor.is_empty() {
             return None;
         }
-        if self.model.is_busy() {
+        if self.model.is_busy() || self.review.running {
             self.model.git_notification = Some(
                 "Model is generating. Press Esc to cancel or wait until done.".to_string(),
             );
@@ -213,13 +233,11 @@ impl AppState {
         self.model.reasoning.clear();
         self.model.text.clear();
         self.model.markdown_lines.clear();
-        self.model.reasoning_lines.clear();
         self.model.error = None;
         self.model.result = None;
         self.model.usage = None;
         self.model.scroll = 0;
         self.model.status = "awaiting".to_string();
-        self.model.show_reasoning = true;
         self.model.auto_scroll = true;
         self.model.current_cost = Some(0.0);
 
@@ -270,6 +288,8 @@ mod tests {
             context: ContextState::default(),
             context_view: ContextViewState::default(),
             history_view: HistoryViewState::default(),
+            review: ReviewViewState::default(),
+            review_dialog: None,
             onboarding: OnboardingState::default(),
             input_editor: InputEditor::default(),
             show_help: false,

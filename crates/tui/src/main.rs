@@ -24,6 +24,7 @@ use crate::input::InputResult;
 use crate::ui::context::ContextViewState;
 use crate::ui::develop::{DevelopView, SPINNER_FRAMES};
 use crate::ui::history::HistoryViewState;
+use crate::ui::review::ReviewViewState;
 use crate::ui::render_ui;
 
 #[tokio::main]
@@ -82,6 +83,8 @@ async fn main() -> anyhow::Result<()> {
         context: initial_context,
         context_view: ContextViewState::default(),
         history_view: HistoryViewState::default(),
+        review: ReviewViewState::default(),
+        review_dialog: None,
         onboarding: onboarding_state,
         input_editor: InputEditor::default(),
         show_help: false,
@@ -105,6 +108,9 @@ async fn main() -> anyhow::Result<()> {
         })?,
     )
     .await?;
+
+    // Restore the latest saved review (if any)
+    rpc::send_request(&mut server_writer, methods::REVIEW_GET, serde_json::json!({})).await?;
 
     // Safety net: restore the terminal before reporting any unexpected panic
     let original_hook = std::panic::take_hook();

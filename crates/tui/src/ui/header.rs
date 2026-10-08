@@ -21,28 +21,20 @@ pub fn render_header(frame: &mut ratatui::Frame, state: &mut AppState, area: Rec
     let inner_header_width = area.width.saturating_sub(2) as usize;
     let mut current_col: u16 = 1;
 
-    let (develop_tab_style, context_tab_style, history_tab_style) = match state.view_mode {
-        ViewMode::Develop => (
-            Style::default().bg(Color::Blue).fg(Color::White).bold(),
-            Style::default().bg(Color::DarkGray).fg(Color::White),
-            Style::default().bg(Color::DarkGray).fg(Color::White),
-        ),
-        ViewMode::Context => (
-            Style::default().bg(Color::DarkGray).fg(Color::White),
-            Style::default().bg(Color::Blue).fg(Color::White).bold(),
-            Style::default().bg(Color::DarkGray).fg(Color::White),
-        ),
-        ViewMode::History => (
-            Style::default().bg(Color::DarkGray).fg(Color::White),
-            Style::default().bg(Color::DarkGray).fg(Color::White),
-            Style::default().bg(Color::Blue).fg(Color::White).bold(),
-        ),
-        ViewMode::Onboarding => (
-            Style::default().bg(Color::DarkGray).fg(Color::White),
-            Style::default().bg(Color::DarkGray).fg(Color::White),
-            Style::default().bg(Color::DarkGray).fg(Color::White),
-        ),
+    let active_mode = state.view_mode;
+    let active_style = Style::default().bg(Color::Blue).fg(Color::White).bold();
+    let inactive_style = Style::default().bg(Color::DarkGray).fg(Color::White);
+    let tab_style = |mode: ViewMode| {
+        if active_mode == mode {
+            active_style
+        } else {
+            inactive_style
+        }
     };
+    let develop_tab_style = tab_style(ViewMode::Develop);
+    let context_tab_style = tab_style(ViewMode::Context);
+    let history_tab_style = tab_style(ViewMode::History);
+    let review_tab_style = tab_style(ViewMode::Review);
 
     let mut header_spans = Vec::new();
 
@@ -72,7 +64,15 @@ pub fn render_header(frame: &mut ratatui::Frame, state: &mut AppState, area: Rec
     state.header_clicks.context_tab = (ctx_start, ctx_start + ctx_len.saturating_sub(1));
     current_col += ctx_len + 1;
 
-    let tab_hist_text = format!(" 3: History ({}) ", state.history_view.total_count);
+    let tab_review_text = " 3: Review ";
+    let review_start = current_col;
+    let review_len = tab_review_text.chars().count() as u16;
+    header_spans.push(Span::styled(tab_review_text, review_tab_style));
+    header_spans.push(Span::raw(" "));
+    state.header_clicks.review_tab = (review_start, review_start + review_len.saturating_sub(1));
+    current_col += review_len + 1;
+
+    let tab_hist_text = format!(" 4: History ({}) ", state.history_view.total_count);
     let hist_start = current_col;
     let hist_len = tab_hist_text.chars().count() as u16;
     header_spans.push(Span::styled(&tab_hist_text, history_tab_style));

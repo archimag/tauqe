@@ -10,15 +10,17 @@ pub mod geometry;
 pub mod header;
 pub mod history;
 pub mod onboarding;
+pub mod review;
 pub mod wrap;
 
 use context::render_context_view;
 use develop::render::render_develop_view;
 use history::render_history_view;
+use review::render_review_view;
 
 pub use dialogs::{
     render_confirm_cancel_popup, render_confirm_clear_history_popup, render_confirm_undo_popup,
-    render_help_popup, render_selection_dialog, render_squash_popup,
+    render_help_popup, render_review_dialog, render_selection_dialog, render_squash_popup,
 };
 pub use footer::{extract_current_round, format_footer_cost, render_footer};
 pub use geometry::centered_rect;
@@ -63,6 +65,9 @@ pub fn render_ui(frame: &mut ratatui::Frame, state: &mut AppState) {
         ViewMode::History => {
             render_history_view(frame, state, chunks[1], chunks[2]);
         }
+        ViewMode::Review => {
+            render_review_view(frame, state, chunks[1], chunks[2]);
+        }
     }
 
     if state.view_mode != ViewMode::Onboarding {
@@ -71,6 +76,8 @@ pub fn render_ui(frame: &mut ratatui::Frame, state: &mut AppState) {
 
     if let Some(dialog) = &state.squash_dialog {
         render_squash_popup(frame, dialog);
+    } else if let Some(dialog) = &state.review_dialog {
+        render_review_dialog(frame, dialog);
     } else if state.confirm_cancel {
         render_confirm_cancel_popup(frame, state);
     } else if state.confirm_undo {

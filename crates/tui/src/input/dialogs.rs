@@ -5,7 +5,7 @@ use tokio::process::ChildStdin;
 use tokio::sync::Mutex;
 use tauqe_protocol::{
     methods, ConfigSetParams, GitSquashApplyParams, GitSquashGenerateMessageParams,
-    GitSquashPreviewParams,
+    GitSquashPreviewParams, ReviewStartParams,
 };
 
 use crate::app::{AppState, SquashBaseMode, SquashDialogFocus};
@@ -209,6 +209,49 @@ pub async fn handle_dialog_event(
             }
             _ => {
                 st.squash_dialog = Some(dialog);
+            }
+        }
+        return Ok(Some(InputResult::Continue));
+    }
+
+    // 1b. Review launch dialog
+    if let Some(mut dialog) = st.review_dialog.take() {
+        match key.code {
+            KeyCode::Esc => {}
+            KeyCode::Enter => {
+                let prompt = dialog.prompt.trim().to_string();
+                let params = ReviewStartParams {
+                    model: dialog.models.get(dialog.model_index).cloned(),
+                    user_prompt: if prompt.is_empty() { None } else { Some(prompt) },
+                };
+                st.review.begin();
+                drop(st);
+                send_request(
+                    server_writer,
+                    methods::REVIEW_START,
+                    serde_json::to_value(params)?,
+                )
+                .await?;
+                return Ok(Some(InputResult::Continue));
+            }
+            code => {
+                let count = dialog.models.len();
+                match code {
+                    KeyCode::Up | KeyCode::BackTab if count > 0 => {
+                        dialog.model_index = (dialog.model_index + count - 1) % count;
+                    }
+                    KeyCode::Down | KeyCode::Tab if count > 0 => {
+                        dialog.model_index = (dialog.model_index + 1) % count;
+                    }
+                    KeyCode::Backspace => {
+                        dialog.prompt.pop();
+                    }
+                    KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        dialog.prompt.push(c);
+                    }
+                    _ => {}
+                }
+                st.review_dialog = Some(dialog);
             }
         }
         return Ok(Some(InputResult::Continue));

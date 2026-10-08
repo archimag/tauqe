@@ -8,10 +8,23 @@ use tauqe_protocol::{
     ContextRemoveParams, ContextSetAccessParams,
 };
 
-use crate::app::{AppState, ViewMode};
+use crate::app::{AppState, KeyCommand, ViewMode};
 use crate::input::InputResult;
 use crate::rpc::send_request;
 use crate::ui::context::ContextRow;
+
+pub const CONTEXT_COMMANDS: &[KeyCommand] = &[
+    KeyCommand { key: "e", description: "Add file to context as editable" },
+    KeyCommand { key: "r / a", description: "Add file to context as read-only" },
+    KeyCommand { key: "t", description: "Toggle access (Editable ↔ Read-Only)" },
+    KeyCommand { key: "p / u", description: "Promote Auto file to persistent User file" },
+    KeyCommand { key: "c / C", description: "Clear all auto-requested files (Auto)" },
+    KeyCommand { key: "d / x / Del", description: "Remove file from context" },
+    KeyCommand { key: "Space / Tab", description: "Fold / unfold section" },
+    KeyCommand { key: "↑/↓ or k/j", description: "Move selection up / down" },
+    KeyCommand { key: "Enter", description: "Promote Auto file or toggle section" },
+    KeyCommand { key: "Esc / q", description: "Return to Develop view" },
+];
 
 pub async fn handle_context_key(
     key: KeyEvent,

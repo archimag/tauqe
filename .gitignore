@@ -26,3 +26,6 @@ Thumbs.db
 
 # Tauqe runtime artifacts
 .tauqe/
+
+# mdBook build artifacts
+book/book/

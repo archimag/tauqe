@@ -1,7 +1,7 @@
 use crate::context::ContextFileContent;
 use crate::edits::EditProtocol;
 use crate::providers::ChatMessage;
-use tauqe_protocol::{ContextAccess, RepositoryState};
+use tauqe_protocol::{ContextAccess, RepositoryState, ReviewItem};
 
 pub fn build_squash_commit_prompt(
     commits: &[crate::git::CommitSummary],
@@ -76,6 +76,7 @@ pub struct PromptAssembly {
     pub history_tag: Option<String>,
     pub repo_map: Option<String>,
     pub target_language: Option<String>,
+    pub active_review_findings: Vec<ReviewItem>,
 }
 
 impl PromptAssembly {
@@ -97,7 +98,13 @@ impl PromptAssembly {
             history_tag,
             repo_map,
             target_language: None,
+            active_review_findings: Vec::new(),
         }
+    }
+
+    pub fn with_active_review_findings(mut self, findings: Vec<ReviewItem>) -> Self {
+        self.active_review_findings = findings;
+        self
     }
 
     pub fn with_target_language(mut self, target_language: Option<String>) -> Self {
@@ -268,6 +275,12 @@ impl PromptAssembly {
             system_text.push_str("\n\n");
         }
 
+        if let Some(review_block) = crate::review::format_active_review_findings(&self.active_review_findings) {
+            system_text.push_str("## Active Review Directives\n");
+            system_text.push_str(&review_block);
+            system_text.push_str("\n\n");
+        }
+
         if let Some(target_lang) = &self.target_language {
             system_text.push_str("## Language Directive\n");
             system_text.push_str(&format!("- Target Response Language: {} (all conversational explanations, answers, and messages MUST be in {})\n", target_lang, target_lang));
@@ -371,10 +384,30 @@ mod tests {
     }
 
     #[test]
+    fn test_prompt_assembly_with_active_review_findings() {
+        let files = vec![];
+        let mut assembly = PromptAssembly::new(None, 1, files, "git", "xml", None, None);
+        assembly.active_review_findings = vec![ReviewItem {
+            id: 1,
+            title: "Fix potential panic on unwrap".to_string(),
+            severity: tauqe_protocol::ReviewSeverity::Critical,
+            status: tauqe_protocol::ReviewStatus::Todo,
+            is_checked: true,
+            file_path: Some("crates/server/src/main.rs".to_string()),
+            line_range: Some((42, 45)),
+            body: "Replace unwrap with match.".to_string(),
+        }];
+        let proto = XmlEditProtocol;
+        let messages = assembly.assemble_chat_messages("Resolve finding", &proto);
+        assert!(messages[0].content.contains("<active_review_findings>"));
+        assert!(messages[0].content.contains("Fix potential panic on unwrap"));
+        assert!(messages[0].content.contains("crates/server/src/main.rs:42-45"));
+    }
+
+    #[test]
     fn test_estimate_tokens() {
         assert_eq!(estimate_tokens(""), 0);
         assert_eq!(estimate_tokens("abcd"), 1);
-        assert_eq!(estimate_tokens("abcde"), 2);
         assert_eq!(estimate_tokens("abcde"), 2);
         assert_eq!(estimate_tokens("абвг"), 1);
     }

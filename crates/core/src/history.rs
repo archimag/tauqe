@@ -112,6 +112,31 @@ impl HistoryManager {
                     files: Vec::new(),
                 }
             }
+            HistoryEntry::Review {
+                model,
+                user_prompt,
+                files,
+                findings_count,
+                ..
+            } => {
+                let mut text = format!(
+                    "Code review completed with {} ({} findings across {} files)",
+                    model,
+                    findings_count,
+                    files.len()
+                );
+                if let Some(prompt) = user_prompt {
+                    text.push_str(&format!("\nFocus: {}", prompt));
+                }
+                UiHistoryItem {
+                    id: final_id,
+                    kind: UiHistoryKind::System,
+                    text,
+                    summary: Some(format!("Review: {} findings", findings_count)),
+                    commit_hash: None,
+                    files: files.clone(),
+                }
+            }
         }
     }
 
@@ -173,6 +198,26 @@ impl HistoryManager {
             id: Some(self.current_max_id),
             commit: commit.into(),
             restored_checkpoint,
+        };
+        self.storage.append_entry(&entry)?;
+        self.notify_entry(&entry);
+        Ok(entry)
+    }
+
+    pub fn record_review(
+        &mut self,
+        model: impl Into<String>,
+        user_prompt: Option<String>,
+        files: Vec<String>,
+        findings_count: usize,
+    ) -> Result<HistoryEntry> {
+        self.current_max_id += 1;
+        let entry = HistoryEntry::Review {
+            id: Some(self.current_max_id),
+            model: model.into(),
+            user_prompt,
+            files,
+            findings_count,
         };
         self.storage.append_entry(&entry)?;
         self.notify_entry(&entry);
