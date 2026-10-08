@@ -75,6 +75,70 @@ pub(crate) fn next_verify_tag(text: &str) -> Option<(usize, usize)> {
     next_simple_tag(text, "<verify")
 }
 
+/// Returns true if byte offset `target_pos` in `text` is inside a markdown fenced code block (``` or ~~~).
+fn is_inside_code_fence(text: &str, target_pos: usize) -> bool {
+    let mut in_fence: Option<(char, usize)> = None;
+    let mut line_start = 0;
+
+    while line_start < text.len() {
+        let (line, next_line_start) = match text[line_start..].find('\n') {
+            Some(nl) => (&text[line_start..line_start + nl], line_start + nl + 1),
+            None => (&text[line_start..], text.len()),
+        };
+        let line_trimmed_cr = line.strip_suffix('\r').unwrap_or(line);
+        let trimmed = line_trimmed_cr.trim_start();
+        let leading_spaces = line_trimmed_cr.len() - trimmed.len();
+
+        let is_fence_line = if leading_spaces <= 3 {
+            match trimmed.chars().next() {
+                Some(ch @ ('`' | '~')) => {
+                    let count = trimmed.chars().take_while(|&c| c == ch).count();
+                    if count >= 3 {
+                        Some((ch, count))
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+
+        if let Some((ch, count)) = is_fence_line {
+            if let Some((active_ch, active_count)) = in_fence {
+                if ch == active_ch && count >= active_count {
+                    if target_pos >= line_start && target_pos < next_line_start {
+                        return true;
+                    }
+                    in_fence = None;
+                    line_start = next_line_start;
+                    continue;
+                }
+            } else {
+                if target_pos >= line_start && target_pos < next_line_start {
+                    return true;
+                }
+                in_fence = Some((ch, count));
+                line_start = next_line_start;
+                continue;
+            }
+        }
+
+        if in_fence.is_some() && target_pos >= line_start && target_pos < next_line_start {
+            return true;
+        }
+
+        if line_start > target_pos {
+            break;
+        }
+
+        line_start = next_line_start;
+    }
+
+    in_fence.is_some() && target_pos >= line_start
+}
+
 /// Locates the next complete `<plan ...>...</plan>` or `<plan .../>` tag.
 pub(crate) fn next_plan_tag(text: &str) -> Option<(usize, usize)> {
     const OPEN: &str = "<plan";
@@ -99,6 +163,10 @@ pub(crate) fn next_plan_tag(text: &str) -> Option<(usize, usize)> {
             .next()
             .is_some_and(|c| c.is_whitespace() || c == '>' || c == '/');
         if boundary {
+            if is_inside_code_fence(text, start) {
+                from = after;
+                continue;
+            }
             let gt = rest.find('>')?;
             let end_open = after + idx + gt + 1;
             if rest[..gt].trim_end().ends_with('/') {
@@ -536,6 +604,11 @@ pub fn parse_plan_tags_with_diagnostics(text: &str) -> (Vec<ParsedPlanTag>, Vec<
             continue;
         }
 
+        if is_inside_code_fence(text, tag_start) {
+            pos = after_plan;
+            continue;
+        }
+
         let Some(gt) = rest.find('>') else {
             errors.push(format!("Malformed <{tag_name}> tag: unclosed opening tag"));
             break;
@@ -731,6 +804,34 @@ Here is our plan:
         let (plans, errors) = parse_plan_tags_with_diagnostics(text);
         assert!(plans.is_empty());
         assert!(errors.is_empty());
+    }
+
+    #[test]
+    fn test_parse_plan_tags_ignores_markdown_fences() {
+        let text = r#"
+Here is an example plan in markdown:
+```markdown
+<plan action="save" id="jwt-auth" title="JWT Auth">
+  <item id="1" title="Example item" />
+</plan>
+```
+And outside markdown:
+<plan action="save" id="real-plan" title="Real Plan">
+  <item id="1" title="Real item" />
+</plan>
+"#;
+        let (plans, errors) = parse_plan_tags_with_diagnostics(text);
+        assert!(errors.is_empty(), "Errors: {:?}", errors);
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0].id, "real-plan");
+    }
+
+    #[test]
+    fn test_strip_plan_tags_preserves_markdown_fences() {
+        let text = "Example:\n```xml\n<plan id=\"example\" title=\"Ex\" />\n```\nReal:\n<plan id=\"real\" title=\"Real\" />\nDone.";
+        let stripped = strip_plan_tags(text);
+        assert!(stripped.contains("<plan id=\"example\""));
+        assert!(!stripped.contains("<plan id=\"real\""));
     }
 
     #[test]

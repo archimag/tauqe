@@ -3,25 +3,32 @@ use std::sync::Arc;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use tokio::process::ChildStdin;
 use tokio::sync::Mutex;
-use tauqe_protocol::{methods, GitSquashPreviewParams, ModelAskParams};
+use tauqe_protocol::{methods, ModelAskParams};
 
 use crate::app::{AppState, KeyCommand};
 use crate::input::InputResult;
 use crate::rpc::send_request;
 
 pub const DEVELOP_COMMANDS: &[KeyCommand] = &[
-    KeyCommand { key: "Enter", description: "Send prompt or expand diff" },
-    KeyCommand { key: "Shift+Enter / Ctrl+J", description: "Insert newline into prompt" },
-    KeyCommand { key: "Alt+C / c / y", description: "Copy model response to clipboard" },
-    KeyCommand { key: "u", description: "Undo last AI commit (when prompt empty)" },
-    KeyCommand { key: "F6 / Ctrl+S / s", description: "Squash commits dialog" },
-    KeyCommand { key: "[ / ]", description: "Navigate between modified files" },
-    KeyCommand { key: "Space / Tab", description: "Fold / unfold diff (when prompt empty)" },
-    KeyCommand { key: "Esc", description: "Interrupt generation or clear prompt" },
-    KeyCommand { key: "Alt+↑ / Alt+↓", description: "Scroll model response up / down" },
+    KeyCommand { key: "Enter / C-Enter", description: "Send prompt" },
+    KeyCommand { key: "Shift+Enter / Alt+Enter / C-J", description: "Insert newline into prompt" },
+    KeyCommand { key: "↑ / ↓", description: "Navigate prompt lines or prompt history (scroll response when empty)" },
+    KeyCommand { key: "C-Left / C-Right / Alt+B / Alt+F", description: "Move cursor word backward / forward" },
+    KeyCommand { key: "C-A / C-E / Home / End", description: "Move cursor to beginning / end of line or response" },
+    KeyCommand { key: "C-K / C-U", description: "Kill line to end / beginning into kill ring" },
+    KeyCommand { key: "C-W / Alt+Backspace", description: "Kill word backward into kill ring" },
+    KeyCommand { key: "Alt+D", description: "Kill word forward into kill ring" },
+    KeyCommand { key: "C-D / Delete", description: "Delete character forward" },
+    KeyCommand { key: "C-B / C-F / Left / Right", description: "Move cursor character backward / forward" },
+    KeyCommand { key: "C-Y", description: "Yank (restore) text from kill ring" },
+    KeyCommand { key: "Esc", description: "Interrupt generation or clear prompt (saves to kill ring)" },
+    KeyCommand { key: "C-Z / Alt+U", description: "Undo last AI commit" },
+    KeyCommand { key: "F6 / C-S", description: "Squash commits dialog" },
+    KeyCommand { key: "C-[ / C-] / Alt+[/]", description: "Select previous / next modified file" },
+    KeyCommand { key: "Tab / C-Space / Alt+Space", description: "Fold / unfold selected file diff (when prompt is empty)" },
+    KeyCommand { key: "Alt+C / Alt+Y", description: "Copy model response to clipboard" },
     KeyCommand { key: "PgUp / PgDn", description: "Page scroll response view" },
-    KeyCommand { key: "Home / End", description: "Jump to beginning / end of response" },
-    KeyCommand { key: "Ctrl+A/E/K/U/Y", description: "Emacs editor line navigation" },
+    KeyCommand { key: "Alt+↑ / Alt+↓", description: "Scroll model response up / down" },
 ];
 
 pub async fn handle_develop_key(
@@ -29,8 +36,11 @@ pub async fn handle_develop_key(
     state: &Arc<Mutex<AppState>>,
     server_writer: &mut ChildStdin,
 ) -> anyhow::Result<InputResult> {
-    // 1. Control shortcuts in Develop view
-    if key.modifiers.contains(KeyModifiers::CONTROL) {
+    let primary_mod = { state.lock().await.tui_config.input.primary_modifier };
+    let is_primary = primary_mod.matches(key.modifiers);
+
+    // 1. Primary command modifier shortcuts (C-x in Emacs style)
+    if is_primary {
         let mut st = state.lock().await;
         match key.code {
             KeyCode::Char('a') => {
@@ -47,6 +57,10 @@ pub async fn handle_develop_key(
             }
             KeyCode::Char('u') => {
                 st.input_editor.kill_to_beginning_of_line();
+                return Ok(InputResult::Continue);
+            }
+            KeyCode::Char('w') => {
+                st.input_editor.kill_word_backward();
                 return Ok(InputResult::Continue);
             }
             KeyCode::Char('y') => {
@@ -74,33 +88,60 @@ pub async fn handle_develop_key(
                 return Ok(InputResult::Continue);
             }
             KeyCode::Char('s') => {
+                crate::input::open_squash_dialog(&mut st, server_writer).await?;
+                return Ok(InputResult::Continue);
+            }
+            KeyCode::Char('z') => {
                 if st.model.is_busy() {
-                    st.model.git_notification = Some(
-                        "Cannot squash commits while model is generating".to_string(),
-                    );
+                    st.notify_warning("Cannot undo while model is generating");
+                } else if st.model.last_commit_hash.is_none() {
+                    st.notify_warning("No AI commit to undo");
                 } else {
-                    st.squash_dialog = Some(crate::app::SquashDialogState::default());
-                    drop(st);
-                    let params = GitSquashPreviewParams { base_ref: None };
-                    send_request(
-                        server_writer,
-                        methods::GIT_SQUASH_PREVIEW,
-                        serde_json::to_value(params)?,
-                    )
-                    .await?;
+                    st.confirm_undo = true;
                 }
                 return Ok(InputResult::Continue);
             }
             KeyCode::Enter => {
                 if let Some(prompt) = st.take_prompt() {
                     drop(st);
-                    let params = ModelAskParams { prompt };
-                    send_request(server_writer, methods::MODEL_ASK, serde_json::to_value(params)?).await?;
+                    let params = ModelAskParams { prompt: prompt.clone() };
+                    if let Err(err) = send_request(server_writer, methods::MODEL_ASK, serde_json::to_value(params)?).await {
+                        let mut st = state.lock().await;
+                        st.input_editor.clear();
+                        st.input_editor.insert_str(&prompt);
+                        st.model.status = "error".to_string();
+                        st.notify_error(format!("Failed to send prompt: {}", err));
+                    }
                 }
                 return Ok(InputResult::Continue);
             }
             KeyCode::Char('j') => {
                 st.input_editor.insert_char('\n');
+                return Ok(InputResult::Continue);
+            }
+            KeyCode::Char('[') => {
+                if !st.model.files.is_empty() {
+                    st.model.selected_file_index = st.model.selected_file_index.saturating_sub(1);
+                    let h = st.last_model_height;
+                    st.model.scroll_to_selected_file(h);
+                }
+                return Ok(InputResult::Continue);
+            }
+            KeyCode::Char(']') => {
+                if !st.model.files.is_empty() && st.model.selected_file_index + 1 < st.model.files.len() {
+                    st.model.selected_file_index += 1;
+                    let h = st.last_model_height;
+                    st.model.scroll_to_selected_file(h);
+                }
+                return Ok(InputResult::Continue);
+            }
+            KeyCode::Char(' ') => {
+                let sel_idx = st.model.selected_file_index;
+                let h = st.last_model_height;
+                if let Some(file) = st.model.files.get_mut(sel_idx) {
+                    file.expanded = !file.expanded;
+                    st.model.scroll_to_selected_file(h);
+                }
                 return Ok(InputResult::Continue);
             }
             _ => {}
@@ -141,36 +182,62 @@ pub async fn handle_develop_key(
                 st.input_editor.kill_word_backward();
                 return Ok(InputResult::Continue);
             }
-            KeyCode::Enter => {
-                if let Some(prompt) = st.take_prompt() {
-                    drop(st);
-                    let params = ModelAskParams { prompt };
-                    send_request(server_writer, methods::MODEL_ASK, serde_json::to_value(params)?).await?;
+            KeyCode::Char('u') | KeyCode::Char('U') => {
+                if st.model.is_busy() {
+                    st.notify_warning("Cannot undo while model is generating");
+                } else if st.model.last_commit_hash.is_none() {
+                    st.notify_warning("No AI commit to undo");
+                } else {
+                    st.confirm_undo = true;
                 }
+                return Ok(InputResult::Continue);
+            }
+            KeyCode::Char('[') => {
+                if !st.model.files.is_empty() {
+                    st.model.selected_file_index = st.model.selected_file_index.saturating_sub(1);
+                    let h = st.last_model_height;
+                    st.model.scroll_to_selected_file(h);
+                }
+                return Ok(InputResult::Continue);
+            }
+            KeyCode::Char(']') => {
+                if !st.model.files.is_empty() && st.model.selected_file_index + 1 < st.model.files.len() {
+                    st.model.selected_file_index += 1;
+                    let h = st.last_model_height;
+                    st.model.scroll_to_selected_file(h);
+                }
+                return Ok(InputResult::Continue);
+            }
+            KeyCode::Char(' ') => {
+                let sel_idx = st.model.selected_file_index;
+                let h = st.last_model_height;
+                if let Some(file) = st.model.files.get_mut(sel_idx) {
+                    file.expanded = !file.expanded;
+                    st.model.scroll_to_selected_file(h);
+                }
+                return Ok(InputResult::Continue);
+            }
+            KeyCode::Enter => {
+                st.input_editor.insert_char('\n');
                 return Ok(InputResult::Continue);
             }
             KeyCode::Char('c') | KeyCode::Char('C') | KeyCode::Char('y') | KeyCode::Char('Y') => {
                 if st.model.is_busy() {
-                    st.model.git_notification = Some(
-                        "Cannot copy while model is generating".to_string(),
-                    );
+                    st.notify_warning("Cannot copy while model is generating");
                 } else if st.model.text.trim().is_empty() {
-                    st.model.copy_notification = Some((
-                        "No model response to copy".to_string(),
-                        std::time::Instant::now(),
-                    ));
+                    st.notify_warning("No model response to copy");
                 } else {
                     let text = st.model.text.clone();
-                    if crate::clipboard::copy_to_clipboard(&text) {
-                        st.model.copy_notification = Some((
-                            "Model response copied to clipboard".to_string(),
-                            std::time::Instant::now(),
-                        ));
-                    } else {
-                        st.model.copy_notification = Some((
-                            "Failed to copy to clipboard".to_string(),
-                            std::time::Instant::now(),
-                        ));
+                    match crate::clipboard::copy_to_clipboard(&text) {
+                        crate::clipboard::CopyResult::Native => {
+                            st.notify_success("Model response copied to clipboard");
+                        }
+                        crate::clipboard::CopyResult::Osc52Only => {
+                            st.notify_success("Model response copied via terminal (OSC 52)");
+                        }
+                        crate::clipboard::CopyResult::Failed => {
+                            st.notify_error("Failed to copy to clipboard");
+                        }
                     }
                 }
                 return Ok(InputResult::Continue);
@@ -187,88 +254,20 @@ pub async fn handle_develop_key(
             if st.model.is_busy() {
                 st.confirm_cancel = true;
             } else if !st.input_editor.is_empty() {
-                st.input_editor.clear();
+                st.input_editor.clear_saving();
+                st.notify_info("Prompt cleared (C-Y to restore)");
             }
         }
-        KeyCode::Char('c') | KeyCode::Char('y') if st.input_editor.is_empty() => {
-            if st.model.is_busy() {
-                st.model.git_notification = Some(
-                    "Cannot copy while model is generating".to_string(),
-                );
-            } else if st.model.text.trim().is_empty() {
-                st.input_editor.insert_char(match key.code {
-                    KeyCode::Char(ch) => ch,
-                    _ => 'c',
-                });
-            } else {
-                let text = st.model.text.clone();
-                if crate::clipboard::copy_to_clipboard(&text) {
-                    st.model.copy_notification = Some((
-                        "Model response copied to clipboard".to_string(),
-                        std::time::Instant::now(),
-                    ));
-                } else {
-                    st.model.copy_notification = Some((
-                        "Failed to copy to clipboard".to_string(),
-                        std::time::Instant::now(),
-                    ));
-                }
-            }
-        }
-        KeyCode::Char('u') if st.input_editor.is_empty() => {
-            if st.model.is_busy() {
-                st.model.git_notification = Some(
-                    "Cannot undo while model is generating".to_string(),
-                );
-            } else {
-                st.confirm_undo = true;
-            }
-        }
-        KeyCode::Char('s') if st.input_editor.is_empty() => {
-            if st.model.is_busy() {
-                st.model.git_notification = Some(
-                    "Cannot squash commits while model is generating".to_string(),
-                );
-            } else {
-                st.squash_dialog = Some(crate::app::SquashDialogState::default());
-                drop(st);
-                let params = GitSquashPreviewParams { base_ref: None };
-                send_request(
-                    server_writer,
-                    methods::GIT_SQUASH_PREVIEW,
-                    serde_json::to_value(params)?,
-                )
-                .await?;
-            }
-        }
-        KeyCode::Char('[') if st.input_editor.is_empty() => {
-            if !st.model.files.is_empty() {
-                st.model.selected_file_index = st.model.selected_file_index.saturating_sub(1);
-                st.model.scroll_to_selected_file(view_height);
-            }
-        }
-        KeyCode::Char(']') if st.input_editor.is_empty() => {
-            if !st.model.files.is_empty() && st.model.selected_file_index + 1 < st.model.files.len() {
-                st.model.selected_file_index += 1;
-                st.model.scroll_to_selected_file(view_height);
-            }
-        }
-        KeyCode::Char(' ') if st.input_editor.is_empty() => {
-            let sel_idx = st.model.selected_file_index;
-            if let Some(file) = st.model.files.get_mut(sel_idx) {
-                file.expanded = !file.expanded;
-                st.model.scroll_to_selected_file(view_height);
-            }
+        KeyCode::F(6) => {
+            crate::input::open_squash_dialog(&mut st, server_writer).await?;
         }
         KeyCode::Tab => {
-            if st.input_editor.is_empty() {
-                if !st.model.files.is_empty() {
-                    let sel_idx = st.model.selected_file_index;
-                    if let Some(file) = st.model.files.get_mut(sel_idx) {
-                        file.expanded = !file.expanded;
-                        let h = st.last_model_height;
-                        st.model.clamp_scroll(h);
-                    }
+            if st.input_editor.is_empty() && !st.model.files.is_empty() {
+                let sel_idx = st.model.selected_file_index;
+                let h = st.last_model_height;
+                if let Some(file) = st.model.files.get_mut(sel_idx) {
+                    file.expanded = !file.expanded;
+                    st.model.scroll_to_selected_file(h);
                 }
             } else {
                 st.input_editor.insert_str("  ");
@@ -280,17 +279,17 @@ pub async fn handle_develop_key(
         KeyCode::Enter => {
             if let Some(prompt) = st.take_prompt() {
                 drop(st);
-                let params = ModelAskParams { prompt };
-                send_request(server_writer, methods::MODEL_ASK, serde_json::to_value(params)?).await?;
-            } else if !st.model.files.is_empty() {
-                let sel_idx = st.model.selected_file_index;
-                if let Some(file) = st.model.files.get_mut(sel_idx) {
-                    file.expanded = !file.expanded;
-                    st.model.scroll_to_selected_file(view_height);
+                let params = ModelAskParams { prompt: prompt.clone() };
+                if let Err(err) = send_request(server_writer, methods::MODEL_ASK, serde_json::to_value(params)?).await {
+                    let mut st = state.lock().await;
+                    st.input_editor.clear();
+                    st.input_editor.insert_str(&prompt);
+                    st.model.status = "error".to_string();
+                    st.notify_error(format!("Failed to send prompt: {}", err));
                 }
             }
         }
-        KeyCode::Char(c) => {
+        KeyCode::Char(c) if crate::input::is_char_typing(key.modifiers) => {
             st.input_editor.insert_char(c);
         }
         KeyCode::Backspace => {
@@ -322,12 +321,14 @@ pub async fn handle_develop_key(
             }
         }
         KeyCode::PageUp => {
+            let page = view_height.saturating_sub(2).max(1);
             st.model.auto_scroll = false;
-            st.model.scroll = st.model.scroll.saturating_sub(10);
+            st.model.scroll = st.model.scroll.saturating_sub(page);
         }
         KeyCode::PageDown => {
+            let page = view_height.saturating_sub(2).max(1);
             let max = st.model.max_scroll(view_height);
-            st.model.scroll = (st.model.scroll.saturating_add(10)).min(max);
+            st.model.scroll = (st.model.scroll.saturating_add(page)).min(max);
             if st.model.scroll >= max {
                 st.model.auto_scroll = true;
             }
@@ -348,8 +349,25 @@ pub async fn handle_develop_key(
             }
         }
         KeyCode::Up => {
-            if !st.input_editor.is_empty() {
-                st.input_editor.move_line_up();
+            if st.input_editor.history_index.is_some() {
+                if !st.input_editor.move_line_up() {
+                    st.input_editor.history_prev();
+                }
+            } else if st.input_editor.is_empty() {
+                if st.input_editor.history_prev() {
+                    return Ok(InputResult::Continue);
+                }
+                if !st.model.files.is_empty() {
+                    st.model.selected_file_index = st.model.selected_file_index.saturating_sub(1);
+                    st.model.scroll_to_selected_file(view_height);
+                } else {
+                    st.model.auto_scroll = false;
+                    st.model.scroll = st.model.scroll.saturating_sub(1);
+                }
+            } else if !st.input_editor.move_line_up() && st.input_editor.line_count() == 1 {
+                if st.input_editor.history_prev() {
+                    return Ok(InputResult::Continue);
+                }
             } else if !st.model.files.is_empty() {
                 st.model.selected_file_index = st.model.selected_file_index.saturating_sub(1);
                 st.model.scroll_to_selected_file(view_height);
@@ -359,7 +377,11 @@ pub async fn handle_develop_key(
             }
         }
         KeyCode::Down => {
-            if !st.input_editor.is_empty() {
+            if st.input_editor.history_index.is_some() {
+                if !st.input_editor.move_line_down() {
+                    st.input_editor.history_next();
+                }
+            } else if !st.input_editor.is_empty() {
                 st.input_editor.move_line_down();
             } else if !st.model.files.is_empty() {
                 if st.model.selected_file_index + 1 < st.model.files.len() {

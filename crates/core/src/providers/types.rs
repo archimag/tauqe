@@ -109,6 +109,22 @@ pub enum StreamEvent {
         reason: String,
     },
 
+    // Turn phase and toolchain telemetry
+    TurnPhase {
+        phase: tauqe_protocol::TurnPhase,
+        round: Option<usize>,
+        max_rounds: Option<usize>,
+        detail: Option<String>,
+    },
+    ToolchainStarted {
+        command: String,
+    },
+    ToolchainFinished {
+        command: String,
+        success: bool,
+        message: Option<String>,
+    },
+
     Usage(ModelUsageInfo),
     Done,
     Cancelled,

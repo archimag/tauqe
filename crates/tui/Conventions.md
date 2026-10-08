@@ -52,3 +52,48 @@ Whenever modifying or extending code within `crates/tui/`, this conventions docu
   - **Orthogonal Status and Focus:** Task lifecycle statuses (`TODO` → `IN_PROGRESS` → `DONE` → `CANCELLED`, cycled via `t`) are strictly separated from context inclusion (`[x]`, toggled via `x`).
   - **High Information Density (No Decorative Gaps):** Collapsed tree items must be rendered tightly adjacent without artificial blank gaps or trailing empty lines. Expanded items with markdown details must be cleanly separated by exactly one line.
   - **Simple Dedicated Navigation:** In view modes without text input (Plans, Review), prioritize simple direct keys (`j`/`k`, `↑`/`↓`, `c` for copy, `s` for status filter) rather than multi-key chord sequences.
+
+---
+
+## 6. Dual Keyboard Paradigm: Vim-Style Navigation vs Emacs-Style Text Commands
+
+1. **Two Distinct Interaction Modes:**
+   - **Vim-Style Navigation (Non-Input Contexts):**
+     In all views, dialogs, and panels where a text buffer is NOT actively receiving text (Plans, Review, History, Context file list, dialog button toggling):
+     - Navigation and actions use simple, direct bare keys (`j`/`k`, `x`, `t`, `s`, `c`, `Tab`, `Space`, `Enter`, `Esc`, `q`, `?`).
+     - Modifier chords are never required for basic browsing, folding, or status toggling.
+     - Never intercept these single keys when a text editor becomes active.
+   - **Emacs-Style Commands with Zero Modal Ambiguity (Text-Input Contexts):**
+     In all views and dialogs where a text input editor is active (Develop prompt input, Squash message editor, file adding, modal text fields):
+     - **Unconditional Character Insertion:** Every printable character typed without a command modifier MUST be unconditionally inserted into the text buffer. Intercepting bare alphanumeric keys (such as `u`, `s`, `c`, `y`, `[`, `]`, or `Space`) when the prompt buffer is empty is strictly forbidden.
+     - All functional commands and actions within text input contexts MUST require an explicit command modifier.
+
+2. **The Abstract Primary Command Modifier (`C-`):**
+   - Commands in text input contexts are formulated conceptually as `C-<key>` (in Emacs tradition).
+   - `C-` represents the abstract Primary Command Modifier, configured by the user in `$XDG_CONFIG_HOME/tauqe/tui.toml` under `[input] primary_modifier = "ctrl"` (default) or `"alt"`.
+   - The codebase must never hardcode raw `KeyModifiers::CONTROL` checks for input-level actions without checking `primary_modifier.matches(...)`.
+   - Standard `C-` bindings:
+     - `C-Enter` — send prompt / confirm message editor;
+     - `C-Z` — undo last AI commit;
+     - `C-S` — open squash commits dialog;
+     - `C-W` — kill word backward;
+     - `C-A`, `C-E`, `C-K`, `C-U`, `C-Y`, `C-D`, `C-B`, `C-F` — standard line editing and yank;
+     - `C-J` — insert newline;
+     - `C-1` … `C-5` — switch tabs;
+     - `C-M` / `C-Y` — model selection picker;
+     - `C-C` — cancel generation;
+     - `C-L` — clear history;
+     - `C-R` — toggle reasoning block;
+     - `C-O` — reload configuration;
+     - `C-[` / `C-]` — navigate response file diffs;
+     - `C-Space` — toggle file diff folding.
+
+3. **Universal Hardware / Terminal Fallbacks:**
+   - Universal function keys (`F1`..`F5` for tabs, `F6` for squash, dedicated arrows, `Home`/`End`, `PgUp`/`PgDn`) remain active across all terminal types, regardless of keyboard protocol capabilities.
+   - `Alt+Enter` and `Ctrl+J` serve as universal fallbacks for newline insertion in legacy terminals lacking `Shift+Enter`.
+
+4. **Explicit Confirmation for Destructive Actions:**
+   - Destructive confirmation modals (such as `git undo`, delete plan, clear history, or cancel generation) must feature interactive `[ Confirm ] / [ Cancel ]` buttons with default focus on safe cancellation (`Cancel`).
+   - Pressing `Enter` or `Esc` defaults to safe cancellation.
+   - Quick confirmation is permitted via direct `y` or `Y` keypress.
+   - Actions like `git undo` must verify that an undoable entity exists before prompting the user, emitting an informative notification otherwise.

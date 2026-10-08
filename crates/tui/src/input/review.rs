@@ -14,13 +14,13 @@ pub const REVIEW_COMMANDS: &[KeyCommand] = &[
     KeyCommand { key: "s", description: "Toggle filter: show all / hide closed (DONE/REJECTED)" },
     KeyCommand { key: "Ctrl+R", description: "Fold / unfold thinking (reasoning) stream" },
     KeyCommand { key: "↑/↓ or k/j", description: "Select previous / next finding" },
-    KeyCommand { key: "Tab / Space", description: "Fold / unfold selected finding" },
+    KeyCommand { key: "Enter / Tab / Space", description: "Fold / unfold selected finding" },
     KeyCommand { key: "x", description: "Check / uncheck finding for Develop" },
     KeyCommand { key: "t", description: "Cycle status: TODO → DONE → REJECTED" },
-    KeyCommand { key: "c / y / Enter", description: "Copy selected finding to clipboard" },
+    KeyCommand { key: "c / y", description: "Copy selected finding to clipboard" },
     KeyCommand { key: "PgUp / PgDn", description: "Page scroll review view" },
     KeyCommand { key: "Home / End", description: "Select first / last finding" },
-    KeyCommand { key: "Esc", description: "Cancel running review / return to Develop" },
+    KeyCommand { key: "Esc / q", description: "Cancel running review / return to Develop" },
 ];
 
 fn format_item_for_clipboard(item: &ReviewItem) -> String {
@@ -74,7 +74,7 @@ pub async fn handle_review_key(
     }
 
     let items_len = st.review.visible_item_indices().len();
-    let page = st.review.view_height.max(1);
+    let page = st.review.view_height.saturating_sub(2).max(1);
 
     match key.code {
         KeyCode::Esc | KeyCode::Char('q') => {
@@ -137,7 +137,7 @@ pub async fn handle_review_key(
             let max = (st.review.rendered_lines as u16).saturating_sub(page);
             st.review.scroll = st.review.scroll.saturating_add(page).min(max);
         }
-        KeyCode::Tab | KeyCode::Char(' ') => {
+        KeyCode::Tab | KeyCode::Char(' ') | KeyCode::Enter => {
             let id = st
                 .review
                 .selected_item_index()
@@ -158,9 +158,15 @@ pub async fn handle_review_key(
                 }
             });
             if let Some(params) = update {
+                let req_id = crate::rpc::allocate_request_id();
+                crate::rpc::record_optimistic_rollback(
+                    req_id,
+                    crate::rpc::OptimisticRollback::ReviewItemChecked { item_id: params.item_id },
+                );
                 drop(st);
-                send_request(
+                crate::rpc::send_request_with_id(
                     server_writer,
+                    req_id,
                     methods::REVIEW_UPDATE_ITEM,
                     serde_json::to_value(params)?,
                 )
@@ -168,6 +174,9 @@ pub async fn handle_review_key(
             }
         }
         KeyCode::Char('t') | KeyCode::Char('T') => {
+            let prev_status = st.review.selected_item_index()
+                .and_then(|idx| st.review.session.as_ref()?.items.get(idx))
+                .map(|item| item.status);
             let update = mutate_selected(&mut st, |item| {
                 item.status = item.status.next();
                 ReviewUpdateItemParams {
@@ -181,9 +190,20 @@ pub async fn handle_review_key(
                 st.review.scroll_to_selected();
             }
             if let Some(params) = update {
+                let req_id = crate::rpc::allocate_request_id();
+                if let Some(prev) = prev_status {
+                    crate::rpc::record_optimistic_rollback(
+                        req_id,
+                        crate::rpc::OptimisticRollback::ReviewItemStatus {
+                            item_id: params.item_id,
+                            prev_status: prev,
+                        },
+                    );
+                }
                 drop(st);
-                send_request(
+                crate::rpc::send_request_with_id(
                     server_writer,
+                    req_id,
                     methods::REVIEW_UPDATE_ITEM,
                     serde_json::to_value(params)?,
                 )
@@ -193,20 +213,24 @@ pub async fn handle_review_key(
         KeyCode::Char('c')
         | KeyCode::Char('C')
         | KeyCode::Char('y')
-        | KeyCode::Char('Y')
-        | KeyCode::Enter => {
+        | KeyCode::Char('Y') => {
             let text = st
                 .review
                 .selected_item_index()
                 .and_then(|idx| st.review.session.as_ref()?.items.get(idx))
                 .map(format_item_for_clipboard);
             if let Some(text) = text {
-                let msg = if crate::clipboard::copy_to_clipboard(&text) {
-                    "Review finding copied to clipboard"
-                } else {
-                    "Failed to copy to clipboard"
-                };
-                st.model.copy_notification = Some((msg.to_string(), std::time::Instant::now()));
+                match crate::clipboard::copy_to_clipboard(&text) {
+                    crate::clipboard::CopyResult::Native => {
+                        st.notify_success("Review finding copied to clipboard");
+                    }
+                    crate::clipboard::CopyResult::Osc52Only => {
+                        st.notify_success("Review finding copied via terminal (OSC 52)");
+                    }
+                    crate::clipboard::CopyResult::Failed => {
+                        st.notify_error("Failed to copy to clipboard");
+                    }
+                }
             }
         }
         _ => {}

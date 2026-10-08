@@ -1,4 +1,4 @@
-use ratatui::layout::{Constraint, Direction, Layout};
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
@@ -6,9 +6,59 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use crate::app::{AppState, ViewMode};
 
 use super::centered_rect;
+use super::header::truncate_to_width;
 
-pub fn render_squash_popup(frame: &mut ratatui::Frame, dialog: &crate::app::SquashDialogState) {
-    let area = centered_rect(85, 85, frame.area());
+/// Single source of truth for the model selection dialog geometry,
+/// shared by rendering and mouse hit-testing.
+pub fn selection_dialog_area(term: Rect, item_count: usize) -> Rect {
+    let height = (item_count as u16 + 4).clamp(5, 16);
+    centered_rect(50, (height * 100 / term.height.max(1)).clamp(15, 60), term)
+}
+
+/// Squash dialog uses almost the whole terminal so that all panes stay readable.
+fn squash_dialog_area(term: Rect) -> Rect {
+    let width = term.width - term.width / 10;
+    let height = term.height.saturating_sub(2);
+    Rect::new(term.x + (term.width - width) / 2, term.y + 1, width, height)
+}
+
+pub fn render_disconnected_popup(frame: &mut ratatui::Frame, message: &str) {
+    let area = centered_rect(66, 32, frame.area());
+    frame.render_widget(Clear, area);
+
+    let lines = vec![
+        Line::raw(""),
+        Line::from(Span::styled(
+            "Connection to tauqe-server Lost",
+            Style::default().bold().fg(Color::Red),
+        )),
+        Line::raw(""),
+        Line::from(Span::styled(
+            message,
+            Style::default().fg(Color::White),
+        )),
+        Line::raw(""),
+        Line::from(Span::styled(
+            "Press 'q' or Ctrl+Q to exit.",
+            Style::default().fg(Color::Yellow).bold(),
+        )),
+    ];
+
+    let block = Paragraph::new(lines)
+        .block(
+            Block::default()
+                .title(" Server Disconnected ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Red)),
+        )
+        .alignment(ratatui::layout::Alignment::Center)
+        .wrap(Wrap { trim: false });
+
+    frame.render_widget(block, area);
+}
+
+pub fn render_squash_popup(frame: &mut ratatui::Frame, dialog: &mut crate::app::SquashDialogState) {
+    let area = squash_dialog_area(frame.area());
     frame.render_widget(Clear, area);
 
     let chunks = Layout::default()
@@ -22,7 +72,10 @@ pub fn render_squash_popup(frame: &mut ratatui::Frame, dialog: &crate::app::Squa
         .split(area);
 
     let session_label = match &dialog.session_base {
-        Some(s) => format!("1: Session ({})", &s[..7.min(s.len())]),
+        Some(s) => {
+            let short: String = s.chars().take(7).collect();
+            format!("1: Session ({})", short)
+        }
         None => "1: Session (none)".to_string(),
     };
     let upstream_label = match &dialog.upstream_base {
@@ -34,22 +87,29 @@ pub fn render_squash_popup(frame: &mut ratatui::Frame, dialog: &crate::app::Squa
         _ => "3: Custom ref".to_string(),
     };
 
-    let (style_s, style_u, style_c) = match dialog.base_mode {
-        crate::app::SquashBaseMode::Session => (
-            Style::default().bg(Color::Cyan).fg(Color::Black).bold(),
-            Style::default().bg(Color::DarkGray).fg(Color::White),
-            Style::default().bg(Color::DarkGray).fg(Color::White),
-        ),
-        crate::app::SquashBaseMode::Upstream => (
-            Style::default().bg(Color::DarkGray).fg(Color::White),
-            Style::default().bg(Color::Cyan).fg(Color::Black).bold(),
-            Style::default().bg(Color::DarkGray).fg(Color::White),
-        ),
-        crate::app::SquashBaseMode::Custom => (
-            Style::default().bg(Color::DarkGray).fg(Color::White),
-            Style::default().bg(Color::DarkGray).fg(Color::White),
-            Style::default().bg(Color::Cyan).fg(Color::Black).bold(),
-        ),
+    let session_available = dialog.session_base.is_some();
+    let upstream_available = dialog.upstream_base.is_some();
+
+    let style_s = if dialog.base_mode == crate::app::SquashBaseMode::Session {
+        Style::default().bg(Color::Cyan).fg(Color::Black).bold()
+    } else if session_available {
+        Style::default().bg(Color::DarkGray).fg(Color::White)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+
+    let style_u = if dialog.base_mode == crate::app::SquashBaseMode::Upstream {
+        Style::default().bg(Color::Cyan).fg(Color::Black).bold()
+    } else if upstream_available {
+        Style::default().bg(Color::DarkGray).fg(Color::White)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+
+    let style_c = if dialog.base_mode == crate::app::SquashBaseMode::Custom {
+        Style::default().bg(Color::Cyan).fg(Color::Black).bold()
+    } else {
+        Style::default().bg(Color::DarkGray).fg(Color::White)
     };
 
     let mut header_lines = Vec::new();
@@ -125,12 +185,16 @@ pub fn render_squash_popup(frame: &mut ratatui::Frame, dialog: &crate::app::Squa
     }
 
     let is_files_focus = dialog.focus == crate::app::SquashDialogFocus::FileList;
-    let file_list_widget = Paragraph::new(file_lines).block(
-        Block::default()
-            .title(format!(" Files Changed ({}) ", dialog.files.len()))
-            .borders(Borders::ALL)
-            .border_style(if is_files_focus { Style::default().fg(Color::Cyan) } else { Style::default() }),
-    );
+    let files_visible = mid_chunks[0].height.saturating_sub(2) as usize;
+    let files_offset = (dialog.selected_file_index + 1).saturating_sub(files_visible);
+    let file_list_widget = Paragraph::new(file_lines)
+        .block(
+            Block::default()
+                .title(format!(" Files Changed ({}) ", dialog.files.len()))
+                .borders(Borders::ALL)
+                .border_style(if is_files_focus { Style::default().fg(Color::Cyan) } else { Style::default() }),
+        )
+        .scroll((files_offset as u16, 0));
     frame.render_widget(file_list_widget, mid_chunks[0]);
 
     // Right: Diff Viewer
@@ -158,6 +222,13 @@ pub fn render_squash_popup(frame: &mut ratatui::Frame, dialog: &crate::app::Squa
         diff_lines.push(Line::from(Span::styled("  No diff to display.", Style::default().fg(Color::DarkGray))));
     }
 
+    let diff_visible = mid_chunks[1].height.saturating_sub(2) as usize;
+    let diff_max_scroll = diff_lines
+        .len()
+        .saturating_sub(diff_visible)
+        .min(u16::MAX as usize) as u16;
+    dialog.diff_scroll = dialog.diff_scroll.min(diff_max_scroll);
+
     let is_diff_focus = dialog.focus == crate::app::SquashDialogFocus::DiffView;
     let diff_widget = Paragraph::new(diff_lines)
         .block(
@@ -183,9 +254,16 @@ pub fn render_squash_popup(frame: &mut ratatui::Frame, dialog: &crate::app::Squa
             Span::styled(" Press 'g' to generate message via AI, or type manually...", Style::default().fg(Color::DarkGray)),
         ]));
     } else {
-        for l in dialog.message_buffer.lines() {
-            msg_lines.push(Line::from(Span::raw(l)));
+        let mut rows: Vec<Line> = dialog.message_buffer.split('\n').map(Line::raw).collect();
+        if let Some(last) = rows.last_mut().filter(|_| is_msg_focus) {
+            last.spans.push(Span::styled("█", Style::default().fg(Color::Yellow)));
         }
+        // Keep the tail visible so the line being typed never leaves the box.
+        let visible = chunks[2].height.saturating_sub(2) as usize;
+        if rows.len() > visible {
+            rows.drain(..rows.len() - visible);
+        }
+        msg_lines.extend(rows);
     }
 
     let msg_widget = Paragraph::new(msg_lines).block(
@@ -200,26 +278,112 @@ pub fn render_squash_popup(frame: &mut ratatui::Frame, dialog: &crate::app::Squa
     let footer_line = Line::from(vec![
         Span::styled(" 1/2/3 ", Style::default().bg(Color::DarkGray).fg(Color::White).bold()),
         Span::raw(" Base  "),
-        Span::styled(" Space ", Style::default().bg(Color::DarkGray).fg(Color::White).bold()),
+        Span::styled(" Space/Enter ", Style::default().bg(Color::DarkGray).fg(Color::White).bold()),
         Span::raw(" Fold  "),
         Span::styled(" Tab ", Style::default().bg(Color::DarkGray).fg(Color::White).bold()),
         Span::raw(" Focus  "),
         Span::styled(" g ", Style::default().bg(Color::Yellow).fg(Color::Black).bold()),
-        Span::raw(" Generate Msg (AI)  "),
+        Span::raw(" Generate Msg  "),
         Span::styled(" e ", Style::default().bg(Color::DarkGray).fg(Color::White).bold()),
         Span::raw(" Edit  "),
-        Span::styled(" Enter ", Style::default().bg(Color::Green).fg(Color::Black).bold()),
+        Span::styled(" Ctrl+Enter / Ctrl+S ", Style::default().bg(Color::Green).fg(Color::Black).bold()),
         Span::raw(" Apply Squash  "),
         Span::styled(" Esc ", Style::default().bg(Color::DarkGray).fg(Color::White).bold()),
         Span::raw(" Close"),
     ]);
     let footer_widget = Paragraph::new(footer_line).block(Block::default().borders(Borders::ALL));
     frame.render_widget(footer_widget, chunks[3]);
+
+    if dialog.confirm_apply {
+        render_squash_confirm_popup(frame, dialog);
+    }
 }
 
-pub fn render_confirm_cancel_popup(frame: &mut ratatui::Frame, _state: &AppState) {
+pub fn render_squash_confirm_popup(frame: &mut ratatui::Frame, dialog: &crate::app::SquashDialogState) {
+    let area = centered_rect(60, 32, frame.area());
+    frame.render_widget(Clear, area);
+
+    let (confirm_style, cancel_style) = match dialog.confirm_button {
+        crate::app::ConfirmDialogButton::Confirm => (
+            Style::default().bg(Color::Red).fg(Color::White).bold(),
+            Style::default().bg(Color::DarkGray).fg(Color::White),
+        ),
+        crate::app::ConfirmDialogButton::Cancel => (
+            Style::default().bg(Color::DarkGray).fg(Color::White),
+            Style::default().bg(Color::Cyan).fg(Color::Black).bold(),
+        ),
+    };
+
+    let first_line = dialog.message_buffer.lines().next().unwrap_or("").trim();
+    let msg_preview = if first_line.is_empty() {
+        "(no message)".to_string()
+    } else {
+        truncate_to_width(first_line, 50)
+    };
+
+    let lines = vec![
+        Line::raw(""),
+        Line::from(Span::styled(
+            "Confirm Git History Squash?",
+            Style::default().bold().fg(Color::Yellow),
+        )),
+        Line::raw(""),
+        Line::from(vec![
+            Span::raw("Squashing "),
+            Span::styled(
+                format!("{} commit(s)", dialog.commits.len()),
+                Style::default().bold().fg(Color::Cyan),
+            ),
+            Span::raw(" into 1 commit on top of "),
+            Span::styled(dialog.base_ref.clone(), Style::default().bold().fg(Color::Green)),
+        ]),
+        Line::from(vec![
+            Span::raw("Message: "),
+            Span::styled(format!("\"{}\"", msg_preview), Style::default().fg(Color::White)),
+        ]),
+        Line::from(Span::styled(
+            "This operation rewrites local Git history ahead of the base ref.",
+            Style::default().fg(Color::DarkGray),
+        )),
+        Line::raw(""),
+        Line::from(vec![
+            Span::styled(" [ Confirm Squash (Y) ] ", confirm_style),
+            Span::raw("   "),
+            Span::styled(" [ Cancel (Esc) ] ", cancel_style),
+        ]),
+        Line::raw(""),
+        Line::from(Span::styled(
+            "Tab / ← / → to select button, Enter to apply",
+            Style::default().fg(Color::DarkGray),
+        )),
+    ];
+
+    let block = Paragraph::new(lines)
+        .block(
+            Block::default()
+                .title(" Confirm Git Squash ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Red)),
+        )
+        .alignment(ratatui::layout::Alignment::Center);
+
+    frame.render_widget(block, area);
+}
+
+pub fn render_confirm_cancel_popup(frame: &mut ratatui::Frame, state: &AppState) {
     let area = centered_rect(58, 28, frame.area());
     frame.render_widget(Clear, area);
+
+    let (confirm_style, cancel_style) = match state.confirm_button {
+        crate::app::ConfirmDialogButton::Confirm => (
+            Style::default().bg(Color::Red).fg(Color::White).bold(),
+            Style::default().bg(Color::DarkGray).fg(Color::White),
+        ),
+        crate::app::ConfirmDialogButton::Cancel => (
+            Style::default().bg(Color::DarkGray).fg(Color::White),
+            Style::default().bg(Color::Cyan).fg(Color::Black).bold(),
+        ),
+    };
 
     let lines = vec![
         Line::raw(""),
@@ -235,17 +399,15 @@ pub fn render_confirm_cancel_popup(frame: &mut ratatui::Frame, _state: &AppState
         )),
         Line::raw(""),
         Line::from(vec![
-            Span::styled(
-                " [Y] / Enter ",
-                Style::default().bg(Color::Red).fg(Color::White).bold(),
-            ),
-            Span::raw(" Interrupt    "),
-            Span::styled(
-                " [N] / Esc ",
-                Style::default().bg(Color::DarkGray).fg(Color::White).bold(),
-            ),
-            Span::raw(" Continue"),
+            Span::styled(" [ Confirm (Y) ] ", confirm_style),
+            Span::raw("   "),
+            Span::styled(" [ Cancel (Esc) ] ", cancel_style),
         ]),
+        Line::raw(""),
+        Line::from(Span::styled(
+            "Tab / ← / → to select button, Enter to apply",
+            Style::default().fg(Color::DarkGray),
+        )),
     ];
 
     let block = Paragraph::new(lines)
@@ -254,6 +416,64 @@ pub fn render_confirm_cancel_popup(frame: &mut ratatui::Frame, _state: &AppState
                 .title(" Confirm Interruption ")
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::Yellow)),
+        )
+        .alignment(ratatui::layout::Alignment::Center);
+
+    frame.render_widget(block, area);
+}
+
+pub fn render_confirm_quit_popup(frame: &mut ratatui::Frame, state: &AppState) {
+    let area = centered_rect(58, 28, frame.area());
+    frame.render_widget(Clear, area);
+
+    let (confirm_style, cancel_style) = match state.confirm_button {
+        crate::app::ConfirmDialogButton::Confirm => (
+            Style::default().bg(Color::Red).fg(Color::White).bold(),
+            Style::default().bg(Color::DarkGray).fg(Color::White),
+        ),
+        crate::app::ConfirmDialogButton::Cancel => (
+            Style::default().bg(Color::DarkGray).fg(Color::White),
+            Style::default().bg(Color::Cyan).fg(Color::Black).bold(),
+        ),
+    };
+
+    let activity = if state.review.running {
+        "Code review is currently in progress."
+    } else {
+        "Model generation / turn is currently in progress."
+    };
+
+    let lines = vec![
+        Line::raw(""),
+        Line::from(Span::styled(
+            "Quit TAUQE while operation is running?",
+            Style::default().bold().fg(Color::Red),
+        )),
+        Line::raw(""),
+        Line::from(activity),
+        Line::from(Span::styled(
+            "Exiting now will terminate the server and discard active work.",
+            Style::default().fg(Color::DarkGray),
+        )),
+        Line::raw(""),
+        Line::from(vec![
+            Span::styled(" [ Quit TAUQE (Y) ] ", confirm_style),
+            Span::raw("   "),
+            Span::styled(" [ Cancel (Esc) ] ", cancel_style),
+        ]),
+        Line::raw(""),
+        Line::from(Span::styled(
+            "Tab / ← / → to select button, Enter to apply",
+            Style::default().fg(Color::DarkGray),
+        )),
+    ];
+
+    let block = Paragraph::new(lines)
+        .block(
+            Block::default()
+                .title(" Confirm Quit ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Red)),
         )
         .alignment(ratatui::layout::Alignment::Center);
 
@@ -290,18 +510,27 @@ pub fn render_confirm_undo_popup(frame: &mut ratatui::Frame, state: &AppState) {
         Style::default().fg(Color::DarkGray),
     )));
     lines.push(Line::raw(""));
-    lines.push(Line::from(vec![
-        Span::styled(
-            " [Y] / Enter ",
+    let (confirm_style, cancel_style) = match state.confirm_button {
+        crate::app::ConfirmDialogButton::Confirm => (
             Style::default().bg(Color::Red).fg(Color::White).bold(),
+            Style::default().bg(Color::DarkGray).fg(Color::White),
         ),
-        Span::raw(" Confirm Undo    "),
-        Span::styled(
-            " [N] / Esc ",
-            Style::default().bg(Color::DarkGray).fg(Color::White).bold(),
+        crate::app::ConfirmDialogButton::Cancel => (
+            Style::default().bg(Color::DarkGray).fg(Color::White),
+            Style::default().bg(Color::Cyan).fg(Color::Black).bold(),
         ),
-        Span::raw(" Cancel"),
+    };
+
+    lines.push(Line::from(vec![
+        Span::styled(" [ Confirm Undo (Y) ] ", confirm_style),
+        Span::raw("   "),
+        Span::styled(" [ Cancel (Esc) ] ", cancel_style),
     ]));
+    lines.push(Line::raw(""));
+    lines.push(Line::from(Span::styled(
+        "Tab / ← / → to select button, Enter to apply",
+        Style::default().fg(Color::DarkGray),
+    )));
 
     let block = Paragraph::new(lines)
         .block(
@@ -353,16 +582,28 @@ pub fn render_confirm_delete_plan_popup(frame: &mut ratatui::Frame, plan_id: &st
         Line::raw(""),
         Line::from(vec![
             Span::styled(
-                " [Y] ",
-                Style::default().bg(Color::Red).fg(Color::White).bold(),
+                " [ Confirm Delete (Y) ] ",
+                if state.confirm_button == crate::app::ConfirmDialogButton::Confirm {
+                    Style::default().bg(Color::Red).fg(Color::White).bold()
+                } else {
+                    Style::default().bg(Color::DarkGray).fg(Color::White)
+                },
             ),
-            Span::raw(" Confirm Delete    "),
+            Span::raw("   "),
             Span::styled(
-                " [N] / Esc ",
-                Style::default().bg(Color::DarkGray).fg(Color::White).bold(),
+                " [ Cancel (Esc) ] ",
+                if state.confirm_button == crate::app::ConfirmDialogButton::Cancel {
+                    Style::default().bg(Color::Cyan).fg(Color::Black).bold()
+                } else {
+                    Style::default().bg(Color::DarkGray).fg(Color::White)
+                },
             ),
-            Span::raw(" Cancel"),
         ]),
+        Line::raw(""),
+        Line::from(Span::styled(
+            "Tab / ← / → to select button, Enter to apply",
+            Style::default().fg(Color::DarkGray),
+        )),
     ];
 
     let block = Paragraph::new(lines)
@@ -377,9 +618,86 @@ pub fn render_confirm_delete_plan_popup(frame: &mut ratatui::Frame, plan_id: &st
     frame.render_widget(block, area);
 }
 
-pub fn render_confirm_clear_history_popup(frame: &mut ratatui::Frame, _state: &AppState) {
+pub fn render_confirm_clear_auto_popup(frame: &mut ratatui::Frame, state: &AppState) {
+    let area = centered_rect(58, 28, frame.area());
+    frame.render_widget(Clear, area);
+
+    let (confirm_style, cancel_style) = match state.confirm_button {
+        crate::app::ConfirmDialogButton::Confirm => (
+            Style::default().bg(Color::Red).fg(Color::White).bold(),
+            Style::default().bg(Color::DarkGray).fg(Color::White),
+        ),
+        crate::app::ConfirmDialogButton::Cancel => (
+            Style::default().bg(Color::DarkGray).fg(Color::White),
+            Style::default().bg(Color::Cyan).fg(Color::Black).bold(),
+        ),
+    };
+
+    let auto_count = state
+        .context
+        .items
+        .iter()
+        .filter(|i| i.layer == tauqe_protocol::ContextLayer::Auto)
+        .count();
+
+    let lines = vec![
+        Line::raw(""),
+        Line::from(Span::styled(
+            "Clear all Auto-context files?",
+            Style::default().bold().fg(Color::Yellow),
+        )),
+        Line::raw(""),
+        Line::from(vec![
+            Span::raw("Are you sure you want to remove all "),
+            Span::styled(
+                format!("{} file(s)", auto_count),
+                Style::default().bold().fg(Color::Magenta),
+            ),
+            Span::raw(" from the Auto layer?"),
+        ]),
+        Line::from(Span::styled(
+            "Persistent User files and Pinned files will not be affected.",
+            Style::default().fg(Color::DarkGray),
+        )),
+        Line::raw(""),
+        Line::from(vec![
+            Span::styled(" [ Confirm Clear (Y) ] ", confirm_style),
+            Span::raw("   "),
+            Span::styled(" [ Cancel (Esc) ] ", cancel_style),
+        ]),
+        Line::raw(""),
+        Line::from(Span::styled(
+            "Tab / ← / → to select button, Enter to apply",
+            Style::default().fg(Color::DarkGray),
+        )),
+    ];
+
+    let block = Paragraph::new(lines)
+        .block(
+            Block::default()
+                .title(" Confirm Clear Auto Context ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Yellow)),
+        )
+        .alignment(ratatui::layout::Alignment::Center);
+
+    frame.render_widget(block, area);
+}
+
+pub fn render_confirm_clear_history_popup(frame: &mut ratatui::Frame, state: &AppState) {
     let area = centered_rect(58, 30, frame.area());
     frame.render_widget(Clear, area);
+
+    let (confirm_style, cancel_style) = match state.confirm_button {
+        crate::app::ConfirmDialogButton::Confirm => (
+            Style::default().bg(Color::Red).fg(Color::White).bold(),
+            Style::default().bg(Color::DarkGray).fg(Color::White),
+        ),
+        crate::app::ConfirmDialogButton::Cancel => (
+            Style::default().bg(Color::DarkGray).fg(Color::White),
+            Style::default().bg(Color::Cyan).fg(Color::Black).bold(),
+        ),
+    };
 
     let lines = vec![
         Line::raw(""),
@@ -399,17 +717,15 @@ pub fn render_confirm_clear_history_popup(frame: &mut ratatui::Frame, _state: &A
         )),
         Line::raw(""),
         Line::from(vec![
-            Span::styled(
-                " [Y] / Enter ",
-                Style::default().bg(Color::Red).fg(Color::White).bold(),
-            ),
-            Span::raw(" Confirm Clear    "),
-            Span::styled(
-                " [N] / Esc ",
-                Style::default().bg(Color::DarkGray).fg(Color::White).bold(),
-            ),
-            Span::raw(" Cancel"),
+            Span::styled(" [ Confirm Clear (Y) ] ", confirm_style),
+            Span::raw("   "),
+            Span::styled(" [ Cancel (Esc) ] ", cancel_style),
         ]),
+        Line::raw(""),
+        Line::from(Span::styled(
+            "Tab / ← / → to select button, Enter to apply",
+            Style::default().fg(Color::DarkGray),
+        )),
     ];
 
     let block = Paragraph::new(lines)
@@ -428,13 +744,7 @@ pub fn render_selection_dialog(
     frame: &mut ratatui::Frame,
     dialog: &crate::app::SelectionDialogState,
 ) {
-    let item_count = dialog.items.len();
-    let height = (item_count as u16 + 4).clamp(5, 16);
-    let area = centered_rect(
-        50,
-        (height * 100 / frame.area().height).clamp(15, 60),
-        frame.area(),
-    );
+    let area = selection_dialog_area(frame.area(), dialog.items.len());
     frame.render_widget(Clear, area);
 
     let title = " Select Model (Mouse Click / Enter) ";
@@ -551,11 +861,15 @@ pub fn render_review_dialog(frame: &mut ratatui::Frame, dialog: &crate::app::Rev
 }
 
 pub const GLOBAL_COMMANDS: &[crate::app::KeyCommand] = &[
-    crate::app::KeyCommand { key: "Ctrl+1 / 2 / 3 / 4 / 5", description: "Switch views: Develop │ Context │ Review │ Plans │ History" },
-    crate::app::KeyCommand { key: "Ctrl+M", description: "Select active model" },
+    crate::app::KeyCommand { key: "Ctrl+1..5 / Alt+1..5 / F1..F5", description: "Switch views: Develop │ Context │ Review │ Plans │ History" },
+    crate::app::KeyCommand { key: "Ctrl+M / Alt+M / Ctrl+Y", description: "Select active model" },
     crate::app::KeyCommand { key: "F6 / Ctrl+S", description: "Squash commits dialog" },
+    crate::app::KeyCommand { key: "Ctrl+C", description: "Cancel active generation" },
+    crate::app::KeyCommand { key: "Ctrl+L", description: "Clear conversation history" },
+    crate::app::KeyCommand { key: "Ctrl+R", description: "Fold / unfold thinking (reasoning) stream" },
     crate::app::KeyCommand { key: "Ctrl+O", description: "Reload configuration from disk" },
-    crate::app::KeyCommand { key: "? / Esc", description: "Open / close this help dialog" },
+    crate::app::KeyCommand { key: "Ctrl+Q", description: "Quit TAUQE" },
+    crate::app::KeyCommand { key: "F1 / ? / Esc", description: "Open / close this help dialog" },
 ];
 
 pub const ONBOARDING_COMMANDS: &[crate::app::KeyCommand] = &[
@@ -578,37 +892,103 @@ pub fn get_mode_key_commands(mode: ViewMode) -> (&'static str, &'static [crate::
     }
 }
 
-pub fn render_help_popup(frame: &mut ratatui::Frame, mode: ViewMode) {
+fn wrap_words(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    for word in text.split_whitespace() {
+        let current_len = current.chars().count();
+        let word_len = word.chars().count();
+        if !current.is_empty() && current_len + 1 + word_len > width {
+            lines.push(std::mem::take(&mut current));
+        }
+        if !current.is_empty() {
+            current.push(' ');
+        }
+        current.push_str(word);
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    lines
+}
+
+fn format_command_key(raw_key: &str, primary_modifier: crate::config::PrimaryModifier) -> String {
+    let mod_prefix = match primary_modifier {
+        crate::config::PrimaryModifier::Ctrl => "Ctrl+",
+        crate::config::PrimaryModifier::Alt => "Alt+",
+    };
+    raw_key.replace("C-", mod_prefix)
+}
+
+fn push_command_lines(
+    lines: &mut Vec<Line<'static>>,
+    commands: &[crate::app::KeyCommand],
+    col_w: usize,
+    desc_w: usize,
+    primary_modifier: crate::config::PrimaryModifier,
+) {
+    for cmd in commands {
+        let display_key = format_command_key(cmd.key, primary_modifier);
+        let mut wrapped = wrap_words(cmd.description, desc_w).into_iter();
+        let first = wrapped.next().unwrap_or_default();
+        lines.push(Line::from(vec![
+            Span::styled(format!("  {:<col_w$}", display_key), Style::default().fg(Color::White).bold()),
+            Span::styled(first, Style::default().fg(Color::Gray)),
+        ]));
+        for rest in wrapped {
+            lines.push(Line::from(vec![
+                Span::raw(" ".repeat(2 + col_w)),
+                Span::styled(rest, Style::default().fg(Color::Gray)),
+            ]));
+        }
+    }
+}
+
+pub fn render_help_popup(
+    frame: &mut ratatui::Frame,
+    mode: ViewMode,
+    scroll: &mut u16,
+    primary_modifier: crate::config::PrimaryModifier,
+) {
     let (title, mode_commands) = get_mode_key_commands(mode);
-    let area = centered_rect(72, 70, frame.area());
+    let area = centered_rect(76, 75, frame.area());
     frame.render_widget(Clear, area);
 
-    let mut help_lines = vec![
-        Line::from(Span::styled(
-            "Global Navigation",
-            Style::default().fg(Color::Cyan).bold(),
-        )),
-    ];
+    let key_w = GLOBAL_COMMANDS
+        .iter()
+        .chain(mode_commands.iter())
+        .map(|c| format_command_key(c.key, primary_modifier).chars().count())
+        .max()
+        .unwrap_or(0);
+    let col_w = key_w + 2;
+    let inner_w = area.width.saturating_sub(2) as usize;
+    let desc_w = inner_w.saturating_sub(2 + col_w).max(10);
 
-    for cmd in GLOBAL_COMMANDS {
-        help_lines.push(Line::from(vec![
-            Span::styled(format!("  {:<20}", cmd.key), Style::default().fg(Color::White).bold()),
-            Span::styled(cmd.description, Style::default().fg(Color::Gray)),
-        ]));
-    }
+    let mut help_lines: Vec<Line<'static>> = vec![Line::from(Span::styled(
+        "Global Navigation",
+        Style::default().fg(Color::Cyan).bold(),
+    ))];
+    push_command_lines(&mut help_lines, GLOBAL_COMMANDS, col_w, desc_w, primary_modifier);
 
     help_lines.push(Line::raw(""));
     help_lines.push(Line::from(Span::styled(
         "Active Mode Shortcuts",
         Style::default().fg(Color::Yellow).bold(),
     )));
+    push_command_lines(&mut help_lines, mode_commands, col_w, desc_w, primary_modifier);
 
-    for cmd in mode_commands {
-        help_lines.push(Line::from(vec![
-            Span::styled(format!("  {:<20}", cmd.key), Style::default().fg(Color::White).bold()),
-            Span::styled(cmd.description, Style::default().fg(Color::Gray)),
-        ]));
-    }
+    let inner_h = area.height.saturating_sub(2) as usize;
+    let max_scroll = help_lines
+        .len()
+        .saturating_sub(inner_h)
+        .min(u16::MAX as usize) as u16;
+    *scroll = (*scroll).min(max_scroll);
+    let title = if max_scroll > 0 {
+        format!("{}(j/k to scroll) ", title)
+    } else {
+        title.to_string()
+    };
 
     let popup_block = Paragraph::new(help_lines)
         .block(
@@ -617,7 +997,7 @@ pub fn render_help_popup(frame: &mut ratatui::Frame, mode: ViewMode) {
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::Yellow)),
         )
-        .wrap(Wrap { trim: false });
+        .scroll((*scroll, 0));
 
     frame.render_widget(popup_block, area);
 }

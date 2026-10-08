@@ -10,14 +10,8 @@ pub fn format_masked_key(key: &str) -> String {
     if len == 0 {
         return String::new();
     }
-    if len <= 14 {
-        key.to_string()
-    } else {
-        let chars: Vec<char> = key.chars().collect();
-        let prefix: String = chars[..8.min(len)].iter().collect();
-        let suffix: String = chars[len.saturating_sub(4)..].iter().collect();
-        format!("{}...{} ({} chars)", prefix, suffix, len)
-    }
+    let bullets = "•".repeat(len.min(16));
+    format!("{} ({} chars)", bullets, len)
 }
 
 pub fn render_onboarding_view(
@@ -42,15 +36,25 @@ pub fn render_onboarding_view(
         crate::app::OnboardingStep::Credentials => Line::from(vec![
             Span::styled(" 0. Git [OK] ─── 1. Configuration ─── ", Style::default().fg(Color::Green)),
             Span::styled("[2. API Key]", Style::default().bg(Color::Yellow).fg(Color::Black).bold()),
-            Span::styled(" ─── 3. Ready", Style::default().fg(Color::DarkGray)),
+            Span::styled(" ─── 3. Layout ─── 4. Modifier ─── 5. Ready", Style::default().fg(Color::DarkGray)),
+        ]),
+        crate::app::OnboardingStep::Workstation => Line::from(vec![
+            Span::styled(" 0. Git [OK] ─── 1. Configuration ─── 2. API Key [OK] ─── ", Style::default().fg(Color::Green)),
+            Span::styled("[3. Keyboard Layout]", Style::default().bg(Color::Magenta).fg(Color::White).bold()),
+            Span::styled(" ─── 4. Modifier ─── 5. Ready", Style::default().fg(Color::DarkGray)),
+        ]),
+        crate::app::OnboardingStep::Modifier => Line::from(vec![
+            Span::styled(" 0. Git [OK] ─── 1. Configuration ─── 2. API Key [OK] ─── 3. Layout [OK] ─── ", Style::default().fg(Color::Green)),
+            Span::styled("[4. Command Modifier]", Style::default().bg(Color::Blue).fg(Color::White).bold()),
+            Span::styled(" ─── 5. Ready", Style::default().fg(Color::DarkGray)),
         ]),
         crate::app::OnboardingStep::Gatekeeper => Line::from(vec![
             Span::styled(" 0. Git [OK] ─── 1. Configuration ─── 2. API Key ─── ", Style::default().fg(Color::DarkGray)),
             Span::styled("[Warning: API Key Missing]", Style::default().bg(Color::Red).fg(Color::White).bold()),
         ]),
         crate::app::OnboardingStep::Ready => Line::from(vec![
-            Span::styled(" 0. Git [OK] ─── 1. Configuration ─── 2. API Key ─── ", Style::default().fg(Color::Green)),
-            Span::styled("[3. Ready to Start]", Style::default().bg(Color::Green).fg(Color::Black).bold()),
+            Span::styled(" 0. Git [OK] ─── 1. Configuration ─── 2. API Key ─── 3. Layout ─── 4. Modifier ─── ", Style::default().fg(Color::Green)),
+            Span::styled("[5. Ready to Start]", Style::default().bg(Color::Green).fg(Color::Black).bold()),
         ]),
     };
 
@@ -170,6 +174,77 @@ pub fn render_onboarding_view(
                 ]));
             }
         }
+        crate::app::OnboardingStep::Workstation => {
+            lines.push(Line::from(Span::styled(
+                "Step 3: Workstation Keyboard Layout and Mapping (tui.toml)",
+                Style::default().bold().fg(Color::Magenta),
+            )));
+            lines.push(Line::from("Configure shortcut key translation and navigation keys for your system layout."));
+            lines.push(Line::from(format!(
+                "Configuration file: {}",
+                ob.default_tui_config_path
+            )));
+            lines.push(Line::raw(""));
+            lines.push(Line::from(Span::styled(
+                "Select keyboard layout option (arrows ↑/↓, then Enter):",
+                Style::default().bold().fg(Color::White),
+            )));
+            lines.push(Line::raw(""));
+
+            let options = [
+                "Standard (No translation, default QWERTY / layout-neutral)".to_string(),
+                "Russian JCUKEN (Translate Cyrillic ЙЦУКЕН to QWERTY for shortcuts & navigation)".to_string(),
+                "Custom Langmap (Input custom character mapping: e.g. Greek, Hebrew, etc.)".to_string(),
+                "Skip (Use defaults without creating tui.toml)".to_string(),
+            ];
+
+            for (idx, opt) in options.iter().enumerate() {
+                let is_sel = idx == ob.selected_index;
+                let prefix = if is_sel { "  ▶ [●] " } else { "    [ ] " };
+                let style = if is_sel {
+                    Style::default().bg(Color::DarkGray).fg(Color::White).bold()
+                } else {
+                    Style::default().fg(Color::Gray)
+                };
+                lines.push(Line::from(vec![
+                    Span::styled(prefix, Style::default().fg(Color::Magenta).bold()),
+                    Span::styled(opt.clone(), style),
+                ]));
+            }
+        }
+        crate::app::OnboardingStep::Modifier => {
+            lines.push(Line::from(Span::styled(
+                "Step 4: Primary Command Modifier (C-)",
+                Style::default().bold().fg(Color::Blue),
+            )));
+            lines.push(Line::from("In text input mode (prompt buffer, commit message editor), every regular key types text."));
+            lines.push(Line::from("Functional commands (send prompt, undo, squash, model picker, tabs) use the primary modifier."));
+            lines.push(Line::raw(""));
+            lines.push(Line::from(Span::styled(
+                "Select primary command modifier (arrows ↑/↓, then Enter):",
+                Style::default().bold().fg(Color::White),
+            )));
+            lines.push(Line::raw(""));
+
+            let options = [
+                "Ctrl (Default — standard Emacs C- shortcuts: Ctrl+Enter, Ctrl+Z, Ctrl+S, Ctrl+M)".to_string(),
+                "Alt (Meta modifier — Alt+Enter, Alt+Z, Alt+S, Alt+M; robust on macOS and legacy terminals)".to_string(),
+            ];
+
+            for (idx, opt) in options.iter().enumerate() {
+                let is_sel = idx == ob.selected_index;
+                let prefix = if is_sel { "  ▶ [●] " } else { "    [ ] " };
+                let style = if is_sel {
+                    Style::default().bg(Color::DarkGray).fg(Color::White).bold()
+                } else {
+                    Style::default().fg(Color::Gray)
+                };
+                lines.push(Line::from(vec![
+                    Span::styled(prefix, Style::default().fg(Color::Blue).bold()),
+                    Span::styled(opt.clone(), style),
+                ]));
+            }
+        }
         crate::app::OnboardingStep::Gatekeeper => {
             lines.push(Line::from(Span::styled(
                 "Warning: System Not Ready",
@@ -221,6 +296,16 @@ pub fn render_onboarding_view(
                 Span::styled("• OpenRouter Key: ", Style::default().bold()),
                 Span::styled("[OK] Configured", Style::default().fg(Color::Green).bold()),
             ]));
+            lines.push(Line::from(vec![
+                Span::styled("• Command Modifier: ", Style::default().bold()),
+                Span::styled(
+                    match state.tui_config.input.primary_modifier {
+                        crate::config::PrimaryModifier::Ctrl => "Ctrl (Default)",
+                        crate::config::PrimaryModifier::Alt => "Alt",
+                    },
+                    Style::default().fg(Color::Blue).bold(),
+                ),
+            ]));
             lines.push(Line::raw(""));
             lines.push(Line::from("Press Enter to open the development workspace."));
             lines.push(Line::from(Span::styled(
@@ -240,30 +325,40 @@ pub fn render_onboarding_view(
 
     if ob.input_active {
         lines.push(Line::raw(""));
-        let prompt = "Enter OpenRouter API Key: ";
+        if ob.input_langmap {
+            let prompt = "Enter Custom Langmap (e.g. 'йцукен;qwerty' or 'йq,цw'): ";
+            lines.push(Line::from(vec![
+                Span::styled(prompt, Style::default().fg(Color::Magenta).bold()),
+                Span::styled(&ob.input_buffer, Style::default().fg(Color::White).bold()),
+                Span::styled("█", Style::default().fg(Color::Magenta)),
+                Span::styled("  (Enter: Save, Esc: Cancel)", Style::default().fg(Color::DarkGray)),
+            ]));
+        } else {
+            let prompt = "Enter OpenRouter API Key: ";
 
-        let displayed = if ob.show_key {
-            if ob.input_buffer.is_empty() {
-                String::new()
+            let displayed = if ob.show_key {
+                if ob.input_buffer.is_empty() {
+                    String::new()
+                } else {
+                    format!("{} ({} chars)", ob.input_buffer, ob.input_buffer.chars().count())
+                }
             } else {
-                format!("{} ({} chars)", ob.input_buffer, ob.input_buffer.chars().count())
-            }
-        } else {
-            format_masked_key(&ob.input_buffer)
-        };
+                format_masked_key(&ob.input_buffer)
+            };
 
-        let hint = if ob.show_key {
-            "  (Ctrl+R: Hide, Ctrl+V: Paste, Enter: Save, Esc: Cancel)"
-        } else {
-            "  (Ctrl+R: Show, Ctrl+V: Paste, Enter: Save, Esc: Cancel)"
-        };
+            let hint = if ob.show_key {
+                "  (Ctrl+R: Hide, Ctrl+V: Paste, Enter: Save, Esc: Cancel)"
+            } else {
+                "  (Ctrl+R: Show, Ctrl+V: Paste, Enter: Save, Esc: Cancel)"
+            };
 
-        lines.push(Line::from(vec![
-            Span::styled(prompt, Style::default().fg(Color::Yellow).bold()),
-            Span::styled(displayed, Style::default().fg(Color::White).bold()),
-            Span::styled("█", Style::default().fg(Color::Yellow)),
-            Span::styled(hint, Style::default().fg(Color::DarkGray)),
-        ]));
+            lines.push(Line::from(vec![
+                Span::styled(prompt, Style::default().fg(Color::Yellow).bold()),
+                Span::styled(displayed, Style::default().fg(Color::White).bold()),
+                Span::styled("█", Style::default().fg(Color::Yellow)),
+                Span::styled(hint, Style::default().fg(Color::DarkGray)),
+            ]));
+        }
     }
 
     if let Some(err) = &ob.error_message {
@@ -272,7 +367,8 @@ pub fn render_onboarding_view(
             format!("Error: {}", err),
             Style::default().fg(Color::Red).bold(),
         )));
-    } else if let Some(msg) = &ob.status_message {
+    }
+    if let Some(msg) = &ob.status_message {
         lines.push(Line::raw(""));
         lines.push(Line::from(Span::styled(
             format!("✓ {}", msg),
@@ -294,6 +390,8 @@ pub fn render_onboarding_view(
         crate::app::OnboardingStep::Git => "Tauqe relies on Git for checkpoints, atomic step commits, and safe undo.",
         crate::app::OnboardingStep::Config => "Create default tauqe.toml or skip to use built-in defaults.",
         crate::app::OnboardingStep::Credentials => "Secure credential storage: created with 0600 file permissions (owner-only read/write).",
+        crate::app::OnboardingStep::Workstation => "Workstation configuration: personal settings stored in ~/.config/tauqe/tui.toml.",
+        crate::app::OnboardingStep::Modifier => "Primary command modifier for text input: choose Ctrl (default) or Alt for legacy/macOS terminals.",
         crate::app::OnboardingStep::Gatekeeper => "OpenRouter API key is required for LLM calls. Select an action.",
         crate::app::OnboardingStep::Ready => "All parameters verified. Press Enter to start.",
     };
@@ -334,10 +432,10 @@ mod tests {
     #[test]
     fn test_format_masked_key() {
         assert_eq!(format_masked_key(""), "");
-        assert_eq!(format_masked_key("short-key"), "short-key");
+        assert_eq!(format_masked_key("short-key"), "••••••••• (9 chars)");
         assert_eq!(
             format_masked_key("sk-or-v1-0123456789abcdef0123456789abcdef"),
-            "sk-or-v1...cdef (41 chars)"
+            "•••••••••••••••• (41 chars)"
         );
     }
 }

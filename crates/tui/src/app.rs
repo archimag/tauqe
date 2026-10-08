@@ -1,5 +1,6 @@
 use tauqe_protocol::{ContextState, ModelRef, RepositoryState};
 
+use crate::config::TuiConfig;
 use crate::editor::InputEditor;
 use crate::ui::context::ContextViewState;
 use crate::ui::develop::DevelopView;
@@ -11,6 +12,29 @@ use crate::ui::review::ReviewViewState;
 pub struct KeyCommand {
     pub key: &'static str,
     pub description: &'static str,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ConfirmDialogButton {
+    #[default]
+    Cancel,
+    Confirm,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotificationLevel {
+    Info,
+    Success,
+    Warning,
+    Error,
+}
+
+#[derive(Debug, Clone)]
+pub struct AppNotification {
+    pub level: NotificationLevel,
+    pub text: String,
+    pub created_at: std::time::Instant,
+    pub ttl: std::time::Duration,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,6 +73,8 @@ pub enum OnboardingStep {
     Git,
     Config,
     Credentials,
+    Workstation,
+    Modifier,
     Ready,
     Gatekeeper,
 }
@@ -63,9 +89,14 @@ pub struct OnboardingState {
     pub has_api_key: bool,
     pub credentials_path: Option<String>,
     pub default_credentials_path: String,
+    pub has_tui_config: bool,
+    pub default_tui_config_path: String,
+    pub chosen_layout: crate::config::LayoutPreset,
+    pub chosen_langmap: Option<String>,
     pub selected_index: usize,
     pub input_buffer: String,
     pub input_active: bool,
+    pub input_langmap: bool,
     pub show_key: bool,
     pub status_message: Option<String>,
     pub error_message: Option<String>,
@@ -73,6 +104,8 @@ pub struct OnboardingState {
 
 impl Default for OnboardingState {
     fn default() -> Self {
+        let has_tui = crate::config::find_tui_config_path().is_some();
+        let default_tui = crate::config::default_tui_config_path().display().to_string();
         Self {
             step: OnboardingStep::Config,
             has_git: true,
@@ -82,9 +115,14 @@ impl Default for OnboardingState {
             has_api_key: false,
             credentials_path: None,
             default_credentials_path: "~/.config/tauqe/credentials.toml".to_string(),
+            has_tui_config: has_tui,
+            default_tui_config_path: default_tui,
+            chosen_layout: crate::config::LayoutPreset::None,
+            chosen_langmap: None,
             selected_index: 0,
             input_buffer: String::new(),
             input_active: false,
+            input_langmap: false,
             show_key: false,
             status_message: None,
             error_message: None,
@@ -92,8 +130,26 @@ impl Default for OnboardingState {
     }
 }
 
+impl OnboardingState {
+    pub fn set_status(&mut self, msg: impl Into<String>) {
+        self.status_message = Some(msg.into());
+        self.error_message = None;
+    }
+
+    pub fn set_error(&mut self, err: impl Into<String>) {
+        self.error_message = Some(err.into());
+        self.status_message = None;
+    }
+
+    pub fn clear_messages(&mut self) {
+        self.status_message = None;
+        self.error_message = None;
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 pub struct HeaderClickAreas {
+    pub row: u16,
     pub develop_tab: (u16, u16),
     pub context_tab: (u16, u16),
     pub review_tab: (u16, u16),
@@ -101,11 +157,6 @@ pub struct HeaderClickAreas {
     pub history_tab: (u16, u16),
     pub model_select: (u16, u16),
     pub squash_button: (u16, u16),
-    pub help_button: (u16, u16),
-}
-
-#[derive(Debug, Clone, Copy, Default)]
-pub struct FooterClickAreas {
     pub help_button: (u16, u16),
 }
 
@@ -138,6 +189,7 @@ pub struct SquashDialogState {
     pub generating_message: bool,
     pub base_mode: SquashBaseMode,
     pub base_ref: String,
+    pub pending_base: Option<(SquashBaseMode, String)>,
     pub session_base: Option<String>,
     pub upstream_base: Option<String>,
     pub custom_input: String,
@@ -150,6 +202,8 @@ pub struct SquashDialogState {
     pub message_buffer: String,
     pub status_message: Option<String>,
     pub focus: SquashDialogFocus,
+    pub confirm_apply: bool,
+    pub confirm_button: ConfirmDialogButton,
 }
 
 impl Default for SquashDialogState {
@@ -159,6 +213,7 @@ impl Default for SquashDialogState {
             generating_message: false,
             base_mode: SquashBaseMode::Session,
             base_ref: String::new(),
+            pending_base: None,
             session_base: None,
             upstream_base: None,
             custom_input: String::new(),
@@ -171,6 +226,8 @@ impl Default for SquashDialogState {
             message_buffer: String::new(),
             status_message: Some("Inspecting repository history...".to_string()),
             focus: SquashDialogFocus::FileList,
+            confirm_apply: false,
+            confirm_button: ConfirmDialogButton::Cancel,
         }
     }
 }
@@ -194,31 +251,86 @@ pub struct AppState {
     pub plans_view: PlansViewState,
     pub onboarding: OnboardingState,
     pub input_editor: InputEditor,
+    pub tui_config: TuiConfig,
     pub show_help: bool,
+    pub help_scroll: u16,
     pub confirm_cancel: bool,
+    pub confirm_quit: bool,
     pub confirm_undo: bool,
     pub confirm_clear_history: bool,
     pub confirm_delete_plan: Option<String>,
+    pub confirm_button: ConfirmDialogButton,
     pub selection_dialog: Option<SelectionDialogState>,
     pub squash_dialog: Option<SquashDialogState>,
     pub review_dialog: Option<ReviewDialogState>,
+    pub notification: Option<AppNotification>,
+    pub turn_started_at: Option<std::time::Instant>,
+    pub server_disconnected: Option<String>,
+    pub server_log_path: std::path::PathBuf,
     pub last_model_height: u16,
     pub header_clicks: HeaderClickAreas,
-    pub footer_clicks: FooterClickAreas,
 }
 
 impl AppState {
+    pub fn notify(&mut self, text: impl Into<String>, level: NotificationLevel, ttl: std::time::Duration) {
+        self.notification = Some(AppNotification {
+            level,
+            text: text.into(),
+            created_at: std::time::Instant::now(),
+            ttl,
+        });
+    }
+
+    pub fn notify_info(&mut self, text: impl Into<String>) {
+        self.notify(text, NotificationLevel::Info, std::time::Duration::from_secs(3));
+    }
+
+    pub fn notify_success(&mut self, text: impl Into<String>) {
+        self.notify(text, NotificationLevel::Success, std::time::Duration::from_secs(4));
+    }
+
+    pub fn notify_warning(&mut self, text: impl Into<String>) {
+        self.notify(text, NotificationLevel::Warning, std::time::Duration::from_secs(4));
+    }
+
+    pub fn notify_error(&mut self, text: impl Into<String>) {
+        self.notify(text, NotificationLevel::Error, std::time::Duration::from_secs(6));
+    }
+
+    pub fn has_active_modal(&self) -> bool {
+        self.server_disconnected.is_some()
+            || self.show_help
+            || self.selection_dialog.is_some()
+            || self.squash_dialog.is_some()
+            || self.review_dialog.is_some()
+            || self.confirm_cancel
+            || self.confirm_quit
+            || self.confirm_undo
+            || self.confirm_clear_history
+            || self.confirm_delete_plan.is_some()
+            || self.context_view.confirm_clear_auto
+            || self.context_view.adding_file
+    }
+
+    pub fn active_notification(&self) -> Option<&AppNotification> {
+        if let Some(ref notif) = self.notification {
+            if notif.created_at.elapsed() < notif.ttl {
+                return Some(notif);
+            }
+        }
+        None
+    }
+
     pub fn take_prompt(&mut self) -> Option<String> {
         if self.input_editor.is_empty() {
             return None;
         }
         if self.model.is_busy() || self.review.running {
-            self.model.git_notification = Some(
-                "Model is generating. Press Esc to cancel or wait until done.".to_string(),
-            );
+            self.notify_warning("Model is generating. Press Esc to cancel or wait until done.");
             return None;
         }
         let prompt = self.input_editor.get_text().trim().to_string();
+        self.input_editor.record_history(&prompt);
         self.input_editor.clear();
         self.confirm_clear_history = false;
         self.confirm_cancel = false;
@@ -244,12 +356,11 @@ impl AppState {
         self.model.edit_final_error = None;
         self.model.last_commit_hash = None;
         self.model.last_commit_summary = None;
-        self.model.git_notification = None;
         self.model.toolchain_command = None;
         self.model.toolchain_status = None;
         self.model.copy_flash = None;
-        self.model.copy_notification = None;
         self.model.code_blocks.clear();
+        self.turn_started_at = Some(std::time::Instant::now());
 
         Some(prompt)
     }
@@ -287,18 +398,25 @@ mod tests {
             review: ReviewViewState::default(),
             plans_view: PlansViewState::default(),
             review_dialog: None,
+            notification: None,
+            turn_started_at: None,
             onboarding: OnboardingState::default(),
             input_editor: InputEditor::default(),
+            tui_config: TuiConfig::default(),
             show_help: false,
+            help_scroll: 0,
             confirm_cancel: false,
+            confirm_quit: false,
             confirm_undo: false,
             confirm_clear_history: false,
             confirm_delete_plan: None,
+            confirm_button: ConfirmDialogButton::Cancel,
             selection_dialog: None,
             squash_dialog: None,
+            server_disconnected: None,
+            server_log_path: std::path::PathBuf::from(".tauqe/server.log"),
             last_model_height: 10,
             header_clicks: HeaderClickAreas::default(),
-            footer_clicks: FooterClickAreas::default(),
         };
 
         state.input_editor.insert_str("next planned prompt");
@@ -307,7 +425,7 @@ mod tests {
         let result = state.take_prompt();
         assert_eq!(result, None);
         assert_eq!(state.input_editor.get_text(), "next planned prompt");
-        assert!(state.model.git_notification.is_some());
+        assert!(state.active_notification().is_some());
 
         state.model.status = "done".to_string();
         assert!(!state.model.is_busy());

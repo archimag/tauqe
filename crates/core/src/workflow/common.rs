@@ -219,6 +219,15 @@ pub async fn execute_edit_pipeline(
 
     let mut turn_detected_language: Option<String> = None;
 
+    let _ = stream_tx
+        .send(StreamEvent::TurnPhase {
+            phase: tauqe_protocol::TurnPhase::Proposal,
+            round: Some(1),
+            max_rounds: None,
+            detail: None,
+        })
+        .await;
+
     // 1. Initial attempt
     let mut pipeline_out = execute_edit_pipeline_step(
         prompt,
@@ -287,6 +296,14 @@ pub async fn execute_edit_pipeline(
             break;
         }
         discovery_round += 1;
+        let _ = stream_tx
+            .send(StreamEvent::TurnPhase {
+                phase: tauqe_protocol::TurnPhase::Discovery,
+                round: Some(discovery_round),
+                max_rounds: Some(options.max_discovery_rounds),
+                detail: Some(format!("Discovery round {}", discovery_round)),
+            })
+            .await;
         tracing::info!(
             "Discovery round {}: added {} file(s) to auto context: [{}]; documentation topics: [{}]",
             discovery_round,
@@ -323,6 +340,15 @@ pub async fn execute_edit_pipeline(
             notes.join("; ")
         );
         let _ = stream_tx.send(StreamEvent::TextDelta(round_banner.clone())).await;
+
+        let _ = stream_tx
+            .send(StreamEvent::TurnPhase {
+                phase: tauqe_protocol::TurnPhase::Proposal,
+                round: Some(discovery_round + 1),
+                max_rounds: None,
+                detail: None,
+            })
+            .await;
 
         pipeline_out = execute_edit_pipeline_step(
             &round_prompt,
@@ -415,6 +441,15 @@ pub async fn execute_edit_pipeline(
         std::collections::HashMap::new();
     let mut attempt = 0;
 
+    let _ = stream_tx
+        .send(StreamEvent::TurnPhase {
+            phase: tauqe_protocol::TurnPhase::Staging,
+            round: Some(1),
+            max_rounds: Some(options.max_retries),
+            detail: None,
+        })
+        .await;
+
     loop {
         let stage_res = stage_and_validate_edits(
             &repo_root,
@@ -467,6 +502,15 @@ pub async fn execute_edit_pipeline(
         }
 
         attempt += 1;
+
+        let _ = stream_tx
+            .send(StreamEvent::TurnPhase {
+                phase: tauqe_protocol::TurnPhase::Staging,
+                round: Some(attempt),
+                max_rounds: Some(options.max_retries),
+                detail: Some(format!("Patch retry {}/{}", attempt, options.max_retries)),
+            })
+            .await;
 
         for (path, err) in &last_failed_errors {
             let reason = format_patch_retry_reason(err);

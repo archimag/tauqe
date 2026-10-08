@@ -3,6 +3,9 @@ pub struct InputEditor {
     pub text: String,
     pub cursor: usize,
     pub kill_ring: String,
+    pub history: Vec<String>,
+    pub history_index: Option<usize>,
+    pub draft: String,
 }
 
 impl InputEditor {
@@ -13,6 +16,69 @@ impl InputEditor {
     pub fn clear(&mut self) {
         self.text.clear();
         self.cursor = 0;
+        self.history_index = None;
+        self.draft.clear();
+    }
+
+    pub fn clear_saving(&mut self) {
+        if !self.text.is_empty() {
+            self.kill_ring = self.text.clone();
+            self.text.clear();
+            self.cursor = 0;
+            self.history_index = None;
+            self.draft.clear();
+        }
+    }
+
+    pub fn record_history(&mut self, prompt: &str) {
+        let trimmed = prompt.trim();
+        if !trimmed.is_empty() && self.history.last().map(|s| s.as_str()) != Some(trimmed) {
+            self.history.push(trimmed.to_string());
+        }
+        self.history_index = None;
+        self.draft.clear();
+    }
+
+    pub fn history_prev(&mut self) -> bool {
+        if self.history.is_empty() {
+            return false;
+        }
+        let new_idx = match self.history_index {
+            None => {
+                self.draft = self.text.clone();
+                self.history.len().saturating_sub(1)
+            }
+            Some(0) => return false,
+            Some(i) => i.saturating_sub(1),
+        };
+        self.history_index = Some(new_idx);
+        if let Some(item) = self.history.get(new_idx) {
+            self.text = item.clone();
+            self.cursor = self.text.len();
+            return true;
+        }
+        false
+    }
+
+    pub fn history_next(&mut self) -> bool {
+        match self.history_index {
+            None => false,
+            Some(i) if i + 1 < self.history.len() => {
+                let new_idx = i + 1;
+                self.history_index = Some(new_idx);
+                if let Some(item) = self.history.get(new_idx) {
+                    self.text = item.clone();
+                    self.cursor = self.text.len();
+                }
+                true
+            }
+            Some(_) => {
+                self.history_index = None;
+                self.text = self.draft.clone();
+                self.cursor = self.text.len();
+                true
+            }
+        }
     }
 
     pub fn get_text(&self) -> &str {
@@ -31,30 +97,8 @@ impl InputEditor {
     /// Computes the total visual line count and the visual line of the cursor
     /// given a specific content width (columns available inside the widget).
     pub fn visual_lines_and_cursor(&self, width: usize) -> (usize, usize) {
-        let width = width.max(10);
-        let mut total_visual_lines = 0;
-        let mut cursor_visual_line = 0;
-        let (cur_line, cur_col) = self.cursor_line_col();
-
-        for (l_idx, line) in self.get_lines().iter().enumerate() {
-            let prefix_len = 3; // " > " or "   "
-            let available_width = width.saturating_sub(prefix_len).max(1);
-            let char_count = line.chars().count();
-            let visual_lines_for_this = if char_count == 0 {
-                1
-            } else {
-                char_count.div_ceil(available_width)
-            };
-
-            if l_idx == cur_line {
-                let offset_in_line = cur_col / available_width;
-                cursor_visual_line = total_visual_lines + offset_in_line.min(visual_lines_for_this.saturating_sub(1));
-            }
-
-            total_visual_lines += visual_lines_for_this;
-        }
-
-        (total_visual_lines.max(1), cursor_visual_line)
+        let (lines, cur) = crate::ui::develop::render::build_prompt_lines(self, width, false);
+        (lines.len(), cur)
     }
 
     pub fn cursor_line_col(&self) -> (usize, usize) {
@@ -83,11 +127,13 @@ impl InputEditor {
     }
 
     pub fn insert_char(&mut self, c: char) {
+        self.history_index = None;
         self.text.insert(self.cursor, c);
         self.cursor += c.len_utf8();
     }
 
     pub fn insert_str(&mut self, s: &str) {
+        self.history_index = None;
         self.text.insert_str(self.cursor, s);
         self.cursor += s.len();
     }
@@ -99,6 +145,7 @@ impl InputEditor {
     }
 
     pub fn delete_backward(&mut self) {
+        self.history_index = None;
         if let Some(prev_char) = self.text[..self.cursor].chars().next_back() {
             let new_cursor = self.cursor - prev_char.len_utf8();
             self.text.drain(new_cursor..self.cursor);
@@ -107,6 +154,7 @@ impl InputEditor {
     }
 
     pub fn delete_forward(&mut self) {
+        self.history_index = None;
         if let Some(next_char) = self.text[self.cursor..].chars().next() {
             self.text
                 .drain(self.cursor..self.cursor + next_char.len_utf8());
@@ -366,5 +414,41 @@ mod tests {
 
         assert_eq!(editor.get_text(), text.as_str());
         assert_eq!(editor.cursor, text.len());
+    }
+
+    #[test]
+    fn prompt_history_navigation_and_draft_restoration() {
+        let mut editor = InputEditor::default();
+        editor.record_history("first prompt");
+        editor.record_history("second prompt");
+
+        editor.insert_str("unfinished draft");
+        assert!(editor.history_prev());
+        assert_eq!(editor.get_text(), "second prompt");
+
+        assert!(editor.history_prev());
+        assert_eq!(editor.get_text(), "first prompt");
+
+        assert!(!editor.history_prev()); // At oldest
+        assert_eq!(editor.get_text(), "first prompt");
+
+        assert!(editor.history_next());
+        assert_eq!(editor.get_text(), "second prompt");
+
+        assert!(editor.history_next()); // Back to draft
+        assert_eq!(editor.get_text(), "unfinished draft");
+    }
+
+    #[test]
+    fn clear_saving_preserves_kill_ring_and_yank_restores_it() {
+        let mut editor = InputEditor::default();
+        editor.insert_str("important multiline\nprompt to keep");
+        editor.clear_saving();
+
+        assert!(editor.is_empty());
+        assert_eq!(editor.kill_ring, "important multiline\nprompt to keep");
+
+        editor.yank();
+        assert_eq!(editor.get_text(), "important multiline\nprompt to keep");
     }
 }

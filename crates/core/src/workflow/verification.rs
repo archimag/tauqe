@@ -30,12 +30,30 @@ pub async fn run_workflow_verification(
         VerifyTarget::All => "all",
     };
 
+    let _ = stream_tx
+        .send(StreamEvent::ToolchainStarted {
+            command: target_str.to_string(),
+        })
+        .await;
+
     if stream_output {
         let start_msg = format!("\n\n🔍 Running verification (`{}`)...\n", target_str);
         let _ = stream_tx.send(StreamEvent::TextDelta(start_msg)).await;
     }
 
     let (ok, results) = crate::toolchain::run_verification_pipeline(repo_root, &verify_req.target).await;
+
+    let _ = stream_tx
+        .send(StreamEvent::ToolchainFinished {
+            command: target_str.to_string(),
+            success: ok,
+            message: if ok {
+                Some(format!("Verification (`{}`) passed", target_str))
+            } else {
+                Some(format!("Verification (`{}`) failed", target_str))
+            },
+        })
+        .await;
 
     if results.is_empty() {
         let note = "⚠️ No build/test toolchain detected in repository for verification.\n".to_string();
@@ -222,6 +240,15 @@ where
     while !verify_outcome.success && verify_attempt < options.max_retries {
         verify_attempt += 1;
 
+        let _ = stream_tx
+            .send(StreamEvent::TurnPhase {
+                phase: tauqe_protocol::TurnPhase::Healing,
+                round: Some(verify_attempt),
+                max_rounds: Some(options.max_retries),
+                detail: Some(format!("Healing retry {}/{}", verify_attempt, options.max_retries)),
+            })
+            .await;
+
         let retry_banner = format!(
             "\n\n---\n**[Verification Retry {}/{}]** Correcting verification failures...\n\n",
             verify_attempt, options.max_retries
@@ -315,6 +342,14 @@ where
                             verify_req = Some(new_req);
                         }
                         if let Some(ref req) = verify_req {
+                            let _ = stream_tx
+                                .send(StreamEvent::TurnPhase {
+                                    phase: tauqe_protocol::TurnPhase::Verification,
+                                    round: Some(verify_attempt),
+                                    max_rounds: Some(options.max_retries),
+                                    detail: None,
+                                })
+                                .await;
                             verify_outcome = run_workflow_verification(repo_root, req, stream_tx, false).await;
                             if !verify_outcome.success {
                                 let new_error_files = auto_register_error_paths(

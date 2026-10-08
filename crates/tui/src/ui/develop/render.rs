@@ -1,7 +1,7 @@
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Style, Stylize};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Padding, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Padding, Paragraph};
 
 use crate::app::AppState;
 use crate::ui::{wrap_line, wrap_lines};
@@ -13,10 +13,11 @@ pub fn render_develop_view(
     state: &mut AppState,
     model_area: Rect,
     input_area: Rect,
+    prompt_lines: Vec<Line<'static>>,
     cursor_visual_line: usize,
 ) {
     render_model_pane(frame, state, model_area);
-    render_prompt_input(frame, state, input_area, cursor_visual_line);
+    render_prompt_input(frame, state, input_area, prompt_lines, cursor_visual_line);
 }
 
 fn render_model_pane(frame: &mut ratatui::Frame, state: &mut AppState, area: Rect) {
@@ -39,16 +40,10 @@ fn render_model_pane(frame: &mut ratatui::Frame, state: &mut AppState, area: Rec
             state.model.update_markdown();
         }
     }
-    if let Some((_, inst)) = state.model.copy_notification {
-        if inst.elapsed().as_secs_f32() >= 2.5 {
-            state.model.copy_notification = None;
-        }
-    }
 
     let raw_lines = compute_model_lines(&state.model);
 
     let prefix_count = (state.model.error.is_some() as usize)
-        + (state.model.git_notification.is_some() as usize)
         + (state.model.toolchain_status.is_some() as usize);
 
     let mut raw_to_visual_start = Vec::with_capacity(raw_lines.len());
@@ -85,67 +80,204 @@ fn render_model_pane(frame: &mut ratatui::Frame, state: &mut AppState, area: Rec
     frame.render_widget(model_paragraph, area);
 }
 
+fn tokenize_with_offsets(s: &str) -> Vec<(&str, bool, usize)> {
+    let mut tokens = Vec::new();
+    let chars: Vec<(usize, char)> = s.char_indices().collect();
+    if chars.is_empty() {
+        return tokens;
+    }
+    let mut i = 0;
+    while i < chars.len() {
+        let is_ws = chars[i].1.is_whitespace();
+        let start = chars[i].0;
+        while i < chars.len() && chars[i].1.is_whitespace() == is_ws {
+            i += 1;
+        }
+        let end = if i < chars.len() { chars[i].0 } else { s.len() };
+        tokens.push((&s[start..end], is_ws, start));
+    }
+    tokens
+}
+
+pub fn build_prompt_lines(
+    editor: &crate::editor::InputEditor,
+    content_width: usize,
+    is_busy: bool,
+) -> (Vec<Line<'static>>, usize) {
+    let content_width = content_width.max(10);
+    let prefix_style = if is_busy {
+        Style::default().fg(Color::DarkGray).bold()
+    } else {
+        Style::default().fg(Color::Cyan).bold()
+    };
+
+    if editor.is_empty() {
+        let line = Line::from(vec![
+            Span::styled(" > ", prefix_style),
+            Span::styled("█", Style::default().fg(Color::Yellow)),
+        ]);
+        return (vec![line], 0);
+    }
+
+    let mut visual_lines: Vec<Line<'static>> = Vec::new();
+    let mut cursor_visual_line: usize = 0;
+    let mut byte_offset = 0;
+    let logical_lines: Vec<&str> = editor.text.split('\n').collect();
+
+    for raw_line in logical_lines {
+        let line_len = raw_line.len();
+        let line_start = byte_offset;
+        let line_end = byte_offset + line_len;
+        byte_offset = line_end + 1;
+
+        let cursor_in_line = editor.cursor >= line_start && editor.cursor <= line_end;
+        let cursor_offset = if cursor_in_line {
+            Some(editor.cursor - line_start)
+        } else {
+            None
+        };
+
+        let mut current_spans: Vec<Span<'static>> = Vec::new();
+        let mut current_width: usize = 0;
+
+        let is_first_visual = visual_lines.is_empty();
+        current_spans.push(Span::styled(
+            if is_first_visual { " > " } else { "   " },
+            prefix_style,
+        ));
+        current_width += 3;
+
+        if raw_line.is_empty() {
+            if cursor_offset == Some(0) {
+                current_spans.push(Span::styled("█", Style::default().fg(Color::Yellow)));
+                cursor_visual_line = visual_lines.len();
+            }
+            visual_lines.push(Line::from(current_spans));
+            continue;
+        }
+
+        let tokens = tokenize_with_offsets(raw_line);
+        for (token_str, is_ws, token_start) in tokens {
+            let token_end = token_start + token_str.len();
+            let has_cursor = cursor_offset.is_some_and(|c| c >= token_start && c < token_end);
+
+            let token_spans: Vec<Span<'static>> = match cursor_offset {
+                Some(c_off) if c_off >= token_start && c_off < token_end => {
+                    let local_off = c_off - token_start;
+                    let before = &token_str[..local_off];
+                    let mut chars = token_str[local_off..].chars();
+                    if let Some(ch) = chars.next() {
+                        let ch_len = ch.len_utf8();
+                        let after = &token_str[local_off + ch_len..];
+
+                        let mut s = Vec::new();
+                        if !before.is_empty() {
+                            s.push(Span::raw(before.to_string()));
+                        }
+                        s.push(Span::styled(
+                            ch.to_string(),
+                            Style::default().bg(Color::White).fg(Color::Black).bold(),
+                        ));
+                        if !after.is_empty() {
+                            s.push(Span::raw(after.to_string()));
+                        }
+                        s
+                    } else {
+                        vec![Span::raw(token_str.to_string())]
+                    }
+                }
+                _ => vec![Span::raw(token_str.to_string())],
+            };
+
+            let token_width: usize = token_spans.iter().map(|s| s.width()).sum();
+
+            if is_ws {
+                if current_width + token_width <= content_width {
+                    if has_cursor {
+                        cursor_visual_line = visual_lines.len();
+                    }
+                    current_spans.extend(token_spans);
+                    current_width += token_width;
+                } else if current_width > 3 {
+                    visual_lines.push(Line::from(std::mem::take(&mut current_spans)));
+                    current_spans.push(Span::styled("   ", prefix_style));
+                    current_width = 3;
+                }
+            } else if current_width + token_width <= content_width {
+                if has_cursor {
+                    cursor_visual_line = visual_lines.len();
+                }
+                current_spans.extend(token_spans);
+                current_width += token_width;
+            } else {
+                if current_width > 3 {
+                    visual_lines.push(Line::from(std::mem::take(&mut current_spans)));
+                    current_spans.push(Span::styled("   ", prefix_style));
+                    current_width = 3;
+                }
+
+                if current_width + token_width <= content_width {
+                    if has_cursor {
+                        cursor_visual_line = visual_lines.len();
+                    }
+                    current_spans.extend(token_spans);
+                    current_width += token_width;
+                } else {
+                    for span in token_spans {
+                        let style = span.style;
+                        for ch in span.content.chars() {
+                            let ch_str = ch.to_string();
+                            let ch_w = Span::raw(&ch_str).width();
+                            if current_width + ch_w > content_width && current_width > 3 {
+                                visual_lines.push(Line::from(std::mem::take(&mut current_spans)));
+                                current_spans.push(Span::styled("   ", prefix_style));
+                                current_width = 3;
+                            }
+                            if style != Style::default() {
+                                cursor_visual_line = visual_lines.len();
+                            }
+                            current_spans.push(Span::styled(ch_str, style));
+                            current_width += ch_w;
+                        }
+                    }
+                }
+            }
+        }
+
+        if cursor_offset == Some(line_len) {
+            let cursor_span = Span::styled("█", Style::default().fg(Color::Yellow));
+            let cursor_w = cursor_span.width();
+            if current_width + cursor_w > content_width && current_width > 3 {
+                visual_lines.push(Line::from(std::mem::take(&mut current_spans)));
+                current_spans.push(Span::styled("   ", prefix_style));
+            }
+            cursor_visual_line = visual_lines.len();
+            current_spans.push(cursor_span);
+        }
+
+        if !current_spans.is_empty() {
+            visual_lines.push(Line::from(current_spans));
+        }
+    }
+
+    if visual_lines.is_empty() {
+        visual_lines.push(Line::from(vec![
+            Span::styled(" > ", prefix_style),
+            Span::styled("█", Style::default().fg(Color::Yellow)),
+        ]));
+    }
+
+    (visual_lines, cursor_visual_line)
+}
+
 fn render_prompt_input(
     frame: &mut ratatui::Frame,
     state: &AppState,
     area: Rect,
+    input_lines: Vec<Line<'static>>,
     cursor_visual_line: usize,
 ) {
     let is_busy = state.model.is_busy();
-    let editor = &state.input_editor;
-    let text = editor.get_text();
-    let mut input_lines = Vec::new();
-    let (cur_line_idx, cur_col) = editor.cursor_line_col();
-
-    if text.is_empty() {
-        let prompt_sym_style = if is_busy {
-            Style::default().fg(Color::DarkGray).bold()
-        } else {
-            Style::default().fg(Color::Cyan).bold()
-        };
-        input_lines.push(Line::from(vec![
-            Span::styled(" > ", prompt_sym_style),
-            Span::styled("█", Style::default().fg(Color::Yellow)),
-        ]));
-    } else {
-        let lines = editor.get_lines();
-
-        for (l_idx, line_str) in lines.iter().enumerate() {
-            let prefix = if l_idx == 0 { " > " } else { "   " };
-            let mut spans = vec![Span::styled(
-                prefix,
-                Style::default().fg(Color::Cyan).bold(),
-            )];
-
-            if l_idx == cur_line_idx {
-                let char_indices: Vec<(usize, char)> = line_str.char_indices().collect();
-                if cur_col >= char_indices.len() {
-                    spans.push(Span::raw(line_str.to_string()));
-                    spans.push(Span::styled("█", Style::default().fg(Color::Yellow)));
-                } else {
-                    let (byte_offset, c) = char_indices[cur_col];
-                    let before = &line_str[..byte_offset];
-                    let char_len = c.len_utf8();
-                    let after = &line_str[byte_offset + char_len..];
-
-                    if !before.is_empty() {
-                        spans.push(Span::raw(before.to_string()));
-                    }
-                    spans.push(Span::styled(
-                        c.to_string(),
-                        Style::default().bg(Color::White).fg(Color::Black).bold(),
-                    ));
-                    if !after.is_empty() {
-                        spans.push(Span::raw(after.to_string()));
-                    }
-                }
-            } else {
-                spans.push(Span::raw(line_str.to_string()));
-            }
-            input_lines.push(Line::from(spans));
-        }
-    }
-
     let visible_input_lines = area.height.saturating_sub(2);
     let input_scroll =
         if visible_input_lines > 0 && cursor_visual_line >= visible_input_lines as usize {
@@ -166,7 +298,6 @@ fn render_prompt_input(
                 .borders(Borders::ALL)
                 .border_style(border_style),
         )
-        .wrap(Wrap { trim: false })
         .scroll((input_scroll, 0));
     frame.render_widget(input_paragraph, area);
 }

@@ -95,14 +95,18 @@ All commits must follow the **Conventional Commits** specification:
 
 ---
 
-## 5. Living Configuration Reference (`tauqe.toml`)
+## 5. Living Configuration Reference (`tauqe.toml` and User Config)
 
-1. **Authoritative Example:**
-   - The root `tauqe.toml` file in this repository serves as the authoritative, living reference example of all configuration options.
-2. **Mandatory Documentation of Parameters:**
+1. **Authoritative Example for Project Configuration:**
+   - The root `tauqe.toml` file in this repository serves as the authoritative, living reference example of project-level configuration options.
+   - Project configuration (`tauqe.toml`) governs toolchains, project models, context limits, and repomap budgets, and is safe for repository version control.
+2. **Separation of Project and User Configuration:**
+   - Personal developer preferences (terminal themes, keyboard layout mappings, primary command modifiers) must never be placed in `tauqe.toml`.
+   - User-specific TUI configuration belongs in `$XDG_CONFIG_HOME/tauqe/tui.toml` (or `~/.config/tauqe/tui.toml`), keeping repository configs free of personal workstation settings.
+3. **Mandatory Documentation of Parameters:**
    - When introducing any new configuration section or parameter in `AppConfig`, it must immediately be reflected in `tauqe.toml`.
    - New or optional parameters should be provided in commented-out form (`# key = value`) with their default values explicitly shown, along with a concise descriptive comment.
-3. **No Hardcoded Budgets:**
+4. **No Hardcoded Budgets:**
    - All token budgets and operational limits (history tokens, tail turns count, repomap tokens, discovery rounds, retry counts) must be configurable through `AppConfig` and carry sensible, modern defaults.
 
 ---
@@ -137,4 +141,4 @@ All commits must follow the **Conventional Commits** specification:
 ## 8. Subsystem Conventions
 
 - **Terminal UI (`crates/tui`):**
-  The directives specified in `crates/tui/Conventions.md` are mandatory and strictly enforced. Whenever a task involves inspecting, modifying, or extending code inside `crates/tui/`, the model MUST explicitly request `crates/tui/Conventions.md` into context (via `<context_request>`) before proposing any modifications, unless it is already loaded in the active context. Proposing or making changes to `crates/tui/` without having `crates/tui/Conventions.md` loaded into context is strictly prohibited. Hierarchical tree structures (Review, Plans) must follow the Org-mode structural paradigm (visibility cycling, distinct lifecycle states, compact density without blank gaps, and simple dedicated navigation keys). Primary view modes must never display persistent keyboard action hint bars; command discovery is handled exclusively via the standard `?` help dialog.
+  The directives specified in `crates/tui/Conventions.md` are mandatory and strictly enforced. Whenever a task involves inspecting, modifying, or extending code inside `crates/tui/`, the model MUST explicitly request `crates/tui/Conventions.md` into context (via `<context_request>`) before proposing any modifications, unless it is already loaded in the active context. Proposing or making changes to `crates/tui/` without having `crates/tui/Conventions.md` loaded into context is strictly prohibited.

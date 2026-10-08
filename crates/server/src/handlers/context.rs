@@ -3,7 +3,8 @@ use std::sync::Arc;
 
 use tauqe_protocol::{
     events, ContextAddParams, ContextAddPatternParams, ContextAddPatternResult,
-    ContextRemoveParams, ContextSetAccessParams, Event, Request, Response, ResponseError,
+    ContextClearParams, ContextLayer, ContextRemoveParams, ContextSetAccessParams, Event,
+    Request, Response, ResponseError,
 };
 
 use crate::state::AppState;
@@ -224,9 +225,19 @@ pub async fn handle_context_set_access(req: Request, state: &Arc<AppState>) -> R
 }
 
 pub async fn handle_context_clear(req: Request, state: &Arc<AppState>) -> Response {
+    let params: Option<ContextClearParams> =
+        req.params.and_then(|p| serde_json::from_value(p).ok());
+
     let ctx_state = {
         let mut ctx = state.context.write().await;
-        ctx.clear();
+        if let Some(ContextClearParams {
+            layer: Some(ContextLayer::Auto),
+        }) = params
+        {
+            ctx.clear_auto();
+        } else {
+            ctx.clear();
+        }
         ctx.get_state()
     };
 

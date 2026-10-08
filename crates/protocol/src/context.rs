@@ -60,6 +60,12 @@ pub(crate) fn default_context_access() -> ContextAccess {
     ContextAccess::ReadOnly
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ContextClearParams {
+    #[serde(default)]
+    pub layer: Option<ContextLayer>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContextRemoveParams {
     pub path: String,

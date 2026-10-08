@@ -10,6 +10,8 @@ pub enum PlanItemStatus {
     Cancelled,
 }
 
+pub type PlanStatus = PlanItemStatus;
+
 impl PlanItemStatus {
     pub fn next(&self) -> Self {
         match self {
@@ -145,6 +147,40 @@ impl Plan {
             false
         }
         walk(&mut self.items, item_id, status)
+    }
+
+    pub fn to_markdown(&self) -> String {
+        let mut out = format!("# Plan: {}\n", self.title);
+        if let Some(desc) = &self.description {
+            let trimmed = desc.trim();
+            if !trimmed.is_empty() {
+                out.push('\n');
+                out.push_str(trimmed);
+                out.push('\n');
+            }
+        }
+        out.push('\n');
+
+        fn write_items(items: &[PlanItem], depth: usize, out: &mut String) {
+            for item in items {
+                let indent = "  ".repeat(depth);
+                let check = if item.checked { "[x]" } else { "[ ]" };
+                let clean_title = item.title.replace(['\r', '\n'], " ").trim().to_string();
+                out.push_str(&format!("{}- {} {} #{}: {}\n", indent, check, item.status, item.id, clean_title));
+                if let Some(details) = &item.details {
+                    let trimmed = details.trim();
+                    if !trimmed.is_empty() {
+                        for line in trimmed.lines() {
+                            out.push_str(&format!("{}    {}\n", indent, line));
+                        }
+                    }
+                }
+                write_items(&item.children, depth + 1, out);
+            }
+        }
+
+        write_items(&self.items, 0, &mut out);
+        out
     }
 }
 
@@ -300,5 +336,51 @@ mod tests {
         assert_eq!(summary.completed_items, 2);
         assert_eq!(summary.checked_items, 2);
         assert_eq!(summary.id, "jwt-auth");
+    }
+
+    #[test]
+    fn test_plan_to_markdown() {
+        let plan = Plan {
+            id: "jwt-auth".to_string(),
+            title: "JWT Authentication".to_string(),
+            description: Some("Replace session cookies".to_string()),
+            created_at: 1700000000,
+            updated_at: 1700000010,
+            items: vec![
+                PlanItem {
+                    id: "1".to_string(),
+                    title: "Models".to_string(),
+                    details: Some("Create token struct".to_string()),
+                    status: PlanItemStatus::Done,
+                    checked: false,
+                    children: vec![
+                        PlanItem {
+                            id: "1.1".to_string(),
+                            title: "Claims".to_string(),
+                            details: None,
+                            status: PlanItemStatus::Done,
+                            checked: true,
+                            children: vec![],
+                        },
+                    ],
+                },
+                PlanItem {
+                    id: "2".to_string(),
+                    title: "Endpoint".to_string(),
+                    details: None,
+                    status: PlanItemStatus::InProgress,
+                    checked: true,
+                    children: vec![],
+                },
+            ],
+        };
+
+        let md = plan.to_markdown();
+        assert!(md.contains("# Plan: JWT Authentication"));
+        assert!(md.contains("Replace session cookies"));
+        assert!(md.contains("- [ ] DONE #1: Models"));
+        assert!(md.contains("    Create token struct"));
+        assert!(md.contains("  - [x] DONE #1.1: Claims"));
+        assert!(md.contains("- [x] IN_PROGRESS #2: Endpoint"));
     }
 }

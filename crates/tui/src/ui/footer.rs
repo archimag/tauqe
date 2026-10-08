@@ -17,7 +17,7 @@ pub fn render_footer(frame: &mut ratatui::Frame, state: &AppState, area: Rect) {
     ));
     footer_spans.push(Span::styled(" │ ", Style::default().fg(Color::DarkGray)));
 
-    // 2. Financial indicator (🪙)
+    // 2. Financial indicator (Σ session · last · now)
     if let Some(cost_str) = format_footer_cost(
         state.model.session_total_cost,
         state.model.prev_cost,
@@ -41,13 +41,26 @@ pub fn render_footer(frame: &mut ratatui::Frame, state: &AppState, area: Rect) {
     } else if state.model.is_busy() {
         let spin = SPINNER_FRAMES[state.model.spinner_frame % SPINNER_FRAMES.len()];
 
-        let (status_name, status_color) = match state.model.status.as_str() {
-            "thinking" => ("Thinking", Color::Rgb(130, 170, 220)),
-            "editing" => ("Editing", Color::Magenta),
-            "verifying" => ("Verifying", Color::Cyan),
-            "responding" | "streaming" => ("Responding", Color::Yellow),
-            "awaiting" | "starting" => ("Awaiting", Color::Yellow),
-            _ => (state.model.status.as_str(), Color::Yellow),
+        let (status_name, status_color) = match state.model.turn_phase {
+            Some(tauqe_protocol::TurnPhase::Discovery) => ("Discovery", Color::Cyan),
+            Some(tauqe_protocol::TurnPhase::Proposal) => {
+                if state.model.status == "thinking" {
+                    ("Thinking", Color::Rgb(130, 170, 220))
+                } else {
+                    ("Proposal", Color::Yellow)
+                }
+            }
+            Some(tauqe_protocol::TurnPhase::Staging) => ("Staging", Color::Magenta),
+            Some(tauqe_protocol::TurnPhase::Verification) => ("Verifying", Color::Cyan),
+            Some(tauqe_protocol::TurnPhase::Healing) => ("Healing", Color::LightRed),
+            None => match state.model.status.as_str() {
+                "thinking" => ("Thinking", Color::Rgb(130, 170, 220)),
+                "editing" => ("Editing", Color::Magenta),
+                "verifying" => ("Verifying", Color::Cyan),
+                "responding" | "streaming" => ("Responding", Color::Yellow),
+                "awaiting" | "starting" => ("Awaiting", Color::Yellow),
+                _ => (state.model.status.as_str(), Color::Yellow),
+            },
         };
 
         footer_spans.push(Span::styled(
@@ -55,7 +68,32 @@ pub fn render_footer(frame: &mut ratatui::Frame, state: &AppState, area: Rect) {
             Style::default().fg(status_color).bold(),
         ));
 
-        if let Some(round_str) = extract_current_round(&state.model.text) {
+        if let Some(phase) = state.model.turn_phase {
+            let inner_width = area.width.saturating_sub(2) as usize;
+            if inner_width >= 80 {
+                footer_spans.push(Span::raw(" "));
+                footer_spans.extend(render_turn_phase_pipeline(phase));
+            }
+        }
+
+        if let Some(detail) = &state.model.turn_phase_detail {
+            footer_spans.push(Span::raw(" "));
+            footer_spans.push(Span::styled(
+                format!("[{}]", detail),
+                Style::default().fg(Color::Yellow).bold(),
+            ));
+        } else if let Some(round) = state.model.turn_round {
+            footer_spans.push(Span::raw(" "));
+            let round_str = if let Some(max) = state.model.turn_max_rounds {
+                format!("[Round {}/{}]", round, max)
+            } else {
+                format!("[Round {}]", round)
+            };
+            footer_spans.push(Span::styled(
+                round_str,
+                Style::default().fg(Color::Cyan).bold(),
+            ));
+        } else if let Some(round_str) = extract_current_round(&state.model.text) {
             footer_spans.push(Span::raw(" "));
             footer_spans.push(Span::styled(
                 format!("[{}]", round_str),
@@ -91,31 +129,17 @@ pub fn render_footer(frame: &mut ratatui::Frame, state: &AppState, area: Rect) {
                 Style::default().fg(Color::Cyan).bold(),
             ));
         }
-    } else if let Some(notif) = &state.model.git_notification {
+    } else if let Some(notif) = state.active_notification() {
+        let (icon, color) = match notif.level {
+            crate::app::NotificationLevel::Info => ("ℹ", Color::Cyan),
+            crate::app::NotificationLevel::Success => ("✓", Color::Green),
+            crate::app::NotificationLevel::Warning => ("⚠", Color::Yellow),
+            crate::app::NotificationLevel::Error => ("✗", Color::Red),
+        };
         footer_spans.push(Span::styled(
-            notif.clone(),
-            Style::default().fg(Color::Green).bold(),
+            format!("{} {}", icon, notif.text),
+            Style::default().fg(color).bold(),
         ));
-    } else if let (ViewMode::Context, Some(msg)) = (state.view_mode, &state.context_view.status_message) {
-        footer_spans.push(Span::styled(
-            msg.clone(),
-            Style::default().fg(Color::Green).bold(),
-        ));
-    } else if let Some((notif, inst)) = &state.model.copy_notification {
-        if inst.elapsed().as_secs_f32() < 2.5 {
-            footer_spans.push(Span::styled(
-                format!("✓ {}", notif),
-                Style::default().fg(Color::Green).bold(),
-            ));
-        } else {
-            let (status_lbl, status_style) = match state.model.status.as_str() {
-                "done" => ("Done", Style::default().fg(Color::Green).bold()),
-                "cancelled" => ("Cancelled", Style::default().fg(Color::Red).bold()),
-                "error" => ("Error", Style::default().fg(Color::Red).bold()),
-                _ => ("Ready", Style::default().fg(Color::Green)),
-            };
-            footer_spans.push(Span::styled(status_lbl, status_style));
-        }
     } else {
         let (status_lbl, status_style) = match state.model.status.as_str() {
             "done" => ("Done", Style::default().fg(Color::Green).bold()),
@@ -155,6 +179,37 @@ pub fn render_footer(frame: &mut ratatui::Frame, state: &AppState, area: Rect) {
     frame.render_widget(footer, area);
 }
 
+pub fn render_turn_phase_pipeline(current: tauqe_protocol::TurnPhase) -> Vec<Span<'static>> {
+    let phases = [
+        (tauqe_protocol::TurnPhase::Discovery, "Discovery"),
+        (tauqe_protocol::TurnPhase::Proposal, "Proposal"),
+        (tauqe_protocol::TurnPhase::Staging, "Staging"),
+        (tauqe_protocol::TurnPhase::Verification, "Verify"),
+        (tauqe_protocol::TurnPhase::Healing, "Heal"),
+    ];
+
+    let mut spans = Vec::new();
+    spans.push(Span::styled("[", Style::default().fg(Color::DarkGray)));
+    for (idx, (phase, label)) in phases.iter().enumerate() {
+        if idx > 0 {
+            spans.push(Span::styled("→", Style::default().fg(Color::DarkGray)));
+        }
+        if *phase == current {
+            spans.push(Span::styled(
+                *label,
+                Style::default().fg(Color::Cyan).bold(),
+            ));
+        } else {
+            spans.push(Span::styled(
+                *label,
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+    }
+    spans.push(Span::styled("]", Style::default().fg(Color::DarkGray)));
+    spans
+}
+
 pub fn extract_current_round(text: &str) -> Option<String> {
     let last_round = text.rfind("[Round ");
     let last_retry = text.rfind("[Patch Retry ");
@@ -186,15 +241,30 @@ pub fn format_footer_cost(
     }
 
     if is_busy {
-        Some(format!("🪙 ${:.4} | ${:.4} | ${:.4}", session_cost, prev, cur))
+        Some(format!(
+            "Σ ${:.4} session · ${:.4} last · ${:.4} now",
+            session_cost, prev, cur
+        ))
     } else {
-        Some(format!("🪙 ${:.4} | ${:.4}", session_cost, prev))
+        Some(format!(
+            "Σ ${:.4} session · ${:.4} last",
+            session_cost, prev
+        ))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_render_turn_phase_pipeline() {
+        let spans = render_turn_phase_pipeline(tauqe_protocol::TurnPhase::Staging);
+        let combined: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(combined, "[Discovery→Proposal→Staging→Verify→Heal]");
+        let staging_span = spans.iter().find(|s| s.content == "Staging").unwrap();
+        assert_eq!(staging_span.style.fg, Some(Color::Cyan));
+    }
 
     #[test]
     fn test_extract_current_round() {
@@ -220,12 +290,12 @@ mod tests {
 
         assert_eq!(
             format_footer_cost(0.0150, Some(0.0050), None, false),
-            Some("🪙 $0.0150 | $0.0050".to_string())
+            Some("Σ $0.0150 session · $0.0050 last".to_string())
         );
 
         assert_eq!(
             format_footer_cost(0.0150, Some(0.0050), Some(0.0020), true),
-            Some("🪙 $0.0150 | $0.0050 | $0.0020".to_string())
+            Some("Σ $0.0150 session · $0.0050 last · $0.0020 now".to_string())
         );
     }
 }

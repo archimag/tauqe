@@ -1,8 +1,13 @@
 use ratatui::style::{Color, Style, Stylize};
 use ratatui::text::{Line, Span};
+use std::time::{Duration, Instant};
+
 use tauqe_protocol::{ModelResult, ModelUsageEvent};
 
 pub mod render;
+
+/// Minimum interval between full markdown re-parses while a response is streaming.
+const MARKDOWN_THROTTLE: Duration = Duration::from_millis(80);
 
 pub const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
@@ -40,6 +45,8 @@ pub struct ReasoningState {
     pub text: String,
     pub lines: Vec<Line<'static>>,
     pub show: bool,
+    dirty: bool,
+    last_render: Option<Instant>,
 }
 
 impl Default for ReasoningState {
@@ -48,6 +55,8 @@ impl Default for ReasoningState {
             text: String::new(),
             lines: Vec::new(),
             show: true,
+            dirty: false,
+            last_render: None,
         }
     }
 }
@@ -61,11 +70,20 @@ impl ReasoningState {
         self.text.clear();
         self.lines.clear();
         self.show = true;
+        self.dirty = false;
+        self.last_render = None;
     }
 
     pub fn append_delta(&mut self, delta: &str) {
         self.text.push_str(delta);
-        self.update_markdown();
+        if self
+            .last_render
+            .is_some_and(|t| t.elapsed() < MARKDOWN_THROTTLE)
+        {
+            self.dirty = true;
+        } else {
+            self.update_markdown();
+        }
     }
 
     pub fn update_markdown(&mut self) {
@@ -73,6 +91,19 @@ impl ReasoningState {
             &self.text,
             &crate::markdown::MarkdownTheme::reasoning(),
         );
+        self.dirty = false;
+        self.last_render = Some(Instant::now());
+    }
+
+    /// Renders deferred deltas once the throttle interval has elapsed.
+    pub fn flush(&mut self) {
+        if self.dirty
+            && self
+                .last_render
+                .is_none_or(|t| t.elapsed() >= MARKDOWN_THROTTLE)
+        {
+            self.update_markdown();
+        }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -153,15 +184,19 @@ pub struct DevelopView {
     pub edit_final_error: Option<String>,
     pub last_commit_hash: Option<String>,
     pub last_commit_summary: Option<String>,
-    pub git_notification: Option<String>,
     pub toolchain_command: Option<String>,
     pub toolchain_status: Option<String>,
+    pub turn_phase: Option<tauqe_protocol::TurnPhase>,
+    pub turn_round: Option<usize>,
+    pub turn_max_rounds: Option<usize>,
+    pub turn_phase_detail: Option<String>,
     pub spinner_frame: usize,
     pub rendered_lines_count: usize,
     pub copy_flash: Option<(usize, std::time::Instant)>,
-    pub copy_notification: Option<(String, std::time::Instant)>,
     pub code_blocks: Vec<ModelCodeBlock>,
     pub content_rect: (u16, u16, u16, u16),
+    pub(crate) markdown_dirty: bool,
+    pub(crate) last_markdown_render: Option<Instant>,
 }
 
 impl Default for DevelopView {
@@ -188,21 +223,39 @@ impl Default for DevelopView {
             edit_final_error: None,
             last_commit_hash: None,
             last_commit_summary: None,
-            git_notification: None,
             toolchain_command: None,
             toolchain_status: None,
+            turn_phase: None,
+            turn_round: None,
+            turn_max_rounds: None,
+            turn_phase_detail: None,
             spinner_frame: 0,
             rendered_lines_count: 0,
             copy_flash: None,
-            copy_notification: None,
             code_blocks: Vec::new(),
             content_rect: (0, 0, 0, 0),
+            markdown_dirty: false,
+            last_markdown_render: None,
         }
     }
 }
 
 impl DevelopView {
+    /// Re-renders the answer markdown; while streaming, repeated calls within the
+    /// throttle interval only mark the view dirty and are flushed later.
     pub fn update_markdown(&mut self) {
+        if self.is_busy()
+            && self
+                .last_markdown_render
+                .is_some_and(|t| t.elapsed() < MARKDOWN_THROTTLE)
+        {
+            self.markdown_dirty = true;
+            return;
+        }
+        self.render_markdown_now();
+    }
+
+    fn render_markdown_now(&mut self) {
         let flashing_id = self.copy_flash.as_ref().map(|(id, _)| *id);
         let (lines, blocks) = crate::markdown::render_markdown_with_blocks(
             &self.text,
@@ -222,19 +275,42 @@ impl DevelopView {
                 visual_end_line: b.end_line,
             })
             .collect();
+        self.markdown_dirty = false;
+        self.last_markdown_render = Some(Instant::now());
     }
 
     pub fn update_reasoning_markdown(&mut self) {
         self.reasoning.update_markdown();
     }
 
+    /// Renders markdown deferred by throttling; called once per frame before drawing.
+    pub fn flush_pending_markdown(&mut self) {
+        if self.markdown_dirty
+            && self
+                .last_markdown_render
+                .is_none_or(|t| t.elapsed() >= MARKDOWN_THROTTLE)
+        {
+            self.render_markdown_now();
+        }
+        self.reasoning.flush();
+    }
+
+    /// True while any animated spinner is visible and needs frame advancement.
+    pub fn needs_spinner(&self) -> bool {
+        self.is_busy()
+            || self.toolchain_command.is_some()
+            || (self.edits_active && self.edit_final_applied.is_none())
+    }
+
     pub fn max_scroll(&self, view_height: u16) -> u16 {
         let count = if self.rendered_lines_count > 0 {
-            self.rendered_lines_count as u16
+            self.rendered_lines_count
         } else {
-            compute_model_lines(self).len() as u16
+            compute_model_lines(self).len()
         };
-        count.saturating_sub(view_height)
+        u16::try_from(count)
+            .unwrap_or(u16::MAX)
+            .saturating_sub(view_height)
     }
 
     pub fn clamp_scroll(&mut self, view_height: u16) {
@@ -265,9 +341,6 @@ impl DevelopView {
     pub fn file_line_offset(&self, target_idx: usize) -> usize {
         let mut line_idx = 0;
         if self.error.is_some() {
-            line_idx += 1;
-        }
-        if self.git_notification.is_some() {
             line_idx += 1;
         }
         if self.toolchain_status.is_some() {
@@ -321,7 +394,8 @@ impl DevelopView {
         if self.files.is_empty() || view_height == 0 {
             return;
         }
-        let target_line = self.file_line_offset(self.selected_file_index) as u16;
+        let target_line =
+            u16::try_from(self.file_line_offset(self.selected_file_index)).unwrap_or(u16::MAX);
         let is_expanded = self
             .files
             .get(self.selected_file_index)
@@ -332,13 +406,13 @@ impl DevelopView {
             self.auto_scroll = false;
             self.scroll = target_line;
         } else if is_expanded {
-            if target_line + 4 >= self.scroll + view_height {
+            if target_line.saturating_add(4) >= self.scroll.saturating_add(view_height) {
                 self.auto_scroll = false;
                 self.scroll = target_line.saturating_sub(1);
             }
-        } else if target_line >= self.scroll + view_height {
+        } else if target_line >= self.scroll.saturating_add(view_height) {
             self.auto_scroll = false;
-            self.scroll = (target_line + 1).saturating_sub(view_height);
+            self.scroll = target_line.saturating_add(1).saturating_sub(view_height);
         }
         self.clamp_scroll(view_height);
     }
@@ -353,6 +427,9 @@ impl DevelopView {
                 | "verifying"
                 | "starting"
                 | "streaming"
+                | "discovery"
+                | "staging"
+                | "healing"
         )
     }
 }
@@ -364,17 +441,6 @@ pub fn compute_model_lines(model: &DevelopView) -> Vec<Line<'static>> {
         model_lines.push(Line::from(vec![
             Span::raw("Error: "),
             Span::styled(err.clone(), Style::default().fg(Color::Red)),
-        ]));
-    }
-
-    if let Some(notif) = &model.git_notification {
-        model_lines.push(Line::from(vec![
-            Span::styled(
-                " [GIT] ",
-                Style::default().bg(Color::Cyan).fg(Color::Black).bold(),
-            ),
-            Span::raw(" "),
-            Span::styled(notif.clone(), Style::default().fg(Color::Cyan).bold()),
         ]));
     }
 

@@ -234,6 +234,50 @@ pub async fn handle_model_ask(req: Request, state: &Arc<AppState>) -> Response {
                         .ok(),
                     });
                 }
+                StreamEvent::TurnPhase {
+                    phase,
+                    round,
+                    max_rounds,
+                    detail,
+                } => {
+                    state_for_spawn.out.send_event(&Event {
+                        method: events::TURN_PHASE.to_string(),
+                        params: serde_json::to_value(tauqe_protocol::TurnPhaseEvent {
+                            operation_id: op_id_for_spawn.clone(),
+                            phase,
+                            round,
+                            max_rounds,
+                            detail,
+                        })
+                        .ok(),
+                    });
+                }
+                StreamEvent::ToolchainStarted { command } => {
+                    state_for_spawn.out.send_event(&Event {
+                        method: events::TOOLCHAIN_STARTED.to_string(),
+                        params: serde_json::to_value(tauqe_protocol::ToolchainStartedEvent {
+                            operation_id: op_id_for_spawn.clone(),
+                            command,
+                        })
+                        .ok(),
+                    });
+                }
+                StreamEvent::ToolchainFinished {
+                    command,
+                    success,
+                    message,
+                } => {
+                    state_for_spawn.out.send_event(&Event {
+                        method: events::TOOLCHAIN_FINISHED.to_string(),
+                        params: serde_json::to_value(tauqe_protocol::ToolchainFinishedEvent {
+                            operation_id: op_id_for_spawn.clone(),
+                            command,
+                            success,
+                            message,
+                        })
+                        .ok(),
+                    });
+                }
                     StreamEvent::Usage(usage) => {
                     accumulate_usage(&mut usage_info, usage.clone());
                     let op_accumulated_cost = usage_info.as_ref().and_then(|u| u.cost);

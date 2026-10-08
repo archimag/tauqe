@@ -3,9 +3,29 @@ use std::sync::Mutex;
 
 static CLIPBOARD: Mutex<Option<arboard::Clipboard>> = Mutex::new(None);
 
-pub fn copy_to_clipboard(text: &str) -> bool {
+/// Maximum payload size (100 KB) for terminal OSC 52 clipboard sequences
+/// to avoid terminal multiplexer buffer overflows.
+pub const MAX_OSC52_BYTES: usize = 100 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CopyResult {
+    /// Copied to native OS clipboard (X11 / Wayland / Win / macOS).
+    Native,
+    /// Copied via terminal escape sequence (OSC 52).
+    Osc52Only,
+    /// Failed to copy to either native clipboard or terminal.
+    Failed,
+}
+
+impl CopyResult {
+    pub fn is_success(&self) -> bool {
+        !matches!(self, CopyResult::Failed)
+    }
+}
+
+pub fn copy_to_clipboard(text: &str) -> CopyResult {
     let clean_text = text.trim_end_matches(['\r', '\n']);
-    let mut ok = false;
+    let mut native_ok = false;
 
     if let Ok(mut guard) = CLIPBOARD.lock() {
         if guard.is_none() {
@@ -15,7 +35,7 @@ pub fn copy_to_clipboard(text: &str) -> bool {
         let mut needs_reinit = false;
         if let Some(clipboard) = guard.as_mut() {
             if clipboard.set_text(clean_text.to_string()).is_ok() {
-                ok = true;
+                native_ok = true;
                 #[cfg(all(unix, not(target_os = "macos"), not(target_os = "android"), not(target_os = "emscripten")))]
                 {
                     use arboard::SetExtLinux;
@@ -34,7 +54,7 @@ pub fn copy_to_clipboard(text: &str) -> bool {
         if needs_reinit {
             if let Ok(mut new_cb) = arboard::Clipboard::new() {
                 if new_cb.set_text(clean_text.to_string()).is_ok() {
-                    ok = true;
+                    native_ok = true;
                     #[cfg(all(unix, not(target_os = "macos"), not(target_os = "android"), not(target_os = "emscripten")))]
                     {
                         use arboard::SetExtLinux;
@@ -50,13 +70,23 @@ pub fn copy_to_clipboard(text: &str) -> bool {
     }
 
     // OSC 52 for terminal multiplexers, ssh and terminal primary/clipboard paste
-    let b64 = base64_encode(clean_text.as_bytes());
-    let osc52 = format!("\x1b]52;c;{b64}\x07\x1b]52;p;{b64}\x07");
-    let mut out = std::io::stdout();
-    let _ = out.write_all(osc52.as_bytes());
-    let _ = out.flush();
+    let mut osc52_ok = false;
+    if clean_text.len() <= MAX_OSC52_BYTES {
+        let b64 = base64_encode(clean_text.as_bytes());
+        let osc52 = format!("\x1b]52;c;{b64}\x07\x1b]52;p;{b64}\x07");
+        let mut out = std::io::stdout();
+        if out.write_all(osc52.as_bytes()).is_ok() && out.flush().is_ok() {
+            osc52_ok = true;
+        }
+    }
 
-    ok
+    if native_ok {
+        CopyResult::Native
+    } else if osc52_ok {
+        CopyResult::Osc52Only
+    } else {
+        CopyResult::Failed
+    }
 }
 
 fn base64_encode(data: &[u8]) -> String {

@@ -18,6 +18,10 @@ pub const EDIT_FILE_DONE: &str = "edit/fileDone";
 pub const EDIT_FILE_RETRYING: &str = "edit/fileRetrying";
 pub const EDIT_FINISHED: &str = "edit/finished";
 
+pub const TURN_PHASE: &str = "turn/phase";
+pub const TOOLCHAIN_STARTED: &str = "toolchain/started";
+pub const TOOLCHAIN_FINISHED: &str = "toolchain/finished";
+
 pub const GIT_STATE_CHANGED: &str = "git/stateChanged";
 pub const GIT_COMMIT_CREATED: &str = "git/commitCreated";
 pub const GIT_UNDO_COMPLETED: &str = "git/undoCompleted";

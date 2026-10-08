@@ -34,6 +34,24 @@ pub async fn handle_context_key(
     let mut st = state.lock().await;
 
     if st.context_view.adding_file {
+        if key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) {
+            match key.code {
+                KeyCode::Char('w') => {
+                    crate::input::pop_word_backward(&mut st.context_view.add_input);
+                    st.context_view.selected_candidate_index = 0;
+                    st.update_filtered_candidates();
+                    return Ok(InputResult::Continue);
+                }
+                KeyCode::Char('u') => {
+                    st.context_view.add_input.clear();
+                    st.context_view.selected_candidate_index = 0;
+                    st.update_filtered_candidates();
+                    return Ok(InputResult::Continue);
+                }
+                _ => {}
+            }
+        }
+
         match key.code {
             KeyCode::Esc => {
                 st.context_view.adding_file = false;
@@ -123,7 +141,7 @@ pub async fn handle_context_key(
                     }
                 }
             }
-            KeyCode::Char(c) => {
+            KeyCode::Char(c) if crate::input::is_char_typing(key.modifiers) => {
                 st.context_view.add_input.push(c);
                 st.context_view.selected_candidate_index = 0;
                 st.update_filtered_candidates();
@@ -213,28 +231,17 @@ pub async fn handle_context_key(
                 }
             }
             KeyCode::Char('c') | KeyCode::Char('C') => {
-                let auto_paths: Vec<String> = st
+                let auto_count = st
                     .context
                     .items
                     .iter()
                     .filter(|i| i.layer == ContextLayer::Auto)
-                    .map(|i| i.path.clone())
-                    .collect();
-                if auto_paths.is_empty() {
-                    st.context_view.status_message = Some("No auto files to clear".to_string());
+                    .count();
+                if auto_count == 0 {
+                    st.notify_info("No auto files to clear");
                 } else {
-                    st.context_view.status_message =
-                        Some(format!("Clearing {} auto files...", auto_paths.len()));
-                    drop(st);
-                    for p in auto_paths {
-                        let params = ContextRemoveParams { path: p };
-                        send_request(
-                            server_writer,
-                            methods::CONTEXT_REMOVE,
-                            serde_json::to_value(params)?,
-                        )
-                        .await?;
-                    }
+                    st.context_view.confirm_clear_auto = true;
+                    st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
                 }
             }
             KeyCode::Char('e') => {
@@ -298,8 +305,8 @@ pub async fn handle_context_key(
             KeyCode::Char('d') | KeyCode::Char('x') | KeyCode::Delete => match current_row {
                 Some(ContextRow::Item(ref item)) => {
                     if item.layer == ContextLayer::Pinned {
-                        st.context_view.status_message = Some(
-                            "Pinned files are protected and cannot be removed".to_string(),
+                        st.notify_warning(
+                            "Pinned files are protected and cannot be removed",
                         );
                     } else {
                         let path = item.path.clone();
@@ -308,6 +315,7 @@ pub async fn handle_context_key(
                         {
                             st.context_view.cursor_index -= 1;
                         }
+                        st.notify_info(format!("Removed '{}' from context", path));
                         drop(st);
                         let params = ContextRemoveParams { path };
                         send_request(
@@ -319,35 +327,26 @@ pub async fn handle_context_key(
                     }
                 }
                 Some(ContextRow::Header(ContextLayer::Auto)) => {
-                    let auto_paths: Vec<String> = st
+                    let auto_count = st
                         .context
                         .items
                         .iter()
                         .filter(|i| i.layer == ContextLayer::Auto)
-                        .map(|i| i.path.clone())
-                        .collect();
-                    if auto_paths.is_empty() {
-                        st.context_view.status_message =
-                            Some("No auto files to clear".to_string());
+                        .count();
+                    if auto_count == 0 {
+                        st.notify_info("No auto files to clear");
                     } else {
-                        st.context_view.status_message =
-                            Some(format!("Clearing {} auto files...", auto_paths.len()));
-                        drop(st);
-                        for p in auto_paths {
-                            let params = ContextRemoveParams { path: p };
-                            send_request(
-                                server_writer,
-                                methods::CONTEXT_REMOVE,
-                                serde_json::to_value(params)?,
-                            )
-                            .await?;
-                        }
+                        st.context_view.confirm_clear_auto = true;
+                        st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
                     }
                 }
                 Some(ContextRow::Header(ContextLayer::Pinned)) => {
-                    st.context_view.status_message = Some(
-                        "Pinned section is protected and cannot be removed".to_string(),
+                    st.notify_warning(
+                        "Pinned section is protected and cannot be removed",
                     );
+                }
+                Some(ContextRow::Header(ContextLayer::User)) => {
+                    st.notify_info("To remove a User file, select the file and press 'd'");
                 }
                 _ => {}
             },

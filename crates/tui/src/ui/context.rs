@@ -16,6 +16,7 @@ pub enum ContextRow {
 #[derive(Debug, Clone)]
 pub struct ContextViewState {
     pub cursor_index: usize,
+    pub scroll: u16,
     pub pinned_expanded: bool,
     pub user_expanded: bool,
     pub auto_expanded: bool,
@@ -23,14 +24,17 @@ pub struct ContextViewState {
     pub add_access: ContextAccess,
     pub add_input: String,
     pub filtered_candidates: Vec<String>,
+    pub total_matching: usize,
     pub selected_candidate_index: usize,
     pub status_message: Option<String>,
+    pub confirm_clear_auto: bool,
 }
 
 impl Default for ContextViewState {
     fn default() -> Self {
         Self {
             cursor_index: 0,
+            scroll: 0,
             pinned_expanded: true,
             user_expanded: true,
             auto_expanded: true,
@@ -38,8 +42,10 @@ impl Default for ContextViewState {
             add_access: ContextAccess::ReadOnly,
             add_input: String::new(),
             filtered_candidates: Vec::new(),
+            total_matching: 0,
             selected_candidate_index: 0,
             status_message: None,
+            confirm_clear_auto: false,
         }
     }
 }
@@ -110,24 +116,25 @@ impl ContextViewState {
             }
 
             let query_lower = query.to_lowercase();
-            let file_candidates: Vec<String> = all_repo_files
+            let all_matches: Vec<String> = all_repo_files
                 .iter()
                 .filter(|f| !existing.contains(f.as_str()))
                 .filter(|f| {
                     f.to_lowercase().contains(&query_lower) || matches_glob_pattern(query, f)
                 })
-                .take(15)
                 .cloned()
                 .collect();
 
-            candidates.extend(file_candidates);
+            self.total_matching = all_matches.len();
+            candidates.extend(all_matches.into_iter().take(50));
         } else {
-            candidates = all_repo_files
+            let available: Vec<String> = all_repo_files
                 .iter()
                 .filter(|f| !existing.contains(f.as_str()))
-                .take(15)
                 .cloned()
                 .collect();
+            self.total_matching = available.len();
+            candidates = available.into_iter().take(50).collect();
         }
 
         self.filtered_candidates = candidates;
@@ -142,7 +149,7 @@ impl ContextViewState {
 
 pub fn render_context_view(
     frame: &mut ratatui::Frame,
-    state: &AppState,
+    state: &mut AppState,
     main_area: Rect,
     info_area: Rect,
 ) {
@@ -262,8 +269,21 @@ pub fn render_context_view(
         }
     }
 
+    let inner_height = main_area.height as usize;
+    if inner_height > 0 {
+        let target_line = state.context_view.cursor_index + 2;
+        if target_line < state.context_view.scroll as usize {
+            state.context_view.scroll = target_line as u16;
+        } else if target_line >= (state.context_view.scroll as usize + inner_height) {
+            state.context_view.scroll = (target_line + 1).saturating_sub(inner_height) as u16;
+        }
+        let max_scroll = context_lines.len().saturating_sub(inner_height) as u16;
+        state.context_view.scroll = state.context_view.scroll.min(max_scroll);
+    }
+
     let ctx_paragraph = Paragraph::new(context_lines)
         .block(Block::default().padding(Padding::horizontal(1)))
+        .scroll((state.context_view.scroll, 0))
         .wrap(Wrap { trim: false });
     frame.render_widget(ctx_paragraph, main_area);
 
@@ -272,33 +292,33 @@ pub fn render_context_view(
     } else {
         match active_row {
             Some(ContextRow::Header(ContextLayer::Pinned)) => Line::from(Span::styled(
-                "Pinned section: Architecture & key documents from tauqe.toml (Space/Enter to fold)",
+                "Pinned layer: Architecture & reference documents specified in tauqe.toml",
                 Style::default().fg(Color::Cyan),
             )),
             Some(ContextRow::Header(ContextLayer::User)) => Line::from(Span::styled(
-                "User section: 'e' Add editable, 'r' Add read-only, Space/Enter to fold",
+                "User layer: Persistent files curated by the developer (Editable or Read-Only)",
                 Style::default().fg(Color::Yellow),
             )),
             Some(ContextRow::Header(ContextLayer::Auto)) => Line::from(Span::styled(
-                "Auto section: Model-requested context. 'c' Clear all auto, Space/Enter to fold",
+                "Auto layer: Files autonomously requested by the model during discovery rounds",
                 Style::default().fg(Color::Magenta),
             )),
             Some(ContextRow::Item(ref it)) => match it.layer {
                 ContextLayer::Pinned => Line::from(Span::styled(
-                    "Pinned file: Protected read-only document (cannot be removed or modified)",
+                    format!("Pinned document: {} (protected, ~{} tokens)", it.path, it.estimated_tokens),
                     Style::default().fg(Color::Cyan),
                 )),
                 ContextLayer::User => Line::from(Span::styled(
-                    "User file: 't' Toggle Editable ↔ Read-Only, 'd'/'x' Remove",
+                    format!("User file: {} [{:?}], ~{} tokens", it.path, it.access, it.estimated_tokens),
                     Style::default().fg(Color::White),
                 )),
                 ContextLayer::Auto => Line::from(Span::styled(
-                    "Auto file: Press 'p'/'u' or Enter to promote to User, 'd'/'x' Remove, 'c' Clear all auto",
+                    format!("Auto-discovered file: {} [{:?}], ~{} tokens", it.path, it.access, it.estimated_tokens),
                     Style::default().fg(Color::Magenta),
                 )),
             },
             None => Line::from(Span::styled(
-                "Press 'e' for editable, 'r' for read-only, 'Space' to fold/unfold",
+                "Context state: 3 layers (Pinned, User, Auto) | Press '?' for commands",
                 Style::default().fg(Color::DarkGray),
             )),
         }
@@ -345,14 +365,32 @@ fn render_add_file_picker(frame: &mut ratatui::Frame, state: &AppState) {
     frame.render_widget(input_block, chunks[0]);
 
     let mut candidate_lines = Vec::new();
-    if state.context_view.filtered_candidates.is_empty() {
+    let visible_rows = chunks[1].height.saturating_sub(2) as usize;
+    let selected = state.context_view.selected_candidate_index;
+    let total_candidates = state.context_view.filtered_candidates.len();
+
+    if state.all_repo_files.is_empty() {
+        candidate_lines.push(Line::from(Span::styled(
+            "  Loading repository files from server...",
+            Style::default().fg(Color::Yellow).italic(),
+        )));
+    } else if total_candidates == 0 {
         candidate_lines.push(Line::from(Span::styled(
             "  No matching files found.",
             Style::default().fg(Color::DarkGray),
         )));
     } else {
-        for (idx, candidate) in state.context_view.filtered_candidates.iter().enumerate() {
-            let is_sel = idx == state.context_view.selected_candidate_index;
+        let max_visible = visible_rows.max(1);
+        let start_idx = if selected < max_visible {
+            0
+        } else {
+            selected + 1 - max_visible
+        };
+        let end_idx = (start_idx + max_visible).min(total_candidates);
+
+        for idx in start_idx..end_idx {
+            let candidate = &state.context_view.filtered_candidates[idx];
+            let is_sel = idx == selected;
             let (prefix, style) = if is_sel {
                 (
                     " ▶ ",
@@ -387,9 +425,26 @@ fn render_add_file_picker(frame: &mut ratatui::Frame, state: &AppState) {
         }
     }
 
+    let count_info = if state.all_repo_files.is_empty() {
+        "loading...".to_string()
+    } else if state.context_view.total_matching > total_candidates {
+        format!(
+            "showing {} of {} matching",
+            total_candidates, state.context_view.total_matching
+        )
+    } else {
+        format!("{} found", total_candidates)
+    };
+
     let list_title = match state.context_view.add_access {
-        ContextAccess::Editable => " Matching Files / Actions (Enter: Add EDITABLE, Tab: Complete, ↑/↓: Navigate, Esc: Cancel) ",
-        ContextAccess::ReadOnly => " Matching Files / Actions (Enter: Add READ-ONLY, Tab: Complete, ↑/↓: Navigate, Esc: Cancel) ",
+        ContextAccess::Editable => format!(
+            " Matching Files ({}) [Enter: Add EDITABLE, Tab: Complete, ↑/↓: Navigate, Esc: Cancel] ",
+            count_info
+        ),
+        ContextAccess::ReadOnly => format!(
+            " Matching Files ({}) [Enter: Add READ-ONLY, Tab: Complete, ↑/↓: Navigate, Esc: Cancel] ",
+            count_info
+        ),
     };
     let list_block = Paragraph::new(candidate_lines).block(
         Block::default()

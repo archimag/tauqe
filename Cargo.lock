@@ -1884,6 +1884,7 @@ dependencies = [
  "syntect",
  "tauqe-protocol",
  "tokio",
+ "toml",
 ]
 
 [[package]]

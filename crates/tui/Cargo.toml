@@ -24,3 +24,4 @@ pulldown-cmark = { version = "0.12", default-features = false }
 syntect = { version = "5.2", default-features = false, features = ["default-syntaxes", "default-themes", "parsing", "regex-fancy"] }
 similar = "2.6"
 arboard = "3.4"
+toml.workspace = true

@@ -213,6 +213,14 @@ pub(crate) async fn execute_workflow_lifecycle<T: WorkflowTransaction>(
                         let _ = transaction.on_initial_applied(&repo_root, &changed_files);
 
                         let verify_req = protocol.parse_verify_request(&pipeline_out.assistant_text);
+                        let _ = stream_tx
+                            .send(StreamEvent::TurnPhase {
+                                phase: tauqe_protocol::TurnPhase::Verification,
+                                round: None,
+                                max_rounds: None,
+                                detail: None,
+                            })
+                            .await;
 
                         let healing_result = run_verification_healing_loop(
                             &repo_root,

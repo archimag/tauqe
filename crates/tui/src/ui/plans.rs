@@ -308,18 +308,21 @@ pub fn render_plans_view(
     let rows = state.plans_view.flatten_items();
     state.plans_view.clamp_selection();
 
-    let lines = if state.plans_view.current_plan.is_none() && state.plans_view.plans_list.is_empty() {
-        vec![
-            Line::raw(""),
-            Line::from(Span::styled(
-                "  No local plans yet.",
-                Style::default().fg(Color::DarkGray).bold(),
-            )),
-            Line::from(Span::styled(
-                "  Ask Tauqe in Develop (Ctrl+1) to formulate a plan, or press 'r' to refresh.",
-                Style::default().fg(Color::DarkGray),
-            )),
-        ]
+    let (lines, offsets) = if state.plans_view.current_plan.is_none() && state.plans_view.plans_list.is_empty() {
+        (
+            vec![
+                Line::raw(""),
+                Line::from(Span::styled(
+                    "  No local plans yet.",
+                    Style::default().fg(Color::DarkGray).bold(),
+                )),
+                Line::from(Span::styled(
+                    "  Ask Tauqe in Develop (Ctrl+1) to formulate a plan, or press 'r' to refresh.",
+                    Style::default().fg(Color::DarkGray),
+                )),
+            ],
+            Vec::new(),
+        )
     } else {
         compute_plan_lines(
             state.plans_view.current_plan.as_ref(),
@@ -329,10 +332,29 @@ pub fn render_plans_view(
             &rows,
             state.plans_view.selected_item_index,
             width,
-        ).0
+        )
     };
 
     state.plans_view.rendered_lines = lines.len();
+
+    if !rows.is_empty() && height > 0 {
+        let sel = state.plans_view.selected_item_index.min(rows.len() - 1);
+        let start = offsets.get(sel).copied().unwrap_or(0);
+        let end = offsets.get(sel + 1).copied().unwrap_or(lines.len());
+        let scroll = state.plans_view.scroll as usize;
+
+        let new_scroll = if sel == 0 {
+            0
+        } else if start < scroll {
+            start
+        } else if end > scroll + height as usize {
+            end.saturating_sub(height as usize).min(start)
+        } else {
+            scroll
+        };
+        state.plans_view.scroll = new_scroll as u16;
+    }
+
     let max_scroll = (lines.len() as u16).saturating_sub(height);
     if state.plans_view.scroll > max_scroll {
         state.plans_view.scroll = max_scroll;

@@ -31,6 +31,10 @@ pub async fn handle_onboarding_key(
                     }
                     return Ok(InputResult::Continue);
                 }
+                KeyCode::Char('w') => {
+                    crate::input::pop_word_backward(&mut st.onboarding.input_buffer);
+                    return Ok(InputResult::Continue);
+                }
                 KeyCode::Char('u') => {
                     st.onboarding.input_buffer.clear();
                     return Ok(InputResult::Continue);
@@ -42,10 +46,12 @@ pub async fn handle_onboarding_key(
         match key.code {
             KeyCode::Esc => {
                 st.onboarding.input_active = false;
+                st.onboarding.input_langmap = false;
                 st.onboarding.input_buffer.clear();
                 st.onboarding.show_key = false;
+                st.onboarding.clear_messages();
             }
-            KeyCode::Char(c) => {
+            KeyCode::Char(c) if crate::input::is_char_typing(key.modifiers) => {
                 st.onboarding.input_buffer.push(c);
             }
             KeyCode::Backspace => {
@@ -53,11 +59,32 @@ pub async fn handle_onboarding_key(
             }
             KeyCode::Enter => {
                 let input = st.onboarding.input_buffer.trim().to_string();
-                st.onboarding.input_active = false;
-                st.onboarding.input_buffer.clear();
+
+                if st.onboarding.input_langmap {
+                    st.onboarding.input_active = false;
+                    st.onboarding.input_buffer.clear();
+                    st.onboarding.input_langmap = false;
+                    if !input.is_empty() {
+                        st.onboarding.chosen_layout = crate::config::LayoutPreset::None;
+                        st.onboarding.chosen_langmap = Some(input);
+                    }
+                    st.onboarding.step = OnboardingStep::Modifier;
+                    st.onboarding.selected_index = 0;
+                    st.onboarding.clear_messages();
+                    return Ok(InputResult::Continue);
+                }
 
                 match st.onboarding.step {
-                    OnboardingStep::Credentials if !input.is_empty() => {
+                    OnboardingStep::Credentials => {
+                        if input.is_empty() {
+                            st.onboarding.set_error(
+                                "API key cannot be empty. Please enter or paste a valid key, or press Esc to cancel.",
+                            );
+                            return Ok(InputResult::Continue);
+                        }
+                        st.onboarding.input_active = false;
+                        st.onboarding.input_buffer.clear();
+                        st.onboarding.clear_messages();
                         drop(st);
                         send_request(
                             server_writer,
@@ -66,7 +93,10 @@ pub async fn handle_onboarding_key(
                         )
                         .await?;
                     }
-                    _ => {}
+                    _ => {
+                        st.onboarding.input_active = false;
+                        st.onboarding.input_buffer.clear();
+                    }
                 }
             }
             _ => {}
@@ -76,16 +106,22 @@ pub async fn handle_onboarding_key(
             OnboardingStep::Git => 3,
             OnboardingStep::Config => 2,
             OnboardingStep::Credentials => 4,
+            OnboardingStep::Workstation => 4,
+            OnboardingStep::Modifier => 2,
             OnboardingStep::Gatekeeper => 3,
             OnboardingStep::Ready => 1,
         };
 
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => {
+                st.onboarding.clear_messages();
                 if st.onboarding.step == OnboardingStep::Gatekeeper
                     || st.onboarding.step == OnboardingStep::Git
                 {
                     return Ok(InputResult::Exit);
+                } else if st.onboarding.step == OnboardingStep::Modifier {
+                    st.onboarding.step = OnboardingStep::Workstation;
+                    st.onboarding.selected_index = 0;
                 } else if st.onboarding.has_api_key {
                     st.view_mode = ViewMode::Develop;
                 } else {
@@ -102,6 +138,7 @@ pub async fn handle_onboarding_key(
                 }
             }
             KeyCode::Enter => {
+                st.onboarding.clear_messages();
                 let sel = st.onboarding.selected_index;
                 match st.onboarding.step {
                     OnboardingStep::Git => match sel {
@@ -186,10 +223,67 @@ pub async fn handle_onboarding_key(
                         }
                         _ => {
                             if st.onboarding.has_api_key {
-                                st.onboarding.step = OnboardingStep::Ready;
+                                if !st.onboarding.has_tui_config {
+                                    st.onboarding.step = OnboardingStep::Workstation;
+                                } else {
+                                    st.onboarding.step = OnboardingStep::Ready;
+                                }
                             } else {
                                 st.onboarding.step = OnboardingStep::Gatekeeper;
                             }
+                            st.onboarding.selected_index = 0;
+                        }
+                    },
+                    OnboardingStep::Workstation => match sel {
+                        0 => {
+                            st.onboarding.chosen_layout = crate::config::LayoutPreset::None;
+                            st.onboarding.chosen_langmap = None;
+                            st.onboarding.step = OnboardingStep::Modifier;
+                            st.onboarding.selected_index = 0;
+                        }
+                        1 => {
+                            st.onboarding.chosen_layout = crate::config::LayoutPreset::RuJcuken;
+                            st.onboarding.chosen_langmap = None;
+                            st.onboarding.step = OnboardingStep::Modifier;
+                            st.onboarding.selected_index = 0;
+                        }
+                        2 => {
+                            st.onboarding.input_active = true;
+                            st.onboarding.input_langmap = true;
+                            st.onboarding.input_buffer.clear();
+                        }
+                        _ => {
+                            st.onboarding.step = OnboardingStep::Ready;
+                            st.onboarding.selected_index = 0;
+                        }
+                    },
+                    OnboardingStep::Modifier => match sel {
+                        0 => {
+                            let _ = crate::config::save_tui_config_full(
+                                st.onboarding.chosen_layout,
+                                st.onboarding.chosen_langmap.clone(),
+                                crate::config::PrimaryModifier::Ctrl,
+                            );
+                            st.tui_config = crate::config::TuiConfig::load();
+                            st.onboarding.has_tui_config = true;
+                            st.onboarding.set_status(
+                                "Workstation configuration saved (Primary modifier: Ctrl)",
+                            );
+                            st.onboarding.step = OnboardingStep::Ready;
+                            st.onboarding.selected_index = 0;
+                        }
+                        _ => {
+                            let _ = crate::config::save_tui_config_full(
+                                st.onboarding.chosen_layout,
+                                st.onboarding.chosen_langmap.clone(),
+                                crate::config::PrimaryModifier::Alt,
+                            );
+                            st.tui_config = crate::config::TuiConfig::load();
+                            st.onboarding.has_tui_config = true;
+                            st.onboarding.set_status(
+                                "Workstation configuration saved (Primary modifier: Alt)",
+                            );
+                            st.onboarding.step = OnboardingStep::Ready;
                             st.onboarding.selected_index = 0;
                         }
                     },
