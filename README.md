@@ -73,52 +73,45 @@ The moment the turn completes, control returns immediately to the developer. No 
 ```text
 tauqe/
 ├── crates/
-│   ├── core/       # Engine: Git transactions, context manager, Tree-sitter repo map, turn pipeline
-│   ├── protocol/   # RPC schemas, typed events, and error codes
-│   ├── server/     # Headless server runtime (Swank-style runtime, stdio/sockets)
-│   └── tui/        # Magit-inspired terminal client built with Ratatui
-├── docs/           # Architecture, specifications, and conceptual vision
-└── tauqe.toml      # Project configuration and context/history parameters
+│   ├── core/           # Engine: Git transactions, context manager, Tree-sitter repo map, turn pipeline
+│   ├── protocol/       # RPC schemas, typed events, and error codes
+│   ├── server/         # Headless server runtime (Swank-style runtime, stdio/sockets)
+│   └── tui/            # Magit-inspired terminal client built with Ratatui
+├── docs/               # User guide and conceptual documentation (mdBook)
+├── Conventions.md      # Architectural standards and engineering invariants
+├── Vision.md           # Conceptual vision, philosophy, and system model
+└── tauqe.toml          # Project configuration reference
 ```
 
 ---
 
 ## Quick Start
 
-### 1. Configuration
+### 1. Installation & Launch
 
-Initialize or edit `tauqe.toml` in your project root:
+- **System Installation:** Install `tauqe` and `tauqe-server` to `~/.cargo/bin`:
+  ```bash
+  just install
+  ```
+  Then run `tauqe` from any Git repository root.
 
-```toml
-[models]
-default = "anthropic/claude-3.5-sonnet"
+- **Self-Hosting / Development:** Build and run the development environment directly from source:
+  ```bash
+  just dev
+  ```
 
-[edit]
-workflow = "git"     # git | naive
-protocol = "xml"     # xml | structured
+On first launch in a repository, the built-in **interactive onboarding wizard** automatically inspects your environment, creates `tauqe.toml`, sets up `Conventions.md`, and securely saves your API credentials.
 
-[context]
-max_discovery_rounds = 3
-repomap_token_budget = 1024
-```
+### 2. Core Workspace Views
 
-Configure your OpenRouter API key via `.tauqe/credentials.toml` or environment variable:
+- **Develop (`Ctrl+1`):** Autonomous bounded turn execution, live streaming diffs, and conversational harness.
+- **Context (`Ctrl+2`):** Three-tier context management (Pinned, User, Auto) with glob pattern matching.
+- **Review (`Ctrl+3`):** Interactive code review with model selection, reasoning inspection, and actionable findings (`TODO`/`DONE`/`REJECTED`).
+- **History (`Ctrl+4`):** Collapsible chronological session log and commit audit trail.
 
-```bash
-export OPENROUTER_API_KEY="sk-or-v1-..."
-```
+### 3. Deep Dive Documentation
 
-### 2. Launch TUI
-
-```bash
-cargo run --bin tauqe-tui
-```
-
-### 3. Workflow
-
-1. **Submit a task:** Enter your prompt in the editor (`Enter` to submit, `Shift+Enter` for newline).
-2. **Observe the turn:** TAUQE discovers missing files, stages patches in memory, validates against `cargo check` / `test`, and renders a verified diff.
-3. **Control the result:** Press `u` to instantly roll back the entire turn via Git undo, or press `F6` to squash session commits into a feature commit.
+For in-depth architectural walkthroughs and user guides, explore the interactive documentation in `docs/` or run `just docs-serve`.
 
 ---
 

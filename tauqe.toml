@@ -15,8 +15,8 @@ models = [
 
 [edit]
 max_retries = 5  # число повторных попыток исправления неудачных правок
-workflow = "git"  # варианты: "toolchain", "git", "naive"
-protocol = "xml"        # активный протокол правок: "xml"
+# workflow = "git"   # варианты: "toolchain", "git", "naive" (по умолчанию "git")
+# protocol = "xml"   # активный протокол правок: "xml" (по умолчанию "xml")
 
 [toolchain]
 # check_command = ""  # своя команда проверки; по умолчанию определяется автоматически
@@ -35,7 +35,7 @@ max_discovery_rounds = 8  # максимум раундов автоматиче
 max_auto_files_per_round = 5  # максимум файлов за один раунд авто-добавления
 # repomap_token_budget = 4000  # бюджет токенов для карты репозитория (по умолчанию 4000)
 pinned = [
-    "docs/Conventions.md",
-    "docs/Vision.md",
+    "Conventions.md",
+    "Vision.md",
     "book/src/SUMMARY.md"
 ]

@@ -244,7 +244,7 @@ pub async fn handle_git_squash_generate_message(req: Request, state: &Arc<AppSta
         (p, m)
     };
 
-    let message = if let Ok(provider) = provider_res {
+    let (message, usage_info) = if let Ok(provider) = provider_res {
         let (tx, mut rx) = tokio::sync::mpsc::channel(50);
         let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
         {
@@ -260,9 +260,16 @@ pub async fn handle_git_squash_generate_message(req: Request, state: &Arc<AppSta
                 async move { provider.stream_text(&model_name, msgs, tx, cancel_rx).await },
             );
         let mut full_text = String::new();
+        let mut usage: Option<tauqe_protocol::ModelUsageInfo> = None;
         while let Some(ev) = rx.recv().await {
-            if let StreamEvent::TextDelta(delta) = ev {
-                full_text.push_str(&delta);
+            match ev {
+                StreamEvent::TextDelta(delta) => {
+                    full_text.push_str(&delta);
+                }
+                StreamEvent::Usage(u) => {
+                    usage = Some(u);
+                }
+                _ => {}
             }
         }
         let _ = stream_task.await;
@@ -274,22 +281,51 @@ pub async fn handle_git_squash_generate_message(req: Request, state: &Arc<AppSta
             .unwrap_or(trimmed)
             .trim()
             .to_string();
-        if cleaned.is_empty() {
+        let msg = if cleaned.is_empty() {
             commits_ahead
                 .first()
                 .map(|c| c.subject.clone())
                 .unwrap_or_else(|| "Squashed commits".to_string())
         } else {
             cleaned
-        }
+        };
+        (msg, usage)
     } else {
-        commits_ahead
-            .first()
-            .map(|c| c.subject.clone())
-            .unwrap_or_else(|| "Squashed commits".to_string())
+        (
+            commits_ahead
+                .first()
+                .map(|c| c.subject.clone())
+                .unwrap_or_else(|| "Squashed commits".to_string()),
+            None,
+        )
     };
 
-    let result = tauqe_protocol::GitSquashGenerateMessageResult { message };
+    let usage = usage_info.unwrap_or_default();
+    let cost = usage.cost.unwrap_or(0.0);
+    let total_cost = {
+        let mut total = state.total_cost.lock().await;
+        *total += cost;
+        *total
+    };
+
+    let op_id = format!("op-{}", crate::state::next_operation_id());
+    state.out.send_event(&Event {
+        method: events::MODEL_USAGE.to_string(),
+        params: serde_json::to_value(tauqe_protocol::ModelUsageEvent {
+            operation_id: op_id,
+            usage: usage.clone(),
+            session_total_cost: total_cost,
+            current_cost: Some(cost),
+        })
+        .ok(),
+    });
+
+    let result = tauqe_protocol::GitSquashGenerateMessageResult {
+        message,
+        usage: Some(usage),
+        session_total_cost: Some(total_cost),
+        current_cost: Some(cost),
+    };
     Response::ok_typed(req.id, &result)
 }
 

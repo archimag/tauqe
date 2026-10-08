@@ -418,6 +418,13 @@ fn apply_fallback_response(st: &mut AppState, val: &serde_json::Value) {
             .unwrap_or(false)
     {
         if let Ok(gen_res) = serde_json::from_value::<GitSquashGenerateMessageResult>(val.clone()) {
+            if let Some(total) = gen_res.session_total_cost {
+                st.model.session_total_cost = total;
+            }
+            if let Some(cost) = gen_res.current_cost {
+                st.model.prev_cost = Some(cost);
+            }
+            st.model.current_cost = None;
             if let Some(ref mut dialog) = st.squash_dialog {
                 dialog.generating_message = false;
                 dialog.message_buffer = gen_res.message;
@@ -610,6 +617,13 @@ pub async fn handle_response(resp: Response, state: &Arc<Mutex<AppState>>) {
             }
             methods::GIT_SQUASH_GENERATE_MESSAGE => {
                 if let Ok(gen_res) = serde_json::from_value::<GitSquashGenerateMessageResult>(val.clone()) {
+                    if let Some(total) = gen_res.session_total_cost {
+                        st.model.session_total_cost = total;
+                    }
+                    if let Some(cost) = gen_res.current_cost {
+                        st.model.prev_cost = Some(cost);
+                    }
+                    st.model.current_cost = None;
                     if let Some(ref mut dialog) = st.squash_dialog {
                         dialog.generating_message = false;
                         dialog.message_buffer = gen_res.message;

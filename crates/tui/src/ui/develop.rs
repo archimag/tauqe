@@ -656,14 +656,6 @@ pub fn compute_model_lines(model: &DevelopView) -> Vec<Line<'static>> {
 
     if let Some(usage) = &model.usage {
         model_lines.push(Line::raw(""));
-        let cost_val = usage.usage.cost.unwrap_or(0.0);
-        let cost_str = format!("${:.5}", cost_val);
-        let cost_style = if cost_val > 0.0 {
-            Style::default().fg(Color::Yellow).bold()
-        } else {
-            Style::default().fg(Color::DarkGray)
-        };
-
         let mut usage_spans = vec![
             Span::styled("Tokens: ", Style::default().fg(Color::DarkGray).bold()),
             Span::styled(
@@ -692,13 +684,6 @@ pub fn compute_model_lines(model: &DevelopView) -> Vec<Line<'static>> {
                 ));
             }
         }
-
-        usage_spans.push(Span::raw(" | "));
-        usage_spans.push(Span::styled(
-            "Operation cost: ",
-            Style::default().fg(Color::Yellow).bold(),
-        ));
-        usage_spans.push(Span::styled(cost_str, cost_style));
 
         model_lines.push(Line::from(usage_spans));
     }

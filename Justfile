@@ -45,9 +45,11 @@ clean:
     cargo clean
 
 # Build mdBook documentation
-book-build:
-    mdbook build book
+docs-build:
+    mdbook build docs
 
 # Serve mdBook documentation with live reload
-book-serve *args="":
-    mdbook serve book {{args}}
+docs-serve *args="":
+    mdbook serve docs {{args}}
+
+    

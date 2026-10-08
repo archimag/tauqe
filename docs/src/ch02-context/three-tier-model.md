@@ -9,7 +9,7 @@ TAUQE eliminates manual file micromanagement through a structured three-tier con
 The working context consists of three distinct layers:
 
 1. **Pinned Layer:**
-   - Permanent project guidelines and index files configured in `tauqe.toml` (such as `docs/Conventions.md`, `docs/Vision.md`, and `book/src/SUMMARY.md`).
+   - Permanent project guidelines and index files configured in `tauqe.toml` (such as `Conventions.md`, `Vision.md`, and `docs/src/SUMMARY.md`).
    - Injected into every prompt to maintain continuous adherence to project standards.
 2. **User Layer:**
    - Files explicitly designated by the developer as relevant to the current work session.

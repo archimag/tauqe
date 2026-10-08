@@ -116,3 +116,10 @@ All commits must follow the **Conventional Commits** specification:
 2. **Operational Invariants over Illustrative Bloat:**
    - Define clear operational invariants, input/output contracts, and behavioral boundaries instead of listing exhaustive ad-hoc special cases.
    - When specifying behavioral rules (such as language consistency, error handling, or format requirements), state the invariant directly (e.g. *"Formulate responses in the primary natural language established by the user's instructions"*), avoiding incidental sample queries or task-specific illustrations.
+
+---
+
+## 8. Subsystem Conventions
+
+- **Terminal UI (`crates/tui`):**
+  When modifying or extending code inside `crates/tui/`, the directives specified in `crates/tui/Conventions.md` are mandatory and must be observed.

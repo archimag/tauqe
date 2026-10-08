@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use crate::ModelUsageInfo;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RepositoryState {
@@ -92,6 +93,12 @@ pub struct GitSquashGenerateMessageParams {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GitSquashGenerateMessageResult {
     pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<ModelUsageInfo>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_total_cost: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_cost: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

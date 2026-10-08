@@ -388,12 +388,50 @@ pub fn has_openrouter_key(config: &AppConfig) -> bool {
         .unwrap_or(false)
 }
 
-pub fn write_default_config(path: &Path, model: &str) -> std::io::Result<()> {
+pub fn write_default_conventions(path: &Path) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent)?;
         }
     }
+    if path.exists() {
+        return Ok(());
+    }
+    let content = r#"# Project Conventions
+
+## 0. Language & Tone
+- All source code, identifiers, comments, documentation, and Git commit messages MUST be strictly in English.
+
+## 1. Architectural Philosophy & Minimalism
+- Strictly adhere to YAGNI (You Aren't Gonna Need It). Implement only what is required by current user goals.
+- Prefer small, cohesive, deterministic modules over speculative abstractions.
+- Do not invent unused configuration options, speculative features, or dead code.
+
+## 2. Git Safety & Commits
+- Formulate Git commit summaries in the imperative mood using Conventional Commits (`feat:`, `fix:`, `refactor:`, `docs:`, `test:`).
+- Keep commits atomic and self-contained.
+
+## 3. Verification & Quality Gates
+- Ensure all changes compile cleanly and pass project build, test, and lint toolchains without warnings or regressions.
+"#;
+    std::fs::write(path, content)
+}
+
+pub fn write_default_config(path: &Path, model: &str) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let conventions_path = if parent.as_os_str().is_empty() {
+            PathBuf::from("Conventions.md")
+        } else {
+            parent.join("Conventions.md")
+        };
+        let _ = write_default_conventions(&conventions_path);
+    } else {
+        let _ = write_default_conventions(Path::new("Conventions.md"));
+    }
+
     let trimmed_model = model.trim();
     let chosen_model = if trimmed_model.is_empty() {
         BUILTIN_DEFAULT_MODEL
@@ -429,6 +467,11 @@ name = "{}"
 [providers.openrouter]
 models = [
 {}
+]
+
+[context]
+pinned = [
+    "Conventions.md",
 ]
 
 [edit]
@@ -1004,6 +1047,18 @@ api_key = "sk-or-v1-secret-token"
         let expected = ModelRef::openrouter("deepseek/deepseek-chat");
         assert_eq!(loaded.active_model(), expected);
         assert!(loaded.available_models().contains(&expected));
+        assert_eq!(loaded.context.pinned, vec!["Conventions.md".to_string()]);
+        assert!(temp_dir.path().join("Conventions.md").is_file());
+    }
+
+    #[test]
+    fn test_write_default_conventions_does_not_overwrite_existing() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let conv_path = temp_dir.path().join("Conventions.md");
+        std::fs::write(&conv_path, "custom conventions").unwrap();
+        write_default_conventions(&conv_path).unwrap();
+        let content = std::fs::read_to_string(&conv_path).unwrap();
+        assert_eq!(content, "custom conventions");
     }
 
     #[test]
