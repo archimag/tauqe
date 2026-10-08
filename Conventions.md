@@ -76,11 +76,22 @@ All commits must follow the **Conventional Commits** specification:
 
 ```text
 <type>(<scope>): <description>
+
+[optional body]
+
+[optional footer(s)]
 ```
 
 - **Types:** `feat`, `fix`, `refactor`, `test`, `docs`, `perf`, `chore`.
 - **Scopes (crates & subsystems):** `core`, `server`, `tui`, `workflow` (or omitted for cross-cutting changes).
-- **Style:** English language, imperative mood (*add*, *fix*, *update*), lowercase, no trailing period, maximum 72 characters in the header.
+- **Header Line:**
+  - Written in English, imperative mood (*add*, *fix*, *update*), lowercase, no trailing period.
+  - Maximum 72 characters in the header line.
+- **Message Body & Formatting:**
+  - Mandatory single blank line separating the header from the body.
+  - **Strict 72-Character Line Limit:** Hard-wrap all body and footer lines at a maximum of **72 characters**. Never generate runaway, single-line paragraphs.
+  - Focus on *what* changed and *why*, articulating conceptual motivation and trade-offs rather than low-level procedural trivia.
+  - Use concise bullet lists or short paragraphs, cleanly wrapped to 72 columns.
 
 ---
 
@@ -96,13 +107,17 @@ All commits must follow the **Conventional Commits** specification:
 
 ---
 
-## 6. Living User Guide (`book/`)
+## 6. Living Documentation and Conceptual Ontology (`docs/`)
 
 1. **Dual-Use Documentation as First-Class Artifact:**
-   - The user guide located in `book/` serves as both the authoritative end-user manual and the semantic concept ontology for the AI model.
-   - `book/src/SUMMARY.md` is pinned as the primary conceptual index.
-2. **Mandatory Documentation of Conceptual Changes:**
-   - Whenever a task introduces or alters user-facing behavior, context mechanics (e.g., layers, permissions), the bounded turn lifecycle, interface workflows, or keybindings, the corresponding chapters in `book/src/` must be updated within the same turn.
+   - The user guide and architecture documentation located in `docs/` serve both as the authoritative reference for human developers and as the high-density semantic concept ontology for the AI model.
+   - `docs/src/SUMMARY.md` is pinned as the primary conceptual index and must reflect all chapters.
+2. **Rationale and Intent ("Why" Alongside "How"):**
+   - Documentation must never be a dry catalog of procedural instructions, flags, or keystrokes describing merely *how* a feature operates.
+   - Every chapter, architectural overview, and feature guide must explicitly articulate the underlying engineering motivation, trade-offs, and conceptual rationale (*why* it is designed this way).
+   - Explaining the "why" allows both human engineers and the large language model to grasp the deep architectural intent, preventing misaligned refactorings, drift, and accidental violations of core invariants.
+3. **Mandatory Documentation of Conceptual Changes:**
+   - Whenever a task introduces or alters user-facing behavior, context mechanics (e.g., layers, permissions), the bounded turn lifecycle, interface workflows, or keybindings, the corresponding chapters in `docs/src/` must be updated within the same turn.
    - Obsolete explanations must be revised immediately to prevent documentation rot and model hallucination.
 
 ---
@@ -122,4 +137,4 @@ All commits must follow the **Conventional Commits** specification:
 ## 8. Subsystem Conventions
 
 - **Terminal UI (`crates/tui`):**
-  The directives specified in `crates/tui/Conventions.md` are mandatory and strictly enforced. Whenever a task involves inspecting, modifying, or extending code inside `crates/tui/`, the model MUST explicitly request `crates/tui/Conventions.md` into context (via `<context_request>`) before proposing any modifications, unless it is already loaded in the active context. Proposing or making changes to `crates/tui/` without having `crates/tui/Conventions.md` loaded into context is strictly prohibited.
+  The directives specified in `crates/tui/Conventions.md` are mandatory and strictly enforced. Whenever a task involves inspecting, modifying, or extending code inside `crates/tui/`, the model MUST explicitly request `crates/tui/Conventions.md` into context (via `<context_request>`) before proposing any modifications, unless it is already loaded in the active context. Proposing or making changes to `crates/tui/` without having `crates/tui/Conventions.md` loaded into context is strictly prohibited. Hierarchical tree structures (Review, Plans) must follow the Org-mode structural paradigm (visibility cycling, distinct lifecycle states, compact density without blank gaps, and simple dedicated navigation keys). Primary view modes must never display persistent keyboard action hint bars; command discovery is handled exclusively via the standard `?` help dialog.

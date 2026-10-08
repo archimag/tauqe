@@ -30,8 +30,25 @@ Whenever modifying or extending code within `crates/tui/`, this conventions docu
 
 ---
 
-## 4. Single Source of Truth for Keyboard Commands
+## 4. Single Source of Truth for Keyboard Commands and Clean Views
 
-- **Automatic Help Generation:**
-  - Every view mode must define its keyboard commands via a structured command registry.
-  - The interactive Help system (`?`) must automatically derive its contents directly from these command definitions without manual duplication of keybindings in modal dialogs or popups.
+1. **Automatic Help Generation:**
+   - Every view mode must define its keyboard commands via a structured command registry.
+   - The interactive Help system (`?`) must automatically derive its contents directly from these command definitions without manual duplication of keybindings in modal dialogs or popups.
+
+2. **Prohibition of Action Hint Bars in Primary Views:**
+   - Primary view modes (Develop, Context, Review, Plans, History) must **never** render persistent keyboard command toolbars, shortcut hint banners ("Actions: Tab Fold, x Check..."), or bottom action bars.
+   - The standardized Help modal (`?`) is the single authoritative mechanism for discovering view commands.
+   - Bottom status areas are reserved strictly for operational telemetry, entity metadata, and progress indicators.
+   - Keybinding hints are permissible only inside temporary, contextual modal dialogs (confirmations, selection popups) where immediate contextual guidance is required.
+
+---
+
+## 5. Hierarchical Tree Navigation and Org-Mode Paradigm
+
+- **Hierarchical Tree Structures (Plans, Review):**
+  - Implement the conceptual Org-mode paradigm for structured trees without burdening navigation with complex Emacs-specific modifier chords.
+  - **Visibility Cycling:** Support clear local folding on items (`Tab` or `Space`) and global folding (`a`) to toggle between dense overview (all collapsed) and expanded states.
+  - **Orthogonal Status and Focus:** Task lifecycle statuses (`TODO` → `IN_PROGRESS` → `DONE` → `CANCELLED`, cycled via `t`) are strictly separated from context inclusion (`[x]`, toggled via `x`).
+  - **High Information Density (No Decorative Gaps):** Collapsed tree items must be rendered tightly adjacent without artificial blank gaps or trailing empty lines. Expanded items with markdown details must be cleanly separated by exactly one line.
+  - **Simple Dedicated Navigation:** In view modes without text input (Plans, Review), prioritize simple direct keys (`j`/`k`, `↑`/`↓`, `c` for copy, `s` for status filter) rather than multi-key chord sequences.

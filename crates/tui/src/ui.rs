@@ -10,17 +10,20 @@ pub mod geometry;
 pub mod header;
 pub mod history;
 pub mod onboarding;
+pub mod plans;
 pub mod review;
 pub mod wrap;
 
 use context::render_context_view;
 use develop::render::render_develop_view;
 use history::render_history_view;
+use plans::render_plans_view;
 use review::render_review_view;
 
 pub use dialogs::{
-    render_confirm_cancel_popup, render_confirm_clear_history_popup, render_confirm_undo_popup,
-    render_help_popup, render_review_dialog, render_selection_dialog, render_squash_popup,
+    render_confirm_cancel_popup, render_confirm_clear_history_popup, render_confirm_delete_plan_popup,
+    render_confirm_undo_popup, render_help_popup, render_review_dialog, render_selection_dialog,
+    render_squash_popup,
 };
 pub use footer::{extract_current_round, format_footer_cost, render_footer};
 pub use geometry::centered_rect;
@@ -68,6 +71,9 @@ pub fn render_ui(frame: &mut ratatui::Frame, state: &mut AppState) {
         ViewMode::Review => {
             render_review_view(frame, state, chunks[1], chunks[2]);
         }
+        ViewMode::Plans => {
+            render_plans_view(frame, state, chunks[1], chunks[2]);
+        }
     }
 
     if state.view_mode != ViewMode::Onboarding {
@@ -84,6 +90,8 @@ pub fn render_ui(frame: &mut ratatui::Frame, state: &mut AppState) {
         render_confirm_undo_popup(frame, state);
     } else if state.confirm_clear_history {
         render_confirm_clear_history_popup(frame, state);
+    } else if let Some(plan_id) = &state.confirm_delete_plan {
+        render_confirm_delete_plan_popup(frame, plan_id, state);
     } else if let Some(dialog) = &state.selection_dialog {
         render_selection_dialog(frame, dialog);
     } else if state.show_help {

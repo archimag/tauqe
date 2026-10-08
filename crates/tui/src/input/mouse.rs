@@ -44,6 +44,9 @@ pub async fn handle_mouse_event(
                 ViewMode::Review => {
                     st.review.scroll = st.review.scroll.saturating_sub(3);
                 }
+                ViewMode::Plans => {
+                    st.plans_view.scroll = st.plans_view.scroll.saturating_sub(3);
+                }
                 ViewMode::Onboarding => {}
             }
             Ok(InputResult::Continue)
@@ -84,6 +87,10 @@ pub async fn handle_mouse_event(
                 ViewMode::Review => {
                     let max = (st.review.rendered_lines as u16).saturating_sub(st.review.view_height);
                     st.review.scroll = st.review.scroll.saturating_add(3).min(max);
+                }
+                ViewMode::Plans => {
+                    let max = (st.plans_view.rendered_lines as u16).saturating_sub(st.plans_view.view_height);
+                    st.plans_view.scroll = st.plans_view.scroll.saturating_add(3).min(max);
                 }
                 ViewMode::Onboarding => {}
             }
@@ -147,6 +154,10 @@ pub async fn handle_mouse_event(
                     return Ok(InputResult::Continue);
                 } else if mouse.column >= areas.review_tab.0 && mouse.column <= areas.review_tab.1 {
                     st.view_mode = ViewMode::Review;
+                    st.context_view.status_message = None;
+                    return Ok(InputResult::Continue);
+                } else if mouse.column >= areas.plans_tab.0 && mouse.column <= areas.plans_tab.1 {
+                    st.view_mode = ViewMode::Plans;
                     st.context_view.status_message = None;
                     return Ok(InputResult::Continue);
                 } else if mouse.column >= areas.history_tab.0 && mouse.column <= areas.history_tab.1 {

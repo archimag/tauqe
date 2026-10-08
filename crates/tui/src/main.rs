@@ -24,6 +24,7 @@ use crate::input::InputResult;
 use crate::ui::context::ContextViewState;
 use crate::ui::develop::{DevelopView, SPINNER_FRAMES};
 use crate::ui::history::HistoryViewState;
+use crate::ui::plans::PlansViewState;
 use crate::ui::review::ReviewViewState;
 use crate::ui::render_ui;
 
@@ -84,6 +85,7 @@ async fn main() -> anyhow::Result<()> {
         context_view: ContextViewState::default(),
         history_view: HistoryViewState::default(),
         review: ReviewViewState::default(),
+        plans_view: PlansViewState::default(),
         review_dialog: None,
         onboarding: onboarding_state,
         input_editor: InputEditor::default(),
@@ -91,6 +93,7 @@ async fn main() -> anyhow::Result<()> {
         confirm_cancel: false,
         confirm_undo: false,
         confirm_clear_history: false,
+        confirm_delete_plan: None,
         selection_dialog: None,
         squash_dialog: None,
         last_model_height: 10,
@@ -111,6 +114,10 @@ async fn main() -> anyhow::Result<()> {
 
     // Restore the latest saved review (if any)
     rpc::send_request(&mut server_writer, methods::REVIEW_GET, serde_json::json!({})).await?;
+
+    // Initial plans fetch
+    rpc::send_request(&mut server_writer, methods::PLAN_LIST, serde_json::json!({})).await?;
+    rpc::send_request(&mut server_writer, methods::PLAN_GET, serde_json::json!({})).await?;
 
     // Safety net: restore the terminal before reporting any unexpected panic
     let original_hook = std::panic::take_hook();

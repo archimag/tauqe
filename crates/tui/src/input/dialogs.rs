@@ -289,6 +289,26 @@ pub async fn handle_dialog_event(
         return Ok(Some(InputResult::Continue));
     }
 
+    // 4a. Delete plan confirmation
+    if let Some(plan_id) = st.confirm_delete_plan.take() {
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                st.plans_view.reset_view_for_new_plan();
+                st.plans_view.current_plan = None;
+                st.plans_view.active_plan_id = None;
+                drop(st);
+                send_request(server_writer, methods::PLAN_DELETE, serde_json::json!({ "id": plan_id })).await?;
+                send_request(server_writer, methods::PLAN_LIST, serde_json::json!({})).await?;
+                send_request(server_writer, methods::PLAN_GET, serde_json::json!({})).await?;
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {}
+            _ => {
+                st.confirm_delete_plan = Some(plan_id);
+            }
+        }
+        return Ok(Some(InputResult::Continue));
+    }
+
     // 4. Clear history confirmation
     if st.confirm_clear_history {
         match key.code {

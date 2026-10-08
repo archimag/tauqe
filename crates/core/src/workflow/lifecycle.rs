@@ -152,6 +152,26 @@ pub(crate) async fn execute_workflow_lifecycle<T: WorkflowTransaction>(
     let mut turn_detected_language = pipeline_out.detected_language.clone();
     let repo_root = context_manager.repo_root().to_path_buf();
 
+    let (parsed_plans, plan_errors) = protocol.parse_plan_tags(&pipeline_out.assistant_text);
+    let plan_outcome = crate::plan::storage::PlanStorage::apply_parsed_plans(
+        &repo_root,
+        parsed_plans,
+        plan_errors,
+    );
+    let plan_error_notice = if !plan_outcome.errors.is_empty() {
+        let mut msg = String::from("\n\n> ⚠️ **Plan Notice:**\n");
+        for err in &plan_outcome.errors {
+            msg.push_str(&format!("> - {}\n", err));
+        }
+        Some(msg)
+    } else {
+        None
+    };
+
+    if let Some(ref notice) = plan_error_notice {
+        let _ = stream_tx.send(StreamEvent::TextDelta(notice.clone())).await;
+    }
+
     let final_result = match pipeline_out.parsed_result {
         ModelResult::Edit {
             summary,
@@ -302,7 +322,7 @@ pub(crate) async fn execute_workflow_lifecycle<T: WorkflowTransaction>(
             }
         }
         ModelResult::Answer { text } => {
-            let text = verify_and_append_to_answer(
+            let mut text = verify_and_append_to_answer(
                 &repo_root,
                 &mut pipeline_out.assistant_text,
                 text,
@@ -310,6 +330,9 @@ pub(crate) async fn execute_workflow_lifecycle<T: WorkflowTransaction>(
                 protocol,
             )
             .await;
+            if let Some(ref notice) = plan_error_notice {
+                text.push_str(notice);
+            }
             ModelResult::Answer {
                 text: protocol.clean_assistant_text(&text),
             }
@@ -317,6 +340,9 @@ pub(crate) async fn execute_workflow_lifecycle<T: WorkflowTransaction>(
     };
 
     pipeline_out.assistant_text = protocol.clean_assistant_text(&pipeline_out.assistant_text);
+    if let Some(ref notice) = plan_error_notice {
+        pipeline_out.assistant_text.push_str(notice);
+    }
 
     record_workflow_response(
         history_manager,

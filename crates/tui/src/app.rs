@@ -4,6 +4,7 @@ use crate::editor::InputEditor;
 use crate::ui::context::ContextViewState;
 use crate::ui::develop::DevelopView;
 use crate::ui::history::HistoryViewState;
+use crate::ui::plans::PlansViewState;
 use crate::ui::review::ReviewViewState;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -28,8 +29,9 @@ pub struct SelectionDialogState {
 pub enum ViewMode {
     Develop,
     Context,
-    History,
     Review,
+    Plans,
+    History,
     Onboarding,
 }
 
@@ -94,8 +96,9 @@ impl Default for OnboardingState {
 pub struct HeaderClickAreas {
     pub develop_tab: (u16, u16),
     pub context_tab: (u16, u16),
-    pub history_tab: (u16, u16),
     pub review_tab: (u16, u16),
+    pub plans_tab: (u16, u16),
+    pub history_tab: (u16, u16),
     pub model_select: (u16, u16),
     pub squash_button: (u16, u16),
     pub help_button: (u16, u16),
@@ -188,12 +191,14 @@ pub struct AppState {
     pub context_view: ContextViewState,
     pub history_view: HistoryViewState,
     pub review: ReviewViewState,
+    pub plans_view: PlansViewState,
     pub onboarding: OnboardingState,
     pub input_editor: InputEditor,
     pub show_help: bool,
     pub confirm_cancel: bool,
     pub confirm_undo: bool,
     pub confirm_clear_history: bool,
+    pub confirm_delete_plan: Option<String>,
     pub selection_dialog: Option<SelectionDialogState>,
     pub squash_dialog: Option<SquashDialogState>,
     pub review_dialog: Option<ReviewDialogState>,
@@ -280,6 +285,7 @@ mod tests {
             context_view: ContextViewState::default(),
             history_view: HistoryViewState::default(),
             review: ReviewViewState::default(),
+            plans_view: PlansViewState::default(),
             review_dialog: None,
             onboarding: OnboardingState::default(),
             input_editor: InputEditor::default(),
@@ -287,6 +293,7 @@ mod tests {
             confirm_cancel: false,
             confirm_undo: false,
             confirm_clear_history: false,
+            confirm_delete_plan: None,
             selection_dialog: None,
             squash_dialog: None,
             last_model_height: 10,

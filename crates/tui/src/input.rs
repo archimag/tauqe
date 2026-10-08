@@ -14,6 +14,7 @@ pub mod dialogs;
 pub mod history;
 pub mod mouse;
 pub mod onboarding;
+pub mod plans;
 pub mod review;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -70,8 +71,9 @@ pub async fn handle_terminal_event(
                 ViewMode::Develop => develop::handle_develop_key(key, state, server_writer).await,
                 ViewMode::Context => context::handle_context_key(key, state, server_writer).await,
                 ViewMode::Onboarding => onboarding::handle_onboarding_key(key, state, server_writer).await,
-                ViewMode::History => history::handle_history_key(key, state, server_writer).await,
                 ViewMode::Review => review::handle_review_key(key, state, server_writer).await,
+                ViewMode::Plans => plans::handle_plans_key(key, state, server_writer).await,
+                ViewMode::History => history::handle_history_key(key, state, server_writer).await,
             }
         }
         _ => Ok(InputResult::Continue),
@@ -103,6 +105,11 @@ async fn handle_global_shortcuts(
                 return Ok(Some(InputResult::Continue));
             }
             KeyCode::Char('4') => {
+                st.view_mode = ViewMode::Plans;
+                st.context_view.status_message = None;
+                return Ok(Some(InputResult::Continue));
+            }
+            KeyCode::Char('5') => {
                 st.view_mode = ViewMode::History;
                 st.history_view.auto_scroll = true;
                 if !st.history_view.items.is_empty() {

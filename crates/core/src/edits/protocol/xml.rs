@@ -8,12 +8,13 @@ mod marker;
 pub(crate) mod tags;
 
 use marker::XML_TAG_BASES;
-use tags::{parse_context_request_tags, parse_doc_request_tags, strip_doc_request_tags};
+use tags::{parse_context_request_tags, parse_doc_request_tags};
 
 pub use marker::generate_turn_marker;
 pub use tags::{
     extract_user_language, extract_verify_request, strip_context_request_tags,
-    strip_user_language_tags, strip_verify_tags, VerifyOnSuccess, VerifyRequest, VerifyTarget,
+    strip_doc_request_tags, strip_plan_tags, strip_user_language_tags, strip_verify_tags,
+    VerifyOnSuccess, VerifyRequest, VerifyTarget,
 };
 pub(crate) use marker::{normalize_marked_xml, restore_xml_literals};
 pub(crate) use tags::{next_context_request_tag, next_user_language_tag, next_verify_tag};
@@ -45,6 +46,13 @@ impl EditProtocol for XmlEditProtocol {
 
     fn parse_user_language(&self, raw_text: &str) -> Option<String> {
         tags::extract_user_language(raw_text)
+    }
+
+    fn parse_plan_tags(
+        &self,
+        raw_text: &str,
+    ) -> (Vec<tags::ParsedPlanTag>, Vec<String>) {
+        tags::parse_plan_tags_with_diagnostics(raw_text)
     }
 
     fn clean_assistant_text(&self, raw_text: &str) -> String {
@@ -123,8 +131,8 @@ impl EditProtocol for XmlEditProtocol {
     fn parse_output(&self, raw_text: &str, editable_paths: &[String]) -> ModelResult {
         if !has_xml_edit_tags(raw_text) {
             return ModelResult::Answer {
-                text: strip_verify_tags(&strip_user_language_tags(&strip_doc_request_tags(
-                    &strip_context_request_tags(raw_text),
+                text: strip_plan_tags(&strip_verify_tags(&strip_user_language_tags(
+                    &strip_doc_request_tags(&strip_context_request_tags(raw_text)),
                 ))),
             };
         }
@@ -212,6 +220,14 @@ impl EditProtocol for MarkedXmlEditProtocol {
     fn parse_user_language(&self, raw_text: &str) -> Option<String> {
         let normalized = normalize_marked_xml(raw_text, &self.marker, true);
         tags::extract_user_language(&normalized)
+    }
+
+    fn parse_plan_tags(
+        &self,
+        raw_text: &str,
+    ) -> (Vec<tags::ParsedPlanTag>, Vec<String>) {
+        let normalized = normalize_marked_xml(raw_text, &self.marker, true);
+        tags::parse_plan_tags_with_diagnostics(&normalized)
     }
 
     fn clean_assistant_text(&self, raw_text: &str) -> String {
@@ -459,6 +475,7 @@ pub fn extract_conversational_text(raw_text: &str) -> String {
     let text = strip_verify_tags(&text);
     let text = strip_context_request_tags(&text);
     let text = strip_doc_request_tags(&text);
+    let text = strip_plan_tags(&text);
     clean_conversational_lines(&text)
 }
 
@@ -1038,6 +1055,15 @@ Everything is tested and working properly."#;
         assert_eq!(
             strip_verify_tags(text).trim(),
             "Here are changes.\n\nAll done."
+        );
+    }
+
+    #[test]
+    fn test_extract_conversational_text_removes_plan_tags() {
+        let output = "Here is the plan:\n<plan id=\"my-plan\" title=\"Title\">\n<item id=\"1\" title=\"A\" />\n</plan>\nLet's do this!";
+        assert_eq!(
+            extract_conversational_text(output),
+            "Here is the plan:\n\nLet's do this!"
         );
     }
 

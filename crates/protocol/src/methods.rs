@@ -36,3 +36,10 @@ pub const REVIEW_CANCEL: &str = "review/cancel";
 pub const REVIEW_GET: &str = "review/get";
 pub const REVIEW_UPDATE_ITEM: &str = "review/updateItem";
 pub const REVIEW_CLEAR: &str = "review/clear";
+
+pub const PLAN_LIST: &str = "plan/list";
+pub const PLAN_GET: &str = "plan/get";
+pub const PLAN_SAVE: &str = "plan/save";
+pub const PLAN_UPDATE_ITEM: &str = "plan/updateItem";
+pub const PLAN_DELETE: &str = "plan/delete";
+pub const PLAN_SET_ACTIVE: &str = "plan/setActive";

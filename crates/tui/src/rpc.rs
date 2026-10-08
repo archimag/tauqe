@@ -780,6 +780,47 @@ pub async fn handle_response(resp: Response, state: &Arc<Mutex<AppState>>) {
             methods::REVIEW_START | methods::REVIEW_CANCEL => {
                 return;
             }
+            methods::PLAN_LIST => {
+                if let Ok(res) = serde_json::from_value::<tauqe_protocol::PlanListResult>(val.clone()) {
+                    st.plans_view.plans_list = res.plans;
+                    st.plans_view.active_plan_id = res.active_id.clone();
+                    if let Some(active) = &res.active_id {
+                        if let Some(pos) = st.plans_view.plans_list.iter().position(|p| &p.id == active) {
+                            st.plans_view.selected_plan_index = pos;
+                        }
+                    }
+                }
+                return;
+            }
+            methods::PLAN_GET | methods::PLAN_SAVE | methods::PLAN_UPDATE_ITEM => {
+                if let Ok(res) = serde_json::from_value::<tauqe_protocol::PlanGetResult>(val.clone()) {
+                    if let Some(plan) = res.plan {
+                        let is_diff = st.plans_view.current_plan.as_ref().map(|p| &p.id) != Some(&plan.id);
+                        if is_diff {
+                            st.plans_view.reset_view_for_new_plan();
+                        }
+                        st.plans_view.active_plan_id = Some(plan.id.clone());
+                        if let Some(pos) = st.plans_view.plans_list.iter().position(|p| p.id == plan.id) {
+                            st.plans_view.selected_plan_index = pos;
+                        }
+                        st.plans_view.current_plan = Some(plan);
+                    }
+                } else if let Ok(res) = serde_json::from_value::<tauqe_protocol::PlanUpdateItemResult>(val.clone()) {
+                    st.plans_view.current_plan = Some(res.plan);
+                }
+                return;
+            }
+            methods::PLAN_SET_ACTIVE => {
+                if let Ok(res) = serde_json::from_value::<tauqe_protocol::PlanSetActiveResult>(val.clone()) {
+                    st.plans_view.active_plan_id = res.active_id.clone();
+                    if let Some(active) = &res.active_id {
+                        if let Some(pos) = st.plans_view.plans_list.iter().position(|p| &p.id == active) {
+                            st.plans_view.selected_plan_index = pos;
+                        }
+                    }
+                }
+                return;
+            }
             methods::SYSTEM_STATUS
             | methods::CONFIG_RELOAD
             | methods::CONFIG_CREATE
@@ -1189,6 +1230,37 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
                 if let Ok(data) = serde_json::from_value::<ReviewErrorEvent>(params) {
                     st.review.running = false;
                     st.review.error = Some(data.message);
+                }
+            }
+        }
+        events::PLAN_UPDATED => {
+            if let Some(params) = ev.params {
+                if let Ok(data) = serde_json::from_value::<tauqe_protocol::PlanUpdatedEvent>(params) {
+                    let is_diff = st.plans_view.current_plan.as_ref().map(|p| &p.id) != Some(&data.plan.id);
+                    if is_diff {
+                        st.plans_view.reset_view_for_new_plan();
+                    }
+                    st.plans_view.active_plan_id = Some(data.plan.id.clone());
+                    st.plans_view.current_plan = Some(data.plan);
+                }
+            }
+        }
+        events::PLAN_LIST_CHANGED => {
+            if let Some(params) = ev.params {
+                if let Ok(data) = serde_json::from_value::<tauqe_protocol::PlanListChangedEvent>(params) {
+                    st.plans_view.plans_list = data.plans;
+                    st.plans_view.active_plan_id = data.active_id.clone();
+                    if let Some(active) = &data.active_id {
+                        if let Some(pos) = st.plans_view.plans_list.iter().position(|p| &p.id == active) {
+                            st.plans_view.selected_plan_index = pos;
+                        }
+                    } else if let Some(first) = st.plans_view.plans_list.first().cloned() {
+                        st.plans_view.selected_plan_index = 0;
+                        st.plans_view.active_plan_id = Some(first.id.clone());
+                    } else {
+                        st.plans_view.current_plan = None;
+                        st.plans_view.selected_plan_index = 0;
+                    }
                 }
             }
         }

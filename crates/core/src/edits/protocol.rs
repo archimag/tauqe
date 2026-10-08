@@ -50,6 +50,14 @@ pub trait EditProtocol: Send + Sync {
         None
     }
 
+    /// Extracts plan tags and validation diagnostics from raw output.
+    fn parse_plan_tags(
+        &self,
+        _raw_text: &str,
+    ) -> (Vec<crate::edits::protocol::xml::tags::ParsedPlanTag>, Vec<String>) {
+        (Vec::new(), Vec::new())
+    }
+
     /// Cleans model output for presentation and history by stripping edit blocks and protocol control tags.
     fn clean_assistant_text(&self, raw_text: &str) -> String {
         raw_text.to_string()

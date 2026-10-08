@@ -8,6 +8,7 @@ const LIFECYCLE: &str = include_str!("../../../docs/src/ch03-bounded-turn/lifecy
 const GIT_SAFETY: &str = include_str!("../../../docs/src/ch04-git-safety/checkpoints-and-undo.md");
 const INTERFACE: &str = include_str!("../../../docs/src/ch05-interface/tui-ux.md");
 const REVIEW: &str = include_str!("../../../docs/src/ch06-review/review.md");
+const PLANS: &str = include_str!("../../../docs/src/ch07-plans/plans.md");
 
 /// Topics the model can request. The last one aggregates every chapter.
 pub(crate) const TOPICS: &[&str] = &[
@@ -17,6 +18,8 @@ pub(crate) const TOPICS: &[&str] = &[
     "git",
     "interface",
     "review",
+    "plan",
+    "plans",
     "all",
 ];
 
@@ -37,8 +40,9 @@ pub(crate) fn get_documentation(topic: &str) -> String {
         "git" => &[GIT_SAFETY],
         "interface" => &[INTERFACE],
         "review" => &[REVIEW],
+        "plan" | "plans" => &[PLANS],
         _ => &[
-            INTRO, PHILOSOPHY, CONTEXT, LIFECYCLE, GIT_SAFETY, INTERFACE, REVIEW,
+            INTRO, PHILOSOPHY, CONTEXT, LIFECYCLE, GIT_SAFETY, INTERFACE, REVIEW, PLANS,
         ],
     };
     sections
@@ -61,9 +65,11 @@ mod tests {
     #[test]
     fn test_get_documentation_topics() {
         assert!(get_documentation("interface").contains("Ctrl+1"));
+        assert!(get_documentation("plan").contains("Local Plans"));
         let all = get_documentation("all");
         assert!(all.contains("Semantic Harness"));
         assert!(all.contains("Ctrl+1"));
+        assert!(all.contains("Local Plans"));
         assert_eq!(get_documentation("bogus"), all);
     }
 }

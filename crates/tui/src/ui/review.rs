@@ -169,6 +169,19 @@ fn location(item: &ReviewItem) -> Option<String> {
     })
 }
 
+fn split_title_and_file_path(title: &str) -> (&str, Option<&str>) {
+    let trimmed = title.trim();
+    if let Some(idx) = trimmed.rfind(" (") {
+        if trimmed.ends_with(')') {
+            let inside = &trimmed[idx + 2..trimmed.len() - 1];
+            if inside.contains('/') || inside.contains('\\') || inside.contains(':') || inside.contains('.') {
+                return (trimmed[..idx].trim(), Some(inside));
+            }
+        }
+    }
+    (trimmed, None)
+}
+
 fn compute_item_lines(
     items: &[ReviewItem],
     visible_indices: &[usize],
@@ -192,10 +205,12 @@ fn compute_item_lines(
         let title_style = if item.status == ReviewStatus::Todo {
             Style::default().bold()
         } else {
-            Style::default().fg(Color::DarkGray)
+            Style::default().fg(Color::Gray)
         };
 
-        let mut spans = vec![
+        let raw_title = item.title.replace(['\r', '\n'], " ");
+        let (display_title, extra_path) = split_title_and_file_path(&raw_title);
+        let spans = vec![
             Span::styled(if is_selected { "● " } else { "  " }, cursor_style),
             Span::styled(
                 if is_expanded { "▼ " } else { "▶ " },
@@ -209,22 +224,33 @@ fn compute_item_lines(
             Span::raw(" "),
             Span::styled(format!("[{}]", item.severity), severity_style(item.severity)),
             Span::raw(" "),
-            Span::styled(format!("#{} {}", item.id, item.title), title_style),
+            Span::styled(format!("#{} {}", item.id, display_title), title_style),
         ];
-        if let Some(loc) = location(item) {
-            spans.push(Span::raw(" "));
-            spans.push(Span::styled(
-                format!("({})", loc),
-                Style::default().fg(Color::DarkGray),
-            ));
-        }
 
         let mut lines = vec![Line::from(spans)];
         if is_expanded {
-            let mut theme = crate::markdown::MarkdownTheme::answer();
-            theme.line_prefix = Some(Span::raw("    "));
-            lines.extend(crate::markdown::render_markdown(&item.body, &theme));
-            lines.push(Line::raw(""));
+            let loc_str = location(item).or_else(|| extra_path.map(|s| s.to_string()));
+            if let Some(loc) = loc_str {
+                let clean_loc = loc.trim();
+                if !clean_loc.is_empty() {
+                    lines.push(Line::from(vec![
+                        Span::raw("    "),
+                        Span::styled("File: ", Style::default().fg(Color::Cyan).bold()),
+                        Span::styled(clean_loc.to_string(), Style::default().fg(Color::White)),
+                    ]));
+                    lines.push(Line::raw(""));
+                }
+            }
+            let clean_body = item.body.trim();
+            if !clean_body.is_empty() {
+                let mut theme = crate::markdown::MarkdownTheme::answer();
+                theme.line_prefix = Some(Span::raw("    "));
+                let md = crate::markdown::render_markdown(clean_body, &theme);
+                if !md.is_empty() {
+                    lines.extend(md);
+                    lines.push(Line::raw(""));
+                }
+            }
         }
 
         offsets.push(all_lines.len());
@@ -354,79 +380,45 @@ pub fn render_review_view(
         .map(|s| s.items.iter().filter(|i| i.is_checked).count())
         .unwrap_or(0);
 
-    let actions_line = if state.review.running {
+    let status_line = if state.review.running {
         Line::from(vec![
             Span::styled(" Reviewing... ", Style::default().fg(Color::Yellow).bold()),
-            Span::styled("Esc", Style::default().bold().fg(Color::White)),
-            Span::raw(" Cancel."),
+            Span::styled("[Esc: Cancel]", Style::default().fg(Color::Gray)),
         ])
-    } else {
-        let key = |k: &'static str| Span::styled(k, Style::default().bold().fg(Color::Yellow));
-        let mut spans = vec![
-            Span::styled(" Actions: ", Style::default().fg(Color::Cyan).bold()),
-            key("r"),
-            Span::raw(" Run review, "),
-            key("s"),
-            Span::raw(if state.review.hide_closed {
-                " Show all, "
-            } else {
-                " Hide closed, "
-            }),
-            key("Tab"),
-            Span::raw(" Fold, "),
-            key("x"),
-            Span::raw(" Check, "),
-            key("t"),
-            Span::raw(" Status, "),
-            key("c"),
-            Span::raw(" Copy, "),
-            key("↑/↓"),
-            Span::raw(" Select. "),
-        ];
-        if visible_len > 0 {
-            let label = if state.review.hide_closed && visible_len < items_len {
-                format!(
-                    "[Item {}/{} ({} total)]",
-                    state.review.selected_index + 1,
-                    visible_len,
-                    items_len
-                )
-            } else {
-                format!("[Item {}/{}]", state.review.selected_index + 1, items_len)
-            };
-            spans.push(Span::styled(label, Style::default().fg(Color::DarkGray)));
-        } else if items_len > 0 && state.review.hide_closed {
-            spans.push(Span::styled(
-                format!("[0/{} visible (all closed)]", items_len),
-                Style::default().fg(Color::DarkGray),
-            ));
-        }
-        Line::from(spans)
-    };
-
-    let status_line = if let Some(err) = &state.review.error {
+    } else if let Some(err) = &state.review.error {
         Line::from(Span::styled(
             format!(" {}", err),
             Style::default().fg(Color::Red).bold(),
         ))
     } else if let Some(session) = &state.review.session {
         let filter_tag = if state.review.hide_closed {
-            " | Filter: Open only [s: show all]"
+            " | Filter: Open only"
         } else {
             ""
         };
+        let item_pos = if visible_len > 0 {
+            if state.review.hide_closed && visible_len < items_len {
+                format!(" | [Item {}/{} ({} total)]", state.review.selected_index + 1, visible_len, items_len)
+            } else {
+                format!(" | [Item {}/{}]", state.review.selected_index + 1, items_len)
+            }
+        } else if items_len > 0 && state.review.hide_closed {
+            format!(" | [0/{} visible (all closed)]", items_len)
+        } else {
+            String::new()
+        };
         Line::from(Span::styled(
             format!(
-                " Review {} | {} | {} item(s), {} checked for Develop{}",
-                session.id, session.model, items_len, checked, filter_tag
+                " Review {} | {} | {} item(s), {} checked for Develop{}{}",
+                session.id, session.model, items_len, checked, filter_tag, item_pos
             ),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(Color::Gray),
         ))
     } else {
         Line::raw("")
     };
 
-    let info = Paragraph::new(vec![actions_line, status_line])
+    let info = Paragraph::new(vec![status_line])
         .block(Block::default().padding(Padding::horizontal(1)));
     frame.render_widget(info, info_area);
 }

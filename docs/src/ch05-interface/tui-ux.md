@@ -26,7 +26,11 @@ When you submit an engineering intent, TAUQE does not simply invoke a single-sho
 - **`Ctrl+3` (Review View):**
   - Dedicated code review workspace for static architectural and security audits.
   - Interactive findings checklist: fold/unfold items (`Tab` / `Space`), toggle status TODO/DONE/REJECTED (`t`), select items for Develop context (`x`), and copy findings (`c` / `y`).
-- **`Ctrl+4` (History View):**
+- **`Ctrl+4` (Plans View):**
+  - Workspace for managing tactical task hierarchies and execution roadmaps.
+  - Interactive tree of tasks with statuses (`[ ]` Todo, `[▶]` InProgress, `[✓]` Done, `[−]` Cancelled).
+  - Select items with `x` to inject them into the Develop prompt context as `<active_plan_context>`, fold/unfold branches (`Tab` / `Space`), switch between plans (`Tab` in plan selector), and copy markdown (`c` / `y`).
+- **`Ctrl+5` (History View):**
   - Paginated audit log of semantic turns, code review runs, AI commit hashes, and file modifications.
   - Collapsible items: All entries are folded by default, displaying the role badge, commit summary, and preview lines.
   - Press `Tab` or `Space` to fold/unfold the active entry and inspect the full response and modified files.

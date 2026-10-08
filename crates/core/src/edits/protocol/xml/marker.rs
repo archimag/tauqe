@@ -20,7 +20,7 @@ pub fn generate_turn_marker() -> String {
 
 pub(super) const XML_TAG_BASES: &[&str] = &[
     "tauqe_edits", "edit", "search", "replace", "create", "delete", "move", "with", "summary",
-    "context_request", "user_language", "verify", "overwrite", "doc_request",
+    "context_request", "user_language", "verify", "overwrite", "doc_request", "plan",
 ];
 
 fn literal_prefix(marker: &str) -> String {

@@ -1,7 +1,7 @@
 use crate::context::ContextFileContent;
 use crate::edits::EditProtocol;
 use crate::providers::ChatMessage;
-use tauqe_protocol::{ContextAccess, RepositoryState, ReviewItem};
+use tauqe_protocol::{ContextAccess, Plan, RepositoryState, ReviewItem};
 
 pub fn build_squash_commit_prompt(
     commits: &[crate::git::CommitSummary],
@@ -77,6 +77,7 @@ pub struct PromptAssembly {
     pub repo_map: Option<String>,
     pub target_language: Option<String>,
     pub active_review_findings: Vec<ReviewItem>,
+    pub active_plan: Option<Plan>,
 }
 
 impl PromptAssembly {
@@ -99,7 +100,13 @@ impl PromptAssembly {
             repo_map,
             target_language: None,
             active_review_findings: Vec::new(),
+            active_plan: None,
         }
+    }
+
+    pub fn with_active_plan(mut self, plan: Option<Plan>) -> Self {
+        self.active_plan = plan;
+        self
     }
 
     pub fn with_active_review_findings(mut self, findings: Vec<ReviewItem>) -> Self {
@@ -148,9 +155,13 @@ impl PromptAssembly {
             marker_suffix
         ));
         prompt.push_str(&format!(
-            "10. Self-Knowledge: When the user asks about your identity, capabilities, concepts, workflows, keyboard shortcuts, or configuration, do NOT guess. Request the authoritative documentation using <doc_request{} topic=\"{}\" /> and output nothing else except a short note. You will be called again with <system_documentation> blocks; base your answer strictly on them and formulate it in the user's language.\n\n",
+            "10. Self-Knowledge: When the user asks about your identity, capabilities, concepts, workflows, keyboard shortcuts, or configuration, do NOT guess. Request the authoritative documentation using <doc_request{} topic=\"{}\" /> and output nothing else except a short note. You will be called again with <system_documentation> blocks; base your answer strictly on them and formulate it in the user's language.\n",
             marker_suffix,
             crate::docs::TOPICS.join("|")
+        ));
+        prompt.push_str(&format!(
+            "11. Local Engineering Plans: When formulating or updating a multi-step task plan, wrap structured plan items in <plan{0} action=\"save|update\" id=\"plan-id\" title=\"Plan Title\">...</plan{0}>. In <active_plan>, items marked with [x] are focused by the user; concentrate your efforts on them and update their status (e.g. in_progress, done) when completed.\n\n",
+            marker_suffix
         ));
 
         let editable_paths: Vec<String> = self
@@ -281,6 +292,14 @@ impl PromptAssembly {
             system_text.push_str("## Session History\n");
             system_text.push_str(&history_block);
             system_text.push_str("\n\n");
+        }
+
+        if let Some(plan) = &self.active_plan {
+            if let Some(plan_block) = crate::plan::format_active_plan_context(plan) {
+                system_text.push_str("## Active Task Plan Context\n");
+                system_text.push_str(&plan_block);
+                system_text.push_str("\n\n");
+            }
         }
 
         if let Some(review_block) = crate::review::format_active_review_findings(&self.active_review_findings) {

@@ -52,4 +52,18 @@ docs-build:
 docs-serve *args="":
     mdbook serve docs {{args}}
 
-    
+# Подсчет строк кода проекта (включая тесты) с помощью tokei
+loc *args="crates":
+    tokei {{args}}
+
+# Подсчет строк кода проекта без тестов (вырезка тестов утилитами find и sed)
+loc-no-tests:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    tmp=$(mktemp -d)
+    trap 'rm -rf "$tmp"' EXIT
+    cp -r crates "$tmp/"
+    find "$tmp" -type d -name "tests" -exec rm -rf {} +
+    find "$tmp" -type f -name "*_test.rs" -delete
+    find "$tmp" -type f -name "*.rs" -exec sed -i '/^[[:space:]]*#\[cfg(test)\]/,$d' {} +
+    (cd "$tmp" && tokei crates)

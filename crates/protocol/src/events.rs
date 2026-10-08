@@ -32,3 +32,6 @@ pub const REVIEW_FINISHED: &str = "review/finished";
 pub const REVIEW_CANCELLED: &str = "review/cancelled";
 pub const REVIEW_ERROR: &str = "review/error";
 pub const REVIEW_STATE_CHANGED: &str = "review/stateChanged";
+
+pub const PLAN_UPDATED: &str = "plan/updated";
+pub const PLAN_LIST_CHANGED: &str = "plan/listChanged";

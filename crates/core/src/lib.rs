@@ -11,6 +11,7 @@ pub(crate) mod docs;
 pub mod edits;
 pub mod git;
 pub mod history;
+pub mod plan;
 pub mod prompt;
 pub mod providers;
 pub mod repomap;

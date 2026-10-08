@@ -33,8 +33,9 @@ pub fn render_header(frame: &mut ratatui::Frame, state: &mut AppState, area: Rec
     };
     let develop_tab_style = tab_style(ViewMode::Develop);
     let context_tab_style = tab_style(ViewMode::Context);
-    let history_tab_style = tab_style(ViewMode::History);
     let review_tab_style = tab_style(ViewMode::Review);
+    let plans_tab_style = tab_style(ViewMode::Plans);
+    let history_tab_style = tab_style(ViewMode::History);
 
     let mut header_spans = Vec::new();
 
@@ -72,7 +73,20 @@ pub fn render_header(frame: &mut ratatui::Frame, state: &mut AppState, area: Rec
     state.header_clicks.review_tab = (review_start, review_start + review_len.saturating_sub(1));
     current_col += review_len + 1;
 
-    let tab_hist_text = " 4: History ";
+    let focused_count = state.plans_view.current_plan.as_ref().map(|p| p.stats().checked).unwrap_or(0);
+    let tab_plans_text = if focused_count > 0 {
+        format!(" 4: Plans ({}) ", focused_count)
+    } else {
+        " 4: Plans ".to_string()
+    };
+    let plans_start = current_col;
+    let plans_len = tab_plans_text.chars().count() as u16;
+    header_spans.push(Span::styled(&tab_plans_text, plans_tab_style));
+    header_spans.push(Span::raw(" "));
+    state.header_clicks.plans_tab = (plans_start, plans_start + plans_len.saturating_sub(1));
+    current_col += plans_len + 1;
+
+    let tab_hist_text = " 5: History ";
     let hist_start = current_col;
     let hist_len = tab_hist_text.chars().count() as u16;
     header_spans.push(Span::styled(tab_hist_text, history_tab_style));

@@ -8,3 +8,4 @@
 - [4. Git Safety & Transactions](ch04-git-safety/checkpoints-and-undo.md)
 - [5. Keyboard-First Interface](ch05-interface/tui-ux.md)
 - [6. Code Review](ch06-review/review.md)
+- [7. Local Plans](ch07-plans/plans.md)

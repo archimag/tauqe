@@ -315,6 +315,68 @@ pub fn render_confirm_undo_popup(frame: &mut ratatui::Frame, state: &AppState) {
     frame.render_widget(block, area);
 }
 
+pub fn render_confirm_delete_plan_popup(frame: &mut ratatui::Frame, plan_id: &str, state: &AppState) {
+    let area = centered_rect(58, 28, frame.area());
+    frame.render_widget(Clear, area);
+
+    let plan_title = state
+        .plans_view
+        .current_plan
+        .as_ref()
+        .filter(|p| p.id == plan_id)
+        .map(|p| p.title.clone())
+        .or_else(|| {
+            state
+                .plans_view
+                .plans_list
+                .iter()
+                .find(|p| p.id == plan_id)
+                .map(|p| p.title.clone())
+        })
+        .unwrap_or_else(|| plan_id.to_string());
+
+    let lines = vec![
+        Line::raw(""),
+        Line::from(Span::styled(
+            "Are you sure you want to delete this plan?",
+            Style::default().bold().fg(Color::Yellow),
+        )),
+        Line::raw(""),
+        Line::from(vec![
+            Span::raw("Plan: "),
+            Span::styled(format!("{} ({})", plan_title, plan_id), Style::default().bold().fg(Color::Cyan)),
+        ]),
+        Line::from(Span::styled(
+            "The plan file in .tauqe/plans/ will be permanently removed.",
+            Style::default().fg(Color::Gray),
+        )),
+        Line::raw(""),
+        Line::from(vec![
+            Span::styled(
+                " [Y] ",
+                Style::default().bg(Color::Red).fg(Color::White).bold(),
+            ),
+            Span::raw(" Confirm Delete    "),
+            Span::styled(
+                " [N] / Esc ",
+                Style::default().bg(Color::DarkGray).fg(Color::White).bold(),
+            ),
+            Span::raw(" Cancel"),
+        ]),
+    ];
+
+    let block = Paragraph::new(lines)
+        .block(
+            Block::default()
+                .title(" Confirm Delete Plan ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Red)),
+        )
+        .alignment(ratatui::layout::Alignment::Center);
+
+    frame.render_widget(block, area);
+}
+
 pub fn render_confirm_clear_history_popup(frame: &mut ratatui::Frame, _state: &AppState) {
     let area = centered_rect(58, 30, frame.area());
     frame.render_widget(Clear, area);
@@ -489,7 +551,7 @@ pub fn render_review_dialog(frame: &mut ratatui::Frame, dialog: &crate::app::Rev
 }
 
 pub const GLOBAL_COMMANDS: &[crate::app::KeyCommand] = &[
-    crate::app::KeyCommand { key: "Ctrl+1 / 2 / 3 / 4", description: "Switch views: Develop │ Context │ History │ Review" },
+    crate::app::KeyCommand { key: "Ctrl+1 / 2 / 3 / 4 / 5", description: "Switch views: Develop │ Context │ Review │ Plans │ History" },
     crate::app::KeyCommand { key: "Ctrl+M", description: "Select active model" },
     crate::app::KeyCommand { key: "F6 / Ctrl+S", description: "Squash commits dialog" },
     crate::app::KeyCommand { key: "Ctrl+O", description: "Reload configuration from disk" },
@@ -511,6 +573,7 @@ pub fn get_mode_key_commands(mode: ViewMode) -> (&'static str, &'static [crate::
         ViewMode::Context => (" Help: Context ", crate::input::context::CONTEXT_COMMANDS),
         ViewMode::History => (" Help: History ", crate::input::history::HISTORY_COMMANDS),
         ViewMode::Review => (" Help: Review ", crate::input::review::REVIEW_COMMANDS),
+        ViewMode::Plans => (" Help: Plans ", crate::input::plans::PLANS_COMMANDS),
         ViewMode::Onboarding => (" Help: Setup ", ONBOARDING_COMMANDS),
     }
 }

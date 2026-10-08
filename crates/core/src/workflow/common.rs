@@ -679,6 +679,12 @@ pub async fn execute_edit_pipeline_step<'a>(
         .unwrap_or_default();
     assembly = assembly.with_active_review_findings(active_findings);
 
+    let active_plan = crate::plan::storage::PlanStorage::load_active_id(&repo_root)
+        .ok()
+        .flatten()
+        .and_then(|id| crate::plan::storage::PlanStorage::load_plan(&repo_root, &id).ok().flatten());
+    assembly = assembly.with_active_plan(active_plan);
+
     let assembled_messages = assembly.assemble_chat_messages(prompt, protocol);
 
     let (llm_tx, mut llm_rx) = mpsc::channel::<StreamEvent>(100);

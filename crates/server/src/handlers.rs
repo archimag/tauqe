@@ -3,6 +3,7 @@ pub mod context;
 pub mod git;
 pub mod history;
 pub mod model;
+pub mod plan;
 pub mod review;
 
 use std::path::Path;
@@ -48,6 +49,13 @@ pub async fn handle_request(req: Request, state: &Arc<AppState>) -> Response {
         methods::REVIEW_CANCEL => review::handle_review_cancel(req, state).await,
         methods::REVIEW_GET => review::handle_review_get(req, state).await,
         methods::REVIEW_UPDATE_ITEM => review::handle_review_update_item(req, state).await,
+
+        methods::PLAN_LIST => plan::handle_plan_list(req, state).await,
+        methods::PLAN_GET => plan::handle_plan_get(req, state).await,
+        methods::PLAN_SAVE => plan::handle_plan_save(req, state).await,
+        methods::PLAN_UPDATE_ITEM => plan::handle_plan_update_item(req, state).await,
+        methods::PLAN_DELETE => plan::handle_plan_delete(req, state).await,
+        methods::PLAN_SET_ACTIVE => plan::handle_plan_set_active(req, state).await,
 
         methods::CONFIG_GET => config::handle_config_get(req, state).await,
         methods::CONFIG_SET => config::handle_config_set(req, state).await,

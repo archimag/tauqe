@@ -439,6 +439,9 @@ fn find_next_control_tag(buf: &str) -> Option<(usize, usize)> {
     if let Some(dr) = crate::edits::protocol::xml::tags::next_doc_request_tag(buf) {
         candidates.push(dr);
     }
+    if let Some(pl) = crate::edits::protocol::xml::tags::next_plan_tag(buf) {
+        candidates.push(pl);
+    }
     candidates.into_iter().min_by_key(|(start, _)| *start)
 }
 
@@ -454,6 +457,7 @@ fn safe_text_emit_len(buf: &str) -> usize {
         "<doc_request",
         "<user_language",
         "<verify",
+        "<plan",
     ];
     let mut limit = buf.len();
     if let Some(last_lt) = buf.rfind('<') {
@@ -477,6 +481,7 @@ fn safe_text_emit_len(buf: &str) -> usize {
                     "<verify" => crate::edits::protocol::xml::next_verify_tag(&buf[idx..]).is_some(),
                     "<context_request" => crate::edits::protocol::xml::next_context_request_tag(&buf[idx..]).is_some(),
                     "<doc_request" => crate::edits::protocol::xml::tags::next_doc_request_tag(&buf[idx..]).is_some(),
+                    "<plan" => crate::edits::protocol::xml::tags::next_plan_tag(&buf[idx..]).is_some(),
                     _ => rest.contains('>'),
                 };
                 if !is_closed {
@@ -592,6 +597,30 @@ mod tests {
             })
             .collect();
         assert_eq!(text, "Check docs.\n\nReady");
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, StreamEvent::EditStarted)));
+    }
+
+    #[test]
+    fn test_plan_tags_hidden_from_stream_text() {
+        let marker = "M456";
+        let input = "Planning.\n<plan_M456 id=\"test\" title=\"T\">\n<item id=\"1\" title=\"Step 1\" />\n</plan_M456>\nReady.";
+        let mut filter = XmlStreamFilter::new(vec![], std::env::temp_dir())
+            .with_marker(Some(marker.to_string()));
+        let mut events = Vec::new();
+        for ch in input.chars() {
+            events.extend(filter.push_chunk(&ch.to_string()));
+        }
+        events.extend(Box::new(filter).finish());
+        let text: String = events
+            .iter()
+            .filter_map(|event| match event {
+                StreamEvent::TextDelta(delta) => Some(delta.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text, "Planning.\n\nReady.");
         assert!(!events
             .iter()
             .any(|event| matches!(event, StreamEvent::EditStarted)));
