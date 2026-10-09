@@ -107,25 +107,9 @@ pub async fn handle_response(resp: Response, state: &Arc<Mutex<AppState>>) {
                             }
                         }
                     }
-                    OptimisticRollback::ReviewItemChecked { item_id } => {
-                        if let Some(session) = st.review.session.as_mut() {
-                            if let Some(item) = session.items.iter_mut().find(|i| i.id == item_id) {
-                                item.is_checked = !item.is_checked;
-                            }
-                        }
-                    }
                     OptimisticRollback::PlanItemStatus { plan_id, item_id, prev_status } => {
-                        if let Some(plan) = st.plans_view.current_plan.as_mut() {
-                            if plan.id == plan_id {
-                                plan.update_item_status(&item_id, prev_status);
-                            }
-                        }
-                    }
-                    OptimisticRollback::PlanItemChecked { plan_id, item_id } => {
-                        if let Some(plan) = st.plans_view.current_plan.as_mut() {
-                            if plan.id == plan_id {
-                                plan.toggle_item_checked(&item_id);
-                            }
+                        if let Some(plan) = st.plans_view.plans.iter_mut().find(|p| p.id == plan_id) {
+                            plan.update_item_status(&item_id, prev_status);
                         }
                     }
                     OptimisticRollback::ActiveModel { prev_model } => {
@@ -178,6 +162,9 @@ pub async fn handle_response(resp: Response, state: &Arc<Mutex<AppState>>) {
 
     if method.as_deref() == Some(methods::PLAN_DELETE) {
         st.notify_success("Plan deleted");
+    }
+    if method.as_deref() == Some(methods::REVIEW_DELETE) {
+        st.notify_success("Review session deleted");
     }
 
     let Some(val) = resp.result else {
@@ -398,52 +385,36 @@ pub async fn handle_response(resp: Response, state: &Arc<Mutex<AppState>>) {
                     st.review.apply_item(res.item);
                 }
             }
-            methods::REVIEW_START | methods::REVIEW_CANCEL => {}
+            methods::REVIEW_LIST => {
+                if let Ok(res) = serde_json::from_value::<tauqe_protocol::ReviewListResult>(val) {
+                    st.review.set_sessions(res.reviews, res.active_id);
+                }
+            }
+            methods::REVIEW_START | methods::REVIEW_CANCEL | methods::REVIEW_DELETE => {}
             methods::PLAN_LIST => {
                 if let Ok(res) = serde_json::from_value::<tauqe_protocol::PlanListResult>(val) {
-                    st.plans_view.plans_list = res.plans;
-                    let current_is_stale = st.plans_view.current_plan.as_ref().is_some_and(|p| {
-                        !st.plans_view.plans_list.iter().any(|l| l.id == p.id)
-                    });
-                    if current_is_stale {
-                        st.plans_view.reset_view_for_new_plan();
-                        st.plans_view.current_plan = None;
-                    }
-                    st.plans_view.active_plan_id = res.active_id.clone();
-                    if let Some(active) = &res.active_id {
-                        if let Some(pos) = st.plans_view.plans_list.iter().position(|p| &p.id == active) {
-                            st.plans_view.selected_plan_index = pos;
-                        }
-                    }
+                    st.plans_view.plans = res.plans;
+                    st.plans_view.clamp_selection();
                 }
             }
             methods::PLAN_GET | methods::PLAN_SAVE | methods::PLAN_UPDATE_ITEM => {
                 if let Ok(res) = serde_json::from_value::<tauqe_protocol::PlanGetResult>(val.clone()) {
                     if let Some(plan) = res.plan {
-                        let is_diff = st.plans_view.current_plan.as_ref().map(|p| &p.id) != Some(&plan.id);
-                        if is_diff {
-                            st.plans_view.reset_view_for_new_plan();
+                        if let Some(pos) = st.plans_view.plans.iter().position(|p| p.id == plan.id) {
+                            st.plans_view.plans[pos] = plan;
+                        } else {
+                            st.plans_view.plans.push(plan);
                         }
-                        st.plans_view.active_plan_id = Some(plan.id.clone());
-                        if let Some(pos) = st.plans_view.plans_list.iter().position(|p| p.id == plan.id) {
-                            st.plans_view.selected_plan_index = pos;
-                        }
-                        st.plans_view.current_plan = Some(plan);
                     }
                 } else if let Ok(res) = serde_json::from_value::<tauqe_protocol::PlanUpdateItemResult>(val) {
-                    st.plans_view.current_plan = Some(res.plan);
-                }
-            }
-            methods::PLAN_SET_ACTIVE => {
-                if let Ok(res) = serde_json::from_value::<tauqe_protocol::PlanSetActiveResult>(val) {
-                    st.plans_view.active_plan_id = res.active_id.clone();
-                    if let Some(active) = &res.active_id {
-                        if let Some(pos) = st.plans_view.plans_list.iter().position(|p| &p.id == active) {
-                            st.plans_view.selected_plan_index = pos;
-                        }
+                    if let Some(pos) = st.plans_view.plans.iter().position(|p| p.id == res.plan.id) {
+                        st.plans_view.plans[pos] = res.plan;
+                    } else {
+                        st.plans_view.plans.push(res.plan);
                     }
                 }
             }
+            methods::PLAN_SET_ACTIVE => {}
             methods::SYSTEM_STATUS
             | methods::CONFIG_RELOAD
             | methods::CONFIG_CREATE

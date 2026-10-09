@@ -100,10 +100,61 @@ pub enum StatusDialogTarget {
         current_status: tauqe_protocol::PlanItemStatus,
     },
     ReviewItem {
+        review_id: Option<String>,
         item_id: u32,
         item_title: String,
         current_status: tauqe_protocol::ReviewStatus,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfirmExecuteScopeState {
+    pub plan_id: String,
+    pub plan_title: String,
+    pub scope_title: String,
+    pub steps: Vec<tauqe_protocol::PlanItem>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfirmExecuteReviewState {
+    pub review_id: String,
+    pub review_title: String,
+    pub scope_title: String,
+    pub items: Vec<tauqe_protocol::ReviewItem>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewBatchQueue {
+    pub review_id: String,
+    pub review_title: String,
+    pub scope_title: String,
+    pub items: Vec<tauqe_protocol::ReviewItem>,
+    pub current_index: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlanBatchQueue {
+    pub plan_id: String,
+    pub plan_title: String,
+    pub scope_title: String,
+    pub steps: Vec<tauqe_protocol::PlanItem>,
+    pub current_index: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct DiscussPlanDialogState {
+    pub plan_id: String,
+    pub plan_title: String,
+    pub focused_items: Vec<(String, String)>,
+    pub prompt_editor: InputEditor,
+}
+
+#[derive(Debug, Clone)]
+pub struct DiscussReviewDialogState {
+    pub review_id: String,
+    pub review_title: String,
+    pub focused_items: Vec<(u32, String)>,
+    pub prompt_editor: InputEditor,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -330,11 +381,19 @@ pub struct AppState {
     pub confirm_undo: bool,
     pub confirm_clear_history: bool,
     pub confirm_delete_plan: Option<String>,
+    pub confirm_delete_review: Option<String>,
+    pub confirm_execute_scope: Option<ConfirmExecuteScopeState>,
+    pub confirm_execute_review: Option<ConfirmExecuteReviewState>,
+    pub plan_batch_queue: Option<PlanBatchQueue>,
+    pub review_batch_queue: Option<ReviewBatchQueue>,
+    pub active_review_step: Option<(String, u32)>,
     pub confirm_button: ConfirmDialogButton,
     pub selection_dialog: Option<SelectionDialogState>,
     pub status_dialog: Option<StatusDialogState>,
     pub squash_dialog: Option<SquashDialogState>,
     pub review_dialog: Option<ReviewDialogState>,
+    pub discuss_plan_dialog: Option<DiscussPlanDialogState>,
+    pub discuss_review_dialog: Option<DiscussReviewDialogState>,
     pub notification: Option<AppNotification>,
     pub turn_started_at: Option<std::time::Instant>,
     pub server_disconnected: Option<String>,
@@ -383,11 +442,16 @@ impl AppState {
             || self.status_dialog.is_some()
             || self.squash_dialog.is_some()
             || self.review_dialog.is_some()
+            || self.discuss_plan_dialog.is_some()
+            || self.discuss_review_dialog.is_some()
             || self.confirm_cancel
             || self.confirm_quit
             || self.confirm_undo
             || self.confirm_clear_history
             || self.confirm_delete_plan.is_some()
+            || self.confirm_delete_review.is_some()
+            || self.confirm_execute_scope.is_some()
+            || self.confirm_execute_review.is_some()
             || self.context_view.confirm_clear_auto
             || self.context_view.adding_file
     }
@@ -494,10 +558,18 @@ mod tests {
             confirm_undo: false,
             confirm_clear_history: false,
             confirm_delete_plan: None,
+            confirm_delete_review: None,
+            confirm_execute_scope: None,
+            confirm_execute_review: None,
+            plan_batch_queue: None,
+            review_batch_queue: None,
+            active_review_step: None,
             confirm_button: ConfirmDialogButton::Cancel,
             selection_dialog: None,
             status_dialog: None,
             squash_dialog: None,
+            discuss_plan_dialog: None,
+            discuss_review_dialog: None,
             server_disconnected: None,
             server_log_path: std::path::PathBuf::from(".tauqe/server.log"),
             last_model_height: 10,
@@ -554,10 +626,18 @@ mod tests {
             confirm_undo: false,
             confirm_clear_history: false,
             confirm_delete_plan: None,
+            confirm_delete_review: None,
+            confirm_execute_scope: None,
+            confirm_execute_review: None,
+            plan_batch_queue: None,
+            review_batch_queue: None,
+            active_review_step: None,
             confirm_button: ConfirmDialogButton::Cancel,
             selection_dialog: None,
             status_dialog: None,
             squash_dialog: None,
+            discuss_plan_dialog: None,
+            discuss_review_dialog: None,
             server_disconnected: None,
             server_log_path: std::path::PathBuf::from(".tauqe/server.log"),
             last_model_height: 10,

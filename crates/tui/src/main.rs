@@ -109,10 +109,18 @@ async fn main() -> anyhow::Result<()> {
         confirm_undo: false,
         confirm_clear_history: false,
         confirm_delete_plan: None,
+        confirm_delete_review: None,
+        confirm_execute_scope: None,
+        confirm_execute_review: None,
+        plan_batch_queue: None,
+        review_batch_queue: None,
+        active_review_step: None,
         confirm_button: crate::app::ConfirmDialogButton::Cancel,
         selection_dialog: None,
         status_dialog: None,
         squash_dialog: None,
+        discuss_plan_dialog: None,
+        discuss_review_dialog: None,
         server_disconnected: None,
         server_log_path: server_log_path.clone(),
         last_model_height: 10,
@@ -123,7 +131,7 @@ async fn main() -> anyhow::Result<()> {
 
     let mut is_reasoning = false;
     for ev in init_events {
-        rpc::handle_event(ev, &state, &mut is_reasoning).await;
+        rpc::handle_event(ev, &state, &mut is_reasoning, Some(&mut server_writer)).await;
     }
 
     // Initial history fetch
@@ -211,7 +219,7 @@ async fn main() -> anyhow::Result<()> {
             msg = msg_rx.recv() => {
                 match msg {
                     Some(Message::Event(ev)) => {
-                        rpc::handle_event(ev, &state, &mut is_reasoning).await;
+                        rpc::handle_event(ev, &state, &mut is_reasoning, Some(&mut server_writer)).await;
                         dirty = true;
                     }
                     Some(Message::Response(resp)) => {

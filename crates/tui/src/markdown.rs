@@ -86,6 +86,7 @@ pub struct MarkdownTheme {
     pub table_cell: Style,
     pub math_style: Style,
     pub compact: bool,
+    pub hard_breaks: bool,
     pub line_prefix: Option<Span<'static>>,
 }
 
@@ -146,6 +147,7 @@ impl MarkdownTheme {
                     .fg(Color::Blue)
                     .add_modifier(Modifier::ITALIC),
                 compact: false,
+                hard_breaks: false,
                 line_prefix: None,
             },
             _ => Self {
@@ -196,6 +198,7 @@ impl MarkdownTheme {
                     .fg(Color::LightCyan)
                     .add_modifier(Modifier::ITALIC),
                 compact: false,
+                hard_breaks: false,
                 line_prefix: None,
             },
         }
@@ -252,6 +255,7 @@ impl MarkdownTheme {
                     table_cell: base_blue,
                     math_style: base_blue.add_modifier(Modifier::ITALIC),
                     compact: true,
+                    hard_breaks: false,
                     line_prefix: None,
                 }
             }
@@ -300,6 +304,7 @@ impl MarkdownTheme {
                     table_cell: base_blue,
                     math_style: base_blue.add_modifier(Modifier::ITALIC),
                     compact: true,
+                    hard_breaks: false,
                     line_prefix: None,
                 }
             }
@@ -432,6 +437,10 @@ fn ensure_line_prefix(
                 }
                 *item_started = false;
             }
+        } else if !list_stack.is_empty() {
+            let depth = list_stack.len().saturating_sub(1);
+            let indent = "  ".repeat(depth);
+            current_spans.push(Span::raw(format!("{}  ", indent)));
         }
     }
 }
@@ -1087,7 +1096,11 @@ pub fn render_markdown_with_blocks(
             }
             Event::SoftBreak => {
                 if code_block.is_none() && table_state.is_none() {
-                    current_spans.push(Span::raw(" "));
+                    if theme.hard_breaks {
+                        flush_line(theme, &mut current_spans, &mut out_lines);
+                    } else {
+                        current_spans.push(Span::raw(" "));
+                    }
                 }
             }
             Event::HardBreak => {
@@ -1169,6 +1182,24 @@ mod tests {
             .collect();
 
         assert_eq!(text, vec!["Первый абзац.", "", "Второй абзац."]);
+    }
+
+    #[test]
+    fn test_hard_breaks_preserves_single_newlines() {
+        let mut theme = MarkdownTheme::answer();
+        theme.hard_breaks = true;
+        let lines = render_markdown("Первая строка\nВторая строка\nТретья строка", &theme);
+        assert_eq!(lines.len(), 3);
+        let text: Vec<String> = lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect()
+            })
+            .collect();
+        assert_eq!(text, vec!["Первая строка", "Вторая строка", "Третья строка"]);
     }
 
     #[test]

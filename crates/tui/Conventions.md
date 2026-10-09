@@ -49,9 +49,9 @@ Whenever modifying or extending code within `crates/tui/`, this conventions docu
 - **Hierarchical Tree Structures (Plans, Review):**
   - Implement the conceptual Org-mode paradigm for structured trees without burdening navigation with complex Emacs-specific modifier chords.
   - **Visibility Cycling:** Support clear local folding on items (`Tab` or `Space`) and global folding (`a`) to toggle between dense overview (all collapsed) and expanded states.
-  - **Orthogonal Status and Focus:** Task lifecycle statuses (`TODO`, `IN_PROGRESS`, `DONE`, `CANCELLED`, consciously chosen via modal dialog `t`) are strictly separated from context inclusion (`[x]`, toggled via `x`).
+  - **Orthogonal Status and Execution:** Task lifecycle statuses (`TODO`, `IN_PROGRESS`, `DONE`, `CANCELLED`, consciously chosen via modal dialog `t`) are strictly separated from execution (`x`).
   - **High Information Density (No Decorative Gaps):** Collapsed tree items must be rendered tightly adjacent without artificial blank gaps or trailing empty lines. Expanded items with markdown details must be cleanly separated by exactly one line.
-  - **Simple Dedicated Navigation:** In view modes without text input (Plans, Review, Context), prioritize simple direct keys (`n`/`p`, `j`/`k`, `↑`/`↓`, `c` for copy, `s` for status filter, `t` for status dialog) rather than multi-key chord sequences.
+  - **Simple Dedicated Navigation:** In view modes without text input (Plans, Review, Context), prioritize simple direct keys (`n`/`p`, `↑`/`↓`, `x` for execute, `c` for copy, `s` for status filter, `t` for status dialog) rather than multi-key chord sequences.
 
 ---
 
@@ -60,8 +60,8 @@ Whenever modifying or extending code within `crates/tui/`, this conventions docu
 1. **Two Distinct Interaction Modes:**
    - **Magit / Org-Mode Structural Navigation (Non-Input Contexts):**
      In all views, dialogs, and panels where a text buffer is NOT actively receiving text (Plans, Review, History, Context file list, dialog button toggling):
-     - Canonical navigation uses simple, direct keys: `n` (*next*) and `p` (*previous*), following the Magit/Dired standard. Vim-style `j`/`k` and arrows `↑`/`↓` are preserved as secondary aliases.
-     - Actions use direct bare keys (`x` for focus/mark, `t` for status dialog, `s` for filter, `c`/`y` for copy, `Tab`/`Space` for folding, `Enter`, `Esc`, `q` to return/bury buffer, `?` for help).
+     - Canonical navigation uses simple, direct keys: `n` (*next*) and `p` (*previous*), following the Magit/Dired standard. Arrows `↑`/`↓` are preserved as secondary aliases.
+     - Actions use direct bare keys (`x` for execute step/session, `t` for status dialog, `s` for filter, `c`/`y` for copy, `Tab`/`Space` for folding, `Enter`, `Esc`, `q` to return/bury buffer, `?` for help).
      - Modifier chords are never required for basic browsing, folding, or status toggling.
      - Never intercept these single keys when a text editor becomes active.
    - **Emacs-Style Commands with Zero Modal Ambiguity (Text-Input Contexts):**
@@ -95,8 +95,8 @@ Whenever modifying or extending code within `crates/tui/`, this conventions docu
    - Universal function keys (`F1`..`F5` for tabs, `F6` for squash, dedicated arrows, `Home`/`End`, `PgUp`/`PgDn`) remain active across all terminal types, regardless of keyboard protocol capabilities.
    - `Alt+Enter` and `Ctrl+J` serve as universal fallbacks for newline insertion in legacy terminals lacking `Shift+Enter`.
 
-4. **Explicit Confirmation for Destructive Actions:**
-   - Destructive confirmation modals (such as `git undo`, delete plan, clear history, or cancel generation) must feature interactive `[ Confirm ] / [ Cancel ]` buttons with default focus on safe cancellation (`Cancel`).
+4. **Explicit Confirmation for Destructive and Long-Running Actions:**
+   - Any modal dialog that initiates a destructive action (such as `git undo`, delete plan, clear history, or cancel generation) or a long-running, autonomous execution workflow (such as executing a plan step, plan batch, or review finding batch) MUST feature interactive `[ Confirm ] / [ Cancel ]` buttons with default focus on safe cancellation (`Cancel`).
    - Pressing `Enter` or `Esc` defaults to safe cancellation.
    - Quick confirmation is permitted via direct `y` or `Y` keypress.
    - Actions like `git undo` must verify that an undoable entity exists before prompting the user, emitting an informative notification otherwise.
@@ -114,7 +114,7 @@ Whenever modifying or extending code within `crates/tui/`, this conventions docu
 2. **Standardized Command Navigation:**
    - **Focus Cycling:** `Tab` and `Shift+Tab` cycle focus between actionable controls (buttons or fields).
    - **Horizontal Button Stepping:** `←` / `→` move focus between adjacent buttons in action bars.
-   - **Execution & Safe Defaults:** `Enter` or `Space` activates the currently focused button. For destructive actions, safe cancellation (`Cancel`) must always receive default focus.
+   - **Execution & Safe Defaults:** `Enter` or `Space` activates the currently focused button. For destructive actions as well as long-running, autonomous execution tasks (plan execution, review finding batch execution), safe cancellation (`Cancel`) must always receive default focus.
    - **Fast Accelerators in Confirmation Modals:** Direct `y` / `Y` confirms immediately; `n` / `N` or `Esc` cancels and closes immediately, regardless of button focus.
    - **Dismissal:** `Esc` or `q` unconditionally cancels and dismisses dialogs (except where a text input editor is actively capturing keystrokes).
    - **List Navigation in Selection Dialogs:** When the body contains a selectable list (e.g., model picker), items are navigated using standard keys (`n`/`p`, `j`/`k`, `↑`/`↓`, `PgUp`/`PgDn`, `Home`/`End`), preserving current item selection when focus shifts to action buttons.

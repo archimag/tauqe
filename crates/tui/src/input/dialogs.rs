@@ -5,7 +5,7 @@ use tauqe_protocol::{methods, ConfigSetParams, ModelRef, ReviewStartParams};
 use tokio::process::ChildStdin;
 use tokio::sync::{Mutex, MutexGuard};
 
-use crate::app::{AppState, ConfirmDialogButton};
+use crate::app::{AppState, ConfirmDialogButton, ViewMode};
 use crate::input::{is_char_typing, squash, InputResult};
 use crate::rpc::{
     allocate_request_id, record_optimistic_rollback, send_request, send_request_with_id,
@@ -96,6 +96,17 @@ pub(crate) async fn delete_plan(server_writer: &mut ChildStdin, plan_id: String)
     Ok(())
 }
 
+pub(crate) async fn delete_review(server_writer: &mut ChildStdin, review_id: String) -> anyhow::Result<()> {
+    send_request(
+        server_writer,
+        methods::REVIEW_DELETE,
+        serde_json::json!({ "id": review_id }),
+    )
+    .await?;
+    send_request(server_writer, methods::REVIEW_LIST, serde_json::json!({})).await?;
+    Ok(())
+}
+
 pub(crate) async fn apply_status_dialog(
     st: &mut AppState,
     chosen_idx: usize,
@@ -114,6 +125,7 @@ pub(crate) async fn apply_status_dialog(
             ..
         } => {
             let statuses = [
+                tauqe_protocol::PlanItemStatus::Discussion,
                 tauqe_protocol::PlanItemStatus::Todo,
                 tauqe_protocol::PlanItemStatus::InProgress,
                 tauqe_protocol::PlanItemStatus::Done,
@@ -125,7 +137,7 @@ pub(crate) async fn apply_status_dialog(
             };
 
             if new_status != current_status {
-                if let Some(plan) = st.plans_view.current_plan.as_mut() {
+                if let Some(plan) = st.plans_view.plans.iter_mut().find(|p| p.id == plan_id) {
                     plan.update_item_status(&item_id, new_status);
                 }
                 let req_id = crate::rpc::allocate_request_id();
@@ -141,7 +153,6 @@ pub(crate) async fn apply_status_dialog(
                     plan_id,
                     item_id,
                     status: Some(new_status),
-                    checked: None,
                 };
                 crate::rpc::send_request_with_id(
                     server_writer,
@@ -153,13 +164,16 @@ pub(crate) async fn apply_status_dialog(
             }
         }
         crate::app::StatusDialogTarget::ReviewItem {
+            review_id,
             item_id,
             current_status,
             ..
         } => {
             let statuses = [
+                tauqe_protocol::ReviewStatus::Discussion,
                 tauqe_protocol::ReviewStatus::Todo,
-                tauqe_protocol::ReviewStatus::Done,
+                tauqe_protocol::ReviewStatus::InProgress,
+                tauqe_protocol::ReviewStatus::Fixed,
                 tauqe_protocol::ReviewStatus::Rejected,
             ];
             let new_status = match statuses.get(chosen_idx).copied() {
@@ -168,6 +182,13 @@ pub(crate) async fn apply_status_dialog(
             };
 
             if new_status != current_status {
+                for session in &mut st.review.sessions {
+                    if review_id.as_ref().map(|id| id == &session.id).unwrap_or(true) {
+                        if let Some(item) = session.items.iter_mut().find(|i| i.id == item_id) {
+                            item.status = new_status;
+                        }
+                    }
+                }
                 if let Some(session) = st.review.session.as_mut() {
                     if let Some(item) = session.items.iter_mut().find(|i| i.id == item_id) {
                         item.status = new_status;
@@ -185,10 +206,11 @@ pub(crate) async fn apply_status_dialog(
                         prev_status: current_status,
                     },
                 );
+                let target_review_id = review_id.or_else(|| st.review.session.as_ref().map(|s| s.id.clone()));
                 let params = tauqe_protocol::ReviewUpdateItemParams {
+                    review_id: target_review_id,
                     item_id,
                     status: Some(new_status),
-                    is_checked: None,
                 };
                 crate::rpc::send_request_with_id(
                     server_writer,
@@ -229,7 +251,7 @@ pub async fn handle_dialog_event(
             KeyCode::Esc => {
                 return Ok(Some(InputResult::Continue));
             }
-            KeyCode::Enter => {
+            KeyCode::Enter if !key.modifiers.contains(KeyModifiers::SHIFT) && !key.modifiers.contains(KeyModifiers::ALT) => {
                 let prompt = dialog.prompt_editor.get_text().trim().to_string();
                 let params = ReviewStartParams {
                     model: dialog.models.get(dialog.model_index).cloned(),
@@ -282,7 +304,7 @@ pub async fn handle_dialog_event(
                     &mut dialog.prompt_editor,
                     key,
                     is_cmd,
-                    false,
+                    true,
                 );
                 st.review_dialog = Some(dialog);
                 return Ok(Some(InputResult::Continue));
@@ -375,6 +397,327 @@ pub async fn handle_dialog_event(
         return Ok(Some(InputResult::Continue));
     }
 
+    // 4a-review-delete. Delete review confirmation
+    if let Some(review_id) = st.confirm_delete_review.take() {
+        match resolve_confirm(&mut st, key) {
+            ConfirmOutcome::Toggled => st.confirm_delete_review = Some(review_id),
+            ConfirmOutcome::Dismissed => {}
+            ConfirmOutcome::Accepted => {
+                drop(st);
+                delete_review(server_writer, review_id).await?;
+            }
+        }
+        return Ok(Some(InputResult::Continue));
+    }
+
+    // 4a-review-execute. Execute review scope confirmation (single item or session batch)
+    if let Some(target) = st.confirm_execute_review.take() {
+        match resolve_confirm(&mut st, key) {
+            ConfirmOutcome::Toggled => st.confirm_execute_review = Some(target),
+            ConfirmOutcome::Dismissed => {}
+            ConfirmOutcome::Accepted => {
+                let first_item = match target.items.first() {
+                    Some(i) => i.clone(),
+                    None => return Ok(Some(InputResult::Continue)),
+                };
+
+                if target.items.len() > 1 {
+                    st.review_batch_queue = Some(crate::app::ReviewBatchQueue {
+                        review_id: target.review_id.clone(),
+                        review_title: target.review_title.clone(),
+                        scope_title: target.scope_title.clone(),
+                        items: target.items.clone(),
+                        current_index: 0,
+                    });
+                } else {
+                    st.review_batch_queue = None;
+                }
+
+                st.active_review_step = Some((target.review_id.clone(), first_item.id));
+
+                for session in &mut st.review.sessions {
+                    if session.id == target.review_id {
+                        if let Some(item) = session.items.iter_mut().find(|i| i.id == first_item.id) {
+                            item.status = tauqe_protocol::ReviewStatus::InProgress;
+                        }
+                    }
+                }
+                if let Some(session) = st.review.session.as_mut() {
+                    if session.id == target.review_id {
+                        if let Some(item) = session.items.iter_mut().find(|i| i.id == first_item.id) {
+                            item.status = tauqe_protocol::ReviewStatus::InProgress;
+                        }
+                    }
+                }
+
+                st.view_mode = ViewMode::Develop;
+                st.model.reasoning.clear();
+                st.model.text.clear();
+                st.model.markdown_lines.clear();
+                st.model.error = None;
+                st.model.result = None;
+                st.model.usage = None;
+                st.model.scroll = 0;
+                st.model.status = "awaiting".to_string();
+                st.model.auto_scroll = true;
+                st.model.current_cost = Some(0.0);
+                st.model.edits_active = false;
+                st.model.files.clear();
+                st.model.selected_file_index = 0;
+                st.model.edit_final_applied = None;
+                st.model.edit_final_error = None;
+                st.model.last_commit_hash = None;
+                st.model.last_commit_summary = None;
+                st.model.toolchain_command = None;
+                st.model.toolchain_status = None;
+                st.model.copy_flash = None;
+                st.model.code_blocks.clear();
+                st.turn_started_at = Some(std::time::Instant::now());
+
+                drop(st);
+                let params = tauqe_protocol::ReviewExecuteItemParams {
+                    review_id: target.review_id,
+                    item_id: first_item.id,
+                };
+                send_request(
+                    server_writer,
+                    methods::REVIEW_EXECUTE_ITEM,
+                    serde_json::to_value(params)?,
+                )
+                .await?;
+            }
+        }
+        return Ok(Some(InputResult::Continue));
+    }
+
+    // 4a-2. Execute plan scope confirmation (single step, group, or entire plan)
+    if let Some(target) = st.confirm_execute_scope.take() {
+        match resolve_confirm(&mut st, key) {
+            ConfirmOutcome::Toggled => st.confirm_execute_scope = Some(target),
+            ConfirmOutcome::Dismissed => {}
+            ConfirmOutcome::Accepted => {
+                let first_step = match target.steps.first() {
+                    Some(s) => s.clone(),
+                    None => return Ok(Some(InputResult::Continue)),
+                };
+
+                if target.steps.len() > 1 {
+                    st.plan_batch_queue = Some(crate::app::PlanBatchQueue {
+                        plan_id: target.plan_id.clone(),
+                        plan_title: target.plan_title.clone(),
+                        scope_title: target.scope_title.clone(),
+                        steps: target.steps.clone(),
+                        current_index: 0,
+                    });
+                } else {
+                    st.plan_batch_queue = None;
+                }
+
+                if let Some(plan) = st.plans_view.plans.iter_mut().find(|p| p.id == target.plan_id) {
+                    plan.update_item_status(&first_step.id, tauqe_protocol::PlanItemStatus::InProgress);
+                }
+                st.view_mode = ViewMode::Develop;
+                st.model.reasoning.clear();
+                st.model.text.clear();
+                st.model.markdown_lines.clear();
+                st.model.error = None;
+                st.model.result = None;
+                st.model.usage = None;
+                st.model.scroll = 0;
+                st.model.status = "awaiting".to_string();
+                st.model.auto_scroll = true;
+                st.model.current_cost = Some(0.0);
+                st.model.edits_active = false;
+                st.model.files.clear();
+                st.model.selected_file_index = 0;
+                st.model.edit_final_applied = None;
+                st.model.edit_final_error = None;
+                st.model.last_commit_hash = None;
+                st.model.last_commit_summary = None;
+                st.model.toolchain_command = None;
+                st.model.toolchain_status = None;
+                st.model.copy_flash = None;
+                st.model.code_blocks.clear();
+                st.turn_started_at = Some(std::time::Instant::now());
+
+                drop(st);
+                let params = tauqe_protocol::PlanExecuteStepParams {
+                    plan_id: target.plan_id,
+                    step_id: first_step.id,
+                };
+                send_request(
+                    server_writer,
+                    methods::PLAN_EXECUTE_STEP,
+                    serde_json::to_value(params)?,
+                )
+                .await?;
+            }
+        }
+        return Ok(Some(InputResult::Continue));
+    }
+
+    // 4a-3. Discuss plan dialog
+    if let Some(mut dialog) = st.discuss_plan_dialog.take() {
+        let primary = st.tui_config.input.primary_modifier;
+        let is_ctrl_alt = key.modifiers.contains(KeyModifiers::CONTROL)
+            && key.modifiers.contains(KeyModifiers::ALT);
+        let is_cmd = !is_ctrl_alt
+            && (primary.matches(key.modifiers) || key.modifiers.contains(KeyModifiers::CONTROL));
+        let has_shift = key.modifiers.contains(KeyModifiers::SHIFT);
+        let has_alt = key.modifiers.contains(KeyModifiers::ALT);
+
+        match key.code {
+            KeyCode::Esc => {
+                return Ok(Some(InputResult::Continue));
+            }
+            KeyCode::Enter if !has_shift && !has_alt => {
+                let user_comment = dialog.prompt_editor.get_text().trim().to_string();
+                if user_comment.is_empty() {
+                    st.discuss_plan_dialog = Some(dialog);
+                    return Ok(Some(InputResult::Continue));
+                }
+
+                let plan = st.plans_view.plans.iter().find(|p| p.id == dialog.plan_id).cloned();
+                if let Some(plan) = plan {
+                    let focused_ids: Vec<String> = dialog.focused_items.iter().map(|(id, _)| id.clone()).collect();
+                    let prompt = tauqe_protocol::plan::format_plan_discussion_prompt(
+                        &plan,
+                        &focused_ids,
+                        &user_comment,
+                    );
+
+                    st.view_mode = ViewMode::Develop;
+                    st.model.reasoning.clear();
+                    st.model.text.clear();
+                    st.model.markdown_lines.clear();
+                    st.model.error = None;
+                    st.model.result = None;
+                    st.model.usage = None;
+                    st.model.scroll = 0;
+                    st.model.status = "awaiting".to_string();
+                    st.model.auto_scroll = true;
+                    st.model.current_cost = Some(0.0);
+                    st.model.edits_active = false;
+                    st.model.files.clear();
+                    st.model.selected_file_index = 0;
+                    st.model.edit_final_applied = None;
+                    st.model.edit_final_error = None;
+                    st.model.last_commit_hash = None;
+                    st.model.last_commit_summary = None;
+                    st.model.toolchain_command = None;
+                    st.model.toolchain_status = None;
+                    st.model.copy_flash = None;
+                    st.model.code_blocks.clear();
+                    st.turn_started_at = Some(std::time::Instant::now());
+
+                    drop(st);
+                    send_request(
+                        server_writer,
+                        methods::MODEL_ASK,
+                        serde_json::json!({ "prompt": prompt }),
+                    )
+                    .await?;
+                    return Ok(Some(InputResult::Continue));
+                }
+            }
+            _ => {
+                crate::input::handle_editor_key(
+                    &mut dialog.prompt_editor,
+                    key,
+                    is_cmd,
+                    true,
+                );
+                st.discuss_plan_dialog = Some(dialog);
+                return Ok(Some(InputResult::Continue));
+            }
+        }
+    }
+
+    // 4a-4. Discuss review dialog
+    if let Some(mut dialog) = st.discuss_review_dialog.take() {
+        let primary = st.tui_config.input.primary_modifier;
+        let is_ctrl_alt = key.modifiers.contains(KeyModifiers::CONTROL)
+            && key.modifiers.contains(KeyModifiers::ALT);
+        let is_cmd = !is_ctrl_alt
+            && (primary.matches(key.modifiers) || key.modifiers.contains(KeyModifiers::CONTROL));
+        let has_shift = key.modifiers.contains(KeyModifiers::SHIFT);
+        let has_alt = key.modifiers.contains(KeyModifiers::ALT);
+
+        match key.code {
+            KeyCode::Esc => {
+                return Ok(Some(InputResult::Continue));
+            }
+            KeyCode::Enter if !has_shift && !has_alt => {
+                let user_comment = dialog.prompt_editor.get_text().trim().to_string();
+                if user_comment.is_empty() {
+                    st.discuss_review_dialog = Some(dialog);
+                    return Ok(Some(InputResult::Continue));
+                }
+
+                let session = st.review.sessions.iter()
+                    .find(|s| s.id == dialog.review_id)
+                    .cloned()
+                    .or_else(|| {
+                        st.review.session.as_ref()
+                            .filter(|s| s.id == dialog.review_id)
+                            .cloned()
+                    });
+
+                if let Some(session) = session {
+                    let focused_ids: Vec<u32> = dialog.focused_items.iter().map(|(id, _)| *id).collect();
+                    let prompt = tauqe_protocol::review::format_review_discussion_prompt_items(
+                        &session,
+                        &focused_ids,
+                        &user_comment,
+                    );
+
+                    st.view_mode = ViewMode::Develop;
+                    st.model.reasoning.clear();
+                    st.model.text.clear();
+                    st.model.markdown_lines.clear();
+                    st.model.error = None;
+                    st.model.result = None;
+                    st.model.usage = None;
+                    st.model.scroll = 0;
+                    st.model.status = "awaiting".to_string();
+                    st.model.auto_scroll = true;
+                    st.model.current_cost = Some(0.0);
+                    st.model.edits_active = false;
+                    st.model.files.clear();
+                    st.model.selected_file_index = 0;
+                    st.model.edit_final_applied = None;
+                    st.model.edit_final_error = None;
+                    st.model.last_commit_hash = None;
+                    st.model.last_commit_summary = None;
+                    st.model.toolchain_command = None;
+                    st.model.toolchain_status = None;
+                    st.model.copy_flash = None;
+                    st.model.code_blocks.clear();
+                    st.turn_started_at = Some(std::time::Instant::now());
+
+                    drop(st);
+                    send_request(
+                        server_writer,
+                        methods::MODEL_ASK,
+                        serde_json::json!({ "prompt": prompt }),
+                    )
+                    .await?;
+                    return Ok(Some(InputResult::Continue));
+                }
+            }
+            _ => {
+                crate::input::handle_editor_key(
+                    &mut dialog.prompt_editor,
+                    key,
+                    is_cmd,
+                    true,
+                );
+                st.discuss_review_dialog = Some(dialog);
+                return Ok(Some(InputResult::Continue));
+            }
+        }
+    }
+
     // 4. Clear history confirmation
     if st.confirm_clear_history {
         match resolve_confirm(&mut st, key) {
@@ -405,8 +748,8 @@ pub async fn handle_dialog_event(
     // 4b. Status dialog (for Plan and Review items)
     if let Some(mut dialog) = st.status_dialog.take() {
         let total_options = match &dialog.target {
-            crate::app::StatusDialogTarget::PlanItem { .. } => 4,
-            crate::app::StatusDialogTarget::ReviewItem { .. } => 3,
+            crate::app::StatusDialogTarget::PlanItem { .. } => 5,
+            crate::app::StatusDialogTarget::ReviewItem { .. } => 5,
         };
 
         match key.code {
@@ -446,6 +789,10 @@ pub async fn handle_dialog_event(
             KeyCode::Char('4') if total_options >= 4 => {
                 st.status_dialog = Some(dialog);
                 apply_status_dialog(&mut st, 3, server_writer).await?;
+            }
+            KeyCode::Char('5') if total_options >= 5 => {
+                st.status_dialog = Some(dialog);
+                apply_status_dialog(&mut st, 4, server_writer).await?;
             }
             KeyCode::Enter | KeyCode::Char(' ') => {
                 let chosen = dialog.selected_index;

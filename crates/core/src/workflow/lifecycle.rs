@@ -128,6 +128,10 @@ pub(crate) async fn execute_workflow_lifecycle<T: WorkflowTransaction>(
     )
     .await;
 
+    let marker = crate::edits::protocol::generate_turn_marker();
+    let marked_protocol = protocol.with_turn_marker(&marker);
+    let protocol: &dyn EditProtocol = marked_protocol.as_deref().unwrap_or(protocol);
+
     let mut pipeline_out = execute_edit_pipeline(
         prompt,
         provider,
@@ -152,12 +156,53 @@ pub(crate) async fn execute_workflow_lifecycle<T: WorkflowTransaction>(
     let mut turn_detected_language = pipeline_out.detected_language.clone();
     let repo_root = context_manager.repo_root().to_path_buf();
 
-    let (parsed_plans, plan_errors) = protocol.parse_plan_tags(&pipeline_out.assistant_text);
-    let plan_outcome = crate::plan::storage::PlanStorage::apply_parsed_plans(
-        &repo_root,
-        parsed_plans,
-        plan_errors,
-    );
+    let is_isolated_plan_step = crate::plan::prompt::is_plan_step_execution_prompt(prompt);
+    let is_isolated_review_step = tauqe_protocol::review::is_review_step_execution_prompt(prompt);
+    let is_discussion = tauqe_protocol::is_discussion_prompt(prompt);
+    let target_step_target = if is_isolated_plan_step {
+        crate::plan::prompt::extract_plan_step_execution_target(prompt)
+    } else {
+        None
+    };
+    let target_step_id = target_step_target.as_ref().map(|t| t.step_id.clone());
+    let target_plan_id = target_step_target.as_ref().and_then(|t| t.plan_id.clone());
+
+    let target_review_target = if is_isolated_review_step {
+        tauqe_protocol::review::extract_review_step_execution_target(prompt)
+    } else {
+        None
+    };
+    let target_review_id = target_review_target.as_ref().and_then(|t| t.review_id.clone());
+    let target_review_item_id = target_review_target.as_ref().map(|t| t.item_id);
+
+    let plan_outcome = if is_discussion {
+        if let Some(update) = pipeline_out
+            .discussion_response
+            .as_ref()
+            .and_then(|r| r.plan_update.as_ref())
+        {
+            crate::plan::storage::PlanStorage::apply_discussion_plan_update(&repo_root, update)
+        } else {
+            let (parsed_plans, plan_errors) = protocol.parse_plan_tags(&pipeline_out.assistant_text);
+            crate::plan::storage::PlanStorage::apply_parsed_plans(&repo_root, parsed_plans, plan_errors)
+        }
+    } else if !is_isolated_plan_step && !is_isolated_review_step {
+        let (parsed_plans, mut plan_errors) = protocol.parse_plan_tags(&pipeline_out.assistant_text);
+        let mut allowed_plans = Vec::new();
+        for plan in parsed_plans {
+            if plan.action.eq_ignore_ascii_case("save") {
+                allowed_plans.push(plan);
+            } else {
+                plan_errors.push(format!(
+                    "Plan action '{}' is forbidden in Develop mode. Modifying existing plans or closing steps is only allowed via Discussion mode or isolated step execution.",
+                    plan.action
+                ));
+            }
+        }
+        crate::plan::storage::PlanStorage::apply_parsed_plans(&repo_root, allowed_plans, plan_errors)
+    } else {
+        crate::plan::storage::PlanApplicationOutcome::default()
+    };
     let plan_error_notice = if !plan_outcome.errors.is_empty() {
         let mut msg = String::from("\n\n> ⚠️ **Plan Notice:**\n");
         for err in &plan_outcome.errors {
@@ -267,6 +312,78 @@ pub(crate) async fn execute_workflow_lifecycle<T: WorkflowTransaction>(
                                     .send(StreamEvent::ContextChanged(ctx_state))
                                     .await;
 
+                                let step_done_tags = if is_isolated_plan_step {
+                                    let mut tags = protocol.parse_plan_step_done(&pipeline_out.assistant_text);
+                                    if tags.is_empty() {
+                                        if let Some(ref target_id) = target_step_id {
+                                            tags.push(crate::edits::protocol::PlanStepDone {
+                                                id: target_id.clone(),
+                                                note: Some("Step executed and verified cleanly".to_string()),
+                                            });
+                                        }
+                                    }
+                                    tags
+                                } else {
+                                    Vec::new()
+                                };
+
+                                if !step_done_tags.is_empty() {
+                                    if let Ok(all_plans) =
+                                        crate::plan::storage::PlanStorage::load_all(&repo_root)
+                                    {
+                                        let active_id = target_plan_id
+                                            .clone()
+                                            .or_else(|| {
+                                                crate::plan::storage::PlanStorage::load_active_id(&repo_root)
+                                                    .ok()
+                                                    .flatten()
+                                            });
+                                        for step in &step_done_tags {
+                                            let target_plan = active_id
+                                                .as_deref()
+                                                .and_then(|id| {
+                                                    all_plans
+                                                        .iter()
+                                                        .find(|p| p.id == id && p.find_item(&step.id).is_some())
+                                                })
+                                                .or_else(|| {
+                                                    all_plans
+                                                        .iter()
+                                                        .find(|p| p.find_item(&step.id).is_some())
+                                                });
+
+                                            if let Some(plan) = target_plan {
+                                                let _ = crate::plan::storage::PlanStorage::update_item(
+                                                    &repo_root,
+                                                    &plan.id,
+                                                    &step.id,
+                                                    Some(tauqe_protocol::PlanItemStatus::Done),
+                                                );
+                                                let _ = crate::plan::storage::PlanStorage::save_active_id(
+                                                    &repo_root,
+                                                    Some(&plan.id),
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+
+                                if let Some(item_id) = target_review_item_id {
+                                    let rev_id = target_review_id.as_deref();
+                                    let _ = crate::review::storage::ReviewStorage::update_session_item_status(
+                                        &repo_root,
+                                        rev_id,
+                                        item_id,
+                                        tauqe_protocol::ReviewItemStatus::Fixed,
+                                    );
+                                    if let Some(id) = rev_id {
+                                        let _ = crate::review::storage::ReviewStorage::save_active_id(
+                                            &repo_root,
+                                            Some(id),
+                                        );
+                                    }
+                                }
+
                                 ModelResult::Edit {
                                     summary,
                                     edits,
@@ -330,16 +447,65 @@ pub(crate) async fn execute_workflow_lifecycle<T: WorkflowTransaction>(
             }
         }
         ModelResult::Answer { text } => {
-            let mut text = verify_and_append_to_answer(
-                &repo_root,
-                &mut pipeline_out.assistant_text,
-                text,
-                &stream_tx,
-                protocol,
-            )
-            .await;
+            let mut text = if is_discussion {
+                text
+            } else {
+                verify_and_append_to_answer(
+                    &repo_root,
+                    &mut pipeline_out.assistant_text,
+                    text,
+                    &stream_tx,
+                    protocol,
+                )
+                .await
+            };
             if let Some(ref notice) = plan_error_notice {
                 text.push_str(notice);
+            }
+            let step_done_tags = if is_isolated_plan_step {
+                protocol.parse_plan_step_done(&pipeline_out.assistant_text)
+            } else {
+                Vec::new()
+            };
+            if !step_done_tags.is_empty() {
+                if let Ok(all_plans) =
+                    crate::plan::storage::PlanStorage::load_all(&repo_root)
+                {
+                    let active_id = target_plan_id
+                        .clone()
+                        .or_else(|| {
+                            crate::plan::storage::PlanStorage::load_active_id(&repo_root)
+                                .ok()
+                                .flatten()
+                        });
+                    for step in &step_done_tags {
+                        let target_plan = active_id
+                            .as_deref()
+                            .and_then(|id| {
+                                all_plans
+                                    .iter()
+                                    .find(|p| p.id == id && p.find_item(&step.id).is_some())
+                            })
+                            .or_else(|| {
+                                all_plans
+                                    .iter()
+                                    .find(|p| p.find_item(&step.id).is_some())
+                            });
+
+                        if let Some(plan) = target_plan {
+                            let _ = crate::plan::storage::PlanStorage::update_item(
+                                &repo_root,
+                                &plan.id,
+                                &step.id,
+                                Some(tauqe_protocol::PlanItemStatus::Done),
+                            );
+                            let _ = crate::plan::storage::PlanStorage::save_active_id(
+                                &repo_root,
+                                Some(&plan.id),
+                            );
+                        }
+                    }
+                }
             }
             ModelResult::Answer {
                 text: protocol.clean_assistant_text(&text),
@@ -352,10 +518,40 @@ pub(crate) async fn execute_workflow_lifecycle<T: WorkflowTransaction>(
         pipeline_out.assistant_text.push_str(notice);
     }
 
+    let mut extra_history_files = Vec::new();
+    for plan in &plan_outcome.applied {
+        extra_history_files.push(format!("[PLAN] {}", plan.id));
+    }
+    let all_step_done = if is_isolated_plan_step {
+        let mut list = protocol.parse_plan_step_done(&pipeline_out.assistant_text);
+        if list.is_empty() {
+            if let Some(ref target_id) = target_step_id {
+                if matches!(final_result, ModelResult::Edit { applied: true, .. }) {
+                    list.push(crate::edits::protocol::PlanStepDone {
+                        id: target_id.clone(),
+                        note: None,
+                    });
+                }
+            }
+        }
+        list
+    } else {
+        Vec::new()
+    };
+    for step in &all_step_done {
+        extra_history_files.push(format!("[STEP DONE] #{}", step.id));
+    }
+    if let Some(item_id) = target_review_item_id {
+        if matches!(final_result, ModelResult::Edit { applied: true, .. }) {
+            extra_history_files.push(format!("[REVIEW ITEM FIXED] #{}", item_id));
+        }
+    }
+
     record_workflow_response(
         history_manager,
         &final_result,
         &pipeline_out.assistant_text,
+        extra_history_files,
     );
 
     Ok(WorkflowExecutionResult {

@@ -33,8 +33,11 @@ pub const SYSTEM_STATUS: &str = "system/status";
 
 pub const REVIEW_START: &str = "review/start";
 pub const REVIEW_CANCEL: &str = "review/cancel";
+pub const REVIEW_LIST: &str = "review/list";
 pub const REVIEW_GET: &str = "review/get";
 pub const REVIEW_UPDATE_ITEM: &str = "review/updateItem";
+pub const REVIEW_DELETE: &str = "review/delete";
+pub const REVIEW_EXECUTE_ITEM: &str = "review/executeItem";
 pub const REVIEW_CLEAR: &str = "review/clear";
 
 pub const PLAN_LIST: &str = "plan/list";
@@ -43,3 +46,4 @@ pub const PLAN_SAVE: &str = "plan/save";
 pub const PLAN_UPDATE_ITEM: &str = "plan/updateItem";
 pub const PLAN_DELETE: &str = "plan/delete";
 pub const PLAN_SET_ACTIVE: &str = "plan/setActive";
+pub const PLAN_EXECUTE_STEP: &str = "plan/executeStep";

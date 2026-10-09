@@ -11,6 +11,49 @@ pub(crate) fn access_satisfies(current: Option<ContextAccess>, requested: Contex
     }
 }
 
+/// Outcome of applying context requests to ContextManager.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ContextApplicationOutcome {
+    pub added: Vec<String>,
+    pub missing: Vec<String>,
+    pub already_satisfied: Vec<String>,
+}
+
+/// Registers model-requested repository files in the Auto layer with detailed diagnostics.
+pub fn apply_context_requests_detailed(
+    context_manager: &mut ContextManager,
+    requests: &[ContextRequest],
+    available_files: &[String],
+    max_auto_files: Option<usize>,
+) -> ContextApplicationOutcome {
+    let mut outcome = ContextApplicationOutcome::default();
+    for request in requests {
+        let Ok(path) = context_manager.normalize_path(&request.path) else {
+            outcome.missing.push(request.path.clone());
+            continue;
+        };
+        if !available_files.contains(&path) && !context_manager.contains(&path).unwrap_or(false) {
+            outcome.missing.push(path);
+            continue;
+        }
+        if access_satisfies(context_manager.effective_access_for(&path), request.access) {
+            outcome.already_satisfied.push(path);
+            continue;
+        }
+        if let Some(limit) = max_auto_files {
+            if outcome.added.len() >= limit {
+                break;
+            }
+        }
+        if context_manager.add_auto_file(&path, request.access).is_ok()
+            && access_satisfies(context_manager.effective_access_for(&path), request.access)
+        {
+            outcome.added.push(path);
+        }
+    }
+    outcome
+}
+
 /// Registers model-requested repository files in the Auto layer.
 /// Returns the paths that actually widened the effective context.
 pub fn apply_context_requests(
@@ -19,29 +62,7 @@ pub fn apply_context_requests(
     available_files: &[String],
     max_auto_files: Option<usize>,
 ) -> Vec<String> {
-    let mut added = Vec::new();
-    for request in requests {
-        if let Some(limit) = max_auto_files {
-            if added.len() >= limit {
-                break;
-            }
-        }
-        let Ok(path) = context_manager.normalize_path(&request.path) else {
-            continue;
-        };
-        if !available_files.contains(&path) && !context_manager.contains(&path).unwrap_or(false) {
-            continue;
-        }
-        if access_satisfies(context_manager.effective_access_for(&path), request.access) {
-            continue;
-        }
-        if context_manager.add_auto_file(&path, request.access).is_ok()
-            && access_satisfies(context_manager.effective_access_for(&path), request.access)
-        {
-            added.push(path);
-        }
-    }
-    added
+    apply_context_requests_detailed(context_manager, requests, available_files, max_auto_files).added
 }
 
 pub(crate) fn has_proposed_edits(result: &ModelResult) -> bool {
@@ -120,5 +141,30 @@ mod tests {
         let added = apply_context_requests(&mut cm, &requests, &available, None);
         assert_eq!(added, vec!["user.rs".to_string()]);
         assert!(cm.is_editable("user.rs").unwrap());
+    }
+
+    #[test]
+    fn test_apply_context_requests_detailed_tracks_missing_and_satisfied() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "fn a() {}").unwrap();
+        let mut cm = ContextManager::new(dir.path().to_path_buf());
+        cm.add_file("a.rs", ContextAccess::ReadOnly).unwrap();
+
+        let available = vec!["a.rs".to_string()];
+        let requests = vec![
+            ContextRequest {
+                path: "a.rs".to_string(),
+                access: ContextAccess::ReadOnly,
+            },
+            ContextRequest {
+                path: "missing.rs".to_string(),
+                access: ContextAccess::ReadOnly,
+            },
+        ];
+
+        let outcome = apply_context_requests_detailed(&mut cm, &requests, &available, None);
+        assert!(outcome.added.is_empty());
+        assert_eq!(outcome.already_satisfied, vec!["a.rs".to_string()]);
+        assert_eq!(outcome.missing, vec!["missing.rs".to_string()]);
     }
 }

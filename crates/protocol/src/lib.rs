@@ -7,6 +7,7 @@ pub const PROTOCOL_VERSION: &str = "0.1.0";
 
 pub mod config;
 pub mod context;
+pub mod discussion;
 pub mod edit;
 pub mod errors;
 pub mod events;
@@ -21,6 +22,7 @@ pub mod review;
 
 pub use config::*;
 pub use context::*;
+pub use discussion::*;
 pub use edit::*;
 pub use errors::*;
 pub use git::*;

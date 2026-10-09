@@ -24,22 +24,89 @@ pub fn wrap_line(line: Line<'static>, max_width: usize) -> Vec<Line<'static>> {
         return vec![line];
     }
 
-    let indent = if let Some(first_span) = line.spans.first() {
-        let leading_spaces = first_span.content.chars().take_while(|c| *c == ' ').count();
-        if leading_spaces > 0 {
-            " ".repeat(leading_spaces.min(8))
+    let mut is_bullet_prefix = false;
+    let continuation_prefix: Vec<Span<'static>> = if let Some(first_span) = line.spans.first() {
+        let is_gutter_prefix = !first_span.content.is_empty()
+            && first_span
+                .content
+                .chars()
+                .all(|c| c.is_whitespace() || c == '│' || c == '▌' || c == '|' || c == '║');
+
+        if is_gutter_prefix {
+            let mut prefix = vec![first_span.clone()];
+            if let Some(second_span) = line.spans.get(1) {
+                let is_bullet = second_span.content.chars().all(|c| {
+                    c == '•' || c == '◦' || c == '▪' || c == '✔' || c == '☐' || c.is_whitespace()
+                }) && second_span.width() <= 4;
+                if is_bullet {
+                    is_bullet_prefix = true;
+                    prefix.push(Span::raw(" ".repeat(second_span.width())));
+                }
+            }
+            prefix
         } else {
-            String::new()
+            let leading_spaces = first_span.content.chars().take_while(|c| *c == ' ').count();
+            if leading_spaces > 0 {
+                vec![Span::raw(" ".repeat(leading_spaces.min(max_width / 2)))]
+            } else {
+                Vec::new()
+            }
         }
     } else {
-        String::new()
+        Vec::new()
+    };
+
+    let prefix_width: usize = continuation_prefix.iter().map(|s| s.width()).sum();
+    let continuation_prefix = if prefix_width >= max_width {
+        Vec::new()
+    } else {
+        continuation_prefix
+    };
+
+    let push_continuation = |current_spans: &mut Vec<Span<'static>>, current_width: &mut usize| {
+        for p in &continuation_prefix {
+            *current_width += p.width();
+            current_spans.push(p.clone());
+        }
     };
 
     let mut wrapped_lines: Vec<Line<'static>> = Vec::new();
     let mut current_spans: Vec<Span<'static>> = Vec::new();
     let mut current_width: usize = 0;
 
-    for span in line.spans {
+    let has_atomic_gutter = !continuation_prefix.is_empty()
+        && line.spans.first().is_some_and(|s| {
+            !s.content.is_empty()
+                && s.content
+                    .chars()
+                    .all(|c| c.is_whitespace() || c == '│' || c == '▌' || c == '|' || c == '║')
+        });
+
+    let skip_count = if has_atomic_gutter {
+        if is_bullet_prefix {
+            2
+        } else {
+            1
+        }
+    } else {
+        0
+    };
+
+    let mut spans_iter = line.spans.into_iter();
+    if skip_count > 0 {
+        if let Some(s0) = spans_iter.next() {
+            current_width += s0.width();
+            current_spans.push(s0);
+        }
+        if skip_count > 1 {
+            if let Some(s1) = spans_iter.next() {
+                current_width += s1.width();
+                current_spans.push(s1);
+            }
+        }
+    }
+
+    for span in spans_iter {
         let style = span.style;
         let content = span.content.into_owned();
         let tokens = tokenize(&content);
@@ -60,11 +127,8 @@ pub fn wrap_line(line: Line<'static>, max_width: usize) -> Vec<Line<'static>> {
                     current_width = 0;
                 }
             } else {
-                if current_spans.is_empty() && !wrapped_lines.is_empty() && !indent.is_empty() {
-                    let indent_span = Span::raw(indent.clone());
-                    let indent_w = indent_span.width();
-                    current_spans.push(indent_span);
-                    current_width += indent_w;
+                if current_spans.is_empty() && !wrapped_lines.is_empty() && !continuation_prefix.is_empty() {
+                    push_continuation(&mut current_spans, &mut current_width);
                 }
 
                 if current_width + token_width <= max_width {
@@ -75,11 +139,8 @@ pub fn wrap_line(line: Line<'static>, max_width: usize) -> Vec<Line<'static>> {
                     if has_words {
                         wrapped_lines.push(Line::from(std::mem::take(&mut current_spans)));
                         current_width = 0;
-                        if !indent.is_empty() {
-                            let indent_span = Span::raw(indent.clone());
-                            let indent_w = indent_span.width();
-                            current_spans.push(indent_span);
-                            current_width += indent_w;
+                        if !continuation_prefix.is_empty() {
+                            push_continuation(&mut current_spans, &mut current_width);
                         }
                     }
 
@@ -95,11 +156,8 @@ pub fn wrap_line(line: Line<'static>, max_width: usize) -> Vec<Line<'static>> {
                                 current_spans.push(Span::styled(std::mem::take(&mut sub), style));
                                 wrapped_lines.push(Line::from(std::mem::take(&mut current_spans)));
                                 current_width = 0;
-                                if !indent.is_empty() {
-                                    let indent_span = Span::raw(indent.clone());
-                                    let indent_w = indent_span.width();
-                                    current_spans.push(indent_span);
-                                    current_width += indent_w;
+                                if !continuation_prefix.is_empty() {
+                                    push_continuation(&mut current_spans, &mut current_width);
                                 }
                             }
                             sub.push(ch);
@@ -115,7 +173,11 @@ pub fn wrap_line(line: Line<'static>, max_width: usize) -> Vec<Line<'static>> {
     }
 
     if !current_spans.is_empty() {
-        let has_content = current_spans.iter().any(|s| !s.content.trim().is_empty());
+        let has_content = current_spans.len() > continuation_prefix.len()
+            || current_spans.iter().any(|s| {
+                !s.content.trim().is_empty()
+                    && !s.content.chars().all(|c| c.is_whitespace() || c == '│' || c == '▌' || c == '|' || c == '║')
+            });
         if has_content || wrapped_lines.is_empty() {
             wrapped_lines.push(Line::from(current_spans));
         }
@@ -158,5 +220,35 @@ mod tests {
         for l in &wrapped {
             assert!(l.width() <= 10);
         }
+    }
+
+    #[test]
+    fn test_wrap_line_preserves_gutter_prefix() {
+        let line = Line::from(vec![
+            Span::raw("    │ "),
+            Span::raw("This is a long description line that must wrap nicely across columns"),
+        ]);
+        let wrapped = wrap_line(line, 35);
+        assert!(wrapped.len() > 1);
+        for l in &wrapped {
+            assert!(l.width() <= 35);
+            let first = l.spans.first().map(|s| s.content.as_ref()).unwrap_or("");
+            assert_eq!(first, "    │ ");
+        }
+    }
+
+    #[test]
+    fn test_wrap_line_hanging_indent_for_bullet() {
+        let line = Line::from(vec![
+            Span::raw("    │ "),
+            Span::raw("• "),
+            Span::raw("Bullet list item text that is very long and wraps to subsequent lines"),
+        ]);
+        let wrapped = wrap_line(line, 35);
+        assert!(wrapped.len() > 1);
+        let first_line_text: String = wrapped[0].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(first_line_text.starts_with("    │ • "));
+        let second_line_text: String = wrapped[1].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(second_line_text.starts_with("    │   "));
     }
 }

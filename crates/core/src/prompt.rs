@@ -1,7 +1,7 @@
 use crate::context::ContextFileContent;
 use crate::edits::EditProtocol;
 use crate::providers::ChatMessage;
-use tauqe_protocol::{ContextAccess, Plan, RepositoryState, ReviewItem};
+use tauqe_protocol::{ContextAccess, Plan, RepositoryState};
 
 pub fn build_squash_commit_prompt(
     commits: &[crate::git::CommitSummary],
@@ -76,8 +76,9 @@ pub struct PromptAssembly {
     pub history_tag: Option<String>,
     pub repo_map: Option<String>,
     pub target_language: Option<String>,
-    pub active_review_findings: Vec<ReviewItem>,
     pub active_plan: Option<Plan>,
+    pub is_plan_step_execution: bool,
+    pub is_discussion: bool,
 }
 
 impl PromptAssembly {
@@ -99,18 +100,19 @@ impl PromptAssembly {
             history_tag,
             repo_map,
             target_language: None,
-            active_review_findings: Vec::new(),
             active_plan: None,
+            is_plan_step_execution: false,
+            is_discussion: false,
         }
+    }
+
+    pub fn with_discussion(mut self, is_discussion: bool) -> Self {
+        self.is_discussion = is_discussion;
+        self
     }
 
     pub fn with_active_plan(mut self, plan: Option<Plan>) -> Self {
         self.active_plan = plan;
-        self
-    }
-
-    pub fn with_active_review_findings(mut self, findings: Vec<ReviewItem>) -> Self {
-        self.active_review_findings = findings;
         self
     }
 
@@ -129,14 +131,23 @@ impl PromptAssembly {
             .map(|m| format!("_{}", m))
             .unwrap_or_default();
 
-        prompt.push_str(&format!(
-            "2. Read-Only Scope: Files inside <read_only_files> are strictly for reference and understanding. Do NOT propose edits to them directly. If completing the user's task requires modifying a file currently in <read_only_files>, request editable access first using <context_request{} path=\"...\" access=\"editable\" />.\n",
-            marker_suffix
-        ));
-        prompt.push_str("3. Editable Scope: Files inside <editable_files> are permitted for modification. You may also create new files using <create path=\"...\"> or move/rename files using <move from=\"...\" to=\"...\" /> when required by the task.\n");
+        if self.is_discussion {
+            prompt.push_str("2. Discussion Mode Scope: You are strictly in Discussion mode. Code modifications, file creations, file edits, and file deletions are strictly prohibited. Do NOT output XML edit blocks (<edit>, <create>, <replace>, <overwrite>, <delete>) or any code patch proposals.\n");
+            prompt.push_str(
+                "3. Read-Only Context Exploration: Files in <read_only_files> are strictly for reference and architectural understanding. If you need to inspect additional files from the repository map to answer the developer's questions, specify them in the `context_requests` array with `access: \"read_only\"`.\n",
+            );
+        } else {
+            prompt.push_str(&format!(
+                "2. Read-Only Scope: Files inside <read_only_files> are strictly for reference and understanding. Do NOT propose edits to them directly. If completing the user's task requires modifying a file currently in <read_only_files>, request editable access first using <context_request{} path=\"...\" access=\"editable\" />.\n",
+                marker_suffix
+            ));
+            prompt.push_str("3. Editable Scope: Files inside <editable_files> are permitted for modification. You may also create new files using <create path=\"...\"> or move/rename files using <move from=\"...\" to=\"...\" /> when required by the task.\n");
+        }
         prompt.push_str("4. No Arbitrary Shell: You do not have shell execution capabilities. Work strictly through the context and actions provided.\n");
-        prompt.push_str("5. Minimal Coherent Change: Prefer the smallest coherent modification necessary to complete the task.\n");
-        prompt.push_str("6. Always Explain Changes: Whenever you propose file edits, you MUST precede them with a concise conversational explanation (1-3 sentences) explaining what changes were made, why, and how they achieve the user's intent. Never output edits alone without an accompanying explanation.\n");
+        if !self.is_discussion {
+            prompt.push_str("5. Minimal Coherent Change: Prefer the smallest coherent modification necessary to complete the task.\n");
+            prompt.push_str("6. Always Explain Changes: Whenever you propose file edits, you MUST precede them with a concise conversational explanation (1-3 sentences) explaining what changes were made, why, and how they achieve the user's intent. Never output edits alone without an accompanying explanation.\n");
+        }
         prompt.push_str("7. Reasoning in English: Always conduct internal reasoning, planning, and thinking strictly in English to preserve token budget and maximize reasoning quality.\n");
 
         if let Some(lang) = &self.target_language {
@@ -144,6 +155,10 @@ impl PromptAssembly {
                 "8. Language Consistency: The user's language is {}. All conversational explanations, answers, and messages MUST be in {}. Do NOT switch to English for conversational responses unless requested.\n",
                 lang, lang
             ));
+        } else if self.is_discussion {
+            prompt.push_str(
+                "8. Language Consistency: Always formulate conversational explanations and user-facing answers in `message` in the same language as the user's request. Identify the user's language in the `user_language` field (e.g. \"Russian\"). Do NOT switch to English for conversational responses unless requested.\n",
+            );
         } else {
             prompt.push_str(&format!(
                 "8. Language Consistency: Always formulate conversational explanations and user-facing answers in the same language as the user's request. Identify the user's language using <user_language{}>language_name</user_language{}> (e.g. <user_language{}>Russian</user_language{}>). Do NOT switch to English for conversational responses unless requested.\n",
@@ -159,20 +174,36 @@ impl PromptAssembly {
             marker_suffix,
             crate::docs::TOPICS.join("|")
         ));
-        prompt.push_str(&format!(
-            "11. Local Engineering Plans: When formulating or updating a multi-step task plan, wrap structured plan items in <plan{0} action=\"save|update\" id=\"plan-id\" title=\"Plan Title\">...</plan{0}>. In <active_plan>, items marked with [x] are focused by the user; concentrate your efforts on them and update their status (e.g. in_progress, done) when completed.\n\n",
-            marker_suffix
-        ));
+        if !self.is_plan_step_execution {
+            if self.is_discussion {
+                prompt.push_str(
+                    "11. Local Engineering Plans: When formulating or updating a task plan, populate the structured `plan_update` field in your response object with `action: \"save\"|\"update\"|\"delete\"`, plan `id`, `title`, `description`, and `items`. Each item has `status: \"todo\"|\"discussion\"|\"in_progress\"|\"done\"|\"cancelled\"`. If you have architectural doubts or options requiring developer clarification, explicitly set status to \"discussion\". Always provide a clear `description` explaining the overall architecture and rationale. Granularity contract: each leaf step is executed in an isolated turn with compulsory toolchain verification, so calibrate leaf step granularity to cohesive functional units of work. In <active_plan>, items marked with [x] are focused by the user.\n\n",
+                );
+            } else {
+                prompt.push_str(&format!(
+                    "11. Local Engineering Plans: When formulating a multi-step task plan, wrap structured plan items in <plan{0} action=\"save\" id=\"plan-id\" title=\"Plan Title\">...</plan{0}>. In Develop mode, you may ONLY propose new plans (action=\"save\"). Updating plan statuses, closing steps, or modifying existing plans from Develop mode is strictly prohibited (step execution and completion occur strictly in isolated step turns, while plan modifications and re-scoping belong exclusively in Discussion mode). Each item has status=\"todo|discussion\". If you have architectural doubts, multiple technical options, or items needing developer clarification, explicitly set status=\"discussion\" to flag them for review before execution. Always provide a clear <description> explaining the overall architecture and rationale, because plan steps are executed in isolated turns without chat history. Granularity contract: each leaf step is executed in an isolated turn with compulsory toolchain verification (check, clippy, test). Therefore, calibrate leaf step granularity to cohesive, self-contained functional units of work (e.g. a complete data layer, a whole storage migration, or a full UI view). Avoid micro-fragmentation as well as unmanageable monoliths. Plan Creation Invariant: Whenever you propose a new plan, you MUST precede the tag with a concise conversational explanation of the proposed plan, and you MUST emit the structured <plan{0} action=\"save\" ...> tag in the same response.\n\n",
+                    marker_suffix
+                ));
+            }
+        } else {
+            prompt.push('\n');
+        }
 
-        let editable_paths: Vec<String> = self
-            .context_files
-            .iter()
-            .filter(|f| f.access == ContextAccess::Editable)
-            .map(|f| f.path.clone())
-            .collect();
+        if !self.is_discussion {
+            let editable_paths: Vec<String> = self
+                .context_files
+                .iter()
+                .filter(|f| f.access == ContextAccess::Editable)
+                .map(|f| f.path.clone())
+                .collect();
 
-        // Delegate edit protocol specific instructions
-        prompt.push_str(&protocol.system_instructions(&editable_paths));
+            // Delegate edit protocol specific instructions
+            prompt.push_str(&protocol.system_instructions(&editable_paths));
+        } else {
+            prompt.push_str("## Mode: Structured Discussion\n");
+            prompt.push_str("You are participating in an architectural discussion. Code modifications are strictly prohibited. You cannot edit, create, or delete code files. Focus purely on answering questions, exploring architecture, clarifying requirements, and updating plans via structured fields.\n");
+            prompt.push_str("Output MUST be a JSON object conforming to the discussion schema with `message`, `plan_update`, `context_requests`, and `user_language`.\n\n");
+        }
 
         prompt.push_str("## Project Metadata\n");
         if let Some(repo) = &self.repo_state {
@@ -203,15 +234,10 @@ impl PromptAssembly {
             self.context_revision
         ));
 
-        let ro_files: Vec<_> = self
-            .context_files
-            .iter()
-            .filter(|f| f.access == ContextAccess::ReadOnly)
-            .collect();
-
-        if !ro_files.is_empty() {
+        if self.is_discussion {
+            // In discussion mode, all context files are rendered strictly as read-only
             out.push_str("  <read_only_files>\n");
-            for f in ro_files {
+            for f in &self.context_files {
                 out.push_str(&format!("    <file path=\"{}\">\n", f.path));
                 out.push_str(&f.content);
                 if !f.content.ends_with('\n') {
@@ -220,25 +246,44 @@ impl PromptAssembly {
                 out.push_str("    </file>\n");
             }
             out.push_str("  </read_only_files>\n");
-        }
+        } else {
+            let ro_files: Vec<_> = self
+                .context_files
+                .iter()
+                .filter(|f| f.access == ContextAccess::ReadOnly)
+                .collect();
 
-        let ed_files: Vec<_> = self
-            .context_files
-            .iter()
-            .filter(|f| f.access == ContextAccess::Editable)
-            .collect();
-
-        if !ed_files.is_empty() {
-            out.push_str("  <editable_files>\n");
-            for f in ed_files {
-                out.push_str(&format!("    <file path=\"{}\">\n", f.path));
-                out.push_str(&f.content);
-                if !f.content.ends_with('\n') {
-                    out.push('\n');
+            if !ro_files.is_empty() {
+                out.push_str("  <read_only_files>\n");
+                for f in ro_files {
+                    out.push_str(&format!("    <file path=\"{}\">\n", f.path));
+                    out.push_str(&f.content);
+                    if !f.content.ends_with('\n') {
+                        out.push('\n');
+                    }
+                    out.push_str("    </file>\n");
                 }
-                out.push_str("    </file>\n");
+                out.push_str("  </read_only_files>\n");
             }
-            out.push_str("  </editable_files>\n");
+
+            let ed_files: Vec<_> = self
+                .context_files
+                .iter()
+                .filter(|f| f.access == ContextAccess::Editable)
+                .collect();
+
+            if !ed_files.is_empty() {
+                out.push_str("  <editable_files>\n");
+                for f in ed_files {
+                    out.push_str(&format!("    <file path=\"{}\">\n", f.path));
+                    out.push_str(&f.content);
+                    if !f.content.ends_with('\n') {
+                        out.push('\n');
+                    }
+                    out.push_str("    </file>\n");
+                }
+                out.push_str("  </editable_files>\n");
+            }
         }
 
         out.push_str("</context>");
@@ -294,20 +339,17 @@ impl PromptAssembly {
             system_text.push_str("\n\n");
         }
 
-        if let Some(plan) = &self.active_plan {
-            if let Some(plan_block) = crate::plan::format_active_plan_context(plan) {
-                system_text.push_str("## Active Task Plan Context\n");
-                system_text.push_str(&plan_block);
-                system_text.push_str("\n\n");
+        if !self.is_plan_step_execution {
+            if let Some(plan) = &self.active_plan {
+                if let Some(plan_block) = crate::plan::format_active_plan_context(plan) {
+                    system_text.push_str("## Active Task Plan Context\n");
+                    system_text.push_str(&plan_block);
+                    system_text.push_str("\n\n");
+                }
             }
         }
 
-        if let Some(review_block) = crate::review::format_active_review_findings(&self.active_review_findings) {
-            system_text.push_str("## Active Review Directives\n");
-            system_text.push_str(&review_block);
-            system_text.push_str("\n\n");
-        }
-
+    
         if let Some(target_lang) = &self.target_language {
             system_text.push_str("## Language Directive\n");
             system_text.push_str(&format!("- Target Response Language: {} (all conversational explanations, answers, and messages MUST be in {})\n", target_lang, target_lang));
@@ -410,25 +452,25 @@ mod tests {
         assert_eq!(messages[1], ChatMessage::user("Explain this code"));
     }
 
+    
     #[test]
-    fn test_prompt_assembly_with_active_review_findings() {
-        let files = vec![];
-        let mut assembly = PromptAssembly::new(None, 1, files, "git", "xml", None, None);
-        assembly.active_review_findings = vec![ReviewItem {
-            id: 1,
-            title: "Fix potential panic on unwrap".to_string(),
-            severity: tauqe_protocol::ReviewSeverity::Critical,
-            status: tauqe_protocol::ReviewStatus::Todo,
-            is_checked: true,
-            file_path: Some("crates/server/src/main.rs".to_string()),
-            line_range: Some((42, 45)),
-            body: "Replace unwrap with match.".to_string(),
+    fn test_prompt_assembly_discussion_mode() {
+        let files = vec![ContextFileContent {
+            path: "src/main.rs".to_string(),
+            access: ContextAccess::Editable,
+            content: "fn main() {}\n".to_string(),
         }];
+        let mut assembly = PromptAssembly::new(None, 1, files, "git", "xml", None, None);
+        assembly.is_discussion = true;
         let proto = XmlEditProtocol;
-        let messages = assembly.assemble_chat_messages("Resolve finding", &proto);
-        assert!(messages[0].content.contains("<active_review_findings>"));
-        assert!(messages[0].content.contains("Fix potential panic on unwrap"));
-        assert!(messages[0].content.contains("crates/server/src/main.rs:42-45"));
+        let messages = assembly.assemble_chat_messages("Let's discuss architecture", &proto);
+        let sys = &messages[0].content;
+
+        assert!(sys.contains("Discussion Mode Scope"));
+        assert!(sys.contains("Mode: Structured Discussion"));
+        assert!(!sys.contains("<editable_files>"));
+        assert!(sys.contains("<read_only_files>"));
+        assert!(!sys.contains("Code Modification Protocol"));
     }
 
     #[test]

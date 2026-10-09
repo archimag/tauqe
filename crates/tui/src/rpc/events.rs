@@ -30,7 +30,12 @@ pub fn fail_safe_reject_edits(model: &mut DevelopView, reason: &str) {
     model.edit_final_error = Some(reason.to_string());
 }
 
-pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning: &mut bool) {
+pub async fn handle_event(
+    ev: Event,
+    state: &Arc<Mutex<AppState>>,
+    is_reasoning: &mut bool,
+    mut server_writer: Option<&mut tokio::process::ChildStdin>,
+) {
     let mut st = state.lock().await;
     match ev.method.as_str() {
         events::GIT_STATE_CHANGED => {
@@ -486,6 +491,277 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
                     st.model.update_markdown();
                     let h = st.last_model_height;
                     st.model.clamp_scroll(h);
+
+                    let step_succeeded = st.model.error.is_none()
+                        && st.model.edit_final_applied != Some(false)
+                        && (st.model.edit_final_applied == Some(true) || st.model.last_commit_hash.is_some());
+
+                    // Review step handling (single or batch queue) with Fail-Fast policy
+                    let mut next_review_batch_step = None;
+                    let mut review_batch_finished_msg = None;
+                    let mut review_failed_msg = None;
+                    let mut review_item_to_mark_fixed = None;
+                    let mut review_single_finished_msg = None;
+
+                    if let Some((review_id, item_id)) = st.active_review_step.clone() {
+                        if step_succeeded {
+                            review_item_to_mark_fixed = Some((review_id.clone(), item_id));
+                            if let Some(ref mut queue) = st.review_batch_queue {
+                                queue.current_index += 1;
+                                if queue.current_index < queue.items.len() {
+                                    let next_item = queue.items[queue.current_index].clone();
+                                    let total = queue.items.len();
+                                    let idx = queue.current_index + 1;
+                                    next_review_batch_step = Some((review_id.clone(), next_item, idx, total));
+                                } else {
+                                    let total = queue.items.len();
+                                    let review_title = queue.review_title.clone();
+                                    review_batch_finished_msg = Some(format!(
+                                        "Review execution finished: all {} findings in '{}' resolved and verified!",
+                                        total, review_title
+                                    ));
+                                    st.review_batch_queue = None;
+                                    st.active_review_step = None;
+                                }
+                            } else {
+                                review_single_finished_msg = Some(format!(
+                                    "Review finding #{} successfully resolved and verified!",
+                                    item_id
+                                ));
+                                st.active_review_step = None;
+                            }
+                        } else {
+                            // Fail-Fast: roll back and stop queue immediately
+                            let err_detail = st.model.error.as_deref()
+                                .or(st.model.edit_final_error.as_deref())
+                                .unwrap_or("verification check failed");
+                            review_failed_msg = Some(format!(
+                                "Fail-Fast: review finding #{} did not complete cleanly ({}); stopping execution and rolling back changes",
+                                item_id, err_detail
+                            ));
+                            st.review_batch_queue = None;
+                            st.active_review_step = None;
+
+                            for session in &mut st.review.sessions {
+                                if session.id == review_id {
+                                    if let Some(item) = session.items.iter_mut().find(|i| i.id == item_id) {
+                                        item.status = tauqe_protocol::ReviewStatus::Todo;
+                                    }
+                                }
+                            }
+                            if let Some(session) = st.review.session.as_mut() {
+                                if session.id == review_id {
+                                    if let Some(item) = session.items.iter_mut().find(|i| i.id == item_id) {
+                                        item.status = tauqe_protocol::ReviewStatus::Todo;
+                                    }
+                                }
+                            }
+
+                            if let Some(ref mut writer) = server_writer {
+                                let _ = super::transport::send_request(
+                                    writer,
+                                    tauqe_protocol::methods::GIT_UNDO,
+                                    serde_json::json!({}),
+                                ).await;
+                                let update_params = tauqe_protocol::ReviewUpdateItemParams {
+                                    review_id: Some(review_id.clone()),
+                                    item_id,
+                                    status: Some(tauqe_protocol::ReviewStatus::Todo),
+                                };
+                                let _ = super::transport::send_request(
+                                    writer,
+                                    tauqe_protocol::methods::REVIEW_UPDATE_ITEM,
+                                    serde_json::to_value(update_params).unwrap_or_default(),
+                                ).await;
+                            }
+                        }
+                    }
+
+                    if let Some((review_id, item_id)) = review_item_to_mark_fixed {
+                        for session in &mut st.review.sessions {
+                            if session.id == review_id {
+                                if let Some(item) = session.items.iter_mut().find(|i| i.id == item_id) {
+                                    item.status = tauqe_protocol::ReviewStatus::Fixed;
+                                }
+                            }
+                        }
+                        if let Some(session) = st.review.session.as_mut() {
+                            if session.id == review_id {
+                                if let Some(item) = session.items.iter_mut().find(|i| i.id == item_id) {
+                                    item.status = tauqe_protocol::ReviewStatus::Fixed;
+                                }
+                            }
+                        }
+                        if let Some(ref mut writer) = server_writer {
+                            let update_params = tauqe_protocol::ReviewUpdateItemParams {
+                                review_id: Some(review_id),
+                                item_id,
+                                status: Some(tauqe_protocol::ReviewStatus::Fixed),
+                            };
+                            let _ = super::transport::send_request(
+                                writer,
+                                tauqe_protocol::methods::REVIEW_UPDATE_ITEM,
+                                serde_json::to_value(update_params).unwrap_or_default(),
+                            ).await;
+                        }
+                    }
+
+                    if let Some(msg) = review_single_finished_msg {
+                        st.notify_success(msg);
+                    } else if let Some(msg) = review_batch_finished_msg {
+                        st.notify_success(msg);
+                    } else if let Some(msg) = review_failed_msg {
+                        st.notify_error(msg);
+                    }
+
+                    if let Some((review_id, next_item, idx, total)) = next_review_batch_step {
+                        st.active_review_step = Some((review_id.clone(), next_item.id));
+                        for session in &mut st.review.sessions {
+                            if session.id == review_id {
+                                if let Some(item) = session.items.iter_mut().find(|i| i.id == next_item.id) {
+                                    item.status = tauqe_protocol::ReviewStatus::InProgress;
+                                }
+                            }
+                        }
+                        if let Some(session) = st.review.session.as_mut() {
+                            if session.id == review_id {
+                                if let Some(item) = session.items.iter_mut().find(|i| i.id == next_item.id) {
+                                    item.status = tauqe_protocol::ReviewStatus::InProgress;
+                                }
+                            }
+                        }
+                        st.notify_info(format!(
+                            "Starting batch review step {} of {}: #{} {}",
+                            idx, total, next_item.id, next_item.title
+                        ));
+
+                        st.model.reasoning.clear();
+                        st.model.text.clear();
+                        st.model.markdown_lines.clear();
+                        st.model.error = None;
+                        st.model.result = None;
+                        st.model.usage = None;
+                        st.model.scroll = 0;
+                        st.model.status = "awaiting".to_string();
+                        st.model.auto_scroll = true;
+                        st.model.current_cost = Some(0.0);
+                        st.model.edits_active = false;
+                        st.model.files.clear();
+                        st.model.selected_file_index = 0;
+                        st.model.edit_final_applied = None;
+                        st.model.edit_final_error = None;
+                        st.model.last_commit_hash = None;
+                        st.model.last_commit_summary = None;
+                        st.model.toolchain_command = None;
+                        st.model.toolchain_status = None;
+                        st.model.copy_flash = None;
+                        st.model.code_blocks.clear();
+                        st.turn_started_at = Some(std::time::Instant::now());
+
+                        if let Some(ref mut writer) = server_writer {
+                            let params = tauqe_protocol::ReviewExecuteItemParams {
+                                review_id,
+                                item_id: next_item.id,
+                            };
+                            let _ = super::transport::send_request(
+                                writer,
+                                tauqe_protocol::methods::REVIEW_EXECUTE_ITEM,
+                                serde_json::to_value(params).unwrap_or_default(),
+                            ).await;
+                        }
+                    }
+
+                    let mut next_batch_step = None;
+                    let mut batch_finished_msg = None;
+                    let mut batch_failed_msg = None;
+                    let mut step_to_mark_done = None;
+
+                    if let Some(ref mut queue) = st.plan_batch_queue {
+                        if step_succeeded {
+                            let finished_step = &queue.steps[queue.current_index];
+                            step_to_mark_done = Some((queue.plan_id.clone(), finished_step.id.clone()));
+                            queue.current_index += 1;
+                            if queue.current_index < queue.steps.len() {
+                                let next_step = queue.steps[queue.current_index].clone();
+                                let plan_id = queue.plan_id.clone();
+                                let total = queue.steps.len();
+                                let idx = queue.current_index + 1;
+                                next_batch_step = Some((plan_id, next_step, idx, total));
+                            } else {
+                                let total = queue.steps.len();
+                                let plan_title = queue.plan_title.clone();
+                                batch_finished_msg = Some(format!(
+                                    "Plan execution finished: all {} steps in '{}' completed!",
+                                    total, plan_title
+                                ));
+                            }
+                        } else {
+                            let failed_step = &queue.steps[queue.current_index];
+                            batch_failed_msg = Some(format!(
+                                "Batch stopped: step #{} ({}) did not complete cleanly",
+                                failed_step.id, failed_step.title
+                            ));
+                        }
+                    }
+
+                    if let Some((plan_id, step_id)) = step_to_mark_done {
+                        if let Some(plan) = st.plans_view.plans.iter_mut().find(|p| p.id == plan_id) {
+                            plan.update_item_status(&step_id, tauqe_protocol::PlanItemStatus::Done);
+                        }
+                    }
+
+                    if let Some(msg) = batch_finished_msg {
+                        st.notify_success(msg);
+                        st.plan_batch_queue = None;
+                    } else if let Some(msg) = batch_failed_msg {
+                        st.notify_error(msg);
+                        st.plan_batch_queue = None;
+                    }
+
+                    if let Some((plan_id, next_step, idx, total)) = next_batch_step {
+                        if let Some(plan) = st.plans_view.plans.iter_mut().find(|p| p.id == plan_id) {
+                            plan.update_item_status(&next_step.id, tauqe_protocol::PlanItemStatus::InProgress);
+                        }
+                        st.notify_info(format!(
+                            "Starting batch step {} of {}: #{} {}",
+                            idx, total, next_step.id, next_step.title
+                        ));
+
+                        st.model.reasoning.clear();
+                        st.model.text.clear();
+                        st.model.markdown_lines.clear();
+                        st.model.error = None;
+                        st.model.result = None;
+                        st.model.usage = None;
+                        st.model.scroll = 0;
+                        st.model.status = "awaiting".to_string();
+                        st.model.auto_scroll = true;
+                        st.model.current_cost = Some(0.0);
+                        st.model.edits_active = false;
+                        st.model.files.clear();
+                        st.model.selected_file_index = 0;
+                        st.model.edit_final_applied = None;
+                        st.model.edit_final_error = None;
+                        st.model.last_commit_hash = None;
+                        st.model.last_commit_summary = None;
+                        st.model.toolchain_command = None;
+                        st.model.toolchain_status = None;
+                        st.model.copy_flash = None;
+                        st.model.code_blocks.clear();
+                        st.turn_started_at = Some(std::time::Instant::now());
+
+                        if let Some(writer) = server_writer {
+                            let params = tauqe_protocol::PlanExecuteStepParams {
+                                plan_id,
+                                step_id: next_step.id,
+                            };
+                            let _ = super::transport::send_request(
+                                writer,
+                                tauqe_protocol::methods::PLAN_EXECUTE_STEP,
+                                serde_json::to_value(params).unwrap_or_default(),
+                            ).await;
+                        }
+                    }
                 }
             }
         }
@@ -493,6 +769,50 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
             *is_reasoning = false;
             st.confirm_cancel = false;
             st.turn_started_at = None;
+            if let Some((review_id, item_id)) = st.active_review_step.take() {
+                st.review_batch_queue = None;
+                st.notify_warning(format!(
+                    "Review execution stopped: finding #{} was cancelled; rolling back changes",
+                    item_id
+                ));
+                for session in &mut st.review.sessions {
+                    if session.id == review_id {
+                        if let Some(item) = session.items.iter_mut().find(|i| i.id == item_id) {
+                            item.status = tauqe_protocol::ReviewStatus::Todo;
+                        }
+                    }
+                }
+                if let Some(session) = st.review.session.as_mut() {
+                    if session.id == review_id {
+                        if let Some(item) = session.items.iter_mut().find(|i| i.id == item_id) {
+                            item.status = tauqe_protocol::ReviewStatus::Todo;
+                        }
+                    }
+                }
+                if let Some(ref mut writer) = server_writer {
+                    let _ = super::transport::send_request(
+                        writer,
+                        tauqe_protocol::methods::GIT_UNDO,
+                        serde_json::json!({}),
+                    ).await;
+                    let update_params = tauqe_protocol::ReviewUpdateItemParams {
+                        review_id: Some(review_id),
+                        item_id,
+                        status: Some(tauqe_protocol::ReviewStatus::Todo),
+                    };
+                    let _ = super::transport::send_request(
+                        writer,
+                        tauqe_protocol::methods::REVIEW_UPDATE_ITEM,
+                        serde_json::to_value(update_params).unwrap_or_default(),
+                    ).await;
+                }
+            }
+            if let Some(queue) = st.plan_batch_queue.take() {
+                st.notify_warning(format!(
+                    "Batch execution stopped: step #{} was cancelled",
+                    queue.steps[queue.current_index].id
+                ));
+            }
             st.model.status = "cancelled".to_string();
             st.model.toolchain_command = None;
             st.model.turn_phase = None;
@@ -513,6 +833,50 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
         events::MODEL_ERROR => {
             *is_reasoning = false;
             st.confirm_cancel = false;
+            if let Some((review_id, item_id)) = st.active_review_step.take() {
+                st.review_batch_queue = None;
+                st.notify_error(format!(
+                    "Review execution stopped: finding #{} failed; rolling back changes",
+                    item_id
+                ));
+                for session in &mut st.review.sessions {
+                    if session.id == review_id {
+                        if let Some(item) = session.items.iter_mut().find(|i| i.id == item_id) {
+                            item.status = tauqe_protocol::ReviewStatus::Todo;
+                        }
+                    }
+                }
+                if let Some(session) = st.review.session.as_mut() {
+                    if session.id == review_id {
+                        if let Some(item) = session.items.iter_mut().find(|i| i.id == item_id) {
+                            item.status = tauqe_protocol::ReviewStatus::Todo;
+                        }
+                    }
+                }
+                if let Some(ref mut writer) = server_writer {
+                    let _ = super::transport::send_request(
+                        writer,
+                        tauqe_protocol::methods::GIT_UNDO,
+                        serde_json::json!({}),
+                    ).await;
+                    let update_params = tauqe_protocol::ReviewUpdateItemParams {
+                        review_id: Some(review_id),
+                        item_id,
+                        status: Some(tauqe_protocol::ReviewStatus::Todo),
+                    };
+                    let _ = super::transport::send_request(
+                        writer,
+                        tauqe_protocol::methods::REVIEW_UPDATE_ITEM,
+                        serde_json::to_value(update_params).unwrap_or_default(),
+                    ).await;
+                }
+            }
+            if let Some(queue) = st.plan_batch_queue.take() {
+                st.notify_error(format!(
+                    "Batch execution stopped: step #{} failed",
+                    queue.steps[queue.current_index].id
+                ));
+            }
             if let Some(started) = st.turn_started_at.take() {
                 let elapsed = started.elapsed().as_secs();
                 if elapsed >= st.tui_config.notifications.min_duration_seconds {
@@ -622,31 +986,33 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
         events::PLAN_UPDATED => {
             if let Some(params) = ev.params {
                 if let Ok(data) = serde_json::from_value::<tauqe_protocol::PlanUpdatedEvent>(params) {
-                    let is_diff = st.plans_view.current_plan.as_ref().map(|p| &p.id) != Some(&data.plan.id);
-                    if is_diff {
-                        st.plans_view.reset_view_for_new_plan();
+                    if let Some(pos) = st.plans_view.plans.iter().position(|p| p.id == data.plan.id) {
+                        st.plans_view.plans[pos] = data.plan;
+                    } else {
+                        st.plans_view.plans.push(data.plan);
                     }
-                    st.plans_view.active_plan_id = Some(data.plan.id.clone());
-                    st.plans_view.current_plan = Some(data.plan);
                 }
             }
         }
         events::PLAN_LIST_CHANGED => {
             if let Some(params) = ev.params {
                 if let Ok(data) = serde_json::from_value::<tauqe_protocol::PlanListChangedEvent>(params) {
-                    st.plans_view.plans_list = data.plans;
-                    st.plans_view.active_plan_id = data.active_id.clone();
-                    if let Some(active) = &data.active_id {
-                        if let Some(pos) = st.plans_view.plans_list.iter().position(|p| &p.id == active) {
-                            st.plans_view.selected_plan_index = pos;
-                        }
-                    } else if let Some(first) = st.plans_view.plans_list.first().cloned() {
-                        st.plans_view.selected_plan_index = 0;
-                        st.plans_view.active_plan_id = Some(first.id.clone());
-                    } else {
-                        st.plans_view.current_plan = None;
-                        st.plans_view.selected_plan_index = 0;
-                    }
+                    st.plans_view.plans = data.plans;
+                    st.plans_view.clamp_selection();
+                }
+            }
+        }
+        events::REVIEW_UPDATED => {
+            if let Some(params) = ev.params {
+                if let Ok(data) = serde_json::from_value::<tauqe_protocol::ReviewUpdatedEvent>(params) {
+                    st.review.update_session(data.session);
+                }
+            }
+        }
+        events::REVIEW_LIST_CHANGED => {
+            if let Some(params) = ev.params {
+                if let Ok(data) = serde_json::from_value::<tauqe_protocol::ReviewListChangedEvent>(params) {
+                    st.review.set_sessions(data.reviews, data.active_id);
                 }
             }
         }

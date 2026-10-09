@@ -1,4 +1,4 @@
-use tauqe_protocol::{ReviewItem, ReviewSeverity, ReviewStatus};
+use tauqe_protocol::{ReviewItem, ReviewItemStatus, ReviewSeverity};
 
 /// Parses raw markdown review output into structured `ReviewItem` instances.
 /// Uses a robust line-oriented state machine that handles slight formatting variances.
@@ -25,8 +25,7 @@ pub fn parse_review_findings(raw_markdown: &str) -> Vec<ReviewItem> {
                 id: *id,
                 title: t,
                 severity,
-                status: ReviewStatus::Todo,
-                is_checked: false,
+                status: ReviewItemStatus::Discussion,
                 file_path: file_path.take(),
                 line_range: line_range.take(),
                 body,
@@ -100,8 +99,7 @@ pub fn parse_review_findings(raw_markdown: &str) -> Vec<ReviewItem> {
                 id: 1,
                 title: "General Review Findings".to_string(),
                 severity: ReviewSeverity::Info,
-                status: ReviewStatus::Todo,
-                is_checked: false,
+                status: ReviewItemStatus::Discussion,
                 file_path: None,
                 line_range: None,
                 body: trimmed.to_string(),

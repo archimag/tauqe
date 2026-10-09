@@ -29,21 +29,32 @@ pub async fn handle_model_ask(req: Request, state: &Arc<AppState>) -> Response {
         }
     };
 
+    match start_model_turn(state, params.prompt).await {
+        Ok(op_id) => Response {
+            id: req.id,
+            result: Some(serde_json::json!({ "operation_id": op_id })),
+            error: None,
+        },
+        Err(err) => Response {
+            id: req.id,
+            result: None,
+            error: Some(err),
+        },
+    }
+}
+
+pub async fn start_model_turn(state: &Arc<AppState>, prompt: String) -> Result<String, ResponseError> {
     let (provider, model, app_config) = {
         let cfg = state.config.lock().await;
         let model = cfg.active_model();
         let provider: Arc<dyn LlmProvider> = match create_provider(model.provider, &cfg) {
             Ok(p) => Arc::from(p),
             Err(err) => {
-                return Response {
-                    id: req.id,
-                    result: None,
-                    error: Some(ResponseError {
-                        code: "NO_API_KEY".to_string(),
-                        message: err.to_string(),
-                        data: None,
-                    }),
-                };
+                return Err(ResponseError {
+                    code: "NO_API_KEY".to_string(),
+                    message: err.to_string(),
+                    data: None,
+                });
             }
         };
 
@@ -70,7 +81,7 @@ pub async fn handle_model_ask(req: Request, state: &Arc<AppState>) -> Response {
         });
     }
 
-    let prompt_for_spawn = params.prompt.clone();
+    let prompt_for_spawn = prompt;
     let state_for_spawn = Arc::clone(state);
     let op_id_for_spawn = op_id.clone();
     let model_for_spawn = model.clone();
@@ -415,6 +426,43 @@ pub async fn handle_model_ask(req: Request, state: &Arc<AppState>) -> Response {
                     params: Some(serde_json::json!({ "state": ctx_state })),
                 });
 
+                let repo_root = state_for_spawn.context.read().await.repo_root().to_path_buf();
+                let active_id = tauqe_core::plan::storage::PlanStorage::load_active_id(&repo_root).ok().flatten();
+                if let Ok(plans) = tauqe_core::plan::storage::PlanStorage::load_all(&repo_root) {
+                    for plan in &plans {
+                        state_for_spawn.out.send_event(&Event {
+                            method: events::PLAN_UPDATED.to_string(),
+                            params: serde_json::to_value(tauqe_protocol::PlanUpdatedEvent { plan: plan.clone() }).ok(),
+                        });
+                    }
+                    state_for_spawn.out.send_event(&Event {
+                        method: events::PLAN_LIST_CHANGED.to_string(),
+                        params: serde_json::to_value(tauqe_protocol::PlanListChangedEvent {
+                            plans,
+                            active_id,
+                        })
+                        .ok(),
+                    });
+                }
+
+                let active_review_id = tauqe_core::review::storage::ReviewStorage::load_active_id(&repo_root).ok().flatten();
+                if let Ok(reviews) = tauqe_core::review::storage::ReviewStorage::load_all(&repo_root) {
+                    for session in &reviews {
+                        state_for_spawn.out.send_event(&Event {
+                            method: events::REVIEW_UPDATED.to_string(),
+                            params: serde_json::to_value(tauqe_protocol::ReviewUpdatedEvent { session: session.clone() }).ok(),
+                        });
+                    }
+                    state_for_spawn.out.send_event(&Event {
+                        method: events::REVIEW_LIST_CHANGED.to_string(),
+                        params: serde_json::to_value(tauqe_protocol::ReviewListChangedEvent {
+                            reviews,
+                            active_id: active_review_id,
+                        })
+                        .ok(),
+                    });
+                }
+
                 if edit_events_sent && !edit_finished_sent {
                     send_edit_aborted(
                         &state_for_spawn.out,
@@ -479,11 +527,7 @@ pub async fn handle_model_ask(req: Request, state: &Arc<AppState>) -> Response {
         *state_for_spawn.active_cancel.lock().await = None;
     });
 
-    Response {
-        id: req.id,
-        result: Some(serde_json::json!({ "operation_id": op_id })),
-        error: None,
-    }
+    Ok(op_id)
 }
 
 pub async fn handle_model_cancel(req: Request, state: &Arc<AppState>) -> Response {

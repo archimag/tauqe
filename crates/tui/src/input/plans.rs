@@ -1,95 +1,78 @@
 use std::sync::Arc;
 
 use crossterm::event::{KeyCode, KeyEvent};
-use tauqe_protocol::{methods, PlanSetActiveParams, PlanUpdateItemParams};
+use tauqe_protocol::methods;
 use tokio::process::ChildStdin;
 use tokio::sync::Mutex;
 
 use crate::app::{AppState, KeyCommand, ViewMode};
+use crate::editor::InputEditor;
 use crate::input::InputResult;
 use crate::rpc::send_request;
+use crate::ui::plans::VisiblePlanRow;
 
 pub const PLANS_COMMANDS: &[KeyCommand] = &[
-    KeyCommand { key: "n / p (or j/k, ↑/↓)", description: "Select next / previous plan item" },
-    KeyCommand { key: "Tab / Space", description: "Fold / unfold item details & subtasks" },
-    KeyCommand { key: "Enter", description: "Fold/unfold item or toggle check on leaf" },
-    KeyCommand { key: "x", description: "Check / uncheck item to focus in Develop context" },
-    KeyCommand { key: "t / s", description: "Change item status (dialog: Todo / InProgress / Done / Cancelled)" },
-    KeyCommand { key: "a", description: "Toggle fold / unfold all items" },
-    KeyCommand { key: "←/→, h/l, [ / ]", description: "Switch between multiple plans" },
-    KeyCommand { key: "D / Delete", description: "Delete current plan (with confirmation)" },
-    KeyCommand { key: "c / y", description: "Copy current plan as Markdown to clipboard" },
+    KeyCommand { key: "n / p (or ↑/↓)", description: "Navigate plans and items" },
+    KeyCommand { key: "C-n / C-p", description: "Inspect next / previous item (accordion walk)" },
+    KeyCommand { key: "Tab / Space", description: "Fold / unfold plan or item subtasks" },
+    KeyCommand { key: "x", description: "Execute target step, group, or entire plan (with confirmation)" },
+    KeyCommand { key: "Enter", description: "Execute leaf step; fold/unfold on groups and plan headers" },
+    KeyCommand { key: "d", description: "Discuss selected step or entire plan with AI in Develop" },
+    KeyCommand { key: "t / s", description: "Change item status (Todo / InProgress / Done / Cancelled)" },
+    KeyCommand { key: "a", description: "Toggle fold / unfold all plans and items" },
+    KeyCommand { key: "Delete", description: "Delete plan (with confirmation)" },
+    KeyCommand { key: "c / y", description: "Copy plan as Markdown to clipboard" },
     KeyCommand { key: "PgUp / PgDn", description: "Page scroll plan view" },
-    KeyCommand { key: "Home / End", description: "Select first / last item" },
+    KeyCommand { key: "Home / End", description: "Select first / last row" },
     KeyCommand { key: "r", description: "Refresh plans from server" },
     KeyCommand { key: "Esc / q", description: "Return to Develop view" },
 ];
 
-async fn switch_plan(
-    target_id: String,
-    server_writer: &mut ChildStdin,
-) -> anyhow::Result<()> {
-    send_request(
-        server_writer,
-        methods::PLAN_SET_ACTIVE,
-        serde_json::to_value(PlanSetActiveParams { id: Some(target_id.clone()) })?,
-    )
-    .await?;
-    send_request(
-        server_writer,
-        methods::PLAN_GET,
-        serde_json::json!({ "id": target_id }),
-    )
-    .await?;
-    Ok(())
-}
-
-async fn switch_to_prev_plan(
-    state: &Arc<Mutex<AppState>>,
-    server_writer: &mut ChildStdin,
-) -> anyhow::Result<InputResult> {
-    let mut st = state.lock().await;
-    let plans_len = st.plans_view.plans_list.len();
-    if plans_len > 1 {
-        let prev_idx = if st.plans_view.selected_plan_index == 0 {
-            plans_len - 1
-        } else {
-            st.plans_view.selected_plan_index - 1
-        };
-        st.plans_view.selected_plan_index = prev_idx;
-        if let Some(target) = st.plans_view.plans_list.get(prev_idx).cloned() {
-            st.plans_view.active_plan_id = Some(target.id.clone());
-            st.plans_view.reset_view_for_new_plan();
-            drop(st);
-            switch_plan(target.id, server_writer).await?;
-        }
-    } else {
-        drop(st);
-        send_request(server_writer, methods::PLAN_LIST, serde_json::json!({})).await?;
+fn execute_scope_action(st: &mut AppState, plan_id: &str, scope_id: Option<&str>, scope_title: &str) {
+    if st.model.is_busy() || st.review.running {
+        st.notify_warning("Model is currently busy; wait for turn to finish or press Esc to cancel");
+        return;
     }
-    Ok(InputResult::Continue)
-}
 
-async fn switch_to_next_plan(
-    state: &Arc<Mutex<AppState>>,
-    server_writer: &mut ChildStdin,
-) -> anyhow::Result<InputResult> {
-    let mut st = state.lock().await;
-    let plans_len = st.plans_view.plans_list.len();
-    if plans_len > 1 {
-        let next_idx = (st.plans_view.selected_plan_index + 1) % plans_len;
-        st.plans_view.selected_plan_index = next_idx;
-        if let Some(target) = st.plans_view.plans_list.get(next_idx).cloned() {
-            st.plans_view.active_plan_id = Some(target.id.clone());
-            st.plans_view.reset_view_for_new_plan();
-            drop(st);
-            switch_plan(target.id, server_writer).await?;
+    let plan = match st.plans_view.plans.iter().find(|p| p.id == plan_id).cloned() {
+        Some(p) => p,
+        None => {
+            st.notify_error(format!("Plan '{}' not found", plan_id));
+            return;
         }
-    } else {
-        drop(st);
-        send_request(server_writer, methods::PLAN_LIST, serde_json::json!({})).await?;
+    };
+
+    match plan.evaluate_scope(scope_id) {
+        tauqe_protocol::PlanScopeEvaluation::BlockedByDiscussion(items) => {
+            let preview = if items.len() <= 2 {
+                items.join(", ")
+            } else {
+                format!("{}, and {} more", items[..2].join(", "), items.len() - 2)
+            };
+            st.notify_warning(format!(
+                "Scope contains {} item(s) in DISCUSSION ({}). Review or approve before executing.",
+                items.len(), preview
+            ));
+        }
+        tauqe_protocol::PlanScopeEvaluation::AllCompleted => {
+            st.notify_info("All steps in this scope are already completed.");
+        }
+        tauqe_protocol::PlanScopeEvaluation::Cancelled => {
+            st.notify_warning("Step is CANCELLED; change status to TODO before executing.");
+        }
+        tauqe_protocol::PlanScopeEvaluation::NotFound => {
+            st.notify_error("Target item not found in plan.");
+        }
+        tauqe_protocol::PlanScopeEvaluation::Ready(steps) => {
+            st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
+            st.confirm_execute_scope = Some(crate::app::ConfirmExecuteScopeState {
+                plan_id: plan.id.clone(),
+                plan_title: plan.title.clone(),
+                scope_title: scope_title.to_string(),
+                steps,
+            });
+        }
     }
-    Ok(InputResult::Continue)
 }
 
 pub async fn handle_plans_key(
@@ -99,31 +82,53 @@ pub async fn handle_plans_key(
 ) -> anyhow::Result<InputResult> {
     let mut st = state.lock().await;
 
-    let rows_len = st.plans_view.flatten_items().len();
+    let primary_mod = st.tui_config.input.primary_modifier;
+    let is_ctrl_alt = key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL)
+        && key.modifiers.contains(crossterm::event::KeyModifiers::ALT);
+    let is_primary = !is_ctrl_alt && primary_mod.matches(key.modifiers);
+    let is_ctrl = key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL);
+
+    let is_ctrl_n = !is_ctrl_alt
+        && (is_ctrl || is_primary)
+        && matches!(key.code, KeyCode::Char('n') | KeyCode::Char('N'));
+    let is_ctrl_p = !is_ctrl_alt
+        && (is_ctrl || is_primary)
+        && matches!(key.code, KeyCode::Char('p') | KeyCode::Char('P'));
+
+    if is_ctrl_n {
+        st.plans_view.accordion_navigate(true);
+        return Ok(InputResult::Continue);
+    }
+    if is_ctrl_p {
+        st.plans_view.accordion_navigate(false);
+        return Ok(InputResult::Continue);
+    }
+
+    let rows_len = st.plans_view.flatten_rows().len();
 
     match key.code {
         KeyCode::Esc | KeyCode::Char('q') => {
             st.view_mode = ViewMode::Develop;
         }
-        KeyCode::Up | KeyCode::Char('k') | KeyCode::Char('p') => {
-            if st.plans_view.selected_item_index > 0 {
-                st.plans_view.selected_item_index -= 1;
+        KeyCode::Up | KeyCode::Char('p') | KeyCode::Char('P') if !is_ctrl && !is_primary => {
+            if st.plans_view.selected_index > 0 {
+                st.plans_view.selected_index -= 1;
                 st.plans_view.scroll_to_selected();
             }
         }
-        KeyCode::Down | KeyCode::Char('j') | KeyCode::Char('n') => {
-            if rows_len > 0 && st.plans_view.selected_item_index + 1 < rows_len {
-                st.plans_view.selected_item_index += 1;
+        KeyCode::Down | KeyCode::Char('n') | KeyCode::Char('N') if !is_ctrl && !is_primary => {
+            if rows_len > 0 && st.plans_view.selected_index + 1 < rows_len {
+                st.plans_view.selected_index += 1;
                 st.plans_view.scroll_to_selected();
             }
         }
         KeyCode::Home => {
-            st.plans_view.selected_item_index = 0;
+            st.plans_view.selected_index = 0;
             st.plans_view.scroll_to_selected();
         }
         KeyCode::End => {
             if rows_len > 0 {
-                st.plans_view.selected_item_index = rows_len - 1;
+                st.plans_view.selected_index = rows_len - 1;
                 st.plans_view.scroll_to_selected();
             }
         }
@@ -136,185 +141,147 @@ pub async fn handle_plans_key(
             let max = (st.plans_view.rendered_lines as u16).saturating_sub(st.plans_view.view_height);
             st.plans_view.scroll = st.plans_view.scroll.saturating_add(page).min(max);
         }
-        KeyCode::Tab => {
+        KeyCode::Tab | KeyCode::Char(' ') => {
             let sel_row = st.plans_view.selected_row();
             if let Some(row) = sel_row {
-                if row.is_expandable {
-                    st.plans_view.toggle_expanded(&row.item_id);
-                    st.plans_view.clamp_selection();
-                    st.plans_view.scroll_to_selected();
-                }
-            }
-        }
-        KeyCode::Enter => {
-            if st.plans_view.current_plan.is_none() {
-                if let Some(target) = st.plans_view.plans_list.get(st.plans_view.selected_plan_index).cloned() {
-                    st.plans_view.active_plan_id = Some(target.id.clone());
-                    st.plans_view.reset_view_for_new_plan();
-                    drop(st);
-                    switch_plan(target.id, server_writer).await?;
-                    return Ok(InputResult::Continue);
-                }
-            } else {
-                let sel_row = st.plans_view.selected_row();
-                if let Some(row) = sel_row {
-                    if row.is_expandable {
-                        st.plans_view.toggle_expanded(&row.item_id);
+                match row {
+                    VisiblePlanRow::PlanHeader { plan_id, .. } => {
+                        st.plans_view.toggle_plan_expanded(&plan_id);
                         st.plans_view.clamp_selection();
                         st.plans_view.scroll_to_selected();
-                    } else {
-                        let plan_id = st.plans_view.current_plan.as_ref().map(|p| p.id.clone());
-                        if let Some(plan_id) = plan_id {
-                            let new_checked = !row.checked;
-                            if let Some(plan) = st.plans_view.current_plan.as_mut() {
-                                plan.toggle_item_checked(&row.item_id);
-                            }
-                            let req_id = crate::rpc::allocate_request_id();
-                            crate::rpc::record_optimistic_rollback(
-                                req_id,
-                                crate::rpc::OptimisticRollback::PlanItemChecked {
-                                    plan_id: plan_id.clone(),
-                                    item_id: row.item_id.clone(),
-                                },
-                            );
-                            drop(st);
-                            let params = PlanUpdateItemParams {
-                                plan_id,
-                                item_id: row.item_id,
-                                status: None,
-                                checked: Some(new_checked),
-                            };
-                            crate::rpc::send_request_with_id(
-                                server_writer,
-                                req_id,
-                                methods::PLAN_UPDATE_ITEM,
-                                serde_json::to_value(params)?,
-                            )
-                            .await?;
-                            return Ok(InputResult::Continue);
+                    }
+                    VisiblePlanRow::PlanItem { plan_id, item_id, is_expandable, .. } => {
+                        if is_expandable {
+                            st.plans_view.toggle_item_expanded(&plan_id, &item_id);
+                            st.plans_view.clamp_selection();
+                            st.plans_view.scroll_to_selected();
                         }
                     }
                 }
             }
         }
-        KeyCode::Char(' ') => {
+        KeyCode::Enter => {
             let sel_row = st.plans_view.selected_row();
             if let Some(row) = sel_row {
-                if row.is_expandable {
-                    st.plans_view.toggle_expanded(&row.item_id);
-                    st.plans_view.clamp_selection();
-                    st.plans_view.scroll_to_selected();
+                match row {
+                    VisiblePlanRow::PlanHeader { plan_id, .. } => {
+                        st.plans_view.toggle_plan_expanded(&plan_id);
+                        st.plans_view.clamp_selection();
+                        st.plans_view.scroll_to_selected();
+                    }
+                    VisiblePlanRow::PlanItem {
+                        plan_id,
+                        item_id,
+                        title,
+                        has_children,
+                        ..
+                    } => {
+                        if has_children {
+                            st.plans_view.toggle_item_expanded(&plan_id, &item_id);
+                            st.plans_view.clamp_selection();
+                            st.plans_view.scroll_to_selected();
+                        } else {
+                            execute_scope_action(&mut st, &plan_id, Some(&item_id), &title);
+                        }
+                    }
+                }
+            }
+        }
+        KeyCode::Char('x') | KeyCode::Char('X') => {
+            let sel_row = st.plans_view.selected_row();
+            if let Some(row) = sel_row {
+                match row {
+                    VisiblePlanRow::PlanHeader { plan_id, title, .. } => {
+                        execute_scope_action(&mut st, &plan_id, None, &title);
+                    }
+                    VisiblePlanRow::PlanItem {
+                        plan_id,
+                        item_id,
+                        title,
+                        ..
+                    } => {
+                        execute_scope_action(&mut st, &plan_id, Some(&item_id), &title);
+                    }
+                }
+            }
+        }
+        KeyCode::Char('d') | KeyCode::Char('D') => {
+            let sel_row = st.plans_view.selected_row();
+            if let Some(row) = sel_row {
+                let plan_id = row.plan_id().to_string();
+                if let Some(plan) = st.plans_view.plans.iter().find(|p| p.id == plan_id).cloned() {
+                    let mut focused = Vec::new();
+                    if let VisiblePlanRow::PlanItem { item_id, title, .. } = row {
+                        focused.push((item_id, title));
+                    }
+
+                    st.discuss_plan_dialog = Some(crate::app::DiscussPlanDialogState {
+                        plan_id: plan.id.clone(),
+                        plan_title: plan.title.clone(),
+                        focused_items: focused,
+                        prompt_editor: InputEditor::default(),
+                    });
                 }
             }
         }
         KeyCode::Char('a') | KeyCode::Char('A') => {
-            if st.plans_view.expanded_items.is_empty() {
-                st.plans_view.expand_all();
-            } else {
-                st.plans_view.collapse_all();
-            }
+            st.plans_view.toggle_fold_all();
             st.plans_view.clamp_selection();
             st.plans_view.scroll_to_selected();
         }
-        KeyCode::Left | KeyCode::Char('h') | KeyCode::Char('[') => {
-            drop(st);
-            return switch_to_prev_plan(state, server_writer).await;
-        }
-        KeyCode::Right | KeyCode::Char('l') | KeyCode::Char(']') => {
-            drop(st);
-            return switch_to_next_plan(state, server_writer).await;
-        }
-        KeyCode::Char('x') | KeyCode::Char('X') => {
-            let plan_id = st.plans_view.current_plan.as_ref().map(|p| p.id.clone());
-            let sel_row = st.plans_view.selected_row();
-            if let (Some(plan_id), Some(row)) = (plan_id, sel_row) {
-                let new_checked = !row.checked;
-                if let Some(plan) = st.plans_view.current_plan.as_mut() {
-                    plan.toggle_item_checked(&row.item_id);
-                }
-                let req_id = crate::rpc::allocate_request_id();
-                crate::rpc::record_optimistic_rollback(
-                    req_id,
-                    crate::rpc::OptimisticRollback::PlanItemChecked {
-                        plan_id: plan_id.clone(),
-                        item_id: row.item_id.clone(),
-                    },
-                );
-                drop(st);
-                let params = PlanUpdateItemParams {
-                    plan_id,
-                    item_id: row.item_id,
-                    status: None,
-                    checked: Some(new_checked),
-                };
-                crate::rpc::send_request_with_id(
-                    server_writer,
-                    req_id,
-                    methods::PLAN_UPDATE_ITEM,
-                    serde_json::to_value(params)?,
-                )
-                .await?;
-            }
-        }
         KeyCode::Char('t') | KeyCode::Char('T') | KeyCode::Char('s') | KeyCode::Char('S') => {
-            let plan_id = st.plans_view.current_plan.as_ref().map(|p| p.id.clone());
             let sel_row = st.plans_view.selected_row();
-            if let (Some(plan_id), Some(row)) = (plan_id, sel_row) {
-                let cur_idx = match row.status {
-                    tauqe_protocol::PlanItemStatus::Todo => 0,
-                    tauqe_protocol::PlanItemStatus::InProgress => 1,
-                    tauqe_protocol::PlanItemStatus::Done => 2,
-                    tauqe_protocol::PlanItemStatus::Cancelled => 3,
+            if let Some(VisiblePlanRow::PlanItem { plan_id, item_id, title, status, .. }) = sel_row {
+                let cur_idx = match status {
+                    tauqe_protocol::PlanItemStatus::Discussion => 0,
+                    tauqe_protocol::PlanItemStatus::Todo => 1,
+                    tauqe_protocol::PlanItemStatus::InProgress => 2,
+                    tauqe_protocol::PlanItemStatus::Done => 3,
+                    tauqe_protocol::PlanItemStatus::Cancelled => 4,
                 };
                 st.status_dialog = Some(crate::app::StatusDialogState {
                     target: crate::app::StatusDialogTarget::PlanItem {
                         plan_id,
-                        item_id: row.item_id,
-                        item_title: row.title,
-                        current_status: row.status,
+                        item_id,
+                        item_title: title,
+                        current_status: status,
                     },
                     selected_index: cur_idx,
                 });
             }
         }
-        KeyCode::Delete | KeyCode::Char('D') | KeyCode::Char('d') => {
-            if let Some(plan) = &st.plans_view.current_plan {
-                st.confirm_delete_plan = Some(plan.id.clone());
+        KeyCode::Delete => {
+            let sel_row = st.plans_view.selected_row();
+            if let Some(row) = sel_row {
+                st.confirm_delete_plan = Some(row.plan_id().to_string());
             }
         }
         KeyCode::Char('c') | KeyCode::Char('C') | KeyCode::Char('y') | KeyCode::Char('Y') => {
-            if let Some(plan) = &st.plans_view.current_plan {
-                let md = plan.to_markdown();
-                drop(st);
-                let res = crate::clipboard::copy_to_clipboard(&md);
-                let mut st = state.lock().await;
-                match res {
-                    crate::clipboard::CopyResult::Native => {
-                        st.notify_success("Plan copied to clipboard");
-                    }
-                    crate::clipboard::CopyResult::Osc52Only => {
-                        st.notify_info("Plan sent to terminal clipboard (OSC 52)");
-                    }
-                    crate::clipboard::CopyResult::Failed => {
-                        st.notify_error("Failed to copy plan to clipboard");
+            let sel_row = st.plans_view.selected_row();
+            if let Some(row) = sel_row {
+                let plan_id = row.plan_id();
+                if let Some(plan) = st.plans_view.plans.iter().find(|p| p.id == plan_id) {
+                    let md = plan.to_markdown();
+                    drop(st);
+                    let res = crate::clipboard::copy_to_clipboard(&md);
+                    let mut st = state.lock().await;
+                    match res {
+                        crate::clipboard::CopyResult::Native => {
+                            st.notify_success("Plan copied to clipboard");
+                        }
+                        crate::clipboard::CopyResult::Osc52Only => {
+                            st.notify_info("Plan sent to terminal clipboard (OSC 52)");
+                        }
+                        crate::clipboard::CopyResult::Failed => {
+                            st.notify_error("Failed to copy plan to clipboard");
+                        }
                     }
                 }
             }
         }
         KeyCode::Char('r') | KeyCode::Char('R') => {
-            let active_id = st.plans_view.active_plan_id.clone().or_else(|| {
-                st.plans_view
-                    .plans_list
-                    .get(st.plans_view.selected_plan_index)
-                    .map(|p| p.id.clone())
-            });
             drop(st);
             send_request(server_writer, methods::PLAN_LIST, serde_json::json!({})).await?;
-            let get_params = match active_id {
-                Some(id) => serde_json::json!({ "id": id }),
-                None => serde_json::json!({}),
-            };
-            send_request(server_writer, methods::PLAN_GET, get_params).await?;
         }
         _ => {}
     }

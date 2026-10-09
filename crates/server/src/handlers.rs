@@ -47,8 +47,11 @@ pub async fn handle_request(req: Request, state: &Arc<AppState>) -> Response {
 
         methods::REVIEW_START => review::handle_review_start(req, state).await,
         methods::REVIEW_CANCEL => review::handle_review_cancel(req, state).await,
+        methods::REVIEW_LIST => review::handle_review_list(req, state).await,
         methods::REVIEW_GET => review::handle_review_get(req, state).await,
         methods::REVIEW_UPDATE_ITEM => review::handle_review_update_item(req, state).await,
+        methods::REVIEW_DELETE => review::handle_review_delete(req, state).await,
+        methods::REVIEW_EXECUTE_ITEM => review::handle_review_execute_item(req, state).await,
 
         methods::PLAN_LIST => plan::handle_plan_list(req, state).await,
         methods::PLAN_GET => plan::handle_plan_get(req, state).await,
@@ -56,6 +59,7 @@ pub async fn handle_request(req: Request, state: &Arc<AppState>) -> Response {
         methods::PLAN_UPDATE_ITEM => plan::handle_plan_update_item(req, state).await,
         methods::PLAN_DELETE => plan::handle_plan_delete(req, state).await,
         methods::PLAN_SET_ACTIVE => plan::handle_plan_set_active(req, state).await,
+        methods::PLAN_EXECUTE_STEP => plan::handle_plan_execute_step(req, state).await,
 
         methods::CONFIG_GET => config::handle_config_get(req, state).await,
         methods::CONFIG_SET => config::handle_config_set(req, state).await,

@@ -3,9 +3,11 @@ use std::path::Path;
 
 use crate::providers::StreamEvent;
 
+pub mod discussion;
 pub mod json;
 pub mod xml;
 
+pub use discussion::DiscussionStreamFilter;
 pub use json::JsonStreamFilter;
 pub use xml::XmlStreamFilter;
 

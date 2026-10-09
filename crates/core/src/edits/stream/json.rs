@@ -428,7 +428,7 @@ fn extract_incomplete_change_op_and_path(
 
 /// Locates the byte offset right after the opening quote of the top-level `"message"`
 /// string value. The scan is depth- and string-aware.
-fn find_message_value_start(buffer: &str) -> Option<usize> {
+pub(crate) fn find_message_value_start(buffer: &str) -> Option<usize> {
     let bytes = buffer.as_bytes();
     let start = buffer.find('{')?;
     let len = bytes.len();
@@ -504,7 +504,7 @@ fn find_message_value_start(buffer: &str) -> Option<usize> {
 }
 
 /// Helper function to scan unescaped characters of the "message" string property in raw JSON.
-fn extract_streamed_message(
+pub(crate) fn extract_streamed_message(
     buffer: &str,
     already_streamed: usize,
 ) -> (Option<String>, usize, bool) {

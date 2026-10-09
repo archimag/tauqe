@@ -73,6 +73,16 @@ pub async fn switch_view(
             )
             .await?;
         }
+    } else if target_mode == ViewMode::Review {
+        st.view_mode = ViewMode::Review;
+        if st.review.sessions.is_empty() {
+            send_request(
+                server_writer,
+                methods::REVIEW_LIST,
+                serde_json::json!({}),
+            )
+            .await?;
+        }
     } else {
         st.view_mode = target_mode;
     }
@@ -96,7 +106,7 @@ pub fn is_text_input_active(st: &AppState) -> bool {
             && !dialog.applying
             && (dialog.custom_input_active || dialog.focus == SquashDialogFocus::MessageEditor);
     }
-    if st.review_dialog.is_some() {
+    if st.review_dialog.is_some() || st.discuss_plan_dialog.is_some() || st.discuss_review_dialog.is_some() {
         return true;
     }
     if st.show_help
@@ -105,6 +115,9 @@ pub fn is_text_input_active(st: &AppState) -> bool {
         || st.confirm_quit
         || st.confirm_clear_history
         || st.confirm_delete_plan.is_some()
+        || st.confirm_delete_review.is_some()
+        || st.confirm_execute_scope.is_some()
+        || st.confirm_execute_review.is_some()
         || st.selection_dialog.is_some()
         || st.status_dialog.is_some()
         || st.context_view.confirm_clear_auto
@@ -163,7 +176,8 @@ pub fn handle_editor_key(
                 'b' => { editor.move_backward(); return true; }
                 'f' => { editor.move_forward(); return true; }
                 'd' => { editor.delete_forward(); return true; }
-                'j' if multiline => { editor.insert_char('\n'); return true; }
+                'j' | 'n' if multiline => { editor.insert_char('\n'); return true; }
+                'p' if multiline => { editor.move_line_up(); return true; }
                 _ => {}
             }
         }
@@ -248,6 +262,18 @@ pub fn handle_paste(st: &mut AppState, text: &str) {
         return;
     }
 
+    // 2b. Discuss plan dialog modal layer
+    if let Some(dialog) = st.discuss_plan_dialog.as_mut() {
+        dialog.prompt_editor.insert_paste(text);
+        return;
+    }
+
+    // 2c. Discuss review dialog modal layer
+    if let Some(dialog) = st.discuss_review_dialog.as_mut() {
+        dialog.prompt_editor.insert_paste(text);
+        return;
+    }
+
     // 3. Blocking modals absorb paste without forwarding to background
     if st.show_help
         || st.confirm_undo
@@ -255,6 +281,9 @@ pub fn handle_paste(st: &mut AppState, text: &str) {
         || st.confirm_quit
         || st.confirm_clear_history
         || st.confirm_delete_plan.is_some()
+        || st.confirm_delete_review.is_some()
+        || st.confirm_execute_scope.is_some()
+        || st.confirm_execute_review.is_some()
         || st.selection_dialog.is_some()
         || st.status_dialog.is_some()
         || st.context_view.confirm_clear_auto
@@ -589,10 +618,18 @@ mod tests {
             confirm_undo: false,
             confirm_clear_history: false,
             confirm_delete_plan: None,
+            confirm_delete_review: None,
+            confirm_execute_scope: None,
+            confirm_execute_review: None,
+            plan_batch_queue: None,
+            review_batch_queue: None,
+            active_review_step: None,
             confirm_button: ConfirmDialogButton::Cancel,
             selection_dialog: None,
             status_dialog: None,
             squash_dialog: None,
+            discuss_plan_dialog: None,
+            discuss_review_dialog: None,
             server_disconnected: None,
             server_log_path: std::path::PathBuf::from(".tauqe/server.log"),
             last_model_height: 10,
@@ -660,6 +697,60 @@ mod tests {
         assert_eq!(
             st.squash_dialog.as_ref().unwrap().custom_editor.get_text(),
             "feature/my-branch"
+        );
+        assert_eq!(st.input_editor.get_text(), "");
+    }
+
+    #[test]
+    fn test_is_text_input_active_in_discuss_plan_dialog() {
+        let mut st = test_state();
+        st.view_mode = ViewMode::Plans;
+        assert!(!is_text_input_active(&st));
+
+        st.discuss_plan_dialog = Some(DiscussPlanDialogState {
+            plan_id: "test".to_string(),
+            plan_title: "Test".to_string(),
+            focused_items: Vec::new(),
+            prompt_editor: crate::editor::InputEditor::default(),
+        });
+        assert!(is_text_input_active(&st));
+    }
+
+    #[test]
+    fn test_handle_editor_key_newline_shortcuts() {
+        let mut editor = crate::editor::InputEditor::default();
+        editor.insert_str("line 1");
+
+        // C-j inserts newline
+        let key_cj = KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL);
+        assert!(handle_editor_key(&mut editor, key_cj, true, true));
+        assert_eq!(editor.get_text(), "line 1\n");
+
+        // C-n inserts newline
+        let key_cn = KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL);
+        assert!(handle_editor_key(&mut editor, key_cn, true, true));
+        assert_eq!(editor.get_text(), "line 1\n\n");
+
+        // Alt+Enter inserts newline
+        let key_alt_enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT);
+        assert!(handle_editor_key(&mut editor, key_alt_enter, false, true));
+        assert_eq!(editor.get_text(), "line 1\n\n\n");
+    }
+
+    #[test]
+    fn test_handle_paste_into_discuss_plan_dialog() {
+        let mut st = test_state();
+        st.view_mode = ViewMode::Plans;
+        st.discuss_plan_dialog = Some(DiscussPlanDialogState {
+            plan_id: "p1".to_string(),
+            plan_title: "Plan 1".to_string(),
+            focused_items: Vec::new(),
+            prompt_editor: crate::editor::InputEditor::default(),
+        });
+        handle_paste(&mut st, "русский текст с переносом\nвторая строка");
+        assert_eq!(
+            st.discuss_plan_dialog.as_ref().unwrap().prompt_editor.get_text(),
+            "русский текст с переносом\nвторая строка"
         );
         assert_eq!(st.input_editor.get_text(), "");
     }

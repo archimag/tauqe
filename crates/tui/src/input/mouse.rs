@@ -345,6 +345,71 @@ pub async fn handle_mouse_event(
                 return Ok(InputResult::Continue);
             }
 
+            // 2b. Discuss plan dialog hit-testing
+            if let Some(dialog) = st.discuss_plan_dialog.clone() {
+                let area = crate::ui::centered_rect(68, 56, term_rect);
+                let inner_y = area.y + 1;
+                let inner_h = area.height.saturating_sub(2);
+                let inner_x = area.x + 1;
+                let inner_w = area.width.saturating_sub(2);
+                let btn_y = inner_y + inner_h.saturating_sub(3);
+                let start_x = inner_x + (inner_w.saturating_sub(52)) / 2;
+                let confirm_btn = Rect::new(start_x, btn_y, 30, 1);
+                let cancel_btn = Rect::new(start_x + 34, btn_y, 18, 1);
+
+                if rect_contains(confirm_btn, mouse.column, mouse.row) {
+                    st.discuss_plan_dialog = None;
+                    let user_comment = dialog.prompt_editor.get_text().trim().to_string();
+                    if !user_comment.is_empty() {
+                        if let Some(plan) = st.plans_view.plans.iter().find(|p| p.id == dialog.plan_id).cloned() {
+                            let focused_ids: Vec<String> = dialog.focused_items.iter().map(|(id, _)| id.clone()).collect();
+                            let prompt = tauqe_protocol::plan::format_plan_discussion_prompt(
+                                &plan,
+                                &focused_ids,
+                                &user_comment,
+                            );
+                            st.view_mode = ViewMode::Develop;
+                            st.model.reasoning.clear();
+                            st.model.text.clear();
+                            st.model.markdown_lines.clear();
+                            st.model.error = None;
+                            st.model.result = None;
+                            st.model.usage = None;
+                            st.model.scroll = 0;
+                            st.model.status = "awaiting".to_string();
+                            st.model.auto_scroll = true;
+                            st.model.current_cost = Some(0.0);
+                            st.model.edits_active = false;
+                            st.model.files.clear();
+                            st.model.selected_file_index = 0;
+                            st.model.edit_final_applied = None;
+                            st.model.edit_final_error = None;
+                            st.model.last_commit_hash = None;
+                            st.model.last_commit_summary = None;
+                            st.model.toolchain_command = None;
+                            st.model.toolchain_status = None;
+                            st.model.copy_flash = None;
+                            st.model.code_blocks.clear();
+                            st.turn_started_at = Some(std::time::Instant::now());
+
+                            drop(st);
+                            send_request(
+                                server_writer,
+                                methods::MODEL_ASK,
+                                serde_json::json!({ "prompt": prompt }),
+                            )
+                            .await?;
+                            return Ok(InputResult::Continue);
+                        }
+                    }
+                } else if rect_contains(cancel_btn, mouse.column, mouse.row) || !rect_contains(area, mouse.column, mouse.row) {
+                    st.discuss_plan_dialog = None;
+                    return Ok(InputResult::Continue);
+                } else {
+                    return Ok(InputResult::Continue);
+                }
+            }
+
             // 3. Review launch dialog hit-testing
             if let Some(dialog) = st.review_dialog.clone() {
                 let area = crate::ui::centered_rect(64, 54, term_rect);
@@ -439,6 +504,84 @@ pub async fn handle_mouse_event(
                     }
                     ModalHit::Cancel | ModalHit::Outside => {
                         st.confirm_undo = false;
+                    }
+                    ModalHit::InsideBody => {}
+                }
+                return Ok(InputResult::Continue);
+            }
+
+            if let Some(target) = st.confirm_execute_scope.clone() {
+                let is_single = target.steps.len() == 1;
+                let c_label = if is_single {
+                    "Execute (Enter)"
+                } else {
+                    "Execute Scope (Enter)"
+                };
+                let body_count = if is_single { 7 } else { 8 + target.steps.len().min(4) };
+                let geom = crate::ui::dialogs::confirm_modal_geometry(
+                    term_rect, 66, body_count, c_label, "Cancel (Esc)",
+                );
+                match check_confirm_hit(&geom, mouse.column, mouse.row) {
+                    ModalHit::Confirm => {
+                        st.confirm_execute_scope = None;
+                        let first_step = match target.steps.first() {
+                            Some(s) => s.clone(),
+                            None => return Ok(InputResult::Continue),
+                        };
+
+                        if target.steps.len() > 1 {
+                            st.plan_batch_queue = Some(crate::app::PlanBatchQueue {
+                                plan_id: target.plan_id.clone(),
+                                plan_title: target.plan_title.clone(),
+                                scope_title: target.scope_title.clone(),
+                                steps: target.steps.clone(),
+                                current_index: 0,
+                            });
+                        } else {
+                            st.plan_batch_queue = None;
+                        }
+
+                        if let Some(plan) = st.plans_view.plans.iter_mut().find(|p| p.id == target.plan_id) {
+                            plan.update_item_status(&first_step.id, tauqe_protocol::PlanItemStatus::InProgress);
+                        }
+                        st.view_mode = ViewMode::Develop;
+                        st.model.reasoning.clear();
+                        st.model.text.clear();
+                        st.model.markdown_lines.clear();
+                        st.model.error = None;
+                        st.model.result = None;
+                        st.model.usage = None;
+                        st.model.scroll = 0;
+                        st.model.status = "awaiting".to_string();
+                        st.model.auto_scroll = true;
+                        st.model.current_cost = Some(0.0);
+                        st.model.edits_active = false;
+                        st.model.files.clear();
+                        st.model.selected_file_index = 0;
+                        st.model.edit_final_applied = None;
+                        st.model.edit_final_error = None;
+                        st.model.last_commit_hash = None;
+                        st.model.last_commit_summary = None;
+                        st.model.toolchain_command = None;
+                        st.model.toolchain_status = None;
+                        st.model.copy_flash = None;
+                        st.model.code_blocks.clear();
+                        st.turn_started_at = Some(std::time::Instant::now());
+
+                        drop(st);
+                        let params = tauqe_protocol::PlanExecuteStepParams {
+                            plan_id: target.plan_id,
+                            step_id: first_step.id,
+                        };
+                        send_request(
+                            server_writer,
+                            methods::PLAN_EXECUTE_STEP,
+                            serde_json::to_value(params)?,
+                        )
+                        .await?;
+                    }
+                    ModalHit::Cancel | ModalHit::Outside => {
+                        st.confirm_execute_scope = None;
                     }
                     ModalHit::InsideBody => {}
                 }

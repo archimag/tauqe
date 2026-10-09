@@ -1,5 +1,12 @@
 use crate::context::ContextFileContent;
-use tauqe_protocol::ReviewItem;
+
+pub use tauqe_protocol::review::{
+    extract_review_step_execution_id, extract_review_step_execution_target,
+    format_review_discussion_prompt, format_review_discussion_prompt_items,
+    format_review_step_execution_prompt, is_discussion_prompt, is_review_discussion_prompt,
+    is_review_step_execution_prompt, ReviewStepTarget, REVIEW_DISCUSSION_PREFIX,
+    REVIEW_STEP_EXECUTION_PREFIX,
+};
 
 /// Builds the system prompt for the isolated code review session.
 /// Focuses purely on architectural soundness, safety, edge cases, and performance.
@@ -71,36 +78,4 @@ pub fn build_review_user_prompt(
     out
 }
 
-/// Formats active (checked) review findings for injection into the Develop prompt.
-pub fn format_active_review_findings(items: &[ReviewItem]) -> Option<String> {
-    let checked: Vec<&ReviewItem> = items.iter().filter(|i| i.is_checked).collect();
-    if checked.is_empty() {
-        return None;
-    }
-
-    let mut out = String::new();
-    out.push_str("<active_review_findings>\n");
-    out.push_str("The developer selected the following code review findings to address in this turn. Focus on resolving them cleanly:\n\n");
-
-    for item in checked {
-        let file_info = match (&item.file_path, item.line_range) {
-            (Some(path), Some((start, end))) if start == end => format!(" ({}:{})", path, start),
-            (Some(path), Some((start, end))) => format!(" ({}:{}-{})", path, start, end),
-            (Some(path), None) => format!(" ({})", path),
-            (None, _) => String::new(),
-        };
-
-        out.push_str(&format!(
-            "- [{:?}] {}{}:\n",
-            item.severity, item.title, file_info
-        ));
-
-        for line in item.body.lines() {
-            out.push_str(&format!("  {}\n", line));
-        }
-        out.push('\n');
-    }
-
-    out.push_str("</active_review_findings>");
-    Some(out)
-}
+    

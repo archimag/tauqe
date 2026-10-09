@@ -203,12 +203,7 @@ pub fn render_header(frame: &mut ratatui::Frame, state: &mut AppState, area: Rec
     let avail_for_left = inner_header_width.saturating_sub(right_width + 1);
 
     let ctx_count = state.context.items.len();
-    let plans_count = state
-        .plans_view
-        .current_plan
-        .as_ref()
-        .map(|p| p.stats().checked)
-        .unwrap_or(0);
+    let plans_count = state.plans_view.plans.len();
 
     let tabs = [
         (ViewMode::Develop, ClickTarget::DevelopTab),
@@ -383,11 +378,19 @@ mod tests {
             confirm_undo: false,
             confirm_clear_history: false,
             confirm_delete_plan: None,
+            confirm_delete_review: None,
+            confirm_execute_scope: None,
+            confirm_execute_review: None,
+            plan_batch_queue: None,
+            review_batch_queue: None,
+            active_review_step: None,
             confirm_button: crate::app::ConfirmDialogButton::Cancel,
             selection_dialog: None,
             status_dialog: None,
             squash_dialog: None,
             review_dialog: None,
+            discuss_plan_dialog: None,
+            discuss_review_dialog: None,
             notification: None,
             turn_started_at: None,
             server_disconnected: None,

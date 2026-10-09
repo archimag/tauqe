@@ -20,17 +20,10 @@ pub enum OptimisticRollback {
         item_id: u32,
         prev_status: tauqe_protocol::ReviewStatus,
     },
-    ReviewItemChecked {
-        item_id: u32,
-    },
     PlanItemStatus {
         plan_id: String,
         item_id: String,
         prev_status: tauqe_protocol::PlanItemStatus,
-    },
-    PlanItemChecked {
-        plan_id: String,
-        item_id: String,
     },
     ActiveModel {
         prev_model: ModelRef,

@@ -9,8 +9,9 @@ pub use utils::{
     normalize_content, parse_context_request_spec, resolve_target_path, resolve_target_path_for_op,
 };
 pub use xml::{
-    generate_turn_marker, has_xml_edit_tags, MarkedXmlEditProtocol, VerifyOnSuccess, VerifyRequest,
-    VerifyTarget, XmlEditProtocol,
+    extract_plan_step_done, generate_turn_marker, has_xml_edit_tags, MarkedXmlEditProtocol,
+    PlanStepDone, strip_plan_step_done_tags, VerifyOnSuccess, VerifyRequest, VerifyTarget,
+    XmlEditProtocol,
 };
 
 /// A file the model asks to be added to the context before it proposes edits.
@@ -56,6 +57,11 @@ pub trait EditProtocol: Send + Sync {
         _raw_text: &str,
     ) -> (Vec<crate::edits::protocol::xml::tags::ParsedPlanTag>, Vec<String>) {
         (Vec::new(), Vec::new())
+    }
+
+    /// Extracts plan step completion signals (<plan_step_done>) from raw output.
+    fn parse_plan_step_done(&self, _raw_text: &str) -> Vec<PlanStepDone> {
+        Vec::new()
     }
 
     /// Cleans model output for presentation and history by stripping edit blocks and protocol control tags.

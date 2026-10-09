@@ -1,7 +1,9 @@
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
-use tauqe_protocol::{Plan, PlanItem, PlanItemStatus, PlanSummary};
+use tauqe_protocol::{
+    DiscussionPlanAction, DiscussionPlanUpdate, Plan, PlanItem, PlanItemStatus, PlanSummary,
+};
 
 pub struct PlanStorage;
 
@@ -77,6 +79,7 @@ impl PlanStorage {
             .with_context(|| format!("Failed to read plan file at {}", file_path.display()))?;
         let plan: Plan = serde_json::from_str(&content)
             .with_context(|| format!("Failed to parse plan JSON at {}", file_path.display()))?;
+
         Ok(Some(plan))
     }
 
@@ -191,13 +194,12 @@ impl PlanStorage {
         Ok(())
     }
 
-    /// Updates status or checked state of a plan item recursively.
+    /// Updates status of a plan item recursively.
     pub fn update_item(
         repo_root: &Path,
         plan_id: &str,
         item_id: &str,
         status: Option<PlanItemStatus>,
-        checked: Option<bool>,
     ) -> Result<Option<Plan>> {
         let mut plan = match Self::load_plan(repo_root, plan_id)? {
             Some(p) => p,
@@ -208,27 +210,24 @@ impl PlanStorage {
             items: &mut [PlanItem],
             target_id: &str,
             status: Option<PlanItemStatus>,
-            checked: Option<bool>,
         ) -> bool {
             for item in items {
                 if item.id.eq_ignore_ascii_case(target_id) {
                     if let Some(s) = status {
                         item.status = s;
                     }
-                    if let Some(c) = checked {
-                        item.checked = c;
-                    }
                     return true;
                 }
-                if visit_mut(&mut item.children, target_id, status, checked) {
+                if visit_mut(&mut item.children, target_id, status) {
                     return true;
                 }
             }
             false
         }
 
-        let updated = visit_mut(&mut plan.items, item_id, status, checked);
+        let updated = visit_mut(&mut plan.items, item_id, status);
         if updated {
+            plan.refresh_parent_statuses();
             plan.updated_at = SystemTime::now()
                 .duration_since(SystemTime::UNIX_EPOCH)
                 .unwrap_or_default()
@@ -281,6 +280,7 @@ impl PlanStorage {
                     if !tag.items.is_empty() {
                         plan.items = tag.items;
                     }
+                    plan.refresh_parent_statuses();
                     plan.updated_at = now;
                     match Self::save_plan(repo_root, &plan) {
                         Ok(()) => {
@@ -296,6 +296,13 @@ impl PlanStorage {
                 }
                 "update" => {
                     if let Some(mut plan) = matched_plan.or_else(|| Self::load_plan(repo_root, &tag.id).ok().flatten()) {
+                        if let Some(t) = tag.title {
+                            plan.title = t;
+                        }
+                        if tag.description.is_some() {
+                            plan.description = tag.description;
+                        }
+
                         fn update_single(items: &mut [PlanItem], update: &PlanItem) -> bool {
                             for item in items.iter_mut() {
                                 if item.id.eq_ignore_ascii_case(&update.id) {
@@ -305,9 +312,6 @@ impl PlanStorage {
                                     }
                                     if !update.title.is_empty() {
                                         item.title = update.title.clone();
-                                    }
-                                    if update.checked {
-                                        item.checked = update.checked;
                                     }
                                     return true;
                                 }
@@ -332,6 +336,7 @@ impl PlanStorage {
                             ));
                         }
 
+                        plan.refresh_parent_statuses();
                         plan.updated_at = now;
                         match Self::save_plan(repo_root, &plan) {
                             Ok(()) => {
@@ -374,6 +379,45 @@ impl PlanStorage {
 PlanApplicationOutcome { applied, errors }
     }
 
+    /// Applies a structured `DiscussionPlanUpdate` directly to local plan storage.
+    pub fn apply_discussion_plan_update(
+        repo_root: &Path,
+        update: &DiscussionPlanUpdate,
+    ) -> PlanApplicationOutcome {
+        let all_plans = Self::load_all(repo_root).unwrap_or_default();
+        let active_id = Self::load_active_id(repo_root).ok().flatten();
+        let plan_id = update
+            .id
+            .as_deref()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+            .or_else(|| {
+                crate::plan::matcher::resolve_plan_id("", &all_plans, active_id.as_deref())
+                    .map(|p| p.id.clone())
+            })
+            .or(active_id)
+            .unwrap_or_else(|| "default".to_string());
+
+        let action = if update.action == DiscussionPlanAction::Update
+            && all_plans.is_empty()
+            && Self::load_plan(repo_root, &plan_id).ok().flatten().is_none()
+        {
+            "save".to_string()
+        } else {
+            update.action.to_string()
+        };
+
+        let parsed_tag = crate::edits::protocol::xml::tags::ParsedPlanTag {
+            action,
+            id: plan_id,
+            title: update.title.clone(),
+            description: update.description.clone(),
+            items: update.items.clone(),
+        };
+        Self::apply_parsed_plans(repo_root, vec![parsed_tag], Vec::new())
+    }
+
     /// Applies plan tags (`<plan>...</plan>`) from model output to local storage.
     pub fn apply_plan_tags(repo_root: &Path, text: &str) -> PlanApplicationOutcome {
 let (parsed, errors) = crate::edits::protocol::xml::tags::parse_plan_tags_with_diagnostics(text);
@@ -410,13 +454,11 @@ mod tests {
                     title: "Models".to_string(),
                     details: None,
                     status: PlanItemStatus::Todo,
-                    checked: false,
                     children: vec![PlanItem {
                         id: "1.1".to_string(),
                         title: "Token struct".to_string(),
                         details: None,
                         status: PlanItemStatus::Todo,
-                        checked: false,
                         children: vec![],
                     }],
                 },
@@ -425,7 +467,6 @@ mod tests {
                     title: "Endpoint".to_string(),
                     details: None,
                     status: PlanItemStatus::Todo,
-                    checked: false,
                     children: vec![],
                 },
             ],
@@ -450,13 +491,11 @@ mod tests {
             "auth-flow",
             "1.1",
             Some(PlanItemStatus::Done),
-            Some(true),
         )
         .unwrap()
         .unwrap();
 
         assert_eq!(updated.items[0].children[0].status, PlanItemStatus::Done);
-        assert!(updated.items[0].children[0].checked);
 
         // 5. Active plan marker
         PlanStorage::save_active_id(root, Some("auth-flow")).unwrap();
@@ -537,7 +576,6 @@ Step 1 is done:
                 title: "T".to_string(),
                 details: None,
                 status: PlanItemStatus::Todo,
-                checked: false,
                 children: vec![],
             }],
         };
@@ -548,5 +586,49 @@ Step 1 is done:
         assert_eq!(res_item.applied.len(), 1);
         assert_eq!(res_item.errors.len(), 1);
         assert!(res_item.errors[0].contains("Item(s) '99' not found in plan 'my-plan'"));
+    }
+
+    #[test]
+    fn test_apply_discussion_plan_update() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+
+        let update = DiscussionPlanUpdate {
+            action: DiscussionPlanAction::Save,
+            id: Some("structured-auth".to_string()),
+            title: Some("Structured Auth".to_string()),
+            description: Some("Implement auth via structured output".to_string()),
+            items: vec![PlanItem {
+                id: "1".to_string(),
+                title: "Protocol types".to_string(),
+                details: Some("Schemas and filters".to_string()),
+                status: PlanItemStatus::Done,
+                children: vec![],
+            }],
+        };
+
+        let outcome = PlanStorage::apply_discussion_plan_update(root, &update);
+        assert!(outcome.errors.is_empty());
+        assert_eq!(outcome.applied.len(), 1);
+        assert_eq!(outcome.applied[0].id, "structured-auth");
+        assert_eq!(PlanStorage::load_active_id(root).unwrap(), Some("structured-auth".to_string()));
+
+        let update2 = DiscussionPlanUpdate {
+            action: DiscussionPlanAction::Update,
+            id: Some("structured-auth".to_string()),
+            title: None,
+            description: None,
+            items: vec![PlanItem {
+                id: "1".to_string(),
+                title: "Protocol types".to_string(),
+                details: Some("Updated details".to_string()),
+                status: PlanItemStatus::Done,
+                children: vec![],
+            }],
+        };
+
+        let outcome2 = PlanStorage::apply_discussion_plan_update(root, &update2);
+        assert!(outcome2.errors.is_empty());
+        assert_eq!(outcome2.applied[0].items[0].details.as_deref(), Some("Updated details"));
     }
 }

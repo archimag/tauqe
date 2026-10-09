@@ -7,12 +7,15 @@ use tauqe_core::review::{
 };
 use tauqe_protocol::{
     events, Event, ModelUsageEvent, ModelUsageInfo, Request, Response, ReviewContentDeltaEvent,
-    ReviewErrorEvent, ReviewFinishedEvent, ReviewGetResult, ReviewReasoningDeltaEvent,
-    ReviewSession, ReviewStartParams, ReviewStartedEvent, ReviewUpdateItemParams,
-    ReviewUpdateItemResult,
+    ReviewDeleteParams, ReviewDeleteResult, ReviewErrorEvent, ReviewExecuteItemParams,
+    ReviewFinishedEvent, ReviewGetParams, ReviewGetResult, ReviewItemStatus,
+    ReviewListChangedEvent, ReviewListResult, ReviewReasoningDeltaEvent, ReviewSession,
+    ReviewStartParams, ReviewStartedEvent, ReviewUpdateItemParams, ReviewUpdateItemResult,
+    ReviewUpdatedEvent,
 };
 use tokio::sync::{mpsc, watch};
 
+use crate::handlers::model::start_model_turn;
 use crate::state::{next_operation_id, ActiveOperation, AppState};
 use crate::transport::OutChannel;
 
@@ -197,10 +200,21 @@ pub async fn handle_review_start(req: Request, state: &Arc<AppState>) -> Respons
             return;
         }
 
+        let title = params
+            .user_prompt
+            .as_deref()
+            .and_then(|p| p.lines().next())
+            .map(|l| l.trim())
+            .filter(|l| !l.is_empty())
+            .map(|l| l.chars().take(60).collect::<String>())
+            .unwrap_or_else(|| format!("Review {}", created_at));
+
         let session = ReviewSession {
             id: format!("rev-{}", created_at),
+            title,
             created_at,
             model: model.to_string(),
+            description: params.user_prompt.clone(),
             user_prompt: params.user_prompt.clone(),
             target_files,
             items: parse_review_findings(&raw_markdown),
@@ -209,6 +223,24 @@ pub async fn handle_review_start(req: Request, state: &Arc<AppState>) -> Respons
         if let Err(err) = ReviewStorage::save_session(&repo_root, &session) {
             emit_error(&state.out, &op_id, format!("{:#}", err));
             return;
+        }
+
+        emit(
+            &state.out,
+            events::REVIEW_UPDATED,
+            serde_json::to_value(ReviewUpdatedEvent {
+                session: session.clone(),
+            })
+            .ok(),
+        );
+
+        if let Ok(reviews) = ReviewStorage::load_all(&repo_root) {
+            let active_id = ReviewStorage::load_active_id(&repo_root).ok().flatten();
+            emit(
+                &state.out,
+                events::REVIEW_LIST_CHANGED,
+                serde_json::to_value(ReviewListChangedEvent { reviews, active_id }).ok(),
+            );
         }
 
         {
@@ -271,11 +303,88 @@ pub async fn handle_review_cancel(req: Request, state: &Arc<AppState>) -> Respon
     Response::ok(req.id, serde_json::json!({ "cancelled": true }))
 }
 
-pub async fn handle_review_get(req: Request, state: &Arc<AppState>) -> Response {
+pub async fn handle_review_list(req: Request, state: &Arc<AppState>) -> Response {
     let repo_root = state.context.read().await.repo_root().to_path_buf();
-    match ReviewStorage::load_latest(&repo_root) {
-        Ok(session) => Response::ok_typed(req.id, &ReviewGetResult { session }),
-        Err(err) => Response::err(req.id, "REVIEW_LOAD_FAILED", format!("{:#}", err)),
+    match ReviewStorage::load_all(&repo_root) {
+        Ok(reviews) => {
+            let active_id = ReviewStorage::load_active_id(&repo_root).ok().flatten();
+            Response::ok_typed(req.id, &ReviewListResult { reviews, active_id })
+        }
+        Err(err) => Response::err(req.id, "REVIEW_LIST_FAILED", format!("{:#}", err)),
+    }
+}
+
+pub async fn handle_review_get(req: Request, state: &Arc<AppState>) -> Response {
+    let target_id = req.params.and_then(|p| {
+        if let Ok(params) = serde_json::from_value::<ReviewGetParams>(p.clone()) {
+            if let Some(id) = params.id {
+                if !id.trim().is_empty() {
+                    return Some(id);
+                }
+            }
+        }
+        if let Ok(val) = serde_json::from_value::<serde_json::Value>(p) {
+            if let Some(id_str) = val.get("id").and_then(|v| v.as_str()) {
+                if !id_str.trim().is_empty() {
+                    return Some(id_str.to_string());
+                }
+            }
+        }
+        None
+    });
+
+    let repo_root = state.context.read().await.repo_root().to_path_buf();
+    let review_id = match &target_id {
+        Some(id) => Some(id.clone()),
+        None => ReviewStorage::load_active_id(&repo_root)
+            .ok()
+            .flatten()
+            .or_else(|| {
+                ReviewStorage::list_reviews(&repo_root)
+                    .ok()
+                    .and_then(|reviews| reviews.into_iter().next().map(|r| r.id))
+            }),
+    };
+
+    if target_id.is_none() {
+        if let Ok(None) = ReviewStorage::load_active_id(&repo_root) {
+            if let Some(ref id) = review_id {
+                let _ = ReviewStorage::save_active_id(&repo_root, Some(id.as_str()));
+            }
+        }
+    }
+
+    match review_id {
+        Some(id) => match ReviewStorage::load_review(&repo_root, &id) {
+            Ok(session) => Response::ok_typed(req.id, &ReviewGetResult { session }),
+            Err(err) => Response::err(req.id, "REVIEW_GET_FAILED", format!("{:#}", err)),
+        },
+        None => Response::ok_typed(req.id, &ReviewGetResult { session: None }),
+    }
+}
+
+pub async fn handle_review_delete(req: Request, state: &Arc<AppState>) -> Response {
+    let params: ReviewDeleteParams = match req.params.and_then(|p| serde_json::from_value(p).ok()) {
+        Some(p) => p,
+        None => return Response::err(req.id, "INVALID_PARAMS", "Missing or invalid review ID"),
+    };
+
+    let repo_root = state.context.read().await.repo_root().to_path_buf();
+    match ReviewStorage::delete_review(&repo_root, &params.id) {
+        Ok(deleted) => {
+            if deleted {
+                if let Ok(reviews) = ReviewStorage::load_all(&repo_root) {
+                    let active_id = ReviewStorage::load_active_id(&repo_root).ok().flatten();
+                    emit(
+                        &state.out,
+                        events::REVIEW_LIST_CHANGED,
+                        serde_json::to_value(ReviewListChangedEvent { reviews, active_id }).ok(),
+                    );
+                }
+            }
+            Response::ok_typed(req.id, &ReviewDeleteResult { success: deleted })
+        }
+        Err(err) => Response::err(req.id, "REVIEW_DELETE_FAILED", format!("{:#}", err)),
     }
 }
 
@@ -289,22 +398,122 @@ pub async fn handle_review_update_item(req: Request, state: &Arc<AppState>) -> R
     };
 
     let repo_root = state.context.read().await.repo_root().to_path_buf();
-    let result = ReviewStorage::update_item(&repo_root, params.item_id, |item| {
-        if let Some(status) = params.status {
-            item.status = status;
-        }
-        if let Some(is_checked) = params.is_checked {
-            item.is_checked = is_checked;
-        }
-    });
+    let result = ReviewStorage::update_session_item(
+        &repo_root,
+        params.review_id.as_deref(),
+        params.item_id,
+        |item| {
+            if let Some(status) = params.status {
+                item.status = status;
+            }
+        },
+    );
 
     match result {
-        Ok(Some(item)) => Response::ok_typed(req.id, &ReviewUpdateItemResult { item }),
+        Ok(Some(item)) => {
+            let session = match params.review_id.as_deref() {
+                Some(id) => ReviewStorage::load_review(&repo_root, id).ok().flatten(),
+                None => ReviewStorage::load_latest(&repo_root).ok().flatten(),
+            };
+            if let Some(session) = session {
+                emit(
+                    &state.out,
+                    events::REVIEW_UPDATED,
+                    serde_json::to_value(ReviewUpdatedEvent { session }).ok(),
+                );
+            }
+            if let Ok(reviews) = ReviewStorage::load_all(&repo_root) {
+                let active_id = ReviewStorage::load_active_id(&repo_root).ok().flatten();
+                emit(
+                    &state.out,
+                    events::REVIEW_LIST_CHANGED,
+                    serde_json::to_value(ReviewListChangedEvent { reviews, active_id }).ok(),
+                );
+            }
+            Response::ok_typed(req.id, &ReviewUpdateItemResult { item })
+        }
         Ok(None) => Response::err(
             req.id,
             "NOT_FOUND",
-            format!("Review item {} not found", params.item_id),
+            format!("Review item #{} not found", params.item_id),
         ),
         Err(err) => Response::err(req.id, "REVIEW_UPDATE_FAILED", format!("{:#}", err)),
+    }
+}
+
+pub async fn handle_review_execute_item(req: Request, state: &Arc<AppState>) -> Response {
+    let params: ReviewExecuteItemParams = match req.params.and_then(|p| serde_json::from_value(p).ok()) {
+        Some(p) => p,
+        None => return Response::err(req.id, "INVALID_PARAMS", "Missing or invalid review execute item params"),
+    };
+
+    let repo_root = state.context.read().await.repo_root().to_path_buf();
+    let session = match ReviewStorage::load_review(&repo_root, &params.review_id) {
+        Ok(Some(s)) => s,
+        Ok(None) => return Response::err(req.id, "NOT_FOUND", format!("Review session '{}' not found", params.review_id)),
+        Err(err) => return Response::err(req.id, "REVIEW_LOAD_FAILED", format!("{:#}", err)),
+    };
+
+    let item = match session.find_item(params.item_id) {
+        Some(i) => i,
+        None => return Response::err(req.id, "NOT_FOUND", format!("Review item #{} not found in session '{}'", params.item_id, params.review_id)),
+    };
+
+    if item.status == ReviewItemStatus::Discussion {
+        return Response::err(
+            req.id,
+            "ITEM_IN_DISCUSSION",
+            format!("Review item #{} is in DISCUSSION status and cannot be executed autonomously until reviewed (change status to TODO first)", item.id),
+        );
+    }
+
+    if item.status == ReviewItemStatus::Rejected {
+        return Response::err(
+            req.id,
+            "ITEM_REJECTED",
+            format!("Review item #{} is REJECTED and cannot be executed", item.id),
+        );
+    }
+
+    if let Ok(Some(_)) = ReviewStorage::update_session_item_status(
+        &repo_root,
+        Some(&params.review_id),
+        params.item_id,
+        ReviewItemStatus::InProgress,
+    ) {
+        let _ = ReviewStorage::save_active_id(&repo_root, Some(&params.review_id));
+        if let Ok(Some(updated_session)) = ReviewStorage::load_review(&repo_root, &params.review_id) {
+            emit(
+                &state.out,
+                events::REVIEW_UPDATED,
+                serde_json::to_value(ReviewUpdatedEvent { session: updated_session }).ok(),
+            );
+        }
+        if let Ok(reviews) = ReviewStorage::load_all(&repo_root) {
+            let active_id = Some(params.review_id.clone());
+            emit(
+                &state.out,
+                events::REVIEW_LIST_CHANGED,
+                serde_json::to_value(ReviewListChangedEvent { reviews, active_id }).ok(),
+            );
+        }
+    }
+
+    let prompt = match tauqe_core::review::prompt::format_review_step_execution_prompt(&session, params.item_id, "") {
+        Ok(p) => p,
+        Err(err) => return Response::err(req.id, "PROMPT_BUILD_FAILED", err),
+    };
+
+    match start_model_turn(state, prompt).await {
+        Ok(op_id) => Response::ok(req.id, serde_json::json!({
+            "operation_id": op_id,
+            "review_id": params.review_id,
+            "item_id": params.item_id,
+        })),
+        Err(err) => Response {
+            id: req.id,
+            result: None,
+            error: Some(err),
+        },
     }
 }

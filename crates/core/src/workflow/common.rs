@@ -8,7 +8,8 @@ use tauqe_protocol::{ContextAccess, EditOperation, ModelResult};
 use tauqe_protocol::ModelRef;
 
 use crate::context::{ContextFileContent, ContextManager};
-use crate::edits::protocol::generate_turn_marker;
+use crate::edits::protocol::{generate_turn_marker, ContextRequest};
+use crate::edits::stream::EditStreamFilter;
 use crate::edits::{stage_and_validate_edits, EditError, EditProtocol, StagedEditsState};
 use crate::history::{HistoryManager, DEFAULT_HISTORY_BUDGET_TOKENS, DEFAULT_TAIL_TURNS_COUNT};
 use crate::prompt::PromptAssembly;
@@ -23,6 +24,7 @@ use super::lifecycle::WorkflowOptions;
 pub struct ParsedPipelineOutput {
     pub assistant_text: String,
     pub parsed_result: ModelResult,
+    pub discussion_response: Option<tauqe_protocol::DiscussionResponse>,
     pub is_cancelled: bool,
     pub detected_language: Option<String>,
 }
@@ -129,6 +131,7 @@ pub fn record_workflow_response(
     history_manager: &mut HistoryManager,
     result: &ModelResult,
     assistant_text: &str,
+    extra_files: Vec<String>,
 ) {
     match result {
         ModelResult::Answer { text } => {
@@ -145,7 +148,12 @@ pub fn record_workflow_response(
             } else {
                 msg
             };
-            let _ = history_manager.record_response(msg, None, None, vec![]);
+            let summary = if !extra_files.is_empty() {
+                Some(extra_files.join(", "))
+            } else {
+                None
+            };
+            let _ = history_manager.record_response(msg, None, summary, extra_files);
         }
         ModelResult::Edit {
             summary,
@@ -182,6 +190,12 @@ pub fn record_workflow_response(
                 }
             }
 
+            for extra in extra_files {
+                if seen.insert(extra.clone()) {
+                    files.push(extra);
+                }
+            }
+
             let commit = if *applied {
                 commit_hash.clone()
             } else {
@@ -213,9 +227,15 @@ pub async fn execute_edit_pipeline(
     cancel_rx: watch::Receiver<bool>,
     options: &WorkflowOptions,
 ) -> anyhow::Result<ParsedPipelineOutput> {
-    let marker = generate_turn_marker();
-    let marked_protocol = protocol.with_turn_marker(&marker);
+    let marked_protocol = if protocol.turn_marker().is_some() {
+        None
+    } else {
+        let marker = generate_turn_marker();
+        protocol.with_turn_marker(&marker)
+    };
     let protocol: &dyn EditProtocol = marked_protocol.as_deref().unwrap_or(protocol);
+
+    let is_discussion = tauqe_protocol::is_discussion_prompt(prompt);
 
     let mut turn_detected_language: Option<String> = None;
 
@@ -269,7 +289,34 @@ pub async fn execute_edit_pipeline(
     while discovery_round < options.max_discovery_rounds
         && !has_proposed_edits(&pipeline_out.parsed_result)
     {
-        let requests = protocol.parse_context_requests(&pipeline_out.assistant_text);
+        let requests = if is_discussion {
+            let resp = pipeline_out.discussion_response.as_ref().cloned().unwrap_or_else(|| {
+                crate::edits::stream::discussion::DiscussionStreamFilter::parse_response(
+                    &pipeline_out.assistant_text,
+                )
+            });
+            let mut reqs: Vec<ContextRequest> = resp
+                .context_requests
+                .into_iter()
+                .map(|r| ContextRequest {
+                    path: r.path,
+                    access: ContextAccess::ReadOnly,
+                })
+                .collect();
+            if reqs.is_empty() {
+                reqs = protocol
+                    .parse_context_requests(&pipeline_out.assistant_text)
+                    .into_iter()
+                    .map(|mut r| {
+                        r.access = ContextAccess::ReadOnly;
+                        r
+                    })
+                    .collect();
+            }
+            reqs
+        } else {
+            protocol.parse_context_requests(&pipeline_out.assistant_text)
+        };
         let mut new_topics: Vec<&'static str> = Vec::new();
         for topic in protocol.parse_doc_requests(&pipeline_out.assistant_text) {
             let topic = crate::docs::resolve_topic(&topic);
@@ -280,19 +327,23 @@ pub async fn execute_edit_pipeline(
         if requests.is_empty() && new_topics.is_empty() {
             break;
         }
-        let added = if requests.is_empty() {
-            Vec::new()
+        let outcome = if requests.is_empty() {
+            ContextApplicationOutcome::default()
         } else {
             let available_files =
                 crate::git::list_repository_files(Some(&repo_root)).unwrap_or_default();
-            apply_context_requests(
+            apply_context_requests_detailed(
                 context_manager,
                 &requests,
                 &available_files,
                 options.max_auto_files_per_round,
             )
         };
-        if added.is_empty() && new_topics.is_empty() {
+        if outcome.added.is_empty()
+            && outcome.missing.is_empty()
+            && outcome.already_satisfied.is_empty()
+            && new_topics.is_empty()
+        {
             break;
         }
         discovery_round += 1;
@@ -305,10 +356,12 @@ pub async fn execute_edit_pipeline(
             })
             .await;
         tracing::info!(
-            "Discovery round {}: added {} file(s) to auto context: [{}]; documentation topics: [{}]",
+            "Discovery round {}: added {} file(s): [{}]; missing: [{}]; already present: [{}]; doc topics: [{}]",
             discovery_round,
-            added.len(),
-            added.join(", "),
+            outcome.added.len(),
+            outcome.added.join(", "),
+            outcome.missing.join(", "),
+            outcome.already_satisfied.join(", "),
             new_topics.join(", ")
         );
         for topic in &new_topics {
@@ -318,17 +371,41 @@ pub async fn execute_edit_pipeline(
                 crate::docs::get_documentation(topic)
             ));
         }
+        if !outcome.missing.is_empty() {
+            round_prompt.push_str(&format!(
+                "\n\n<context_feedback>\nThe following requested files do not exist in the repository: [{}]\nPlease check <repo_map> for exact existing file paths.\n</context_feedback>",
+                outcome.missing.join(", ")
+            ));
+        }
+        if !outcome.already_satisfied.is_empty() && outcome.added.is_empty() {
+            round_prompt.push_str(&format!(
+                "\n\n<context_feedback>\nThe following files are already loaded in <context> with the requested access level: [{}]\nYou may proceed with inspecting them and proposing edits.\n</context_feedback>",
+                outcome.already_satisfied.join(", ")
+            ));
+        }
 
         let ctx_state = context_manager.get_state();
         let _ = stream_tx.send(StreamEvent::ContextChanged(ctx_state)).await;
 
         let prev_text = std::mem::take(&mut pipeline_out.assistant_text);
         let mut notes = Vec::new();
-        if !added.is_empty() {
+        if !outcome.added.is_empty() {
             notes.push(format!(
                 "Added {} file(s) to context: {}",
-                added.len(),
-                added.join(", ")
+                outcome.added.len(),
+                outcome.added.join(", ")
+            ));
+        }
+        if !outcome.missing.is_empty() {
+            notes.push(format!(
+                "Files not found in repository: {}",
+                outcome.missing.join(", ")
+            ));
+        }
+        if !outcome.already_satisfied.is_empty() && outcome.added.is_empty() {
+            notes.push(format!(
+                "Files already in context: {}",
+                outcome.already_satisfied.join(", ")
             ));
         }
         if !new_topics.is_empty() {
@@ -420,6 +497,27 @@ pub async fn execute_edit_pipeline(
         }
     }
 
+    if is_discussion {
+        let resp = pipeline_out.discussion_response.take().unwrap_or_else(|| {
+            crate::edits::stream::discussion::DiscussionStreamFilter::parse_response(
+                &pipeline_out.assistant_text,
+            )
+        });
+        let final_text = if !resp.message.trim().is_empty() {
+            resp.message.clone()
+        } else {
+            pipeline_out.assistant_text
+        };
+        let _ = stream_tx.send(StreamEvent::Done).await;
+        return Ok(ParsedPipelineOutput {
+            assistant_text: final_text.clone(),
+            parsed_result: ModelResult::Answer { text: final_text },
+            discussion_response: Some(resp),
+            is_cancelled: false,
+            detected_language: turn_detected_language,
+        });
+    }
+
     let (mut current_summary, mut current_edits, initial_proposal) = match &pipeline_out.parsed_result {
         ModelResult::Edit {
             summary,
@@ -477,6 +575,7 @@ pub async fn execute_edit_pipeline(
                     parsed_result: ModelResult::Answer {
                         text: pipeline_out.assistant_text,
                     },
+                    discussion_response: None,
                     is_cancelled: false,
                     detected_language: turn_detected_language,
                 });
@@ -492,6 +591,7 @@ pub async fn execute_edit_pipeline(
                     changed_files: Vec::new(),
                     commit_hash: None,
                 },
+                discussion_response: None,
                 is_cancelled: false,
                 detected_language: turn_detected_language,
             });
@@ -624,6 +724,7 @@ pub async fn execute_edit_pipeline(
             changed_files: Vec::new(),
             commit_hash: None,
         },
+        discussion_response: None,
         is_cancelled: false,
         detected_language: turn_detected_language,
     })
@@ -664,21 +765,30 @@ pub async fn execute_edit_pipeline_step<'a>(
         context_files.sort_by(|a, b| a.path.cmp(&b.path));
     }
 
+    let is_isolated_plan_step = crate::plan::prompt::is_plan_step_execution_prompt(prompt);
+    let is_discussion = tauqe_protocol::is_discussion_prompt(prompt);
+
     if params.record_turn {
-        let _ = compact_history_if_needed_with_budget(
-            history_manager,
-            provider,
-            model,
-            cancel_rx.clone(),
-            options.history_budget_tokens,
-            options.history_tail_turns,
-        )
-        .await;
+        if !is_isolated_plan_step {
+            let _ = compact_history_if_needed_with_budget(
+                history_manager,
+                provider,
+                model,
+                cancel_rx.clone(),
+                options.history_budget_tokens,
+                options.history_tail_turns,
+            )
+            .await;
+        }
         let context_paths: Vec<String> = ctx_state.items.iter().map(|it| it.path.clone()).collect();
         let _ = history_manager.record_turn(prompt, context_paths);
     }
 
-    let history_tag = history_manager.format_history_tag().ok();
+    let history_tag = if is_isolated_plan_step {
+        None
+    } else {
+        history_manager.format_history_tag().ok()
+    };
 
     let editable_paths: Vec<String> = context_files
         .iter()
@@ -709,30 +819,26 @@ pub async fn execute_edit_pipeline_step<'a>(
         repo_map,
     );
     assembly.target_language = params.target_language.map(|s| s.to_string());
-
-    let active_findings = crate::review::ReviewStorage::load_latest(&repo_root)
-        .ok()
-        .flatten()
-        .map(|session| {
-            session
-                .items
-                .into_iter()
-                .filter(|it| it.is_checked)
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    assembly = assembly.with_active_review_findings(active_findings);
-
-    let active_plan = crate::plan::storage::PlanStorage::load_active_id(&repo_root)
-        .ok()
-        .flatten()
-        .and_then(|id| crate::plan::storage::PlanStorage::load_plan(&repo_root, &id).ok().flatten());
-    assembly = assembly.with_active_plan(active_plan);
+    assembly.is_plan_step_execution = is_isolated_plan_step;
+    assembly.is_discussion = is_discussion;
 
     let assembled_messages = assembly.assemble_chat_messages(prompt, protocol);
 
     let (llm_tx, mut llm_rx) = mpsc::channel::<StreamEvent>(100);
-    let response_format = protocol.response_format(&editable_paths);
+    let response_format = if is_discussion {
+        Some(crate::providers::ResponseFormat::JsonSchema {
+            json_schema: crate::providers::JsonSchemaDefinition {
+                name: "discussion_response".to_string(),
+                description: Some(
+                    "Structured response for discussion and planning modes".to_string(),
+                ),
+                schema: tauqe_protocol::DiscussionResponse::schema(),
+                strict: Some(true),
+            },
+        })
+    } else {
+        protocol.response_format(&editable_paths)
+    };
 
     let client_call = provider.stream_chat(
         &model.name,
@@ -748,11 +854,15 @@ pub async fn execute_edit_pipeline_step<'a>(
         .map(|s| s.staged_files.clone())
         .unwrap_or_default();
     let forward_stream_tx = stream_tx.clone();
-    let mut stream_filter = protocol.create_stream_filter(
-        editable_paths_for_filter,
-        repo_root,
-        staged_for_filter,
-    );
+    let mut stream_filter: Box<dyn EditStreamFilter> = if is_discussion {
+        Box::new(crate::edits::stream::discussion::DiscussionStreamFilter::new())
+    } else {
+        protocol.create_stream_filter(
+            editable_paths_for_filter,
+            repo_root,
+            staged_for_filter,
+        )
+    };
     let has_emitted_edits = Arc::new(AtomicBool::new(false));
     let has_emitted_edits_forward = has_emitted_edits.clone();
 
@@ -766,16 +876,28 @@ pub async fn execute_edit_pipeline_step<'a>(
                     assistant_text.push_str(delta);
                     let filtered_events = stream_filter.push_chunk(delta);
                     for ev in filtered_events {
-                        if matches!(
-                            ev,
-                            StreamEvent::EditStarted
-                                | StreamEvent::EditFileStarted { .. }
-                                | StreamEvent::EditHunk { .. }
-                        ) {
-                            has_emitted_edits_forward.store(true, Ordering::SeqCst);
-                        }
-                        if forward_stream_tx.send(ev).await.is_err() {
-                            break;
+                        if is_discussion {
+                            if !matches!(
+                                ev,
+                                StreamEvent::EditStarted
+                                    | StreamEvent::EditFileStarted { .. }
+                                    | StreamEvent::EditHunk { .. }
+                                    | StreamEvent::EditFileDone { .. }
+                            ) && forward_stream_tx.send(ev).await.is_err() {
+                                break;
+                            }
+                        } else {
+                            if matches!(
+                                ev,
+                                StreamEvent::EditStarted
+                                    | StreamEvent::EditFileStarted { .. }
+                                    | StreamEvent::EditHunk { .. }
+                            ) {
+                                has_emitted_edits_forward.store(true, Ordering::SeqCst);
+                            }
+                            if forward_stream_tx.send(ev).await.is_err() {
+                                break;
+                            }
                         }
                     }
                 }
@@ -826,31 +948,43 @@ pub async fn execute_edit_pipeline_step<'a>(
             parsed_result: ModelResult::Answer {
                 text: assistant_text,
             },
+            discussion_response: None,
             is_cancelled: true,
             detected_language: params.target_language.map(|s| s.to_string()),
         });
     }
 
-    let parsed_result = protocol.parse_output(&assistant_text, &editable_paths);
-
-    let parsed_result = if has_emitted_edits.load(Ordering::SeqCst) {
-        match parsed_result {
-            ModelResult::Answer { .. } => ModelResult::Edit {
-                summary: "Edits could not be finalized".to_string(),
-                edits: Vec::new(),
-                proposal: None,
-                applied: false,
-                error: Some(
-                    "Edits were streamed but the final model response could not be parsed into a valid edit proposal"
-                        .to_string(),
-                ),
-                changed_files: Vec::new(),
-                commit_hash: None,
-            },
-            other => other,
-        }
+    let (parsed_result, discussion_response) = if is_discussion {
+        let resp =
+            crate::edits::stream::discussion::DiscussionStreamFilter::parse_response(&assistant_text);
+        let msg = if !resp.message.trim().is_empty() {
+            resp.message.clone()
+        } else {
+            assistant_text.clone()
+        };
+        (ModelResult::Answer { text: msg }, Some(resp))
     } else {
-        parsed_result
+        let parsed = protocol.parse_output(&assistant_text, &editable_paths);
+        let res = if has_emitted_edits.load(Ordering::SeqCst) {
+            match parsed {
+                ModelResult::Answer { .. } => ModelResult::Edit {
+                    summary: "Edits could not be finalized".to_string(),
+                    edits: Vec::new(),
+                    proposal: None,
+                    applied: false,
+                    error: Some(
+                        "Edits were streamed but the final model response could not be parsed into a valid edit proposal"
+                            .to_string(),
+                    ),
+                    changed_files: Vec::new(),
+                    commit_hash: None,
+                },
+                other => other,
+            }
+        } else {
+            parsed
+        };
+        (res, None)
     };
 
     if !has_emitted_edits.load(Ordering::SeqCst) {
@@ -863,12 +997,22 @@ pub async fn execute_edit_pipeline_step<'a>(
         let _ = stream_tx.send(StreamEvent::Done).await;
     }
 
-    let detected_language = protocol.parse_user_language(&assistant_text)
-        .or_else(|| params.target_language.map(|s| s.to_string()));
+    let detected_language = if is_discussion {
+        discussion_response
+            .as_ref()
+            .and_then(|r| r.user_language.clone())
+            .or_else(|| protocol.parse_user_language(&assistant_text))
+            .or_else(|| params.target_language.map(|s| s.to_string()))
+    } else {
+        protocol
+            .parse_user_language(&assistant_text)
+            .or_else(|| params.target_language.map(|s| s.to_string()))
+    };
 
     Ok(ParsedPipelineOutput {
         assistant_text,
         parsed_result,
+        discussion_response,
         is_cancelled: false,
         detected_language,
     })
@@ -1037,7 +1181,7 @@ mod tests {
             commit_hash: Some("1234567".to_string()),
         };
 
-        record_workflow_response(&mut hm, &edit_res, raw_json);
+        record_workflow_response(&mut hm, &edit_res, raw_json, vec![]);
 
         let entries = hm.get_entries().unwrap();
         assert_eq!(entries.len(), 1);
@@ -1078,7 +1222,7 @@ mod tests {
             commit_hash: Some("abcdef1".to_string()),
         };
 
-        record_workflow_response(&mut hm, &edit_res, raw_discovery);
+        record_workflow_response(&mut hm, &edit_res, raw_discovery, vec![]);
 
         let entries = hm.get_entries().unwrap();
         assert_eq!(entries.len(), 1);

@@ -24,13 +24,13 @@ async fn main() -> anyhow::Result<()> {
     let explicit_config = tauqe_core::config::cli_arg_value_from(std::env::args(), "--config");
     let explicit_credentials =
         tauqe_core::config::cli_arg_value_from(std::env::args(), "--credentials");
+    let repo_state = tauqe_core::git::get_repository_state(None);
+    let repo_path = PathBuf::from(&repo_state.root);
     let config = tauqe_core::config::load_config_with_options(tauqe_core::config::ConfigLoadOptions {
-        repo_root: None,
+        repo_root: Some(&repo_path),
         explicit_config: explicit_config.as_deref(),
         explicit_credentials: explicit_credentials.as_deref(),
     });
-    let repo_state = tauqe_core::git::get_repository_state(None);
-    let repo_path = PathBuf::from(&repo_state.root);
 
     let (history_tx, mut history_rx) = tokio::sync::mpsc::unbounded_channel::<UiHistoryItem>();
     let (out, mut out_rx) = OutChannel::new();

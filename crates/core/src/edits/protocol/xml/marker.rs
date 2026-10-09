@@ -20,8 +20,11 @@ pub fn generate_turn_marker() -> String {
 
 pub(super) const XML_TAG_BASES: &[&str] = &[
     "tauqe_edits", "edit", "search", "replace", "create", "delete", "move", "with", "summary",
-    "context_request", "user_language", "verify", "overwrite", "doc_request", "plan",
+    "context_request", "user_language", "verify", "overwrite", "doc_request", "plan_step_done",
+    "plan", "item", "description", "details", "title",
 ];
+
+const PLAN_CHILD_TAGS: &[&str] = &["item", "description", "details", "title", "summary"];
 
 fn literal_prefix(marker: &str) -> String {
     format!("\u{e000}{}\u{e001}", marker)
@@ -78,12 +81,19 @@ pub(crate) fn normalize_marked_xml(text: &str, marker: &str, finished: bool) -> 
         let name_end = name_start + name_len;
         if name_end == text.len() && !finished { break; }
         let name = &text[name_start..name_end];
-        let active = XML_TAG_BASES.iter().copied().find(|base| {
+        let mut active = XML_TAG_BASES.iter().copied().find(|base| {
             name.strip_prefix(base)
                 .and_then(|rest| rest.strip_prefix('_').or_else(|| rest.strip_prefix('-')))
                 .map(|suffix| marker_matches(suffix, marker))
                 .unwrap_or(false)
         });
+        if active.is_none() && (name == "plan_step_done" || stack.contains(&"plan")) {
+            if name == "plan_step_done" {
+                active = Some("plan_step_done");
+            } else if let Some(base) = PLAN_CHILD_TAGS.iter().copied().find(|&base| name == base) {
+                active = Some(base);
+            }
+        }
         let boundary = text[name_end..].chars().next()
             .map(|c| c.is_whitespace() || c == '>' || c == '/')
             .unwrap_or(false);
@@ -107,15 +117,22 @@ pub(crate) fn normalize_marked_xml(text: &str, marker: &str, finished: bool) -> 
                 pos = start + 1;
                 continue;
             };
-            let accepted = !closing || stack.last().copied() == Some(base);
+            let accepted = if closing {
+                if let Some(pos) = stack.iter().rposition(|&s| s == base) {
+                    stack.truncate(pos);
+                    true
+                } else {
+                    false
+                }
+            } else {
+                true
+            };
             if accepted {
                 output.push('<');
                 if closing { output.push('/'); }
                 output.push_str(base);
                 output.push_str(&text[name_end..end]);
-                if closing {
-                    stack.pop();
-                } else if !text[name_end..end].trim_end().ends_with("/>") {
+                if !closing && !text[name_end..end].trim_end().ends_with("/>") {
                     stack.push(base);
                 }
                 pos = end;
@@ -126,4 +143,26 @@ pub(crate) fn normalize_marked_xml(text: &str, marker: &str, finished: bool) -> 
         pos = start + 1;
     }
     output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_normalize_marked_plan_with_unsuffixed_items() {
+        let marker = "M123456";
+        let raw = format!(
+            "Some conversational text\n\
+            <plan_{m} action=\"update\" id=\"my-plan\">\n\
+              <item id=\"2\" status=\"todo\" />\n\
+            </plan_{m}>\n\
+            Trailing text",
+            m = marker
+        );
+        let normalized = normalize_marked_xml(&raw, marker, true);
+        assert!(normalized.contains("<plan action=\"update\" id=\"my-plan\">"));
+        assert!(normalized.contains("<item id=\"2\" status=\"todo\" />"));
+        assert!(normalized.contains("</plan>"));
+    }
 }

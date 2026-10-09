@@ -12,8 +12,9 @@ use tags::{parse_context_request_tags, parse_doc_request_tags};
 
 pub use marker::generate_turn_marker;
 pub use tags::{
-    extract_user_language, extract_verify_request, strip_context_request_tags,
-    strip_doc_request_tags, strip_plan_tags, strip_user_language_tags, strip_verify_tags,
+    extract_plan_step_done, extract_user_language, extract_verify_request,
+    strip_context_request_tags, strip_doc_request_tags, strip_plan_step_done_tags,
+    strip_plan_tags, strip_user_language_tags, strip_verify_tags, PlanStepDone,
     VerifyOnSuccess, VerifyRequest, VerifyTarget,
 };
 pub(crate) use marker::{normalize_marked_xml, restore_xml_literals};
@@ -53,6 +54,10 @@ impl EditProtocol for XmlEditProtocol {
         raw_text: &str,
     ) -> (Vec<tags::ParsedPlanTag>, Vec<String>) {
         tags::parse_plan_tags_with_diagnostics(raw_text)
+    }
+
+    fn parse_plan_step_done(&self, raw_text: &str) -> Vec<PlanStepDone> {
+        tags::extract_plan_step_done(raw_text)
     }
 
     fn clean_assistant_text(&self, raw_text: &str) -> String {
@@ -131,9 +136,9 @@ impl EditProtocol for XmlEditProtocol {
     fn parse_output(&self, raw_text: &str, editable_paths: &[String]) -> ModelResult {
         if !has_xml_edit_tags(raw_text) {
             return ModelResult::Answer {
-                text: strip_plan_tags(&strip_verify_tags(&strip_user_language_tags(
+                text: strip_plan_step_done_tags(&strip_plan_tags(&strip_verify_tags(&strip_user_language_tags(
                     &strip_doc_request_tags(&strip_context_request_tags(raw_text)),
-                ))),
+                )))),
             };
         }
 
@@ -228,6 +233,15 @@ impl EditProtocol for MarkedXmlEditProtocol {
     ) -> (Vec<tags::ParsedPlanTag>, Vec<String>) {
         let normalized = normalize_marked_xml(raw_text, &self.marker, true);
         tags::parse_plan_tags_with_diagnostics(&normalized)
+    }
+
+    fn parse_plan_step_done(&self, raw_text: &str) -> Vec<PlanStepDone> {
+        let from_raw = tags::extract_plan_step_done(raw_text);
+        if !from_raw.is_empty() {
+            return from_raw;
+        }
+        let normalized = normalize_marked_xml(raw_text, &self.marker, true);
+        tags::extract_plan_step_done(&normalized)
     }
 
     fn clean_assistant_text(&self, raw_text: &str) -> String {
@@ -476,6 +490,7 @@ pub fn extract_conversational_text(raw_text: &str) -> String {
     let text = strip_context_request_tags(&text);
     let text = strip_doc_request_tags(&text);
     let text = strip_plan_tags(&text);
+    let text = strip_plan_step_done_tags(&text);
     clean_conversational_lines(&text)
 }
 
@@ -831,12 +846,16 @@ fn find_next_edit_tag(text: &str) -> Option<(TagType, usize)> {
 
 /// Locates an opening tag by base name with support for optional turn marker suffixes (e.g. `<edit_18DC...>`).
 /// Returns the start position and the full matched tag name.
-fn find_base_tag_start(text: &str, tag_base: &str) -> Option<(usize, String)> {
+pub(crate) fn find_base_tag_start(text: &str, tag_base: &str) -> Option<(usize, String)> {
     let prefix = format!("<{}", tag_base);
     let mut search_from = 0;
     while let Some(idx) = text[search_from..].find(&prefix) {
         let abs_idx = search_from + idx;
         let after = &text[abs_idx + prefix.len()..];
+        if tag_base == "plan" && (after.starts_with("_step_done") || after.starts_with("-step_done")) {
+            search_from = abs_idx + prefix.len();
+            continue;
+        }
         let bytes = after.as_bytes();
         let mut i = 0;
         if i < bytes.len() && (bytes[i] == b'_' || bytes[i] == b'-') {
@@ -910,13 +929,26 @@ fn extract_attribute(tag_header: &str, attr: &str) -> Option<String> {
                 let end_quote = rest.find(quote_char)?;
                 let val = &rest[..end_quote];
                 return Some(val.trim().trim_matches('`').to_string());
+            } else if after_eq.starts_with("\\\"") || after_eq.starts_with("\\'") {
+                let quote_str = &after_eq[..2];
+                let rest = &after_eq[2..];
+                if let Some(end_quote) = rest.find(quote_str) {
+                    let val = &rest[..end_quote];
+                    return Some(val.trim().trim_matches('`').to_string());
+                }
             } else {
                 let val: String = after_eq
                     .chars()
                     .take_while(|c| !c.is_whitespace() && *c != '>' && *c != '/')
                     .collect();
                 if !val.is_empty() {
-                    return Some(val.trim_matches('`').to_string());
+                    return Some(
+                        val.trim_matches('`')
+                            .trim_matches('\\')
+                            .trim_matches('"')
+                            .trim_matches('\'')
+                            .to_string(),
+                    );
                 }
             }
         }
@@ -1098,6 +1130,44 @@ Everything is tested and working properly."#;
             }
             _ => panic!("Expected valid edit"),
         }
+    }
+
+    #[test]
+    fn test_marked_xml_ignores_unsuffixed_plan_tags() {
+        let marker = "M12345";
+        let proto = MarkedXmlEditProtocol::new(marker);
+
+        let output = format!(
+            "Here is an example in discussion: <plan action=\"update\" id=\"fake\"><item id=\"1\" /></plan>\n\
+            And here is the real plan:\n\
+            <plan_{m} action=\"save\" id=\"real-plan\" title=\"Real\">\n\
+              <item id=\"1\" title=\"Step 1\" status=\"todo\" />\n\
+            </plan_{m}>",
+            m = marker
+        );
+
+        let (plans, errors) = proto.parse_plan_tags(&output);
+        assert!(errors.is_empty(), "Errors: {:?}", errors);
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0].id, "real-plan");
+    }
+
+    #[test]
+    fn test_marked_xml_clean_assistant_text_preserves_unsuffixed_plan_literals() {
+        let marker = "M12345";
+        let proto = MarkedXmlEditProtocol::new(marker);
+
+        let output = format!(
+            "To update a plan, write: <plan action=\"update\" id=\"my-plan\"><item id=\"1\" status=\"done\" /></plan>\n\
+            <plan_{m} action=\"save\" id=\"real-plan\" title=\"Real\">\n\
+              <item id=\"1\" title=\"Step 1\" status=\"todo\" />\n\
+            </plan_{m}>",
+            m = marker
+        );
+
+        let cleaned = proto.clean_assistant_text(&output);
+        assert!(cleaned.contains("<plan action=\"update\" id=\"my-plan\">"));
+        assert!(!cleaned.contains("real-plan"));
     }
 
     #[test]

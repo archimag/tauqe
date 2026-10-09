@@ -1,9 +1,9 @@
 use std::sync::Arc;
 use tauqe_core::plan::storage::PlanStorage;
 use tauqe_protocol::{
-    events, Event, PlanDeleteParams, PlanGetParams, PlanGetResult, PlanListChangedEvent,
-    PlanListResult, PlanSaveParams, PlanSetActiveParams, PlanUpdateItemParams, PlanUpdatedEvent,
-    Request, Response,
+    events, Event, PlanDeleteParams, PlanExecuteStepParams, PlanGetParams, PlanGetResult,
+    PlanListChangedEvent, PlanListResult, PlanSaveParams, PlanSetActiveParams, PlanUpdateItemParams,
+    PlanUpdatedEvent, Request, Response,
 };
 
 use crate::state::AppState;
@@ -18,16 +18,9 @@ fn emit(out: &OutChannel, method: &str, params: Option<serde_json::Value>) {
 
 pub async fn handle_plan_list(req: Request, state: &Arc<AppState>) -> Response {
     let repo_root = state.context.read().await.repo_root().to_path_buf();
-    match PlanStorage::list_plans(&repo_root) {
+    match PlanStorage::load_all(&repo_root) {
         Ok(plans) => {
-            let mut active_id = PlanStorage::load_active_id(&repo_root).ok().flatten();
-            if active_id.is_none() {
-                if let Some(first) = plans.first() {
-                    active_id = Some(first.id.clone());
-                    let _ = PlanStorage::save_active_id(&repo_root, Some(first.id.as_str()));
-                }
-            }
-            Response::ok_typed(req.id, &PlanListResult { plans, active_id })
+            Response::ok_typed(req.id, &PlanListResult { plans, active_id: None })
         }
         Err(err) => Response::err(req.id, "PLAN_LIST_FAILED", format!("{:#}", err)),
     }
@@ -100,12 +93,11 @@ pub async fn handle_plan_save(req: Request, state: &Arc<AppState>) -> Response {
         .ok(),
     );
 
-    if let Ok(plans) = PlanStorage::list_plans(&repo_root) {
-        let active_id = PlanStorage::load_active_id(&repo_root).ok().flatten();
+    if let Ok(plans) = PlanStorage::load_all(&repo_root) {
         emit(
             &state.out,
             events::PLAN_LIST_CHANGED,
-            serde_json::to_value(PlanListChangedEvent { plans, active_id }).ok(),
+            serde_json::to_value(PlanListChangedEvent { plans, active_id: None }).ok(),
         );
     }
 
@@ -124,7 +116,6 @@ pub async fn handle_plan_update_item(req: Request, state: &Arc<AppState>) -> Res
         &params.plan_id,
         &params.item_id,
         params.status,
-        params.checked,
     ) {
         Ok(Some(plan)) => {
             emit(
@@ -135,12 +126,11 @@ pub async fn handle_plan_update_item(req: Request, state: &Arc<AppState>) -> Res
                 })
                 .ok(),
             );
-            if let Ok(plans) = PlanStorage::list_plans(&repo_root) {
-                let active_id = PlanStorage::load_active_id(&repo_root).ok().flatten();
+            if let Ok(plans) = PlanStorage::load_all(&repo_root) {
                 emit(
                     &state.out,
                     events::PLAN_LIST_CHANGED,
-                    serde_json::to_value(PlanListChangedEvent { plans, active_id }).ok(),
+                    serde_json::to_value(PlanListChangedEvent { plans, active_id: None }).ok(),
                 );
             }
             Response::ok(req.id, serde_json::json!({ "plan": plan }))
@@ -164,12 +154,11 @@ pub async fn handle_plan_delete(req: Request, state: &Arc<AppState>) -> Response
     match PlanStorage::delete_plan(&repo_root, &params.id) {
         Ok(deleted) => {
             if deleted {
-                if let Ok(plans) = PlanStorage::list_plans(&repo_root) {
-                    let active_id = PlanStorage::load_active_id(&repo_root).ok().flatten();
+                if let Ok(plans) = PlanStorage::load_all(&repo_root) {
                     emit(
                         &state.out,
                         events::PLAN_LIST_CHANGED,
-                        serde_json::to_value(PlanListChangedEvent { plans, active_id }).ok(),
+                        serde_json::to_value(PlanListChangedEvent { plans, active_id: None }).ok(),
                     );
                 }
             }
@@ -190,7 +179,7 @@ pub async fn handle_plan_set_active(req: Request, state: &Arc<AppState>) -> Resp
         return Response::err(req.id, "PLAN_SET_ACTIVE_FAILED", format!("{:#}", err));
     }
 
-    if let Ok(plans) = PlanStorage::list_plans(&repo_root) {
+    if let Ok(plans) = PlanStorage::load_all(&repo_root) {
         emit(
             &state.out,
             events::PLAN_LIST_CHANGED,
@@ -203,4 +192,86 @@ pub async fn handle_plan_set_active(req: Request, state: &Arc<AppState>) -> Resp
     }
 
     Response::ok(req.id, serde_json::json!({ "active_id": params.id }))
+}
+
+pub async fn handle_plan_execute_step(req: Request, state: &Arc<AppState>) -> Response {
+    let params: PlanExecuteStepParams = match req.params.and_then(|p| serde_json::from_value(p).ok()) {
+        Some(p) => p,
+        None => return Response::err(req.id, "INVALID_PARAMS", "Missing or invalid plan execute step params"),
+    };
+
+    let repo_root = state.context.read().await.repo_root().to_path_buf();
+    let plan = match PlanStorage::load_plan(&repo_root, &params.plan_id) {
+        Ok(Some(p)) => p,
+        Ok(None) => return Response::err(req.id, "NOT_FOUND", format!("Plan '{}' not found", params.plan_id)),
+        Err(err) => return Response::err(req.id, "PLAN_LOAD_FAILED", format!("{:#}", err)),
+    };
+
+    let item = match plan.find_item(&params.step_id) {
+        Some(i) => i,
+        None => return Response::err(req.id, "NOT_FOUND", format!("Step '{}' not found in plan '{}'", params.step_id, params.plan_id)),
+    };
+
+    if !item.is_leaf() {
+        return Response::err(
+            req.id,
+            "INVALID_PARAMS",
+            format!("Step '{}' ({}) is not a leaf item; execute individual sub-tasks instead", item.id, item.title),
+        );
+    }
+
+    if item.status == tauqe_protocol::PlanItemStatus::Discussion {
+        return Response::err(
+            req.id,
+            "STEP_IN_DISCUSSION",
+            format!("Step '{}' ({}) is in DISCUSSION status and cannot be executed autonomously until reviewed (change status to TODO first)", item.id, item.title),
+        );
+    }
+
+    if item.status == tauqe_protocol::PlanItemStatus::Cancelled {
+        return Response::err(
+            req.id,
+            "STEP_CANCELLED",
+            format!("Step '{}' ({}) is CANCELLED and cannot be executed", item.id, item.title),
+        );
+    }
+
+    if let Ok(Some(updated_plan)) = PlanStorage::update_item(
+        &repo_root,
+        &params.plan_id,
+        &params.step_id,
+        Some(tauqe_protocol::PlanItemStatus::InProgress),
+    ) {
+        let _ = PlanStorage::save_active_id(&repo_root, Some(&params.plan_id));
+        emit(
+            &state.out,
+            events::PLAN_UPDATED,
+            serde_json::to_value(PlanUpdatedEvent { plan: updated_plan }).ok(),
+        );
+        if let Ok(plans) = PlanStorage::load_all(&repo_root) {
+            emit(
+                &state.out,
+                events::PLAN_LIST_CHANGED,
+                serde_json::to_value(PlanListChangedEvent {
+                    plans,
+                    active_id: Some(params.plan_id.clone()),
+                })
+                .ok(),
+            );
+        }
+    }
+
+    let prompt = match tauqe_core::plan::prompt::format_plan_step_execution_prompt(&plan, &params.step_id, "") {
+        Ok(p) => p,
+        Err(err) => return Response::err(req.id, "PROMPT_BUILD_FAILED", err),
+    };
+
+    match crate::handlers::model::start_model_turn(state, prompt).await {
+        Ok(op_id) => Response::ok(req.id, serde_json::json!({ "operation_id": op_id, "step_id": params.step_id })),
+        Err(err) => Response {
+            id: req.id,
+            result: None,
+            error: Some(err),
+        },
+    }
 }

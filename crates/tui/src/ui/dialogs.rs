@@ -22,8 +22,8 @@ pub fn selection_dialog_visible_height(area: Rect) -> usize {
 }
 
 pub fn status_dialog_area(term: Rect, options_count: usize) -> Rect {
-    let height = (options_count as u16 + 9).clamp(11, 17);
-    let height_percent = (height * 100 / term.height.max(1)).clamp(30, 60);
+    let height = (options_count as u16 + 9).clamp(11, 18);
+    let height_percent = (height * 100 / term.height.max(1)).clamp(30, 65);
     centered_rect(60, height_percent, term)
 }
 
@@ -32,8 +32,8 @@ pub fn render_status_dialog(
     dialog: &crate::app::StatusDialogState,
 ) {
     let options_count = match &dialog.target {
-        crate::app::StatusDialogTarget::PlanItem { .. } => 4,
-        crate::app::StatusDialogTarget::ReviewItem { .. } => 3,
+        crate::app::StatusDialogTarget::PlanItem { .. } => 5,
+        crate::app::StatusDialogTarget::ReviewItem { .. } => 5,
     };
     let area = status_dialog_area(frame.area(), options_count);
     frame.render_widget(Clear, area);
@@ -41,13 +41,15 @@ pub fn render_status_dialog(
     let (title, raw_target_title, current_idx, options) = match &dialog.target {
         crate::app::StatusDialogTarget::PlanItem { item_title, current_status, .. } => {
             let cur = match current_status {
-                tauqe_protocol::PlanItemStatus::Todo => 0,
-                tauqe_protocol::PlanItemStatus::InProgress => 1,
-                tauqe_protocol::PlanItemStatus::Done => 2,
-                tauqe_protocol::PlanItemStatus::Cancelled => 3,
+                tauqe_protocol::PlanItemStatus::Discussion => 0,
+                tauqe_protocol::PlanItemStatus::Todo => 1,
+                tauqe_protocol::PlanItemStatus::InProgress => 2,
+                tauqe_protocol::PlanItemStatus::Done => 3,
+                tauqe_protocol::PlanItemStatus::Cancelled => 4,
             };
             let opts = vec![
-                ("TODO", Color::Yellow, Color::Black, "Pending / not started yet"),
+                ("DISCUSSION", Color::Magenta, Color::Black, "Under review / requires discussion"),
+                ("TODO", Color::Yellow, Color::Black, "Approved / ready for execution"),
                 ("IN_PROGRESS", Color::Cyan, Color::Black, "Currently in active development"),
                 ("DONE", Color::Green, Color::Black, "Completed and verified"),
                 ("CANCELLED", Color::DarkGray, Color::White, "Superseded or cancelled"),
@@ -56,13 +58,17 @@ pub fn render_status_dialog(
         }
         crate::app::StatusDialogTarget::ReviewItem { item_title, current_status, .. } => {
             let cur = match current_status {
-                tauqe_protocol::ReviewStatus::Todo => 0,
-                tauqe_protocol::ReviewStatus::Done => 1,
-                tauqe_protocol::ReviewStatus::Rejected => 2,
+                tauqe_protocol::ReviewStatus::Discussion => 0,
+                tauqe_protocol::ReviewStatus::Todo => 1,
+                tauqe_protocol::ReviewStatus::InProgress => 2,
+                tauqe_protocol::ReviewStatus::Fixed => 3,
+                tauqe_protocol::ReviewStatus::Rejected => 4,
             };
             let opts = vec![
-                ("TODO", Color::Yellow, Color::Black, "Open finding needing attention"),
-                ("DONE", Color::Green, Color::Black, "Resolved and addressed in code"),
+                ("DISCUSSION", Color::Magenta, Color::Black, "Under review / requires discussion"),
+                ("TODO", Color::Yellow, Color::Black, "Approved / ready for implementation"),
+                ("IN_PROGRESS", Color::Cyan, Color::Black, "Currently being fixed"),
+                ("FIXED", Color::Green, Color::Black, "Resolved and addressed in code"),
                 ("REJECTED", Color::DarkGray, Color::White, "False positive / won't fix"),
             ];
             (" Change Finding Status ", item_title.as_str(), cur, opts)
@@ -128,14 +134,15 @@ pub fn render_status_dialog(
     }
     frame.render_widget(Paragraph::new(body_lines), chunks[1]);
 
+    let fast_select_label = if options_count >= 5 { "1-5" } else { "1-4" };
     let actions = vec![
         Line::from(vec![
-            Span::styled(" [ Apply (Enter / 1-4) ] ", Style::default().bg(Color::Green).fg(Color::Black).bold()),
+            Span::styled(format!(" [ Apply (Enter / {}) ] ", fast_select_label), Style::default().bg(Color::Green).fg(Color::Black).bold()),
             Span::raw("    "),
             Span::styled(" [ Cancel (Esc) ] ", Style::default().bg(Color::DarkGray).fg(Color::White)),
         ]),
         Line::from(Span::styled(
-            "1-4 fast select • n/p or j/k navigate • Enter apply • Esc cancel",
+            format!("{} fast select • n/p or j/k navigate • Enter apply • Esc cancel", fast_select_label),
             Style::default().fg(Color::DarkGray),
         )),
     ];
@@ -820,21 +827,226 @@ pub fn render_confirm_undo_popup(frame: &mut ratatui::Frame, state: &AppState) {
     );
 }
 
+pub fn render_confirm_execute_review_popup(frame: &mut ratatui::Frame, state: &AppState) {
+    let Some(target) = &state.confirm_execute_review else {
+        return;
+    };
+
+    let is_single = target.items.len() == 1;
+    let title_text = if is_single {
+        "Execute Review Finding"
+    } else {
+        "Execute Review Session"
+    };
+
+    let heading = if is_single {
+        "Resolve target review finding autonomously?"
+    } else {
+        "Resolve remaining findings sequentially with automated verification?"
+    };
+
+    let mut body_lines = vec![
+        Line::raw(""),
+        Line::from(Span::styled(
+            heading,
+            Style::default().bold().fg(Color::Cyan),
+        )),
+        Line::raw(""),
+        Line::from(vec![
+            Span::styled(" Review: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(&target.review_title, Style::default().bold().fg(Color::White)),
+            Span::styled(format!(" [{}]", target.review_id), Style::default().fg(Color::DarkGray)),
+        ]),
+        Line::from(vec![
+            Span::styled(" Scope: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(&target.scope_title, Style::default().bold().fg(Color::Yellow)),
+            Span::styled(format!(" ({} finding(s) to resolve)", target.items.len()), Style::default().fg(Color::White)),
+        ]),
+    ];
+
+    if is_single {
+        let item = &target.items[0];
+        if let Some(path) = &item.file_path {
+            let loc = match item.line_range {
+                Some((s, e)) if s == e => format!("{}:{}", path, s),
+                Some((s, e)) => format!("{}:{}-{}", path, s, e),
+                None => path.clone(),
+            };
+            body_lines.push(Line::from(vec![
+                Span::styled(" Location: ", Style::default().fg(Color::DarkGray)),
+                Span::styled(loc, Style::default().fg(Color::Cyan)),
+            ]));
+        }
+        let trimmed = item.body.trim();
+        if !trimmed.is_empty() {
+            let first_line = trimmed.lines().next().unwrap_or("");
+            body_lines.push(Line::from(vec![
+                Span::styled(" Recommendation: ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    truncate_to_width(first_line, 45),
+                    Style::default().fg(Color::Gray),
+                ),
+            ]));
+        }
+    } else {
+        body_lines.push(Line::raw(""));
+        body_lines.push(Line::from(Span::styled(" Findings in execution queue:", Style::default().fg(Color::DarkGray))));
+        for (i, item) in target.items.iter().take(4).enumerate() {
+            body_lines.push(Line::from(vec![
+                Span::styled(format!("   {}. ", i + 1), Style::default().fg(Color::Cyan)),
+                Span::styled(format!("[{}] #{} {}", item.severity, item.id, truncate_to_width(&item.title, 36)), Style::default().fg(Color::White)),
+            ]));
+        }
+        if target.items.len() > 4 {
+            body_lines.push(Line::from(Span::styled(
+                format!("   ... and {} more finding(s)", target.items.len() - 4),
+                Style::default().fg(Color::DarkGray).italic(),
+            )));
+        }
+    }
+
+    body_lines.push(Line::raw(""));
+    body_lines.push(Line::from(Span::styled(
+        "TAUQE will resolve each finding in an isolated turn with compiler verification gates.",
+        Style::default().fg(Color::DarkGray),
+    )));
+    if !is_single {
+        body_lines.push(Line::from(Span::styled(
+            "Fail-Fast Policy: execution stops and rolls back immediately if any finding fails verification.",
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+
+    let confirm_label = if is_single {
+        "Resolve (Enter)"
+    } else {
+        "Resolve Queue (Enter)"
+    };
+
+    render_modal_confirm(
+        frame,
+        ConfirmModalParams {
+            title: title_text,
+            border_color: Color::Cyan,
+            body_lines,
+            confirm_label,
+            cancel_label: "Cancel (Esc)",
+            confirm_button: state.confirm_button,
+            destructive: false,
+            width: 66,
+        },
+    );
+}
+
+pub fn render_confirm_execute_scope_popup(frame: &mut ratatui::Frame, state: &AppState) {
+    let Some(target) = &state.confirm_execute_scope else {
+        return;
+    };
+
+    let is_single = target.steps.len() == 1;
+    let title_text = if is_single {
+        "Execute Plan Step"
+    } else {
+        "Execute Plan Scope"
+    };
+
+    let heading = if is_single {
+        "Execute target plan step autonomously?"
+    } else {
+        "Execute plan steps sequentially with automated verification?"
+    };
+
+    let mut body_lines = vec![
+        Line::raw(""),
+        Line::from(Span::styled(
+            heading,
+            Style::default().bold().fg(Color::Cyan),
+        )),
+        Line::raw(""),
+        Line::from(vec![
+            Span::styled(" Plan: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(&target.plan_title, Style::default().bold().fg(Color::White)),
+            Span::styled(format!(" [{}]", target.plan_id), Style::default().fg(Color::DarkGray)),
+        ]),
+        Line::from(vec![
+            Span::styled(" Scope: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(&target.scope_title, Style::default().bold().fg(Color::Yellow)),
+            Span::styled(format!(" ({} step(s) to execute)", target.steps.len()), Style::default().fg(Color::White)),
+        ]),
+    ];
+
+    if is_single {
+        let step = &target.steps[0];
+        if let Some(details) = &step.details {
+            let trimmed = details.trim();
+            if !trimmed.is_empty() {
+                let first_line = trimmed.lines().next().unwrap_or("");
+                body_lines.push(Line::from(vec![
+                    Span::styled(" Details: ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        truncate_to_width(first_line, 45),
+                        Style::default().fg(Color::Gray),
+                    ),
+                ]));
+            }
+        }
+    } else {
+        body_lines.push(Line::raw(""));
+        body_lines.push(Line::from(Span::styled(" Steps in execution queue:", Style::default().fg(Color::DarkGray))));
+        for (i, step) in target.steps.iter().take(4).enumerate() {
+            body_lines.push(Line::from(vec![
+                Span::styled(format!("   {}. ", i + 1), Style::default().fg(Color::Cyan)),
+                Span::styled(format!("#{} {}", step.id, truncate_to_width(&step.title, 40)), Style::default().fg(Color::White)),
+            ]));
+        }
+        if target.steps.len() > 4 {
+            body_lines.push(Line::from(Span::styled(
+                format!("   ... and {} more step(s)", target.steps.len() - 4),
+                Style::default().fg(Color::DarkGray).italic(),
+            )));
+        }
+    }
+
+    body_lines.push(Line::raw(""));
+    body_lines.push(Line::from(Span::styled(
+        "TAUQE will execute each step in an isolated turn with compiler verification gates.",
+        Style::default().fg(Color::DarkGray),
+    )));
+    if !is_single {
+        body_lines.push(Line::from(Span::styled(
+            "Execution stops immediately if any step fails or is interrupted.",
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+
+    let confirm_label = if is_single {
+        "Execute (Enter)"
+    } else {
+        "Execute Scope (Enter)"
+    };
+
+    render_modal_confirm(
+        frame,
+        ConfirmModalParams {
+            title: title_text,
+            border_color: Color::Cyan,
+            body_lines,
+            confirm_label,
+            cancel_label: "Cancel (Esc)",
+            confirm_button: state.confirm_button,
+            destructive: false,
+            width: 66,
+        },
+    );
+}
+
 pub fn render_confirm_delete_plan_popup(frame: &mut ratatui::Frame, plan_id: &str, state: &AppState) {
     let plan_title = state
         .plans_view
-        .current_plan
-        .as_ref()
-        .filter(|p| p.id == plan_id)
+        .plans
+        .iter()
+        .find(|p| p.id == plan_id)
         .map(|p| p.title.clone())
-        .or_else(|| {
-            state
-                .plans_view
-                .plans_list
-                .iter()
-                .find(|p| p.id == plan_id)
-                .map(|p| p.title.clone())
-        })
         .unwrap_or_else(|| plan_id.to_string());
 
     let body_lines = vec![
@@ -858,6 +1070,48 @@ pub fn render_confirm_delete_plan_popup(frame: &mut ratatui::Frame, plan_id: &st
         frame,
         ConfirmModalParams {
             title: "Confirm Delete Plan",
+            border_color: Color::Red,
+            body_lines,
+            confirm_label: "Confirm Delete (Y)",
+            cancel_label: "Cancel (Esc)",
+            confirm_button: state.confirm_button,
+            destructive: true,
+            width: 58,
+        },
+    );
+}
+
+pub fn render_confirm_delete_review_popup(frame: &mut ratatui::Frame, session_id: &str, state: &AppState) {
+    let review_title = state
+        .review
+        .sessions
+        .iter()
+        .find(|s| s.id == session_id)
+        .map(|s| s.title.clone())
+        .or_else(|| state.review.session.as_ref().filter(|s| s.id == session_id).map(|s| s.title.clone()))
+        .unwrap_or_else(|| session_id.to_string());
+
+    let body_lines = vec![
+        Line::raw(""),
+        Line::from(Span::styled(
+            "Are you sure you want to delete this review session?",
+            Style::default().bold().fg(Color::Yellow),
+        )),
+        Line::raw(""),
+        Line::from(vec![
+            Span::raw("Review: "),
+            Span::styled(format!("{} ({})", review_title, session_id), Style::default().bold().fg(Color::Cyan)),
+        ]),
+        Line::from(Span::styled(
+            "The review file in .tauqe/reviews/ will be permanently removed.",
+            Style::default().fg(Color::Gray),
+        )),
+    ];
+
+    render_modal_confirm(
+        frame,
+        ConfirmModalParams {
+            title: "Confirm Delete Review",
             border_color: Color::Red,
             body_lines,
             confirm_label: "Confirm Delete (Y)",
@@ -1022,6 +1276,190 @@ pub fn render_selection_dialog(
     ];
     let actions_widget = Paragraph::new(actions).alignment(ratatui::layout::Alignment::Center);
     frame.render_widget(actions_widget, chunks[1]);
+}
+
+pub fn render_discuss_plan_dialog(
+    frame: &mut ratatui::Frame,
+    dialog: &crate::app::DiscussPlanDialogState,
+) {
+    let area = centered_rect(68, 56, frame.area());
+    frame.render_widget(Clear, area);
+
+    let dialog_title = if let Some((step_id, _)) = dialog.focused_items.first() {
+        format!(" Discuss Step: [{}] #{} ", dialog.plan_id, step_id)
+    } else {
+        format!(" Discuss Plan: [{}] ", dialog.plan_id)
+    };
+
+    let outer_block = Block::default()
+        .title(dialog_title)
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan));
+    let inner_area = outer_block.inner(area);
+    frame.render_widget(outer_block, area);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(4), Constraint::Min(6), Constraint::Length(3)])
+        .split(inner_area);
+
+    let mut header_lines = vec![
+        Line::from(vec![
+            Span::styled(" Plan: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(&dialog.plan_title, Style::default().bold().fg(Color::White)),
+        ]),
+    ];
+
+    if dialog.focused_items.is_empty() {
+        header_lines.push(Line::from(vec![
+            Span::styled(" Scope: ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Entire plan", Style::default().fg(Color::Yellow).bold()),
+            Span::styled(" (discussing architecture and overall strategy)", Style::default().fg(Color::DarkGray)),
+        ]));
+    } else if let Some((id, title)) = dialog.focused_items.first() {
+        header_lines.push(Line::from(vec![
+            Span::styled(" Target step: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                truncate_to_width(&format!("#{} {}", id, title), chunks[0].width.saturating_sub(18) as usize),
+                Style::default().bold().fg(Color::Green),
+            ),
+        ]));
+    }
+
+    let header_widget = Paragraph::new(header_lines);
+    frame.render_widget(header_widget, chunks[0]);
+
+    let mut editor_content = Vec::new();
+    if dialog.prompt_editor.is_empty() {
+        editor_content.push(Line::from(vec![
+            Span::styled("█", Style::default().fg(Color::Yellow)),
+            Span::styled(
+                " Enter your architectural questions, task critique, or refinement proposals for Tauqe AI...",
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]));
+    } else {
+        editor_content.extend(editor_lines(&dialog.prompt_editor, true));
+    }
+
+    let editor_block = Block::default()
+        .title(" Your Comments / Questions (Enter send, Shift+Enter / Alt+Enter / C-J / C-N newline) ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Green));
+    let editor_widget = Paragraph::new(editor_content).block(editor_block).wrap(Wrap { trim: false });
+    frame.render_widget(editor_widget, chunks[1]);
+
+    let actions = vec![
+        Line::from(vec![
+            Span::styled(
+                " [ Discuss in Develop (Enter / C-Enter) ] ",
+                Style::default().bg(Color::Green).fg(Color::Black).bold(),
+            ),
+            Span::raw("    "),
+            Span::styled(
+                " [ Cancel (Esc) ] ",
+                Style::default().bg(Color::DarkGray).fg(Color::White),
+            ),
+        ]),
+        Line::from(Span::styled(
+            "Enter send • Shift+Enter / Alt+Enter / C-J / C-N newline • Esc cancel",
+            Style::default().fg(Color::DarkGray),
+        )),
+    ];
+    let footer_widget = Paragraph::new(actions).alignment(ratatui::layout::Alignment::Center);
+    frame.render_widget(footer_widget, chunks[2]);
+}
+
+pub fn render_discuss_review_dialog(
+    frame: &mut ratatui::Frame,
+    dialog: &crate::app::DiscussReviewDialogState,
+) {
+    let area = centered_rect(68, 56, frame.area());
+    frame.render_widget(Clear, area);
+
+    let dialog_title = if let Some((item_id, _)) = dialog.focused_items.first() {
+        format!(" Discuss Finding: [{}] #{} ", dialog.review_id, item_id)
+    } else {
+        format!(" Discuss Review Session: [{}] ", dialog.review_id)
+    };
+
+    let outer_block = Block::default()
+        .title(dialog_title)
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Magenta));
+    let inner_area = outer_block.inner(area);
+    frame.render_widget(outer_block, area);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(4), Constraint::Min(6), Constraint::Length(3)])
+        .split(inner_area);
+
+    let mut header_lines = vec![
+        Line::from(vec![
+            Span::styled(" Review: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(&dialog.review_title, Style::default().bold().fg(Color::White)),
+        ]),
+    ];
+
+    if dialog.focused_items.is_empty() {
+        header_lines.push(Line::from(vec![
+            Span::styled(" Scope: ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Entire review session", Style::default().fg(Color::Yellow).bold()),
+            Span::styled(" (discussing code quality findings and resolution plan)", Style::default().fg(Color::DarkGray)),
+        ]));
+    } else if let Some((id, title)) = dialog.focused_items.first() {
+        header_lines.push(Line::from(vec![
+            Span::styled(" Target finding: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                truncate_to_width(&format!("#{} {}", id, title), chunks[0].width.saturating_sub(18) as usize),
+                Style::default().bold().fg(Color::Green),
+            ),
+        ]));
+    }
+
+    let header_widget = Paragraph::new(header_lines);
+    frame.render_widget(header_widget, chunks[0]);
+
+    let mut editor_content = Vec::new();
+    if dialog.prompt_editor.is_empty() {
+        editor_content.push(Line::from(vec![
+            Span::styled("█", Style::default().fg(Color::Yellow)),
+            Span::styled(
+                " Enter your questions, counter-arguments, or instructions for Tauqe AI regarding this finding...",
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]));
+    } else {
+        editor_content.extend(editor_lines(&dialog.prompt_editor, true));
+    }
+
+    let editor_block = Block::default()
+        .title(" Your Comments / Questions (Enter send, Shift+Enter / Alt+Enter / C-J newline) ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Green));
+    let editor_widget = Paragraph::new(editor_content).block(editor_block).wrap(Wrap { trim: false });
+    frame.render_widget(editor_widget, chunks[1]);
+
+    let actions = vec![
+        Line::from(vec![
+            Span::styled(
+                " [ Discuss in Develop (Enter / C-Enter) ] ",
+                Style::default().bg(Color::Green).fg(Color::Black).bold(),
+            ),
+            Span::raw("    "),
+            Span::styled(
+                " [ Cancel (Esc) ] ",
+                Style::default().bg(Color::DarkGray).fg(Color::White),
+            ),
+        ]),
+        Line::from(Span::styled(
+            "Enter send • Shift+Enter / Alt+Enter / C-J newline • Esc cancel",
+            Style::default().fg(Color::DarkGray),
+        )),
+    ];
+    let footer_widget = Paragraph::new(actions).alignment(ratatui::layout::Alignment::Center);
+    frame.render_widget(footer_widget, chunks[2]);
 }
 
 pub fn render_review_dialog(frame: &mut ratatui::Frame, dialog: &crate::app::ReviewDialogState) {

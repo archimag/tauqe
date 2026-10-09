@@ -150,3 +150,6 @@ All commits must follow the **Conventional Commits** specification:
 
 - **Terminal UI (`crates/tui`):**
   The directives specified in `crates/tui/Conventions.md` are mandatory and strictly enforced. Whenever a task involves inspecting, modifying, or extending code inside `crates/tui/`, the model MUST explicitly request `crates/tui/Conventions.md` into context (via `<context_request>`) before proposing any modifications, unless it is already loaded in the active context. Proposing or making changes to `crates/tui/` without having `crates/tui/Conventions.md` loaded into context is strictly prohibited.
+
+- **Core Engine (`crates/core`):**
+  The directives specified in `crates/core/Conventions.md` are mandatory and strictly enforced. Whenever a task involves inspecting, modifying, or extending code inside `crates/core/`, the model MUST explicitly request `crates/core/Conventions.md` into context (via `<context_request>`) before proposing any modifications, unless it is already loaded in the active context. In particular, all operations not directly involving code modifications MUST strictly adhere to the Structured Output paradigm specified therein. Proposing or making changes to `crates/core/` without having `crates/core/Conventions.md` loaded into context is strictly prohibited.

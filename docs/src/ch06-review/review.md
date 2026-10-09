@@ -22,9 +22,9 @@ TAUQE resolves this dilemma by treating code review as an **independent, structu
                    ↓
           Structured Findings
                    ↓
-       Human Engineering Judgment (Triage)
+       Human Engineering Judgment (Triage / Discussion)
                    ↓
-       Focused Execution (Develop)
+       Isolated Autonomous Execution (Fail-Fast Verification)
 ```
 
 The fundamental philosophy is:
@@ -48,33 +48,91 @@ When you trigger a review in TAUQE, the review model does **not** receive the on
 
 ---
 
-## 6.3 Findings as an Interactive Backlog (Not a Disposable Chat Stream)
+## 6.3 Multi-Session Storage & Review Formats
 
-Unstructured markdown reports generated in chat windows are quickly scrolled past and forgotten. TAUQE parses review output into **discrete, persistent findings**:
-- **Persistent Storage:** Saved in `.tauqe/reviews/` and preserved across sessions.
-- **Triage States:** Each finding can be marked as `TODO`, `DONE`, or `REJECTED`. Pressing `t` opens an intentional status selection dialog, allowing immediate selection via number keys (`1`..`3`).
-- **Display Filtering:** Press `s` to toggle filtering, hiding resolved items and focusing only on open engineering issues.
+All review sessions in TAUQE are first-class versioned engineering artifacts persisted across workspace restarts:
+- **Directory Structure:** Saved in `.tauqe/reviews/` in JSON format (`rev-<timestamp>.json`).
+- **Active Session Pointer:** `.tauqe/reviews/.active_review` tracks the latest inspected session across client reconnects.
+- **Session Metadata:** Each session stores:
+  - `id`: unique session identifier (`rev-<timestamp>`);
+  - `title`: title derived from the review prompt or timestamp;
+  - `created_at`: Unix timestamp of creation;
+  - `model`: model reference utilized for auditing;
+  - `description` / `user_prompt`: optional audit instructions and focus directives;
+  - `target_files`: list of audited repository file paths;
+  - `items`: collection of discrete structured review findings.
 
 ---
 
-## 6.4 The Review Workflow in Practice
+## 6.4 Finding Lifecycle and Status Progression
 
-1. **Curate Context:** In Context (`Ctrl+2`), mark the files you want to review as active.
-2. **Initiate Review:** Switch to the Review tab (`Ctrl+3`) and press `r`.
-   - The confirmation dialog displays file count, estimated token budget, and active review model.
-   - You can optionally provide targeted instructions (e.g. *"Focus strictly on concurrency hazards and memory allocations"*).
-3. **Audit and Triage:**
-   - Navigate findings using `n` / `p`, `j` / `k`, or `↑` / `↓`.
-   - Fold/unfold details with `Tab` or `Space`.
-   - Assign status with `t` (opens status selection dialog: `1` Todo, `2` Done, `3` Rejected).
-   - Press `c` / `y` (or `Enter`) to copy an individual finding to the system clipboard.
+Each finding in a review session undergoes a formal lifecycle:
 
-### Selective Resolution in Develop
-Rather than feeding an entire 15-point review dump back to the coding model (which overwhelms its attention window and causes scattered, chaotic edits), you select specific tasks:
+```text
+   [ DISCUSSION ] ──(approve via 't' or 'd')──► [ TODO ]
+         │                                         │
+         ▼                                         ▼
+   [ REJECTED ]                             [ IN_PROGRESS ]
+   (won't fix /                             (under active execution)
+    false positive)                                │
+                                                   ▼
+                                              [ FIXED ]
+                                            (compiler verified)
+```
 
-1. Press `x` on the relevant finding(s) to mark them with `[x]`.
-2. Return to the Develop tab (`Ctrl+1`).
-3. The selected findings are automatically injected into the model's prompt under `<review_findings>`.
-4. Instruct the model:
-   > *"Address the checked review findings."*
-5. When no findings are checked, review context is completely excluded from Develop, preserving optimal context hygiene.
+1. **DISCUSSION:**
+   Default initial status for newly parsed findings. Represents findings that require human triage, feasibility assessment, or architectural discussion. Findings in `DISCUSSION` **cannot** be executed autonomously until explicitly reviewed and approved.
+2. **TODO:**
+   Approved findings ready for autonomous resolution.
+3. **IN_PROGRESS:**
+   Actively being resolved by the model in an isolated turn.
+4. **FIXED:**
+   Successfully resolved, staged in Git, and verified by deterministic toolchain gates (`cargo check`, linters, tests).
+5. **REJECTED:**
+   Dismissed as false positive, intentional design trade-off, or non-actionable.
+
+Press `t` or `s` on any finding to open the interactive status picker modal, supporting fast numeric selection (`1` Discussion, `2` Todo, `3` InProgress, `4` Fixed, `5` Rejected).
+
+---
+
+## 6.5 Interactive Discussion (`d`) in Structured Output Mode
+
+When evaluating complex findings, the developer does not have to accept or reject them blindly. Pressing `d` on a finding or session header opens the **Discussion Modal**:
+
+- **Focused Scope:** Discussions target either a specific finding (`[rev-xxx] #id`) or the entire session scope.
+- **Structured Output Protocol:** Discussions run in Develop using a dedicated structured prompt. The model discusses trade-offs conceptually without generating unstructured code edits.
+- **Automatic Status Synchronization:** If the developer approves or rejects items during discussion, the model emits structured `review_update` objects that update finding statuses directly in `.tauqe/reviews/` without manual editing.
+
+---
+
+## 6.6 Isolated Execution & Fail-Fast Batch Runner (`e` / `Enter`)
+
+Findings approved as `TODO` can be executed directly from the Review workspace without conversational context pollution:
+
+### 1. Single Finding Execution (`e` or `Enter` on a finding)
+- Validates that the finding is in `TODO` status (blocking execution if still in `DISCUSSION` or `REJECTED`).
+- Opens an execution confirmation popup with finding details and file location.
+- Formats an isolated model prompt containing only the target finding, file location, and directives.
+- Model requests necessary context via `<context_request>`, stages patches in memory, and validates with toolchain gates.
+- Upon passing all gates, the finding status is marked `FIXED`.
+
+### 2. Batch Execution Queue (`e` on session header)
+- Evaluates the entire review session: if any items remain in `DISCUSSION`, batch execution is blocked to enforce human triage.
+- Sequences all remaining `TODO` findings into a deterministic batch execution queue.
+- Opens a confirmation dialog detailing the queue order and findings to resolve.
+- **Fail-Fast Policy:** Findings execute sequentially. If any step fails toolchain verification, encounters compiler errors, or is interrupted by the user (`Esc` / `Ctrl+C`):
+  - Execution stops immediately.
+  - The working tree is atomically rolled back to the pre-edit checkpoint (`git/undo`).
+  - The offending item is reverted to `TODO`.
+  - Subsequent items in the queue are aborted, preventing compounding errors.
+
+---
+
+## 6.7 Architectural Triage via Structured Discussion (`d`)
+
+In accordance with TAUQE's dual-contour architecture, review findings are not dumped indiscriminately into the general Develop conversation context via checkboxes:
+- **Zero Prompt Pollution:** General Develop turns remain clean and focused on user-specified objectives without carrying stale review findings in system prompt headers.
+- **Dedicated Discussion Contour (`d`):** Whenever an architectural finding needs triage, feasibility inquiry, or refinement, pressing `d` launches a focused Structured Discussion targeting specifically the chosen finding or entire audit session.
+- **Direct Status Approval:** During discussion, findings can be approved (`TODO`) or dismissed (`REJECTED`) programmatically via structured `review_update` responses.
+- **Focused Execution (`e`):** Approved findings are executed in isolated turns with deterministic toolchain verification.
+- **View Filtering (`f`):** Press `f` in Review to filter out closed findings (`FIXED` and `REJECTED`), keeping the view focused strictly on outstanding engineering debt.
