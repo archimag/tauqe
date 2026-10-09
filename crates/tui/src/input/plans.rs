@@ -10,11 +10,11 @@ use crate::input::InputResult;
 use crate::rpc::send_request;
 
 pub const PLANS_COMMANDS: &[KeyCommand] = &[
-    KeyCommand { key: "↑/↓ or k/j", description: "Select previous / next plan item" },
+    KeyCommand { key: "n / p (or j/k, ↑/↓)", description: "Select next / previous plan item" },
     KeyCommand { key: "Tab / Space", description: "Fold / unfold item details & subtasks" },
     KeyCommand { key: "Enter", description: "Fold/unfold item or toggle check on leaf" },
     KeyCommand { key: "x", description: "Check / uncheck item to focus in Develop context" },
-    KeyCommand { key: "t", description: "Cycle status: Todo → InProgress → Done → Cancelled" },
+    KeyCommand { key: "t / s", description: "Change item status (dialog: Todo / InProgress / Done / Cancelled)" },
     KeyCommand { key: "a", description: "Toggle fold / unfold all items" },
     KeyCommand { key: "←/→, h/l, [ / ]", description: "Switch between multiple plans" },
     KeyCommand { key: "D / Delete", description: "Delete current plan (with confirmation)" },
@@ -105,13 +105,13 @@ pub async fn handle_plans_key(
         KeyCode::Esc | KeyCode::Char('q') => {
             st.view_mode = ViewMode::Develop;
         }
-        KeyCode::Up | KeyCode::Char('k') => {
+        KeyCode::Up | KeyCode::Char('k') | KeyCode::Char('p') => {
             if st.plans_view.selected_item_index > 0 {
                 st.plans_view.selected_item_index -= 1;
                 st.plans_view.scroll_to_selected();
             }
         }
-        KeyCode::Down | KeyCode::Char('j') => {
+        KeyCode::Down | KeyCode::Char('j') | KeyCode::Char('n') => {
             if rows_len > 0 && st.plans_view.selected_item_index + 1 < rows_len {
                 st.plans_view.selected_item_index += 1;
                 st.plans_view.scroll_to_selected();
@@ -256,38 +256,25 @@ pub async fn handle_plans_key(
                 .await?;
             }
         }
-        KeyCode::Char('t') | KeyCode::Char('T') => {
+        KeyCode::Char('t') | KeyCode::Char('T') | KeyCode::Char('s') | KeyCode::Char('S') => {
             let plan_id = st.plans_view.current_plan.as_ref().map(|p| p.id.clone());
             let sel_row = st.plans_view.selected_row();
             if let (Some(plan_id), Some(row)) = (plan_id, sel_row) {
-                let prev_status = row.status;
-                let next_status = row.status.next();
-                if let Some(plan) = st.plans_view.current_plan.as_mut() {
-                    plan.update_item_status(&row.item_id, next_status);
-                }
-                let req_id = crate::rpc::allocate_request_id();
-                crate::rpc::record_optimistic_rollback(
-                    req_id,
-                    crate::rpc::OptimisticRollback::PlanItemStatus {
-                        plan_id: plan_id.clone(),
-                        item_id: row.item_id.clone(),
-                        prev_status,
-                    },
-                );
-                drop(st);
-                let params = PlanUpdateItemParams {
-                    plan_id,
-                    item_id: row.item_id,
-                    status: Some(next_status),
-                    checked: None,
+                let cur_idx = match row.status {
+                    tauqe_protocol::PlanItemStatus::Todo => 0,
+                    tauqe_protocol::PlanItemStatus::InProgress => 1,
+                    tauqe_protocol::PlanItemStatus::Done => 2,
+                    tauqe_protocol::PlanItemStatus::Cancelled => 3,
                 };
-                crate::rpc::send_request_with_id(
-                    server_writer,
-                    req_id,
-                    methods::PLAN_UPDATE_ITEM,
-                    serde_json::to_value(params)?,
-                )
-                .await?;
+                st.status_dialog = Some(crate::app::StatusDialogState {
+                    target: crate::app::StatusDialogTarget::PlanItem {
+                        plan_id,
+                        item_id: row.item_id,
+                        item_title: row.title,
+                        current_status: row.status,
+                    },
+                    selected_index: cur_idx,
+                });
             }
         }
         KeyCode::Delete | KeyCode::Char('D') | KeyCode::Char('d') => {
@@ -298,12 +285,15 @@ pub async fn handle_plans_key(
         KeyCode::Char('c') | KeyCode::Char('C') | KeyCode::Char('y') | KeyCode::Char('Y') => {
             if let Some(plan) = &st.plans_view.current_plan {
                 let md = plan.to_markdown();
-                match crate::clipboard::copy_to_clipboard(&md) {
+                drop(st);
+                let res = crate::clipboard::copy_to_clipboard(&md);
+                let mut st = state.lock().await;
+                match res {
                     crate::clipboard::CopyResult::Native => {
                         st.notify_success("Plan copied to clipboard");
                     }
                     crate::clipboard::CopyResult::Osc52Only => {
-                        st.notify_success("Plan copied via terminal (OSC 52)");
+                        st.notify_info("Plan sent to terminal clipboard (OSC 52)");
                     }
                     crate::clipboard::CopyResult::Failed => {
                         st.notify_error("Failed to copy plan to clipboard");

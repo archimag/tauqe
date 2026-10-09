@@ -21,7 +21,7 @@ pub enum ConfirmDialogButton {
     Confirm,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum NotificationLevel {
     Info,
     Success,
@@ -47,6 +47,69 @@ pub struct SelectionDialogState {
     pub kind: SelectionDialogKind,
     pub items: Vec<ModelRef>,
     pub selected_index: usize,
+    pub scroll_offset: usize,
+}
+
+impl SelectionDialogState {
+    pub fn new(kind: SelectionDialogKind, items: Vec<ModelRef>, selected_index: usize) -> Self {
+        let mut state = Self {
+            kind,
+            items,
+            selected_index,
+            scroll_offset: 0,
+        };
+        state.ensure_visible(10);
+        state
+    }
+
+    pub fn select_prev(&mut self, visible_height: usize) {
+        if self.selected_index > 0 {
+            self.selected_index -= 1;
+            self.ensure_visible(visible_height);
+        }
+    }
+
+    pub fn select_next(&mut self, visible_height: usize) {
+        if !self.items.is_empty() && self.selected_index + 1 < self.items.len() {
+            self.selected_index += 1;
+            self.ensure_visible(visible_height);
+        }
+    }
+
+    pub fn ensure_visible(&mut self, visible_height: usize) {
+        if visible_height == 0 || self.items.is_empty() {
+            self.scroll_offset = 0;
+            return;
+        }
+        if self.selected_index < self.scroll_offset {
+            self.scroll_offset = self.selected_index;
+        } else if self.selected_index >= self.scroll_offset + visible_height {
+            self.scroll_offset = self.selected_index + 1 - visible_height;
+        }
+        let max_scroll = self.items.len().saturating_sub(visible_height);
+        self.scroll_offset = self.scroll_offset.min(max_scroll);
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StatusDialogTarget {
+    PlanItem {
+        plan_id: String,
+        item_id: String,
+        item_title: String,
+        current_status: tauqe_protocol::PlanItemStatus,
+    },
+    ReviewItem {
+        item_id: u32,
+        item_title: String,
+        current_status: tauqe_protocol::ReviewStatus,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StatusDialogState {
+    pub target: StatusDialogTarget,
+    pub selected_index: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -65,7 +128,7 @@ pub struct ReviewDialogState {
     pub estimated_tokens: usize,
     pub models: Vec<ModelRef>,
     pub model_index: usize,
-    pub prompt: String,
+    pub prompt_editor: InputEditor,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -176,6 +239,12 @@ pub enum SquashDialogFocus {
     MessageEditor,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SquashConfirm {
+    Apply,
+    Discard,
+}
+
 #[derive(Debug, Clone)]
 pub struct SquashFileItem {
     pub path: String,
@@ -187,22 +256,23 @@ pub struct SquashFileItem {
 pub struct SquashDialogState {
     pub loading: bool,
     pub generating_message: bool,
+    pub applying: bool,
     pub base_mode: SquashBaseMode,
     pub base_ref: String,
     pub pending_base: Option<(SquashBaseMode, String)>,
     pub session_base: Option<String>,
     pub upstream_base: Option<String>,
-    pub custom_input: String,
+    pub custom_editor: InputEditor,
     pub custom_input_active: bool,
     pub commits: Vec<tauqe_protocol::GitSquashCommitItem>,
     pub diff_stat: String,
     pub files: Vec<SquashFileItem>,
     pub selected_file_index: usize,
     pub diff_scroll: u16,
-    pub message_buffer: String,
+    pub message_editor: InputEditor,
     pub status_message: Option<String>,
     pub focus: SquashDialogFocus,
-    pub confirm_apply: bool,
+    pub confirm: Option<SquashConfirm>,
     pub confirm_button: ConfirmDialogButton,
 }
 
@@ -211,22 +281,23 @@ impl Default for SquashDialogState {
         Self {
             loading: true,
             generating_message: false,
+            applying: false,
             base_mode: SquashBaseMode::Session,
             base_ref: String::new(),
             pending_base: None,
             session_base: None,
             upstream_base: None,
-            custom_input: String::new(),
+            custom_editor: InputEditor::default(),
             custom_input_active: false,
             commits: Vec::new(),
             diff_stat: String::new(),
             files: Vec::new(),
             selected_file_index: 0,
             diff_scroll: 0,
-            message_buffer: String::new(),
+            message_editor: InputEditor::default(),
             status_message: Some("Inspecting repository history...".to_string()),
             focus: SquashDialogFocus::FileList,
-            confirm_apply: false,
+            confirm: None,
             confirm_button: ConfirmDialogButton::Cancel,
         }
     }
@@ -261,6 +332,7 @@ pub struct AppState {
     pub confirm_delete_plan: Option<String>,
     pub confirm_button: ConfirmDialogButton,
     pub selection_dialog: Option<SelectionDialogState>,
+    pub status_dialog: Option<StatusDialogState>,
     pub squash_dialog: Option<SquashDialogState>,
     pub review_dialog: Option<ReviewDialogState>,
     pub notification: Option<AppNotification>,
@@ -269,10 +341,17 @@ pub struct AppState {
     pub server_log_path: std::path::PathBuf,
     pub last_model_height: u16,
     pub header_clicks: HeaderClickAreas,
+    pub terminal_focused: bool,
+    pub shift_tip_shown: bool,
 }
 
 impl AppState {
     pub fn notify(&mut self, text: impl Into<String>, level: NotificationLevel, ttl: std::time::Duration) {
+        if let Some(ref current) = self.notification {
+            if current.created_at.elapsed() < current.ttl && current.level > level {
+                return;
+            }
+        }
         self.notification = Some(AppNotification {
             level,
             text: text.into(),
@@ -301,6 +380,7 @@ impl AppState {
         self.server_disconnected.is_some()
             || self.show_help
             || self.selection_dialog.is_some()
+            || self.status_dialog.is_some()
             || self.squash_dialog.is_some()
             || self.review_dialog.is_some()
             || self.confirm_cancel
@@ -369,6 +449,10 @@ impl AppState {
         self.context_view
             .update_filtered_candidates(&self.context.items, &self.all_repo_files);
     }
+
+    pub fn sync_theme_mode(&mut self) {
+        self.model.set_theme_mode(self.tui_config.theme.mode);
+    }
 }
 
 #[cfg(test)]
@@ -412,11 +496,14 @@ mod tests {
             confirm_delete_plan: None,
             confirm_button: ConfirmDialogButton::Cancel,
             selection_dialog: None,
+            status_dialog: None,
             squash_dialog: None,
             server_disconnected: None,
             server_log_path: std::path::PathBuf::from(".tauqe/server.log"),
             last_model_height: 10,
             header_clicks: HeaderClickAreas::default(),
+            terminal_focused: true,
+            shift_tip_shown: false,
         };
 
         state.input_editor.insert_str("next planned prompt");
@@ -433,5 +520,99 @@ mod tests {
         let result = state.take_prompt();
         assert_eq!(result, Some("next planned prompt".to_string()));
         assert!(state.input_editor.is_empty());
+    }
+
+    #[test]
+    fn test_notification_level_priority_preserves_error() {
+        let mut state = AppState {
+            view_mode: ViewMode::Develop,
+            protocol_version: "1.0".to_string(),
+            repo_state: None,
+            all_repo_files: Vec::new(),
+            workflow: "git".to_string(),
+            edit_protocol: "xml".to_string(),
+            active_model: ModelRef::openrouter("test-model"),
+            available_models: Vec::new(),
+            available_workflows: Vec::new(),
+            available_edit_protocols: Vec::new(),
+            model: DevelopView::default(),
+            context: ContextState::default(),
+            context_view: ContextViewState::default(),
+            history_view: HistoryViewState::default(),
+            review: ReviewViewState::default(),
+            plans_view: PlansViewState::default(),
+            review_dialog: None,
+            notification: None,
+            turn_started_at: None,
+            onboarding: OnboardingState::default(),
+            input_editor: InputEditor::default(),
+            tui_config: TuiConfig::default(),
+            show_help: false,
+            help_scroll: 0,
+            confirm_cancel: false,
+            confirm_quit: false,
+            confirm_undo: false,
+            confirm_clear_history: false,
+            confirm_delete_plan: None,
+            confirm_button: ConfirmDialogButton::Cancel,
+            selection_dialog: None,
+            status_dialog: None,
+            squash_dialog: None,
+            server_disconnected: None,
+            server_log_path: std::path::PathBuf::from(".tauqe/server.log"),
+            last_model_height: 10,
+            header_clicks: HeaderClickAreas::default(),
+            terminal_focused: true,
+            shift_tip_shown: false,
+        };
+
+        state.notify_error("Critical failure");
+        assert_eq!(state.active_notification().unwrap().text, "Critical failure");
+
+        // Lower-priority info should not overwrite active error
+        state.notify_info("Minor info");
+        assert_eq!(state.active_notification().unwrap().text, "Critical failure");
+
+        // Equal or higher priority replaces it
+        state.notify_error("New critical failure");
+        assert_eq!(state.active_notification().unwrap().text, "New critical failure");
+    }
+
+    #[test]
+    fn test_selection_dialog_scrolling_and_bounds() {
+        let items: Vec<ModelRef> = (0..20)
+            .map(|i| ModelRef::openrouter(format!("model-{}", i)))
+            .collect();
+        let mut dialog = SelectionDialogState::new(SelectionDialogKind::Model, items, 0);
+        let visible_height = 5;
+
+        assert_eq!(dialog.selected_index, 0);
+        assert_eq!(dialog.scroll_offset, 0);
+
+        for _ in 0..4 {
+            dialog.select_next(visible_height);
+        }
+        assert_eq!(dialog.selected_index, 4);
+        assert_eq!(dialog.scroll_offset, 0);
+
+        dialog.select_next(visible_height);
+        assert_eq!(dialog.selected_index, 5);
+        assert_eq!(dialog.scroll_offset, 1);
+
+        for _ in 0..20 {
+            dialog.select_next(visible_height);
+        }
+        assert_eq!(dialog.selected_index, 19);
+        assert_eq!(dialog.scroll_offset, 15);
+
+        dialog.select_prev(visible_height);
+        assert_eq!(dialog.selected_index, 18);
+        assert_eq!(dialog.scroll_offset, 15);
+
+        for _ in 0..5 {
+            dialog.select_prev(visible_height);
+        }
+        assert_eq!(dialog.selected_index, 13);
+        assert_eq!(dialog.scroll_offset, 13);
     }
 }

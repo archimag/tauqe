@@ -17,11 +17,11 @@ pub const CONTEXT_COMMANDS: &[KeyCommand] = &[
     KeyCommand { key: "e", description: "Add file to context as editable" },
     KeyCommand { key: "r / a", description: "Add file to context as read-only" },
     KeyCommand { key: "t", description: "Toggle access (Editable ↔ Read-Only)" },
-    KeyCommand { key: "p / u", description: "Promote Auto file to persistent User file" },
+    KeyCommand { key: "u", description: "Promote Auto file to persistent User file" },
     KeyCommand { key: "c / C", description: "Clear all auto-requested files (Auto)" },
     KeyCommand { key: "d / x / Del", description: "Remove file from context" },
     KeyCommand { key: "Space / Tab", description: "Fold / unfold section" },
-    KeyCommand { key: "↑/↓ or k/j", description: "Move selection up / down" },
+    KeyCommand { key: "n / p (or j/k, ↑/↓)", description: "Move selection down / up" },
     KeyCommand { key: "Enter", description: "Promote Auto file or toggle section" },
     KeyCommand { key: "Esc / q", description: "Return to Develop view" },
 ];
@@ -56,7 +56,6 @@ pub async fn handle_context_key(
             KeyCode::Esc => {
                 st.context_view.adding_file = false;
                 st.context_view.add_input.clear();
-                st.context_view.status_message = None;
             }
             KeyCode::Up => {
                 if !st.context_view.filtered_candidates.is_empty() {
@@ -165,13 +164,13 @@ pub async fn handle_context_key(
             KeyCode::Esc | KeyCode::Char('q') => {
                 st.view_mode = ViewMode::Develop;
             }
-            KeyCode::Up | KeyCode::Char('k') => {
+            KeyCode::Up | KeyCode::Char('k') | KeyCode::Char('p') => {
                 if total_rows > 0 {
                     st.context_view.cursor_index =
                         st.context_view.cursor_index.saturating_sub(1);
                 }
             }
-            KeyCode::Down | KeyCode::Char('j') => {
+            KeyCode::Down | KeyCode::Char('j') | KeyCode::Char('n') => {
                 if total_rows > 0 && st.context_view.cursor_index + 1 < total_rows {
                     st.context_view.cursor_index += 1;
                 }
@@ -188,8 +187,7 @@ pub async fn handle_context_key(
                 Some(ContextRow::Item(ref item)) if item.layer == ContextLayer::Auto => {
                     let path = item.path.clone();
                     let access = item.access;
-                    st.context_view.status_message =
-                        Some(format!("Promoting '{}' to User context...", path));
+                    st.notify_info(format!("Promoting '{}' to User context...", path));
                     drop(st);
                     let params = ContextAddParams {
                         path,
@@ -205,13 +203,12 @@ pub async fn handle_context_key(
                 }
                 _ => {}
             },
-            KeyCode::Char('p') | KeyCode::Char('u') => {
+            KeyCode::Char('u') => {
                 if let Some(ContextRow::Item(ref item)) = current_row {
                     if item.layer == ContextLayer::Auto {
                         let path = item.path.clone();
                         let access = item.access;
-                        st.context_view.status_message =
-                            Some(format!("Promoting '{}' to User context...", path));
+                        st.notify_info(format!("Promoting '{}' to User context...", path));
                         drop(st);
                         let params = ContextAddParams {
                             path,
@@ -225,8 +222,7 @@ pub async fn handle_context_key(
                         )
                         .await?;
                     } else {
-                        st.context_view.status_message =
-                            Some("Only Auto files can be promoted to User context".to_string());
+                        st.notify_warning("Only Auto files can be promoted to User context");
                     }
                 }
             }
@@ -249,7 +245,6 @@ pub async fn handle_context_key(
                 st.context_view.add_access = ContextAccess::Editable;
                 st.context_view.add_input.clear();
                 st.context_view.selected_candidate_index = 0;
-                st.context_view.status_message = None;
                 st.update_filtered_candidates();
 
                 drop(st);
@@ -265,7 +260,6 @@ pub async fn handle_context_key(
                 st.context_view.add_access = ContextAccess::ReadOnly;
                 st.context_view.add_input.clear();
                 st.context_view.selected_candidate_index = 0;
-                st.context_view.status_message = None;
                 st.update_filtered_candidates();
 
                 drop(st);
@@ -279,8 +273,8 @@ pub async fn handle_context_key(
             KeyCode::Char('t') => {
                 if let Some(ContextRow::Item(ref item)) = current_row {
                     if item.layer == ContextLayer::Pinned {
-                        st.context_view.status_message = Some(
-                            "Pinned files are read-only and cannot be changed".to_string(),
+                        st.notify_warning(
+                            "Pinned files are read-only and cannot be changed",
                         );
                     } else {
                         let path = item.path.clone();
@@ -315,7 +309,6 @@ pub async fn handle_context_key(
                         {
                             st.context_view.cursor_index -= 1;
                         }
-                        st.notify_info(format!("Removed '{}' from context", path));
                         drop(st);
                         let params = ContextRemoveParams { path };
                         send_request(

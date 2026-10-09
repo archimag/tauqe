@@ -266,7 +266,7 @@ fn markdown_lines(text: &str) -> Vec<Line<'static>> {
 
 fn streaming_lines(review: &ReviewViewState, width: usize) -> Vec<Line<'static>> {
     let mut lines = vec![Line::from(Span::styled(
-        " Reviewing... (Esc to cancel, Ctrl+R to fold/unfold thinking)",
+        " Reviewing...",
         Style::default().fg(Color::Yellow).bold(),
     ))];
     if !review.reasoning.is_empty() {
@@ -383,7 +383,6 @@ pub fn render_review_view(
     let status_line = if state.review.running {
         Line::from(vec![
             Span::styled(" Reviewing... ", Style::default().fg(Color::Yellow).bold()),
-            Span::styled("[Esc: Cancel]", Style::default().fg(Color::Gray)),
         ])
     } else if let Some(err) = &state.review.error {
         Line::from(Span::styled(

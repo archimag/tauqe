@@ -14,6 +14,52 @@ use latex::render_text_spans;
 static SYNTAX_SET: LazyLock<SyntaxSet> = LazyLock::new(SyntaxSet::load_defaults_newlines);
 static THEME_SET: LazyLock<ThemeSet> = LazyLock::new(ThemeSet::load_defaults);
 
+pub fn supports_truecolor() -> bool {
+    static TRUECOLOR: LazyLock<bool> = LazyLock::new(|| {
+        if let Ok(val) = std::env::var("COLORTERM") {
+            let v = val.to_lowercase();
+            if v == "truecolor" || v == "24bit" {
+                return true;
+            }
+        }
+        if let Ok(term) = std::env::var("TERM") {
+            let t = term.to_lowercase();
+            if t.contains("kitty") || t.contains("alacritty") || t.contains("wezterm") {
+                return true;
+            }
+        }
+        false
+    });
+    *TRUECOLOR
+}
+
+pub fn rgb_to_ansi256(r: u8, g: u8, b: u8) -> u8 {
+    let max = r.max(g).max(b);
+    let min = r.min(g).min(b);
+    if max - min <= 8 {
+        let avg = (r as u16 + g as u16 + b as u16) / 3;
+        if avg < 8 {
+            return 16;
+        }
+        if avg > 248 {
+            return 231;
+        }
+        return (232 + ((avg - 8) * 24 / 240)).min(255) as u8;
+    }
+    let r_idx = (r as u16 * 5 / 255) as u8;
+    let g_idx = (g as u16 * 5 / 255) as u8;
+    let b_idx = (b as u16 * 5 / 255) as u8;
+    16 + 36 * r_idx + 6 * g_idx + b_idx
+}
+
+pub fn safe_rgb(r: u8, g: u8, b: u8) -> Color {
+    if supports_truecolor() {
+        Color::Rgb(r, g, b)
+    } else {
+        Color::Indexed(rgb_to_ansi256(r, g, b))
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct MarkdownTheme {
     pub text_style: Style,
@@ -50,105 +96,218 @@ impl Default for MarkdownTheme {
 }
 
 impl MarkdownTheme {
+    pub fn answer_themed(mode: crate::config::ThemeMode) -> Self {
+        match mode {
+            crate::config::ThemeMode::Light => Self {
+                text_style: Style::default(),
+                bold_style: Style::default().add_modifier(Modifier::BOLD),
+                italic_style: Style::default().add_modifier(Modifier::ITALIC),
+                h1: Style::default()
+                    .fg(Color::Blue)
+                    .add_modifier(Modifier::BOLD),
+                h2: Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+                h3: Style::default()
+                    .fg(Color::Magenta)
+                    .add_modifier(Modifier::BOLD),
+                h4: Style::default()
+                    .fg(safe_rgb(160, 100, 20))
+                    .add_modifier(Modifier::BOLD),
+                h5: Style::default().add_modifier(Modifier::BOLD),
+                h6: Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::BOLD),
+                inline_code: Style::default()
+                    .bg(safe_rgb(235, 238, 245))
+                    .fg(safe_rgb(180, 80, 20))
+                    .add_modifier(Modifier::BOLD),
+                code_border: Style::default().fg(safe_rgb(180, 190, 205)),
+                code_lang: Style::default()
+                    .fg(safe_rgb(160, 90, 10))
+                    .add_modifier(Modifier::BOLD),
+                code_text: Style::default().fg(safe_rgb(30, 35, 45)),
+                code_bg: safe_rgb(240, 243, 250),
+                blockquote_bar: Style::default().fg(Color::Blue),
+                blockquote_text: Style::default().fg(Color::DarkGray),
+                list_bullet: Style::default()
+                    .fg(Color::Blue)
+                    .add_modifier(Modifier::BOLD),
+                link: Style::default()
+                    .fg(Color::Blue)
+                    .add_modifier(Modifier::UNDERLINED),
+                hr: Style::default().fg(Color::Gray),
+                table_border: Style::default().fg(Color::Gray),
+                table_head: Style::default()
+                    .fg(Color::Blue)
+                    .add_modifier(Modifier::BOLD),
+                table_cell: Style::default(),
+                math_style: Style::default()
+                    .fg(Color::Blue)
+                    .add_modifier(Modifier::ITALIC),
+                compact: false,
+                line_prefix: None,
+            },
+            _ => Self {
+                text_style: Style::default(),
+                bold_style: Style::default().add_modifier(Modifier::BOLD),
+                italic_style: Style::default().add_modifier(Modifier::ITALIC),
+                h1: Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+                h2: Style::default()
+                    .fg(Color::LightBlue)
+                    .add_modifier(Modifier::BOLD),
+                h3: Style::default()
+                    .fg(Color::Magenta)
+                    .add_modifier(Modifier::BOLD),
+                h4: Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+                h5: Style::default().add_modifier(Modifier::BOLD),
+                h6: Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::BOLD),
+                inline_code: Style::default()
+                    .bg(safe_rgb(36, 40, 52))
+                    .fg(safe_rgb(240, 205, 120))
+                    .add_modifier(Modifier::BOLD),
+                code_border: Style::default().fg(safe_rgb(75, 90, 115)),
+                code_lang: Style::default()
+                    .fg(safe_rgb(245, 205, 100))
+                    .add_modifier(Modifier::BOLD),
+                code_text: Style::default().fg(safe_rgb(220, 225, 235)),
+                code_bg: safe_rgb(24, 27, 36),
+                blockquote_bar: Style::default().fg(Color::Cyan),
+                blockquote_text: Style::default().fg(Color::Gray),
+                list_bullet: Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+                link: Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::UNDERLINED),
+                hr: Style::default().fg(Color::DarkGray),
+                table_border: Style::default().fg(Color::DarkGray),
+                table_head: Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+                table_cell: Style::default(),
+                math_style: Style::default()
+                    .fg(Color::LightCyan)
+                    .add_modifier(Modifier::ITALIC),
+                compact: false,
+                line_prefix: None,
+            },
+        }
+    }
+
     pub fn answer() -> Self {
-        Self {
-            text_style: Style::default().fg(Color::White),
-            bold_style: Style::default().add_modifier(Modifier::BOLD),
-            italic_style: Style::default().add_modifier(Modifier::ITALIC),
-            h1: Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-            h2: Style::default()
-                .fg(Color::LightBlue)
-                .add_modifier(Modifier::BOLD),
-            h3: Style::default()
-                .fg(Color::Magenta)
-                .add_modifier(Modifier::BOLD),
-            h4: Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-            h5: Style::default()
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD),
-            h6: Style::default()
-                .fg(Color::DarkGray)
-                .add_modifier(Modifier::BOLD),
-            inline_code: Style::default()
-                .bg(Color::Rgb(36, 40, 52))
-                .fg(Color::Rgb(240, 205, 120))
-                .add_modifier(Modifier::BOLD),
-            code_border: Style::default().fg(Color::Rgb(75, 90, 115)),
-            code_lang: Style::default()
-                .fg(Color::Rgb(245, 205, 100))
-                .add_modifier(Modifier::BOLD),
-            code_text: Style::default().fg(Color::Rgb(220, 225, 235)),
-            code_bg: Color::Rgb(24, 27, 36),
-            blockquote_bar: Style::default().fg(Color::Cyan),
-            blockquote_text: Style::default().fg(Color::Gray),
-            list_bullet: Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-            link: Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::UNDERLINED),
-            hr: Style::default().fg(Color::DarkGray),
-            table_border: Style::default().fg(Color::DarkGray),
-            table_head: Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-            table_cell: Style::default().fg(Color::White),
-            math_style: Style::default()
-                .fg(Color::LightCyan)
-                .add_modifier(Modifier::ITALIC),
-            compact: false,
-            line_prefix: None,
+        Self::answer_themed(crate::config::ThemeMode::Auto)
+    }
+
+    pub fn reasoning_themed(mode: crate::config::ThemeMode) -> Self {
+        match mode {
+            crate::config::ThemeMode::Light => {
+                let base_blue = Style::default().fg(safe_rgb(45, 85, 140));
+                Self {
+                    text_style: base_blue,
+                    bold_style: Style::default()
+                        .fg(safe_rgb(30, 65, 120))
+                        .add_modifier(Modifier::BOLD),
+                    italic_style: Style::default().add_modifier(Modifier::ITALIC),
+                    h1: Style::default()
+                        .fg(safe_rgb(25, 60, 115))
+                        .add_modifier(Modifier::BOLD),
+                    h2: Style::default()
+                        .fg(safe_rgb(35, 75, 130))
+                        .add_modifier(Modifier::BOLD),
+                    h3: Style::default()
+                        .fg(safe_rgb(45, 85, 140))
+                        .add_modifier(Modifier::BOLD),
+                    h4: Style::default()
+                        .fg(safe_rgb(55, 95, 150))
+                        .add_modifier(Modifier::BOLD),
+                    h5: Style::default()
+                        .fg(safe_rgb(65, 105, 160))
+                        .add_modifier(Modifier::BOLD),
+                    h6: Style::default()
+                        .fg(safe_rgb(75, 115, 170))
+                        .add_modifier(Modifier::BOLD),
+                    inline_code: Style::default()
+                        .fg(safe_rgb(35, 75, 130))
+                        .bg(safe_rgb(225, 235, 248)),
+                    code_border: Style::default().fg(safe_rgb(180, 195, 220)),
+                    code_lang: Style::default().fg(safe_rgb(70, 100, 145)),
+                    code_text: base_blue,
+                    code_bg: safe_rgb(238, 244, 252),
+                    blockquote_bar: Style::default().fg(safe_rgb(100, 130, 180)),
+                    blockquote_text: base_blue,
+                    list_bullet: Style::default().fg(safe_rgb(60, 100, 160)),
+                    link: Style::default()
+                        .fg(safe_rgb(35, 75, 130))
+                        .add_modifier(Modifier::UNDERLINED),
+                    hr: Style::default().fg(safe_rgb(180, 195, 220)),
+                    table_border: Style::default().fg(safe_rgb(180, 195, 220)),
+                    table_head: Style::default().fg(safe_rgb(35, 75, 130)),
+                    table_cell: base_blue,
+                    math_style: base_blue.add_modifier(Modifier::ITALIC),
+                    compact: true,
+                    line_prefix: None,
+                }
+            }
+            _ => {
+                let base_blue = Style::default().fg(safe_rgb(140, 180, 225));
+                Self {
+                    text_style: base_blue,
+                    bold_style: Style::default()
+                        .fg(safe_rgb(165, 200, 240))
+                        .add_modifier(Modifier::BOLD),
+                    italic_style: Style::default().add_modifier(Modifier::ITALIC),
+                    h1: Style::default()
+                        .fg(safe_rgb(155, 195, 240))
+                        .add_modifier(Modifier::BOLD),
+                    h2: Style::default()
+                        .fg(safe_rgb(140, 180, 225))
+                        .add_modifier(Modifier::BOLD),
+                    h3: Style::default()
+                        .fg(safe_rgb(130, 170, 215))
+                        .add_modifier(Modifier::BOLD),
+                    h4: Style::default()
+                        .fg(safe_rgb(120, 160, 205))
+                        .add_modifier(Modifier::BOLD),
+                    h5: Style::default()
+                        .fg(safe_rgb(110, 150, 195))
+                        .add_modifier(Modifier::BOLD),
+                    h6: Style::default()
+                        .fg(safe_rgb(95, 130, 175))
+                        .add_modifier(Modifier::BOLD),
+                    inline_code: Style::default()
+                        .fg(safe_rgb(165, 200, 240))
+                        .bg(safe_rgb(30, 42, 60)),
+                    code_border: Style::default().fg(safe_rgb(60, 85, 120)),
+                    code_lang: Style::default().fg(safe_rgb(130, 170, 220)),
+                    code_text: base_blue,
+                    code_bg: safe_rgb(18, 25, 38),
+                    blockquote_bar: Style::default().fg(safe_rgb(70, 95, 130)),
+                    blockquote_text: base_blue,
+                    list_bullet: Style::default().fg(safe_rgb(100, 145, 195)),
+                    link: Style::default()
+                        .fg(safe_rgb(130, 170, 225))
+                        .add_modifier(Modifier::UNDERLINED),
+                    hr: Style::default().fg(safe_rgb(60, 85, 120)),
+                    table_border: Style::default().fg(safe_rgb(60, 85, 120)),
+                    table_head: Style::default().fg(safe_rgb(145, 185, 230)),
+                    table_cell: base_blue,
+                    math_style: base_blue.add_modifier(Modifier::ITALIC),
+                    compact: true,
+                    line_prefix: None,
+                }
+            }
         }
     }
 
     pub fn reasoning() -> Self {
-        let base_blue = Style::default()
-            .fg(Color::Rgb(125, 160, 205))
-            .add_modifier(Modifier::DIM);
-
-        Self {
-            text_style: base_blue,
-            bold_style: Style::default().fg(Color::Rgb(150, 185, 230)),
-            italic_style: Style::default().add_modifier(Modifier::ITALIC),
-            h1: Style::default().fg(Color::Rgb(155, 195, 240)),
-            h2: Style::default().fg(Color::Rgb(140, 180, 225)),
-            h3: Style::default().fg(Color::Rgb(130, 170, 215)),
-            h4: Style::default().fg(Color::Rgb(120, 160, 205)),
-            h5: Style::default().fg(Color::Rgb(110, 150, 195)),
-            h6: Style::default().fg(Color::Rgb(95, 130, 175)),
-            inline_code: Style::default()
-                .fg(Color::Rgb(165, 200, 240))
-                .bg(Color::Rgb(30, 42, 60)),
-            code_border: Style::default()
-                .fg(Color::Rgb(60, 85, 120))
-                .add_modifier(Modifier::DIM),
-            code_lang: Style::default()
-                .fg(Color::Rgb(130, 170, 220))
-                .add_modifier(Modifier::DIM),
-            code_text: base_blue,
-            code_bg: Color::Rgb(18, 25, 38),
-            blockquote_bar: Style::default().fg(Color::Rgb(70, 95, 130)),
-            blockquote_text: base_blue,
-            list_bullet: Style::default().fg(Color::Rgb(100, 145, 195)),
-            link: Style::default()
-                .fg(Color::Rgb(130, 170, 225))
-                .add_modifier(Modifier::UNDERLINED),
-            hr: Style::default()
-                .fg(Color::Rgb(60, 85, 120))
-                .add_modifier(Modifier::DIM),
-            table_border: Style::default()
-                .fg(Color::Rgb(60, 85, 120))
-                .add_modifier(Modifier::DIM),
-            table_head: Style::default().fg(Color::Rgb(145, 185, 230)),
-            table_cell: base_blue,
-            math_style: base_blue.add_modifier(Modifier::ITALIC),
-            compact: true,
-            line_prefix: None,
-        }
+        Self::reasoning_themed(crate::config::ThemeMode::Auto)
     }
 }
 
@@ -325,7 +484,7 @@ fn resolve_syntax(token: &str) -> &'static syntect::parsing::SyntaxReference {
 }
 
 fn syntect_style_to_ratatui(style: SynStyle, fallback_bg: Color) -> Style {
-    let mut s = Style::default().fg(Color::Rgb(
+    let mut s = Style::default().fg(safe_rgb(
         style.foreground.r,
         style.foreground.g,
         style.foreground.b,
@@ -403,9 +562,14 @@ fn render_code_block(
 
     let syntax = resolve_syntax(lang_trimmed);
 
+    let theme_name = if theme.code_text.fg == Some(safe_rgb(30, 35, 45)) {
+        "base16-ocean.light"
+    } else {
+        "base16-ocean.dark"
+    };
     let syn_theme = THEME_SET
         .themes
-        .get("base16-ocean.dark")
+        .get(theme_name)
         .or_else(|| THEME_SET.themes.values().next());
 
     let mut highlighter = syn_theme.map(|t| HighlightLines::new(syntax, t));
@@ -1027,13 +1191,10 @@ mod tests {
     fn test_code_block_empty_lines_and_typescript_highlighting() {
         let ts_code = "```typescript\nconst x: number = 42;\n\nfunction test(): void {}\n```";
         let lines = render_markdown(ts_code, &MarkdownTheme::answer());
+        let default_code_fg = safe_rgb(220, 225, 235);
         let has_highlighting = lines.iter().any(|l| {
             l.spans.iter().any(|s| {
-                if let Some(Color::Rgb(r, g, b)) = s.style.fg {
-                    !(r == 220 && g == 225 && b == 235)
-                } else {
-                    false
-                }
+                s.style.fg.is_some_and(|fg| fg != default_code_fg)
             })
         });
         assert!(has_highlighting, "TypeScript code must have syntax highlighting");

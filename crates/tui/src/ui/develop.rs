@@ -45,6 +45,7 @@ pub struct ReasoningState {
     pub text: String,
     pub lines: Vec<Line<'static>>,
     pub show: bool,
+    pub theme_mode: crate::config::ThemeMode,
     dirty: bool,
     last_render: Option<Instant>,
 }
@@ -55,6 +56,7 @@ impl Default for ReasoningState {
             text: String::new(),
             lines: Vec::new(),
             show: true,
+            theme_mode: crate::config::ThemeMode::default(),
             dirty: false,
             last_render: None,
         }
@@ -89,7 +91,7 @@ impl ReasoningState {
     pub fn update_markdown(&mut self) {
         self.lines = crate::markdown::render_markdown(
             &self.text,
-            &crate::markdown::MarkdownTheme::reasoning(),
+            &crate::markdown::MarkdownTheme::reasoning_themed(self.theme_mode),
         );
         self.dirty = false;
         self.last_render = Some(Instant::now());
@@ -122,7 +124,10 @@ impl ReasoningState {
         let mut lines = Vec::new();
         let reasoning_badge = Span::styled(
             " [REASONING] ",
-            Style::default().bg(Color::Rgb(60, 90, 140)).fg(Color::White).bold(),
+            Style::default()
+                .bg(crate::markdown::safe_rgb(60, 90, 140))
+                .fg(Color::White)
+                .bold(),
         );
 
         if self.show {
@@ -130,8 +135,10 @@ impl ReasoningState {
                 reasoning_badge,
                 Span::raw(" "),
                 Span::styled(
-                    "Thinking (Ctrl+R to fold)",
-                    Style::default().fg(Color::Rgb(130, 170, 220)).bold(),
+                    "Thinking",
+                    Style::default()
+                        .fg(crate::markdown::safe_rgb(130, 170, 220))
+                        .bold(),
                 ),
             ]));
 
@@ -139,8 +146,7 @@ impl ReasoningState {
                 lines.extend(self.lines.iter().cloned());
             } else {
                 let text_style = Style::default()
-                    .fg(Color::Rgb(130, 165, 210))
-                    .add_modifier(ratatui::style::Modifier::DIM);
+                    .fg(crate::markdown::safe_rgb(140, 180, 230));
                 for line in self.text.lines() {
                     lines.push(Line::from(Span::styled(line.to_string(), text_style)));
                 }
@@ -150,7 +156,7 @@ impl ReasoningState {
                 reasoning_badge,
                 Span::raw(" "),
                 Span::styled(
-                    "▶ Thinking hidden (Ctrl+R to expand)",
+                    "▶ Thinking hidden",
                     Style::default().fg(Color::DarkGray).bold(),
                 ),
             ]));
@@ -160,10 +166,19 @@ impl ReasoningState {
     }
 }
 
+/// Which pane of the Develop tab receives navigation keys.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DevelopFocus {
+    #[default]
+    Editor,
+    Viewport,
+}
+
 pub struct DevelopView {
     pub operation_id: Option<String>,
     pub model: Option<String>,
     pub reasoning: ReasoningState,
+    pub theme_mode: crate::config::ThemeMode,
     pub text: String,
     pub markdown_lines: Vec<Line<'static>>,
     pub usage: Option<ModelUsageEvent>,
@@ -175,6 +190,7 @@ pub struct DevelopView {
     pub result: Option<ModelResult>,
     pub scroll: u16,
     pub auto_scroll: bool,
+    pub focus: DevelopFocus,
 
     // Structured Org-Mode Edits & Git State
     pub edits_active: bool,
@@ -205,6 +221,7 @@ impl Default for DevelopView {
             operation_id: None,
             model: None,
             reasoning: ReasoningState::default(),
+            theme_mode: crate::config::ThemeMode::default(),
             text: String::new(),
             markdown_lines: Vec::new(),
             usage: None,
@@ -216,6 +233,7 @@ impl Default for DevelopView {
             result: None,
             scroll: 0,
             auto_scroll: true,
+            focus: DevelopFocus::Editor,
             edits_active: false,
             files: Vec::new(),
             selected_file_index: 0,
@@ -255,11 +273,21 @@ impl DevelopView {
         self.render_markdown_now();
     }
 
+    pub fn set_theme_mode(&mut self, mode: crate::config::ThemeMode) {
+        let changed = self.theme_mode != mode || self.reasoning.theme_mode != mode;
+        self.theme_mode = mode;
+        self.reasoning.theme_mode = mode;
+        if changed {
+            self.render_markdown_now();
+            self.reasoning.update_markdown();
+        }
+    }
+
     fn render_markdown_now(&mut self) {
         let flashing_id = self.copy_flash.as_ref().map(|(id, _)| *id);
         let (lines, blocks) = crate::markdown::render_markdown_with_blocks(
             &self.text,
-            &crate::markdown::MarkdownTheme::answer(),
+            &crate::markdown::MarkdownTheme::answer_themed(self.theme_mode),
             flashing_id,
         );
         self.markdown_lines = lines;
@@ -469,7 +497,7 @@ pub fn compute_model_lines(model: &DevelopView) -> Vec<Line<'static>> {
             Span::raw(" "),
             Span::styled(
                 toolchain_info.clone(),
-                Style::default().bold().fg(Color::White),
+                Style::default().bold(),
             ),
         ]));
     }
@@ -524,32 +552,21 @@ pub fn compute_model_lines(model: &DevelopView) -> Vec<Line<'static>> {
             }
         };
 
-        let mut header_spans = vec![
+        let header_spans = vec![
             header_badge,
             Span::raw(" "),
             Span::styled(
-                format!(
-                    "Proposed Edits ({}/{} files) - [ / ] Navigate, Space/Enter to Fold/Unfold",
-                    ok_files, total_files
-                ),
+                format!("Proposed Edits ({}/{} files)", ok_files, total_files),
                 Style::default().bold().fg(Color::Cyan),
             ),
         ];
-
-        if model.last_commit_hash.is_some() {
-            header_spans.push(Span::raw(" | "));
-            header_spans.push(Span::styled(
-                "Press 'u' to Undo AI commit",
-                Style::default().fg(Color::Yellow),
-            ));
-        }
 
         model_lines.push(Line::from(header_spans));
 
         if let Some(summary) = &model.last_commit_summary {
             model_lines.push(Line::from(vec![
                 Span::raw("  Summary: "),
-                Span::styled(summary.clone(), Style::default().bold().fg(Color::White)),
+                Span::styled(summary.clone(), Style::default().bold()),
             ]));
         }
 

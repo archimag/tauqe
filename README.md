@@ -118,10 +118,11 @@ On first launch in a repository, the built-in **interactive onboarding wizard** 
 
 ### 2. Core Workspace Views
 
-- **Develop (`Ctrl+1`):** Autonomous bounded turn execution, live streaming diffs, and conversational harness.
+- **Develop (`Ctrl+1`):** Autonomous bounded turn execution, live streaming diffs, persistent prompt history, and conversational harness.
 - **Context (`Ctrl+2`):** Three-tier context management (Pinned, User, Auto) with glob pattern matching.
-- **Review (`Ctrl+3`):** Interactive code review with model selection, reasoning inspection, and actionable findings (`TODO`/`DONE`/`REJECTED`).
-- **History (`Ctrl+4`):** Collapsible chronological session log and commit audit trail.
+- **Review (`Ctrl+3`):** Interactive code review with model selection, reasoning inspection, and structured finding triage (`TODO` / `DONE` / `REJECTED`).
+- **Plans (`Ctrl+4`):** Tactical task execution, hierarchical task trees, and active context focus injection.
+- **History (`Ctrl+5`):** Collapsible chronological session log and commit audit trail.
 
 ### 3. Deep Dive Documentation & Asking TAUQE Directly
 

@@ -10,12 +10,16 @@ To guarantee universal compatibility across modern and legacy terminal emulators
 
 - **`F1` / `Alt+1` / `Ctrl+1` (Develop View):**
   - The central engineering cockpit and execution canvas where coding turns take place.
-  - Displays the turn progression as a structured, live document: collapsible reasoning blocks (`Ctrl+R`), streaming markdown explanations, and interactive proposed file diffs.
+  - Displays turn progression as a structured, live document: collapsible reasoning blocks (`Ctrl+R`), streaming markdown explanations, and interactive proposed file diffs.
+  - **Dual-Focus Architecture:** Switch focus seamlessly between the prompt editor and the response/diffs viewport using `Ctrl+Space` or `Shift+Tab`.
   - Multi-line intent editor with auto-growing height and Emacs navigation (`Ctrl+A`, `Ctrl+E`, `Alt+B`, `Alt+F`, `Ctrl+K`, `Ctrl+Y`, `Ctrl+W` / `Alt+Backspace` to kill word backward, `Tab` for 2-space indentation).
+  - Persistent prompt history: Use `Ctrl+P` / `Ctrl+N` (or `Alt+P` / `Alt+N`) to cycle through previous prompt inputs. History is saved to `.tauqe/prompts.history` and persists across sessions.
   - Newline insertion: `Shift+Enter`, `Alt+Enter`, or `Ctrl+J`.
   - Response clipboard: Press `Alt+C` or `Alt+Y` while idle to copy the model's markdown response to the system clipboard.
   - Undo AI commit: Press `Ctrl+Z` or `Alt+U` to trigger safe rollback. If no AI commit exists, TAUQE displays a status notice without opening unnecessary dialogs.
-  - Active LLM selection: Press `Alt+M` or `Ctrl+M` / `Ctrl+Y` from any screen to open the model selector.
+  - Active LLM selection: Press `Alt+M` or `Ctrl+M` from any screen to open the model selector.
+  - Contextual help: Press `Ctrl+H` / `Alt+H` from any view or `?` in navigation views to open the interactive help dialog.
+  - Configuration reload: Press `Ctrl+O` to reload `tui.toml` settings without restarting TAUQE.
 
 ### What Happens in Develop When You Submit a Prompt
 When you submit an engineering intent, TAUQE does not simply invoke a single-shot completion. Instead, it guides the model through an **autonomous, multi-round bounded turn**:
@@ -30,10 +34,14 @@ When you submit an engineering intent, TAUQE does not simply invoke a single-sho
   - Quick keys: `e` (add editable), `r` (add read-only), `t` (toggle permission), `p` (promote auto to user), `c` (clear auto), `d` (remove file).
 - **`F3` / `Alt+3` / `Ctrl+3` (Review View):**
   - Dedicated code review workspace for static architectural and security audits.
-  - Interactive findings checklist: fold/unfold items (`Tab` / `Space`), toggle status TODO/DONE/REJECTED (`t`), select items for Develop context (`x`), and copy findings (`c` / `y`).
+  - Unified navigation: `n` / `p`, `j` / `k`, or arrow keys.
+  - Interactive findings checklist: fold/unfold items (`Tab` / `Space`), select items for Develop context (`x`), and copy findings (`c` / `y`).
+  - Intentional status assignment: Press `t` to open the status selection dialog (`1` Todo, `2` Done, `3` Rejected).
 - **`F4` / `Alt+4` / `Ctrl+4` (Plans View):**
   - Workspace for managing tactical task hierarchies and execution roadmaps.
+  - Unified navigation: `n` / `p`, `j` / `k`, or arrow keys.
   - Interactive tree of tasks with statuses (`[ ]` Todo, `[▶]` InProgress, `[✓]` Done, `[−]` Cancelled).
+  - Intentional status assignment: Press `t`, `s`, or `d` to open the status dialog (`1` Todo, `2` InProgress, `3` Done, `4` Cancelled).
   - Select items with `x` to inject them into the Develop prompt context as `<active_plan_context>`, fold/unfold branches (`Tab` / `Space`), switch between plans (`Tab` in plan selector), and copy markdown (`c` / `y`).
 - **`F5` / `Alt+5` / `Ctrl+5` (History View):**
   - Paginated audit log of semantic turns, code review runs, AI commit hashes, and file modifications.
@@ -44,27 +52,48 @@ When you submit an engineering intent, TAUQE does not simply invoke a single-sho
 
 ---
 
-## 5.2 Zero Modal Ambiguity in Text Fields
+## 5.2 Dual-Focus Architecture in Develop (Editor vs. Viewport)
 
-To prevent accidental command invocation and cognitive traps, TAUQE enforces a strict input safety invariant:
-- **Typing always types:** When the prompt editor or any text field is focused, every printable character is unconditionally inserted into the text buffer. Single-letter command shortcuts are never intercepted during text entry, even if the editor buffer is empty.
-- **Commands require modifiers:** Operations in editing views use explicit modifiers (`Ctrl+Z` / `Alt+U` for Undo, `F6` / `Ctrl+S` for Squash, `Alt+C` for copying responses).
-- **Diff file inspection:** Press `Alt+[` and `Alt+]` (or `↑` / `↓` when the prompt is empty) to navigate through proposed files, and `Tab` (when empty) or `Alt+Space` to fold or unfold the unified diff of the selected file.
-- Press `?` at any time to open the contextual Help modal.
+In the Develop view, TAUQE resolves the tension between text editing and inspection through a clean two-focus model without modal traps:
+
+### 1. Editor Focus (Default Mode)
+- **Typing always types:** Every printable character is unconditionally inserted into the text buffer. Single-letter command keys are never intercepted during text entry.
+- **Emacs navigation:** `Ctrl+A` / `Ctrl+E` for start/end of line, `Alt+B` / `Alt+F` for words backward/forward, `Ctrl+K` to kill to end of line, `Ctrl+Y` to yank from kill-ring, `Ctrl+W` / `Alt+Backspace` to kill word backward.
+- **Persistent prompt history:** `Ctrl+P` and `Ctrl+N` cycle backward and forward through previous prompt inputs.
+- **Switching focus:** Press `Ctrl+Space` or `Shift+Tab` to move focus to the response and diffs viewport.
+
+### 2. Viewport Focus (Response & Diffs Inspection)
+- **Visual indicator:** The prompt border dims to dark gray and displays `[VIEWPORT ACTIVE]`, while the currently inspected file shows an active cursor (`▶ `).
+- **File selection:** Use `Ctrl+N` / `Ctrl+P` or arrow keys (`↑` / `↓`) to navigate through modified files. If no files are present, `Ctrl+N` and `Ctrl+P` scroll the assistant response.
+- **Folding diffs:** Press `Tab`, `Enter`, or `Ctrl+T` to fold or unfold diff hunks for the active file.
+- **Scrolling response:** `PgUp` and `PgDn` scroll the response content by full pages.
+- **Zero-loss return to typing:** Pressing any printable character (letters, digits, symbols, or unshifted space) immediately returns focus to the prompt editor and inserts that character at the text cursor without dropping the key event.
+- **Explicit return:** Press `Esc`, `Ctrl+Space`, or `Shift+Tab` to return focus to the prompt editor without modifying text.
 
 ---
 
-## 5.3 Layout-Agnostic Modal Dialogs
+## 5.3 Input Safety and Onboarding Protection
 
-Confirmation dialogs for potentially destructive actions (Undo AI commit, Git history squash, cancel running generation, clear session history, delete plan) are designed to be completely independent of system keyboard layouts:
-- **Interactive Button Focus:** Each confirmation dialog renders distinct `[ Confirm ]` and `[ Cancel ]` buttons, with the initial focus resting securely on **Cancel**.
-- **Universal Navigation:** Developers can switch focus between buttons using `Tab`, `Shift+Tab`, or the arrow keys (`←`, `→`). Pressing `Enter` executes the currently focused action (safe cancellation by default).
-- **Fast Shortcuts:** Pressing `y` or `Y` confirms immediately, while `Esc` or `n` / `N` cancels.
-- **Git Squash Safety:** Within the squash dialog (`F6` / `Ctrl+S`), `Enter` or `Space` folds/unfolds changed files in the file list, and `Enter` in the message editor inserts a standard newline. Triggering the squash requires a dedicated shortcut (`Ctrl+Enter` or `Ctrl+S`), which prompts an explicit confirmation modal summarizing the commits and target base ref. Applying is strictly blocked while diffs are loading or AI commit messages are generating.
+- **Commands require modifiers:** Destructive or state-changing actions use explicit modifiers (`Ctrl+Z` / `Alt+U` for Undo, `F6` / `Ctrl+S` for Squash, `Alt+C` for copying responses).
+- **Draft protection on exit:** Pressing `Ctrl+Q` prompts for confirmation whenever a prompt draft is non-empty, a model turn is active, or an unapplied squash diff exists, preventing accidental loss of uncommitted work.
+- **Onboarding isolation:** During initial configuration (`ViewMode::Onboarding`), view switching keys (`F1..F5`, `Ctrl+1..5`, `Alt+1..5`) and header mouse clicks are locked until setup is completed, preventing accidental bypass of credential verification.
+- **Contextual help:** Press `Ctrl+H` / `Alt+H` from any view or `?` in navigation views to open the contextual help dialog.
 
 ---
 
-## 5.4 User Configuration (`tui.toml`)
+## 5.4 Modal Dialog Architecture & Interaction Standard
+
+Modal dialogs follow a unified, three-tier layout standard designed for keyboard reliability, safety, and layout neutrality:
+- **Structure:** Every dialog consists of a distinct **Header** (title and context), a central **Body** (content, form, or options), and an **Actions / Keybindings Footer**.
+- **Destructive Action Safety:** Confirmation dialogs (Quit with draft, Undo AI commit, Git squash, Cancel generation, Delete plan, Clear history) default focus securely to `[ Cancel ]`.
+- **Button Navigation:** Switch focus between buttons using `Tab`, `Shift+Tab`, or arrow keys (`←`, `→`). Press `Enter` or `Space` to activate the focused button.
+- **Fast Accelerators:** In confirmation dialogs, pressing `y` / `Y` confirms immediately, while `n` / `N`, `q`, or `Esc` cancels.
+- **Intentional Status Dialogs:** In Plans and Review, task and finding statuses are selected through explicit modal dialogs rather than accidental cycling. Choose a target status using direct numeric keys (`1`..`4`), or navigate with `n` / `p` and confirm with `Enter` / `Space`.
+- **Git Squash Safety:** Within the squash dialog (`F6` / `Ctrl+S`), `Enter` or `Space` folds/unfolds changed files in the file list, and `Enter` in the message editor inserts a newline. Triggering the squash requires `Ctrl+Enter` or `Ctrl+S`, which opens an explicit confirmation dialog summarizing affected commits.
+
+---
+
+## 5.5 User Configuration (`tui.toml`)
 
 In accordance with XDG standards, developer-specific terminal interface preferences are kept strictly separated from project configuration (`tauqe.toml`).
 
@@ -84,15 +113,25 @@ layout = "none"
 # 2. Pairs list: "йq,цw,уe" or "й:q,ц:w"
 # langmap = "йцукенгшщзхъ;qwertyuiop[]"
 
+[theme]
+# Color theme mode: "dark", "light", or "auto" (default: "auto").
+# When "auto" is set, TAUQE checks COLORFGBG or terminal environment hints.
+# Automatically detects 24-bit truecolor support and quantizes to ANSI-256 where required.
+mode = "auto"
+
 [notifications]
 # Terminal audio bell (\x07 / BEL). In Kitty, WezTerm, Alacritty, and modern desktop
 # window managers, this triggers window urgency hints or tab highlighting:
 sound = true
 
-# Native desktop notifications via terminal OSC sequences (OSC 777 and OSC 9):
-# Supported natively by Kitty, Ghostty, WezTerm, iTerm2, foot, and Windows Terminal.
-# Delivers notifications directly to your desktop environment without external dependencies.
+# Native desktop notifications via terminal OSC sequences:
 desktop = true
+
+# Desktop notification protocol: "osc9" (default), "osc777", or "both":
+desktop_protocol = "osc9"
+
+# Only notify when the terminal window is unfocused:
+only_unfocused = true
 
 # Minimum turn/review execution duration in seconds before triggering notifications
 # (prevents notification spam on fast sub-second interactions, default: 5):
@@ -104,7 +143,7 @@ min_duration_seconds = 5
 
 ---
 
-## 5.5 Long-Running Turn Notifications
+## 5.6 Long-Running Turn Notifications
 
 Engineering tasks (discovery rounds, toolchain verifications, test suites) can take dozens of seconds. TAUQE ensures developers never miss turn completion when switching to another window or workspace:
 

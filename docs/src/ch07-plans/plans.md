@@ -69,10 +69,11 @@ All `<plan>` tags are automatically filtered out during streaming to prevent vis
 
 | Keybinding | Action |
 |---|---|
-| `j` / `k` or `↑` / `↓` | Move selection up / down through the plan hierarchy |
+| `n` / `p`, `j` / `k`, or `↑` / `↓` | Move selection through the plan hierarchy |
 | `x` | Toggle checkbox (mark item for injection into prompt context) |
-| `t` / `d` | Cycle item status (`Todo` → `InProgress` → `Done` → `Cancelled`) |
+| `t` / `s` / `d` | Open status selection dialog (`1` Todo, `2` InProgress, `3` Done, `4` Cancelled) |
 | `Space` / `Enter` | Fold or unfold child items |
 | `Tab` / `Shift+Tab` | Switch between active plans |
 | `c` / `y` (or `Alt+C`) | Copy entire plan to clipboard in Markdown format |
+| `Ctrl+H` / `?` | Open contextual Help dialog |
 | `Ctrl+1..5` | Quick switch between views |

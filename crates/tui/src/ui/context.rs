@@ -26,7 +26,6 @@ pub struct ContextViewState {
     pub filtered_candidates: Vec<String>,
     pub total_matching: usize,
     pub selected_candidate_index: usize,
-    pub status_message: Option<String>,
     pub confirm_clear_auto: bool,
 }
 
@@ -44,7 +43,6 @@ impl Default for ContextViewState {
             filtered_candidates: Vec::new(),
             total_matching: 0,
             selected_candidate_index: 0,
-            status_message: None,
             confirm_clear_auto: false,
         }
     }
@@ -287,41 +285,37 @@ pub fn render_context_view(
         .wrap(Wrap { trim: false });
     frame.render_widget(ctx_paragraph, main_area);
 
-    let info_line = if let Some(msg) = &state.context_view.status_message {
-        Line::from(Span::styled(msg, Style::default().fg(Color::Green).bold()))
-    } else {
-        match active_row {
-            Some(ContextRow::Header(ContextLayer::Pinned)) => Line::from(Span::styled(
-                "Pinned layer: Architecture & reference documents specified in tauqe.toml",
+    let info_line = match active_row {
+        Some(ContextRow::Header(ContextLayer::Pinned)) => Line::from(Span::styled(
+            "Pinned layer: Architecture & reference documents specified in tauqe.toml",
+            Style::default().fg(Color::Cyan),
+        )),
+        Some(ContextRow::Header(ContextLayer::User)) => Line::from(Span::styled(
+            "User layer: Persistent files curated by the developer (Editable or Read-Only)",
+            Style::default().fg(Color::Yellow),
+        )),
+        Some(ContextRow::Header(ContextLayer::Auto)) => Line::from(Span::styled(
+            "Auto layer: Files autonomously requested by the model during discovery rounds",
+            Style::default().fg(Color::Magenta),
+        )),
+        Some(ContextRow::Item(ref it)) => match it.layer {
+            ContextLayer::Pinned => Line::from(Span::styled(
+                format!("Pinned document: {} (protected, ~{} tokens)", it.path, it.estimated_tokens),
                 Style::default().fg(Color::Cyan),
             )),
-            Some(ContextRow::Header(ContextLayer::User)) => Line::from(Span::styled(
-                "User layer: Persistent files curated by the developer (Editable or Read-Only)",
-                Style::default().fg(Color::Yellow),
+            ContextLayer::User => Line::from(Span::styled(
+                format!("User file: {} [{:?}], ~{} tokens", it.path, it.access, it.estimated_tokens),
+                Style::default().fg(Color::White),
             )),
-            Some(ContextRow::Header(ContextLayer::Auto)) => Line::from(Span::styled(
-                "Auto layer: Files autonomously requested by the model during discovery rounds",
+            ContextLayer::Auto => Line::from(Span::styled(
+                format!("Auto-discovered file: {} [{:?}], ~{} tokens", it.path, it.access, it.estimated_tokens),
                 Style::default().fg(Color::Magenta),
             )),
-            Some(ContextRow::Item(ref it)) => match it.layer {
-                ContextLayer::Pinned => Line::from(Span::styled(
-                    format!("Pinned document: {} (protected, ~{} tokens)", it.path, it.estimated_tokens),
-                    Style::default().fg(Color::Cyan),
-                )),
-                ContextLayer::User => Line::from(Span::styled(
-                    format!("User file: {} [{:?}], ~{} tokens", it.path, it.access, it.estimated_tokens),
-                    Style::default().fg(Color::White),
-                )),
-                ContextLayer::Auto => Line::from(Span::styled(
-                    format!("Auto-discovered file: {} [{:?}], ~{} tokens", it.path, it.access, it.estimated_tokens),
-                    Style::default().fg(Color::Magenta),
-                )),
-            },
-            None => Line::from(Span::styled(
-                "Context state: 3 layers (Pinned, User, Auto) | Press '?' for commands",
-                Style::default().fg(Color::DarkGray),
-            )),
-        }
+        },
+        None => Line::from(Span::styled(
+            "Context state: 3 layers (Pinned, User, Auto) | Press '?' for commands",
+            Style::default().fg(Color::DarkGray),
+        )),
     };
     let prompt_widget = Paragraph::new(info_line)
         .block(Block::default().padding(Padding::horizontal(1)));

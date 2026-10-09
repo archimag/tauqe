@@ -1,43 +1,206 @@
 use std::sync::Arc;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use tauqe_protocol::{methods, ConfigSetParams, ModelRef, ReviewStartParams};
 use tokio::process::ChildStdin;
-use tokio::sync::Mutex;
-use tauqe_protocol::{
-    methods, ConfigSetParams, GitSquashApplyParams, GitSquashGenerateMessageParams,
-    GitSquashPreviewParams, ReviewStartParams,
-};
+use tokio::sync::{Mutex, MutexGuard};
 
-use crate::app::{AppState, SquashBaseMode, SquashDialogFocus};
-use crate::input::InputResult;
-use crate::rpc::send_request;
+use crate::app::{AppState, ConfirmDialogButton};
+use crate::input::{is_char_typing, squash, InputResult};
+use crate::rpc::{
+    allocate_request_id, record_optimistic_rollback, send_request, send_request_with_id,
+    OptimisticRollback,
+};
 use crate::ui::develop::DevelopView;
 use crate::ui::history::HistoryViewState;
 
-fn try_trigger_squash_confirm(dialog: &mut crate::app::SquashDialogState) {
-    if dialog.loading {
-        dialog.status_message = Some("Diff is still loading, please wait...".to_string());
-        return;
+enum ConfirmOutcome {
+    Toggled,
+    Accepted,
+    Dismissed,
+}
+
+/// Standard key handling for `[ Confirm ] / [ Cancel ]` modals (§7 Conventions):
+/// arrows/Tab cycle buttons, `Enter`/`Space` activates the focused button,
+/// `y`/`Y` confirms immediately, `n`/`N`/`Esc`/`q` dismisses safely.
+fn resolve_confirm(st: &mut AppState, key: KeyEvent) -> ConfirmOutcome {
+    match key.code {
+        KeyCode::Left | KeyCode::Right | KeyCode::Tab | KeyCode::BackTab => {
+            st.confirm_button = match st.confirm_button {
+                ConfirmDialogButton::Cancel => ConfirmDialogButton::Confirm,
+                ConfirmDialogButton::Confirm => ConfirmDialogButton::Cancel,
+            };
+            ConfirmOutcome::Toggled
+        }
+        KeyCode::Enter | KeyCode::Char(' ') => {
+            let accepted = st.confirm_button == ConfirmDialogButton::Confirm;
+            st.confirm_button = ConfirmDialogButton::Cancel;
+            if accepted {
+                ConfirmOutcome::Accepted
+            } else {
+                ConfirmOutcome::Dismissed
+            }
+        }
+        KeyCode::Char('y') | KeyCode::Char('Y') if is_char_typing(key.modifiers) => {
+            st.confirm_button = ConfirmDialogButton::Cancel;
+            ConfirmOutcome::Accepted
+        }
+        KeyCode::Char('n') | KeyCode::Char('N') if is_char_typing(key.modifiers) => {
+            st.confirm_button = ConfirmDialogButton::Cancel;
+            ConfirmOutcome::Dismissed
+        }
+        KeyCode::Esc | KeyCode::Char('q') => {
+            st.confirm_button = ConfirmDialogButton::Cancel;
+            ConfirmOutcome::Dismissed
+        }
+        _ => ConfirmOutcome::Toggled,
     }
-    if dialog.generating_message {
-        dialog.status_message = Some("Commit message is generating, please wait...".to_string());
-        return;
+}
+
+/// Applies a model choice optimistically and registers a rollback so that a failed
+/// `config/set` restores the previously active model (shared by keyboard and mouse).
+pub(super) async fn apply_model_selection(
+    mut st: MutexGuard<'_, AppState>,
+    chosen: ModelRef,
+    server_writer: &mut ChildStdin,
+) -> anyhow::Result<()> {
+    let prev_model = std::mem::replace(&mut st.active_model, chosen.clone());
+    st.selection_dialog = None;
+    let req_id = allocate_request_id();
+    record_optimistic_rollback(req_id, OptimisticRollback::ActiveModel { prev_model });
+    drop(st);
+    let params = ConfigSetParams {
+        model: Some(chosen),
+        ..Default::default()
+    };
+    send_request_with_id(
+        server_writer,
+        req_id,
+        methods::CONFIG_SET,
+        serde_json::to_value(params)?,
+    )
+    .await
+}
+
+/// The plan view is refreshed from server responses, so nothing is cleared locally
+/// until the server confirms the deletion.
+pub(crate) async fn delete_plan(server_writer: &mut ChildStdin, plan_id: String) -> anyhow::Result<()> {
+    send_request(
+        server_writer,
+        methods::PLAN_DELETE,
+        serde_json::json!({ "id": plan_id }),
+    )
+    .await?;
+    send_request(server_writer, methods::PLAN_LIST, serde_json::json!({})).await?;
+    send_request(server_writer, methods::PLAN_GET, serde_json::json!({})).await?;
+    Ok(())
+}
+
+pub(crate) async fn apply_status_dialog(
+    st: &mut AppState,
+    chosen_idx: usize,
+    server_writer: &mut ChildStdin,
+) -> anyhow::Result<()> {
+    let dialog = match st.status_dialog.take() {
+        Some(d) => d,
+        None => return Ok(()),
+    };
+
+    match dialog.target {
+        crate::app::StatusDialogTarget::PlanItem {
+            plan_id,
+            item_id,
+            current_status,
+            ..
+        } => {
+            let statuses = [
+                tauqe_protocol::PlanItemStatus::Todo,
+                tauqe_protocol::PlanItemStatus::InProgress,
+                tauqe_protocol::PlanItemStatus::Done,
+                tauqe_protocol::PlanItemStatus::Cancelled,
+            ];
+            let new_status = match statuses.get(chosen_idx).copied() {
+                Some(s) => s,
+                None => return Ok(()),
+            };
+
+            if new_status != current_status {
+                if let Some(plan) = st.plans_view.current_plan.as_mut() {
+                    plan.update_item_status(&item_id, new_status);
+                }
+                let req_id = crate::rpc::allocate_request_id();
+                crate::rpc::record_optimistic_rollback(
+                    req_id,
+                    crate::rpc::OptimisticRollback::PlanItemStatus {
+                        plan_id: plan_id.clone(),
+                        item_id: item_id.clone(),
+                        prev_status: current_status,
+                    },
+                );
+                let params = tauqe_protocol::PlanUpdateItemParams {
+                    plan_id,
+                    item_id,
+                    status: Some(new_status),
+                    checked: None,
+                };
+                crate::rpc::send_request_with_id(
+                    server_writer,
+                    req_id,
+                    methods::PLAN_UPDATE_ITEM,
+                    serde_json::to_value(params)?,
+                )
+                .await?;
+            }
+        }
+        crate::app::StatusDialogTarget::ReviewItem {
+            item_id,
+            current_status,
+            ..
+        } => {
+            let statuses = [
+                tauqe_protocol::ReviewStatus::Todo,
+                tauqe_protocol::ReviewStatus::Done,
+                tauqe_protocol::ReviewStatus::Rejected,
+            ];
+            let new_status = match statuses.get(chosen_idx).copied() {
+                Some(s) => s,
+                None => return Ok(()),
+            };
+
+            if new_status != current_status {
+                if let Some(session) = st.review.session.as_mut() {
+                    if let Some(item) = session.items.iter_mut().find(|i| i.id == item_id) {
+                        item.status = new_status;
+                    }
+                }
+                if st.review.hide_closed {
+                    st.review.clamp_selection();
+                    st.review.scroll_to_selected();
+                }
+                let req_id = crate::rpc::allocate_request_id();
+                crate::rpc::record_optimistic_rollback(
+                    req_id,
+                    crate::rpc::OptimisticRollback::ReviewItemStatus {
+                        item_id,
+                        prev_status: current_status,
+                    },
+                );
+                let params = tauqe_protocol::ReviewUpdateItemParams {
+                    item_id,
+                    status: Some(new_status),
+                    is_checked: None,
+                };
+                crate::rpc::send_request_with_id(
+                    server_writer,
+                    req_id,
+                    methods::REVIEW_UPDATE_ITEM,
+                    serde_json::to_value(params)?,
+                )
+                .await?;
+            }
+        }
     }
-    if dialog.base_ref.trim().is_empty() {
-        dialog.status_message = Some("Invalid or empty base ref.".to_string());
-        return;
-    }
-    if dialog.commits.is_empty() {
-        dialog.status_message = Some("No commits ahead of base to squash.".to_string());
-        return;
-    }
-    if dialog.message_buffer.trim().is_empty() {
-        dialog.status_message = Some("Commit message cannot be empty (press 'g' to generate).".to_string());
-        dialog.focus = SquashDialogFocus::MessageEditor;
-        return;
-    }
-    dialog.confirm_apply = true;
-    dialog.confirm_button = crate::app::ConfirmDialogButton::Cancel;
+    Ok(())
 }
 
 pub async fn handle_dialog_event(
@@ -48,305 +211,26 @@ pub async fn handle_dialog_event(
     let mut st = state.lock().await;
 
     // 1. Squash dialog modal
-    if let Some(mut dialog) = st.squash_dialog.take() {
-        if dialog.confirm_apply {
-            match key.code {
-                KeyCode::Left | KeyCode::Right | KeyCode::Tab | KeyCode::BackTab => {
-                    dialog.confirm_button = match dialog.confirm_button {
-                        crate::app::ConfirmDialogButton::Cancel => crate::app::ConfirmDialogButton::Confirm,
-                        crate::app::ConfirmDialogButton::Confirm => crate::app::ConfirmDialogButton::Cancel,
-                    };
-                    st.squash_dialog = Some(dialog);
-                }
-                KeyCode::Enter if dialog.confirm_button == crate::app::ConfirmDialogButton::Confirm => {
-                    let msg = dialog.message_buffer.trim().to_string();
-                    let base_ref = dialog.base_ref.clone();
-                    st.squash_dialog = None;
-                    drop(st);
-                    let params = GitSquashApplyParams { base_ref, message: msg };
-                    send_request(server_writer, methods::GIT_SQUASH_APPLY, serde_json::to_value(params)?).await?;
-                }
-                KeyCode::Enter => {
-                    dialog.confirm_apply = false;
-                    dialog.confirm_button = crate::app::ConfirmDialogButton::Cancel;
-                    st.squash_dialog = Some(dialog);
-                }
-                KeyCode::Char('y') | KeyCode::Char('Y') if crate::input::is_char_typing(key.modifiers) => {
-                    let msg = dialog.message_buffer.trim().to_string();
-                    let base_ref = dialog.base_ref.clone();
-                    st.squash_dialog = None;
-                    drop(st);
-                    let params = GitSquashApplyParams { base_ref, message: msg };
-                    send_request(server_writer, methods::GIT_SQUASH_APPLY, serde_json::to_value(params)?).await?;
-                }
-                KeyCode::Esc => {
-                    dialog.confirm_apply = false;
-                    dialog.confirm_button = crate::app::ConfirmDialogButton::Cancel;
-                    st.squash_dialog = Some(dialog);
-                }
-                KeyCode::Char('n') | KeyCode::Char('N') if crate::input::is_char_typing(key.modifiers) => {
-                    dialog.confirm_apply = false;
-                    dialog.confirm_button = crate::app::ConfirmDialogButton::Cancel;
-                    st.squash_dialog = Some(dialog);
-                }
-                _ => {
-                    st.squash_dialog = Some(dialog);
-                }
-            }
-            return Ok(Some(InputResult::Continue));
-        }
-
-        if dialog.custom_input_active {
-            if key.modifiers.contains(KeyModifiers::CONTROL) {
-                match key.code {
-                    KeyCode::Char('w') => {
-                        crate::input::pop_word_backward(&mut dialog.custom_input);
-                        st.squash_dialog = Some(dialog);
-                        return Ok(Some(InputResult::Continue));
-                    }
-                    KeyCode::Char('u') => {
-                        dialog.custom_input.clear();
-                        st.squash_dialog = Some(dialog);
-                        return Ok(Some(InputResult::Continue));
-                    }
-                    _ => {}
-                }
-            }
-
-            match key.code {
-                KeyCode::Esc => {
-                    dialog.custom_input_active = false;
-                    st.squash_dialog = Some(dialog);
-                }
-                KeyCode::Enter => {
-                    let custom = dialog.custom_input.trim().to_string();
-                    if !custom.is_empty() {
-                        dialog.custom_input_active = false;
-                        dialog.pending_base = Some((SquashBaseMode::Custom, custom.clone()));
-                        dialog.loading = true;
-                        dialog.status_message = Some(format!("Checking base '{}'...", custom));
-                        st.squash_dialog = Some(dialog);
-                        drop(st);
-                        let params = GitSquashPreviewParams { base_ref: Some(custom) };
-                        send_request(server_writer, methods::GIT_SQUASH_PREVIEW, serde_json::to_value(params)?).await?;
-                    } else {
-                        dialog.custom_input_active = false;
-                        st.squash_dialog = Some(dialog);
-                    }
-                }
-                KeyCode::Backspace => {
-                    dialog.custom_input.pop();
-                    st.squash_dialog = Some(dialog);
-                }
-                KeyCode::Char(c) if crate::input::is_char_typing(key.modifiers) => {
-                    dialog.custom_input.push(c);
-                    st.squash_dialog = Some(dialog);
-                }
-                _ => {
-                    st.squash_dialog = Some(dialog);
-                }
-            }
-            return Ok(Some(InputResult::Continue));
-        }
-
-        if dialog.focus == SquashDialogFocus::MessageEditor {
-            let primary_mod = st.tui_config.input.primary_modifier;
-            let is_primary = primary_mod.matches(key.modifiers);
-
-            if is_primary || key.modifiers.contains(KeyModifiers::CONTROL) {
-                match key.code {
-                    KeyCode::Char('w') => {
-                        crate::input::pop_word_backward(&mut dialog.message_buffer);
-                        st.squash_dialog = Some(dialog);
-                        return Ok(Some(InputResult::Continue));
-                    }
-                    KeyCode::Char('u') => {
-                        dialog.message_buffer.clear();
-                        st.squash_dialog = Some(dialog);
-                        return Ok(Some(InputResult::Continue));
-                    }
-                    _ => {}
-                }
-            }
-
-            match key.code {
-                KeyCode::Esc => {
-                    dialog.focus = SquashDialogFocus::FileList;
-                    st.squash_dialog = Some(dialog);
-                }
-                KeyCode::Tab => {
-                    dialog.focus = SquashDialogFocus::FileList;
-                    st.squash_dialog = Some(dialog);
-                }
-                KeyCode::Enter if is_primary || key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    try_trigger_squash_confirm(&mut dialog);
-                    st.squash_dialog = Some(dialog);
-                }
-                KeyCode::Char('s') if is_primary || key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    try_trigger_squash_confirm(&mut dialog);
-                    st.squash_dialog = Some(dialog);
-                }
-                KeyCode::Enter => {
-                    dialog.message_buffer.push('\n');
-                    st.squash_dialog = Some(dialog);
-                }
-                KeyCode::Char('g') if is_primary || key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    dialog.generating_message = true;
-                    dialog.status_message = Some("Generating Conventional Commit message with AI...".to_string());
-                    let base_ref = dialog.base_ref.clone();
-                    st.squash_dialog = Some(dialog);
-                    drop(st);
-                    let params = GitSquashGenerateMessageParams { base_ref };
-                    send_request(server_writer, methods::GIT_SQUASH_GENERATE_MESSAGE, serde_json::to_value(params)?).await?;
-                }
-                KeyCode::Backspace => {
-                    dialog.message_buffer.pop();
-                    st.squash_dialog = Some(dialog);
-                }
-                KeyCode::Char(c) if crate::input::is_char_typing(key.modifiers) => {
-                    dialog.message_buffer.push(c);
-                    st.squash_dialog = Some(dialog);
-                }
-                _ => {
-                    st.squash_dialog = Some(dialog);
-                }
-            }
-            return Ok(Some(InputResult::Continue));
-        }
-
-        match key.code {
-            KeyCode::Esc => {
-                st.squash_dialog = None;
-            }
-            KeyCode::Char('1') => {
-                if let Some(ref base_ref) = dialog.session_base {
-                    let base_ref = base_ref.clone();
-                    dialog.pending_base = Some((SquashBaseMode::Session, base_ref.clone()));
-                    dialog.loading = true;
-                    dialog.status_message = Some("Switching base to Tauqe session...".to_string());
-                    st.squash_dialog = Some(dialog);
-                    drop(st);
-                    let params = GitSquashPreviewParams { base_ref: Some(base_ref) };
-                    send_request(server_writer, methods::GIT_SQUASH_PREVIEW, serde_json::to_value(params)?).await?;
-                } else {
-                    dialog.status_message = Some("Session base commit not available (no AI commits in session).".to_string());
-                    st.squash_dialog = Some(dialog);
-                }
-            }
-            KeyCode::Char('2') => {
-                if let Some(ref base_ref) = dialog.upstream_base {
-                    let base_ref = base_ref.clone();
-                    dialog.pending_base = Some((SquashBaseMode::Upstream, base_ref.clone()));
-                    dialog.loading = true;
-                    dialog.status_message = Some(format!("Switching base to upstream '{}'...", base_ref));
-                    st.squash_dialog = Some(dialog);
-                    drop(st);
-                    let params = GitSquashPreviewParams { base_ref: Some(base_ref) };
-                    send_request(server_writer, methods::GIT_SQUASH_PREVIEW, serde_json::to_value(params)?).await?;
-                } else {
-                    dialog.status_message = Some("No upstream branch configured or detected.".to_string());
-                    st.squash_dialog = Some(dialog);
-                }
-            }
-            KeyCode::Char('3') => {
-                dialog.custom_input_active = true;
-                dialog.custom_input = dialog.base_ref.clone();
-                st.squash_dialog = Some(dialog);
-            }
-            KeyCode::Tab => {
-                dialog.focus = match dialog.focus {
-                    SquashDialogFocus::FileList => SquashDialogFocus::DiffView,
-                    SquashDialogFocus::DiffView => SquashDialogFocus::MessageEditor,
-                    SquashDialogFocus::MessageEditor => SquashDialogFocus::FileList,
-                };
-                st.squash_dialog = Some(dialog);
-            }
-            KeyCode::Char('g') => {
-                dialog.generating_message = true;
-                dialog.status_message = Some("Generating Conventional Commit message with AI...".to_string());
-                let base_ref = dialog.base_ref.clone();
-                st.squash_dialog = Some(dialog);
-                drop(st);
-                let params = GitSquashGenerateMessageParams { base_ref };
-                send_request(server_writer, methods::GIT_SQUASH_GENERATE_MESSAGE, serde_json::to_value(params)?).await?;
-            }
-            KeyCode::Char('e') | KeyCode::Char('m') => {
-                dialog.focus = SquashDialogFocus::MessageEditor;
-                st.squash_dialog = Some(dialog);
-            }
-            KeyCode::Enter if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                try_trigger_squash_confirm(&mut dialog);
-                st.squash_dialog = Some(dialog);
-            }
-            KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                try_trigger_squash_confirm(&mut dialog);
-                st.squash_dialog = Some(dialog);
-            }
-            KeyCode::F(6) => {
-                try_trigger_squash_confirm(&mut dialog);
-                st.squash_dialog = Some(dialog);
-            }
-            KeyCode::Char(' ') | KeyCode::Enter => {
-                if let Some(file) = dialog.files.get_mut(dialog.selected_file_index) {
-                    file.expanded = !file.expanded;
-                }
-                st.squash_dialog = Some(dialog);
-            }
-            KeyCode::Up | KeyCode::Char('k') => {
-                if dialog.focus == SquashDialogFocus::DiffView {
-                    dialog.diff_scroll = dialog.diff_scroll.saturating_sub(1);
-                } else if dialog.selected_file_index > 0 {
-                    dialog.selected_file_index -= 1;
-                    dialog.diff_scroll = 0;
-                }
-                st.squash_dialog = Some(dialog);
-            }
-            KeyCode::Down | KeyCode::Char('j') => {
-                if dialog.focus == SquashDialogFocus::DiffView {
-                    dialog.diff_scroll = dialog.diff_scroll.saturating_add(1);
-                } else if !dialog.files.is_empty() && dialog.selected_file_index + 1 < dialog.files.len() {
-                    dialog.selected_file_index += 1;
-                    dialog.diff_scroll = 0;
-                }
-                st.squash_dialog = Some(dialog);
-            }
-            KeyCode::PageUp => {
-                dialog.diff_scroll = dialog.diff_scroll.saturating_sub(10);
-                st.squash_dialog = Some(dialog);
-            }
-            KeyCode::PageDown => {
-                dialog.diff_scroll = dialog.diff_scroll.saturating_add(10);
-                st.squash_dialog = Some(dialog);
-            }
-            _ => {
-                st.squash_dialog = Some(dialog);
-            }
-        }
-        return Ok(Some(InputResult::Continue));
+    if st.squash_dialog.is_some() {
+        return squash::handle_squash_key(key, st, server_writer)
+            .await
+            .map(Some);
     }
 
     // 1b. Review launch dialog
     if let Some(mut dialog) = st.review_dialog.take() {
-        if key.modifiers.contains(KeyModifiers::CONTROL) {
-            match key.code {
-                KeyCode::Char('w') => {
-                    crate::input::pop_word_backward(&mut dialog.prompt);
-                    st.review_dialog = Some(dialog);
-                    return Ok(Some(InputResult::Continue));
-                }
-                KeyCode::Char('u') => {
-                    dialog.prompt.clear();
-                    st.review_dialog = Some(dialog);
-                    return Ok(Some(InputResult::Continue));
-                }
-                _ => {}
-            }
-        }
+        let primary = st.tui_config.input.primary_modifier;
+        let is_ctrl_alt = key.modifiers.contains(KeyModifiers::CONTROL)
+            && key.modifiers.contains(KeyModifiers::ALT);
+        let is_cmd = !is_ctrl_alt
+            && (primary.matches(key.modifiers) || key.modifiers.contains(KeyModifiers::CONTROL));
 
         match key.code {
-            KeyCode::Esc => {}
+            KeyCode::Esc => {
+                return Ok(Some(InputResult::Continue));
+            }
             KeyCode::Enter => {
-                let prompt = dialog.prompt.trim().to_string();
+                let prompt = dialog.prompt_editor.get_text().trim().to_string();
                 let params = ReviewStartParams {
                     model: dialog.models.get(dialog.model_index).cloned(),
                     user_prompt: if prompt.is_empty() { None } else { Some(prompt) },
@@ -361,63 +245,69 @@ pub async fn handle_dialog_event(
                 .await?;
                 return Ok(Some(InputResult::Continue));
             }
-            code => {
+            KeyCode::Tab => {
                 let count = dialog.models.len();
-                match code {
-                    KeyCode::Up | KeyCode::BackTab if count > 0 => {
-                        dialog.model_index = (dialog.model_index + count - 1) % count;
-                    }
-                    KeyCode::Down | KeyCode::Tab if count > 0 => {
-                        dialog.model_index = (dialog.model_index + 1) % count;
-                    }
-                    KeyCode::Backspace => {
-                        dialog.prompt.pop();
-                    }
-                    KeyCode::Char(c) if crate::input::is_char_typing(key.modifiers) => {
-                        dialog.prompt.push(c);
-                    }
-                    _ => {}
+                if count > 0 {
+                    dialog.model_index = (dialog.model_index + 1) % count;
                 }
                 st.review_dialog = Some(dialog);
+                return Ok(Some(InputResult::Continue));
+            }
+            KeyCode::BackTab => {
+                let count = dialog.models.len();
+                if count > 0 {
+                    dialog.model_index = (dialog.model_index + count - 1) % count;
+                }
+                st.review_dialog = Some(dialog);
+                return Ok(Some(InputResult::Continue));
+            }
+            KeyCode::Up if dialog.prompt_editor.is_empty() => {
+                let count = dialog.models.len();
+                if count > 0 {
+                    dialog.model_index = (dialog.model_index + count - 1) % count;
+                }
+                st.review_dialog = Some(dialog);
+                return Ok(Some(InputResult::Continue));
+            }
+            KeyCode::Down if dialog.prompt_editor.is_empty() => {
+                let count = dialog.models.len();
+                if count > 0 {
+                    dialog.model_index = (dialog.model_index + 1) % count;
+                }
+                st.review_dialog = Some(dialog);
+                return Ok(Some(InputResult::Continue));
+            }
+            _ => {
+                crate::input::handle_editor_key(
+                    &mut dialog.prompt_editor,
+                    key,
+                    is_cmd,
+                    false,
+                );
+                st.review_dialog = Some(dialog);
+                return Ok(Some(InputResult::Continue));
             }
         }
-        return Ok(Some(InputResult::Continue));
     }
 
     // 2. Cancel confirmation
     if st.confirm_cancel {
-        match key.code {
-            KeyCode::Left | KeyCode::Right | KeyCode::Tab | KeyCode::BackTab => {
-                st.confirm_button = match st.confirm_button {
-                    crate::app::ConfirmDialogButton::Cancel => crate::app::ConfirmDialogButton::Confirm,
-                    crate::app::ConfirmDialogButton::Confirm => crate::app::ConfirmDialogButton::Cancel,
-                };
-            }
-            KeyCode::Enter if st.confirm_button == crate::app::ConfirmDialogButton::Confirm => {
+        match resolve_confirm(&mut st, key) {
+            ConfirmOutcome::Toggled => {}
+            ConfirmOutcome::Dismissed => st.confirm_cancel = false,
+            ConfirmOutcome::Accepted => {
                 st.confirm_cancel = false;
-                st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
-                if st.review.running {
-                    st.review.running = false;
-                }
+                let cancel_review = st.review.running;
+                let cancel_model = st.model.is_busy();
                 drop(st);
-                send_request(server_writer, methods::MODEL_CANCEL, serde_json::json!({})).await?;
-            }
-            KeyCode::Enter => {
-                st.confirm_cancel = false;
-                st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
-            }
-            KeyCode::Char('y') | KeyCode::Char('Y') if crate::input::is_char_typing(key.modifiers) => {
-                st.confirm_cancel = false;
-                st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
-                if st.review.running {
-                    st.review.running = false;
+                if cancel_review {
+                    send_request(server_writer, methods::REVIEW_CANCEL, serde_json::json!({}))
+                        .await?;
                 }
-                drop(st);
-                send_request(server_writer, methods::MODEL_CANCEL, serde_json::json!({})).await?;
-            }
-            _ => {
-                st.confirm_cancel = false;
-                st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
+                if cancel_model || !cancel_review {
+                    send_request(server_writer, methods::MODEL_CANCEL, serde_json::json!({}))
+                        .await?;
+                }
             }
         }
         return Ok(Some(InputResult::Continue));
@@ -425,73 +315,34 @@ pub async fn handle_dialog_event(
 
     // 2a. Quit confirmation
     if st.confirm_quit {
-        match key.code {
-            KeyCode::Left | KeyCode::Right | KeyCode::Tab | KeyCode::BackTab => {
-                st.confirm_button = match st.confirm_button {
-                    crate::app::ConfirmDialogButton::Cancel => crate::app::ConfirmDialogButton::Confirm,
-                    crate::app::ConfirmDialogButton::Confirm => crate::app::ConfirmDialogButton::Cancel,
-                };
-            }
-            KeyCode::Enter if st.confirm_button == crate::app::ConfirmDialogButton::Confirm => {
+        match resolve_confirm(&mut st, key) {
+            ConfirmOutcome::Toggled => {}
+            ConfirmOutcome::Dismissed => st.confirm_quit = false,
+            ConfirmOutcome::Accepted => {
                 st.confirm_quit = false;
-                st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
                 return Ok(Some(InputResult::Exit));
-            }
-            KeyCode::Enter => {
-                st.confirm_quit = false;
-                st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
-            }
-            KeyCode::Char('y') | KeyCode::Char('Y') if crate::input::is_char_typing(key.modifiers) => {
-                st.confirm_quit = false;
-                st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
-                return Ok(Some(InputResult::Exit));
-            }
-            _ => {
-                st.confirm_quit = false;
-                st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
             }
         }
         return Ok(Some(InputResult::Continue));
     }
 
-    // 2b. Context clear auto confirmation
+    // 2b. Context clear auto confirmation (success is reported on the server response)
     if st.context_view.confirm_clear_auto {
-        match key.code {
-            KeyCode::Left | KeyCode::Right | KeyCode::Tab | KeyCode::BackTab => {
-                st.confirm_button = match st.confirm_button {
-                    crate::app::ConfirmDialogButton::Cancel => crate::app::ConfirmDialogButton::Confirm,
-                    crate::app::ConfirmDialogButton::Confirm => crate::app::ConfirmDialogButton::Cancel,
-                };
-            }
-            KeyCode::Enter if st.confirm_button == crate::app::ConfirmDialogButton::Confirm => {
-                let auto_count = st.context.items.iter().filter(|i| i.layer == tauqe_protocol::ContextLayer::Auto).count();
+        match resolve_confirm(&mut st, key) {
+            ConfirmOutcome::Toggled => {}
+            ConfirmOutcome::Dismissed => st.context_view.confirm_clear_auto = false,
+            ConfirmOutcome::Accepted => {
                 st.context_view.confirm_clear_auto = false;
-                st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
-                st.notify_success(format!("Cleared {} auto file(s) from context", auto_count));
                 drop(st);
                 let params = tauqe_protocol::ContextClearParams {
                     layer: Some(tauqe_protocol::ContextLayer::Auto),
                 };
-                send_request(server_writer, methods::CONTEXT_CLEAR, serde_json::to_value(params)?).await?;
-            }
-            KeyCode::Enter => {
-                st.context_view.confirm_clear_auto = false;
-                st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
-            }
-            KeyCode::Char('y') | KeyCode::Char('Y') if crate::input::is_char_typing(key.modifiers) => {
-                let auto_count = st.context.items.iter().filter(|i| i.layer == tauqe_protocol::ContextLayer::Auto).count();
-                st.context_view.confirm_clear_auto = false;
-                st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
-                st.notify_success(format!("Cleared {} auto file(s) from context", auto_count));
-                drop(st);
-                let params = tauqe_protocol::ContextClearParams {
-                    layer: Some(tauqe_protocol::ContextLayer::Auto),
-                };
-                send_request(server_writer, methods::CONTEXT_CLEAR, serde_json::to_value(params)?).await?;
-            }
-            _ => {
-                st.context_view.confirm_clear_auto = false;
-                st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
+                send_request(
+                    server_writer,
+                    methods::CONTEXT_CLEAR,
+                    serde_json::to_value(params)?,
+                )
+                .await?;
             }
         }
         return Ok(Some(InputResult::Continue));
@@ -499,32 +350,13 @@ pub async fn handle_dialog_event(
 
     // 3. Undo confirmation
     if st.confirm_undo {
-        match key.code {
-            KeyCode::Left | KeyCode::Right | KeyCode::Tab | KeyCode::BackTab => {
-                st.confirm_button = match st.confirm_button {
-                    crate::app::ConfirmDialogButton::Cancel => crate::app::ConfirmDialogButton::Confirm,
-                    crate::app::ConfirmDialogButton::Confirm => crate::app::ConfirmDialogButton::Cancel,
-                };
-            }
-            KeyCode::Enter if st.confirm_button == crate::app::ConfirmDialogButton::Confirm => {
+        match resolve_confirm(&mut st, key) {
+            ConfirmOutcome::Toggled => {}
+            ConfirmOutcome::Dismissed => st.confirm_undo = false,
+            ConfirmOutcome::Accepted => {
                 st.confirm_undo = false;
-                st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
                 drop(st);
                 send_request(server_writer, methods::GIT_UNDO, serde_json::json!({})).await?;
-            }
-            KeyCode::Enter => {
-                st.confirm_undo = false;
-                st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
-            }
-            KeyCode::Char('y') | KeyCode::Char('Y') if crate::input::is_char_typing(key.modifiers) => {
-                st.confirm_undo = false;
-                st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
-                drop(st);
-                send_request(server_writer, methods::GIT_UNDO, serde_json::json!({})).await?;
-            }
-            _ => {
-                st.confirm_undo = false;
-                st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
             }
         }
         return Ok(Some(InputResult::Continue));
@@ -532,39 +364,12 @@ pub async fn handle_dialog_event(
 
     // 4a. Delete plan confirmation
     if let Some(plan_id) = st.confirm_delete_plan.take() {
-        match key.code {
-            KeyCode::Left | KeyCode::Right | KeyCode::Tab | KeyCode::BackTab => {
-                st.confirm_button = match st.confirm_button {
-                    crate::app::ConfirmDialogButton::Cancel => crate::app::ConfirmDialogButton::Confirm,
-                    crate::app::ConfirmDialogButton::Confirm => crate::app::ConfirmDialogButton::Cancel,
-                };
-                st.confirm_delete_plan = Some(plan_id);
-            }
-            KeyCode::Enter if st.confirm_button == crate::app::ConfirmDialogButton::Confirm => {
-                st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
-                st.plans_view.reset_view_for_new_plan();
-                st.plans_view.current_plan = None;
-                st.plans_view.active_plan_id = None;
+        match resolve_confirm(&mut st, key) {
+            ConfirmOutcome::Toggled => st.confirm_delete_plan = Some(plan_id),
+            ConfirmOutcome::Dismissed => {}
+            ConfirmOutcome::Accepted => {
                 drop(st);
-                send_request(server_writer, methods::PLAN_DELETE, serde_json::json!({ "id": plan_id })).await?;
-                send_request(server_writer, methods::PLAN_LIST, serde_json::json!({})).await?;
-                send_request(server_writer, methods::PLAN_GET, serde_json::json!({})).await?;
-            }
-            KeyCode::Enter => {
-                st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
-            }
-            KeyCode::Char('y') | KeyCode::Char('Y') if crate::input::is_char_typing(key.modifiers) => {
-                st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
-                st.plans_view.reset_view_for_new_plan();
-                st.plans_view.current_plan = None;
-                st.plans_view.active_plan_id = None;
-                drop(st);
-                send_request(server_writer, methods::PLAN_DELETE, serde_json::json!({ "id": plan_id })).await?;
-                send_request(server_writer, methods::PLAN_LIST, serde_json::json!({})).await?;
-                send_request(server_writer, methods::PLAN_GET, serde_json::json!({})).await?;
-            }
-            _ => {
-                st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
+                delete_plan(server_writer, plan_id).await?;
             }
         }
         return Ok(Some(InputResult::Continue));
@@ -572,48 +377,83 @@ pub async fn handle_dialog_event(
 
     // 4. Clear history confirmation
     if st.confirm_clear_history {
+        match resolve_confirm(&mut st, key) {
+            ConfirmOutcome::Toggled => {}
+            ConfirmOutcome::Dismissed => st.confirm_clear_history = false,
+            ConfirmOutcome::Accepted => {
+                st.confirm_clear_history = false;
+                let cost = st.model.session_total_cost;
+                let prev_cost = st.model.prev_cost;
+                st.model = DevelopView {
+                    session_total_cost: cost,
+                    prev_cost,
+                    ..Default::default()
+                };
+                st.history_view = HistoryViewState::default();
+                drop(st);
+                send_request(
+                    server_writer,
+                    methods::MODEL_CLEAR_HISTORY,
+                    serde_json::json!({}),
+                )
+                .await?;
+            }
+        }
+        return Ok(Some(InputResult::Continue));
+    }
+
+    // 4b. Status dialog (for Plan and Review items)
+    if let Some(mut dialog) = st.status_dialog.take() {
+        let total_options = match &dialog.target {
+            crate::app::StatusDialogTarget::PlanItem { .. } => 4,
+            crate::app::StatusDialogTarget::ReviewItem { .. } => 3,
+        };
+
         match key.code {
-            KeyCode::Left | KeyCode::Right | KeyCode::Tab | KeyCode::BackTab => {
-                st.confirm_button = match st.confirm_button {
-                    crate::app::ConfirmDialogButton::Cancel => crate::app::ConfirmDialogButton::Confirm,
-                    crate::app::ConfirmDialogButton::Confirm => crate::app::ConfirmDialogButton::Cancel,
-                };
+            KeyCode::Esc | KeyCode::Char('q') => {
+                return Ok(Some(InputResult::Continue));
             }
-            KeyCode::Enter if st.confirm_button == crate::app::ConfirmDialogButton::Confirm => {
-                st.confirm_clear_history = false;
-                st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
-                let cost = st.model.session_total_cost;
-                let prev_cost = st.model.prev_cost;
-                st.model = DevelopView {
-                    session_total_cost: cost,
-                    prev_cost,
-                    ..Default::default()
-                };
-                st.history_view = HistoryViewState::default();
-                drop(st);
-                send_request(server_writer, methods::MODEL_CLEAR_HISTORY, serde_json::json!({})).await?;
+            KeyCode::Up | KeyCode::Char('k') | KeyCode::Char('p') => {
+                dialog.selected_index = dialog.selected_index.saturating_sub(1);
+                st.status_dialog = Some(dialog);
             }
-            KeyCode::Enter => {
-                st.confirm_clear_history = false;
-                st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
+            KeyCode::Down | KeyCode::Char('j') | KeyCode::Char('n') => {
+                if dialog.selected_index + 1 < total_options {
+                    dialog.selected_index += 1;
+                }
+                st.status_dialog = Some(dialog);
             }
-            KeyCode::Char('y') | KeyCode::Char('Y') if crate::input::is_char_typing(key.modifiers) => {
-                st.confirm_clear_history = false;
-                st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
-                let cost = st.model.session_total_cost;
-                let prev_cost = st.model.prev_cost;
-                st.model = DevelopView {
-                    session_total_cost: cost,
-                    prev_cost,
-                    ..Default::default()
-                };
-                st.history_view = HistoryViewState::default();
-                drop(st);
-                send_request(server_writer, methods::MODEL_CLEAR_HISTORY, serde_json::json!({})).await?;
+            KeyCode::Home => {
+                dialog.selected_index = 0;
+                st.status_dialog = Some(dialog);
+            }
+            KeyCode::End => {
+                dialog.selected_index = total_options - 1;
+                st.status_dialog = Some(dialog);
+            }
+            KeyCode::Char('1') => {
+                st.status_dialog = Some(dialog);
+                apply_status_dialog(&mut st, 0, server_writer).await?;
+            }
+            KeyCode::Char('2') => {
+                st.status_dialog = Some(dialog);
+                apply_status_dialog(&mut st, 1, server_writer).await?;
+            }
+            KeyCode::Char('3') => {
+                st.status_dialog = Some(dialog);
+                apply_status_dialog(&mut st, 2, server_writer).await?;
+            }
+            KeyCode::Char('4') if total_options >= 4 => {
+                st.status_dialog = Some(dialog);
+                apply_status_dialog(&mut st, 3, server_writer).await?;
+            }
+            KeyCode::Enter | KeyCode::Char(' ') => {
+                let chosen = dialog.selected_index;
+                st.status_dialog = Some(dialog);
+                apply_status_dialog(&mut st, chosen, server_writer).await?;
             }
             _ => {
-                st.confirm_clear_history = false;
-                st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
+                st.status_dialog = Some(dialog);
             }
         }
         return Ok(Some(InputResult::Continue));
@@ -621,29 +461,49 @@ pub async fn handle_dialog_event(
 
     // 5. Selection dialog
     if let Some(mut dialog) = st.selection_dialog.take() {
+        let (term_w, term_h) = crossterm::terminal::size().unwrap_or((80, 24));
+        let area = crate::ui::selection_dialog_area(ratatui::layout::Rect::new(0, 0, term_w, term_h), dialog.items.len());
+        let visible_height = crate::ui::dialogs::selection_dialog_visible_height(area);
+
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => {
                 return Ok(Some(InputResult::Continue));
             }
-            KeyCode::Up | KeyCode::Char('k') => {
-                dialog.selected_index = dialog.selected_index.saturating_sub(1);
+            KeyCode::Up | KeyCode::Char('k') | KeyCode::Char('p') => {
+                dialog.select_prev(visible_height);
                 st.selection_dialog = Some(dialog);
             }
-            KeyCode::Down | KeyCode::Char('j') => {
-                if !dialog.items.is_empty() && dialog.selected_index + 1 < dialog.items.len() {
-                    dialog.selected_index += 1;
+            KeyCode::Down | KeyCode::Char('j') | KeyCode::Char('n') => {
+                dialog.select_next(visible_height);
+                st.selection_dialog = Some(dialog);
+            }
+            KeyCode::PageUp => {
+                for _ in 0..visible_height {
+                    dialog.select_prev(visible_height);
+                }
+                st.selection_dialog = Some(dialog);
+            }
+            KeyCode::PageDown => {
+                for _ in 0..visible_height {
+                    dialog.select_next(visible_height);
+                }
+                st.selection_dialog = Some(dialog);
+            }
+            KeyCode::Home => {
+                dialog.selected_index = 0;
+                dialog.ensure_visible(visible_height);
+                st.selection_dialog = Some(dialog);
+            }
+            KeyCode::End => {
+                if !dialog.items.is_empty() {
+                    dialog.selected_index = dialog.items.len() - 1;
+                    dialog.ensure_visible(visible_height);
                 }
                 st.selection_dialog = Some(dialog);
             }
             KeyCode::Enter => {
                 if let Some(chosen) = dialog.items.get(dialog.selected_index).cloned() {
-                    st.active_model = chosen.clone();
-                    let params = ConfigSetParams {
-                        model: Some(chosen),
-                        ..Default::default()
-                    };
-                    drop(st);
-                    send_request(server_writer, methods::CONFIG_SET, serde_json::to_value(params)?).await?;
+                    apply_model_selection(st, chosen, server_writer).await?;
                 }
             }
             _ => {
@@ -660,10 +520,17 @@ pub async fn handle_dialog_event(
                 st.show_help = false;
                 st.help_scroll = 0;
             }
-            KeyCode::Down | KeyCode::Char('j') => {
+            KeyCode::Char('h') | KeyCode::Char('H')
+                if key.modifiers.contains(KeyModifiers::CONTROL)
+                    || key.modifiers.contains(KeyModifiers::ALT) =>
+            {
+                st.show_help = false;
+                st.help_scroll = 0;
+            }
+            KeyCode::Down | KeyCode::Char('j') | KeyCode::Char('n') => {
                 st.help_scroll = st.help_scroll.saturating_add(1);
             }
-            KeyCode::Up | KeyCode::Char('k') => {
+            KeyCode::Up | KeyCode::Char('k') | KeyCode::Char('p') => {
                 st.help_scroll = st.help_scroll.saturating_sub(1);
             }
             KeyCode::PageDown => {

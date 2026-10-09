@@ -28,7 +28,7 @@ pub use dialogs::{
     render_confirm_clear_history_popup, render_confirm_delete_plan_popup,
     render_confirm_quit_popup, render_confirm_undo_popup,
     render_disconnected_popup, render_help_popup, render_review_dialog, render_selection_dialog,
-    render_squash_popup, selection_dialog_area,
+    render_squash_popup, render_status_dialog, selection_dialog_area,
 };
 pub use footer::{extract_current_round, format_footer_cost, render_footer};
 pub use geometry::centered_rect;
@@ -36,7 +36,7 @@ pub use header::render_header;
 pub use onboarding::{format_masked_key, render_onboarding_view};
 pub use wrap::{wrap_line, wrap_lines};
 
-const MIN_TERM_WIDTH: u16 = 80;
+const MIN_TERM_WIDTH: u16 = 60;
 const MIN_TERM_HEIGHT: u16 = 24;
 
 fn render_terminal_too_small(frame: &mut ratatui::Frame) {
@@ -134,6 +134,8 @@ pub fn render_ui(frame: &mut ratatui::Frame, state: &mut AppState) {
         render_confirm_clear_auto_popup(frame, state);
     } else if let Some(plan_id) = &state.confirm_delete_plan {
         render_confirm_delete_plan_popup(frame, plan_id, state);
+    } else if let Some(dialog) = &state.status_dialog {
+        render_status_dialog(frame, dialog);
     } else if let Some(dialog) = &state.selection_dialog {
         render_selection_dialog(frame, dialog);
     } else if state.show_help {

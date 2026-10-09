@@ -450,10 +450,12 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
                 let elapsed = started.elapsed().as_secs();
                 if elapsed >= st.tui_config.notifications.min_duration_seconds {
                     let summary = st.model.last_commit_summary.as_deref().unwrap_or("Turn completed");
+                    let focused = st.terminal_focused;
                     crate::terminal::trigger_turn_notification(
                         "TAUQE",
                         summary,
                         &st.tui_config.notifications,
+                        focused,
                     );
                 }
             }
@@ -514,10 +516,12 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
             if let Some(started) = st.turn_started_at.take() {
                 let elapsed = started.elapsed().as_secs();
                 if elapsed >= st.tui_config.notifications.min_duration_seconds {
+                    let focused = st.terminal_focused;
                     crate::terminal::trigger_turn_notification(
                         "TAUQE Error",
                         "Turn failed with error",
                         &st.tui_config.notifications,
+                        focused,
                     );
                 }
             }
@@ -580,10 +584,12 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
                 let elapsed = started.elapsed().as_secs();
                 if elapsed >= st.tui_config.notifications.min_duration_seconds {
                     let summary = format!("Code review completed ({} findings)", findings_count);
+                    let focused = st.terminal_focused;
                     crate::terminal::trigger_turn_notification(
                         "TAUQE Review",
                         &summary,
                         &st.tui_config.notifications,
+                        focused,
                     );
                 }
             }
@@ -597,10 +603,12 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
             if let Some(started) = st.turn_started_at.take() {
                 let elapsed = started.elapsed().as_secs();
                 if elapsed >= st.tui_config.notifications.min_duration_seconds {
+                    let focused = st.terminal_focused;
                     crate::terminal::trigger_turn_notification(
                         "TAUQE Review Error",
                         "Code review failed",
                         &st.tui_config.notifications,
+                        focused,
                     );
                 }
             }

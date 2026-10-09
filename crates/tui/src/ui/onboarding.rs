@@ -14,6 +14,92 @@ pub fn format_masked_key(key: &str) -> String {
     format!("{} ({} chars)", bullets, len)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OnboardingStepMeta {
+    pub step: crate::app::OnboardingStep,
+    pub name: &'static str,
+    pub active_bg: Color,
+    pub active_fg: Color,
+}
+
+pub const ONBOARDING_STEPS: &[OnboardingStepMeta] = &[
+    OnboardingStepMeta {
+        step: crate::app::OnboardingStep::Git,
+        name: "0. Git",
+        active_bg: Color::Red,
+        active_fg: Color::White,
+    },
+    OnboardingStepMeta {
+        step: crate::app::OnboardingStep::Config,
+        name: "1. Configuration",
+        active_bg: Color::Cyan,
+        active_fg: Color::Black,
+    },
+    OnboardingStepMeta {
+        step: crate::app::OnboardingStep::Credentials,
+        name: "2. API Key",
+        active_bg: Color::Yellow,
+        active_fg: Color::Black,
+    },
+    OnboardingStepMeta {
+        step: crate::app::OnboardingStep::Workstation,
+        name: "3. Layout",
+        active_bg: Color::Magenta,
+        active_fg: Color::White,
+    },
+    OnboardingStepMeta {
+        step: crate::app::OnboardingStep::Modifier,
+        name: "4. Modifier",
+        active_bg: Color::Blue,
+        active_fg: Color::White,
+    },
+    OnboardingStepMeta {
+        step: crate::app::OnboardingStep::Ready,
+        name: "5. Ready",
+        active_bg: Color::Green,
+        active_fg: Color::Black,
+    },
+];
+
+pub fn render_onboarding_step_badge(current_step: crate::app::OnboardingStep) -> Line<'static> {
+    if current_step == crate::app::OnboardingStep::Gatekeeper {
+        return Line::from(vec![
+            Span::styled(" 0. Git [OK] ─── 1. Configuration [OK] ─── ", Style::default().fg(Color::Green)),
+            Span::styled("[Warning: API Key Missing]", Style::default().bg(Color::Red).fg(Color::White).bold()),
+            Span::styled(" ─── 3. Layout ─── 4. Modifier ─── 5. Ready", Style::default().fg(Color::DarkGray)),
+        ]);
+    }
+
+    let current_idx = ONBOARDING_STEPS
+        .iter()
+        .position(|meta| meta.step == current_step)
+        .unwrap_or(0);
+
+    let mut spans = Vec::new();
+    for (idx, meta) in ONBOARDING_STEPS.iter().enumerate() {
+        if idx > 0 {
+            spans.push(Span::styled(" ─── ", Style::default().fg(Color::DarkGray)));
+        }
+        if idx < current_idx {
+            spans.push(Span::styled(
+                format!("{}{} [OK]", if idx == 0 { " " } else { "" }, meta.name),
+                Style::default().fg(Color::Green),
+            ));
+        } else if idx == current_idx {
+            spans.push(Span::styled(
+                format!(" [{}] ", meta.name),
+                Style::default().bg(meta.active_bg).fg(meta.active_fg).bold(),
+            ));
+        } else {
+            spans.push(Span::styled(
+                meta.name,
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+    }
+    Line::from(spans)
+}
+
 pub fn render_onboarding_view(
     frame: &mut ratatui::Frame,
     state: &AppState,
@@ -23,40 +109,7 @@ pub fn render_onboarding_view(
 ) {
     let ob = &state.onboarding;
 
-    let step_badge = match ob.step {
-        crate::app::OnboardingStep::Git => Line::from(vec![
-            Span::styled(" [0. Git Repository] ", Style::default().bg(Color::Red).fg(Color::White).bold()),
-            Span::styled(" ─── 1. Configuration ─── 2. API Key ─── 3. Ready", Style::default().fg(Color::DarkGray)),
-        ]),
-        crate::app::OnboardingStep::Config => Line::from(vec![
-            Span::styled(" 0. Git [OK] ─── ", Style::default().fg(Color::Green)),
-            Span::styled("[1. Configuration]", Style::default().bg(Color::Cyan).fg(Color::Black).bold()),
-            Span::styled(" ─── 2. API Key ─── 3. Ready", Style::default().fg(Color::DarkGray)),
-        ]),
-        crate::app::OnboardingStep::Credentials => Line::from(vec![
-            Span::styled(" 0. Git [OK] ─── 1. Configuration ─── ", Style::default().fg(Color::Green)),
-            Span::styled("[2. API Key]", Style::default().bg(Color::Yellow).fg(Color::Black).bold()),
-            Span::styled(" ─── 3. Layout ─── 4. Modifier ─── 5. Ready", Style::default().fg(Color::DarkGray)),
-        ]),
-        crate::app::OnboardingStep::Workstation => Line::from(vec![
-            Span::styled(" 0. Git [OK] ─── 1. Configuration ─── 2. API Key [OK] ─── ", Style::default().fg(Color::Green)),
-            Span::styled("[3. Keyboard Layout]", Style::default().bg(Color::Magenta).fg(Color::White).bold()),
-            Span::styled(" ─── 4. Modifier ─── 5. Ready", Style::default().fg(Color::DarkGray)),
-        ]),
-        crate::app::OnboardingStep::Modifier => Line::from(vec![
-            Span::styled(" 0. Git [OK] ─── 1. Configuration ─── 2. API Key [OK] ─── 3. Layout [OK] ─── ", Style::default().fg(Color::Green)),
-            Span::styled("[4. Command Modifier]", Style::default().bg(Color::Blue).fg(Color::White).bold()),
-            Span::styled(" ─── 5. Ready", Style::default().fg(Color::DarkGray)),
-        ]),
-        crate::app::OnboardingStep::Gatekeeper => Line::from(vec![
-            Span::styled(" 0. Git [OK] ─── 1. Configuration ─── 2. API Key ─── ", Style::default().fg(Color::DarkGray)),
-            Span::styled("[Warning: API Key Missing]", Style::default().bg(Color::Red).fg(Color::White).bold()),
-        ]),
-        crate::app::OnboardingStep::Ready => Line::from(vec![
-            Span::styled(" 0. Git [OK] ─── 1. Configuration ─── 2. API Key ─── 3. Layout ─── 4. Modifier ─── ", Style::default().fg(Color::Green)),
-            Span::styled("[5. Ready to Start]", Style::default().bg(Color::Green).fg(Color::Black).bold()),
-        ]),
-    };
+    let step_badge = render_onboarding_step_badge(ob.step);
 
     let mut lines = Vec::new();
     lines.push(Line::raw(""));
@@ -277,7 +330,7 @@ pub fn render_onboarding_view(
         }
         crate::app::OnboardingStep::Ready => {
             lines.push(Line::from(Span::styled(
-                "System is successfully configured and ready to use!",
+                "Step 5: System is successfully configured and ready to use!",
                 Style::default().bold().fg(Color::Green),
             )));
             lines.push(Line::raw(""));
@@ -437,5 +490,26 @@ mod tests {
             format_masked_key("sk-or-v1-0123456789abcdef0123456789abcdef"),
             "•••••••••••••••• (41 chars)"
         );
+    }
+
+    #[test]
+    fn test_onboarding_step_badge_consistency() {
+        assert_eq!(ONBOARDING_STEPS.len(), 6);
+
+        let badge_git = render_onboarding_step_badge(crate::app::OnboardingStep::Git);
+        let text_git = badge_git.to_string();
+        assert!(text_git.contains("[0. Git]"));
+        assert!(text_git.contains("1. Configuration"));
+        assert!(text_git.contains("5. Ready"));
+
+        let badge_ready = render_onboarding_step_badge(crate::app::OnboardingStep::Ready);
+        let text_ready = badge_ready.to_string();
+        assert!(text_ready.contains("0. Git [OK]"));
+        assert!(text_ready.contains("4. Modifier [OK]"));
+        assert!(text_ready.contains("[5. Ready]"));
+
+        let badge_gatekeeper = render_onboarding_step_badge(crate::app::OnboardingStep::Gatekeeper);
+        let text_gatekeeper = badge_gatekeeper.to_string();
+        assert!(text_gatekeeper.contains("Warning: API Key Missing"));
     }
 }

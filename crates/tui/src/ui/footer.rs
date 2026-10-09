@@ -31,13 +31,23 @@ pub fn render_footer(frame: &mut ratatui::Frame, state: &AppState, area: Rect) {
         footer_spans.push(Span::styled(" │ ", Style::default().fg(Color::DarkGray)));
     }
 
-    // 3. Status, Round, Retry, Current file indicators
+    // 3. Status, Round, Retry, Current file indicators AND Notifications
+    let active_notif = state.active_notification();
+
     if state.review.running {
         let spin = SPINNER_FRAMES[state.model.spinner_frame % SPINNER_FRAMES.len()];
         footer_spans.push(Span::styled(
             format!("{} Reviewing", spin),
             Style::default().fg(Color::Magenta).bold(),
         ));
+        if let Some(notif) = active_notif {
+            footer_spans.push(Span::styled(" │ ", Style::default().fg(Color::DarkGray)));
+            let (icon, color) = format_notification(notif);
+            footer_spans.push(Span::styled(
+                format!("{} {}", icon, notif.text),
+                Style::default().fg(color).bold(),
+            ));
+        }
     } else if state.model.is_busy() {
         let spin = SPINNER_FRAMES[state.model.spinner_frame % SPINNER_FRAMES.len()];
 
@@ -68,74 +78,78 @@ pub fn render_footer(frame: &mut ratatui::Frame, state: &AppState, area: Rect) {
             Style::default().fg(status_color).bold(),
         ));
 
-        if let Some(phase) = state.model.turn_phase {
-            let inner_width = area.width.saturating_sub(2) as usize;
-            if inner_width >= 80 {
-                footer_spans.push(Span::raw(" "));
-                footer_spans.extend(render_turn_phase_pipeline(phase));
+        if let Some(notif) = active_notif {
+            footer_spans.push(Span::styled(" │ ", Style::default().fg(Color::DarkGray)));
+            let (icon, color) = format_notification(notif);
+            footer_spans.push(Span::styled(
+                format!("{} {}", icon, notif.text),
+                Style::default().fg(color).bold(),
+            ));
+        } else {
+            if let Some(phase) = state.model.turn_phase {
+                let inner_width = area.width.saturating_sub(2) as usize;
+                if inner_width >= 80 {
+                    footer_spans.push(Span::raw(" "));
+                    footer_spans.extend(render_turn_phase_pipeline(phase));
+                }
             }
-        }
 
-        if let Some(detail) = &state.model.turn_phase_detail {
-            footer_spans.push(Span::raw(" "));
-            footer_spans.push(Span::styled(
-                format!("[{}]", detail),
-                Style::default().fg(Color::Yellow).bold(),
-            ));
-        } else if let Some(round) = state.model.turn_round {
-            footer_spans.push(Span::raw(" "));
-            let round_str = if let Some(max) = state.model.turn_max_rounds {
-                format!("[Round {}/{}]", round, max)
-            } else {
-                format!("[Round {}]", round)
-            };
-            footer_spans.push(Span::styled(
-                round_str,
-                Style::default().fg(Color::Cyan).bold(),
-            ));
-        } else if let Some(round_str) = extract_current_round(&state.model.text) {
-            footer_spans.push(Span::raw(" "));
-            footer_spans.push(Span::styled(
-                format!("[{}]", round_str),
-                Style::default().fg(Color::Cyan).bold(),
-            ));
-        }
-
-        // Active retrying / modifying file
-        let active_file = state
-            .model
-            .files
-            .iter()
-            .rev()
-            .find(|f| f.status == "running" || f.status == "retrying");
-
-        if let Some(f) = active_file {
-            if let Some(retry) = &f.retry_info {
+            if let Some(detail) = &state.model.turn_phase_detail {
                 footer_spans.push(Span::raw(" "));
                 footer_spans.push(Span::styled(
-                    format!("[{}]", retry),
+                    format!("[{}]", detail),
                     Style::default().fg(Color::Yellow).bold(),
                 ));
+            } else if let Some(round) = state.model.turn_round {
+                footer_spans.push(Span::raw(" "));
+                let round_str = if let Some(max) = state.model.turn_max_rounds {
+                    format!("[Round {}/{}]", round, max)
+                } else {
+                    format!("[Round {}]", round)
+                };
+                footer_spans.push(Span::styled(
+                    round_str,
+                    Style::default().fg(Color::Cyan).bold(),
+                ));
+            } else if let Some(round_str) = extract_current_round(&state.model.text) {
+                footer_spans.push(Span::raw(" "));
+                footer_spans.push(Span::styled(
+                    format!("[{}]", round_str),
+                    Style::default().fg(Color::Cyan).bold(),
+                ));
             }
-            footer_spans.push(Span::raw(" "));
-            footer_spans.push(Span::styled(
-                format!("→ {}", f.path),
-                Style::default().fg(Color::White).bold(),
-            ));
-        } else if let Some(cmd) = &state.model.toolchain_command {
-            footer_spans.push(Span::raw(" "));
-            footer_spans.push(Span::styled(
-                format!("→ {}", cmd),
-                Style::default().fg(Color::Cyan).bold(),
-            ));
+
+            // Active retrying / modifying file
+            let active_file = state
+                .model
+                .files
+                .iter()
+                .rev()
+                .find(|f| f.status == "running" || f.status == "retrying");
+
+            if let Some(f) = active_file {
+                if let Some(retry) = &f.retry_info {
+                    footer_spans.push(Span::raw(" "));
+                    footer_spans.push(Span::styled(
+                        format!("[{}]", retry),
+                        Style::default().fg(Color::Yellow).bold(),
+                    ));
+                }
+                footer_spans.push(Span::raw(" "));
+                footer_spans.push(Span::styled(
+                    format!("→ {}", f.path),
+                    Style::default().fg(Color::White).bold(),
+                ));
+            } else if let Some(cmd) = &state.model.toolchain_command {
+                footer_spans.push(Span::raw(" "));
+                footer_spans.push(Span::styled(
+                    format!("→ {}", cmd),
+                    Style::default().fg(Color::Cyan).bold(),
+                ));
+            }
         }
-    } else if let Some(notif) = state.active_notification() {
-        let (icon, color) = match notif.level {
-            crate::app::NotificationLevel::Info => ("ℹ", Color::Cyan),
-            crate::app::NotificationLevel::Success => ("✓", Color::Green),
-            crate::app::NotificationLevel::Warning => ("⚠", Color::Yellow),
-            crate::app::NotificationLevel::Error => ("✗", Color::Red),
-        };
+    } else if let Some(notif) = active_notif {
+        let (icon, color) = format_notification(notif);
         footer_spans.push(Span::styled(
             format!("{} {}", icon, notif.text),
             Style::default().fg(color).bold(),
@@ -177,6 +191,15 @@ pub fn render_footer(frame: &mut ratatui::Frame, state: &AppState, area: Rect) {
     let footer_line = Line::from(footer_spans);
     let footer = Paragraph::new(footer_line).block(Block::default().borders(Borders::ALL));
     frame.render_widget(footer, area);
+}
+
+pub fn format_notification(notif: &crate::app::AppNotification) -> (&'static str, Color) {
+    match notif.level {
+        crate::app::NotificationLevel::Info => ("ℹ", Color::Cyan),
+        crate::app::NotificationLevel::Success => ("✓", Color::Green),
+        crate::app::NotificationLevel::Warning => ("⚠", Color::Yellow),
+        crate::app::NotificationLevel::Error => ("✗", Color::Red),
+    }
 }
 
 pub fn render_turn_phase_pipeline(current: tauqe_protocol::TurnPhase) -> Vec<Span<'static>> {
@@ -281,6 +304,25 @@ mod tests {
             extract_current_round("Text [Round 2] [Patch Retry 1/3] fixing"),
             Some("Patch Retry 1/3".to_string())
         );
+    }
+
+    #[test]
+    fn test_format_notification() {
+        let notif_info = crate::app::AppNotification {
+            level: crate::app::NotificationLevel::Info,
+            text: "info text".to_string(),
+            created_at: std::time::Instant::now(),
+            ttl: std::time::Duration::from_secs(3),
+        };
+        assert_eq!(format_notification(&notif_info), ("ℹ", Color::Cyan));
+
+        let notif_err = crate::app::AppNotification {
+            level: crate::app::NotificationLevel::Error,
+            text: "err text".to_string(),
+            created_at: std::time::Instant::now(),
+            ttl: std::time::Duration::from_secs(6),
+        };
+        assert_eq!(format_notification(&notif_err), ("✗", Color::Red));
     }
 
     #[test]

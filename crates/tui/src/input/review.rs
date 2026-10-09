@@ -7,16 +7,15 @@ use tokio::sync::Mutex;
 
 use crate::app::{AppState, KeyCommand, ReviewDialogState, ViewMode};
 use crate::input::InputResult;
-use crate::rpc::send_request;
 
 pub const REVIEW_COMMANDS: &[KeyCommand] = &[
     KeyCommand { key: "r", description: "Run code review on the current context" },
     KeyCommand { key: "s", description: "Toggle filter: show all / hide closed (DONE/REJECTED)" },
     KeyCommand { key: "Ctrl+R", description: "Fold / unfold thinking (reasoning) stream" },
-    KeyCommand { key: "↑/↓ or k/j", description: "Select previous / next finding" },
+    KeyCommand { key: "n / p (or j/k, ↑/↓)", description: "Select next / previous finding" },
     KeyCommand { key: "Enter / Tab / Space", description: "Fold / unfold selected finding" },
     KeyCommand { key: "x", description: "Check / uncheck finding for Develop" },
-    KeyCommand { key: "t", description: "Cycle status: TODO → DONE → REJECTED" },
+    KeyCommand { key: "t", description: "Change finding status (dialog: TODO / DONE / REJECTED)" },
     KeyCommand { key: "c / y", description: "Copy selected finding to clipboard" },
     KeyCommand { key: "PgUp / PgDn", description: "Page scroll review view" },
     KeyCommand { key: "Home / End", description: "Select first / last finding" },
@@ -66,9 +65,9 @@ pub async fn handle_review_key(
     }
 
     if st.review.running {
-        if key.code == KeyCode::Esc {
-            drop(st);
-            send_request(server_writer, methods::REVIEW_CANCEL, serde_json::json!({})).await?;
+        if key.code == KeyCode::Esc || key.code == KeyCode::Char('q') {
+            st.confirm_cancel = true;
+            st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
         }
         return Ok(InputResult::Continue);
     }
@@ -106,17 +105,17 @@ pub async fn handle_review_key(
                     estimated_tokens,
                     models,
                     model_index,
-                    prompt: String::new(),
+                    prompt_editor: crate::editor::InputEditor::default(),
                 });
             }
         }
-        KeyCode::Up | KeyCode::Char('k') => {
+        KeyCode::Up | KeyCode::Char('k') | KeyCode::Char('p') => {
             if st.review.selected_index > 0 {
                 st.review.selected_index -= 1;
                 st.review.scroll_to_selected();
             }
         }
-        KeyCode::Down | KeyCode::Char('j') => {
+        KeyCode::Down | KeyCode::Char('j') | KeyCode::Char('n') => {
             if st.review.selected_index + 1 < items_len {
                 st.review.selected_index += 1;
                 st.review.scroll_to_selected();
@@ -174,40 +173,23 @@ pub async fn handle_review_key(
             }
         }
         KeyCode::Char('t') | KeyCode::Char('T') => {
-            let prev_status = st.review.selected_item_index()
+            let item_opt = st.review.selected_item_index()
                 .and_then(|idx| st.review.session.as_ref()?.items.get(idx))
-                .map(|item| item.status);
-            let update = mutate_selected(&mut st, |item| {
-                item.status = item.status.next();
-                ReviewUpdateItemParams {
-                    item_id: item.id,
-                    status: Some(item.status),
-                    is_checked: None,
-                }
-            });
-            if st.review.hide_closed {
-                st.review.clamp_selection();
-                st.review.scroll_to_selected();
-            }
-            if let Some(params) = update {
-                let req_id = crate::rpc::allocate_request_id();
-                if let Some(prev) = prev_status {
-                    crate::rpc::record_optimistic_rollback(
-                        req_id,
-                        crate::rpc::OptimisticRollback::ReviewItemStatus {
-                            item_id: params.item_id,
-                            prev_status: prev,
-                        },
-                    );
-                }
-                drop(st);
-                crate::rpc::send_request_with_id(
-                    server_writer,
-                    req_id,
-                    methods::REVIEW_UPDATE_ITEM,
-                    serde_json::to_value(params)?,
-                )
-                .await?;
+                .cloned();
+            if let Some(item) = item_opt {
+                let cur_idx = match item.status {
+                    tauqe_protocol::ReviewStatus::Todo => 0,
+                    tauqe_protocol::ReviewStatus::Done => 1,
+                    tauqe_protocol::ReviewStatus::Rejected => 2,
+                };
+                st.status_dialog = Some(crate::app::StatusDialogState {
+                    target: crate::app::StatusDialogTarget::ReviewItem {
+                        item_id: item.id,
+                        item_title: item.title,
+                        current_status: item.status,
+                    },
+                    selected_index: cur_idx,
+                });
             }
         }
         KeyCode::Char('c')
@@ -220,12 +202,15 @@ pub async fn handle_review_key(
                 .and_then(|idx| st.review.session.as_ref()?.items.get(idx))
                 .map(format_item_for_clipboard);
             if let Some(text) = text {
-                match crate::clipboard::copy_to_clipboard(&text) {
+                drop(st);
+                let res = crate::clipboard::copy_to_clipboard(&text);
+                let mut st = state.lock().await;
+                match res {
                     crate::clipboard::CopyResult::Native => {
                         st.notify_success("Review finding copied to clipboard");
                     }
                     crate::clipboard::CopyResult::Osc52Only => {
-                        st.notify_success("Review finding copied via terminal (OSC 52)");
+                        st.notify_info("Review finding sent to terminal clipboard (OSC 52)");
                     }
                     crate::clipboard::CopyResult::Failed => {
                         st.notify_error("Failed to copy to clipboard");

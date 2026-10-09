@@ -147,6 +147,7 @@ pub async fn handle_response(resp: Response, state: &Arc<Mutex<AppState>>) {
                     dialog.loading = false;
                     dialog.generating_message = false;
                     dialog.pending_base = None;
+                    dialog.applying = false;
                     dialog.status_message = Some(err_text.clone());
                 }
             }
@@ -157,14 +158,6 @@ pub async fn handle_response(resp: Response, state: &Arc<Mutex<AppState>>) {
             | Some(methods::CREDENTIALS_CREATE_STUB)
             | Some(methods::SYSTEM_STATUS) => {
                 st.onboarding.set_error(err.message.clone());
-            }
-            Some(methods::CONTEXT_GET)
-            | Some(methods::CONTEXT_ADD)
-            | Some(methods::CONTEXT_ADD_PATTERN)
-            | Some(methods::CONTEXT_REMOVE)
-            | Some(methods::CONTEXT_SET_ACCESS)
-            | Some(methods::CONTEXT_CLEAR) => {
-                st.context_view.status_message = Some(err_text.clone());
             }
             Some(methods::HISTORY_GET) => {
                 st.history_view.loading = false;
@@ -181,6 +174,10 @@ pub async fn handle_response(resp: Response, state: &Arc<Mutex<AppState>>) {
 
     if let RequestId::Number(id) = resp.id {
         take_optimistic_rollback(id);
+    }
+
+    if method.as_deref() == Some(methods::PLAN_DELETE) {
+        st.notify_success("Plan deleted");
     }
 
     let Some(val) = resp.result else {
@@ -224,9 +221,9 @@ pub async fn handle_response(resp: Response, state: &Arc<Mutex<AppState>>) {
                             .collect();
                         dialog.selected_file_index = 0;
                         dialog.diff_scroll = 0;
-                        if dialog.message_buffer.is_empty() {
+                        if dialog.message_editor.is_empty() {
                             if let Some(msg) = preview.suggested_message {
-                                dialog.message_buffer = msg;
+                                dialog.message_editor.insert_str(&msg);
                             }
                         }
                         dialog.status_message = None;
@@ -244,7 +241,8 @@ pub async fn handle_response(resp: Response, state: &Arc<Mutex<AppState>>) {
                     st.model.current_cost = None;
                     if let Some(ref mut dialog) = st.squash_dialog {
                         dialog.generating_message = false;
-                        dialog.message_buffer = gen_res.message;
+                        dialog.message_editor.clear();
+                        dialog.message_editor.insert_str(&gen_res.message);
                         dialog.focus = crate::app::SquashDialogFocus::MessageEditor;
                         dialog.status_message = Some(messages::SQUASH_MSG_GENERATED.to_string());
                     }
@@ -307,7 +305,7 @@ pub async fn handle_response(resp: Response, state: &Arc<Mutex<AppState>>) {
                     serde_json::from_value::<tauqe_protocol::ContextAddPatternResult>(val)
                 {
                     st.context = pattern_res.state;
-                    st.context_view.status_message = Some(format!(
+                    st.notify_success(format!(
                         "Added {} files (~{} tokens)",
                         pattern_res.added_count, pattern_res.added_tokens
                     ));
@@ -330,7 +328,18 @@ pub async fn handle_response(resp: Response, state: &Arc<Mutex<AppState>>) {
             | methods::CONTEXT_SET_ACCESS
             | methods::CONTEXT_CLEAR => {
                 if let Ok(ctx) = serde_json::from_value::<ContextState>(val) {
+                    let items_before = st.context.items.len();
                     st.context = ctx;
+                    let items_removed = items_before.saturating_sub(st.context.items.len());
+                    match method_name {
+                        methods::CONTEXT_REMOVE => {
+                            st.notify_info(format!("Removed {} file(s) from context", items_removed));
+                        }
+                        methods::CONTEXT_CLEAR => {
+                            st.notify_success(format!("Cleared {} file(s) from context", items_removed));
+                        }
+                        _ => {}
+                    }
                     let rows = st.context_view.compute_rows(&st.context.items);
                     if rows.is_empty() {
                         st.context_view.cursor_index = 0;
@@ -393,6 +402,13 @@ pub async fn handle_response(resp: Response, state: &Arc<Mutex<AppState>>) {
             methods::PLAN_LIST => {
                 if let Ok(res) = serde_json::from_value::<tauqe_protocol::PlanListResult>(val) {
                     st.plans_view.plans_list = res.plans;
+                    let current_is_stale = st.plans_view.current_plan.as_ref().is_some_and(|p| {
+                        !st.plans_view.plans_list.iter().any(|l| l.id == p.id)
+                    });
+                    if current_is_stale {
+                        st.plans_view.reset_view_for_new_plan();
+                        st.plans_view.current_plan = None;
+                    }
                     st.plans_view.active_plan_id = res.active_id.clone();
                     if let Some(active) = &res.active_id {
                         if let Some(pos) = st.plans_view.plans_list.iter().position(|p| &p.id == active) {

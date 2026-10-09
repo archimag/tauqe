@@ -4,13 +4,37 @@ use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
 use tokio::process::ChildStdin;
 use tokio::sync::Mutex;
-use tauqe_protocol::{methods, ConfigSetParams};
+use tauqe_protocol::methods;
 
 use crate::app::{AppState, ViewMode};
 use crate::input::InputResult;
-use crate::rpc::{allocate_request_id, record_optimistic_rollback, send_request, send_request_with_id, OptimisticRollback};
+use crate::rpc::send_request;
 
 pub const MOUSE_SCROLL_STEP: usize = 3;
+
+pub fn rect_contains(rect: Rect, col: u16, row: u16) -> bool {
+    col >= rect.x && col < rect.x + rect.width && row >= rect.y && row < rect.y + rect.height
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModalHit {
+    Confirm,
+    Cancel,
+    Outside,
+    InsideBody,
+}
+
+pub fn check_confirm_hit(geom: &crate::ui::dialogs::ConfirmModalGeometry, col: u16, row: u16) -> ModalHit {
+    if rect_contains(geom.confirm_button, col, row) {
+        ModalHit::Confirm
+    } else if rect_contains(geom.cancel_button, col, row) {
+        ModalHit::Cancel
+    } else if !rect_contains(geom.area, col, row) {
+        ModalHit::Outside
+    } else {
+        ModalHit::InsideBody
+    }
+}
 
 pub async fn handle_mouse_event(
     mouse: MouseEvent,
@@ -21,13 +45,37 @@ pub async fn handle_mouse_event(
 
     match mouse.kind {
         MouseEventKind::ScrollUp => {
-            if let Some(ref mut dialog) = st.selection_dialog {
+            if let Some(ref mut dialog) = st.status_dialog {
                 dialog.selected_index = dialog.selected_index.saturating_sub(1);
+                return Ok(InputResult::Continue);
+            }
+            if let Some(ref mut dialog) = st.selection_dialog {
+                let (term_w, term_h) = crossterm::terminal::size().unwrap_or((80, 24));
+                let area = crate::ui::selection_dialog_area(Rect::new(0, 0, term_w, term_h), dialog.items.len());
+                let visible_height = crate::ui::dialogs::selection_dialog_visible_height(area);
+                dialog.select_prev(visible_height);
                 return Ok(InputResult::Continue);
             }
             if st.show_help {
                 st.help_scroll = st.help_scroll.saturating_sub(MOUSE_SCROLL_STEP as u16);
                 return Ok(InputResult::Continue);
+            }
+            // Allow wheel scrolling in squash dialog (diff or file list)
+            if let Some(ref mut dialog) = st.squash_dialog {
+                if dialog.confirm.is_none() {
+                    let (term_w, term_h) = crossterm::terminal::size().unwrap_or((80, 24));
+                    let term_rect = Rect::new(0, 0, term_w, term_h);
+                    let (_area, files_rect, _diff_rect) = crate::ui::dialogs::squash_dialog_chunks(term_rect);
+                    if rect_contains(files_rect, mouse.column, mouse.row) {
+                        if dialog.selected_file_index > 0 {
+                            dialog.selected_file_index -= 1;
+                            dialog.diff_scroll = 0;
+                        }
+                    } else {
+                        dialog.diff_scroll = dialog.diff_scroll.saturating_sub(MOUSE_SCROLL_STEP as u16);
+                    }
+                    return Ok(InputResult::Continue);
+                }
             }
             // Do not scroll background content when modal dialogs are open
             if st.has_active_modal() {
@@ -60,15 +108,43 @@ pub async fn handle_mouse_event(
             Ok(InputResult::Continue)
         }
         MouseEventKind::ScrollDown => {
-            if let Some(ref mut dialog) = st.selection_dialog {
-                if !dialog.items.is_empty() && dialog.selected_index + 1 < dialog.items.len() {
+            if let Some(ref mut dialog) = st.status_dialog {
+                let total = match &dialog.target {
+                    crate::app::StatusDialogTarget::PlanItem { .. } => 4,
+                    crate::app::StatusDialogTarget::ReviewItem { .. } => 3,
+                };
+                if dialog.selected_index + 1 < total {
                     dialog.selected_index += 1;
                 }
+                return Ok(InputResult::Continue);
+            }
+            if let Some(ref mut dialog) = st.selection_dialog {
+                let (term_w, term_h) = crossterm::terminal::size().unwrap_or((80, 24));
+                let area = crate::ui::selection_dialog_area(Rect::new(0, 0, term_w, term_h), dialog.items.len());
+                let visible_height = crate::ui::dialogs::selection_dialog_visible_height(area);
+                dialog.select_next(visible_height);
                 return Ok(InputResult::Continue);
             }
             if st.show_help {
                 st.help_scroll = st.help_scroll.saturating_add(MOUSE_SCROLL_STEP as u16);
                 return Ok(InputResult::Continue);
+            }
+            // Allow wheel scrolling in squash dialog (diff or file list)
+            if let Some(ref mut dialog) = st.squash_dialog {
+                if dialog.confirm.is_none() {
+                    let (term_w, term_h) = crossterm::terminal::size().unwrap_or((80, 24));
+                    let term_rect = Rect::new(0, 0, term_w, term_h);
+                    let (_area, files_rect, _diff_rect) = crate::ui::dialogs::squash_dialog_chunks(term_rect);
+                    if rect_contains(files_rect, mouse.column, mouse.row) {
+                        if !dialog.files.is_empty() && dialog.selected_file_index + 1 < dialog.files.len() {
+                            dialog.selected_file_index += 1;
+                            dialog.diff_scroll = 0;
+                        }
+                    } else {
+                        dialog.diff_scroll = dialog.diff_scroll.saturating_add(MOUSE_SCROLL_STEP as u16);
+                    }
+                    return Ok(InputResult::Continue);
+                }
             }
             // Do not scroll background content when modal dialogs are open
             if st.has_active_modal() {
@@ -124,33 +200,22 @@ pub async fn handle_mouse_event(
                     && mouse.row >= area.y
                     && mouse.row < area.y + area.height
                 {
+                    let inner_height = crate::ui::dialogs::selection_dialog_visible_height(area);
+                    let max_scroll = dialog.items.len().saturating_sub(inner_height);
+                    let scroll_offset = dialog.scroll_offset.min(max_scroll);
                     let start_y = area.y + 2;
-                    if mouse.row >= start_y
-                        && (mouse.row as usize) < start_y as usize + item_count
-                    {
-                        let clicked_idx = (mouse.row - start_y) as usize;
+                    if mouse.row >= start_y && (mouse.row as usize) < start_y as usize + inner_height {
+                        let clicked_visible = (mouse.row - start_y) as usize;
+                        let clicked_idx = scroll_offset + clicked_visible;
                         if let Some(chosen) = dialog.items.get(clicked_idx).cloned() {
-                            let prev_model = st.active_model.clone();
-                            st.active_model = chosen.clone();
-                            st.selection_dialog = None;
-                            let req_id = allocate_request_id();
-                            record_optimistic_rollback(
-                                req_id,
-                                OptimisticRollback::ActiveModel { prev_model },
-                            );
-                            let params = ConfigSetParams {
-                                model: Some(chosen),
-                                ..Default::default()
-                            };
-                            drop(st);
-                            send_request_with_id(
-                                server_writer,
-                                req_id,
-                                methods::CONFIG_SET,
-                                serde_json::to_value(params)?,
-                            )
-                            .await?;
+                            crate::input::dialogs::apply_model_selection(st, chosen, server_writer)
+                                .await?;
                             return Ok(InputResult::Continue);
+                        }
+                    } else {
+                        let footer_y = area.y + area.height.saturating_sub(3);
+                        if mouse.row >= footer_y {
+                            st.selection_dialog = None;
                         }
                     }
                     return Ok(InputResult::Continue);
@@ -166,7 +231,296 @@ pub async fn handle_mouse_event(
                 return Ok(InputResult::Continue);
             }
 
-            // If any modal is active, swallow clicks to protect background state and tabs
+            let (term_w, term_h) = crossterm::terminal::size().unwrap_or((80, 24));
+            let term_rect = Rect::new(0, 0, term_w, term_h);
+
+            // 0. Status dialog hit-testing
+            if let Some(dialog) = st.status_dialog.clone() {
+                let options_count = match &dialog.target {
+                    crate::app::StatusDialogTarget::PlanItem { .. } => 4,
+                    crate::app::StatusDialogTarget::ReviewItem { .. } => 3,
+                };
+                let area = crate::ui::dialogs::status_dialog_area(term_rect, options_count);
+                if rect_contains(area, mouse.column, mouse.row) {
+                    let start_y = area.y + 4; // header border (1) + top margin (1) + target preview (2)
+                    let clicked_row = mouse.row.saturating_sub(start_y) as usize;
+                    if clicked_row < options_count {
+                        crate::input::dialogs::apply_status_dialog(&mut st, clicked_row, server_writer).await?;
+                    } else {
+                        let footer_y = area.y + area.height.saturating_sub(3);
+                        if mouse.row >= footer_y {
+                            st.status_dialog = None;
+                        }
+                    }
+                } else {
+                    st.status_dialog = None;
+                }
+                return Ok(InputResult::Continue);
+            }
+
+            // 1. Server disconnected popup button hit-testing
+            if st.server_disconnected.is_some() {
+                let area = crate::ui::centered_rect(64, 30, term_rect);
+                let inner_y = area.y + 1;
+                let inner_h = area.height.saturating_sub(2);
+                let inner_x = area.x + 1;
+                let inner_w = area.width.saturating_sub(2);
+                let btn_y = inner_y + inner_h.saturating_sub(3);
+                let btn_len = " [ Quit TAUQE (q / Ctrl+Q) ] ".len() as u16;
+                let start_x = inner_x + (inner_w.saturating_sub(btn_len)) / 2;
+                let quit_btn = Rect::new(start_x, btn_y, btn_len, 1);
+                if rect_contains(quit_btn, mouse.column, mouse.row) || !rect_contains(area, mouse.column, mouse.row) {
+                    return Ok(InputResult::Exit);
+                }
+                return Ok(InputResult::Continue);
+            }
+
+            // 2. Squash dialog confirm modal & browsing hit-testing
+            if let Some(ref mut dialog) = st.squash_dialog {
+                if let Some(kind) = dialog.confirm {
+                    let (w, lines_len, c_label, d_label) = match kind {
+                        crate::app::SquashConfirm::Apply => (60, 6, "Confirm Squash (Y)", "Cancel (Esc)"),
+                        crate::app::SquashConfirm::Discard => (58, 4, "Discard (Y)", "Cancel (Esc)"),
+                    };
+                    let geom = crate::ui::dialogs::confirm_modal_geometry(term_rect, w, lines_len, c_label, d_label);
+                    match check_confirm_hit(&geom, mouse.column, mouse.row) {
+                        ModalHit::Confirm => {
+                            dialog.confirm = None;
+                            match kind {
+                                crate::app::SquashConfirm::Apply => {
+                                    let base_ref = dialog.base_ref.clone();
+                                    let message = dialog.message_editor.get_text().trim().to_string();
+                                    dialog.applying = true;
+                                    dialog.status_message = Some("Applying squash...".to_string());
+                                    drop(st);
+                                    let params = tauqe_protocol::GitSquashApplyParams { base_ref, message };
+                                    send_request(
+                                        server_writer,
+                                        methods::GIT_SQUASH_APPLY,
+                                        serde_json::to_value(params)?,
+                                    )
+                                    .await?;
+                                }
+                                crate::app::SquashConfirm::Discard => {
+                                    st.squash_dialog = None;
+                                }
+                            }
+                            return Ok(InputResult::Continue);
+                        }
+                        ModalHit::Cancel | ModalHit::Outside => {
+                            dialog.confirm = None;
+                            return Ok(InputResult::Continue);
+                        }
+                        ModalHit::InsideBody => return Ok(InputResult::Continue),
+                    }
+                }
+
+                let (area, files_rect, _diff_rect) = crate::ui::dialogs::squash_dialog_chunks(term_rect);
+                if !rect_contains(area, mouse.column, mouse.row) {
+                    if dialog.message_editor.get_text().trim().is_empty() {
+                        st.squash_dialog = None;
+                    } else {
+                        dialog.confirm = Some(crate::app::SquashConfirm::Discard);
+                        dialog.confirm_button = crate::app::ConfirmDialogButton::Cancel;
+                    }
+                    return Ok(InputResult::Continue);
+                }
+
+                if rect_contains(files_rect, mouse.column, mouse.row) {
+                    let files_visible = files_rect.height.saturating_sub(2) as usize;
+                    let files_offset = (dialog.selected_file_index + 1).saturating_sub(files_visible);
+                    let clicked_row = (mouse.row.saturating_sub(files_rect.y + 1)) as usize;
+                    let clicked_idx = files_offset + clicked_row;
+                    if clicked_idx < dialog.files.len() {
+                        if clicked_idx == dialog.selected_file_index {
+                            dialog.files[clicked_idx].expanded = !dialog.files[clicked_idx].expanded;
+                        } else {
+                            dialog.selected_file_index = clicked_idx;
+                            dialog.diff_scroll = 0;
+                        }
+                        dialog.focus = crate::app::SquashDialogFocus::FileList;
+                    }
+                    return Ok(InputResult::Continue);
+                }
+                return Ok(InputResult::Continue);
+            }
+
+            // 3. Review launch dialog hit-testing
+            if let Some(dialog) = st.review_dialog.clone() {
+                let area = crate::ui::centered_rect(64, 54, term_rect);
+                let inner_y = area.y + 1;
+                let inner_h = area.height.saturating_sub(2);
+                let inner_x = area.x + 1;
+                let inner_w = area.width.saturating_sub(2);
+                let btn_y = inner_y + inner_h.saturating_sub(3);
+                let start_x = inner_x + (inner_w.saturating_sub(48)) / 2;
+                let confirm_btn = Rect::new(start_x, btn_y, 26, 1);
+                let cancel_btn = Rect::new(start_x + 30, btn_y, 18, 1);
+
+                if rect_contains(confirm_btn, mouse.column, mouse.row) {
+                    st.review_dialog = None;
+                    let prompt = dialog.prompt_editor.get_text().trim().to_string();
+                    let params = tauqe_protocol::ReviewStartParams {
+                        model: dialog.models.get(dialog.model_index).cloned(),
+                        user_prompt: if prompt.is_empty() { None } else { Some(prompt) },
+                    };
+                    st.review.begin();
+                    drop(st);
+                    send_request(
+                        server_writer,
+                        methods::REVIEW_START,
+                        serde_json::to_value(params)?,
+                    )
+                    .await?;
+                    return Ok(InputResult::Continue);
+                } else if rect_contains(cancel_btn, mouse.column, mouse.row) || !rect_contains(area, mouse.column, mouse.row) {
+                    st.review_dialog = None;
+                    return Ok(InputResult::Continue);
+                } else {
+                    return Ok(InputResult::Continue);
+                }
+            }
+
+            // 4. Confirmation modals hit-testing (Cancel, Quit, Undo, Delete Plan, Clear Auto, Clear History)
+            if st.confirm_cancel {
+                let geom = crate::ui::dialogs::confirm_modal_geometry(
+                    term_rect, 58, 5, "Interrupt (Y)", "Cancel (Esc)",
+                );
+                match check_confirm_hit(&geom, mouse.column, mouse.row) {
+                    ModalHit::Confirm => {
+                        st.confirm_cancel = false;
+                        let cancel_review = st.review.running;
+                        let cancel_model = st.model.is_busy();
+                        drop(st);
+                        if cancel_review {
+                            send_request(server_writer, methods::REVIEW_CANCEL, serde_json::json!({})).await?;
+                        }
+                        if cancel_model || !cancel_review {
+                            send_request(server_writer, methods::MODEL_CANCEL, serde_json::json!({})).await?;
+                        }
+                    }
+                    ModalHit::Cancel | ModalHit::Outside => {
+                        st.confirm_cancel = false;
+                    }
+                    ModalHit::InsideBody => {}
+                }
+                return Ok(InputResult::Continue);
+            }
+
+            if st.confirm_quit {
+                let geom = crate::ui::dialogs::confirm_modal_geometry(
+                    term_rect, 58, 5, "Quit TAUQE (Y)", "Cancel (Esc)",
+                );
+                match check_confirm_hit(&geom, mouse.column, mouse.row) {
+                    ModalHit::Confirm => {
+                        st.confirm_quit = false;
+                        return Ok(InputResult::Exit);
+                    }
+                    ModalHit::Cancel | ModalHit::Outside => {
+                        st.confirm_quit = false;
+                    }
+                    ModalHit::InsideBody => {}
+                }
+                return Ok(InputResult::Continue);
+            }
+
+            if st.confirm_undo {
+                let lines_count = 5
+                    + (st.model.last_commit_hash.is_some() as usize)
+                    + (st.model.last_commit_summary.is_some() as usize);
+                let geom = crate::ui::dialogs::confirm_modal_geometry(
+                    term_rect, 58, lines_count, "Confirm Undo (Y)", "Cancel (Esc)",
+                );
+                match check_confirm_hit(&geom, mouse.column, mouse.row) {
+                    ModalHit::Confirm => {
+                        st.confirm_undo = false;
+                        drop(st);
+                        send_request(server_writer, methods::GIT_UNDO, serde_json::json!({})).await?;
+                    }
+                    ModalHit::Cancel | ModalHit::Outside => {
+                        st.confirm_undo = false;
+                    }
+                    ModalHit::InsideBody => {}
+                }
+                return Ok(InputResult::Continue);
+            }
+
+            if let Some(plan_id) = st.confirm_delete_plan.clone() {
+                let geom = crate::ui::dialogs::confirm_modal_geometry(
+                    term_rect, 58, 5, "Confirm Delete (Y)", "Cancel (Esc)",
+                );
+                match check_confirm_hit(&geom, mouse.column, mouse.row) {
+                    ModalHit::Confirm => {
+                        st.confirm_delete_plan = None;
+                        drop(st);
+                        crate::input::dialogs::delete_plan(server_writer, plan_id).await?;
+                    }
+                    ModalHit::Cancel | ModalHit::Outside => {
+                        st.confirm_delete_plan = None;
+                    }
+                    ModalHit::InsideBody => {}
+                }
+                return Ok(InputResult::Continue);
+            }
+
+            if st.context_view.confirm_clear_auto {
+                let geom = crate::ui::dialogs::confirm_modal_geometry(
+                    term_rect, 58, 5, "Confirm Clear (Y)", "Cancel (Esc)",
+                );
+                match check_confirm_hit(&geom, mouse.column, mouse.row) {
+                    ModalHit::Confirm => {
+                        st.context_view.confirm_clear_auto = false;
+                        drop(st);
+                        let params = tauqe_protocol::ContextClearParams {
+                            layer: Some(tauqe_protocol::ContextLayer::Auto),
+                        };
+                        send_request(
+                            server_writer,
+                            methods::CONTEXT_CLEAR,
+                            serde_json::to_value(params)?,
+                        )
+                        .await?;
+                    }
+                    ModalHit::Cancel | ModalHit::Outside => {
+                        st.context_view.confirm_clear_auto = false;
+                    }
+                    ModalHit::InsideBody => {}
+                }
+                return Ok(InputResult::Continue);
+            }
+
+            if st.confirm_clear_history {
+                let geom = crate::ui::dialogs::confirm_modal_geometry(
+                    term_rect, 58, 6, "Confirm Clear (Y)", "Cancel (Esc)",
+                );
+                match check_confirm_hit(&geom, mouse.column, mouse.row) {
+                    ModalHit::Confirm => {
+                        st.confirm_clear_history = false;
+                        let cost = st.model.session_total_cost;
+                        let prev_cost = st.model.prev_cost;
+                        st.model = crate::ui::develop::DevelopView {
+                            session_total_cost: cost,
+                            prev_cost,
+                            ..Default::default()
+                        };
+                        st.history_view = crate::ui::history::HistoryViewState::default();
+                        drop(st);
+                        send_request(
+                            server_writer,
+                            methods::MODEL_CLEAR_HISTORY,
+                            serde_json::json!({}),
+                        )
+                        .await?;
+                    }
+                    ModalHit::Cancel | ModalHit::Outside => {
+                        st.confirm_clear_history = false;
+                    }
+                    ModalHit::InsideBody => {}
+                }
+                return Ok(InputResult::Continue);
+            }
+
+            // If any other modal is active, swallow clicks to protect background state and tabs
             if st.has_active_modal() {
                 return Ok(InputResult::Continue);
             }
@@ -174,56 +528,36 @@ pub async fn handle_mouse_event(
             if st.header_clicks.row > 0 && mouse.row == st.header_clicks.row {
                 let areas = st.header_clicks;
                 if areas.develop_tab.1 > 0 && mouse.column >= areas.develop_tab.0 && mouse.column <= areas.develop_tab.1 {
-                    st.view_mode = ViewMode::Develop;
-                    st.context_view.status_message = None;
+                    crate::input::switch_view(&mut st, ViewMode::Develop, server_writer).await?;
                     return Ok(InputResult::Continue);
                 } else if areas.context_tab.1 > 0 && mouse.column >= areas.context_tab.0 && mouse.column <= areas.context_tab.1 {
-                    st.view_mode = ViewMode::Context;
-                    st.context_view.status_message = None;
+                    crate::input::switch_view(&mut st, ViewMode::Context, server_writer).await?;
                     return Ok(InputResult::Continue);
                 } else if areas.review_tab.1 > 0 && mouse.column >= areas.review_tab.0 && mouse.column <= areas.review_tab.1 {
-                    st.view_mode = ViewMode::Review;
-                    st.context_view.status_message = None;
+                    crate::input::switch_view(&mut st, ViewMode::Review, server_writer).await?;
                     return Ok(InputResult::Continue);
                 } else if areas.plans_tab.1 > 0 && mouse.column >= areas.plans_tab.0 && mouse.column <= areas.plans_tab.1 {
-                    st.view_mode = ViewMode::Plans;
-                    st.context_view.status_message = None;
+                    crate::input::switch_view(&mut st, ViewMode::Plans, server_writer).await?;
                     return Ok(InputResult::Continue);
                 } else if areas.history_tab.1 > 0 && mouse.column >= areas.history_tab.0 && mouse.column <= areas.history_tab.1 {
-                    st.view_mode = ViewMode::History;
-                    st.history_view.auto_scroll = true;
-                    if !st.history_view.items.is_empty() {
-                        st.history_view.selected_item_index =
-                            st.history_view.items.len().saturating_sub(1);
-                    } else if !st.history_view.loading {
-                        st.history_view.loading = true;
-                        drop(st);
-                        let params = tauqe_protocol::HistoryGetParams {
-                            limit: Some(20),
-                            before_id: None,
-                        };
-                        send_request(
-                            server_writer,
-                            methods::HISTORY_GET,
-                            serde_json::to_value(params)?,
-                        )
-                        .await?;
-                        return Ok(InputResult::Continue);
-                    }
-                    st.context_view.status_message = None;
+                    crate::input::switch_view(&mut st, ViewMode::History, server_writer).await?;
                     return Ok(InputResult::Continue);
                 } else if areas.model_select.1 > 0 && mouse.column >= areas.model_select.0 && mouse.column <= areas.model_select.1 {
-                    if !st.model.is_busy() && !st.available_models.is_empty() {
+                    if st.model.is_busy() {
+                        st.notify_warning("Cannot change model while model is generating");
+                        return Ok(InputResult::Continue);
+                    }
+                    if !st.available_models.is_empty() {
                         let cur_idx = st
                             .available_models
                             .iter()
                             .position(|m| m == &st.active_model)
                             .unwrap_or(0);
-                        st.selection_dialog = Some(crate::app::SelectionDialogState {
-                            kind: crate::app::SelectionDialogKind::Model,
-                            items: st.available_models.clone(),
-                            selected_index: cur_idx,
-                        });
+                        st.selection_dialog = Some(crate::app::SelectionDialogState::new(
+                            crate::app::SelectionDialogKind::Model,
+                            st.available_models.clone(),
+                            cur_idx,
+                        ));
                         return Ok(InputResult::Continue);
                     }
                 } else if areas.squash_button.1 > 0 && mouse.column >= areas.squash_button.0 && mouse.column <= areas.squash_button.1 {
@@ -272,8 +606,9 @@ pub async fn handle_mouse_event(
                                     st.notify_error("Failed to copy code to clipboard");
                                 }
                             }
-                        } else {
+                        } else if !st.shift_tip_shown {
                             st.notify_info("Tip: Hold Shift while dragging to select text with mouse");
+                            st.shift_tip_shown = true;
                         }
                     }
                 }
@@ -313,8 +648,9 @@ pub async fn handle_mouse_event(
                                     st.notify_error("Failed to copy code to clipboard");
                                 }
                             }
-                        } else {
+                        } else if !st.shift_tip_shown {
                             st.notify_info("Tip: Hold Shift while dragging to select text with mouse");
+                            st.shift_tip_shown = true;
                         }
                     }
                 }
@@ -322,5 +658,36 @@ pub async fn handle_mouse_event(
             Ok(InputResult::Continue)
         }
         _ => Ok(InputResult::Continue),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::layout::Rect;
+
+    #[test]
+    fn test_rect_contains_and_check_confirm_hit() {
+        let term = Rect::new(0, 0, 100, 30);
+        let geom = crate::ui::dialogs::confirm_modal_geometry(term, 58, 5, "Interrupt (Y)", "Cancel (Esc)");
+
+        assert!(geom.area.width > 0 && geom.area.height > 0);
+        assert!(geom.confirm_button.width > 0 && geom.cancel_button.width > 0);
+
+        // Click exactly on Confirm button
+        let hit = check_confirm_hit(&geom, geom.confirm_button.x, geom.confirm_button.y);
+        assert_eq!(hit, ModalHit::Confirm);
+
+        // Click exactly on Cancel button
+        let hit = check_confirm_hit(&geom, geom.cancel_button.x, geom.cancel_button.y);
+        assert_eq!(hit, ModalHit::Cancel);
+
+        // Click outside modal area
+        let hit = check_confirm_hit(&geom, 0, 0);
+        assert_eq!(hit, ModalHit::Outside);
+
+        // Click inside modal body (above button row)
+        let hit = check_confirm_hit(&geom, geom.area.x + 5, geom.area.y + 2);
+        assert_eq!(hit, ModalHit::InsideBody);
     }
 }

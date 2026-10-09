@@ -386,18 +386,6 @@ fn build_item_header(item: &UiHistoryItem, is_selected: bool, is_expanded: bool)
         header_spans.push(Span::raw(" - "));
         header_spans.push(Span::styled(summary.clone(), Style::default().bold()));
     }
-    if is_selected {
-        header_spans.push(Span::raw(" "));
-        let fold_hint = if is_expanded {
-            "◄ [Tab: fold, c: copy, Alt+C: copy code]"
-        } else {
-            "◄ [Tab: expand, c: copy]"
-        };
-        header_spans.push(Span::styled(
-            fold_hint,
-            Style::default().fg(Color::Yellow).bold(),
-        ));
-    }
     Line::from(header_spans)
 }
 
@@ -501,7 +489,7 @@ fn build_item_body(
         }
 
         if !notes.is_empty() {
-            let note_str = format!("    ... [{} | Tab to expand]", notes.join(", "));
+            let note_str = format!("    ... [{}]", notes.join(", "));
             raw_lines.push(Line::from(Span::styled(
                 note_str,
                 Style::default().fg(Color::DarkGray).italic(),
@@ -768,7 +756,7 @@ mod tests {
         assert!(rendered.iter().any(|line| line.contains("Line 2")));
         assert!(rendered.iter().any(|line| line.contains("Line 3")));
         assert!(!rendered.iter().any(|line| line.contains("Line 5")));
-        assert!(rendered.iter().any(|line| line.contains("[+2 more lines, 1 modified files | Tab to expand]")));
+        assert!(rendered.iter().any(|line| line.contains("[+2 more lines, 1 modified files]")));
     }
 
     #[test]
@@ -822,7 +810,7 @@ mod tests {
             })
             .collect();
 
-        assert!(rendered.iter().any(|l| l.contains("● ▶  [ASSISTANT]  #2") && l.contains("[Tab: expand, c: copy]")));
+        assert!(rendered.iter().any(|l| l.contains("● ▶  [ASSISTANT]  #2")));
         assert!(rendered.iter().any(|l| l.contains("  ▶  [USER]  #1")));
     }
 

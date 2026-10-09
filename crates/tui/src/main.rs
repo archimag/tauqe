@@ -76,6 +76,9 @@ async fn main() -> anyhow::Result<()> {
 
     let tui_config = config::TuiConfig::load();
 
+    let mut input_editor = InputEditor::default();
+    input_editor.set_history_path(editor::default_prompt_history_path());
+
     let state = Arc::new(Mutex::new(AppState {
         view_mode: initial_view_mode,
         protocol_version,
@@ -97,7 +100,7 @@ async fn main() -> anyhow::Result<()> {
         notification: None,
         turn_started_at: None,
         onboarding: onboarding_state,
-        input_editor: InputEditor::default(),
+        input_editor,
         tui_config,
         show_help: false,
         help_scroll: 0,
@@ -108,11 +111,14 @@ async fn main() -> anyhow::Result<()> {
         confirm_delete_plan: None,
         confirm_button: crate::app::ConfirmDialogButton::Cancel,
         selection_dialog: None,
+        status_dialog: None,
         squash_dialog: None,
         server_disconnected: None,
         server_log_path: server_log_path.clone(),
         last_model_height: 10,
         header_clicks: crate::app::HeaderClickAreas::default(),
+        terminal_focused: true,
+        shift_tip_shown: false,
     }));
 
     let mut is_reasoning = false;
@@ -154,33 +160,64 @@ async fn main() -> anyhow::Result<()> {
     let (mut terminal, _guard) = terminal::init_terminal()?;
     let mut event_rx = terminal::spawn_event_reader();
     let mut last_spinner_tick = Instant::now();
+    let mut dirty = true;
 
     loop {
-        {
+        let (needs_spin, has_active_notif) = {
             let mut st = state.lock().await;
-            if st.model.needs_spinner() && last_spinner_tick.elapsed() >= SPINNER_INTERVAL {
+            let spin = st.model.needs_spinner() || st.review.running;
+            if spin && last_spinner_tick.elapsed() >= SPINNER_INTERVAL {
                 st.model.spinner_frame = (st.model.spinner_frame + 1) % SPINNER_FRAMES.len();
                 last_spinner_tick = Instant::now();
+                dirty = true;
             }
-            st.model.flush_pending_markdown();
-            terminal.draw(|f| render_ui(f, &mut st))?;
-        }
+
+            if dirty {
+                st.model.flush_pending_markdown();
+                terminal.draw(|f| render_ui(f, &mut st))?;
+                dirty = false;
+            }
+
+            (spin, st.active_notification().is_some())
+        };
+
+        let sleep_duration = if needs_spin {
+            let elapsed = last_spinner_tick.elapsed();
+            if elapsed >= SPINNER_INTERVAL {
+                Duration::from_millis(5)
+            } else {
+                SPINNER_INTERVAL - elapsed
+            }
+        } else if has_active_notif {
+            Duration::from_millis(200)
+        } else {
+            Duration::from_millis(500)
+        };
 
         tokio::select! {
             Some(terminal_event) = event_rx.recv() => {
                 match input::handle_terminal_event(terminal_event, &state, &mut server_writer).await {
-                    Ok(InputResult::Continue) => {}
+                    Ok(InputResult::Continue) => {
+                        dirty = true;
+                    }
                     Ok(InputResult::Exit) => break,
                     Err(err) => {
                         let mut st = state.lock().await;
                         st.notify_error(format!("Command error: {}", err));
+                        dirty = true;
                     }
                 }
             }
             msg = msg_rx.recv() => {
                 match msg {
-                    Some(Message::Event(ev)) => rpc::handle_event(ev, &state, &mut is_reasoning).await,
-                    Some(Message::Response(resp)) => rpc::handle_response(resp, &state).await,
+                    Some(Message::Event(ev)) => {
+                        rpc::handle_event(ev, &state, &mut is_reasoning).await;
+                        dirty = true;
+                    }
+                    Some(Message::Response(resp)) => {
+                        rpc::handle_response(resp, &state).await;
+                        dirty = true;
+                    }
                     Some(_) => {}
                     None => {
                         let mut st = state.lock().await;
@@ -193,24 +230,38 @@ async fn main() -> anyhow::Result<()> {
                             let banner = format!("{}. Logs: {}. Press 'q' or Ctrl+Q to exit.", status_text, server_log_path.display());
                             st.server_disconnected = Some(banner.clone());
                             st.notify_error(banner);
+                            dirty = true;
                         }
                     }
                 }
             }
-            _ = tokio::time::sleep(Duration::from_millis(50)) => {
+            _ = tokio::time::sleep(sleep_duration) => {
                 if let Ok(Some(status)) = server_child.try_wait() {
                     let mut st = state.lock().await;
                     if st.server_disconnected.is_none() {
                         let banner = format!("Server process exited ({}). Logs: {}. Press 'q' or Ctrl+Q to exit.", status, server_log_path.display());
                         st.server_disconnected = Some(banner.clone());
                         st.notify_error(banner);
+                        dirty = true;
+                    }
+                } else if has_active_notif {
+                    let st = state.lock().await;
+                    if st.active_notification().is_none() {
+                        dirty = true;
                     }
                 }
             }
         }
     }
 
-    let _ = server_child.kill().await;
+    drop(server_writer);
+    let shutdown_timeout = Duration::from_millis(1500);
+    if tokio::time::timeout(shutdown_timeout, server_child.wait())
+        .await
+        .is_err()
+    {
+        let _ = server_child.kill().await;
+    }
 
     Ok(())
 }

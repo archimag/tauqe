@@ -54,14 +54,27 @@ fn default_min_duration() -> u64 {
     5
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DesktopNotificationProtocol {
+    #[default]
+    Osc9,
+    Osc777,
+    Both,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct NotificationConfig {
     #[serde(default = "default_true")]
     pub sound: bool,
     #[serde(default = "default_true")]
     pub desktop: bool,
+    #[serde(default)]
+    pub desktop_protocol: DesktopNotificationProtocol,
     #[serde(default = "default_min_duration")]
     pub min_duration_seconds: u64,
+    #[serde(default = "default_true")]
+    pub only_unfocused: bool,
     #[serde(default)]
     pub command: Option<String>,
 }
@@ -71,10 +84,27 @@ impl Default for NotificationConfig {
         Self {
             sound: true,
             desktop: true,
+            desktop_protocol: DesktopNotificationProtocol::Osc9,
             min_duration_seconds: 5,
+            only_unfocused: true,
             command: None,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ThemeMode {
+    #[default]
+    Auto,
+    Dark,
+    Light,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ThemeConfig {
+    #[serde(default)]
+    pub mode: ThemeMode,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -83,19 +113,30 @@ pub struct TuiConfig {
     pub input: InputConfig,
     #[serde(default)]
     pub notifications: NotificationConfig,
+    #[serde(default)]
+    pub theme: ThemeConfig,
 }
 
 impl TuiConfig {
+    /// Loads `tui.toml`. A missing file yields defaults; an unreadable or
+    /// invalid file is reported as an error so the caller can surface it.
+    pub fn load_checked() -> Result<Self, String> {
+        let Some(path) = find_tui_config_path() else {
+            return Ok(TuiConfig::default());
+        };
+        let content = fs::read_to_string(&path)
+            .map_err(|e| format!("Cannot read {}: {}", path.display(), e))?;
+        toml::from_str::<TuiConfig>(&content).map_err(|e| {
+            format!(
+                "Invalid {}: {}",
+                path.display(),
+                e.to_string().lines().next().unwrap_or("parse error")
+            )
+        })
+    }
+
     pub fn load() -> Self {
-        let config_path = find_tui_config_path();
-        if let Some(path) = config_path {
-            if let Ok(content) = fs::read_to_string(&path) {
-                if let Ok(cfg) = toml::from_str::<TuiConfig>(&content) {
-                    return cfg;
-                }
-            }
-        }
-        TuiConfig::default()
+        Self::load_checked().unwrap_or_default()
     }
 }
 
@@ -151,10 +192,17 @@ pub fn save_tui_config_full(
     content.push_str("sound = true\n");
     content.push_str("# Desktop notification via terminal OSC escape codes:\n");
     content.push_str("desktop = true\n");
+    content.push_str("# Desktop notification protocol: \"osc9\" (default, iTerm2/Windows Terminal), \"osc777\" (Kitty), or \"both\":\n");
+    content.push_str("# desktop_protocol = \"osc9\"\n");
+    content.push_str("# Notify only when terminal window has lost focus (requires terminal focus reporting):\n");
+    content.push_str("only_unfocused = true\n");
     content.push_str("# Minimum turn duration in seconds before triggering notification (default: 5):\n");
     content.push_str("min_duration_seconds = 5\n");
     content.push_str("# Optional external command hook executed on long turn completion:\n");
     content.push_str("# command = \"paplay /usr/share/sounds/freedesktop/stereo/complete.oga\"\n");
+    content.push_str("\n[theme]\n");
+    content.push_str("# Color theme mode: \"auto\" (default), \"dark\", or \"light\":\n");
+    content.push_str("# mode = \"auto\"\n");
     fs::write(&path, content)?;
     Ok(path)
 }

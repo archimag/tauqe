@@ -6,7 +6,7 @@ use ratatui::widgets::{Block, Borders, Padding, Paragraph};
 use crate::app::AppState;
 use crate::ui::{wrap_line, wrap_lines};
 
-use super::compute_model_lines;
+use super::{compute_model_lines, DevelopFocus};
 
 pub fn render_develop_view(
     frame: &mut ratatui::Frame,
@@ -286,18 +286,24 @@ fn render_prompt_input(
             0
         };
 
+    let in_viewport = state.model.focus == DevelopFocus::Viewport;
     let border_style = if is_busy {
         Style::default().fg(Color::Yellow)
+    } else if in_viewport {
+        Style::default().fg(Color::DarkGray)
     } else {
         Style::default()
     };
 
+    let mut input_block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(border_style);
+    if in_viewport {
+        input_block = input_block.title(" [VIEWPORT] ");
+    }
+
     let input_paragraph = Paragraph::new(input_lines)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(border_style),
-        )
+        .block(input_block)
         .scroll((input_scroll, 0));
     frame.render_widget(input_paragraph, area);
 }

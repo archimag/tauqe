@@ -52,7 +52,7 @@ When you trigger a review in TAUQE, the review model does **not** receive the on
 
 Unstructured markdown reports generated in chat windows are quickly scrolled past and forgotten. TAUQE parses review output into **discrete, persistent findings**:
 - **Persistent Storage:** Saved in `.tauqe/reviews/` and preserved across sessions.
-- **Triage States:** Each finding can be marked as `TODO`, `DONE`, or `REJECTED` (cycled via `t`).
+- **Triage States:** Each finding can be marked as `TODO`, `DONE`, or `REJECTED`. Pressing `t` opens an intentional status selection dialog, allowing immediate selection via number keys (`1`..`3`).
 - **Display Filtering:** Press `s` to toggle filtering, hiding resolved items and focusing only on open engineering issues.
 
 ---
@@ -64,9 +64,9 @@ Unstructured markdown reports generated in chat windows are quickly scrolled pas
    - The confirmation dialog displays file count, estimated token budget, and active review model.
    - You can optionally provide targeted instructions (e.g. *"Focus strictly on concurrency hazards and memory allocations"*).
 3. **Audit and Triage:**
-   - Navigate findings using `j` / `k` or `↑` / `↓`.
+   - Navigate findings using `n` / `p`, `j` / `k`, or `↑` / `↓`.
    - Fold/unfold details with `Tab` or `Space`.
-   - Cycle status (`TODO` → `DONE` → `REJECTED`) with `t`.
+   - Assign status with `t` (opens status selection dialog: `1` Todo, `2` Done, `3` Rejected).
    - Press `c` / `y` (or `Enter`) to copy an individual finding to the system clipboard.
 
 ### Selective Resolution in Develop

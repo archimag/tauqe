@@ -23,6 +23,12 @@ impl CopyResult {
     }
 }
 
+pub fn is_ssh_session() -> bool {
+    std::env::var_os("SSH_TTY").is_some()
+        || std::env::var_os("SSH_CONNECTION").is_some()
+        || std::env::var_os("SSH_CLIENT").is_some()
+}
+
 pub fn copy_to_clipboard(text: &str) -> CopyResult {
     let clean_text = text.trim_end_matches(['\r', '\n']);
     let mut native_ok = false;
@@ -69,9 +75,10 @@ pub fn copy_to_clipboard(text: &str) -> CopyResult {
         }
     }
 
-    // OSC 52 for terminal multiplexers, ssh and terminal primary/clipboard paste
+    let in_ssh = is_ssh_session();
+    let should_send_osc52 = !native_ok || in_ssh;
     let mut osc52_ok = false;
-    if clean_text.len() <= MAX_OSC52_BYTES {
+    if should_send_osc52 && clean_text.len() <= MAX_OSC52_BYTES {
         let b64 = base64_encode(clean_text.as_bytes());
         let osc52 = format!("\x1b]52;c;{b64}\x07\x1b]52;p;{b64}\x07");
         let mut out = std::io::stdout();
@@ -80,7 +87,9 @@ pub fn copy_to_clipboard(text: &str) -> CopyResult {
         }
     }
 
-    if native_ok {
+    if in_ssh && osc52_ok {
+        CopyResult::Osc52Only
+    } else if native_ok {
         CopyResult::Native
     } else if osc52_ok {
         CopyResult::Osc52Only

@@ -9,6 +9,54 @@ use crate::app::{AppState, OnboardingStep, ViewMode};
 use crate::input::InputResult;
 use crate::rpc::send_request;
 
+fn read_clipboard() -> Result<String, String> {
+    arboard::Clipboard::new()
+        .map_err(|e| e.to_string())?
+        .get_text()
+        .map_err(|e| e.to_string())
+}
+
+/// Persists the chosen workstation settings and reloads them, advancing to the
+/// Ready step only when both the write and the re-read succeed.
+fn save_workstation_config(st: &mut AppState, modifier: crate::config::PrimaryModifier) {
+    let label = match modifier {
+        crate::config::PrimaryModifier::Ctrl => "Ctrl",
+        crate::config::PrimaryModifier::Alt => "Alt",
+    };
+    let saved = crate::config::save_tui_config_full(
+        st.onboarding.chosen_layout,
+        st.onboarding.chosen_langmap.clone(),
+        modifier,
+    );
+    match saved {
+        Ok(path) => match crate::config::TuiConfig::load_checked() {
+            Ok(cfg) => {
+                st.tui_config = cfg;
+                st.onboarding.has_tui_config = true;
+                st.onboarding.set_status(format!(
+                    "Workstation configuration saved to {} (Primary modifier: {})",
+                    path.display(),
+                    label
+                ));
+                st.onboarding.step = OnboardingStep::Ready;
+                st.onboarding.selected_index = 0;
+            }
+            Err(err) => {
+                st.onboarding.set_error(format!(
+                    "Saved {}, but it cannot be loaded: {}",
+                    path.display(),
+                    err
+                ));
+            }
+        },
+        Err(err) => {
+            let target = st.onboarding.default_tui_config_path.clone();
+            st.onboarding
+                .set_error(format!("Failed to save {}: {}", target, err));
+        }
+    }
+}
+
 pub async fn handle_onboarding_key(
     key: KeyEvent,
     state: &Arc<Mutex<AppState>>,
@@ -24,9 +72,15 @@ pub async fn handle_onboarding_key(
                     return Ok(InputResult::Continue);
                 }
                 KeyCode::Char('v') | KeyCode::Char('y') => {
-                    if let Ok(mut cb) = arboard::Clipboard::new() {
-                        if let Ok(clip_text) = cb.get_text() {
+                    match read_clipboard() {
+                        Ok(clip_text) => {
                             st.onboarding.input_buffer.push_str(clip_text.trim());
+                        }
+                        Err(err) => {
+                            st.onboarding.set_error(format!(
+                                "Clipboard unavailable ({}). Use your terminal's paste instead.",
+                                err
+                            ));
                         }
                     }
                     return Ok(InputResult::Continue);
@@ -194,13 +248,13 @@ pub async fn handle_onboarding_key(
                             st.onboarding.input_active = true;
                             st.onboarding.input_buffer.clear();
                             st.onboarding.show_key = false;
-                            if let Ok(mut cb) = arboard::Clipboard::new() {
-                                if let Ok(clip_text) = cb.get_text() {
-                                    let trimmed = clip_text.trim();
-                                    if trimmed.starts_with("sk-or-") {
-                                        st.onboarding.input_buffer = trimmed.to_string();
-                                    }
-                                }
+                            let key_in_clipboard = read_clipboard()
+                                .map(|text| text.trim().starts_with("sk-or-"))
+                                .unwrap_or(false);
+                            if key_in_clipboard {
+                                st.onboarding.set_status(
+                                    "API key detected in clipboard. Press Ctrl+V to paste it.",
+                                );
                             }
                         }
                         1 => {
@@ -257,36 +311,14 @@ pub async fn handle_onboarding_key(
                             st.onboarding.selected_index = 0;
                         }
                     },
-                    OnboardingStep::Modifier => match sel {
-                        0 => {
-                            let _ = crate::config::save_tui_config_full(
-                                st.onboarding.chosen_layout,
-                                st.onboarding.chosen_langmap.clone(),
-                                crate::config::PrimaryModifier::Ctrl,
-                            );
-                            st.tui_config = crate::config::TuiConfig::load();
-                            st.onboarding.has_tui_config = true;
-                            st.onboarding.set_status(
-                                "Workstation configuration saved (Primary modifier: Ctrl)",
-                            );
-                            st.onboarding.step = OnboardingStep::Ready;
-                            st.onboarding.selected_index = 0;
-                        }
-                        _ => {
-                            let _ = crate::config::save_tui_config_full(
-                                st.onboarding.chosen_layout,
-                                st.onboarding.chosen_langmap.clone(),
-                                crate::config::PrimaryModifier::Alt,
-                            );
-                            st.tui_config = crate::config::TuiConfig::load();
-                            st.onboarding.has_tui_config = true;
-                            st.onboarding.set_status(
-                                "Workstation configuration saved (Primary modifier: Alt)",
-                            );
-                            st.onboarding.step = OnboardingStep::Ready;
-                            st.onboarding.selected_index = 0;
-                        }
-                    },
+                    OnboardingStep::Modifier => {
+                        let modifier = if sel == 0 {
+                            crate::config::PrimaryModifier::Ctrl
+                        } else {
+                            crate::config::PrimaryModifier::Alt
+                        };
+                        save_workstation_config(&mut st, modifier);
+                    }
                     OnboardingStep::Gatekeeper => match sel {
                         0 => {
                             st.onboarding.step = OnboardingStep::Credentials;

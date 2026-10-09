@@ -39,7 +39,7 @@ pub async fn request_older_history(
 
 pub const HISTORY_COMMANDS: &[KeyCommand] = &[
     KeyCommand { key: "Enter / Tab / Space", description: "Fold / unfold active history item" },
-    KeyCommand { key: "[ / ] or p / n", description: "Navigate between history items" },
+    KeyCommand { key: "n / p (or [ / ])", description: "Navigate between history items" },
     KeyCommand { key: "l", description: "Recenter active item (Emacs C-l style)" },
     KeyCommand { key: "c", description: "Copy code block from active item" },
     KeyCommand { key: "y", description: "Copy selected item text to clipboard" },
@@ -118,7 +118,10 @@ pub async fn handle_history_key(
                     .find(|b| b.item_id == item_id)
                     .cloned();
                 if let Some(block) = maybe_block {
-                    match crate::clipboard::copy_to_clipboard(&block.code) {
+                    drop(st);
+                    let res = crate::clipboard::copy_to_clipboard(&block.code);
+                    let mut st = state.lock().await;
+                    match res {
                         crate::clipboard::CopyResult::Native => {
                             st.history_view.copy_flash =
                                 Some(((block.item_id, block.block_id), std::time::Instant::now()));
@@ -132,8 +135,8 @@ pub async fn handle_history_key(
                             st.history_view.copy_flash =
                                 Some(((block.item_id, block.block_id), std::time::Instant::now()));
                             let lines_count = block.code.lines().count().max(1);
-                            st.notify_success(format!(
-                                "Copied {} lines of code via terminal (OSC 52)",
+                            st.notify_info(format!(
+                                "Sent {} lines of code to terminal clipboard (OSC 52)",
                                 lines_count
                             ));
                         }
@@ -142,7 +145,10 @@ pub async fn handle_history_key(
                         }
                     }
                 } else if !item_text.is_empty() {
-                    match crate::clipboard::copy_to_clipboard(&item_text) {
+                    drop(st);
+                    let res = crate::clipboard::copy_to_clipboard(&item_text);
+                    let mut st = state.lock().await;
+                    match res {
                         crate::clipboard::CopyResult::Native => {
                             st.notify_success(format!(
                                 "History item #{} copied to clipboard",
@@ -150,8 +156,8 @@ pub async fn handle_history_key(
                             ));
                         }
                         crate::clipboard::CopyResult::Osc52Only => {
-                            st.notify_success(format!(
-                                "History item #{} copied via terminal (OSC 52)",
+                            st.notify_info(format!(
+                                "History item #{} sent to terminal clipboard (OSC 52)",
                                 item_id
                             ));
                         }
@@ -179,7 +185,10 @@ pub async fn handle_history_key(
                 .map(|item| (item.id, item.text.clone()));
             if let Some((item_id, item_text)) = item_info {
                 if !item_text.is_empty() {
-                    match crate::clipboard::copy_to_clipboard(&item_text) {
+                    drop(st);
+                    let res = crate::clipboard::copy_to_clipboard(&item_text);
+                    let mut st = state.lock().await;
+                    match res {
                         crate::clipboard::CopyResult::Native => {
                             st.notify_success(format!(
                                 "History item #{} copied to clipboard",
@@ -187,8 +196,8 @@ pub async fn handle_history_key(
                             ));
                         }
                         crate::clipboard::CopyResult::Osc52Only => {
-                            st.notify_success(format!(
-                                "History item #{} copied via terminal (OSC 52)",
+                            st.notify_info(format!(
+                                "History item #{} sent to terminal clipboard (OSC 52)",
                                 item_id
                             ));
                         }

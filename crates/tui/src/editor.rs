@@ -1,3 +1,23 @@
+use std::path::{Path, PathBuf};
+
+pub fn default_prompt_history_path() -> PathBuf {
+    if Path::new(".tauqe").is_dir() || Path::new(".git").exists() {
+        let p = Path::new(".tauqe");
+        let _ = std::fs::create_dir_all(p);
+        p.join("prompts.history")
+    } else if let Ok(state_home) = std::env::var("XDG_STATE_HOME") {
+        let dir = PathBuf::from(state_home).join("tauqe");
+        let _ = std::fs::create_dir_all(&dir);
+        dir.join("prompts.history")
+    } else if let Ok(home) = std::env::var("HOME") {
+        let dir = PathBuf::from(home).join(".local").join("state").join("tauqe");
+        let _ = std::fs::create_dir_all(&dir);
+        dir.join("prompts.history")
+    } else {
+        PathBuf::from(".tauqe/prompts.history")
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct InputEditor {
     pub text: String,
@@ -6,11 +26,62 @@ pub struct InputEditor {
     pub history: Vec<String>,
     pub history_index: Option<usize>,
     pub draft: String,
+    pub history_path: Option<PathBuf>,
 }
 
 impl InputEditor {
     pub fn is_empty(&self) -> bool {
         self.text.is_empty()
+    }
+
+    pub fn set_history_path(&mut self, path: PathBuf) {
+        self.load_history_from_file(&path);
+        self.history_path = Some(path);
+    }
+
+    pub fn load_history_from_file(&mut self, path: &Path) {
+        if let Ok(file) = std::fs::File::open(path) {
+            use std::io::{BufRead, BufReader};
+            let reader = BufReader::new(file);
+            let mut loaded = Vec::new();
+            for line in reader.lines().map_while(Result::ok) {
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                if let Ok(prompt) = serde_json::from_str::<String>(trimmed) {
+                    let prompt_trimmed = prompt.trim();
+                    if !prompt_trimmed.is_empty()
+                        && loaded.last().map(|s: &String| s.as_str()) != Some(prompt_trimmed)
+                    {
+                        loaded.push(prompt_trimmed.to_string());
+                    }
+                } else if !trimmed.is_empty()
+                    && loaded.last().map(|s: &String| s.as_str()) != Some(trimmed)
+                {
+                    loaded.push(trimmed.to_string());
+                }
+            }
+            if loaded.len() > 1000 {
+                let start = loaded.len() - 1000;
+                loaded = loaded.split_off(start);
+            }
+            self.history = loaded;
+        }
+    }
+
+    pub fn save_history_to_file(&self, path: &Path) {
+        use std::io::Write;
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Ok(mut file) = std::fs::File::create(path) {
+            for item in &self.history {
+                if let Ok(serialized) = serde_json::to_string(item) {
+                    let _ = writeln!(file, "{}", serialized);
+                }
+            }
+        }
     }
 
     pub fn clear(&mut self) {
@@ -34,6 +105,25 @@ impl InputEditor {
         let trimmed = prompt.trim();
         if !trimmed.is_empty() && self.history.last().map(|s| s.as_str()) != Some(trimmed) {
             self.history.push(trimmed.to_string());
+            if let Some(ref path) = self.history_path {
+                use std::io::Write;
+                if self.history.len() > 1000 {
+                    let start = self.history.len() - 1000;
+                    self.history = self.history.split_off(start);
+                    self.save_history_to_file(path);
+                } else if let Some(parent) = path.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                    if let Ok(mut file) = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(path)
+                    {
+                        if let Ok(serialized) = serde_json::to_string(trimmed) {
+                            let _ = writeln!(file, "{}", serialized);
+                        }
+                    }
+                }
+            }
         }
         self.history_index = None;
         self.draft.clear();
@@ -450,5 +540,30 @@ mod tests {
 
         editor.yank();
         assert_eq!(editor.get_text(), "important multiline\nprompt to keep");
+    }
+
+    #[test]
+    fn prompt_history_persists_multiline_to_disk_and_reloads() {
+        let temp_dir = std::env::temp_dir().join(format!("tauqe_test_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let history_file = temp_dir.join("prompts.history");
+
+        let mut editor = InputEditor::default();
+        editor.set_history_path(history_file.clone());
+
+        editor.record_history("first simple prompt");
+        editor.record_history("multiline\nprompt with \"quotes\" and <tags>");
+        editor.record_history("third prompt");
+
+        let mut reloaded = InputEditor::default();
+        reloaded.set_history_path(history_file.clone());
+
+        assert_eq!(reloaded.history.len(), 3);
+        assert_eq!(reloaded.history[0], "first simple prompt");
+        assert_eq!(reloaded.history[1], "multiline\nprompt with \"quotes\" and <tags>");
+        assert_eq!(reloaded.history[2], "third prompt");
+
+        let _ = std::fs::remove_file(history_file);
+        let _ = std::fs::remove_dir(temp_dir);
     }
 }

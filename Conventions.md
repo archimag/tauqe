@@ -9,6 +9,11 @@ This document specifies mandatory engineering and architectural conventions for 
 1. **English as the Sole Project Language:**
    - English is the mandatory and official language for the entire codebase and repository artifacts.
    - All documentation (`README.md`, `Vision.md`, `Conventions.md`, architecture docs), source code comments, variable and function identifiers, Git commit messages, and user-facing interfaces (terminal UI views, modal dialogs, help menus, status/error messages, onboarding steps) must be written exclusively in English.
+2. **Plain Technical English (Direct, Accessible, and Rigorous):**
+   - Write in clean, concise, plain engineering English.
+   - The primary audience consists of global software engineers—many of whom are non-native speakers—and large language models.
+   - Avoid flowery prose, baroque vocabulary, archaic turns of phrase, metaphors, and convoluted sentence structures.
+   - Prefer direct active voice, short unambiguous sentences, standard industry terminology, and straightforward syntax.
 
 ---
 
@@ -123,6 +128,9 @@ All commits must follow the **Conventional Commits** specification:
 3. **Mandatory Documentation of Conceptual Changes:**
    - Whenever a task introduces or alters user-facing behavior, context mechanics (e.g., layers, permissions), the bounded turn lifecycle, interface workflows, or keybindings, the corresponding chapters in `docs/src/` must be updated within the same turn.
    - Obsolete explanations must be revised immediately to prevent documentation rot and model hallucination.
+4. **Accessible Engineering Prose (No Florid or Baroque Language):**
+   - While documentation must clearly convey deep architectural intent and rationale, it must be written in simple, direct, and unpretentious technical English.
+   - High information density does not mean dense or complex grammar; clarity and accessibility take precedence over literary style.
 
 ---
 
