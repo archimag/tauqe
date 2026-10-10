@@ -1,11 +1,11 @@
 use std::sync::Arc;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use tauqe_protocol::{methods, ConfigSetParams, ModelRef, ReviewStartParams};
+use tauqe_protocol::{methods, ModelSelectParams, ModelSelection, ReviewStartParams};
 use tokio::process::ChildStdin;
 use tokio::sync::{Mutex, MutexGuard};
 
-use crate::app::{AppState, ConfirmDialogButton, ViewMode};
+use crate::app::{AppState, ConfirmDialogButton, SelectionDialogKind, SelectionItem, ViewMode};
 use crate::input::{is_char_typing, squash, InputResult};
 use crate::rpc::{
     allocate_request_id, record_optimistic_rollback, send_request, send_request_with_id,
@@ -58,28 +58,58 @@ fn resolve_confirm(st: &mut AppState, key: KeyEvent) -> ConfirmOutcome {
 }
 
 /// Applies a model choice optimistically and registers a rollback so that a failed
-/// `config/set` restores the previously active model (shared by keyboard and mouse).
-pub(super) async fn apply_model_selection(
+/// `model/select` restores the previously active selection.
+async fn apply_model_selection(
     mut st: MutexGuard<'_, AppState>,
-    chosen: ModelRef,
+    selection: ModelSelection,
     server_writer: &mut ChildStdin,
 ) -> anyhow::Result<()> {
-    let prev_model = std::mem::replace(&mut st.active_model, chosen.clone());
     st.selection_dialog = None;
+    let prev_model = st.active_model.clone();
+    let prev_selection = std::mem::replace(&mut st.model_choice.selection, selection.clone());
+    if let Some(effective) = st.model_choice.resolve(&selection) {
+        st.active_model = effective;
+    }
     let req_id = allocate_request_id();
-    record_optimistic_rollback(req_id, OptimisticRollback::ActiveModel { prev_model });
+    record_optimistic_rollback(
+        req_id,
+        OptimisticRollback::ActiveModel {
+            prev_model,
+            prev_selection,
+        },
+    );
     drop(st);
-    let params = ConfigSetParams {
-        model: Some(chosen),
-        ..Default::default()
-    };
+    let params = ModelSelectParams { selection };
     send_request_with_id(
         server_writer,
         req_id,
-        methods::CONFIG_SET,
+        methods::MODEL_SELECT,
         serde_json::to_value(params)?,
     )
     .await
+}
+
+/// Applies the chosen picker row (shared by keyboard and mouse): a tier or a model is
+/// selected, `Others...` opens the full model catalog.
+pub(super) async fn activate_selection_item(
+    mut st: MutexGuard<'_, AppState>,
+    item: SelectionItem,
+    server_writer: &mut ChildStdin,
+) -> anyhow::Result<()> {
+    match item {
+        SelectionItem::Tier(tier, _) => {
+            apply_model_selection(st, ModelSelection::Tier(tier), server_writer).await
+        }
+        SelectionItem::Model(model) => {
+            apply_model_selection(st, ModelSelection::Specific(model), server_writer).await
+        }
+        SelectionItem::Others => {
+            if !st.open_model_catalog() {
+                st.notify_warning("No other models are available");
+            }
+            Ok(())
+        }
+    }
 }
 
 /// The plan view is refreshed from server responses, so nothing is cleared locally
@@ -573,6 +603,7 @@ pub async fn handle_dialog_event(
             KeyCode::Enter if !has_shift && !has_alt => {
                 let user_comment = dialog.prompt_editor.get_text().trim().to_string();
                 if user_comment.is_empty() {
+                    st.notify_warning("Comment is empty");
                     st.discuss_plan_dialog = Some(dialog);
                     return Ok(Some(InputResult::Continue));
                 }
@@ -618,6 +649,10 @@ pub async fn handle_dialog_event(
                     )
                     .await?;
                     return Ok(Some(InputResult::Continue));
+                } else {
+                    st.notify_error(format!("Plan '{}' not found", dialog.plan_id));
+                    st.discuss_plan_dialog = Some(dialog);
+                    return Ok(Some(InputResult::Continue));
                 }
             }
             _ => {
@@ -628,6 +663,160 @@ pub async fn handle_dialog_event(
                     true,
                 );
                 st.discuss_plan_dialog = Some(dialog);
+                return Ok(Some(InputResult::Continue));
+            }
+        }
+    }
+
+    // 4a-3b. Plan refine dialog
+    if let Some(mut dialog) = st.plans_view.refine_dialog.take() {
+        let primary = st.tui_config.input.primary_modifier;
+        let is_ctrl_alt = key.modifiers.contains(KeyModifiers::CONTROL)
+            && key.modifiers.contains(KeyModifiers::ALT);
+        let is_cmd = !is_ctrl_alt
+            && (primary.matches(key.modifiers) || key.modifiers.contains(KeyModifiers::CONTROL));
+        let has_shift = key.modifiers.contains(KeyModifiers::SHIFT);
+        let has_alt = key.modifiers.contains(KeyModifiers::ALT);
+
+        match key.code {
+            KeyCode::Esc => {
+                return Ok(Some(InputResult::Continue));
+            }
+            KeyCode::Left | KeyCode::Right => {
+                dialog.confirm_button = match dialog.confirm_button {
+                    crate::app::ConfirmDialogButton::Cancel => crate::app::ConfirmDialogButton::Confirm,
+                    crate::app::ConfirmDialogButton::Confirm => crate::app::ConfirmDialogButton::Cancel,
+                };
+                st.plans_view.refine_dialog = Some(dialog);
+                return Ok(Some(InputResult::Continue));
+            }
+            KeyCode::Tab => {
+                dialog.confirm_button = match dialog.confirm_button {
+                    crate::app::ConfirmDialogButton::Cancel => crate::app::ConfirmDialogButton::Confirm,
+                    crate::app::ConfirmDialogButton::Confirm => crate::app::ConfirmDialogButton::Cancel,
+                };
+                st.plans_view.refine_dialog = Some(dialog);
+                return Ok(Some(InputResult::Continue));
+            }
+            KeyCode::BackTab => {
+                dialog.confirm_button = match dialog.confirm_button {
+                    crate::app::ConfirmDialogButton::Cancel => crate::app::ConfirmDialogButton::Confirm,
+                    crate::app::ConfirmDialogButton::Confirm => crate::app::ConfirmDialogButton::Cancel,
+                };
+                st.plans_view.refine_dialog = Some(dialog);
+                return Ok(Some(InputResult::Continue));
+            }
+            KeyCode::Up => {
+                let count = dialog.models.len();
+                if count > 0 {
+                    dialog.selected_model_index = (dialog.selected_model_index + count - 1) % count;
+                }
+                st.plans_view.refine_dialog = Some(dialog);
+                return Ok(Some(InputResult::Continue));
+            }
+            KeyCode::Down => {
+                let count = dialog.models.len();
+                if count > 0 {
+                    dialog.selected_model_index = (dialog.selected_model_index + 1) % count;
+                }
+                st.plans_view.refine_dialog = Some(dialog);
+                return Ok(Some(InputResult::Continue));
+            }
+            KeyCode::Enter if !has_shift && !has_alt => {
+                if dialog.confirm_button == crate::app::ConfirmDialogButton::Cancel {
+                    return Ok(Some(InputResult::Continue));
+                }
+
+                let instructions_raw = dialog.instructions_editor.get_text().trim().to_string();
+                let instructions = if instructions_raw.is_empty() {
+                    None
+                } else {
+                    Some(instructions_raw)
+                };
+                let selected_model = dialog
+                    .models
+                    .get(dialog.selected_model_index)
+                    .and_then(|(_, m)| m.clone());
+
+                let params = tauqe_protocol::PlanRefineParams {
+                    plan_id: dialog.plan_id.clone(),
+                    model: selected_model,
+                    instructions,
+                };
+
+                st.plans_view.refining = true;
+                st.plans_view.refining_plan_id = Some(dialog.plan_id.clone());
+                st.view_mode = ViewMode::Develop;
+                st.model.reasoning.clear();
+                st.model.text.clear();
+                st.model.markdown_lines.clear();
+                st.model.error = None;
+                st.model.result = None;
+                st.model.usage = None;
+                st.model.scroll = 0;
+                st.model.status = "awaiting".to_string();
+                st.model.auto_scroll = true;
+                st.model.current_cost = Some(0.0);
+                st.model.edits_active = false;
+                st.model.files.clear();
+                st.model.selected_file_index = 0;
+                st.model.edit_final_applied = None;
+                st.model.edit_final_error = None;
+                st.model.last_commit_hash = None;
+                st.model.last_commit_summary = None;
+                st.model.toolchain_command = None;
+                st.model.toolchain_status = None;
+                st.model.copy_flash = None;
+                st.model.code_blocks.clear();
+                st.turn_started_at = Some(std::time::Instant::now());
+
+                drop(st);
+                send_request(
+                    server_writer,
+                    methods::PLAN_REFINE,
+                    serde_json::to_value(params)?,
+                )
+                .await?;
+                return Ok(Some(InputResult::Continue));
+            }
+            _ => {
+                crate::input::handle_editor_key(
+                    &mut dialog.instructions_editor,
+                    key,
+                    is_cmd,
+                    true,
+                );
+                st.plans_view.refine_dialog = Some(dialog);
+                return Ok(Some(InputResult::Continue));
+            }
+        }
+    }
+
+    // 4a-3c. Plan refine blocked modal
+    if let Some(blocked) = st.plans_view.refine_blocked.take() {
+        match key.code {
+            KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => {
+                return Ok(Some(InputResult::Continue));
+            }
+            KeyCode::Char('d') | KeyCode::Char('D') => {
+                let plan = st.plans_view.plans.iter().find(|p| p.id == blocked.plan_id).cloned();
+                if let Some(plan) = plan {
+                    let mut editor = crate::editor::InputEditor::default();
+                    editor.insert_str(&format!(
+                        "The architect reported blockers during plan refinement:\n{}\n\nHow should we resolve these requirements or architecture contradictions?",
+                        blocked.reason
+                    ));
+                    st.discuss_plan_dialog = Some(crate::app::DiscussPlanDialogState {
+                        plan_id: plan.id,
+                        plan_title: plan.title,
+                        focused_items: Vec::new(),
+                        prompt_editor: editor,
+                    });
+                }
+                return Ok(Some(InputResult::Continue));
+            }
+            _ => {
+                st.plans_view.refine_blocked = Some(blocked);
                 return Ok(Some(InputResult::Continue));
             }
         }
@@ -650,6 +839,7 @@ pub async fn handle_dialog_event(
             KeyCode::Enter if !has_shift && !has_alt => {
                 let user_comment = dialog.prompt_editor.get_text().trim().to_string();
                 if user_comment.is_empty() {
+                    st.notify_warning("Comment is empty");
                     st.discuss_review_dialog = Some(dialog);
                     return Ok(Some(InputResult::Continue));
                 }
@@ -702,6 +892,10 @@ pub async fn handle_dialog_event(
                         serde_json::json!({ "prompt": prompt }),
                     )
                     .await?;
+                    return Ok(Some(InputResult::Continue));
+                } else {
+                    st.notify_error(format!("Review session '{}' not found", dialog.review_id));
+                    st.discuss_review_dialog = Some(dialog);
                     return Ok(Some(InputResult::Continue));
                 }
             }
@@ -849,8 +1043,13 @@ pub async fn handle_dialog_event(
                 st.selection_dialog = Some(dialog);
             }
             KeyCode::Enter => {
-                if let Some(chosen) = dialog.items.get(dialog.selected_index).cloned() {
-                    apply_model_selection(st, chosen, server_writer).await?;
+                if let Some(item) = dialog.items.get(dialog.selected_index).cloned() {
+                    activate_selection_item(st, item, server_writer).await?;
+                }
+            }
+            KeyCode::Char(c @ '1'..='4') if dialog.kind == SelectionDialogKind::ModelTiers => {
+                if let Some(item) = dialog.items.get(c as usize - '1' as usize).cloned() {
+                    activate_selection_item(st, item, server_writer).await?;
                 }
             }
             _ => {

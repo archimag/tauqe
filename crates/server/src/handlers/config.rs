@@ -5,16 +5,20 @@ use tauqe_core::config::{load_config, AppConfig};
 use tauqe_core::edits::EditProtocolFactory;
 use tauqe_core::workflow::WorkflowFactory;
 use tauqe_protocol::{
-    events, ConfigSetParams, ConfigState, Event, Request, Response, ResponseError,
+    events, ConfigSetParams, ConfigState, Event, ModelSelection, Request, Response, ResponseError,
 };
 
 use crate::state::AppState;
 
-pub fn config_state(cfg: &AppConfig) -> ConfigState {
+pub fn config_state(cfg: &AppConfig, selection: Option<&ModelSelection>) -> ConfigState {
+    let sel = selection.cloned().unwrap_or_else(|| cfg.default_selection());
+    let effective = cfg.resolve_model(&sel);
     ConfigState {
         workflow: cfg.develop.workflow.clone(),
         edit_protocol: cfg.develop.protocol.clone(),
-        model: cfg.active_model(),
+        model: effective,
+        selection: Some(sel),
+        tiers: Some(cfg.tiers_summary()),
         history_model: Some(cfg.history_model()),
         available_workflows: WorkflowFactory::available_workflows(),
         available_edit_protocols: EditProtocolFactory::available_protocols(),
@@ -23,8 +27,9 @@ pub fn config_state(cfg: &AppConfig) -> ConfigState {
 }
 
 pub async fn handle_config_get(req: Request, state: &Arc<AppState>) -> Response {
+    let cur_sel = state.current_selection.lock().await;
     let cfg = state.config.lock().await;
-    let result = config_state(&cfg);
+    let result = config_state(&cfg, Some(&cur_sel));
     Response {
         id: req.id,
         result: serde_json::to_value(result).ok(),
@@ -63,8 +68,32 @@ pub async fn handle_config_set(req: Request, state: &Arc<AppState>) -> Response 
     };
 
     let updated_state = {
+        let mut cur_sel = state.current_selection.lock().await;
         let mut cfg = state.config.lock().await;
-        if let Some(requested_model) = params.model.as_ref() {
+        if let Some(ref sel) = params.selection {
+            let effective = cfg.resolve_model(sel);
+            let available = cfg.available_models();
+            if !available.contains(&effective) {
+                return Response {
+                    id: req.id,
+                    result: None,
+                    error: Some(ResponseError {
+                        code: "INVALID_MODEL".to_string(),
+                        message: format!(
+                            "Unknown model '{}'. Available models: {}",
+                            effective,
+                            available
+                                .iter()
+                                .map(ToString::to_string)
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ),
+                        data: None,
+                    }),
+                };
+            }
+            *cur_sel = sel.clone();
+        } else if let Some(ref requested_model) = params.model {
             let available = cfg.available_models();
             if !available.contains(requested_model) {
                 return Response {
@@ -85,8 +114,10 @@ pub async fn handle_config_set(req: Request, state: &Arc<AppState>) -> Response 
                     }),
                 };
             }
+            *cur_sel = ModelSelection::Specific(requested_model.clone());
         }
-        if let Some(hist_model) = params.history_model.as_ref() {
+
+        if let Some(ref hist_model) = params.history_model {
             let available = cfg.available_models();
             if !available.contains(hist_model) {
                 return Response {
@@ -107,7 +138,9 @@ pub async fn handle_config_set(req: Request, state: &Arc<AppState>) -> Response 
                     }),
                 };
             }
+            cfg.models.junior = Some(hist_model.clone());
         }
+
         if let Some(wf) = params.workflow {
             if !WorkflowFactory::is_valid(&wf) {
                 return Response {
@@ -126,6 +159,7 @@ pub async fn handle_config_set(req: Request, state: &Arc<AppState>) -> Response 
             }
             cfg.develop.workflow = wf;
         }
+
         if let Some(proto) = params.edit_protocol {
             match EditProtocolFactory::canonical_name(&proto) {
                 Some(canonical) => {
@@ -148,13 +182,8 @@ pub async fn handle_config_set(req: Request, state: &Arc<AppState>) -> Response 
                 }
             }
         }
-        if let Some(requested_model) = params.model {
-            cfg.set_active_model(requested_model);
-        }
-        if let Some(hist_model) = params.history_model {
-            cfg.history.model = Some(hist_model);
-        }
-        config_state(&cfg)
+
+        config_state(&cfg, Some(&cur_sel))
     };
 
     state.out.send_event(&Event {
@@ -178,6 +207,7 @@ pub async fn handle_system_status(req: Request, state: &Arc<AppState>) -> Respon
         None
     };
 
+    let cur_sel = state.current_selection.lock().await;
     let cfg = state.config.lock().await;
     let config_file = tauqe_core::config::find_config_file(repo_opt);
     let has_config = config_file.is_some();
@@ -195,6 +225,7 @@ pub async fn handle_system_status(req: Request, state: &Arc<AppState>) -> Respon
 
     let has_git = tauqe_core::git::is_git_repository(None);
     let ready = has_git && has_api_key;
+    let effective_model = cfg.resolve_model(&cur_sel);
 
     let status_json = serde_json::json!({
         "has_git": has_git,
@@ -205,7 +236,9 @@ pub async fn handle_system_status(req: Request, state: &Arc<AppState>) -> Respon
         "credentials_path": credentials_path,
         "default_credentials_path": default_credentials_path,
         "ready": ready,
-        "model": cfg.active_model(),
+        "model": effective_model,
+        "selection": *cur_sel,
+        "tiers": cfg.tiers_summary(),
         "history_model": cfg.history_model(),
         "available_models": cfg.available_models(),
     });
@@ -227,17 +260,21 @@ pub async fn handle_config_reload(req: Request, state: &Arc<AppState>) -> Respon
     };
 
     let new_cfg = load_config(repo_opt);
-    {
+    let (updated_state, cur_sel_val) = {
+        let mut cur_sel = state.current_selection.lock().await;
+        *cur_sel = new_cfg.default_selection();
         let mut cfg = state.config.lock().await;
         *cfg = new_cfg;
-    }
-    let cfg = state.config.lock().await;
-    let updated_state = config_state(&cfg);
+        let st = config_state(&cfg, Some(&cur_sel));
+        (st, cur_sel.clone())
+    };
+
     state.out.send_event(&Event {
         method: events::CONFIG_CHANGED.to_string(),
         params: serde_json::to_value(&updated_state).ok(),
     });
 
+    let cfg = state.config.lock().await;
     let config_file = tauqe_core::config::find_config_file(repo_opt);
     let has_config = config_file.is_some();
     let config_path = config_file.map(|p| p.to_string_lossy().to_string());
@@ -254,6 +291,7 @@ pub async fn handle_config_reload(req: Request, state: &Arc<AppState>) -> Respon
 
     let has_git = tauqe_core::git::is_git_repository(None);
     let ready = has_git && has_api_key;
+    let effective_model = cfg.resolve_model(&cur_sel_val);
 
     let status_json = serde_json::json!({
         "reloaded": true,
@@ -265,7 +303,9 @@ pub async fn handle_config_reload(req: Request, state: &Arc<AppState>) -> Respon
         "credentials_path": credentials_path,
         "default_credentials_path": default_credentials_path,
         "ready": ready,
-        "model": cfg.active_model(),
+        "model": effective_model,
+        "selection": cur_sel_val,
+        "tiers": cfg.tiers_summary(),
         "history_model": cfg.history_model(),
         "available_models": cfg.available_models(),
     });
@@ -300,17 +340,21 @@ pub async fn handle_config_create(req: Request, state: &Arc<AppState>) -> Respon
     }
 
     let new_cfg = load_config(repo_opt);
-    {
+    let (updated_state, cur_sel_val) = {
+        let mut cur_sel = state.current_selection.lock().await;
+        *cur_sel = new_cfg.default_selection();
         let mut cfg = state.config.lock().await;
         *cfg = new_cfg;
-    }
-    let cfg = state.config.lock().await;
-    let updated_state = config_state(&cfg);
+        let st = config_state(&cfg, Some(&cur_sel));
+        (st, cur_sel.clone())
+    };
+
     state.out.send_event(&Event {
         method: events::CONFIG_CHANGED.to_string(),
         params: serde_json::to_value(&updated_state).ok(),
     });
 
+    let cfg = state.config.lock().await;
     let config_path = Some(target_path.to_string_lossy().to_string());
     let default_config_path = target_path.to_string_lossy().to_string();
 
@@ -320,6 +364,8 @@ pub async fn handle_config_create(req: Request, state: &Arc<AppState>) -> Respon
     let default_credentials_path = tauqe_core::config::default_credentials_path(repo_opt)
         .to_string_lossy()
         .to_string();
+
+    let effective_model = cfg.resolve_model(&cur_sel_val);
 
     Response {
         id: req.id,
@@ -332,7 +378,9 @@ pub async fn handle_config_create(req: Request, state: &Arc<AppState>) -> Respon
             "credentials_path": credentials_path,
             "default_credentials_path": default_credentials_path,
             "ready": has_api_key,
-            "model": cfg.active_model(),
+            "model": effective_model,
+            "selection": cur_sel_val,
+            "tiers": cfg.tiers_summary(),
             "history_model": cfg.history_model(),
             "available_models": cfg.available_models(),
         })),
@@ -386,17 +434,20 @@ pub async fn handle_credentials_save(req: Request, state: &Arc<AppState>) -> Res
     }
 
     let new_cfg = load_config(repo_opt);
-    {
+    let (updated_state, cur_sel_val) = {
+        let cur_sel = state.current_selection.lock().await;
         let mut cfg = state.config.lock().await;
         *cfg = new_cfg;
-    }
-    let cfg = state.config.lock().await;
-    let updated_state = config_state(&cfg);
+        let st = config_state(&cfg, Some(&cur_sel));
+        (st, cur_sel.clone())
+    };
+
     state.out.send_event(&Event {
         method: events::CONFIG_CHANGED.to_string(),
         params: serde_json::to_value(&updated_state).ok(),
     });
 
+    let cfg = state.config.lock().await;
     let config_file = tauqe_core::config::find_config_file(repo_opt);
     let has_config = config_file.is_some();
     let config_path = config_file.map(|p| p.to_string_lossy().to_string());
@@ -407,6 +458,7 @@ pub async fn handle_credentials_save(req: Request, state: &Arc<AppState>) -> Res
     let has_api_key = tauqe_core::config::has_openrouter_key(&cfg);
     let credentials_path = Some(target_path.to_string_lossy().to_string());
     let default_credentials_path = target_path.to_string_lossy().to_string();
+    let effective_model = cfg.resolve_model(&cur_sel_val);
 
     Response {
         id: req.id,
@@ -419,7 +471,9 @@ pub async fn handle_credentials_save(req: Request, state: &Arc<AppState>) -> Res
             "credentials_path": credentials_path,
             "default_credentials_path": default_credentials_path,
             "ready": has_api_key,
-            "model": cfg.active_model(),
+            "model": effective_model,
+            "selection": cur_sel_val,
+            "tiers": cfg.tiers_summary(),
             "history_model": cfg.history_model(),
             "available_models": cfg.available_models(),
         })),
@@ -452,6 +506,7 @@ pub async fn handle_credentials_create_stub(req: Request, state: &Arc<AppState>)
         };
     }
 
+    let cur_sel = state.current_selection.lock().await;
     let cfg = state.config.lock().await;
     let config_file = tauqe_core::config::find_config_file(repo_opt);
     let has_config = config_file.is_some();
@@ -463,6 +518,7 @@ pub async fn handle_credentials_create_stub(req: Request, state: &Arc<AppState>)
     let has_api_key = tauqe_core::config::has_openrouter_key(&cfg);
     let credentials_path = Some(target_path.to_string_lossy().to_string());
     let default_credentials_path = target_path.to_string_lossy().to_string();
+    let effective_model = cfg.resolve_model(&cur_sel);
 
     Response {
         id: req.id,
@@ -475,7 +531,9 @@ pub async fn handle_credentials_create_stub(req: Request, state: &Arc<AppState>)
             "credentials_path": credentials_path,
             "default_credentials_path": default_credentials_path,
             "ready": has_api_key,
-            "model": cfg.active_model(),
+            "model": effective_model,
+            "selection": *cur_sel,
+            "tiers": cfg.tiers_summary(),
             "history_model": cfg.history_model(),
             "available_models": cfg.available_models(),
         })),

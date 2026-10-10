@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::model::{ModelRef, ModelUsageInfo};
+use crate::model::{ModelRef, ModelSelection, ModelUsageInfo};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -65,6 +65,9 @@ impl std::fmt::Display for ReviewItemStatus {
 pub struct ReviewItem {
     pub id: u32,
     pub title: String,
+    /// Model tier or explicit model assigned to resolve this finding. `None` means the default tier.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<ModelSelection>,
     #[serde(default)]
     pub severity: ReviewSeverity,
     #[serde(default)]
@@ -504,6 +507,7 @@ mod tests {
         let item = ReviewItem {
             id: 1,
             title: "Potential race condition".to_string(),
+            model: Some(ModelSelection::Tier(crate::model::ModelTier::Senior)),
             severity: ReviewSeverity::Critical,
             status: ReviewItemStatus::Discussion,
             file_path: Some("crates/server/src/state.rs".to_string()),
@@ -537,6 +541,7 @@ mod tests {
             items: vec![ReviewItem {
                 id: 1,
                 title: "Race condition in cache".to_string(),
+                model: None,
                 severity: ReviewSeverity::Critical,
                 status: ReviewItemStatus::Discussion,
                 file_path: Some("src/lib.rs".to_string()),
@@ -568,6 +573,7 @@ mod tests {
             items: vec![ReviewItem {
                 id: 3,
                 title: "Excessive clone in hot path".to_string(),
+                model: None,
                 severity: ReviewSeverity::Warning,
                 status: ReviewItemStatus::Todo,
                 file_path: Some("crates/tui/src/view.rs".to_string()),
@@ -602,6 +608,7 @@ mod tests {
                 ReviewItem {
                     id: 1,
                     title: "Issue 1".to_string(),
+                    model: None,
                     severity: ReviewSeverity::Warning,
                     status: ReviewItemStatus::Fixed,
                     file_path: None,
@@ -611,6 +618,7 @@ mod tests {
                 ReviewItem {
                     id: 2,
                     title: "Issue 2".to_string(),
+                    model: None,
                     severity: ReviewSeverity::Critical,
                     status: ReviewItemStatus::Todo,
                     file_path: None,

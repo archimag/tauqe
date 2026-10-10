@@ -8,8 +8,14 @@ models = [
   "~anthropic/claude-haiku-latest"
 ]
 
+[models]
+junior = "~anthropic/claude-haiku-latest"
+middle = "~google/gemini-flash-latest"
+senior = "~anthropic/claude-sonnet-latest"
+default = "middle"
+auto_level_up = true
+
 [develop]
-model = "openrouter:~google/gemini-flash-latest"  # primary development model (format: provider:model)
 max_retries = 5  # maximum retry attempts for failed edit staging
 # workflow = "git"   # edit workflow: "toolchain", "git", "naive" (default: "git")
 # protocol = "xml"   # active edit protocol: "xml" (default: "xml")
@@ -23,13 +29,13 @@ max_retries = 5  # maximum retry attempts for failed edit staging
 # upstream = "origin/master"  # base upstream branch for calculating diffs (auto-detected by default)
 
 [history]
-model = "openrouter:~anthropic/claude-haiku-latest"  # model for history compaction and squash commits (defaults to develop.model)
 budget_tokens = 20000  # session history token budget before compaction is triggered (default: 20000)
 # tail_turns = 10        # number of recent turns kept uncompressed in original form (default: 10)
 
 [context]
+# discovery_mode = "monotonic"  # context discovery strategy: "monotonic" (pure append-only growth, default), "incremental" (additive with explicit drops), or "snapshot" (full active working set declared each round)
 max_discovery_rounds = 8  # maximum rounds for autonomous context discovery
-max_auto_files_per_round = 5  # maximum files automatically added per discovery round
+max_files = 30  # maximum total files in context before stopping execution (default: 25)
 # repomap_token_budget = 4000  # token budget for the repository map (default: 4000)
 pinned = [
     "Conventions.md",

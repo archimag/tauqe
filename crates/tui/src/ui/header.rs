@@ -5,7 +5,7 @@ use ratatui::style::{Color, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 
-use crate::app::{AppState, HeaderClickAreas, ViewMode};
+use crate::app::{tier_title, AppState, HeaderClickAreas, ViewMode};
 
 /// Helper to truncate a string to a max visual display width, appending `…` if needed.
 pub(crate) fn truncate_to_width(s: &str, max_width: usize) -> String {
@@ -172,8 +172,13 @@ pub fn render_header(frame: &mut ratatui::Frame, state: &mut AppState, area: Rec
     };
 
     let raw_model_str = &state.active_model.name;
-    let truncated_model = truncate_to_width(raw_model_str, max_model_len);
-    let model_text = format!(" 🧠 {} ", truncated_model);
+    let model_label = match &state.model_choice.selection {
+        tauqe_protocol::ModelSelection::Tier(tier) => tier_title(*tier).to_string(),
+        tauqe_protocol::ModelSelection::Specific(_) => {
+            truncate_to_width(raw_model_str, max_model_len)
+        }
+    };
+    let model_text = format!(" 🧠 {} ", model_label);
     let model_span = Span::styled(model_text, Style::default().fg(Color::Green).bold());
 
     let squash_span = Span::styled(
@@ -399,6 +404,7 @@ mod tests {
             header_clicks: HeaderClickAreas::default(),
             terminal_focused: true,
             shift_tip_shown: false,
+            model_choice: crate::app::ModelChoice::default(),
         }
     }
 

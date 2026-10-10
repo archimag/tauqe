@@ -1,7 +1,10 @@
 use crate::context::ContextFileContent;
 use crate::edits::EditProtocol;
 use crate::providers::ChatMessage;
-use tauqe_protocol::{ContextAccess, Plan, RepositoryState};
+use tauqe_protocol::{ContextAccess, ModelTier, Plan, RepositoryState};
+
+/// Default model tier used for squash commit message synthesis.
+pub const SQUASH_COMMIT_TIER: ModelTier = ModelTier::Junior;
 
 pub fn build_squash_commit_prompt(
     commits: &[crate::git::CommitSummary],
@@ -79,6 +82,7 @@ pub struct PromptAssembly {
     pub active_plan: Option<Plan>,
     pub is_plan_step_execution: bool,
     pub is_discussion: bool,
+    pub discovery_mode: crate::config::DiscoveryMode,
 }
 
 impl PromptAssembly {
@@ -103,7 +107,13 @@ impl PromptAssembly {
             active_plan: None,
             is_plan_step_execution: false,
             is_discussion: false,
+            discovery_mode: crate::config::DiscoveryMode::default(),
         }
+    }
+
+    pub fn with_discovery_mode(mut self, mode: crate::config::DiscoveryMode) -> Self {
+        self.discovery_mode = mode;
+        self
     }
 
     pub fn with_discussion(mut self, is_discussion: bool) -> Self {
@@ -126,6 +136,7 @@ impl PromptAssembly {
         prompt.push_str("You are Tauqe AI, an expert programming assistant operating inside TAUQE (The Answer to the Ultimate Question of Engineering), an AI-native engineering control environment built on the literal harness paradigm.\n\n");
         prompt.push_str("## Core System Contract\n");
         prompt.push_str("1. Authoritative Source: The files provided in <context> represent the authoritative current state of the project. Do not invent missing code.\n");
+        prompt.push_str("1a. Operational Protocol Tags: All operational protocol tags (<context_request>, <doc_request>, <verify>, <user_language>, <plan>, <plan_step_done>) must be emitted strictly at the end of your response outside markdown code blocks. If you mention, quote, or discuss tags in conversational text, you MUST enclose them in backticks (e.g. `<context_request ...>`) so they are treated as literal text and not operational commands.\n");
         let marker_suffix = protocol
             .turn_marker()
             .map(|m| format!("_{}", m))
@@ -133,9 +144,23 @@ impl PromptAssembly {
 
         if self.is_discussion {
             prompt.push_str("2. Discussion Mode Scope: You are strictly in Discussion mode. Code modifications, file creations, file edits, and file deletions are strictly prohibited. Do NOT output XML edit blocks (<edit>, <create>, <replace>, <overwrite>, <delete>) or any code patch proposals.\n");
-            prompt.push_str(
-                "3. Read-Only Context Exploration: Files in <read_only_files> are strictly for reference and architectural understanding. If you need to inspect additional files from the repository map to answer the developer's questions, specify them in the `context_requests` array with `access: \"read_only\"`.\n",
-            );
+            match self.discovery_mode {
+                crate::config::DiscoveryMode::Monotonic => {
+                    prompt.push_str(
+                        "3. Read-Only Context Exploration: Files in <read_only_files> are strictly for reference and architectural understanding. If you need to inspect additional files from the repository map to answer the developer's questions, specify them in the `context_requests` array with `access: \"read_only\"`.\n",
+                    );
+                }
+                crate::config::DiscoveryMode::Incremental => {
+                    prompt.push_str(
+                        "3. Read-Only Context Exploration (Incremental Strategy): Files in <read_only_files> are strictly for reference and architectural understanding. If you need to inspect additional files from the repository map to answer the developer's questions, specify them in the `context_requests` array with `access: \"read_only\"`. If an inspected auto-context file turns out to be irrelevant, specify it in `context_drops` to release context and preserve token budget.\n",
+                    );
+                }
+                crate::config::DiscoveryMode::Snapshot => {
+                    prompt.push_str(
+                        "3. Read-Only Context Exploration (Snapshot Strategy): Files in <read_only_files> are strictly for reference and architectural understanding. In each discovery round, specify the complete active working set of auto-context files needed for your reasoning in `context_requests` (`access: \"read_only\"`). Any auto-context files omitted from `context_requests` will be automatically evicted from context. User and pinned files are never evicted.\n",
+                    );
+                }
+            }
         } else {
             prompt.push_str(&format!(
                 "2. Read-Only Scope: Files inside <read_only_files> are strictly for reference and understanding. Do NOT propose edits to them directly. If completing the user's task requires modifying a file currently in <read_only_files>, request editable access first using <context_request{} path=\"...\" access=\"editable\" />.\n",
@@ -177,11 +202,11 @@ impl PromptAssembly {
         if !self.is_plan_step_execution {
             if self.is_discussion {
                 prompt.push_str(
-                    "11. Local Engineering Plans: When formulating or updating a task plan, populate the structured `plan_update` field in your response object with `action: \"save\"|\"update\"|\"delete\"`, plan `id`, `title`, `description`, and `items`. Each item has `status: \"todo\"|\"discussion\"|\"in_progress\"|\"done\"|\"cancelled\"`. If you have architectural doubts or options requiring developer clarification, explicitly set status to \"discussion\". Always provide a clear `description` explaining the overall architecture and rationale. Granularity contract: each leaf step is executed in an isolated turn with compulsory toolchain verification, so calibrate leaf step granularity to cohesive functional units of work. In <active_plan>, items marked with [x] are focused by the user.\n\n",
+                    "11. Local Engineering Plans: When formulating or updating a task plan, populate the structured `plan_update` field in your response object with `action: \"save\"|\"update\"|\"delete\"`, plan `id`, `title`, `description`, and `items`. Plan Action Semantics: Use `action: \"save\"` to create or completely overwrite/replace the entire step tree (e.g. initial plan creation, full tree restructuring, or clearing all items); use `action: \"update\"` strictly to modify specific individual nodes or items in place by ID without touching unmentioned items; use `action: \"delete\"` to remove the plan. Reins Invariant: Never mutate the plan (leave `plan_update: null`) without an explicit user instruction to modify it. Questions, analysis, trade-off reviews, and critique must be answered strictly in conversational text in `message`. Planning Objective: Collaborative planning focuses on conceptual comprehension of the objective ('What'), aligning on key architectural decisions and trade-offs, and defining a cohesive step tree without premature low-level code churn or deep file inspection. Step Formulation Contract: Formulate each step around an engineering objective and operational invariants rather than detailed procedural micro-instructions; define what state must be achieved and what invariants preserved. Each item has `status: \"todo\"|\"discussion\"|\"in_progress\"|\"done\"|\"cancelled\"`. If you have architectural doubts, alternative approaches, or decisions requiring developer clarification, explicitly set status to \"discussion\". Always provide a clear `description` explaining the overall architecture, boundaries, and rationale. Granularity Contract: Each leaf step is executed in an isolated turn with compulsory toolchain verification, so calibrate leaf step granularity to cohesive functional units of work. Language Consistency: Formulate plan title, description, step titles, and step details in the same language as the plan description and user's request. In <active_plan>, items marked with [x] are focused by the user.\n\n",
                 );
             } else {
                 prompt.push_str(&format!(
-                    "11. Local Engineering Plans: When formulating a multi-step task plan, wrap structured plan items in <plan{0} action=\"save\" id=\"plan-id\" title=\"Plan Title\">...</plan{0}>. In Develop mode, you may ONLY propose new plans (action=\"save\"). Updating plan statuses, closing steps, or modifying existing plans from Develop mode is strictly prohibited (step execution and completion occur strictly in isolated step turns, while plan modifications and re-scoping belong exclusively in Discussion mode). Each item has status=\"todo|discussion\". If you have architectural doubts, multiple technical options, or items needing developer clarification, explicitly set status=\"discussion\" to flag them for review before execution. Always provide a clear <description> explaining the overall architecture and rationale, because plan steps are executed in isolated turns without chat history. Granularity contract: each leaf step is executed in an isolated turn with compulsory toolchain verification (check, clippy, test). Therefore, calibrate leaf step granularity to cohesive, self-contained functional units of work (e.g. a complete data layer, a whole storage migration, or a full UI view). Avoid micro-fragmentation as well as unmanageable monoliths. Plan Creation Invariant: Whenever you propose a new plan, you MUST precede the tag with a concise conversational explanation of the proposed plan, and you MUST emit the structured <plan{0} action=\"save\" ...> tag in the same response.\n\n",
+                    "11. Local Engineering Plans: When formulating a multi-step task plan, wrap structured plan items in <plan{0} action=\"save\" id=\"plan-id\" title=\"Plan Title\">...</plan{0}>. In Develop mode, you may ONLY propose new plans (action=\"save\"). Updating plan statuses, closing steps, or modifying existing plans from Develop mode is strictly prohibited (step execution and completion occur strictly in isolated step turns, while plan modifications and re-scoping belong exclusively in Discussion mode). Planning Objective: Plan synthesis focuses on conceptual comprehension of the objective ('What'), aligning on key architectural decisions and trade-offs, and defining a cohesive step tree without premature low-level code churn or deep file inspection. Step Formulation Contract: Formulate each step around an engineering objective and operational invariants rather than detailed procedural micro-instructions; define what state must be achieved and what invariants preserved. Each item has status=\"todo|discussion\". If you have architectural doubts, multiple technical options, or items needing developer clarification, explicitly set status=\"discussion\" to flag them for review before execution. Always provide a clear <description> explaining the overall architecture, boundaries, and rationale, because plan steps are executed in isolated turns without chat history. Granularity Contract: Each leaf step is executed in an isolated turn with compulsory toolchain verification (check, clippy, test). Therefore, calibrate leaf step granularity to cohesive, self-contained functional units of work. Avoid micro-fragmentation as well as unmanageable monoliths. Plan Creation Invariant: Whenever you propose a new plan, you MUST precede the tag with a concise conversational explanation of the proposed plan, and you MUST emit the structured <plan{0} action=\"save\" ...> tag in the same response. Language Consistency: Formulate the plan title, description, step titles, and step details in the same language as the plan description and user's request.\n\n",
                     marker_suffix
                 ));
             }
@@ -198,10 +223,10 @@ impl PromptAssembly {
                 .collect();
 
             // Delegate edit protocol specific instructions
-            prompt.push_str(&protocol.system_instructions(&editable_paths));
+            prompt.push_str(&protocol.system_instructions(&editable_paths, self.discovery_mode));
         } else {
             prompt.push_str("## Mode: Structured Discussion\n");
-            prompt.push_str("You are participating in an architectural discussion. Code modifications are strictly prohibited. You cannot edit, create, or delete code files. Focus purely on answering questions, exploring architecture, clarifying requirements, and updating plans via structured fields.\n");
+            prompt.push_str("You are participating in an architectural discussion. Code modifications are strictly prohibited. You cannot edit, create, or delete code files. Focus on conceptual comprehension of the objective ('What'), clarifying requirements, evaluating trade-offs, establishing key design decisions, and formulating or refining plans via structured fields.\n");
             prompt.push_str("Output MUST be a JSON object conforming to the discussion schema with `message`, `plan_update`, `context_requests`, and `user_language`.\n\n");
         }
 
@@ -352,7 +377,7 @@ impl PromptAssembly {
     
         if let Some(target_lang) = &self.target_language {
             system_text.push_str("## Language Directive\n");
-            system_text.push_str(&format!("- Target Response Language: {} (all conversational explanations, answers, and messages MUST be in {})\n", target_lang, target_lang));
+            system_text.push_str(&format!("- Target Response Language: {} (all conversational explanations, answers, messages, and plan items/titles/details MUST be in {})\n", target_lang, target_lang));
             system_text.push_str("- Reasoning / Thoughts: Strictly in English.\n\n");
         }
 
@@ -479,5 +504,72 @@ mod tests {
         assert_eq!(estimate_tokens("abcd"), 1);
         assert_eq!(estimate_tokens("abcde"), 2);
         assert_eq!(estimate_tokens("абвг"), 1);
+    }
+
+    #[test]
+    fn test_planning_prompt_instructions() {
+        let proto = XmlEditProtocol;
+
+        // Develop mode
+        let dev_assembly = PromptAssembly::new(None, 1, vec![], "git", "xml", None, None);
+        let dev_prompt = dev_assembly.build_system_prompt(&proto);
+        assert!(dev_prompt.contains("Planning Objective: Plan synthesis focuses on conceptual comprehension of the objective ('What')"));
+        assert!(dev_prompt.contains("Step Formulation Contract: Formulate each step around an engineering objective and operational invariants"));
+
+        // Discussion mode
+        let mut disc_assembly = PromptAssembly::new(None, 1, vec![], "git", "xml", None, None);
+        disc_assembly.is_discussion = true;
+        let disc_prompt = disc_assembly.build_system_prompt(&proto);
+        assert!(disc_prompt.contains("Planning Objective: Collaborative planning focuses on conceptual comprehension of the objective ('What')"));
+        assert!(disc_prompt.contains("Step Formulation Contract: Formulate each step around an engineering objective and operational invariants"));
+    }
+
+    #[test]
+    fn test_prompt_assembly_discovery_mode_instructions() {
+        let proto = XmlEditProtocol;
+
+        // Monotonic Develop mode (default)
+        let mono_assembly = PromptAssembly::new(None, 1, vec![], "git", "xml", None, None)
+            .with_discovery_mode(crate::config::DiscoveryMode::Monotonic);
+        let mono_prompt = mono_assembly.build_system_prompt(&proto);
+        assert!(!mono_prompt.contains("<context_drop"));
+        assert!(!mono_prompt.contains("Incremental Strategy"));
+        assert!(!mono_prompt.contains("Snapshot Strategy"));
+
+        // Incremental Develop mode
+        let inc_assembly = PromptAssembly::new(None, 1, vec![], "git", "xml", None, None)
+            .with_discovery_mode(crate::config::DiscoveryMode::Incremental);
+        let inc_prompt = inc_assembly.build_system_prompt(&proto);
+        assert!(inc_prompt.contains("<context_drop"));
+        assert!(inc_prompt.contains("Incremental Strategy"));
+        assert!(!inc_prompt.contains("Snapshot Strategy"));
+
+        // Snapshot Develop mode
+        let snap_assembly = PromptAssembly::new(None, 1, vec![], "git", "xml", None, None)
+            .with_discovery_mode(crate::config::DiscoveryMode::Snapshot);
+        let snap_prompt = snap_assembly.build_system_prompt(&proto);
+        assert!(snap_prompt.contains("Snapshot Strategy"));
+        assert!(snap_prompt.contains("entire active working set of auto-context files"));
+
+        // Discussion mode monotonic
+        let mut disc_mono = PromptAssembly::new(None, 1, vec![], "git", "xml", None, None)
+            .with_discovery_mode(crate::config::DiscoveryMode::Monotonic);
+        disc_mono.is_discussion = true;
+        let disc_mono_prompt = disc_mono.build_system_prompt(&proto);
+        assert!(!disc_mono_prompt.contains("context_drops"));
+
+        // Discussion mode incremental
+        let mut disc_inc = PromptAssembly::new(None, 1, vec![], "git", "xml", None, None)
+            .with_discovery_mode(crate::config::DiscoveryMode::Incremental);
+        disc_inc.is_discussion = true;
+        let disc_inc_prompt = disc_inc.build_system_prompt(&proto);
+        assert!(disc_inc_prompt.contains("context_drops"));
+
+        // Discussion mode snapshot
+        let mut disc_snap = PromptAssembly::new(None, 1, vec![], "git", "xml", None, None)
+            .with_discovery_mode(crate::config::DiscoveryMode::Snapshot);
+        disc_snap.is_discussion = true;
+        let disc_snap_prompt = disc_snap.build_system_prompt(&proto);
+        assert!(disc_snap_prompt.contains("Snapshot Strategy"));
     }
 }

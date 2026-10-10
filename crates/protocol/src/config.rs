@@ -1,12 +1,16 @@
 use serde::{Deserialize, Serialize};
 
-use crate::model::ModelRef;
+use crate::model::{ModelRef, ModelSelection, ModelTiersSummary};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConfigState {
     pub workflow: String,
     pub edit_protocol: String,
     pub model: ModelRef,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selection: Option<ModelSelection>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tiers: Option<ModelTiersSummary>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub history_model: Option<ModelRef>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -25,6 +29,8 @@ pub struct ConfigSetParams {
     pub edit_protocol: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<ModelRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selection: Option<ModelSelection>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub history_model: Option<ModelRef>,
 }
@@ -53,6 +59,10 @@ pub struct SystemStatusResult {
     pub default_credentials_path: String,
     pub ready: bool,
     pub model: ModelRef,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selection: Option<ModelSelection>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tiers: Option<ModelTiersSummary>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub history_model: Option<ModelRef>,
     pub available_models: Vec<ModelRef>,

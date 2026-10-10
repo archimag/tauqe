@@ -170,6 +170,14 @@ impl DiscussionStreamFilter {
                 })
                 .unwrap_or_default();
 
+            let context_drops = val
+                .get("context_drops")
+                .filter(|v| !v.is_null())
+                .and_then(|v| {
+                    serde_json::from_value::<Vec<String>>(v.clone()).ok()
+                })
+                .unwrap_or_default();
+
             let user_language = val
                 .get("user_language")
                 .and_then(|v| v.as_str())
@@ -179,6 +187,7 @@ impl DiscussionStreamFilter {
                 message,
                 plan_update,
                 context_requests,
+                context_drops,
                 user_language,
             };
         }

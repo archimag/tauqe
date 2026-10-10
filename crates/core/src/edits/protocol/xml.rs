@@ -13,12 +13,15 @@ use tags::{parse_context_request_tags, parse_doc_request_tags};
 pub use marker::generate_turn_marker;
 pub use tags::{
     extract_plan_step_done, extract_user_language, extract_verify_request,
-    strip_context_request_tags, strip_doc_request_tags, strip_plan_step_done_tags,
-    strip_plan_tags, strip_user_language_tags, strip_verify_tags, PlanStepDone,
-    VerifyOnSuccess, VerifyRequest, VerifyTarget,
+    parse_context_drop_tags, strip_context_drop_tags, strip_context_request_tags,
+    strip_doc_request_tags, strip_plan_step_done_tags, strip_plan_tags,
+    strip_user_language_tags, strip_verify_tags, PlanStepDone, VerifyOnSuccess,
+    VerifyRequest, VerifyTarget,
 };
 pub(crate) use marker::{normalize_marked_xml, restore_xml_literals};
-pub(crate) use tags::{next_context_request_tag, next_user_language_tag, next_verify_tag};
+pub(crate) use tags::{
+    next_context_request_tag, next_user_language_tag, next_verify_tag,
+};
 
 /// XML-based code edit protocol
 #[derive(Debug, Default, Clone)]
@@ -35,6 +38,10 @@ impl EditProtocol for XmlEditProtocol {
 
     fn parse_context_requests(&self, raw_text: &str) -> Vec<ContextRequest> {
         parse_context_request_tags(raw_text)
+    }
+
+    fn parse_context_drops(&self, raw_text: &str) -> Vec<String> {
+        parse_context_drop_tags(raw_text)
     }
 
     fn parse_doc_requests(&self, raw_text: &str) -> Vec<String> {
@@ -64,7 +71,11 @@ impl EditProtocol for XmlEditProtocol {
         extract_conversational_text(raw_text)
     }
 
-    fn system_instructions(&self, editable_paths: &[String]) -> String {
+    fn system_instructions(
+        &self,
+        editable_paths: &[String],
+        discovery_mode: crate::config::DiscoveryMode,
+    ) -> String {
         let mut prompt = String::new();
         prompt.push_str("## Code Modification Protocol (XML Edits)\n");
         prompt.push_str("When proposing changes, use structured XML blocks:\n");
@@ -125,7 +136,19 @@ impl EditProtocol for XmlEditProtocol {
         );
         prompt.push_str("6. You may include multiple <edit>, <create>, or <delete> blocks inside <tauqe_edits>.\n");
         prompt.push_str("7. If no code changes are needed (e.g. conversational answer or explanation), output plain text without any XML edit tags.\n");
-        prompt.push_str("8. If the task requires files listed in <repo_map> that are not yet present in context, or if a file currently in <read_only_files> needs to be modified, request them FIRST instead of guessing: output only a short note plus one tag per file, e.g. <context_request path=\"path/to/file.rs\" access=\"read_only\" /> (use access=\"editable\" to add or upgrade a file to editable). You will be called again with the updated context. Do not request files that are already present with the required access level.\n");
+
+        match discovery_mode {
+            crate::config::DiscoveryMode::Monotonic => {
+                prompt.push_str("8. Context Discovery: If the task requires files listed in <repo_map> that are not yet present in context, or if a file currently in <read_only_files> needs to be modified, request them FIRST instead of guessing: output only a short note plus one tag per file, e.g. <context_request path=\"path/to/file.rs\" access=\"read_only\" /> (use access=\"editable\" to add or upgrade a file to editable). You will be called again with the updated context. Do not request files that are already present with the required access level. Place all operational protocol tags strictly at the end of your response outside markdown formatting; any tags inside markdown code fences or backticks are treated as literal examples and ignored.\n");
+            }
+            crate::config::DiscoveryMode::Incremental => {
+                prompt.push_str("8. Context Discovery (Incremental Strategy): If the task requires files listed in <repo_map> that are not yet present in context, or if a file currently in <read_only_files> needs to be modified, request them FIRST instead of guessing: output only a short note plus one tag per file, e.g. <context_request path=\"path/to/file.rs\" access=\"read_only\" /> (use access=\"editable\" to add or upgrade a file to editable). If an inspected auto-context file turns out to be irrelevant or misleading, release it immediately using <context_drop path=\"path/to/file.rs\" /> to prevent context pollution and preserve token budget. You will be called again with the updated context. Do not request files that are already present with the required access level. Place all operational protocol tags strictly at the end of your response outside markdown formatting; any tags inside markdown code fences or backticks are treated as literal examples and ignored.\n");
+            }
+            crate::config::DiscoveryMode::Snapshot => {
+                prompt.push_str("8. Context Discovery (Snapshot Strategy): If the task requires inspecting or modifying files listed in <repo_map> that are not yet in context, request them FIRST: output only a short note plus <context_request path=\"path/to/file.rs\" access=\"read_only|editable\" /> tags. In each discovery round, your <context_request> tags MUST specify the entire active working set of auto-context files required for the task. Any auto-context files omitted from your requests will be automatically evicted from context. User and pinned files are never evicted. Place all operational protocol tags strictly at the end of your response outside markdown formatting; any tags inside markdown code fences or backticks are treated as literal examples and ignored.\n");
+            }
+        }
+
         prompt.push_str("9. Code Verification: You may request code verification using <verify target=\"all|check|test|clippy\" on_success=\"silent|report\" />. Use target=\"all\" (or check, test, clippy). Always use on_success=\"silent\" unless the user explicitly asked to see the raw test/build logs or command output. Do not quote or output raw logs when verification succeeds; concise confirmation that all checks passed is sufficient.\n");
         prompt.push_str("10. Detect User Language: Identify the primary language of the user's prompt and output a <user_language>language</user_language> tag (e.g. <user_language>Russian</user_language>). All conversational explanations MUST be in this detected language. Internal thoughts and reasoning MUST be strictly in English.\n");
         prompt.push_str("11. Choosing <edit> vs <overwrite>: use <edit> by default for local changes. Use <overwrite path=\"...\"> with the COMPLETE new file content when most of an existing editable file changes (roughly more than half), when the file is small, or when many fragile search blocks would be needed. Never use <create> for a path that already exists; use <create> only for new files.\n\n");
@@ -137,7 +160,7 @@ impl EditProtocol for XmlEditProtocol {
         if !has_xml_edit_tags(raw_text) {
             return ModelResult::Answer {
                 text: strip_plan_step_done_tags(&strip_plan_tags(&strip_verify_tags(&strip_user_language_tags(
-                    &strip_doc_request_tags(&strip_context_request_tags(raw_text)),
+                    &strip_doc_request_tags(&strip_context_drop_tags(&strip_context_request_tags(raw_text))),
                 )))),
             };
         }
@@ -213,6 +236,10 @@ impl EditProtocol for MarkedXmlEditProtocol {
         parse_context_request_tags(&normalize_marked_xml(raw_text, &self.marker, true))
     }
 
+    fn parse_context_drops(&self, raw_text: &str) -> Vec<String> {
+        parse_context_drop_tags(&normalize_marked_xml(raw_text, &self.marker, true))
+    }
+
     fn parse_doc_requests(&self, raw_text: &str) -> Vec<String> {
         parse_doc_request_tags(&normalize_marked_xml(raw_text, &self.marker, true))
     }
@@ -253,8 +280,12 @@ impl EditProtocol for MarkedXmlEditProtocol {
         Some(Box::new(Self::new(marker)))
     }
 
-    fn system_instructions(&self, editable_paths: &[String]) -> String {
-        let mut prompt = XmlEditProtocol.system_instructions(editable_paths);
+    fn system_instructions(
+        &self,
+        editable_paths: &[String],
+        discovery_mode: crate::config::DiscoveryMode,
+    ) -> String {
+        let mut prompt = XmlEditProtocol.system_instructions(editable_paths, discovery_mode);
         for base in XML_TAG_BASES {
             prompt = prompt.replace(&format!("<{}", base), &format!("<{}_{}", base, self.marker));
             prompt = prompt.replace(&format!("</{}", base), &format!("</{}_{}", base, self.marker));
@@ -488,6 +519,7 @@ pub fn extract_conversational_text(raw_text: &str) -> String {
     let text = strip_user_language_tags(&text);
     let text = strip_verify_tags(&text);
     let text = strip_context_request_tags(&text);
+    let text = strip_context_drop_tags(&text);
     let text = strip_doc_request_tags(&text);
     let text = strip_plan_tags(&text);
     let text = strip_plan_step_done_tags(&text);

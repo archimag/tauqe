@@ -1,4 +1,8 @@
 use super::entry::HistoryEntry;
+use tauqe_protocol::ModelTier;
+
+/// Default model tier used for history compaction.
+pub const COMPACTION_MODEL_TIER: ModelTier = ModelTier::Junior;
 
 /// Default estimated tokens budget before compaction is triggered (raised for modern LLMs).
 pub const DEFAULT_HISTORY_BUDGET_TOKENS: u64 = 20_000;

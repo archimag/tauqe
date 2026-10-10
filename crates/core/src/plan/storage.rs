@@ -277,9 +277,7 @@ impl PlanStorage {
                     if tag.description.is_some() {
                         plan.description = tag.description;
                     }
-                    if !tag.items.is_empty() {
-                        plan.items = tag.items;
-                    }
+                    plan.items = tag.items;
                     plan.refresh_parent_statuses();
                     plan.updated_at = now;
                     match Self::save_plan(repo_root, &plan) {
@@ -630,5 +628,42 @@ Step 1 is done:
         let outcome2 = PlanStorage::apply_discussion_plan_update(root, &update2);
         assert!(outcome2.errors.is_empty());
         assert_eq!(outcome2.applied[0].items[0].details.as_deref(), Some("Updated details"));
+    }
+
+    #[test]
+    fn test_save_plan_clears_items_when_empty() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+
+        let plan = Plan {
+            id: "test-plan".to_string(),
+            title: "Test".to_string(),
+            description: Some("Desc".to_string()),
+            created_at: 100,
+            updated_at: 100,
+            items: vec![PlanItem {
+                id: "1".to_string(),
+                title: "Step 1".to_string(),
+                ..Default::default()
+            }],
+        };
+        PlanStorage::save_plan(root, &plan).unwrap();
+        assert_eq!(PlanStorage::load_plan(root, "test-plan").unwrap().unwrap().items.len(), 1);
+
+        let update = DiscussionPlanUpdate {
+            action: DiscussionPlanAction::Save,
+            id: Some("test-plan".to_string()),
+            title: Some("Test".to_string()),
+            description: Some("Updated Desc without items".to_string()),
+            items: vec![],
+        };
+        let outcome = PlanStorage::apply_discussion_plan_update(root, &update);
+        assert!(outcome.errors.is_empty());
+        assert_eq!(outcome.applied.len(), 1);
+        assert_eq!(outcome.applied[0].items.len(), 0);
+
+        let reloaded = PlanStorage::load_plan(root, "test-plan").unwrap().unwrap();
+        assert_eq!(reloaded.items.len(), 0);
+        assert_eq!(reloaded.description.as_deref(), Some("Updated Desc without items"));
     }
 }

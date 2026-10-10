@@ -426,9 +426,9 @@ fn extract_incomplete_change_op_and_path(
     None
 }
 
-/// Locates the byte offset right after the opening quote of the top-level `"message"`
-/// string value. The scan is depth- and string-aware.
-pub(crate) fn find_message_value_start(buffer: &str) -> Option<usize> {
+/// Locates the byte offset right after the opening quote of a top-level string value
+/// with the given `target_field` name. The scan is depth- and string-aware.
+pub fn find_string_field_value_start(buffer: &str, target_field: &str) -> Option<usize> {
     let bytes = buffer.as_bytes();
     let start = buffer.find('{')?;
     let len = bytes.len();
@@ -477,7 +477,7 @@ pub(crate) fn find_message_value_start(buffer: &str) -> Option<usize> {
                 }
                 if depth == 1 && expect_key {
                     expect_key = false;
-                    if &bytes[str_start..j] == b"message" {
+                    if &bytes[str_start..j] == target_field.as_bytes() {
                         let mut k = j + 1;
                         while k < len && bytes[k].is_ascii_whitespace() {
                             k += 1;
@@ -503,12 +503,13 @@ pub(crate) fn find_message_value_start(buffer: &str) -> Option<usize> {
     None
 }
 
-/// Helper function to scan unescaped characters of the "message" string property in raw JSON.
-pub(crate) fn extract_streamed_message(
+/// Helper function to scan unescaped characters of an arbitrary string property in raw JSON.
+pub fn extract_streamed_string_field(
     buffer: &str,
+    field_name: &str,
     already_streamed: usize,
 ) -> (Option<String>, usize, bool) {
-    let value_start = match find_message_value_start(buffer) {
+    let value_start = match find_string_field_value_start(buffer, field_name) {
         Some(idx) => idx,
         None => return (None, already_streamed, false),
     };
@@ -572,6 +573,14 @@ pub(crate) fn extract_streamed_message(
     } else {
         (None, already_streamed, is_finished)
     }
+}
+
+/// Helper function to scan unescaped characters of the "message" string property in raw JSON.
+pub(crate) fn extract_streamed_message(
+    buffer: &str,
+    already_streamed: usize,
+) -> (Option<String>, usize, bool) {
+    extract_streamed_string_field(buffer, "message", already_streamed)
 }
 
 #[cfg(test)]
@@ -650,6 +659,24 @@ mod tests {
         assert!(events
             .iter()
             .any(|e| matches!(e, StreamEvent::EditFileDone { .. })));
+    }
+
+    #[test]
+    fn test_extract_streamed_string_field_chunked() {
+        let json = r#"{"status":"success","explanation":"Hello world!\nLine 2","items":[]}"#;
+        let mut buf = String::new();
+        let mut streamed = String::new();
+        let mut streamed_bytes = 0;
+        for c in json.chars() {
+            buf.push(c);
+            let (delta, new_bytes, _) =
+                extract_streamed_string_field(&buf, "explanation", streamed_bytes);
+            if let Some(d) = delta {
+                streamed.push_str(&d);
+            }
+            streamed_bytes = new_bytes;
+        }
+        assert_eq!(streamed, "Hello world!\nLine 2");
     }
 
     #[test]

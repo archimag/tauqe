@@ -345,6 +345,7 @@ mod tests {
             items: vec![ReviewItem {
                 id: 1,
                 title: "Security finding".to_string(),
+                model: None,
                 severity: ReviewSeverity::Critical,
                 status: ReviewItemStatus::Discussion,
                 file_path: Some("crates/core/src/lib.rs".to_string()),

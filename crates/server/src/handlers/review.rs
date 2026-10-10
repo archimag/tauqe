@@ -55,7 +55,13 @@ pub async fn handle_review_start(req: Request, state: &Arc<AppState>) -> Respons
 
     let (provider, model) = {
         let cfg = state.config.lock().await;
-        let model = params.model.clone().unwrap_or_else(|| cfg.active_model());
+        let model = match params.model.clone() {
+            Some(m) => m,
+            None => {
+                let selection = state.current_selection.lock().await;
+                cfg.resolve_model(&selection)
+            }
+        };
         let provider: Arc<dyn LlmProvider> = match create_provider(model.provider, &cfg) {
             Ok(p) => Arc::from(p),
             Err(err) => return Response::err(req.id, "NO_API_KEY", err.to_string()),
@@ -504,7 +510,8 @@ pub async fn handle_review_execute_item(req: Request, state: &Arc<AppState>) -> 
         Err(err) => return Response::err(req.id, "PROMPT_BUILD_FAILED", err),
     };
 
-    match start_model_turn(state, prompt).await {
+    let item_model = item.model.clone();
+    match start_model_turn(state, prompt, item_model).await {
         Ok(op_id) => Response::ok(req.id, serde_json::json!({
             "operation_id": op_id,
             "review_id": params.review_id,

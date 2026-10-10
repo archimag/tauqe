@@ -301,7 +301,7 @@ where
                 context_manager,
                 &context_requests,
                 &available_files,
-                options.max_auto_files_per_round,
+                options.max_files,
             )
         } else {
             Vec::new()

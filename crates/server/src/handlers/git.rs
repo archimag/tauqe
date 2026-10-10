@@ -239,7 +239,7 @@ pub async fn handle_git_squash_generate_message(req: Request, state: &Arc<AppSta
 
     let (provider_res, model) = {
         let cfg = state.config.lock().await;
-        let m = cfg.history_model();
+        let m = cfg.resolve_tier(tauqe_protocol::ModelTier::Junior);
         let p = create_provider(m.provider, &cfg);
         (p, m)
     };

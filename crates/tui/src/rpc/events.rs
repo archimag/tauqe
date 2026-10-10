@@ -122,6 +122,17 @@ pub async fn handle_event(
                 }
             }
         }
+        events::MODEL_CHANGED => {
+            if let Some(params) = ev.params {
+                if let Ok(data) = serde_json::from_value::<tauqe_protocol::ModelChangedEvent>(params) {
+                    st.active_model = data.effective_model;
+                    st.model_choice = crate::app::ModelChoice {
+                        selection: data.selection,
+                        tiers: Some(data.tiers),
+                    };
+                }
+            }
+        }
         events::CONTEXT_CHANGED => {
             if let Some(params) = ev.params {
                 if let Some(val) = params.get("state") {

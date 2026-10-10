@@ -44,6 +44,8 @@ pub async fn handle_request(req: Request, state: &Arc<AppState>) -> Response {
         methods::MODEL_ASK => model::handle_model_ask(req, state).await,
         methods::MODEL_CANCEL => model::handle_model_cancel(req, state).await,
         methods::MODEL_CLEAR_HISTORY => model::handle_model_clear_history(req, state).await,
+        methods::MODEL_SELECT => model::handle_model_select(req, state).await,
+        methods::MODEL_CURRENT => model::handle_model_current(req, state).await,
 
         methods::REVIEW_START => review::handle_review_start(req, state).await,
         methods::REVIEW_CANCEL => review::handle_review_cancel(req, state).await,
@@ -60,6 +62,7 @@ pub async fn handle_request(req: Request, state: &Arc<AppState>) -> Response {
         methods::PLAN_DELETE => plan::handle_plan_delete(req, state).await,
         methods::PLAN_SET_ACTIVE => plan::handle_plan_set_active(req, state).await,
         methods::PLAN_EXECUTE_STEP => plan::handle_plan_execute_step(req, state).await,
+        methods::PLAN_REFINE => plan::handle_plan_refine(req, state).await,
 
         methods::CONFIG_GET => config::handle_config_get(req, state).await,
         methods::CONFIG_SET => config::handle_config_set(req, state).await,
@@ -84,7 +87,9 @@ async fn handle_client_initialize(req: Request, state: &Arc<AppState>) -> Respon
     let repo_path = Path::new(&repo_state.root);
     let mut cfg = state.config.lock().await;
     if !repo_path.as_os_str().is_empty() {
-        *cfg = load_config(Some(repo_path));
+        let loaded = load_config(Some(repo_path));
+        *state.current_selection.lock().await = loaded.default_selection();
+        *cfg = loaded;
         {
             let mut ctx = state.context.write().await;
             ctx.set_repo_root(repo_path.to_path_buf());
@@ -98,12 +103,15 @@ async fn handle_client_initialize(req: Request, state: &Arc<AppState>) -> Respon
         *history = hm;
     }
 
+    let selection = state.current_selection.lock().await.clone();
+    let effective_model = cfg.resolve_model(&selection);
+
     let result = InitializeResult {
         protocol_version: PROTOCOL_VERSION.to_string(),
         server_name: "tauqe-server".to_string(),
         server_version: env!("CARGO_PKG_VERSION").to_string(),
         repository: Some(repo_state),
-        model: cfg.active_model(),
+        model: effective_model,
         workflow: Some(cfg.develop.workflow.clone()),
         edit_protocol: Some(cfg.develop.protocol.clone()),
         available_models: cfg.available_models(),

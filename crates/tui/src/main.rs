@@ -127,6 +127,7 @@ async fn main() -> anyhow::Result<()> {
         header_clicks: crate::app::HeaderClickAreas::default(),
         terminal_focused: true,
         shift_tip_shown: false,
+        model_choice: crate::app::ModelChoice::default(),
     }));
 
     let mut is_reasoning = false;
@@ -147,6 +148,9 @@ async fn main() -> anyhow::Result<()> {
 
     // Restore the latest saved review (if any)
     rpc::send_request(&mut server_writer, methods::REVIEW_GET, serde_json::json!({})).await?;
+
+    // Initial model selection and tier assignments
+    rpc::send_request(&mut server_writer, methods::MODEL_CURRENT, serde_json::json!({})).await?;
 
     // Initial plans fetch
     rpc::send_request(&mut server_writer, methods::PLAN_LIST, serde_json::json!({})).await?;

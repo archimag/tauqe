@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use crate::model::ModelSelection;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum PlanItemStatus {
@@ -332,7 +334,10 @@ impl Plan {
                     PlanItemStatus::Todo => "[ ]",
                 };
                 let clean_title = item.title.replace(['\r', '\n'], " ").trim().to_string();
-                out.push_str(&format!("{}- {} {} #{}: {}\n", indent, check, item.status, item.id, clean_title));
+                out.push_str(&format!(
+                    "{}- {} {} #{}: {}\n",
+                    indent, check, item.status, item.id, clean_title
+                ));
                 if let Some(details) = &item.details {
                     let trimmed = details.trim();
                     if !trimmed.is_empty() {
@@ -440,8 +445,11 @@ pub fn format_plan_discussion_prompt(
 
     out.push_str("## Instructions for Model:\n");
     out.push_str("1. Address the developer's question or feedback regarding the plan architecture and steps.\n");
-    out.push_str("2. If the plan structure, steps, or statuses should be updated based on this discussion, explain the proposed modifications in conversational text in `message` AND populate the structured `plan_update` field in your response object (with action, id, title, description, and items). Never describe plan changes solely in conversational text without populating `plan_update`.\n");
-    out.push_str("3. Keep explanations clear, rigorous, and directly aligned with codebase design.\n");
+    out.push_str("2. Reins Invariant: Never mutate the plan (keep `plan_update: null`) without an explicit user instruction to modify it. Questions, analysis, trade-off reviews, and critique must be answered strictly in conversational text in `message`.\n");
+    out.push_str("3. When explicitly instructed to update the plan, explain the proposed modifications in `message` and populate the structured `plan_update` field.\n");
+    out.push_str("4. Plan Action Semantics: Use `action: \"save\"` to create or completely overwrite the entire plan and its step hierarchy (e.g. full restructuring or clearing steps). Use `action: \"update\"` to modify individual existing items by ID without altering unmentioned items. Use `action: \"delete\"` to remove the plan.\n");
+    out.push_str("5. Keep explanations clear, rigorous, and directly aligned with codebase design.\n");
+    out.push_str("6. Language Consistency Directive: Detect the natural language of the plan title and description. Formulate all plan titles, descriptions, step titles, step details, and conversational explanations strictly in that same language.\n");
 
     out
 }
@@ -519,6 +527,52 @@ pub struct PlanExecuteStepParams {
     pub step_id: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct PlanRefineParams {
+    pub plan_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<ModelSelection>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instructions: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum PlanRefineResult {
+    Success {
+        plan: Plan,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        explanation: Option<String>,
+    },
+    Blocked {
+        reason: String,
+    },
+}
+
+impl PlanRefineResult {
+    pub fn is_success(&self) -> bool {
+        matches!(self, Self::Success { .. })
+    }
+
+    pub fn is_blocked(&self) -> bool {
+        matches!(self, Self::Blocked { .. })
+    }
+
+    pub fn plan(&self) -> Option<&Plan> {
+        match self {
+            Self::Success { plan, .. } => Some(plan),
+            Self::Blocked { .. } => None,
+        }
+    }
+
+    pub fn reason(&self) -> Option<&str> {
+        match self {
+            Self::Success { .. } => None,
+            Self::Blocked { reason } => Some(reason),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlanUpdatedEvent {
     pub plan: Plan,
@@ -534,6 +588,68 @@ pub struct PlanListChangedEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::ModelTier;
+
+    fn item(id: &str, title: &str, status: PlanItemStatus, children: Vec<PlanItem>) -> PlanItem {
+        PlanItem {
+            id: id.to_string(),
+            title: title.to_string(),
+            status,
+            children,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_plan_refine_types_serde_and_helpers() {
+        let params = PlanRefineParams {
+            plan_id: "core-feature".to_string(),
+            model: Some(ModelSelection::Tier(ModelTier::Senior)),
+            instructions: Some("Decompose into atomic steps".to_string()),
+        };
+        let json_params = serde_json::to_string(&params).unwrap();
+        assert!(json_params.contains("\"core-feature\""));
+        assert!(json_params.contains("\"senior\""));
+        let de_params: PlanRefineParams = serde_json::from_str(&json_params).unwrap();
+        assert_eq!(de_params, params);
+
+        let plan = Plan {
+            id: "core-feature".to_string(),
+            title: "Feature".to_string(),
+            description: None,
+            created_at: 10,
+            updated_at: 20,
+            items: vec![],
+        };
+
+        let success_res = PlanRefineResult::Success {
+            plan: plan.clone(),
+            explanation: Some("All decomposed".to_string()),
+        };
+        assert!(success_res.is_success());
+        assert!(!success_res.is_blocked());
+        assert_eq!(success_res.plan().unwrap().id, "core-feature");
+        assert_eq!(success_res.reason(), None);
+
+        let json_success = serde_json::to_string(&success_res).unwrap();
+        assert!(json_success.contains("\"status\":\"success\""));
+        let de_success: PlanRefineResult = serde_json::from_str(&json_success).unwrap();
+        assert_eq!(de_success, success_res);
+
+        let blocked_res = PlanRefineResult::Blocked {
+            reason: "Contradiction in requirements".to_string(),
+        };
+        assert!(!blocked_res.is_success());
+        assert!(blocked_res.is_blocked());
+        assert_eq!(blocked_res.plan(), None);
+        assert_eq!(blocked_res.reason(), Some("Contradiction in requirements"));
+
+        let json_blocked = serde_json::to_string(&blocked_res).unwrap();
+        assert!(json_blocked.contains("\"status\":\"blocked\""));
+        assert!(json_blocked.contains("Contradiction in requirements"));
+        let de_blocked: PlanRefineResult = serde_json::from_str(&json_blocked).unwrap();
+        assert_eq!(de_blocked, blocked_res);
+    }
 
     #[test]
     fn test_plan_item_status_lifecycle() {
@@ -548,19 +664,21 @@ mod tests {
 
     #[test]
     fn test_plan_item_serde() {
-        let item = PlanItem {
-            id: "1.1".to_string(),
-            title: "Define claims".to_string(),
-            details: Some("Claims struct with exp and sub".to_string()),
-            status: PlanItemStatus::InProgress,
-            children: vec![],
-        };
+        let mut it = item("1.1", "Define claims", PlanItemStatus::InProgress, vec![]);
+        it.details = Some("Claims struct with exp and sub".to_string());
 
-        let json = serde_json::to_string(&item).unwrap();
+        let json = serde_json::to_string(&it).unwrap();
         assert!(json.contains("\"in_progress\""));
 
         let de: PlanItem = serde_json::from_str(&json).unwrap();
-        assert_eq!(de, item);
+        assert_eq!(de, it);
+    }
+
+    #[test]
+    fn test_plan_item_ignores_legacy_model_field() {
+        let legacy: PlanItem = serde_json::from_str(r#"{"id":"2","title":"Old step","model":"junior"}"#).unwrap();
+        assert_eq!(legacy.id, "2");
+        assert_eq!(legacy.title, "Old step");
     }
 
     #[test]
@@ -572,28 +690,13 @@ mod tests {
             created_at: 1700000000,
             updated_at: 1700000010,
             items: vec![
-                PlanItem {
-                    id: "1".to_string(),
-                    title: "Models".to_string(),
-                    details: None,
-                    status: PlanItemStatus::Done,
-                    children: vec![
-                        PlanItem {
-                            id: "1.1".to_string(),
-                            title: "Claims".to_string(),
-                            details: None,
-                            status: PlanItemStatus::Done,
-                            children: vec![],
-                        },
-                    ],
-                },
-                PlanItem {
-                    id: "2".to_string(),
-                    title: "Endpoint".to_string(),
-                    details: None,
-                    status: PlanItemStatus::InProgress,
-                    children: vec![],
-                },
+                item(
+                    "1",
+                    "Models",
+                    PlanItemStatus::Done,
+                    vec![item("1.1", "Claims", PlanItemStatus::Done, vec![])],
+                ),
+                item("2", "Endpoint", PlanItemStatus::InProgress, vec![]),
             ],
         };
 
@@ -618,20 +721,8 @@ mod tests {
             created_at: 1,
             updated_at: 1,
             items: vec![
-                PlanItem {
-                    id: "1".to_string(),
-                    title: "Step 1".to_string(),
-                    details: None,
-                    status: PlanItemStatus::Todo,
-                    children: vec![],
-                },
-                PlanItem {
-                    id: "2".to_string(),
-                    title: "Step 2".to_string(),
-                    details: None,
-                    status: PlanItemStatus::Todo,
-                    children: vec![],
-                },
+                item("1", "Step 1", PlanItemStatus::Todo, vec![]),
+                item("2", "Step 2", PlanItemStatus::Todo, vec![]),
             ],
         };
 
@@ -671,30 +762,15 @@ mod tests {
             description: None,
             created_at: 1,
             updated_at: 1,
-            items: vec![
-                PlanItem {
-                    id: "parent".to_string(),
-                    title: "Parent".to_string(),
-                    details: None,
-                    status: PlanItemStatus::Todo,
-                    children: vec![
-                        PlanItem {
-                            id: "sub-1".to_string(),
-                            title: "Sub 1".to_string(),
-                            details: None,
-                            status: PlanItemStatus::Todo,
-                            children: vec![],
-                        },
-                        PlanItem {
-                            id: "sub-2".to_string(),
-                            title: "Sub 2".to_string(),
-                            details: None,
-                            status: PlanItemStatus::Todo,
-                            children: vec![],
-                        },
-                    ],
-                },
-            ],
+            items: vec![item(
+                "parent",
+                "Parent",
+                PlanItemStatus::Todo,
+                vec![
+                    item("sub-1", "Sub 1", PlanItemStatus::Todo, vec![]),
+                    item("sub-2", "Sub 2", PlanItemStatus::Todo, vec![]),
+                ],
+            )],
         };
 
         assert_eq!(plan.is_leaf_item("parent"), Some(false));
@@ -727,35 +803,16 @@ mod tests {
             created_at: 1,
             updated_at: 1,
             items: vec![
-                PlanItem {
-                    id: "1".to_string(),
-                    title: "Parent Group".to_string(),
-                    details: None,
-                    status: PlanItemStatus::Todo,
-                    children: vec![
-                        PlanItem {
-                            id: "1.1".to_string(),
-                            title: "Step 1.1".to_string(),
-                            details: None,
-                            status: PlanItemStatus::Todo,
-                            children: vec![],
-                        },
-                        PlanItem {
-                            id: "1.2".to_string(),
-                            title: "Step 1.2".to_string(),
-                            details: None,
-                            status: PlanItemStatus::Discussion,
-                            children: vec![],
-                        },
+                item(
+                    "1",
+                    "Parent Group",
+                    PlanItemStatus::Todo,
+                    vec![
+                        item("1.1", "Step 1.1", PlanItemStatus::Todo, vec![]),
+                        item("1.2", "Step 1.2", PlanItemStatus::Discussion, vec![]),
                     ],
-                },
-                PlanItem {
-                    id: "2".to_string(),
-                    title: "Step 2".to_string(),
-                    details: None,
-                    status: PlanItemStatus::Todo,
-                    children: vec![],
-                },
+                ),
+                item("2", "Step 2", PlanItemStatus::Todo, vec![]),
             ],
         };
 
@@ -811,36 +868,22 @@ mod tests {
 
     #[test]
     fn test_plan_to_markdown() {
+        let mut models = item(
+            "1",
+            "Models",
+            PlanItemStatus::Done,
+            vec![item("1.1", "Claims", PlanItemStatus::Done, vec![])],
+        );
+        models.details = Some("Create token struct".to_string());
+        let endpoint = item("2", "Endpoint", PlanItemStatus::InProgress, vec![]);
+
         let plan = Plan {
             id: "jwt-auth".to_string(),
             title: "JWT Authentication".to_string(),
             description: Some("Replace session cookies".to_string()),
             created_at: 1700000000,
             updated_at: 1700000010,
-            items: vec![
-                PlanItem {
-                    id: "1".to_string(),
-                    title: "Models".to_string(),
-                    details: Some("Create token struct".to_string()),
-                    status: PlanItemStatus::Done,
-                    children: vec![
-                        PlanItem {
-                            id: "1.1".to_string(),
-                            title: "Claims".to_string(),
-                            details: None,
-                            status: PlanItemStatus::Done,
-                            children: vec![],
-                        },
-                    ],
-                },
-                PlanItem {
-                    id: "2".to_string(),
-                    title: "Endpoint".to_string(),
-                    details: None,
-                    status: PlanItemStatus::InProgress,
-                    children: vec![],
-                },
-            ],
+            items: vec![models, endpoint],
         };
 
         let md = plan.to_markdown();

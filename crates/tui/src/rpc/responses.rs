@@ -112,8 +112,9 @@ pub async fn handle_response(resp: Response, state: &Arc<Mutex<AppState>>) {
                             plan.update_item_status(&item_id, prev_status);
                         }
                     }
-                    OptimisticRollback::ActiveModel { prev_model } => {
+                    OptimisticRollback::ActiveModel { prev_model, prev_selection } => {
                         st.active_model = prev_model;
+                        st.model_choice.selection = prev_selection;
                     }
                 }
             }
@@ -123,6 +124,10 @@ pub async fn handle_response(resp: Response, state: &Arc<Mutex<AppState>>) {
             Some(methods::REVIEW_START) => {
                 st.review.running = false;
                 st.review.error = Some(err.message.clone());
+            }
+            Some(methods::PLAN_REFINE) => {
+                st.plans_view.refining = false;
+                st.plans_view.refining_plan_id = None;
             }
             Some(methods::GIT_SQUASH_PREVIEW)
             | Some(methods::GIT_SQUASH_GENERATE_MESSAGE)
@@ -373,6 +378,27 @@ pub async fn handle_response(resp: Response, state: &Arc<Mutex<AppState>>) {
                     }
                 }
             }
+            methods::MODEL_CURRENT => {
+                if let Ok(res) = serde_json::from_value::<tauqe_protocol::ModelCurrentResult>(val) {
+                    st.active_model = res.effective_model;
+                    st.model_choice = crate::app::ModelChoice {
+                        selection: res.selection,
+                        tiers: Some(res.tiers),
+                    };
+                    if !res.available_models.is_empty() {
+                        st.available_models = res.available_models;
+                    }
+                }
+            }
+            methods::MODEL_SELECT => {
+                if let Ok(res) = serde_json::from_value::<tauqe_protocol::ModelSelectResult>(val) {
+                    st.active_model = res.effective_model;
+                    st.model_choice = crate::app::ModelChoice {
+                        selection: res.selection,
+                        tiers: Some(res.tiers),
+                    };
+                }
+            }
             methods::REVIEW_GET => {
                 if let Ok(res) = serde_json::from_value::<ReviewGetResult>(val) {
                     if let Some(session) = res.session {
@@ -415,6 +441,49 @@ pub async fn handle_response(resp: Response, state: &Arc<Mutex<AppState>>) {
                 }
             }
             methods::PLAN_SET_ACTIVE => {}
+            methods::PLAN_REFINE => {
+                st.plans_view.refining = false;
+                let refining_plan_id = st.plans_view.refining_plan_id.take();
+                if let Ok(refine_res) = serde_json::from_value::<tauqe_protocol::PlanRefineResult>(val) {
+                    match refine_res {
+                        tauqe_protocol::PlanRefineResult::Success { plan, explanation } => {
+                            let plan_title = plan.title.clone();
+                            let plan_id = plan.id.clone();
+                            if let Some(pos) = st.plans_view.plans.iter().position(|p| p.id == plan.id) {
+                                st.plans_view.plans[pos] = plan;
+                            } else {
+                                st.plans_view.plans.push(plan);
+                            }
+                            st.plans_view.expanded_plans.insert(plan_id);
+                            st.plans_view.clamp_selection();
+                            st.plans_view.scroll_to_selected();
+                            let msg = match explanation {
+                                Some(exp) if !exp.trim().is_empty() => {
+                                    format!("Plan '{}' refined: {}", plan_title, exp)
+                                }
+                                _ => format!("Plan '{}' refined successfully by architect", plan_title),
+                            };
+                            st.notify_success(msg);
+                        }
+                        tauqe_protocol::PlanRefineResult::Blocked { reason } => {
+                            let target_plan_id = refining_plan_id.unwrap_or_else(|| {
+                                st.plans_view.selected_row().map(|r| r.plan_id().to_string()).unwrap_or_default()
+                            });
+                            let plan_title = st.plans_view.plans.iter()
+                                .find(|p| p.id == target_plan_id)
+                                .map(|p| p.title.clone())
+                                .unwrap_or_else(|| "Plan".to_string());
+                            st.plans_view.refine_blocked = Some(crate::ui::plans::PlanRefineBlockedState {
+                                plan_id: target_plan_id,
+                                plan_title,
+                                reason,
+                            });
+                            st.view_mode = ViewMode::Plans;
+                            st.notify_warning("Plan refinement blocked by architect: review required");
+                        }
+                    }
+                }
+            }
             methods::SYSTEM_STATUS
             | methods::CONFIG_RELOAD
             | methods::CONFIG_CREATE

@@ -26,7 +26,7 @@ pub const DEVELOP_COMMANDS: &[KeyCommand] = &[
     KeyCommand { key: "Alt+D", description: "Kill word forward into kill ring" },
     KeyCommand { key: "C-D / Delete", description: "Delete character forward" },
     KeyCommand { key: "C-B / C-F / Left / Right", description: "Move cursor character backward / forward" },
-    KeyCommand { key: "C-Y", description: "Yank (restore) text from kill ring" },
+    KeyCommand { key: "C-Y", description: "Yank (paste) text from clipboard or kill ring" },
     KeyCommand { key: "Esc", description: "Interrupt generation or clear prompt (saves to kill ring); leave Viewport" },
     KeyCommand { key: "C-Z / Alt+U", description: "Undo last AI commit" },
     KeyCommand { key: "F6 / C-S", description: "Squash commits dialog" },

@@ -5,6 +5,8 @@ pub const REPOSITORY_INIT: &str = "repository/init";
 pub const MODEL_ASK: &str = "model/ask";
 pub const MODEL_CANCEL: &str = "model/cancel";
 pub const MODEL_CLEAR_HISTORY: &str = "model/clearHistory";
+pub const MODEL_SELECT: &str = "model/select";
+pub const MODEL_CURRENT: &str = "model/current";
 
 pub const CONTEXT_GET: &str = "context/get";
 pub const CONTEXT_ADD: &str = "context/add";
@@ -47,3 +49,4 @@ pub const PLAN_UPDATE_ITEM: &str = "plan/updateItem";
 pub const PLAN_DELETE: &str = "plan/delete";
 pub const PLAN_SET_ACTIVE: &str = "plan/setActive";
 pub const PLAN_EXECUTE_STEP: &str = "plan/executeStep";
+pub const PLAN_REFINE: &str = "plan/refine";

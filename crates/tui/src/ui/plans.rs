@@ -4,7 +4,7 @@ use ratatui::layout::Rect;
 use ratatui::style::{Color, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Padding, Paragraph};
-use tauqe_protocol::{Plan, PlanItem, PlanItemStatus};
+use tauqe_protocol::{ModelSelection, Plan, PlanItem, PlanItemStatus};
 
 use crate::app::AppState;
 use crate::ui::wrap_lines;
@@ -43,6 +43,23 @@ impl VisiblePlanRow {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct PlanRefineDialogState {
+    pub plan_id: String,
+    pub plan_title: String,
+    pub models: Vec<(String, Option<ModelSelection>)>,
+    pub selected_model_index: usize,
+    pub instructions_editor: crate::editor::InputEditor,
+    pub confirm_button: crate::app::ConfirmDialogButton,
+}
+
+#[derive(Debug, Clone)]
+pub struct PlanRefineBlockedState {
+    pub plan_id: String,
+    pub plan_title: String,
+    pub reason: String,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct PlansViewState {
     pub plans: Vec<Plan>,
@@ -54,6 +71,10 @@ pub struct PlansViewState {
     pub content_width: usize,
     pub rendered_lines: usize,
     pub status_message: Option<String>,
+    pub refining: bool,
+    pub refining_plan_id: Option<String>,
+    pub refine_dialog: Option<PlanRefineDialogState>,
+    pub refine_blocked: Option<PlanRefineBlockedState>,
 }
 
 impl PlansViewState {
@@ -650,22 +671,18 @@ pub fn render_plans_view(
                 Style::default().fg(Color::Yellow).bold(),
             ));
         }
+        if state.plans_view.refining {
+            status_spans.push(Span::styled(
+                " | [REFINING: AI Architect is analyzing codebase...]",
+                Style::default().fg(Color::Yellow).bold(),
+            ));
+        }
     }
     let status_line = Line::from(status_spans);
 
     let info_widget = Paragraph::new(vec![status_line])
         .block(Block::default().padding(Padding::horizontal(1)));
     frame.render_widget(info_widget, info_area);
-
-    if let Some(plan_id) = &state.confirm_delete_plan {
-        crate::ui::dialogs::render_confirm_delete_plan_popup(frame, plan_id, state);
-    }
-    if state.confirm_execute_scope.is_some() {
-        crate::ui::dialogs::render_confirm_execute_scope_popup(frame, state);
-    }
-    if let Some(discuss) = &state.discuss_plan_dialog {
-        crate::ui::dialogs::render_discuss_plan_dialog(frame, discuss);
-    }
 }
 
 #[cfg(test)]

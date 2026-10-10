@@ -40,6 +40,100 @@ impl std::fmt::Display for ModelRef {
     }
 }
 
+/// Three-tier model hierarchy classification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelTier {
+    Junior,
+    Middle,
+    Senior,
+}
+
+impl std::fmt::Display for ModelTier {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ModelTier::Junior => f.write_str("junior"),
+            ModelTier::Middle => f.write_str("middle"),
+            ModelTier::Senior => f.write_str("senior"),
+        }
+    }
+}
+
+impl std::str::FromStr for ModelTier {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_lowercase().as_str() {
+            "junior" => Ok(ModelTier::Junior),
+            "middle" => Ok(ModelTier::Middle),
+            "senior" => Ok(ModelTier::Senior),
+            other => Err(format!(
+                "Unknown model tier '{}'. Expected junior, middle, or senior",
+                other
+            )),
+        }
+    }
+}
+
+/// Target model selection: either an abstract tier or an explicit model reference.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ModelSelection {
+    Tier(ModelTier),
+    Specific(ModelRef),
+}
+
+impl std::fmt::Display for ModelSelection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ModelSelection::Tier(tier) => write!(f, "{}", tier),
+            ModelSelection::Specific(model) => write!(f, "{}", model),
+        }
+    }
+}
+
+impl Default for ModelSelection {
+    fn default() -> Self {
+        ModelSelection::Tier(ModelTier::Middle)
+    }
+}
+
+/// Summary of effective concrete models assigned to each tier.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelTiersSummary {
+    pub junior: ModelRef,
+    pub middle: ModelRef,
+    pub senior: ModelRef,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelSelectParams {
+    pub selection: ModelSelection,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelSelectResult {
+    pub selection: ModelSelection,
+    pub effective_model: ModelRef,
+    pub tiers: ModelTiersSummary,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelCurrentResult {
+    pub selection: ModelSelection,
+    pub effective_model: ModelRef,
+    pub tiers: ModelTiersSummary,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub available_models: Vec<ModelRef>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelChangedEvent {
+    pub selection: ModelSelection,
+    pub effective_model: ModelRef,
+    pub tiers: ModelTiersSummary,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelAskParams {
     pub prompt: String,
@@ -88,9 +182,12 @@ pub struct ModelResultProposal {
     #[serde(default)]
     pub context_requests: Vec<String>,
     #[serde(default)]
+    pub context_drops: Vec<String>,
+    #[serde(default)]
     pub suggested_actions: Vec<String>,
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ModelResult {
@@ -197,6 +294,34 @@ mod tests {
         let json = serde_json::to_string(&model).unwrap();
         let de: ModelRef = serde_json::from_str(&json).unwrap();
         assert_eq!(de, model);
+    }
+
+    #[test]
+    fn test_model_tier_and_selection_serde() {
+        let tier = ModelTier::Junior;
+        let tier_json = serde_json::to_string(&tier).unwrap();
+        assert_eq!(tier_json, "\"junior\"");
+        assert_eq!(serde_json::from_str::<ModelTier>("\"junior\"").unwrap(), ModelTier::Junior);
+
+        let sel_tier = ModelSelection::Tier(ModelTier::Middle);
+        let sel_tier_json = serde_json::to_string(&sel_tier).unwrap();
+        assert_eq!(sel_tier_json, "\"middle\"");
+        assert_eq!(serde_json::from_str::<ModelSelection>("\"middle\"").unwrap(), sel_tier);
+
+        let specific = ModelRef::openrouter("anthropic/claude-3.5-sonnet");
+        let sel_spec = ModelSelection::Specific(specific.clone());
+        let sel_spec_json = serde_json::to_string(&sel_spec).unwrap();
+        assert!(sel_spec_json.contains("\"provider\":\"openrouter\""));
+        assert_eq!(serde_json::from_str::<ModelSelection>(&sel_spec_json).unwrap(), sel_spec);
+
+        let summary = ModelTiersSummary {
+            junior: ModelRef::openrouter("j"),
+            middle: ModelRef::openrouter("m"),
+            senior: ModelRef::openrouter("s"),
+        };
+        let summary_json = serde_json::to_string(&summary).unwrap();
+        let de_summary: ModelTiersSummary = serde_json::from_str(&summary_json).unwrap();
+        assert_eq!(de_summary, summary);
     }
 
     #[test]

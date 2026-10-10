@@ -3,7 +3,7 @@ use std::sync::Arc;
 use tokio::sync::watch;
 use tauqe_core::edits::{EditProtocolFactory, XmlEditProtocol};
 use tauqe_core::providers::{create_provider, LlmProvider, StreamEvent};
-use tauqe_core::workflow::{GitEditWorkflow, WorkflowFactory};
+use tauqe_core::workflow::GitEditWorkflow;
 use tauqe_protocol::{
     events, EditFileDoneEvent, EditFileRetryingEvent, EditFileStartedEvent, EditFinishedEvent,
     EditHunkEvent, EditStartedEvent, Event, GitCommitCreatedEvent, ModelAskParams, ModelResultEvent,
@@ -29,7 +29,7 @@ pub async fn handle_model_ask(req: Request, state: &Arc<AppState>) -> Response {
         }
     };
 
-    match start_model_turn(state, params.prompt).await {
+    match start_model_turn(state, params.prompt, None).await {
         Ok(op_id) => Response {
             id: req.id,
             result: Some(serde_json::json!({ "operation_id": op_id })),
@@ -43,10 +43,93 @@ pub async fn handle_model_ask(req: Request, state: &Arc<AppState>) -> Response {
     }
 }
 
-pub async fn start_model_turn(state: &Arc<AppState>, prompt: String) -> Result<String, ResponseError> {
-    let (provider, model, app_config) = {
+pub async fn handle_model_select(req: Request, state: &Arc<AppState>) -> Response {
+    if state.active_cancel.lock().await.is_some() {
+        return Response {
+            id: req.id,
+            result: None,
+            error: Some(ResponseError {
+                code: "OPERATION_IN_PROGRESS".to_string(),
+                message: "Cannot change model while an operation is in progress".to_string(),
+                data: None,
+            }),
+        };
+    }
+
+    let params: tauqe_protocol::ModelSelectParams = match req.params.and_then(|p| serde_json::from_value(p).ok()) {
+        Some(p) => p,
+        None => {
+            return Response {
+                id: req.id,
+                result: None,
+                error: Some(ResponseError {
+                    code: "INVALID_PARAMS".to_string(),
+                    message: "Missing or invalid model selection".to_string(),
+                    data: None,
+                }),
+            };
+        }
+    };
+
+    let (selection, effective_model, tiers) = {
+        let mut cur = state.current_selection.lock().await;
+        *cur = params.selection.clone();
         let cfg = state.config.lock().await;
-        let model = cfg.active_model();
+        let effective = cfg.resolve_model(&cur);
+        let tiers = cfg.tiers_summary();
+        (cur.clone(), effective, tiers)
+    };
+
+    state.out.send_event(&Event {
+        method: events::MODEL_CHANGED.to_string(),
+        params: serde_json::to_value(tauqe_protocol::ModelChangedEvent {
+            selection: selection.clone(),
+            effective_model: effective_model.clone(),
+            tiers: tiers.clone(),
+        })
+        .ok(),
+    });
+
+    Response::ok_typed(
+        req.id,
+        &tauqe_protocol::ModelSelectResult {
+            selection,
+            effective_model,
+            tiers,
+        },
+    )
+}
+
+pub async fn handle_model_current(req: Request, state: &Arc<AppState>) -> Response {
+    let selection = state.current_selection().await;
+    let cfg = state.config.lock().await;
+    let effective_model = cfg.resolve_model(&selection);
+    let tiers = cfg.tiers_summary();
+    let available_models = cfg.available_models();
+
+    Response::ok_typed(
+        req.id,
+        &tauqe_protocol::ModelCurrentResult {
+            selection,
+            effective_model,
+            tiers,
+            available_models,
+        },
+    )
+}
+
+pub async fn start_model_turn(
+    state: &Arc<AppState>,
+    prompt: String,
+    custom_selection: Option<tauqe_protocol::ModelSelection>,
+) -> Result<String, ResponseError> {
+    let (provider, model, app_config, selection) = {
+        let cfg = state.config.lock().await;
+        let selection = match custom_selection {
+            Some(s) => s,
+            None => state.current_selection.lock().await.clone(),
+        };
+        let model = cfg.resolve_model(&selection);
         let provider: Arc<dyn LlmProvider> = match create_provider(model.provider, &cfg) {
             Ok(p) => Arc::from(p),
             Err(err) => {
@@ -58,7 +141,7 @@ pub async fn start_model_turn(state: &Arc<AppState>, prompt: String) -> Result<S
             }
         };
 
-        (provider, model, cfg.clone())
+        (provider, model, cfg.clone(), selection)
     };
 
     let op_id = format!("op-{}", next_operation_id());
@@ -93,15 +176,12 @@ pub async fn start_model_turn(state: &Arc<AppState>, prompt: String) -> Result<S
         let protocol = EditProtocolFactory::create_protocol(&app_config.develop.protocol)
             .unwrap_or_else(|_| Box::new(XmlEditProtocol));
 
-        let workflow = WorkflowFactory::create_workflow_from_app_config(
-            &app_config.develop.workflow,
-            &app_config,
-        )
-        .unwrap_or_else(|_| {
-            Box::new(GitEditWorkflow {
-                options: tauqe_core::workflow::WorkflowOptions::from_app_config(&app_config),
-            })
-        });
+        let mut workflow_opts = tauqe_core::workflow::WorkflowOptions::from_app_config(&app_config);
+        workflow_opts.initial_selection = Some(selection);
+        let workflow: Box<dyn tauqe_core::workflow::EditWorkflow> = match app_config.develop.workflow.trim().to_lowercase().as_str() {
+            "naive" => Box::new(tauqe_core::workflow::NaiveEditWorkflow { options: workflow_opts }),
+            _ => Box::new(GitEditWorkflow { options: workflow_opts }),
+        };
 
         let (wf_tx, wf_rx) = (tx.clone(), cancel_rx.clone());
         drop(tx); // Drop local tx clone so rx closes when wf_task finishes

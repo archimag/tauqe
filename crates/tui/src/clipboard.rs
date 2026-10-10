@@ -29,6 +29,34 @@ pub fn is_ssh_session() -> bool {
         || std::env::var_os("SSH_CLIENT").is_some()
 }
 
+/// Reads plain text from the native OS clipboard, re-initializing the handle if necessary.
+pub fn get_from_clipboard() -> Option<String> {
+    if let Ok(mut guard) = CLIPBOARD.lock() {
+        if guard.is_none() {
+            *guard = arboard::Clipboard::new().ok();
+        }
+
+        if let Some(clipboard) = guard.as_mut() {
+            match clipboard.get_text() {
+                Ok(text) if !text.is_empty() => return Some(text),
+                Ok(_) => return None,
+                Err(_) => {}
+            }
+        }
+
+        if let Ok(mut new_cb) = arboard::Clipboard::new() {
+            let res = new_cb.get_text().ok();
+            *guard = Some(new_cb);
+            if let Some(text) = res {
+                if !text.is_empty() {
+                    return Some(text);
+                }
+            }
+        }
+    }
+    None
+}
+
 pub fn copy_to_clipboard(text: &str) -> CopyResult {
     let clean_text = text.trim_end_matches(['\r', '\n']);
     let mut native_ok = false;

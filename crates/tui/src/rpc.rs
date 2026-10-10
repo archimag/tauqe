@@ -25,6 +25,7 @@ mod tests {
             req_id,
             OptimisticRollback::ActiveModel {
                 prev_model: ModelRef::openrouter("test/prev"),
+                prev_selection: tauqe_protocol::ModelSelection::default(),
             },
         );
         let rollback = take_optimistic_rollback(req_id);

@@ -18,6 +18,7 @@ pub const PLANS_COMMANDS: &[KeyCommand] = &[
     KeyCommand { key: "x", description: "Execute target step, group, or entire plan (with confirmation)" },
     KeyCommand { key: "Enter", description: "Execute leaf step; fold/unfold on groups and plan headers" },
     KeyCommand { key: "d", description: "Discuss selected step or entire plan with AI in Develop" },
+    KeyCommand { key: "R", description: "Deep refine plan architecture & steps with AI (Architect)" },
     KeyCommand { key: "t / s", description: "Change item status (Todo / InProgress / Done / Cancelled)" },
     KeyCommand { key: "a", description: "Toggle fold / unfold all plans and items" },
     KeyCommand { key: "Delete", description: "Delete plan (with confirmation)" },
@@ -279,7 +280,40 @@ pub async fn handle_plans_key(
                 }
             }
         }
-        KeyCode::Char('r') | KeyCode::Char('R') => {
+        KeyCode::Char('R') => {
+            if st.model.is_busy() || st.review.running || st.plans_view.refining {
+                st.notify_warning("Model is currently busy; wait for operation to finish");
+                return Ok(InputResult::Continue);
+            }
+            let sel_row = st.plans_view.selected_row();
+            if let Some(row) = sel_row {
+                let plan_id = row.plan_id().to_string();
+                if let Some(plan) = st.plans_view.plans.iter().find(|p| p.id == plan_id).cloned() {
+                    let mut models = vec![
+                        (format!("Default ({})", st.active_model), None),
+                    ];
+                    let senior_label = if let Some(tiers) = &st.model_choice.tiers {
+                        format!("Senior Architect ({})", tiers.senior)
+                    } else {
+                        "Senior Architect (tier)".to_string()
+                    };
+                    models.push((
+                        senior_label,
+                        Some(tauqe_protocol::ModelSelection::Tier(tauqe_protocol::ModelTier::Senior)),
+                    ));
+
+                    st.plans_view.refine_dialog = Some(crate::ui::plans::PlanRefineDialogState {
+                        plan_id: plan.id,
+                        plan_title: plan.title,
+                        models,
+                        selected_model_index: 0,
+                        instructions_editor: InputEditor::default(),
+                        confirm_button: crate::app::ConfirmDialogButton::Cancel,
+                    });
+                }
+            }
+        }
+        KeyCode::Char('r') => {
             drop(st);
             send_request(server_writer, methods::PLAN_LIST, serde_json::json!({})).await?;
         }

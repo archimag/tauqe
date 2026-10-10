@@ -84,6 +84,12 @@ pub struct DiscussionResponse {
         skip_serializing_if = "Vec::is_empty"
     )]
     pub context_requests: Vec<DiscussionContextRequest>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_null_as_default",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub context_drops: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_language: Option<String>,
 }
@@ -94,6 +100,7 @@ impl DiscussionResponse {
             message: message.into(),
             plan_update: None,
             context_requests: Vec::new(),
+            context_drops: Vec::new(),
             user_language: None,
         }
     }
@@ -105,6 +112,11 @@ impl DiscussionResponse {
 
     pub fn with_context_requests(mut self, requests: Vec<DiscussionContextRequest>) -> Self {
         self.context_requests = requests;
+        self
+    }
+
+    pub fn with_context_drops(mut self, drops: Vec<String>) -> Self {
+        self.context_drops = drops;
         self
     }
 
@@ -157,12 +169,12 @@ pub fn discussion_response_schema() -> serde_json::Value {
                 "anyOf": [
                     {
                         "type": "object",
-                        "description": "Modifications or creation/deletion of plan items",
+                        "description": "Modifications or creation/deletion of plan items. Must be null unless the user explicitly requested to update or modify the plan.",
                         "properties": {
                             "action": {
                                 "type": "string",
                                 "enum": ["update", "save", "delete"],
-                                "description": "Action to perform on the plan"
+                                "description": "Action to perform: 'save' to create or completely overwrite/replace the entire plan and step tree, 'update' to modify individual existing items by ID, or 'delete' to remove the plan"
                             },
                             "id": {
                                 "anyOf": [
@@ -204,7 +216,7 @@ pub fn discussion_response_schema() -> serde_json::Value {
             },
             "context_requests": {
                 "type": "array",
-                "description": "Files to request into context for inspection or editable access",
+                "description": "Files to request into context for inspection or editable access (in snapshot discovery mode, specify the complete active set of auto-context files)",
                 "items": {
                     "type": "object",
                     "properties": {
@@ -222,6 +234,13 @@ pub fn discussion_response_schema() -> serde_json::Value {
                     "additionalProperties": false
                 }
             },
+            "context_drops": {
+                "type": "array",
+                "description": "Files to drop from auto context if no longer needed (used in incremental discovery mode to release irrelevant files)",
+                "items": {
+                    "type": "string"
+                }
+            },
             "user_language": {
                 "anyOf": [
                     { "type": "string" },
@@ -230,7 +249,7 @@ pub fn discussion_response_schema() -> serde_json::Value {
                 "description": "Detected primary natural language of user prompt (e.g. Russian, English)"
             }
         },
-        "required": ["message", "plan_update", "context_requests", "user_language"],
+        "required": ["message", "plan_update", "context_requests", "context_drops", "user_language"],
         "additionalProperties": false,
         "$defs": {
             "PlanItem": {
@@ -243,14 +262,14 @@ pub fn discussion_response_schema() -> serde_json::Value {
                     },
                     "title": {
                         "type": "string",
-                        "description": "Short title of the step"
+                        "description": "Short title of the step in the same language as the plan description and user request"
                     },
                     "details": {
                         "anyOf": [
                             { "type": "string" },
                             { "type": "null" }
                         ],
-                        "description": "Detailed description, requirements, or execution criteria"
+                        "description": "Detailed description, requirements, or execution criteria in the same language as the plan description"
                     },
                     "status": {
                         "type": "string",
@@ -306,6 +325,7 @@ mod tests {
         assert_eq!(resp.message, "Hello developer!");
         assert!(resp.plan_update.is_none());
         assert!(resp.context_requests.is_empty());
+        assert!(resp.context_drops.is_empty());
         assert!(resp.user_language.is_none());
     }
 
@@ -315,12 +335,14 @@ mod tests {
             "message": "Acknowledged",
             "plan_update": null,
             "context_requests": null,
+            "context_drops": null,
             "user_language": null
         }"#;
         let resp: DiscussionResponse = serde_json::from_str(raw).unwrap();
         assert_eq!(resp.message, "Acknowledged");
         assert!(resp.plan_update.is_none());
         assert!(resp.context_requests.is_empty());
+        assert!(resp.context_drops.is_empty());
         assert!(resp.user_language.is_none());
     }
 
@@ -366,11 +388,13 @@ mod tests {
         let msg_idx = schema_str.find("\"message\"").expect("message found");
         let plan_idx = schema_str.find("\"plan_update\"").expect("plan_update found");
         let ctx_idx = schema_str.find("\"context_requests\"").expect("context_requests found");
+        let drops_idx = schema_str.find("\"context_drops\"").expect("context_drops found");
         let lang_idx = schema_str.find("\"user_language\"").expect("user_language found");
 
         assert!(msg_idx < plan_idx);
         assert!(plan_idx < ctx_idx);
-        assert!(ctx_idx < lang_idx);
+        assert!(ctx_idx < drops_idx);
+        assert!(drops_idx < lang_idx);
     }
 
     #[test]

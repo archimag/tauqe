@@ -26,9 +26,12 @@ use review::render_review_view;
 pub use dialogs::{
     render_confirm_cancel_popup, render_confirm_clear_auto_popup,
     render_confirm_clear_history_popup, render_confirm_delete_plan_popup,
-    render_confirm_quit_popup, render_confirm_undo_popup,
-    render_disconnected_popup, render_help_popup, render_review_dialog, render_selection_dialog,
-    render_squash_popup, render_status_dialog, selection_dialog_area,
+    render_confirm_delete_review_popup, render_confirm_execute_review_popup,
+    render_confirm_execute_scope_popup, render_confirm_quit_popup, render_confirm_undo_popup,
+    render_disconnected_popup, render_discuss_plan_dialog, render_discuss_review_dialog,
+    render_help_popup, render_plan_refine_blocked_dialog, render_plan_refine_dialog,
+    render_review_dialog, render_selection_dialog, render_squash_popup, render_status_dialog,
+    selection_dialog_area,
 };
 pub use footer::{extract_current_round, format_footer_cost, render_footer};
 pub use geometry::centered_rect;
@@ -134,6 +137,20 @@ pub fn render_ui(frame: &mut ratatui::Frame, state: &mut AppState) {
         render_confirm_clear_auto_popup(frame, state);
     } else if let Some(plan_id) = &state.confirm_delete_plan {
         render_confirm_delete_plan_popup(frame, plan_id, state);
+    } else if let Some(session_id) = &state.confirm_delete_review {
+        render_confirm_delete_review_popup(frame, session_id, state);
+    } else if state.confirm_execute_scope.is_some() {
+        render_confirm_execute_scope_popup(frame, state);
+    } else if state.confirm_execute_review.is_some() {
+        render_confirm_execute_review_popup(frame, state);
+    } else if let Some(discuss) = &state.discuss_plan_dialog {
+        render_discuss_plan_dialog(frame, discuss);
+    } else if let Some(discuss) = &state.discuss_review_dialog {
+        render_discuss_review_dialog(frame, discuss);
+    } else if let Some(dialog) = &state.plans_view.refine_dialog {
+        render_plan_refine_dialog(frame, dialog);
+    } else if let Some(blocked) = &state.plans_view.refine_blocked {
+        render_plan_refine_blocked_dialog(frame, blocked);
     } else if let Some(dialog) = &state.status_dialog {
         render_status_dialog(frame, dialog);
     } else if let Some(dialog) = &state.selection_dialog {

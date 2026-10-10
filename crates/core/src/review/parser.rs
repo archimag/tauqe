@@ -26,6 +26,7 @@ pub fn parse_review_findings(raw_markdown: &str) -> Vec<ReviewItem> {
                 title: t,
                 severity,
                 status: ReviewItemStatus::Discussion,
+                model: None,
                 file_path: file_path.take(),
                 line_range: line_range.take(),
                 body,
@@ -98,6 +99,7 @@ pub fn parse_review_findings(raw_markdown: &str) -> Vec<ReviewItem> {
             items.push(ReviewItem {
                 id: 1,
                 title: "General Review Findings".to_string(),
+                model: None,
                 severity: ReviewSeverity::Info,
                 status: ReviewItemStatus::Discussion,
                 file_path: None,

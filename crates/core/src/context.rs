@@ -248,6 +248,23 @@ impl ContextManager {
         }
     }
 
+    /// Drops a file strictly from the auto context layer.
+    /// Files present in `user` or `pinned` layers are never removed and return `Ok(false)`.
+    pub fn drop_auto_file(&mut self, relative_path: &str) -> Result<bool> {
+        let clean_path = self.normalize_path(relative_path)?;
+        if self.auto.remove(&clean_path).is_some() {
+            self.revision += 1;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    /// Returns all paths currently tracked in the auto context layer.
+    pub fn auto_files(&self) -> Vec<String> {
+        self.auto.keys().cloned().collect()
+    }
+
     /// Adds all repository files matching a glob pattern or directory prefix.
     ///
     /// Skips files already present in context.
@@ -694,5 +711,83 @@ mod tests {
 
         primary.merge_turn_context(&turn_snapshot);
         assert!(primary.is_editable("pinned.rs").unwrap());
+    }
+
+    #[test]
+    fn test_drop_auto_file_removes_only_from_auto_and_preserves_other_layers() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        std::fs::write(root.join("pinned.rs"), "fn pinned() {}").unwrap();
+        std::fs::write(root.join("user.rs"), "fn user() {}").unwrap();
+        std::fs::write(root.join("auto.rs"), "fn auto() {}").unwrap();
+
+        let mut cm = ContextManager::new(root);
+        cm.load_pinned(&["pinned.rs".to_string()]);
+        cm.add_file("user.rs", ContextAccess::ReadOnly).unwrap();
+        cm.add_auto_file("auto.rs", ContextAccess::ReadOnly).unwrap();
+
+        assert_eq!(cm.auto_files(), vec!["auto.rs".to_string()]);
+
+        // Dropping auto file succeeds
+        assert!(cm.drop_auto_file("auto.rs").unwrap());
+        assert!(!cm.contains("auto.rs").unwrap());
+        assert!(cm.auto_files().is_empty());
+
+        // Attempting to drop pinned or user files fails safely
+        assert!(!cm.drop_auto_file("pinned.rs").unwrap());
+        assert!(cm.contains("pinned.rs").unwrap());
+
+        assert!(!cm.drop_auto_file("user.rs").unwrap());
+        assert!(cm.contains("user.rs").unwrap());
+    }
+
+    #[test]
+    fn test_drop_auto_file_normalization_and_revision() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        std::fs::write(root.join("auto.rs"), "fn auto() {}").unwrap();
+
+        let mut cm = ContextManager::new(root);
+        cm.add_auto_file("auto.rs", ContextAccess::ReadOnly).unwrap();
+        let rev_before = cm.get_state().revision;
+
+        // Dropping non-existent path doesn't change revision
+        assert!(!cm.drop_auto_file("nonexistent.rs").unwrap());
+        assert_eq!(cm.get_state().revision, rev_before);
+
+        // Dropping with relative/un-normalized path succeeds and bumps revision
+        assert!(cm.drop_auto_file("./dir/../auto.rs").unwrap());
+        assert!(!cm.contains("auto.rs").unwrap());
+        assert!(cm.get_state().revision > rev_before);
+    }
+
+    #[test]
+    fn test_merge_turn_context_reflects_auto_eviction() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        std::fs::write(root.join("pinned.rs"), "fn pinned() {}").unwrap();
+        std::fs::write(root.join("user.rs"), "fn user() {}").unwrap();
+        std::fs::write(root.join("auto1.rs"), "fn auto1() {}").unwrap();
+        std::fs::write(root.join("auto2.rs"), "fn auto2() {}").unwrap();
+
+        let mut primary = ContextManager::new(root.clone());
+        primary.load_pinned(&["pinned.rs".to_string()]);
+        primary.add_file("user.rs", ContextAccess::ReadOnly).unwrap();
+        primary.add_auto_file("auto1.rs", ContextAccess::ReadOnly).unwrap();
+
+        let mut turn = primary.clone();
+        // During turn, auto1 is dropped/evicted, auto2 is added
+        turn.drop_auto_file("auto1.rs").unwrap();
+        turn.add_auto_file("auto2.rs", ContextAccess::ReadOnly).unwrap();
+
+        primary.merge_turn_context(&turn);
+
+        // auto1 evicted from primary
+        assert!(!primary.contains("auto1.rs").unwrap());
+        // auto2 added to primary
+        assert!(primary.contains("auto2.rs").unwrap());
+        // pinned and user preserved
+        assert!(primary.contains("pinned.rs").unwrap());
+        assert!(primary.contains("user.rs").unwrap());
     }
 }

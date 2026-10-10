@@ -32,6 +32,10 @@ fn next_simple_tag(text: &str, open: &str) -> Option<(usize, usize)> {
             .next()
             .is_some_and(|c| c.is_whitespace() || c == '>' || c == '/');
         if boundary {
+            if is_inside_markdown_code(text, start) {
+                from = after;
+                continue;
+            }
             let gt = rest.find('>')?;
             let mut end = after + idx + gt + 1;
             if !rest[..gt].trim_end().ends_with('/') {
@@ -65,6 +69,11 @@ pub(crate) fn next_context_request_tag(text: &str) -> Option<(usize, usize)> {
     next_simple_tag(text, "<context_request")
 }
 
+/// Locates the next complete `<context_drop .../>` tag (unsuffixed dialect).
+pub(crate) fn next_context_drop_tag(text: &str) -> Option<(usize, usize)> {
+    next_simple_tag(text, "<context_drop")
+}
+
 /// Locates the next complete `<doc_request .../>` tag.
 pub(crate) fn next_doc_request_tag(text: &str) -> Option<(usize, usize)> {
     next_simple_tag(text, "<doc_request")
@@ -73,6 +82,42 @@ pub(crate) fn next_doc_request_tag(text: &str) -> Option<(usize, usize)> {
 /// Locates the next complete `<verify .../>` or `<verify>...</verify>` tag.
 pub(crate) fn next_verify_tag(text: &str) -> Option<(usize, usize)> {
     next_simple_tag(text, "<verify")
+}
+
+/// Returns true if byte offset `target_pos` in `text` is inside an inline markdown code span (`...`).
+fn is_inside_inline_code(text: &str, target_pos: usize) -> bool {
+    let line_start = text[..target_pos].rfind('\n').map_or(0, |i| i + 1);
+    let line_end = text[target_pos..].find('\n').map_or(text.len(), |i| target_pos + i);
+    let line = &text[line_start..line_end];
+    let rel_pos = target_pos - line_start;
+
+    let mut i = 0;
+    let bytes = line.as_bytes();
+    while i < bytes.len() {
+        if bytes[i] == b'`' {
+            let start_bt = i;
+            while i < bytes.len() && bytes[i] == b'`' {
+                i += 1;
+            }
+            let bt_len = i - start_bt;
+            let delimiter = "`".repeat(bt_len);
+            if let Some(close_rel) = line[i..].find(&delimiter) {
+                let span_end = i + close_rel + bt_len;
+                if rel_pos >= start_bt && rel_pos < span_end {
+                    return true;
+                }
+                i = span_end;
+                continue;
+            } else {
+                if rel_pos >= start_bt {
+                    return true;
+                }
+                break;
+            }
+        }
+        i += 1;
+    }
+    false
 }
 
 /// Returns true if byte offset `target_pos` in `text` is inside a markdown fenced code block (``` or ~~~).
@@ -139,6 +184,11 @@ fn is_inside_code_fence(text: &str, target_pos: usize) -> bool {
     in_fence.is_some() && target_pos >= line_start
 }
 
+/// Returns true if byte offset `target_pos` in `text` is inside a markdown code block (fenced or inline).
+fn is_inside_markdown_code(text: &str, target_pos: usize) -> bool {
+    is_inside_code_fence(text, target_pos) || is_inside_inline_code(text, target_pos)
+}
+
 /// Locates the next complete `<plan ...>...</plan>` or `<plan .../>` tag.
 pub(crate) fn next_plan_tag(text: &str) -> Option<(usize, usize)> {
     const OPEN: &str = "<plan";
@@ -172,7 +222,7 @@ pub(crate) fn next_plan_tag(text: &str) -> Option<(usize, usize)> {
             .next()
             .is_some_and(|c| c.is_whitespace() || c == '>' || c == '/');
         if boundary {
-            if is_inside_code_fence(text, start) {
+            if is_inside_markdown_code(text, start) {
                 from = after;
                 continue;
             }
@@ -215,6 +265,10 @@ pub(crate) fn next_user_language_tag(text: &str) -> Option<(usize, usize)> {
             .next()
             .is_some_and(|c| c.is_whitespace() || c == '>' || c == '/');
         if boundary {
+            if is_inside_markdown_code(text, start) {
+                from = after;
+                continue;
+            }
             let gt = rest.find('>')?;
             let end_open = after + idx + gt + 1;
             if rest[..gt].trim_end().ends_with('/') {
@@ -327,6 +381,11 @@ pub fn strip_context_request_tags(text: &str) -> String {
     strip_tags(text, next_context_request_tag)
 }
 
+/// Removes all context drop tags from text.
+pub fn strip_context_drop_tags(text: &str) -> String {
+    strip_tags(text, next_context_drop_tag)
+}
+
 /// Removes all documentation request tags from text.
 pub fn strip_doc_request_tags(text: &str) -> String {
     strip_tags(text, next_doc_request_tag)
@@ -340,7 +399,7 @@ pub fn strip_plan_tags(text: &str) -> String {
 /// Completion signal emitted by the model when finishing a plan step.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlanStepDone {
-    pub id: String,
+    pub id: Option<String>,
     pub note: Option<String>,
 }
 
@@ -368,7 +427,7 @@ pub(crate) fn next_plan_step_done_tag(text: &str) -> Option<(usize, usize)> {
             .next()
             .is_some_and(|c| c.is_whitespace() || c == '>' || c == '/');
         if boundary {
-            if is_inside_code_fence(text, start) {
+            if is_inside_markdown_code(text, start) {
                 from = after;
                 continue;
             }
@@ -400,26 +459,24 @@ pub fn extract_plan_step_done(text: &str) -> Vec<PlanStepDone> {
         let tag = &text[abs_start..abs_end];
         let header_end = tag.find('>').unwrap_or(tag.len());
         let header = &tag[..header_end];
-        let id_opt = extract_attribute(header, "id").or_else(|| extract_attribute(header, "item"));
-        if let Some(id) = id_opt {
-            let id = id.trim().to_string();
-            if !id.is_empty() {
-                let is_self_closing = header.trim_end().ends_with('/');
-                let mut note = extract_attribute(header, "note");
-                if note.is_none() && !is_self_closing && header_end < tag.len() {
-                    let after_header = &tag[header_end + 1..];
-                    let body = if let Some(close_idx) = after_header.rfind("</") {
-                        after_header[..close_idx].trim()
-                    } else {
-                        after_header.trim()
-                    };
-                    if !body.is_empty() {
-                        note = Some(body.to_string());
-                    }
-                }
-                results.push(PlanStepDone { id, note });
+        let id = extract_attribute(header, "id")
+            .or_else(|| extract_attribute(header, "item"))
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        let is_self_closing = header.trim_end().ends_with('/');
+        let mut note = extract_attribute(header, "note");
+        if note.is_none() && !is_self_closing && header_end < tag.len() {
+            let after_header = &tag[header_end + 1..];
+            let body = if let Some(close_idx) = after_header.rfind("</") {
+                after_header[..close_idx].trim()
+            } else {
+                after_header.trim()
+            };
+            if !body.is_empty() {
+                note = Some(body.to_string());
             }
         }
+        results.push(PlanStepDone { id, note });
         pos = abs_end;
     }
     results
@@ -729,7 +786,7 @@ pub fn parse_plan_tags_with_diagnostics(text: &str) -> (Vec<ParsedPlanTag>, Vec<
             continue;
         }
 
-        if is_inside_code_fence(text, tag_start) {
+        if is_inside_markdown_code(text, tag_start) {
             pos = after_plan;
             continue;
         }
@@ -867,6 +924,28 @@ pub(super) fn parse_context_request_tags(text: &str) -> Vec<ContextRequest> {
     requests
 }
 
+pub fn parse_context_drop_tags(text: &str) -> Vec<String> {
+    let mut drops = Vec::new();
+    let mut pos = 0;
+    while let Some((start, end)) = next_context_drop_tag(&text[pos..]) {
+        let tag = &text[pos + start..pos + end];
+        let header_end = tag.find('>').unwrap_or(tag.len());
+        let header = &tag[..header_end];
+        if let Some(path) = extract_attribute(header, "path") {
+            let path = path
+                .trim()
+                .trim_start_matches("./")
+                .trim_start_matches('/')
+                .to_string();
+            if !path.is_empty() && !drops.contains(&path) {
+                drops.push(path);
+            }
+        }
+        pos += end;
+    }
+    drops
+}
+
 /// Returns the requested documentation topics (lowercase); a missing topic means `all`.
 pub(super) fn parse_doc_request_tags(text: &str) -> Vec<String> {
     let mut topics = Vec::new();
@@ -890,6 +969,19 @@ mod tests {
 
     fn parse_plan_tags(text: &str) -> Vec<ParsedPlanTag> {
         parse_plan_tags_with_diagnostics(text).0
+    }
+
+    #[test]
+    fn test_parse_and_strip_context_drop_tags() {
+        let text = "Dropping:\n<context_drop path=\"crates/a.rs\" />\nMiddle\n<context_drop_ABC path=\"crates/b.rs\"></context_drop_ABC>\nDone.";
+        assert_eq!(
+            parse_context_drop_tags(text),
+            vec!["crates/a.rs".to_string(), "crates/b.rs".to_string()]
+        );
+        assert_eq!(
+            strip_context_drop_tags(text).trim(),
+            "Dropping:\n\nMiddle\n\nDone."
+        );
     }
 
     #[test]
@@ -971,6 +1063,18 @@ Here is our plan:
     }
 
     #[test]
+    fn test_next_simple_tag_ignores_code_fences_and_inline_backticks() {
+        let text = "Here is an example:\n```xml\n<context_request path=\"fence.rs\" />\n```\nAnd inline `<context_request path=\"inline.rs\" />`.\nReal:\n<context_request path=\"real.rs\" />";
+        let reqs = parse_context_request_tags(text);
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(reqs[0].path, "real.rs");
+
+        let doc_text = "See `<doc_request topic=\"git\" />`.\n<doc_request topic=\"interface\" />";
+        let topics = parse_doc_request_tags(doc_text);
+        assert_eq!(topics, vec!["interface".to_string()]);
+    }
+
+    #[test]
     fn test_parse_plan_tags_ignores_markdown_fences() {
         let text = r#"
 Here is an example plan in markdown:
@@ -1005,14 +1109,18 @@ I finished the task:
 <plan_step_done id="2.1" note="JWT validation added" />
 And step 2.2:
 <plan_step_done id="2.2">All handlers updated and tested</plan_step_done>
+And empty tag:
+<plan_step_done />
 All work done.
 "#;
         let extracted = extract_plan_step_done(text);
-        assert_eq!(extracted.len(), 2);
-        assert_eq!(extracted[0].id, "2.1");
+        assert_eq!(extracted.len(), 3);
+        assert_eq!(extracted[0].id.as_deref(), Some("2.1"));
         assert_eq!(extracted[0].note.as_deref(), Some("JWT validation added"));
-        assert_eq!(extracted[1].id, "2.2");
+        assert_eq!(extracted[1].id.as_deref(), Some("2.2"));
         assert_eq!(extracted[1].note.as_deref(), Some("All handlers updated and tested"));
+        assert_eq!(extracted[2].id, None);
+        assert_eq!(extracted[2].note, None);
 
         let stripped = strip_plan_step_done_tags(text);
         assert!(!stripped.contains("<plan_step_done"));
@@ -1032,7 +1140,7 @@ Real:
 "#;
         let extracted = extract_plan_step_done(text);
         assert_eq!(extracted.len(), 1);
-        assert_eq!(extracted[0].id, "real-task");
+        assert_eq!(extracted[0].id.as_deref(), Some("real-task"));
     }
 
     #[test]
@@ -1094,5 +1202,23 @@ Real:
         assert_eq!(p.items[1].id, "2");
         assert_eq!(p.items[1].title, "Compile and run");
         assert_eq!(p.items[1].details.as_deref(), Some("Run cargo run to verify"));
+    }
+
+    #[test]
+    fn test_parse_plan_tags_ignores_legacy_item_tier() {
+        let text = r#"
+<plan action="save" id="tiers" title="Tiers">
+  <item id="1" title="Cheap" tier="junior" />
+  <item id="2" title="Default" status="todo">Body</item>
+  <item id="3" title="Hard" tier="Senior"></item>
+</plan>
+"#;
+        let (plans, errors) = parse_plan_tags_with_diagnostics(text);
+        let items = &plans[0].items;
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[0].id, "1");
+        assert_eq!(items[1].id, "2");
+        assert_eq!(items[2].id, "3");
+        assert!(errors.is_empty(), "Unexpected errors: {:?}", errors);
     }
 }

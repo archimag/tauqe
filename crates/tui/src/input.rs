@@ -106,7 +106,11 @@ pub fn is_text_input_active(st: &AppState) -> bool {
             && !dialog.applying
             && (dialog.custom_input_active || dialog.focus == SquashDialogFocus::MessageEditor);
     }
-    if st.review_dialog.is_some() || st.discuss_plan_dialog.is_some() || st.discuss_review_dialog.is_some() {
+    if st.review_dialog.is_some()
+        || st.discuss_plan_dialog.is_some()
+        || st.discuss_review_dialog.is_some()
+        || st.plans_view.refine_dialog.is_some()
+    {
         return true;
     }
     if st.show_help
@@ -121,6 +125,7 @@ pub fn is_text_input_active(st: &AppState) -> bool {
         || st.selection_dialog.is_some()
         || st.status_dialog.is_some()
         || st.context_view.confirm_clear_auto
+        || st.plans_view.refine_blocked.is_some()
     {
         return false;
     }
@@ -274,6 +279,12 @@ pub fn handle_paste(st: &mut AppState, text: &str) {
         return;
     }
 
+    // 2d. Plan refine dialog modal layer
+    if let Some(dialog) = st.plans_view.refine_dialog.as_mut() {
+        dialog.instructions_editor.insert_paste(text);
+        return;
+    }
+
     // 3. Blocking modals absorb paste without forwarding to background
     if st.show_help
         || st.confirm_undo
@@ -287,6 +298,7 @@ pub fn handle_paste(st: &mut AppState, text: &str) {
         || st.selection_dialog.is_some()
         || st.status_dialog.is_some()
         || st.context_view.confirm_clear_auto
+        || st.plans_view.refine_blocked.is_some()
     {
         return;
     }
@@ -482,17 +494,7 @@ async fn handle_global_shortcuts(
             st.notify_warning("Cannot change model while model is generating");
             return Ok(Some(InputResult::Continue));
         }
-        if !st.available_models.is_empty() {
-            let cur_idx = st
-                .available_models
-                .iter()
-                .position(|m| m == &st.active_model)
-                .unwrap_or(0);
-            st.selection_dialog = Some(crate::app::SelectionDialogState::new(
-                crate::app::SelectionDialogKind::Model,
-                st.available_models.clone(),
-                cur_idx,
-            ));
+        if st.open_model_dialog() {
             return Ok(Some(InputResult::Continue));
         }
     }
@@ -636,6 +638,7 @@ mod tests {
             header_clicks: HeaderClickAreas::default(),
             terminal_focused: true,
             shift_tip_shown: false,
+            model_choice: ModelChoice::default(),
         }
     }
 

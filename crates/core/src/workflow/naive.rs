@@ -34,12 +34,14 @@ impl NaiveEditWorkflow {
     pub fn with_discovery(
         mut self,
         max_discovery_rounds: Option<usize>,
-        max_auto_files_per_round: Option<usize>,
+        max_files: Option<usize>,
     ) -> Self {
         if let Some(rounds) = max_discovery_rounds {
             self.options.max_discovery_rounds = rounds;
         }
-        self.options.max_auto_files_per_round = max_auto_files_per_round;
+        if let Some(files) = max_files {
+            self.options.max_files = files;
+        }
         self
     }
 

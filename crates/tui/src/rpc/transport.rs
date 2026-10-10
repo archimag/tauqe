@@ -27,6 +27,7 @@ pub enum OptimisticRollback {
     },
     ActiveModel {
         prev_model: ModelRef,
+        prev_selection: tauqe_protocol::ModelSelection,
     },
 }
 

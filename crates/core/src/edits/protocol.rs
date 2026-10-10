@@ -10,8 +10,8 @@ pub use utils::{
 };
 pub use xml::{
     extract_plan_step_done, generate_turn_marker, has_xml_edit_tags, MarkedXmlEditProtocol,
-    PlanStepDone, strip_plan_step_done_tags, VerifyOnSuccess, VerifyRequest, VerifyTarget,
-    XmlEditProtocol,
+    parse_context_drop_tags, strip_context_drop_tags, PlanStepDone, strip_plan_step_done_tags,
+    VerifyOnSuccess, VerifyRequest, VerifyTarget, XmlEditProtocol,
 };
 
 /// A file the model asks to be added to the context before it proposes edits.
@@ -25,14 +25,23 @@ pub trait EditProtocol: Send + Sync {
     /// Identifier name of the edit protocol (e.g. "xml", "structured")
     fn name(&self) -> &'static str;
 
-    /// Returns system prompt instructions tailored for this edit protocol.
-    fn system_instructions(&self, editable_paths: &[String]) -> String;
+    /// Returns system prompt instructions tailored for this edit protocol and discovery strategy.
+    fn system_instructions(
+        &self,
+        editable_paths: &[String],
+        discovery_mode: crate::config::DiscoveryMode,
+    ) -> String;
 
     /// Parses the model text output into a ModelResult.
     fn parse_output(&self, raw_text: &str, editable_paths: &[String]) -> ModelResult;
 
     /// Extracts context requests (files the model wants added to context) from raw output.
     fn parse_context_requests(&self, _raw_text: &str) -> Vec<ContextRequest> {
+        Vec::new()
+    }
+
+    /// Extracts context drops (files the model wants removed from auto context) from raw output.
+    fn parse_context_drops(&self, _raw_text: &str) -> Vec<String> {
         Vec::new()
     }
 

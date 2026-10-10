@@ -6,7 +6,7 @@ use tokio::sync::{watch, Mutex};
 use tauqe_core::config::AppConfig;
 use tauqe_core::context::ContextManager;
 use tauqe_core::history::HistoryManager;
-use tauqe_protocol::UiHistoryItem;
+use tauqe_protocol::{ModelSelection, UiHistoryItem};
 
 use crate::transport::OutChannel;
 
@@ -17,6 +17,7 @@ pub struct ActiveOperation {
 
 pub struct AppState {
     pub config: Mutex<AppConfig>,
+    pub current_selection: Mutex<ModelSelection>,
     pub context: tokio::sync::RwLock<ContextManager>,
     pub history: Mutex<HistoryManager>,
     pub session_lock: Mutex<()>,
@@ -40,6 +41,7 @@ impl AppState {
             eprintln!("[tauqe-recovery] {}", recovery_msg);
         }
 
+        let default_selection = config.default_selection();
         let history_sender_init = history_sender.clone();
         let mut initial_history_manager = HistoryManager::new(repo_path.clone());
         initial_history_manager.set_listener(move |item| {
@@ -47,6 +49,7 @@ impl AppState {
         });
 
         Arc::new(Self {
+            current_selection: Mutex::new(default_selection),
             config: Mutex::new(config),
             context: tokio::sync::RwLock::new(ContextManager::new(repo_path)),
             history: Mutex::new(initial_history_manager),
@@ -56,6 +59,10 @@ impl AppState {
             history_sender,
             out,
         })
+    }
+
+    pub async fn current_selection(&self) -> ModelSelection {
+        self.current_selection.lock().await.clone()
     }
 }
 

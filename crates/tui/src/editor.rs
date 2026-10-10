@@ -94,6 +94,7 @@ impl InputEditor {
     pub fn clear_saving(&mut self) {
         if !self.text.is_empty() {
             self.kill_ring = self.text.clone();
+            let _ = crate::clipboard::copy_to_clipboard(&self.kill_ring);
             self.text.clear();
             self.cursor = 0;
             self.history_index = None;
@@ -291,10 +292,12 @@ impl InputEditor {
             if self.cursor < self.text.len() {
                 let removed = self.text.remove(self.cursor);
                 self.kill_ring = removed.to_string();
+                let _ = crate::clipboard::copy_to_clipboard(&self.kill_ring);
             }
         } else {
             let killed: String = self.text.drain(self.cursor..line_end).collect();
             self.kill_ring = killed;
+            let _ = crate::clipboard::copy_to_clipboard(&self.kill_ring);
         }
     }
 
@@ -303,6 +306,7 @@ impl InputEditor {
         if self.cursor > line_start {
             let killed: String = self.text.drain(line_start..self.cursor).collect();
             self.kill_ring = killed;
+            let _ = crate::clipboard::copy_to_clipboard(&self.kill_ring);
             self.cursor = line_start;
         } else if self.cursor > 0 {
             self.delete_backward();
@@ -310,9 +314,16 @@ impl InputEditor {
     }
 
     pub fn yank(&mut self) {
+        if let Some(clip) = crate::clipboard::get_from_clipboard() {
+            if !clip.is_empty() {
+                self.kill_ring = clip.clone();
+                self.insert_paste(&clip);
+                return;
+            }
+        }
         if !self.kill_ring.is_empty() {
             let s = self.kill_ring.clone();
-            self.insert_str(&s);
+            self.insert_paste(&s);
         }
     }
 
@@ -332,6 +343,7 @@ impl InputEditor {
         if first_word_idx.is_none() {
             let killed: String = self.text.drain(self.cursor..).collect();
             self.kill_ring = killed;
+            let _ = crate::clipboard::copy_to_clipboard(&self.kill_ring);
             return;
         }
         let mut end_idx = after.len();
@@ -346,6 +358,7 @@ impl InputEditor {
             .drain(self.cursor..self.cursor + end_idx)
             .collect();
         self.kill_ring = killed;
+        let _ = crate::clipboard::copy_to_clipboard(&self.kill_ring);
     }
 
     pub fn kill_word_backward(&mut self) {
@@ -374,6 +387,7 @@ impl InputEditor {
             .unwrap_or(0);
         let killed: String = self.text.drain(target_pos..self.cursor).collect();
         self.kill_ring = killed;
+        let _ = crate::clipboard::copy_to_clipboard(&self.kill_ring);
         self.cursor = target_pos;
     }
 

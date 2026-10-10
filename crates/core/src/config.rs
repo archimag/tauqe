@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use tauqe_protocol::ModelRef;
+use tauqe_protocol::{ModelRef, ModelSelection, ModelTier, ModelTiersSummary};
 
 pub fn parse_model_ref(s: &str) -> Result<ModelRef, String> {
     let s = s.trim();
@@ -57,10 +57,103 @@ where
     }
 }
 
+fn default_model_tier() -> ModelTier {
+    ModelTier::Middle
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelsConfig {
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_model_ref_opt",
+        serialize_with = "serialize_model_ref_opt"
+    )]
+    pub junior: Option<ModelRef>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_model_ref_opt",
+        serialize_with = "serialize_model_ref_opt"
+    )]
+    pub middle: Option<ModelRef>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_model_ref_opt",
+        serialize_with = "serialize_model_ref_opt"
+    )]
+    pub senior: Option<ModelRef>,
+    #[serde(default = "default_model_tier")]
+    pub default: ModelTier,
+    #[serde(default)]
+    pub auto_level_up: bool,
+}
+
+impl Default for ModelsConfig {
+    fn default() -> Self {
+        Self {
+            junior: None,
+            middle: None,
+            senior: None,
+            default: ModelTier::Middle,
+            auto_level_up: false,
+        }
+    }
+}
+
+impl ModelsConfig {
+    /// Resolves a ModelTier using the deterministic fallback chain within the models configuration.
+    pub fn resolve_tier(&self, tier: ModelTier) -> ModelRef {
+        self.resolve_tier_with_fallback(tier, None)
+    }
+
+    /// Resolves a ModelTier with an optional external fallback model (e.g. from configured provider models).
+    pub fn resolve_tier_with_fallback(
+        &self,
+        tier: ModelTier,
+        fallback: Option<ModelRef>,
+    ) -> ModelRef {
+        match tier {
+            ModelTier::Junior => self
+                .junior
+                .clone()
+                .or_else(|| self.middle.clone())
+                .or_else(|| self.senior.clone())
+                .or(fallback)
+                .unwrap_or_else(|| ModelRef::openrouter(BUILTIN_DEFAULT_JUNIOR_MODEL)),
+            ModelTier::Middle => self
+                .middle
+                .clone()
+                .or_else(|| self.senior.clone())
+                .or_else(|| self.junior.clone())
+                .or(fallback)
+                .unwrap_or_else(|| ModelRef::openrouter(BUILTIN_DEFAULT_MIDDLE_MODEL)),
+            ModelTier::Senior => self
+                .senior
+                .clone()
+                .or_else(|| self.middle.clone())
+                .or_else(|| self.junior.clone())
+                .or(fallback)
+                .unwrap_or_else(|| ModelRef::openrouter(BUILTIN_DEFAULT_SENIOR_MODEL)),
+        }
+    }
+
+    /// Resolves a ModelSelection to a concrete ModelRef.
+    pub fn resolve_model(&self, selection: &ModelSelection) -> ModelRef {
+        match selection {
+            ModelSelection::Tier(tier) => self.resolve_tier(*tier),
+            ModelSelection::Specific(model) => model.clone(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AppConfig {
     #[serde(default)]
     pub providers: ProvidersConfig,
+    #[serde(default)]
+    pub models: ModelsConfig,
     #[serde(default, alias = "edit")]
     pub develop: DevelopConfig,
     #[serde(default)]
@@ -83,13 +176,6 @@ fn default_tail_turns() -> usize {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HistoryConfig {
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        deserialize_with = "deserialize_model_ref_opt",
-        serialize_with = "serialize_model_ref_opt"
-    )]
-    pub model: Option<ModelRef>,
     #[serde(default = "default_history_budget_tokens")]
     pub budget_tokens: u64,
     #[serde(default = "default_tail_turns")]
@@ -99,7 +185,6 @@ pub struct HistoryConfig {
 impl Default for HistoryConfig {
     fn default() -> Self {
         Self {
-            model: None,
             budget_tokens: default_history_budget_tokens(),
             tail_turns: default_tail_turns(),
         }
@@ -113,9 +198,57 @@ pub struct GitConfig {
 }
 
 pub const DEFAULT_MAX_DISCOVERY_ROUNDS: usize = 5;
+pub const DEFAULT_MAX_CONTEXT_FILES: usize = 25;
+
+/// Strategy for managing the auto-context layer during multi-round Discovery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiscoveryMode {
+    /// Pure append-only context growth (original behavior); files accumulate monotonically until turn end.
+    #[default]
+    Monotonic,
+    /// Additive layer expansion with explicit drops via `<context_drop path="..." />`.
+    Incremental,
+    /// Explicit declaration of the full working set each round; omitted auto-files are evicted.
+    Snapshot,
+}
+
+impl std::fmt::Display for DiscoveryMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Monotonic => write!(f, "monotonic"),
+            Self::Incremental => write!(f, "incremental"),
+            Self::Snapshot => write!(f, "snapshot"),
+        }
+    }
+}
+
+impl std::str::FromStr for DiscoveryMode {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_lowercase().as_str() {
+            "monotonic" | "cumulative" | "append_only" => Ok(Self::Monotonic),
+            "incremental" => Ok(Self::Incremental),
+            "snapshot" => Ok(Self::Snapshot),
+            other => Err(format!(
+                "Unknown discovery mode '{}'. Expected 'monotonic', 'incremental', or 'snapshot'",
+                other
+            )),
+        }
+    }
+}
+
+fn default_discovery_mode() -> DiscoveryMode {
+    DiscoveryMode::Monotonic
+}
 
 fn default_max_discovery_rounds() -> usize {
     DEFAULT_MAX_DISCOVERY_ROUNDS
+}
+
+fn default_max_files() -> usize {
+    DEFAULT_MAX_CONTEXT_FILES
 }
 
 fn default_repomap_token_budget() -> usize {
@@ -128,10 +261,12 @@ pub struct ContextConfig {
     pub pinned: Vec<String>,
     #[serde(default = "default_max_discovery_rounds")]
     pub max_discovery_rounds: usize,
-    #[serde(default)]
-    pub max_auto_files_per_round: Option<usize>,
+    #[serde(default = "default_max_files")]
+    pub max_files: usize,
     #[serde(default = "default_repomap_token_budget")]
     pub repomap_token_budget: usize,
+    #[serde(default = "default_discovery_mode")]
+    pub discovery_mode: DiscoveryMode,
 }
 
 impl Default for ContextConfig {
@@ -139,8 +274,9 @@ impl Default for ContextConfig {
         Self {
             pinned: Vec::new(),
             max_discovery_rounds: DEFAULT_MAX_DISCOVERY_ROUNDS,
-            max_auto_files_per_round: None,
+            max_files: DEFAULT_MAX_CONTEXT_FILES,
             repomap_token_budget: default_repomap_token_budget(),
+            discovery_mode: DiscoveryMode::default(),
         }
     }
 }
@@ -237,11 +373,14 @@ pub struct OpenRouterCredentials {
     pub api_key: Option<String>,
 }
 
-pub const BUILTIN_DEFAULT_MODEL: &str = "anthropic/claude-3.5-sonnet";
+pub const BUILTIN_DEFAULT_JUNIOR_MODEL: &str = "~anthropic/claude-haiku-latest";
+pub const BUILTIN_DEFAULT_MIDDLE_MODEL: &str = "~google/gemini-flash-latest";
+pub const BUILTIN_DEFAULT_SENIOR_MODEL: &str = "~anthropic/claude-sonnet-latest";
+pub const BUILTIN_DEFAULT_MODEL: &str = BUILTIN_DEFAULT_MIDDLE_MODEL;
 
 impl AppConfig {
     /// Models from provider sections, trimmed and de-duplicated.
-    fn configured_models(&self) -> Vec<ModelRef> {
+    pub fn configured_models(&self) -> Vec<ModelRef> {
         let names = self
             .providers
             .openrouter
@@ -262,47 +401,60 @@ impl AppConfig {
         models
     }
 
-    /// The model used for new requests.
+    /// Resolves a ModelTier to a concrete ModelRef using the deterministic fallback chain.
+    /// If at least one model is configured in `models`, it covers all unspecified roles.
+    pub fn resolve_tier(&self, tier: ModelTier) -> ModelRef {
+        let fallback = self.configured_models().into_iter().next();
+        self.models.resolve_tier_with_fallback(tier, fallback)
+    }
+
+    /// Resolves a ModelSelection to a concrete ModelRef.
+    pub fn resolve_model(&self, selection: &ModelSelection) -> ModelRef {
+        match selection {
+            ModelSelection::Tier(tier) => self.resolve_tier(*tier),
+            ModelSelection::Specific(model) => model.clone(),
+        }
+    }
+
+    /// Summary of effective concrete models assigned to all tiers.
+    pub fn tiers_summary(&self) -> ModelTiersSummary {
+        ModelTiersSummary {
+            junior: self.resolve_tier(ModelTier::Junior),
+            middle: self.resolve_tier(ModelTier::Middle),
+            senior: self.resolve_tier(ModelTier::Senior),
+        }
+    }
+
+    /// The default active model based on `models.default`.
     pub fn active_model(&self) -> ModelRef {
-        self.develop
-            .model
-            .clone()
-            .or_else(|| self.configured_models().into_iter().next())
-            .unwrap_or_else(|| ModelRef::openrouter(BUILTIN_DEFAULT_MODEL))
+        self.resolve_tier(self.models.default)
+    }
+
+    /// The default model selection based on `models.default`.
+    pub fn default_selection(&self) -> ModelSelection {
+        ModelSelection::Tier(self.models.default)
     }
 
     /// The model used for history summarization and squash commit message generation.
     pub fn history_model(&self) -> ModelRef {
-        self.history
-            .model
-            .clone()
-            .unwrap_or_else(|| self.active_model())
+        self.resolve_tier(ModelTier::Junior)
     }
 
-    /// Models the user may switch between. Always contains the active model.
+    /// Models the user may switch between. Always contains all tier models and configured models.
     pub fn available_models(&self) -> Vec<ModelRef> {
         let mut models = self.configured_models();
-        let active = self.active_model();
-        if !models.contains(&active) {
-            models.push(active);
+        let summary = self.tiers_summary();
+        for m in [summary.junior, summary.middle, summary.senior] {
+            if !models.contains(&m) {
+                models.push(m);
+            }
         }
         models
-    }
-
-    pub fn set_active_model(&mut self, model: ModelRef) {
-        self.develop.model = Some(model);
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DevelopConfig {
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        deserialize_with = "deserialize_model_ref_opt",
-        serialize_with = "serialize_model_ref_opt"
-    )]
-    pub model: Option<ModelRef>,
     #[serde(default = "default_workflow")]
     pub workflow: String, // "git", "naive"
     #[serde(default = "default_protocol")]
@@ -328,7 +480,6 @@ fn default_max_retries() -> usize {
 impl Default for DevelopConfig {
     fn default() -> Self {
         Self {
-            model: None,
             workflow: default_workflow(),
             protocol: default_protocol(),
             max_retries: default_max_retries(),
@@ -795,75 +946,61 @@ max_retries = 1
     }
 
     #[test]
-    fn test_develop_model_and_history_model() {
+    fn test_models_config_and_tiers_resolution() {
         let toml_str = r#"
-[develop]
-model = "openrouter:anthropic/claude-3.7-sonnet"
-
-[history]
-model = "openrouter:anthropic/claude-haiku-latest"
-
-[providers.openrouter]
-models = ["deepseek/deepseek-chat"]
+[models]
+junior = "openrouter:anthropic/claude-haiku-latest"
+middle = "openrouter:google/gemini-flash-latest"
+senior = "openrouter:anthropic/claude-sonnet-latest"
+default = "senior"
+auto_level_up = true
 "#;
         let config: AppConfig = toml::from_str(toml_str).expect("Failed to parse config");
-        assert_eq!(
-            config.active_model(),
-            ModelRef::openrouter("anthropic/claude-3.7-sonnet")
-        );
-        assert_eq!(
-            config.history_model(),
-            ModelRef::openrouter("anthropic/claude-haiku-latest")
-        );
+        assert_eq!(config.models.default, ModelTier::Senior);
+        assert!(config.models.auto_level_up);
+        assert_eq!(config.active_model(), ModelRef::openrouter("anthropic/claude-sonnet-latest"));
+        assert_eq!(config.history_model(), ModelRef::openrouter("anthropic/claude-haiku-latest"));
+
+        let summary = config.tiers_summary();
+        assert_eq!(summary.junior, ModelRef::openrouter("anthropic/claude-haiku-latest"));
+        assert_eq!(summary.middle, ModelRef::openrouter("google/gemini-flash-latest"));
+        assert_eq!(summary.senior, ModelRef::openrouter("anthropic/claude-sonnet-latest"));
+
+        let specific = ModelRef::openrouter("custom/model");
+        assert_eq!(config.resolve_model(&ModelSelection::Specific(specific.clone())), specific);
+        assert_eq!(config.resolve_model(&ModelSelection::Tier(ModelTier::Junior)), summary.junior);
     }
 
     #[test]
-    fn test_history_model_fallback_to_develop_model() {
+    fn test_single_model_fallback_closes_all_roles() {
         let toml_str = r#"
-[develop]
-model = "openrouter:anthropic/claude-3.7-sonnet"
+[models]
+middle = "openrouter:anthropic/claude-3.7-sonnet"
 "#;
         let config: AppConfig = toml::from_str(toml_str).expect("Failed to parse config");
-        assert_eq!(
-            config.active_model(),
-            ModelRef::openrouter("anthropic/claude-3.7-sonnet")
-        );
-        assert_eq!(
-            config.history_model(),
-            ModelRef::openrouter("anthropic/claude-3.7-sonnet")
-        );
+        let expected = ModelRef::openrouter("anthropic/claude-3.7-sonnet");
+        assert_eq!(config.resolve_tier(ModelTier::Junior), expected);
+        assert_eq!(config.resolve_tier(ModelTier::Middle), expected);
+        assert_eq!(config.resolve_tier(ModelTier::Senior), expected);
     }
 
     #[test]
-    fn test_available_models_include_default() {
+    fn test_available_models_include_all_tiers() {
         let toml_str = r#"
-[develop]
-model = "openrouter:a/b"
+[models]
+junior = "openrouter:a/junior"
+middle = "openrouter:b/middle"
+senior = "openrouter:c/senior"
 
 [providers.openrouter]
-models = ["c/d", "e/f", "c/d"]
+models = ["d/extra", "a/junior"]
 "#;
         let config: AppConfig = toml::from_str(toml_str).expect("Failed to parse config");
-        assert_eq!(config.active_model(), ModelRef::openrouter("a/b"));
-        assert_eq!(
-            config.available_models(),
-            vec![
-                ModelRef::openrouter("c/d"),
-                ModelRef::openrouter("e/f"),
-                ModelRef::openrouter("a/b"),
-            ]
-        );
-    }
-
-    #[test]
-    fn test_available_without_default_uses_first() {
-        let toml_str = r#"
-[providers.openrouter]
-models = ["x/y", "z/w"]
-"#;
-        let config: AppConfig = toml::from_str(toml_str).expect("Failed to parse config");
-        assert_eq!(config.active_model(), ModelRef::openrouter("x/y"));
-        assert_eq!(config.available_models().len(), 2);
+        let available = config.available_models();
+        assert!(available.contains(&ModelRef::openrouter("d/extra")));
+        assert!(available.contains(&ModelRef::openrouter("a/junior")));
+        assert!(available.contains(&ModelRef::openrouter("b/middle")));
+        assert!(available.contains(&ModelRef::openrouter("c/senior")));
     }
 
     #[test]
@@ -933,35 +1070,47 @@ repomap_token_budget = 6000
         let toml_str = r#"
 [context]
 max_discovery_rounds = 8
-max_auto_files_per_round = 15
+max_files = 40
+discovery_mode = "snapshot"
 "#;
         let config: AppConfig = toml::from_str(toml_str).expect("Failed to parse config");
         assert_eq!(config.context.max_discovery_rounds, 8);
-        assert_eq!(config.context.max_auto_files_per_round, Some(15));
+        assert_eq!(config.context.max_files, 40);
+        assert_eq!(config.context.discovery_mode, DiscoveryMode::Snapshot);
 
         let default_cfg = ContextConfig::default();
         assert_eq!(default_cfg.max_discovery_rounds, 5);
-        assert_eq!(default_cfg.max_auto_files_per_round, None);
+        assert_eq!(default_cfg.max_files, 25);
+        assert_eq!(default_cfg.discovery_mode, DiscoveryMode::Monotonic);
+
+        assert_eq!(
+            "monotonic".parse::<DiscoveryMode>().unwrap(),
+            DiscoveryMode::Monotonic
+        );
+        assert_eq!(
+            "cumulative".parse::<DiscoveryMode>().unwrap(),
+            DiscoveryMode::Monotonic
+        );
+        assert_eq!(
+            "append_only".parse::<DiscoveryMode>().unwrap(),
+            DiscoveryMode::Monotonic
+        );
     }
 
     #[test]
     fn test_typed_provider_models_config() {
         let toml_str = r#"
-[develop]
-model = "openrouter:openai/gpt-4o"
+[models]
+middle = "openrouter:openai/gpt-4o"
 
 [providers.openrouter]
 models = ["deepseek/deepseek-chat", " ", "openai/gpt-4o"]
 "#;
         let config: AppConfig = toml::from_str(toml_str).expect("Failed to parse config");
         assert_eq!(config.active_model(), ModelRef::openrouter("openai/gpt-4o"));
-        assert_eq!(
-            config.available_models(),
-            vec![
-                ModelRef::openrouter("deepseek/deepseek-chat"),
-                ModelRef::openrouter("openai/gpt-4o"),
-            ]
-        );
+        let available = config.available_models();
+        assert!(available.contains(&ModelRef::openrouter("deepseek/deepseek-chat")));
+        assert!(available.contains(&ModelRef::openrouter("openai/gpt-4o")));
     }
 
     #[test]
@@ -969,7 +1118,7 @@ models = ["deepseek/deepseek-chat", " ", "openai/gpt-4o"]
         let config = AppConfig::default();
         assert_eq!(
             config.active_model(),
-            ModelRef::openrouter("anthropic/claude-3.5-sonnet")
+            ModelRef::openrouter(BUILTIN_DEFAULT_MIDDLE_MODEL)
         );
         assert_eq!(config.develop.workflow, "git");
         assert_eq!(config.develop.protocol, "xml");
@@ -1067,7 +1216,7 @@ api_key = "sk-or-v1-secret-token"
         let temp_dir = tempfile::tempdir().unwrap();
         std::fs::write(
             temp_dir.path().join("tauqe.toml"),
-            "[develop]\nmodel = \"openrouter:anthropic/claude-3.5-sonnet\"\n",
+            "[models]\nmiddle = \"openrouter:anthropic/claude-3.5-sonnet\"\n",
         )
         .unwrap();
 
@@ -1096,7 +1245,7 @@ api_key = "sk-or-v1-secret-token"
         let custom_cfg = temp_dir.path().join("my-custom.toml");
         std::fs::write(
             &custom_cfg,
-            "[develop]\nmodel = \"openrouter:deepseek/deepseek-chat\"\n",
+            "[models]\nmiddle = \"openrouter:deepseek/deepseek-chat\"\n",
         )
         .unwrap();
 

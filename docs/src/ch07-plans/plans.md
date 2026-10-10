@@ -39,15 +39,27 @@ When running an assigned leaf task in an isolated turn:
 
 ## 7.3 Workflow: From Planning to Execution
 
-TAUQE provides two complementary workflows for working with tactical plans:
+TAUQE implements a disciplined, multi-stage planning pipeline:
 
-### 7.3.1 Context Injection (Manual Steering)
+### 7.3.0 The Duality: "What" vs "How" in Planning
+Software architecture thrives when the distinction between intent and implementation is strictly maintained:
+1. **The "What" Phase (Conversational Planning):** High-level architectural trade-offs, scope boundaries, and core design invariants are discussed and agreed with the developer in Develop (`Ctrl+1`). In this phase, TAUQE focuses strictly on understanding *what* needs to be achieved, avoiding low-level boilerplate drift.
+2. **The "How" Phase (Deep Plan Refinement):** Once the high-level plan structure is established, the developer triggers automated Deep Refine (`R`). An AI Architect analyzes the actual codebase AST contours and Tree-sitter symbols to produce an actionable, atomic engineering decomposition.
+
+### 7.3.1 Deep Plan Refinement (Architectural Decomposition)
+Deep Plan Refinement (`R` in Plans view or RPC `plan/refine`) executes an isolated architectural pass with strict invariants:
+- **Anti-Drift Invariant (No Conceptual Drift):** The architect model is explicitly prohibited from redesigning agreed requirements, inventing unprompted features, or altering the high-level architectural intent. Its sole mandate is to break down existing high-level items into verified leaf steps.
+- **Context Isolation:** To prevent generative hallucinations and prompt pollution, Deep Refine executes outside normal conversational history. The architect receives the Tree-sitter Repo Map, active context files, and the target plan structure.
+- **Atomic Decomposition & Roles:** Steps are decomposed into leaf tasks with concrete verification requirements. The model can assign optimal model tiers (Senior for intricate algorithmic changes, Junior/Middle for mechanical steps).
+- **Explicit Blocker Protocol (Refusal to Guess):** If requirements are contradictory, specifications incomplete, or codebase conventions violated, the architect must **refuse to guess**. It returns a structured `Blocked` status explaining the exact conflict. TAUQE presents this in a dedicated blocker modal with an option to immediately discuss the resolution with AI in Develop (`d`).
+
+### 7.3.2 Context Injection (Manual Steering)
 1. **Formulate the Plan:** In Develop (`Ctrl+1`), ask TAUQE to design an implementation plan. The model outputs a structured `<plan>` tag, which populates the Plans view.
 2. **Select Focus Tasks:** In Plans (`Ctrl+4`), navigate with `n` / `p` or `↑` / `↓` and press `x` to check tasks (`[x] 2.2 Handler implementation`).
 3. **Context Injection:** Checked items are injected into subsequent prompts as `<active_plan_context>`.
 4. **Execute in Develop:** Return to Develop and instruct the harness to work on the selected items.
 
-### 7.3.2 Autonomous Step Execution (Engine-Driven)
+### 7.3.3 Autonomous Step Execution (Engine-Driven)
 For disciplined step-by-step implementation, execute plan leaves directly through the engine:
 1. **Select a Leaf Step:** In Plans (`Ctrl+4`), place the cursor on a leaf task and press `e` or `Enter`. Container nodes with child tasks cannot be executed directly; each leaf must be run individually to maintain minimal change scope.
 2. **Confirm Execution:** A modal confirmation dialog displays the task title and details. Press `Enter` to proceed or `Esc` to cancel.
@@ -63,12 +75,15 @@ For disciplined step-by-step implementation, execute plan leaves directly throug
 
 | Keybinding | Action |
 |---|---|
-| `n` / `p` or `↑` / `↓` | Move selection through the plan hierarchy |
-| `e` / `Enter` | Execute selected leaf step (opens confirmation dialog) |
-| `x` | Toggle checkbox (mark item for injection into prompt context) |
-| `t` / `s` / `d` | Open status selection dialog (`1` Todo, `2` InProgress, `3` Done, `4` Cancelled) |
-| `Space` | Fold or unfold child items |
-| `Tab` / `Shift+Tab` | Switch between active plans |
-| `c` / `y` (or `Alt+C`) | Copy entire plan to clipboard in Markdown format |
+| `n` / `p` (or `↑` / `↓`) | Move selection through the plan hierarchy |
+| `Enter` / `x` | Execute leaf step, group, or entire plan (with confirmation) |
+| `d` | Discuss selected item or plan architecture in Develop |
+| `R` | Deep refine plan architecture & steps with AI Architect |
+| `t` / `s` | Open status selection dialog (`DISCUSSION`, `TODO`, `IN_PROGRESS`, `DONE`, `CANCELLED`) |
+| `Tab` / `Space` | Fold or unfold child items |
+| `a` | Toggle fold / unfold all plans and items |
+| `c` / `y` | Copy entire plan to clipboard in Markdown format |
+| `r` | Refresh plans from server storage |
+| `Delete` | Delete plan (with confirmation) |
 | `Ctrl+H` / `?` | Open contextual Help dialog |
 | `Ctrl+1..5` | Quick switch between views |

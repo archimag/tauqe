@@ -134,6 +134,20 @@ On first launch in a repository, the built-in **interactive onboarding wizard** 
 
 ---
 
+## Contributing
+
+Pull requests are not accepted.
+
+In an AI-native engineering environment, raw implementation code has little intrinsic value. Concrete implementation details are synthesized, verified, and healed on demand. What truly matters are sound ideas, clear architectural intent, and rigorous specifications.
+
+To propose changes:
+1. Launch TAUQE in self-development mode (`just dev`).
+2. Discuss the design and explore trade-offs with the model.
+3. Formulate a well-structured architectural proposal or specification.
+4. Submit the proposal as an issue for discussion.
+
+---
+
 ## License
 
 TAUQE is licensed under the [MIT License](LICENSE).

@@ -1,4 +1,6 @@
-use tauqe_protocol::{ContextState, ModelRef, RepositoryState};
+use tauqe_protocol::{
+    ContextState, ModelRef, ModelSelection, ModelTier, ModelTiersSummary, RepositoryState,
+};
 
 use crate::config::TuiConfig;
 use crate::editor::InputEditor;
@@ -37,21 +39,62 @@ pub struct AppNotification {
     pub ttl: std::time::Duration,
 }
 
+/// The developer's model choice (a tier role or a specific model) together with the
+/// tier assignments reported by the server.
+#[derive(Debug, Clone, Default)]
+pub struct ModelChoice {
+    pub selection: ModelSelection,
+    pub tiers: Option<ModelTiersSummary>,
+}
+
+impl ModelChoice {
+    /// Resolves a selection to a concrete model. A tier cannot be resolved until the
+    /// server has reported the tier assignments.
+    pub fn resolve(&self, selection: &ModelSelection) -> Option<ModelRef> {
+        match selection {
+            ModelSelection::Specific(model) => Some(model.clone()),
+            ModelSelection::Tier(tier) => self.tiers.as_ref().map(|tiers| match tier {
+                ModelTier::Junior => tiers.junior.clone(),
+                ModelTier::Middle => tiers.middle.clone(),
+                ModelTier::Senior => tiers.senior.clone(),
+            }),
+        }
+    }
+}
+
+pub fn tier_title(tier: ModelTier) -> &'static str {
+    match tier {
+        ModelTier::Junior => "Junior",
+        ModelTier::Middle => "Middle",
+        ModelTier::Senior => "Senior",
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SelectionDialogKind {
-    Model,
+    /// Quick menu: one row per tier plus `Others...`.
+    ModelTiers,
+    /// Full list of available models.
+    ModelCatalog,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SelectionItem {
+    Tier(ModelTier, ModelRef),
+    Model(ModelRef),
+    Others,
 }
 
 #[derive(Debug, Clone)]
 pub struct SelectionDialogState {
     pub kind: SelectionDialogKind,
-    pub items: Vec<ModelRef>,
+    pub items: Vec<SelectionItem>,
     pub selected_index: usize,
     pub scroll_offset: usize,
 }
 
 impl SelectionDialogState {
-    pub fn new(kind: SelectionDialogKind, items: Vec<ModelRef>, selected_index: usize) -> Self {
+    pub fn new(kind: SelectionDialogKind, items: Vec<SelectionItem>, selected_index: usize) -> Self {
         let mut state = Self {
             kind,
             items,
@@ -402,6 +445,7 @@ pub struct AppState {
     pub header_clicks: HeaderClickAreas,
     pub terminal_focused: bool,
     pub shift_tip_shown: bool,
+    pub model_choice: ModelChoice,
 }
 
 impl AppState {
@@ -435,6 +479,56 @@ impl AppState {
         self.notify(text, NotificationLevel::Error, std::time::Duration::from_secs(6));
     }
 
+    /// Opens the model picker: the tier menu when tier assignments are known,
+    /// otherwise the full catalog. Returns false when there is nothing to choose from.
+    pub fn open_model_dialog(&mut self) -> bool {
+        let Some(tiers) = &self.model_choice.tiers else {
+            return self.open_model_catalog();
+        };
+        let items = vec![
+            SelectionItem::Tier(ModelTier::Junior, tiers.junior.clone()),
+            SelectionItem::Tier(ModelTier::Middle, tiers.middle.clone()),
+            SelectionItem::Tier(ModelTier::Senior, tiers.senior.clone()),
+            SelectionItem::Others,
+        ];
+        let selected = match &self.model_choice.selection {
+            ModelSelection::Tier(ModelTier::Junior) => 0,
+            ModelSelection::Tier(ModelTier::Middle) => 1,
+            ModelSelection::Tier(ModelTier::Senior) => 2,
+            ModelSelection::Specific(_) => 3,
+        };
+        self.selection_dialog = Some(SelectionDialogState::new(
+            SelectionDialogKind::ModelTiers,
+            items,
+            selected,
+        ));
+        true
+    }
+
+    /// Opens the full list of available models. Returns false when the list is empty.
+    pub fn open_model_catalog(&mut self) -> bool {
+        if self.available_models.is_empty() {
+            return false;
+        }
+        let selected = self
+            .available_models
+            .iter()
+            .position(|m| m == &self.active_model)
+            .unwrap_or(0);
+        let items = self
+            .available_models
+            .iter()
+            .cloned()
+            .map(SelectionItem::Model)
+            .collect();
+        self.selection_dialog = Some(SelectionDialogState::new(
+            SelectionDialogKind::ModelCatalog,
+            items,
+            selected,
+        ));
+        true
+    }
+
     pub fn has_active_modal(&self) -> bool {
         self.server_disconnected.is_some()
             || self.show_help
@@ -444,6 +538,8 @@ impl AppState {
             || self.review_dialog.is_some()
             || self.discuss_plan_dialog.is_some()
             || self.discuss_review_dialog.is_some()
+            || self.plans_view.refine_dialog.is_some()
+            || self.plans_view.refine_blocked.is_some()
             || self.confirm_cancel
             || self.confirm_quit
             || self.confirm_undo
@@ -536,6 +632,7 @@ mod tests {
             available_models: Vec::new(),
             available_workflows: Vec::new(),
             available_edit_protocols: Vec::new(),
+            model_choice: ModelChoice::default(),
             model: DevelopView {
                 status: "thinking".to_string(),
                 ..Default::default()
@@ -607,6 +704,7 @@ mod tests {
             available_models: Vec::new(),
             available_workflows: Vec::new(),
             available_edit_protocols: Vec::new(),
+            model_choice: ModelChoice::default(),
             model: DevelopView::default(),
             context: ContextState::default(),
             context_view: ContextViewState::default(),
@@ -660,10 +758,10 @@ mod tests {
 
     #[test]
     fn test_selection_dialog_scrolling_and_bounds() {
-        let items: Vec<ModelRef> = (0..20)
-            .map(|i| ModelRef::openrouter(format!("model-{}", i)))
+        let items: Vec<SelectionItem> = (0..20)
+            .map(|i| SelectionItem::Model(ModelRef::openrouter(format!("model-{}", i))))
             .collect();
-        let mut dialog = SelectionDialogState::new(SelectionDialogKind::Model, items, 0);
+        let mut dialog = SelectionDialogState::new(SelectionDialogKind::ModelCatalog, items, 0);
         let visible_height = 5;
 
         assert_eq!(dialog.selected_index, 0);

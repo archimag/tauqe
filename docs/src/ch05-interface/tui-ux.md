@@ -17,7 +17,7 @@ To guarantee universal compatibility across modern and legacy terminal emulators
   - Newline insertion: `Shift+Enter`, `Alt+Enter`, or `Ctrl+J`.
   - Response clipboard: Press `Alt+C` or `Alt+Y` while idle to copy the model's markdown response to the system clipboard.
   - Undo AI commit: Press `Ctrl+Z` or `Alt+U` to trigger safe rollback. If no AI commit exists, TAUQE displays a status notice without opening unnecessary dialogs.
-  - Active LLM selection: Press `Alt+M` or `Ctrl+M` from any screen to open the model selector.
+  - Active LLM selection: Press `Alt+M` or `Ctrl+M` from any screen (or click the model in the header) to open the model picker. See section 5.7 for the tier model.
   - Contextual help: Press `Ctrl+H` / `Alt+H` from any view or `?` in navigation views to open the interactive help dialog.
   - Configuration reload: Press `Ctrl+O` to reload `tui.toml` settings without restarting TAUQE.
 
@@ -150,3 +150,24 @@ Engineering tasks (discovery rounds, toolchain verifications, test suites) can t
 - **Urgency Alert & Terminal Bell:** Emits a standard ASCII `BEL` (`\x07`), prompting modern terminal emulators (Kitty, WezTerm, iTerm2) to raise window urgency flags in your desktop taskbar or window manager.
 - **Zero-Dependency Desktop Notifications:** Utilizes standard terminal OSC protocols (`OSC 777` and `OSC 9`) to display native desktop banners with turn summaries or verification statuses. Clicking the notification immediately focuses the terminal window.
 - **Smart Duration Threshold:** Notifications fire only if turn execution equals or exceeds `min_duration_seconds` (default: 5 seconds), eliminating noise during rapid iterative dialogs.
+
+---
+
+## 5.7 Model Tiers and Model Selection
+
+Tasks differ in difficulty and cost. A rename does not need the same model as a multi-file refactoring. Instead of making the developer remember model identifiers, TAUQE assigns models to three **roles** (tiers) in the `[models]` section of `tauqe.toml`:
+
+```toml
+[models]
+junior = "~anthropic/claude-haiku-latest"      # cheap and fast
+middle = "~google/gemini-flash-latest"         # default for most work
+senior = "~anthropic/claude-sonnet-latest"     # complex, multi-file changes
+default = "middle"                             # selection used at startup
+auto_level_up = false                          # escalate on failure (plans and review only)
+```
+
+- **Selection model:** The active choice is either a tier (`Junior`, `Middle`, `Senior`) or one specific model. A tier is resolved to a concrete model by the server, so the TUI never guesses the mapping. If only some tiers are configured, the missing ones fall back to a configured neighbour.
+- **Picker (`Alt+M` / `Ctrl+M`, or a click on the model in the header):** The first screen lists the tiers with their resolved models. Press `1`, `2`, or `3` to select a tier immediately, or `4` (`Others...`) to open the full catalog and pin one specific model. `Esc` closes the picker.
+- **Header:** The model indicator shows the role and the resolved model (for example `Middle: ~google/gem…`). On narrow terminals only the role is shown. A pinned specific model is shown without a role.
+- **Background work:** Squash commit messages and history compaction always use the Junior tier. They are routine tasks, so they should not spend the budget of a stronger model.
+- **Level Up:** When `auto_level_up = true`, a plan step or review fix that still fails after verification healing is rolled back to the Git checkpoint taken before the step. The step then restarts on the next tier (Junior → Middle → Senior). Files found during discovery stay in context, so the stronger model does not search again. When the tiers are exhausted, or Level Up is off, the normal Fail-Fast stop applies. Develop never escalates automatically: the developer's explicit choice in the picker is always respected.

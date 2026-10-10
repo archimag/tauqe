@@ -289,7 +289,7 @@ pub async fn execute_edit_pipeline(
     while discovery_round < options.max_discovery_rounds
         && !has_proposed_edits(&pipeline_out.parsed_result)
     {
-        let requests = if is_discussion {
+        let (requests, drops) = if is_discussion {
             let resp = pipeline_out.discussion_response.as_ref().cloned().unwrap_or_else(|| {
                 crate::edits::stream::discussion::DiscussionStreamFilter::parse_response(
                     &pipeline_out.assistant_text,
@@ -313,9 +313,16 @@ pub async fn execute_edit_pipeline(
                     })
                     .collect();
             }
-            reqs
+            let mut drps = resp.context_drops;
+            if drps.is_empty() {
+                drps = protocol.parse_context_drops(&pipeline_out.assistant_text);
+            }
+            (reqs, drps)
         } else {
-            protocol.parse_context_requests(&pipeline_out.assistant_text)
+            (
+                protocol.parse_context_requests(&pipeline_out.assistant_text),
+                protocol.parse_context_drops(&pipeline_out.assistant_text),
+            )
         };
         let mut new_topics: Vec<&'static str> = Vec::new();
         for topic in protocol.parse_doc_requests(&pipeline_out.assistant_text) {
@@ -324,26 +331,45 @@ pub async fn execute_edit_pipeline(
                 new_topics.push(topic);
             }
         }
-        if requests.is_empty() && new_topics.is_empty() {
+        if requests.is_empty() && drops.is_empty() && new_topics.is_empty() {
             break;
         }
-        let outcome = if requests.is_empty() {
-            ContextApplicationOutcome::default()
-        } else {
-            let available_files =
-                crate::git::list_repository_files(Some(&repo_root)).unwrap_or_default();
-            apply_context_requests_detailed(
-                context_manager,
-                &requests,
-                &available_files,
-                options.max_auto_files_per_round,
-            )
-        };
-        if outcome.added.is_empty()
-            && outcome.missing.is_empty()
-            && outcome.already_satisfied.is_empty()
-            && new_topics.is_empty()
-        {
+        let available_files =
+            crate::git::list_repository_files(Some(&repo_root)).unwrap_or_default();
+        let outcome = reconcile_discovery_context(
+            context_manager,
+            options.discovery_mode,
+            &requests,
+            &drops,
+            &available_files,
+            options.max_files,
+        );
+        if let Some(limit) = outcome.limit_exceeded {
+            let warn_msg = format!(
+                "Context files limit exceeded (max_files = {}). The model requested {} new file(s) [{}], but the context already contains {} files. The task is too broad for a single turn and should be scoped down or decomposed into a plan. Execution stopped.",
+                limit.max_files,
+                limit.requested_count,
+                limit.requested_files.join(", "),
+                limit.current_count
+            );
+            tracing::warn!("{}", warn_msg);
+            let _ = stream_tx.send(StreamEvent::TextDelta(format!("\n\n⚠️ {}", warn_msg))).await;
+            let _ = stream_tx.send(StreamEvent::Done).await;
+            if pipeline_out.assistant_text.trim().is_empty() {
+                pipeline_out.assistant_text = warn_msg.clone();
+            } else {
+                pipeline_out.assistant_text = format!("{}\n\n⚠️ {}", pipeline_out.assistant_text.trim(), warn_msg);
+            }
+            pipeline_out.parsed_result = ModelResult::Answer { text: pipeline_out.assistant_text.clone() };
+            return Ok(pipeline_out);
+        }
+        if outcome.added.is_empty() && outcome.dropped.is_empty() && new_topics.is_empty() && outcome.missing.is_empty() {
+            if !outcome.already_satisfied.is_empty() {
+                tracing::info!(
+                    "All {} requested context file(s) are already satisfied; concluding discovery.",
+                    outcome.already_satisfied.len()
+                );
+            }
             break;
         }
         discovery_round += 1;
@@ -394,6 +420,13 @@ pub async fn execute_edit_pipeline(
                 "Added {} file(s) to context: {}",
                 outcome.added.len(),
                 outcome.added.join(", ")
+            ));
+        }
+        if !outcome.dropped.is_empty() {
+            notes.push(format!(
+                "Dropped {} file(s) from context: {}",
+                outcome.dropped.len(),
+                outcome.dropped.join(", ")
             ));
         }
         if !outcome.missing.is_empty() {
@@ -821,6 +854,7 @@ pub async fn execute_edit_pipeline_step<'a>(
     assembly.target_language = params.target_language.map(|s| s.to_string());
     assembly.is_plan_step_execution = is_isolated_plan_step;
     assembly.is_discussion = is_discussion;
+    assembly.discovery_mode = options.discovery_mode;
 
     let assembled_messages = assembly.assemble_chat_messages(prompt, protocol);
 

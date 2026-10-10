@@ -4,7 +4,7 @@ use ratatui::layout::Rect;
 use ratatui::style::{Color, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Padding, Paragraph};
-use tauqe_protocol::{ReviewItem, ReviewSession, ReviewSeverity, ReviewStatus};
+use tauqe_protocol::{ModelSelection, ReviewItem, ReviewSession, ReviewSeverity, ReviewStatus};
 
 use crate::app::AppState;
 use crate::ui::develop::ReasoningState;
@@ -33,6 +33,7 @@ pub enum VisibleReviewRow {
         body: String,
         severity: ReviewSeverity,
         status: ReviewStatus,
+        model: Option<ModelSelection>,
         file_path: Option<String>,
         line_range: Option<(usize, usize)>,
         is_expanded: bool,
@@ -244,6 +245,7 @@ impl ReviewViewState {
                         body: item.body.clone(),
                         severity: item.severity,
                         status: item.status,
+                        model: item.model.clone(),
                         file_path: item.file_path.clone(),
                         line_range: item.line_range,
                         is_expanded: item_expanded,
@@ -404,6 +406,25 @@ fn status_style(status: ReviewStatus) -> Style {
     }
 }
 
+fn model_badge(selection: &ModelSelection) -> Span<'static> {
+    match selection {
+        ModelSelection::Tier(tier) => match tier {
+            tauqe_protocol::ModelTier::Junior => {
+                Span::styled(" [junior]", Style::default().fg(Color::Green))
+            }
+            tauqe_protocol::ModelTier::Middle => {
+                Span::styled(" [middle]", Style::default().fg(Color::Yellow))
+            }
+            tauqe_protocol::ModelTier::Senior => {
+                Span::styled(" [senior]", Style::default().fg(Color::Red))
+            }
+        },
+        ModelSelection::Specific(model_ref) => {
+            Span::styled(format!(" [{}]", model_ref.name), Style::default().fg(Color::Cyan))
+        }
+    }
+}
+
 fn status_label(status: ReviewStatus) -> &'static str {
     match status {
         ReviewStatus::Discussion => "DISCUSSION",
@@ -547,6 +568,7 @@ fn compute_unified_review_lines(
                 body,
                 severity,
                 status,
+                model,
                 file_path,
                 line_range,
                 is_expanded,
@@ -576,6 +598,9 @@ fn compute_unified_review_lines(
                     Span::raw(" "),
                     Span::styled(format!("#{} {}", item_id, display_title), title_style),
                 ];
+                if let Some(selection) = model {
+                    spans.push(model_badge(selection));
+                }
 
                 if is_selected {
                     let hint = if *status == ReviewStatus::Discussion {
@@ -776,14 +801,4 @@ pub fn render_review_view(
     let info_widget = Paragraph::new(vec![Line::from(status_spans)])
         .block(Block::default().padding(Padding::horizontal(1)));
     frame.render_widget(info_widget, info_area);
-
-    if let Some(ref session_id) = state.confirm_delete_review {
-        crate::ui::dialogs::render_confirm_delete_review_popup(frame, session_id, state);
-    }
-    if state.confirm_execute_review.is_some() {
-        crate::ui::dialogs::render_confirm_execute_review_popup(frame, state);
-    }
-    if let Some(ref discuss) = state.discuss_review_dialog {
-        crate::ui::dialogs::render_discuss_review_dialog(frame, discuss);
-    }
 }

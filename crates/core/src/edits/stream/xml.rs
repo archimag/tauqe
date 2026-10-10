@@ -442,6 +442,9 @@ fn find_next_control_tag(buf: &str) -> Option<(usize, usize)> {
     if let Some(pl) = crate::edits::protocol::xml::tags::next_plan_tag(buf) {
         candidates.push(pl);
     }
+    if let Some(psd) = crate::edits::protocol::xml::tags::next_plan_step_done_tag(buf) {
+        candidates.push(psd);
+    }
     candidates.into_iter().min_by_key(|(start, _)| *start)
 }
 
@@ -457,6 +460,7 @@ fn safe_text_emit_len(buf: &str) -> usize {
         "<doc_request",
         "<user_language",
         "<verify",
+        "<plan_step_done",
         "<plan",
     ];
     let mut limit = buf.len();
@@ -481,6 +485,7 @@ fn safe_text_emit_len(buf: &str) -> usize {
                     "<verify" => crate::edits::protocol::xml::next_verify_tag(&buf[idx..]).is_some(),
                     "<context_request" => crate::edits::protocol::xml::next_context_request_tag(&buf[idx..]).is_some(),
                     "<doc_request" => crate::edits::protocol::xml::tags::next_doc_request_tag(&buf[idx..]).is_some(),
+                    "<plan_step_done" => crate::edits::protocol::xml::tags::next_plan_step_done_tag(&buf[idx..]).is_some(),
                     "<plan" => crate::edits::protocol::xml::tags::next_plan_tag(&buf[idx..]).is_some(),
                     _ => rest.contains('>'),
                 };
@@ -624,6 +629,26 @@ mod tests {
         assert!(!events
             .iter()
             .any(|event| matches!(event, StreamEvent::EditStarted)));
+    }
+
+    #[test]
+    fn test_plan_step_done_tags_hidden_from_stream_text() {
+        let input = "Step done.\n<plan_step_done id=\"4\" />\nReady";
+        let mut filter = XmlStreamFilter::new(vec![], std::env::temp_dir());
+        let mut events = Vec::new();
+        for ch in input.chars() {
+            events.extend(filter.push_chunk(&ch.to_string()));
+        }
+        events.extend(Box::new(filter).finish());
+        let text: String = events
+            .iter()
+            .filter_map(|event| match event {
+                StreamEvent::TextDelta(delta) => Some(delta.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text, "Step done.\n\nReady");
+        assert!(!text.contains("plan_step_done"));
     }
 
     #[test]

@@ -207,8 +207,8 @@ pub async fn handle_mouse_event(
                     if mouse.row >= start_y && (mouse.row as usize) < start_y as usize + inner_height {
                         let clicked_visible = (mouse.row - start_y) as usize;
                         let clicked_idx = scroll_offset + clicked_visible;
-                        if let Some(chosen) = dialog.items.get(clicked_idx).cloned() {
-                            crate::input::dialogs::apply_model_selection(st, chosen, server_writer)
+                        if let Some(item) = dialog.items.get(clicked_idx).cloned() {
+                            crate::input::dialogs::activate_selection_item(st, item, server_writer)
                                 .await?;
                             return Ok(InputResult::Continue);
                         }
@@ -690,17 +690,7 @@ pub async fn handle_mouse_event(
                         st.notify_warning("Cannot change model while model is generating");
                         return Ok(InputResult::Continue);
                     }
-                    if !st.available_models.is_empty() {
-                        let cur_idx = st
-                            .available_models
-                            .iter()
-                            .position(|m| m == &st.active_model)
-                            .unwrap_or(0);
-                        st.selection_dialog = Some(crate::app::SelectionDialogState::new(
-                            crate::app::SelectionDialogKind::Model,
-                            st.available_models.clone(),
-                            cur_idx,
-                        ));
+                    if st.open_model_dialog() {
                         return Ok(InputResult::Continue);
                     }
                 } else if areas.squash_button.1 > 0 && mouse.column >= areas.squash_button.0 && mouse.column <= areas.squash_button.1 {

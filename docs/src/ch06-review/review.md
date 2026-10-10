@@ -136,3 +136,11 @@ In accordance with TAUQE's dual-contour architecture, review findings are not du
 - **Direct Status Approval:** During discussion, findings can be approved (`TODO`) or dismissed (`REJECTED`) programmatically via structured `review_update` responses.
 - **Focused Execution (`e`):** Approved findings are executed in isolated turns with deterministic toolchain verification.
 - **View Filtering (`f`):** Press `f` in Review to filter out closed findings (`FIXED` and `REJECTED`), keeping the view focused strictly on outstanding engineering debt.
+
+---
+
+## 6.8 Model Tiers and Level Up in Review
+
+A finding can carry a model assignment: a tier (`junior`, `middle`, `senior`) or a specific model. It is shown as a badge next to the status. Simple findings can then run on a cheap model, while hard ones use a stronger model. A finding without an assignment runs on the model currently selected by the developer.
+
+If `auto_level_up = true` in the `[models]` section of `tauqe.toml`, a finding that fails verification does not stop the queue immediately. TAUQE first rolls the working tree back to the pre-step checkpoint, then restarts the finding on the next tier. Files already found during discovery stay in context. Only when the tiers are exhausted does the Fail-Fast policy from section 6.6 apply: the tree stays rolled back, the finding returns to `TODO`, and the batch stops. Review models are chosen per run in the launch dialog; Level Up affects only fix execution, never the audit itself.
