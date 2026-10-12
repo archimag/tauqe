@@ -194,6 +194,55 @@ impl PlanStorage {
         Ok(())
     }
 
+    /// Updates an architectural concept item recursively.
+    pub fn update_concept_item(
+        repo_root: &Path,
+        plan_id: &str,
+        concept_id: &str,
+        title: Option<&str>,
+        details: Option<&str>,
+    ) -> Result<Option<Plan>> {
+        let mut plan = match Self::load_plan(repo_root, plan_id)? {
+            Some(p) => p,
+            None => return Ok(None),
+        };
+
+        fn visit_concept_mut(
+            items: &mut [tauqe_protocol::ConceptItem],
+            target_id: &str,
+            title: Option<&str>,
+            details: Option<&str>,
+        ) -> bool {
+            for item in items {
+                if item.id.eq_ignore_ascii_case(target_id) {
+                    if let Some(t) = title {
+                        item.title = t.to_string();
+                    }
+                    if let Some(d) = details {
+                        item.details = Some(d.to_string());
+                    }
+                    return true;
+                }
+                if visit_concept_mut(&mut item.children, target_id, title, details) {
+                    return true;
+                }
+            }
+            false
+        }
+
+        let updated = visit_concept_mut(&mut plan.concept, concept_id, title, details);
+        if updated {
+            plan.updated_at = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            Self::save_plan(repo_root, &plan)?;
+            Ok(Some(plan))
+        } else {
+            Ok(None)
+        }
+    }
+
     /// Updates status of a plan item recursively.
     pub fn update_item(
         repo_root: &Path,
@@ -263,12 +312,20 @@ impl PlanStorage {
 
             match action.as_str() {
                 "save" => {
+                    if tag.concept.is_empty() {
+                        errors.push(format!(
+                            "Cannot save plan '{}': plan must contain a <concept> section defining architectural intent and invariants",
+                            tag.id
+                        ));
+                        continue;
+                    }
                     let mut plan = matched_plan.unwrap_or_else(|| Plan {
                         id: tag.id.clone(),
                         title: tag.title.clone().unwrap_or_else(|| tag.id.clone()),
                         description: tag.description.clone(),
                         created_at: now,
                         updated_at: now,
+                        concept: Vec::new(),
                         items: Vec::new(),
                     });
                     if let Some(t) = tag.title {
@@ -276,6 +333,9 @@ impl PlanStorage {
                     }
                     if tag.description.is_some() {
                         plan.description = tag.description;
+                    }
+                    if !tag.concept.is_empty() || plan.concept.is_empty() {
+                        plan.concept = tag.concept;
                     }
                     plan.items = tag.items;
                     plan.refresh_parent_statuses();
@@ -301,6 +361,34 @@ impl PlanStorage {
                             plan.description = tag.description;
                         }
 
+                        // Update or append concept items
+                        fn update_concept_single(
+                            concepts: &mut [tauqe_protocol::ConceptItem],
+                            update: &tauqe_protocol::ConceptItem,
+                        ) -> bool {
+                            for item in concepts.iter_mut() {
+                                if item.id.eq_ignore_ascii_case(&update.id) {
+                                    if !update.title.is_empty() {
+                                        item.title = update.title.clone();
+                                    }
+                                    if update.details.is_some() {
+                                        item.details = update.details.clone();
+                                    }
+                                    return true;
+                                }
+                                if update_concept_single(&mut item.children, update) {
+                                    return true;
+                                }
+                            }
+                            false
+                        }
+
+                        for c_update in &tag.concept {
+                            if !update_concept_single(&mut plan.concept, c_update) {
+                                plan.concept.push(c_update.clone());
+                            }
+                        }
+
                         fn update_single(items: &mut [PlanItem], update: &PlanItem) -> bool {
                             for item in items.iter_mut() {
                                 if item.id.eq_ignore_ascii_case(&update.id) {
@@ -310,6 +398,12 @@ impl PlanStorage {
                                     }
                                     if !update.title.is_empty() {
                                         item.title = update.title.clone();
+                                    }
+                                    if !update.files.is_empty() {
+                                        item.files = update.files.clone();
+                                    }
+                                    if !update.concept_refs.is_empty() {
+                                        item.concept_refs = update.concept_refs.clone();
                                     }
                                     return true;
                                 }
@@ -406,11 +500,22 @@ PlanApplicationOutcome { applied, errors }
             update.action.to_string()
         };
 
+        if action == "save" && update.concept.is_empty() {
+            return PlanApplicationOutcome {
+                applied: Vec::new(),
+                errors: vec![format!(
+                    "Cannot save plan '{}': plan must contain a concept tree defining architectural intent and invariants",
+                    plan_id
+                )],
+            };
+        }
+
         let parsed_tag = crate::edits::protocol::xml::tags::ParsedPlanTag {
             action,
             id: plan_id,
             title: update.title.clone(),
             description: update.description.clone(),
+            concept: update.concept.clone(),
             items: update.items.clone(),
         };
         Self::apply_parsed_plans(repo_root, vec![parsed_tag], Vec::new())
@@ -446,17 +551,22 @@ mod tests {
             description: Some("OAuth2 + JWT".to_string()),
             created_at: 100,
             updated_at: 100,
+            concept: vec![],
             items: vec![
                 PlanItem {
                     id: "1".to_string(),
                     title: "Models".to_string(),
                     details: None,
                     status: PlanItemStatus::Todo,
+                    files: vec![],
+                    concept_refs: vec![],
                     children: vec![PlanItem {
                         id: "1.1".to_string(),
                         title: "Token struct".to_string(),
                         details: None,
                         status: PlanItemStatus::Todo,
+                        files: vec![],
+                        concept_refs: vec![],
                         children: vec![],
                     }],
                 },
@@ -465,6 +575,8 @@ mod tests {
                     title: "Endpoint".to_string(),
                     details: None,
                     status: PlanItemStatus::Todo,
+                    files: vec![],
+                    concept_refs: vec![],
                     children: vec![],
                 },
             ],
@@ -518,6 +630,9 @@ mod tests {
 I have prepared the plan:
 <plan action="save" id="jwt-auth" title="JWT Auth">
   <description>Auth migration</description>
+  <concept>
+    <concept_item id="c-1" title="Stateless tokens" />
+  </concept>
   <item id="1" title="Model" status="todo" />
   <item id="2" title="Handler" status="todo" />
 </plan>
@@ -527,6 +642,7 @@ I have prepared the plan:
         assert_eq!(affected.applied.len(), 1);
         assert!(affected.errors.is_empty());
         assert_eq!(affected.applied[0].id, "jwt-auth");
+        assert_eq!(affected.applied[0].concept.len(), 1);
         assert_eq!(affected.applied[0].items.len(), 2);
         assert_eq!(PlanStorage::load_active_id(root).unwrap(), Some("jwt-auth".to_string()));
 
@@ -569,11 +685,14 @@ Step 1 is done:
             description: None,
             created_at: 1,
             updated_at: 1,
+            concept: vec![],
             items: vec![PlanItem {
                 id: "1".to_string(),
                 title: "T".to_string(),
                 details: None,
                 status: PlanItemStatus::Todo,
+                files: vec![],
+                concept_refs: vec![],
                 children: vec![],
             }],
         };
@@ -596,11 +715,19 @@ Step 1 is done:
             id: Some("structured-auth".to_string()),
             title: Some("Structured Auth".to_string()),
             description: Some("Implement auth via structured output".to_string()),
+            concept: vec![tauqe_protocol::ConceptItem {
+                id: "c-1".to_string(),
+                title: "Structured auth requirement".to_string(),
+                details: None,
+                children: vec![],
+            }],
             items: vec![PlanItem {
                 id: "1".to_string(),
                 title: "Protocol types".to_string(),
                 details: Some("Schemas and filters".to_string()),
                 status: PlanItemStatus::Done,
+                files: vec![],
+                concept_refs: vec![],
                 children: vec![],
             }],
         };
@@ -616,11 +743,14 @@ Step 1 is done:
             id: Some("structured-auth".to_string()),
             title: None,
             description: None,
+            concept: vec![],
             items: vec![PlanItem {
                 id: "1".to_string(),
                 title: "Protocol types".to_string(),
                 details: Some("Updated details".to_string()),
                 status: PlanItemStatus::Done,
+                files: vec![],
+                concept_refs: vec![],
                 children: vec![],
             }],
         };
@@ -628,6 +758,41 @@ Step 1 is done:
         let outcome2 = PlanStorage::apply_discussion_plan_update(root, &update2);
         assert!(outcome2.errors.is_empty());
         assert_eq!(outcome2.applied[0].items[0].details.as_deref(), Some("Updated details"));
+    }
+
+    #[test]
+    fn test_plan_storage_concept_item_update() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+
+        let plan = Plan {
+            id: "arch-plan".to_string(),
+            title: "Arch Plan".to_string(),
+            description: None,
+            created_at: 100,
+            updated_at: 100,
+            concept: vec![tauqe_protocol::ConceptItem {
+                id: "c-1".to_string(),
+                title: "Original title".to_string(),
+                details: None,
+                children: vec![],
+            }],
+            items: vec![],
+        };
+        PlanStorage::save_plan(root, &plan).unwrap();
+
+        let updated = PlanStorage::update_concept_item(
+            root,
+            "arch-plan",
+            "c-1",
+            Some("New title"),
+            Some("New details"),
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(updated.concept[0].title, "New title");
+        assert_eq!(updated.concept[0].details.as_deref(), Some("New details"));
     }
 
     #[test]
@@ -641,6 +806,7 @@ Step 1 is done:
             description: Some("Desc".to_string()),
             created_at: 100,
             updated_at: 100,
+            concept: vec![],
             items: vec![PlanItem {
                 id: "1".to_string(),
                 title: "Step 1".to_string(),
@@ -655,6 +821,12 @@ Step 1 is done:
             id: Some("test-plan".to_string()),
             title: Some("Test".to_string()),
             description: Some("Updated Desc without items".to_string()),
+            concept: vec![tauqe_protocol::ConceptItem {
+                id: "c-1".to_string(),
+                title: "Architecture concept".to_string(),
+                details: None,
+                children: vec![],
+            }],
             items: vec![],
         };
         let outcome = PlanStorage::apply_discussion_plan_update(root, &update);

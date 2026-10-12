@@ -388,6 +388,7 @@ pub async fn handle_develop_key(
         DevelopAction::ClearPromptSaving => {
             if st.model.is_busy() {
                 st.confirm_cancel = true;
+                st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
             } else if !st.input_editor.is_empty() {
                 st.input_editor.clear_saving();
                 st.notify_info("Prompt cleared (C-Y to restore)");
@@ -414,6 +415,7 @@ pub async fn handle_develop_key(
                 st.notify_warning("No AI commit to undo");
             } else {
                 st.confirm_undo = true;
+                st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
             }
         }
         DevelopAction::OpenSquashDialog => {

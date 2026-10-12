@@ -454,6 +454,7 @@ pub async fn handle_mouse_event(
                 match check_confirm_hit(&geom, mouse.column, mouse.row) {
                     ModalHit::Confirm => {
                         st.confirm_cancel = false;
+                        st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
                         let cancel_review = st.review.running;
                         let cancel_model = st.model.is_busy();
                         drop(st);
@@ -466,6 +467,7 @@ pub async fn handle_mouse_event(
                     }
                     ModalHit::Cancel | ModalHit::Outside => {
                         st.confirm_cancel = false;
+                        st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
                     }
                     ModalHit::InsideBody => {}
                 }
@@ -479,10 +481,12 @@ pub async fn handle_mouse_event(
                 match check_confirm_hit(&geom, mouse.column, mouse.row) {
                     ModalHit::Confirm => {
                         st.confirm_quit = false;
+                        st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
                         return Ok(InputResult::Exit);
                     }
                     ModalHit::Cancel | ModalHit::Outside => {
                         st.confirm_quit = false;
+                        st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
                     }
                     ModalHit::InsideBody => {}
                 }
@@ -499,11 +503,13 @@ pub async fn handle_mouse_event(
                 match check_confirm_hit(&geom, mouse.column, mouse.row) {
                     ModalHit::Confirm => {
                         st.confirm_undo = false;
+                        st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
                         drop(st);
                         send_request(server_writer, methods::GIT_UNDO, serde_json::json!({})).await?;
                     }
                     ModalHit::Cancel | ModalHit::Outside => {
                         st.confirm_undo = false;
+                        st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
                     }
                     ModalHit::InsideBody => {}
                 }
@@ -524,26 +530,7 @@ pub async fn handle_mouse_event(
                 match check_confirm_hit(&geom, mouse.column, mouse.row) {
                     ModalHit::Confirm => {
                         st.confirm_execute_scope = None;
-                        let first_step = match target.steps.first() {
-                            Some(s) => s.clone(),
-                            None => return Ok(InputResult::Continue),
-                        };
-
-                        if target.steps.len() > 1 {
-                            st.plan_batch_queue = Some(crate::app::PlanBatchQueue {
-                                plan_id: target.plan_id.clone(),
-                                plan_title: target.plan_title.clone(),
-                                scope_title: target.scope_title.clone(),
-                                steps: target.steps.clone(),
-                                current_index: 0,
-                            });
-                        } else {
-                            st.plan_batch_queue = None;
-                        }
-
-                        if let Some(plan) = st.plans_view.plans.iter_mut().find(|p| p.id == target.plan_id) {
-                            plan.update_item_status(&first_step.id, tauqe_protocol::PlanItemStatus::InProgress);
-                        }
+                        st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
                         st.view_mode = ViewMode::Develop;
                         st.model.reasoning.clear();
                         st.model.text.clear();
@@ -569,19 +556,80 @@ pub async fn handle_mouse_event(
                         st.turn_started_at = Some(std::time::Instant::now());
 
                         drop(st);
-                        let params = tauqe_protocol::PlanExecuteStepParams {
+                        let params = tauqe_protocol::PlanExecuteParams {
                             plan_id: target.plan_id,
-                            step_id: first_step.id,
+                            step_id: target.step_id,
                         };
                         send_request(
                             server_writer,
-                            methods::PLAN_EXECUTE_STEP,
+                            methods::PLAN_EXECUTE,
                             serde_json::to_value(params)?,
                         )
                         .await?;
                     }
                     ModalHit::Cancel | ModalHit::Outside => {
                         st.confirm_execute_scope = None;
+                        st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
+                    }
+                    ModalHit::InsideBody => {}
+                }
+                return Ok(InputResult::Continue);
+            }
+
+            if let Some(target) = st.confirm_execute_review.clone() {
+                let is_single = target.items.len() == 1;
+                let c_label = if is_single {
+                    "Execute Finding (Enter)"
+                } else {
+                    "Execute Batch (Enter)"
+                };
+                let body_count = if is_single { 7 } else { 8 + target.items.len().min(4) };
+                let geom = crate::ui::dialogs::confirm_modal_geometry(
+                    term_rect, 66, body_count, c_label, "Cancel (Esc)",
+                );
+                match check_confirm_hit(&geom, mouse.column, mouse.row) {
+                    ModalHit::Confirm => {
+                        st.confirm_execute_review = None;
+                        st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
+                        st.view_mode = ViewMode::Develop;
+                        st.model.reasoning.clear();
+                        st.model.text.clear();
+                        st.model.markdown_lines.clear();
+                        st.model.error = None;
+                        st.model.result = None;
+                        st.model.usage = None;
+                        st.model.scroll = 0;
+                        st.model.status = "awaiting".to_string();
+                        st.model.auto_scroll = true;
+                        st.model.current_cost = Some(0.0);
+                        st.model.edits_active = false;
+                        st.model.files.clear();
+                        st.model.selected_file_index = 0;
+                        st.model.edit_final_applied = None;
+                        st.model.edit_final_error = None;
+                        st.model.last_commit_hash = None;
+                        st.model.last_commit_summary = None;
+                        st.model.toolchain_command = None;
+                        st.model.toolchain_status = None;
+                        st.model.copy_flash = None;
+                        st.model.code_blocks.clear();
+                        st.turn_started_at = Some(std::time::Instant::now());
+
+                        drop(st);
+                        let params = tauqe_protocol::ReviewExecuteParams {
+                            review_id: target.review_id,
+                            item_id: target.item_id,
+                        };
+                        send_request(
+                            server_writer,
+                            methods::REVIEW_EXECUTE,
+                            serde_json::to_value(params)?,
+                        )
+                        .await?;
+                    }
+                    ModalHit::Cancel | ModalHit::Outside => {
+                        st.confirm_execute_review = None;
+                        st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
                     }
                     ModalHit::InsideBody => {}
                 }
@@ -595,11 +643,33 @@ pub async fn handle_mouse_event(
                 match check_confirm_hit(&geom, mouse.column, mouse.row) {
                     ModalHit::Confirm => {
                         st.confirm_delete_plan = None;
+                        st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
                         drop(st);
                         crate::input::dialogs::delete_plan(server_writer, plan_id).await?;
                     }
                     ModalHit::Cancel | ModalHit::Outside => {
                         st.confirm_delete_plan = None;
+                        st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
+                    }
+                    ModalHit::InsideBody => {}
+                }
+                return Ok(InputResult::Continue);
+            }
+
+            if let Some(review_id) = st.confirm_delete_review.clone() {
+                let geom = crate::ui::dialogs::confirm_modal_geometry(
+                    term_rect, 58, 5, "Confirm Delete (Y)", "Cancel (Esc)",
+                );
+                match check_confirm_hit(&geom, mouse.column, mouse.row) {
+                    ModalHit::Confirm => {
+                        st.confirm_delete_review = None;
+                        st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
+                        drop(st);
+                        crate::input::dialogs::delete_review(server_writer, review_id).await?;
+                    }
+                    ModalHit::Cancel | ModalHit::Outside => {
+                        st.confirm_delete_review = None;
+                        st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
                     }
                     ModalHit::InsideBody => {}
                 }
@@ -613,6 +683,7 @@ pub async fn handle_mouse_event(
                 match check_confirm_hit(&geom, mouse.column, mouse.row) {
                     ModalHit::Confirm => {
                         st.context_view.confirm_clear_auto = false;
+                        st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
                         drop(st);
                         let params = tauqe_protocol::ContextClearParams {
                             layer: Some(tauqe_protocol::ContextLayer::Auto),
@@ -626,6 +697,7 @@ pub async fn handle_mouse_event(
                     }
                     ModalHit::Cancel | ModalHit::Outside => {
                         st.context_view.confirm_clear_auto = false;
+                        st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
                     }
                     ModalHit::InsideBody => {}
                 }
@@ -639,6 +711,7 @@ pub async fn handle_mouse_event(
                 match check_confirm_hit(&geom, mouse.column, mouse.row) {
                     ModalHit::Confirm => {
                         st.confirm_clear_history = false;
+                        st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
                         let cost = st.model.session_total_cost;
                         let prev_cost = st.model.prev_cost;
                         st.model = crate::ui::develop::DevelopView {
@@ -657,6 +730,7 @@ pub async fn handle_mouse_event(
                     }
                     ModalHit::Cancel | ModalHit::Outside => {
                         st.confirm_clear_history = false;
+                        st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
                     }
                     ModalHit::InsideBody => {}
                 }

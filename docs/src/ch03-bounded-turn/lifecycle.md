@@ -27,7 +27,7 @@ Instead of an unbounded background agent loop, TAUQE operates as a **finite-stat
 
 ---
 
-- **Discovery & Exploration Phase:** The model inspects the task and navigates the Tree-sitter repository map to locate missing symbols and type signatures, or requests internal system documentation via `<doc_request topic="...">`. If required files are missing from context, the system autonomously fetches them into the `auto` layer and proceeds to the next round. Code generation is deferred until the model has sufficient clarity to avoid blind speculation.
+- **Discovery & Exploration Phase:** The model inspects the task and navigates the Tree-sitter repository map to locate missing symbols and type signatures, or requests internal system documentation via `<doc_request topic="...">`. If required files are missing from context, the system autonomously fetches them into the `auto` layer and proceeds to the next round. Throughout multi-round discovery, the model retains intermediate findings and working hypotheses in the ephemeral Turn Scratchpad. Code generation is deferred until the model has sufficient clarity to avoid blind speculation.
 
 ---
 
@@ -51,7 +51,32 @@ Modifications never touch disk unverified:
 
 ---
 
-## 3.4 Dual Protocol Circuits: Execution vs Discussion
+## 3.4 Turn Scratchpad: Ephemeral Working Memory
+
+During multi-round discovery and verification healing cycles, maintaining cognitive focus and retaining intermediate findings is essential. Without a dedicated mechanism, a model can lose track of what has already been checked or why specific files were requested.
+
+However, recording intermediate reasoning or scratch notes into persistent session history would pollute context, cause token bloat, and introduce noise into subsequent turns. TAUQE resolves this with the **Turn Scratchpad**:
+
+- **Turn-Scoped Ephemerality (Why & How):** The scratchpad exists strictly within the ephemeral lifecycle of the active bounded turn. It lives in memory across discovery rounds and compiler healing retries, but is completely discarded when the turn ends. It is never written to session history (`.tauqe/history.jsonl`), never recorded in Git commits, and never displayed in the chat view.
+- **Protocol Contract (`<scratchpad>`):** The model emits working hypotheses, verified facts, and exploration goals inside `<scratchpad>...</scratchpad>` tags (or `<scratchpad note="..." />`). Turn-marker normalization protects it against collisions with literal source code, while `clean_assistant_text` strips it completely from final user-facing responses.
+- **Round-to-Round Injection (`<turn_scratchpad>`):** When the model transitions to the next discovery round or a verification healing step, `PromptAssembly` injects the accumulated scratchpad into the system prompt under `<turn_scratchpad>`. The model instantly regains its working context without re-reading past tool outputs.
+- **Strict Budgeting & Anti-Bloat:** To prevent generative bloat, the scratchpad is capped at `MAX_SCRATCHPAD_CHARS` (4,000 characters) with UTF-8 safe boundary truncation. The prompt instructions guide the model to maintain dense, concise bullet points rather than runaway prose.
+
+---
+
+## 3.5 Unified Terminal Outcome Protocol (`<success>` / `<error>`)
+
+To eliminate ambiguity at turn conclusion and prevent speculative execution cascades, every code-modifying turn and isolated task step adheres to a binary terminal outcome contract:
+
+- **Protocol Rationale (Why & How):** Free-form conversational text is nondeterministic and fragile for automated task runners. When executing isolated plan steps or triaging review findings in batch queues, the system requires an unambiguous, machine-readable signal indicating whether the task was fully accomplished or blocked.
+- **Binary Outcome Tags:**
+  - `<success summary="...">` (or `<success>...</success>`): Signifies that the target goal was fully implemented, staged, and verified by compiler checks. In batch execution (e.g. executing all steps of an implementation plan or resolving code review findings), `<success>` signals the runner to transition the item to `Done`/`Fixed` and advance to the next queued item.
+  - `<error message="...">` (or `<error>...</error>`): Signifies that the model encountered an insurmountable architectural contradiction, missing prerequisite, or unresolvable toolchain failure. In batch pipelines, `<error>` immediately halts execution to prevent cascading corruption, marks the current item as blocked, and reports the structured error message to the developer.
+- **Turn-Marker Protection:** Like all operational tags, `<success>` and `<error>` are suffixed with the active turn marker (e.g., `<success_MARKER>`), preventing accidental invocation from literal source code, git diffs, or markdown examples.
+
+---
+
+## 3.6 Dual Protocol Circuits: Execution vs Discussion
 
 TAUQE separates model interaction into two dedicated protocol circuits based on functional requirements:
 

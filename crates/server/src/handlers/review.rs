@@ -1,21 +1,24 @@
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use tauqe_core::edits::protocol::ContextRequest;
 use tauqe_core::providers::{create_provider, ChatMessage, LlmProvider, StreamEvent};
 use tauqe_core::review::{
     build_review_system_prompt, build_review_user_prompt, parse_review_findings, ReviewStorage,
 };
+use tauqe_core::workflow::common::apply_context_requests_detailed;
 use tauqe_protocol::{
-    events, Event, ModelUsageEvent, ModelUsageInfo, Request, Response, ReviewContentDeltaEvent,
-    ReviewDeleteParams, ReviewDeleteResult, ReviewErrorEvent, ReviewExecuteItemParams,
-    ReviewFinishedEvent, ReviewGetParams, ReviewGetResult, ReviewItemStatus,
+    events, ContextAccess, Event, ModelUsageEvent, ModelUsageInfo, Request, Response,
+    ReviewContentDeltaEvent, ReviewDeleteParams, ReviewDeleteResult, ReviewErrorEvent,
+    ReviewExecuteParams, ReviewFinishedEvent, ReviewGetParams, ReviewGetResult, ReviewItemStatus,
     ReviewListChangedEvent, ReviewListResult, ReviewReasoningDeltaEvent, ReviewSession,
     ReviewStartParams, ReviewStartedEvent, ReviewUpdateItemParams, ReviewUpdateItemResult,
     ReviewUpdatedEvent,
 };
 use tokio::sync::{mpsc, watch};
 
-use crate::handlers::model::start_model_turn;
+use crate::handlers::model::execute_model_turn;
 use crate::state::{next_operation_id, ActiveOperation, AppState};
 use crate::transport::OutChannel;
 
@@ -447,10 +450,196 @@ pub async fn handle_review_update_item(req: Request, state: &Arc<AppState>) -> R
     }
 }
 
-pub async fn handle_review_execute_item(req: Request, state: &Arc<AppState>) -> Response {
-    let params: ReviewExecuteItemParams = match req.params.and_then(|p| serde_json::from_value(p).ok()) {
+/// Outcome of a server-driven batch of review findings.
+#[derive(Debug, PartialEq, Eq)]
+enum BatchOutcome {
+    Completed {
+        items: usize,
+    },
+    Failed {
+        completed: usize,
+        item_id: u32,
+        reason: String,
+    },
+}
+
+fn publish_review(state: &Arc<AppState>, repo_root: &Path, review_id: &str) {
+    if let Ok(Some(session)) = ReviewStorage::load_review(repo_root, review_id) {
+        emit(
+            &state.out,
+            events::REVIEW_UPDATED,
+            serde_json::to_value(ReviewUpdatedEvent { session }).ok(),
+        );
+    }
+    if let Ok(reviews) = ReviewStorage::load_all(repo_root) {
+        let active_id = ReviewStorage::load_active_id(repo_root).ok().flatten();
+        emit(
+            &state.out,
+            events::REVIEW_LIST_CHANGED,
+            serde_json::to_value(ReviewListChangedEvent { reviews, active_id }).ok(),
+        );
+    }
+}
+
+fn set_item_status(
+    state: &Arc<AppState>,
+    repo_root: &Path,
+    review_id: &str,
+    item_id: u32,
+    status: ReviewItemStatus,
+) {
+    if let Ok(Some(_)) =
+        ReviewStorage::update_session_item_status(repo_root, Some(review_id), item_id, status)
+    {
+        publish_review(state, repo_root, review_id);
+    }
+}
+
+fn report_item_failure(state: &Arc<AppState>, operation_id: &str, message: &str) {
+    emit(
+        &state.out,
+        events::MODEL_ERROR,
+        Some(serde_json::json!({
+            "operation_id": operation_id,
+            "message": message,
+        })),
+    );
+}
+
+/// Loads the file referenced by a finding into editable context before the turn starts.
+async fn preload_item_file(state: &Arc<AppState>, repo_root: &Path, file_path: &str) {
+    let clean_path = file_path.trim().trim_start_matches("./").trim_start_matches('/');
+    if clean_path.is_empty() {
+        return;
+    }
+    let max_files = state.config.lock().await.context.max_files;
+    let available_files =
+        tauqe_core::git::list_repository_files(Some(repo_root)).unwrap_or_default();
+    let requests = vec![ContextRequest {
+        path: clean_path.to_string(),
+        access: ContextAccess::Editable,
+    }];
+
+    let (outcome, new_ctx_state) = {
+        let mut ctx = state.context.write().await;
+        let oc = apply_context_requests_detailed(&mut ctx, &requests, &available_files, max_files);
+        let s = ctx.get_state();
+        (oc, s)
+    };
+
+    if !outcome.added.is_empty() {
+        emit(
+            &state.out,
+            events::CONTEXT_CHANGED,
+            Some(serde_json::json!({ "state": new_ctx_state })),
+        );
+    }
+}
+
+/// Executes one finding in an isolated turn. The finding becomes FIXED only when the
+/// turn satisfies the success contract; on any failure it returns to TODO.
+async fn run_review_step(
+    state: &Arc<AppState>,
+    repo_root: &Path,
+    review_id: &str,
+    item_id: u32,
+) -> Result<(), String> {
+    let session = match ReviewStorage::load_review(repo_root, review_id) {
+        Ok(Some(s)) => s,
+        Ok(None) => return Err(format!("Review session '{}' not found", review_id)),
+        Err(err) => return Err(format!("{:#}", err)),
+    };
+    let item = match session.find_item(item_id) {
+        Some(i) => i.clone(),
+        None => {
+            return Err(format!(
+                "Review item #{} not found in session '{}'",
+                item_id, review_id
+            ));
+        }
+    };
+
+    match item.status {
+        ReviewItemStatus::Fixed => return Ok(()),
+        ReviewItemStatus::Discussion => {
+            return Err(format!(
+                "Review item #{} is in DISCUSSION status and cannot be executed until reviewed",
+                item.id
+            ));
+        }
+        ReviewItemStatus::Rejected => {
+            return Err(format!("Review item #{} is REJECTED and cannot be executed", item.id));
+        }
+        ReviewItemStatus::Todo | ReviewItemStatus::InProgress => {}
+    }
+
+    if let Some(file_path) = &item.file_path {
+        preload_item_file(state, repo_root, file_path).await;
+    }
+    set_item_status(state, repo_root, review_id, item_id, ReviewItemStatus::InProgress);
+
+    let prompt = match tauqe_core::review::prompt::format_review_step_execution_prompt(
+        &session, item_id, "",
+    ) {
+        Ok(p) => p,
+        Err(err) => {
+            set_item_status(state, repo_root, review_id, item_id, ReviewItemStatus::Todo);
+            return Err(err);
+        }
+    };
+
+    match execute_model_turn(state, prompt, item.model.clone()).await {
+        Ok(turn) if turn.is_success() => {
+            set_item_status(state, repo_root, review_id, item_id, ReviewItemStatus::Fixed);
+            Ok(())
+        }
+        Ok(turn) => {
+            set_item_status(state, repo_root, review_id, item_id, ReviewItemStatus::Todo);
+            let reason = turn.error.clone().unwrap_or_else(|| {
+                "Finding turn ended without verified changes or a success tag".to_string()
+            });
+            if turn.error.is_none() && !turn.is_cancelled {
+                report_item_failure(state, &turn.operation_id, &reason);
+            }
+            Err(reason)
+        }
+        Err(err) => {
+            set_item_status(state, repo_root, review_id, item_id, ReviewItemStatus::Todo);
+            let op_id = format!("op-{}", next_operation_id());
+            report_item_failure(state, &op_id, &err.message);
+            Err(err.message)
+        }
+    }
+}
+
+/// Runs findings sequentially and stops at the first failure (server-side Fail-Fast).
+/// Findings fixed before the failure stay FIXED.
+async fn run_review_batch(
+    state: &Arc<AppState>,
+    review_id: &str,
+    item_ids: Vec<u32>,
+) -> BatchOutcome {
+    let repo_root = state.context.read().await.repo_root().to_path_buf();
+    let _ = ReviewStorage::save_active_id(&repo_root, Some(review_id));
+
+    let mut completed = 0usize;
+    for item_id in item_ids {
+        if let Err(reason) = run_review_step(state, &repo_root, review_id, item_id).await {
+            return BatchOutcome::Failed {
+                completed,
+                item_id,
+                reason,
+            };
+        }
+        completed += 1;
+    }
+    BatchOutcome::Completed { items: completed }
+}
+
+pub async fn handle_review_execute(req: Request, state: &Arc<AppState>) -> Response {
+    let params: ReviewExecuteParams = match req.params.and_then(|p| serde_json::from_value(p).ok()) {
         Some(p) => p,
-        None => return Response::err(req.id, "INVALID_PARAMS", "Missing or invalid review execute item params"),
+        None => return Response::err(req.id, "INVALID_PARAMS", "Missing or invalid review execute params"),
     };
 
     let repo_root = state.context.read().await.repo_root().to_path_buf();
@@ -460,67 +649,336 @@ pub async fn handle_review_execute_item(req: Request, state: &Arc<AppState>) -> 
         Err(err) => return Response::err(req.id, "REVIEW_LOAD_FAILED", format!("{:#}", err)),
     };
 
-    let item = match session.find_item(params.item_id) {
-        Some(i) => i,
-        None => return Response::err(req.id, "NOT_FOUND", format!("Review item #{} not found in session '{}'", params.item_id, params.review_id)),
+    let item_ids: Vec<u32> = match params.item_id {
+        Some(item_id) => {
+            let item = match session.find_item(item_id) {
+                Some(i) => i,
+                None => return Response::err(req.id, "NOT_FOUND", format!("Review item #{} not found in session '{}'", item_id, params.review_id)),
+            };
+            match item.status {
+                ReviewItemStatus::Discussion => {
+                    return Response::err(
+                        req.id,
+                        "ITEM_IN_DISCUSSION",
+                        format!("Review item #{} is in DISCUSSION status and cannot be executed autonomously until reviewed (change status to TODO first)", item.id),
+                    );
+                }
+                ReviewItemStatus::Rejected => {
+                    return Response::err(
+                        req.id,
+                        "ITEM_REJECTED",
+                        format!("Review item #{} is REJECTED and cannot be executed", item.id),
+                    );
+                }
+                ReviewItemStatus::Fixed => {
+                    return Response::err(
+                        req.id,
+                        "NOTHING_TO_EXECUTE",
+                        format!("Review item #{} is already FIXED", item.id),
+                    );
+                }
+                ReviewItemStatus::Todo | ReviewItemStatus::InProgress => vec![item_id],
+            }
+        }
+        None => {
+            let discussion: Vec<String> = session
+                .items
+                .iter()
+                .filter(|i| i.status == ReviewItemStatus::Discussion)
+                .map(|i| format!("#{}", i.id))
+                .collect();
+            if !discussion.is_empty() {
+                return Response::err(
+                    req.id,
+                    "ITEM_IN_DISCUSSION",
+                    format!(
+                        "Review session contains item(s) in DISCUSSION status: {}. Review them (change status to TODO) before executing the batch",
+                        discussion.join(", ")
+                    ),
+                );
+            }
+            let ids: Vec<u32> = session
+                .items
+                .iter()
+                .filter(|i| {
+                    i.status == ReviewItemStatus::Todo || i.status == ReviewItemStatus::InProgress
+                })
+                .map(|i| i.id)
+                .collect();
+            if ids.is_empty() {
+                return Response::err(
+                    req.id,
+                    "NOTHING_TO_EXECUTE",
+                    "No TODO findings to execute in this review session",
+                );
+            }
+            ids
+        }
     };
 
-    if item.status == ReviewItemStatus::Discussion {
+    if state.active_cancel.lock().await.is_some() {
         return Response::err(
             req.id,
-            "ITEM_IN_DISCUSSION",
-            format!("Review item #{} is in DISCUSSION status and cannot be executed autonomously until reviewed (change status to TODO first)", item.id),
+            "OPERATION_IN_PROGRESS",
+            "Another operation is already running",
         );
     }
 
-    if item.status == ReviewItemStatus::Rejected {
-        return Response::err(
-            req.id,
-            "ITEM_REJECTED",
-            format!("Review item #{} is REJECTED and cannot be executed", item.id),
+    if let Err(report) = crate::handlers::run_preflight_verification(&repo_root).await {
+        let message = format!(
+            "Pre-flight verification failed: the repository does not build cleanly. Batch execution was blocked before starting any finding.\n\n{}",
+            report
         );
+        return Response::err(req.id, "PREFLIGHT_VERIFICATION_FAILED", message);
     }
 
-    if let Ok(Some(_)) = ReviewStorage::update_session_item_status(
-        &repo_root,
-        Some(&params.review_id),
-        params.item_id,
-        ReviewItemStatus::InProgress,
-    ) {
-        let _ = ReviewStorage::save_active_id(&repo_root, Some(&params.review_id));
-        if let Ok(Some(updated_session)) = ReviewStorage::load_review(&repo_root, &params.review_id) {
-            emit(
-                &state.out,
-                events::REVIEW_UPDATED,
-                serde_json::to_value(ReviewUpdatedEvent { session: updated_session }).ok(),
-            );
+    let response = Response::ok(
+        req.id,
+        serde_json::json!({ "review_id": params.review_id, "item_ids": item_ids }),
+    );
+
+    let state = Arc::clone(state);
+    let review_id = params.review_id.clone();
+    tokio::spawn(async move {
+        match run_review_batch(&state, &review_id, item_ids).await {
+            BatchOutcome::Completed { items } => {
+                tracing::info!("Review '{}' batch completed: {} finding(s)", review_id, items);
+            }
+            BatchOutcome::Failed {
+                completed,
+                item_id,
+                reason,
+            } => {
+                tracing::warn!(
+                    "Review '{}' batch stopped at finding #{} after {} fixed finding(s): {}",
+                    review_id,
+                    item_id,
+                    completed,
+                    reason
+                );
+            }
         }
-        if let Ok(reviews) = ReviewStorage::load_all(&repo_root) {
-            let active_id = Some(params.review_id.clone());
-            emit(
-                &state.out,
-                events::REVIEW_LIST_CHANGED,
-                serde_json::to_value(ReviewListChangedEvent { reviews, active_id }).ok(),
-            );
+    });
+
+    response
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct TestDir(std::path::PathBuf);
+    impl TestDir {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "tauqe-test-review-{}",
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos()
+            ));
+            let _ = std::fs::create_dir_all(&path);
+            Self(path)
+        }
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
         }
     }
 
-    let prompt = match tauqe_core::review::prompt::format_review_step_execution_prompt(&session, params.item_id, "") {
-        Ok(p) => p,
-        Err(err) => return Response::err(req.id, "PROMPT_BUILD_FAILED", err),
-    };
+    fn test_state(dir: &TestDir) -> Arc<AppState> {
+        let (out, _rx) = OutChannel::new();
+        let (hist_tx, _hist_rx) = tokio::sync::mpsc::unbounded_channel();
+        AppState::new(
+            tauqe_core::config::AppConfig::default(),
+            dir.path().to_path_buf(),
+            hist_tx,
+            out,
+        )
+    }
 
-    let item_model = item.model.clone();
-    match start_model_turn(state, prompt, item_model).await {
-        Ok(op_id) => Response::ok(req.id, serde_json::json!({
-            "operation_id": op_id,
-            "review_id": params.review_id,
-            "item_id": params.item_id,
-        })),
-        Err(err) => Response {
-            id: req.id,
-            result: None,
-            error: Some(err),
-        },
+    fn test_item(id: u32, status: ReviewItemStatus, file: &str) -> tauqe_protocol::ReviewItem {
+        tauqe_protocol::ReviewItem {
+            id,
+            title: format!("Finding {}", id),
+            model: None,
+            severity: tauqe_protocol::ReviewSeverity::Info,
+            status,
+            file_path: Some(file.to_string()),
+            line_range: None,
+            body: "Details".to_string(),
+        }
+    }
+
+    fn test_session(id: &str, items: Vec<tauqe_protocol::ReviewItem>) -> ReviewSession {
+        ReviewSession {
+            id: id.to_string(),
+            title: format!("Session {}", id),
+            created_at: 100,
+            model: "test-model".to_string(),
+            description: None,
+            user_prompt: None,
+            target_files: vec!["foo.rs".to_string()],
+            items,
+            raw_markdown: String::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handle_review_execute_validations() {
+        let dir = TestDir::new();
+        let state = test_state(&dir);
+        let make_req = |id: u64, params: Option<serde_json::Value>| Request {
+            id: tauqe_protocol::RequestId::Number(id),
+            method: tauqe_protocol::methods::REVIEW_EXECUTE.to_string(),
+            params,
+        };
+
+        let res = handle_review_execute(make_req(1, None), &state).await;
+        assert_eq!(res.error.unwrap().code, "INVALID_PARAMS");
+
+        let res = handle_review_execute(
+            make_req(2, Some(serde_json::json!({ "review_id": "non-existent", "item_id": 1 }))),
+            &state,
+        )
+        .await;
+        assert_eq!(res.error.unwrap().code, "NOT_FOUND");
+
+        let session = test_session(
+            "rev-val-1",
+            vec![
+                test_item(1, ReviewItemStatus::Discussion, "foo.rs"),
+                test_item(2, ReviewItemStatus::Rejected, "foo.rs"),
+                test_item(3, ReviewItemStatus::Fixed, "foo.rs"),
+            ],
+        );
+        ReviewStorage::save_session(dir.path(), &session).unwrap();
+
+        let cases = [
+            (Some(1), "ITEM_IN_DISCUSSION"),
+            (Some(2), "ITEM_REJECTED"),
+            (Some(3), "NOTHING_TO_EXECUTE"),
+            (Some(9), "NOT_FOUND"),
+            (None, "ITEM_IN_DISCUSSION"),
+        ];
+        for (idx, (item_id, code)) in cases.iter().enumerate() {
+            let params = serde_json::json!({ "review_id": "rev-val-1", "item_id": item_id });
+            let res = handle_review_execute(make_req(10 + idx as u64, Some(params)), &state).await;
+            assert_eq!(res.error.unwrap().code, *code);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_review_batch_fail_fast_resets_status_and_preloads_file() {
+        let dir = TestDir::new();
+        let _ = tauqe_core::git::init_repository(Some(dir.path()), true).unwrap();
+
+        let target_path = dir.path().join("src");
+        std::fs::create_dir_all(&target_path).unwrap();
+        std::fs::write(target_path.join("target.rs"), "fn target() {}\n").unwrap();
+        tauqe_core::git::cmd::stage_files(dir.path(), &["src/target.rs".to_string()]).unwrap();
+        tauqe_core::git::cmd::commit_with_developer_author(dir.path(), "Add target", false).unwrap();
+
+        let session = test_session(
+            "rev-exec-1",
+            vec![
+                test_item(1, ReviewItemStatus::Todo, "./src/target.rs"),
+                test_item(2, ReviewItemStatus::Todo, "./src/target.rs"),
+            ],
+        );
+        ReviewStorage::save_session(dir.path(), &session).unwrap();
+        let state = test_state(&dir);
+
+        // Without an API key the first turn cannot start: the batch must stop at finding 1.
+        let outcome = run_review_batch(&state, "rev-exec-1", vec![1, 2]).await;
+        match outcome {
+            BatchOutcome::Failed {
+                completed, item_id, ..
+            } => {
+                assert_eq!(completed, 0);
+                assert_eq!(item_id, 1);
+            }
+            other => panic!("Expected Failed, got {:?}", other),
+        }
+
+        // The finding file was preloaded as editable before the turn.
+        {
+            let ctx = state.context.read().await;
+            assert!(ctx.is_editable("src/target.rs").unwrap());
+        }
+
+        // Fail-Fast: statuses are back to TODO and nothing is marked FIXED.
+        let updated = ReviewStorage::load_review(dir.path(), "rev-exec-1")
+            .unwrap()
+            .unwrap();
+        assert!(updated.items.iter().all(|i| i.status == ReviewItemStatus::Todo));
+
+        let active_id = ReviewStorage::load_active_id(dir.path()).unwrap();
+        assert_eq!(active_id.as_deref(), Some("rev-exec-1"));
+    }
+
+    #[tokio::test]
+    async fn test_review_batch_skips_fixed_and_stops_on_rejected() {
+        let dir = TestDir::new();
+        let session = test_session(
+            "rev-skip",
+            vec![
+                test_item(1, ReviewItemStatus::Fixed, "foo.rs"),
+                test_item(2, ReviewItemStatus::Rejected, "foo.rs"),
+            ],
+        );
+        ReviewStorage::save_session(dir.path(), &session).unwrap();
+        let state = test_state(&dir);
+
+        let outcome = run_review_batch(&state, "rev-skip", vec![1, 2]).await;
+        match outcome {
+            BatchOutcome::Failed {
+                completed, item_id, ..
+            } => {
+                assert_eq!(completed, 1);
+                assert_eq!(item_id, 2);
+            }
+            other => panic!("Expected Failed, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_review_execute_blocked_by_failed_preflight() {
+        let dir = TestDir::new();
+        let session = test_session(
+            "rev-preflight",
+            vec![
+                test_item(1, ReviewItemStatus::Todo, "foo.rs"),
+                test_item(2, ReviewItemStatus::Todo, "foo.rs"),
+            ],
+        );
+        ReviewStorage::save_session(dir.path(), &session).unwrap();
+        // A malformed manifest makes the deterministic toolchain pipeline fail.
+        std::fs::write(dir.path().join("Cargo.toml"), "[package\n").unwrap();
+        let state = test_state(&dir);
+
+        let req = Request {
+            id: tauqe_protocol::RequestId::Number(1),
+            method: tauqe_protocol::methods::REVIEW_EXECUTE.to_string(),
+            params: Some(serde_json::json!({ "review_id": "rev-preflight" })),
+        };
+        let res = handle_review_execute(req, &state).await;
+
+        let err = res.error.expect("preflight must block the batch");
+        assert_eq!(err.code, "PREFLIGHT_VERIFICATION_FAILED");
+        assert!(err.message.contains("Pre-flight verification failed"));
+
+        // The failure is detected before any turn starts: no active operation.
+        assert!(state.active_cancel.lock().await.is_none());
+
+        // No finding was touched: every status stays TODO.
+        let reloaded = ReviewStorage::load_review(dir.path(), "rev-preflight")
+            .unwrap()
+            .unwrap();
+        assert!(reloaded.items.iter().all(|i| i.status == ReviewItemStatus::Todo));
     }
 }

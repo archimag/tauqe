@@ -160,7 +160,7 @@ impl DiscussionStreamFilter {
                 .get("plan_update")
                 .filter(|v| !v.is_null())
                 .and_then(|v| serde_json::from_value::<DiscussionPlanUpdate>(v.clone()).ok())
-                .filter(|u| u.id.is_some() || !u.items.is_empty() || u.title.is_some());
+                .filter(|u| u.id.is_some() || !u.items.is_empty() || !u.concept.is_empty() || u.title.is_some());
 
             let context_requests = val
                 .get("context_requests")
@@ -199,7 +199,7 @@ impl DiscussionStreamFilter {
 
     fn sanitize_plan_update(resp: &mut DiscussionResponse) {
         if let Some(ref update) = resp.plan_update {
-            if update.id.is_none() && update.items.is_empty() && update.title.is_none() {
+            if update.id.is_none() && update.items.is_empty() && update.concept.is_empty() && update.title.is_none() {
                 resp.plan_update = None;
             }
         }
@@ -357,6 +357,8 @@ mod tests {
                 title: "First step".to_string(),
                 details: Some("Details of first step".to_string()),
                 status: PlanItemStatus::Todo,
+                files: vec![],
+                concept_refs: vec![],
                 children: vec![],
             }
         );

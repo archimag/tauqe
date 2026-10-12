@@ -208,6 +208,7 @@ pub async fn run_verification_healing_loop<F>(
     assistant_text: &mut String,
     turn_detected_language: &mut Option<String>,
     total_changed_files: &mut Vec<String>,
+    mut turn_scratchpad: Option<String>,
     mut on_step_applied: F,
 ) -> anyhow::Result<VerificationHealingResult>
 where
@@ -276,6 +277,7 @@ where
                 emit_done: false,
                 staged_state: None,
                 target_language: turn_detected_language.as_deref(),
+                turn_scratchpad: turn_scratchpad.as_deref(),
             },
         )
         .await?;
@@ -285,6 +287,10 @@ where
                 result: step_out.parsed_result,
                 assistant_text: step_out.assistant_text,
             })));
+        }
+
+        if let Some(pad) = step_out.turn_scratchpad {
+            turn_scratchpad = Some(pad);
         }
 
         if let Some(lang) = protocol.parse_user_language(&step_out.assistant_text) {

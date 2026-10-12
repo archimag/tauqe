@@ -105,26 +105,29 @@ When evaluating complex findings, the developer does not have to accept or rejec
 
 ---
 
-## 6.6 Isolated Execution & Fail-Fast Batch Runner (`e` / `Enter`)
+## 6.6 Isolated Execution & Server-Side Fail-Fast Batch Runner (`x` / `Enter`)
 
-Findings approved as `TODO` can be executed directly from the Review workspace without conversational context pollution:
+Findings approved as `TODO` can be executed directly from the Review workspace without conversational context pollution. The client sends one `review/execute` request with `review_id` and an optional `item_id`. The server owns the queue and every status transition.
 
-### 1. Single Finding Execution (`e` or `Enter` on a finding)
-- Validates that the finding is in `TODO` status (blocking execution if still in `DISCUSSION` or `REJECTED`).
-- Opens an execution confirmation popup with finding details and file location.
-- Formats an isolated model prompt containing only the target finding, file location, and directives.
-- Model requests necessary context via `<context_request>`, stages patches in memory, and validates with toolchain gates.
-- Upon passing all gates, the finding status is marked `FIXED`.
+**Why the server owns the batch.** Marking a finding `FIXED` and advancing to the next finding must be one atomic decision tied to the verified result of the turn. If the TUI drove the queue, a disconnect would lose the batch and clients could disagree about the review state. The TUI is a thin view: it starts the scope and renders `review/updated`, `review/listChanged`, `turn/phase`, and `model/*` events.
 
-### 2. Batch Execution Queue (`e` on session header)
-- Evaluates the entire review session: if any items remain in `DISCUSSION`, batch execution is blocked to enforce human triage.
-- Sequences all remaining `TODO` findings into a deterministic batch execution queue.
-- Opens a confirmation dialog detailing the queue order and findings to resolve.
-- **Fail-Fast Policy:** Findings execute sequentially. If any step fails toolchain verification, encounters compiler errors, or is interrupted by the user (`Esc` / `Ctrl+C`):
-  - Execution stops immediately.
-  - The working tree is atomically rolled back to the pre-edit checkpoint (`git/undo`).
-  - The offending item is reverted to `TODO`.
-  - Subsequent items in the queue are aborted, preventing compounding errors.
+**Mandatory Pre-Flight Verification.** Before executing any finding, a single one or a whole batch, the server runs the exact same toolchain pipeline (`VerifyTarget::All`) that the core runs after each fixing turn. If the repository does not build or its tests fail, execution is blocked synchronously before any LLM request and before any status change, at zero token cost. The server returns `PREFLIGHT_VERIFICATION_FAILED` with the full compiler or test output and leaves the finding statuses untouched. Repositories without a detected toolchain skip this gate transparently.
+
+### 1. Single Finding Execution (`x` or `Enter` on a finding)
+- The server validates that the finding is in `TODO` or `IN_PROGRESS` status. Findings in `DISCUSSION`, `REJECTED`, or already `FIXED` are refused.
+- A confirmation popup shows the finding details and file location.
+- The server marks the finding `IN_PROGRESS`, pre-loads its file as editable, and formats an isolated prompt containing only the target finding, its location, and directives.
+- The model requests necessary context via `<context_request>`, edits are staged in memory, and toolchain gates validate them.
+- The finding becomes `FIXED` only if the turn is successful: verified edits were applied, or the model emitted the terminal success tag. A text-only answer without the tag does not close the finding.
+
+### 2. Batch Execution (`x` on a session header)
+- The server evaluates the whole session: if any finding remains in `DISCUSSION`, the batch is refused to enforce human triage.
+- All findings in `TODO` or `IN_PROGRESS` form an ordered queue. A confirmation dialog shows the queue before it starts.
+- **Server-Side Fail-Fast Policy:** Findings execute sequentially. If a finding fails toolchain verification, hits compiler errors, ends with a terminal error tag or without a decision, or is interrupted by the user (`Esc` / `Ctrl+C`):
+  - The server stops the batch immediately and reports the reason.
+  - The failed finding returns to `TODO`. File changes of the failed turn are undone by the Git workflow checkpoint.
+  - Findings fixed earlier in the batch stay `FIXED`; they are not rolled back.
+  - Subsequent findings are not started, which prevents compounding errors.
 
 ---
 

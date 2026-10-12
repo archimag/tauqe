@@ -6,6 +6,9 @@ use tauqe_protocol::{ContextAccess, ModelTier, Plan, RepositoryState};
 /// Default model tier used for squash commit message synthesis.
 pub const SQUASH_COMMIT_TIER: ModelTier = ModelTier::Junior;
 
+/// Maximum characters allowed in a turn scratchpad block before safe truncation.
+pub const MAX_SCRATCHPAD_CHARS: usize = 4_000;
+
 pub fn build_squash_commit_prompt(
     commits: &[crate::git::CommitSummary],
     cumulative_diff: &str,
@@ -80,9 +83,10 @@ pub struct PromptAssembly {
     pub repo_map: Option<String>,
     pub target_language: Option<String>,
     pub active_plan: Option<Plan>,
-    pub is_plan_step_execution: bool,
+    pub is_isolated_step: bool,
     pub is_discussion: bool,
     pub discovery_mode: crate::config::DiscoveryMode,
+    pub turn_scratchpad: Option<String>,
 }
 
 impl PromptAssembly {
@@ -105,10 +109,21 @@ impl PromptAssembly {
             repo_map,
             target_language: None,
             active_plan: None,
-            is_plan_step_execution: false,
+            is_isolated_step: false,
             is_discussion: false,
             discovery_mode: crate::config::DiscoveryMode::default(),
+            turn_scratchpad: None,
         }
+    }
+
+    pub fn with_isolated_step(mut self, is_isolated: bool) -> Self {
+        self.is_isolated_step = is_isolated;
+        self
+    }
+
+    pub fn with_scratchpad(mut self, scratchpad: Option<String>) -> Self {
+        self.turn_scratchpad = scratchpad;
+        self
     }
 
     pub fn with_discovery_mode(mut self, mode: crate::config::DiscoveryMode) -> Self {
@@ -136,7 +151,7 @@ impl PromptAssembly {
         prompt.push_str("You are Tauqe AI, an expert programming assistant operating inside TAUQE (The Answer to the Ultimate Question of Engineering), an AI-native engineering control environment built on the literal harness paradigm.\n\n");
         prompt.push_str("## Core System Contract\n");
         prompt.push_str("1. Authoritative Source: The files provided in <context> represent the authoritative current state of the project. Do not invent missing code.\n");
-        prompt.push_str("1a. Operational Protocol Tags: All operational protocol tags (<context_request>, <doc_request>, <verify>, <user_language>, <plan>, <plan_step_done>) must be emitted strictly at the end of your response outside markdown code blocks. If you mention, quote, or discuss tags in conversational text, you MUST enclose them in backticks (e.g. `<context_request ...>`) so they are treated as literal text and not operational commands.\n");
+        prompt.push_str("1a. Operational Protocol Tags: All operational protocol tags (<context_request>, <doc_request>, <verify>, <user_language>, <plan>, <scratchpad>, <success>, <error>) must be emitted strictly at the end of your response outside markdown code blocks. If you mention, quote, or discuss tags in conversational text, you MUST enclose them in backticks (e.g. `<context_request ...>`) so they are treated as literal text and not operational commands.\n");
         let marker_suffix = protocol
             .turn_marker()
             .map(|m| format!("_{}", m))
@@ -199,14 +214,18 @@ impl PromptAssembly {
             marker_suffix,
             crate::docs::TOPICS.join("|")
         ));
-        if !self.is_plan_step_execution {
+        prompt.push_str(&format!(
+            "10a. Turn Scratchpad (Working Memory): To retain working hypotheses, verified findings, or focus across multi-round discovery and verification healing cycles, you may emit <scratchpad{0}>...</scratchpad{0}>. Keep scratchpad notes concise (bullet points of what is verified, current hypothesis, and purpose of requested files). Notes are preserved within the current turn in <turn_scratchpad> and isolated from persistent history.\n",
+            marker_suffix
+        ));
+        if !self.is_isolated_step {
             if self.is_discussion {
                 prompt.push_str(
-                    "11. Local Engineering Plans: When formulating or updating a task plan, populate the structured `plan_update` field in your response object with `action: \"save\"|\"update\"|\"delete\"`, plan `id`, `title`, `description`, and `items`. Plan Action Semantics: Use `action: \"save\"` to create or completely overwrite/replace the entire step tree (e.g. initial plan creation, full tree restructuring, or clearing all items); use `action: \"update\"` strictly to modify specific individual nodes or items in place by ID without touching unmentioned items; use `action: \"delete\"` to remove the plan. Reins Invariant: Never mutate the plan (leave `plan_update: null`) without an explicit user instruction to modify it. Questions, analysis, trade-off reviews, and critique must be answered strictly in conversational text in `message`. Planning Objective: Collaborative planning focuses on conceptual comprehension of the objective ('What'), aligning on key architectural decisions and trade-offs, and defining a cohesive step tree without premature low-level code churn or deep file inspection. Step Formulation Contract: Formulate each step around an engineering objective and operational invariants rather than detailed procedural micro-instructions; define what state must be achieved and what invariants preserved. Each item has `status: \"todo\"|\"discussion\"|\"in_progress\"|\"done\"|\"cancelled\"`. If you have architectural doubts, alternative approaches, or decisions requiring developer clarification, explicitly set status to \"discussion\". Always provide a clear `description` explaining the overall architecture, boundaries, and rationale. Granularity Contract: Each leaf step is executed in an isolated turn with compulsory toolchain verification, so calibrate leaf step granularity to cohesive functional units of work. Language Consistency: Formulate plan title, description, step titles, and step details in the same language as the plan description and user's request. In <active_plan>, items marked with [x] are focused by the user.\n\n",
+                    "11. Local Engineering Plans: When formulating or updating a task plan, populate the structured `plan_update` field in your response object with `action: \"save\"|\"update\"|\"delete\"`, plan `id`, `title`, `description`, `concept`, and `items`. Conceptual Foundation Invariant: Every plan in TAUQE is a two-section document and MUST have an architectural concept tree in `concept` defining requirements, design decisions, and system invariants ('What'). When creating a new plan (`action: \"save\"`), you MUST populate `concept` with at least one concept node. Creating a plan without a concept tree is strictly prohibited. Implementation steps in `items` ('How') are either outlined with `concept_refs` pointing to concept nodes, or left empty (`items: []`) to be synthesized subsequently by deep refinement (`plan_refine`). Plan Action Semantics: Use `action: \"save\"` to create or completely overwrite/replace the entire plan; use `action: \"update\"` strictly to modify specific individual nodes or items in place by ID without touching unmentioned items; use `action: \"delete\"` to remove the plan. Reins Invariant: Never mutate the plan (leave `plan_update: null`) without an explicit user instruction to modify it. Questions, analysis, trade-off reviews, and critique must be answered strictly in conversational text in `message`. Planning Objective: Collaborative planning focuses on conceptual comprehension of the objective ('What'), aligning on key architectural decisions and trade-offs, and defining a cohesive concept tree without premature low-level code churn. Step Formulation Contract: Formulate each step around an engineering objective and operational invariants; define what state must be achieved and what invariants preserved. Always provide a clear `description` explaining the overall architecture, boundaries, and rationale. Language Consistency: Formulate plan title, description, concept titles/details, and step titles/details in the same language as the plan description and user's request. In <active_plan>, items marked with [FOCUSED] are focused by the user.\n\n",
                 );
             } else {
                 prompt.push_str(&format!(
-                    "11. Local Engineering Plans: When formulating a multi-step task plan, wrap structured plan items in <plan{0} action=\"save\" id=\"plan-id\" title=\"Plan Title\">...</plan{0}>. In Develop mode, you may ONLY propose new plans (action=\"save\"). Updating plan statuses, closing steps, or modifying existing plans from Develop mode is strictly prohibited (step execution and completion occur strictly in isolated step turns, while plan modifications and re-scoping belong exclusively in Discussion mode). Planning Objective: Plan synthesis focuses on conceptual comprehension of the objective ('What'), aligning on key architectural decisions and trade-offs, and defining a cohesive step tree without premature low-level code churn or deep file inspection. Step Formulation Contract: Formulate each step around an engineering objective and operational invariants rather than detailed procedural micro-instructions; define what state must be achieved and what invariants preserved. Each item has status=\"todo|discussion\". If you have architectural doubts, multiple technical options, or items needing developer clarification, explicitly set status=\"discussion\" to flag them for review before execution. Always provide a clear <description> explaining the overall architecture, boundaries, and rationale, because plan steps are executed in isolated turns without chat history. Granularity Contract: Each leaf step is executed in an isolated turn with compulsory toolchain verification (check, clippy, test). Therefore, calibrate leaf step granularity to cohesive, self-contained functional units of work. Avoid micro-fragmentation as well as unmanageable monoliths. Plan Creation Invariant: Whenever you propose a new plan, you MUST precede the tag with a concise conversational explanation of the proposed plan, and you MUST emit the structured <plan{0} action=\"save\" ...> tag in the same response. Language Consistency: Formulate the plan title, description, step titles, and step details in the same language as the plan description and user's request.\n\n",
+                    "11. Local Engineering Plans: When formulating a task plan, wrap structured plan items in <plan{0} action=\"save\" id=\"plan-id\" title=\"Plan Title\">...</plan{0}>. In Develop mode, you may ONLY propose new plans (action=\"save\"). Updating plan statuses, closing steps, or modifying existing plans from Develop mode is strictly prohibited (step execution and completion occur strictly in isolated step turns, while plan modifications and re-scoping belong exclusively in Discussion mode). Conceptual Foundation Invariant: Every plan MUST contain an architectural concept tree in <concept>...</concept> defining the core requirements, design decisions, and system invariants ('What'). Inside <concept>, define architectural nodes using structured <concept_item id=\"c-...\" title=\"...\"><details>...</details></concept_item> tags. Plan creation without <concept> containing at least one <concept_item> is strictly prohibited. Implementation steps in <item> define 'How', may be included with concept_refs=\"c-...\" and files=\"...\", or omitted if awaiting deep refinement. Planning Objective: Plan synthesis focuses on conceptual comprehension of the objective ('What'), aligning on key architectural decisions and trade-offs, and defining a cohesive concept tree without premature low-level code churn or deep file inspection. Step Formulation Contract: Formulate each step around an engineering objective and operational invariants rather than detailed procedural micro-instructions; define what state must be achieved and what invariants preserved. Always provide a clear <description> explaining the overall architecture, boundaries, and rationale. Plan Creation Invariant: Whenever you propose a new plan, you MUST precede the tag with a concise conversational explanation of the proposed plan, and you MUST emit the structured <plan{0} action=\"save\" ...> tag in the same response containing both <concept> (mandatory) and optional <item> elements. Language Consistency: Formulate the plan title, description, concept nodes, step titles, and step details in the same language as the user's request.\nStructured Plan XML Format:\n<plan{0} action=\"save\" id=\"plan-id\" title=\"Plan Title\">\n  <description>Overall architecture and rationale</description>\n  <concept>\n    <concept_item id=\"c-1\" title=\"Core Invariant\">\n      <details>Design rationale and invariants</details>\n    </concept_item>\n  </concept>\n  <item id=\"1\" title=\"Step Title\" concept_refs=\"c-1\" files=\"path/to/file.rs\">\n    <details>Engineering objective and verification criteria</details>\n  </item>\n</plan{0}>\n\n",
                     marker_suffix
                 ));
             }
@@ -337,6 +356,31 @@ impl PromptAssembly {
         })
     }
 
+    pub fn format_scratchpad_block(&self) -> Option<String> {
+        self.turn_scratchpad.as_ref().and_then(|pad| {
+            let trimmed = pad.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                let text = if trimmed.len() > MAX_SCRATCHPAD_CHARS {
+                    let truncate_index = trimmed
+                        .char_indices()
+                        .map(|(idx, _)| idx)
+                        .take_while(|&idx| idx <= MAX_SCRATCHPAD_CHARS)
+                        .last()
+                        .unwrap_or(0);
+                    format!(
+                        "{}\n... [scratchpad truncated for length] ...",
+                        &trimmed[..truncate_index]
+                    )
+                } else {
+                    trimmed.to_string()
+                };
+                Some(format!("<turn_scratchpad>\n{}\n</turn_scratchpad>", text))
+            }
+        })
+    }
+
     pub fn assemble_chat_messages(
         &self,
         current_prompt: &str,
@@ -358,13 +402,19 @@ impl PromptAssembly {
             system_text.push_str("\n\n");
         }
 
+        if let Some(scratchpad_block) = self.format_scratchpad_block() {
+            system_text.push_str("## Turn Scratchpad (Working Memory)\n");
+            system_text.push_str(&scratchpad_block);
+            system_text.push_str("\n\n");
+        }
+
         if let Some(history_block) = self.format_history_block() {
             system_text.push_str("## Session History\n");
             system_text.push_str(&history_block);
             system_text.push_str("\n\n");
         }
 
-        if !self.is_plan_step_execution {
+        if !self.is_isolated_step {
             if let Some(plan) = &self.active_plan {
                 if let Some(plan_block) = crate::plan::format_active_plan_context(plan) {
                     system_text.push_str("## Active Task Plan Context\n");
@@ -507,12 +557,45 @@ mod tests {
     }
 
     #[test]
+    fn test_prompt_assembly_isolated_step() {
+        let proto = XmlEditProtocol;
+        let mut assembly = PromptAssembly::new(
+            None,
+            1,
+            vec![],
+            "git",
+            "xml",
+            None,
+            None,
+        );
+        assembly.is_isolated_step = true;
+        assembly.active_plan = Some(Plan {
+            id: "plan-test".to_string(),
+            title: "Test Plan".to_string(),
+            description: None,
+            created_at: 0,
+            updated_at: 0,
+            concept: vec![],
+            items: vec![],
+        });
+
+        let sys_prompt = assembly.build_system_prompt(&proto);
+        assert!(!sys_prompt.contains("11. Local Engineering Plans"));
+
+        let messages = assembly.assemble_chat_messages("Execute step", &proto);
+        assert!(!messages[0].content.contains("## Active Task Plan Context"));
+    }
+
+    #[test]
     fn test_planning_prompt_instructions() {
         let proto = XmlEditProtocol;
 
         // Develop mode
         let dev_assembly = PromptAssembly::new(None, 1, vec![], "git", "xml", None, None);
         let dev_prompt = dev_assembly.build_system_prompt(&proto);
+        assert!(dev_prompt.contains("Conceptual Foundation Invariant"));
+        assert!(dev_prompt.contains("<concept_item"));
+        assert!(dev_prompt.contains("Structured Plan XML Format"));
         assert!(dev_prompt.contains("Planning Objective: Plan synthesis focuses on conceptual comprehension of the objective ('What')"));
         assert!(dev_prompt.contains("Step Formulation Contract: Formulate each step around an engineering objective and operational invariants"));
 
@@ -520,6 +603,7 @@ mod tests {
         let mut disc_assembly = PromptAssembly::new(None, 1, vec![], "git", "xml", None, None);
         disc_assembly.is_discussion = true;
         let disc_prompt = disc_assembly.build_system_prompt(&proto);
+        assert!(disc_prompt.contains("Conceptual Foundation Invariant"));
         assert!(disc_prompt.contains("Planning Objective: Collaborative planning focuses on conceptual comprehension of the objective ('What')"));
         assert!(disc_prompt.contains("Step Formulation Contract: Formulate each step around an engineering objective and operational invariants"));
     }
@@ -571,5 +655,36 @@ mod tests {
         disc_snap.is_discussion = true;
         let disc_snap_prompt = disc_snap.build_system_prompt(&proto);
         assert!(disc_snap_prompt.contains("Snapshot Strategy"));
+    }
+
+    #[test]
+    fn test_prompt_assembly_with_turn_scratchpad() {
+        let proto = XmlEditProtocol;
+        let mut assembly = PromptAssembly::new(None, 1, vec![], "git", "xml", None, None);
+        assert!(assembly.format_scratchpad_block().is_none());
+
+        assembly.turn_scratchpad = Some("   ".to_string());
+        assert!(assembly.format_scratchpad_block().is_none());
+
+        assembly.turn_scratchpad = Some("- Hypothesis: Foo needs Bar\n- Status: Inspecting bar.rs".to_string());
+        let block = assembly.format_scratchpad_block().unwrap();
+        assert!(block.contains("<turn_scratchpad>"));
+        assert!(block.contains("- Hypothesis: Foo needs Bar"));
+        assert!(block.contains("</turn_scratchpad>"));
+
+        let messages = assembly.assemble_chat_messages("Continue", &proto);
+        assert!(messages[0].content.contains("## Turn Scratchpad (Working Memory)"));
+        assert!(messages[0].content.contains("- Hypothesis: Foo needs Bar"));
+    }
+
+    #[test]
+    fn test_turn_scratchpad_truncation_utf8_safety() {
+        let multi_byte_text = "Рабочая гипотеза и детали проверки UTF-8 символов. ".repeat(200);
+        assert!(multi_byte_text.len() > MAX_SCRATCHPAD_CHARS);
+
+        let mut assembly = PromptAssembly::new(None, 1, vec![], "git", "xml", None, None);
+        assembly.turn_scratchpad = Some(multi_byte_text);
+        let block = assembly.format_scratchpad_block().unwrap();
+        assert!(block.contains("... [scratchpad truncated for length] ..."));
     }
 }

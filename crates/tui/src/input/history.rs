@@ -90,6 +90,9 @@ pub async fn handle_history_key(
             {
                 st.history_view.selected_item_index += 1;
                 st.history_view.scroll_to_selected_item(view_height, Some(content_width));
+                if st.history_view.selected_item_index + 1 >= st.history_view.items.len() {
+                    st.history_view.auto_scroll = true;
+                }
             }
         }
         KeyCode::BackTab => {

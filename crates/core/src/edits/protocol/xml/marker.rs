@@ -21,10 +21,13 @@ pub fn generate_turn_marker() -> String {
 pub(super) const XML_TAG_BASES: &[&str] = &[
     "tauqe_edits", "edit", "search", "replace", "create", "delete", "move", "with", "summary",
     "context_request", "context_drop", "user_language", "verify", "overwrite", "doc_request",
-    "plan_step_done", "plan", "item", "description", "details", "title",
+    "plan", "concept", "concept_item", "item", "description", "details", "title",
+    "scratchpad", "success", "error",
 ];
 
-const PLAN_CHILD_TAGS: &[&str] = &["item", "description", "details", "title", "summary"];
+const PLAN_CHILD_TAGS: &[&str] = &[
+    "concept", "concept_item", "item", "description", "details", "title", "summary",
+];
 
 fn literal_prefix(marker: &str) -> String {
     format!("\u{e000}{}\u{e001}", marker)
@@ -87,10 +90,12 @@ pub(crate) fn normalize_marked_xml(text: &str, marker: &str, finished: bool) -> 
                 .map(|suffix| marker_matches(suffix, marker))
                 .unwrap_or(false)
         });
-        if active.is_none() && (name == "plan_step_done" || stack.contains(&"plan")) {
-            if name == "plan_step_done" {
-                active = Some("plan_step_done");
-            } else if let Some(base) = PLAN_CHILD_TAGS.iter().copied().find(|&base| name == base) {
+        if active.is_none()
+            && stack
+                .iter()
+                .any(|s| *s == "plan" || *s == "concept" || *s == "concept_item")
+        {
+            if let Some(base) = PLAN_CHILD_TAGS.iter().copied().find(|&base| name == base) {
                 active = Some(base);
             }
         }
@@ -163,6 +168,27 @@ mod tests {
         let normalized = normalize_marked_xml(&raw, marker, true);
         assert!(normalized.contains("<plan action=\"update\" id=\"my-plan\">"));
         assert!(normalized.contains("<item id=\"2\" status=\"todo\" />"));
+        assert!(normalized.contains("</plan>"));
+    }
+
+    #[test]
+    fn test_normalize_marked_plan_with_concept_and_items() {
+        let marker = "M123456";
+        let raw = format!(
+            "<plan_{m} action=\"save\" id=\"concept-plan\">\n\
+              <concept_{m}>\n\
+                <concept_item_{m} id=\"c-1\" title=\"Core Invariant\" />\n\
+              </concept_{m}>\n\
+              <item id=\"1\" title=\"Step\" status=\"todo\" />\n\
+            </plan_{m}>",
+            m = marker
+        );
+        let normalized = normalize_marked_xml(&raw, marker, true);
+        assert!(normalized.contains("<plan action=\"save\" id=\"concept-plan\">"));
+        assert!(normalized.contains("<concept>"));
+        assert!(normalized.contains("<concept_item id=\"c-1\" title=\"Core Invariant\" />"));
+        assert!(normalized.contains("</concept>"));
+        assert!(normalized.contains("<item id=\"1\" title=\"Step\" status=\"todo\" />"));
         assert!(normalized.contains("</plan>"));
     }
 }

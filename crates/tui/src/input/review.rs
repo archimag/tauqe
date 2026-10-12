@@ -95,6 +95,7 @@ fn execute_review_scope_action(
                         session.title.clone()
                     },
                     scope_title: scope_title.to_string(),
+                    item_id: Some(item.id),
                     items: vec![item],
                 });
             }
@@ -161,6 +162,7 @@ fn execute_review_scope_action(
                 session.title.clone()
             },
             scope_title: format!("All remaining TODO findings ({} items)", todo_items.len()),
+            item_id: None,
             items: todo_items,
         });
     }
@@ -349,12 +351,13 @@ pub async fn handle_review_key(
                     {
                         focused.push((item_id, title));
                     }
-                    st.discuss_review_dialog = Some(crate::app::DiscussReviewDialogState {
-                        review_id: session.id.clone(),
-                        review_title: session.title.clone(),
-                        focused_items: focused,
-                        prompt_editor: crate::editor::InputEditor::default(),
-                    });
+                    st.prompt_modal = Some(crate::app::PromptModalState::new(
+                        crate::app::PromptModalTarget::Review {
+                            review_id: session.id.clone(),
+                            review_title: session.title.clone(),
+                            focused_items: focused,
+                        },
+                    ));
                 }
             }
         }
@@ -403,6 +406,7 @@ pub async fn handle_review_key(
             let sel_row = st.review.selected_row();
             if let Some(row) = sel_row {
                 st.confirm_delete_review = Some(row.session_id().to_string());
+                st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
             }
         }
         KeyCode::Char('c')

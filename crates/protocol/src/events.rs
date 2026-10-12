@@ -20,6 +20,7 @@ pub const EDIT_FILE_RETRYING: &str = "edit/fileRetrying";
 pub const EDIT_FINISHED: &str = "edit/finished";
 
 pub const TURN_PHASE: &str = "turn/phase";
+pub const TURN_REPOMAP: &str = "turn/repoMap";
 pub const TOOLCHAIN_STARTED: &str = "toolchain/started";
 pub const TOOLCHAIN_FINISHED: &str = "toolchain/finished";
 

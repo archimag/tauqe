@@ -197,10 +197,11 @@ pub struct ReviewDeleteResult {
     pub success: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ReviewExecuteItemParams {
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ReviewExecuteParams {
     pub review_id: String,
-    pub item_id: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub item_id: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -475,14 +476,17 @@ pub fn format_review_step_execution_prompt(
     out.push_str("2. Do NOT touch unrelated code or address other findings outside of this scope.\n");
     out.push_str("3. Keep changes minimal, coherent, and verified with toolchain checks.\n");
     out.push_str(&format!(
-        "4. When implementation and verification are complete, emit the completion tag: <review_step_done{0} id=\"{1}\" />.\n",
-        marker_suffix, item.id
+        "4. When implementation and verification are complete, emit the completion tag: <success{0} summary=\"...\" />.\n",
+        marker_suffix
     ));
     out.push_str(&format!(
         "5. Discovery Phase: If you need to inspect or edit files listed in <repo_map> that are not yet loaded in <context>, request them immediately using <context_request{0} path=\"...\" access=\"read_only|editable\" /> before writing code or explanations. Do NOT halt with conversational text if the necessary files can simply be requested.\n",
         marker_suffix
     ));
-    out.push_str("6. If you encounter an unsolvable blocking issue or need developer architectural decisions, explain it in text and DO NOT emit the completion tag.\n");
+    out.push_str(&format!(
+        "6. If you encounter an insurmountable technical blocker, contradictory requirements, or need developer decisions, emit the terminal error tag: <error{0} message=\"...\" /> explaining the exact blocker.\n",
+        marker_suffix
+    ));
 
     Ok(out)
 }
@@ -586,7 +590,8 @@ mod tests {
         let prompt = format_review_step_execution_prompt(&session, 3, "_TAG").unwrap();
         assert!(is_review_step_execution_prompt(&prompt));
         assert!(prompt.contains("# Target Review Step Execution: [rev-7:3] Excessive clone in hot path"));
-        assert!(prompt.contains("<review_step_done_TAG id=\"3\" />"));
+        assert!(prompt.contains("<success_TAG summary=\"...\" />"));
+        assert!(prompt.contains("<error_TAG message=\"...\" />"));
 
         let target = extract_review_step_execution_target(&prompt).unwrap();
         assert_eq!(target.review_id.as_deref(), Some("rev-7"));

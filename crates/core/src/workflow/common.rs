@@ -27,6 +27,7 @@ pub struct ParsedPipelineOutput {
     pub discussion_response: Option<tauqe_protocol::DiscussionResponse>,
     pub is_cancelled: bool,
     pub detected_language: Option<String>,
+    pub turn_scratchpad: Option<String>,
 }
 
 /// Options controlling a single invocation step of the LLM pipeline.
@@ -36,6 +37,7 @@ pub struct StepParams<'a> {
     pub emit_done: bool,
     pub staged_state: Option<&'a StagedEditsState>,
     pub target_language: Option<&'a str>,
+    pub turn_scratchpad: Option<&'a str>,
 }
 
 /// Compacts session history if estimated tokens exceed the configured threshold using default budgets.
@@ -238,6 +240,7 @@ pub async fn execute_edit_pipeline(
     let is_discussion = tauqe_protocol::is_discussion_prompt(prompt);
 
     let mut turn_detected_language: Option<String> = None;
+    let mut current_scratchpad: Option<String> = None;
 
     let _ = stream_tx
         .send(StreamEvent::TurnPhase {
@@ -265,6 +268,7 @@ pub async fn execute_edit_pipeline(
             emit_done: false,
             staged_state: None,
             target_language: turn_detected_language.as_deref(),
+            turn_scratchpad: current_scratchpad.as_deref(),
         },
     )
     .await?;
@@ -272,6 +276,10 @@ pub async fn execute_edit_pipeline(
     if pipeline_out.is_cancelled {
         let _ = stream_tx.send(StreamEvent::Done).await;
         return Ok(pipeline_out);
+    }
+
+    if let Some(pad) = pipeline_out.turn_scratchpad.clone() {
+        current_scratchpad = Some(pad);
     }
 
     if let Some(lang) = protocol.parse_user_language(&pipeline_out.assistant_text) {
@@ -361,6 +369,7 @@ pub async fn execute_edit_pipeline(
                 pipeline_out.assistant_text = format!("{}\n\n⚠️ {}", pipeline_out.assistant_text.trim(), warn_msg);
             }
             pipeline_out.parsed_result = ModelResult::Answer { text: pipeline_out.assistant_text.clone() };
+            pipeline_out.turn_scratchpad = current_scratchpad;
             return Ok(pipeline_out);
         }
         if outcome.added.is_empty() && outcome.dropped.is_empty() && new_topics.is_empty() && outcome.missing.is_empty() {
@@ -476,9 +485,14 @@ pub async fn execute_edit_pipeline(
                 emit_done: false,
                 staged_state: None,
                 target_language: turn_detected_language.as_deref(),
+                turn_scratchpad: current_scratchpad.as_deref(),
             },
         )
         .await?;
+
+        if let Some(pad) = pipeline_out.turn_scratchpad.clone() {
+            current_scratchpad = Some(pad);
+        }
 
         if let Some(lang) = protocol.parse_user_language(&pipeline_out.assistant_text) {
             turn_detected_language = Some(lang);
@@ -548,6 +562,29 @@ pub async fn execute_edit_pipeline(
             discussion_response: Some(resp),
             is_cancelled: false,
             detected_language: turn_detected_language,
+            turn_scratchpad: current_scratchpad,
+        });
+    }
+
+    if let Some(crate::edits::protocol::xml::tags::TerminalOutcome::Error { message }) =
+        protocol.parse_terminal_outcome(&pipeline_out.assistant_text)
+    {
+        let _ = stream_tx.send(StreamEvent::Done).await;
+        return Ok(ParsedPipelineOutput {
+            assistant_text: pipeline_out.assistant_text,
+            parsed_result: ModelResult::Edit {
+                summary: "Execution blocked".to_string(),
+                edits: Vec::new(),
+                proposal: None,
+                applied: false,
+                error: Some(message),
+                changed_files: Vec::new(),
+                commit_hash: None,
+            },
+            discussion_response: None,
+            is_cancelled: false,
+            detected_language: turn_detected_language,
+            turn_scratchpad: current_scratchpad,
         });
     }
 
@@ -611,6 +648,7 @@ pub async fn execute_edit_pipeline(
                     discussion_response: None,
                     is_cancelled: false,
                     detected_language: turn_detected_language,
+                    turn_scratchpad: current_scratchpad.clone(),
                 });
             }
             return Ok(ParsedPipelineOutput {
@@ -627,6 +665,7 @@ pub async fn execute_edit_pipeline(
                 discussion_response: None,
                 is_cancelled: false,
                 detected_language: turn_detected_language,
+                turn_scratchpad: current_scratchpad.clone(),
             });
         }
 
@@ -685,6 +724,7 @@ pub async fn execute_edit_pipeline(
                 emit_done: false,
                 staged_state: staged_state.as_ref(),
                 target_language: turn_detected_language.as_deref(),
+                turn_scratchpad: current_scratchpad.as_deref(),
             },
         )
         .await?;
@@ -692,6 +732,10 @@ pub async fn execute_edit_pipeline(
         if step_out.is_cancelled {
             let _ = stream_tx.send(StreamEvent::Done).await;
             return Ok(step_out);
+        }
+
+        if let Some(pad) = step_out.turn_scratchpad {
+            current_scratchpad = Some(pad);
         }
 
         if let Some(lang) = protocol.parse_user_language(&step_out.assistant_text) {
@@ -760,6 +804,7 @@ pub async fn execute_edit_pipeline(
         discussion_response: None,
         is_cancelled: false,
         detected_language: turn_detected_language,
+        turn_scratchpad: current_scratchpad,
     })
 }
 
@@ -799,25 +844,25 @@ pub async fn execute_edit_pipeline_step<'a>(
     }
 
     let is_isolated_plan_step = crate::plan::prompt::is_plan_step_execution_prompt(prompt);
+    let is_isolated_review_step = tauqe_protocol::review::is_review_step_execution_prompt(prompt);
+    let is_isolated_step = is_isolated_plan_step || is_isolated_review_step;
     let is_discussion = tauqe_protocol::is_discussion_prompt(prompt);
 
-    if params.record_turn {
-        if !is_isolated_plan_step {
-            let _ = compact_history_if_needed_with_budget(
-                history_manager,
-                provider,
-                model,
-                cancel_rx.clone(),
-                options.history_budget_tokens,
-                options.history_tail_turns,
-            )
-            .await;
-        }
+    if params.record_turn && !is_isolated_step {
+        let _ = compact_history_if_needed_with_budget(
+            history_manager,
+            provider,
+            model,
+            cancel_rx.clone(),
+            options.history_budget_tokens,
+            options.history_tail_turns,
+        )
+        .await;
         let context_paths: Vec<String> = ctx_state.items.iter().map(|it| it.path.clone()).collect();
         let _ = history_manager.record_turn(prompt, context_paths);
     }
 
-    let history_tag = if is_isolated_plan_step {
+    let history_tag = if is_isolated_step {
         None
     } else {
         history_manager.format_history_tag().ok()
@@ -842,6 +887,12 @@ pub async fn execute_edit_pipeline_step<'a>(
     .ok()
     .filter(|m| !m.trim().is_empty());
 
+    let repomap_tokens = repo_map
+        .as_ref()
+        .map(|m| crate::prompt::estimate_tokens(m))
+        .unwrap_or(0);
+    let _ = stream_tx.send(StreamEvent::RepoMapTokens(repomap_tokens)).await;
+
     let mut assembly = PromptAssembly::new(
         Some(repo_state),
         ctx_state.revision,
@@ -852,9 +903,10 @@ pub async fn execute_edit_pipeline_step<'a>(
         repo_map,
     );
     assembly.target_language = params.target_language.map(|s| s.to_string());
-    assembly.is_plan_step_execution = is_isolated_plan_step;
+    assembly.is_isolated_step = is_isolated_step;
     assembly.is_discussion = is_discussion;
     assembly.discovery_mode = options.discovery_mode;
+    assembly.turn_scratchpad = params.turn_scratchpad.map(|s| s.to_string());
 
     let assembled_messages = assembly.assemble_chat_messages(prompt, protocol);
 
@@ -985,6 +1037,7 @@ pub async fn execute_edit_pipeline_step<'a>(
             discussion_response: None,
             is_cancelled: true,
             detected_language: params.target_language.map(|s| s.to_string()),
+            turn_scratchpad: params.turn_scratchpad.map(|s| s.to_string()),
         });
     }
 
@@ -1043,12 +1096,17 @@ pub async fn execute_edit_pipeline_step<'a>(
             .or_else(|| params.target_language.map(|s| s.to_string()))
     };
 
+    let detected_scratchpad = protocol
+        .parse_scratchpad(&assistant_text)
+        .or_else(|| params.turn_scratchpad.map(|s| s.to_string()));
+
     Ok(ParsedPipelineOutput {
         assistant_text,
         parsed_result,
         discussion_response,
         is_cancelled: false,
         detected_language,
+        turn_scratchpad: detected_scratchpad,
     })
 }
 
@@ -1286,5 +1344,93 @@ mod tests {
         let cleaned = proto.clean_assistant_text(raw);
         assert!(!cleaned.contains("<context_request"));
         assert!(proto.parse_context_requests(&cleaned).is_empty());
+    }
+
+    #[test]
+    fn test_record_workflow_response_scratchpad_isolated_from_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut hm = HistoryManager::new(dir.path().to_path_buf());
+
+        let raw_assistant = "I found the issue and fixed it.\n<scratchpad>\nWorking hypothesis: broken parser.\nVerified: parser fixed.\n</scratchpad>";
+        let edit_res = ModelResult::Edit {
+            summary: "Fix parser bug".to_string(),
+            edits: vec![EditOperation::Replace {
+                path: "src/parser.rs".to_string(),
+                old_text: "bad()".to_string(),
+                new_text: "good()".to_string(),
+            }],
+            proposal: Some(tauqe_protocol::ModelResultProposal {
+                message: "I found the issue and fixed it.".to_string(),
+                ..Default::default()
+            }),
+            applied: true,
+            error: None,
+            changed_files: vec!["src/parser.rs".to_string()],
+            commit_hash: Some("1122334".to_string()),
+        };
+
+        record_workflow_response(&mut hm, &edit_res, raw_assistant, vec![]);
+
+        let entries = hm.get_entries().unwrap();
+        assert_eq!(entries.len(), 1);
+        match &entries[0] {
+            crate::history::entry::HistoryEntry::Response { message, .. } => {
+                assert_eq!(message, "I found the issue and fixed it.");
+                assert!(!message.contains("scratchpad"));
+                assert!(!message.contains("Working hypothesis"));
+            }
+            _ => panic!("Expected Response entry"),
+        }
+    }
+
+    #[test]
+    fn test_scratchpad_round_accumulation_and_turn_isolation() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut hm = HistoryManager::new(dir.path().to_path_buf());
+        let proto = crate::edits::XmlEditProtocol;
+
+        // Round 1: Model emits discovery request and scratchpad note
+        let round1_output = "Need to inspect config.\n<context_request path=\"src/config.rs\" access=\"read_only\" />\n<scratchpad>\n- Hypothesis: missing timeout field\n- Goal: inspect config struct\n</scratchpad>";
+        let pad1 = proto.parse_scratchpad(round1_output);
+        assert_eq!(
+            pad1.as_deref(),
+            Some("- Hypothesis: missing timeout field\n- Goal: inspect config struct")
+        );
+
+        // Round 2: Prompt assembly injects scratchpad into next round
+        let mut assembly = PromptAssembly::new(None, 1, vec![], "git", "xml", None, None);
+        assembly.turn_scratchpad = pad1;
+        let messages = assembly.assemble_chat_messages("Continue", &proto);
+        let prompt_text = &messages[0].content;
+        assert!(prompt_text.contains("<turn_scratchpad>"));
+        assert!(prompt_text.contains("- Hypothesis: missing timeout field"));
+
+        // Round 2 response: Model updates scratchpad with verified conclusion
+        let round2_output = "I have updated the config.\n<tauqe_edits summary=\"Add timeout field\">\n<edit path=\"src/config.rs\">\n<search>\nstruct Config {}\n</search>\n<replace>\nstruct Config {\n    timeout: u64,\n}\n</replace>\n</edit>\n</tauqe_edits>\n<scratchpad>\n- Verified: timeout field added\n- Status: ready for test\n</scratchpad>";
+        let pad2 = proto.parse_scratchpad(round2_output);
+        assert_eq!(
+            pad2.as_deref(),
+            Some("- Verified: timeout field added\n- Status: ready for test")
+        );
+
+        // Turn completion: assistant text is cleaned and recorded in history
+        let cleaned = proto.clean_assistant_text(round2_output);
+        assert!(!cleaned.contains("<scratchpad"));
+        assert!(!cleaned.contains("Verified: timeout field added"));
+        assert!(cleaned.contains("I have updated the config."));
+
+        let edit_res = proto.parse_output(round2_output, &["src/config.rs".to_string()]);
+        record_workflow_response(&mut hm, &edit_res, &cleaned, vec![]);
+
+        let entries = hm.get_entries().unwrap();
+        assert_eq!(entries.len(), 1);
+        match &entries[0] {
+            crate::history::entry::HistoryEntry::Response { message, files, .. } => {
+                assert!(!message.contains("scratchpad"));
+                assert!(!message.contains("Verified: timeout field"));
+                assert_eq!(files, &vec!["[EDIT] src/config.rs"]);
+            }
+            _ => panic!("Expected Response entry"),
+        }
     }
 }

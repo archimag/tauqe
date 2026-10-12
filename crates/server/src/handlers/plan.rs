@@ -1,3 +1,4 @@
+use std::path::Path;
 use std::sync::Arc;
 use tauqe_core::edits::protocol::ContextRequest;
 use tauqe_core::plan::storage::PlanStorage;
@@ -6,10 +7,10 @@ use tauqe_core::providers::{
 };
 use tauqe_core::workflow::common::apply_context_requests_detailed;
 use tauqe_protocol::{
-    events, ContextAccess, Event, PlanDeleteParams, PlanExecuteStepParams, PlanGetParams,
-    PlanGetResult, PlanListChangedEvent, PlanListResult, PlanRefineParams, PlanRefineResult,
-    PlanSaveParams, PlanSetActiveParams, PlanUpdateItemParams, PlanUpdatedEvent, Request, Response,
-    TurnPhase, TurnPhaseEvent,
+    events, ContextAccess, Event, Plan, PlanDeleteParams, PlanExecuteParams, PlanGetParams,
+    PlanGetResult, PlanItemStatus, PlanListChangedEvent, PlanListResult, PlanRefineParams,
+    PlanRefineResult, PlanSaveParams, PlanScopeEvaluation, PlanSetActiveParams,
+    PlanUpdateItemParams, PlanUpdatedEvent, Request, Response, TurnPhase, TurnPhaseEvent,
 };
 use tokio::sync::{mpsc, watch};
 
@@ -201,10 +202,191 @@ pub async fn handle_plan_set_active(req: Request, state: &Arc<AppState>) -> Resp
     Response::ok(req.id, serde_json::json!({ "active_id": params.id }))
 }
 
-pub async fn handle_plan_execute_step(req: Request, state: &Arc<AppState>) -> Response {
-    let params: PlanExecuteStepParams = match req.params.and_then(|p| serde_json::from_value(p).ok()) {
+/// Outcome of a server-driven batch of plan steps.
+#[derive(Debug, PartialEq, Eq)]
+enum BatchOutcome {
+    Completed {
+        steps: usize,
+    },
+    Failed {
+        completed: usize,
+        step_id: String,
+        reason: String,
+    },
+}
+
+fn publish_plan(state: &Arc<AppState>, repo_root: &Path, plan: Plan, active_id: &str) {
+    emit(
+        &state.out,
+        events::PLAN_UPDATED,
+        serde_json::to_value(PlanUpdatedEvent { plan }).ok(),
+    );
+    if let Ok(plans) = PlanStorage::load_all(repo_root) {
+        emit(
+            &state.out,
+            events::PLAN_LIST_CHANGED,
+            serde_json::to_value(PlanListChangedEvent {
+                plans,
+                active_id: Some(active_id.to_string()),
+            })
+            .ok(),
+        );
+    }
+}
+
+fn set_step_status(
+    state: &Arc<AppState>,
+    repo_root: &Path,
+    plan_id: &str,
+    step_id: &str,
+    status: PlanItemStatus,
+) {
+    if let Ok(Some(plan)) = PlanStorage::update_item(repo_root, plan_id, step_id, Some(status)) {
+        publish_plan(state, repo_root, plan, plan_id);
+    }
+}
+
+fn report_step_failure(state: &Arc<AppState>, operation_id: &str, message: &str) {
+    emit(
+        &state.out,
+        events::MODEL_ERROR,
+        Some(serde_json::json!({
+            "operation_id": operation_id,
+            "message": message,
+        })),
+    );
+}
+
+/// Loads the declared target files of a step into editable context before the turn starts.
+async fn preload_step_files(state: &Arc<AppState>, repo_root: &Path, files: &[String]) {
+    if files.is_empty() {
+        return;
+    }
+    let max_files = state.config.lock().await.context.max_files;
+    let available_files =
+        tauqe_core::git::list_repository_files(Some(repo_root)).unwrap_or_default();
+    let requests: Vec<ContextRequest> = files
+        .iter()
+        .map(|p| ContextRequest {
+            path: p.clone(),
+            access: ContextAccess::Editable,
+        })
+        .collect();
+
+    let (outcome, new_ctx_state) = {
+        let mut ctx = state.context.write().await;
+        let oc = apply_context_requests_detailed(&mut ctx, &requests, &available_files, max_files);
+        let s = ctx.get_state();
+        (oc, s)
+    };
+
+    if !outcome.added.is_empty() {
+        emit(
+            &state.out,
+            events::CONTEXT_CHANGED,
+            Some(serde_json::json!({ "state": new_ctx_state })),
+        );
+    }
+}
+
+/// Executes one step in an isolated turn. The step becomes DONE only when the turn
+/// satisfies the success contract; on any failure it returns to TODO.
+async fn run_plan_step(
+    state: &Arc<AppState>,
+    repo_root: &Path,
+    plan_id: &str,
+    step_id: &str,
+) -> Result<(), String> {
+    let plan = match PlanStorage::load_plan(repo_root, plan_id) {
+        Ok(Some(p)) => p,
+        Ok(None) => return Err(format!("Plan '{}' not found", plan_id)),
+        Err(err) => return Err(format!("{:#}", err)),
+    };
+    let item = match plan.find_item(step_id) {
+        Some(i) => i.clone(),
+        None => return Err(format!("Step '{}' not found in plan '{}'", step_id, plan_id)),
+    };
+
+    match item.status {
+        PlanItemStatus::Done => return Ok(()),
+        PlanItemStatus::Discussion => {
+            return Err(format!(
+                "Step '{}' ({}) is in DISCUSSION status and cannot be executed until reviewed",
+                item.id, item.title
+            ));
+        }
+        PlanItemStatus::Cancelled => {
+            return Err(format!(
+                "Step '{}' ({}) is CANCELLED and cannot be executed",
+                item.id, item.title
+            ));
+        }
+        PlanItemStatus::Todo | PlanItemStatus::InProgress => {}
+    }
+
+    preload_step_files(state, repo_root, &item.files).await;
+    set_step_status(state, repo_root, plan_id, step_id, PlanItemStatus::InProgress);
+
+    let prompt = match tauqe_core::plan::prompt::format_plan_step_execution_prompt(&plan, step_id, "") {
+        Ok(p) => p,
+        Err(err) => {
+            set_step_status(state, repo_root, plan_id, step_id, PlanItemStatus::Todo);
+            return Err(err);
+        }
+    };
+
+    match crate::handlers::model::execute_model_turn(state, prompt, None).await {
+        Ok(turn) if turn.is_success() => {
+            set_step_status(state, repo_root, plan_id, step_id, PlanItemStatus::Done);
+            Ok(())
+        }
+        Ok(turn) => {
+            set_step_status(state, repo_root, plan_id, step_id, PlanItemStatus::Todo);
+            let reason = turn.error.clone().unwrap_or_else(|| {
+                "Step finished without verified changes or a success tag".to_string()
+            });
+            if turn.error.is_none() && !turn.is_cancelled {
+                report_step_failure(state, &turn.operation_id, &reason);
+            }
+            Err(reason)
+        }
+        Err(err) => {
+            set_step_status(state, repo_root, plan_id, step_id, PlanItemStatus::Todo);
+            let op_id = format!("op-{}", crate::state::next_operation_id());
+            report_step_failure(state, &op_id, &err.message);
+            Err(err.message)
+        }
+    }
+}
+
+/// Runs steps sequentially and stops at the first failure (server-side Fail-Fast).
+/// Steps completed before the failure stay DONE.
+async fn run_plan_batch(
+    state: &Arc<AppState>,
+    plan_id: &str,
+    step_ids: Vec<String>,
+) -> BatchOutcome {
+    let repo_root = state.context.read().await.repo_root().to_path_buf();
+    let _ = PlanStorage::save_active_id(&repo_root, Some(plan_id));
+
+    let mut completed = 0usize;
+    for step_id in step_ids {
+        if let Err(reason) = run_plan_step(state, &repo_root, plan_id, &step_id).await {
+            return BatchOutcome::Failed {
+                completed,
+                step_id,
+                reason,
+            };
+        }
+        completed += 1;
+    }
+    BatchOutcome::Completed { steps: completed }
+}
+
+pub async fn handle_plan_execute(req: Request, state: &Arc<AppState>) -> Response {
+    let params: PlanExecuteParams = match req.params.and_then(|p| serde_json::from_value(p).ok()) {
         Some(p) => p,
-        None => return Response::err(req.id, "INVALID_PARAMS", "Missing or invalid plan execute step params"),
+        None => return Response::err(req.id, "INVALID_PARAMS", "Missing or invalid plan execute params"),
     };
 
     let repo_root = state.context.read().await.repo_root().to_path_buf();
@@ -214,73 +396,75 @@ pub async fn handle_plan_execute_step(req: Request, state: &Arc<AppState>) -> Re
         Err(err) => return Response::err(req.id, "PLAN_LOAD_FAILED", format!("{:#}", err)),
     };
 
-    let item = match plan.find_item(&params.step_id) {
-        Some(i) => i,
-        None => return Response::err(req.id, "NOT_FOUND", format!("Step '{}' not found in plan '{}'", params.step_id, params.plan_id)),
-    };
-
-    if !item.is_leaf() {
-        return Response::err(
-            req.id,
-            "INVALID_PARAMS",
-            format!("Step '{}' ({}) is not a leaf item; execute individual sub-tasks instead", item.id, item.title),
-        );
-    }
-
-    if item.status == tauqe_protocol::PlanItemStatus::Discussion {
-        return Response::err(
-            req.id,
-            "STEP_IN_DISCUSSION",
-            format!("Step '{}' ({}) is in DISCUSSION status and cannot be executed autonomously until reviewed (change status to TODO first)", item.id, item.title),
-        );
-    }
-
-    if item.status == tauqe_protocol::PlanItemStatus::Cancelled {
-        return Response::err(
-            req.id,
-            "STEP_CANCELLED",
-            format!("Step '{}' ({}) is CANCELLED and cannot be executed", item.id, item.title),
-        );
-    }
-
-    if let Ok(Some(updated_plan)) = PlanStorage::update_item(
-        &repo_root,
-        &params.plan_id,
-        &params.step_id,
-        Some(tauqe_protocol::PlanItemStatus::InProgress),
-    ) {
-        let _ = PlanStorage::save_active_id(&repo_root, Some(&params.plan_id));
-        emit(
-            &state.out,
-            events::PLAN_UPDATED,
-            serde_json::to_value(PlanUpdatedEvent { plan: updated_plan }).ok(),
-        );
-        if let Ok(plans) = PlanStorage::load_all(&repo_root) {
-            emit(
-                &state.out,
-                events::PLAN_LIST_CHANGED,
-                serde_json::to_value(PlanListChangedEvent {
-                    plans,
-                    active_id: Some(params.plan_id.clone()),
-                })
-                .ok(),
+    let steps = match plan.evaluate_scope(params.step_id.as_deref()) {
+        PlanScopeEvaluation::Ready(steps) => steps,
+        PlanScopeEvaluation::BlockedByDiscussion(items) => {
+            return Response::err(
+                req.id,
+                "STEP_IN_DISCUSSION",
+                format!(
+                    "Scope contains item(s) in DISCUSSION status: {}. Review them (change status to TODO) first",
+                    items.join(", ")
+                ),
             );
         }
-    }
-
-    let prompt = match tauqe_core::plan::prompt::format_plan_step_execution_prompt(&plan, &params.step_id, "") {
-        Ok(p) => p,
-        Err(err) => return Response::err(req.id, "PROMPT_BUILD_FAILED", err),
+        PlanScopeEvaluation::AllCompleted => {
+            return Response::err(req.id, "NOTHING_TO_EXECUTE", "All steps in this scope are already completed");
+        }
+        PlanScopeEvaluation::Cancelled => {
+            return Response::err(req.id, "STEP_CANCELLED", "Step is CANCELLED and cannot be executed");
+        }
+        PlanScopeEvaluation::NotFound => {
+            return Response::err(req.id, "NOT_FOUND", "Target item not found in plan");
+        }
     };
 
-    match crate::handlers::model::start_model_turn(state, prompt, None).await {
-        Ok(op_id) => Response::ok(req.id, serde_json::json!({ "operation_id": op_id, "step_id": params.step_id })),
-        Err(err) => Response {
-            id: req.id,
-            result: None,
-            error: Some(err),
-        },
+    if state.active_cancel.lock().await.is_some() {
+        return Response::err(
+            req.id,
+            "OPERATION_IN_PROGRESS",
+            "Another operation is already running",
+        );
     }
+
+    if let Err(report) = crate::handlers::run_preflight_verification(&repo_root).await {
+        let message = format!(
+            "Pre-flight verification failed: the repository does not build cleanly. Batch execution was blocked before starting any step.\n\n{}",
+            report
+        );
+        return Response::err(req.id, "PREFLIGHT_VERIFICATION_FAILED", message);
+    }
+
+    let step_ids: Vec<String> = steps.iter().map(|s| s.id.clone()).collect();
+    let response = Response::ok(
+        req.id,
+        serde_json::json!({ "plan_id": plan.id, "step_ids": step_ids }),
+    );
+
+    let state = Arc::clone(state);
+    let plan_id = plan.id.clone();
+    tokio::spawn(async move {
+        match run_plan_batch(&state, &plan_id, step_ids).await {
+            BatchOutcome::Completed { steps } => {
+                tracing::info!("Plan '{}' batch completed: {} step(s)", plan_id, steps);
+            }
+            BatchOutcome::Failed {
+                completed,
+                step_id,
+                reason,
+            } => {
+                tracing::warn!(
+                    "Plan '{}' batch stopped at step '{}' after {} completed step(s): {}",
+                    plan_id,
+                    step_id,
+                    completed,
+                    reason
+                );
+            }
+        }
+    });
+
+    response
 }
 
 pub async fn handle_plan_refine(req: Request, state: &Arc<AppState>) -> Response {
@@ -884,6 +1068,143 @@ mod tests {
         }
     }
 
+    fn test_item(id: &str, status: PlanItemStatus) -> tauqe_protocol::PlanItem {
+        tauqe_protocol::PlanItem {
+            id: id.to_string(),
+            title: format!("Step {}", id),
+            status,
+            ..Default::default()
+        }
+    }
+
+    fn test_state(dir: &TestDir) -> Arc<AppState> {
+        let (out, _rx) = OutChannel::new();
+        let (hist_tx, _hist_rx) = tokio::sync::mpsc::unbounded_channel();
+        AppState::new(
+            tauqe_core::config::AppConfig::default(),
+            dir.path().to_path_buf(),
+            hist_tx,
+            out,
+        )
+    }
+
+    #[tokio::test]
+    async fn test_plan_batch_fail_fast_resets_status() {
+        let dir = TestDir::new();
+        let plan = Plan {
+            id: "batch".to_string(),
+            title: "Batch".to_string(),
+            created_at: 1,
+            updated_at: 1,
+            items: vec![
+                test_item("1", PlanItemStatus::Todo),
+                test_item("2", PlanItemStatus::Todo),
+            ],
+            ..Default::default()
+        };
+        PlanStorage::save_plan(dir.path(), &plan).unwrap();
+        let state = test_state(&dir);
+
+        // Without an API key the first turn cannot start: the batch must stop at step 1.
+        let outcome =
+            run_plan_batch(&state, "batch", vec!["1".to_string(), "2".to_string()]).await;
+        match outcome {
+            BatchOutcome::Failed {
+                completed, step_id, ..
+            } => {
+                assert_eq!(completed, 0);
+                assert_eq!(step_id, "1");
+            }
+            other => panic!("Expected Failed, got {:?}", other),
+        }
+
+        let reloaded = PlanStorage::load_plan(dir.path(), "batch").unwrap().unwrap();
+        assert!(reloaded.items.iter().all(|i| i.status == PlanItemStatus::Todo));
+        assert_eq!(
+            PlanStorage::load_active_id(dir.path()).unwrap().as_deref(),
+            Some("batch")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_plan_batch_skips_done_and_stops_on_discussion() {
+        let dir = TestDir::new();
+        let plan = Plan {
+            id: "skip".to_string(),
+            title: "Skip".to_string(),
+            created_at: 1,
+            updated_at: 1,
+            items: vec![
+                test_item("1", PlanItemStatus::Done),
+                test_item("2", PlanItemStatus::Discussion),
+            ],
+            ..Default::default()
+        };
+        PlanStorage::save_plan(dir.path(), &plan).unwrap();
+        let state = test_state(&dir);
+
+        let outcome = run_plan_batch(&state, "skip", vec!["1".to_string(), "2".to_string()]).await;
+        match outcome {
+            BatchOutcome::Failed {
+                completed, step_id, ..
+            } => {
+                assert_eq!(completed, 1);
+                assert_eq!(step_id, "2");
+            }
+            other => panic!("Expected Failed, got {:?}", other),
+        }
+        let reloaded = PlanStorage::load_plan(dir.path(), "skip").unwrap().unwrap();
+        assert_eq!(reloaded.find_item("2").unwrap().status, PlanItemStatus::Discussion);
+    }
+
+    #[tokio::test]
+    async fn test_handle_plan_execute_validation() {
+        let dir = TestDir::new();
+        let state = test_state(&dir);
+        let make_req = |id: u64, params: Option<serde_json::Value>| Request {
+            id: tauqe_protocol::RequestId::Number(id),
+            method: tauqe_protocol::methods::PLAN_EXECUTE.to_string(),
+            params,
+        };
+
+        let res = handle_plan_execute(make_req(1, None), &state).await;
+        assert_eq!(res.error.unwrap().code, "INVALID_PARAMS");
+
+        let res = handle_plan_execute(
+            make_req(2, Some(serde_json::json!({ "plan_id": "missing" }))),
+            &state,
+        )
+        .await;
+        assert_eq!(res.error.unwrap().code, "NOT_FOUND");
+
+        let plan = Plan {
+            id: "val".to_string(),
+            title: "Validation".to_string(),
+            created_at: 1,
+            updated_at: 1,
+            items: vec![
+                test_item("1", PlanItemStatus::Discussion),
+                test_item("2", PlanItemStatus::Cancelled),
+                test_item("3", PlanItemStatus::Done),
+            ],
+            ..Default::default()
+        };
+        PlanStorage::save_plan(dir.path(), &plan).unwrap();
+
+        let cases = [
+            (None, "STEP_IN_DISCUSSION"),
+            (Some("1"), "STEP_IN_DISCUSSION"),
+            (Some("2"), "STEP_CANCELLED"),
+            (Some("3"), "NOTHING_TO_EXECUTE"),
+            (Some("9"), "NOT_FOUND"),
+        ];
+        for (idx, (step, code)) in cases.iter().enumerate() {
+            let params = serde_json::json!({ "plan_id": "val", "step_id": step });
+            let res = handle_plan_execute(make_req(10 + idx as u64, Some(params)), &state).await;
+            assert_eq!(res.error.unwrap().code, *code);
+        }
+    }
+
     #[tokio::test]
     async fn test_handle_plan_refine_validation() {
         let dir = TestDir::new();
@@ -915,5 +1236,45 @@ mod tests {
         };
         let res_nf = handle_plan_refine(req_not_found, &state).await;
         assert_eq!(res_nf.error.unwrap().code, "NOT_FOUND");
+    }
+
+    #[tokio::test]
+    async fn test_plan_execute_blocked_by_failed_preflight() {
+        let dir = TestDir::new();
+        let plan = Plan {
+            id: "preflight".to_string(),
+            title: "Preflight".to_string(),
+            created_at: 1,
+            updated_at: 1,
+            items: vec![
+                test_item("1", PlanItemStatus::Todo),
+                test_item("2", PlanItemStatus::Todo),
+            ],
+            ..Default::default()
+        };
+        PlanStorage::save_plan(dir.path(), &plan).unwrap();
+        // A malformed manifest makes the deterministic toolchain pipeline fail.
+        std::fs::write(dir.path().join("Cargo.toml"), "[package\n").unwrap();
+        let state = test_state(&dir);
+
+        let req = Request {
+            id: tauqe_protocol::RequestId::Number(1),
+            method: tauqe_protocol::methods::PLAN_EXECUTE.to_string(),
+            params: Some(serde_json::json!({ "plan_id": "preflight" })),
+        };
+        let res = handle_plan_execute(req, &state).await;
+
+        let err = res.error.expect("preflight must block the batch");
+        assert_eq!(err.code, "PREFLIGHT_VERIFICATION_FAILED");
+        assert!(err.message.contains("Pre-flight verification failed"));
+
+        // The failure is detected before any turn starts: no active operation.
+        assert!(state.active_cancel.lock().await.is_none());
+
+        // No step was started: every status stays TODO.
+        let reloaded = PlanStorage::load_plan(dir.path(), "preflight")
+            .unwrap()
+            .unwrap();
+        assert!(reloaded.items.iter().all(|i| i.status == PlanItemStatus::Todo));
     }
 }

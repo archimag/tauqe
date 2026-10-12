@@ -196,15 +196,6 @@ pub(crate) fn next_plan_tag(text: &str) -> Option<(usize, usize)> {
     while let Some(rel) = text[from..].find(OPEN) {
         let start = from + rel;
         let after = start + OPEN.len();
-        let after_str = &text[after..];
-        if after_str.starts_with("_step_done")
-            || after_str.starts_with("-step_done")
-            || after_str.starts_with("_step-done")
-            || after_str.starts_with("-step-done")
-        {
-            from = after;
-            continue;
-        }
         let bytes = &text.as_bytes()[after..];
         let mut idx = 0;
         if idx < bytes.len() && (bytes[idx] == b'_' || bytes[idx] == b'-') {
@@ -396,20 +387,13 @@ pub fn strip_plan_tags(text: &str) -> String {
     strip_tags(text, next_plan_tag)
 }
 
-/// Completion signal emitted by the model when finishing a plan step.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PlanStepDone {
-    pub id: Option<String>,
-    pub note: Option<String>,
-}
-
-/// Locates the next complete `<plan_step_done .../>` or `<plan_step_done>...</plan_step_done>` tag.
-pub(crate) fn next_plan_step_done_tag(text: &str) -> Option<(usize, usize)> {
-    const OPEN: &str = "<plan_step_done";
+/// Locates the next complete simple control tag by opening prefix (e.g. `<success`, `<error`),
+/// supporting self-closing `<tag .../>` or paired `<tag ...>...</tag>`.
+fn next_control_tag(text: &str, open: &str) -> Option<(usize, usize)> {
     let mut from = 0;
-    while let Some(rel) = text[from..].find(OPEN) {
+    while let Some(rel) = text[from..].find(open) {
         let start = from + rel;
-        let after = start + OPEN.len();
+        let after = start + open.len();
         let bytes = &text.as_bytes()[after..];
         let mut idx = 0;
         if idx < bytes.len() && (bytes[idx] == b'_' || bytes[idx] == b'-') {
@@ -449,23 +433,122 @@ pub(crate) fn next_plan_step_done_tag(text: &str) -> Option<(usize, usize)> {
     None
 }
 
-/// Extracts `<plan_step_done ...>` completion signals from model output.
-pub fn extract_plan_step_done(text: &str) -> Vec<PlanStepDone> {
-    let mut results = Vec::new();
+/// Locates the next complete `<scratchpad ...>...</scratchpad>` or `<scratchpad .../>` tag.
+pub(crate) fn next_scratchpad_tag(text: &str) -> Option<(usize, usize)> {
+    next_control_tag(text, "<scratchpad")
+}
+
+/// Extracts ephemeral scratchpad content from model output if present.
+pub fn extract_scratchpad(text: &str) -> Option<String> {
+    let mut notes = Vec::new();
     let mut pos = 0;
-    while let Some((start, end)) = next_plan_step_done_tag(&text[pos..]) {
+    while let Some((start, end)) = next_scratchpad_tag(&text[pos..]) {
         let abs_start = pos + start;
         let abs_end = pos + end;
         let tag = &text[abs_start..abs_end];
         let header_end = tag.find('>').unwrap_or(tag.len());
         let header = &tag[..header_end];
-        let id = extract_attribute(header, "id")
-            .or_else(|| extract_attribute(header, "item"))
+        let is_self_closing = header.trim_end().ends_with('/');
+
+        let tag_name = header[1..]
+            .chars()
+            .take_while(|c| !c.is_whitespace() && *c != '>' && *c != '/')
+            .collect::<String>();
+        let close_tag = format!("</{}>", tag_name);
+
+        let mut note = None;
+        if !is_self_closing && tag.ends_with(&close_tag) {
+            let body = tag[header_end + 1..tag.len() - close_tag.len()].trim();
+            if !body.is_empty() {
+                note = Some(body.to_string());
+            }
+        }
+        if note.is_none() {
+            if let Some(attr_note) = extract_attribute(header, "note") {
+                let trimmed = attr_note.trim();
+                if !trimmed.is_empty() {
+                    note = Some(trimmed.to_string());
+                }
+            }
+        }
+        if let Some(n) = note {
+            notes.push(n);
+        }
+        pos = abs_end;
+    }
+    if notes.is_empty() {
+        None
+    } else {
+        Some(notes.join("\n\n"))
+    }
+}
+
+/// Removes all scratchpad tags and enclosed content from text.
+pub fn strip_scratchpad_tags(text: &str) -> String {
+    strip_tags(text, next_scratchpad_tag)
+}
+
+/// Universal terminal outcome emitted by the model at the conclusion of a turn.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TerminalOutcome {
+    Success { summary: Option<String> },
+    Error { message: String },
+}
+
+impl TerminalOutcome {
+    pub fn is_success(&self) -> bool {
+        matches!(self, Self::Success { .. })
+    }
+
+    pub fn is_error(&self) -> bool {
+        matches!(self, Self::Error { .. })
+    }
+
+    pub fn summary(&self) -> Option<&str> {
+        match self {
+            Self::Success { summary } => summary.as_deref(),
+            Self::Error { .. } => None,
+        }
+    }
+
+    pub fn error_message(&self) -> Option<&str> {
+        match self {
+            Self::Success { .. } => None,
+            Self::Error { message } => Some(message.as_str()),
+        }
+    }
+}
+
+/// Locates the next complete `<success .../>` or `<success>...</success>` tag.
+pub(crate) fn next_success_tag(text: &str) -> Option<(usize, usize)> {
+    next_control_tag(text, "<success")
+}
+
+/// Locates the next complete `<error .../>` or `<error>...</error>` tag.
+pub(crate) fn next_error_tag(text: &str) -> Option<(usize, usize)> {
+    next_control_tag(text, "<error")
+}
+
+/// Extracts `<success ...>` completion signal from model output if present.
+pub fn extract_success(text: &str) -> Option<Option<String>> {
+    let mut last_summary = None;
+    let mut found = false;
+    let mut pos = 0;
+    while let Some((start, end)) = next_success_tag(&text[pos..]) {
+        let abs_start = pos + start;
+        let abs_end = pos + end;
+        let tag = &text[abs_start..abs_end];
+        let header_end = tag.find('>').unwrap_or(tag.len());
+        let header = &tag[..header_end];
+        let is_self_closing = header.trim_end().ends_with('/');
+
+        let mut summary = extract_attribute(header, "summary")
+            .or_else(|| extract_attribute(header, "note"))
+            .or_else(|| extract_attribute(header, "message"))
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
-        let is_self_closing = header.trim_end().ends_with('/');
-        let mut note = extract_attribute(header, "note");
-        if note.is_none() && !is_self_closing && header_end < tag.len() {
+
+        if summary.is_none() && !is_self_closing && header_end < tag.len() {
             let after_header = &tag[header_end + 1..];
             let body = if let Some(close_idx) = after_header.rfind("</") {
                 after_header[..close_idx].trim()
@@ -473,18 +556,143 @@ pub fn extract_plan_step_done(text: &str) -> Vec<PlanStepDone> {
                 after_header.trim()
             };
             if !body.is_empty() {
-                note = Some(body.to_string());
+                summary = Some(body.to_string());
             }
         }
-        results.push(PlanStepDone { id, note });
+        last_summary = summary;
+        found = true;
         pos = abs_end;
     }
-    results
+    if found {
+        Some(last_summary)
+    } else {
+        None
+    }
 }
 
-/// Removes all `<plan_step_done>` tags from text.
-pub fn strip_plan_step_done_tags(text: &str) -> String {
-    strip_tags(text, next_plan_step_done_tag)
+/// Extracts `<error ...>` blocker/failure signal from model output if present.
+pub fn extract_error(text: &str) -> Option<String> {
+    let mut last_error = None;
+    let mut pos = 0;
+    while let Some((start, end)) = next_error_tag(&text[pos..]) {
+        let abs_start = pos + start;
+        let abs_end = pos + end;
+        let tag = &text[abs_start..abs_end];
+        let header_end = tag.find('>').unwrap_or(tag.len());
+        let header = &tag[..header_end];
+        let is_self_closing = header.trim_end().ends_with('/');
+
+        let mut msg = extract_attribute(header, "message")
+            .or_else(|| extract_attribute(header, "reason"))
+            .or_else(|| extract_attribute(header, "details"))
+            .or_else(|| extract_attribute(header, "note"))
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+
+        if msg.is_none() && !is_self_closing && header_end < tag.len() {
+            let after_header = &tag[header_end + 1..];
+            let body = if let Some(close_idx) = after_header.rfind("</") {
+                after_header[..close_idx].trim()
+            } else {
+                after_header.trim()
+            };
+            if !body.is_empty() {
+                msg = Some(body.to_string());
+            }
+        }
+        last_error = Some(msg.unwrap_or_else(|| "Execution error".to_string()));
+        pos = abs_end;
+    }
+    last_error
+}
+
+/// Extracts the final terminal outcome (`<success>` or `<error>`) from model output.
+pub fn extract_terminal_outcome(text: &str) -> Option<TerminalOutcome> {
+    let mut outcomes: Vec<(usize, TerminalOutcome)> = Vec::new();
+
+    let mut pos = 0;
+    while let Some((start, end)) = next_success_tag(&text[pos..]) {
+        let abs_start = pos + start;
+        let abs_end = pos + end;
+        let tag = &text[abs_start..abs_end];
+        let header_end = tag.find('>').unwrap_or(tag.len());
+        let header = &tag[..header_end];
+        let is_self_closing = header.trim_end().ends_with('/');
+
+        let mut summary = extract_attribute(header, "summary")
+            .or_else(|| extract_attribute(header, "note"))
+            .or_else(|| extract_attribute(header, "message"))
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+
+        if summary.is_none() && !is_self_closing && header_end < tag.len() {
+            let after_header = &tag[header_end + 1..];
+            let body = if let Some(close_idx) = after_header.rfind("</") {
+                after_header[..close_idx].trim()
+            } else {
+                after_header.trim()
+            };
+            if !body.is_empty() {
+                summary = Some(body.to_string());
+            }
+        }
+        outcomes.push((abs_start, TerminalOutcome::Success { summary }));
+        pos = abs_end;
+    }
+
+    pos = 0;
+    while let Some((start, end)) = next_error_tag(&text[pos..]) {
+        let abs_start = pos + start;
+        let abs_end = pos + end;
+        let tag = &text[abs_start..abs_end];
+        let header_end = tag.find('>').unwrap_or(tag.len());
+        let header = &tag[..header_end];
+        let is_self_closing = header.trim_end().ends_with('/');
+
+        let mut msg = extract_attribute(header, "message")
+            .or_else(|| extract_attribute(header, "reason"))
+            .or_else(|| extract_attribute(header, "details"))
+            .or_else(|| extract_attribute(header, "note"))
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+
+        if msg.is_none() && !is_self_closing && header_end < tag.len() {
+            let after_header = &tag[header_end + 1..];
+            let body = if let Some(close_idx) = after_header.rfind("</") {
+                after_header[..close_idx].trim()
+            } else {
+                after_header.trim()
+            };
+            if !body.is_empty() {
+                msg = Some(body.to_string());
+            }
+        }
+        outcomes.push((
+            abs_start,
+            TerminalOutcome::Error {
+                message: msg.unwrap_or_else(|| "Execution error".to_string()),
+            },
+        ));
+        pos = abs_end;
+    }
+
+    outcomes.sort_by_key(|(start, _)| *start);
+    outcomes.pop().map(|(_, outcome)| outcome)
+}
+
+/// Removes all `<success>` tags and content from text.
+pub fn strip_success_tags(text: &str) -> String {
+    strip_tags(text, next_success_tag)
+}
+
+/// Removes all `<error>` tags and content from text.
+pub fn strip_error_tags(text: &str) -> String {
+    strip_tags(text, next_error_tag)
+}
+
+/// Removes all `<success>` and `<error>` outcome tags from text.
+pub fn strip_terminal_outcome_tags(text: &str) -> String {
+    strip_error_tags(&strip_success_tags(text))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -493,11 +701,44 @@ pub struct ParsedPlanTag {
     pub id: String,
     pub title: Option<String>,
     pub description: Option<String>,
+    pub concept: Vec<tauqe_protocol::ConceptItem>,
     pub items: Vec<tauqe_protocol::PlanItem>,
 }
 
+fn find_closing_inner_tag(
+    slice: &str,
+    search_pos: usize,
+    base_name: &str,
+    open_tag_name: &str,
+) -> Option<(usize, usize)> {
+    let prefix = format!("</{base_name}");
+    let mut pos = search_pos;
+    while let Some(rel) = slice[pos..].find(&prefix) {
+        let close_start = pos + rel;
+        let after_prefix = &slice[close_start + prefix.len()..];
+        if let Some(gt) = after_prefix.find('>') {
+            let suffix = after_prefix[..gt].trim();
+            let open_suffix = &open_tag_name[base_name.len()..];
+            let is_match = suffix.is_empty()
+                || suffix == open_suffix
+                || (open_suffix.is_empty()
+                    && !suffix.starts_with("_item")
+                    && !suffix.starts_with("-item")
+                    && (suffix.starts_with('_') || suffix.starts_with('-'))
+                    && suffix.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'));
+
+            if is_match {
+                let close_end = close_start + prefix.len() + gt + 1;
+                return Some((close_start, close_end));
+            }
+        }
+        pos = close_start + prefix.len();
+    }
+    None
+}
+
 fn extract_and_strip_inner_tag(text: &str, base_name: &str) -> (Option<String>, String) {
-    if let Some((start, _tag_name)) = find_base_tag_start(text, base_name) {
+    if let Some((start, tag_name)) = find_base_tag_start(text, base_name) {
         let slice = &text[start..];
         if let Some(open_end) = slice.find('>') {
             if slice[..open_end].trim_end().ends_with('/') {
@@ -507,17 +748,15 @@ fn extract_and_strip_inner_tag(text: &str, base_name: &str) -> (Option<String>, 
                 remaining.push_str(&text[full_end..]);
                 return (None, remaining);
             }
-            let close_needle = format!("</{base_name}");
-            if let Some(close_rel) = slice[open_end + 1..].find(&close_needle) {
-                let close_start_in_slice = open_end + 1 + close_rel;
-                if let Some(close_gt) = slice[close_start_in_slice..].find('>') {
-                    let content = slice[open_end + 1..close_start_in_slice].trim().to_string();
-                    let full_end = start + close_start_in_slice + close_gt + 1;
-                    let mut remaining = String::with_capacity(text.len() - (full_end - start));
-                    remaining.push_str(&text[..start]);
-                    remaining.push_str(&text[full_end..]);
-                    return (Some(content), remaining);
-                }
+            if let Some((close_start_in_slice, close_end_in_slice)) =
+                find_closing_inner_tag(slice, open_end + 1, base_name, &tag_name)
+            {
+                let content = slice[open_end + 1..close_start_in_slice].trim().to_string();
+                let full_end = start + close_end_in_slice;
+                let mut remaining = String::with_capacity(text.len() - (full_end - start));
+                remaining.push_str(&text[..start]);
+                remaining.push_str(&text[full_end..]);
+                return (Some(content), remaining);
             }
         }
     }
@@ -584,6 +823,394 @@ fn next_item_tag_bounds(text: &str) -> Option<(usize, usize)> {
     None
 }
 
+fn next_concept_item_bounds(text: &str) -> Option<(usize, usize)> {
+    let mut from = 0;
+    while from < text.len() {
+        let next_c = text[from..].find("<concept_item");
+        let next_i = text[from..].find("<item");
+        let (rel, open_len) = match (next_c, next_i) {
+            (Some(c), Some(i)) if c <= i => (c, "<concept_item".len()),
+            (Some(_), Some(i)) => (i, "<item".len()),
+            (Some(c), None) => (c, "<concept_item".len()),
+            (None, Some(i)) => (i, "<item".len()),
+            (None, None) => break,
+        };
+
+        let start = from + rel;
+        let after = start + open_len;
+        let bytes = text.as_bytes();
+        let mut idx = after;
+        while idx < bytes.len() && (bytes[idx].is_ascii_alphanumeric() || bytes[idx] == b'_' || bytes[idx] == b'-') {
+            idx += 1;
+        }
+        let rest = &text[idx..];
+        let boundary = rest.chars().next().is_some_and(|c| c.is_whitespace() || c == '>' || c == '/');
+        if !boundary {
+            from = after;
+            continue;
+        }
+        let gt = rest.find('>')?;
+        let header_end = idx + gt + 1;
+        if rest[..gt].trim_end().ends_with('/') {
+            return Some((start, header_end));
+        }
+
+        let tag_name = &text[start + 1..idx];
+        let open_needle = format!("<{tag_name}");
+        let close_needle = format!("</{tag_name}");
+        let mut depth = 1;
+        let mut search_pos = header_end;
+        while search_pos < text.len() {
+            let next_open = text[search_pos..].find(&open_needle);
+            let next_close = text[search_pos..].find(&close_needle);
+            match (next_open, next_close) {
+                (Some(o), Some(c)) if o < c => {
+                    let tag_header = &text[search_pos + o..];
+                    if let Some(hgt) = tag_header.find('>') {
+                        if !tag_header[..hgt].trim_end().ends_with('/') {
+                            depth += 1;
+                        }
+                        search_pos += o + hgt + 1;
+                    } else {
+                        break;
+                    }
+                }
+                (_, Some(c)) => {
+                    let close_start = search_pos + c;
+                    let close_rest = &text[close_start..];
+                    if let Some(close_gt) = close_rest.find('>') {
+                        let inside = &close_rest[close_needle.len()..close_gt];
+                        if inside.trim().is_empty() {
+                            depth -= 1;
+                            if depth == 0 {
+                                return Some((start, close_start + close_gt + 1));
+                            }
+                        }
+                        search_pos = close_start + close_gt + 1;
+                    } else {
+                        break;
+                    }
+                }
+                _ => break,
+            }
+        }
+        return Some((start, header_end));
+    }
+    None
+}
+
+fn parse_concept_items_with_diagnostics(content: &str) -> (Vec<tauqe_protocol::ConceptItem>, Vec<String>) {
+    let mut items = Vec::new();
+    let mut errors = Vec::new();
+    let mut pos = 0;
+
+    let needle_concept = "<concept_item";
+    let needle_item = "<item";
+
+    while pos < content.len() {
+        let next_c = content[pos..].find(needle_concept);
+        let next_i = content[pos..].find(needle_item);
+        let (rel, open_len) = match (next_c, next_i) {
+            (Some(c), Some(i)) if c <= i => (c, needle_concept.len()),
+            (Some(_), Some(i)) => (i, needle_item.len()),
+            (Some(c), None) => (c, needle_concept.len()),
+            (None, Some(i)) => (i, needle_item.len()),
+            (None, None) => break,
+        };
+
+        let start = pos + rel;
+        let after = start + open_len;
+        let bytes = &content.as_bytes()[after..];
+        let mut idx = 0;
+        while idx < bytes.len() && (bytes[idx] == b'_' || bytes[idx] == b'-' || bytes[idx].is_ascii_alphanumeric()) {
+            idx += 1;
+        }
+        let rest = &content[after + idx..];
+        let boundary = rest.chars().next().is_some_and(|c| c.is_whitespace() || c == '>' || c == '/');
+        if !boundary {
+            pos = after;
+            continue;
+        }
+
+        let Some(gt) = rest.find('>') else {
+            errors.push("Malformed concept item tag: unclosed opening tag".to_string());
+            break;
+        };
+        let header_end = after + idx + gt + 1;
+        let header = &content[start..header_end];
+        let id = extract_attribute(header, "id").unwrap_or_default().trim().to_string();
+        let raw_title = extract_attribute(header, "title").unwrap_or_default().trim().to_string();
+        let attr_details = extract_attribute(header, "details")
+            .or_else(|| extract_attribute(header, "description"))
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+
+        if rest[..gt].trim_end().ends_with('/') {
+            if !id.is_empty() || !raw_title.is_empty() {
+                items.push(tauqe_protocol::ConceptItem {
+                    id: if id.is_empty() { format!("c-{}", items.len() + 1) } else { id },
+                    title: raw_title,
+                    details: attr_details,
+                    children: Vec::new(),
+                });
+            }
+            pos = header_end;
+        } else {
+            let tag_name = &content[start + 1..after + idx];
+            let open_needle = format!("<{tag_name}");
+            let close_needle = format!("</{tag_name}");
+            let mut depth = 1;
+            let mut search_pos = header_end;
+            let mut close_start = None;
+            let mut close_end = None;
+
+            while search_pos < content.len() {
+                let next_open = content[search_pos..].find(&open_needle);
+                let next_close = content[search_pos..].find(&close_needle);
+
+                match (next_open, next_close) {
+                    (Some(o), Some(c)) if o < c => {
+                        let tag_header = &content[search_pos + o..];
+                        if let Some(hgt) = tag_header.find('>') {
+                            if !tag_header[..hgt].trim_end().ends_with('/') {
+                                depth += 1;
+                            }
+                            search_pos += o + hgt + 1;
+                        } else {
+                            break;
+                        }
+                    }
+                    (_, Some(c)) => {
+                        let close_tag_start = search_pos + c;
+                        let close_rest = &content[close_tag_start..];
+                        if let Some(cgt) = close_rest.find('>') {
+                            let inside = &close_rest[close_needle.len()..cgt];
+                            if inside.trim().is_empty() {
+                                depth -= 1;
+                                if depth == 0 {
+                                    close_start = Some(close_tag_start);
+                                    close_end = Some(close_tag_start + cgt + 1);
+                                    break;
+                                }
+                            }
+                            search_pos = close_tag_start + cgt + 1;
+                        } else {
+                            break;
+                        }
+                    }
+                    _ => break,
+                }
+            }
+
+            if let (Some(cend), Some(cend_full)) = (close_start, close_end) {
+                let body = &content[header_end..cend];
+                let (children, child_errors) = parse_concept_items_with_diagnostics(body);
+                errors.extend(child_errors);
+                let text_only = strip_tags(body, next_concept_item_bounds);
+
+                let (inner_title, text_without_title) = extract_and_strip_inner_tag(&text_only, "title");
+                let mut title = raw_title;
+                if title.is_empty() {
+                    if let Some(it) = inner_title {
+                        title = it;
+                    }
+                }
+
+                let (inner_details, text_without_details) = {
+                    let (d, rem) = extract_and_strip_inner_tag(&text_without_title, "details");
+                    if d.is_some() {
+                        (d, rem)
+                    } else {
+                        extract_and_strip_inner_tag(&text_without_title, "description")
+                    }
+                };
+
+                let mut details = inner_details.or(attr_details).or_else(|| {
+                    let trimmed = text_without_details.trim();
+                    if trimmed.is_empty() {
+                        None
+                    } else {
+                        Some(trimmed.to_string())
+                    }
+                });
+
+                if title.is_empty() {
+                    if let Some(d) = details.take() {
+                        if let Some((first, rest)) = d.split_once('\n') {
+                            title = first.trim().to_string();
+                            let rest_trimmed = rest.trim();
+                            if !rest_trimmed.is_empty() {
+                                details = Some(rest_trimmed.to_string());
+                            }
+                        } else {
+                            title = d;
+                        }
+                    }
+                }
+
+                if !id.is_empty() || !title.is_empty() {
+                    items.push(tauqe_protocol::ConceptItem {
+                        id: if id.is_empty() { format!("c-{}", items.len() + 1) } else { id.clone() },
+                        title: if title.is_empty() { id } else { title },
+                        details,
+                        children,
+                    });
+                }
+                pos = cend_full;
+            } else {
+                errors.push(format!("Malformed concept item tag: missing closing tag </{tag_name}>"));
+                pos = header_end;
+            }
+        }
+    }
+
+    if items.is_empty() && !content.trim().is_empty() {
+        let fallback_items = parse_concept_items_fallback(content);
+        if !fallback_items.is_empty() {
+            return (fallback_items, errors);
+        }
+    }
+
+    (items, errors)
+}
+
+fn parse_fallback_item_header(text: &str, fallback_index: usize) -> (String, String, Option<String>) {
+    let raw = text.trim();
+    let mut words = raw.split_whitespace();
+    let first_word = words.next().unwrap_or("");
+    let clean_first = first_word.trim_matches(['[', ']', '(', ')', ':', ',']);
+
+    let (id, remainder) = if clean_first.starts_with("#c-") || clean_first.starts_with("#c_") {
+        let id_val = clean_first.trim_start_matches('#');
+        let rem = raw.strip_prefix(first_word).unwrap_or(raw).trim().trim_start_matches(':').trim();
+        (id_val.to_string(), rem)
+    } else if clean_first.starts_with("c-") || clean_first.starts_with("c_") {
+        let rem = raw.strip_prefix(first_word).unwrap_or(raw).trim().trim_start_matches(':').trim();
+        (clean_first.to_string(), rem)
+    } else if clean_first.starts_with('#')
+        && clean_first.strip_prefix('#').unwrap_or("").chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
+        && clean_first.len() > 1
+    {
+        let id_val = clean_first.trim_start_matches('#');
+        let rem = raw.strip_prefix(first_word).unwrap_or(raw).trim().trim_start_matches(':').trim();
+        let formatted_id = if id_val.starts_with("c-") {
+            id_val.to_string()
+        } else {
+            format!("c-{}", id_val)
+        };
+        (formatted_id, rem)
+    } else {
+        (format!("c-{}", fallback_index), raw)
+    };
+
+    let (title, details) = if let Some((t, d)) = remainder.split_once(": ") {
+        (t.trim(), Some(d.trim().to_string()))
+    } else if let Some((t, d)) = remainder.split_once(" - ") {
+        (t.trim(), Some(d.trim().to_string()))
+    } else {
+        (remainder.trim(), None)
+    };
+
+    let title_clean = title.trim_matches(['*', '_', '`']).trim();
+    let final_title = if title_clean.is_empty() {
+        id.clone()
+    } else {
+        title_clean.to_string()
+    };
+
+    (id, final_title, details.filter(|s| !s.is_empty()))
+}
+
+fn parse_concept_items_fallback(content: &str) -> Vec<tauqe_protocol::ConceptItem> {
+    let mut items = Vec::new();
+    let lines: Vec<&str> = content.lines().collect();
+    let mut current_item: Option<tauqe_protocol::ConceptItem> = None;
+
+    for line in lines {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        let is_new_item = if let Some(rest) = trimmed
+            .strip_prefix("- ")
+            .or_else(|| trimmed.strip_prefix("* "))
+            .or_else(|| trimmed.strip_prefix("+ "))
+        {
+            Some(rest.trim())
+        } else if let Some(rest) = trimmed.strip_prefix(|c: char| c.is_ascii_digit()) {
+            let after_digits = rest.trim_start_matches(|c: char| c.is_ascii_digit());
+            after_digits.strip_prefix(". ").map(|after_dot| after_dot.trim())
+        } else if trimmed.starts_with("#c-")
+            || trimmed.starts_with("c-")
+            || trimmed.starts_with("#c_")
+            || trimmed.starts_with("c_")
+        {
+            Some(trimmed)
+        } else {
+            None
+        };
+
+        if let Some(item_text) = is_new_item {
+            if let Some(prev) = current_item.take() {
+                items.push(prev);
+            }
+
+            let (id, title, inline_details) =
+                parse_fallback_item_header(item_text, items.len() + 1);
+            current_item = Some(tauqe_protocol::ConceptItem {
+                id,
+                title,
+                details: inline_details,
+                children: Vec::new(),
+            });
+        } else if let Some(ref mut cur) = current_item {
+            if let Some(ref mut d) = cur.details {
+                d.push('\n');
+                d.push_str(trimmed);
+            } else {
+                cur.details = Some(trimmed.to_string());
+            }
+        }
+    }
+
+    if let Some(last) = current_item {
+        items.push(last);
+    }
+
+    if items.is_empty() && !content.trim().is_empty() {
+        let trimmed = content.trim();
+        let (first_line, rest) = match trimmed.split_once('\n') {
+            Some((f, r)) => (f.trim(), Some(r.trim())),
+            None => (trimmed, None),
+        };
+        let title = if first_line.chars().count() > 80 {
+            let truncated: String = first_line.chars().take(77).collect();
+            format!("{}...", truncated)
+        } else {
+            first_line.to_string()
+        };
+        let details = match rest {
+            Some(r) if !r.is_empty() => Some(r.to_string()),
+            _ => {
+                if first_line != title {
+                    Some(trimmed.to_string())
+                } else {
+                    None
+                }
+            }
+        };
+        items.push(tauqe_protocol::ConceptItem {
+            id: "c-1".to_string(),
+            title,
+            details,
+            children: Vec::new(),
+        });
+    }
+
+    items
+}
+
 fn parse_plan_items_with_diagnostics(content: &str) -> (Vec<tauqe_protocol::PlanItem>, Vec<String>) {
     let mut items = Vec::new();
     let mut errors = Vec::new();
@@ -630,6 +1257,37 @@ fn parse_plan_items_with_diagnostics(content: &str) -> (Vec<tauqe_protocol::Plan
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
 
+        let files = extract_attribute(header, "files")
+            .map(|s| {
+                s.split([',', ';', '\n'])
+                    .filter_map(|p| {
+                        let trimmed = p.trim().trim_start_matches("./").trim_start_matches('/');
+                        if trimmed.is_empty() {
+                            None
+                        } else {
+                            Some(trimmed.to_string())
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+
+        let concept_refs = extract_attribute(header, "concept_refs")
+            .or_else(|| extract_attribute(header, "concept"))
+            .map(|s| {
+                s.split([',', ';', '\n'])
+                    .filter_map(|p| {
+                        let trimmed = p.trim();
+                        if trimmed.is_empty() {
+                            None
+                        } else {
+                            Some(trimmed.to_string())
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+
         if rest[..gt].trim_end().ends_with('/') {
             // Self-closing item
             if !id.is_empty() || !raw_title.is_empty() {
@@ -638,6 +1296,8 @@ fn parse_plan_items_with_diagnostics(content: &str) -> (Vec<tauqe_protocol::Plan
                     title: raw_title,
                     details: attr_details,
                     status,
+                    files,
+                    concept_refs,
                     children: Vec::new(),
                 });
             }
@@ -738,6 +1398,8 @@ fn parse_plan_items_with_diagnostics(content: &str) -> (Vec<tauqe_protocol::Plan
                         title: if title.is_empty() { id } else { title },
                         details,
                         status,
+                        files,
+                        concept_refs,
                         children,
                     });
                 }
@@ -761,15 +1423,6 @@ pub fn parse_plan_tags_with_diagnostics(text: &str) -> (Vec<ParsedPlanTag>, Vec<
     while let Some(rel) = text[pos..].find("<plan") {
         let tag_start = pos + rel;
         let after_plan = tag_start + "<plan".len();
-        let after_str = &text[after_plan..];
-        if after_str.starts_with("_step_done")
-            || after_str.starts_with("-step_done")
-            || after_str.starts_with("_step-done")
-            || after_str.starts_with("-step-done")
-        {
-            pos = after_plan;
-            continue;
-        }
         let bytes = text.as_bytes();
         let mut idx = after_plan;
         if idx < bytes.len() && (bytes[idx] == b'_' || bytes[idx] == b'-') {
@@ -842,7 +1495,15 @@ pub fn parse_plan_tags_with_diagnostics(text: &str) -> (Vec<ParsedPlanTag>, Vec<
             .trim()
             .to_string();
 
-        let plan_meta = strip_tags(body, next_item_tag_bounds);
+        let (concept_block, body_without_concept) = extract_and_strip_inner_tag(body, "concept");
+        let (concept, concept_errors) = if let Some(ref c_str) = concept_block {
+            parse_concept_items_with_diagnostics(c_str)
+        } else {
+            (Vec::new(), Vec::new())
+        };
+        errors.extend(concept_errors);
+
+        let plan_meta = strip_tags(&body_without_concept, next_item_tag_bounds);
 
         let title = raw_title_opt
             .or_else(|| {
@@ -860,7 +1521,7 @@ pub fn parse_plan_tags_with_diagnostics(text: &str) -> (Vec<ParsedPlanTag>, Vec<
                 })
             });
 
-        let (mut items, item_errors) = parse_plan_items_with_diagnostics(body);
+        let (mut items, item_errors) = parse_plan_items_with_diagnostics(&body_without_concept);
         errors.extend(item_errors);
 
         if action == "save" {
@@ -873,9 +1534,21 @@ pub fn parse_plan_tags_with_diagnostics(text: &str) -> (Vec<ParsedPlanTag>, Vec<
             errors.push(format!("Plan update for '{}' contains no items or fields to update", if id.is_empty() { tag_name } else { id.as_str() }));
         }
 
-        if id.is_empty() && items.is_empty() {
+        if id.is_empty() && items.is_empty() && concept.is_empty() {
             if has_plan_attributes {
                 errors.push(format!("Malformed <{tag_name}> tag: both 'id' and items are missing"));
+            }
+        } else if action == "save" && concept.is_empty() {
+            if concept_block.is_some() {
+                errors.push(format!(
+                    "Plan '{}': <concept> section is present but empty or invalid; define architectural concepts using <concept_item id=\"c-...\" title=\"...\"> or bullet points",
+                    if id.is_empty() { tag_name } else { id.as_str() }
+                ));
+            } else {
+                errors.push(format!(
+                    "Plan '{}' must contain a <concept> section defining architectural intent and invariants",
+                    if id.is_empty() { tag_name } else { id.as_str() }
+                ));
             }
         } else {
             plans.push(ParsedPlanTag {
@@ -883,6 +1556,7 @@ pub fn parse_plan_tags_with_diagnostics(text: &str) -> (Vec<ParsedPlanTag>, Vec<
                 id: if id.is_empty() { "default".to_string() } else { id },
                 title,
                 description,
+                concept,
                 items,
             });
         }
@@ -1011,6 +1685,9 @@ mod tests {
 Here is our plan:
 <plan action="save" id="jwt-auth" title="JWT Auth">
   <summary>Migrate to tokens</summary>
+  <concept>
+    <concept_item id="c-1" title="Token Security" />
+  </concept>
   <item id="1" title="Data models" status="done">Define User and Claims</item>
   <item id="2" title="Handlers" status="in_progress">
     <item id="2.1" title="Refresh handler" status="todo" />
@@ -1024,6 +1701,8 @@ Here is our plan:
         assert_eq!(p.id, "jwt-auth");
         assert_eq!(p.title.as_deref(), Some("JWT Auth"));
         assert_eq!(p.description.as_deref(), Some("Migrate to tokens"));
+        assert_eq!(p.concept.len(), 1);
+        assert_eq!(p.concept[0].id, "c-1");
         assert_eq!(p.items.len(), 2);
         assert_eq!(p.items[0].id, "1");
         assert_eq!(p.items[0].status, tauqe_protocol::PlanItemStatus::Done);
@@ -1036,14 +1715,111 @@ Here is our plan:
     fn test_parse_plan_tags_item_attributes_details() {
         let text = r#"
 <plan action="save" id="test-attr" title="Test Attr">
+  <concept>
+    <concept_item id="c-1" title="Attribute Concept" />
+  </concept>
   <item id="1" title="Self closing" status="todo" details="Attribute details here" />
   <item id="2" title="Paired tag" status="discussion" details="Paired with attr"></item>
 </plan>
 "#;
         let parsed = parse_plan_tags(text);
         assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].concept.len(), 1);
         assert_eq!(parsed[0].items[0].details.as_deref(), Some("Attribute details here"));
         assert_eq!(parsed[0].items[1].details.as_deref(), Some("Paired with attr"));
+    }
+
+    #[test]
+    fn test_parse_plan_tags_requires_concept_on_save() {
+        let text = r#"
+<plan action="save" id="flat-plan" title="Flat Plan">
+  <item id="1" title="Step without concept" status="todo" />
+</plan>
+"#;
+        let (plans, errors) = parse_plan_tags_with_diagnostics(text);
+        assert!(plans.is_empty(), "Plan without concept should not be accepted on save");
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("must contain a <concept> section"));
+    }
+
+    #[test]
+    fn test_parse_concept_fallback_long_cyrillic_no_panic() {
+        let text = r#"
+<plan action="save" id="cyrillic-plan" title="Тест">
+  <concept>
+    Это очень длинная строка с кириллическим текстом, которая превышает лимит восемьдесят символов и раньше вызывала панику
+  </concept>
+  <item id="1" title="Шаг 1" status="todo" />
+</plan>
+"#;
+        let (plans, errors) = parse_plan_tags_with_diagnostics(text);
+        assert!(errors.is_empty(), "Errors: {:?}", errors);
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0].concept.len(), 1);
+        assert!(plans[0].concept[0].title.ends_with("..."));
+    }
+
+    #[test]
+    fn test_parse_plan_tags_with_markdown_concept_fallback() {
+        let text = r#"
+<plan action="save" id="md-concept" title="Markdown Concept">
+  <concept>
+    - #c-1: Verification Symmetry
+      Preflight verification runs the exact same checks.
+    - #c-2 Fail-Early: Abort immediately on broken build.
+  </concept>
+  <item id="1" title="Execute check" status="todo" />
+</plan>
+"#;
+        let (plans, errors) = parse_plan_tags_with_diagnostics(text);
+        assert!(errors.is_empty(), "Unexpected errors: {:?}", errors);
+        assert_eq!(plans.len(), 1);
+        let p = &plans[0];
+        assert_eq!(p.concept.len(), 2);
+        assert_eq!(p.concept[0].id, "c-1");
+        assert_eq!(p.concept[0].title, "Verification Symmetry");
+        assert_eq!(
+            p.concept[0].details.as_deref(),
+            Some("Preflight verification runs the exact same checks.")
+        );
+        assert_eq!(p.concept[1].id, "c-2");
+        assert_eq!(p.concept[1].title, "Fail-Early");
+        assert_eq!(
+            p.concept[1].details.as_deref(),
+            Some("Abort immediately on broken build.")
+        );
+    }
+
+    #[test]
+    fn test_parse_plan_tags_turn_marker_tolerance_on_inner_tag() {
+        let text = r#"
+<plan action="save" id="suffixed" title="Suffixed">
+  <concept>
+    - #c-1 Invariant One
+  </concept>
+  <item id="1" title="Step 1" status="todo" />
+</plan>
+"#;
+        let (plans, errors) = parse_plan_tags_with_diagnostics(text);
+        assert!(errors.is_empty(), "Unexpected errors: {:?}", errors);
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0].concept.len(), 1);
+        assert_eq!(plans[0].concept[0].id, "c-1");
+        assert_eq!(plans[0].concept[0].title, "Invariant One");
+    }
+
+    #[test]
+    fn test_parse_plan_tags_concept_present_but_empty_diagnostic() {
+        let text = r#"
+<plan action="save" id="empty-concept" title="Empty Concept">
+  <concept>   </concept>
+  <item id="1" title="Step" status="todo" />
+</plan>
+"#;
+        let (plans, errors) = parse_plan_tags_with_diagnostics(text);
+        assert!(plans.is_empty());
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("is present but empty or invalid"));
     }
 
     #[test]
@@ -1051,14 +1827,6 @@ Here is our plan:
         let text = "Here we discuss <plan> in text without closing tags or attributes.";
         let (plans, errors) = parse_plan_tags_with_diagnostics(text);
         assert!(plans.is_empty());
-        assert!(errors.is_empty());
-    }
-
-    #[test]
-    fn test_parse_plan_tags_ignores_plan_step_done() {
-        let text = "Done with step:\n<plan_step_done id=\"2\" note=\"All handlers updated\" />\nGreat!";
-        let (plans, errors) = parse_plan_tags_with_diagnostics(text);
-        assert!(plans.is_empty(), "Should not parse plan_step_done as plan: {:?}", plans);
         assert!(errors.is_empty());
     }
 
@@ -1080,11 +1848,17 @@ Here is our plan:
 Here is an example plan in markdown:
 ```markdown
 <plan action="save" id="jwt-auth" title="JWT Auth">
+  <concept>
+    <concept_item id="c-1" title="Ex Concept" />
+  </concept>
   <item id="1" title="Example item" />
 </plan>
 ```
 And outside markdown:
 <plan action="save" id="real-plan" title="Real Plan">
+  <concept>
+    <concept_item id="c-1" title="Real Concept" />
+  </concept>
   <item id="1" title="Real item" />
 </plan>
 "#;
@@ -1103,44 +1877,52 @@ And outside markdown:
     }
 
     #[test]
-    fn test_extract_and_strip_plan_step_done() {
+    fn test_extract_and_strip_scratchpad() {
         let text = r#"
-I finished the task:
-<plan_step_done id="2.1" note="JWT validation added" />
-And step 2.2:
-<plan_step_done id="2.2">All handlers updated and tested</plan_step_done>
-And empty tag:
-<plan_step_done />
-All work done.
+Introductory text
+<scratchpad>
+Working hypothesis: missing imports in protocol.rs.
+Need to inspect protocol/xml/tags.rs.
+</scratchpad>
+Conversational explanation.
+<scratchpad note="Secondary note" />
+Final remarks.
 "#;
-        let extracted = extract_plan_step_done(text);
-        assert_eq!(extracted.len(), 3);
-        assert_eq!(extracted[0].id.as_deref(), Some("2.1"));
-        assert_eq!(extracted[0].note.as_deref(), Some("JWT validation added"));
-        assert_eq!(extracted[1].id.as_deref(), Some("2.2"));
-        assert_eq!(extracted[1].note.as_deref(), Some("All handlers updated and tested"));
-        assert_eq!(extracted[2].id, None);
-        assert_eq!(extracted[2].note, None);
+        let extracted = extract_scratchpad(text);
+        assert_eq!(
+            extracted.as_deref(),
+            Some("Working hypothesis: missing imports in protocol.rs.\nNeed to inspect protocol/xml/tags.rs.\n\nSecondary note")
+        );
 
-        let stripped = strip_plan_step_done_tags(text);
-        assert!(!stripped.contains("<plan_step_done"));
-        assert!(stripped.contains("I finished the task:"));
-        assert!(stripped.contains("All work done."));
+        let stripped = strip_scratchpad_tags(text);
+        assert!(!stripped.contains("<scratchpad"));
+        assert!(!stripped.contains("Working hypothesis"));
+        assert!(stripped.contains("Introductory text"));
+        assert!(stripped.contains("Final remarks."));
     }
 
     #[test]
-    fn test_extract_plan_step_done_ignores_code_fences() {
+    fn test_extract_scratchpad_ignores_markdown_code() {
         let text = r#"
-Here is an example:
+Example:
 ```xml
-<plan_step_done id="sample" />
+<scratchpad>
+Ignore this code fence note
+</scratchpad>
 ```
+Inline `<scratchpad>Ignore inline</scratchpad>`
 Real:
-<plan_step_done id="real-task" />
+<scratchpad>
+Real working note
+</scratchpad>
 "#;
-        let extracted = extract_plan_step_done(text);
-        assert_eq!(extracted.len(), 1);
-        assert_eq!(extracted[0].id.as_deref(), Some("real-task"));
+        let extracted = extract_scratchpad(text);
+        assert_eq!(extracted.as_deref(), Some("Real working note"));
+
+        let stripped = strip_scratchpad_tags(text);
+        assert!(stripped.contains("Ignore this code fence note"));
+        assert!(stripped.contains("`<scratchpad>Ignore inline</scratchpad>`"));
+        assert!(!stripped.contains("Real working note"));
     }
 
     #[test]
@@ -1151,6 +1933,9 @@ Real:
     Architectural plan for isolated step execution.
     Contains multiple paragraphs of context.
   </description_18DCD1DA6EB762E1>
+  <concept_18DCD1DA6EB762E1>
+    <concept_item_18DCD1DA6EB762E1 id="c-1" title="Execution Harness" />
+  </concept_18DCD1DA6EB762E1>
   <item_18DCD1DA6EB762E1 id="1" status="done">
     <title_18DCD1DA6EB762E1>Protocol tags</title_18DCD1DA6EB762E1>
     <details_18DCD1DA6EB762E1>Step done marker</details_18DCD1DA6EB762E1>
@@ -1165,6 +1950,8 @@ Real:
         assert_eq!(p.id, "plan-exec");
         assert_eq!(p.title.as_deref(), Some("Execution Engine"));
         assert!(p.description.as_ref().unwrap().contains("Architectural plan"));
+        assert_eq!(p.concept.len(), 1);
+        assert_eq!(p.concept[0].id, "c-1");
         assert_eq!(p.items.len(), 2);
         assert_eq!(p.items[0].id, "1");
         assert_eq!(p.items[0].status, tauqe_protocol::PlanItemStatus::Done);
@@ -1174,11 +1961,44 @@ Real:
     }
 
     #[test]
+    fn test_parse_plan_tags_with_concept_and_files() {
+        let text = r#"
+<plan action="save" id="two-section" title="Two-Section Plan">
+  <concept>
+    <concept_item id="c-1" title="Architectural intent">
+      <details>Core invariant details</details>
+      <concept_item id="c-1.1" title="Sub invariant" />
+    </concept_item>
+  </concept>
+  <item id="1" title="Implementation step" status="todo" files="crates/core/src/lib.rs,crates/protocol/src/plan.rs" concept_refs="c-1,c-1.1" />
+</plan>
+"#;
+        let (parsed, errors) = parse_plan_tags_with_diagnostics(text);
+        assert!(errors.is_empty(), "Errors: {:?}", errors);
+        assert_eq!(parsed.len(), 1);
+        let p = &parsed[0];
+        assert_eq!(p.concept.len(), 1);
+        assert_eq!(p.concept[0].id, "c-1");
+        assert_eq!(p.concept[0].details.as_deref(), Some("Core invariant details"));
+        assert_eq!(p.concept[0].children.len(), 1);
+        assert_eq!(p.concept[0].children[0].id, "c-1.1");
+        assert_eq!(p.items.len(), 1);
+        assert_eq!(
+            p.items[0].files,
+            vec!["crates/core/src/lib.rs", "crates/protocol/src/plan.rs"]
+        );
+        assert_eq!(p.items[0].concept_refs, vec!["c-1", "c-1.1"]);
+    }
+
+    #[test]
     fn test_parse_plan_tags_nested_elements() {
         let text = r#"
 <plan action="save" id="rust-hello-world">
   <title>Rust Hello World</title>
   <description>Complete binary creation</description>
+  <concept>
+    <concept_item id="c-1" title="Binary Entrypoint Invariant" />
+  </concept>
   <item id="1" status="todo">
     <title>Create package manifest and binary entrypoint</title>
     <details>Setup Cargo.toml and src/main.rs entrypoint for the application</details>
@@ -1195,6 +2015,8 @@ Real:
         assert_eq!(p.id, "rust-hello-world");
         assert_eq!(p.title.as_deref(), Some("Rust Hello World"));
         assert_eq!(p.description.as_deref(), Some("Complete binary creation"));
+        assert_eq!(p.concept.len(), 1);
+        assert_eq!(p.concept[0].id, "c-1");
         assert_eq!(p.items.len(), 2);
         assert_eq!(p.items[0].id, "1");
         assert_eq!(p.items[0].title, "Create package manifest and binary entrypoint");
@@ -1205,9 +2027,114 @@ Real:
     }
 
     #[test]
+    fn test_extract_and_strip_success_self_closing_with_summary() {
+        let text = "Changes applied.\n<success summary=\"Created models and passed checks\" />\nDone.";
+        let outcome = extract_terminal_outcome(text).unwrap();
+        assert_eq!(
+            outcome,
+            TerminalOutcome::Success {
+                summary: Some("Created models and passed checks".to_string()),
+            }
+        );
+        assert_eq!(extract_success(text), Some(Some("Created models and passed checks".to_string())));
+        assert_eq!(extract_error(text), None);
+
+        let stripped = strip_terminal_outcome_tags(text);
+        assert!(!stripped.contains("<success"));
+        assert_eq!(stripped.trim(), "Changes applied.\n\nDone.");
+    }
+
+    #[test]
+    fn test_extract_and_strip_success_paired_with_body() {
+        let text = "Result:\n<success>\nRefactored database module and verified transactions.\n</success>\nFinished.";
+        let outcome = extract_terminal_outcome(text).unwrap();
+        assert_eq!(
+            outcome,
+            TerminalOutcome::Success {
+                summary: Some("Refactored database module and verified transactions.".to_string()),
+            }
+        );
+        let stripped = strip_terminal_outcome_tags(text);
+        assert!(!stripped.contains("<success"));
+        assert_eq!(stripped.trim(), "Result:\n\nFinished.");
+    }
+
+    #[test]
+    fn test_extract_and_strip_success_empty() {
+        let text = "Completed.\n<success />";
+        let outcome = extract_terminal_outcome(text).unwrap();
+        assert_eq!(outcome, TerminalOutcome::Success { summary: None });
+        assert_eq!(extract_success(text), Some(None));
+    }
+
+    #[test]
+    fn test_extract_and_strip_error_attribute() {
+        let text = "Blocked:\n<error message=\"Missing required cryptographic library in Cargo.toml\" />\nExiting.";
+        let outcome = extract_terminal_outcome(text).unwrap();
+        assert_eq!(
+            outcome,
+            TerminalOutcome::Error {
+                message: "Missing required cryptographic library in Cargo.toml".to_string(),
+            }
+        );
+        assert_eq!(
+            extract_error(text),
+            Some("Missing required cryptographic library in Cargo.toml".to_string())
+        );
+        assert_eq!(extract_success(text), None);
+
+        let stripped = strip_terminal_outcome_tags(text);
+        assert!(!stripped.contains("<error"));
+        assert_eq!(stripped.trim(), "Blocked:\n\nExiting.");
+    }
+
+    #[test]
+    fn test_extract_and_strip_error_paired_with_body() {
+        let text = "Inspection failed:\n<error>\nContradiction in architectural requirements: cannot ensure atomic commits.\n</error>\nHalting.";
+        let outcome = extract_terminal_outcome(text).unwrap();
+        assert_eq!(
+            outcome,
+            TerminalOutcome::Error {
+                message: "Contradiction in architectural requirements: cannot ensure atomic commits.".to_string(),
+            }
+        );
+        let stripped = strip_terminal_outcome_tags(text);
+        assert!(!stripped.contains("<error"));
+        assert_eq!(stripped.trim(), "Inspection failed:\n\nHalting.");
+    }
+
+    #[test]
+    fn test_terminal_outcome_ignores_markdown_code() {
+        let text = r#"
+Example outcome:
+```xml
+<success summary="Mock success" />
+<error message="Mock error" />
+```
+Inline `<success />` and `<error message="inline" />`.
+Real outcome:
+<error message="Real blocker" />
+"#;
+        let outcome = extract_terminal_outcome(text).unwrap();
+        assert_eq!(
+            outcome,
+            TerminalOutcome::Error {
+                message: "Real blocker".to_string(),
+            }
+        );
+        let stripped = strip_terminal_outcome_tags(text);
+        assert!(stripped.contains("<success summary=\"Mock success\" />"));
+        assert!(stripped.contains("`<error message=\"inline\" />`"));
+        assert!(!stripped.contains("<error message=\"Real blocker\" />"));
+    }
+
+    #[test]
     fn test_parse_plan_tags_ignores_legacy_item_tier() {
         let text = r#"
 <plan action="save" id="tiers" title="Tiers">
+  <concept>
+    <concept_item id="c-1" title="Tiers Concept" />
+  </concept>
   <item id="1" title="Cheap" tier="junior" />
   <item id="2" title="Default" status="todo">Body</item>
   <item id="3" title="Hard" tier="Senior"></item>

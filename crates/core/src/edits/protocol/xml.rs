@@ -12,11 +12,12 @@ use tags::{parse_context_request_tags, parse_doc_request_tags};
 
 pub use marker::generate_turn_marker;
 pub use tags::{
-    extract_plan_step_done, extract_user_language, extract_verify_request,
-    parse_context_drop_tags, strip_context_drop_tags, strip_context_request_tags,
-    strip_doc_request_tags, strip_plan_step_done_tags, strip_plan_tags,
-    strip_user_language_tags, strip_verify_tags, PlanStepDone, VerifyOnSuccess,
-    VerifyRequest, VerifyTarget,
+    extract_error, extract_scratchpad, extract_success, extract_terminal_outcome,
+    extract_user_language, extract_verify_request, parse_context_drop_tags,
+    strip_context_drop_tags, strip_context_request_tags, strip_doc_request_tags,
+    strip_error_tags, strip_plan_tags, strip_scratchpad_tags, strip_success_tags,
+    strip_terminal_outcome_tags, strip_user_language_tags, strip_verify_tags,
+    TerminalOutcome, VerifyOnSuccess, VerifyRequest, VerifyTarget,
 };
 pub(crate) use marker::{normalize_marked_xml, restore_xml_literals};
 pub(crate) use tags::{
@@ -63,8 +64,16 @@ impl EditProtocol for XmlEditProtocol {
         tags::parse_plan_tags_with_diagnostics(raw_text)
     }
 
-    fn parse_plan_step_done(&self, raw_text: &str) -> Vec<PlanStepDone> {
-        tags::extract_plan_step_done(raw_text)
+    fn parse_scratchpad(&self, raw_text: &str) -> Option<String> {
+        tags::extract_scratchpad(raw_text)
+    }
+
+    fn parse_terminal_outcome(&self, raw_text: &str) -> Option<TerminalOutcome> {
+        tags::extract_terminal_outcome(raw_text)
+    }
+
+    fn parse_error(&self, raw_text: &str) -> Option<String> {
+        tags::extract_error(raw_text)
     }
 
     fn clean_assistant_text(&self, raw_text: &str) -> String {
@@ -151,7 +160,9 @@ impl EditProtocol for XmlEditProtocol {
 
         prompt.push_str("9. Code Verification: You may request code verification using <verify target=\"all|check|test|clippy\" on_success=\"silent|report\" />. Use target=\"all\" (or check, test, clippy). Always use on_success=\"silent\" unless the user explicitly asked to see the raw test/build logs or command output. Do not quote or output raw logs when verification succeeds; concise confirmation that all checks passed is sufficient.\n");
         prompt.push_str("10. Detect User Language: Identify the primary language of the user's prompt and output a <user_language>language</user_language> tag (e.g. <user_language>Russian</user_language>). All conversational explanations MUST be in this detected language. Internal thoughts and reasoning MUST be strictly in English.\n");
-        prompt.push_str("11. Choosing <edit> vs <overwrite>: use <edit> by default for local changes. Use <overwrite path=\"...\"> with the COMPLETE new file content when most of an existing editable file changes (roughly more than half), when the file is small, or when many fragile search blocks would be needed. Never use <create> for a path that already exists; use <create> only for new files.\n\n");
+        prompt.push_str("11. Choosing <edit> vs <overwrite>: use <edit> by default for local changes. Use <overwrite path=\"...\"> with the COMPLETE new file content when most of an existing editable file changes (roughly more than half), when the file is small, or when many fragile search blocks would be needed. Never use <create> for a path that already exists; use <create> only for new files.\n");
+        prompt.push_str("12. Turn Scratchpad (Working Memory): To retain working hypotheses, verified findings, or focus across multi-round discovery and verification healing cycles, you may emit <scratchpad>...</scratchpad> (or <scratchpad note=\"...\" />). Keep notes concise (bullet points of what is verified, current hypothesis, and purpose of requested files). Notes are preserved strictly within the current turn and automatically stripped from conversational text.\n");
+        prompt.push_str("13. Terminal Outcome Protocol: Conclude every task execution cleanly with an explicit terminal outcome tag. When your changes are complete, staged, and verified (or the user's task is resolved), emit <success summary=\"...\" />. If you encounter an insurmountable blocker, contradictory requirements, or cannot proceed, do not silently fail or hallucinate; emit <error message=\"...\" /> detailing the blocker.\n\n");
 
         prompt
     }
@@ -159,9 +170,9 @@ impl EditProtocol for XmlEditProtocol {
     fn parse_output(&self, raw_text: &str, editable_paths: &[String]) -> ModelResult {
         if !has_xml_edit_tags(raw_text) {
             return ModelResult::Answer {
-                text: strip_plan_step_done_tags(&strip_plan_tags(&strip_verify_tags(&strip_user_language_tags(
+                text: strip_terminal_outcome_tags(&strip_scratchpad_tags(&strip_plan_tags(&strip_verify_tags(&strip_user_language_tags(
                     &strip_doc_request_tags(&strip_context_drop_tags(&strip_context_request_tags(raw_text))),
-                )))),
+                ))))),
             };
         }
 
@@ -262,13 +273,27 @@ impl EditProtocol for MarkedXmlEditProtocol {
         tags::parse_plan_tags_with_diagnostics(&normalized)
     }
 
-    fn parse_plan_step_done(&self, raw_text: &str) -> Vec<PlanStepDone> {
-        let from_raw = tags::extract_plan_step_done(raw_text);
-        if !from_raw.is_empty() {
-            return from_raw;
-        }
+    fn parse_scratchpad(&self, raw_text: &str) -> Option<String> {
         let normalized = normalize_marked_xml(raw_text, &self.marker, true);
-        tags::extract_plan_step_done(&normalized)
+        tags::extract_scratchpad(&normalized)
+            .map(|notes| restore_xml_literals(&notes, &self.marker))
+    }
+
+    fn parse_terminal_outcome(&self, raw_text: &str) -> Option<TerminalOutcome> {
+        let normalized = normalize_marked_xml(raw_text, &self.marker, true);
+        tags::extract_terminal_outcome(&normalized).map(|outcome| match outcome {
+            TerminalOutcome::Success { summary } => TerminalOutcome::Success {
+                summary: summary.map(|s| restore_xml_literals(&s, &self.marker)),
+            },
+            TerminalOutcome::Error { message } => TerminalOutcome::Error {
+                message: restore_xml_literals(&message, &self.marker),
+            },
+        })
+    }
+
+    fn parse_error(&self, raw_text: &str) -> Option<String> {
+        let normalized = normalize_marked_xml(raw_text, &self.marker, true);
+        tags::extract_error(&normalized).map(|m| restore_xml_literals(&m, &self.marker))
     }
 
     fn clean_assistant_text(&self, raw_text: &str) -> String {
@@ -522,7 +547,8 @@ pub fn extract_conversational_text(raw_text: &str) -> String {
     let text = strip_context_drop_tags(&text);
     let text = strip_doc_request_tags(&text);
     let text = strip_plan_tags(&text);
-    let text = strip_plan_step_done_tags(&text);
+    let text = strip_scratchpad_tags(&text);
+    let text = strip_terminal_outcome_tags(&text);
     clean_conversational_lines(&text)
 }
 
@@ -884,10 +910,6 @@ pub(crate) fn find_base_tag_start(text: &str, tag_base: &str) -> Option<(usize, 
     while let Some(idx) = text[search_from..].find(&prefix) {
         let abs_idx = search_from + idx;
         let after = &text[abs_idx + prefix.len()..];
-        if tag_base == "plan" && (after.starts_with("_step_done") || after.starts_with("-step_done")) {
-            search_from = abs_idx + prefix.len();
-            continue;
-        }
         let bytes = after.as_bytes();
         let mut i = 0;
         if i < bytes.len() && (bytes[i] == b'_' || bytes[i] == b'-') {
@@ -1173,6 +1195,7 @@ Everything is tested and working properly."#;
             "Here is an example in discussion: <plan action=\"update\" id=\"fake\"><item id=\"1\" /></plan>\n\
             And here is the real plan:\n\
             <plan_{m} action=\"save\" id=\"real-plan\" title=\"Real\">\n\
+              <concept_{m}><concept_item_{m} id=\"c-1\" title=\"Concept\" /></concept_{m}>\n\
               <item id=\"1\" title=\"Step 1\" status=\"todo\" />\n\
             </plan_{m}>",
             m = marker
@@ -1192,6 +1215,7 @@ Everything is tested and working properly."#;
         let output = format!(
             "To update a plan, write: <plan action=\"update\" id=\"my-plan\"><item id=\"1\" status=\"done\" /></plan>\n\
             <plan_{m} action=\"save\" id=\"real-plan\" title=\"Real\">\n\
+              <concept_{m}><concept_item_{m} id=\"c-1\" title=\"Concept\" /></concept_{m}>\n\
               <item id=\"1\" title=\"Step 1\" status=\"todo\" />\n\
             </plan_{m}>",
             m = marker
@@ -1200,6 +1224,147 @@ Everything is tested and working properly."#;
         let cleaned = proto.clean_assistant_text(&output);
         assert!(cleaned.contains("<plan action=\"update\" id=\"my-plan\">"));
         assert!(!cleaned.contains("real-plan"));
+    }
+
+    #[test]
+    fn test_marked_xml_scratchpad_extraction_and_cleaning() {
+        let marker = "M12345";
+        let proto = MarkedXmlEditProtocol::new(marker);
+
+        let output = format!(
+            "Conversational response before.\n\
+            <scratchpad_{m}>\n\
+              Target: update tags.rs.\n\
+              Verified: trait methods compiled.\n\
+            </scratchpad_{m}>\n\
+            Conversational response after.",
+            m = marker
+        );
+
+        let scratchpad = proto.parse_scratchpad(&output);
+        assert_eq!(
+            scratchpad.as_deref(),
+            Some("Target: update tags.rs.\nVerified: trait methods compiled.")
+        );
+
+        let cleaned = proto.clean_assistant_text(&output);
+        assert_eq!(
+            cleaned,
+            "Conversational response before.\n\nConversational response after."
+        );
+    }
+
+    #[test]
+    fn test_marked_xml_preserves_unsuffixed_scratchpad_literals() {
+        let marker = "M12345";
+        let proto = MarkedXmlEditProtocol::new(marker);
+
+        let output = format!(
+            "Here is documentation: `<scratchpad>example notes</scratchpad>`.\n\
+            <scratchpad_{m}>\n\
+              Real notes here.\n\
+            </scratchpad_{m}>\n\
+            All done.",
+            m = marker
+        );
+
+        let scratchpad = proto.parse_scratchpad(&output);
+        assert_eq!(scratchpad.as_deref(), Some("Real notes here."));
+
+        let cleaned = proto.clean_assistant_text(&output);
+        assert!(cleaned.contains("`<scratchpad>example notes</scratchpad>`"));
+        assert!(!cleaned.contains("Real notes here."));
+    }
+
+    #[test]
+    fn test_system_instructions_includes_scratchpad() {
+        let proto = XmlEditProtocol;
+        let instr = proto.system_instructions(&[], crate::config::DiscoveryMode::Monotonic);
+        assert!(instr.contains("12. Turn Scratchpad (Working Memory)"));
+        assert!(instr.contains("<scratchpad>...</scratchpad>"));
+
+        let marker = "M987654";
+        let marked = MarkedXmlEditProtocol::new(marker);
+        let marked_instr = marked.system_instructions(&[], crate::config::DiscoveryMode::Monotonic);
+        assert!(marked_instr.contains(&format!("<scratchpad_{m}>...</scratchpad_{m}>", m = marker)));
+        assert!(marked_instr.contains(&format!("<success_{m} summary=\"...\" />", m = marker)));
+        assert!(marked_instr.contains(&format!("<error_{m} message=\"...\" />", m = marker)));
+    }
+
+    #[test]
+    fn test_marked_xml_terminal_outcome_parsing_and_cleaning() {
+        let marker = "M456789";
+        let proto = MarkedXmlEditProtocol::new(marker);
+
+        let success_output = format!(
+            "Implemented the feature.\n\
+            <success_{m} summary=\"All unit tests pass cleanly\" />\n\
+            Conversational outro.",
+            m = marker
+        );
+        let outcome = proto.parse_terminal_outcome(&success_output).unwrap();
+        assert_eq!(
+            outcome,
+            TerminalOutcome::Success {
+                summary: Some("All unit tests pass cleanly".to_string()),
+            }
+        );
+        let cleaned_success = proto.clean_assistant_text(&success_output);
+        assert!(!cleaned_success.contains("success"));
+        assert_eq!(
+            cleaned_success,
+            "Implemented the feature.\n\nConversational outro."
+        );
+
+        let error_output = format!(
+            "Encountered blocker.\n\
+            <error_{m} message=\"Missing dependency in workspace\" />\n\
+            Explanation text.",
+            m = marker
+        );
+        let err_outcome = proto.parse_terminal_outcome(&error_output).unwrap();
+        assert_eq!(
+            err_outcome,
+            TerminalOutcome::Error {
+                message: "Missing dependency in workspace".to_string(),
+            }
+        );
+        assert_eq!(
+            proto.parse_error(&error_output),
+            Some("Missing dependency in workspace".to_string())
+        );
+        let cleaned_error = proto.clean_assistant_text(&error_output);
+        assert!(!cleaned_error.contains("error"));
+        assert_eq!(
+            cleaned_error,
+            "Encountered blocker.\n\nExplanation text."
+        );
+    }
+
+    #[test]
+    fn test_marked_xml_preserves_unsuffixed_terminal_literals() {
+        let marker = "M456789";
+        let proto = MarkedXmlEditProtocol::new(marker);
+
+        let output = format!(
+            "Here is documentation: `<success>example</success>` and `<error message=\"x\" />`.\n\
+            <success_{m} summary=\"Real outcome\" />\n\
+            Done.",
+            m = marker
+        );
+
+        let outcome = proto.parse_terminal_outcome(&output).unwrap();
+        assert_eq!(
+            outcome,
+            TerminalOutcome::Success {
+                summary: Some("Real outcome".to_string()),
+            }
+        );
+
+        let cleaned = proto.clean_assistant_text(&output);
+        assert!(cleaned.contains("`<success>example</success>`"));
+        assert!(cleaned.contains("`<error message=\"x\" />`"));
+        assert!(!cleaned.contains("Real outcome"));
     }
 
     #[test]

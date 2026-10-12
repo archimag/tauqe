@@ -3,7 +3,12 @@ use ratatui::style::{Color, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 
-use crate::app::{tier_title, AppState, SelectionDialogKind, SelectionItem, ViewMode};
+use crate::app::{
+    tier_title, AppState, ConfirmDialogButton, ModalActionsState, SelectionDialogKind,
+    SelectionItem, ViewMode,
+};
+
+pub use crate::app::{ModalActionsState as ExportedModalActionsState, ModalFocus as ExportedModalFocus};
 use crate::editor::InputEditor;
 
 use super::centered_rect;
@@ -218,24 +223,34 @@ pub fn confirm_modal_geometry(
     }
 }
 
-/// Standardized three-tier confirmation modal renderer (Header, Body, Actions).
-pub fn render_modal_confirm(frame: &mut ratatui::Frame, params: ConfirmModalParams) {
-    let geom = confirm_modal_geometry(
-        frame.area(),
-        params.width,
-        params.body_lines.len(),
-        params.confirm_label,
-        params.cancel_label,
-    );
-    let area = geom.area;
-    frame.render_widget(Clear, area);
+pub struct ModalFrameParams<'a> {
+    pub title: &'a str,
+    pub border_color: Color,
+    pub area: Rect,
+    pub confirm_label: &'a str,
+    pub cancel_label: &'a str,
+    pub actions_state: ModalActionsState,
+    pub is_actions_focused: bool,
+    pub destructive: bool,
+    pub hint_text: Option<&'a str>,
+}
+
+/// Standardized three-tier modal frame renderer (Header, Body, Actions).
+pub fn render_modal_frame<F>(
+    frame: &mut ratatui::Frame,
+    params: ModalFrameParams,
+    render_body: F,
+) where
+    F: FnOnce(&mut ratatui::Frame, Rect),
+{
+    frame.render_widget(Clear, params.area);
 
     let outer_block = Block::default()
         .title(format!(" {} ", params.title))
         .borders(Borders::ALL)
         .border_style(Style::default().fg(params.border_color));
-    let inner_area = outer_block.inner(area);
-    frame.render_widget(outer_block, area);
+    let inner_area = outer_block.inner(params.area);
+    frame.render_widget(outer_block, params.area);
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -245,24 +260,32 @@ pub fn render_modal_confirm(frame: &mut ratatui::Frame, params: ConfirmModalPara
         ])
         .split(inner_area);
 
-    let body_widget = Paragraph::new(params.body_lines)
-        .alignment(ratatui::layout::Alignment::Center)
-        .wrap(Wrap { trim: false });
-    frame.render_widget(body_widget, chunks[0]);
+    render_body(frame, chunks[0]);
 
-    let (confirm_style, cancel_style) = match params.confirm_button {
-        crate::app::ConfirmDialogButton::Confirm => {
-            let bg = if params.destructive { Color::Red } else { Color::Green };
-            (
-                Style::default().bg(bg).fg(Color::White).bold(),
+    let (confirm_style, cancel_style) = if params.is_actions_focused {
+        match params.actions_state.focused_button {
+            ConfirmDialogButton::Confirm => {
+                let bg = if params.destructive { Color::Red } else { Color::Green };
+                (
+                    Style::default().bg(bg).fg(Color::White).bold(),
+                    Style::default().bg(Color::DarkGray).fg(Color::White),
+                )
+            }
+            ConfirmDialogButton::Cancel => (
                 Style::default().bg(Color::DarkGray).fg(Color::White),
-            )
+                Style::default().bg(Color::Cyan).fg(Color::Black).bold(),
+            ),
         }
-        crate::app::ConfirmDialogButton::Cancel => (
-            Style::default().bg(Color::DarkGray).fg(Color::White),
-            Style::default().bg(Color::Cyan).fg(Color::Black).bold(),
-        ),
+    } else {
+        (
+            Style::default().bg(Color::DarkGray).fg(Color::Gray),
+            Style::default().bg(Color::DarkGray).fg(Color::Gray),
+        )
     };
+
+    let hint = params.hint_text.unwrap_or(
+        "Tab / ← / → focus • Enter/Space execute • y / n fast select • Esc cancel",
+    );
 
     let actions_lines = vec![
         Line::from(vec![
@@ -270,13 +293,40 @@ pub fn render_modal_confirm(frame: &mut ratatui::Frame, params: ConfirmModalPara
             Span::raw("    "),
             Span::styled(format!(" [ {} ] ", params.cancel_label), cancel_style),
         ]),
-        Line::from(Span::styled(
-            "Tab / ← / → focus • Enter/Space execute • y / n fast select • Esc cancel",
-            Style::default().fg(Color::DarkGray),
-        )),
+        Line::from(Span::styled(hint, Style::default().fg(Color::DarkGray))),
     ];
     let actions_widget = Paragraph::new(actions_lines).alignment(ratatui::layout::Alignment::Center);
     frame.render_widget(actions_widget, chunks[1]);
+}
+
+/// Standardized three-tier confirmation modal renderer (Header, Body, Actions).
+pub fn render_modal_confirm(frame: &mut ratatui::Frame, params: ConfirmModalParams) {
+    let geom = confirm_modal_geometry(
+        frame.area(),
+        params.width,
+        params.body_lines.len(),
+        params.confirm_label,
+        params.cancel_label,
+    );
+
+    let frame_params = ModalFrameParams {
+        title: params.title,
+        border_color: params.border_color,
+        area: geom.area,
+        confirm_label: params.confirm_label,
+        cancel_label: params.cancel_label,
+        actions_state: params.confirm_button.into(),
+        is_actions_focused: true,
+        destructive: params.destructive,
+        hint_text: Some("Tab / ← / → focus • Enter/Space execute • y / n fast select • Esc cancel"),
+    };
+
+    render_modal_frame(frame, frame_params, |f, body_area| {
+        let body_widget = Paragraph::new(params.body_lines)
+            .alignment(ratatui::layout::Alignment::Center)
+            .wrap(Wrap { trim: false });
+        f.render_widget(body_widget, body_area);
+    });
 }
 
 /// Squash dialog uses almost the whole terminal so that all panes stay readable.
@@ -1542,96 +1592,132 @@ pub fn render_discuss_plan_dialog(
     frame.render_widget(footer_widget, chunks[2]);
 }
 
-pub fn render_discuss_review_dialog(
+pub fn render_prompt_modal(
     frame: &mut ratatui::Frame,
-    dialog: &crate::app::DiscussReviewDialogState,
+    modal: &crate::app::PromptModalState,
 ) {
     let area = centered_rect(68, 56, frame.area());
-    frame.render_widget(Clear, area);
-
-    let dialog_title = if let Some((item_id, _)) = dialog.focused_items.first() {
-        format!(" Discuss Finding: [{}] #{} ", dialog.review_id, item_id)
-    } else {
-        format!(" Discuss Review Session: [{}] ", dialog.review_id)
+    let (dialog_title, border_color, header_lines) = match &modal.target {
+        crate::app::PromptModalTarget::Review { review_id, review_title, focused_items } => {
+            let title = if let Some((item_id, _)) = focused_items.first() {
+                format!("Discuss Finding: [{}] #{}", review_id, item_id)
+            } else {
+                format!("Discuss Review Session: [{}]", review_id)
+            };
+            let mut lines = vec![
+                Line::from(vec![
+                    Span::styled(" Review: ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(review_title, Style::default().bold().fg(Color::White)),
+                ]),
+            ];
+            if focused_items.is_empty() {
+                lines.push(Line::from(vec![
+                    Span::styled(" Scope: ", Style::default().fg(Color::DarkGray)),
+                    Span::styled("Entire review session", Style::default().fg(Color::Yellow).bold()),
+                    Span::styled(" (discussing code quality findings and resolution plan)", Style::default().fg(Color::DarkGray)),
+                ]));
+            } else if let Some((id, title)) = focused_items.first() {
+                let max_w = area.width.saturating_sub(22) as usize;
+                lines.push(Line::from(vec![
+                    Span::styled(" Target finding: ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        truncate_to_width(&format!("#{} {}", id, title), max_w),
+                        Style::default().bold().fg(Color::Green),
+                    ),
+                ]));
+            }
+            (title, Color::Magenta, lines)
+        }
+        crate::app::PromptModalTarget::Plan { plan_id, plan_title, focused_items } => {
+            let title = if let Some((step_id, _)) = focused_items.first() {
+                format!("Discuss Step: [{}] #{}", plan_id, step_id)
+            } else {
+                format!("Discuss Plan: [{}]", plan_id)
+            };
+            let mut lines = vec![
+                Line::from(vec![
+                    Span::styled(" Plan: ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(plan_title, Style::default().bold().fg(Color::White)),
+                ]),
+            ];
+            if focused_items.is_empty() {
+                lines.push(Line::from(vec![
+                    Span::styled(" Scope: ", Style::default().fg(Color::DarkGray)),
+                    Span::styled("Entire plan", Style::default().fg(Color::Yellow).bold()),
+                    Span::styled(" (discussing architecture and overall strategy)", Style::default().fg(Color::DarkGray)),
+                ]));
+            } else if let Some((id, title)) = focused_items.first() {
+                let max_w = area.width.saturating_sub(22) as usize;
+                lines.push(Line::from(vec![
+                    Span::styled(" Target step: ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        truncate_to_width(&format!("#{} {}", id, title), max_w),
+                        Style::default().bold().fg(Color::Green),
+                    ),
+                ]));
+            }
+            (title, Color::Cyan, lines)
+        }
     };
 
-    let outer_block = Block::default()
-        .title(dialog_title)
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Magenta));
-    let inner_area = outer_block.inner(area);
-    frame.render_widget(outer_block, area);
+    let is_actions_focused = modal.focus.is_actions();
+    let frame_params = ModalFrameParams {
+        title: &dialog_title,
+        border_color,
+        area,
+        confirm_label: "Send to AI (C-Enter)",
+        cancel_label: "Cancel (Esc)",
+        actions_state: modal.actions,
+        is_actions_focused,
+        destructive: false,
+        hint_text: if is_actions_focused {
+            Some("← / → switch button • Enter/Space execute • Tab to Editor • y / n fast select • Esc cancel")
+        } else {
+            Some("Type message • C-Enter send • Enter newline • Tab to Buttons • Esc cancel")
+        },
+    };
 
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(4), Constraint::Min(6), Constraint::Length(3)])
-        .split(inner_area);
+    render_modal_frame(frame, frame_params, |f, body_area| {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(header_lines.len() as u16 + 1),
+                Constraint::Min(4),
+            ])
+            .split(body_area);
 
-    let mut header_lines = vec![
-        Line::from(vec![
-            Span::styled(" Review: ", Style::default().fg(Color::DarkGray)),
-            Span::styled(&dialog.review_title, Style::default().bold().fg(Color::White)),
-        ]),
-    ];
+        f.render_widget(Paragraph::new(header_lines), chunks[0]);
 
-    if dialog.focused_items.is_empty() {
-        header_lines.push(Line::from(vec![
-            Span::styled(" Scope: ", Style::default().fg(Color::DarkGray)),
-            Span::styled("Entire review session", Style::default().fg(Color::Yellow).bold()),
-            Span::styled(" (discussing code quality findings and resolution plan)", Style::default().fg(Color::DarkGray)),
-        ]));
-    } else if let Some((id, title)) = dialog.focused_items.first() {
-        header_lines.push(Line::from(vec![
-            Span::styled(" Target finding: ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                truncate_to_width(&format!("#{} {}", id, title), chunks[0].width.saturating_sub(18) as usize),
-                Style::default().bold().fg(Color::Green),
-            ),
-        ]));
-    }
+        let is_editor_focused = modal.focus.is_editor();
+        let mut editor_content = Vec::new();
+        if modal.prompt_editor.is_empty() {
+            let cursor = if is_editor_focused { "█" } else { " " };
+            editor_content.push(Line::from(vec![
+                Span::styled(cursor, Style::default().fg(Color::Yellow)),
+                Span::styled(
+                    " Enter your comments, questions, or directives for Tauqe AI...",
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]));
+        } else {
+            editor_content.extend(editor_lines(&modal.prompt_editor, is_editor_focused));
+        }
 
-    let header_widget = Paragraph::new(header_lines);
-    frame.render_widget(header_widget, chunks[0]);
+        let editor_border_color = if is_editor_focused {
+            Color::Green
+        } else {
+            Color::DarkGray
+        };
 
-    let mut editor_content = Vec::new();
-    if dialog.prompt_editor.is_empty() {
-        editor_content.push(Line::from(vec![
-            Span::styled("█", Style::default().fg(Color::Yellow)),
-            Span::styled(
-                " Enter your questions, counter-arguments, or instructions for Tauqe AI regarding this finding...",
-                Style::default().fg(Color::DarkGray),
-            ),
-        ]));
-    } else {
-        editor_content.extend(editor_lines(&dialog.prompt_editor, true));
-    }
-
-    let editor_block = Block::default()
-        .title(" Your Comments / Questions (Enter send, Shift+Enter / Alt+Enter / C-J newline) ")
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Green));
-    let editor_widget = Paragraph::new(editor_content).block(editor_block).wrap(Wrap { trim: false });
-    frame.render_widget(editor_widget, chunks[1]);
-
-    let actions = vec![
-        Line::from(vec![
-            Span::styled(
-                " [ Discuss in Develop (Enter / C-Enter) ] ",
-                Style::default().bg(Color::Green).fg(Color::Black).bold(),
-            ),
-            Span::raw("    "),
-            Span::styled(
-                " [ Cancel (Esc) ] ",
-                Style::default().bg(Color::DarkGray).fg(Color::White),
-            ),
-        ]),
-        Line::from(Span::styled(
-            "Enter send • Shift+Enter / Alt+Enter / C-J newline • Esc cancel",
-            Style::default().fg(Color::DarkGray),
-        )),
-    ];
-    let footer_widget = Paragraph::new(actions).alignment(ratatui::layout::Alignment::Center);
-    frame.render_widget(footer_widget, chunks[2]);
+        let editor_block = Block::default()
+            .title(" Your Comments / Questions (C-Enter send, Enter newline) ")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(editor_border_color));
+        let editor_widget = Paragraph::new(editor_content)
+            .block(editor_block)
+            .wrap(Wrap { trim: false });
+        f.render_widget(editor_widget, chunks[1]);
+    });
 }
 
 pub fn render_review_dialog(frame: &mut ratatui::Frame, dialog: &crate::app::ReviewDialogState) {

@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::context::{default_context_access, ContextAccess};
-use crate::plan::PlanItem;
+use crate::plan::{ConceptItem, PlanItem};
 
 /// Action to perform on a project plan as part of discussion structured output.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
@@ -34,6 +34,12 @@ pub struct DiscussionPlanUpdate {
     pub title: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_null_as_default",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub concept: Vec<ConceptItem>,
     #[serde(
         default,
         deserialize_with = "deserialize_null_as_default",
@@ -197,15 +203,22 @@ pub fn discussion_response_schema() -> serde_json::Value {
                                 ],
                                 "description": "Plan description and architectural rationale"
                             },
+                            "concept": {
+                                "type": "array",
+                                "description": "Hierarchical architectural concept items (requirements, invariants, decisions). Mandatory when action is 'save' to establish the conceptual foundation.",
+                                "items": {
+                                    "$ref": "#/$defs/ConceptItem"
+                                }
+                            },
                             "items": {
                                 "type": "array",
-                                "description": "Hierarchical plan items or steps",
+                                "description": "Hierarchical implementation plan items or steps",
                                 "items": {
                                     "$ref": "#/$defs/PlanItem"
                                 }
                             }
                         },
-                        "required": ["action", "id", "title", "description", "items"],
+                        "required": ["action", "id", "title", "description", "concept", "items"],
                         "additionalProperties": false
                     },
                     {
@@ -252,6 +265,36 @@ pub fn discussion_response_schema() -> serde_json::Value {
         "required": ["message", "plan_update", "context_requests", "context_drops", "user_language"],
         "additionalProperties": false,
         "$defs": {
+            "ConceptItem": {
+                "type": "object",
+                "description": "An architectural concept item or requirement",
+                "properties": {
+                    "id": {
+                        "type": "string",
+                        "description": "Concept item identifier (e.g. 'c-1', '1.1')"
+                    },
+                    "title": {
+                        "type": "string",
+                        "description": "Short title or thesis of the concept item"
+                    },
+                    "details": {
+                        "anyOf": [
+                            { "type": "string" },
+                            { "type": "null" }
+                        ],
+                        "description": "Detailed explanation, rationale, or invariant"
+                    },
+                    "children": {
+                        "type": "array",
+                        "description": "Sub-items or nested concept requirements",
+                        "items": {
+                            "$ref": "#/$defs/ConceptItem"
+                        }
+                    }
+                },
+                "required": ["id", "title", "details", "children"],
+                "additionalProperties": false
+            },
             "PlanItem": {
                 "type": "object",
                 "description": "An item or step within a plan",
@@ -276,6 +319,20 @@ pub fn discussion_response_schema() -> serde_json::Value {
                         "enum": ["discussion", "todo", "in_progress", "done", "cancelled"],
                         "description": "Status of the plan step"
                     },
+                    "files": {
+                        "type": "array",
+                        "description": "Target repository-relative file paths for this implementation step",
+                        "items": {
+                            "type": "string"
+                        }
+                    },
+                    "concept_refs": {
+                        "type": "array",
+                        "description": "IDs of referenced concept items",
+                        "items": {
+                            "type": "string"
+                        }
+                    },
                     "children": {
                         "type": "array",
                         "description": "Sub-items or nested steps",
@@ -284,7 +341,7 @@ pub fn discussion_response_schema() -> serde_json::Value {
                         }
                     }
                 },
-                "required": ["id", "title", "details", "status", "children"],
+                "required": ["id", "title", "details", "status", "files", "concept_refs", "children"],
                 "additionalProperties": false
             }
         }
@@ -359,11 +416,14 @@ mod tests {
                 id: Some("structured-output".to_string()),
                 title: Some("Structured Output".to_string()),
                 description: Some("Implement JSON schema protocol".to_string()),
+                concept: vec![],
                 items: vec![PlanItem {
                     id: "1".to_string(),
                     title: "Protocol types".to_string(),
                     details: Some("Add discussion schemas".to_string()),
                     status: PlanItemStatus::Done,
+                    files: vec![],
+                    concept_refs: vec![],
                     children: vec![],
                 }],
             });

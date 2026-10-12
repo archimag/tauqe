@@ -106,9 +106,11 @@ pub fn is_text_input_active(st: &AppState) -> bool {
             && !dialog.applying
             && (dialog.custom_input_active || dialog.focus == SquashDialogFocus::MessageEditor);
     }
+    if let Some(modal) = &st.prompt_modal {
+        return modal.focus.is_editor();
+    }
     if st.review_dialog.is_some()
         || st.discuss_plan_dialog.is_some()
-        || st.discuss_review_dialog.is_some()
         || st.plans_view.refine_dialog.is_some()
     {
         return true;
@@ -273,9 +275,11 @@ pub fn handle_paste(st: &mut AppState, text: &str) {
         return;
     }
 
-    // 2c. Discuss review dialog modal layer
-    if let Some(dialog) = st.discuss_review_dialog.as_mut() {
-        dialog.prompt_editor.insert_paste(text);
+    // 2c. Prompt modal layer (unified discussion)
+    if let Some(modal) = st.prompt_modal.as_mut() {
+        if modal.focus.is_editor() {
+            modal.prompt_editor.insert_paste(text);
+        }
         return;
     }
 
@@ -506,6 +510,7 @@ async fn handle_global_shortcuts(
     if is_cancel_shortcut {
         if st.model.is_busy() || st.review.running {
             st.confirm_cancel = true;
+            st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
         } else {
             st.notify_info("Press Ctrl+Q to quit TAUQE, or ? for help");
         }
@@ -533,6 +538,7 @@ async fn handle_global_shortcuts(
                     st.notify_warning("Cannot clear history while model is generating");
                 } else {
                     st.confirm_clear_history = true;
+                    st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
                 }
                 return Ok(Some(InputResult::Continue));
             }
@@ -623,13 +629,11 @@ mod tests {
             confirm_delete_review: None,
             confirm_execute_scope: None,
             confirm_execute_review: None,
-            plan_batch_queue: None,
-            review_batch_queue: None,
-            active_review_step: None,
             confirm_button: ConfirmDialogButton::Cancel,
             selection_dialog: None,
             status_dialog: None,
             squash_dialog: None,
+            prompt_modal: None,
             discuss_plan_dialog: None,
             discuss_review_dialog: None,
             server_disconnected: None,
@@ -700,6 +704,39 @@ mod tests {
         assert_eq!(
             st.squash_dialog.as_ref().unwrap().custom_editor.get_text(),
             "feature/my-branch"
+        );
+        assert_eq!(st.input_editor.get_text(), "");
+    }
+
+    #[test]
+    fn test_is_text_input_active_in_prompt_modal() {
+        let mut st = test_state();
+        st.view_mode = ViewMode::Review;
+        assert!(!is_text_input_active(&st));
+
+        st.prompt_modal = Some(PromptModalState::new(PromptModalTarget::Review {
+            review_id: "test".to_string(),
+            review_title: "Test".to_string(),
+            focused_items: Vec::new(),
+        }));
+        assert!(is_text_input_active(&st));
+
+        st.prompt_modal.as_mut().unwrap().focus = ModalFocus::Actions;
+        assert!(!is_text_input_active(&st));
+    }
+
+    #[test]
+    fn test_handle_paste_into_prompt_modal() {
+        let mut st = test_state();
+        st.prompt_modal = Some(PromptModalState::new(PromptModalTarget::Review {
+            review_id: "r1".to_string(),
+            review_title: "Review 1".to_string(),
+            focused_items: Vec::new(),
+        }));
+        handle_paste(&mut st, "pasted review comment");
+        assert_eq!(
+            st.prompt_modal.as_ref().unwrap().prompt_editor.get_text(),
+            "pasted review comment"
         );
         assert_eq!(st.input_editor.get_text(), "");
     }
@@ -930,6 +967,37 @@ mod tests {
             .unwrap();
         assert_eq!(res, InputResult::Exit);
         assert!(!state.lock().await.confirm_quit);
+    }
+
+    #[tokio::test]
+    async fn test_confirmation_modals_default_to_cancel_even_if_leaked() {
+        let mut st = test_state();
+        st.confirm_button = ConfirmDialogButton::Confirm;
+
+        let state = Arc::new(Mutex::new(st));
+        let mut cmd = tokio::process::Command::new("cat");
+        cmd.stdin(std::process::Stdio::piped());
+        let mut child = cmd.spawn().unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+
+        // 1. Clear history shortcut (Ctrl+L) resets confirm_button to Cancel
+        let key_ctrl_l = KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL);
+        let res = handle_global_shortcuts(key_ctrl_l, &state, &mut stdin, true).await.unwrap();
+        assert_eq!(res, Some(InputResult::Continue));
+        assert!(state.lock().await.confirm_clear_history);
+        assert_eq!(state.lock().await.confirm_button, ConfirmDialogButton::Cancel);
+
+        // Reset
+        state.lock().await.confirm_clear_history = false;
+        state.lock().await.confirm_button = ConfirmDialogButton::Confirm;
+
+        // 2. Cancel shortcut (Ctrl+C) when busy resets confirm_button to Cancel
+        state.lock().await.model.status = "thinking".to_string();
+        let key_ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        let res = handle_global_shortcuts(key_ctrl_c, &state, &mut stdin, true).await.unwrap();
+        assert_eq!(res, Some(InputResult::Continue));
+        assert!(state.lock().await.confirm_cancel);
+        assert_eq!(state.lock().await.confirm_button, ConfirmDialogButton::Cancel);
     }
 
     #[tokio::test]

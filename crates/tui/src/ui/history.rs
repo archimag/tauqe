@@ -182,8 +182,15 @@ impl HistoryViewState {
         let (total_lines, offsets) = self.layout_offsets(max_width, Some(sel));
         let max_scroll = clamp_u16(total_lines).saturating_sub(view_height);
 
+        let is_last = sel + 1 >= self.items.len();
+        if is_last {
+            self.auto_scroll = true;
+            self.scroll = max_scroll;
+            return;
+        }
+
         if let Some(&start_offset) = offsets.get(sel) {
-            let header_line = start_offset + if sel > 0 { 1 } else { 0 };
+            let header_line = start_offset;
             let next_offset = offsets.get(sel + 1).copied().unwrap_or(total_lines);
 
             let vis_top = self.scroll as usize;
@@ -194,13 +201,8 @@ impl HistoryViewState {
                 self.scroll = clamp_u16(start_offset).min(max_scroll);
             } else if next_offset > vis_bottom {
                 self.auto_scroll = false;
-                let item_height = next_offset.saturating_sub(start_offset);
-                if item_height <= view_height as usize {
-                    let target = next_offset.saturating_sub(view_height as usize);
-                    self.scroll = clamp_u16(target).min(max_scroll);
-                } else {
-                    self.scroll = clamp_u16(start_offset).min(max_scroll);
-                }
+                let target = next_offset.saturating_sub(view_height as usize);
+                self.scroll = clamp_u16(target).min(max_scroll);
             }
         }
     }
@@ -544,8 +546,6 @@ fn layout_history(
     cache.prepare(max_width, items);
 
     for (idx, item) in items.iter().enumerate() {
-        offsets.push(all_lines.len());
-
         if idx > 0 {
             let divider = Line::from(Span::styled(
                 "─".repeat(div_width),
@@ -553,6 +553,8 @@ fn layout_history(
             ));
             all_lines.extend(wrap_one(divider, max_width));
         }
+
+        offsets.push(all_lines.len());
 
         let is_selected = selected_index == Some(idx);
         let is_expanded = expanded_items.map(|set| set.contains(&item.id)).unwrap_or(false);

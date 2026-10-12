@@ -787,15 +787,6 @@ pub fn render_review_view(
                 Style::default().fg(Color::Gray),
             ));
         }
-        if let Some(ref queue) = state.review_batch_queue {
-            let cur = queue.current_index + 1;
-            let total = queue.items.len();
-            let item_id = queue.items.get(queue.current_index).map(|i| i.id).unwrap_or(0);
-            status_spans.push(Span::styled(
-                format!(" | [BATCH: Finding {}/{} (#{})]", cur, total, item_id),
-                Style::default().fg(Color::Yellow).bold(),
-            ));
-        }
     }
 
     let info_widget = Paragraph::new(vec![Line::from(status_spans)])

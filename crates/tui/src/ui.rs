@@ -28,8 +28,8 @@ pub use dialogs::{
     render_confirm_clear_history_popup, render_confirm_delete_plan_popup,
     render_confirm_delete_review_popup, render_confirm_execute_review_popup,
     render_confirm_execute_scope_popup, render_confirm_quit_popup, render_confirm_undo_popup,
-    render_disconnected_popup, render_discuss_plan_dialog, render_discuss_review_dialog,
-    render_help_popup, render_plan_refine_blocked_dialog, render_plan_refine_dialog,
+    render_disconnected_popup, render_discuss_plan_dialog, render_help_popup,
+    render_plan_refine_blocked_dialog, render_plan_refine_dialog, render_prompt_modal,
     render_review_dialog, render_selection_dialog, render_squash_popup, render_status_dialog,
     selection_dialog_area,
 };
@@ -143,10 +143,10 @@ pub fn render_ui(frame: &mut ratatui::Frame, state: &mut AppState) {
         render_confirm_execute_scope_popup(frame, state);
     } else if state.confirm_execute_review.is_some() {
         render_confirm_execute_review_popup(frame, state);
+    } else if let Some(modal) = &state.prompt_modal {
+        render_prompt_modal(frame, modal);
     } else if let Some(discuss) = &state.discuss_plan_dialog {
         render_discuss_plan_dialog(frame, discuss);
-    } else if let Some(discuss) = &state.discuss_review_dialog {
-        render_discuss_review_dialog(frame, discuss);
     } else if let Some(dialog) = &state.plans_view.refine_dialog {
         render_plan_refine_dialog(frame, dialog);
     } else if let Some(blocked) = &state.plans_view.refine_blocked {

@@ -1289,7 +1289,7 @@ api_key = "sk-or-v1-secret-token"
         assert_eq!(found, Some(cfg_path));
 
         let loaded = load_config(Some(temp_dir.path()));
-        let expected = ModelRef::openrouter("~google/gemini-flash-latest");
+        let expected = ModelRef::openrouter("~deepseek/deepseek-flash-latest");
         assert_eq!(loaded.active_model(), expected);
         assert!(loaded.available_models().contains(&expected));
         assert!(loaded.context.pinned.contains(&"Conventions.md".to_string()));

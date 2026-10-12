@@ -39,6 +39,33 @@ impl std::fmt::Display for PlanItemStatus {
     }
 }
 
+/// A node in the conceptual architectural tree ("What" / Requirements & Invariants).
+///
+/// Conceptual items represent design decisions, architectural invariants, and high-level
+/// goals. They are formed and discussed in dialogue, and remain read-only during deep
+/// implementation refinement.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ConceptItem {
+    pub id: String,
+    pub title: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub details: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub children: Vec<ConceptItem>,
+}
+
+impl ConceptItem {
+    pub fn is_leaf(&self) -> bool {
+        self.children.is_empty()
+    }
+}
+
+/// An actionable engineering step in the implementation blueprint ("How").
+///
+/// Implementation items are formed and refined by autonomous deep analysis.
+/// Each step contains the exact paths of targeted files (`files`) that are
+/// deterministically pre-loaded into context upon execution, as well as optional
+/// references to conceptual requirements (`concept_refs`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct PlanItem {
     pub id: String,
@@ -47,6 +74,10 @@ pub struct PlanItem {
     pub details: Option<String>,
     #[serde(default)]
     pub status: PlanItemStatus,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub files: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub concept_refs: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub children: Vec<PlanItem>,
 }
@@ -57,6 +88,7 @@ impl PlanItem {
     }
 }
 
+/// Two-section engineering plan: Concept Tree ("What") and Implementation Blueprint ("How").
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct Plan {
     pub id: String,
@@ -65,6 +97,8 @@ pub struct Plan {
     pub description: Option<String>,
     pub created_at: u64,
     pub updated_at: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub concept: Vec<ConceptItem>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub items: Vec<PlanItem>,
 }
@@ -171,6 +205,36 @@ impl Plan {
         let mut completed = 0;
         walk(&self.items, &mut total, &mut completed);
         (total, completed)
+    }
+
+    pub fn find_concept_item(&self, item_id: &str) -> Option<&ConceptItem> {
+        fn walk<'a>(items: &'a [ConceptItem], target: &str) -> Option<&'a ConceptItem> {
+            for item in items {
+                if item.id.eq_ignore_ascii_case(target) {
+                    return Some(item);
+                }
+                if let Some(found) = walk(&item.children, target) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        walk(&self.concept, item_id)
+    }
+
+    pub fn find_concept_item_mut(&mut self, item_id: &str) -> Option<&mut ConceptItem> {
+        fn walk<'a>(items: &'a mut [ConceptItem], target: &str) -> Option<&'a mut ConceptItem> {
+            for item in items {
+                if item.id.eq_ignore_ascii_case(target) {
+                    return Some(item);
+                }
+                if let Some(found) = walk(&mut item.children, target) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        walk(&mut self.concept, item_id)
     }
 
     pub fn find_item(&self, item_id: &str) -> Option<&PlanItem> {
@@ -321,6 +385,31 @@ impl Plan {
                 out.push('\n');
             }
         }
+
+        if !self.concept.is_empty() {
+            out.push_str("\n## Concept\n\n");
+            fn write_concept(items: &[ConceptItem], depth: usize, out: &mut String) {
+                for item in items {
+                    let indent = "  ".repeat(depth);
+                    let clean_title = item.title.replace(['\r', '\n'], " ").trim().to_string();
+                    out.push_str(&format!("{}- #{}: {}\n", indent, item.id, clean_title));
+                    if let Some(details) = &item.details {
+                        let trimmed = details.trim();
+                        if !trimmed.is_empty() {
+                            for line in trimmed.lines() {
+                                out.push_str(&format!("{}    {}\n", indent, line));
+                            }
+                        }
+                    }
+                    write_concept(&item.children, depth + 1, out);
+                }
+            }
+            write_concept(&self.concept, 0, &mut out);
+        }
+
+        if !self.concept.is_empty() && !self.items.is_empty() {
+            out.push_str("\n## Implementation\n");
+        }
         out.push('\n');
 
         fn write_items(items: &[PlanItem], depth: usize, out: &mut String) {
@@ -338,6 +427,12 @@ impl Plan {
                     "{}- {} {} #{}: {}\n",
                     indent, check, item.status, item.id, clean_title
                 ));
+                if !item.concept_refs.is_empty() {
+                    out.push_str(&format!("{}    ref: {}\n", indent, item.concept_refs.join(", ")));
+                }
+                if !item.files.is_empty() {
+                    out.push_str(&format!("{}    files: {}\n", indent, item.files.join(", ")));
+                }
                 if let Some(details) = &item.details {
                     let trimmed = details.trim();
                     if !trimmed.is_empty() {
@@ -394,6 +489,35 @@ pub fn format_plan_discussion_prompt(
         out.push_str(&format!("  <description>{}</description>\n", desc.trim()));
     }
 
+    if !plan.concept.is_empty() {
+        out.push_str("  <concept>\n");
+        fn render_concept_xml(
+            out: &mut String,
+            items: &[ConceptItem],
+            depth: usize,
+            focused_item_ids: &[String],
+        ) {
+            let indent = "  ".repeat(depth + 2);
+            for item in items {
+                let is_focused = focused_item_ids.iter().any(|id| id == &item.id);
+                let focus_marker = if is_focused { " [FOCUSED]" } else { "" };
+                out.push_str(&format!("{}- #{}{} {}", indent, item.id, focus_marker, item.title));
+                if let Some(details) = &item.details {
+                    let trimmed = details.trim();
+                    if !trimmed.is_empty() {
+                        out.push_str(&format!(": {}", trimmed));
+                    }
+                }
+                out.push('\n');
+                if !item.children.is_empty() {
+                    render_concept_xml(out, &item.children, depth + 1, focused_item_ids);
+                }
+            }
+        }
+        render_concept_xml(&mut out, &plan.concept, 0, focused_item_ids);
+        out.push_str("  </concept>\n");
+    }
+
     fn render_discussion_items(
         out: &mut String,
         items: &[PlanItem],
@@ -434,6 +558,14 @@ pub fn format_plan_discussion_prompt(
                         out.push_str(&format!("  {}\n", trimmed));
                     }
                 }
+            } else if let Some(concept) = plan.find_concept_item(id) {
+                out.push_str(&format!("- **[CONCEPT] #{} {}**\n", concept.id, concept.title));
+                if let Some(details) = &concept.details {
+                    let trimmed = details.trim();
+                    if !trimmed.is_empty() {
+                        out.push_str(&format!("  {}\n", trimmed));
+                    }
+                }
             }
         }
         out.push('\n');
@@ -447,7 +579,7 @@ pub fn format_plan_discussion_prompt(
     out.push_str("1. Address the developer's question or feedback regarding the plan architecture and steps.\n");
     out.push_str("2. Reins Invariant: Never mutate the plan (keep `plan_update: null`) without an explicit user instruction to modify it. Questions, analysis, trade-off reviews, and critique must be answered strictly in conversational text in `message`.\n");
     out.push_str("3. When explicitly instructed to update the plan, explain the proposed modifications in `message` and populate the structured `plan_update` field.\n");
-    out.push_str("4. Plan Action Semantics: Use `action: \"save\"` to create or completely overwrite the entire plan and its step hierarchy (e.g. full restructuring or clearing steps). Use `action: \"update\"` to modify individual existing items by ID without altering unmentioned items. Use `action: \"delete\"` to remove the plan.\n");
+    out.push_str("4. Plan Action Semantics: Use `action: \"save\"` to create or completely overwrite the plan (mandatory `concept` tree defining architectural intent, with optional implementation `items`). Use `action: \"update\"` to modify individual existing items or concept nodes by ID without altering unmentioned items. Use `action: \"delete\"` to remove the plan.\n");
     out.push_str("5. Keep explanations clear, rigorous, and directly aligned with codebase design.\n");
     out.push_str("6. Language Consistency Directive: Detect the natural language of the plan title and description. Formulate all plan titles, descriptions, step titles, step details, and conversational explanations strictly in that same language.\n");
 
@@ -521,10 +653,11 @@ pub struct PlanSetActiveResult {
     pub active_id: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PlanExecuteStepParams {
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct PlanExecuteParams {
     pub plan_id: String,
-    pub step_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -619,6 +752,7 @@ mod tests {
             description: None,
             created_at: 10,
             updated_at: 20,
+            concept: vec![],
             items: vec![],
         };
 
@@ -663,15 +797,90 @@ mod tests {
     }
 
     #[test]
+    fn test_concept_item_and_two_section_plan_serde() {
+        let concept = vec![
+            ConceptItem {
+                id: "c-1".to_string(),
+                title: "Stateless Auth".to_string(),
+                details: Some("Tokens must be signed with ed25519".to_string()),
+                children: vec![ConceptItem {
+                    id: "c-1.1".to_string(),
+                    title: "Token Expiration Invariant".to_string(),
+                    details: None,
+                    children: vec![],
+                }],
+            },
+        ];
+
+        let mut step = item("s-1", "Implement JWT signer", PlanItemStatus::Todo, vec![]);
+        step.files = vec!["crates/core/src/auth.rs".to_string()];
+        step.concept_refs = vec!["c-1.1".to_string()];
+
+        let mut plan = Plan {
+            id: "auth-plan".to_string(),
+            title: "Auth Plan".to_string(),
+            description: Some("Architecture & steps".to_string()),
+            created_at: 100,
+            updated_at: 200,
+            concept,
+            items: vec![step],
+        };
+
+        // Concept navigation
+        assert!(plan.find_concept_item("c-1").is_some());
+        assert_eq!(plan.find_concept_item("c-1.1").unwrap().title, "Token Expiration Invariant");
+        assert!(plan.find_concept_item("non-existent").is_none());
+
+        // Serde roundtrip
+        let json = serde_json::to_string(&plan).unwrap();
+        assert!(json.contains("\"concept\""));
+        assert!(json.contains("\"files\""));
+        assert!(json.contains("\"concept_refs\""));
+
+        let de: Plan = serde_json::from_str(&json).unwrap();
+        assert_eq!(de, plan);
+
+        // Markdown rendering with concept and files
+        let md = plan.to_markdown();
+        assert!(md.contains("## Concept"));
+        assert!(md.contains("- #c-1: Stateless Auth"));
+        assert!(md.contains("    Tokens must be signed with ed25519"));
+        assert!(md.contains("  - #c-1.1: Token Expiration Invariant"));
+        assert!(md.contains("## Implementation"));
+        assert!(md.contains("files: crates/core/src/auth.rs"));
+        assert!(md.contains("ref: c-1.1"));
+
+        // Mutate concept item
+        if let Some(c) = plan.find_concept_item_mut("c-1.1") {
+            c.title = "Updated Invariant".to_string();
+        }
+        assert_eq!(plan.find_concept_item("c-1.1").unwrap().title, "Updated Invariant");
+    }
+
+    #[test]
     fn test_plan_item_serde() {
         let mut it = item("1.1", "Define claims", PlanItemStatus::InProgress, vec![]);
         it.details = Some("Claims struct with exp and sub".to_string());
+        it.files = vec!["src/claims.rs".to_string()];
+        it.concept_refs = vec!["c-1".to_string()];
 
         let json = serde_json::to_string(&it).unwrap();
         assert!(json.contains("\"in_progress\""));
+        assert!(json.contains("\"files\""));
+        assert!(json.contains("\"concept_refs\""));
 
         let de: PlanItem = serde_json::from_str(&json).unwrap();
         assert_eq!(de, it);
+
+        // Backward compatibility: missing concept, files, concept_refs deserialize to empty defaults
+        let legacy_json = r#"{"id":"1.1","title":"Define claims","status":"in_progress"}"#;
+        let legacy_item: PlanItem = serde_json::from_str(legacy_json).unwrap();
+        assert!(legacy_item.files.is_empty());
+        assert!(legacy_item.concept_refs.is_empty());
+
+        let legacy_plan_json = r#"{"id":"p1","title":"Plan","created_at":1,"updated_at":2,"items":[]}"#;
+        let legacy_plan: Plan = serde_json::from_str(legacy_plan_json).unwrap();
+        assert!(legacy_plan.concept.is_empty());
     }
 
     #[test]
@@ -689,6 +898,7 @@ mod tests {
             description: Some("Replace session cookies".to_string()),
             created_at: 1700000000,
             updated_at: 1700000010,
+            concept: vec![],
             items: vec![
                 item(
                     "1",
@@ -720,6 +930,7 @@ mod tests {
             description: None,
             created_at: 1,
             updated_at: 1,
+            concept: vec![],
             items: vec![
                 item("1", "Step 1", PlanItemStatus::Todo, vec![]),
                 item("2", "Step 2", PlanItemStatus::Todo, vec![]),
@@ -762,6 +973,7 @@ mod tests {
             description: None,
             created_at: 1,
             updated_at: 1,
+            concept: vec![],
             items: vec![item(
                 "parent",
                 "Parent",
@@ -802,6 +1014,7 @@ mod tests {
             description: None,
             created_at: 1,
             updated_at: 1,
+            concept: vec![],
             items: vec![
                 item(
                     "1",
@@ -883,6 +1096,7 @@ mod tests {
             description: Some("Replace session cookies".to_string()),
             created_at: 1700000000,
             updated_at: 1700000010,
+            concept: vec![],
             items: vec![models, endpoint],
         };
 

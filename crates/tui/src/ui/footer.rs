@@ -166,25 +166,52 @@ pub fn render_footer(frame: &mut ratatui::Frame, state: &AppState, area: Rect) {
 
     let inner_width = area.width.saturating_sub(2) as usize;
 
+    let mut right_spans: Vec<Span<'static>> = Vec::new();
+
+    if let Some(tokens) = state.model.repomap_tokens {
+        if tokens > 0 {
+            let (color, bold) = if state.model.is_busy() {
+                (Color::Cyan, true)
+            } else {
+                (Color::DarkGray, false)
+            };
+            let mut style = Style::default().fg(color);
+            if bold {
+                style = style.bold();
+            }
+            right_spans.push(Span::styled(format_repomap_tokens(tokens), style));
+        }
+    }
+
     if state.view_mode == ViewMode::History {
+        if !right_spans.is_empty() {
+            right_spans.push(Span::styled(" │ ", Style::default().fg(Color::DarkGray)));
+        }
         let tokens = state.history_view.get_estimated_tokens();
         let total = state.history_view.total_count;
-        let hist_stats = format!(" {} entries (~{} tokens) ", total, tokens);
+        let hist_stats = format!("{} entries (~{} tokens)", total, tokens);
+        right_spans.push(Span::styled(
+            hist_stats,
+            Style::default().fg(Color::Cyan).bold(),
+        ));
+    }
+
+    if !right_spans.is_empty() {
         let left_len: usize = footer_spans.iter().map(|s| s.content.chars().count()).sum();
-        let right_len = hist_stats.chars().count();
-        if left_len + right_len < inner_width {
+        let right_len: usize = right_spans.iter().map(|s| s.content.chars().count()).sum();
+        let target_right_len = right_len + 1;
+        if left_len + target_right_len < inner_width {
+            let padding = inner_width - left_len - target_right_len;
+            footer_spans.push(Span::raw(" ".repeat(padding)));
+            footer_spans.extend(right_spans);
+            footer_spans.push(Span::raw(" "));
+        } else if left_len + right_len < inner_width {
             let padding = inner_width - left_len - right_len;
             footer_spans.push(Span::raw(" ".repeat(padding)));
-            footer_spans.push(Span::styled(
-                hist_stats,
-                Style::default().fg(Color::Cyan).bold(),
-            ));
+            footer_spans.extend(right_spans);
         } else {
             footer_spans.push(Span::styled(" │ ", Style::default().fg(Color::DarkGray)));
-            footer_spans.push(Span::styled(
-                hist_stats,
-                Style::default().fg(Color::Cyan).bold(),
-            ));
+            footer_spans.extend(right_spans);
         }
     }
 
@@ -247,6 +274,10 @@ pub fn extract_current_round(text: &str) -> Option<String> {
 
 fn extract_bracketed(slice: &str) -> Option<String> {
     slice.find(']').map(|end| slice[1..end].to_string())
+}
+
+pub fn format_repomap_tokens(tokens: usize) -> String {
+    format!("map: {} tok", tokens)
 }
 
 pub fn format_footer_cost(
@@ -323,6 +354,12 @@ mod tests {
             ttl: std::time::Duration::from_secs(6),
         };
         assert_eq!(format_notification(&notif_err), ("✗", Color::Red));
+    }
+
+    #[test]
+    fn test_format_repomap_tokens() {
+        assert_eq!(format_repomap_tokens(850), "map: 850 tok");
+        assert_eq!(format_repomap_tokens(1024), "map: 1024 tok");
     }
 
     #[test]

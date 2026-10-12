@@ -116,6 +116,7 @@ pub enum StreamEvent {
         max_rounds: Option<usize>,
         detail: Option<String>,
     },
+    RepoMapTokens(usize),
     ToolchainStarted {
         command: String,
     },

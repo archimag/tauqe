@@ -2,9 +2,9 @@ use crate::context::ContextFileContent;
 use serde::{Deserialize, Serialize};
 use tauqe_protocol::{Plan, PlanItem, PlanItemStatus};
 
-/// Formats the plan and its items into a prompt block for LLM context.
+/// Formats the plan, its concept tree, and implementation items into a prompt block for LLM context.
 pub fn format_active_plan_context(plan: &Plan) -> Option<String> {
-    if plan.items.is_empty() {
+    if plan.concept.is_empty() && plan.items.is_empty() {
         return None;
     }
 
@@ -19,37 +19,68 @@ pub fn format_active_plan_context(plan: &Plan) -> Option<String> {
         out.push_str(&format!("  <description>{}</description>\n", desc.trim()));
     }
 
-    fn render_items(out: &mut String, items: &[PlanItem], depth: usize) {
-        let indent = "  ".repeat(depth + 1);
-        for item in items {
-            let status_mark = match item.status {
-                PlanItemStatus::Discussion => "DISCUSSION",
-                PlanItemStatus::Todo => "TODO",
-                PlanItemStatus::InProgress => "IN_PROGRESS",
-                PlanItemStatus::Done => "DONE",
-                PlanItemStatus::Cancelled => "CANCELLED",
-            };
-
-            out.push_str(&format!(
-                "{}- {} (id: \"{}\", status: {})",
-                indent, item.title, item.id, status_mark
-            ));
-
-            if let Some(details) = &item.details {
-                let trimmed = details.trim();
-                if !trimmed.is_empty() {
-                    out.push_str(&format!(": {}", trimmed));
+    if !plan.concept.is_empty() {
+        out.push_str("  <concept>\n");
+        fn render_concept(out: &mut String, items: &[tauqe_protocol::ConceptItem], depth: usize) {
+            let indent = "  ".repeat(depth + 2);
+            for item in items {
+                out.push_str(&format!("{}- {} (id: \"{}\")", indent, item.title, item.id));
+                if let Some(details) = &item.details {
+                    let trimmed = details.trim();
+                    if !trimmed.is_empty() {
+                        out.push_str(&format!(": {}", trimmed));
+                    }
+                }
+                out.push('\n');
+                if !item.children.is_empty() {
+                    render_concept(out, &item.children, depth + 1);
                 }
             }
-            out.push('\n');
-
-            if !item.children.is_empty() {
-                render_items(out, &item.children, depth + 1);
-            }
         }
+        render_concept(&mut out, &plan.concept, 0);
+        out.push_str("  </concept>\n");
     }
 
-    render_items(&mut out, &plan.items, 0);
+    if !plan.items.is_empty() {
+        fn render_items(out: &mut String, items: &[PlanItem], depth: usize) {
+            let indent = "  ".repeat(depth + 1);
+            for item in items {
+                let status_mark = match item.status {
+                    PlanItemStatus::Discussion => "DISCUSSION",
+                    PlanItemStatus::Todo => "TODO",
+                    PlanItemStatus::InProgress => "IN_PROGRESS",
+                    PlanItemStatus::Done => "DONE",
+                    PlanItemStatus::Cancelled => "CANCELLED",
+                };
+
+                out.push_str(&format!(
+                    "{}- {} (id: \"{}\", status: {})",
+                    indent, item.title, item.id, status_mark
+                ));
+
+                if !item.concept_refs.is_empty() {
+                    out.push_str(&format!(" [concept_refs: {}]", item.concept_refs.join(", ")));
+                }
+                if !item.files.is_empty() {
+                    out.push_str(&format!(" [files: {}]", item.files.join(", ")));
+                }
+
+                if let Some(details) = &item.details {
+                    let trimmed = details.trim();
+                    if !trimmed.is_empty() {
+                        out.push_str(&format!(": {}", trimmed));
+                    }
+                }
+                out.push('\n');
+
+                if !item.children.is_empty() {
+                    render_items(out, &item.children, depth + 1);
+                }
+            }
+        }
+
+        render_items(&mut out, &plan.items, 0);
+    }
     out.push_str("</active_plan>");
 
     Some(out)
@@ -121,12 +152,30 @@ fn plan_item_schema(depth: usize, max_depth: usize) -> serde_json::Value {
             "description": "Step status"
         }),
     );
+    properties.insert(
+        "files".to_string(),
+        serde_json::json!({
+            "type": "array",
+            "description": "Repository-relative file paths that this step creates, modifies, or inspects (pre-loaded into context when executing)",
+            "items": { "type": "string" }
+        }),
+    );
+    properties.insert(
+        "concept_refs".to_string(),
+        serde_json::json!({
+            "type": "array",
+            "description": "IDs of concept items from the architectural concept tree that this step addresses or implements",
+            "items": { "type": "string" }
+        }),
+    );
 
     let mut required = vec![
         serde_json::Value::String("id".to_string()),
         serde_json::Value::String("title".to_string()),
         serde_json::Value::String("details".to_string()),
         serde_json::Value::String("status".to_string()),
+        serde_json::Value::String("files".to_string()),
+        serde_json::Value::String("concept_refs".to_string()),
     ];
 
     if depth < max_depth {
@@ -215,8 +264,8 @@ pub fn build_plan_refine_system_prompt(_plan: &Plan) -> String {
 
     out.push_str("## Core Invariants & Rules:\n\n");
     out.push_str("1. Strict Prohibition of Conceptual Drift (\"How\" vs \"What\"):\n");
-    out.push_str("   - The developer has already defined the conceptual intent, architectural direction, and scope (\"What\").\n");
-    out.push_str("   - You MUST NOT alter, expand, dilute, or contradict the core intent of the plan.\n");
+    out.push_str("   - The developer has already defined the conceptual intent and architectural concept tree (`concept`).\n");
+    out.push_str("   - The concept tree is strictly immutable and read-only for you. You MUST NOT alter, expand, dilute, or contradict it.\n");
     out.push_str("   - Your exclusive responsibility is engineering decomposition (\"How\"): determining the exact modules, interfaces, contracts, types, and sequence of implementation.\n\n");
     out.push_str("2. Strict Blocker Protocol (Refusal to Plan):\n");
     out.push_str("   - If you discover an insurmountable contradiction, technical blocker, missing prerequisite, or flawed assumption in the codebase or plan requirements:\n");
@@ -224,7 +273,9 @@ pub fn build_plan_refine_system_prompt(_plan: &Plan) -> String {
     out.push_str("   - You MUST set `status: \"blocked\"`, provide empty `items: []`, and document a comprehensive, rigorous technical explanation in `reason` detailing the exact contradiction, codebase evidence, and recommended developer action.\n\n");
     out.push_str("3. Step Granularity, Grouping and Compilability Invariants:\n");
     out.push_str("   - Execution Lifecycle Contract: EVERY leaf step is executed in an isolated turn with its own toolchain verification gates (check, clippy, test).\n");
-    out.push_str("   - Avoid Micro-Fragmentation: Strictly avoid splitting adjacent, closely related edits into separate microscopic steps (e.g. adding a type and its immediate handler, or updating a module and its registration). Group cohesive changes across 1-4 related files under a single leaf step if they form a logical unit of work and carry no risk of patch conflicts.\n");
+    out.push_str("   - Target File Precision: For every implementation step, you MUST populate `files: [\"path/to/file\"]` with exact repository-relative file paths. The execution harness automatically pre-loads these files into context when the step is run.\n");
+    out.push_str("   - Concept Traceability: For each step, link it to the relevant architectural concept IDs via `concept_refs: [\"concept_id\"]`.\n");
+    out.push_str("   - Avoid Micro-Fragmentation: Strictly avoid splitting adjacent, closely related edits into separate microscopic steps. Group cohesive changes across 1-4 related files under a single leaf step if they form a logical unit of work and carry no risk of patch conflicts.\n");
     out.push_str("   - Avoid Unmanageable Monoliths: Do not bundle 10-20 unrelated files into a single step; keep each leaf step calibrated to a cohesive unit (targeting 150-400 lines of change).\n");
     out.push_str("   - Compilability Invariant: The codebase MUST remain in a compiling, fully verified state at the end of EVERY leaf step. Never create broken intermediate steps.\n");
     out.push_str("   - Order steps strictly by prerequisite dependencies.\n");
@@ -259,6 +310,26 @@ pub fn build_plan_refine_user_prompt(
             out.push_str(trimmed);
             out.push_str("\n\n");
         }
+    }
+
+    if !plan.concept.is_empty() {
+        out.push_str("## Architectural Concept Tree (\"What\" - Immutable Source of Truth):\n");
+        fn render_concept(out: &mut String, items: &[tauqe_protocol::ConceptItem], depth: usize) {
+            let indent = "  ".repeat(depth);
+            for item in items {
+                out.push_str(&format!("{}- **#{}** {}", indent, item.id, item.title));
+                if let Some(details) = &item.details {
+                    let trimmed = details.trim();
+                    if !trimmed.is_empty() {
+                        out.push_str(&format!(": {}", trimmed));
+                    }
+                }
+                out.push('\n');
+                render_concept(out, &item.children, depth + 1);
+            }
+        }
+        render_concept(&mut out, &plan.concept, 0);
+        out.push('\n');
     }
 
     if let Some(ins) = instructions {
@@ -408,6 +479,26 @@ pub fn format_plan_step_execution_prompt_with_mode(
         }
     }
 
+    if !plan.concept.is_empty() {
+        out.push_str("### Architectural Concept (System Invariants & Focus):\n");
+        fn render_concept(out: &mut String, items: &[tauqe_protocol::ConceptItem], depth: usize) {
+            let indent = "  ".repeat(depth);
+            for item in items {
+                out.push_str(&format!("{}- #{} {}", indent, item.id, item.title));
+                if let Some(details) = &item.details {
+                    let trimmed = details.trim();
+                    if !trimmed.is_empty() {
+                        out.push_str(&format!(": {}", trimmed));
+                    }
+                }
+                out.push('\n');
+                render_concept(out, &item.children, depth + 1);
+            }
+        }
+        render_concept(&mut out, &plan.concept, 0);
+        out.push('\n');
+    }
+
     let mut completed_items = Vec::new();
     fn collect_completed<'a>(items: &'a [PlanItem], acc: &mut Vec<(&'a str, &'a str)>) {
         for item in items {
@@ -430,6 +521,12 @@ pub fn format_plan_step_execution_prompt_with_mode(
     out.push_str("### Target Step to Implement:\n");
     out.push_str(&format!("- **ID**: `{}`\n", step.id));
     out.push_str(&format!("- **Title**: {}\n", step.title));
+    if !step.concept_refs.is_empty() {
+        out.push_str(&format!("- **Addressed Concept Nodes**: {}\n", step.concept_refs.join(", ")));
+    }
+    if !step.files.is_empty() {
+        out.push_str(&format!("- **Pre-loaded Step Files**: {}\n", step.files.join(", ")));
+    }
     if let Some(details) = &step.details {
         let trimmed = details.trim();
         if !trimmed.is_empty() {
@@ -440,13 +537,13 @@ pub fn format_plan_step_execution_prompt_with_mode(
 
     out.push_str("## Execution Directives:\n");
     out.push_str(&format!(
-        "1. Focus STRICTLY and EXCLUSIVELY on implementing step `{}`.\n",
+        "1. Focus STRICTLY and EXCLUSIVELY on implementing step `{}` while upholding the Architectural Concept invariants.\n",
         step.id
     ));
     out.push_str("2. Do NOT implement any upcoming or subsequent steps from the plan.\n");
     out.push_str("3. Keep changes minimal, coherent, and verified with toolchain checks.\n");
     out.push_str(&format!(
-        "4. When implementation and verification are complete, emit the completion tag: <plan_step_done{0} /> (optionally with note=\"...\").\n",
+        "4. When implementation and verification are complete, emit the completion tag: <success{0} summary=\"...\" />.\n",
         marker_suffix
     ));
 
@@ -471,7 +568,10 @@ pub fn format_plan_step_execution_prompt_with_mode(
         }
     }
 
-    out.push_str("6. If you encounter an unsolvable blocking issue or need developer architectural decisions, explain it in text and DO NOT emit the completion tag.\n");
+    out.push_str(&format!(
+        "6. If you encounter an insurmountable technical blocker, contradictory requirements, or need developer decisions, emit the terminal error tag: <error{0} message=\"...\" /> explaining the exact blocker.\n",
+        marker_suffix
+    ));
 
     Ok(out)
 }
@@ -486,20 +586,30 @@ mod tests {
             description: Some("Implement secure tokens".to_string()),
             created_at: 100,
             updated_at: 200,
+            concept: vec![tauqe_protocol::ConceptItem {
+                id: "c-1".to_string(),
+                title: "Stateless JWT".to_string(),
+                details: Some("Use asymmetric ECDSA".to_string()),
+                children: vec![],
+            }],
             items: vec![
                 PlanItem {
                     id: "1".to_string(),
                     title: "Models".to_string(),
                     details: Some("Claims struct".to_string()),
                     status: PlanItemStatus::Done,
-                    ..Default::default()
+                    concept_refs: vec!["c-1".to_string()],
+                    files: vec!["crates/core/src/models.rs".to_string()],
+                    children: vec![],
                 },
                 PlanItem {
                     id: "2".to_string(),
                     title: "Endpoint".to_string(),
                     details: Some("Write handler".to_string()),
                     status: PlanItemStatus::InProgress,
-                    ..Default::default()
+                    concept_refs: vec!["c-1".to_string()],
+                    files: vec!["crates/core/src/handler.rs".to_string()],
+                    children: vec![],
                 },
             ],
         }
@@ -510,7 +620,10 @@ mod tests {
         let formatted = format_active_plan_context(&sample_plan()).unwrap();
         assert!(formatted.contains("<active_plan id=\"jwt-auth\""));
         assert!(formatted.contains("progress=\"1/2 completed\""));
-        assert!(formatted.contains("Endpoint (id: \"2\", status: IN_PROGRESS): Write handler"));
+        assert!(formatted.contains("Endpoint (id: \"2\", status: IN_PROGRESS)"));
+        assert!(formatted.contains("[concept_refs: c-1]"));
+        assert!(formatted.contains("[files: crates/core/src/handler.rs]"));
+        assert!(formatted.contains(": Write handler"));
     }
 
     #[test]
@@ -520,13 +633,18 @@ mod tests {
         let prompt = format_plan_step_execution_prompt(&plan, "2", "_XYZ").unwrap();
         assert!(prompt.contains("Target Plan Step Execution: [jwt-auth:2] Endpoint"));
         assert!(prompt.contains("Already Completed Prerequisites:"));
+        assert!(prompt.contains("Architectural Concept (System Invariants & Focus):"));
+        assert!(prompt.contains("- #c-1 Stateless JWT: Use asymmetric ECDSA"));
+        assert!(prompt.contains("- **Pre-loaded Step Files**: crates/core/src/handler.rs"));
+        assert!(prompt.contains("- **Addressed Concept Nodes**: c-1"));
 
         let target = extract_plan_step_execution_target(&prompt).unwrap();
         assert_eq!(target.plan_id.as_deref(), Some("jwt-auth"));
         assert_eq!(target.step_id, "2");
         assert!(prompt.contains("- [x] #1 Models"));
         assert!(prompt.contains("- **ID**: `2`"));
-        assert!(prompt.contains("<plan_step_done_XYZ />"));
+        assert!(prompt.contains("<success_XYZ summary=\"...\" />"));
+        assert!(prompt.contains("<error_XYZ message=\"...\" />"));
         assert!(!prompt.contains("<context_drop_XYZ"));
 
         let inc_prompt = format_plan_step_execution_prompt_with_mode(

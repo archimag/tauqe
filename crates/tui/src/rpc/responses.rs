@@ -9,6 +9,10 @@ use tauqe_protocol::{
 use crate::app::{AppState, OnboardingStep, ViewMode};
 use super::transport::{take_optimistic_rollback, take_pending_request, OptimisticRollback};
 
+/// RPC error code returned by the server when the pre-flight toolchain
+/// verification blocks a plan or review batch before any step starts.
+const PREFLIGHT_VERIFICATION_FAILED: &str = "PREFLIGHT_VERIFICATION_FAILED";
+
 pub mod messages {
     pub fn stub_credentials_created(path: &str) -> String {
         format!("Stub credentials file created at '{}'. Edit it and select 'Check again'.", path)
@@ -119,6 +123,19 @@ pub async fn handle_response(resp: Response, state: &Arc<Mutex<AppState>>) {
                 }
             }
         }
+        if err.code == PREFLIGHT_VERIFICATION_FAILED {
+            st.turn_started_at = None;
+            st.model.status = "error".to_string();
+            st.model.toolchain_command = None;
+            st.model.turn_phase = None;
+            st.model.turn_phase_detail = None;
+            st.model.error = Some(err.message.clone());
+            st.notify_warning(
+                "Pre-flight verification failed: the repository does not build or pass tests. Fix the build/test errors before re-running the batch.",
+            );
+            return;
+        }
+
         let err_text = format!("Error: {}", err.message);
         match method.as_deref() {
             Some(methods::REVIEW_START) => {
@@ -493,5 +510,107 @@ pub async fn handle_response(resp: Response, state: &Arc<Mutex<AppState>>) {
             }
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::{
+        ConfirmDialogButton, HeaderClickAreas, ModelChoice, NotificationLevel, OnboardingState,
+    };
+    use crate::config::TuiConfig;
+    use crate::editor::InputEditor;
+    use crate::ui::context::ContextViewState;
+    use crate::ui::develop::DevelopView;
+    use crate::ui::history::HistoryViewState;
+    use crate::ui::plans::PlansViewState;
+    use crate::ui::review::ReviewViewState;
+    use tauqe_protocol::ResponseError;
+
+    fn test_state() -> Arc<Mutex<AppState>> {
+        Arc::new(Mutex::new(AppState {
+            view_mode: ViewMode::Develop,
+            protocol_version: "1.0".to_string(),
+            repo_state: None,
+            all_repo_files: Vec::new(),
+            workflow: "git".to_string(),
+            edit_protocol: "xml".to_string(),
+            active_model: ModelRef::openrouter("test-model"),
+            available_models: Vec::new(),
+            available_workflows: Vec::new(),
+            available_edit_protocols: Vec::new(),
+            model_choice: ModelChoice::default(),
+            model: DevelopView::default(),
+            context: ContextState::default(),
+            context_view: ContextViewState::default(),
+            history_view: HistoryViewState::default(),
+            review: ReviewViewState::default(),
+            plans_view: PlansViewState::default(),
+            review_dialog: None,
+            notification: None,
+            turn_started_at: None,
+            onboarding: OnboardingState::default(),
+            input_editor: InputEditor::default(),
+            tui_config: TuiConfig::default(),
+            show_help: false,
+            help_scroll: 0,
+            confirm_cancel: false,
+            confirm_quit: false,
+            confirm_undo: false,
+            confirm_clear_history: false,
+            confirm_delete_plan: None,
+            confirm_delete_review: None,
+            confirm_execute_scope: None,
+            confirm_execute_review: None,
+            confirm_button: ConfirmDialogButton::Cancel,
+            selection_dialog: None,
+            status_dialog: None,
+            squash_dialog: None,
+            prompt_modal: None,
+            discuss_plan_dialog: None,
+            discuss_review_dialog: None,
+            server_disconnected: None,
+            server_log_path: std::path::PathBuf::from(".tauqe/server.log"),
+            last_model_height: 10,
+            header_clicks: HeaderClickAreas::default(),
+            terminal_focused: true,
+            shift_tip_shown: false,
+        }))
+    }
+
+    #[tokio::test]
+    async fn test_preflight_failure_unsticks_model_and_warns() {
+        let state = test_state();
+        {
+            let mut st = state.lock().await;
+            st.model.status = "awaiting".to_string();
+            st.turn_started_at = Some(std::time::Instant::now());
+            assert!(st.model.is_busy());
+        }
+
+        let resp = Response {
+            id: RequestId::Number(1),
+            result: None,
+            error: Some(ResponseError::new(
+                PREFLIGHT_VERIFICATION_FAILED,
+                "Pre-flight verification failed: the repository does not build cleanly.",
+            )),
+        };
+        handle_response(resp, &state).await;
+
+        let st = state.lock().await;
+        assert_eq!(st.model.status, "error");
+        assert!(!st.model.is_busy());
+        assert!(st.turn_started_at.is_none());
+        assert!(st
+            .model
+            .error
+            .as_deref()
+            .is_some_and(|e| e.contains("Pre-flight verification failed")));
+        let notif = st
+            .active_notification()
+            .expect("pre-flight failure should raise a notification");
+        assert_eq!(notif.level, NotificationLevel::Warning);
     }
 }

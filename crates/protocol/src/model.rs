@@ -268,6 +268,12 @@ pub struct TurnPhaseEvent {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepoMapInfoEvent {
+    pub operation_id: String,
+    pub tokens: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolchainStartedEvent {
     pub operation_id: String,
     pub command: String,

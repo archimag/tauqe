@@ -10,6 +10,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use tauqe_core::config::load_config;
+use tauqe_core::edits::protocol::VerifyTarget;
 use tauqe_core::edits::EditProtocolFactory;
 use tauqe_core::history::HistoryManager;
 use tauqe_core::workflow::WorkflowFactory;
@@ -53,7 +54,7 @@ pub async fn handle_request(req: Request, state: &Arc<AppState>) -> Response {
         methods::REVIEW_GET => review::handle_review_get(req, state).await,
         methods::REVIEW_UPDATE_ITEM => review::handle_review_update_item(req, state).await,
         methods::REVIEW_DELETE => review::handle_review_delete(req, state).await,
-        methods::REVIEW_EXECUTE_ITEM => review::handle_review_execute_item(req, state).await,
+        methods::REVIEW_EXECUTE => review::handle_review_execute(req, state).await,
 
         methods::PLAN_LIST => plan::handle_plan_list(req, state).await,
         methods::PLAN_GET => plan::handle_plan_get(req, state).await,
@@ -61,7 +62,7 @@ pub async fn handle_request(req: Request, state: &Arc<AppState>) -> Response {
         methods::PLAN_UPDATE_ITEM => plan::handle_plan_update_item(req, state).await,
         methods::PLAN_DELETE => plan::handle_plan_delete(req, state).await,
         methods::PLAN_SET_ACTIVE => plan::handle_plan_set_active(req, state).await,
-        methods::PLAN_EXECUTE_STEP => plan::handle_plan_execute_step(req, state).await,
+        methods::PLAN_EXECUTE => plan::handle_plan_execute(req, state).await,
         methods::PLAN_REFINE => plan::handle_plan_refine(req, state).await,
 
         methods::CONFIG_GET => config::handle_config_get(req, state).await,
@@ -80,6 +81,34 @@ pub async fn handle_request(req: Request, state: &Arc<AppState>) -> Response {
             format!("Method '{}' not found", req.method),
         ),
     }
+}
+
+/// Deterministic pre-flight verification shared by server-driven batches.
+///
+/// Runs the exact same toolchain pipeline (`VerifyTarget::All`) that the core executes
+/// after each autonomous workflow step. When the repository does not build or tests fail,
+/// the batch is blocked synchronously before any LLM request or status change, so a broken
+/// tree never triggers a wasted self-healing loop. Repositories without a detected
+/// toolchain pass transparently.
+pub(crate) async fn run_preflight_verification(repo_root: &Path) -> Result<(), String> {
+    let (ok, results) =
+        tauqe_core::toolchain::run_verification_pipeline(repo_root, &VerifyTarget::All).await;
+    if ok {
+        return Ok(());
+    }
+
+    let mut report = String::new();
+    for result in results.iter().filter(|r| !r.success) {
+        report.push_str(&format!(
+            "Command `{}` failed:\n```\n{}\n```\n\n",
+            result.command,
+            result.combined_output.trim()
+        ));
+    }
+    if report.trim().is_empty() {
+        report = "Pre-flight verification failed without diagnostic output.".to_string();
+    }
+    Err(report)
 }
 
 async fn handle_client_initialize(req: Request, state: &Arc<AppState>) -> Response {
@@ -171,5 +200,20 @@ mod tests {
         assert_eq!(resp.id, RequestId::String("cfg-1".to_string()));
         assert!(resp.error.is_none());
         assert!(resp.result.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_preflight_verification_passes_without_toolchain() {
+        let dir = std::env::temp_dir().join(format!(
+            "tauqe-test-preflight-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let result = run_preflight_verification(&dir).await;
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(result.is_ok());
     }
 }

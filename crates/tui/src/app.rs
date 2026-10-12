@@ -23,6 +23,94 @@ pub enum ConfirmDialogButton {
     Confirm,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ModalFocus {
+    #[default]
+    Editor,
+    Actions,
+}
+
+impl ModalFocus {
+    pub fn is_editor(&self) -> bool {
+        matches!(self, Self::Editor)
+    }
+
+    pub fn is_actions(&self) -> bool {
+        matches!(self, Self::Actions)
+    }
+
+    pub fn toggle(&mut self) {
+        *self = match self {
+            Self::Editor => Self::Actions,
+            Self::Actions => Self::Editor,
+        };
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ModalActionsState {
+    pub focused_button: ConfirmDialogButton,
+}
+
+impl Default for ModalActionsState {
+    fn default() -> Self {
+        Self {
+            focused_button: ConfirmDialogButton::Cancel,
+        }
+    }
+}
+
+impl ModalActionsState {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn cancel() -> Self {
+        Self {
+            focused_button: ConfirmDialogButton::Cancel,
+        }
+    }
+
+    pub fn confirm() -> Self {
+        Self {
+            focused_button: ConfirmDialogButton::Confirm,
+        }
+    }
+
+    pub fn toggle(&mut self) {
+        self.focused_button = match self.focused_button {
+            ConfirmDialogButton::Cancel => ConfirmDialogButton::Confirm,
+            ConfirmDialogButton::Confirm => ConfirmDialogButton::Cancel,
+        };
+    }
+
+    pub fn is_confirm(&self) -> bool {
+        self.focused_button == ConfirmDialogButton::Confirm
+    }
+
+    pub fn is_cancel(&self) -> bool {
+        self.focused_button == ConfirmDialogButton::Cancel
+    }
+
+    pub fn reset_to_cancel(&mut self) {
+        self.focused_button = ConfirmDialogButton::Cancel;
+    }
+}
+
+impl From<ConfirmDialogButton> for ModalActionsState {
+    fn from(btn: ConfirmDialogButton) -> Self {
+        Self {
+            focused_button: btn,
+        }
+    }
+}
+
+impl From<ModalActionsState> for ConfirmDialogButton {
+    fn from(st: ModalActionsState) -> Self {
+        st.focused_button
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum NotificationLevel {
     Info,
@@ -155,6 +243,7 @@ pub struct ConfirmExecuteScopeState {
     pub plan_id: String,
     pub plan_title: String,
     pub scope_title: String,
+    pub step_id: Option<String>,
     pub steps: Vec<tauqe_protocol::PlanItem>,
 }
 
@@ -163,25 +252,41 @@ pub struct ConfirmExecuteReviewState {
     pub review_id: String,
     pub review_title: String,
     pub scope_title: String,
+    pub item_id: Option<u32>,
     pub items: Vec<tauqe_protocol::ReviewItem>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ReviewBatchQueue {
-    pub review_id: String,
-    pub review_title: String,
-    pub scope_title: String,
-    pub items: Vec<tauqe_protocol::ReviewItem>,
-    pub current_index: usize,
+pub enum PromptModalTarget {
+    Review {
+        review_id: String,
+        review_title: String,
+        focused_items: Vec<(u32, String)>,
+    },
+    Plan {
+        plan_id: String,
+        plan_title: String,
+        focused_items: Vec<(String, String)>,
+    },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PlanBatchQueue {
-    pub plan_id: String,
-    pub plan_title: String,
-    pub scope_title: String,
-    pub steps: Vec<tauqe_protocol::PlanItem>,
-    pub current_index: usize,
+#[derive(Debug, Clone)]
+pub struct PromptModalState {
+    pub target: PromptModalTarget,
+    pub prompt_editor: InputEditor,
+    pub focus: ModalFocus,
+    pub actions: ModalActionsState,
+}
+
+impl PromptModalState {
+    pub fn new(target: PromptModalTarget) -> Self {
+        Self {
+            target,
+            prompt_editor: InputEditor::default(),
+            focus: ModalFocus::Editor,
+            actions: ModalActionsState::cancel(),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -427,14 +532,12 @@ pub struct AppState {
     pub confirm_delete_review: Option<String>,
     pub confirm_execute_scope: Option<ConfirmExecuteScopeState>,
     pub confirm_execute_review: Option<ConfirmExecuteReviewState>,
-    pub plan_batch_queue: Option<PlanBatchQueue>,
-    pub review_batch_queue: Option<ReviewBatchQueue>,
-    pub active_review_step: Option<(String, u32)>,
     pub confirm_button: ConfirmDialogButton,
     pub selection_dialog: Option<SelectionDialogState>,
     pub status_dialog: Option<StatusDialogState>,
     pub squash_dialog: Option<SquashDialogState>,
     pub review_dialog: Option<ReviewDialogState>,
+    pub prompt_modal: Option<PromptModalState>,
     pub discuss_plan_dialog: Option<DiscussPlanDialogState>,
     pub discuss_review_dialog: Option<DiscussReviewDialogState>,
     pub notification: Option<AppNotification>,
@@ -536,6 +639,7 @@ impl AppState {
             || self.status_dialog.is_some()
             || self.squash_dialog.is_some()
             || self.review_dialog.is_some()
+            || self.prompt_modal.is_some()
             || self.discuss_plan_dialog.is_some()
             || self.discuss_review_dialog.is_some()
             || self.plans_view.refine_dialog.is_some()
@@ -574,6 +678,7 @@ impl AppState {
         self.input_editor.clear();
         self.confirm_clear_history = false;
         self.confirm_cancel = false;
+        self.confirm_button = ConfirmDialogButton::Cancel;
         if prompt.is_empty() {
             return None;
         }
@@ -620,6 +725,37 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_modal_actions_state_defaults_to_cancel() {
+        let state = ModalActionsState::new();
+        assert_eq!(state.focused_button, ConfirmDialogButton::Cancel);
+        assert!(state.is_cancel());
+        assert!(!state.is_confirm());
+
+        let mut toggled = state;
+        toggled.toggle();
+        assert_eq!(toggled.focused_button, ConfirmDialogButton::Confirm);
+        assert!(toggled.is_confirm());
+
+        toggled.reset_to_cancel();
+        assert_eq!(toggled.focused_button, ConfirmDialogButton::Cancel);
+    }
+
+    #[test]
+    fn test_modal_focus_toggle() {
+        let mut focus = ModalFocus::default();
+        assert_eq!(focus, ModalFocus::Editor);
+        assert!(focus.is_editor());
+        assert!(!focus.is_actions());
+
+        focus.toggle();
+        assert_eq!(focus, ModalFocus::Actions);
+        assert!(focus.is_actions());
+
+        focus.toggle();
+        assert_eq!(focus, ModalFocus::Editor);
+    }
+
+    #[test]
     fn test_take_prompt_when_busy_preserves_input() {
         let mut state = AppState {
             view_mode: ViewMode::Develop,
@@ -658,13 +794,11 @@ mod tests {
             confirm_delete_review: None,
             confirm_execute_scope: None,
             confirm_execute_review: None,
-            plan_batch_queue: None,
-            review_batch_queue: None,
-            active_review_step: None,
             confirm_button: ConfirmDialogButton::Cancel,
             selection_dialog: None,
             status_dialog: None,
             squash_dialog: None,
+            prompt_modal: None,
             discuss_plan_dialog: None,
             discuss_review_dialog: None,
             server_disconnected: None,
@@ -727,13 +861,11 @@ mod tests {
             confirm_delete_review: None,
             confirm_execute_scope: None,
             confirm_execute_review: None,
-            plan_batch_queue: None,
-            review_batch_queue: None,
-            active_review_step: None,
             confirm_button: ConfirmDialogButton::Cancel,
             selection_dialog: None,
             status_dialog: None,
             squash_dialog: None,
+            prompt_modal: None,
             discuss_plan_dialog: None,
             discuss_review_dialog: None,
             server_disconnected: None,

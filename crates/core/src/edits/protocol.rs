@@ -9,9 +9,11 @@ pub use utils::{
     normalize_content, parse_context_request_spec, resolve_target_path, resolve_target_path_for_op,
 };
 pub use xml::{
-    extract_plan_step_done, generate_turn_marker, has_xml_edit_tags, MarkedXmlEditProtocol,
-    parse_context_drop_tags, strip_context_drop_tags, PlanStepDone, strip_plan_step_done_tags,
-    VerifyOnSuccess, VerifyRequest, VerifyTarget, XmlEditProtocol,
+    extract_error, extract_scratchpad, extract_success, extract_terminal_outcome,
+    generate_turn_marker, has_xml_edit_tags, MarkedXmlEditProtocol, parse_context_drop_tags,
+    strip_context_drop_tags, strip_error_tags, strip_scratchpad_tags, strip_success_tags,
+    strip_terminal_outcome_tags, TerminalOutcome, VerifyOnSuccess, VerifyRequest, VerifyTarget,
+    XmlEditProtocol,
 };
 
 /// A file the model asks to be added to the context before it proposes edits.
@@ -68,9 +70,19 @@ pub trait EditProtocol: Send + Sync {
         (Vec::new(), Vec::new())
     }
 
-    /// Extracts plan step completion signals (<plan_step_done>) from raw output.
-    fn parse_plan_step_done(&self, _raw_text: &str) -> Vec<PlanStepDone> {
-        Vec::new()
+    /// Extracts ephemeral scratchpad notes (<scratchpad>) from raw output if present.
+    fn parse_scratchpad(&self, _raw_text: &str) -> Option<String> {
+        None
+    }
+
+    /// Extracts terminal outcome (<success> or <error>) from raw output if present.
+    fn parse_terminal_outcome(&self, _raw_text: &str) -> Option<TerminalOutcome> {
+        None
+    }
+
+    /// Extracts blocker or error message (<error>) from raw output if present.
+    fn parse_error(&self, _raw_text: &str) -> Option<String> {
+        None
     }
 
     /// Cleans model output for presentation and history by stripping edit blocks and protocol control tags.

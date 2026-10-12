@@ -12,15 +12,15 @@ use crate::rpc::send_request;
 use crate::ui::plans::VisiblePlanRow;
 
 pub const PLANS_COMMANDS: &[KeyCommand] = &[
-    KeyCommand { key: "n / p (or ↑/↓)", description: "Navigate plans and items" },
+    KeyCommand { key: "n / p (or ↑/↓)", description: "Navigate plans, concept, and steps" },
     KeyCommand { key: "C-n / C-p", description: "Inspect next / previous item (accordion walk)" },
-    KeyCommand { key: "Tab / Space", description: "Fold / unfold plan or item subtasks" },
+    KeyCommand { key: "Tab / Space", description: "Fold / unfold plan, section, or subtasks" },
     KeyCommand { key: "x", description: "Execute target step, group, or entire plan (with confirmation)" },
     KeyCommand { key: "Enter", description: "Execute leaf step; fold/unfold on groups and plan headers" },
-    KeyCommand { key: "d", description: "Discuss selected step or entire plan with AI in Develop" },
+    KeyCommand { key: "d", description: "Discuss selected concept/step or entire plan with AI in Develop" },
     KeyCommand { key: "R", description: "Deep refine plan architecture & steps with AI (Architect)" },
-    KeyCommand { key: "t / s", description: "Change item status (Todo / InProgress / Done / Cancelled)" },
-    KeyCommand { key: "a", description: "Toggle fold / unfold all plans and items" },
+    KeyCommand { key: "t / s", description: "Change step status (Todo / InProgress / Done / Cancelled)" },
+    KeyCommand { key: "a", description: "Toggle fold / unfold all plans, sections, and items" },
     KeyCommand { key: "Delete", description: "Delete plan (with confirmation)" },
     KeyCommand { key: "c / y", description: "Copy plan as Markdown to clipboard" },
     KeyCommand { key: "PgUp / PgDn", description: "Page scroll plan view" },
@@ -70,6 +70,7 @@ fn execute_scope_action(st: &mut AppState, plan_id: &str, scope_id: Option<&str>
                 plan_id: plan.id.clone(),
                 plan_title: plan.title.clone(),
                 scope_title: scope_title.to_string(),
+                step_id: scope_id.map(str::to_string),
                 steps,
             });
         }
@@ -151,6 +152,23 @@ pub async fn handle_plans_key(
                         st.plans_view.clamp_selection();
                         st.plans_view.scroll_to_selected();
                     }
+                    VisiblePlanRow::ConceptHeader { plan_id, .. } => {
+                        st.plans_view.toggle_concept_section_expanded(&plan_id);
+                        st.plans_view.clamp_selection();
+                        st.plans_view.scroll_to_selected();
+                    }
+                    VisiblePlanRow::ConceptItem { plan_id, item_id, is_expandable, .. } => {
+                        if is_expandable {
+                            st.plans_view.toggle_concept_item_expanded(&plan_id, &item_id);
+                            st.plans_view.clamp_selection();
+                            st.plans_view.scroll_to_selected();
+                        }
+                    }
+                    VisiblePlanRow::ImplementationHeader { plan_id, .. } => {
+                        st.plans_view.toggle_impl_section_expanded(&plan_id);
+                        st.plans_view.clamp_selection();
+                        st.plans_view.scroll_to_selected();
+                    }
                     VisiblePlanRow::PlanItem { plan_id, item_id, is_expandable, .. } => {
                         if is_expandable {
                             st.plans_view.toggle_item_expanded(&plan_id, &item_id);
@@ -167,6 +185,30 @@ pub async fn handle_plans_key(
                 match row {
                     VisiblePlanRow::PlanHeader { plan_id, .. } => {
                         st.plans_view.toggle_plan_expanded(&plan_id);
+                        st.plans_view.clamp_selection();
+                        st.plans_view.scroll_to_selected();
+                    }
+                    VisiblePlanRow::ConceptHeader { plan_id, .. } => {
+                        st.plans_view.toggle_concept_section_expanded(&plan_id);
+                        st.plans_view.clamp_selection();
+                        st.plans_view.scroll_to_selected();
+                    }
+                    VisiblePlanRow::ConceptItem {
+                        plan_id,
+                        item_id,
+                        is_expandable,
+                        ..
+                    } => {
+                        if is_expandable {
+                            st.plans_view.toggle_concept_item_expanded(&plan_id, &item_id);
+                            st.plans_view.clamp_selection();
+                            st.plans_view.scroll_to_selected();
+                        } else {
+                            st.notify_info("Concept items define architectural requirements. Press 'd' to discuss in Develop.");
+                        }
+                    }
+                    VisiblePlanRow::ImplementationHeader { plan_id, .. } => {
+                        st.plans_view.toggle_impl_section_expanded(&plan_id);
                         st.plans_view.clamp_selection();
                         st.plans_view.scroll_to_selected();
                     }
@@ -195,6 +237,15 @@ pub async fn handle_plans_key(
                     VisiblePlanRow::PlanHeader { plan_id, title, .. } => {
                         execute_scope_action(&mut st, &plan_id, None, &title);
                     }
+                    VisiblePlanRow::ConceptHeader { .. } => {
+                        st.notify_warning("Concept section cannot be executed; execute implementation steps below.");
+                    }
+                    VisiblePlanRow::ConceptItem { .. } => {
+                        st.notify_warning("Concept item cannot be executed directly; execute implementation steps or press 'd' to discuss.");
+                    }
+                    VisiblePlanRow::ImplementationHeader { plan_id, .. } => {
+                        execute_scope_action(&mut st, &plan_id, None, "Implementation Scope");
+                    }
                     VisiblePlanRow::PlanItem {
                         plan_id,
                         item_id,
@@ -212,8 +263,14 @@ pub async fn handle_plans_key(
                 let plan_id = row.plan_id().to_string();
                 if let Some(plan) = st.plans_view.plans.iter().find(|p| p.id == plan_id).cloned() {
                     let mut focused = Vec::new();
-                    if let VisiblePlanRow::PlanItem { item_id, title, .. } = row {
-                        focused.push((item_id, title));
+                    match row {
+                        VisiblePlanRow::ConceptItem { item_id, title, .. } => {
+                            focused.push((item_id, title));
+                        }
+                        VisiblePlanRow::PlanItem { item_id, title, .. } => {
+                            focused.push((item_id, title));
+                        }
+                        _ => {}
                     }
 
                     st.discuss_plan_dialog = Some(crate::app::DiscussPlanDialogState {
@@ -232,29 +289,36 @@ pub async fn handle_plans_key(
         }
         KeyCode::Char('t') | KeyCode::Char('T') | KeyCode::Char('s') | KeyCode::Char('S') => {
             let sel_row = st.plans_view.selected_row();
-            if let Some(VisiblePlanRow::PlanItem { plan_id, item_id, title, status, .. }) = sel_row {
-                let cur_idx = match status {
-                    tauqe_protocol::PlanItemStatus::Discussion => 0,
-                    tauqe_protocol::PlanItemStatus::Todo => 1,
-                    tauqe_protocol::PlanItemStatus::InProgress => 2,
-                    tauqe_protocol::PlanItemStatus::Done => 3,
-                    tauqe_protocol::PlanItemStatus::Cancelled => 4,
-                };
-                st.status_dialog = Some(crate::app::StatusDialogState {
-                    target: crate::app::StatusDialogTarget::PlanItem {
-                        plan_id,
-                        item_id,
-                        item_title: title,
-                        current_status: status,
-                    },
-                    selected_index: cur_idx,
-                });
+            match sel_row {
+                Some(VisiblePlanRow::PlanItem { plan_id, item_id, title, status, .. }) => {
+                    let cur_idx = match status {
+                        tauqe_protocol::PlanItemStatus::Discussion => 0,
+                        tauqe_protocol::PlanItemStatus::Todo => 1,
+                        tauqe_protocol::PlanItemStatus::InProgress => 2,
+                        tauqe_protocol::PlanItemStatus::Done => 3,
+                        tauqe_protocol::PlanItemStatus::Cancelled => 4,
+                    };
+                    st.status_dialog = Some(crate::app::StatusDialogState {
+                        target: crate::app::StatusDialogTarget::PlanItem {
+                            plan_id,
+                            item_id,
+                            item_title: title,
+                            current_status: status,
+                        },
+                        selected_index: cur_idx,
+                    });
+                }
+                Some(VisiblePlanRow::ConceptItem { .. }) => {
+                    st.notify_info("Concept items define architectural requirements and do not have task statuses. Press 'd' to discuss.");
+                }
+                _ => {}
             }
         }
         KeyCode::Delete => {
             let sel_row = st.plans_view.selected_row();
             if let Some(row) = sel_row {
                 st.confirm_delete_plan = Some(row.plan_id().to_string());
+                st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
             }
         }
         KeyCode::Char('c') | KeyCode::Char('C') | KeyCode::Char('y') | KeyCode::Char('Y') => {

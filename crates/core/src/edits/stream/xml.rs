@@ -442,8 +442,14 @@ fn find_next_control_tag(buf: &str) -> Option<(usize, usize)> {
     if let Some(pl) = crate::edits::protocol::xml::tags::next_plan_tag(buf) {
         candidates.push(pl);
     }
-    if let Some(psd) = crate::edits::protocol::xml::tags::next_plan_step_done_tag(buf) {
-        candidates.push(psd);
+    if let Some(sc) = crate::edits::protocol::xml::tags::next_scratchpad_tag(buf) {
+        candidates.push(sc);
+    }
+    if let Some(suc) = crate::edits::protocol::xml::tags::next_success_tag(buf) {
+        candidates.push(suc);
+    }
+    if let Some(err) = crate::edits::protocol::xml::tags::next_error_tag(buf) {
+        candidates.push(err);
     }
     candidates.into_iter().min_by_key(|(start, _)| *start)
 }
@@ -460,8 +466,10 @@ fn safe_text_emit_len(buf: &str) -> usize {
         "<doc_request",
         "<user_language",
         "<verify",
-        "<plan_step_done",
         "<plan",
+        "<scratchpad",
+        "<success",
+        "<error",
     ];
     let mut limit = buf.len();
     if let Some(last_lt) = buf.rfind('<') {
@@ -485,8 +493,10 @@ fn safe_text_emit_len(buf: &str) -> usize {
                     "<verify" => crate::edits::protocol::xml::next_verify_tag(&buf[idx..]).is_some(),
                     "<context_request" => crate::edits::protocol::xml::next_context_request_tag(&buf[idx..]).is_some(),
                     "<doc_request" => crate::edits::protocol::xml::tags::next_doc_request_tag(&buf[idx..]).is_some(),
-                    "<plan_step_done" => crate::edits::protocol::xml::tags::next_plan_step_done_tag(&buf[idx..]).is_some(),
                     "<plan" => crate::edits::protocol::xml::tags::next_plan_tag(&buf[idx..]).is_some(),
+                    "<scratchpad" => crate::edits::protocol::xml::tags::next_scratchpad_tag(&buf[idx..]).is_some(),
+                    "<success" => crate::edits::protocol::xml::tags::next_success_tag(&buf[idx..]).is_some(),
+                    "<error" => crate::edits::protocol::xml::tags::next_error_tag(&buf[idx..]).is_some(),
                     _ => rest.contains('>'),
                 };
                 if !is_closed {
@@ -633,7 +643,7 @@ mod tests {
 
     #[test]
     fn test_plan_step_done_tags_hidden_from_stream_text() {
-        let input = "Step done.\n<plan_step_done id=\"4\" />\nReady";
+        let input = "Step done.\n<success summary=\"All checks pass\" />\nReady";
         let mut filter = XmlStreamFilter::new(vec![], std::env::temp_dir());
         let mut events = Vec::new();
         for ch in input.chars() {
@@ -648,7 +658,7 @@ mod tests {
             })
             .collect();
         assert_eq!(text, "Step done.\n\nReady");
-        assert!(!text.contains("plan_step_done"));
+        assert!(!text.contains("success"));
     }
 
     #[test]
