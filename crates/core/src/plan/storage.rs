@@ -110,6 +110,9 @@ impl PlanStorage {
     }
 
     /// Saves a plan into `.tauqe/plans/<id>.json` atomically.
+    ///
+    /// The persisted plan enforces the leaf-only file invariant: any item with
+    /// children is a conceptual container and is stored without `files`.
     pub fn save_plan(repo_root: &Path, plan: &Plan) -> Result<()> {
         let dir = Self::plans_dir(repo_root);
         std::fs::create_dir_all(&dir).with_context(|| {
@@ -120,7 +123,10 @@ impl PlanStorage {
         let target_file = dir.join(format!("{safe_id}.json"));
         let temp_file = dir.join(format!("{safe_id}.json.tmp"));
 
-        let json = serde_json::to_string_pretty(plan)
+        let mut normalized = plan.clone();
+        normalized.normalize_leaf_files();
+
+        let json = serde_json::to_string_pretty(&normalized)
             .context("Failed to serialize plan to JSON")?;
         std::fs::write(&temp_file, json).with_context(|| {
             format!("Failed to write temporary plan file at {}", temp_file.display())
@@ -559,6 +565,7 @@ mod tests {
                     details: None,
                     status: PlanItemStatus::Todo,
                     files: vec![],
+                    readonly_files: vec![],
                     concept_refs: vec![],
                     children: vec![PlanItem {
                         id: "1.1".to_string(),
@@ -566,6 +573,7 @@ mod tests {
                         details: None,
                         status: PlanItemStatus::Todo,
                         files: vec![],
+                        readonly_files: vec![],
                         concept_refs: vec![],
                         children: vec![],
                     }],
@@ -576,6 +584,7 @@ mod tests {
                     details: None,
                     status: PlanItemStatus::Todo,
                     files: vec![],
+                    readonly_files: vec![],
                     concept_refs: vec![],
                     children: vec![],
                 },
@@ -692,6 +701,7 @@ Step 1 is done:
                 details: None,
                 status: PlanItemStatus::Todo,
                 files: vec![],
+                readonly_files: vec![],
                 concept_refs: vec![],
                 children: vec![],
             }],
@@ -727,6 +737,7 @@ Step 1 is done:
                 details: Some("Schemas and filters".to_string()),
                 status: PlanItemStatus::Done,
                 files: vec![],
+                readonly_files: vec![],
                 concept_refs: vec![],
                 children: vec![],
             }],
@@ -750,6 +761,7 @@ Step 1 is done:
                 details: Some("Updated details".to_string()),
                 status: PlanItemStatus::Done,
                 files: vec![],
+                readonly_files: vec![],
                 concept_refs: vec![],
                 children: vec![],
             }],
@@ -837,5 +849,40 @@ Step 1 is done:
         let reloaded = PlanStorage::load_plan(root, "test-plan").unwrap().unwrap();
         assert_eq!(reloaded.items.len(), 0);
         assert_eq!(reloaded.description.as_deref(), Some("Updated Desc without items"));
+    }
+
+    #[test]
+    fn test_save_plan_normalizes_leaf_files() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+
+        let plan = Plan {
+            id: "leaf-only".to_string(),
+            title: "Leaf Only".to_string(),
+            description: None,
+            created_at: 1,
+            updated_at: 1,
+            concept: vec![],
+            items: vec![PlanItem {
+                id: "1".to_string(),
+                title: "Parent".to_string(),
+                status: PlanItemStatus::Todo,
+                files: vec!["src/parent.rs".to_string()],
+                children: vec![PlanItem {
+                    id: "1.1".to_string(),
+                    title: "Leaf".to_string(),
+                    status: PlanItemStatus::Todo,
+                    files: vec!["src/leaf.rs".to_string()],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        };
+
+        PlanStorage::save_plan(root, &plan).unwrap();
+
+        let loaded = PlanStorage::load_plan(root, "leaf-only").unwrap().unwrap();
+        assert!(loaded.items[0].files.is_empty());
+        assert_eq!(loaded.items[0].children[0].files, vec!["src/leaf.rs".to_string()]);
     }
 }

@@ -30,6 +30,7 @@ use crate::ui::review::ReviewViewState;
 use crate::ui::render_ui;
 
 const SPINNER_INTERVAL: Duration = Duration::from_millis(100);
+const FRAME_INTERVAL: Duration = Duration::from_millis(16);
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -170,6 +171,7 @@ async fn main() -> anyhow::Result<()> {
     let (mut terminal, _guard) = terminal::init_terminal()?;
     let mut event_rx = terminal::spawn_event_reader();
     let mut last_spinner_tick = Instant::now();
+    let mut last_draw: Option<Instant> = None;
     let mut dirty = true;
 
     loop {
@@ -182,16 +184,24 @@ async fn main() -> anyhow::Result<()> {
                 dirty = true;
             }
 
-            if dirty {
+            if dirty && last_draw.is_none_or(|t| t.elapsed() >= FRAME_INTERVAL) {
                 st.model.flush_pending_markdown();
                 terminal.draw(|f| render_ui(f, &mut st))?;
+                last_draw = Some(Instant::now());
                 dirty = false;
             }
 
             (spin, st.active_notification().is_some())
         };
 
-        let sleep_duration = if needs_spin {
+        let sleep_duration = if dirty {
+            match last_draw {
+                Some(t) => FRAME_INTERVAL
+                    .saturating_sub(t.elapsed())
+                    .max(Duration::from_millis(1)),
+                None => Duration::from_millis(1),
+            }
+        } else if needs_spin {
             let elapsed = last_spinner_tick.elapsed();
             if elapsed >= SPINNER_INTERVAL {
                 Duration::from_millis(5)
@@ -220,15 +230,13 @@ async fn main() -> anyhow::Result<()> {
             }
             msg = msg_rx.recv() => {
                 match msg {
-                    Some(Message::Event(ev)) => {
-                        rpc::handle_event(ev, &state, &mut is_reasoning, Some(&mut server_writer)).await;
+                    Some(msg) => {
+                        dispatch_server_message(msg, &state, &mut is_reasoning, &mut server_writer).await;
+                        while let Ok(msg) = msg_rx.try_recv() {
+                            dispatch_server_message(msg, &state, &mut is_reasoning, &mut server_writer).await;
+                        }
                         dirty = true;
                     }
-                    Some(Message::Response(resp)) => {
-                        rpc::handle_response(resp, &state).await;
-                        dirty = true;
-                    }
-                    Some(_) => {}
                     None => {
                         let mut st = state.lock().await;
                         if st.server_disconnected.is_none() {
@@ -274,4 +282,26 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// Applies a single server message to the shared application state.
+///
+/// Events and responses are dispatched in arrival order to keep streaming
+/// updates consistent; requests are ignored because the server never
+/// initiates RPC calls toward the client.
+async fn dispatch_server_message(
+    msg: Message,
+    state: &Arc<Mutex<AppState>>,
+    is_reasoning: &mut bool,
+    server_writer: &mut tokio::process::ChildStdin,
+) {
+    match msg {
+        Message::Event(ev) => {
+            rpc::handle_event(ev, state, is_reasoning, Some(server_writer)).await;
+        }
+        Message::Response(resp) => {
+            rpc::handle_response(resp, state).await;
+        }
+        Message::Request(_) => {}
+    }
 }

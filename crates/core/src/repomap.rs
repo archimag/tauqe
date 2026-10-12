@@ -57,10 +57,12 @@ impl Symbol {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RepoFileSymbols {
     pub path: String,
     pub symbols: Vec<Symbol>,
+    #[serde(default)]
+    pub line_count: usize,
 }
 
 impl RepoFileSymbols {
@@ -68,7 +70,13 @@ impl RepoFileSymbols {
         Self {
             path: path.into(),
             symbols,
+            line_count: 0,
         }
+    }
+
+    pub fn with_line_count(mut self, line_count: usize) -> Self {
+        self.line_count = line_count;
+        self
     }
 }
 
@@ -197,6 +205,7 @@ pub fn format_repo_map_with_budget(
     let present_in_outline: HashSet<&str> = outline
         .lines()
         .filter(|l| !l.starts_with(' ') && !l.starts_with('\t') && !l.is_empty())
+        .map(|l| l.split(" (").next().unwrap_or(l).trim())
         .collect();
 
     let other_files: Vec<&str> = all_git_files
@@ -239,6 +248,7 @@ fn combine_outline_and_other_files(outline: &str, all_git_files: &[String]) -> S
     let present_in_outline: HashSet<&str> = outline
         .lines()
         .filter(|l| !l.starts_with(' ') && !l.starts_with('\t') && !l.is_empty())
+        .map(|l| l.split(" (").next().unwrap_or(l).trim())
         .collect();
 
     let other_files: Vec<&str> = all_git_files
@@ -272,7 +282,12 @@ fn format_all_files(files: &[RepoFileSymbols], level: DetailLevel) -> String {
 
 fn format_file_symbols(file: &RepoFileSymbols, level: DetailLevel) -> String {
     let mut lines = Vec::new();
-    lines.push(file.path.clone());
+    if file.line_count > 0 {
+        let suffix = if file.line_count == 1 { "line" } else { "lines" };
+        lines.push(format!("{} ({} {})", file.path, file.line_count, suffix));
+    } else {
+        lines.push(file.path.clone());
+    }
 
     for sym in &file.symbols {
         format_symbol_into_lines(sym, 1, level, &mut lines);
@@ -447,18 +462,19 @@ mod tests {
                     children: Vec::new(),
                 },
             ],
+            line_count: 10,
         }];
 
         // Generous budget: includes full details and private symbols
         let full = format_symbols_with_budget(&syms, 500);
-        assert!(full.contains("src/sample.rs"));
+        assert!(full.contains("src/sample.rs (10 lines)"));
         assert!(full.contains("pub struct PublicStruct"));
         assert!(full.contains("pub id: u64"));
         assert!(full.contains("fn private_func()"));
         assert!(full.contains("pub fn public_func() -> bool"));
 
         // Tight budget: drops private symbols and struct fields
-        let restricted = format_symbols_with_budget(&syms, 20);
+        let restricted = format_symbols_with_budget(&syms, 25);
         assert!(restricted.contains("src/sample.rs"));
         assert!(!restricted.contains("fn private_func()"));
         assert!(!restricted.contains("pub id: u64"));
@@ -476,6 +492,7 @@ mod tests {
                     true,
                     1,
                 )],
+                line_count: 1,
             },
             RepoFileSymbols {
                 path: "src/b.rs".to_string(),
@@ -486,6 +503,7 @@ mod tests {
                     true,
                     1,
                 )],
+                line_count: 1,
             },
         ];
 
@@ -514,6 +532,7 @@ mod tests {
                     children: Vec::new(),
                 }],
             }],
+            line_count: 5,
         }];
 
         let outline = format_symbols_with_budget(&syms, 100);
@@ -532,6 +551,7 @@ mod tests {
                 true,
                 1,
             )],
+            line_count: 1,
         }];
         let all_files = vec![
             "Cargo.toml".to_string(),
@@ -540,7 +560,7 @@ mod tests {
         ];
 
         let outline = format_repo_map_with_budget(&syms, &all_files, 500);
-        assert!(outline.contains("src/main.rs"));
+        assert!(outline.contains("src/main.rs (1 line)"));
         assert!(outline.contains("fn main()"));
         assert!(outline.contains("Cargo.toml"));
         assert!(outline.contains("README.md"));

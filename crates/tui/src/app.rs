@@ -1,5 +1,5 @@
 use tauqe_protocol::{
-    ContextState, ModelRef, ModelSelection, ModelTier, ModelTiersSummary, RepositoryState,
+    ContextState, ModelRef, ModelRole, ModelRolesSummary, ModelSelection, RepositoryState,
 };
 
 use crate::config::TuiConfig;
@@ -127,48 +127,64 @@ pub struct AppNotification {
     pub ttl: std::time::Duration,
 }
 
-/// The developer's model choice (a tier role or a specific model) together with the
-/// tier assignments reported by the server.
+/// The developer's model choice (a semantic role or specific model)
+/// together with the semantic role assignments reported by the server.
 #[derive(Debug, Clone, Default)]
 pub struct ModelChoice {
     pub selection: ModelSelection,
-    pub tiers: Option<ModelTiersSummary>,
+    pub roles: Option<ModelRolesSummary>,
 }
 
 impl ModelChoice {
-    /// Resolves a selection to a concrete model. A tier cannot be resolved until the
-    /// server has reported the tier assignments.
+    /// Resolves a selection to a concrete model. A role cannot be resolved until the
+    /// server has reported the role assignments.
     pub fn resolve(&self, selection: &ModelSelection) -> Option<ModelRef> {
         match selection {
             ModelSelection::Specific(model) => Some(model.clone()),
-            ModelSelection::Tier(tier) => self.tiers.as_ref().map(|tiers| match tier {
-                ModelTier::Junior => tiers.junior.clone(),
-                ModelTier::Middle => tiers.middle.clone(),
-                ModelTier::Senior => tiers.senior.clone(),
-            }),
+            ModelSelection::Role(role) => {
+                self.roles.as_ref().map(|roles| match role {
+                    ModelRole::Scribe => roles.scribe.clone(),
+                    ModelRole::Coder => roles.coder.clone(),
+                    ModelRole::Architect => roles.architect.clone(),
+                    ModelRole::Advisor => roles.advisor.clone(),
+                    ModelRole::Reviewer => roles.reviewer.clone(),
+                })
+            }
         }
     }
 }
 
-pub fn tier_title(tier: ModelTier) -> &'static str {
-    match tier {
-        ModelTier::Junior => "Junior",
-        ModelTier::Middle => "Middle",
-        ModelTier::Senior => "Senior",
+pub fn role_title(role: ModelRole) -> &'static str {
+    match role {
+        ModelRole::Scribe => "Scribe",
+        ModelRole::Coder => "Coder",
+        ModelRole::Architect => "Architect",
+        ModelRole::Advisor => "Advisor",
+        ModelRole::Reviewer => "Reviewer",
+    }
+}
+
+pub fn role_badge(role: ModelRole) -> &'static str {
+    match role {
+        ModelRole::Scribe => "[Scr]",
+        ModelRole::Coder => "[Cod]",
+        ModelRole::Architect => "[Arc]",
+        ModelRole::Advisor => "[Adv]",
+        ModelRole::Reviewer => "[Rev]",
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SelectionDialogKind {
-    /// Quick menu: one row per tier plus `Others...`.
-    ModelTiers,
+    /// Quick menu: one row per semantic role plus `Others...`.
+    ModelRoles,
     /// Full list of available models.
     ModelCatalog,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SelectionItem {
-    Tier(ModelTier, ModelRef),
+    Role(ModelRole, ModelRef),
     Model(ModelRef),
     Others,
 }
@@ -582,30 +598,35 @@ impl AppState {
         self.notify(text, NotificationLevel::Error, std::time::Duration::from_secs(6));
     }
 
-    /// Opens the model picker: the tier menu when tier assignments are known,
+    /// Opens the model picker: the semantic role menu when roles are known,
     /// otherwise the full catalog. Returns false when there is nothing to choose from.
     pub fn open_model_dialog(&mut self) -> bool {
-        let Some(tiers) = &self.model_choice.tiers else {
-            return self.open_model_catalog();
-        };
-        let items = vec![
-            SelectionItem::Tier(ModelTier::Junior, tiers.junior.clone()),
-            SelectionItem::Tier(ModelTier::Middle, tiers.middle.clone()),
-            SelectionItem::Tier(ModelTier::Senior, tiers.senior.clone()),
-            SelectionItem::Others,
-        ];
-        let selected = match &self.model_choice.selection {
-            ModelSelection::Tier(ModelTier::Junior) => 0,
-            ModelSelection::Tier(ModelTier::Middle) => 1,
-            ModelSelection::Tier(ModelTier::Senior) => 2,
-            ModelSelection::Specific(_) => 3,
-        };
-        self.selection_dialog = Some(SelectionDialogState::new(
-            SelectionDialogKind::ModelTiers,
-            items,
-            selected,
-        ));
-        true
+        if let Some(roles) = &self.model_choice.roles {
+            let items = vec![
+                SelectionItem::Role(ModelRole::Scribe, roles.scribe.clone()),
+                SelectionItem::Role(ModelRole::Coder, roles.coder.clone()),
+                SelectionItem::Role(ModelRole::Architect, roles.architect.clone()),
+                SelectionItem::Role(ModelRole::Advisor, roles.advisor.clone()),
+                SelectionItem::Role(ModelRole::Reviewer, roles.reviewer.clone()),
+                SelectionItem::Others,
+            ];
+            let selected = match &self.model_choice.selection {
+                ModelSelection::Role(ModelRole::Scribe) => 0,
+                ModelSelection::Role(ModelRole::Coder) => 1,
+                ModelSelection::Role(ModelRole::Architect) => 2,
+                ModelSelection::Role(ModelRole::Advisor) => 3,
+                ModelSelection::Role(ModelRole::Reviewer) => 4,
+                _ => 5,
+            };
+            self.selection_dialog = Some(SelectionDialogState::new(
+                SelectionDialogKind::ModelRoles,
+                items,
+                selected,
+            ));
+            return true;
+        }
+
+        self.open_model_catalog()
     }
 
     /// Opens the full list of available models. Returns false when the list is empty.
@@ -924,5 +945,107 @@ mod tests {
         }
         assert_eq!(dialog.selected_index, 13);
         assert_eq!(dialog.scroll_offset, 13);
+    }
+
+    #[test]
+    fn test_model_choice_resolve_semantic_roles() {
+        let choice = ModelChoice {
+            selection: ModelSelection::Role(ModelRole::Architect),
+            roles: Some(ModelRolesSummary {
+                scribe: ModelRef::openrouter("scribe-model"),
+                coder: ModelRef::openrouter("coder-model"),
+                architect: ModelRef::openrouter("architect-model"),
+                advisor: ModelRef::openrouter("advisor-model"),
+                reviewer: ModelRef::openrouter("reviewer-model"),
+            }),
+        };
+
+        assert_eq!(
+            choice.resolve(&ModelSelection::Role(ModelRole::Scribe)),
+            Some(ModelRef::openrouter("scribe-model"))
+        );
+        assert_eq!(
+            choice.resolve(&ModelSelection::Role(ModelRole::Coder)),
+            Some(ModelRef::openrouter("coder-model"))
+        );
+        assert_eq!(
+            choice.resolve(&ModelSelection::Role(ModelRole::Architect)),
+            Some(ModelRef::openrouter("architect-model"))
+        );
+        assert_eq!(
+            choice.resolve(&ModelSelection::Role(ModelRole::Advisor)),
+            Some(ModelRef::openrouter("advisor-model"))
+        );
+        assert_eq!(
+            choice.resolve(&ModelSelection::Role(ModelRole::Reviewer)),
+            Some(ModelRef::openrouter("reviewer-model"))
+        );
+    }
+
+    #[test]
+    fn test_open_model_dialog_prefers_roles() {
+        let mut state = AppState {
+            view_mode: ViewMode::Develop,
+            protocol_version: "1.0".to_string(),
+            repo_state: None,
+            all_repo_files: Vec::new(),
+            workflow: "git".to_string(),
+            edit_protocol: "xml".to_string(),
+            active_model: ModelRef::openrouter("test-model"),
+            available_models: Vec::new(),
+            available_workflows: Vec::new(),
+            available_edit_protocols: Vec::new(),
+            model_choice: ModelChoice {
+                selection: ModelSelection::Role(ModelRole::Coder),
+                roles: Some(ModelRolesSummary {
+                    scribe: ModelRef::openrouter("scribe-model"),
+                    coder: ModelRef::openrouter("coder-model"),
+                    architect: ModelRef::openrouter("architect-model"),
+                    advisor: ModelRef::openrouter("advisor-model"),
+                    reviewer: ModelRef::openrouter("reviewer-model"),
+                }),
+            },
+            model: DevelopView::default(),
+            context: ContextState::default(),
+            context_view: ContextViewState::default(),
+            history_view: HistoryViewState::default(),
+            review: ReviewViewState::default(),
+            plans_view: PlansViewState::default(),
+            review_dialog: None,
+            notification: None,
+            turn_started_at: None,
+            onboarding: OnboardingState::default(),
+            input_editor: InputEditor::default(),
+            tui_config: TuiConfig::default(),
+            show_help: false,
+            help_scroll: 0,
+            confirm_cancel: false,
+            confirm_quit: false,
+            confirm_undo: false,
+            confirm_clear_history: false,
+            confirm_delete_plan: None,
+            confirm_delete_review: None,
+            confirm_execute_scope: None,
+            confirm_execute_review: None,
+            confirm_button: ConfirmDialogButton::Cancel,
+            selection_dialog: None,
+            status_dialog: None,
+            squash_dialog: None,
+            prompt_modal: None,
+            discuss_plan_dialog: None,
+            discuss_review_dialog: None,
+            server_disconnected: None,
+            server_log_path: std::path::PathBuf::from(".tauqe/server.log"),
+            last_model_height: 10,
+            header_clicks: HeaderClickAreas::default(),
+            terminal_focused: true,
+            shift_tip_shown: false,
+        };
+
+        assert!(state.open_model_dialog());
+        let dialog = state.selection_dialog.expect("dialog should be opened");
+        assert_eq!(dialog.kind, SelectionDialogKind::ModelRoles);
+        assert_eq!(dialog.items.len(), 6);
+        assert_eq!(dialog.selected_index, 1); // Coder is index 1
     }
 }

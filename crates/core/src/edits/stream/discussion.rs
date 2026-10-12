@@ -358,6 +358,7 @@ mod tests {
                 details: Some("Details of first step".to_string()),
                 status: PlanItemStatus::Todo,
                 files: vec![],
+                readonly_files: vec![],
                 concept_refs: vec![],
                 children: vec![],
             }

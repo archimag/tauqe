@@ -356,14 +356,14 @@ pub async fn handle_plans_key(
                     let mut models = vec![
                         (format!("Default ({})", st.active_model), None),
                     ];
-                    let senior_label = if let Some(tiers) = &st.model_choice.tiers {
-                        format!("Senior Architect ({})", tiers.senior)
+                    let architect_label = if let Some(roles) = &st.model_choice.roles {
+                        format!("[Arc] Architect ({})", roles.architect)
                     } else {
-                        "Senior Architect (tier)".to_string()
+                        "[Arc] Architect".to_string()
                     };
                     models.push((
-                        senior_label,
-                        Some(tauqe_protocol::ModelSelection::Tier(tauqe_protocol::ModelTier::Senior)),
+                        architect_label,
+                        Some(tauqe_protocol::ModelSelection::Role(tauqe_protocol::ModelRole::Architect)),
                     ));
 
                     st.plans_view.refine_dialog = Some(crate::ui::plans::PlanRefineDialogState {

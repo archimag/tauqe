@@ -423,6 +423,7 @@ mod tests {
                     details: Some("Add discussion schemas".to_string()),
                     status: PlanItemStatus::Done,
                     files: vec![],
+                    readonly_files: vec![],
                     concept_refs: vec![],
                     children: vec![],
                 }],

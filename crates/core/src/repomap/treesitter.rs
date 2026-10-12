@@ -53,6 +53,7 @@ pub fn extract_symbols_from_str(path: &str, source: &str) -> Result<RepoFileSymb
         .unwrap_or_else(|| RepoFileSymbols {
             path: path.to_string(),
             symbols: Vec::new(),
+            line_count: source.lines().count(),
         });
     Ok(syms)
 }
@@ -65,9 +66,11 @@ fn extract_symbols_from_source(
     let tree = parser.parse(source, None)?;
     let root = tree.root_node();
     let symbols = extract_container_symbols(root, source.as_bytes());
+    let line_count = source.lines().count();
     Some(RepoFileSymbols {
         path: rel_path.to_string(),
         symbols,
+        line_count,
     })
 }
 
@@ -549,6 +552,7 @@ pub fn create_user(name: &str) -> User {
 
         let res = extract_symbols_from_str("src/user.rs", code).unwrap();
         assert_eq!(res.path, "src/user.rs");
+        assert_eq!(res.line_count, code.lines().count());
 
         let mod_sym = res.symbols.iter().find(|s| s.kind == SymbolKind::Mod).unwrap();
         assert_eq!(mod_sym.name, "sub_module");

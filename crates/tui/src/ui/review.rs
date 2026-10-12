@@ -408,15 +408,21 @@ fn status_style(status: ReviewStatus) -> Style {
 
 fn model_badge(selection: &ModelSelection) -> Span<'static> {
     match selection {
-        ModelSelection::Tier(tier) => match tier {
-            tauqe_protocol::ModelTier::Junior => {
-                Span::styled(" [junior]", Style::default().fg(Color::Green))
+        ModelSelection::Role(role) => match role {
+            tauqe_protocol::ModelRole::Scribe => {
+                Span::styled(" [Scr]", Style::default().fg(Color::Green))
             }
-            tauqe_protocol::ModelTier::Middle => {
-                Span::styled(" [middle]", Style::default().fg(Color::Yellow))
+            tauqe_protocol::ModelRole::Coder => {
+                Span::styled(" [Cod]", Style::default().fg(Color::Yellow))
             }
-            tauqe_protocol::ModelTier::Senior => {
-                Span::styled(" [senior]", Style::default().fg(Color::Red))
+            tauqe_protocol::ModelRole::Architect => {
+                Span::styled(" [Arc]", Style::default().fg(Color::Red))
+            }
+            tauqe_protocol::ModelRole::Advisor => {
+                Span::styled(" [Adv]", Style::default().fg(Color::Cyan))
+            }
+            tauqe_protocol::ModelRole::Reviewer => {
+                Span::styled(" [Rev]", Style::default().fg(Color::Magenta))
             }
         },
         ModelSelection::Specific(model_ref) => {

@@ -511,7 +511,7 @@ mod tests {
         let item = ReviewItem {
             id: 1,
             title: "Potential race condition".to_string(),
-            model: Some(ModelSelection::Tier(crate::model::ModelTier::Senior)),
+            model: Some(ModelSelection::Role(crate::model::ModelRole::Architect)),
             severity: ReviewSeverity::Critical,
             status: ReviewItemStatus::Discussion,
             file_path: Some("crates/server/src/state.rs".to_string()),
@@ -526,10 +526,11 @@ mod tests {
         let de: ReviewItem = serde_json::from_str(&json).unwrap();
         assert_eq!(de, item);
 
-        // Test serde alias "done" -> Fixed
-        let legacy_json = r#"{"id":2,"title":"Legacy","severity":"info","status":"done","body":""}"#;
+        // Test serde alias "done" -> Fixed and legacy model "senior" -> Architect
+        let legacy_json = r#"{"id":2,"title":"Legacy","severity":"info","status":"done","body":"","model":"senior"}"#;
         let de_legacy: ReviewItem = serde_json::from_str(legacy_json).unwrap();
         assert_eq!(de_legacy.status, ReviewItemStatus::Fixed);
+        assert_eq!(de_legacy.model, Some(ModelSelection::Role(crate::model::ModelRole::Architect)));
     }
 
     #[test]

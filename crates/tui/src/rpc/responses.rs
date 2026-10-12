@@ -44,6 +44,18 @@ pub fn apply_system_status_response(st: &mut AppState, val: &serde_json::Value) 
     {
         st.active_model = m;
     }
+    if let Some(sel) = val
+        .get("selection")
+        .and_then(|v| serde_json::from_value::<tauqe_protocol::ModelSelection>(v.clone()).ok())
+    {
+        st.model_choice.selection = sel;
+    }
+    if let Some(roles) = val
+        .get("roles")
+        .and_then(|v| serde_json::from_value::<tauqe_protocol::ModelRolesSummary>(v.clone()).ok())
+    {
+        st.model_choice.roles = Some(roles);
+    }
     if let Some(av) = val
         .get("available_models")
         .and_then(|v| serde_json::from_value::<Vec<ModelRef>>(v.clone()).ok())
@@ -383,6 +395,12 @@ pub async fn handle_response(resp: Response, state: &Arc<Mutex<AppState>>) {
                 if let Ok(cfg) = serde_json::from_value::<ConfigState>(val) {
                     st.workflow = cfg.workflow;
                     st.active_model = cfg.model;
+                    if let Some(sel) = cfg.selection {
+                        st.model_choice.selection = sel;
+                    }
+                    if cfg.roles.is_some() {
+                        st.model_choice.roles = cfg.roles;
+                    }
                     if !cfg.available_models.is_empty() {
                         st.available_models = cfg.available_models;
                     }
@@ -400,7 +418,7 @@ pub async fn handle_response(resp: Response, state: &Arc<Mutex<AppState>>) {
                     st.active_model = res.effective_model;
                     st.model_choice = crate::app::ModelChoice {
                         selection: res.selection,
-                        tiers: Some(res.tiers),
+                        roles: res.roles,
                     };
                     if !res.available_models.is_empty() {
                         st.available_models = res.available_models;
@@ -412,7 +430,7 @@ pub async fn handle_response(resp: Response, state: &Arc<Mutex<AppState>>) {
                     st.active_model = res.effective_model;
                     st.model_choice = crate::app::ModelChoice {
                         selection: res.selection,
-                        tiers: Some(res.tiers),
+                        roles: res.roles,
                     };
                 }
             }

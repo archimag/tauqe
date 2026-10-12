@@ -135,28 +135,25 @@ pub fn prepare_staged_for_retry(
         succeeded_files.remove(path);
     }
 
-    cumulative_edits.retain(|op| {
-        let op_path = match op {
-            EditOperation::Replace { path, .. }
-            | EditOperation::Create { path, .. }
-            | EditOperation::Delete { path }
-            | EditOperation::Overwrite { path, .. } => context_manager
+    cumulative_edits.retain(|op| match op {
+        EditOperation::Replace { path, .. }
+        | EditOperation::Create { path, .. }
+        | EditOperation::Delete { path }
+        | EditOperation::Overwrite { path, .. } => {
+            let op_path = context_manager
                 .normalize_path(path)
-                .unwrap_or_else(|_| path.clone()),
-            EditOperation::Move { from, to } => {
-                let clean_from = context_manager
-                    .normalize_path(from)
-                    .unwrap_or_else(|_| from.clone());
-                let clean_to = context_manager
-                    .normalize_path(to)
-                    .unwrap_or_else(|_| to.clone());
-                if touched_paths.contains(&clean_from) || touched_paths.contains(&clean_to) {
-                    return false;
-                }
-                return true;
-            }
-        };
-        !touched_paths.contains(&op_path)
+                .unwrap_or_else(|_| path.clone());
+            !touched_paths.contains(&op_path)
+        }
+        EditOperation::Move { from, to } => {
+            let clean_from = context_manager
+                .normalize_path(from)
+                .unwrap_or_else(|_| from.clone());
+            let clean_to = context_manager
+                .normalize_path(to)
+                .unwrap_or_else(|_| to.clone());
+            !touched_paths.contains(&clean_from) && !touched_paths.contains(&clean_to)
+        }
     });
 }
 

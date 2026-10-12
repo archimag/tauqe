@@ -88,15 +88,15 @@ impl EditProtocol for XmlEditProtocol {
         let mut prompt = String::new();
         prompt.push_str("## Code Modification Protocol (XML Edits)\n");
         prompt.push_str("When proposing changes, use structured XML blocks:\n");
-        prompt.push_str("- Existing files: modify ONLY files listed in <editable_files> via <edit path=\"...\">.\n");
+        prompt.push_str("- Existing files: modify files present in <context> (preferring <editable_files>) via <edit path=\"...\">. Files in <read_only_files> are automatically upgraded to editable when edited.\n");
         prompt.push_str("- New files: create new files using <create path=\"...\"> with a valid repository-relative path. Created files are automatically added to context.\n");
         prompt.push_str("- Move or rename files: move existing editable files using <move from=\"...\" to=\"...\" />.\n");
-        prompt.push_str("- Full rewrite: replace the entire content of an existing editable file using <overwrite path=\"...\">.\n");
+        prompt.push_str("- Full rewrite: replace the entire content of an existing file in context using <overwrite path=\"...\">.\n");
         prompt
             .push_str("- File deletions: delete obsolete files using <delete path=\"...\" />.\n\n");
 
         if editable_paths.is_empty() {
-            prompt.push_str("NOTE: No existing files are currently marked as editable. You may answer questions, explain code, or create new files with <create path=\"...\"> if requested.\n\n");
+            prompt.push_str("NOTE: No existing files are currently marked as explicitly editable. You may edit any existing file in <context>, answer questions, explain code, or create new files with <create path=\"...\"> if requested.\n\n");
         } else {
             prompt.push_str("Currently permitted existing target files for modification:\n");
             for path in editable_paths {
@@ -137,7 +137,7 @@ impl EditProtocol for XmlEditProtocol {
 
         prompt.push_str("CRITICAL INVARIANTS:\n");
         prompt.push_str("1. Specify 'summary=\"...\"' on <tauqe_edits> with a high-quality Git commit message.\n");
-        prompt.push_str("2. For <edit>, the 'path' attribute MUST EXACTLY match one of the paths listed in <editable_files>.\n");
+        prompt.push_str("2. For <edit>, the 'path' attribute MUST match a file present in <context>.\n");
         prompt.push_str("3. For <create>, specify a valid relative path within the repository.\n");
         prompt.push_str("4. The <search> block must match EXACTLY ONE location in the target file, including whitespace and line breaks.\n");
         prompt.push_str(
@@ -148,13 +148,13 @@ impl EditProtocol for XmlEditProtocol {
 
         match discovery_mode {
             crate::config::DiscoveryMode::Monotonic => {
-                prompt.push_str("8. Context Discovery: If the task requires files listed in <repo_map> that are not yet present in context, or if a file currently in <read_only_files> needs to be modified, request them FIRST instead of guessing: output only a short note plus one tag per file, e.g. <context_request path=\"path/to/file.rs\" access=\"read_only\" /> (use access=\"editable\" to add or upgrade a file to editable). You will be called again with the updated context. Do not request files that are already present with the required access level. Place all operational protocol tags strictly at the end of your response outside markdown formatting; any tags inside markdown code fences or backticks are treated as literal examples and ignored.\n");
+                prompt.push_str("8. Context Discovery: If the task requires files listed in <repo_map> that are not yet present in context, request them FIRST instead of guessing: output only a short note plus one tag per file, e.g. <context_request path=\"path/to/file.rs\" access=\"read_only\" /> (use access=\"editable\" if you know you need to modify it). Files already present in <context> (including <read_only_files>) can be edited directly without requesting. Place all operational protocol tags strictly at the end of your response outside markdown formatting; any tags inside markdown code fences or backticks are treated as literal examples and ignored.\n");
             }
             crate::config::DiscoveryMode::Incremental => {
-                prompt.push_str("8. Context Discovery (Incremental Strategy): If the task requires files listed in <repo_map> that are not yet present in context, or if a file currently in <read_only_files> needs to be modified, request them FIRST instead of guessing: output only a short note plus one tag per file, e.g. <context_request path=\"path/to/file.rs\" access=\"read_only\" /> (use access=\"editable\" to add or upgrade a file to editable). If an inspected auto-context file turns out to be irrelevant or misleading, release it immediately using <context_drop path=\"path/to/file.rs\" /> to prevent context pollution and preserve token budget. You will be called again with the updated context. Do not request files that are already present with the required access level. Place all operational protocol tags strictly at the end of your response outside markdown formatting; any tags inside markdown code fences or backticks are treated as literal examples and ignored.\n");
+                prompt.push_str("8. Context Discovery (Incremental Strategy): If the task requires files listed in <repo_map> that are not yet present in context, request them FIRST instead of guessing: output only a short note plus one tag per file, e.g. <context_request path=\"path/to/file.rs\" access=\"read_only\" /> (use access=\"editable\" if you know you need to modify it). If an inspected auto-context file turns out to be irrelevant or misleading, release it immediately using <context_drop path=\"path/to/file.rs\" /> to prevent context pollution and preserve token budget. Files already present in <context> (including <read_only_files>) can be edited directly without requesting. Place all operational protocol tags strictly at the end of your response outside markdown formatting; any tags inside markdown code fences or backticks are treated as literal examples and ignored.\n");
             }
             crate::config::DiscoveryMode::Snapshot => {
-                prompt.push_str("8. Context Discovery (Snapshot Strategy): If the task requires inspecting or modifying files listed in <repo_map> that are not yet in context, request them FIRST: output only a short note plus <context_request path=\"path/to/file.rs\" access=\"read_only|editable\" /> tags. In each discovery round, your <context_request> tags MUST specify the entire active working set of auto-context files required for the task. Any auto-context files omitted from your requests will be automatically evicted from context. User and pinned files are never evicted. Place all operational protocol tags strictly at the end of your response outside markdown formatting; any tags inside markdown code fences or backticks are treated as literal examples and ignored.\n");
+                prompt.push_str("8. Context Discovery (Snapshot Strategy): If the task requires inspecting or modifying files listed in <repo_map> that are not yet in context, request them FIRST: output only a short note plus <context_request path=\"path/to/file.rs\" access=\"read_only|editable\" /> tags. In each discovery round, your <context_request> tags MUST specify the entire active working set of auto-context files required for the task. Any auto-context files omitted from your requests will be automatically evicted from context. User and pinned files are never evicted. Files already present in <context> (including <read_only_files>) can be edited directly without requesting. Place all operational protocol tags strictly at the end of your response outside markdown formatting; any tags inside markdown code fences or backticks are treated as literal examples and ignored.\n");
             }
         }
 
@@ -163,6 +163,7 @@ impl EditProtocol for XmlEditProtocol {
         prompt.push_str("11. Choosing <edit> vs <overwrite>: use <edit> by default for local changes. Use <overwrite path=\"...\"> with the COMPLETE new file content when most of an existing editable file changes (roughly more than half), when the file is small, or when many fragile search blocks would be needed. Never use <create> for a path that already exists; use <create> only for new files.\n");
         prompt.push_str("12. Turn Scratchpad (Working Memory): To retain working hypotheses, verified findings, or focus across multi-round discovery and verification healing cycles, you may emit <scratchpad>...</scratchpad> (or <scratchpad note=\"...\" />). Keep notes concise (bullet points of what is verified, current hypothesis, and purpose of requested files). Notes are preserved strictly within the current turn and automatically stripped from conversational text.\n");
         prompt.push_str("13. Terminal Outcome Protocol: Conclude every task execution cleanly with an explicit terminal outcome tag. When your changes are complete, staged, and verified (or the user's task is resolved), emit <success summary=\"...\" />. If you encounter an insurmountable blocker, contradictory requirements, or cannot proceed, do not silently fail or hallucinate; emit <error message=\"...\" /> detailing the blocker.\n\n");
+        prompt.push_str("14. Plan Item Tags: When authoring an engineering plan, an <item ...> step tag accepts optional attributes: concept_refs=\"c-1,c-2\" (addressed concept nodes), files=\"path/to/modify.rs,...\" (target files loaded as editable context), and readonly=\"path/to/contract.rs,...\" (reference or contract files loaded as read-only context and never modified). Leaf-Only Files Invariant: `files` and `readonly` must be declared only on executable leaf steps without children; parent container items and task groups must never declare either.\n\n");
 
         prompt
     }
@@ -281,7 +282,11 @@ impl EditProtocol for MarkedXmlEditProtocol {
 
     fn parse_terminal_outcome(&self, raw_text: &str) -> Option<TerminalOutcome> {
         let normalized = normalize_marked_xml(raw_text, &self.marker, true);
-        tags::extract_terminal_outcome(&normalized).map(|outcome| match outcome {
+        // Prefer marker-suffixed tags; fall back to unmarked <success>/<error>
+        // tags when the model omitted the turn-marker suffix (deep-reasoning models).
+        let outcome = tags::extract_terminal_outcome(&normalized)
+            .or_else(|| tags::extract_terminal_outcome(raw_text));
+        outcome.map(|outcome| match outcome {
             TerminalOutcome::Success { summary } => TerminalOutcome::Success {
                 summary: summary.map(|s| restore_xml_literals(&s, &self.marker)),
             },
@@ -297,7 +302,10 @@ impl EditProtocol for MarkedXmlEditProtocol {
     }
 
     fn clean_assistant_text(&self, raw_text: &str) -> String {
-        let normalized = normalize_marked_xml(raw_text, &self.marker, true);
+        // Strip terminal outcome tags (both marker-suffixed and unmarked, while
+        // respecting markdown code) so they never leak into conversational text.
+        let without_terminal = strip_terminal_outcome_tags(raw_text);
+        let normalized = normalize_marked_xml(&without_terminal, &self.marker, true);
         restore_xml_literals(&extract_conversational_text(&normalized), &self.marker)
     }
 
@@ -1365,6 +1373,63 @@ Everything is tested and working properly."#;
         assert!(cleaned.contains("`<success>example</success>`"));
         assert!(cleaned.contains("`<error message=\"x\" />`"));
         assert!(!cleaned.contains("Real outcome"));
+    }
+
+    #[test]
+    fn test_marked_xml_terminal_outcome_falls_back_to_unmarked_tags() {
+        let marker = "M246801";
+        let proto = MarkedXmlEditProtocol::new(marker);
+
+        let success_output =
+            "Implemented the fix.\n<success summary=\"Fallback success\" />\nDone.";
+        assert_eq!(
+            proto.parse_terminal_outcome(success_output),
+            Some(TerminalOutcome::Success {
+                summary: Some("Fallback success".to_string()),
+            })
+        );
+        assert_eq!(
+            proto.clean_assistant_text(success_output),
+            "Implemented the fix.\n\nDone."
+        );
+
+        let error_output = "Blocked.\n<error message=\"Fallback blocker\" />\nExiting.";
+        assert_eq!(
+            proto.parse_terminal_outcome(error_output),
+            Some(TerminalOutcome::Error {
+                message: "Fallback blocker".to_string(),
+            })
+        );
+        assert_eq!(
+            proto.clean_assistant_text(error_output),
+            "Blocked.\n\nExiting."
+        );
+    }
+
+    #[test]
+    fn test_marked_xml_terminal_outcome_prefers_marked_over_unmarked() {
+        let marker = "M246802";
+        let proto = MarkedXmlEditProtocol::new(marker);
+
+        let output = format!(
+            "Prefer the marked tag.\n<success summary=\"Unmarked\" />\n<success_{m} summary=\"Marked\" />\n",
+            m = marker
+        );
+        assert_eq!(
+            proto.parse_terminal_outcome(&output),
+            Some(TerminalOutcome::Success {
+                summary: Some("Marked".to_string()),
+            })
+        );
+    }
+
+    #[test]
+    fn test_marked_xml_terminal_outcome_fallback_ignores_markdown_code() {
+        let marker = "M246803";
+        let proto = MarkedXmlEditProtocol::new(marker);
+
+        let output = "Example only:\n```xml\n<success summary=\"Example\" />\n```\nInline `<error message=\"Example\" />`.";
+        assert_eq!(proto.parse_terminal_outcome(output), None);
     }
 
     #[test]

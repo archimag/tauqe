@@ -9,6 +9,11 @@ pub mod render;
 /// Minimum interval between full markdown re-parses while a response is streaming.
 const MARKDOWN_THROTTLE: Duration = Duration::from_millis(80);
 
+/// Number of trailing reasoning lines kept visible while a reasoning stream is
+/// active. The live stream acts as a progress indicator; the full transcript is
+/// rendered once via [`ReasoningState::finalize`].
+const REASONING_TAIL_LINES: usize = 10;
+
 pub const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 #[derive(Debug, Clone)]
@@ -46,8 +51,11 @@ pub struct ReasoningState {
     pub lines: Vec<Line<'static>>,
     pub show: bool,
     pub theme_mode: crate::config::ThemeMode,
-    dirty: bool,
-    last_render: Option<Instant>,
+    streaming: bool,
+    tail: Vec<Line<'static>>,
+    pending: String,
+    newline_count: usize,
+    tail_consumed: usize,
 }
 
 impl Default for ReasoningState {
@@ -57,8 +65,11 @@ impl Default for ReasoningState {
             lines: Vec::new(),
             show: true,
             theme_mode: crate::config::ThemeMode::default(),
-            dirty: false,
-            last_render: None,
+            streaming: false,
+            tail: Vec::new(),
+            pending: String::new(),
+            newline_count: 0,
+            tail_consumed: 0,
         }
     }
 }
@@ -72,20 +83,31 @@ impl ReasoningState {
         self.text.clear();
         self.lines.clear();
         self.show = true;
-        self.dirty = false;
-        self.last_render = None;
+        self.streaming = false;
+        self.tail.clear();
+        self.pending.clear();
+        self.newline_count = 0;
+        self.tail_consumed = 0;
     }
 
+    /// Appends a streamed reasoning delta.
+    ///
+    /// While the stream is active only a lightweight tail window is maintained;
+    /// the heavy Markdown render is deferred to [`Self::finalize`].
     pub fn append_delta(&mut self, delta: &str) {
         self.text.push_str(delta);
-        if self
-            .last_render
-            .is_some_and(|t| t.elapsed() < MARKDOWN_THROTTLE)
-        {
-            self.dirty = true;
-        } else {
-            self.update_markdown();
+        self.streaming = true;
+        self.fold_tail();
+    }
+
+    /// Finalizes an active reasoning stream by performing the full Markdown
+    /// render exactly once. No-op when the stream has already settled.
+    pub fn finalize(&mut self) {
+        if !self.streaming {
+            return;
         }
+        self.streaming = false;
+        self.update_markdown();
     }
 
     pub fn update_markdown(&mut self) {
@@ -93,19 +115,51 @@ impl ReasoningState {
             &self.text,
             &crate::markdown::MarkdownTheme::reasoning_themed(self.theme_mode),
         );
-        self.dirty = false;
-        self.last_render = Some(Instant::now());
     }
 
-    /// Renders deferred deltas once the throttle interval has elapsed.
-    pub fn flush(&mut self) {
-        if self.dirty
-            && self
-                .last_render
-                .is_none_or(|t| t.elapsed() >= MARKDOWN_THROTTLE)
-        {
-            self.update_markdown();
+    /// Folds newly appended text into the rolling tail window.
+    ///
+    /// Text is consumed starting at [`Self::tail_consumed`], which tolerates
+    /// deltas inserted directly into [`Self::text`] by event handlers.
+    fn fold_tail(&mut self) {
+        if self.tail_consumed >= self.text.len() {
+            return;
         }
+        let segment = self
+            .text
+            .get(self.tail_consumed..)
+            .unwrap_or(self.text.as_str())
+            .to_string();
+        self.tail_consumed = self.text.len();
+
+        let mut rest = segment.as_str();
+        while let Some(idx) = rest.find('\n') {
+            let (head, after) = rest.split_at(idx);
+            self.pending.push_str(head);
+            self.commit_pending_line();
+            rest = &after[1..];
+        }
+        self.pending.push_str(rest);
+    }
+
+    fn commit_pending_line(&mut self) {
+        let line = std::mem::take(&mut self.pending);
+        self.tail.push(Self::tail_line(&line));
+        if self.tail.len() > REASONING_TAIL_LINES {
+            self.tail.remove(0);
+        }
+        self.newline_count += 1;
+    }
+
+    fn tail_line(line: &str) -> Line<'static> {
+        Line::from(Span::styled(
+            line.to_string(),
+            Style::default().fg(crate::markdown::safe_rgb(140, 180, 230)),
+        ))
+    }
+
+    fn total_lines(&self) -> usize {
+        self.newline_count + usize::from(!self.pending.is_empty())
     }
 
     pub fn is_empty(&self) -> bool {
@@ -130,7 +184,35 @@ impl ReasoningState {
                 .bold(),
         );
 
-        if self.show {
+        if !self.show {
+            lines.push(Line::from(vec![
+                reasoning_badge,
+                Span::raw(" "),
+                Span::styled(
+                    "▶ Thinking hidden",
+                    Style::default().fg(Color::DarkGray).bold(),
+                ),
+            ]));
+            return lines;
+        }
+
+        if self.streaming {
+            lines.push(Line::from(vec![
+                reasoning_badge,
+                Span::raw(" "),
+                Span::styled(
+                    format!("Thinking… ({} lines)", self.total_lines()),
+                    Style::default()
+                        .fg(crate::markdown::safe_rgb(130, 170, 220))
+                        .bold(),
+                ),
+            ]));
+
+            lines.extend(self.tail.iter().cloned());
+            if !self.pending.is_empty() {
+                lines.push(Self::tail_line(&self.pending));
+            }
+        } else {
             lines.push(Line::from(vec![
                 reasoning_badge,
                 Span::raw(" "),
@@ -151,15 +233,6 @@ impl ReasoningState {
                     lines.push(Line::from(Span::styled(line.to_string(), text_style)));
                 }
             }
-        } else {
-            lines.push(Line::from(vec![
-                reasoning_badge,
-                Span::raw(" "),
-                Span::styled(
-                    "▶ Thinking hidden",
-                    Style::default().fg(Color::DarkGray).bold(),
-                ),
-            ]));
         }
 
         lines
@@ -206,6 +279,7 @@ pub struct DevelopView {
     pub turn_round: Option<usize>,
     pub turn_max_rounds: Option<usize>,
     pub turn_phase_detail: Option<String>,
+    pub plan_context: Option<tauqe_protocol::ModelTurnPlanContext>,
     pub repomap_tokens: Option<usize>,
     pub spinner_frame: usize,
     pub rendered_lines_count: usize,
@@ -248,6 +322,7 @@ impl Default for DevelopView {
             turn_round: None,
             turn_max_rounds: None,
             turn_phase_detail: None,
+            plan_context: None,
             repomap_tokens: None,
             spinner_frame: 0,
             rendered_lines_count: 0,
@@ -322,7 +397,6 @@ impl DevelopView {
         {
             self.render_markdown_now();
         }
-        self.reasoning.flush();
     }
 
     /// True while any animated spinner is visible and needs frame advancement.

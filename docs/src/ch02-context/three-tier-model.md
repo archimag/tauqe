@@ -36,9 +36,11 @@ The working context is organized into three distinct layers:
 
 ## 2.3 Permissions: Knowledge Scope vs Write Scope
 
-Every context item carries strict permission boundaries:
-- **`read_only` (Knowledge Scope):** Accessible for reading, structural comprehension, and referencing definitions. Edits proposed to read-only files are rejected in staging unless explicitly escalated.
-- **`editable` (Write Scope):** Explicitly authorized for modification. Only files within the editable scope may be altered.
+Every context item carries semantic permission boundaries:
+- **`read_only` (Knowledge Scope):** Accessible for reading, structural comprehension, and referencing definitions. Files in this scope serve as a semantic hint to the model that they are primarily intended for reference. However, if fulfilling a task genuinely requires updating a file present in the read-only scope, TAUQE allows the modification and automatically promotes the file to the `editable` scope upon applying the patch. This eliminates unnecessary round-trips and token waste while keeping the developer fully informed via live streaming diffs.
+- **`editable` (Write Scope):** Explicitly designated for modification.
+
+Files not present in the active context (visible only in the Tree-sitter Repo Map) remain strictly protected: the model cannot edit them blindly and must first request them into context via `<context_request>`.
 
 ---
 
@@ -46,7 +48,7 @@ Every context item carries strict permission boundaries:
 
 TAUQE balances developer control with model autonomy:
 1. When a task is submitted, the model inspects the Tree-sitter Repo Map alongside the currently loaded files.
-2. If symbols or implementations are missing, the model emits protocol requests (e.g., `<context_request path="crates/core/src/context.rs" access="editable" />`).
+2. If symbols or implementations are missing from context, the model emits protocol requests (e.g., `<context_request path="crates/core/src/context.rs" access="read_only" />`). Files already present in context (including read-only files) do not require a separate discovery round and may be edited directly if required.
 3. The server adds requested files to the `Auto` context layer and immediately initiates the next round.
 4. Once all needed files are loaded, the model produces code modifications.
 

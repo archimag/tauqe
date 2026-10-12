@@ -29,6 +29,13 @@ When you submit an engineering intent, TAUQE does not simply invoke a single-sho
 4. **Deterministic Toolchain Verification & Self-Healing:** After in-memory staging converges and changes are written to disk, TAUQE automatically triggers deterministic project toolchains (`cargo check`, `npm test`, linters). If compile or lint errors are detected, the raw compiler diagnostics are packaged and fed back to the model for an immediate **verification healing cycle**, correcting syntax or type errors before the developer even inspects the code.
 5. **Git Transaction & Rollback:** The entire successful sequence is recorded as an isolated Git commit. If the outcome deviates from the developer's intent, pressing `Ctrl+Z` or `Alt+U` opens a confirmation dialog to immediately and atomically restore the repository to its exact pre-turn state.
 
+### Live Reasoning Display During Streaming
+Reasoning output during an active turn is a progress indicator, not a document that must be read while it grows. TAUQE uses this distinction to keep the interface responsive even when the reasoning stream is long and contains draft code:
+
+- **Sliding window (Reasoning Tail Stream):** While reasoning is actively streaming, the Develop view renders only a compact slice of the most recent lines (ten lines by default) below the `[REASONING]` badge. The badge shows the running total line count (`Thinking… (N lines)`), so forward progress stays visible without re-wrapping the entire, ever-growing transcript on every update.
+- **Deferred deep rendering:** The tail uses lightweight per-line styling. The full Markdown parse and `syntect` code-block highlighting are not restarted against the still-open stream; they run exactly once, when the reasoning stage finalizes.
+- **Finalized transcript:** When reasoning completes, the sliding window is replaced by the complete reasoning transcript rendered through the standard Markdown pipeline, including syntax-highlighted code fences. The `Ctrl+R` fold/unfold toggle applies to both the live tail and the finalized transcript.
+
 - **`F2` / `Alt+2` / `Ctrl+2` (Context View):**
   - Displays Pinned, User, and Auto context layers with token metrics.
   - Quick keys: `e` (add editable), `r` (add read-only), `t` (toggle permission), `p` (promote auto to user), `c` (clear auto), `d` (remove file).
@@ -168,6 +175,16 @@ auto_level_up = false                          # escalate on failure (plans and 
 
 - **Selection model:** The active choice is either a tier (`Junior`, `Middle`, `Senior`) or one specific model. A tier is resolved to a concrete model by the server, so the TUI never guesses the mapping. If only some tiers are configured, the missing ones fall back to a configured neighbour.
 - **Picker (`Alt+M` / `Ctrl+M`, or a click on the model in the header):** The first screen lists the tiers with their resolved models. Press `1`, `2`, or `3` to select a tier immediately, or `4` (`Others...`) to open the full catalog and pin one specific model. `Esc` closes the picker.
-- **Header:** The model indicator shows the role and the resolved model (for example `Middle: ~google/gem…`). On narrow terminals only the role is shown. A pinned specific model is shown without a role.
+- **Header:** A semantic role is rendered as its title only, for example `Coder`. The concrete model name is deliberately omitted to keep the header free of provider-level noise; the resolved role-to-model mapping stays visible in the picker. A pinned specific model is shown by its own name instead (truncated on narrow terminals).
 - **Background work:** Squash commit messages and history compaction always use the Junior tier. They are routine tasks, so they should not spend the budget of a stronger model.
 - **Level Up:** When `auto_level_up = true`, a plan step or review fix that still fails after verification healing is rolled back to the Git checkpoint taken before the step. The step then restarts on the next tier (Junior → Middle → Senior). Files found during discovery stay in context, so the stronger model does not search again. When the tiers are exhausted, or Level Up is off, the normal Fail-Fast stop applies. Develop never escalates automatically: the developer's explicit choice in the picker is always respected.
+
+---
+
+## 5.8 Plan Stepper in Develop (Batch Step Progress)
+
+When a Develop turn belongs to a plan execution (a single step or a server-orchestrated batch), the Develop view renders a compact **Plan Stepper** above the model output. Its role is to keep the developer oriented during a multi-step scope without leaving Develop and without switching to the Plans view (`F4`).
+
+- **Title-only by design:** The stepper shows only step identifiers, a concise status (`Done`, `InProgress`, `Todo`), and short step titles, fitting in a 2–4 line header. It never renders expanded diffs, detail text, or concept nodes. Keeping the header terse preserves the reasoning and code output as the visual focus and avoids the noise of a full plan tree.
+- **Zero overhead for ad-hoc turns:** The stepper appears only when the turn carries plan-step metadata. A plain ad-hoc prompt renders exactly as before, with no extra header.
+- **Diff scoping invariant:** The Proposed Edits section and the streaming file list belong strictly to the *current active step*. Files that an earlier step already committed are removed from the working area when the batch advances, so the visible diffs always describe one step rather than an accreted history. What is shown is what this step changed; earlier steps are already safe in Git.

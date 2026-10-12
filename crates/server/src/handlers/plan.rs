@@ -7,10 +7,11 @@ use tauqe_core::providers::{
 };
 use tauqe_core::workflow::common::apply_context_requests_detailed;
 use tauqe_protocol::{
-    events, ContextAccess, Event, Plan, PlanDeleteParams, PlanExecuteParams, PlanGetParams,
-    PlanGetResult, PlanItemStatus, PlanListChangedEvent, PlanListResult, PlanRefineParams,
-    PlanRefineResult, PlanSaveParams, PlanScopeEvaluation, PlanSetActiveParams,
-    PlanUpdateItemParams, PlanUpdatedEvent, Request, Response, TurnPhase, TurnPhaseEvent,
+    events, ContextAccess, Event, ModelRole, ModelSelection, Plan, PlanDeleteParams,
+    PlanExecuteParams, PlanGetParams, PlanGetResult, PlanItem, PlanItemStatus, PlanListChangedEvent,
+    PlanListResult, PlanRefineParams, PlanRefineResult, PlanSaveParams, PlanScopeEvaluation,
+    PlanSetActiveParams, PlanUpdateItemParams, PlanUpdatedEvent, Request, Response, TurnPhase,
+    TurnPhaseEvent,
 };
 use tokio::sync::{mpsc, watch};
 
@@ -257,25 +258,30 @@ fn report_step_failure(state: &Arc<AppState>, operation_id: &str, message: &str)
     );
 }
 
-/// Loads the declared target files of a step into editable context before the turn starts.
-async fn preload_step_files(state: &Arc<AppState>, repo_root: &Path, files: &[String]) {
-    if files.is_empty() {
+/// Loads the declared target and reference files of a step into the auto context
+/// layer before the turn starts. Target files are registered as editable, while
+/// reference files are registered as read-only. Declared step files are never
+/// capped by an artificial quota.
+async fn preload_step_files(state: &Arc<AppState>, repo_root: &Path, item: &PlanItem) {
+    if item.files.is_empty() && item.readonly_files.is_empty() {
         return;
     }
-    let max_files = state.config.lock().await.context.max_files;
     let available_files =
         tauqe_core::git::list_repository_files(Some(repo_root)).unwrap_or_default();
-    let requests: Vec<ContextRequest> = files
-        .iter()
-        .map(|p| ContextRequest {
-            path: p.clone(),
-            access: ContextAccess::Editable,
-        })
-        .collect();
+    let mut requests: Vec<ContextRequest> =
+        Vec::with_capacity(item.files.len() + item.readonly_files.len());
+    requests.extend(item.files.iter().map(|p| ContextRequest {
+        path: p.clone(),
+        access: ContextAccess::Editable,
+    }));
+    requests.extend(item.readonly_files.iter().map(|p| ContextRequest {
+        path: p.clone(),
+        access: ContextAccess::ReadOnly,
+    }));
 
     let (outcome, new_ctx_state) = {
         let mut ctx = state.context.write().await;
-        let oc = apply_context_requests_detailed(&mut ctx, &requests, &available_files, max_files);
+        let oc = apply_context_requests_detailed(&mut ctx, &requests, &available_files, usize::MAX);
         let s = ctx.get_state();
         (oc, s)
     };
@@ -289,13 +295,30 @@ async fn preload_step_files(state: &Arc<AppState>, repo_root: &Path, files: &[St
     }
 }
 
-/// Executes one step in an isolated turn. The step becomes DONE only when the turn
-/// satisfies the success contract; on any failure it returns to TODO.
+/// Clears the transient auto context layer so a retried attempt starts from a
+/// clean, deterministic basis, then notifies clients of the new snapshot.
+async fn clear_auto_context(state: &Arc<AppState>) {
+    let new_ctx_state = {
+        let mut ctx = state.context.write().await;
+        ctx.clear_auto();
+        ctx.get_state()
+    };
+    emit(
+        &state.out,
+        events::CONTEXT_CHANGED,
+        Some(serde_json::json!({ "state": new_ctx_state })),
+    );
+}
+
+/// Executes one step in an isolated turn, retrying with corrective feedback while
+/// the attempt budget lasts. The step becomes DONE only when a turn satisfies the
+/// success contract; once all attempts are exhausted it returns to TODO.
 async fn run_plan_step(
     state: &Arc<AppState>,
     repo_root: &Path,
     plan_id: &str,
     step_id: &str,
+    batch_step_ids: &[String],
 ) -> Result<(), String> {
     let plan = match PlanStorage::load_plan(repo_root, plan_id) {
         Ok(Some(p)) => p,
@@ -324,10 +347,10 @@ async fn run_plan_step(
         PlanItemStatus::Todo | PlanItemStatus::InProgress => {}
     }
 
-    preload_step_files(state, repo_root, &item.files).await;
+    preload_step_files(state, repo_root, &item).await;
     set_step_status(state, repo_root, plan_id, step_id, PlanItemStatus::InProgress);
 
-    let prompt = match tauqe_core::plan::prompt::format_plan_step_execution_prompt(&plan, step_id, "") {
+    let mut prompt = match tauqe_core::plan::prompt::format_plan_step_execution_prompt(&plan, step_id, "") {
         Ok(p) => p,
         Err(err) => {
             set_step_status(state, repo_root, plan_id, step_id, PlanItemStatus::Todo);
@@ -335,27 +358,69 @@ async fn run_plan_step(
         }
     };
 
-    match crate::handlers::model::execute_model_turn(state, prompt, None).await {
-        Ok(turn) if turn.is_success() => {
+    let (max_retries, auto_level_up) = {
+        let cfg = state.config.lock().await;
+        (cfg.develop.max_retries, cfg.models.auto_level_up)
+    };
+
+    let mut selection = ModelSelection::Role(ModelRole::Coder);
+    let mut attempt = 0usize;
+
+    loop {
+        let plan_context = tauqe_protocol::ModelTurnPlanContext {
+            plan_id: plan_id.to_string(),
+            step_id: step_id.to_string(),
+            batch_step_ids: batch_step_ids.to_vec(),
+        };
+
+        let turn_result = crate::handlers::model::execute_model_turn(
+            state,
+            prompt.clone(),
+            Some(selection.clone()),
+            Some(plan_context),
+        )
+        .await;
+
+        let turn = match turn_result {
+            Ok(turn) => turn,
+            Err(err) => {
+                set_step_status(state, repo_root, plan_id, step_id, PlanItemStatus::Todo);
+                let op_id = format!("op-{}", crate::state::next_operation_id());
+                report_step_failure(state, &op_id, &err.message);
+                return Err(err.message);
+            }
+        };
+
+        if turn.is_success() {
             set_step_status(state, repo_root, plan_id, step_id, PlanItemStatus::Done);
-            Ok(())
+            return Ok(());
         }
-        Ok(turn) => {
+
+        let reason = turn.error.clone().unwrap_or_else(|| {
+            "Step finished without verified changes or a success tag".to_string()
+        });
+
+        if turn.is_cancelled || attempt >= max_retries {
             set_step_status(state, repo_root, plan_id, step_id, PlanItemStatus::Todo);
-            let reason = turn.error.clone().unwrap_or_else(|| {
-                "Step finished without verified changes or a success tag".to_string()
-            });
             if turn.error.is_none() && !turn.is_cancelled {
                 report_step_failure(state, &turn.operation_id, &reason);
             }
-            Err(reason)
+            return Err(reason);
         }
-        Err(err) => {
-            set_step_status(state, repo_root, plan_id, step_id, PlanItemStatus::Todo);
-            let op_id = format!("op-{}", crate::state::next_operation_id());
-            report_step_failure(state, &op_id, &err.message);
-            Err(err.message)
+
+        // Reset to a clean, deterministic basis before the corrective attempt.
+        clear_auto_context(state).await;
+        preload_step_files(state, repo_root, &item).await;
+
+        if auto_level_up {
+            selection = ModelSelection::Role(ModelRole::Architect);
         }
+
+        prompt = tauqe_core::plan::prompt::format_plan_step_retry_prompt(
+            &turn.assistant_text,
+            turn.error.as_deref(),
+        );
+        attempt += 1;
     }
 }
 
@@ -370,11 +435,11 @@ async fn run_plan_batch(
     let _ = PlanStorage::save_active_id(&repo_root, Some(plan_id));
 
     let mut completed = 0usize;
-    for step_id in step_ids {
-        if let Err(reason) = run_plan_step(state, &repo_root, plan_id, &step_id).await {
+    for step_id in &step_ids {
+        if let Err(reason) = run_plan_step(state, &repo_root, plan_id, step_id, &step_ids).await {
             return BatchOutcome::Failed {
                 completed,
-                step_id,
+                step_id: step_id.clone(),
                 reason,
             };
         }
@@ -542,10 +607,7 @@ pub async fn handle_plan_refine(req: Request, state: &Arc<AppState>) -> Response
         let cfg = state.config.lock().await;
         let model = match custom_model {
             Some(m) => cfg.resolve_model(&m),
-            None => {
-                let cur = state.current_selection.lock().await;
-                cfg.resolve_model(&cur)
-            }
+            None => cfg.resolve_role(ModelRole::Architect),
         };
         let provider: Arc<dyn LlmProvider> = match create_provider(model.provider, &cfg) {
             Ok(p) => Arc::from(p),
@@ -1048,12 +1110,12 @@ mod tests {
     struct TestDir(std::path::PathBuf);
     impl TestDir {
         fn new() -> Self {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
             let path = std::env::temp_dir().join(format!(
-                "tauqe-test-plan-{}",
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_nanos()
+                "tauqe-test-plan-{}-{}",
+                std::process::id(),
+                COUNTER.fetch_add(1, Ordering::Relaxed)
             ));
             let _ = std::fs::create_dir_all(&path);
             Self(path)
@@ -1203,6 +1265,37 @@ mod tests {
             let res = handle_plan_execute(make_req(10 + idx as u64, Some(params)), &state).await;
             assert_eq!(res.error.unwrap().code, *code);
         }
+    }
+
+    #[tokio::test]
+    async fn test_handle_plan_refine_defaults_to_architect_role() {
+        let dir = TestDir::new();
+        let plan = Plan {
+            id: "refine-role".to_string(),
+            title: "Refine Role".to_string(),
+            created_at: 1,
+            updated_at: 1,
+            items: vec![test_item("1", PlanItemStatus::Todo)],
+            ..Default::default()
+        };
+        PlanStorage::save_plan(dir.path(), &plan).unwrap();
+
+        let mut config = tauqe_core::config::AppConfig::default();
+        config.models.architect = Some(tauqe_protocol::ModelRef::openrouter("test/architect-model"));
+        config.models.advisor = Some(tauqe_protocol::ModelRef::openrouter("test/advisor-model"));
+
+        let (out, _rx) = OutChannel::new();
+        let (hist_tx, _hist_rx) = tokio::sync::mpsc::unbounded_channel();
+        let state = AppState::new(config, dir.path().to_path_buf(), hist_tx, out);
+
+        let req = Request {
+            id: tauqe_protocol::RequestId::Number(1),
+            method: tauqe_protocol::methods::PLAN_REFINE.to_string(),
+            params: Some(serde_json::json!({ "plan_id": "refine-role" })),
+        };
+        let res = handle_plan_refine(req, &state).await;
+        let err = res.error.expect("should fail without api key");
+        assert_eq!(err.code, "NO_API_KEY");
     }
 
     #[tokio::test]

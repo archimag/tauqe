@@ -852,7 +852,7 @@ pub async fn execute_edit_pipeline_step<'a>(
         let _ = compact_history_if_needed_with_budget(
             history_manager,
             provider,
-            model,
+            &options.history_model,
             cancel_rx.clone(),
             options.history_budget_tokens,
             options.history_tail_turns,
@@ -868,9 +868,8 @@ pub async fn execute_edit_pipeline_step<'a>(
         history_manager.format_history_tag().ok()
     };
 
-    let editable_paths: Vec<String> = context_files
+    let targetable_paths: Vec<String> = context_files
         .iter()
-        .filter(|f| f.access == ContextAccess::Editable)
         .map(|f| f.path.clone())
         .collect();
 
@@ -923,7 +922,7 @@ pub async fn execute_edit_pipeline_step<'a>(
             },
         })
     } else {
-        protocol.response_format(&editable_paths)
+        protocol.response_format(&targetable_paths)
     };
 
     let client_call = provider.stream_chat(
@@ -934,7 +933,7 @@ pub async fn execute_edit_pipeline_step<'a>(
         cancel_rx.clone(),
     );
 
-    let editable_paths_for_filter = editable_paths.clone();
+    let targetable_paths_for_filter = targetable_paths.clone();
     let staged_for_filter = params
         .staged_state
         .map(|s| s.staged_files.clone())
@@ -944,7 +943,7 @@ pub async fn execute_edit_pipeline_step<'a>(
         Box::new(crate::edits::stream::discussion::DiscussionStreamFilter::new())
     } else {
         protocol.create_stream_filter(
-            editable_paths_for_filter,
+            targetable_paths_for_filter,
             repo_root,
             staged_for_filter,
         )
@@ -1051,7 +1050,7 @@ pub async fn execute_edit_pipeline_step<'a>(
         };
         (ModelResult::Answer { text: msg }, Some(resp))
     } else {
-        let parsed = protocol.parse_output(&assistant_text, &editable_paths);
+        let parsed = protocol.parse_output(&assistant_text, &targetable_paths);
         let res = if has_emitted_edits.load(Ordering::SeqCst) {
             match parsed {
                 ModelResult::Answer { .. } => ModelResult::Edit {

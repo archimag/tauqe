@@ -158,17 +158,8 @@ pub fn stage_and_validate_edits(
                 }
 
                 let in_context = context_manager.contains(&clean_from).unwrap_or(false);
-                let editable = context_manager.is_editable(&clean_from).unwrap_or(false);
                 let newly_created = !repo_root.join(&clean_from).exists()
                     && result.staged_state.staged_files.contains_key(&clean_from);
-
-                if in_context && !editable {
-                    result.failed_files.push(FailedFileEdit {
-                        path: clean_from.clone(),
-                        error: EditError::ReadOnly(clean_from),
-                    });
-                    continue;
-                }
 
                 if !in_context && !newly_created {
                     result.failed_files.push(FailedFileEdit {
@@ -264,7 +255,6 @@ fn stage_file_edits(
 ) -> Result<Option<String>, EditError> {
     let invalid_path = |err: anyhow::Error| EditError::InvalidPath(path.to_string(), err.to_string());
     let in_context = context_manager.contains(path).map_err(invalid_path)?;
-    let editable = context_manager.is_editable(path).map_err(invalid_path)?;
     let full_path = repo_root.join(path);
     let deleted = initial_staged.deleted_paths.contains(path);
     let mut content = if deleted {
@@ -277,9 +267,6 @@ fn stage_file_edits(
     let mut newly_created = !full_path.exists() && content.is_some();
 
     for edit in edits {
-        if in_context && !editable {
-            return Err(EditError::ReadOnly(path.to_string()));
-        }
         if !in_context && !newly_created {
             match edit {
                 EditOperation::Create { .. } if !full_path.exists() => {}
@@ -644,6 +631,7 @@ pub fn apply_edit_proposal(
                 context_manager.normalize_path(to),
             ) {
                 let _ = context_manager.rename_file(&clean_from, &clean_to);
+                let _ = context_manager.set_access(&clean_to, tauqe_protocol::ContextAccess::Editable);
             }
         }
     }
@@ -661,6 +649,7 @@ pub fn apply_edit_proposal(
 
             if context_manager.contains(path).unwrap_or(false) {
                 let _ = context_manager.update_file_metadata(path);
+                let _ = context_manager.set_access(path, tauqe_protocol::ContextAccess::Editable);
             } else {
                 let _ = context_manager.add_auto_file(path, tauqe_protocol::ContextAccess::Editable);
             }
@@ -788,23 +777,13 @@ mod staging_tests {
     fn permissions_paths_missing_files_and_ambiguous_matches_are_reported() {
         let dir = tempdir().unwrap();
         let root = dir.path();
-        std::fs::write(root.join("readonly.rs"), "one").unwrap();
         std::fs::write(root.join("outside.rs"), "one").unwrap();
         std::fs::write(root.join("ambiguous.rs"), "one one").unwrap();
         std::fs::write(root.join("missing.rs"), "one").unwrap();
         let mut cm = ContextManager::new(root.to_path_buf());
-        cm.add_file("readonly.rs", ContextAccess::ReadOnly).unwrap();
         cm.add_file("ambiguous.rs", ContextAccess::Editable).unwrap();
         cm.add_file("missing.rs", ContextAccess::Editable).unwrap();
         std::fs::remove_file(root.join("missing.rs")).unwrap();
-        for edit in [
-            replace("readonly.rs", "one", "two"),
-            EditOperation::Create { path: "readonly.rs".into(), content: "two".into() },
-            EditOperation::Delete { path: "readonly.rs".into() },
-        ] {
-            let result = stage_and_validate_edits(root, &cm, &[edit], None);
-            assert!(matches!(&result.failed_files[0].error, EditError::ReadOnly(_)));
-        }
         for edit in [
             replace("outside.rs", "one", "two"),
             EditOperation::Create { path: "outside.rs".into(), content: "two".into() },
@@ -819,6 +798,30 @@ mod staging_tests {
         assert!(matches!(&missing.failed_files[0].error, EditError::FileNotFound(_)));
         let invalid = stage_and_validate_edits(root, &cm, &[replace("../escape.rs", "one", "two")], None);
         assert!(matches!(&invalid.failed_files[0].error, EditError::InvalidPath(_, _)));
+    }
+
+    #[test]
+    fn readonly_file_in_context_can_be_edited_and_promoted_to_editable() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("ref.rs"), "fn original() {}").unwrap();
+        let mut cm = ContextManager::new(root.to_path_buf());
+        cm.add_file("ref.rs", ContextAccess::ReadOnly).unwrap();
+        assert!(!cm.is_editable("ref.rs").unwrap());
+
+        let edit = replace("ref.rs", "fn original() {}", "fn updated() {}");
+        let stage_res = stage_and_validate_edits(root, &cm, std::slice::from_ref(&edit), None);
+        assert!(stage_res.is_success());
+        assert_eq!(stage_res.staged_state.staged_files["ref.rs"], "fn updated() {}");
+
+        let proposal = EditProposal {
+            summary: "Update read-only file".into(),
+            edits: vec![edit],
+        };
+        let changed = apply_edit_proposal(root, &mut cm, &proposal).unwrap();
+        assert_eq!(changed, vec!["ref.rs"]);
+        assert_eq!(std::fs::read_to_string(root.join("ref.rs")).unwrap(), "fn updated() {}");
+        assert!(cm.is_editable("ref.rs").unwrap());
     }
 
     #[test]

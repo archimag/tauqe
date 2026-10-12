@@ -77,6 +77,8 @@ pub struct PlanItem {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub files: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub readonly_files: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub concept_refs: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub children: Vec<PlanItem>,
@@ -355,6 +357,29 @@ impl Plan {
         walk(&mut self.items);
     }
 
+    /// Enforces the leaf-only file invariant across the plan.
+    ///
+    /// Parent items act as conceptual milestones, phases, and task groups.
+    /// They are never executed autonomously, so any `files` list attached to a
+    /// non-leaf item is cleared. Only leaf items (`is_leaf()`) define target
+    /// context files.
+    pub fn normalize_leaf_files(&mut self) {
+        fn walk(items: &mut [PlanItem]) {
+            for item in items.iter_mut() {
+                if item.children.is_empty() {
+                    if !item.readonly_files.is_empty() && !item.files.is_empty() {
+                        item.readonly_files.retain(|r| !item.files.contains(r));
+                    }
+                    continue;
+                }
+                item.files.clear();
+                item.readonly_files.clear();
+                walk(&mut item.children);
+            }
+        }
+        walk(&mut self.items);
+    }
+
     pub fn update_item_status(&mut self, item_id: &str, status: PlanItemStatus) -> bool {
         fn walk(items: &mut [PlanItem], item_id: &str, status: PlanItemStatus) -> bool {
             for item in items {
@@ -432,6 +457,9 @@ impl Plan {
                 }
                 if !item.files.is_empty() {
                     out.push_str(&format!("{}    files: {}\n", indent, item.files.join(", ")));
+                }
+                if !item.readonly_files.is_empty() {
+                    out.push_str(&format!("{}    readonly_files: {}\n", indent, item.readonly_files.join(", ")));
                 }
                 if let Some(details) = &item.details {
                     let trimmed = details.trim();
@@ -721,7 +749,7 @@ pub struct PlanListChangedEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::ModelTier;
+    use crate::model::ModelRole;
 
     fn item(id: &str, title: &str, status: PlanItemStatus, children: Vec<PlanItem>) -> PlanItem {
         PlanItem {
@@ -737,14 +765,19 @@ mod tests {
     fn test_plan_refine_types_serde_and_helpers() {
         let params = PlanRefineParams {
             plan_id: "core-feature".to_string(),
-            model: Some(ModelSelection::Tier(ModelTier::Senior)),
+            model: Some(ModelSelection::Role(ModelRole::Architect)),
             instructions: Some("Decompose into atomic steps".to_string()),
         };
         let json_params = serde_json::to_string(&params).unwrap();
         assert!(json_params.contains("\"core-feature\""));
-        assert!(json_params.contains("\"senior\""));
+        assert!(json_params.contains("\"architect\""));
         let de_params: PlanRefineParams = serde_json::from_str(&json_params).unwrap();
         assert_eq!(de_params, params);
+
+        // Backward compatibility with legacy tier string:
+        let legacy_json = r#"{"plan_id":"core-feature","model":"senior"}"#;
+        let legacy_params: PlanRefineParams = serde_json::from_str(legacy_json).unwrap();
+        assert_eq!(legacy_params.model, Some(ModelSelection::Role(ModelRole::Architect)));
 
         let plan = Plan {
             id: "core-feature".to_string(),
@@ -862,20 +895,23 @@ mod tests {
         let mut it = item("1.1", "Define claims", PlanItemStatus::InProgress, vec![]);
         it.details = Some("Claims struct with exp and sub".to_string());
         it.files = vec!["src/claims.rs".to_string()];
+        it.readonly_files = vec!["src/utils.rs".to_string()];
         it.concept_refs = vec!["c-1".to_string()];
 
         let json = serde_json::to_string(&it).unwrap();
         assert!(json.contains("\"in_progress\""));
         assert!(json.contains("\"files\""));
+        assert!(json.contains("\"readonly_files\""));
         assert!(json.contains("\"concept_refs\""));
 
         let de: PlanItem = serde_json::from_str(&json).unwrap();
         assert_eq!(de, it);
 
-        // Backward compatibility: missing concept, files, concept_refs deserialize to empty defaults
+        // Backward compatibility: missing concept, files, readonly_files, concept_refs deserialize to empty defaults
         let legacy_json = r#"{"id":"1.1","title":"Define claims","status":"in_progress"}"#;
         let legacy_item: PlanItem = serde_json::from_str(legacy_json).unwrap();
         assert!(legacy_item.files.is_empty());
+        assert!(legacy_item.readonly_files.is_empty());
         assert!(legacy_item.concept_refs.is_empty());
 
         let legacy_plan_json = r#"{"id":"p1","title":"Plan","created_at":1,"updated_at":2,"items":[]}"#;
@@ -1007,6 +1043,53 @@ mod tests {
     }
 
     #[test]
+    fn test_plan_normalize_leaf_files() {
+        let mut inner_leaf = item("1.1", "Inner Leaf", PlanItemStatus::Todo, vec![]);
+        inner_leaf.files = vec!["src/inner.rs".to_string(), "src/shared.rs".to_string()];
+        inner_leaf.readonly_files = vec!["src/ref.rs".to_string(), "src/shared.rs".to_string()];
+
+        let mut mid = item("1", "Mid Group", PlanItemStatus::Todo, vec![inner_leaf]);
+        mid.files = vec!["src/mid.rs".to_string()];
+        mid.readonly_files = vec!["src/mid_ref.rs".to_string()];
+
+        let mut top = item("root", "Root Group", PlanItemStatus::Todo, vec![mid]);
+        top.files = vec!["src/top.rs".to_string()];
+
+        let mut leaf = item("2", "Top Leaf", PlanItemStatus::Todo, vec![]);
+        leaf.files = vec!["src/leaf.rs".to_string()];
+        leaf.readonly_files = vec!["src/leaf_ref.rs".to_string()];
+
+        let mut plan = Plan {
+            id: "leaf-files".to_string(),
+            title: "Leaf Files".to_string(),
+            description: None,
+            created_at: 1,
+            updated_at: 1,
+            concept: vec![],
+            items: vec![top, leaf],
+        };
+
+        plan.normalize_leaf_files();
+
+        // Containers are cleared at every depth.
+        assert!(plan.items[0].files.is_empty());
+        assert!(plan.items[0].readonly_files.is_empty());
+        assert!(plan.items[0].children[0].files.is_empty());
+        assert!(plan.items[0].children[0].readonly_files.is_empty());
+        // Leaves keep their files, overlapping readonly_files are removed.
+        assert_eq!(
+            plan.items[0].children[0].children[0].files,
+            vec!["src/inner.rs".to_string(), "src/shared.rs".to_string()]
+        );
+        assert_eq!(
+            plan.items[0].children[0].children[0].readonly_files,
+            vec!["src/ref.rs".to_string()]
+        );
+        assert_eq!(plan.items[1].files, vec!["src/leaf.rs".to_string()]);
+        assert_eq!(plan.items[1].readonly_files, vec!["src/leaf_ref.rs".to_string()]);
+    }
+
+    #[test]
     fn test_plan_evaluate_scope() {
         let plan = Plan {
             id: "batch-test".to_string(),
@@ -1088,7 +1171,8 @@ mod tests {
             vec![item("1.1", "Claims", PlanItemStatus::Done, vec![])],
         );
         models.details = Some("Create token struct".to_string());
-        let endpoint = item("2", "Endpoint", PlanItemStatus::InProgress, vec![]);
+        let mut endpoint = item("2", "Endpoint", PlanItemStatus::InProgress, vec![]);
+        endpoint.readonly_files = vec!["src/models.rs".to_string()];
 
         let plan = Plan {
             id: "jwt-auth".to_string(),
@@ -1107,5 +1191,6 @@ mod tests {
         assert!(md.contains("    Create token struct"));
         assert!(md.contains("  - [x] DONE #1.1: Claims"));
         assert!(md.contains("- [>] IN_PROGRESS #2: Endpoint"));
+        assert!(md.contains("    readonly_files: src/models.rs"));
     }
 }

@@ -49,6 +49,7 @@ pub enum VisiblePlanRow {
         details: Option<String>,
         status: PlanItemStatus,
         files: Vec<String>,
+        readonly_files: Vec<String>,
         concept_refs: Vec<String>,
         depth: usize,
         has_children: bool,
@@ -300,7 +301,9 @@ impl PlansViewState {
     ) {
         let has_children = !item.children.is_empty();
         let has_details = item.details.as_deref().map(|s| !s.trim().is_empty()).unwrap_or(false);
-        let has_meta = !item.files.is_empty() || !item.concept_refs.is_empty();
+        let has_meta = !item.files.is_empty()
+            || !item.readonly_files.is_empty()
+            || !item.concept_refs.is_empty();
         let is_expandable = has_children || has_details || has_meta;
         let is_expanded = self.is_item_expanded(plan_id, &item.id);
 
@@ -311,6 +314,7 @@ impl PlansViewState {
             details: item.details.clone(),
             status: item.status,
             files: item.files.clone(),
+            readonly_files: item.readonly_files.clone(),
             concept_refs: item.concept_refs.clone(),
             depth,
             has_children,
@@ -411,7 +415,9 @@ impl PlansViewState {
         ) {
             let has_children = !item.children.is_empty();
             let has_details = item.details.as_deref().map(|s| !s.trim().is_empty()).unwrap_or(false);
-            let has_meta = !item.files.is_empty() || !item.concept_refs.is_empty();
+            let has_meta = !item.files.is_empty()
+                || !item.readonly_files.is_empty()
+                || !item.concept_refs.is_empty();
             let is_expandable = has_children || has_details || has_meta;
 
             out.push(PlanNodeRef {
@@ -791,6 +797,7 @@ fn compute_unified_plan_lines(
                 details,
                 status,
                 files,
+                readonly_files,
                 concept_refs,
                 depth,
                 has_children,
@@ -838,9 +845,20 @@ fn compute_unified_plan_lines(
                     Span::styled(format!("#{} {}", item_id, clean_title), title_style),
                 ];
 
-                if !files.is_empty() {
+                if !*has_children && (!files.is_empty() || !readonly_files.is_empty()) {
+                    let mut badge_parts = Vec::new();
+                    if !files.is_empty() {
+                        badge_parts.push(format!(
+                            "{} file{}",
+                            files.len(),
+                            if files.len() == 1 { "" } else { "s" }
+                        ));
+                    }
+                    if !readonly_files.is_empty() {
+                        badge_parts.push(format!("{} ref", readonly_files.len()));
+                    }
                     spans.push(Span::styled(
-                        format!(" [{} file{}]", files.len(), if files.len() == 1 { "" } else { "s" }),
+                        format!(" [{}]", badge_parts.join(" + ")),
                         Style::default().fg(Color::DarkGray),
                     ));
                 }
@@ -865,18 +883,25 @@ fn compute_unified_plan_lines(
                 let mut row_lines = vec![row_line];
 
                 if *is_expanded {
-                    if !concept_refs.is_empty() {
-                        row_lines.push(Line::from(vec![
-                            Span::styled(format!("{}    │ ", indent), Style::default().fg(Color::DarkGray)),
-                            Span::styled("ref: ", Style::default().fg(Color::DarkGray)),
-                            Span::styled(concept_refs.join(", "), Style::default().fg(Color::Magenta)),
-                        ]));
-                    }
-                    if !files.is_empty() {
+                    if !*has_children && !files.is_empty() {
                         row_lines.push(Line::from(vec![
                             Span::styled(format!("{}    │ ", indent), Style::default().fg(Color::DarkGray)),
                             Span::styled("files: ", Style::default().fg(Color::DarkGray)),
                             Span::styled(files.join(", "), Style::default().fg(Color::Cyan)),
+                        ]));
+                    }
+                    if !*has_children && !readonly_files.is_empty() {
+                        row_lines.push(Line::from(vec![
+                            Span::styled(format!("{}    │ ", indent), Style::default().fg(Color::DarkGray)),
+                            Span::styled("ref: ", Style::default().fg(Color::DarkGray)),
+                            Span::styled(readonly_files.join(", "), Style::default().fg(Color::LightCyan)),
+                        ]));
+                    }
+                    if !concept_refs.is_empty() {
+                        row_lines.push(Line::from(vec![
+                            Span::styled(format!("{}    │ ", indent), Style::default().fg(Color::DarkGray)),
+                            Span::styled("concept: ", Style::default().fg(Color::DarkGray)),
+                            Span::styled(concept_refs.join(", "), Style::default().fg(Color::Magenta)),
                         ]));
                     }
                     if let Some(det) = details {
@@ -1026,6 +1051,7 @@ mod tests {
                 details: None,
                 status: PlanItemStatus::Todo,
                 files: vec![],
+                readonly_files: vec![],
                 concept_refs: vec![],
                 children: vec![],
             }],
@@ -1076,6 +1102,7 @@ mod tests {
                 details: None,
                 status: PlanItemStatus::Todo,
                 files: vec!["src/jwt.rs".to_string()],
+                readonly_files: vec![],
                 concept_refs: vec!["c-1".to_string()],
                 children: vec![],
             }],
@@ -1098,5 +1125,104 @@ mod tests {
         // PlanHeader, ConceptHeader (collapsed), ImplementationHeader, PlanItem
         assert_eq!(rows_collapsed_concept.len(), 4);
         assert!(matches!(rows_collapsed_concept[1], VisiblePlanRow::ConceptHeader { is_expanded: false, .. }));
+    }
+
+    #[test]
+    fn test_file_badges_render_only_for_leaf_items() {
+        let mut view = PlansViewState::default();
+        let plan = Plan {
+            id: "leaf-files".to_string(),
+            title: "Leaf Files".to_string(),
+            description: None,
+            created_at: 0,
+            updated_at: 0,
+            concept: vec![],
+            items: vec![PlanItem {
+                id: "1".to_string(),
+                title: "Phase".to_string(),
+                details: None,
+                status: PlanItemStatus::Todo,
+                files: vec!["parent.rs".to_string()],
+                readonly_files: vec![],
+                concept_refs: vec![],
+                children: vec![PlanItem {
+                    id: "1.1".to_string(),
+                    title: "Leaf Task".to_string(),
+                    details: None,
+                    status: PlanItemStatus::Todo,
+                    files: vec!["leaf.rs".to_string()],
+                    readonly_files: vec![],
+                    concept_refs: vec![],
+                    children: vec![],
+                }],
+            }],
+        };
+        view.plans = vec![plan];
+        view.expand_all();
+
+        let rows = view.flatten_rows();
+        let (lines, _) = compute_unified_plan_lines(&rows, usize::MAX, 200);
+        let mut text = String::new();
+        for line in &lines {
+            for span in &line.spans {
+                text.push_str(&span.content);
+            }
+        }
+
+        assert!(text.contains("Leaf Task"), "leaf row should render: {}", text);
+        // Exactly one file badge: the leaf task. The parent phase carries a
+        // non-empty `files` list in memory but must never render a badge.
+        assert_eq!(
+            text.matches("file]").count(),
+            1,
+            "only leaf rows may show file badges: {}",
+            text
+        );
+    }
+
+    #[test]
+    fn test_reference_files_badge_and_details() {
+        let mut view = PlansViewState::default();
+        let plan = Plan {
+            id: "ref-files".to_string(),
+            title: "Reference Files".to_string(),
+            description: None,
+            created_at: 0,
+            updated_at: 0,
+            concept: vec![],
+            items: vec![PlanItem {
+                id: "1".to_string(),
+                title: "Wire Auth".to_string(),
+                details: None,
+                status: PlanItemStatus::Todo,
+                files: vec!["src/auth.rs".to_string()],
+                readonly_files: vec!["contracts/api.md".to_string(), "contracts/types.rs".to_string()],
+                concept_refs: vec![],
+                children: vec![],
+            }],
+        };
+        view.plans = vec![plan];
+        view.expand_all();
+
+        let rows = view.flatten_rows();
+        let (lines, _) = compute_unified_plan_lines(&rows, usize::MAX, 200);
+        let mut text = String::new();
+        for line in &lines {
+            for span in &line.spans {
+                text.push_str(&span.content);
+            }
+        }
+
+        assert!(
+            text.contains("[1 file + 2 ref]"),
+            "badge should count target and reference files: {}",
+            text
+        );
+        assert!(text.contains("files: src/auth.rs"), "target files line: {}", text);
+        assert!(
+            text.contains("ref: contracts/api.md, contracts/types.rs"),
+            "reference files line: {}",
+            text
+        );
     }
 }

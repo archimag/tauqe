@@ -1,22 +1,34 @@
 [providers.openrouter]
 models = [
   "~google/gemini-flash-latest",
+  "~google/gemini-pro-latest",
   "~openai/gpt-luna-latest",
   "~openai/gpt-sol-latest",
   "~anthropic/claude-opus-latest",
   "~anthropic/claude-sonnet-latest",
-  "~anthropic/claude-haiku-latest"
+  "~anthropic/claude-haiku-latest",
+  "~deepseek/deepseek-flash-latest",
+  "qwen/qwen3-coder-next"
 ]
 
 [models]
-junior = "~anthropic/claude-haiku-latest"
-middle = "~google/gemini-flash-latest"
-senior = "~anthropic/claude-sonnet-latest"
-default = "middle"
+# Semantic model roles: specialized domain roles instead of generic difficulty tiers.
+# If any role is omitted, it is deterministically inferred via a proximity fallback chain.
+# At least one role must be defined.
+scribe = "~anthropic/claude-haiku-latest"    # history compaction, git squash commit messages, diff summarization
+advisor = "~google/gemini-flash-latest"      # interactive engineering dialogue, develop consultation
+coder = "~deepseek/deepseek-flash-latest"    # code modification, patch generation, verification healing, plan step execution
+architect = "~google/gemini-pro-latest"      # conceptual design, plan refinement, escalation target
+reviewer = "~anthropic/claude-sonnet-latest" # automated code review of active context files
+
+# Automatically escalate from Coder to Architect when verification healing stalls,
+# when retry limits are exceeded, or when a plan step must be re-prompted after protocol drift
 auto_level_up = true
 
 [develop]
-max_retries = 5  # maximum retry attempts for failed edit staging
+# Retry budget for failed edit staging and for the plan step reprompt loop
+# (corrective re-runs of a step turn that produced no verified edits and no <success> tag).
+max_retries = 5
 # workflow = "git"   # edit workflow: "toolchain", "git", "naive" (default: "git")
 # protocol = "xml"   # active edit protocol: "xml" (default: "xml")
 
@@ -36,7 +48,7 @@ budget_tokens = 20000  # session history token budget before compaction is trigg
 # discovery_mode = "monotonic"  # context discovery strategy: "monotonic" (pure append-only growth, default), "incremental" (additive with explicit drops), or "snapshot" (full active working set declared each round)
 max_discovery_rounds = 8  # maximum rounds for autonomous context discovery
 max_files = 30  # maximum total files in context before stopping execution (default: 25)
-# repomap_token_budget = 4000  # token budget for the repository map (default: 4000)
+repomap_token_budget = 40000  # token budget for the repository map (default: 4000)
 pinned = [
     "Conventions.md",
     "Vision.md",

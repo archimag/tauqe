@@ -117,12 +117,12 @@ impl StructuredEditProtocol {
                 && !editable_paths.contains(&target_path)
             {
                 return ModelResult::Edit {
-                    summary: format!("File '{}' is not editable", target_path),
+                    summary: format!("File '{}' is not in context", target_path),
                     edits: Vec::new(),
                     proposal: Some(proposal),
                     applied: false,
                     error: Some(format!(
-                        "Permission error: file '{}' is not marked as editable in context. Permitted files: {}",
+                        "File '{}' is not present in context. To edit it, request it first via context_requests. Permitted files in context: {}",
                         target_path,
                         editable_paths.join(", ")
                     )),

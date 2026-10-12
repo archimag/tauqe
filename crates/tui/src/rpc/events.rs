@@ -128,7 +128,7 @@ pub async fn handle_event(
                     st.active_model = data.effective_model;
                     st.model_choice = crate::app::ModelChoice {
                         selection: data.selection,
-                        tiers: Some(data.tiers),
+                        roles: data.roles,
                     };
                 }
             }
@@ -179,6 +179,7 @@ pub async fn handle_event(
                     st.model.turn_round = None;
                     st.model.turn_max_rounds = None;
                     st.model.turn_phase_detail = None;
+                    st.model.plan_context = data.plan_context;
                     st.model.repomap_tokens = None;
                     st.model.auto_scroll = true;
                     st.model.current_cost = Some(0.0);
@@ -270,6 +271,7 @@ pub async fn handle_event(
                         }
                         if *is_reasoning {
                             *is_reasoning = false;
+                            st.model.reasoning.finalize();
                             st.model.reasoning.show = false;
                             let h = st.last_model_height;
                             st.model.clamp_scroll(h);
@@ -476,6 +478,7 @@ pub async fn handle_event(
         }
         events::MODEL_FINISHED => {
             *is_reasoning = false;
+            st.model.reasoning.finalize();
             st.confirm_cancel = false;
             if let Some(started) = st.turn_started_at.take() {
                 let elapsed = started.elapsed().as_secs();
@@ -528,6 +531,7 @@ pub async fn handle_event(
         }
         events::MODEL_CANCELLED => {
             *is_reasoning = false;
+            st.model.reasoning.finalize();
             st.confirm_cancel = false;
             st.turn_started_at = None;
             st.model.status = "cancelled".to_string();
@@ -549,6 +553,7 @@ pub async fn handle_event(
         }
         events::MODEL_ERROR => {
             *is_reasoning = false;
+            st.model.reasoning.finalize();
             st.confirm_cancel = false;
             if let Some(started) = st.turn_started_at.take() {
                 let elapsed = started.elapsed().as_secs();

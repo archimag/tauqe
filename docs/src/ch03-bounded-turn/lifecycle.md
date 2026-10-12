@@ -49,6 +49,14 @@ Modifications never touch disk unverified:
 - TAUQE executes project-specific toolchain checks (`cargo check`, `npm test`).
 - If compilation fails, compiler diagnostics are parsed and returned to the model for an immediate **Self-Healing Loop**, fixing syntax and type errors automatically before concluding the turn.
 
+### Verification Healing and Role Escalation
+
+When verification errors occur, the model enters a targeted healing cycle:
+1. Compiler error messages and diagnostic line spans are parsed and formatted into a targeted healing prompt.
+2. Missing error paths are automatically staged into the context working set.
+3. The prompt is presented to the active role (typically `Coder`).
+4. **Escalation to Architect:** If verification fails repeatedly or patch staging errors persist across retries, superficial syntactic adjustments are often insufficient because the failure stems from a deeper architectural contradiction or missing dependency. When `auto_level_up` is enabled in configuration, the harness automatically escalates the healing turn from `Coder` to `Architect`. The `Architect` model re-evaluates the problem with higher-order reasoning, adjusting types and signatures to resolve the blocker before the turn concludes.
+
 ---
 
 ## 3.4 Turn Scratchpad: Ephemeral Working Memory

@@ -1,255 +1,54 @@
 use std::sync::Arc;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use tauqe_protocol::{methods, ModelSelectParams, ModelSelection, ReviewStartParams};
+use tauqe_protocol::{methods, ReviewStartParams};
 use tokio::process::ChildStdin;
-use tokio::sync::{Mutex, MutexGuard};
+use tokio::sync::Mutex;
 
-use crate::app::{AppState, ConfirmDialogButton, SelectionDialogKind, SelectionItem, ViewMode};
-use crate::input::{is_char_typing, squash, InputResult};
-use crate::rpc::{
-    allocate_request_id, record_optimistic_rollback, send_request, send_request_with_id,
-    OptimisticRollback,
-};
+use crate::app::{AppState, SelectionDialogKind, ViewMode};
+use crate::input::{squash, InputResult};
+use crate::rpc::send_request;
 use crate::ui::develop::DevelopView;
 use crate::ui::history::HistoryViewState;
 
-enum ConfirmOutcome {
-    Toggled,
-    Accepted,
-    Dismissed,
-}
+mod confirm;
+mod discuss;
+mod prompt;
+mod refine;
+mod selection;
+mod status;
 
-/// Standard key handling for `[ Confirm ] / [ Cancel ]` modals (§7 Conventions):
-/// arrows/Tab cycle buttons, `Enter`/`Space` activates the focused button,
-/// `y`/`Y` confirms immediately, `n`/`N`/`Esc`/`q` dismisses safely.
-fn resolve_confirm(st: &mut AppState, key: KeyEvent) -> ConfirmOutcome {
-    match key.code {
-        KeyCode::Left | KeyCode::Right | KeyCode::Tab | KeyCode::BackTab => {
-            st.confirm_button = match st.confirm_button {
-                ConfirmDialogButton::Cancel => ConfirmDialogButton::Confirm,
-                ConfirmDialogButton::Confirm => ConfirmDialogButton::Cancel,
-            };
-            ConfirmOutcome::Toggled
-        }
-        KeyCode::Enter | KeyCode::Char(' ') => {
-            let accepted = st.confirm_button == ConfirmDialogButton::Confirm;
-            st.confirm_button = ConfirmDialogButton::Cancel;
-            if accepted {
-                ConfirmOutcome::Accepted
-            } else {
-                ConfirmOutcome::Dismissed
-            }
-        }
-        KeyCode::Char('y') | KeyCode::Char('Y') if is_char_typing(key.modifiers) => {
-            st.confirm_button = ConfirmDialogButton::Cancel;
-            ConfirmOutcome::Accepted
-        }
-        KeyCode::Char('n') | KeyCode::Char('N') if is_char_typing(key.modifiers) => {
-            st.confirm_button = ConfirmDialogButton::Cancel;
-            ConfirmOutcome::Dismissed
-        }
-        KeyCode::Esc | KeyCode::Char('q') => {
-            st.confirm_button = ConfirmDialogButton::Cancel;
-            ConfirmOutcome::Dismissed
-        }
-        _ => ConfirmOutcome::Toggled,
-    }
-}
+use confirm::{resolve_confirm, ConfirmOutcome};
+pub(crate) use selection::activate_selection_item;
+pub(crate) use status::apply_status_dialog;
 
-/// Applies a model choice optimistically and registers a rollback so that a failed
-/// `model/select` restores the previously active selection.
-async fn submit_prompt_modal(
-    mut st: MutexGuard<'_, AppState>,
-    dialog: crate::app::PromptModalState,
-    server_writer: &mut ChildStdin,
-) -> anyhow::Result<Option<InputResult>> {
-    let user_comment = dialog.prompt_editor.get_text().trim().to_string();
-    if user_comment.is_empty() {
-        st.notify_warning("Comment is empty");
-        st.prompt_modal = Some(dialog);
-        return Ok(Some(InputResult::Continue));
-    }
-
-    match &dialog.target {
-        crate::app::PromptModalTarget::Review {
-            review_id,
-            focused_items,
-            ..
-        } => {
-            let session = st
-                .review
-                .sessions
-                .iter()
-                .find(|s| &s.id == review_id)
-                .cloned()
-                .or_else(|| {
-                    st.review
-                        .session
-                        .as_ref()
-                        .filter(|s| &s.id == review_id)
-                        .cloned()
-                });
-
-            if let Some(session) = session {
-                let focused_ids: Vec<u32> =
-                    focused_items.iter().map(|(id, _)| *id).collect();
-                let prompt = tauqe_protocol::review::format_review_discussion_prompt_items(
-                    &session,
-                    &focused_ids,
-                    &user_comment,
-                );
-
-                st.view_mode = ViewMode::Develop;
-                st.model.reasoning.clear();
-                st.model.text.clear();
-                st.model.markdown_lines.clear();
-                st.model.error = None;
-                st.model.result = None;
-                st.model.usage = None;
-                st.model.scroll = 0;
-                st.model.status = "awaiting".to_string();
-                st.model.auto_scroll = true;
-                st.model.current_cost = Some(0.0);
-                st.model.edits_active = false;
-                st.model.files.clear();
-                st.model.selected_file_index = 0;
-                st.model.edit_final_applied = None;
-                st.model.edit_final_error = None;
-                st.model.last_commit_hash = None;
-                st.model.last_commit_summary = None;
-                st.model.toolchain_command = None;
-                st.model.toolchain_status = None;
-                st.model.copy_flash = None;
-                st.model.code_blocks.clear();
-                st.turn_started_at = Some(std::time::Instant::now());
-
-                drop(st);
-                send_request(
-                    server_writer,
-                    methods::MODEL_ASK,
-                    serde_json::json!({ "prompt": prompt }),
-                )
-                .await?;
-                Ok(Some(InputResult::Continue))
-            } else {
-                st.notify_error(format!("Review session '{}' not found", review_id));
-                st.prompt_modal = Some(dialog);
-                Ok(Some(InputResult::Continue))
-            }
-        }
-        crate::app::PromptModalTarget::Plan {
-            plan_id,
-            focused_items,
-            ..
-        } => {
-            let plan = st
-                .plans_view
-                .plans
-                .iter()
-                .find(|p| &p.id == plan_id)
-                .cloned();
-            if let Some(plan) = plan {
-                let focused_ids: Vec<String> =
-                    focused_items.iter().map(|(id, _)| id.clone()).collect();
-                let prompt = tauqe_protocol::plan::format_plan_discussion_prompt(
-                    &plan,
-                    &focused_ids,
-                    &user_comment,
-                );
-
-                st.view_mode = ViewMode::Develop;
-                st.model.reasoning.clear();
-                st.model.text.clear();
-                st.model.markdown_lines.clear();
-                st.model.error = None;
-                st.model.result = None;
-                st.model.usage = None;
-                st.model.scroll = 0;
-                st.model.status = "awaiting".to_string();
-                st.model.auto_scroll = true;
-                st.model.current_cost = Some(0.0);
-                st.model.edits_active = false;
-                st.model.files.clear();
-                st.model.selected_file_index = 0;
-                st.model.edit_final_applied = None;
-                st.model.edit_final_error = None;
-                st.model.last_commit_hash = None;
-                st.model.last_commit_summary = None;
-                st.model.toolchain_command = None;
-                st.model.toolchain_status = None;
-                st.model.copy_flash = None;
-                st.model.code_blocks.clear();
-                st.turn_started_at = Some(std::time::Instant::now());
-
-                drop(st);
-                send_request(
-                    server_writer,
-                    methods::MODEL_ASK,
-                    serde_json::json!({ "prompt": prompt }),
-                )
-                .await?;
-                Ok(Some(InputResult::Continue))
-            } else {
-                st.notify_error(format!("Plan '{}' not found", plan_id));
-                st.prompt_modal = Some(dialog);
-                Ok(Some(InputResult::Continue))
-            }
-        }
-    }
-}
-
-async fn apply_model_selection(
-    mut st: MutexGuard<'_, AppState>,
-    selection: ModelSelection,
-    server_writer: &mut ChildStdin,
-) -> anyhow::Result<()> {
-    st.selection_dialog = None;
-    let prev_model = st.active_model.clone();
-    let prev_selection = std::mem::replace(&mut st.model_choice.selection, selection.clone());
-    if let Some(effective) = st.model_choice.resolve(&selection) {
-        st.active_model = effective;
-    }
-    let req_id = allocate_request_id();
-    record_optimistic_rollback(
-        req_id,
-        OptimisticRollback::ActiveModel {
-            prev_model,
-            prev_selection,
-        },
-    );
-    drop(st);
-    let params = ModelSelectParams { selection };
-    send_request_with_id(
-        server_writer,
-        req_id,
-        methods::MODEL_SELECT,
-        serde_json::to_value(params)?,
-    )
-    .await
-}
-
-/// Applies the chosen picker row (shared by keyboard and mouse): a tier or a model is
-/// selected, `Others...` opens the full model catalog.
-pub(super) async fn activate_selection_item(
-    mut st: MutexGuard<'_, AppState>,
-    item: SelectionItem,
-    server_writer: &mut ChildStdin,
-) -> anyhow::Result<()> {
-    match item {
-        SelectionItem::Tier(tier, _) => {
-            apply_model_selection(st, ModelSelection::Tier(tier), server_writer).await
-        }
-        SelectionItem::Model(model) => {
-            apply_model_selection(st, ModelSelection::Specific(model), server_writer).await
-        }
-        SelectionItem::Others => {
-            if !st.open_model_catalog() {
-                st.notify_warning("No other models are available");
-            }
-            Ok(())
-        }
-    }
+/// Resets the Develop view and marks the start of a new autonomous turn. Shared by
+/// every dialog that launches a model request (prompt, discuss, refine, plan and
+/// review execution) so the state transition stays consistent.
+fn begin_develop_turn(st: &mut AppState) {
+    st.view_mode = ViewMode::Develop;
+    st.model.reasoning.clear();
+    st.model.text.clear();
+    st.model.markdown_lines.clear();
+    st.model.error = None;
+    st.model.result = None;
+    st.model.usage = None;
+    st.model.scroll = 0;
+    st.model.status = "awaiting".to_string();
+    st.model.auto_scroll = true;
+    st.model.current_cost = Some(0.0);
+    st.model.edits_active = false;
+    st.model.files.clear();
+    st.model.selected_file_index = 0;
+    st.model.edit_final_applied = None;
+    st.model.edit_final_error = None;
+    st.model.last_commit_hash = None;
+    st.model.last_commit_summary = None;
+    st.model.toolchain_command = None;
+    st.model.toolchain_status = None;
+    st.model.copy_flash = None;
+    st.model.code_blocks.clear();
+    st.turn_started_at = Some(std::time::Instant::now());
 }
 
 /// The plan view is refreshed from server responses, so nothing is cleared locally
@@ -274,124 +73,6 @@ pub(crate) async fn delete_review(server_writer: &mut ChildStdin, review_id: Str
     )
     .await?;
     send_request(server_writer, methods::REVIEW_LIST, serde_json::json!({})).await?;
-    Ok(())
-}
-
-pub(crate) async fn apply_status_dialog(
-    st: &mut AppState,
-    chosen_idx: usize,
-    server_writer: &mut ChildStdin,
-) -> anyhow::Result<()> {
-    let dialog = match st.status_dialog.take() {
-        Some(d) => d,
-        None => return Ok(()),
-    };
-
-    match dialog.target {
-        crate::app::StatusDialogTarget::PlanItem {
-            plan_id,
-            item_id,
-            current_status,
-            ..
-        } => {
-            let statuses = [
-                tauqe_protocol::PlanItemStatus::Discussion,
-                tauqe_protocol::PlanItemStatus::Todo,
-                tauqe_protocol::PlanItemStatus::InProgress,
-                tauqe_protocol::PlanItemStatus::Done,
-                tauqe_protocol::PlanItemStatus::Cancelled,
-            ];
-            let new_status = match statuses.get(chosen_idx).copied() {
-                Some(s) => s,
-                None => return Ok(()),
-            };
-
-            if new_status != current_status {
-                if let Some(plan) = st.plans_view.plans.iter_mut().find(|p| p.id == plan_id) {
-                    plan.update_item_status(&item_id, new_status);
-                }
-                let req_id = crate::rpc::allocate_request_id();
-                crate::rpc::record_optimistic_rollback(
-                    req_id,
-                    crate::rpc::OptimisticRollback::PlanItemStatus {
-                        plan_id: plan_id.clone(),
-                        item_id: item_id.clone(),
-                        prev_status: current_status,
-                    },
-                );
-                let params = tauqe_protocol::PlanUpdateItemParams {
-                    plan_id,
-                    item_id,
-                    status: Some(new_status),
-                };
-                crate::rpc::send_request_with_id(
-                    server_writer,
-                    req_id,
-                    methods::PLAN_UPDATE_ITEM,
-                    serde_json::to_value(params)?,
-                )
-                .await?;
-            }
-        }
-        crate::app::StatusDialogTarget::ReviewItem {
-            review_id,
-            item_id,
-            current_status,
-            ..
-        } => {
-            let statuses = [
-                tauqe_protocol::ReviewStatus::Discussion,
-                tauqe_protocol::ReviewStatus::Todo,
-                tauqe_protocol::ReviewStatus::InProgress,
-                tauqe_protocol::ReviewStatus::Fixed,
-                tauqe_protocol::ReviewStatus::Rejected,
-            ];
-            let new_status = match statuses.get(chosen_idx).copied() {
-                Some(s) => s,
-                None => return Ok(()),
-            };
-
-            if new_status != current_status {
-                for session in &mut st.review.sessions {
-                    if review_id.as_ref().map(|id| id == &session.id).unwrap_or(true) {
-                        if let Some(item) = session.items.iter_mut().find(|i| i.id == item_id) {
-                            item.status = new_status;
-                        }
-                    }
-                }
-                if let Some(session) = st.review.session.as_mut() {
-                    if let Some(item) = session.items.iter_mut().find(|i| i.id == item_id) {
-                        item.status = new_status;
-                    }
-                }
-                if st.review.hide_closed {
-                    st.review.clamp_selection();
-                    st.review.scroll_to_selected();
-                }
-                let req_id = crate::rpc::allocate_request_id();
-                crate::rpc::record_optimistic_rollback(
-                    req_id,
-                    crate::rpc::OptimisticRollback::ReviewItemStatus {
-                        item_id,
-                        prev_status: current_status,
-                    },
-                );
-                let target_review_id = review_id.or_else(|| st.review.session.as_ref().map(|s| s.id.clone()));
-                let params = tauqe_protocol::ReviewUpdateItemParams {
-                    review_id: target_review_id,
-                    item_id,
-                    status: Some(new_status),
-                };
-                crate::rpc::send_request_with_id(
-                    server_writer,
-                    req_id,
-                    methods::REVIEW_UPDATE_ITEM,
-                    serde_json::to_value(params)?,
-                )
-                .await?;
-            }
-        }
-    }
     Ok(())
 }
 
@@ -586,30 +267,7 @@ pub async fn handle_dialog_event(
             ConfirmOutcome::Toggled => st.confirm_execute_review = Some(target),
             ConfirmOutcome::Dismissed => {}
             ConfirmOutcome::Accepted => {
-                st.view_mode = ViewMode::Develop;
-                st.model.reasoning.clear();
-                st.model.text.clear();
-                st.model.markdown_lines.clear();
-                st.model.error = None;
-                st.model.result = None;
-                st.model.usage = None;
-                st.model.scroll = 0;
-                st.model.status = "awaiting".to_string();
-                st.model.auto_scroll = true;
-                st.model.current_cost = Some(0.0);
-                st.model.edits_active = false;
-                st.model.files.clear();
-                st.model.selected_file_index = 0;
-                st.model.edit_final_applied = None;
-                st.model.edit_final_error = None;
-                st.model.last_commit_hash = None;
-                st.model.last_commit_summary = None;
-                st.model.toolchain_command = None;
-                st.model.toolchain_status = None;
-                st.model.copy_flash = None;
-                st.model.code_blocks.clear();
-                st.turn_started_at = Some(std::time::Instant::now());
-
+                begin_develop_turn(&mut st);
                 drop(st);
                 let params = tauqe_protocol::ReviewExecuteParams {
                     review_id: target.review_id,
@@ -632,30 +290,7 @@ pub async fn handle_dialog_event(
             ConfirmOutcome::Toggled => st.confirm_execute_scope = Some(target),
             ConfirmOutcome::Dismissed => {}
             ConfirmOutcome::Accepted => {
-                st.view_mode = ViewMode::Develop;
-                st.model.reasoning.clear();
-                st.model.text.clear();
-                st.model.markdown_lines.clear();
-                st.model.error = None;
-                st.model.result = None;
-                st.model.usage = None;
-                st.model.scroll = 0;
-                st.model.status = "awaiting".to_string();
-                st.model.auto_scroll = true;
-                st.model.current_cost = Some(0.0);
-                st.model.edits_active = false;
-                st.model.files.clear();
-                st.model.selected_file_index = 0;
-                st.model.edit_final_applied = None;
-                st.model.edit_final_error = None;
-                st.model.last_commit_hash = None;
-                st.model.last_commit_summary = None;
-                st.model.toolchain_command = None;
-                st.model.toolchain_status = None;
-                st.model.copy_flash = None;
-                st.model.code_blocks.clear();
-                st.turn_started_at = Some(std::time::Instant::now());
-
+                begin_develop_turn(&mut st);
                 drop(st);
                 let params = tauqe_protocol::PlanExecuteParams {
                     plan_id: target.plan_id,
@@ -673,308 +308,23 @@ pub async fn handle_dialog_event(
     }
 
     // 4a-3. Discuss plan dialog
-    if let Some(mut dialog) = st.discuss_plan_dialog.take() {
-        let primary = st.tui_config.input.primary_modifier;
-        let is_ctrl_alt = key.modifiers.contains(KeyModifiers::CONTROL)
-            && key.modifiers.contains(KeyModifiers::ALT);
-        let is_cmd = !is_ctrl_alt
-            && (primary.matches(key.modifiers) || key.modifiers.contains(KeyModifiers::CONTROL));
-        let has_shift = key.modifiers.contains(KeyModifiers::SHIFT);
-        let has_alt = key.modifiers.contains(KeyModifiers::ALT);
-
-        match key.code {
-            KeyCode::Esc => {
-                return Ok(Some(InputResult::Continue));
-            }
-            KeyCode::Enter if !has_shift && !has_alt => {
-                let user_comment = dialog.prompt_editor.get_text().trim().to_string();
-                if user_comment.is_empty() {
-                    st.notify_warning("Comment is empty");
-                    st.discuss_plan_dialog = Some(dialog);
-                    return Ok(Some(InputResult::Continue));
-                }
-
-                let plan = st.plans_view.plans.iter().find(|p| p.id == dialog.plan_id).cloned();
-                if let Some(plan) = plan {
-                    let focused_ids: Vec<String> = dialog.focused_items.iter().map(|(id, _)| id.clone()).collect();
-                    let prompt = tauqe_protocol::plan::format_plan_discussion_prompt(
-                        &plan,
-                        &focused_ids,
-                        &user_comment,
-                    );
-
-                    st.view_mode = ViewMode::Develop;
-                    st.model.reasoning.clear();
-                    st.model.text.clear();
-                    st.model.markdown_lines.clear();
-                    st.model.error = None;
-                    st.model.result = None;
-                    st.model.usage = None;
-                    st.model.scroll = 0;
-                    st.model.status = "awaiting".to_string();
-                    st.model.auto_scroll = true;
-                    st.model.current_cost = Some(0.0);
-                    st.model.edits_active = false;
-                    st.model.files.clear();
-                    st.model.selected_file_index = 0;
-                    st.model.edit_final_applied = None;
-                    st.model.edit_final_error = None;
-                    st.model.last_commit_hash = None;
-                    st.model.last_commit_summary = None;
-                    st.model.toolchain_command = None;
-                    st.model.toolchain_status = None;
-                    st.model.copy_flash = None;
-                    st.model.code_blocks.clear();
-                    st.turn_started_at = Some(std::time::Instant::now());
-
-                    drop(st);
-                    send_request(
-                        server_writer,
-                        methods::MODEL_ASK,
-                        serde_json::json!({ "prompt": prompt }),
-                    )
-                    .await?;
-                    return Ok(Some(InputResult::Continue));
-                } else {
-                    st.notify_error(format!("Plan '{}' not found", dialog.plan_id));
-                    st.discuss_plan_dialog = Some(dialog);
-                    return Ok(Some(InputResult::Continue));
-                }
-            }
-            _ => {
-                crate::input::handle_editor_key(
-                    &mut dialog.prompt_editor,
-                    key,
-                    is_cmd,
-                    true,
-                );
-                st.discuss_plan_dialog = Some(dialog);
-                return Ok(Some(InputResult::Continue));
-            }
-        }
+    if st.discuss_plan_dialog.is_some() {
+        return discuss::handle_discuss_plan(key, st, server_writer).await;
     }
 
     // 4a-3b. Plan refine dialog
-    if let Some(mut dialog) = st.plans_view.refine_dialog.take() {
-        let primary = st.tui_config.input.primary_modifier;
-        let is_ctrl_alt = key.modifiers.contains(KeyModifiers::CONTROL)
-            && key.modifiers.contains(KeyModifiers::ALT);
-        let is_cmd = !is_ctrl_alt
-            && (primary.matches(key.modifiers) || key.modifiers.contains(KeyModifiers::CONTROL));
-        let has_shift = key.modifiers.contains(KeyModifiers::SHIFT);
-        let has_alt = key.modifiers.contains(KeyModifiers::ALT);
-
-        match key.code {
-            KeyCode::Esc => {
-                return Ok(Some(InputResult::Continue));
-            }
-            KeyCode::Left | KeyCode::Right => {
-                dialog.confirm_button = match dialog.confirm_button {
-                    crate::app::ConfirmDialogButton::Cancel => crate::app::ConfirmDialogButton::Confirm,
-                    crate::app::ConfirmDialogButton::Confirm => crate::app::ConfirmDialogButton::Cancel,
-                };
-                st.plans_view.refine_dialog = Some(dialog);
-                return Ok(Some(InputResult::Continue));
-            }
-            KeyCode::Tab => {
-                dialog.confirm_button = match dialog.confirm_button {
-                    crate::app::ConfirmDialogButton::Cancel => crate::app::ConfirmDialogButton::Confirm,
-                    crate::app::ConfirmDialogButton::Confirm => crate::app::ConfirmDialogButton::Cancel,
-                };
-                st.plans_view.refine_dialog = Some(dialog);
-                return Ok(Some(InputResult::Continue));
-            }
-            KeyCode::BackTab => {
-                dialog.confirm_button = match dialog.confirm_button {
-                    crate::app::ConfirmDialogButton::Cancel => crate::app::ConfirmDialogButton::Confirm,
-                    crate::app::ConfirmDialogButton::Confirm => crate::app::ConfirmDialogButton::Cancel,
-                };
-                st.plans_view.refine_dialog = Some(dialog);
-                return Ok(Some(InputResult::Continue));
-            }
-            KeyCode::Up => {
-                let count = dialog.models.len();
-                if count > 0 {
-                    dialog.selected_model_index = (dialog.selected_model_index + count - 1) % count;
-                }
-                st.plans_view.refine_dialog = Some(dialog);
-                return Ok(Some(InputResult::Continue));
-            }
-            KeyCode::Down => {
-                let count = dialog.models.len();
-                if count > 0 {
-                    dialog.selected_model_index = (dialog.selected_model_index + 1) % count;
-                }
-                st.plans_view.refine_dialog = Some(dialog);
-                return Ok(Some(InputResult::Continue));
-            }
-            KeyCode::Enter if !has_shift && !has_alt => {
-                if dialog.confirm_button == crate::app::ConfirmDialogButton::Cancel {
-                    return Ok(Some(InputResult::Continue));
-                }
-
-                let instructions_raw = dialog.instructions_editor.get_text().trim().to_string();
-                let instructions = if instructions_raw.is_empty() {
-                    None
-                } else {
-                    Some(instructions_raw)
-                };
-                let selected_model = dialog
-                    .models
-                    .get(dialog.selected_model_index)
-                    .and_then(|(_, m)| m.clone());
-
-                let params = tauqe_protocol::PlanRefineParams {
-                    plan_id: dialog.plan_id.clone(),
-                    model: selected_model,
-                    instructions,
-                };
-
-                st.plans_view.refining = true;
-                st.plans_view.refining_plan_id = Some(dialog.plan_id.clone());
-                st.view_mode = ViewMode::Develop;
-                st.model.reasoning.clear();
-                st.model.text.clear();
-                st.model.markdown_lines.clear();
-                st.model.error = None;
-                st.model.result = None;
-                st.model.usage = None;
-                st.model.scroll = 0;
-                st.model.status = "awaiting".to_string();
-                st.model.auto_scroll = true;
-                st.model.current_cost = Some(0.0);
-                st.model.edits_active = false;
-                st.model.files.clear();
-                st.model.selected_file_index = 0;
-                st.model.edit_final_applied = None;
-                st.model.edit_final_error = None;
-                st.model.last_commit_hash = None;
-                st.model.last_commit_summary = None;
-                st.model.toolchain_command = None;
-                st.model.toolchain_status = None;
-                st.model.copy_flash = None;
-                st.model.code_blocks.clear();
-                st.turn_started_at = Some(std::time::Instant::now());
-
-                drop(st);
-                send_request(
-                    server_writer,
-                    methods::PLAN_REFINE,
-                    serde_json::to_value(params)?,
-                )
-                .await?;
-                return Ok(Some(InputResult::Continue));
-            }
-            _ => {
-                crate::input::handle_editor_key(
-                    &mut dialog.instructions_editor,
-                    key,
-                    is_cmd,
-                    true,
-                );
-                st.plans_view.refine_dialog = Some(dialog);
-                return Ok(Some(InputResult::Continue));
-            }
-        }
+    if st.plans_view.refine_dialog.is_some() {
+        return refine::handle_refine_dialog(key, st, server_writer).await;
     }
 
     // 4a-3c. Plan refine blocked modal
-    if let Some(blocked) = st.plans_view.refine_blocked.take() {
-        match key.code {
-            KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => {
-                return Ok(Some(InputResult::Continue));
-            }
-            KeyCode::Char('d') | KeyCode::Char('D') => {
-                let plan = st.plans_view.plans.iter().find(|p| p.id == blocked.plan_id).cloned();
-                if let Some(plan) = plan {
-                    let mut editor = crate::editor::InputEditor::default();
-                    editor.insert_str(&format!(
-                        "The architect reported blockers during plan refinement:\n{}\n\nHow should we resolve these requirements or architecture contradictions?",
-                        blocked.reason
-                    ));
-                    st.discuss_plan_dialog = Some(crate::app::DiscussPlanDialogState {
-                        plan_id: plan.id,
-                        plan_title: plan.title,
-                        focused_items: Vec::new(),
-                        prompt_editor: editor,
-                    });
-                }
-                return Ok(Some(InputResult::Continue));
-            }
-            _ => {
-                st.plans_view.refine_blocked = Some(blocked);
-                return Ok(Some(InputResult::Continue));
-            }
-        }
+    if st.plans_view.refine_blocked.is_some() {
+        return refine::handle_refine_blocked(key, st);
     }
 
     // 4a-4. Prompt modal dialog (unified discussion)
-    if let Some(mut modal) = st.prompt_modal.take() {
-        let primary = st.tui_config.input.primary_modifier;
-        let is_ctrl_alt = key.modifiers.contains(KeyModifiers::CONTROL)
-            && key.modifiers.contains(KeyModifiers::ALT);
-        let is_cmd = !is_ctrl_alt
-            && (primary.matches(key.modifiers) || key.modifiers.contains(KeyModifiers::CONTROL));
-
-        if modal.focus.is_actions() {
-            match key.code {
-                KeyCode::Esc | KeyCode::Char('q') => {
-                    return Ok(Some(InputResult::Continue));
-                }
-                KeyCode::Tab | KeyCode::BackTab => {
-                    modal.focus = crate::app::ModalFocus::Editor;
-                    st.prompt_modal = Some(modal);
-                    return Ok(Some(InputResult::Continue));
-                }
-                KeyCode::Left | KeyCode::Right => {
-                    modal.actions.toggle();
-                    st.prompt_modal = Some(modal);
-                    return Ok(Some(InputResult::Continue));
-                }
-                KeyCode::Char('y') | KeyCode::Char('Y') if is_char_typing(key.modifiers) => {
-                    return submit_prompt_modal(st, modal, server_writer).await;
-                }
-                KeyCode::Char('n') | KeyCode::Char('N') if is_char_typing(key.modifiers) => {
-                    return Ok(Some(InputResult::Continue));
-                }
-                KeyCode::Enter | KeyCode::Char(' ') => {
-                    if modal.actions.is_confirm() {
-                        return submit_prompt_modal(st, modal, server_writer).await;
-                    } else {
-                        return Ok(Some(InputResult::Continue));
-                    }
-                }
-                _ => {
-                    st.prompt_modal = Some(modal);
-                    return Ok(Some(InputResult::Continue));
-                }
-            }
-        }
-
-        match key.code {
-            KeyCode::Esc => {
-                return Ok(Some(InputResult::Continue));
-            }
-            KeyCode::Tab | KeyCode::BackTab => {
-                modal.focus = crate::app::ModalFocus::Actions;
-                modal.actions.reset_to_cancel();
-                st.prompt_modal = Some(modal);
-                return Ok(Some(InputResult::Continue));
-            }
-            KeyCode::Enter if is_cmd => {
-                return submit_prompt_modal(st, modal, server_writer).await;
-            }
-            _ => {
-                crate::input::handle_editor_key(
-                    &mut modal.prompt_editor,
-                    key,
-                    is_cmd,
-                    true,
-                );
-                st.prompt_modal = Some(modal);
-                return Ok(Some(InputResult::Continue));
-            }
-        }
+    if st.prompt_modal.is_some() {
+        return prompt::handle_prompt_modal(key, st, server_writer).await;
     }
 
     // 4. Clear history confirmation
@@ -1112,7 +462,7 @@ pub async fn handle_dialog_event(
                     activate_selection_item(st, item, server_writer).await?;
                 }
             }
-            KeyCode::Char(c @ '1'..='4') if dialog.kind == SelectionDialogKind::ModelTiers => {
+            KeyCode::Char(c @ '1'..='6') if dialog.kind == SelectionDialogKind::ModelRoles => {
                 if let Some(item) = dialog.items.get(c as usize - '1' as usize).cloned() {
                     activate_selection_item(st, item, server_writer).await?;
                 }

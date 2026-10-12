@@ -29,7 +29,7 @@ pub async fn handle_model_ask(req: Request, state: &Arc<AppState>) -> Response {
         }
     };
 
-    match start_model_turn(state, params.prompt, None).await {
+    match start_model_turn(state, params.prompt, None, None).await {
         Ok(op_id) => Response {
             id: req.id,
             result: Some(serde_json::json!({ "operation_id": op_id })),
@@ -71,13 +71,13 @@ pub async fn handle_model_select(req: Request, state: &Arc<AppState>) -> Respons
         }
     };
 
-    let (selection, effective_model, tiers) = {
+    let (selection, effective_model, roles) = {
         let mut cur = state.current_selection.lock().await;
         *cur = params.selection.clone();
         let cfg = state.config.lock().await;
         let effective = cfg.resolve_model(&cur);
-        let tiers = cfg.tiers_summary();
-        (cur.clone(), effective, tiers)
+        let roles = cfg.roles_summary();
+        (cur.clone(), effective, roles)
     };
 
     state.out.send_event(&Event {
@@ -85,7 +85,7 @@ pub async fn handle_model_select(req: Request, state: &Arc<AppState>) -> Respons
         params: serde_json::to_value(tauqe_protocol::ModelChangedEvent {
             selection: selection.clone(),
             effective_model: effective_model.clone(),
-            tiers: tiers.clone(),
+            roles: Some(roles.clone()),
         })
         .ok(),
     });
@@ -95,7 +95,7 @@ pub async fn handle_model_select(req: Request, state: &Arc<AppState>) -> Respons
         &tauqe_protocol::ModelSelectResult {
             selection,
             effective_model,
-            tiers,
+            roles: Some(roles),
         },
     )
 }
@@ -104,15 +104,15 @@ pub async fn handle_model_current(req: Request, state: &Arc<AppState>) -> Respon
     let selection = state.current_selection().await;
     let cfg = state.config.lock().await;
     let effective_model = cfg.resolve_model(&selection);
-    let tiers = cfg.tiers_summary();
     let available_models = cfg.available_models();
+    let roles = cfg.roles_summary();
 
     Response::ok_typed(
         req.id,
         &tauqe_protocol::ModelCurrentResult {
             selection,
             effective_model,
-            tiers,
+            roles: Some(roles),
             available_models,
         },
     )
@@ -166,6 +166,7 @@ struct PreparedTurn {
 async fn prepare_turn(
     state: &Arc<AppState>,
     custom_selection: Option<tauqe_protocol::ModelSelection>,
+    plan_context: Option<tauqe_protocol::ModelTurnPlanContext>,
 ) -> Result<PreparedTurn, ResponseError> {
     let (provider, model, app_config, selection) = {
         let cfg = state.config.lock().await;
@@ -195,6 +196,7 @@ async fn prepare_turn(
         params: Some(serde_json::json!({
             "operation_id": op_id.clone(),
             "model": model,
+            "plan_context": plan_context,
         })),
     });
 
@@ -762,8 +764,9 @@ pub async fn start_model_turn(
     state: &Arc<AppState>,
     prompt: String,
     custom_selection: Option<tauqe_protocol::ModelSelection>,
+    plan_context: Option<tauqe_protocol::ModelTurnPlanContext>,
 ) -> Result<String, ResponseError> {
-    let prepared = prepare_turn(state, custom_selection).await?;
+    let prepared = prepare_turn(state, custom_selection, plan_context).await?;
     let op_id = prepared.op_id.clone();
     let state_clone = Arc::clone(state);
     tokio::spawn(async move {
@@ -781,8 +784,9 @@ pub async fn execute_model_turn(
     state: &Arc<AppState>,
     prompt: String,
     custom_selection: Option<tauqe_protocol::ModelSelection>,
+    plan_context: Option<tauqe_protocol::ModelTurnPlanContext>,
 ) -> Result<ModelTurnResult, ResponseError> {
-    let prepared = prepare_turn(state, custom_selection).await?;
+    let prepared = prepare_turn(state, custom_selection, plan_context).await?;
     run_prepared_turn(state, prompt, prepared).await
 }
 
@@ -931,6 +935,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_handle_model_current_and_select_roles_summary() {
+        let (out, _rx) = crate::transport::OutChannel::new();
+        let (hist_tx, _hist_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut config = tauqe_core::config::AppConfig::default();
+        config.models.scribe = Some(tauqe_protocol::ModelRef::openrouter("test/scribe"));
+        config.models.coder = Some(tauqe_protocol::ModelRef::openrouter("test/coder"));
+        config.models.architect = Some(tauqe_protocol::ModelRef::openrouter("test/architect"));
+        config.models.advisor = Some(tauqe_protocol::ModelRef::openrouter("test/advisor"));
+        config.models.reviewer = Some(tauqe_protocol::ModelRef::openrouter("test/reviewer"));
+
+        let state = AppState::new(
+            config,
+            std::path::PathBuf::from("/nonexistent"),
+            hist_tx,
+            out,
+        );
+
+        // 1. Initial selection defaults to Advisor
+        let req_current = Request {
+            id: tauqe_protocol::RequestId::Number(1),
+            method: tauqe_protocol::methods::MODEL_CURRENT.to_string(),
+            params: None,
+        };
+        let res_current = handle_model_current(req_current, &state).await;
+        assert!(res_current.error.is_none());
+        let current_val: tauqe_protocol::ModelCurrentResult =
+            serde_json::from_value(res_current.result.unwrap()).unwrap();
+        assert_eq!(
+            current_val.selection,
+            tauqe_protocol::ModelSelection::Role(tauqe_protocol::ModelRole::Advisor)
+        );
+        let roles = current_val.roles.unwrap();
+        assert_eq!(roles.scribe, tauqe_protocol::ModelRef::openrouter("test/scribe"));
+        assert_eq!(roles.coder, tauqe_protocol::ModelRef::openrouter("test/coder"));
+        assert_eq!(roles.architect, tauqe_protocol::ModelRef::openrouter("test/architect"));
+        assert_eq!(roles.advisor, tauqe_protocol::ModelRef::openrouter("test/advisor"));
+        assert_eq!(roles.reviewer, tauqe_protocol::ModelRef::openrouter("test/reviewer"));
+
+        // 2. Select Coder role
+        let req_select = Request {
+            id: tauqe_protocol::RequestId::Number(2),
+            method: tauqe_protocol::methods::MODEL_SELECT.to_string(),
+            params: Some(serde_json::json!({
+                "selection": "coder"
+            })),
+        };
+        let res_select = handle_model_select(req_select, &state).await;
+        assert!(res_select.error.is_none());
+        let select_val: tauqe_protocol::ModelSelectResult =
+            serde_json::from_value(res_select.result.unwrap()).unwrap();
+        assert_eq!(
+            select_val.selection,
+            tauqe_protocol::ModelSelection::Role(tauqe_protocol::ModelRole::Coder)
+        );
+        assert_eq!(
+            select_val.effective_model,
+            tauqe_protocol::ModelRef::openrouter("test/coder")
+        );
+        let selected_roles = select_val.roles.unwrap();
+        assert_eq!(selected_roles.advisor, tauqe_protocol::ModelRef::openrouter("test/advisor"));
+    }
+
+    #[tokio::test]
     async fn test_turn_preparation_no_api_key() {
         let (out, _rx) = crate::transport::OutChannel::new();
         let (hist_tx, _hist_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -941,11 +1008,11 @@ mod tests {
             out,
         );
 
-        let res_start = start_model_turn(&state, "test prompt".to_string(), None).await;
+        let res_start = start_model_turn(&state, "test prompt".to_string(), None, None).await;
         assert!(res_start.is_err());
         assert_eq!(res_start.unwrap_err().code, "NO_API_KEY");
 
-        let res_exec = execute_model_turn(&state, "test prompt".to_string(), None).await;
+        let res_exec = execute_model_turn(&state, "test prompt".to_string(), None, None).await;
         assert!(res_exec.is_err());
         assert_eq!(res_exec.unwrap_err().code, "NO_API_KEY");
     }

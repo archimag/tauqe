@@ -13,12 +13,13 @@ use crate::state::AppState;
 pub fn config_state(cfg: &AppConfig, selection: Option<&ModelSelection>) -> ConfigState {
     let sel = selection.cloned().unwrap_or_else(|| cfg.default_selection());
     let effective = cfg.resolve_model(&sel);
+    let roles = cfg.roles_summary();
     ConfigState {
         workflow: cfg.develop.workflow.clone(),
         edit_protocol: cfg.develop.protocol.clone(),
         model: effective,
         selection: Some(sel),
-        tiers: Some(cfg.tiers_summary()),
+        roles: Some(roles),
         history_model: Some(cfg.history_model()),
         available_workflows: WorkflowFactory::available_workflows(),
         available_edit_protocols: EditProtocolFactory::available_protocols(),
@@ -138,7 +139,7 @@ pub async fn handle_config_set(req: Request, state: &Arc<AppState>) -> Response 
                     }),
                 };
             }
-            cfg.models.junior = Some(hist_model.clone());
+            cfg.models.scribe = Some(hist_model.clone());
         }
 
         if let Some(wf) = params.workflow {
@@ -238,7 +239,7 @@ pub async fn handle_system_status(req: Request, state: &Arc<AppState>) -> Respon
         "ready": ready,
         "model": effective_model,
         "selection": *cur_sel,
-        "tiers": cfg.tiers_summary(),
+        "roles": cfg.roles_summary(),
         "history_model": cfg.history_model(),
         "available_models": cfg.available_models(),
     });
@@ -305,7 +306,7 @@ pub async fn handle_config_reload(req: Request, state: &Arc<AppState>) -> Respon
         "ready": ready,
         "model": effective_model,
         "selection": cur_sel_val,
-        "tiers": cfg.tiers_summary(),
+        "roles": cfg.roles_summary(),
         "history_model": cfg.history_model(),
         "available_models": cfg.available_models(),
     });
@@ -380,7 +381,7 @@ pub async fn handle_config_create(req: Request, state: &Arc<AppState>) -> Respon
             "ready": has_api_key,
             "model": effective_model,
             "selection": cur_sel_val,
-            "tiers": cfg.tiers_summary(),
+            "roles": cfg.roles_summary(),
             "history_model": cfg.history_model(),
             "available_models": cfg.available_models(),
         })),
@@ -473,7 +474,7 @@ pub async fn handle_credentials_save(req: Request, state: &Arc<AppState>) -> Res
             "ready": has_api_key,
             "model": effective_model,
             "selection": cur_sel_val,
-            "tiers": cfg.tiers_summary(),
+            "roles": cfg.roles_summary(),
             "history_model": cfg.history_model(),
             "available_models": cfg.available_models(),
         })),
@@ -533,10 +534,87 @@ pub async fn handle_credentials_create_stub(req: Request, state: &Arc<AppState>)
             "ready": has_api_key,
             "model": effective_model,
             "selection": *cur_sel,
-            "tiers": cfg.tiers_summary(),
+            "roles": cfg.roles_summary(),
             "history_model": cfg.history_model(),
             "available_models": cfg.available_models(),
         })),
         error: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tauqe_protocol::{ModelRef, ModelRole};
+
+    #[tokio::test]
+    async fn test_config_state_roles_and_scribe_history() {
+        let mut cfg = AppConfig::default();
+        cfg.models.scribe = Some(ModelRef::openrouter("anthropic/claude-3.5-haiku"));
+        cfg.models.coder = Some(ModelRef::openrouter("anthropic/claude-3.7-sonnet"));
+        cfg.models.architect = Some(ModelRef::openrouter("anthropic/claude-3.7-sonnet"));
+        cfg.models.advisor = Some(ModelRef::openrouter("google/gemini-2.5-flash"));
+        cfg.models.reviewer = Some(ModelRef::openrouter("anthropic/claude-3.7-sonnet"));
+
+        let st = config_state(&cfg, None);
+        assert_eq!(
+            st.history_model,
+            Some(ModelRef::openrouter("anthropic/claude-3.5-haiku"))
+        );
+
+        let roles = st.roles.expect("roles summary must be present");
+        assert_eq!(
+            roles.scribe,
+            ModelRef::openrouter("anthropic/claude-3.5-haiku")
+        );
+        assert_eq!(
+            roles.coder,
+            ModelRef::openrouter("anthropic/claude-3.7-sonnet")
+        );
+        assert_eq!(
+            roles.architect,
+            ModelRef::openrouter("anthropic/claude-3.7-sonnet")
+        );
+        assert_eq!(
+            roles.advisor,
+            ModelRef::openrouter("google/gemini-2.5-flash")
+        );
+        assert_eq!(
+            roles.reviewer,
+            ModelRef::openrouter("anthropic/claude-3.7-sonnet")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_handle_config_set_model_role_selection() {
+        let mut cfg = AppConfig::default();
+        cfg.models.scribe = Some(ModelRef::openrouter("model/scribe"));
+        cfg.models.coder = Some(ModelRef::openrouter("model/coder"));
+
+        let (out, _rx) = crate::transport::OutChannel::new();
+        let (history_sender, _hrx) = tokio::sync::mpsc::unbounded_channel();
+        let state = AppState::new(cfg, std::env::temp_dir(), history_sender, out);
+
+        let req = Request {
+            id: tauqe_protocol::RequestId::Number(1),
+            method: "config/set".to_string(),
+            params: Some(serde_json::to_value(ConfigSetParams {
+                workflow: None,
+                edit_protocol: None,
+                model: None,
+                selection: Some(ModelSelection::Role(ModelRole::Scribe)),
+                history_model: None,
+            }).unwrap()),
+        };
+
+        let resp = handle_config_set(req, &state).await;
+        assert!(resp.error.is_none());
+
+        let res_state: ConfigState = serde_json::from_value(resp.result.unwrap()).unwrap();
+        assert_eq!(
+            res_state.selection,
+            Some(ModelSelection::Role(ModelRole::Scribe))
+        );
+        assert_eq!(res_state.model, ModelRef::openrouter("model/scribe"));
     }
 }

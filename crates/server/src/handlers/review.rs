@@ -9,12 +9,12 @@ use tauqe_core::review::{
 };
 use tauqe_core::workflow::common::apply_context_requests_detailed;
 use tauqe_protocol::{
-    events, ContextAccess, Event, ModelUsageEvent, ModelUsageInfo, Request, Response,
-    ReviewContentDeltaEvent, ReviewDeleteParams, ReviewDeleteResult, ReviewErrorEvent,
-    ReviewExecuteParams, ReviewFinishedEvent, ReviewGetParams, ReviewGetResult, ReviewItemStatus,
-    ReviewListChangedEvent, ReviewListResult, ReviewReasoningDeltaEvent, ReviewSession,
-    ReviewStartParams, ReviewStartedEvent, ReviewUpdateItemParams, ReviewUpdateItemResult,
-    ReviewUpdatedEvent,
+    events, ContextAccess, Event, ModelRole, ModelSelection, ModelUsageEvent, ModelUsageInfo,
+    Request, Response, ReviewContentDeltaEvent, ReviewDeleteParams, ReviewDeleteResult,
+    ReviewErrorEvent, ReviewExecuteParams, ReviewFinishedEvent, ReviewGetParams, ReviewGetResult,
+    ReviewItemStatus, ReviewListChangedEvent, ReviewListResult, ReviewReasoningDeltaEvent,
+    ReviewSession, ReviewStartParams, ReviewStartedEvent, ReviewUpdateItemParams,
+    ReviewUpdateItemResult, ReviewUpdatedEvent,
 };
 use tokio::sync::{mpsc, watch};
 
@@ -60,10 +60,7 @@ pub async fn handle_review_start(req: Request, state: &Arc<AppState>) -> Respons
         let cfg = state.config.lock().await;
         let model = match params.model.clone() {
             Some(m) => m,
-            None => {
-                let selection = state.current_selection.lock().await;
-                cfg.resolve_model(&selection)
-            }
+            None => cfg.resolve_role(ModelRole::Reviewer),
         };
         let provider: Arc<dyn LlmProvider> = match create_provider(model.provider, &cfg) {
             Ok(p) => Arc::from(p),
@@ -588,7 +585,12 @@ async fn run_review_step(
         }
     };
 
-    match execute_model_turn(state, prompt, item.model.clone()).await {
+    let step_selection = item
+        .model
+        .clone()
+        .unwrap_or(ModelSelection::Role(ModelRole::Coder));
+
+    match execute_model_turn(state, prompt, Some(step_selection), None).await {
         Ok(turn) if turn.is_success() => {
             set_item_status(state, repo_root, review_id, item_id, ReviewItemStatus::Fixed);
             Ok(())
@@ -770,12 +772,12 @@ mod tests {
     struct TestDir(std::path::PathBuf);
     impl TestDir {
         fn new() -> Self {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
             let path = std::env::temp_dir().join(format!(
-                "tauqe-test-review-{}",
-                SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_nanos()
+                "tauqe-test-review-{}-{}",
+                std::process::id(),
+                COUNTER.fetch_add(1, Ordering::Relaxed)
             ));
             let _ = std::fs::create_dir_all(&path);
             Self(path)
@@ -826,6 +828,37 @@ mod tests {
             items,
             raw_markdown: String::new(),
         }
+    }
+
+    #[tokio::test]
+    async fn test_handle_review_start_defaults_to_reviewer_role() {
+        let dir = TestDir::new();
+        let target_file = dir.path().join("file.rs");
+        std::fs::write(&target_file, "fn foo() {}\n").unwrap();
+
+        let mut config = tauqe_core::config::AppConfig::default();
+        config.models.reviewer = Some(tauqe_protocol::ModelRef::openrouter("test/reviewer-model"));
+        config.models.advisor = Some(tauqe_protocol::ModelRef::openrouter("test/advisor-model"));
+
+        let (out, _rx) = OutChannel::new();
+        let (hist_tx, _hist_rx) = tokio::sync::mpsc::unbounded_channel();
+        let state = AppState::new(config, dir.path().to_path_buf(), hist_tx, out);
+
+        state
+            .context
+            .write()
+            .await
+            .add_file("file.rs", ContextAccess::ReadOnly)
+            .unwrap();
+
+        let req = Request {
+            id: tauqe_protocol::RequestId::Number(1),
+            method: tauqe_protocol::methods::REVIEW_START.to_string(),
+            params: None,
+        };
+        let res = handle_review_start(req, &state).await;
+        let err = res.error.expect("should fail without api key");
+        assert_eq!(err.code, "NO_API_KEY");
     }
 
     #[tokio::test]

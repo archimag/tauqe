@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::model::{ModelRef, ModelSelection, ModelTiersSummary};
+use crate::model::{ModelRef, ModelRolesSummary, ModelSelection};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConfigState {
@@ -10,7 +10,7 @@ pub struct ConfigState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selection: Option<ModelSelection>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tiers: Option<ModelTiersSummary>,
+    pub roles: Option<ModelRolesSummary>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub history_model: Option<ModelRef>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -62,8 +62,41 @@ pub struct SystemStatusResult {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selection: Option<ModelSelection>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tiers: Option<ModelTiersSummary>,
+    pub roles: Option<ModelRolesSummary>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub history_model: Option<ModelRef>,
     pub available_models: Vec<ModelRef>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{ModelRef, ModelRole, ModelRolesSummary, ModelSelection};
+
+    #[test]
+    fn test_config_state_roles_serde() {
+        let state = ConfigState {
+            workflow: "git".to_string(),
+            edit_protocol: "xml".to_string(),
+            model: ModelRef::openrouter("anthropic/claude-3.5-sonnet"),
+            selection: Some(ModelSelection::Role(ModelRole::Coder)),
+            roles: Some(ModelRolesSummary {
+                scribe: ModelRef::openrouter("scribe-model"),
+                coder: ModelRef::openrouter("coder-model"),
+                architect: ModelRef::openrouter("architect-model"),
+                advisor: ModelRef::openrouter("advisor-model"),
+                reviewer: ModelRef::openrouter("reviewer-model"),
+            }),
+            history_model: Some(ModelRef::openrouter("scribe-model")),
+            available_workflows: vec!["git".to_string()],
+            available_edit_protocols: vec!["xml".to_string()],
+            available_models: vec![ModelRef::openrouter("coder-model")],
+        };
+
+        let json = serde_json::to_string(&state).unwrap();
+        assert!(json.contains("\"roles\""));
+        assert!(json.contains("\"coder\""));
+        let de: ConfigState = serde_json::from_str(&json).unwrap();
+        assert_eq!(de.roles.unwrap().coder, ModelRef::openrouter("coder-model"));
+    }
 }

@@ -2,7 +2,7 @@ use std::path::Path;
 
 use tokio::sync::mpsc;
 use tokio::sync::watch;
-use tauqe_protocol::{EditProposal, ModelRef, ModelResult};
+use tauqe_protocol::{EditProposal, ModelRef, ModelResult, ModelRole};
 
 use super::common::{
     execute_edit_pipeline, record_workflow_response, run_verification_healing_loop,
@@ -41,7 +41,7 @@ impl Default for WorkflowOptions {
             history_budget_tokens: crate::history::DEFAULT_HISTORY_BUDGET_TOKENS,
             history_tail_turns: crate::history::DEFAULT_TAIL_TURNS_COUNT,
             repomap_token_budget: crate::repomap::DEFAULT_REPOMAP_TOKEN_BUDGET,
-            history_model: ModelRef::openrouter(crate::config::BUILTIN_DEFAULT_JUNIOR_MODEL),
+            history_model: ModelRef::openrouter(crate::config::BUILTIN_DEFAULT_SCRIBE_MODEL),
             auto_level_up: false,
             models_config: crate::config::ModelsConfig::default(),
             initial_selection: None,
@@ -65,7 +65,7 @@ impl WorkflowOptions {
             history_budget_tokens: config.history.budget_tokens,
             history_tail_turns: config.history.tail_turns,
             repomap_token_budget: config.context.repomap_token_budget,
-            history_model: config.resolve_tier(tauqe_protocol::ModelTier::Junior),
+            history_model: config.history_model(),
             auto_level_up: config.models.auto_level_up,
             models_config: config.models.clone(),
             initial_selection: None,
@@ -75,11 +75,10 @@ impl WorkflowOptions {
     }
 }
 
-fn next_tier(tier: tauqe_protocol::ModelTier) -> Option<tauqe_protocol::ModelTier> {
-    match tier {
-        tauqe_protocol::ModelTier::Junior => Some(tauqe_protocol::ModelTier::Middle),
-        tauqe_protocol::ModelTier::Middle => Some(tauqe_protocol::ModelTier::Senior),
-        tauqe_protocol::ModelTier::Senior => None,
+pub(crate) fn next_role(role: ModelRole) -> Option<ModelRole> {
+    match role {
+        ModelRole::Coder => Some(ModelRole::Architect),
+        _ => None,
     }
 }
 
@@ -184,14 +183,11 @@ pub(crate) async fn execute_workflow_lifecycle<T: WorkflowTransaction>(
     let target_review_item_id = target_review_target.as_ref().map(|t| t.item_id);
 
     let mut current_model = model.clone();
-    let mut current_tier = if is_isolated_step {
-        match options.initial_selection {
-            Some(tauqe_protocol::ModelSelection::Tier(t)) => Some(t),
-            Some(tauqe_protocol::ModelSelection::Specific(_)) => None,
-            None => Some(options.models_config.default),
-        }
-    } else {
-        None
+    let mut current_role = match options.initial_selection {
+        Some(tauqe_protocol::ModelSelection::Role(role)) => Some(role),
+        Some(tauqe_protocol::ModelSelection::Specific(_)) => None,
+        None if is_isolated_step => Some(ModelRole::Coder),
+        None => None,
     };
 
     let mut dynamic_provider: Option<Box<dyn LlmProvider>> = None;
@@ -301,24 +297,24 @@ pub(crate) async fn execute_workflow_lifecycle<T: WorkflowTransaction>(
                 error,
                 ..
             } => {
-                let escalation = if is_isolated_step && options.auto_level_up {
-                    current_tier.and_then(|cur| next_tier(cur).map(|next| (cur, next)))
+                let escalation = if options.auto_level_up {
+                    current_role.and_then(|cur| next_role(cur).map(|next| (cur, next)))
                 } else {
                     None
                 };
 
                 if let Some(err_msg) = error {
-                    if let Some((cur_t, next_t)) = escalation {
-                        let next_m = options.models_config.resolve_tier(next_t);
+                    if let Some((cur_r, next_r)) = escalation {
+                        let next_m = options.models_config.resolve_role(next_r);
                         if next_m != current_model {
                             let _ = transaction.on_rollback(&repo_root);
                             context_manager.prune_missing_files();
                             let notice = format!(
                                 "\n\n> ⚠️ **Level Up Escalation:** Step generation failed on `{}` ({}: {}). Escalating to `{}` ({})...\n\n",
-                                cur_t, current_model, err_msg, next_t, next_m
+                                cur_r, current_model, err_msg, next_r, next_m
                             );
                             let _ = stream_tx.send(StreamEvent::TextDelta(notice)).await;
-                            current_tier = Some(next_t);
+                            current_role = Some(next_r);
                             if next_m.provider != current_model.provider {
                                 if let Some(ref app_cfg) = options.app_config {
                                     if let Ok(np) = crate::providers::create_provider(next_m.provider, app_cfg) {
@@ -342,17 +338,17 @@ pub(crate) async fn execute_workflow_lifecycle<T: WorkflowTransaction>(
                     };
                     break;
                 } else if edits.is_empty() {
-                    if let Some((cur_t, next_t)) = escalation {
-                        let next_m = options.models_config.resolve_tier(next_t);
+                    if let Some((cur_r, next_r)) = escalation {
+                        let next_m = options.models_config.resolve_role(next_r);
                         if next_m != current_model {
                             let _ = transaction.on_rollback(&repo_root);
                             context_manager.prune_missing_files();
                             let notice = format!(
                                 "\n\n> ⚠️ **Level Up Escalation:** Model `{}` ({}) produced no valid edits. Escalating to `{}` ({})...\n\n",
-                                cur_t, current_model, next_t, next_m
+                                cur_r, current_model, next_r, next_m
                             );
                             let _ = stream_tx.send(StreamEvent::TextDelta(notice)).await;
-                            current_tier = Some(next_t);
+                            current_role = Some(next_r);
                             if next_m.provider != current_model.provider {
                                 if let Some(ref app_cfg) = options.app_config {
                                     if let Ok(np) = crate::providers::create_provider(next_m.provider, app_cfg) {
@@ -557,17 +553,17 @@ pub(crate) async fn execute_workflow_lifecycle<T: WorkflowTransaction>(
                                     break;
                                 }
                                 VerificationHealingResult::Failed(outcome) => {
-                                    if let Some((cur_t, next_t)) = escalation {
-                                        let next_m = options.models_config.resolve_tier(next_t);
+                                    if let Some((cur_r, next_r)) = escalation {
+                                        let next_m = options.models_config.resolve_role(next_r);
                                         if next_m != current_model {
                                             let _ = transaction.on_rollback(&repo_root);
                                             context_manager.prune_missing_files();
                                             let notice = format!(
                                                 "\n\n> ⚠️ **Level Up Escalation:** Verification failed on `{}` ({})\n> Rolling back working tree to pre-step checkpoint and escalating to `{}` ({})...\n\n",
-                                                cur_t, current_model, next_t, next_m
+                                                cur_r, current_model, next_r, next_m
                                             );
                                             let _ = stream_tx.send(StreamEvent::TextDelta(notice)).await;
-                                            current_tier = Some(next_t);
+                                            current_role = Some(next_r);
                                             if next_m.provider != current_model.provider {
                                                 if let Some(ref app_cfg) = options.app_config {
                                                     if let Ok(np) = crate::providers::create_provider(next_m.provider, app_cfg) {
@@ -610,17 +606,17 @@ pub(crate) async fn execute_workflow_lifecycle<T: WorkflowTransaction>(
                             }
                         }
                         Err(err) => {
-                            if let Some((cur_t, next_t)) = escalation {
-                                let next_m = options.models_config.resolve_tier(next_t);
+                            if let Some((cur_r, next_r)) = escalation {
+                                let next_m = options.models_config.resolve_role(next_r);
                                 if next_m != current_model {
                                     let _ = transaction.on_rollback(&repo_root);
                                     context_manager.prune_missing_files();
                                     let notice = format!(
                                         "\n\n> ⚠️ **Level Up Escalation:** Patch application failed on `{}` ({}). Escalating to `{}` ({})...\n\n",
-                                        cur_t, current_model, next_t, next_m
+                                        cur_r, current_model, next_r, next_m
                                     );
                                     let _ = stream_tx.send(StreamEvent::TextDelta(notice)).await;
-                                    current_tier = Some(next_t);
+                                    current_role = Some(next_r);
                                     if next_m.provider != current_model.provider {
                                         if let Some(ref app_cfg) = options.app_config {
                                             if let Ok(np) = crate::providers::create_provider(next_m.provider, app_cfg) {
@@ -788,14 +784,14 @@ pub(crate) async fn execute_workflow_lifecycle<T: WorkflowTransaction>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tauqe_protocol::ModelTier;
     use crate::providers::ChatMessage;
 
     #[test]
-    fn test_next_tier_escalation_chain() {
-        assert_eq!(next_tier(ModelTier::Junior), Some(ModelTier::Middle));
-        assert_eq!(next_tier(ModelTier::Middle), Some(ModelTier::Senior));
-        assert_eq!(next_tier(ModelTier::Senior), None);
+    fn test_next_role_escalation_chain() {
+        assert_eq!(next_role(ModelRole::Coder), Some(ModelRole::Architect));
+        assert_eq!(next_role(ModelRole::Architect), None);
+        assert_eq!(next_role(ModelRole::Scribe), None);
+        assert_eq!(next_role(ModelRole::Advisor), None);
     }
 
     struct MockReviewStreamProvider {
@@ -1058,6 +1054,7 @@ mod tests {
                 details: None,
                 status: tauqe_protocol::PlanItemStatus::Todo,
                 files: vec![],
+                readonly_files: vec![],
                 concept_refs: vec![],
                 children: vec![],
             }],
@@ -1137,6 +1134,7 @@ mod tests {
                 details: None,
                 status: tauqe_protocol::PlanItemStatus::Todo,
                 files: vec![],
+                readonly_files: vec![],
                 concept_refs: vec![],
                 children: vec![],
             }],
@@ -1203,5 +1201,149 @@ mod tests {
             }
             _ => panic!("Expected Response entry"),
         }
+    }
+
+    struct MockMultiModelProvider {
+        invocations: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmProvider for MockMultiModelProvider {
+        fn kind(&self) -> tauqe_protocol::ProviderKind {
+            tauqe_protocol::ProviderKind::OpenRouter
+        }
+
+        async fn stream_chat(
+            &self,
+            model: &str,
+            _messages: Vec<ChatMessage>,
+            _response_format: Option<crate::providers::ResponseFormat>,
+            tx: mpsc::Sender<StreamEvent>,
+            _cancel_rx: watch::Receiver<bool>,
+        ) -> anyhow::Result<()> {
+            self.invocations.lock().unwrap().push(model.to_string());
+            let chunk = if model == "test/coder" {
+                // Coder attempts edit with unmatched search block -> patch application fails
+                "<tauqe_edits_MOCKESC summary=\"Coder attempt\">\n<edit_MOCKESC path=\"target.rs\">\n<search_MOCKESC>\nnonexistent pattern\n</search_MOCKESC>\n<replace_MOCKESC>\nreplacement\n</replace_MOCKESC>\n</edit_MOCKESC>\n</tauqe_edits_MOCKESC>".to_string()
+            } else {
+                // Architect rethinks and provides correct replacement
+                "<tauqe_edits_MOCKESC summary=\"Architect architectural fix\">\n<edit_MOCKESC path=\"target.rs\">\n<search_MOCKESC>\npub fn compute() -> i32 { 0 }\n</search_MOCKESC>\n<replace_MOCKESC>\npub fn compute() -> i32 { 42 }\n</replace_MOCKESC>\n</edit_MOCKESC>\n</tauqe_edits_MOCKESC>\n<success_MOCKESC summary=\"Architectural fix verified\" />".to_string()
+            };
+
+            let _ = tx.send(StreamEvent::TextDelta(chunk)).await;
+            let _ = tx.send(StreamEvent::Done).await;
+            Ok(())
+        }
+
+        async fn stream_text(
+            &self,
+            _model: &str,
+            _messages: Vec<ChatMessage>,
+            tx: mpsc::Sender<StreamEvent>,
+            _cancel_rx: watch::Receiver<bool>,
+        ) -> anyhow::Result<()> {
+            let _ = tx.send(StreamEvent::Done).await;
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn test_step_lifecycle_coder_to_architect_escalation() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_root = dir.path().to_path_buf();
+        let _ = crate::git::init_repository(Some(&repo_root), true).unwrap();
+
+        std::fs::write(repo_root.join("target.rs"), "pub fn compute() -> i32 { 0 }\n").unwrap();
+        crate::git::cmd::stage_files(&repo_root, &["target.rs".to_string()]).unwrap();
+        crate::git::cmd::commit_with_developer_author(&repo_root, "Initial commit", false).unwrap();
+
+        let plan = tauqe_protocol::Plan {
+            id: "plan-escalate".to_string(),
+            title: "Plan with escalation".to_string(),
+            description: None,
+            created_at: 100,
+            updated_at: 100,
+            concept: vec![],
+            items: vec![tauqe_protocol::PlanItem {
+                id: "step-esc".to_string(),
+                title: "Complex architectural step".to_string(),
+                details: None,
+                status: tauqe_protocol::PlanItemStatus::Todo,
+                files: vec!["target.rs".to_string()],
+                readonly_files: vec![],
+                concept_refs: vec![],
+                children: vec![],
+            }],
+        };
+        crate::plan::storage::PlanStorage::save_plan(&repo_root, &plan).unwrap();
+        crate::plan::storage::PlanStorage::save_active_id(&repo_root, Some("plan-escalate")).unwrap();
+
+        let mut context_manager = ContextManager::new(repo_root.clone());
+        context_manager.add_file("target.rs", tauqe_protocol::ContextAccess::Editable).unwrap();
+        let mut history_manager = HistoryManager::new(repo_root.clone());
+
+        let marker = "MOCKESC";
+        let protocol = crate::edits::protocol::xml::MarkedXmlEditProtocol::new(marker);
+
+        let prompt = crate::plan::prompt::format_plan_step_execution_prompt(&plan, "step-esc", marker).unwrap();
+
+        let provider = MockMultiModelProvider {
+            invocations: std::sync::Mutex::new(Vec::new()),
+        };
+
+        let coder_ref = ModelRef::openrouter("test/coder");
+        let architect_ref = ModelRef::openrouter("test/architect");
+
+        let models_config = crate::config::ModelsConfig {
+            scribe: Some(ModelRef::openrouter("test/scribe")),
+            coder: Some(coder_ref.clone()),
+            architect: Some(architect_ref.clone()),
+            advisor: Some(ModelRef::openrouter("test/advisor")),
+            reviewer: Some(ModelRef::openrouter("test/reviewer")),
+            auto_level_up: true,
+        };
+
+        let options = WorkflowOptions {
+            max_retries: 0,
+            auto_level_up: true,
+            models_config,
+            initial_selection: Some(tauqe_protocol::ModelSelection::Role(ModelRole::Coder)),
+            ..Default::default()
+        };
+
+        let tx_mock = MockTx {
+            commit_hash: Some("commit-after-architect".to_string()),
+        };
+
+        let (tx, _rx) = mpsc::channel(100);
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+
+        let res = execute_workflow_lifecycle(
+            "git",
+            &options,
+            tx_mock,
+            &prompt,
+            &provider,
+            &coder_ref,
+            &mut context_manager,
+            &mut history_manager,
+            &protocol,
+            tx,
+            cancel_rx,
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(res.result, ModelResult::Edit { applied: true, .. }));
+        let updated_content = std::fs::read_to_string(repo_root.join("target.rs")).unwrap();
+        assert!(updated_content.contains("pub fn compute() -> i32 { 42 }"));
+
+        let invocations = provider.invocations.lock().unwrap().clone();
+        assert_eq!(invocations, vec!["test/coder", "test/architect"]);
+
+        let updated_plan = crate::plan::storage::PlanStorage::load_plan(&repo_root, "plan-escalate")
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated_plan.items[0].status, tauqe_protocol::PlanItemStatus::Done);
     }
 }

@@ -3,8 +3,8 @@ use std::sync::Arc;
 
 use tauqe_core::providers::{create_provider, ChatMessage, StreamEvent};
 use tauqe_protocol::{
-    errors, events, Event, GitDiffParams, GitDiffResult, RepositoryListFilesResult, Request,
-    Response,
+    errors, events, Event, GitDiffParams, GitDiffResult, ModelRole, RepositoryListFilesResult,
+    Request, Response,
 };
 
 use crate::state::AppState;
@@ -239,7 +239,7 @@ pub async fn handle_git_squash_generate_message(req: Request, state: &Arc<AppSta
 
     let (provider_res, model) = {
         let cfg = state.config.lock().await;
-        let m = cfg.resolve_tier(tauqe_protocol::ModelTier::Junior);
+        let m = cfg.resolve_role(ModelRole::Scribe);
         let p = create_provider(m.provider, &cfg);
         (p, m)
     };

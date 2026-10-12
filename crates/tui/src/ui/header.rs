@@ -5,7 +5,7 @@ use ratatui::style::{Color, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 
-use crate::app::{tier_title, AppState, HeaderClickAreas, ViewMode};
+use crate::app::{role_title, AppState, HeaderClickAreas, ViewMode};
 
 /// Helper to truncate a string to a max visual display width, appending `…` if needed.
 pub(crate) fn truncate_to_width(s: &str, max_width: usize) -> String {
@@ -29,6 +29,21 @@ pub(crate) fn truncate_to_width(s: &str, max_width: usize) -> String {
     }
     truncated.push('…');
     truncated
+}
+
+/// Builds the model selector label strictly from the active selection.
+/// Semantic roles render cleanly as the role title (e.g. `Coder`),
+/// while an explicit model selection renders the concrete model name.
+fn model_selector_label(
+    selection: &tauqe_protocol::ModelSelection,
+    max_model_len: usize,
+) -> String {
+    match selection {
+        tauqe_protocol::ModelSelection::Role(role) => role_title(*role).to_string(),
+        tauqe_protocol::ModelSelection::Specific(model_ref) => {
+            truncate_to_width(&model_ref.name, max_model_len)
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -171,13 +186,7 @@ pub fn render_header(frame: &mut ratatui::Frame, state: &mut AppState, area: Rec
         (6, " [F6] ", " [?] ")
     };
 
-    let raw_model_str = &state.active_model.name;
-    let model_label = match &state.model_choice.selection {
-        tauqe_protocol::ModelSelection::Tier(tier) => tier_title(*tier).to_string(),
-        tauqe_protocol::ModelSelection::Specific(_) => {
-            truncate_to_width(raw_model_str, max_model_len)
-        }
-    };
+    let model_label = model_selector_label(&state.model_choice.selection, max_model_len);
     let model_text = format!(" 🧠 {} ", model_label);
     let model_span = Span::styled(model_text, Style::default().fg(Color::Green).bold());
 
@@ -348,7 +357,7 @@ mod tests {
     use super::*;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
-    use tauqe_protocol::ModelRef;
+    use tauqe_protocol::{ModelRef, ModelRole, ModelSelection};
 
     fn test_app_state() -> AppState {
         AppState {
@@ -473,5 +482,37 @@ mod tests {
             assert!(clicks.model_select.1 < clicks.squash_button.0, "Model and squash button overlap");
             assert!(clicks.develop_tab.1 < clicks.context_tab.0, "Develop and context tab overlap");
         }
+    }
+
+    #[test]
+    fn test_model_selector_label_role_shows_title_only() {
+        assert_eq!(
+            model_selector_label(&ModelSelection::Role(ModelRole::Coder), 20),
+            "Coder"
+        );
+        assert_eq!(
+            model_selector_label(&ModelSelection::Role(ModelRole::Architect), 20),
+            "Architect"
+        );
+        // Roles are never truncated by the model-length budget.
+        assert_eq!(
+            model_selector_label(&ModelSelection::Role(ModelRole::Reviewer), 6),
+            "Reviewer"
+        );
+    }
+
+    #[test]
+    fn test_model_selector_label_specific_shows_model_name() {
+        let long = ModelRef::openrouter("anthropic/claude-3-7-sonnet");
+        let label = model_selector_label(&ModelSelection::Specific(long), 20);
+        assert!(label.starts_with("anthropic/claude-3"));
+        assert!(label.ends_with('…'));
+        assert!(Span::raw(&label).width() <= 20);
+
+        let short = ModelRef::openrouter("gpt-4o");
+        assert_eq!(
+            model_selector_label(&ModelSelection::Specific(short), 20),
+            "gpt-4o"
+        );
     }
 }

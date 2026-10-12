@@ -156,7 +156,15 @@ fn plan_item_schema(depth: usize, max_depth: usize) -> serde_json::Value {
         "files".to_string(),
         serde_json::json!({
             "type": "array",
-            "description": "Repository-relative file paths that this step creates, modifies, or inspects (pre-loaded into context when executing)",
+            "description": "Repository-relative file paths that this step creates, modifies, or inspects (pre-loaded into context when executing). Invariant: files must only be specified for executable leaf steps without children; parent container items must have an empty files list.",
+            "items": { "type": "string" }
+        }),
+    );
+    properties.insert(
+        "readonly_files".to_string(),
+        serde_json::json!({
+            "type": "array",
+            "description": "Repository-relative file paths for read-only reference context (subsystem conventions like Conventions.md, interface contracts, protocol types). Invariant: readonly_files must only be specified for executable leaf steps without children; parent container items must have an empty readonly_files list.",
             "items": { "type": "string" }
         }),
     );
@@ -175,6 +183,7 @@ fn plan_item_schema(depth: usize, max_depth: usize) -> serde_json::Value {
         serde_json::Value::String("details".to_string()),
         serde_json::Value::String("status".to_string()),
         serde_json::Value::String("files".to_string()),
+        serde_json::Value::String("readonly_files".to_string()),
         serde_json::Value::String("concept_refs".to_string()),
     ];
 
@@ -273,7 +282,8 @@ pub fn build_plan_refine_system_prompt(_plan: &Plan) -> String {
     out.push_str("   - You MUST set `status: \"blocked\"`, provide empty `items: []`, and document a comprehensive, rigorous technical explanation in `reason` detailing the exact contradiction, codebase evidence, and recommended developer action.\n\n");
     out.push_str("3. Step Granularity, Grouping and Compilability Invariants:\n");
     out.push_str("   - Execution Lifecycle Contract: EVERY leaf step is executed in an isolated turn with its own toolchain verification gates (check, clippy, test).\n");
-    out.push_str("   - Target File Precision: For every implementation step, you MUST populate `files: [\"path/to/file\"]` with exact repository-relative file paths. The execution harness automatically pre-loads these files into context when the step is run.\n");
+    out.push_str("   - Target File Precision (Leaf-Only Files Invariant): For every executable leaf step, you MUST populate `files: [\"path/to/file\"]` with exact repository-relative file paths. Parent items and task groups are conceptual containers and MUST have empty `files: []`. Only leaf steps (`children: []`) pre-load files into context upon execution.\n");
+    out.push_str("   - Reference Files Contract (Read-Only Context): For every executable leaf step, identify and populate `readonly_files: [\"path/to/reference\"]` with existing interfaces, protocol types, or subsystem conventions (e.g. `crates/tui/Conventions.md`, `crates/core/Conventions.md`) needed as context during implementation. These files are pre-loaded as read-only context during step execution. Invariant: parent items must have empty `readonly_files: []`.\n");
     out.push_str("   - Concept Traceability: For each step, link it to the relevant architectural concept IDs via `concept_refs: [\"concept_id\"]`.\n");
     out.push_str("   - Avoid Micro-Fragmentation: Strictly avoid splitting adjacent, closely related edits into separate microscopic steps. Group cohesive changes across 1-4 related files under a single leaf step if they form a logical unit of work and carry no risk of patch conflicts.\n");
     out.push_str("   - Avoid Unmanageable Monoliths: Do not bundle 10-20 unrelated files into a single step; keep each leaf step calibrated to a cohesive unit (targeting 150-400 lines of change).\n");
@@ -369,7 +379,7 @@ pub fn build_plan_refine_user_prompt(
     out.push_str("1. Conduct deep technical dependency analysis using the codebase contours and context files.\n");
     out.push_str("2. If you need to inspect specific file implementations before decomposing the plan, request them by setting `status: \"needs_context\"` with `context_requests: [\"path/to/file\"]` and empty `items: []`.\n");
     out.push_str("3. Check for any blockers, circular dependencies, or contradictions. If blocked, report `status: \"blocked\"` with exact `reason`.\n");
-    out.push_str("4. If viable, decompose the plan into actionable, dependency-ordered leaf steps with `status: \"todo\"`. Calibrate leaf step granularity to cohesive units: group closely related adjacent edits together under one step to avoid micro-fragmentation, while avoiding monolithic multi-file dumps.\n");
+    out.push_str("4. If viable, decompose the plan into actionable, dependency-ordered leaf steps with `status: \"todo\"`. Specify target files in `files` and reference contracts/types/conventions in `readonly_files`. Calibrate leaf step granularity to cohesive units: group closely related adjacent edits together under one step to avoid micro-fragmentation, while avoiding monolithic multi-file dumps.\n");
     out.push_str("5. Language Directive: Detect the natural language of the plan title and description. Formulate all titles, details, explanations, and reasons strictly in that same language.\n");
 
     out
@@ -525,7 +535,13 @@ pub fn format_plan_step_execution_prompt_with_mode(
         out.push_str(&format!("- **Addressed Concept Nodes**: {}\n", step.concept_refs.join(", ")));
     }
     if !step.files.is_empty() {
-        out.push_str(&format!("- **Pre-loaded Step Files**: {}\n", step.files.join(", ")));
+        out.push_str(&format!("- **Target Files (to modify)**: {}\n", step.files.join(", ")));
+    }
+    if !step.readonly_files.is_empty() {
+        out.push_str(&format!(
+            "- **Reference Files (read-only context)**: {}\n",
+            step.readonly_files.join(", ")
+        ));
     }
     if let Some(details) = &step.details {
         let trimmed = details.trim();
@@ -576,6 +592,44 @@ pub fn format_plan_step_execution_prompt_with_mode(
     Ok(out)
 }
 
+/// Builds a corrective reprompt for a plan step turn that ended without valid
+/// code edits and without a terminal success tag.
+///
+/// The prompt echoes the model's previous response and optional diagnostic
+/// feedback, then explicitly demands strict adherence to the active edit
+/// protocol on the next turn.
+pub fn format_plan_step_retry_prompt(assistant_text: &str, error: Option<&str>) -> String {
+    let mut out = String::new();
+    out.push_str("# Correction Required: Plan Step Turn Incomplete\n\n");
+    out.push_str("Your previous turn ended without applying any verified code changes and without emitting the terminal success tag (`<success>`). This violates the execution protocol.\n\n");
+
+    out.push_str("## Previous Assistant Response:\n");
+    let previous = assistant_text.trim();
+    if previous.is_empty() {
+        out.push_str("(empty response)\n\n");
+    } else {
+        out.push_str("<previous_response>\n");
+        out.push_str(previous);
+        out.push_str("\n</previous_response>\n\n");
+    }
+
+    if let Some(err) = error {
+        let trimmed = err.trim();
+        if !trimmed.is_empty() {
+            out.push_str("## Diagnostic Feedback:\n");
+            out.push_str(trimmed);
+            out.push_str("\n\n");
+        }
+    }
+
+    out.push_str("## Required Actions:\n");
+    out.push_str("1. If the step requires code changes, emit a valid edit block that strictly conforms to the active edit protocol.\n");
+    out.push_str("2. If no code changes are required to complete the step, confirm completion explicitly by emitting the terminal success tag.\n");
+    out.push_str("3. Do NOT replace protocol operations with conversational text, and do NOT end the turn without either a valid edit block or the terminal success tag.\n");
+
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -600,6 +654,7 @@ mod tests {
                     status: PlanItemStatus::Done,
                     concept_refs: vec!["c-1".to_string()],
                     files: vec!["crates/core/src/models.rs".to_string()],
+                    readonly_files: vec![],
                     children: vec![],
                 },
                 PlanItem {
@@ -609,6 +664,7 @@ mod tests {
                     status: PlanItemStatus::InProgress,
                     concept_refs: vec!["c-1".to_string()],
                     files: vec!["crates/core/src/handler.rs".to_string()],
+                    readonly_files: vec!["crates/core/src/contract.rs".to_string()],
                     children: vec![],
                 },
             ],
@@ -635,7 +691,9 @@ mod tests {
         assert!(prompt.contains("Already Completed Prerequisites:"));
         assert!(prompt.contains("Architectural Concept (System Invariants & Focus):"));
         assert!(prompt.contains("- #c-1 Stateless JWT: Use asymmetric ECDSA"));
-        assert!(prompt.contains("- **Pre-loaded Step Files**: crates/core/src/handler.rs"));
+        assert!(prompt.contains("- **Target Files (to modify)**: crates/core/src/handler.rs"));
+        assert!(prompt
+            .contains("- **Reference Files (read-only context)**: crates/core/src/contract.rs"));
         assert!(prompt.contains("- **Addressed Concept Nodes**: c-1"));
 
         let target = extract_plan_step_execution_target(&prompt).unwrap();
@@ -669,12 +727,30 @@ mod tests {
     }
 
     #[test]
+    fn test_format_plan_step_retry_prompt() {
+        let prompt =
+            format_plan_step_retry_prompt("I think we are done.", Some("No edits were applied"));
+        assert!(prompt.contains("Correction Required"));
+        assert!(prompt.contains("<previous_response>"));
+        assert!(prompt.contains("I think we are done."));
+        assert!(prompt.contains("No edits were applied"));
+        assert!(prompt.contains("terminal success tag"));
+
+        let empty = format_plan_step_retry_prompt("   ", None);
+        assert!(empty.contains("(empty response)"));
+        assert!(!empty.contains("<previous_response>"));
+        assert!(!empty.contains("Diagnostic Feedback"));
+    }
+
+    #[test]
     fn test_plan_refine_prompts_and_schema() {
         let plan = sample_plan();
         let sys = build_plan_refine_system_prompt(&plan);
         assert!(sys.contains("Strict Prohibition of Conceptual Drift"));
         assert!(sys.contains("Strict Blocker Protocol"));
         assert!(sys.contains("Compilability Invariants"));
+        assert!(sys.contains("Leaf-Only Files Invariant"));
+        assert!(sys.contains("Reference Files Contract"));
 
         let ctx_files = vec![ContextFileContent {
             path: "crates/core/src/lib.rs".to_string(),
@@ -691,10 +767,12 @@ mod tests {
         assert!(user_prompt.contains("Focus on EdDSA"));
         assert!(user_prompt.contains("crates/core/src/lib.rs"));
         assert!(user_prompt.contains("fn generate_token()"));
+        assert!(user_prompt.contains("readonly_files"));
 
         let schema = plan_refine_response_schema();
         assert!(schema.get("properties").is_some());
         assert!(!schema.to_string().contains("$ref"), "Schema must not contain recursive $ref");
+        assert!(schema.to_string().contains("readonly_files"));
         let def = plan_refine_response_schema_definition();
         assert_eq!(def["name"], "plan_refinement");
 
@@ -708,6 +786,8 @@ mod tests {
                     "title": "Model definition",
                     "details": "JWT claims struct",
                     "status": "todo",
+                    "files": ["crates/core/src/models.rs"],
+                    "readonly_files": ["crates/core/src/contract.rs"],
                     "children": []
                 }
             ]
@@ -716,6 +796,7 @@ mod tests {
         assert_eq!(parsed.status, "success");
         assert_eq!(parsed.items.len(), 1);
         assert_eq!(parsed.items[0].id, "1");
+        assert_eq!(parsed.items[0].readonly_files, vec!["crates/core/src/contract.rs"]);
 
         let raw_blocked = r#"```json
         {

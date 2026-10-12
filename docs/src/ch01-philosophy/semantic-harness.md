@@ -18,3 +18,28 @@ TAUQE resolves this dilemma by holding the model in a firm grip:
 - **Reins (Git Transactions):** The developer steers high-level objectives, while Git guarantees instant, deterministic rollback at any sign of divergence.
 
 > **TAUQE is not an agent. It is an environment where the model operates autonomously within a single bounded turn, completely stripped of persistent agentic drift.**
+
+---
+
+## 1.2 The Semantic Quartet: Model Roles and Specialization
+
+Modern engineering workflows demand distinct cognitive strengths depending on the operational context. Rather than categorizing models into arbitrary difficulty tiers (*junior*, *middle*, *senior*), TAUQE structures model interactions around **semantic functional roles**:
+
+- **Scribe:** Dedicated to history compaction, session summarization, and Git squash commit messages. Requires high speed, concise output, and minimal token cost without complex code reasoning overhead.
+- **Coder:** Dedicated to patch generation, code editing, and toolchain verification healing. Specialized in syntactically sound diffs, surgical search/replace operations, and minimal blast radius.
+- **Architect:** Dedicated to conceptual design, plan refinement (`plan/refine`), deep code review, and architectural reasoning. Serves as the escalation target when implementation-level heuristics stall.
+- **Advisor:** Dedicated to conversational engineering consultation, brainstorming, and interactive develop sessions with the human engineer.
+
+### Deterministic Fallback Resolution
+
+TAUQE rejects speculative `default` configurations. A project configuration is valid as long as at least one semantic role is defined:
+- Any unconfigured role is deterministically inferred along a fixed proximity chain across the specified roles (e.g. resolving `coder` -> `advisor` -> `architect` -> `scribe`).
+- This invariant ensures zero configuration friction: teams can configure four purpose-tuned models for maximum efficiency, or specify a single model that predictably serves all four roles.
+
+### Contextual Routing
+
+Core subsystems automatically dispatch tasks to their designated semantic role:
+- Compaction and Git squash commit generation invoke **Scribe**.
+- Batch plan step execution and code review remediation invoke **Coder**.
+- Plan refinement and review session creation invoke **Architect**.
+- Interactive prompts in the Develop pane invoke **Advisor** (or the engineer's manual override).

@@ -40,53 +40,76 @@ impl std::fmt::Display for ModelRef {
     }
 }
 
-/// Three-tier model hierarchy classification.
+/// Five semantic model role specializations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum ModelTier {
-    Junior,
-    Middle,
-    Senior,
+pub enum ModelRole {
+    #[serde(alias = "junior")]
+    Scribe,
+    #[serde(alias = "middle")]
+    Coder,
+    #[serde(alias = "senior")]
+    Architect,
+    Advisor,
+    Reviewer,
 }
 
-impl std::fmt::Display for ModelTier {
+pub type ModelTier = ModelRole;
+
+impl std::fmt::Display for ModelRole {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ModelTier::Junior => f.write_str("junior"),
-            ModelTier::Middle => f.write_str("middle"),
-            ModelTier::Senior => f.write_str("senior"),
+            ModelRole::Scribe => f.write_str("scribe"),
+            ModelRole::Coder => f.write_str("coder"),
+            ModelRole::Architect => f.write_str("architect"),
+            ModelRole::Advisor => f.write_str("advisor"),
+            ModelRole::Reviewer => f.write_str("reviewer"),
         }
     }
 }
 
-impl std::str::FromStr for ModelTier {
+impl std::str::FromStr for ModelRole {
     type Err = String;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.trim().to_lowercase().as_str() {
-            "junior" => Ok(ModelTier::Junior),
-            "middle" => Ok(ModelTier::Middle),
-            "senior" => Ok(ModelTier::Senior),
+            "scribe" | "junior" => Ok(ModelRole::Scribe),
+            "coder" | "middle" => Ok(ModelRole::Coder),
+            "architect" | "senior" => Ok(ModelRole::Architect),
+            "advisor" => Ok(ModelRole::Advisor),
+            "reviewer" => Ok(ModelRole::Reviewer),
             other => Err(format!(
-                "Unknown model tier '{}'. Expected junior, middle, or senior",
+                "Unknown model role '{}'. Expected scribe, coder, architect, advisor, or reviewer",
                 other
             )),
         }
     }
 }
 
-/// Target model selection: either an abstract tier or an explicit model reference.
+/// Summary of effective concrete models assigned to each semantic role.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelRolesSummary {
+    pub scribe: ModelRef,
+    pub coder: ModelRef,
+    pub architect: ModelRef,
+    pub advisor: ModelRef,
+    pub reviewer: ModelRef,
+}
+
+pub type ModelTiersSummary = ModelRolesSummary;
+
+/// Target model selection: either an abstract semantic role or an explicit model reference.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum ModelSelection {
-    Tier(ModelTier),
+    Role(ModelRole),
     Specific(ModelRef),
 }
 
 impl std::fmt::Display for ModelSelection {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ModelSelection::Tier(tier) => write!(f, "{}", tier),
+            ModelSelection::Role(role) => write!(f, "{}", role),
             ModelSelection::Specific(model) => write!(f, "{}", model),
         }
     }
@@ -94,16 +117,8 @@ impl std::fmt::Display for ModelSelection {
 
 impl Default for ModelSelection {
     fn default() -> Self {
-        ModelSelection::Tier(ModelTier::Middle)
+        ModelSelection::Role(ModelRole::Coder)
     }
-}
-
-/// Summary of effective concrete models assigned to each tier.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ModelTiersSummary {
-    pub junior: ModelRef,
-    pub middle: ModelRef,
-    pub senior: ModelRef,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -115,14 +130,16 @@ pub struct ModelSelectParams {
 pub struct ModelSelectResult {
     pub selection: ModelSelection,
     pub effective_model: ModelRef,
-    pub tiers: ModelTiersSummary,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub roles: Option<ModelRolesSummary>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelCurrentResult {
     pub selection: ModelSelection,
     pub effective_model: ModelRef,
-    pub tiers: ModelTiersSummary,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub roles: Option<ModelRolesSummary>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub available_models: Vec<ModelRef>,
 }
@@ -131,7 +148,8 @@ pub struct ModelCurrentResult {
 pub struct ModelChangedEvent {
     pub selection: ModelSelection,
     pub effective_model: ModelRef,
-    pub tiers: ModelTiersSummary,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub roles: Option<ModelRolesSummary>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -139,10 +157,25 @@ pub struct ModelAskParams {
     pub prompt: String,
 }
 
+/// Execution context of a model turn driven by a plan step.
+///
+/// Carries the owning plan identifier, the currently executing step, and the
+/// compact ordered list of step identifiers that form the batch scope. This
+/// allows clients to render a live plan stepper without switching views.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ModelTurnPlanContext {
+    pub plan_id: String,
+    pub step_id: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub batch_step_ids: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelStartedEvent {
     pub operation_id: String,
     pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_context: Option<ModelTurnPlanContext>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -303,16 +336,21 @@ mod tests {
     }
 
     #[test]
-    fn test_model_tier_and_selection_serde() {
-        let tier = ModelTier::Junior;
-        let tier_json = serde_json::to_string(&tier).unwrap();
-        assert_eq!(tier_json, "\"junior\"");
-        assert_eq!(serde_json::from_str::<ModelTier>("\"junior\"").unwrap(), ModelTier::Junior);
+    fn test_model_role_and_selection_serde() {
+        let role = ModelRole::Coder;
+        let role_json = serde_json::to_string(&role).unwrap();
+        assert_eq!(role_json, "\"coder\"");
+        assert_eq!(serde_json::from_str::<ModelRole>("\"coder\"").unwrap(), ModelRole::Coder);
+        assert_eq!(serde_json::from_str::<ModelRole>("\"senior\"").unwrap(), ModelRole::Architect);
+        assert_eq!(
+            serde_json::from_str::<ModelSelection>("\"senior\"").unwrap(),
+            ModelSelection::Role(ModelRole::Architect)
+        );
 
-        let sel_tier = ModelSelection::Tier(ModelTier::Middle);
-        let sel_tier_json = serde_json::to_string(&sel_tier).unwrap();
-        assert_eq!(sel_tier_json, "\"middle\"");
-        assert_eq!(serde_json::from_str::<ModelSelection>("\"middle\"").unwrap(), sel_tier);
+        let sel_role = ModelSelection::Role(ModelRole::Advisor);
+        let sel_role_json = serde_json::to_string(&sel_role).unwrap();
+        assert_eq!(sel_role_json, "\"advisor\"");
+        assert_eq!(serde_json::from_str::<ModelSelection>("\"advisor\"").unwrap(), sel_role);
 
         let specific = ModelRef::openrouter("anthropic/claude-3.5-sonnet");
         let sel_spec = ModelSelection::Specific(specific.clone());
@@ -320,14 +358,16 @@ mod tests {
         assert!(sel_spec_json.contains("\"provider\":\"openrouter\""));
         assert_eq!(serde_json::from_str::<ModelSelection>(&sel_spec_json).unwrap(), sel_spec);
 
-        let summary = ModelTiersSummary {
-            junior: ModelRef::openrouter("j"),
-            middle: ModelRef::openrouter("m"),
-            senior: ModelRef::openrouter("s"),
+        let roles_summary = ModelRolesSummary {
+            scribe: ModelRef::openrouter("s"),
+            coder: ModelRef::openrouter("c"),
+            architect: ModelRef::openrouter("a"),
+            advisor: ModelRef::openrouter("ad"),
+            reviewer: ModelRef::openrouter("rev"),
         };
-        let summary_json = serde_json::to_string(&summary).unwrap();
-        let de_summary: ModelTiersSummary = serde_json::from_str(&summary_json).unwrap();
-        assert_eq!(de_summary, summary);
+        let roles_json = serde_json::to_string(&roles_summary).unwrap();
+        let de_roles: ModelRolesSummary = serde_json::from_str(&roles_json).unwrap();
+        assert_eq!(de_roles, roles_summary);
     }
 
     #[test]
