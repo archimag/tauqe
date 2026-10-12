@@ -957,6 +957,7 @@ mod tests {
                 architect: ModelRef::openrouter("architect-model"),
                 advisor: ModelRef::openrouter("advisor-model"),
                 reviewer: ModelRef::openrouter("reviewer-model"),
+                efforts: None,
             }),
         };
 
@@ -1003,6 +1004,7 @@ mod tests {
                     architect: ModelRef::openrouter("architect-model"),
                     advisor: ModelRef::openrouter("advisor-model"),
                     reviewer: ModelRef::openrouter("reviewer-model"),
+                    efforts: None,
                 }),
             },
             model: DevelopView::default(),

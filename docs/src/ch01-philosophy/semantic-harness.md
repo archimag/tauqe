@@ -36,6 +36,24 @@ TAUQE rejects speculative `default` configurations. A project configuration is v
 - Any unconfigured role is deterministically inferred along a fixed proximity chain across the specified roles (e.g. resolving `coder` -> `advisor` -> `architect` -> `scribe`).
 - This invariant ensures zero configuration friction: teams can configure four purpose-tuned models for maximum efficiency, or specify a single model that predictably serves all four roles.
 
+### Role-Scoped Reasoning Depth
+
+Reasoning depth is configured **per semantic role**, never bound to a model name. The optional `[models.effort]` subsection of `tauqe.toml` stays fully orthogonal to model identity: `[models]` answers *who thinks*, while `[models.effort]` answers *how deeply it thinks*.
+
+- **Typed levels.** Effort is a strictly typed `ReasoningEffort` value (`low`, `medium`, `high`, `xhigh`), deserialized from lowercase strings rather than free-form text.
+- **Conservative defaults.** Any role omitted from the subsection falls back to the provider default, and the subsection itself is optional. Existing configurations remain 100% valid without edits, so role-scoped effort never forces a migration.
+- **Role reuse without duplication.** Because depth is role-scoped, the same concrete model can run shallowly in one role and deeply in another; there is no need to register a duplicate model entry per cognitive depth.
+
+```toml
+[models]
+architect = "~google/gemini-pro-latest"
+
+# Optional per-role reasoning depth; omitted roles use the provider default.
+[models.effort]
+architect = "xhigh"   # deep conceptual design and plan refinement
+coder = "medium"      # balanced patch generation and verification healing
+```
+
 ### Contextual Routing
 
 Core subsystems automatically dispatch tasks to their designated semantic role:

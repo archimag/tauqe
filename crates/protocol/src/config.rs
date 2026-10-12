@@ -86,6 +86,7 @@ mod tests {
                 architect: ModelRef::openrouter("architect-model"),
                 advisor: ModelRef::openrouter("advisor-model"),
                 reviewer: ModelRef::openrouter("reviewer-model"),
+                efforts: None,
             }),
             history_model: Some(ModelRef::openrouter("scribe-model")),
             available_workflows: vec!["git".to_string()],

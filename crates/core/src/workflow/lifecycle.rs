@@ -2,7 +2,7 @@ use std::path::Path;
 
 use tokio::sync::mpsc;
 use tokio::sync::watch;
-use tauqe_protocol::{EditProposal, ModelRef, ModelResult, ModelRole};
+use tauqe_protocol::{EditProposal, ModelRef, ModelResult, ModelRole, ReasoningEffort};
 
 use super::common::{
     execute_edit_pipeline, record_workflow_response, run_verification_healing_loop,
@@ -30,6 +30,10 @@ pub struct WorkflowOptions {
     pub initial_selection: Option<tauqe_protocol::ModelSelection>,
     pub app_config: Option<crate::config::AppConfig>,
     pub discovery_mode: crate::config::DiscoveryMode,
+    /// Reasoning effort applied to the current turn, resolved from the active
+    /// semantic role. Updated on `auto_level_up` escalation so a
+    /// Coder→Architect switch inherits the deeper Architect effort.
+    pub reasoning_effort: Option<ReasoningEffort>,
 }
 
 impl Default for WorkflowOptions {
@@ -47,6 +51,7 @@ impl Default for WorkflowOptions {
             initial_selection: None,
             app_config: None,
             discovery_mode: crate::config::DiscoveryMode::default(),
+            reasoning_effort: None,
         }
     }
 }
@@ -71,6 +76,7 @@ impl WorkflowOptions {
             initial_selection: None,
             app_config: Some(config.clone()),
             discovery_mode: config.context.discovery_mode,
+            reasoning_effort: None,
         }
     }
 }
@@ -141,6 +147,7 @@ pub(crate) async fn execute_workflow_lifecycle<T: WorkflowTransaction>(
     stream_tx: mpsc::Sender<StreamEvent>,
     cancel_rx: watch::Receiver<bool>,
 ) -> anyhow::Result<WorkflowExecutionResult> {
+    let mut turn_options = options.clone();
     let is_isolated_plan_step = crate::plan::prompt::is_plan_step_execution_prompt(prompt);
     let is_isolated_review_step = tauqe_protocol::review::is_review_step_execution_prompt(prompt);
     let is_isolated_step = is_isolated_plan_step || is_isolated_review_step;
@@ -214,7 +221,7 @@ pub(crate) async fn execute_workflow_lifecycle<T: WorkflowTransaction>(
             workflow_name,
             stream_tx.clone(),
             cancel_rx.clone(),
-            options,
+            &turn_options,
         )
         .await?;
 
@@ -315,6 +322,8 @@ pub(crate) async fn execute_workflow_lifecycle<T: WorkflowTransaction>(
                             );
                             let _ = stream_tx.send(StreamEvent::TextDelta(notice)).await;
                             current_role = Some(next_r);
+                            turn_options.reasoning_effort =
+                                options.models_config.resolve_effort(next_r);
                             if next_m.provider != current_model.provider {
                                 if let Some(ref app_cfg) = options.app_config {
                                     if let Ok(np) = crate::providers::create_provider(next_m.provider, app_cfg) {
@@ -349,6 +358,8 @@ pub(crate) async fn execute_workflow_lifecycle<T: WorkflowTransaction>(
                             );
                             let _ = stream_tx.send(StreamEvent::TextDelta(notice)).await;
                             current_role = Some(next_r);
+                            turn_options.reasoning_effort =
+                                options.models_config.resolve_effort(next_r);
                             if next_m.provider != current_model.provider {
                                 if let Some(ref app_cfg) = options.app_config {
                                     if let Ok(np) = crate::providers::create_provider(next_m.provider, app_cfg) {
@@ -405,7 +416,7 @@ pub(crate) async fn execute_workflow_lifecycle<T: WorkflowTransaction>(
                                 workflow_name,
                                 &stream_tx,
                                 &cancel_rx,
-                                options,
+                                &turn_options,
                                 verify_req,
                                 &mut pipeline_out.assistant_text,
                                 &mut turn_detected_language,
@@ -564,6 +575,8 @@ pub(crate) async fn execute_workflow_lifecycle<T: WorkflowTransaction>(
                                             );
                                             let _ = stream_tx.send(StreamEvent::TextDelta(notice)).await;
                                             current_role = Some(next_r);
+                                            turn_options.reasoning_effort =
+                                                options.models_config.resolve_effort(next_r);
                                             if next_m.provider != current_model.provider {
                                                 if let Some(ref app_cfg) = options.app_config {
                                                     if let Ok(np) = crate::providers::create_provider(next_m.provider, app_cfg) {
@@ -617,6 +630,8 @@ pub(crate) async fn execute_workflow_lifecycle<T: WorkflowTransaction>(
                                     );
                                     let _ = stream_tx.send(StreamEvent::TextDelta(notice)).await;
                                     current_role = Some(next_r);
+                                    turn_options.reasoning_effort =
+                                        options.models_config.resolve_effort(next_r);
                                     if next_m.provider != current_model.provider {
                                         if let Some(ref app_cfg) = options.app_config {
                                             if let Ok(np) = crate::providers::create_provider(next_m.provider, app_cfg) {
@@ -1300,6 +1315,7 @@ mod tests {
             architect: Some(architect_ref.clone()),
             advisor: Some(ModelRef::openrouter("test/advisor")),
             reviewer: Some(ModelRef::openrouter("test/reviewer")),
+            effort: None,
             auto_level_up: true,
         };
 
@@ -1345,5 +1361,156 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(updated_plan.items[0].status, tauqe_protocol::PlanItemStatus::Done);
+    }
+
+    struct MockEffortProvider {
+        seen: std::sync::Mutex<Vec<(String, Option<ReasoningEffort>)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmProvider for MockEffortProvider {
+        fn kind(&self) -> tauqe_protocol::ProviderKind {
+            tauqe_protocol::ProviderKind::OpenRouter
+        }
+
+        async fn stream_chat(
+            &self,
+            model: &str,
+            messages: Vec<ChatMessage>,
+            response_format: Option<crate::providers::ResponseFormat>,
+            tx: mpsc::Sender<StreamEvent>,
+            cancel_rx: watch::Receiver<bool>,
+        ) -> anyhow::Result<()> {
+            self.stream_chat_with_effort(model, messages, response_format, None, tx, cancel_rx)
+                .await
+        }
+
+        async fn stream_chat_with_effort(
+            &self,
+            model: &str,
+            _messages: Vec<ChatMessage>,
+            _response_format: Option<crate::providers::ResponseFormat>,
+            reasoning_effort: Option<ReasoningEffort>,
+            tx: mpsc::Sender<StreamEvent>,
+            _cancel_rx: watch::Receiver<bool>,
+        ) -> anyhow::Result<()> {
+            self.seen
+                .lock()
+                .unwrap()
+                .push((model.to_string(), reasoning_effort));
+            let chunk = if model == "test/coder" {
+                "<tauqe_edits_MOCKEFF summary=\"Coder attempt\">\n<edit_MOCKEFF path=\"target.rs\">\n<search_MOCKEFF>\nnonexistent pattern\n</search_MOCKEFF>\n<replace_MOCKEFF>\nreplacement\n</replace_MOCKEFF>\n</edit_MOCKEFF>\n</tauqe_edits_MOCKEFF>".to_string()
+            } else {
+                "<tauqe_edits_MOCKEFF summary=\"Architect fix\">\n<edit_MOCKEFF path=\"target.rs\">\n<search_MOCKEFF>\npub fn compute() -> i32 { 0 }\n</search_MOCKEFF>\n<replace_MOCKEFF>\npub fn compute() -> i32 { 42 }\n</replace_MOCKEFF>\n</edit_MOCKEFF>\n</tauqe_edits_MOCKEFF>\n<success_MOCKEFF summary=\"Architectural fix verified\" />".to_string()
+            };
+            let _ = tx.send(StreamEvent::TextDelta(chunk)).await;
+            let _ = tx.send(StreamEvent::Done).await;
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn test_step_lifecycle_escalation_updates_reasoning_effort() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_root = dir.path().to_path_buf();
+        let _ = crate::git::init_repository(Some(&repo_root), true).unwrap();
+
+        std::fs::write(repo_root.join("target.rs"), "pub fn compute() -> i32 { 0 }\n").unwrap();
+        crate::git::cmd::stage_files(&repo_root, &["target.rs".to_string()]).unwrap();
+        crate::git::cmd::commit_with_developer_author(&repo_root, "Initial commit", false).unwrap();
+
+        let plan = tauqe_protocol::Plan {
+            id: "plan-effort".to_string(),
+            title: "Effort escalation".to_string(),
+            description: None,
+            created_at: 100,
+            updated_at: 100,
+            concept: vec![],
+            items: vec![tauqe_protocol::PlanItem {
+                id: "step-eff".to_string(),
+                title: "Effort step".to_string(),
+                details: None,
+                status: tauqe_protocol::PlanItemStatus::Todo,
+                files: vec!["target.rs".to_string()],
+                readonly_files: vec![],
+                concept_refs: vec![],
+                children: vec![],
+            }],
+        };
+        crate::plan::storage::PlanStorage::save_plan(&repo_root, &plan).unwrap();
+        crate::plan::storage::PlanStorage::save_active_id(&repo_root, Some("plan-effort")).unwrap();
+
+        let mut context_manager = ContextManager::new(repo_root.clone());
+        context_manager.add_file("target.rs", tauqe_protocol::ContextAccess::Editable).unwrap();
+        let mut history_manager = HistoryManager::new(repo_root.clone());
+
+        let marker = "MOCKEFF";
+        let protocol = crate::edits::protocol::xml::MarkedXmlEditProtocol::new(marker);
+
+        let prompt = crate::plan::prompt::format_plan_step_execution_prompt(&plan, "step-eff", marker).unwrap();
+
+        let provider = MockEffortProvider {
+            seen: std::sync::Mutex::new(Vec::new()),
+        };
+
+        let coder_ref = ModelRef::openrouter("test/coder");
+        let architect_ref = ModelRef::openrouter("test/architect");
+
+        let models_config = crate::config::ModelsConfig {
+            scribe: Some(ModelRef::openrouter("test/scribe")),
+            coder: Some(coder_ref.clone()),
+            architect: Some(architect_ref.clone()),
+            advisor: Some(ModelRef::openrouter("test/advisor")),
+            reviewer: Some(ModelRef::openrouter("test/reviewer")),
+            effort: Some(tauqe_protocol::ModelRolesEffort {
+                coder: Some(ReasoningEffort::Low),
+                architect: Some(ReasoningEffort::High),
+                ..Default::default()
+            }),
+            auto_level_up: true,
+        };
+
+        let options = WorkflowOptions {
+            max_retries: 0,
+            auto_level_up: true,
+            models_config,
+            initial_selection: Some(tauqe_protocol::ModelSelection::Role(ModelRole::Coder)),
+            reasoning_effort: Some(ReasoningEffort::Low),
+            ..Default::default()
+        };
+
+        let tx_mock = MockTx {
+            commit_hash: Some("commit-after-effort".to_string()),
+        };
+
+        let (tx, _rx) = mpsc::channel(100);
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+
+        let res = execute_workflow_lifecycle(
+            "git",
+            &options,
+            tx_mock,
+            &prompt,
+            &provider,
+            &coder_ref,
+            &mut context_manager,
+            &mut history_manager,
+            &protocol,
+            tx,
+            cancel_rx,
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(res.result, ModelResult::Edit { applied: true, .. }));
+
+        let seen = provider.seen.lock().unwrap().clone();
+        assert_eq!(
+            seen,
+            vec![
+                ("test/coder".to_string(), Some(ReasoningEffort::Low)),
+                ("test/architect".to_string(), Some(ReasoningEffort::High)),
+            ]
+        );
     }
 }

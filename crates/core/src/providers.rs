@@ -23,6 +23,25 @@ pub trait LlmProvider: Send + Sync {
         cancel_rx: watch::Receiver<bool>,
     ) -> anyhow::Result<()>;
 
+    /// Effort-aware chat streaming.
+    ///
+    /// Providers that expose a native reasoning parameter translate the
+    /// optional reasoning effort into it. The default implementation ignores
+    /// the effort and delegates to `stream_chat`, so existing providers stay
+    /// compatible without any change.
+    async fn stream_chat_with_effort(
+        &self,
+        model: &str,
+        messages: Vec<ChatMessage>,
+        response_format: Option<ResponseFormat>,
+        _reasoning_effort: Option<ReasoningEffort>,
+        tx: mpsc::Sender<StreamEvent>,
+        cancel_rx: watch::Receiver<bool>,
+    ) -> anyhow::Result<()> {
+        self.stream_chat(model, messages, response_format, tx, cancel_rx)
+            .await
+    }
+
     async fn stream_text(
         &self,
         model: &str,

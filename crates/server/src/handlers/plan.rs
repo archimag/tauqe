@@ -603,12 +603,13 @@ pub async fn handle_plan_refine(req: Request, state: &Arc<AppState>) -> Response
         });
     }
 
-    let (provider, model, repomap_budget, max_discovery_rounds, max_files) = {
+    let (provider, model, reasoning_effort, repomap_budget, max_discovery_rounds, max_files) = {
         let cfg = state.config.lock().await;
         let model = match custom_model {
             Some(m) => cfg.resolve_model(&m),
             None => cfg.resolve_role(ModelRole::Architect),
         };
+        let reasoning_effort = cfg.models.resolve_effort(ModelRole::Architect);
         let provider: Arc<dyn LlmProvider> = match create_provider(model.provider, &cfg) {
             Ok(p) => Arc::from(p),
             Err(err) => {
@@ -619,6 +620,7 @@ pub async fn handle_plan_refine(req: Request, state: &Arc<AppState>) -> Response
         (
             provider,
             model,
+            reasoning_effort,
             cfg.context.repomap_token_budget,
             cfg.context.max_discovery_rounds,
             cfg.context.max_files,
@@ -737,7 +739,14 @@ pub async fn handle_plan_refine(req: Request, state: &Arc<AppState>) -> Response
 
         let stream_task = tokio::spawn(async move {
             provider_stream
-                .stream_chat(&model_name, messages, response_format, tx, stream_cancel)
+                .stream_chat_with_effort(
+                    &model_name,
+                    messages,
+                    response_format,
+                    reasoning_effort,
+                    tx,
+                    stream_cancel,
+                )
                 .await
         });
 

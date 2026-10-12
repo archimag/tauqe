@@ -25,9 +25,21 @@ reviewer = "~anthropic/claude-sonnet-latest" # automated code review of active c
 # when retry limits are exceeded, or when a plan step must be re-prompted after protocol drift
 auto_level_up = true
 
+# Optional per-role reasoning depth: "low", "medium", "high", or "xhigh".
+# Effort stays orthogonal to model identity: the same model may be driven at a
+# different depth depending on the role it plays. Omitted roles fall back to the
+# provider default.
+[models.effort]
+# scribe = "low"        # cheap history compaction and commit message synthesis
+# coder = "medium"      # balanced patch generation and verification healing
+# architect = "xhigh"   # deep conceptual design and plan refinement
+# advisor = "medium"    # interactive engineering dialogue
+# reviewer = "high"     # thorough automated code review
+
 [develop]
 # Retry budget for failed edit staging and for the plan step reprompt loop
-# (corrective re-runs of a step turn that produced no verified edits and no <success> tag).
+# (corrective re-runs of a step turn that produced no verified edits and no terminal
+# success tag).
 max_retries = 5
 # workflow = "git"   # edit workflow: "toolchain", "git", "naive" (default: "git")
 # protocol = "xml"   # active edit protocol: "xml" (default: "xml")

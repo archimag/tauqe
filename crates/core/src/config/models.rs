@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
-use tauqe_protocol::{ModelRef, ModelRole, ModelRolesSummary, ModelSelection};
+use tauqe_protocol::{
+    ModelRef, ModelRole, ModelRolesEffort, ModelRolesSummary, ModelSelection, ReasoningEffort,
+};
 
 pub const BUILTIN_DEFAULT_SCRIBE_MODEL: &str = "~anthropic/claude-haiku-latest";
 pub const BUILTIN_DEFAULT_CODER_MODEL: &str = "~google/gemini-flash-latest";
@@ -7,6 +9,12 @@ pub const BUILTIN_DEFAULT_ARCHITECT_MODEL: &str = "~anthropic/claude-sonnet-late
 pub const BUILTIN_DEFAULT_ADVISOR_MODEL: &str = "~google/gemini-flash-latest";
 pub const BUILTIN_DEFAULT_REVIEWER_MODEL: &str = "~anthropic/claude-sonnet-latest";
 pub const BUILTIN_DEFAULT_MODEL: &str = BUILTIN_DEFAULT_ADVISOR_MODEL;
+
+/// Optional per-role reasoning depth configuration (`[models.effort]`).
+///
+/// Reuses the protocol-level `ModelRolesEffort` shape so effort levels stay
+/// strictly typed (`ReasoningEffort`) and orthogonal to model identity.
+pub type ModelsEffortConfig = ModelRolesEffort;
 
 pub fn parse_model_ref(s: &str) -> Result<ModelRef, String> {
     let s = s.trim();
@@ -100,6 +108,8 @@ pub struct ModelsConfig {
         serialize_with = "serialize_model_ref_opt"
     )]
     pub reviewer: Option<ModelRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<ModelsEffortConfig>,
     #[serde(default)]
     pub auto_level_up: bool,
 }
@@ -124,6 +134,21 @@ impl ModelsConfig {
     /// Resolves a ModelRole using the deterministic proximity fallback chain within the models configuration.
     pub fn resolve_role(&self, role: ModelRole) -> ModelRef {
         self.resolve_role_with_fallback(role, None)
+    }
+
+    /// Resolves the optional reasoning effort configured for a semantic role.
+    ///
+    /// Returns `None` when no effort overrides are configured or when the
+    /// requested role has no explicit effort, preserving the provider default.
+    pub fn resolve_effort(&self, role: ModelRole) -> Option<ReasoningEffort> {
+        let effort = self.effort.as_ref()?;
+        match role {
+            ModelRole::Scribe => effort.scribe,
+            ModelRole::Coder => effort.coder,
+            ModelRole::Architect => effort.architect,
+            ModelRole::Advisor => effort.advisor,
+            ModelRole::Reviewer => effort.reviewer,
+        }
     }
 
     /// Resolves a ModelRole with an optional external fallback model (e.g. from configured provider models).
@@ -202,6 +227,51 @@ impl ModelsConfig {
             architect: self.resolve_role_with_fallback(ModelRole::Architect, fallback.clone()),
             advisor: self.resolve_role_with_fallback(ModelRole::Advisor, fallback.clone()),
             reviewer: self.resolve_role_with_fallback(ModelRole::Reviewer, fallback),
+            efforts: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_resolve_effort_defaults_to_none() {
+        let config = ModelsConfig::default();
+        assert!(config.effort.is_none());
+        for role in [
+            ModelRole::Scribe,
+            ModelRole::Coder,
+            ModelRole::Architect,
+            ModelRole::Advisor,
+            ModelRole::Reviewer,
+        ] {
+            assert_eq!(config.resolve_effort(role), None);
+        }
+    }
+
+    #[test]
+    fn test_resolve_effort_per_role_override() {
+        let toml_str = r#"
+architect = "xhigh"
+coder = "low"
+"#;
+        let effort: ModelsEffortConfig = toml::from_str(toml_str).expect("parse effort");
+        let config = ModelsConfig {
+            effort: Some(effort),
+            ..Default::default()
+        };
+        assert_eq!(
+            config.resolve_effort(ModelRole::Architect),
+            Some(ReasoningEffort::XHigh)
+        );
+        assert_eq!(
+            config.resolve_effort(ModelRole::Coder),
+            Some(ReasoningEffort::Low)
+        );
+        assert_eq!(config.resolve_effort(ModelRole::Scribe), None);
+        assert_eq!(config.resolve_effort(ModelRole::Advisor), None);
+        assert_eq!(config.resolve_effort(ModelRole::Reviewer), None);
     }
 }

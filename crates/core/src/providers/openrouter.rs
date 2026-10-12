@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, watch};
 use tauqe_protocol::{ModelUsageInfo, ProviderKind};
 
-use super::types::{ChatMessage, ResponseFormat, StreamEvent};
+use super::types::{ChatMessage, ReasoningEffort, ResponseFormat, StreamEvent};
 use super::LlmProvider;
 
 pub struct OpenRouterProvider {
@@ -43,6 +43,8 @@ struct StreamOptions {
 #[derive(Debug, Serialize)]
 struct ReasoningOption {
     enabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    effort: Option<ReasoningEffort>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -215,6 +217,7 @@ impl OpenRouterProvider {
         model: &str,
         messages: Vec<ChatMessage>,
         response_format: Option<ResponseFormat>,
+        reasoning_effort: Option<ReasoningEffort>,
         tx: mpsc::Sender<StreamEvent>,
         mut cancel_rx: watch::Receiver<bool>,
     ) -> Result<()> {
@@ -238,11 +241,10 @@ impl OpenRouterProvider {
             stream_options: Some(StreamOptions {
                 include_usage: true,
             }),
-            reasoning: if uses_json_schema {
-                None
-            } else {
-                Some(ReasoningOption { enabled: true })
-            },
+            reasoning: Some(ReasoningOption {
+                enabled: true,
+                effort: reasoning_effort,
+            }),
             provider: if uses_json_schema {
                 Some(ProviderPreferences {
                     require_parameters: true,
@@ -440,8 +442,28 @@ impl LlmProvider for OpenRouterProvider {
         tx: mpsc::Sender<StreamEvent>,
         cancel_rx: watch::Receiver<bool>,
     ) -> Result<()> {
-        self.execute_stream(model, messages, response_format, tx, cancel_rx)
+        self.execute_stream(model, messages, response_format, None, tx, cancel_rx)
             .await
+    }
+
+    async fn stream_chat_with_effort(
+        &self,
+        model: &str,
+        messages: Vec<ChatMessage>,
+        response_format: Option<ResponseFormat>,
+        reasoning_effort: Option<ReasoningEffort>,
+        tx: mpsc::Sender<StreamEvent>,
+        cancel_rx: watch::Receiver<bool>,
+    ) -> Result<()> {
+        self.execute_stream(
+            model,
+            messages,
+            response_format,
+            reasoning_effort,
+            tx,
+            cancel_rx,
+        )
+        .await
     }
 }
 
@@ -622,9 +644,66 @@ mod tests {
         let req_json: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
         assert_eq!(req_json["provider"]["require_parameters"], true);
         assert_eq!(req_json["response_format"]["type"], "json_schema");
+        assert_eq!(req_json["reasoning"]["enabled"], true);
         assert!(req_json.get("tools").is_none());
         assert!(req_json.get("tool_choice").is_none());
         assert!(req_json.get("parallel_tool_calls").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_stream_chat_with_effort_translates_reasoning_effort() {
+        use super::super::types::JsonSchemaDefinition;
+
+        let mock_server = MockServer::start().await;
+
+        let sse_body = "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndn\n";
+
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(sse_body, "text/event-stream"),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let provider =
+            OpenRouterProvider::new("test-api-key".to_string()).with_base_url(mock_server.uri());
+
+        let (tx, mut rx) = mpsc::channel(10);
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+
+        let response_format = Some(ResponseFormat::JsonSchema {
+            json_schema: JsonSchemaDefinition {
+                name: "model_result".to_string(),
+                description: None,
+                schema: serde_json::json!({"type": "object"}),
+                strict: Some(true),
+            },
+        });
+
+        let provider_task = tokio::spawn(async move {
+            provider
+                .stream_chat_with_effort(
+                    "test-model",
+                    vec![],
+                    response_format,
+                    Some(ReasoningEffort::XHigh),
+                    tx,
+                    cancel_rx,
+                )
+                .await
+        });
+
+        while let Some(_event) = rx.recv().await {}
+        assert!(provider_task.await.expect("task join failed").is_ok());
+
+        let requests = mock_server.received_requests().await.unwrap();
+        let req_json: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(req_json["reasoning"]["enabled"], true);
+        assert_eq!(req_json["reasoning"]["effort"], "xhigh");
+        assert_eq!(req_json["provider"]["require_parameters"], true);
     }
 
     #[tokio::test]

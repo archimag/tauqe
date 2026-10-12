@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use tauqe_protocol::ModelUsageInfo;
 
+pub use tauqe_protocol::ReasoningEffort;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ChatMessage {
     pub role: String,

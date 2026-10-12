@@ -925,10 +925,11 @@ pub async fn execute_edit_pipeline_step<'a>(
         protocol.response_format(&targetable_paths)
     };
 
-    let client_call = provider.stream_chat(
+    let client_call = provider.stream_chat_with_effort(
         &model.name,
         assembled_messages.clone(),
         response_format,
+        options.reasoning_effort,
         llm_tx,
         cancel_rx.clone(),
     );

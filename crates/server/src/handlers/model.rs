@@ -238,6 +238,10 @@ async fn run_prepared_turn(
         .unwrap_or_else(|_| Box::new(XmlEditProtocol));
 
     let mut workflow_opts = tauqe_core::workflow::WorkflowOptions::from_app_config(&app_config);
+    workflow_opts.reasoning_effort = match &selection {
+        tauqe_protocol::ModelSelection::Role(role) => app_config.models.resolve_effort(*role),
+        tauqe_protocol::ModelSelection::Specific(_) => None,
+    };
     workflow_opts.initial_selection = Some(selection);
     let workflow: Box<dyn tauqe_core::workflow::EditWorkflow> =
         match app_config.develop.workflow.trim().to_lowercase().as_str() {
