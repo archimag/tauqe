@@ -12,9 +12,9 @@ use tags::{parse_context_request_tags, parse_doc_request_tags};
 
 pub use marker::generate_turn_marker;
 pub use tags::{
-    extract_error, extract_scratchpad, extract_success, extract_terminal_outcome,
+    extract_blocked, extract_error, extract_scratchpad, extract_success, extract_terminal_outcome,
     extract_user_language, extract_verify_request, parse_context_drop_tags,
-    strip_context_drop_tags, strip_context_request_tags, strip_doc_request_tags,
+    strip_blocked_tags, strip_context_drop_tags, strip_context_request_tags, strip_doc_request_tags,
     strip_error_tags, strip_plan_tags, strip_scratchpad_tags, strip_success_tags,
     strip_terminal_outcome_tags, strip_user_language_tags, strip_verify_tags,
     TerminalOutcome, VerifyOnSuccess, VerifyRequest, VerifyTarget,
@@ -162,7 +162,7 @@ impl EditProtocol for XmlEditProtocol {
         prompt.push_str("10. Detect User Language: Identify the primary language of the user's prompt and output a <user_language>language</user_language> tag (e.g. <user_language>Russian</user_language>). All conversational explanations MUST be in this detected language. Internal thoughts and reasoning MUST be strictly in English.\n");
         prompt.push_str("11. Choosing <edit> vs <overwrite>: use <edit> by default for local changes. Use <overwrite path=\"...\"> with the COMPLETE new file content when most of an existing editable file changes (roughly more than half), when the file is small, or when many fragile search blocks would be needed. Never use <create> for a path that already exists; use <create> only for new files.\n");
         prompt.push_str("12. Turn Scratchpad (Working Memory): To retain working hypotheses, verified findings, or focus across multi-round discovery and verification healing cycles, you may emit <scratchpad>...</scratchpad> (or <scratchpad note=\"...\" />). Keep notes concise (bullet points of what is verified, current hypothesis, and purpose of requested files). Notes are preserved strictly within the current turn and automatically stripped from conversational text.\n");
-        prompt.push_str("13. Terminal Outcome Protocol: Conclude every task execution cleanly with an explicit terminal outcome tag. When your changes are complete, staged, and verified (or the user's task is resolved), emit <success summary=\"...\" />. If you encounter an insurmountable blocker, contradictory requirements, or cannot proceed, do not silently fail or hallucinate; emit <error message=\"...\" /> detailing the blocker.\n\n");
+        prompt.push_str("13. Terminal Outcome Protocol: Conclude every task execution cleanly with an explicit terminal outcome tag. When your changes are complete, staged, and verified (or the user's task is resolved), emit <success summary=\"...\" />. If you encounter an insurmountable blocker, contradictory requirements, or cannot proceed, do not silently fail or hallucinate; emit <error message=\"...\" /> detailing the blocker. When executing a plan step and an essential precondition, assumption, or dependency fails, emit <blocked reason=\"...\" details=\"...\" /> to trigger semantic recovery without wasteful retry cycles.\n\n");
         prompt.push_str("14. Plan Item Tags: When authoring an engineering plan, an <item ...> step tag accepts optional attributes: concept_refs=\"c-1,c-2\" (addressed concept nodes), files=\"path/to/modify.rs,...\" (target files loaded as editable context), and readonly=\"path/to/contract.rs,...\" (reference or contract files loaded as read-only context and never modified). Leaf-Only Files Invariant: `files` and `readonly` must be declared only on executable leaf steps without children; parent container items and task groups must never declare either.\n\n");
 
         prompt
@@ -292,6 +292,10 @@ impl EditProtocol for MarkedXmlEditProtocol {
             },
             TerminalOutcome::Error { message } => TerminalOutcome::Error {
                 message: restore_xml_literals(&message, &self.marker),
+            },
+            TerminalOutcome::Blocked { reason, details } => TerminalOutcome::Blocked {
+                reason: restore_xml_literals(&reason, &self.marker),
+                details: details.map(|d| restore_xml_literals(&d, &self.marker)),
             },
         })
     }
@@ -1297,6 +1301,34 @@ Everything is tested and working properly."#;
         assert!(marked_instr.contains(&format!("<scratchpad_{m}>...</scratchpad_{m}>", m = marker)));
         assert!(marked_instr.contains(&format!("<success_{m} summary=\"...\" />", m = marker)));
         assert!(marked_instr.contains(&format!("<error_{m} message=\"...\" />", m = marker)));
+        assert!(marked_instr.contains(&format!("<blocked_{m} reason=\"...\" details=\"...\" />", m = marker)));
+    }
+
+    #[test]
+    fn test_marked_xml_blocked_outcome_parsing_and_cleaning() {
+        let marker = "M998877";
+        let proto = MarkedXmlEditProtocol::new(marker);
+
+        let blocked_output = format!(
+            "Cannot fulfill step contract.\n\
+            <blocked_{m} reason=\"Precondition violated\" details=\"File schema missing\" />\n\
+            Conversational note.",
+            m = marker
+        );
+        let outcome = proto.parse_terminal_outcome(&blocked_output).unwrap();
+        assert_eq!(
+            outcome,
+            TerminalOutcome::Blocked {
+                reason: "Precondition violated".to_string(),
+                details: Some("File schema missing".to_string()),
+            }
+        );
+        let cleaned = proto.clean_assistant_text(&blocked_output);
+        assert!(!cleaned.contains("blocked"));
+        assert_eq!(
+            cleaned,
+            "Cannot fulfill step contract.\n\nConversational note."
+        );
     }
 
     #[test]

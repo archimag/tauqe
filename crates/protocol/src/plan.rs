@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use serde::{Deserialize, Serialize};
 
 use crate::model::ModelSelection;
@@ -10,6 +12,7 @@ pub enum PlanItemStatus {
     Todo,
     InProgress,
     Done,
+    Blocked,
     Cancelled,
 }
 
@@ -21,7 +24,8 @@ impl PlanItemStatus {
             Self::Discussion => Self::Todo,
             Self::Todo => Self::InProgress,
             Self::InProgress => Self::Done,
-            Self::Done => Self::Cancelled,
+            Self::Done => Self::Blocked,
+            Self::Blocked => Self::Cancelled,
             Self::Cancelled => Self::Discussion,
         }
     }
@@ -34,6 +38,7 @@ impl std::fmt::Display for PlanItemStatus {
             Self::Todo => write!(f, "TODO"),
             Self::InProgress => write!(f, "IN_PROGRESS"),
             Self::Done => write!(f, "DONE"),
+            Self::Blocked => write!(f, "BLOCKED"),
             Self::Cancelled => write!(f, "CANCELLED"),
         }
     }
@@ -80,6 +85,8 @@ pub struct PlanItem {
     pub readonly_files: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub concept_refs: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub depends_on: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub children: Vec<PlanItem>,
 }
@@ -138,6 +145,9 @@ pub fn compute_items_status(items: &[PlanItem]) -> PlanItemStatus {
     if statuses.contains(&PlanItemStatus::Discussion) {
         return PlanItemStatus::Discussion;
     }
+    if statuses.contains(&PlanItemStatus::Blocked) {
+        return PlanItemStatus::Blocked;
+    }
     if statuses.contains(&PlanItemStatus::InProgress) {
         return PlanItemStatus::InProgress;
     }
@@ -163,6 +173,28 @@ pub fn compute_items_status(items: &[PlanItem]) -> PlanItemStatus {
         return PlanItemStatus::Todo;
     }
     PlanItemStatus::InProgress
+}
+
+/// Collects DISCUSSION markers and executable candidate leaves from a plan subtree.
+///
+/// A candidate leaf is an executable step whose status is `Todo` or `InProgress`.
+fn walk_candidate_leaves(
+    items: &[PlanItem],
+    discussion: &mut Vec<String>,
+    candidates: &mut Vec<PlanItem>,
+) {
+    for item in items {
+        if item.status == PlanItemStatus::Discussion {
+            discussion.push(format!("#{} {}", item.id, item.title));
+        }
+        if item.is_leaf() {
+            if item.status == PlanItemStatus::Todo || item.status == PlanItemStatus::InProgress {
+                candidates.push(item.clone());
+            }
+        } else {
+            walk_candidate_leaves(&item.children, discussion, candidates);
+        }
+    }
 }
 
 impl Plan {
@@ -260,36 +292,21 @@ impl Plan {
 
     /// Evaluates a scope (leaf item, composite subtree, or entire plan if `scope_id` is None)
     /// for autonomous execution.
+    ///
+    /// A candidate leaf is ready only when every identifier in its `depends_on`
+    /// list refers to a step that is already `Done` or is scheduled earlier in the
+    /// same scope, enforcing the DAG readiness contract.
     pub fn evaluate_scope(&self, scope_id: Option<&str>) -> PlanScopeEvaluation {
         match scope_id {
             None => {
                 let mut discussion = Vec::new();
-                let mut leaves = Vec::new();
-
-                fn walk(items: &[PlanItem], discussion: &mut Vec<String>, leaves: &mut Vec<PlanItem>) {
-                    for item in items {
-                        if item.status == PlanItemStatus::Discussion {
-                            discussion.push(format!("#{} {}", item.id, item.title));
-                        }
-                        if item.is_leaf() {
-                            if item.status == PlanItemStatus::Todo || item.status == PlanItemStatus::InProgress {
-                                leaves.push(item.clone());
-                            }
-                        } else {
-                            walk(&item.children, discussion, leaves);
-                        }
-                    }
-                }
-
-                walk(&self.items, &mut discussion, &mut leaves);
+                let mut candidates = Vec::new();
+                walk_candidate_leaves(&self.items, &mut discussion, &mut candidates);
 
                 if !discussion.is_empty() {
-                    PlanScopeEvaluation::BlockedByDiscussion(discussion)
-                } else if leaves.is_empty() {
-                    PlanScopeEvaluation::AllCompleted
-                } else {
-                    PlanScopeEvaluation::Ready(leaves)
+                    return PlanScopeEvaluation::BlockedByDiscussion(discussion);
                 }
+                self.resolve_scope_candidates(candidates)
             }
             Some(id) => {
                 let target = match self.find_item(id) {
@@ -299,50 +316,93 @@ impl Plan {
 
                 if target.is_leaf() {
                     match target.status {
-                        PlanItemStatus::Discussion => {
-                            PlanScopeEvaluation::BlockedByDiscussion(vec![format!("#{} {}", target.id, target.title)])
-                        }
+                        PlanItemStatus::Discussion => PlanScopeEvaluation::BlockedByDiscussion(vec![
+                            format!("#{} {}", target.id, target.title),
+                        ]),
+                        PlanItemStatus::Blocked => PlanScopeEvaluation::StepBlocked,
                         PlanItemStatus::Cancelled => PlanScopeEvaluation::Cancelled,
                         PlanItemStatus::Done => PlanScopeEvaluation::AllCompleted,
                         PlanItemStatus::Todo | PlanItemStatus::InProgress => {
-                            PlanScopeEvaluation::Ready(vec![target.clone()])
+                            self.resolve_scope_candidates(vec![target.clone()])
                         }
                     }
                 } else {
                     let mut discussion = Vec::new();
-                    let mut leaves = Vec::new();
+                    let mut candidates = Vec::new();
 
                     if target.status == PlanItemStatus::Discussion {
                         discussion.push(format!("#{} {}", target.id, target.title));
                     }
-
-                    fn walk(items: &[PlanItem], discussion: &mut Vec<String>, leaves: &mut Vec<PlanItem>) {
-                        for item in items {
-                            if item.status == PlanItemStatus::Discussion {
-                                discussion.push(format!("#{} {}", item.id, item.title));
-                            }
-                            if item.is_leaf() {
-                                if item.status == PlanItemStatus::Todo || item.status == PlanItemStatus::InProgress {
-                                    leaves.push(item.clone());
-                                }
-                            } else {
-                                walk(&item.children, discussion, leaves);
-                            }
-                        }
-                    }
-
-                    walk(&target.children, &mut discussion, &mut leaves);
+                    walk_candidate_leaves(&target.children, &mut discussion, &mut candidates);
 
                     if !discussion.is_empty() {
-                        PlanScopeEvaluation::BlockedByDiscussion(discussion)
-                    } else if leaves.is_empty() {
-                        PlanScopeEvaluation::AllCompleted
-                    } else {
-                        PlanScopeEvaluation::Ready(leaves)
+                        return PlanScopeEvaluation::BlockedByDiscussion(discussion);
                     }
+                    self.resolve_scope_candidates(candidates)
                 }
             }
         }
+    }
+
+    /// Filters executable candidate leaves by DAG readiness, mapping the outcome
+    /// onto a scope evaluation.
+    fn resolve_scope_candidates(&self, candidates: Vec<PlanItem>) -> PlanScopeEvaluation {
+        if candidates.is_empty() {
+            return PlanScopeEvaluation::AllCompleted;
+        }
+        let (ready, blocked) = self.resolve_dependency_readiness(candidates);
+        if ready.is_empty() {
+            PlanScopeEvaluation::BlockedByDependencies(blocked)
+        } else {
+            PlanScopeEvaluation::Ready(ready)
+        }
+    }
+
+    /// Topologically resolves which candidate leaves are ready for execution.
+    ///
+    /// Returns the ordered ready leaves together with the descriptions of the
+    /// leaves that remain blocked by unmet dependencies.
+    fn resolve_dependency_readiness(&self, candidates: Vec<PlanItem>) -> (Vec<PlanItem>, Vec<String>) {
+        let mut satisfied: HashSet<String> = HashSet::new();
+        fn collect_done(items: &[PlanItem], satisfied: &mut HashSet<String>) {
+            for item in items {
+                if item.status == PlanItemStatus::Done {
+                    satisfied.insert(item.id.to_ascii_lowercase());
+                }
+                collect_done(&item.children, satisfied);
+            }
+        }
+        collect_done(&self.items, &mut satisfied);
+
+        let mut ready = Vec::new();
+        let mut pending = candidates;
+        loop {
+            let mut progressed = false;
+            let mut still = Vec::new();
+            for leaf in pending {
+                let deps_met = leaf
+                    .depends_on
+                    .iter()
+                    .all(|dep| satisfied.contains(&dep.to_ascii_lowercase()));
+                if deps_met {
+                    satisfied.insert(leaf.id.to_ascii_lowercase());
+                    ready.push(leaf);
+                    progressed = true;
+                } else {
+                    still.push(leaf);
+                }
+            }
+            pending = still;
+            if !progressed {
+                break;
+            }
+        }
+
+        let blocked = pending
+            .into_iter()
+            .map(|leaf| format!("#{} {}", leaf.id, leaf.title))
+            .collect();
+        (ready, blocked)
     }
 
     pub fn refresh_parent_statuses(&mut self) {
@@ -360,9 +420,9 @@ impl Plan {
     /// Enforces the leaf-only file invariant across the plan.
     ///
     /// Parent items act as conceptual milestones, phases, and task groups.
-    /// They are never executed autonomously, so any `files` list attached to a
-    /// non-leaf item is cleared. Only leaf items (`is_leaf()`) define target
-    /// context files.
+    /// They are never executed autonomously, so any `files`, `readonly_files`,
+    /// or `depends_on` list attached to a non-leaf item is cleared. Only leaf
+    /// items (`is_leaf()`) define target context files and DAG dependencies.
     pub fn normalize_leaf_files(&mut self) {
         fn walk(items: &mut [PlanItem]) {
             for item in items.iter_mut() {
@@ -374,6 +434,7 @@ impl Plan {
                 }
                 item.files.clear();
                 item.readonly_files.clear();
+                item.depends_on.clear();
                 walk(&mut item.children);
             }
         }
@@ -443,6 +504,7 @@ impl Plan {
                 let check = match item.status {
                     PlanItemStatus::Done => "[x]",
                     PlanItemStatus::InProgress => "[>]",
+                    PlanItemStatus::Blocked => "[!]",
                     PlanItemStatus::Cancelled => "[-]",
                     PlanItemStatus::Discussion => "[?]",
                     PlanItemStatus::Todo => "[ ]",
@@ -460,6 +522,9 @@ impl Plan {
                 }
                 if !item.readonly_files.is_empty() {
                     out.push_str(&format!("{}    readonly_files: {}\n", indent, item.readonly_files.join(", ")));
+                }
+                if !item.depends_on.is_empty() {
+                    out.push_str(&format!("{}    depends_on: {}\n", indent, item.depends_on.join(", ")));
                 }
                 if let Some(details) = &item.details {
                     let trimmed = details.trim();
@@ -619,6 +684,8 @@ pub fn format_plan_discussion_prompt(
 pub enum PlanScopeEvaluation {
     Ready(Vec<PlanItem>),
     BlockedByDiscussion(Vec<String>),
+    BlockedByDependencies(Vec<String>),
+    StepBlocked,
     AllCompleted,
     Cancelled,
     NotFound,
@@ -824,9 +891,14 @@ mod tests {
         assert_eq!(status.next(), PlanItemStatus::Todo);
         assert_eq!(status.next().next(), PlanItemStatus::InProgress);
         assert_eq!(status.next().next().next(), PlanItemStatus::Done);
-        assert_eq!(status.next().next().next().next(), PlanItemStatus::Cancelled);
-        assert_eq!(status.next().next().next().next().next(), PlanItemStatus::Discussion);
+        assert_eq!(status.next().next().next().next(), PlanItemStatus::Blocked);
+        assert_eq!(status.next().next().next().next().next(), PlanItemStatus::Cancelled);
+        assert_eq!(
+            status.next().next().next().next().next().next(),
+            PlanItemStatus::Discussion
+        );
         assert_eq!(status.to_string(), "DISCUSSION");
+        assert_eq!(PlanItemStatus::Blocked.to_string(), "BLOCKED");
     }
 
     #[test]
@@ -897,22 +969,25 @@ mod tests {
         it.files = vec!["src/claims.rs".to_string()];
         it.readonly_files = vec!["src/utils.rs".to_string()];
         it.concept_refs = vec!["c-1".to_string()];
+        it.depends_on = vec!["1.0".to_string()];
 
         let json = serde_json::to_string(&it).unwrap();
         assert!(json.contains("\"in_progress\""));
         assert!(json.contains("\"files\""));
         assert!(json.contains("\"readonly_files\""));
         assert!(json.contains("\"concept_refs\""));
+        assert!(json.contains("\"depends_on\""));
 
         let de: PlanItem = serde_json::from_str(&json).unwrap();
         assert_eq!(de, it);
 
-        // Backward compatibility: missing concept, files, readonly_files, concept_refs deserialize to empty defaults
+        // Backward compatibility: missing fields deserialize to empty defaults.
         let legacy_json = r#"{"id":"1.1","title":"Define claims","status":"in_progress"}"#;
         let legacy_item: PlanItem = serde_json::from_str(legacy_json).unwrap();
         assert!(legacy_item.files.is_empty());
         assert!(legacy_item.readonly_files.is_empty());
         assert!(legacy_item.concept_refs.is_empty());
+        assert!(legacy_item.depends_on.is_empty());
 
         let legacy_plan_json = r#"{"id":"p1","title":"Plan","created_at":1,"updated_at":2,"items":[]}"#;
         let legacy_plan: Plan = serde_json::from_str(legacy_plan_json).unwrap();
@@ -1047,13 +1122,16 @@ mod tests {
         let mut inner_leaf = item("1.1", "Inner Leaf", PlanItemStatus::Todo, vec![]);
         inner_leaf.files = vec!["src/inner.rs".to_string(), "src/shared.rs".to_string()];
         inner_leaf.readonly_files = vec!["src/ref.rs".to_string(), "src/shared.rs".to_string()];
+        inner_leaf.depends_on = vec!["2".to_string()];
 
         let mut mid = item("1", "Mid Group", PlanItemStatus::Todo, vec![inner_leaf]);
         mid.files = vec!["src/mid.rs".to_string()];
         mid.readonly_files = vec!["src/mid_ref.rs".to_string()];
+        mid.depends_on = vec!["2".to_string()];
 
         let mut top = item("root", "Root Group", PlanItemStatus::Todo, vec![mid]);
         top.files = vec!["src/top.rs".to_string()];
+        top.depends_on = vec!["2".to_string()];
 
         let mut leaf = item("2", "Top Leaf", PlanItemStatus::Todo, vec![]);
         leaf.files = vec!["src/leaf.rs".to_string()];
@@ -1074,8 +1152,10 @@ mod tests {
         // Containers are cleared at every depth.
         assert!(plan.items[0].files.is_empty());
         assert!(plan.items[0].readonly_files.is_empty());
+        assert!(plan.items[0].depends_on.is_empty());
         assert!(plan.items[0].children[0].files.is_empty());
         assert!(plan.items[0].children[0].readonly_files.is_empty());
+        assert!(plan.items[0].children[0].depends_on.is_empty());
         // Leaves keep their files, overlapping readonly_files are removed.
         assert_eq!(
             plan.items[0].children[0].children[0].files,
@@ -1087,6 +1167,10 @@ mod tests {
         );
         assert_eq!(plan.items[1].files, vec!["src/leaf.rs".to_string()]);
         assert_eq!(plan.items[1].readonly_files, vec!["src/leaf_ref.rs".to_string()]);
+        assert_eq!(
+            plan.items[0].children[0].children[0].depends_on,
+            vec!["2".to_string()]
+        );
     }
 
     #[test]
@@ -1160,6 +1244,51 @@ mod tests {
             }
             other => panic!("Expected Ready, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_plan_evaluate_scope_dependencies() {
+        let first = item("1", "First", PlanItemStatus::Todo, vec![]);
+        let mut second = item("2", "Second", PlanItemStatus::Todo, vec![]);
+        second.depends_on = vec!["1".to_string()];
+        let mut third = item("3", "Third", PlanItemStatus::Todo, vec![]);
+        third.depends_on = vec!["2".to_string()];
+
+        let plan = Plan {
+            id: "dag".to_string(),
+            title: "DAG".to_string(),
+            description: None,
+            created_at: 1,
+            updated_at: 1,
+            concept: vec![],
+            items: vec![first, second, third],
+        };
+
+        // The whole chain is scheduled in dependency order.
+        match plan.evaluate_scope(None) {
+            PlanScopeEvaluation::Ready(leaves) => {
+                let ids: Vec<&str> = leaves.iter().map(|i| i.id.as_str()).collect();
+                assert_eq!(ids, vec!["1", "2", "3"]);
+            }
+            other => panic!("Expected Ready, got {:?}", other),
+        }
+
+        // A step whose dependency is not DONE yet is blocked when targeted.
+        match plan.evaluate_scope(Some("2")) {
+            PlanScopeEvaluation::BlockedByDependencies(items) => {
+                assert_eq!(items.len(), 1);
+                assert!(items[0].contains("#2"));
+            }
+            other => panic!("Expected BlockedByDependencies, got {:?}", other),
+        }
+
+        // A step in BLOCKED status cannot be executed.
+        let mut blocked_plan = plan.clone();
+        blocked_plan.update_item_status("1", PlanItemStatus::Blocked);
+        assert_eq!(
+            blocked_plan.evaluate_scope(Some("1")),
+            PlanScopeEvaluation::StepBlocked
+        );
     }
 
     #[test]

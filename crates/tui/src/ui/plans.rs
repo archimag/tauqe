@@ -541,6 +541,7 @@ fn status_style(status: PlanItemStatus) -> Style {
         PlanItemStatus::Todo => Style::default().bg(Color::Yellow).fg(Color::Black).bold(),
         PlanItemStatus::InProgress => Style::default().bg(Color::Cyan).fg(Color::Black).bold(),
         PlanItemStatus::Done => Style::default().bg(Color::Green).fg(Color::Black).bold(),
+        PlanItemStatus::Blocked => Style::default().bg(Color::Red).fg(Color::White).bold(),
         PlanItemStatus::Cancelled => Style::default().bg(Color::DarkGray).fg(Color::White).bold(),
     }
 }
@@ -814,6 +815,8 @@ fn compute_unified_plan_lines(
                     "▶ "
                 } else if *status == PlanItemStatus::Discussion {
                     "? "
+                } else if *status == PlanItemStatus::Blocked {
+                    "! "
                 } else {
                     "• "
                 };
@@ -868,6 +871,8 @@ fn compute_unified_plan_lines(
                         "  [Tab: fold, x: exec, d: discuss, t: status]"
                     } else if *status == PlanItemStatus::Discussion {
                         "  [d: discuss, t: status (approve)]"
+                    } else if *status == PlanItemStatus::Blocked {
+                        "  [d: discuss, R: replan, t: status]"
                     } else if *status == PlanItemStatus::Cancelled {
                         "  [t: status]"
                     } else {
@@ -1053,6 +1058,7 @@ mod tests {
                 files: vec![],
                 readonly_files: vec![],
                 concept_refs: vec![],
+                depends_on: vec![],
                 children: vec![],
             }],
         };
@@ -1104,6 +1110,7 @@ mod tests {
                 files: vec!["src/jwt.rs".to_string()],
                 readonly_files: vec![],
                 concept_refs: vec!["c-1".to_string()],
+                depends_on: vec![],
                 children: vec![],
             }],
         };
@@ -1145,6 +1152,7 @@ mod tests {
                 files: vec!["parent.rs".to_string()],
                 readonly_files: vec![],
                 concept_refs: vec![],
+                depends_on: vec![],
                 children: vec![PlanItem {
                     id: "1.1".to_string(),
                     title: "Leaf Task".to_string(),
@@ -1153,6 +1161,7 @@ mod tests {
                     files: vec!["leaf.rs".to_string()],
                     readonly_files: vec![],
                     concept_refs: vec![],
+                    depends_on: vec![],
                     children: vec![],
                 }],
             }],
@@ -1198,6 +1207,7 @@ mod tests {
                 files: vec!["src/auth.rs".to_string()],
                 readonly_files: vec!["contracts/api.md".to_string(), "contracts/types.rs".to_string()],
                 concept_refs: vec![],
+                depends_on: vec![],
                 children: vec![],
             }],
         };

@@ -27,6 +27,7 @@ pub(crate) async fn apply_status_dialog(
                 tauqe_protocol::PlanItemStatus::Todo,
                 tauqe_protocol::PlanItemStatus::InProgress,
                 tauqe_protocol::PlanItemStatus::Done,
+                tauqe_protocol::PlanItemStatus::Blocked,
                 tauqe_protocol::PlanItemStatus::Cancelled,
             ];
             let new_status = match statuses.get(chosen_idx).copied() {

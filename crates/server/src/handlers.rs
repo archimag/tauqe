@@ -64,6 +64,7 @@ pub async fn handle_request(req: Request, state: &Arc<AppState>) -> Response {
         methods::PLAN_SET_ACTIVE => plan::handle_plan_set_active(req, state).await,
         methods::PLAN_EXECUTE => plan::handle_plan_execute(req, state).await,
         methods::PLAN_REFINE => plan::handle_plan_refine(req, state).await,
+        methods::PLAN_REPLAN => plan::handle_plan_replan(req, state).await,
 
         methods::CONFIG_GET => config::handle_config_get(req, state).await,
         methods::CONFIG_SET => config::handle_config_set(req, state).await,

@@ -50,3 +50,4 @@ pub const PLAN_DELETE: &str = "plan/delete";
 pub const PLAN_SET_ACTIVE: &str = "plan/setActive";
 pub const PLAN_EXECUTE: &str = "plan/execute";
 pub const PLAN_REFINE: &str = "plan/refine";
+pub const PLAN_REPLAN: &str = "plan/replan";

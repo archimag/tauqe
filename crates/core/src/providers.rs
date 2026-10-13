@@ -1,6 +1,8 @@
+pub mod mock;
 pub mod openrouter;
 pub mod types;
 
+pub use mock::MockLlmProvider;
 pub use openrouter::OpenRouterProvider;
 pub use types::*;
 

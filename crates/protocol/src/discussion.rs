@@ -425,6 +425,7 @@ mod tests {
                     files: vec![],
                     readonly_files: vec![],
                     concept_refs: vec![],
+                    depends_on: vec![],
                     children: vec![],
                 }],
             });

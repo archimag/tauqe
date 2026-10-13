@@ -95,19 +95,18 @@ impl DiscussionStreamFilter {
             self.message_finished = finished;
         }
 
-        // Fallback: if nothing was streamed as message, and buffer is non-empty
-        if self.message_streamed_bytes == 0 && !self.buffer.trim().is_empty() {
-            let parsed = Self::parse_response(&self.buffer);
-            if !parsed.message.is_empty() {
-                events.push(StreamEvent::TextDelta(parsed.message.clone()));
-            } else {
-                events.push(StreamEvent::TextDelta(self.buffer.clone()));
-            }
-            self.response = Some(parsed);
-        } else {
-            self.response = Some(Self::parse_response(&self.buffer));
+        let parsed = Self::parse_response(&self.buffer);
+
+        // Finalization guard: residual message text must never stay trapped in the
+        // buffer when the stream closes. If the on-the-fly scanner surfaced nothing
+        // as the message, emit the parsed message exactly once. Emitting only
+        // `parsed.message` also keeps JSON scaffolding (such as `{"message":""}` or
+        // payloads without a message field) out of the text stream.
+        if self.message_streamed_bytes == 0 && !parsed.message.is_empty() {
+            events.push(StreamEvent::TextDelta(parsed.message.clone()));
         }
 
+        self.response = Some(parsed);
         events
     }
 
@@ -360,6 +359,7 @@ mod tests {
                 files: vec![],
                 readonly_files: vec![],
                 concept_refs: vec![],
+                depends_on: vec![],
                 children: vec![],
             }
         );
@@ -425,5 +425,76 @@ mod tests {
         let resp = DiscussionStreamFilter::parse_response(raw);
         assert_eq!(resp.message, "Partial valid message");
         assert!(resp.plan_update.is_none());
+    }
+
+    #[test]
+    fn test_finish_does_not_leak_json_for_empty_message() {
+        let mut filter = DiscussionStreamFilter::new();
+        let json =
+            r#"{"message":"","plan_update":null,"context_requests":[],"user_language":null}"#;
+
+        let mut streamed = String::new();
+        for c in json.chars() {
+            for ev in filter.push_chunk(&c.to_string()) {
+                if let StreamEvent::TextDelta(d) = ev {
+                    streamed.push_str(&d);
+                }
+            }
+        }
+        for ev in filter.finish_internal() {
+            if let StreamEvent::TextDelta(d) = ev {
+                streamed.push_str(&d);
+            }
+        }
+
+        assert!(
+            streamed.is_empty(),
+            "structured empty message must not leak JSON as text: {streamed:?}"
+        );
+        assert_eq!(filter.response().map(|r| r.message.as_str()), Some(""));
+    }
+
+    #[test]
+    fn test_finish_flushes_held_plain_text() {
+        let mut filter = DiscussionStreamFilter::new();
+        // A short leading-fence payload without a JSON object is buffered while
+        // streaming; finish must flush it instead of dropping it.
+        let _ = filter.push_chunk("```held plain tail");
+        let events = filter.finish_internal();
+        let streamed: String = events
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::TextDelta(d) => Some(d.as_str()),
+                _ => None,
+            })
+            .collect();
+
+        assert!(
+            streamed.contains("held plain tail"),
+            "residual held text must be emitted: {streamed:?}"
+        );
+    }
+
+    #[test]
+    fn test_finish_streams_truncated_message_exactly_once() {
+        let mut filter = DiscussionStreamFilter::new();
+        // Truncated payload: the closing quote and brace never arrive.
+        let json = r#"{"message":"Hello wor"#;
+
+        let mut streamed = String::new();
+        for c in json.chars() {
+            for ev in filter.push_chunk(&c.to_string()) {
+                if let StreamEvent::TextDelta(d) = ev {
+                    streamed.push_str(&d);
+                }
+            }
+        }
+        for ev in filter.finish_internal() {
+            if let StreamEvent::TextDelta(d) = ev {
+                streamed.push_str(&d);
+            }
+        }
+
+        assert_eq!(streamed, "Hello wor");
     }
 }

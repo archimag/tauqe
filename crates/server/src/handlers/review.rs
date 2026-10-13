@@ -2,10 +2,14 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use async_trait::async_trait;
 use tauqe_core::edits::protocol::ContextRequest;
 use tauqe_core::providers::{create_provider, ChatMessage, LlmProvider, StreamEvent};
 use tauqe_core::review::{
     build_review_system_prompt, build_review_user_prompt, parse_review_findings, ReviewStorage,
+};
+use tauqe_core::workflow::batch::{
+    BatchExecution, BatchStep, BatchStepExecutor, BatchStepOutcome, BatchStop,
 };
 use tauqe_core::workflow::common::apply_context_requests_detailed;
 use tauqe_protocol::{
@@ -458,6 +462,9 @@ enum BatchOutcome {
         item_id: u32,
         reason: String,
     },
+    Cancelled {
+        completed: usize,
+    },
 }
 
 fn publish_review(state: &Arc<AppState>, repo_root: &Path, review_id: &str) {
@@ -533,6 +540,19 @@ async fn preload_item_file(state: &Arc<AppState>, repo_root: &Path, file_path: &
     }
 }
 
+/// Whether a completed turn actually applied code edits to disk.
+///
+/// Review findings ask the model to fix code: explanatory text alone, even when
+/// accompanied by a terminal success tag, must not satisfy the finding contract.
+fn turn_applied_edits(turn: &crate::handlers::model::ModelTurnResult) -> bool {
+    match &turn.result {
+        Some(tauqe_protocol::ModelResult::Edit { applied, error, .. }) => {
+            *applied && error.is_none()
+        }
+        _ => false,
+    }
+}
+
 /// Executes one finding in an isolated turn. The finding becomes FIXED only when the
 /// turn satisfies the success contract; on any failure it returns to TODO.
 async fn run_review_step(
@@ -590,15 +610,26 @@ async fn run_review_step(
         .clone()
         .unwrap_or(ModelSelection::Role(ModelRole::Coder));
 
-    match execute_model_turn(state, prompt, Some(step_selection), None).await {
-        Ok(turn) if turn.is_success() => {
+    let workflow_name = state.config.lock().await.develop.workflow.trim().to_lowercase();
+    let policy: Box<dyn tauqe_core::workflow::policy::ApplyPolicy> = match workflow_name.as_str() {
+        "naive" => Box::new(tauqe_core::workflow::policy::DirectApplyPolicy::new()),
+        _ => Box::new(tauqe_core::workflow::git_policy::GitTransactionPolicy::new()),
+    };
+
+    match execute_model_turn(state, prompt, Some(step_selection), None, policy).await {
+        Ok(turn) if turn.is_success() && turn_applied_edits(&turn) => {
             set_item_status(state, repo_root, review_id, item_id, ReviewItemStatus::Fixed);
             Ok(())
         }
         Ok(turn) => {
             set_item_status(state, repo_root, review_id, item_id, ReviewItemStatus::Todo);
+            let applied = turn_applied_edits(&turn);
             let reason = turn.error.clone().unwrap_or_else(|| {
-                "Finding turn ended without verified changes or a success tag".to_string()
+                if applied {
+                    "Finding turn ended without verified changes or a success tag".to_string()
+                } else {
+                    "Finding turn applied no code changes".to_string()
+                }
             });
             if turn.error.is_none() && !turn.is_cancelled {
                 report_item_failure(state, &turn.operation_id, &reason);
@@ -614,8 +645,44 @@ async fn run_review_step(
     }
 }
 
-/// Runs findings sequentially and stops at the first failure (server-side Fail-Fast).
-/// Findings fixed before the failure stay FIXED.
+/// Adapter that executes a single review finding as a [`BatchStepExecutor`] step.
+///
+/// Finding status synchronization (InProgress/Fixed/Todo) and file preloading
+/// stay inside the executor, keeping the batch supervisor agnostic of review
+/// storage.
+struct ReviewItemExecutor<'a> {
+    state: &'a Arc<AppState>,
+    repo_root: &'a Path,
+    review_id: &'a str,
+}
+
+#[async_trait]
+impl BatchStepExecutor for ReviewItemExecutor<'_> {
+    async fn execute_step(
+        &mut self,
+        step: &BatchStep,
+        _stream_tx: mpsc::Sender<StreamEvent>,
+        _cancel_rx: watch::Receiver<bool>,
+    ) -> anyhow::Result<BatchStepOutcome> {
+        let item_id = match step.id.parse::<u32>() {
+            Ok(id) => id,
+            Err(_) => {
+                return Ok(BatchStepOutcome::failed(format!(
+                    "Invalid review item id: {}",
+                    step.id
+                )));
+            }
+        };
+        match run_review_step(self.state, self.repo_root, self.review_id, item_id).await {
+            Ok(()) => Ok(BatchStepOutcome::succeeded()),
+            Err(reason) => Ok(BatchStepOutcome::failed(reason)),
+        }
+    }
+}
+
+/// Runs the review findings through the core [`BatchExecution`] supervisor, which
+/// enforces ordered, fail-fast traversal. Findings fixed before the first failure
+/// stay FIXED.
 async fn run_review_batch(
     state: &Arc<AppState>,
     review_id: &str,
@@ -624,18 +691,57 @@ async fn run_review_batch(
     let repo_root = state.context.read().await.repo_root().to_path_buf();
     let _ = ReviewStorage::save_active_id(&repo_root, Some(review_id));
 
-    let mut completed = 0usize;
-    for item_id in item_ids {
-        if let Err(reason) = run_review_step(state, &repo_root, review_id, item_id).await {
-            return BatchOutcome::Failed {
+    let steps: Vec<BatchStep> = item_ids
+        .iter()
+        .map(|id| BatchStep::new(id.to_string(), format!("Fix review finding #{}", id)))
+        .collect();
+
+    let (stream_tx, _stream_rx) = mpsc::channel::<StreamEvent>(1);
+    let (_cancel_tx, cancel_rx) = watch::channel(false);
+
+    let mut executor = ReviewItemExecutor {
+        state,
+        repo_root: &repo_root,
+        review_id,
+    };
+
+    let report = BatchExecution::new()
+        .run(&steps, &mut executor, &stream_tx, &cancel_rx)
+        .await;
+
+    match report.stop {
+        BatchStop::Completed => BatchOutcome::Completed {
+            items: report.executed.len(),
+        },
+        BatchStop::Cancelled => BatchOutcome::Cancelled {
+            completed: report.executed.len(),
+        },
+        BatchStop::Failed { step_id } => {
+            let completed = report.executed.len().saturating_sub(1);
+            let item_id = step_id.parse::<u32>().unwrap_or(0);
+            let reason = report
+                .executed
+                .last()
+                .and_then(|r| r.outcome.error.clone())
+                .unwrap_or_else(|| "finding failed without diagnostics".to_string());
+            BatchOutcome::Failed {
                 completed,
                 item_id,
                 reason,
-            };
+            }
         }
-        completed += 1;
+        BatchStop::Blocked { step_id, reason } => {
+            // Review findings have no blocked status; a semantic block stops
+            // the batch and is reported as a failed finding.
+            let completed = report.executed.len().saturating_sub(1);
+            let item_id = step_id.parse::<u32>().unwrap_or(0);
+            BatchOutcome::Failed {
+                completed,
+                item_id,
+                reason,
+            }
+        }
     }
-    BatchOutcome::Completed { items: completed }
 }
 
 pub async fn handle_review_execute(req: Request, state: &Arc<AppState>) -> Response {
@@ -757,6 +863,13 @@ pub async fn handle_review_execute(req: Request, state: &Arc<AppState>) -> Respo
                     item_id,
                     completed,
                     reason
+                );
+            }
+            BatchOutcome::Cancelled { completed } => {
+                tracing::warn!(
+                    "Review '{}' batch cancelled after {} fixed finding(s)",
+                    review_id,
+                    completed
                 );
             }
         }
@@ -1013,5 +1126,65 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(reloaded.items.iter().all(|i| i.status == ReviewItemStatus::Todo));
+    }
+
+    #[test]
+    fn test_turn_applied_edits_requires_applied_change() {
+        use crate::handlers::model::ModelTurnResult;
+
+        let applied = ModelTurnResult {
+            operation_id: "op-1".to_string(),
+            result: Some(tauqe_protocol::ModelResult::Edit {
+                summary: "fix".to_string(),
+                edits: vec![],
+                proposal: None,
+                applied: true,
+                error: None,
+                changed_files: vec!["src/lib.rs".to_string()],
+                commit_hash: Some("abc".to_string()),
+            }),
+            assistant_text: "done".to_string(),
+            is_cancelled: false,
+            error: None,
+            has_terminal_success: false,
+            blocked: None,
+        };
+        assert!(applied.is_success());
+        assert!(turn_applied_edits(&applied));
+
+        // Explanatory text with a terminal success tag satisfies an interactive
+        // turn but must not complete a code-modifying review finding.
+        let answer = ModelTurnResult {
+            operation_id: "op-2".to_string(),
+            result: Some(tauqe_protocol::ModelResult::Answer {
+                text: "Nothing to fix.".to_string(),
+            }),
+            assistant_text: "Nothing to fix.".to_string(),
+            is_cancelled: false,
+            error: None,
+            has_terminal_success: true,
+            blocked: None,
+        };
+        assert!(answer.is_success());
+        assert!(!turn_applied_edits(&answer));
+
+        let failed = ModelTurnResult {
+            operation_id: "op-3".to_string(),
+            result: Some(tauqe_protocol::ModelResult::Edit {
+                summary: "fix".to_string(),
+                edits: vec![],
+                proposal: None,
+                applied: false,
+                error: Some("compiler error".to_string()),
+                changed_files: vec![],
+                commit_hash: None,
+            }),
+            assistant_text: String::new(),
+            is_cancelled: false,
+            error: Some("compiler error".to_string()),
+            has_terminal_success: false,
+            blocked: None,
+        };
+        assert!(!turn_applied_edits(&failed));
     }
 }

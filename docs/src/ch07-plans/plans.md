@@ -12,7 +12,9 @@ TAUQE provides a dedicated **Local Plans** subsystem designed around structured 
 - **Two-Section Document Model:** Each plan cleanly separates intent from execution into two distinct trees:
   - **Concept Tree (`concept: Vec<ConceptItem>`):** The structured architectural blueprint specifying *What* must be built—core invariants, interfaces, scope boundaries, and non-functional requirements.
   - **Implementation Blueprint (`items: Vec<PlanItem>`):** The ordered checklist of engineering tasks specifying *How* to build it—concrete coding steps, each linked to related concept items (`concept_refs: Vec<String>`). Target files (`files: Vec<String>`) are carried exclusively by leaf steps.
+- **Explicit DAG Dependencies (`depends_on: Vec<String>`):** Tasks form a Directed Acyclic Graph (DAG) rather than a rigid linear list. Steps declare dependencies on preceding items via their IDs. Topological scope validation (`Plan::evaluate_scope`) ensures tasks can only start once all direct prerequisites reach `PlanItemStatus::Done`. Parent task groups have container dependencies normalized so execution remains strictly leaf-scoped.
 - **Leaf-Only File Binding Invariant:** Parent items are conceptual milestones, phases, and task groups. They are never executed autonomously and must not carry file lists. Only leaf steps (`PlanItem::is_leaf() == true`) define the target context files and form the atomic execution units of a bounded turn. Any item with children has its `files` and its read-only reference files (`readonly_files`) cleared automatically during XML parsing, storage, and deserialization, so containers and leaves can never disagree. The TUI renders file badges only on leaf task rows and keeps section headers clean: a badge counts both roles (for example `[1 file + 2 ref]`), and an expanded leaf lists the target `files:`, the reference `ref:` paths, and the addressed `concept:` nodes on separate lines.
+- **"Done is Immutable" Persistence Invariant:** Completed tasks (`PlanItemStatus::Done`) represent verified, committed engineering progress. `PlanStorage::validate_done_immutability` cryptographically and semantically safeguards them: once a step is marked `Done`, subsequent plan saves, conversational updates, or replanning passes can neither delete it, alter its title, details, or target files, nor regress its status back to `Todo` or `InProgress`. Established architectural milestones cannot be rewritten or erased by generative drift.
 - **Immune to History Compaction:** Unlike plain conversational chat where instructions fade after compaction rounds, local plans survive session restarts and compaction cycles intact.
 - **Typo-Tolerant Identifier Matching:** Plan identifiers (slugs like `jwt-auth` or `tui-refactor`) are resolved using Levenshtein distance and prefix matching. Minor typos made by the developer or model resolve seamlessly to the intended plan.
 
@@ -35,6 +37,7 @@ When running an assigned leaf task in an isolated turn:
 - **Concept Focus Retention:** The turn is supplied with the entire concept tree (`<plan_concept>`), completed milestones, and the single target task. The model retains full architectural awareness while chat history is suppressed to prevent hallucination.
 - **Streaming Edits:** Code edits are produced via the streaming XML protocol.
 - **Completion Marker:** When requirements are satisfied and verified, the step is marked complete by the terminal success tag (`<success summary="..." />`). The active protocol uses a dynamic per-turn marker suffix (for example `<success_<marker>>`); if the model omits the suffix, an unmarked `<success>` tag outside Markdown code fences is accepted as a fallback (§7.3.3).
+- **Semantic Blocker Protocol (`<blocked>`):** If an essential precondition fails, requirements contradict code invariants, or an unexpected architectural impediment arises, the model must **refuse to guess** or engage in blind trial-and-error. It emits `<blocked reason="..." details="..." />`. The harness instantly intercepts this command, aborts the turn, rolls back working tree modifications to the clean pre-turn checkpoint (`policy.rollback()`), and marks the step `BLOCKED` on disk without wasting cognitive tokens on futile patch-retry or healing loops (§7.3.4).
 - The engine marks the step `DONE` on disk and creates an atomic Git commit only after all project toolchain checks (`check`, `clippy`, `test`) pass cleanly.
 
 ---
@@ -62,11 +65,15 @@ A **scope** is one leaf step, a group of steps, or the whole plan. The client se
 **Why the server owns the batch.** The step lifecycle (mark `in_progress`, run a turn, mark `done`) must be atomic and must not depend on a client that can disconnect or restart. If the TUI kept the queue, a reconnect would lose the batch and two clients could disagree about the plan state. With one owner, the TUI is a thin view: it only starts the scope and renders the events `plan/updated`, `plan/listChanged`, `turn/phase`, and `model/*`.
 
 1. **Select a Scope:** In Plans (`Ctrl+4`), place the cursor on a leaf, a group, or the plan header and press `x` (or `Enter` on a leaf). A modal dialog lists the steps. Press `y` or activate `Execute` to confirm; the default focus is `Cancel`.
-2. **Server Scope Evaluation:** The server rejects the request if any step in the scope is in `DISCUSSION`, if the target is `CANCELLED`, or if everything is already `done`. Otherwise it builds the ordered list of leaf steps in `TODO` or `IN_PROGRESS`. Only one operation can run at a time.
+2. **Server Scope Evaluation & DAG Verification:** The server evaluates the requested scope against active task states and dependencies:
+   - Rejects the request if any step is in `DISCUSSION` or `CANCELLED`.
+   - Validates prerequisites (`Plan::evaluate_scope`): if any scheduled step references prerequisites (`depends_on`) that are not yet marked `DONE`, execution is refused upfront with `STEP_BLOCKED_BY_DEPENDENCIES`.
+   - If all tasks in scope are already `DONE`, returns `ALL_COMPLETED`.
+   - Otherwise, constructs the topologically ordered sequence of executable leaf steps in `TODO`, `BLOCKED`, or `IN_PROGRESS`. Only one batch operation can execute concurrently.
 3. **Mandatory Pre-Flight Verification:** Before any step starts, the server runs the exact same toolchain pipeline (`VerifyTarget::All`) that the core runs after every autonomous step. If the repository does not build or its tests fail, execution is blocked synchronously, before any LLM request, before any step moves to `in_progress`, and at zero token cost. The server returns `PREFLIGHT_VERIFICATION_FAILED` with the full compiler or test output and leaves the scope statuses untouched. Repositories without a detected toolchain skip this gate transparently.
 4. **Per-Step Isolated Turn:** For each step, sequentially, the server marks it `in_progress`, pre-loads `step.files` into editable context and `step.readonly_files` into read-only reference context, injects the concept tree, suppresses conversational history, and runs a bounded turn. The interface switches to Develop (`Ctrl+1`) and shows the live turn together with a compact **Plan Stepper** (§5.8).
-5. **Atomic Completion:** A step becomes `done` only when the turn is successful: the edits were applied and passed all toolchain checks, or the model emitted the terminal success tag. A text-only answer without code and without the tag does not close the step. Marking the step `done` and moving to the next step is one server decision.
-6. **Corrective Reprompt, then Fail-Fast:** If a step turn ends without verified code changes and without the terminal success tag, the server first re-runs the step with a corrective prompt while the retry budget lasts (§7.3.3). Only once the budget is exhausted, the turn is cancelled, or a terminal error is reported does the server set the step back to `todo`, report the reason, and stop the batch. Steps completed earlier stay `done`. Each failed turn's own file changes are undone by the Git workflow checkpoint.
+5. **Atomic Completion & Semantic Blocking:** A step becomes `done` only when the turn is successful: the edits were applied and passed all toolchain checks, or the model emitted the terminal success tag. If the model emits `<blocked>`, the step transitions to `BLOCKED`, its working changes are rolled back, and the batch supervisor immediately halts with a diagnostic report. A text-only answer without code and without a terminal tag does not close the step.
+6. **Corrective Reprompt, then Fail-Fast:** If a step turn ends without verified code changes and without any terminal protocol tag (`<success>` or `<blocked>`), the server re-runs the step with a corrective prompt while the retry budget lasts (§7.3.3). Only once the budget is exhausted, the turn is cancelled, or a terminal error is reported does the server reset the step back to `todo`, report the reason, and stop the batch. Steps completed earlier stay `done`. Each failed turn's own file changes are undone by the Git workflow checkpoint.
 7. **Parent Status Recalculation:** When all child tasks under a parent node become `done`, the parent is automatically marked `done`.
 8. **Safe Cancellation:** `Esc` / `Ctrl+C` cancels the running turn. The cancelled step returns to `todo` and the rest of the batch does not start.
 
@@ -86,6 +93,52 @@ A bounded turn can fail the step contract in a purely conversational way: the mo
 
 Both settings that shape this loop are surfaced in project configuration and documented inline in `tauqe.toml`: `develop.max_retries` (the attempt budget) and `models.auto_level_up` (escalation on retry).
 
+### 7.3.4 Semantic Blocking, Sub-tree Grafting & Scoped Replanning (`plan/replan`)
+
+Real-world software development is hierarchical and non-linear. When an engineering task encounters an insurmountable roadblock, discarding the entire plan or manually editing JSON structures wastes effort and breaks architectural continuity.
+
+TAUQE implements **Hierarchical Task Network (HTN) Semantic Recovery**:
+
+```text
+       Step N Execution (Coder)
+                  │
+          Precondition Fails
+                  │
+           <blocked> tag
+                  │
+        Git Rollback to Pre-Turn Checkpoint
+        Step N status → BLOCKED
+                  │
+       Escalation to Architect (RPC plan/replan)
+                  │
+       Diagnostic Replanning Packet
+       ├── Immutable Concept Tree
+       ├── Immutable Done Foundation (Steps 1..N-1)
+       ├── Blocker Diagnostics (reason + details)
+       └── Remaining Task Horizon
+                  │
+       Architect Decomposes Step N into Sub-tree
+                  │
+       PlanStorage::graft_subtree()
+       ├── Replaces Step N with Sub-tree Tasks (N.1, N.2...)
+       ├── Preserves Completed Steps (Done is Immutable)
+       └── Rewires Downstream Dependencies (depends_on)
+                  │
+       Developer Resumes Batch Execution (Enter / x)
+```
+
+1. **Deterministic Rollback on Block:** When a Coder turn emits `<blocked reason="..." details="..." />`, the turn loop bypasses the patch-retry and verification healing stages. The Git policy immediately rolls back the working directory to the pre-turn checkpoint, transient auto-context files are flushed, and the step status is recorded as `BLOCKED`.
+2. **Targeted Diagnostic Packet:** Replanning invokes the Architect role through RPC `plan/replan`. The core constructs a focused diagnostic packet (`build_replan_diagnostic_packet`) containing:
+   - The immutable Concept Tree (architectural invariants);
+   - The verified foundation of all preceding completed tasks (`Done`);
+   - The explicit diagnostic report of why step $N$ failed;
+   - The remaining unfinished tasks and their dependencies.
+3. **Sub-tree Grafting (`PlanStorage::graft_subtree`):** Rather than re-generating the entire plan, the Architect returns a targeted decomposition of the blocked task into finer-grained sub-steps. The storage engine performs an atomic surgical graft:
+   - **Done Invariant Preserved:** Preceding completed milestones are untouched and cannot be modified.
+   - **Downstream Dependency Rewiring:** Any subsequent steps in the plan that depended on the blocked step ($N$) are automatically rewritten to depend on the terminal leaf tasks of the newly grafted sub-tree ($N.k$).
+   - **Parallel Branches Intact:** Independent tasks elsewhere in the plan maintain their original positions, statuses, and dependencies.
+4. **Seamless Execution Resumption:** Once the sub-tree is grafted, the developer presses `x` or `Enter` on the newly expanded tasks in Plans view (`Ctrl+4`). Scope execution resumes immediately from the first leaf step of the grafted sub-tree without manual intervention.
+
 ---
 
 ## 7.4 Plans View Keybindings
@@ -96,7 +149,7 @@ Both settings that shape this loop are surfaced in project configuration and doc
 | `Enter` / `x` | Execute leaf implementation step, group, or entire plan (with confirmation) |
 | `d` | Discuss selected concept item, implementation step, or plan architecture in Develop |
 | `R` | Deep refine implementation blueprint with AI Architect (preserves concept) |
-| `t` / `s` | Open status selection dialog (`DISCUSSION`, `TODO`, `IN_PROGRESS`, `DONE`, `CANCELLED`) |
+| `t` / `s` | Open status selection dialog (`DISCUSSION`, `TODO`, `IN_PROGRESS`, `DONE`, `BLOCKED`, `CANCELLED`) |
 | `Tab` / `Space` | Fold or unfold section (Concept / Implementation) or hierarchical items |
 | `a` | Toggle fold / unfold all plans and sections |
 | `c` / `y` | Copy entire plan to clipboard in Markdown format |

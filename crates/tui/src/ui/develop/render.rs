@@ -113,6 +113,7 @@ fn plan_status_badge(status: tauqe_protocol::PlanItemStatus) -> (&'static str, S
             ("▶", Style::default().fg(Color::Yellow).bold())
         }
         tauqe_protocol::PlanItemStatus::Todo => ("○", Style::default().fg(Color::DarkGray)),
+        tauqe_protocol::PlanItemStatus::Blocked => ("!", Style::default().fg(Color::Red).bold()),
         tauqe_protocol::PlanItemStatus::Cancelled => ("✗", Style::default().fg(Color::Red)),
         tauqe_protocol::PlanItemStatus::Discussion => {
             ("?", Style::default().fg(Color::Magenta).bold())

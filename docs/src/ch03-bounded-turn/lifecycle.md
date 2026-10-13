@@ -102,3 +102,92 @@ TAUQE separates model interaction into two dedicated protocol circuits based on 
      - `plan_update`: Structured modifications to project plans (`save`, `update`, `delete`);
      - `context_requests`: Read-only file inspection requests.
    - Eliminates turn-marker leaking, regex parsing ambiguities, and history pollution.
+
+---
+
+## 3.7 Core Pipeline Architecture
+
+The bounded turn is deliberately not implemented as one monolithic routine. The pipeline is decomposed into five orthogonal layers, each owning exactly one reason to change. This separation is what makes the harness testable without an LLM, keeps the Git transaction model decoupled from the healing loop, and lets new protocols be added without touching FSM control flow.
+
+```text
+        ┌────────────────── ExecutionMode ──────────────────┐
+        │  SingleExecution         BatchExecution           │
+        │  turn lifecycle          queue supervision         │
+        │  role escalation         status sync               │
+        │  cost accounting         aggregate cost            │
+        └───────────────────────────┬───────────────────────┘
+                                    ↓
+        ┌───────────────────── Task / Loop ─────────────────┐
+        │  AnswerEditLoop  EditLoop                         │
+        │  StructuredTask  StructuredStreamingTask          │
+        │  TurnCycle: Discovery → Staging → Verify → Healing│
+        └───────────────────────────┬───────────────────────┘
+                                    ↓
+        ┌──────────────────── PromptProtocol ───────────────┐
+        │  XmlPromptProtocol   JsonPromptProtocol           │
+        │  prompt assembly, capability declaration,         │
+        │  output decoding into normalized LlmCommand       │
+        └───────────────────────────┬───────────────────────┘
+                                    ↓
+        ┌────────────────────── ApplyPolicy ────────────────┐
+        │  DirectApplyPolicy    GitTransactionPolicy        │
+        │  staging, temporary commit, finalize, rollback    │
+        └───────────────────────────┬───────────────────────┘
+                                    ↓
+        ┌────────────────────── LlmProvider ────────────────┐
+        │  OpenRouterProvider   MockLlmProvider             │
+        │  network transport    deterministic scripts       │
+        └───────────────────────────────────────────────────┘
+```
+
+### ExecutionMode: Task Lifecycle and Cost Accounting
+
+`ExecutionMode` (`workflow/execution.rs`) owns the lifecycle of one or more turns and is the seam between "run one objective" and "run a queue of objectives".
+
+- **`SingleExecution`** drives one complete FSM cycle. It is responsible for role escalation — when `auto_level_up` is enabled and healing stalls, the turn is escalated from `Coder` to `Architect` — and for cost accounting. The session cost observed before the turn is recorded as *previous*, while the cost accumulated during the turn is recorded as *current*, so the interface can attribute spend to a single turn rather than a blurred running total.
+- **`BatchExecution`** (`workflow/batch.rs`) is a supervisor over a queue of independent steps (implementation plan steps or code review findings). It synchronizes entity statuses (`InProgress`, `Done`, `Todo`), stops the queue on the first failure or cancellation to avoid cascading corruption, and accumulates token and cost usage across the whole chain via `BatchUsage`.
+
+Both modes are parameterized by `WorkflowOptions`, which carries retry limits, discovery budgets, history budget, and model configuration. This keeps execution strategy independent of the concrete task being executed.
+
+### Task and Loop: FSM Cycles
+
+`Task` (`workflow/task.rs`) is the minimal unit of a single LLM exchange. A task composes a `TurnCycle` from ordered `TaskStep`s — `DiscoveryStep`, `StagingStep`, `VerificationStep`, and `HealingStep` — and executes it against a `TaskEnv` that bundles the provider, model, context manager, history manager, protocol, policy, and streaming/cancellation channels. Steps declare whether they repeat, which is how the cycle expresses the discovery loop and the healing retry loop declaratively rather than as hard-coded control flow.
+
+Specialized loops (`workflow/loops.rs`) encode distinct contracts over the same machinery:
+
+- **`AnswerEditLoop`** — the general discovery/editing/healing cycle. It may answer without producing edits and may generate or update plans.
+- **`EditLoop`** — requires at least one valid edit and a terminal success tag; if either is missing, it triggers a corrective retry, making an edits-only task fail loudly instead of silently returning prose.
+- **`StructuredTask` / `StructuredStreamingTask`** — strictly typed structured-data exchange (plan refinement, review) without the heavy edit and healing cycle.
+
+### PromptProtocol: Assembly and Decoding
+
+`PromptProtocol` (`prompt/protocol.rs`) separates prompt assembly and output decoding from FSM control flow. A protocol declares its `capabilities()`, assembles the system prompt, optionally provides a `response_format()` (JSON Schema for structured output), builds the matching streaming filter, and decodes raw model text into a normalized `Vec<LlmCommand>`.
+
+Because decoding is a trait method, the identical FSM drives XML, JSON, or any future syntax without modification. Concrete implementations include `XmlPromptProtocol`, `MarkedXmlPromptProtocol` (turn-marker protected), and `JsonPromptProtocol`.
+
+### ApplyPolicy: Transactional Application
+
+`ApplyPolicy` (`workflow/policy.rs`) isolates *how* validated edits reach disk from FSM logic. The trait exposes four operations: `staging`, `apply_temporary`, `apply_final`, and `rollback`. This is precisely the abstraction that removes the implicit coupling between Git transactions and the healing loop.
+
+Two policies cover the supported transactional models:
+
+- **`DirectApplyPolicy`** — writes straight to disk with no Git involvement. It is used for naive mode and local tests where a persistent transaction is unnecessary.
+- **`GitTransactionPolicy`** (`workflow/git_policy.rs`) — the production policy. It creates a pre-edit checkpoint, applies validated edits, issues a temporary step commit before toolchain verification, finalizes the result into a permanent commit, and performs a clean rollback to the checkpoint if the turn fails.
+
+The `git` module remains a low-level facade over subprocess operations; `ApplyPolicy` encapsulates the step-level transactional model on top of it.
+
+### LlmProvider: Transport Boundary
+
+`LlmProvider` (`providers.rs`) is the model transport boundary. It exposes `stream_chat`, `stream_chat_with_effort`, and `stream_text`, emitting `StreamEvent`s into an async channel and honoring a cancellation watch channel so a bounded turn can be interrupted cleanly. Two implementations exist:
+
+- **`OpenRouterProvider`** — real network transport.
+- **`MockLlmProvider`** — a scripted provider that replays predetermined responses. It enables deterministic multi-round scenarios (context request, compiler failure, successful healing patch, cancellation) to be exercised in the standard test runner in milliseconds and without any external network call.
+
+### Command Normalization: `LlmCapability` and `LlmCommand`
+
+The syntax of a protocol (XML tags or JSON Schema) is kept strictly separate from core business logic.
+
+- A protocol declares its behavior as a declarative set of **`LlmCapability`** values: `TextMessage`, `FileEdits`, `Discovery`, `DocRequest`, `ToolchainVerify`, `PlanCreation`, `PlanUpdate`, `Scratchpad`, `Outcome`, and `UserLanguage`. The core queries these capabilities through `supports()` instead of branching on protocol identity, so adding a capability never requires touching the FSM.
+- Model output is decoded into a normalized **`Vec<LlmCommand>`**: `Text`, `Edit`, `ContextRequest`, `ContextDrop`, `DocRequest`, `Verify`, `Plan`, `Scratchpad`, `Outcome`, and `UserLanguage`.
+
+The streaming parser splits the data stream in two. Lightweight streaming events (`EditFileStarted`, `EditHunk`, `TurnPhase`, usage, toolchain status) are emitted to the UI as they arrive for immediate feedback, while the normalized commands are accumulated and handed to the core only once the stream finishes. This is why streaming remains responsive even though the commands themselves are processed deterministically.

@@ -360,6 +360,17 @@ impl EditStreamFilter for JsonStreamFilter {
     }
 }
 
+/// Recognized structured edit operation names.
+///
+/// Confirms that a partially streamed change element carries a valid,
+/// unambiguous edit signature before file edit reporting starts, avoiding
+/// false edit starts on malformed or partial operations.
+fn is_known_edit_op(op: &str) -> bool {
+    const KNOWN_OPS: [&str; 5] = ["create", "overwrite", "delete", "move", "replace"];
+    let op = op.trim();
+    KNOWN_OPS.iter().any(|known| op.eq_ignore_ascii_case(known))
+}
+
 /// Extracts `(op, path)` for an incomplete element at `target_idx` in `changes` array.
 fn extract_incomplete_change_op_and_path(
     buffer: &str,
@@ -411,7 +422,7 @@ fn extract_incomplete_change_op_and_path(
                     }
                     if let (Some(op), Some(path)) = (op, path) {
                         let trimmed_path = path.trim().to_string();
-                        if !trimmed_path.is_empty() {
+                        if is_known_edit_op(&op) && !trimmed_path.is_empty() {
                             return Some((op, trimmed_path));
                         }
                     }
@@ -689,5 +700,98 @@ mod tests {
         assert!(!events.is_empty());
         let finish_events = Box::new(filter).finish();
         assert!(finish_events.is_empty() || matches!(&finish_events[0], StreamEvent::TextDelta(_)));
+    }
+
+    #[test]
+    fn test_no_edit_started_for_empty_changes_streams_full_message() {
+        let root = std::env::temp_dir();
+        let mut filter = JsonStreamFilter::new(vec!["a.rs".to_string()], root);
+        let json = r#"{"message":"Nothing to change here.","changes":[]}"#;
+        let mut events = Vec::new();
+        for c in json.chars() {
+            events.extend(filter.push_chunk(&c.to_string()));
+        }
+        events.extend(Box::new(filter).finish());
+        let text: String = events
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::TextDelta(d) => Some(d.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text, "Nothing to change here.");
+        assert!(!events.iter().any(|e| matches!(e, StreamEvent::EditStarted)));
+        assert!(!events
+            .iter()
+            .any(|e| matches!(e, StreamEvent::EditFileStarted { .. })));
+    }
+
+    #[test]
+    fn test_early_detection_requires_known_edit_op() {
+        let root = std::env::temp_dir();
+
+        // An unrecognized operation in an incomplete element must not start
+        // early edit reporting, avoiding a false positive.
+        let mut unknown = JsonStreamFilter::new(vec!["a.rs".to_string()], root.clone());
+        let chunk = r#"{"changes":[{"op":"frobnicate","path":"a.rs""#;
+        let events = unknown.push_chunk(chunk);
+        assert!(!events.iter().any(|e| matches!(e, StreamEvent::EditStarted)));
+        assert!(!events
+            .iter()
+            .any(|e| matches!(e, StreamEvent::EditFileStarted { .. })));
+
+        // A recognized operation with a non-empty path still starts early
+        // edit reporting.
+        let mut known = JsonStreamFilter::new(vec!["a.rs".to_string()], root);
+        let chunk = r#"{"changes":[{"op":"create","path":"a.rs""#;
+        let events = known.push_chunk(chunk);
+        assert!(events.iter().any(|e| matches!(e, StreamEvent::EditStarted)));
+        assert!(events.iter().any(|e| matches!(
+            e,
+            StreamEvent::EditFileStarted { path, op_type }
+                if path == "a.rs" && op_type == "create"
+        )));
+    }
+
+    #[test]
+    fn test_json_edit_response_streams_across_all_split_points() {
+        let root = std::env::temp_dir();
+        let input = r#"{"message":"Hi","changes":[{"op":"replace","path":"a.rs","old_text":"x","new_text":"y"}]}"#;
+        let boundaries: Vec<usize> = input
+            .char_indices()
+            .map(|(idx, _)| idx)
+            .chain(std::iter::once(input.len()))
+            .collect();
+        for &split in &boundaries {
+            let staged = HashMap::from([("a.rs".to_string(), "x".to_string())]);
+            let mut filter = JsonStreamFilter::new(vec!["a.rs".to_string()], root.clone())
+                .with_staged_contents(staged);
+            let mut events = filter.push_chunk(&input[..split]);
+            events.extend(filter.push_chunk(&input[split..]));
+            events.extend(Box::new(filter).finish());
+
+            let started = events
+                .iter()
+                .filter(|e| matches!(e, StreamEvent::EditStarted))
+                .count();
+            assert_eq!(started, 1, "split {split}");
+
+            let text: String = events
+                .iter()
+                .filter_map(|e| match e {
+                    StreamEvent::TextDelta(d) => Some(d.as_str()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(text, "Hi", "split {split}");
+
+            assert!(
+                events.iter().any(|e| matches!(
+                    e,
+                    StreamEvent::EditFileDone { status, .. } if status == "ok"
+                )),
+                "split {split}"
+            );
+        }
     }
 }

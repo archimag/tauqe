@@ -50,6 +50,7 @@ pub fn format_active_plan_context(plan: &Plan) -> Option<String> {
                     PlanItemStatus::Todo => "TODO",
                     PlanItemStatus::InProgress => "IN_PROGRESS",
                     PlanItemStatus::Done => "DONE",
+                    PlanItemStatus::Blocked => "BLOCKED",
                     PlanItemStatus::Cancelled => "CANCELLED",
                 };
 
@@ -63,6 +64,9 @@ pub fn format_active_plan_context(plan: &Plan) -> Option<String> {
                 }
                 if !item.files.is_empty() {
                     out.push_str(&format!(" [files: {}]", item.files.join(", ")));
+                }
+                if !item.depends_on.is_empty() {
+                    out.push_str(&format!(" [depends_on: {}]", item.depends_on.join(", ")));
                 }
 
                 if let Some(details) = &item.details {
@@ -176,6 +180,14 @@ fn plan_item_schema(depth: usize, max_depth: usize) -> serde_json::Value {
             "items": { "type": "string" }
         }),
     );
+    properties.insert(
+        "depends_on".to_string(),
+        serde_json::json!({
+            "type": "array",
+            "description": "IDs of prerequisite steps that must reach DONE status before this step can execute (DAG edges). Only reference earlier steps. Must be empty for steps without prerequisites. Invariant: depends_on must only be specified for executable leaf steps without children; parent container items must have an empty depends_on list.",
+            "items": { "type": "string" }
+        }),
+    );
 
     let mut required = vec![
         serde_json::Value::String("id".to_string()),
@@ -185,6 +197,7 @@ fn plan_item_schema(depth: usize, max_depth: usize) -> serde_json::Value {
         serde_json::Value::String("files".to_string()),
         serde_json::Value::String("readonly_files".to_string()),
         serde_json::Value::String("concept_refs".to_string()),
+        serde_json::Value::String("depends_on".to_string()),
     ];
 
     if depth < max_depth {
@@ -285,6 +298,7 @@ pub fn build_plan_refine_system_prompt(_plan: &Plan) -> String {
     out.push_str("   - Target File Precision (Leaf-Only Files Invariant): For every executable leaf step, you MUST populate `files: [\"path/to/file\"]` with exact repository-relative file paths. Parent items and task groups are conceptual containers and MUST have empty `files: []`. Only leaf steps (`children: []`) pre-load files into context upon execution.\n");
     out.push_str("   - Reference Files Contract (Read-Only Context): For every executable leaf step, identify and populate `readonly_files: [\"path/to/reference\"]` with existing interfaces, protocol types, or subsystem conventions (e.g. `crates/tui/Conventions.md`, `crates/core/Conventions.md`) needed as context during implementation. These files are pre-loaded as read-only context during step execution. Invariant: parent items must have empty `readonly_files: []`.\n");
     out.push_str("   - Concept Traceability: For each step, link it to the relevant architectural concept IDs via `concept_refs: [\"concept_id\"]`.\n");
+    out.push_str("   - DAG Dependency Contract: For every executable leaf step, declare prerequisite step IDs in `depends_on: [\"step_id\"]`. A step runs only after every dependency reaches DONE status. Reference only earlier steps; steps without prerequisites must use `depends_on: []`.\n");
     out.push_str("   - Avoid Micro-Fragmentation: Strictly avoid splitting adjacent, closely related edits into separate microscopic steps. Group cohesive changes across 1-4 related files under a single leaf step if they form a logical unit of work and carry no risk of patch conflicts.\n");
     out.push_str("   - Avoid Unmanageable Monoliths: Do not bundle 10-20 unrelated files into a single step; keep each leaf step calibrated to a cohesive unit (targeting 150-400 lines of change).\n");
     out.push_str("   - Compilability Invariant: The codebase MUST remain in a compiling, fully verified state at the end of EVERY leaf step. Never create broken intermediate steps.\n");
@@ -379,7 +393,7 @@ pub fn build_plan_refine_user_prompt(
     out.push_str("1. Conduct deep technical dependency analysis using the codebase contours and context files.\n");
     out.push_str("2. If you need to inspect specific file implementations before decomposing the plan, request them by setting `status: \"needs_context\"` with `context_requests: [\"path/to/file\"]` and empty `items: []`.\n");
     out.push_str("3. Check for any blockers, circular dependencies, or contradictions. If blocked, report `status: \"blocked\"` with exact `reason`.\n");
-    out.push_str("4. If viable, decompose the plan into actionable, dependency-ordered leaf steps with `status: \"todo\"`. Specify target files in `files` and reference contracts/types/conventions in `readonly_files`. Calibrate leaf step granularity to cohesive units: group closely related adjacent edits together under one step to avoid micro-fragmentation, while avoiding monolithic multi-file dumps.\n");
+    out.push_str("4. If viable, decompose the plan into actionable, dependency-ordered leaf steps with `status: \"todo\"`. Specify target files in `files`, reference contracts/types/conventions in `readonly_files`, and declare prerequisite step IDs in `depends_on`. Calibrate leaf step granularity to cohesive units: group closely related adjacent edits together under one step to avoid micro-fragmentation, while avoiding monolithic multi-file dumps.\n");
     out.push_str("5. Language Directive: Detect the natural language of the plan title and description. Formulate all titles, details, explanations, and reasons strictly in that same language.\n");
 
     out
@@ -543,6 +557,12 @@ pub fn format_plan_step_execution_prompt_with_mode(
             step.readonly_files.join(", ")
         ));
     }
+    if !step.depends_on.is_empty() {
+        out.push_str(&format!(
+            "- **Prerequisite Steps (must be DONE)**: {}\n",
+            step.depends_on.join(", ")
+        ));
+    }
     if let Some(details) = &step.details {
         let trimmed = details.trim();
         if !trimmed.is_empty() {
@@ -630,6 +650,203 @@ pub fn format_plan_step_retry_prompt(assistant_text: &str, error: Option<&str>) 
     out
 }
 
+/// Builds a targeted diagnostic packet for the Architect during semantic recovery.
+///
+/// The packet frames a strictly local replanning request around a blocked step: it
+/// presents the immutable foundation of completed (DONE) steps, the diagnostics of the
+/// blocked step (its declared contract plus the coder's blocker report), the remaining
+/// plan horizon, and the architectural concept invariants the replacement sub-tree must
+/// uphold. The returned text is embedded as the user prompt of a structured Architect
+/// call that returns the replacement sub-tree.
+pub fn build_replan_diagnostic_packet(
+    plan: &Plan,
+    blocked_step_id: &str,
+    blocked_reason: Option<&str>,
+) -> String {
+    let mut out = String::new();
+    out.push_str(&format!(
+        "# Local Plan Replanning: [{}] {}\n\n",
+        plan.id, plan.title
+    ));
+
+    if let Some(desc) = &plan.description {
+        let trimmed = desc.trim();
+        if !trimmed.is_empty() {
+            out.push_str("## Architectural Intent (\"What\"):\n");
+            out.push_str(trimmed);
+            out.push_str("\n\n");
+        }
+    }
+
+    out.push_str("## Mission:\n");
+    out.push_str(&format!(
+        "Step `{}` could not be executed as declared. Redesign ONLY this step by replacing it with a concrete, dependency-ordered sub-tree of executable leaf steps. Preserve the immutable DONE foundation and the remaining plan horizon; do not redesign the rest of the plan.\n\n",
+        blocked_step_id
+    ));
+
+    if !plan.concept.is_empty() {
+        out.push_str("## Architectural Concept (Invariants the replacement must uphold):\n");
+        fn render_concept(out: &mut String, items: &[tauqe_protocol::ConceptItem], depth: usize) {
+            let indent = "  ".repeat(depth);
+            for item in items {
+                out.push_str(&format!("{}- **#{}** {}", indent, item.id, item.title));
+                if let Some(details) = &item.details {
+                    let trimmed = details.trim();
+                    if !trimmed.is_empty() {
+                        out.push_str(&format!(": {}", trimmed));
+                    }
+                }
+                out.push('\n');
+                render_concept(out, &item.children, depth + 1);
+            }
+        }
+        render_concept(&mut out, &plan.concept, 0);
+        out.push('\n');
+    }
+
+    out.push_str("## Immutable Foundation (DONE steps - read-only, already committed):\n");
+    let mut has_done = false;
+    fn render_done(out: &mut String, items: &[PlanItem], depth: usize, has_done: &mut bool) {
+        let indent = "  ".repeat(depth);
+        for item in items {
+            if item.status == PlanItemStatus::Done {
+                *has_done = true;
+                out.push_str(&format!("{}- [x] #{} {}\n", indent, item.id, item.title));
+                if !item.files.is_empty() {
+                    out.push_str(&format!("{}    files: {}\n", indent, item.files.join(", ")));
+                }
+            }
+            render_done(out, &item.children, depth + 1, has_done);
+        }
+    }
+    render_done(&mut out, &plan.items, 0, &mut has_done);
+    if !has_done {
+        out.push_str("*(No completed steps yet)*\n");
+    }
+    out.push('\n');
+
+    out.push_str("## Blocked Step Diagnostics:\n");
+    if let Some(step) = plan.find_item(blocked_step_id) {
+        out.push_str(&format!("- **ID**: `{}`\n", step.id));
+        out.push_str(&format!("- **Title**: {}\n", step.title));
+        if !step.concept_refs.is_empty() {
+            out.push_str(&format!(
+                "- **Addressed Concept Nodes**: {}\n",
+                step.concept_refs.join(", ")
+            ));
+        }
+        if !step.files.is_empty() {
+            out.push_str(&format!(
+                "- **Declared Target Files**: {}\n",
+                step.files.join(", ")
+            ));
+        }
+        if !step.readonly_files.is_empty() {
+            out.push_str(&format!(
+                "- **Declared Reference Files**: {}\n",
+                step.readonly_files.join(", ")
+            ));
+        }
+        if !step.depends_on.is_empty() {
+            out.push_str(&format!(
+                "- **Prerequisites**: {}\n",
+                step.depends_on.join(", ")
+            ));
+        }
+        if let Some(details) = &step.details {
+            let trimmed = details.trim();
+            if !trimmed.is_empty() {
+                out.push_str(&format!("- **Declared Contract**:\n{}\n", trimmed));
+            }
+        }
+    } else {
+        out.push_str(&format!(
+            "*(Step `{}` not found in the plan)*\n",
+            blocked_step_id
+        ));
+    }
+    match blocked_reason.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(reason) => out.push_str(&format!("- **Blocker reported by coder**: {}\n", reason)),
+        None => out.push_str("- **Blocker reported by coder**: (no diagnostics provided)\n"),
+    }
+    out.push('\n');
+
+    out.push_str("## Remaining Plan Horizon (non-DONE steps to preserve):\n");
+    let mut has_remaining = false;
+    fn render_remaining(
+        out: &mut String,
+        items: &[PlanItem],
+        depth: usize,
+        blocked_step_id: &str,
+        has_remaining: &mut bool,
+    ) {
+        let indent = "  ".repeat(depth);
+        for item in items {
+            let is_blocked = item.id.eq_ignore_ascii_case(blocked_step_id);
+            if item.status != PlanItemStatus::Done && !is_blocked {
+                *has_remaining = true;
+                out.push_str(&format!(
+                    "{}- #{} {} (status: {})\n",
+                    indent, item.id, item.title, item.status
+                ));
+                if !item.depends_on.is_empty() {
+                    out.push_str(&format!(
+                        "{}    depends_on: {}\n",
+                        indent,
+                        item.depends_on.join(", ")
+                    ));
+                }
+            }
+            render_remaining(out, &item.children, depth + 1, blocked_step_id, has_remaining);
+        }
+    }
+    render_remaining(&mut out, &plan.items, 0, blocked_step_id, &mut has_remaining);
+    if !has_remaining {
+        out.push_str("*(No remaining steps)*\n");
+    }
+    out.push('\n');
+
+    out.push_str("## Architect Instructions:\n");
+    out.push_str(&format!(
+        "1. Return ONLY the replacement sub-tree for step `{}` in `items`; do not restate or redesign other steps.\n",
+        blocked_step_id
+    ));
+    out.push_str("2. Decompose the blocked work into concrete, dependency-ordered executable leaf steps with `status: \"todo\"`.\n");
+    out.push_str("3. Populate `files` (target) and `readonly_files` (reference) on leaf steps only; parent containers must leave them empty. Declare prerequisite step IDs in `depends_on`.\n");
+    out.push_str("4. Link each new step to the relevant concept nodes via `concept_refs`.\n");
+    out.push_str("5. Keep the codebase compiling: the replacement must be implementable as a sequence of self-contained, verifiable steps.\n");
+    out.push_str("6. If the blocker is insurmountable, set `status: \"blocked\"` with an exact `reason` instead of inventing a broken plan.\n");
+    out.push_str("7. Language Directive: detect the natural language of the plan title and description and formulate all titles, details, explanations, and reasons strictly in that same language.\n");
+
+    out
+}
+
+/// Builds the system prompt for local plan recovery (Architect replanning of a blocked step).
+pub fn build_replan_system_prompt() -> String {
+    let mut out = String::new();
+    out.push_str("You are a Principal Software Architect in TAUQE (The Answer to the Ultimate Question of Engineering).\n\n");
+    out.push_str("Your mission is Local Plan Recovery: a previously planned step was reported blocked, and you must redesign ONLY that step as a concrete, dependency-ordered sub-tree of executable leaf steps.\n\n");
+
+    out.push_str("## Core Invariants & Rules:\n\n");
+    out.push_str("1. Strict Locality:\n");
+    out.push_str("   - Redesign ONLY the blocked step. The immutable DONE foundation and the remaining plan horizon are read-only and must be preserved.\n");
+    out.push_str("   - Return the replacement sub-tree in `items`; never restate or redesign the rest of the plan.\n\n");
+    out.push_str("2. Strict Blocker Protocol:\n");
+    out.push_str("   - If the blocker is insurmountable, set `status: \"blocked\"`, leave `items: []`, and document the exact contradiction and recommended developer action in `reason`.\n");
+    out.push_str("   - Never invent a compromised or speculative plan.\n\n");
+    out.push_str("3. Step Granularity and Compilability:\n");
+    out.push_str("   - EVERY leaf step is executed in an isolated turn with its own toolchain verification gates; the codebase must remain compiling after each step.\n");
+    out.push_str("   - Leaf-Only Files Invariant: populate `files` and `readonly_files` only on executable leaf steps without children; parent containers must leave them empty.\n");
+    out.push_str("   - DAG Dependency Contract: declare prerequisite step IDs in `depends_on`, referencing only earlier steps. Steps without prerequisites use `depends_on: []`.\n");
+    out.push_str("   - Concept Traceability: link each step to relevant concept node IDs via `concept_refs`.\n");
+    out.push_str("   - Avoid micro-fragmentation and unmanageable monoliths; group cohesive edits into calibrated leaf steps.\n\n");
+    out.push_str("4. Strict Language Consistency:\n");
+    out.push_str("   - Detect the primary natural language of the plan and formulate all titles, details, explanations, and reasons strictly in that same language.\n\n");
+    out.push_str("5. Output Format:\n");
+    out.push_str("   - Output strictly according to the specified JSON schema, using status \"success\" for a valid replacement sub-tree.\n");
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -655,6 +872,7 @@ mod tests {
                     concept_refs: vec!["c-1".to_string()],
                     files: vec!["crates/core/src/models.rs".to_string()],
                     readonly_files: vec![],
+                    depends_on: vec![],
                     children: vec![],
                 },
                 PlanItem {
@@ -665,6 +883,7 @@ mod tests {
                     concept_refs: vec!["c-1".to_string()],
                     files: vec!["crates/core/src/handler.rs".to_string()],
                     readonly_files: vec!["crates/core/src/contract.rs".to_string()],
+                    depends_on: vec!["1".to_string()],
                     children: vec![],
                 },
             ],
@@ -679,6 +898,7 @@ mod tests {
         assert!(formatted.contains("Endpoint (id: \"2\", status: IN_PROGRESS)"));
         assert!(formatted.contains("[concept_refs: c-1]"));
         assert!(formatted.contains("[files: crates/core/src/handler.rs]"));
+        assert!(formatted.contains("[depends_on: 1]"));
         assert!(formatted.contains(": Write handler"));
     }
 
@@ -695,6 +915,7 @@ mod tests {
         assert!(prompt
             .contains("- **Reference Files (read-only context)**: crates/core/src/contract.rs"));
         assert!(prompt.contains("- **Addressed Concept Nodes**: c-1"));
+        assert!(prompt.contains("- **Prerequisite Steps (must be DONE)**: 1"));
 
         let target = extract_plan_step_execution_target(&prompt).unwrap();
         assert_eq!(target.plan_id.as_deref(), Some("jwt-auth"));
@@ -751,6 +972,7 @@ mod tests {
         assert!(sys.contains("Compilability Invariants"));
         assert!(sys.contains("Leaf-Only Files Invariant"));
         assert!(sys.contains("Reference Files Contract"));
+        assert!(sys.contains("DAG Dependency Contract"));
 
         let ctx_files = vec![ContextFileContent {
             path: "crates/core/src/lib.rs".to_string(),
@@ -773,6 +995,7 @@ mod tests {
         assert!(schema.get("properties").is_some());
         assert!(!schema.to_string().contains("$ref"), "Schema must not contain recursive $ref");
         assert!(schema.to_string().contains("readonly_files"));
+        assert!(schema.to_string().contains("depends_on"));
         let def = plan_refine_response_schema_definition();
         assert_eq!(def["name"], "plan_refinement");
 
@@ -892,5 +1115,25 @@ mod tests {
         assert!(prompt.contains("- **#2 Endpoint**"));
         assert!(prompt.contains("Should we use EdDSA?"));
         assert!(prompt.contains("Instructions for Model:"));
+    }
+
+    #[test]
+    fn test_build_replan_diagnostic_packet_and_system_prompt() {
+        let plan = sample_plan();
+        let packet =
+            build_replan_diagnostic_packet(&plan, "2", Some("Missing crypto dependency"));
+        assert!(packet.contains("# Local Plan Replanning: [jwt-auth] JWT Authentication"));
+        assert!(packet.contains("## Immutable Foundation"));
+        assert!(packet.contains("#1 Models"));
+        assert!(packet.contains("## Blocked Step Diagnostics"));
+        assert!(packet.contains("Missing crypto dependency"));
+        assert!(packet.contains("## Remaining Plan Horizon"));
+        assert!(packet.contains("## Architectural Concept"));
+        assert!(packet.contains("Architect Instructions"));
+
+        let sys = build_replan_system_prompt();
+        assert!(sys.contains("Local Plan Recovery"));
+        assert!(sys.contains("Strict Locality"));
+        assert!(sys.contains("Strict Blocker Protocol"));
     }
 }

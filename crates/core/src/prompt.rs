@@ -1,5 +1,12 @@
+pub mod json;
+pub mod protocol;
+pub mod stream;
+pub mod xml;
+
 use crate::context::ContextFileContent;
+use crate::edits::protocol::create_edit_protocol;
 use crate::edits::EditProtocol;
+use crate::prompt::protocol::PromptProtocol;
 use crate::providers::ChatMessage;
 use tauqe_protocol::{ContextAccess, ModelRole, Plan, RepositoryState};
 
@@ -361,16 +368,12 @@ impl PromptAssembly {
             if trimmed.is_empty() {
                 None
             } else {
-                let text = if trimmed.len() > MAX_SCRATCHPAD_CHARS {
-                    let truncate_index = trimmed
-                        .char_indices()
-                        .map(|(idx, _)| idx)
-                        .take_while(|&idx| idx <= MAX_SCRATCHPAD_CHARS)
-                        .last()
-                        .unwrap_or(0);
+                let text = if trimmed.chars().count() > MAX_SCRATCHPAD_CHARS {
+                    let truncated: String =
+                        trimmed.chars().take(MAX_SCRATCHPAD_CHARS).collect();
                     format!(
                         "{}\n... [scratchpad truncated for length] ...",
-                        &trimmed[..truncate_index]
+                        truncated
                     )
                 } else {
                     trimmed.to_string()
@@ -436,6 +439,30 @@ impl PromptAssembly {
         messages.push(ChatMessage::user(current_prompt));
 
         messages
+    }
+
+    /// Builds the system prompt using the protocol-agnostic [`PromptProtocol`] abstraction.
+    ///
+    /// This bridging entry point resolves the protocol to its underlying edit
+    /// protocol and delegates to [`PromptAssembly::build_system_prompt`], keeping
+    /// the existing [`EditProtocol`]-based call sites fully backward compatible.
+    pub fn build_system_prompt_for(&self, protocol: &dyn PromptProtocol) -> String {
+        let edit_protocol = create_edit_protocol(protocol.name());
+        self.build_system_prompt(edit_protocol.as_ref())
+    }
+
+    /// Assembles chat messages using the protocol-agnostic [`PromptProtocol`] abstraction.
+    ///
+    /// Bridging counterpart of [`PromptAssembly::assemble_chat_messages`] so the
+    /// core pipeline can migrate to [`PromptProtocol`] without breaking existing
+    /// callers.
+    pub fn assemble_chat_messages_for(
+        &self,
+        current_prompt: &str,
+        protocol: &dyn PromptProtocol,
+    ) -> Vec<ChatMessage> {
+        let edit_protocol = create_edit_protocol(protocol.name());
+        self.assemble_chat_messages(current_prompt, edit_protocol.as_ref())
     }
 }
 
@@ -689,5 +716,38 @@ mod tests {
         assembly.turn_scratchpad = Some(multi_byte_text);
         let block = assembly.format_scratchpad_block().unwrap();
         assert!(block.contains("... [scratchpad truncated for length] ..."));
+    }
+
+    #[test]
+    fn test_prompt_assembly_prompt_protocol_bridge() {
+        use crate::prompt::json::JsonPromptProtocol;
+        use crate::prompt::xml::XmlPromptProtocol;
+
+        let files = vec![ContextFileContent {
+            path: "src/main.rs".to_string(),
+            access: ContextAccess::Editable,
+            content: "fn main() {}\n".to_string(),
+        }];
+        let assembly = PromptAssembly::new(None, 1, files, "git", "xml", None, None);
+
+        // The XML PromptProtocol bridges to the XML edit protocol.
+        let xml = XmlPromptProtocol;
+        assert_eq!(
+            assembly.build_system_prompt_for(&xml),
+            assembly.build_system_prompt(&XmlEditProtocol)
+        );
+
+        // The structured PromptProtocol bridges to the structured edit protocol.
+        let json = JsonPromptProtocol;
+        assert_eq!(
+            assembly.build_system_prompt_for(&json),
+            assembly.build_system_prompt(&crate::edits::protocol::StructuredEditProtocol)
+        );
+
+        // Chat assembly delegates equivalently and yields system + user messages.
+        let messages = assembly.assemble_chat_messages_for("Explain this code", &xml);
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].role, "system");
+        assert_eq!(messages[1], ChatMessage::user("Explain this code"));
     }
 }

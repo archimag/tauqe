@@ -24,8 +24,8 @@ pub use context::{parse_context_drop_tags, strip_context_drop_tags, strip_contex
 pub use docs::strip_doc_request_tags;
 pub use language::{extract_user_language, strip_user_language_tags};
 pub use outcome::{
-    extract_error, extract_success, extract_terminal_outcome, strip_error_tags, strip_success_tags,
-    strip_terminal_outcome_tags, TerminalOutcome,
+    extract_blocked, extract_error, extract_success, extract_terminal_outcome, strip_blocked_tags,
+    strip_error_tags, strip_success_tags, strip_terminal_outcome_tags, TerminalOutcome,
 };
 pub use plan::{parse_plan_tags_with_diagnostics, strip_plan_tags, ParsedPlanTag};
 pub use scratchpad::{extract_scratchpad, strip_scratchpad_tags};
@@ -304,6 +304,46 @@ mod tests {
         let stripped = strip_terminal_outcome_tags(text);
         assert!(!stripped.contains("<error"));
         assert_eq!(stripped.trim(), "Blocked:\n\nExiting.");
+    }
+
+    #[test]
+    fn test_extract_and_strip_blocked_attribute() {
+        let text = "Prerequisite missing:\n<blocked reason=\"Dependency not installed\" details=\"Please run npm install\" />\nHalting.";
+        let outcome = extract_terminal_outcome(text).unwrap();
+        assert_eq!(
+            outcome,
+            TerminalOutcome::Blocked {
+                reason: "Dependency not installed".to_string(),
+                details: Some("Please run npm install".to_string()),
+            }
+        );
+        assert_eq!(
+            extract_blocked(text),
+            Some((
+                "Dependency not installed".to_string(),
+                Some("Please run npm install".to_string())
+            ))
+        );
+
+        let stripped = strip_terminal_outcome_tags(text);
+        assert!(!stripped.contains("<blocked"));
+        assert_eq!(stripped.trim(), "Prerequisite missing:\n\nHalting.");
+    }
+
+    #[test]
+    fn test_extract_and_strip_blocked_paired_with_body() {
+        let text = "Blocked:\n<blocked reason=\"Assumption broken\">\nUnderlying service API has changed.\n</blocked>\nStopping.";
+        let outcome = extract_terminal_outcome(text).unwrap();
+        assert_eq!(
+            outcome,
+            TerminalOutcome::Blocked {
+                reason: "Assumption broken".to_string(),
+                details: Some("Underlying service API has changed.".to_string()),
+            }
+        );
+        let stripped = strip_terminal_outcome_tags(text);
+        assert!(!stripped.contains("<blocked"));
+        assert_eq!(stripped.trim(), "Blocked:\n\nStopping.");
     }
 
     #[test]

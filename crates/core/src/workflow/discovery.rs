@@ -1,4 +1,4 @@
-use tauqe_protocol::{ContextAccess, ModelResult};
+use tauqe_protocol::ContextAccess;
 
 use crate::config::DiscoveryMode;
 use crate::context::ContextManager;
@@ -192,10 +192,6 @@ pub fn apply_context_requests(
     max_files: usize,
 ) -> Vec<String> {
     apply_context_requests_detailed(context_manager, requests, available_files, max_files).added
-}
-
-pub(crate) fn has_proposed_edits(result: &ModelResult) -> bool {
-    matches!(result, ModelResult::Edit { edits, .. } if !edits.is_empty())
 }
 
 #[cfg(test)]

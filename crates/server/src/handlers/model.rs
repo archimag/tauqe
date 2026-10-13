@@ -1,9 +1,11 @@
 use std::sync::Arc;
 
 use tokio::sync::watch;
-use tauqe_core::edits::{EditProtocolFactory, XmlEditProtocol};
+use tauqe_core::prompt::json::JsonPromptProtocol;
+use tauqe_core::prompt::protocol::PromptProtocol;
+use tauqe_core::prompt::xml::XmlPromptProtocol;
 use tauqe_core::providers::{create_provider, LlmProvider, StreamEvent};
-use tauqe_core::workflow::GitEditWorkflow;
+use tauqe_core::workflow::{ExecutionMode, SingleExecution};
 use tauqe_protocol::{
     events, EditFileDoneEvent, EditFileRetryingEvent, EditFileStartedEvent, EditFinishedEvent,
     EditHunkEvent, EditStartedEvent, Event, GitCommitCreatedEvent, ModelAskParams, ModelResultEvent,
@@ -128,6 +130,9 @@ pub struct ModelTurnResult {
     pub is_cancelled: bool,
     pub error: Option<String>,
     pub has_terminal_success: bool,
+    /// Coder's block report when the turn ended with a semantic `<blocked>`
+    /// signal. Preserved so plan and review supervisors can react accordingly.
+    pub blocked: Option<String>,
 }
 
 #[allow(dead_code)]
@@ -222,6 +227,7 @@ async fn run_prepared_turn(
     state: &Arc<AppState>,
     prompt: String,
     prepared: PreparedTurn,
+    mut policy: Box<dyn tauqe_core::workflow::policy::ApplyPolicy>,
 ) -> Result<ModelTurnResult, ResponseError> {
     let PreparedTurn {
         provider,
@@ -234,8 +240,11 @@ async fn run_prepared_turn(
 
     let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamEvent>(100);
 
-    let protocol = EditProtocolFactory::create_protocol(&app_config.develop.protocol)
-        .unwrap_or_else(|_| Box::new(XmlEditProtocol));
+    let protocol_str = app_config.develop.protocol.trim().to_lowercase();
+    let protocol: Box<dyn PromptProtocol> = match protocol_str.as_str() {
+        "structured" | "json" => Box::new(JsonPromptProtocol),
+        _ => Box::new(XmlPromptProtocol),
+    };
 
     let mut workflow_opts = tauqe_core::workflow::WorkflowOptions::from_app_config(&app_config);
     workflow_opts.reasoning_effort = match &selection {
@@ -243,16 +252,7 @@ async fn run_prepared_turn(
         tauqe_protocol::ModelSelection::Specific(_) => None,
     };
     workflow_opts.initial_selection = Some(selection);
-    let workflow: Box<dyn tauqe_core::workflow::EditWorkflow> =
-        match app_config.develop.workflow.trim().to_lowercase().as_str() {
-            "naive" => Box::new(tauqe_core::workflow::NaiveEditWorkflow {
-                options: workflow_opts,
-            }),
-            _ => Box::new(GitEditWorkflow {
-                options: workflow_opts,
-            }),
-        };
-
+    let execution = SingleExecution::new(workflow_opts);
     let (wf_tx, wf_rx) = (tx.clone(), cancel_rx.clone());
     drop(tx);
 
@@ -264,8 +264,9 @@ async fn run_prepared_turn(
         let _session_guard = state_clone.session_lock.lock().await;
         let mut local_context = state_clone.context.read().await.clone();
         let mut history = state_clone.history.lock().await;
-        let res = workflow
+        let res = execution
             .execute(
+                policy.as_mut(),
                 &prompt_clone,
                 provider.as_ref(),
                 &model_clone,
@@ -533,6 +534,7 @@ async fn run_prepared_turn(
             is_cancelled,
             error,
             has_terminal_success: false,
+            blocked: None,
         });
     }
 
@@ -652,7 +654,7 @@ async fn run_prepared_turn(
                 });
             }
 
-            if edit_events_sent && !edit_finished_sent {
+            if should_report_aborted_edits(edit_events_sent, edit_finished_sent, &wf_result.result) {
                 send_edit_aborted(
                     &state.out,
                     &op_id,
@@ -703,6 +705,7 @@ async fn run_prepared_turn(
                 is_cancelled: false,
                 error: turn_error,
                 has_terminal_success,
+                blocked: wf_result.blocked,
             }
         }
         Ok(Err(err)) => {
@@ -728,6 +731,7 @@ async fn run_prepared_turn(
                 is_cancelled: false,
                 error: Some(err.to_string()),
                 has_terminal_success: false,
+                blocked: None,
             }
         }
         Err(join_err) => {
@@ -753,6 +757,7 @@ async fn run_prepared_turn(
                 is_cancelled: false,
                 error: Some(join_err.to_string()),
                 has_terminal_success: false,
+                blocked: None,
             }
         }
     };
@@ -773,8 +778,13 @@ pub async fn start_model_turn(
     let prepared = prepare_turn(state, custom_selection, plan_context).await?;
     let op_id = prepared.op_id.clone();
     let state_clone = Arc::clone(state);
+    let workflow_name = prepared.app_config.develop.workflow.trim().to_lowercase();
     tokio::spawn(async move {
-        let _ = run_prepared_turn(&state_clone, prompt, prepared).await;
+        let policy: Box<dyn tauqe_core::workflow::policy::ApplyPolicy> = match workflow_name.as_str() {
+            "naive" => Box::new(tauqe_core::workflow::policy::DirectApplyPolicy::new()),
+            _ => Box::new(tauqe_core::workflow::git_policy::GitTransactionPolicy::new()),
+        };
+        let _ = run_prepared_turn(&state_clone, prompt, prepared, policy).await;
     });
     Ok(op_id)
 }
@@ -789,9 +799,10 @@ pub async fn execute_model_turn(
     prompt: String,
     custom_selection: Option<tauqe_protocol::ModelSelection>,
     plan_context: Option<tauqe_protocol::ModelTurnPlanContext>,
+    policy: Box<dyn tauqe_core::workflow::policy::ApplyPolicy>,
 ) -> Result<ModelTurnResult, ResponseError> {
     let prepared = prepare_turn(state, custom_selection, plan_context).await?;
-    run_prepared_turn(state, prompt, prepared).await
+    run_prepared_turn(state, prompt, prepared, policy).await
 }
 
 pub async fn handle_model_cancel(req: Request, state: &Arc<AppState>) -> Response {
@@ -842,6 +853,17 @@ fn accumulate_usage(accum: &mut Option<ModelUsageInfo>, new_usage: ModelUsageInf
     }
 }
 
+fn should_report_aborted_edits(
+    edit_events_sent: bool,
+    edit_finished_sent: bool,
+    result: &tauqe_protocol::ModelResult,
+) -> bool {
+    if !edit_events_sent || edit_finished_sent {
+        return false;
+    }
+    !matches!(result, tauqe_protocol::ModelResult::Answer { .. })
+}
+
 fn send_edit_aborted(out: &OutChannel, op_id: &str, error: String) {
     out.send_event(&Event {
         method: events::EDIT_FINISHED.to_string(),
@@ -878,6 +900,7 @@ mod tests {
             is_cancelled: false,
             error: None,
             has_terminal_success: false,
+            blocked: None,
         };
         assert!(ok_edit.is_success());
 
@@ -897,6 +920,7 @@ mod tests {
             is_cancelled: false,
             error: Some("compiler error".to_string()),
             has_terminal_success: false,
+            blocked: None,
         };
         assert!(!failed_edit.is_success());
 
@@ -910,6 +934,7 @@ mod tests {
             is_cancelled: false,
             error: None,
             has_terminal_success: false,
+            blocked: None,
         };
         assert!(!conversational_answer.is_success());
 
@@ -923,6 +948,7 @@ mod tests {
             is_cancelled: false,
             error: None,
             has_terminal_success: true,
+            blocked: None,
         };
         assert!(verified_answer.is_success());
 
@@ -934,8 +960,55 @@ mod tests {
             is_cancelled: true,
             error: Some("Operation cancelled".to_string()),
             has_terminal_success: true,
+            blocked: None,
         };
         assert!(!cancelled_turn.is_success());
+
+        // 6. A semantically blocked turn is never a success.
+        let blocked_turn = ModelTurnResult {
+            operation_id: "op-6".to_string(),
+            result: Some(tauqe_protocol::ModelResult::Edit {
+                summary: "Execution blocked".to_string(),
+                edits: vec![],
+                proposal: None,
+                applied: false,
+                error: Some("precondition missing".to_string()),
+                changed_files: vec![],
+                commit_hash: None,
+            }),
+            assistant_text: "Blocked.".to_string(),
+            is_cancelled: false,
+            error: Some("precondition missing".to_string()),
+            has_terminal_success: false,
+            blocked: Some("precondition missing".to_string()),
+        };
+        assert!(!blocked_turn.is_success());
+    }
+
+    #[test]
+    fn test_should_report_aborted_edits() {
+        let answer = tauqe_protocol::ModelResult::Answer { text: "text".to_string() };
+        let edit = tauqe_protocol::ModelResult::Edit {
+            summary: "sum".to_string(),
+            edits: vec![],
+            proposal: None,
+            applied: false,
+            error: None,
+            changed_files: vec![],
+            commit_hash: None,
+        };
+        
+        // Never report if no edit events were sent
+        assert!(!should_report_aborted_edits(false, false, &answer));
+        assert!(!should_report_aborted_edits(false, false, &edit));
+        
+        // Never report if already sent
+        assert!(!should_report_aborted_edits(true, true, &answer));
+        assert!(!should_report_aborted_edits(true, true, &edit));
+        
+        // If edit events were sent but not finished, report ONLY if it's not an Answer
+        assert!(!should_report_aborted_edits(true, false, &answer));
+        assert!(should_report_aborted_edits(true, false, &edit));
     }
 
     #[tokio::test]
@@ -1016,7 +1089,8 @@ mod tests {
         assert!(res_start.is_err());
         assert_eq!(res_start.unwrap_err().code, "NO_API_KEY");
 
-        let res_exec = execute_model_turn(&state, "test prompt".to_string(), None, None).await;
+        let policy = Box::new(tauqe_core::workflow::policy::DirectApplyPolicy::new());
+        let res_exec = execute_model_turn(&state, "test prompt".to_string(), None, None, policy).await;
         assert!(res_exec.is_err());
         assert_eq!(res_exec.unwrap_err().code, "NO_API_KEY");
     }

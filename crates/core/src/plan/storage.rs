@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 use tauqe_protocol::{
@@ -113,6 +114,76 @@ impl PlanStorage {
     ///
     /// The persisted plan enforces the leaf-only file invariant: any item with
     /// children is a conceptual container and is stored without `files`.
+    /// Validates that any items marked as `Done` in `existing` are preserved immutably in `updated`:
+    /// - Cannot be removed or deleted.
+    /// - Cannot regress status (must remain `Done`).
+    /// - Cannot modify `title`, `details`, or target `files`.
+    pub fn validate_done_immutability(existing: &Plan, updated: &Plan) -> Result<()> {
+        fn collect_done_items<'a>(items: &'a [PlanItem], out: &mut Vec<&'a PlanItem>) {
+            for item in items {
+                if item.status == PlanItemStatus::Done {
+                    out.push(item);
+                }
+                collect_done_items(&item.children, out);
+            }
+        }
+
+        let mut done_items = Vec::new();
+        collect_done_items(&existing.items, &mut done_items);
+
+        for done_item in done_items {
+            let updated_item = match updated.find_item(&done_item.id) {
+                Some(it) => it,
+                None => {
+                    anyhow::bail!(
+                        "Cannot remove completed step '{}' (status: DONE): completed steps are immutable",
+                        done_item.id
+                    );
+                }
+            };
+
+            if updated_item.status != PlanItemStatus::Done {
+                anyhow::bail!(
+                    "Cannot regress status of completed step '{}' from DONE to {}: completed steps are immutable",
+                    done_item.id,
+                    updated_item.status
+                );
+            }
+
+            if updated_item.title.trim() != done_item.title.trim() {
+                anyhow::bail!(
+                    "Cannot modify title of completed step '{}' ('{}' -> '{}'): completed steps are immutable",
+                    done_item.id,
+                    done_item.title.trim(),
+                    updated_item.title.trim()
+                );
+            }
+
+            let old_details = done_item.details.as_deref().map(str::trim).filter(|s| !s.is_empty());
+            let new_details = updated_item.details.as_deref().map(str::trim).filter(|s| !s.is_empty());
+            if old_details != new_details {
+                anyhow::bail!(
+                    "Cannot modify details of completed step '{}': completed steps are immutable",
+                    done_item.id
+                );
+            }
+
+            if updated_item.files != done_item.files {
+                anyhow::bail!(
+                    "Cannot modify target files of completed step '{}': completed steps are immutable",
+                    done_item.id
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Saves a plan into `.tauqe/plans/<id>.json` atomically.
+    ///
+    /// The persisted plan enforces the leaf-only file invariant: any item with
+    /// children is a conceptual container and is stored without `files`.
+    /// Also enforces the `Done is Immutable` invariant against any existing on-disk plan.
     pub fn save_plan(repo_root: &Path, plan: &Plan) -> Result<()> {
         let dir = Self::plans_dir(repo_root);
         std::fs::create_dir_all(&dir).with_context(|| {
@@ -125,6 +196,22 @@ impl PlanStorage {
 
         let mut normalized = plan.clone();
         normalized.normalize_leaf_files();
+        normalized.refresh_parent_statuses();
+
+        let existing = if target_file.is_file() {
+            let content = std::fs::read_to_string(&target_file)
+                .with_context(|| format!("Failed to read existing plan file at {}", target_file.display()))?;
+            Some(serde_json::from_str::<Plan>(&content)
+                .with_context(|| format!("Failed to parse existing plan JSON at {}", target_file.display()))?)
+        } else if let Ok(all) = Self::load_all(repo_root) {
+            all.into_iter().find(|p| p.id.eq_ignore_ascii_case(&plan.id))
+        } else {
+            None
+        };
+
+        if let Some(existing_plan) = existing {
+            Self::validate_done_immutability(&existing_plan, &normalized)?;
+        }
 
         let json = serde_json::to_string_pretty(&normalized)
             .context("Failed to serialize plan to JSON")?;
@@ -532,6 +619,163 @@ PlanApplicationOutcome { applied, errors }
 let (parsed, errors) = crate::edits::protocol::xml::tags::parse_plan_tags_with_diagnostics(text);
 Self::apply_parsed_plans(repo_root, parsed, errors)
     }
+
+    /// Locally replaces a blocked leaf step with a structured sub-tree produced by the
+    /// Architect during semantic recovery (Rolling Wave Planning).
+    ///
+    /// The graft is strictly local: the target step must be an executable leaf that is
+    /// not `Done` (completed steps are immutable). The sub-tree items are spliced into
+    /// the target's position, so the preceding tasks and the independent remainder of
+    /// the plan stay untouched. Every downstream task that depended on the replaced
+    /// step is re-pointed at the exit items of the grafted sub-tree, keeping the
+    /// dependent tail waiting on the decomposed work. Leaf-only file invariants are
+    /// normalized before the plan is persisted atomically.
+    pub fn graft_subtree(
+        repo_root: &Path,
+        plan_id: &str,
+        target_step_id: &str,
+        new_subtree: Vec<PlanItem>,
+    ) -> Result<Plan> {
+        if new_subtree.is_empty() {
+            anyhow::bail!(
+                "Cannot graft an empty sub-tree over step '{}'",
+                target_step_id
+            );
+        }
+
+        let mut plan = match Self::load_plan(repo_root, plan_id)? {
+            Some(p) => p,
+            None => anyhow::bail!("Plan '{}' not found", plan_id),
+        };
+
+        let target = match plan.find_item(target_step_id) {
+            Some(item) => item.clone(),
+            None => anyhow::bail!(
+                "Step '{}' not found in plan '{}'",
+                target_step_id,
+                plan_id
+            ),
+        };
+
+        if !target.is_leaf() {
+            anyhow::bail!(
+                "Step '{}' ({}) is not a leaf and cannot be grafted; graft only over executable leaf steps",
+                target.id,
+                target.title
+            );
+        }
+
+        if target.status == PlanItemStatus::Done {
+            anyhow::bail!(
+                "Step '{}' is DONE and immutable; completed steps cannot be replaced",
+                target.id
+            );
+        }
+
+        let exits = subtree_exit_ids(&new_subtree);
+
+        // Re-point the dependent tail before splicing so the grafted sub-tree itself is
+        // never rewritten.
+        if !exits.is_empty() {
+            remap_dependencies(&mut plan.items, &target.id, &exits);
+        }
+
+        if !splice_replacement(&mut plan.items, &target.id, &new_subtree) {
+            anyhow::bail!(
+                "Failed to locate step '{}' for grafting in plan '{}'",
+                target.id,
+                plan_id
+            );
+        }
+
+        plan.normalize_leaf_files();
+        plan.refresh_parent_statuses();
+        plan.updated_at = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        Self::save_plan(repo_root, &plan)?;
+        Ok(plan)
+    }
+}
+
+/// Splices `replacement` into the position of the item whose id matches `target_id`,
+/// preserving sibling order. Returns true when the target was found and replaced.
+fn splice_replacement(
+    items: &mut Vec<PlanItem>,
+    target_id: &str,
+    replacement: &[PlanItem],
+) -> bool {
+    if let Some(index) = items
+        .iter()
+        .position(|item| item.id.eq_ignore_ascii_case(target_id))
+    {
+        items.splice(index..=index, replacement.iter().cloned());
+        return true;
+    }
+    for item in items.iter_mut() {
+        if splice_replacement(&mut item.children, target_id, replacement) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Rewrites every `depends_on` reference to `old_id` into references to `new_ids`,
+/// preserving unrelated dependencies and de-duplicating the result.
+fn remap_dependencies(items: &mut [PlanItem], old_id: &str, new_ids: &[String]) {
+    for item in items.iter_mut() {
+        if item
+            .depends_on
+            .iter()
+            .any(|dep| dep.eq_ignore_ascii_case(old_id))
+        {
+            let mut remapped: Vec<String> = Vec::with_capacity(item.depends_on.len());
+            for dep in &item.depends_on {
+                if dep.eq_ignore_ascii_case(old_id) {
+                    for new_id in new_ids {
+                        if !remapped.iter().any(|r| r.eq_ignore_ascii_case(new_id)) {
+                            remapped.push(new_id.clone());
+                        }
+                    }
+                } else if !remapped.iter().any(|r| r.eq_ignore_ascii_case(dep)) {
+                    remapped.push(dep.clone());
+                }
+            }
+            item.depends_on = remapped;
+        }
+        remap_dependencies(&mut item.children, old_id, new_ids);
+    }
+}
+
+/// Collects the exit item ids of a grafted sub-tree: the top-level items that no other
+/// item in the sub-tree depends on. When every top-level item is referenced (or the
+/// sub-tree holds a single item), the last item acts as the continuation point.
+fn subtree_exit_ids(subtree: &[PlanItem]) -> Vec<String> {
+    let mut referenced: HashSet<String> = HashSet::new();
+    fn collect(items: &[PlanItem], referenced: &mut HashSet<String>) {
+        for item in items {
+            for dep in &item.depends_on {
+                referenced.insert(dep.to_ascii_lowercase());
+            }
+            collect(&item.children, referenced);
+        }
+    }
+    collect(subtree, &mut referenced);
+
+    let mut exits: Vec<String> = subtree
+        .iter()
+        .filter(|item| !referenced.contains(&item.id.to_ascii_lowercase()))
+        .map(|item| item.id.clone())
+        .collect();
+
+    if exits.is_empty() {
+        if let Some(last) = subtree.last() {
+            exits.push(last.id.clone());
+        }
+    }
+    exits
 }
 
 /// Result of applying plan operations from model output.
@@ -567,6 +811,7 @@ mod tests {
                     files: vec![],
                     readonly_files: vec![],
                     concept_refs: vec![],
+                    depends_on: vec![],
                     children: vec![PlanItem {
                         id: "1.1".to_string(),
                         title: "Token struct".to_string(),
@@ -575,6 +820,7 @@ mod tests {
                         files: vec![],
                         readonly_files: vec![],
                         concept_refs: vec![],
+                        depends_on: vec![],
                         children: vec![],
                     }],
                 },
@@ -586,6 +832,7 @@ mod tests {
                     files: vec![],
                     readonly_files: vec![],
                     concept_refs: vec![],
+                    depends_on: vec![],
                     children: vec![],
                 },
             ],
@@ -703,6 +950,7 @@ Step 1 is done:
                 files: vec![],
                 readonly_files: vec![],
                 concept_refs: vec![],
+                depends_on: vec![],
                 children: vec![],
             }],
         };
@@ -735,10 +983,11 @@ Step 1 is done:
                 id: "1".to_string(),
                 title: "Protocol types".to_string(),
                 details: Some("Schemas and filters".to_string()),
-                status: PlanItemStatus::Done,
+                status: PlanItemStatus::InProgress,
                 files: vec![],
                 readonly_files: vec![],
                 concept_refs: vec![],
+                depends_on: vec![],
                 children: vec![],
             }],
         };
@@ -759,10 +1008,11 @@ Step 1 is done:
                 id: "1".to_string(),
                 title: "Protocol types".to_string(),
                 details: Some("Updated details".to_string()),
-                status: PlanItemStatus::Done,
+                status: PlanItemStatus::InProgress,
                 files: vec![],
                 readonly_files: vec![],
                 concept_refs: vec![],
+                depends_on: vec![],
                 children: vec![],
             }],
         };
@@ -884,5 +1134,289 @@ Step 1 is done:
         let loaded = PlanStorage::load_plan(root, "leaf-only").unwrap().unwrap();
         assert!(loaded.items[0].files.is_empty());
         assert_eq!(loaded.items[0].children[0].files, vec!["src/leaf.rs".to_string()]);
+    }
+
+    #[test]
+    fn test_validate_done_immutability_prevents_deletion() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+
+        let plan = Plan {
+            id: "done-plan".to_string(),
+            title: "Done Plan".to_string(),
+            description: None,
+            created_at: 10,
+            updated_at: 10,
+            concept: vec![],
+            items: vec![
+                PlanItem {
+                    id: "1".to_string(),
+                    title: "Step 1".to_string(),
+                    status: PlanItemStatus::Done,
+                    ..Default::default()
+                },
+                PlanItem {
+                    id: "2".to_string(),
+                    title: "Step 2".to_string(),
+                    status: PlanItemStatus::Todo,
+                    ..Default::default()
+                },
+            ],
+        };
+        PlanStorage::save_plan(root, &plan).unwrap();
+
+        // Attempt to remove Step 1
+        let truncated = Plan {
+            id: "done-plan".to_string(),
+            title: "Done Plan".to_string(),
+            description: None,
+            created_at: 10,
+            updated_at: 20,
+            concept: vec![],
+            items: vec![PlanItem {
+                id: "2".to_string(),
+                title: "Step 2".to_string(),
+                status: PlanItemStatus::Todo,
+                ..Default::default()
+            }],
+        };
+        let err = PlanStorage::save_plan(root, &truncated).unwrap_err();
+        assert!(err.to_string().contains("Cannot remove completed step '1'"));
+    }
+
+    #[test]
+    fn test_validate_done_immutability_prevents_regression_and_mutation() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+
+        let plan = Plan {
+            id: "done-plan".to_string(),
+            title: "Done Plan".to_string(),
+            description: None,
+            created_at: 10,
+            updated_at: 10,
+            concept: vec![],
+            items: vec![PlanItem {
+                id: "1".to_string(),
+                title: "Original Title".to_string(),
+                details: Some("Original Details".to_string()),
+                status: PlanItemStatus::Done,
+                files: vec!["src/done.rs".to_string()],
+                ..Default::default()
+            }],
+        };
+        PlanStorage::save_plan(root, &plan).unwrap();
+
+        // 1. Status regression
+        let mut regressed = plan.clone();
+        regressed.items[0].status = PlanItemStatus::Todo;
+        let err1 = PlanStorage::save_plan(root, &regressed).unwrap_err();
+        assert!(err1.to_string().contains("Cannot regress status of completed step '1'"));
+
+        // 2. Title mutation
+        let mut title_mutated = plan.clone();
+        title_mutated.items[0].title = "Altered Title".to_string();
+        let err2 = PlanStorage::save_plan(root, &title_mutated).unwrap_err();
+        assert!(err2.to_string().contains("Cannot modify title of completed step '1'"));
+
+        // 3. Details mutation
+        let mut details_mutated = plan.clone();
+        details_mutated.items[0].details = Some("Altered Details".to_string());
+        let err3 = PlanStorage::save_plan(root, &details_mutated).unwrap_err();
+        assert!(err3.to_string().contains("Cannot modify details of completed step '1'"));
+
+        // 4. Target files mutation
+        let mut files_mutated = plan.clone();
+        files_mutated.items[0].files = vec!["src/other.rs".to_string()];
+        let err4 = PlanStorage::save_plan(root, &files_mutated).unwrap_err();
+        assert!(err4.to_string().contains("Cannot modify target files of completed step '1'"));
+    }
+
+    #[test]
+    fn test_apply_parsed_plans_and_discussion_enforce_done_immutability() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+
+        let initial_text = r#"
+<plan action="save" id="guard-plan" title="Guard">
+  <concept>
+    <concept_item id="c-1" title="Invariant" />
+  </concept>
+  <item id="1" title="Step 1" status="done" />
+  <item id="2" title="Step 2" status="todo" />
+</plan>
+"#;
+        let initial_res = PlanStorage::apply_plan_tags(root, initial_text);
+        assert!(initial_res.errors.is_empty());
+        assert_eq!(initial_res.applied.len(), 1);
+
+        // 1. apply_plan_tags update attempting status regression
+        let invalid_update = r#"
+<plan action="update" id="guard-plan">
+  <item id="1" status="todo" />
+</plan>
+"#;
+        let invalid_res = PlanStorage::apply_plan_tags(root, invalid_update);
+        assert!(invalid_res.applied.is_empty());
+        assert!(!invalid_res.errors.is_empty());
+        assert!(invalid_res.errors[0].contains("Cannot regress status of completed step '1'"));
+
+        // 2. apply_discussion_plan_update attempting to delete completed step
+        let invalid_disc = DiscussionPlanUpdate {
+            action: DiscussionPlanAction::Save,
+            id: Some("guard-plan".to_string()),
+            title: Some("Guard".to_string()),
+            description: None,
+            concept: vec![tauqe_protocol::ConceptItem {
+                id: "c-1".to_string(),
+                title: "Invariant".to_string(),
+                details: None,
+                children: vec![],
+            }],
+            items: vec![PlanItem {
+                id: "2".to_string(),
+                title: "Step 2".to_string(),
+                status: PlanItemStatus::Done,
+                ..Default::default()
+            }],
+        };
+        let disc_res = PlanStorage::apply_discussion_plan_update(root, &invalid_disc);
+        assert!(disc_res.applied.is_empty());
+        assert!(!disc_res.errors.is_empty());
+        assert!(disc_res.errors[0].contains("Cannot remove completed step '1'"));
+    }
+
+    #[test]
+    fn test_graft_subtree_replaces_blocked_leaf_and_remaps_dependents() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+
+        let plan = Plan {
+            id: "graft-plan".to_string(),
+            title: "Graft Plan".to_string(),
+            description: None,
+            created_at: 1,
+            updated_at: 1,
+            concept: vec![],
+            items: vec![
+                PlanItem {
+                    id: "1".to_string(),
+                    title: "Done foundation".to_string(),
+                    status: PlanItemStatus::Done,
+                    ..Default::default()
+                },
+                PlanItem {
+                    id: "2".to_string(),
+                    title: "Blocked endpoint".to_string(),
+                    details: Some("Implement handler".to_string()),
+                    status: PlanItemStatus::Blocked,
+                    files: vec!["src/endpoint.rs".to_string()],
+                    ..Default::default()
+                },
+                PlanItem {
+                    id: "3".to_string(),
+                    title: "Dependent integration".to_string(),
+                    status: PlanItemStatus::Todo,
+                    files: vec!["src/integration.rs".to_string()],
+                    depends_on: vec!["1".to_string(), "2".to_string()],
+                    ..Default::default()
+                },
+            ],
+        };
+        PlanStorage::save_plan(root, &plan).unwrap();
+
+        let replacement = vec![
+            PlanItem {
+                id: "2.1".to_string(),
+                title: "Split model".to_string(),
+                status: PlanItemStatus::Todo,
+                files: vec!["src/model.rs".to_string()],
+                readonly_files: vec!["src/contract.rs".to_string()],
+                ..Default::default()
+            },
+            PlanItem {
+                id: "2.2".to_string(),
+                title: "Split handler".to_string(),
+                status: PlanItemStatus::Todo,
+                files: vec!["src/handler.rs".to_string()],
+                depends_on: vec!["2.1".to_string()],
+                ..Default::default()
+            },
+        ];
+
+        let grafted =
+            PlanStorage::graft_subtree(root, "graft-plan", "2", replacement).unwrap();
+
+        // The blocked leaf is replaced by the sub-tree in place.
+        assert_eq!(grafted.items.len(), 4);
+        assert_eq!(grafted.items[0].id, "1");
+        assert_eq!(grafted.items[1].id, "2.1");
+        assert_eq!(grafted.items[2].id, "2.2");
+        assert_eq!(grafted.items[3].id, "3");
+        assert!(grafted.find_item("2").is_none());
+
+        // The dependent tail is re-pointed at the sub-tree exit item.
+        let dependent = grafted.find_item("3").unwrap();
+        assert_eq!(dependent.depends_on, vec!["1".to_string(), "2.2".to_string()]);
+    }
+
+    #[test]
+    fn test_graft_subtree_rejects_done_non_leaf_and_empty() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+
+        let plan = Plan {
+            id: "graft-reject".to_string(),
+            title: "Graft Reject".to_string(),
+            description: None,
+            created_at: 1,
+            updated_at: 1,
+            concept: vec![],
+            items: vec![
+                PlanItem {
+                    id: "1".to_string(),
+                    title: "Done".to_string(),
+                    status: PlanItemStatus::Done,
+                    ..Default::default()
+                },
+                PlanItem {
+                    id: "2".to_string(),
+                    title: "Parent".to_string(),
+                    status: PlanItemStatus::Todo,
+                    children: vec![PlanItem {
+                        id: "2.1".to_string(),
+                        title: "Child".to_string(),
+                        status: PlanItemStatus::Todo,
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+            ],
+        };
+        PlanStorage::save_plan(root, &plan).unwrap();
+
+        let replacement = vec![PlanItem {
+            id: "new".to_string(),
+            title: "New".to_string(),
+            status: PlanItemStatus::Todo,
+            ..Default::default()
+        }];
+
+        // DONE steps are immutable.
+        let err_done =
+            PlanStorage::graft_subtree(root, "graft-reject", "1", replacement.clone())
+                .unwrap_err();
+        assert!(err_done.to_string().contains("DONE and immutable"));
+
+        // Only leaves can be grafted.
+        let err_parent =
+            PlanStorage::graft_subtree(root, "graft-reject", "2", replacement.clone())
+                .unwrap_err();
+        assert!(err_parent.to_string().contains("not a leaf"));
+
+        // Empty sub-trees are rejected.
+        let err_empty =
+            PlanStorage::graft_subtree(root, "graft-reject", "2.1", Vec::new()).unwrap_err();
+        assert!(err_empty.to_string().contains("empty sub-tree"));
     }
 }

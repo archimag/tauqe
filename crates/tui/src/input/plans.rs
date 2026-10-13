@@ -58,6 +58,20 @@ fn execute_scope_action(st: &mut AppState, plan_id: &str, scope_id: Option<&str>
         tauqe_protocol::PlanScopeEvaluation::AllCompleted => {
             st.notify_info("All steps in this scope are already completed.");
         }
+        tauqe_protocol::PlanScopeEvaluation::BlockedByDependencies(items) => {
+            let preview = if items.len() <= 2 {
+                items.join(", ")
+            } else {
+                format!("{}, and {} more", items[..2].join(", "), items.len() - 2)
+            };
+            st.notify_warning(format!(
+                "Scope contains {} step(s) with unmet dependencies ({}). Complete prerequisites first.",
+                items.len(), preview
+            ));
+        }
+        tauqe_protocol::PlanScopeEvaluation::StepBlocked => {
+            st.notify_warning("Step is BLOCKED; resolve the blocker or replan before executing.");
+        }
         tauqe_protocol::PlanScopeEvaluation::Cancelled => {
             st.notify_warning("Step is CANCELLED; change status to TODO before executing.");
         }
@@ -296,7 +310,8 @@ pub async fn handle_plans_key(
                         tauqe_protocol::PlanItemStatus::Todo => 1,
                         tauqe_protocol::PlanItemStatus::InProgress => 2,
                         tauqe_protocol::PlanItemStatus::Done => 3,
-                        tauqe_protocol::PlanItemStatus::Cancelled => 4,
+                        tauqe_protocol::PlanItemStatus::Blocked => 4,
+                        tauqe_protocol::PlanItemStatus::Cancelled => 5,
                     };
                     st.status_dialog = Some(crate::app::StatusDialogState {
                         target: crate::app::StatusDialogTarget::PlanItem {

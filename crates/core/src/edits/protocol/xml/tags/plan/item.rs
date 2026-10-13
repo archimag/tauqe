@@ -97,6 +97,7 @@ pub(super) fn parse_plan_items_with_diagnostics(content: &str) -> (Vec<tauqe_pro
             "discussion" | "discuss" | "question" | "?" | "обсуждение" => tauqe_protocol::PlanItemStatus::Discussion,
             "in_progress" | "inprogress" | "doing" => tauqe_protocol::PlanItemStatus::InProgress,
             "done" | "completed" | "finished" => tauqe_protocol::PlanItemStatus::Done,
+            "blocked" | "block" => tauqe_protocol::PlanItemStatus::Blocked,
             "cancelled" | "canceled" => tauqe_protocol::PlanItemStatus::Cancelled,
             "todo" | "pending" | "" => tauqe_protocol::PlanItemStatus::Todo,
             other => {
@@ -158,6 +159,22 @@ pub(super) fn parse_plan_items_with_diagnostics(content: &str) -> (Vec<tauqe_pro
             })
             .unwrap_or_default();
 
+        let depends_on = extract_attribute(header, "depends_on")
+            .or_else(|| extract_attribute(header, "deps"))
+            .map(|s| {
+                s.split([',', ';', '\n'])
+                    .filter_map(|p| {
+                        let trimmed = p.trim();
+                        if trimmed.is_empty() {
+                            None
+                        } else {
+                            Some(trimmed.to_string())
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+
         if rest[..gt].trim_end().ends_with('/') {
             // Self-closing item
             if !id.is_empty() || !raw_title.is_empty() {
@@ -169,6 +186,7 @@ pub(super) fn parse_plan_items_with_diagnostics(content: &str) -> (Vec<tauqe_pro
                     files,
                     readonly_files,
                     concept_refs,
+                    depends_on,
                     children: Vec::new(),
                 });
             }
@@ -272,6 +290,7 @@ pub(super) fn parse_plan_items_with_diagnostics(content: &str) -> (Vec<tauqe_pro
                         files: if children.is_empty() { files } else { Vec::new() },
                         readonly_files: if children.is_empty() { readonly_files } else { Vec::new() },
                         concept_refs,
+                        depends_on: if children.is_empty() { depends_on } else { Vec::new() },
                         children,
                     });
                 }

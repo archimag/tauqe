@@ -101,16 +101,25 @@ impl XmlStreamFilter {
                     }
                 }
 
+                let safe_limit = safe_text_emit_len(&self.buffer);
+
                 if let Some(tag_idx) = find_any_edit_start(&self.buffer) {
+                    if safe_limit < self.buffer.len() && tag_idx >= safe_limit {
+                        if safe_limit > 0 {
+                            let text_part = self.buffer[..safe_limit].to_string();
+                            events.push(StreamEvent::TextDelta(text_part));
+                            self.buffer.drain(..safe_limit);
+                        }
+                        break;
+                    }
+
                     if tag_idx > 0 {
                         let text_part = self.buffer[..tag_idx].to_string();
                         events.push(StreamEvent::TextDelta(text_part));
                         self.buffer.drain(..tag_idx);
                     }
 
-                    if self.buffer.starts_with("<tauqe_edits>")
-                        || self.buffer.starts_with("<tauqe_edits")
-                    {
+                    if self.buffer.starts_with("<tauqe_edits") {
                         if let Some(close_tag_bracket) = self.buffer.find('>') {
                             self.buffer.drain(..=close_tag_bracket);
                             self.in_edits_block = true;
@@ -125,11 +134,10 @@ impl XmlStreamFilter {
                         continue;
                     }
                 } else {
-                    let emit_len = safe_text_emit_len(&self.buffer);
-                    if emit_len > 0 {
-                        let text_part = self.buffer[..emit_len].to_string();
+                    if safe_limit > 0 {
+                        let text_part = self.buffer[..safe_limit].to_string();
                         events.push(StreamEvent::TextDelta(text_part));
-                        self.buffer.drain(..emit_len);
+                        self.buffer.drain(..safe_limit);
                     }
                     break;
                 }
@@ -414,10 +422,13 @@ impl EditStreamFilter for XmlStreamFilter {
                     hunks_count: self.file_hunks_count,
                 });
             }
-            if !self.buffer.trim().is_empty()
-                && (!self.in_edits_block || !self.buffer.contains('<'))
-            {
-                events.push(StreamEvent::TextDelta(std::mem::take(&mut self.buffer)));
+            if !self.buffer.trim().is_empty() {
+                let cleaned = crate::edits::protocol::xml::extract_conversational_text(&self.buffer);
+                let cleaned = self.restore_content(&cleaned);
+                if !cleaned.trim().is_empty() {
+                    events.push(StreamEvent::TextDelta(cleaned));
+                }
+                self.buffer.clear();
             }
         }
         self.restore_events(&mut events);
@@ -510,9 +521,47 @@ fn safe_text_emit_len(buf: &str) -> usize {
 
 fn find_any_edit_start(buf: &str) -> Option<usize> {
     let mut min_idx = None;
-    for prefix in &["<tauqe_edits", "<edit", "<create", "<overwrite", "<delete", "<move"] {
-        if let Some(idx) = buf.find(prefix) {
-            min_idx = Some(min_idx.map_or(idx, |m: usize| m.min(idx)));
+
+    if let Some(idx) = buf.find("<tauqe_edits") {
+        let after = &buf[idx + "<tauqe_edits".len()..];
+        if after.starts_with(|c: char| c.is_whitespace() || c == '>' || c == '_' || c == '-') {
+            min_idx = Some(idx);
+        }
+    }
+
+    for tag in &["edit", "create", "overwrite", "delete", "move"] {
+        let pat = format!("<{}", tag);
+        let mut from = 0;
+        while let Some(idx) = buf[from..].find(&pat) {
+            let abs_idx = from + idx;
+            let after = &buf[abs_idx + pat.len()..];
+            let mut is_tag_match = false;
+            if after.starts_with(char::is_whitespace) {
+                is_tag_match = true;
+            } else if after.starts_with(['_', '-']) {
+                if let Some(ws_idx) = after.find(char::is_whitespace) {
+                    let suffix = &after[1..ws_idx];
+                    if suffix.chars().all(|c| c.is_ascii_alphanumeric()) {
+                        is_tag_match = true;
+                    }
+                }
+            }
+
+            if is_tag_match {
+                if let Some(gt_idx) = buf[abs_idx..].find('>') {
+                    let header = &buf[abs_idx..abs_idx + gt_idx + 1];
+                    let has_req_attr = if *tag == "move" {
+                        header.contains("from=") || header.contains("path=")
+                    } else {
+                        header.contains("path=")
+                    };
+                    if has_req_attr {
+                        min_idx = Some(min_idx.map_or(abs_idx, |m: usize| m.min(abs_idx)));
+                        break;
+                    }
+                }
+            }
+            from = abs_idx + pat.len();
         }
     }
     min_idx
@@ -782,6 +831,26 @@ mod tests {
         assert!(events.iter().any(|event| matches!(event,
             StreamEvent::EditHunk { new_text, .. } if new_text == "hello"
         )));
+    }
+
+    #[test]
+    fn test_stream_plan_with_embedded_edit_mentions_does_not_trigger_edit_started() {
+        let input = "Here is the plan:\n<plan id=\"p1\" title=\"P\">\n<item id=\"1\" title=\"Add <edit> helper\" />\n</plan>\nHope this helps!";
+        let mut filter = XmlStreamFilter::new(vec![], std::env::temp_dir());
+        let mut events = Vec::new();
+        for ch in input.chars() {
+            events.extend(filter.push_chunk(&ch.to_string()));
+        }
+        events.extend(Box::new(filter).finish());
+        assert!(!events.iter().any(|e| matches!(e, StreamEvent::EditStarted)));
+        let text: String = events
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::TextDelta(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text, "Here is the plan:\n\nHope this helps!");
     }
 
     #[test]

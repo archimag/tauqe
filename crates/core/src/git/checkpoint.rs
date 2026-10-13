@@ -329,4 +329,41 @@ mod tests {
         // Intermediate step modification should be removed
         assert!(!ai_file.exists());
     }
+
+    #[test]
+    fn test_recover_interrupted_workflow_unwinds_multiple_steps() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+        crate::git::state::init_repository(Some(path), true).unwrap();
+
+        let user_file = path.join("user_work.txt");
+        fs::write(&user_file, "original uncommitted work").unwrap();
+
+        let chk = create_checkpoint(path).unwrap();
+        assert!(chk.created_checkpoint_commit);
+
+        // Two intermediate step commits imitate a healed turn that crashed
+        // before its squashed commit could be produced.
+        fs::write(path.join("step_one.txt"), "first step").unwrap();
+        create_step_commit(path, &["step_one.txt".to_string()], "apply step 1").unwrap();
+
+        fs::write(path.join("step_two.txt"), "second step").unwrap();
+        create_step_commit(path, &["step_two.txt".to_string()], "apply step 2").unwrap();
+
+        let recovery = recover_interrupted_workflow(path).unwrap();
+        assert!(recovery.is_some());
+        let msg = recovery.unwrap();
+        assert!(msg.contains("unwound 2 step commit(s)"));
+        assert!(msg.contains("restored checkpoint: true"));
+
+        // Every temporary commit is unwound while the developer's work survives
+        // in the working tree exactly as before the turn.
+        assert!(user_file.exists());
+        assert_eq!(
+            fs::read_to_string(&user_file).unwrap(),
+            "original uncommitted work"
+        );
+        assert!(!path.join("step_one.txt").exists());
+        assert!(!path.join("step_two.txt").exists());
+    }
 }

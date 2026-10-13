@@ -22,7 +22,7 @@ pub(super) const XML_TAG_BASES: &[&str] = &[
     "tauqe_edits", "edit", "search", "replace", "create", "delete", "move", "with", "summary",
     "context_request", "context_drop", "user_language", "verify", "overwrite", "doc_request",
     "plan", "concept", "concept_item", "item", "description", "details", "title",
-    "scratchpad", "success", "error",
+    "scratchpad", "success", "error", "blocked",
 ];
 
 const PLAN_CHILD_TAGS: &[&str] = &[

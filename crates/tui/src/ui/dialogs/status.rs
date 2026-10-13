@@ -17,7 +17,7 @@ pub fn render_status_dialog(
     dialog: &crate::app::StatusDialogState,
 ) {
     let options_count = match &dialog.target {
-        crate::app::StatusDialogTarget::PlanItem { .. } => 5,
+        crate::app::StatusDialogTarget::PlanItem { .. } => 6,
         crate::app::StatusDialogTarget::ReviewItem { .. } => 5,
     };
     let area = status_dialog_area(frame.area(), options_count);
@@ -30,13 +30,15 @@ pub fn render_status_dialog(
                 tauqe_protocol::PlanItemStatus::Todo => 1,
                 tauqe_protocol::PlanItemStatus::InProgress => 2,
                 tauqe_protocol::PlanItemStatus::Done => 3,
-                tauqe_protocol::PlanItemStatus::Cancelled => 4,
+                tauqe_protocol::PlanItemStatus::Blocked => 4,
+                tauqe_protocol::PlanItemStatus::Cancelled => 5,
             };
             let opts = vec![
                 ("DISCUSSION", Color::Magenta, Color::Black, "Under review / requires discussion"),
                 ("TODO", Color::Yellow, Color::Black, "Approved / ready for execution"),
                 ("IN_PROGRESS", Color::Cyan, Color::Black, "Currently in active development"),
                 ("DONE", Color::Green, Color::Black, "Completed and verified"),
+                ("BLOCKED", Color::Red, Color::White, "Blocked by unmet prerequisites / needs replanning"),
                 ("CANCELLED", Color::DarkGray, Color::White, "Superseded or cancelled"),
             ];
             (" Change Task Status ", item_title.as_str(), cur, opts)
@@ -119,7 +121,13 @@ pub fn render_status_dialog(
     }
     frame.render_widget(Paragraph::new(body_lines), chunks[1]);
 
-    let fast_select_label = if options_count >= 5 { "1-5" } else { "1-4" };
+    let fast_select_label = if options_count >= 6 {
+        "1-6"
+    } else if options_count >= 5 {
+        "1-5"
+    } else {
+        "1-4"
+    };
     let actions = vec![
         Line::from(vec![
             Span::styled(format!(" [ Apply (Enter / {}) ] ", fast_select_label), Style::default().bg(Color::Green).fg(Color::Black).bold()),

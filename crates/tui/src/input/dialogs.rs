@@ -357,7 +357,7 @@ pub async fn handle_dialog_event(
     // 4b. Status dialog (for Plan and Review items)
     if let Some(mut dialog) = st.status_dialog.take() {
         let total_options = match &dialog.target {
-            crate::app::StatusDialogTarget::PlanItem { .. } => 5,
+            crate::app::StatusDialogTarget::PlanItem { .. } => 6,
             crate::app::StatusDialogTarget::ReviewItem { .. } => 5,
         };
 
@@ -402,6 +402,10 @@ pub async fn handle_dialog_event(
             KeyCode::Char('5') if total_options >= 5 => {
                 st.status_dialog = Some(dialog);
                 apply_status_dialog(&mut st, 4, server_writer).await?;
+            }
+            KeyCode::Char('6') if total_options >= 6 => {
+                st.status_dialog = Some(dialog);
+                apply_status_dialog(&mut st, 5, server_writer).await?;
             }
             KeyCode::Enter | KeyCode::Char(' ') => {
                 let chosen = dialog.selected_index;
