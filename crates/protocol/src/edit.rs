@@ -51,32 +51,74 @@ fn default_change_op() -> String {
 }
 
 impl StructuredChangeProposal {
-    pub fn to_edit_operation(&self) -> EditOperation {
-        match self.op.as_str() {
-            "create" => EditOperation::Create {
+    /// Converts the proposal into a concrete edit operation.
+    ///
+    /// Malformed proposals are rejected with a diagnostic instead of being
+    /// silently coerced into a destructive edit. An unknown `op`, a `create`
+    /// or `overwrite` without `content`, a `move` without a destination, and a
+    /// `replace` without a search block all yield `Err`.
+    pub fn to_edit_operation(&self) -> Result<EditOperation, String> {
+        let op = self.op.trim().to_ascii_lowercase();
+        match op.as_str() {
+            "create" => {
+                let content = self.content.clone().ok_or_else(|| {
+                    "Change 'create' requires a 'content' field".to_string()
+                })?;
+                Ok(EditOperation::Create {
+                    path: self.path.clone(),
+                    content,
+                })
+            }
+            "overwrite" => {
+                let content = self.content.clone().ok_or_else(|| {
+                    "Change 'overwrite' requires a 'content' field".to_string()
+                })?;
+                Ok(EditOperation::Overwrite {
+                    path: self.path.clone(),
+                    content,
+                })
+            }
+            "delete" => Ok(EditOperation::Delete {
                 path: self.path.clone(),
-                content: self.content.clone().unwrap_or_default(),
-            },
-            "overwrite" => EditOperation::Overwrite {
-                path: self.path.clone(),
-                content: self.content.clone().unwrap_or_default(),
-            },
-            "delete" => EditOperation::Delete {
-                path: self.path.clone(),
-            },
-            "move" => EditOperation::Move {
-                from: self.path.clone(),
-                to: self.to.clone().unwrap_or_default(),
-            },
-            _ => EditOperation::Replace {
-                path: self.path.clone(),
-                old_text: self.old_text.clone().unwrap_or_default(),
-                new_text: self
+            }),
+            "move" => {
+                let to = self
+                    .to
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|to| !to.is_empty())
+                    .ok_or_else(|| {
+                        "Change 'move' requires a non-empty 'to' field".to_string()
+                    })?;
+                Ok(EditOperation::Move {
+                    from: self.path.clone(),
+                    to: to.to_string(),
+                })
+            }
+            "replace" => {
+                let old_text = self
+                    .old_text
+                    .as_deref()
+                    .filter(|old| !old.is_empty())
+                    .ok_or_else(|| {
+                        "Change 'replace' requires a non-empty 'old_text' field".to_string()
+                    })?;
+                let new_text = self
                     .new_text
                     .clone()
+                    .filter(|new| !new.is_empty())
                     .or_else(|| self.content.clone())
-                    .unwrap_or_default(),
-            },
+                    .unwrap_or_default();
+                Ok(EditOperation::Replace {
+                    path: self.path.clone(),
+                    old_text: old_text.to_string(),
+                    new_text,
+                })
+            }
+            other => Err(format!(
+                "Unknown change operation '{}'. Expected replace, create, delete, move, or overwrite",
+                other
+            )),
         }
     }
 }
@@ -153,24 +195,44 @@ mod tests {
         assert_eq!(de, op);
     }
 
-    #[test]
-    fn test_structured_proposal_conversion() {
-        let proposal = StructuredChangeProposal {
-            op: "create".to_string(),
-            path: "new.txt".to_string(),
+    fn proposal(op: &str, path: &str) -> StructuredChangeProposal {
+        StructuredChangeProposal {
+            op: op.to_string(),
+            path: path.to_string(),
             to: None,
             old_text: None,
             new_text: None,
-            content: Some("hello".to_string()),
-        };
+            content: None,
+        }
+    }
 
-        let edit = proposal.to_edit_operation();
-        match edit {
+    #[test]
+    fn test_structured_proposal_conversion() {
+        let mut change = proposal("create", "new.txt");
+        change.content = Some("hello".to_string());
+
+        match change.to_edit_operation().unwrap() {
             EditOperation::Create { path, content } => {
                 assert_eq!(path, "new.txt");
                 assert_eq!(content, "hello");
             }
-            _ => panic!("Expected Create operation"),
+            other => panic!("Expected Create operation, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_structured_proposal_rejects_malformed_input() {
+        // An unknown operation is never coerced into a replacement.
+        assert!(proposal("frobnicate", "a.txt").to_edit_operation().is_err());
+
+        // Missing payloads that would truncate a file are rejected.
+        assert!(proposal("create", "a.txt").to_edit_operation().is_err());
+        assert!(proposal("overwrite", "a.txt").to_edit_operation().is_err());
+
+        // A move requires a non-empty destination path.
+        assert!(proposal("move", "a.txt").to_edit_operation().is_err());
+
+        // A replace requires a non-empty search block.
+        assert!(proposal("replace", "a.txt").to_edit_operation().is_err());
     }
 }

@@ -90,12 +90,6 @@ pub struct DiscussionResponse {
         skip_serializing_if = "Vec::is_empty"
     )]
     pub context_requests: Vec<DiscussionContextRequest>,
-    #[serde(
-        default,
-        deserialize_with = "deserialize_null_as_default",
-        skip_serializing_if = "Vec::is_empty"
-    )]
-    pub context_drops: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_language: Option<String>,
 }
@@ -106,7 +100,6 @@ impl DiscussionResponse {
             message: message.into(),
             plan_update: None,
             context_requests: Vec::new(),
-            context_drops: Vec::new(),
             user_language: None,
         }
     }
@@ -118,11 +111,6 @@ impl DiscussionResponse {
 
     pub fn with_context_requests(mut self, requests: Vec<DiscussionContextRequest>) -> Self {
         self.context_requests = requests;
-        self
-    }
-
-    pub fn with_context_drops(mut self, drops: Vec<String>) -> Self {
-        self.context_drops = drops;
         self
     }
 
@@ -229,7 +217,7 @@ pub fn discussion_response_schema() -> serde_json::Value {
             },
             "context_requests": {
                 "type": "array",
-                "description": "Files to request into context for inspection or editable access (in snapshot discovery mode, specify the complete active set of auto-context files)",
+                "description": "Files to request into context for inspection or editable access",
                 "items": {
                     "type": "object",
                     "properties": {
@@ -247,13 +235,6 @@ pub fn discussion_response_schema() -> serde_json::Value {
                     "additionalProperties": false
                 }
             },
-            "context_drops": {
-                "type": "array",
-                "description": "Files to drop from auto context if no longer needed (used in incremental discovery mode to release irrelevant files)",
-                "items": {
-                    "type": "string"
-                }
-            },
             "user_language": {
                 "anyOf": [
                     { "type": "string" },
@@ -262,7 +243,7 @@ pub fn discussion_response_schema() -> serde_json::Value {
                 "description": "Detected primary natural language of user prompt (e.g. Russian, English)"
             }
         },
-        "required": ["message", "plan_update", "context_requests", "context_drops", "user_language"],
+        "required": ["message", "plan_update", "context_requests", "user_language"],
         "additionalProperties": false,
         "$defs": {
             "ConceptItem": {
@@ -316,7 +297,7 @@ pub fn discussion_response_schema() -> serde_json::Value {
                     },
                     "status": {
                         "type": "string",
-                        "enum": ["discussion", "todo", "in_progress", "done", "cancelled"],
+                        "enum": ["discussion", "todo", "in_progress", "done", "blocked", "cancelled"],
                         "description": "Status of the plan step"
                     },
                     "files": {
@@ -326,9 +307,23 @@ pub fn discussion_response_schema() -> serde_json::Value {
                             "type": "string"
                         }
                     },
+                    "readonly_files": {
+                        "type": "array",
+                        "description": "Repository-relative file paths for read-only reference context (subsystem conventions, interface contracts, protocol types)",
+                        "items": {
+                            "type": "string"
+                        }
+                    },
                     "concept_refs": {
                         "type": "array",
                         "description": "IDs of referenced concept items",
+                        "items": {
+                            "type": "string"
+                        }
+                    },
+                    "depends_on": {
+                        "type": "array",
+                        "description": "IDs of prerequisite steps that must reach DONE status before this step executes",
                         "items": {
                             "type": "string"
                         }
@@ -341,7 +336,7 @@ pub fn discussion_response_schema() -> serde_json::Value {
                         }
                     }
                 },
-                "required": ["id", "title", "details", "status", "files", "concept_refs", "children"],
+                "required": ["id", "title", "details", "status", "files", "readonly_files", "concept_refs", "depends_on", "children"],
                 "additionalProperties": false
             }
         }
@@ -382,7 +377,6 @@ mod tests {
         assert_eq!(resp.message, "Hello developer!");
         assert!(resp.plan_update.is_none());
         assert!(resp.context_requests.is_empty());
-        assert!(resp.context_drops.is_empty());
         assert!(resp.user_language.is_none());
     }
 
@@ -392,14 +386,12 @@ mod tests {
             "message": "Acknowledged",
             "plan_update": null,
             "context_requests": null,
-            "context_drops": null,
             "user_language": null
         }"#;
         let resp: DiscussionResponse = serde_json::from_str(raw).unwrap();
         assert_eq!(resp.message, "Acknowledged");
         assert!(resp.plan_update.is_none());
         assert!(resp.context_requests.is_empty());
-        assert!(resp.context_drops.is_empty());
         assert!(resp.user_language.is_none());
     }
 
@@ -450,13 +442,11 @@ mod tests {
         let msg_idx = schema_str.find("\"message\"").expect("message found");
         let plan_idx = schema_str.find("\"plan_update\"").expect("plan_update found");
         let ctx_idx = schema_str.find("\"context_requests\"").expect("context_requests found");
-        let drops_idx = schema_str.find("\"context_drops\"").expect("context_drops found");
         let lang_idx = schema_str.find("\"user_language\"").expect("user_language found");
 
         assert!(msg_idx < plan_idx);
         assert!(plan_idx < ctx_idx);
-        assert!(ctx_idx < drops_idx);
-        assert!(drops_idx < lang_idx);
+        assert!(ctx_idx < lang_idx);
     }
 
     #[test]
@@ -465,5 +455,119 @@ mod tests {
         assert_eq!(def["name"], "discussion_response");
         assert_eq!(def["strict"], true);
         assert!(def["schema"].is_object());
+    }
+
+    /// Pins the strict JSON Schema to the authoritative Rust data model.
+    ///
+    /// Every property of `DiscussionResponse` and its nested types must appear in the
+    /// schema (and vice versa), and every required field must be listed in `required`.
+    /// This prevents silent drift between the strict schema and the types, which would
+    /// otherwise forbid the model from expressing fields that exist in the model.
+    #[test]
+    fn test_schema_matches_data_model() {
+        use crate::plan::PlanItemStatus;
+        use std::collections::BTreeSet;
+
+        fn keys(value: &serde_json::Value) -> BTreeSet<String> {
+            value
+                .as_object()
+                .map(|m| m.keys().cloned().collect())
+                .unwrap_or_default()
+        }
+
+        fn field_sets(node: &serde_json::Value) -> (BTreeSet<String>, BTreeSet<String>) {
+            let props = keys(&node["properties"]);
+            let required: BTreeSet<String> = node["required"]
+                .as_array()
+                .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                .unwrap_or_default();
+            (props, required)
+        }
+
+        let schema = discussion_response_schema();
+
+        // 1. Top-level DiscussionResponse fields must match the schema exactly.
+        let response = DiscussionResponse::new("hello")
+            .with_plan_update(DiscussionPlanUpdate {
+                action: DiscussionPlanAction::Save,
+                id: Some("p1".to_string()),
+                title: Some("Plan".to_string()),
+                description: Some("desc".to_string()),
+                concept: vec![ConceptItem::default()],
+                items: vec![PlanItem::default()],
+            })
+            .with_context_requests(vec![DiscussionContextRequest::read_only("a.rs")])
+            .with_user_language("English");
+        let (props, required) = field_sets(&schema);
+        assert_eq!(props, keys(&serde_json::to_value(&response).unwrap()));
+        assert_eq!(
+            required, props,
+            "strict schema must require every DiscussionResponse field"
+        );
+
+        // 2. Nested plan_update object.
+        let (props, required) = field_sets(&schema["properties"]["plan_update"]["anyOf"][0]);
+        assert_eq!(
+            props,
+            keys(&serde_json::to_value(response.plan_update.clone().unwrap()).unwrap())
+        );
+        assert_eq!(required, props);
+
+        // 3. context_requests item object.
+        let (props, required) = field_sets(&schema["properties"]["context_requests"]["items"]);
+        assert_eq!(
+            props,
+            keys(&serde_json::to_value(DiscussionContextRequest::read_only("a.rs")).unwrap())
+        );
+        assert_eq!(required, props);
+
+        // 4. ConceptItem definition.
+        let concept = ConceptItem {
+            id: "c-1".to_string(),
+            title: "Concept".to_string(),
+            details: Some("details".to_string()),
+            children: vec![ConceptItem::default()],
+        };
+        let (props, required) = field_sets(&schema["$defs"]["ConceptItem"]);
+        assert_eq!(props, keys(&serde_json::to_value(&concept).unwrap()));
+        assert_eq!(required, props);
+
+        // 5. PlanItem definition (includes readonly_files, depends_on, status).
+        let item = PlanItem {
+            id: "1".to_string(),
+            title: "Step".to_string(),
+            details: Some("details".to_string()),
+            status: PlanItemStatus::Todo,
+            files: vec!["src/a.rs".to_string()],
+            readonly_files: vec!["src/b.rs".to_string()],
+            concept_refs: vec!["c-1".to_string()],
+            depends_on: vec!["0".to_string()],
+            children: vec![PlanItem::default()],
+        };
+        let (props, required) = field_sets(&schema["$defs"]["PlanItem"]);
+        assert_eq!(props, keys(&serde_json::to_value(&item).unwrap()));
+        assert_eq!(required, props);
+
+        // 6. Every PlanItemStatus variant must be expressible in the status enum.
+        let status_enum: BTreeSet<String> =
+            schema["$defs"]["PlanItem"]["properties"]["status"]["enum"]
+                .as_array()
+                .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                .unwrap_or_default();
+        for status in [
+            PlanItemStatus::Discussion,
+            PlanItemStatus::Todo,
+            PlanItemStatus::InProgress,
+            PlanItemStatus::Done,
+            PlanItemStatus::Blocked,
+            PlanItemStatus::Cancelled,
+        ] {
+            let wire = serde_json::to_value(status).unwrap();
+            let wire = wire.as_str().unwrap();
+            assert!(
+                status_enum.contains(wire),
+                "status enum is missing variant {wire}"
+            );
+        }
     }
 }

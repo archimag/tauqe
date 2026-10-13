@@ -164,22 +164,6 @@ pub(crate) async fn handle_dialog_event(
                         st.review_dialog = Some(dialog);
                         return Ok(Some(InputResult::Continue));
                     }
-                    KeyCode::Up => {
-                        let count = dialog.models.len();
-                        if count > 0 {
-                            dialog.model_index = (dialog.model_index + count - 1) % count;
-                        }
-                        st.review_dialog = Some(dialog);
-                        return Ok(Some(InputResult::Continue));
-                    }
-                    KeyCode::Down => {
-                        let count = dialog.models.len();
-                        if count > 0 {
-                            dialog.model_index = (dialog.model_index + 1) % count;
-                        }
-                        st.review_dialog = Some(dialog);
-                        return Ok(Some(InputResult::Continue));
-                    }
                     KeyCode::Enter
                         if !key.modifiers.contains(KeyModifiers::SHIFT)
                             && !key.modifiers.contains(KeyModifiers::ALT) =>
@@ -190,7 +174,7 @@ pub(crate) async fn handle_dialog_event(
                         if dialog.confirm_button == crate::app::ConfirmDialogButton::Confirm {
                             let prompt = dialog.prompt_editor.get_text().trim().to_string();
                             let params = ReviewStartParams {
-                                model: dialog.models.get(dialog.model_index).cloned(),
+                                model: None,
                                 user_prompt: if prompt.is_empty() {
                                     None
                                 } else {

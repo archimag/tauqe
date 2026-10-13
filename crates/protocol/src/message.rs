@@ -8,6 +8,9 @@ use crate::model::ModelRef;
 pub enum RequestId {
     Number(u64),
     String(String),
+    /// Absent id, used for responses that cannot be correlated with a request
+    /// (for example a request that failed to parse). Serialized as `null`.
+    Null,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -37,10 +40,16 @@ impl Response {
     }
 
     pub fn ok_typed<T: Serialize>(id: RequestId, result: &T) -> Self {
-        Self {
-            id,
-            result: serde_json::to_value(result).ok(),
-            error: None,
+        match serde_json::to_value(result) {
+            Ok(value) => Self {
+                id,
+                result: Some(value),
+                error: None,
+            },
+            // A serialization failure must never masquerade as a successful
+            // void result: surface it as a deterministic internal error so the
+            // client can distinguish it from an empty success.
+            Err(err) => Self::err(id, crate::errors::INTERNAL_ERROR, err.to_string()),
         }
     }
 
@@ -144,6 +153,15 @@ mod tests {
 
         assert_eq!(de_num, num_id);
         assert_eq!(de_str, str_id);
+    }
+
+    #[test]
+    fn test_request_id_null_roundtrip() {
+        let json = serde_json::to_string(&RequestId::Null).unwrap();
+        assert_eq!(json, "null");
+
+        let de: RequestId = serde_json::from_str("null").unwrap();
+        assert_eq!(de, RequestId::Null);
     }
 
     #[test]

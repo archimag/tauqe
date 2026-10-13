@@ -30,7 +30,7 @@ use crate::workflow::loops::AnswerEditLoop;
 pub struct WorkflowOptions {
     pub max_retries: usize,
     pub max_discovery_rounds: usize,
-    pub max_files: usize,
+    pub files_token_budget: usize,
     pub history_budget_tokens: u64,
     pub history_tail_turns: usize,
     pub repomap_token_budget: usize,
@@ -39,7 +39,6 @@ pub struct WorkflowOptions {
     pub models_config: crate::config::ModelsConfig,
     pub initial_selection: Option<tauqe_protocol::ModelSelection>,
     pub app_config: Option<crate::config::AppConfig>,
-    pub discovery_mode: crate::config::DiscoveryMode,
     /// Reasoning effort applied to the current turn, resolved from the active
     /// semantic role. Updated on `auto_level_up` escalation so a
     /// Coder→Architect switch inherits the deeper Architect effort.
@@ -51,7 +50,7 @@ impl Default for WorkflowOptions {
         Self {
             max_retries: 3,
             max_discovery_rounds: crate::config::DEFAULT_MAX_DISCOVERY_ROUNDS,
-            max_files: crate::config::DEFAULT_MAX_CONTEXT_FILES,
+            files_token_budget: crate::config::DEFAULT_FILES_TOKEN_BUDGET,
             history_budget_tokens: crate::history::DEFAULT_HISTORY_BUDGET_TOKENS,
             history_tail_turns: crate::history::DEFAULT_TAIL_TURNS_COUNT,
             repomap_token_budget: crate::repomap::DEFAULT_REPOMAP_TOKEN_BUDGET,
@@ -60,7 +59,6 @@ impl Default for WorkflowOptions {
             models_config: crate::config::ModelsConfig::default(),
             initial_selection: None,
             app_config: None,
-            discovery_mode: crate::config::DiscoveryMode::default(),
             reasoning_effort: None,
         }
     }
@@ -76,7 +74,7 @@ impl WorkflowOptions {
         Self {
             max_retries,
             max_discovery_rounds: config.context.max_discovery_rounds,
-            max_files: config.context.max_files,
+            files_token_budget: config.context.files_token_budget,
             history_budget_tokens: config.history.budget_tokens,
             history_tail_turns: config.history.tail_turns,
             repomap_token_budget: config.context.repomap_token_budget,
@@ -85,7 +83,6 @@ impl WorkflowOptions {
             models_config: config.models.clone(),
             initial_selection: None,
             app_config: Some(config.clone()),
-            discovery_mode: config.context.discovery_mode,
             reasoning_effort: None,
         }
     }

@@ -68,7 +68,21 @@ On first launch, an interactive onboarding wizard automatically checks your Git 
 | `Ctrl+4` | **Plans** | Hierarchical task trees, deep refinement, and isolated step execution |
 | `Ctrl+5` | **History** | Chronological session audit trail, token metrics, and commit inspect |
 
-> **Ask TAUQE directly:** Launch the interface and ask anything about the system, shortcuts, or concepts—TAUQE queries its own authoritative manuals on the fly.
+---
+
+## Documentation
+
+TAUQE includes comprehensive architectural and user documentation built with mdBook (located in `docs/`):
+
+```bash
+# Build the documentation:
+just docs-build
+
+# Serve documentation with live reload:
+just docs-serve
+```
+
+The simplest way, however, is to **ask TAUQE directly** in the interactive environment: ask anything about concepts, workflows, architecture, or keyboard shortcuts, and TAUQE will consult its authoritative manuals and explain them in your language.
 
 ---
 

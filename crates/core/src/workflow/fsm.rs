@@ -103,17 +103,6 @@ impl ProposalStep {
             .collect()
     }
 
-    /// Context evictions requested by the model.
-    fn context_drops(&self) -> Vec<String> {
-        self.commands
-            .iter()
-            .filter_map(|command| match command {
-                LlmCommand::ContextDrop { path } => Some(path.clone()),
-                _ => None,
-            })
-            .collect()
-    }
-
     /// Documentation topics requested by the model.
     fn doc_requests(&self) -> Vec<String> {
         self.commands
@@ -372,7 +361,7 @@ pub async fn run_fsm_turn(
 ) -> anyhow::Result<FsmTurnOutcome> {
     let repo_root = context_manager.repo_root().to_path_buf();
     let is_isolated_step = crate::plan::prompt::is_plan_step_execution_prompt(prompt)
-        || tauqe_protocol::review::is_review_step_execution_prompt(prompt);
+        || crate::review::is_review_step_execution_prompt(prompt);
 
     if !is_isolated_step {
         let _ = compact_history_if_needed_with_budget(
@@ -455,9 +444,8 @@ pub async fn run_fsm_turn(
     let mut round_prompt = prompt.to_string();
     while discovery_round < options.max_discovery_rounds && step.edits().is_empty() {
         let requests = step.context_requests();
-        let drops = step.context_drops();
         let doc_topics = step.doc_requests();
-        if requests.is_empty() && drops.is_empty() && doc_topics.is_empty() {
+        if requests.is_empty() && doc_topics.is_empty() {
             break;
         }
 
@@ -465,20 +453,18 @@ pub async fn run_fsm_turn(
             crate::git::list_repository_files(Some(&repo_root)).unwrap_or_default();
         let outcome = reconcile_discovery_context(
             context_manager,
-            options.discovery_mode,
             &requests,
-            &drops,
             &available_files,
-            options.max_files,
+            options.files_token_budget,
         );
 
         if let Some(limit) = outcome.limit_exceeded {
             let warn = format!(
-                "Context files limit exceeded (max_files = {}). The model requested {} new file(s) [{}], but the context already contains {} files. Scope the task down or decompose it into a plan.",
-                limit.max_files,
-                limit.requested_count,
+                "Context files token budget exceeded (files_token_budget = {}). The model requested {} tokens in new file(s) [{}], but the context already contains {} tokens. Scope the task down or decompose it into a plan.",
+                limit.token_budget,
+                limit.requested_tokens,
                 limit.requested_files.join(", "),
-                limit.current_count
+                limit.current_tokens
             );
             tracing::warn!("{}", warn);
             let _ = stream_tx
@@ -494,7 +480,6 @@ pub async fn run_fsm_turn(
         }
 
         let context_changed = !outcome.added.is_empty()
-            || !outcome.dropped.is_empty()
             || !outcome.missing.is_empty();
         if !context_changed && doc_topics.is_empty() {
             break;
@@ -533,10 +518,9 @@ pub async fn run_fsm_turn(
         let _ = stream_tx.send(StreamEvent::ContextChanged(ctx_state)).await;
 
         let banner = format!(
-            "\n\n---\n**[Round {}]** {} file(s) added, {} dropped.\n\n",
+            "\n\n---\n**[Round {}]** {} file(s) added.\n\n",
             discovery_round + 1,
-            outcome.added.len(),
-            outcome.dropped.len()
+            outcome.added.len()
         );
         let _ = stream_tx
             .send(StreamEvent::TextDelta(banner.clone()))
@@ -594,29 +578,6 @@ pub async fn run_fsm_turn(
                 &state.plans,
             )
             .await);
-        }
-    }
-
-    // A proposal that already carries edits ends the discovery cycle before its
-    // eviction commands are reconciled. Apply those drops here so a proposal
-    // that both edits files and releases context never silently loses a
-    // `<context_drop>` command; the reconciled context is what the subsequent
-    // verification-healing rounds observe.
-    let trailing_drops = step.context_drops();
-    if !step.edits().is_empty() && !trailing_drops.is_empty() {
-        let available_files =
-            crate::git::list_repository_files(Some(&repo_root)).unwrap_or_default();
-        let outcome = reconcile_discovery_context(
-            context_manager,
-            options.discovery_mode,
-            &[],
-            &trailing_drops,
-            &available_files,
-            options.max_files,
-        );
-        if !outcome.dropped.is_empty() {
-            let ctx_state = context_manager.get_state();
-            let _ = stream_tx.send(StreamEvent::ContextChanged(ctx_state)).await;
         }
     }
 
@@ -1132,6 +1093,14 @@ async fn run_proposal_step(
     .ok()
     .filter(|map| !map.trim().is_empty());
 
+    let repomap_tokens = repo_map
+        .as_deref()
+        .map(crate::prompt::estimate_tokens)
+        .unwrap_or(0);
+    let _ = stream_tx
+        .send(StreamEvent::RepoMapTokens(repomap_tokens))
+        .await;
+
     let history_tag = if is_isolated_step {
         None
     } else {
@@ -1149,7 +1118,6 @@ async fn run_proposal_step(
     );
     assembly.target_language = target_language.map(|language| language.to_string());
     assembly.is_isolated_step = is_isolated_step;
-    assembly.discovery_mode = options.discovery_mode;
     assembly.turn_scratchpad = turn_scratchpad.map(|notes| notes.to_string());
 
     let messages = assembly.assemble_chat_messages_for(prompt, protocol);
@@ -1510,64 +1478,7 @@ mod tests {
         assert_eq!(plan.items.len(), 1);
     }
 
-    #[tokio::test]
-    async fn context_drop_evicts_auto_file_before_follow_up_round() {
-        let (_dir, root) = setup_repo(&[
-            ("a.rs", TARGET),
-            ("obsolete.rs", "pub const OBSOLETE: i32 = 7;\n"),
-        ]);
-        let mut context = context_with_target(&root);
-        let mut history = HistoryManager::new(root.clone());
-
-        let provider = MockLlmProvider::scripted([
-            MockResponse::text(
-                "Loading obsolete context.\n<context_request path=\"obsolete.rs\" access=\"read_only\" />",
-            ),
-            MockResponse::text("Releasing obsolete context.\n<context_drop path=\"obsolete.rs\" />"),
-            MockResponse::text(edit_block(
-                "pub fn compute() -> i32 { 0 }",
-                "pub fn compute() -> i32 { 42 }",
-            )),
-        ]);
-        let model = ModelRef::openrouter("mock/model");
-        let protocol = XmlPromptProtocol;
-        let mut policy = DirectApplyPolicy::new();
-        let options = WorkflowOptions {
-            discovery_mode: crate::config::DiscoveryMode::Incremental,
-            ..WorkflowOptions::default()
-        };
-        let (stream_tx, rx) = mpsc::channel(256);
-        drop(rx);
-        let (_cancel_tx, cancel_rx) = watch::channel(false);
-
-        let outcome = run_fsm_turn(
-            "Change compute to 42",
-            &provider,
-            &model,
-            &mut context,
-            &mut history,
-            &protocol,
-            &mut policy,
-            "git",
-            stream_tx,
-            cancel_rx,
-            &options,
-        )
-        .await
-        .unwrap();
-
-        assert!(matches!(
-            outcome.result,
-            ModelResult::Edit { applied: true, .. }
-        ));
-        assert_eq!(provider.requests().len(), 3);
-        let final_request = &provider.requests()[2];
-        assert!(
-            !final_request.messages[0].content.contains("OBSOLETE"),
-            "the evicted file must not reach the follow-up proposal"
-        );
-    }
-
+    
     #[tokio::test]
     async fn scratchpad_is_preserved_and_injected_across_rounds() {
         let (_dir, root) = setup_repo(&[
@@ -1777,40 +1688,26 @@ mod tests {
         }
     }
 
+    
     #[tokio::test]
-    async fn context_drop_with_edits_is_applied_mid_turn() {
+    async fn emits_repomap_tokens_event() {
         let (_dir, root) = setup_repo(&[
             ("a.rs", TARGET),
-            ("helper.rs", "pub const ANSWER: i32 = 42;\n"),
+            ("other.rs", "pub fn other() -> i32 { 10 }\n"),
         ]);
         let mut context = context_with_target(&root);
         let mut history = HistoryManager::new(root.clone());
 
-        let edit_then_drop = format!(
-            "{}\n<context_drop path=\"helper.rs\" />",
-            edit_block(
-                "pub fn compute() -> i32 { 0 }",
-                "pub fn compute() -> i32 { 42 }",
-            )
-        );
-        let provider = MockLlmProvider::scripted([
-            MockResponse::text(
-                "Loading helper context.\n<context_request path=\"helper.rs\" access=\"read_only\" />",
-            ),
-            MockResponse::text(edit_then_drop),
-        ]);
+        let provider = MockLlmProvider::scripted([MockResponse::text("Ready.")]);
         let model = ModelRef::openrouter("mock/model");
         let protocol = XmlPromptProtocol;
         let mut policy = DirectApplyPolicy::new();
-        let options = WorkflowOptions {
-            discovery_mode: crate::config::DiscoveryMode::Incremental,
-            ..WorkflowOptions::default()
-        };
+        let options = WorkflowOptions::default();
         let (stream_tx, mut rx) = mpsc::channel(256);
         let (_cancel_tx, cancel_rx) = watch::channel(false);
 
-        let outcome = run_fsm_turn(
-            "Change compute to 42",
+        let _outcome = run_fsm_turn(
+            "Explain",
             &provider,
             &model,
             &mut context,
@@ -1825,24 +1722,17 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(matches!(
-            outcome.result,
-            ModelResult::Edit { applied: true, .. }
-        ));
-
-        let mut saw_eviction = false;
+        let mut saw_repomap_tokens = false;
         while let Ok(event) = rx.try_recv() {
-            if let StreamEvent::ContextChanged(state) = event {
-                let has_target = state.items.iter().any(|item| item.path == "a.rs");
-                let has_evicted = state.items.iter().any(|item| item.path == "helper.rs");
-                if has_target && !has_evicted {
-                    saw_eviction = true;
+            if let StreamEvent::RepoMapTokens(tokens) = event {
+                if tokens > 0 {
+                    saw_repomap_tokens = true;
                 }
             }
         }
         assert!(
-            saw_eviction,
-            "the dropped file must leave the context before the turn finalizes"
+            saw_repomap_tokens,
+            "turn must emit StreamEvent::RepoMapTokens with estimated tokens"
         );
     }
 }

@@ -2,6 +2,13 @@ use crate::context::ContextFileContent;
 use serde::{Deserialize, Serialize};
 use tauqe_protocol::{Plan, PlanItem, PlanItemStatus};
 
+fn escape_xml_attr(val: &str) -> String {
+    val.replace('&', "&amp;")
+        .replace('"', "&quot;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
 /// Formats the plan, its concept tree, and implementation items into a prompt block for LLM context.
 pub fn format_active_plan_context(plan: &Plan) -> Option<String> {
     if plan.concept.is_empty() && plan.items.is_empty() {
@@ -12,7 +19,10 @@ pub fn format_active_plan_context(plan: &Plan) -> Option<String> {
     let mut out = String::new();
     out.push_str(&format!(
         "<active_plan id=\"{}\" title=\"{}\" progress=\"{}/{} completed\">\n",
-        plan.id, plan.title, completed, total
+        escape_xml_attr(&plan.id),
+        escape_xml_attr(&plan.title),
+        completed,
+        total
     ));
 
     if let Some(desc) = &plan.description {
@@ -402,7 +412,8 @@ pub fn build_plan_refine_user_prompt(
 pub const PLAN_STEP_EXECUTION_PREFIX: &str = "# Target Plan Step Execution:";
 
 pub use tauqe_protocol::plan::{
-    format_plan_discussion_prompt, is_plan_discussion_prompt, PLAN_DISCUSSION_PREFIX,
+    extract_plan_discussion_id, format_plan_discussion_prompt, is_plan_discussion_prompt,
+    PLAN_DISCUSSION_PREFIX,
 };
 
 /// Target plan and step identifiers parsed from an isolated plan step execution prompt.
@@ -414,15 +425,16 @@ pub struct PlanStepTarget {
 
 /// Returns true if the prompt represents an isolated plan step execution turn.
 pub fn is_plan_step_execution_prompt(prompt: &str) -> bool {
-    prompt.starts_with(PLAN_STEP_EXECUTION_PREFIX)
+    prompt.trim_start().starts_with(PLAN_STEP_EXECUTION_PREFIX)
 }
 
 /// Extracts the target plan ID and step ID from an isolated plan step execution prompt.
 pub fn extract_plan_step_execution_target(prompt: &str) -> Option<PlanStepTarget> {
-    if !prompt.starts_with(PLAN_STEP_EXECUTION_PREFIX) {
+    let trimmed = prompt.trim_start();
+    if !trimmed.starts_with(PLAN_STEP_EXECUTION_PREFIX) {
         return None;
     }
-    let rest = prompt.strip_prefix(PLAN_STEP_EXECUTION_PREFIX)?.trim_start();
+    let rest = trimmed.strip_prefix(PLAN_STEP_EXECUTION_PREFIX)?.trim_start();
     if let Some(rest) = rest.strip_prefix('[') {
         let (spec, _) = rest.split_once(']')?;
         let spec = spec.trim();
@@ -457,26 +469,10 @@ pub fn extract_plan_step_execution_id(prompt: &str) -> Option<String> {
 ///
 /// Excludes unrelated chat history and focuses the model entirely on completing
 /// the designated step, while providing architectural plan context and completed prerequisites.
-/// Formats a targeted prompt for executing a specific leaf step of a plan in isolation using default monotonic discovery.
 pub fn format_plan_step_execution_prompt(
     plan: &Plan,
     step_id: &str,
     marker_suffix: &str,
-) -> Result<String, String> {
-    format_plan_step_execution_prompt_with_mode(
-        plan,
-        step_id,
-        marker_suffix,
-        crate::config::DiscoveryMode::Monotonic,
-    )
-}
-
-/// Formats a targeted prompt for executing a specific leaf step of a plan in isolation with an explicit discovery strategy.
-pub fn format_plan_step_execution_prompt_with_mode(
-    plan: &Plan,
-    step_id: &str,
-    marker_suffix: &str,
-    discovery_mode: crate::config::DiscoveryMode,
 ) -> Result<String, String> {
     let step = plan
         .find_item(step_id)
@@ -490,9 +486,10 @@ pub fn format_plan_step_execution_prompt_with_mode(
     }
 
     let mut out = String::new();
+    let clean_title = step.title.replace(['\r', '\n'], " ").trim().to_string();
     out.push_str(&format!(
         "{} [{}:{}] {}\n\n",
-        PLAN_STEP_EXECUTION_PREFIX, plan.id, step.id, step.title
+        PLAN_STEP_EXECUTION_PREFIX, plan.id, step.id, clean_title
     ));
 
     out.push_str(&format!("## Plan: {}\n", plan.title));
@@ -583,26 +580,10 @@ pub fn format_plan_step_execution_prompt_with_mode(
         marker_suffix
     ));
 
-    match discovery_mode {
-        crate::config::DiscoveryMode::Monotonic => {
-            out.push_str(&format!(
-                "5. Discovery Phase: If you need to inspect or edit files listed in <repo_map> that are not yet loaded in <context>, request them immediately using <context_request{0} path=\"...\" access=\"read_only|editable\" /> before writing code or explanations. Request all necessary files together in a single turn to avoid exhausting discovery rounds. Do NOT halt with conversational text if the necessary files can simply be requested.\n",
-                marker_suffix
-            ));
-        }
-        crate::config::DiscoveryMode::Incremental => {
-            out.push_str(&format!(
-                "5. Discovery Phase (Incremental Strategy): If you need to inspect or edit files listed in <repo_map> that are not yet loaded in <context>, request them immediately using <context_request{0} path=\"...\" access=\"read_only|editable\" /> before writing code or explanations. If any loaded auto-context files turn out to be irrelevant or misleading, release them immediately using <context_drop{0} path=\"...\" /> to preserve token budget. Request all necessary files together in a single turn to avoid exhausting discovery rounds. Do NOT halt with conversational text if the necessary files can simply be requested.\n",
-                marker_suffix
-            ));
-        }
-        crate::config::DiscoveryMode::Snapshot => {
-            out.push_str(&format!(
-                "5. Discovery Phase (Snapshot Strategy): If you need to inspect or edit files listed in <repo_map> that are not yet loaded in <context>, request them immediately using <context_request{0} path=\"...\" access=\"read_only|editable\" /> before writing code or explanations. In each discovery round, your requests MUST specify the entire active working set of auto-context files required for this step; any auto-context files omitted from your requests will be automatically evicted from context. Do NOT halt with conversational text if the necessary files can simply be requested.\n",
-                marker_suffix
-            ));
-        }
-    }
+    out.push_str(&format!(
+        "5. Discovery Phase: If you need to inspect or edit files listed in <repo_map> that are not yet loaded in <context>, request them immediately using <context_request{0} path=\"...\" access=\"read_only|editable\" /> before writing code or explanations. Request all necessary files together in a single turn to avoid exhausting discovery rounds. Do NOT halt with conversational text if the necessary files can simply be requested.\n",
+        marker_suffix
+    ));
 
     out.push_str(&format!(
         "6. If you encounter an insurmountable technical blocker, contradictory requirements, or need developer decisions, emit the terminal error tag: <error{0} message=\"...\" /> explaining the exact blocker.\n",
@@ -917,34 +898,17 @@ mod tests {
         assert!(prompt.contains("- **Addressed Concept Nodes**: c-1"));
         assert!(prompt.contains("- **Prerequisite Steps (must be DONE)**: 1"));
 
+        assert!(is_plan_step_execution_prompt(&format!(" \n\t{}", prompt)));
         let target = extract_plan_step_execution_target(&prompt).unwrap();
         assert_eq!(target.plan_id.as_deref(), Some("jwt-auth"));
         assert_eq!(target.step_id, "2");
+        let ws_target = extract_plan_step_execution_target(&format!("  \n  {}", prompt)).unwrap();
+        assert_eq!(ws_target.plan_id.as_deref(), Some("jwt-auth"));
+        assert_eq!(ws_target.step_id, "2");
         assert!(prompt.contains("- [x] #1 Models"));
         assert!(prompt.contains("- **ID**: `2`"));
         assert!(prompt.contains("<success_XYZ summary=\"...\" />"));
         assert!(prompt.contains("<error_XYZ message=\"...\" />"));
-        assert!(!prompt.contains("<context_drop_XYZ"));
-
-        let inc_prompt = format_plan_step_execution_prompt_with_mode(
-            &plan,
-            "2",
-            "_XYZ",
-            crate::config::DiscoveryMode::Incremental,
-        )
-        .unwrap();
-        assert!(inc_prompt.contains("Incremental Strategy"));
-        assert!(inc_prompt.contains("<context_drop_XYZ"));
-
-        let snap_prompt = format_plan_step_execution_prompt_with_mode(
-            &plan,
-            "2",
-            "_XYZ",
-            crate::config::DiscoveryMode::Snapshot,
-        )
-        .unwrap();
-        assert!(snap_prompt.contains("Snapshot Strategy"));
-        assert!(snap_prompt.contains("entire active working set"));
     }
 
     #[test]

@@ -92,7 +92,6 @@ pub struct PromptAssembly {
     pub active_plan: Option<Plan>,
     pub is_isolated_step: bool,
     pub is_discussion: bool,
-    pub discovery_mode: crate::config::DiscoveryMode,
     pub turn_scratchpad: Option<String>,
 }
 
@@ -118,7 +117,6 @@ impl PromptAssembly {
             active_plan: None,
             is_isolated_step: false,
             is_discussion: false,
-            discovery_mode: crate::config::DiscoveryMode::default(),
             turn_scratchpad: None,
         }
     }
@@ -130,11 +128,6 @@ impl PromptAssembly {
 
     pub fn with_scratchpad(mut self, scratchpad: Option<String>) -> Self {
         self.turn_scratchpad = scratchpad;
-        self
-    }
-
-    pub fn with_discovery_mode(mut self, mode: crate::config::DiscoveryMode) -> Self {
-        self.discovery_mode = mode;
         self
     }
 
@@ -166,23 +159,9 @@ impl PromptAssembly {
 
         if self.is_discussion {
             prompt.push_str("2. Discussion Mode Scope: You are strictly in Discussion mode. Code modifications, file creations, file edits, and file deletions are strictly prohibited. Do NOT output XML edit blocks (<edit>, <create>, <replace>, <overwrite>, <delete>) or any code patch proposals.\n");
-            match self.discovery_mode {
-                crate::config::DiscoveryMode::Monotonic => {
-                    prompt.push_str(
-                        "3. Read-Only Context Exploration: Files in <read_only_files> are strictly for reference and architectural understanding. If you need to inspect additional files from the repository map to answer the developer's questions, specify them in the `context_requests` array with `access: \"read_only\"`.\n",
-                    );
-                }
-                crate::config::DiscoveryMode::Incremental => {
-                    prompt.push_str(
-                        "3. Read-Only Context Exploration (Incremental Strategy): Files in <read_only_files> are strictly for reference and architectural understanding. If you need to inspect additional files from the repository map to answer the developer's questions, specify them in the `context_requests` array with `access: \"read_only\"`. If an inspected auto-context file turns out to be irrelevant, specify it in `context_drops` to release context and preserve token budget.\n",
-                    );
-                }
-                crate::config::DiscoveryMode::Snapshot => {
-                    prompt.push_str(
-                        "3. Read-Only Context Exploration (Snapshot Strategy): Files in <read_only_files> are strictly for reference and architectural understanding. In each discovery round, specify the complete active working set of auto-context files needed for your reasoning in `context_requests` (`access: \"read_only\"`). Any auto-context files omitted from `context_requests` will be automatically evicted from context. User and pinned files are never evicted.\n",
-                    );
-                }
-            }
+            prompt.push_str(
+                "3. Read-Only Context Exploration: Files in <read_only_files> are strictly for reference and architectural understanding. If you need to inspect additional files from the repository map to answer the developer's questions, specify them in the `context_requests` array with `access: \"read_only\"`.\n",
+            );
         } else {
             prompt.push_str(
                 "2. Read-Only Scope: Files inside <read_only_files> are provided for reference, context, and structural comprehension. Prefer modifying files in <editable_files>. If completing the task requires editing a file present in <read_only_files>, you may propose edits to it directly without an extra discovery round — the environment will automatically promote it to editable upon applying the changes.\n"
@@ -248,7 +227,7 @@ impl PromptAssembly {
                 .collect();
 
             // Delegate edit protocol specific instructions
-            prompt.push_str(&protocol.system_instructions(&editable_paths, self.discovery_mode));
+            prompt.push_str(&protocol.system_instructions(&editable_paths));
         } else {
             prompt.push_str("## Mode: Structured Discussion\n");
             prompt.push_str("You are participating in an architectural discussion. Code modifications are strictly prohibited. You cannot edit, create, or delete code files. Focus on conceptual comprehension of the objective ('What'), clarifying requirements, evaluating trade-offs, establishing key design decisions, and formulating or refining plans via structured fields.\n");
@@ -653,52 +632,15 @@ mod tests {
     }
 
     #[test]
-    fn test_prompt_assembly_discovery_mode_instructions() {
+    fn test_prompt_assembly_discovery_instructions() {
         let proto = XmlEditProtocol;
 
-        // Monotonic Develop mode (default)
-        let mono_assembly = PromptAssembly::new(None, 1, vec![], "git", "xml", None, None)
-            .with_discovery_mode(crate::config::DiscoveryMode::Monotonic);
-        let mono_prompt = mono_assembly.build_system_prompt(&proto);
-        assert!(!mono_prompt.contains("<context_drop"));
-        assert!(!mono_prompt.contains("Incremental Strategy"));
-        assert!(!mono_prompt.contains("Snapshot Strategy"));
-
-        // Incremental Develop mode
-        let inc_assembly = PromptAssembly::new(None, 1, vec![], "git", "xml", None, None)
-            .with_discovery_mode(crate::config::DiscoveryMode::Incremental);
-        let inc_prompt = inc_assembly.build_system_prompt(&proto);
-        assert!(inc_prompt.contains("<context_drop"));
-        assert!(inc_prompt.contains("Incremental Strategy"));
-        assert!(!inc_prompt.contains("Snapshot Strategy"));
-
-        // Snapshot Develop mode
-        let snap_assembly = PromptAssembly::new(None, 1, vec![], "git", "xml", None, None)
-            .with_discovery_mode(crate::config::DiscoveryMode::Snapshot);
-        let snap_prompt = snap_assembly.build_system_prompt(&proto);
-        assert!(snap_prompt.contains("Snapshot Strategy"));
-        assert!(snap_prompt.contains("entire active working set of auto-context files"));
-
-        // Discussion mode monotonic
-        let mut disc_mono = PromptAssembly::new(None, 1, vec![], "git", "xml", None, None)
-            .with_discovery_mode(crate::config::DiscoveryMode::Monotonic);
-        disc_mono.is_discussion = true;
-        let disc_mono_prompt = disc_mono.build_system_prompt(&proto);
-        assert!(!disc_mono_prompt.contains("context_drops"));
-
-        // Discussion mode incremental
-        let mut disc_inc = PromptAssembly::new(None, 1, vec![], "git", "xml", None, None)
-            .with_discovery_mode(crate::config::DiscoveryMode::Incremental);
-        disc_inc.is_discussion = true;
-        let disc_inc_prompt = disc_inc.build_system_prompt(&proto);
-        assert!(disc_inc_prompt.contains("context_drops"));
-
-        // Discussion mode snapshot
-        let mut disc_snap = PromptAssembly::new(None, 1, vec![], "git", "xml", None, None)
-            .with_discovery_mode(crate::config::DiscoveryMode::Snapshot);
-        disc_snap.is_discussion = true;
-        let disc_snap_prompt = disc_snap.build_system_prompt(&proto);
-        assert!(disc_snap_prompt.contains("Snapshot Strategy"));
+        let assembly = PromptAssembly::new(None, 1, vec![], "git", "xml", None, None);
+        let prompt = assembly.build_system_prompt(&proto);
+        assert!(!prompt.contains("<context_drop"));
+        assert!(!prompt.contains("Incremental Strategy"));
+        assert!(!prompt.contains("Snapshot Strategy"));
+        assert!(prompt.contains("<context_request"));
     }
 
     #[test]

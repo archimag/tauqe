@@ -1,6 +1,8 @@
 //! Git-backed transactional apply policy for edit workflows.
 
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use tauqe_protocol::{EditOperation, EditProposal};
 
@@ -24,14 +26,42 @@ use crate::git::{
 /// commits are squashed into a single permanent AI commit; on failure the
 /// working tree is reset back to the pre-edit checkpoint, restoring the
 /// developer's original uncommitted state.
+///
+/// The optional `guard` flag mirrors whether a transaction is currently open.
+/// A turn supervisor consults it to avoid force-aborting a workflow task in the
+/// middle of a Git transaction, which would otherwise strand a checkpoint or
+/// step commit until startup crash recovery runs.
 #[derive(Debug, Default, Clone)]
 pub struct GitTransactionPolicy {
     checkpoint: Option<CheckpointInfo>,
+    guard: Option<Arc<AtomicBool>>,
 }
 
 impl GitTransactionPolicy {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Creates a policy that reports an open transaction through `guard`.
+    pub fn with_guard(guard: Arc<AtomicBool>) -> Self {
+        Self {
+            checkpoint: None,
+            guard: Some(guard),
+        }
+    }
+
+    /// Publishes the current transaction state to the shared guard, if any.
+    fn publish_transaction_state(&self) {
+        if let Some(guard) = &self.guard {
+            guard.store(self.checkpoint.is_some(), Ordering::SeqCst);
+        }
+    }
+
+    /// Clears the shared guard once the transaction is closed.
+    fn clear_transaction_state(&self) {
+        if let Some(guard) = &self.guard {
+            guard.store(false, Ordering::SeqCst);
+        }
     }
 }
 
@@ -60,6 +90,7 @@ impl ApplyPolicy for GitTransactionPolicy {
         if self.checkpoint.is_none() {
             self.checkpoint = create_checkpoint(repo_root).ok();
         }
+        self.publish_transaction_state();
 
         let changed_files = apply_edit_proposal(repo_root, context_manager, proposal)?;
 
@@ -93,12 +124,14 @@ impl ApplyPolicy for GitTransactionPolicy {
                 }
             }
         };
+        self.clear_transaction_state();
         Ok(commit_hash)
     }
 
     fn rollback(&mut self, repo_root: &Path) -> anyhow::Result<bool> {
         if let Some(checkpoint) = &self.checkpoint {
             restore_checkpoint(repo_root, checkpoint)?;
+            self.clear_transaction_state();
             Ok(true)
         } else {
             Ok(false)

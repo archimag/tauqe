@@ -62,13 +62,6 @@ impl StructuredEditProtocol {
                         "type": "string"
                     }
                 },
-                "context_drops": {
-                    "type": "array",
-                    "description": "Files to drop from auto context if no longer needed",
-                    "items": {
-                        "type": "string"
-                    }
-                },
                 "suggested_actions": {
                     "type": "array",
                     "description": "Optional list of suggested follow-up options for the user",
@@ -77,7 +70,7 @@ impl StructuredEditProtocol {
                     }
                 }
             },
-            "required": ["message", "changes", "context_requests", "context_drops", "suggested_actions"],
+            "required": ["message", "changes", "context_requests", "suggested_actions"],
             "additionalProperties": false
         })
     }
@@ -96,7 +89,7 @@ impl StructuredEditProtocol {
         let mut edits = Vec::new();
 
         for change in &proposal.changes {
-            let is_create = change.op == "create";
+            let is_create = change.op.trim().eq_ignore_ascii_case("create");
             let target_path = match resolve_target_path_for_op(&change.path, editable_paths, is_create) {
                 Ok(p) => p,
                 Err(ambiguity_err) => {
@@ -131,51 +124,46 @@ impl StructuredEditProtocol {
                 };
             }
 
-            match change.op.as_str() {
-                "create" => {
-                    edits.push(EditOperation::Create {
-                        path: target_path,
-                        content: normalize_content(change.content.as_deref().unwrap_or_default()),
-                    });
-                    // Flat-string schema: empty values mean "not applicable".
-                }
-                "delete" => {
-                    edits.push(EditOperation::Delete { path: target_path });
-                }
-                "move" => {
-                    let dest_raw = change.to.as_deref().unwrap_or_default();
-                    let target_to = match resolve_target_path_for_op(dest_raw, editable_paths, true) {
-                        Ok(p) => p,
-                        Err(ambiguity_err) => {
-                            return ModelResult::Edit {
-                                summary: "Ambiguous destination file path".to_string(),
-                                edits: Vec::new(),
-                                proposal: Some(proposal),
-                                applied: false,
-                                error: Some(ambiguity_err),
-                                changed_files: Vec::new(),
-                                commit_hash: None,
-                            };
-                        }
+            // Structural conversion is delegated to the shared, validating
+            // routine: an unknown operation or a missing payload is rejected
+            // here instead of being silently coerced into a destructive edit.
+            let mut resolved = change.clone();
+            resolved.path = target_path;
+            resolved.old_text = change.old_text.as_deref().map(normalize_content);
+            resolved.new_text = change.new_text.as_deref().map(normalize_content);
+            resolved.content = change.content.as_deref().map(normalize_content);
+
+            if resolved.op.trim().eq_ignore_ascii_case("move") {
+                let dest_raw = change.to.as_deref().unwrap_or_default();
+                let target_to = match resolve_target_path_for_op(dest_raw, editable_paths, true) {
+                    Ok(p) => p,
+                    Err(ambiguity_err) => {
+                        return ModelResult::Edit {
+                            summary: "Ambiguous destination file path".to_string(),
+                            edits: Vec::new(),
+                            proposal: Some(proposal),
+                            applied: false,
+                            error: Some(ambiguity_err),
+                            changed_files: Vec::new(),
+                            commit_hash: None,
+                        };
+                    }
+                };
+                resolved.to = Some(target_to);
+            }
+
+            match resolved.to_edit_operation() {
+                Ok(operation) => edits.push(operation),
+                Err(message) => {
+                    return ModelResult::Edit {
+                        summary: format!("Invalid change: {}", message),
+                        edits: Vec::new(),
+                        proposal: Some(proposal),
+                        applied: false,
+                        error: Some(message),
+                        changed_files: Vec::new(),
+                        commit_hash: None,
                     };
-                    edits.push(EditOperation::Move {
-                        from: target_path,
-                        to: target_to,
-                    });
-                }
-                _ => {
-                    edits.push(EditOperation::Replace {
-                        path: target_path,
-                        old_text: normalize_content(change.old_text.as_deref().unwrap_or_default()),
-                        new_text: normalize_content(
-                            change
-                                .new_text
-                                .as_deref()
-                                .filter(|s| !s.is_empty())
-                                .or(change.content.as_deref())
-                                .unwrap_or_default(),
-                        ),
-                    });
                 }
             }
         }
@@ -225,7 +213,6 @@ impl EditProtocol for StructuredEditProtocol {
     fn system_instructions(
         &self,
         editable_paths: &[String],
-        discovery_mode: crate::config::DiscoveryMode,
     ) -> String {
         let mut prompt = String::new();
         prompt.push_str("## Code Modification Protocol (Structured Output JSON)\n");
@@ -233,9 +220,6 @@ impl EditProtocol for StructuredEditProtocol {
         prompt.push_str("- `message`: Your conversational explanation or answer to the user.\n");
         prompt.push_str("- `changes`: Array of code edit operations (`op`: 'replace'|'create'|'delete'|'move', `path`, `to`, `old_text`, `new_text`, `content`).\n");
         prompt.push_str("- `context_requests`: Files to add to context. Each entry is a repository-relative path (read-only) or `editable:<path>` for files you need to modify.\n");
-        if discovery_mode != crate::config::DiscoveryMode::Monotonic {
-            prompt.push_str("- `context_drops`: Files to drop from auto context if no longer needed.\n");
-        }
         prompt.push_str(
             "- `suggested_actions`: Optional list of suggested follow-up options for the user.\n",
         );
@@ -260,17 +244,7 @@ impl EditProtocol for StructuredEditProtocol {
         prompt.push_str("4. For 'create', `content` must contain the complete file content from first to last line.\n");
         prompt.push_str("5. If no code changes are needed, set `changes: []` and provide your answer in `message`.\n");
 
-        match discovery_mode {
-            crate::config::DiscoveryMode::Monotonic => {
-                prompt.push_str("6. Context Discovery: If the task requires files listed in <repo_map> that are not present in the editable or read-only files, request them FIRST: set `changes: []` and list them in `context_requests`. You will be called again with the full file contents added to context. Never request files that are already in context.\n\n");
-            }
-            crate::config::DiscoveryMode::Incremental => {
-                prompt.push_str("6. Context Discovery (Incremental Strategy): If the task requires files listed in <repo_map> that are not present in the editable or read-only files, request them FIRST: set `changes: []` and list them in `context_requests`. If an inspected auto-context file turns out to be irrelevant or misleading, list it in `context_drops` to release context and preserve token budget. You will be called again with the full file contents added to context. Never request files that are already in context.\n\n");
-            }
-            crate::config::DiscoveryMode::Snapshot => {
-                prompt.push_str("6. Context Discovery (Snapshot Strategy): If the task requires files listed in <repo_map> that are not present in context, request them FIRST: set `changes: []` and specify the complete active working set of auto-context files in `context_requests`. Any auto-context files omitted from `context_requests` will be automatically evicted from context. User and pinned files are never evicted. You will be called again with the updated context.\n\n");
-            }
-        }
+        prompt.push_str("6. Context Discovery: If the task requires files listed in <repo_map> that are not present in the editable or read-only files, request them FIRST: set `changes: []` and list them in `context_requests`. You will be called again with the full file contents added to context. Never request files that are already in context.\n\n");
 
         prompt
     }
@@ -292,18 +266,6 @@ impl EditProtocol for StructuredEditProtocol {
                 p.context_requests
                     .iter()
                     .filter_map(|spec| parse_context_request_spec(spec))
-                    .collect()
-            })
-            .unwrap_or_default()
-    }
-
-    fn parse_context_drops(&self, raw_text: &str) -> Vec<String> {
-        parse_proposal(raw_text)
-            .map(|p| {
-                p.context_drops
-                    .into_iter()
-                    .map(|p| p.trim().trim_start_matches("./").trim_start_matches('/').to_string())
-                    .filter(|p| !p.is_empty())
                     .collect()
             })
             .unwrap_or_default()
@@ -426,9 +388,7 @@ pub fn clean_raw_json_or_text(raw: &str) -> String {
         let joined = msgs.join("\n\n");
         return super::xml::tags::strip_verify_tags(
             &super::xml::tags::strip_user_language_tags(
-                &super::xml::tags::strip_context_drop_tags(
-                    &super::xml::tags::strip_context_request_tags(&joined),
-                ),
+                &super::xml::tags::strip_context_request_tags(&joined),
             ),
         );
     }
@@ -437,9 +397,7 @@ pub fn clean_raw_json_or_text(raw: &str) -> String {
         if !proposal.message.trim().is_empty() {
             return super::xml::tags::strip_verify_tags(
                 &super::xml::tags::strip_user_language_tags(
-                    &super::xml::tags::strip_context_drop_tags(
-                        &super::xml::tags::strip_context_request_tags(&proposal.message),
-                    ),
+                    &super::xml::tags::strip_context_request_tags(&proposal.message),
                 ),
             );
         }
@@ -451,9 +409,7 @@ pub fn clean_raw_json_or_text(raw: &str) -> String {
 
     super::xml::tags::strip_verify_tags(
         &super::xml::tags::strip_user_language_tags(
-            &super::xml::tags::strip_context_drop_tags(
-                &super::xml::tags::strip_context_request_tags(raw),
-            ),
+            &super::xml::tags::strip_context_request_tags(raw),
         ),
     )
 }
@@ -492,17 +448,14 @@ mod tests {
     use tauqe_protocol::ContextAccess;
 
     #[test]
-    fn test_structured_protocol_context_requests_and_drops() {
+    fn test_structured_protocol_context_requests() {
         let proto = StructuredEditProtocol;
-        let json = r#"{"message":"Need files","changes":[],"context_requests":["src/a.rs","editable:src/b.rs"],"context_drops":["src/old.rs"],"suggested_actions":[]}"#;
+        let json = r#"{"message":"Need files","changes":[],"context_requests":["src/a.rs","editable:src/b.rs"],"suggested_actions":[]}"#;
         let reqs = proto.parse_context_requests(json);
         assert_eq!(reqs.len(), 2);
         assert_eq!(reqs[0].access, ContextAccess::ReadOnly);
         assert_eq!(reqs[1].path, "src/b.rs");
         assert_eq!(reqs[1].access, ContextAccess::Editable);
-
-        let drops = proto.parse_context_drops(json);
-        assert_eq!(drops, vec!["src/old.rs".to_string()]);
     }
 
     #[test]
@@ -653,20 +606,12 @@ mod tests {
     }
 
     #[test]
-    fn test_structured_protocol_system_instructions_discovery_modes() {
+    fn test_structured_protocol_system_instructions() {
         let proto = StructuredEditProtocol;
         let paths = vec!["src/lib.rs".to_string()];
 
-        let mono = proto.system_instructions(&paths, crate::config::DiscoveryMode::Monotonic);
-        assert!(!mono.contains("context_drops"));
-        assert!(!mono.contains("Incremental Strategy"));
-        assert!(!mono.contains("Snapshot Strategy"));
-
-        let inc = proto.system_instructions(&paths, crate::config::DiscoveryMode::Incremental);
-        assert!(inc.contains("Incremental Strategy"));
-        assert!(inc.contains("context_drops"));
-
-        let snap = proto.system_instructions(&paths, crate::config::DiscoveryMode::Snapshot);
-        assert!(snap.contains("Snapshot Strategy"));
+        let instr = proto.system_instructions(&paths);
+        assert!(!instr.contains("context_drops"));
+        assert!(instr.contains("context_requests"));
     }
 }

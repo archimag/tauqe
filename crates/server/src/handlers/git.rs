@@ -9,9 +9,21 @@ use tauqe_protocol::{
 
 use crate::state::AppState;
 
-pub async fn handle_repository_get_state(req: Request, _state: &Arc<AppState>) -> Response {
-    let repo_state = tauqe_core::git::get_repository_state(None);
-    Response::ok_typed(req.id, &repo_state)
+/// Distinguishes a failure while reading the commit list from a failure while
+/// squashing, so each maps to the correct client error code.
+enum SquashApplyError {
+    Commits(anyhow::Error),
+    Squash(anyhow::Error),
+}
+
+pub async fn handle_repository_get_state(req: Request, state: &Arc<AppState>) -> Response {
+    let repo_root = state.repo_root().await;
+    match super::offload(move || tauqe_core::git::get_repository_state(Some(repo_root.as_path())))
+        .await
+    {
+        Ok(repo_state) => Response::ok_typed(req.id, &repo_state),
+        Err(err) => Response::err(req.id, errors::REPOSITORY_STATE_FAILED, err),
+    }
 }
 
 pub async fn handle_repository_init(req: Request, state: &Arc<AppState>) -> Response {
@@ -20,8 +32,12 @@ pub async fn handle_repository_init(req: Request, state: &Arc<AppState>) -> Resp
         .and_then(|p| serde_json::from_value(p).ok())
         .unwrap_or_default();
 
-    match tauqe_core::git::init_repository(None, params.initial_commit) {
-        Ok(repo_state) => {
+    let initial_commit = params.initial_commit;
+    let init_result =
+        super::offload(move || tauqe_core::git::init_repository(None, initial_commit)).await;
+
+    match init_result {
+        Ok(Ok(repo_state)) => {
             let repo_path = Path::new(&repo_state.root);
             if !repo_path.as_os_str().is_empty() {
                 {
@@ -47,21 +63,27 @@ pub async fn handle_repository_init(req: Request, state: &Arc<AppState>) -> Resp
             };
             Response::ok_typed(req.id, &result)
         }
-        Err(err) => Response::err(req.id, errors::INIT_FAILED, err.to_string()),
+        Ok(Err(err)) => Response::err(req.id, errors::INIT_FAILED, err.to_string()),
+        Err(err) => Response::err(req.id, errors::INIT_FAILED, err),
     }
 }
 
-pub async fn handle_repository_list_files(req: Request, _state: &Arc<AppState>) -> Response {
-    let repo_state = tauqe_core::git::get_repository_state(None);
-    let repo_dir = Path::new(&repo_state.root);
-    match tauqe_core::git::list_repository_files(Some(repo_dir)) {
-        Ok(files) => Response::ok_typed(req.id, &RepositoryListFilesResult { files }),
-        Err(err) => Response::err(req.id, errors::LIST_FILES_FAILED, err.to_string()),
+pub async fn handle_repository_list_files(req: Request, state: &Arc<AppState>) -> Response {
+    let repo_root = state.repo_root().await;
+    let files = super::offload(move || {
+        tauqe_core::git::list_repository_files(Some(repo_root.as_path()))
+    })
+    .await;
+
+    match files {
+        Ok(Ok(files)) => Response::ok_typed(req.id, &RepositoryListFilesResult { files }),
+        Ok(Err(err)) => Response::err(req.id, errors::LIST_FILES_FAILED, err.to_string()),
+        Err(err) => Response::err(req.id, errors::LIST_FILES_FAILED, err),
     }
 }
 
 pub async fn handle_git_undo(req: Request, state: &Arc<AppState>) -> Response {
-    if state.active_cancel.lock().await.is_some() {
+    if state.is_operation_active() {
         return Response::err(
             req.id,
             errors::OPERATION_IN_PROGRESS,
@@ -69,61 +91,75 @@ pub async fn handle_git_undo(req: Request, state: &Arc<AppState>) -> Response {
         );
     }
 
-    let repo_state = tauqe_core::git::get_repository_state(None);
-    let repo_dir = Path::new(&repo_state.root);
+    let repo_root = state.repo_root().await;
 
-    match tauqe_core::git::undo_last_ai_commit(repo_dir) {
-        Ok(undo_result) => {
-            let ctx_state = {
-                {
-                    let mut history = state.history.lock().await;
-                    let _ = history.record_undo(
-                        &undo_result.undone_commit,
-                        undo_result.restored_checkpoint,
-                    );
-                }
-                let mut ctx = state.context.write().await;
-                ctx.prune_missing_files();
-                ctx.get_state()
-            };
+    // The undo itself is a git transaction; re-reading the repository state
+    // afterwards is also blocking, so both run on the same blocking task.
+    let undo = super::offload(move || {
+        let undo_result = tauqe_core::git::undo_last_ai_commit(&repo_root);
+        let repo_state = tauqe_core::git::get_repository_state(Some(repo_root.as_path()));
+        (undo_result, repo_state)
+    })
+    .await;
 
-            let new_repo_state = tauqe_core::git::get_repository_state(Some(repo_dir));
-            state.out.send_event(&Event {
-                method: events::GIT_STATE_CHANGED.to_string(),
-                params: Some(serde_json::json!({ "repository": new_repo_state })),
-            });
-
-            state.out.send_event(&Event {
-                method: events::CONTEXT_CHANGED.to_string(),
-                params: Some(serde_json::json!({ "state": ctx_state })),
-            });
-
-            state.out.send_event(&Event {
-                method: events::GIT_UNDO_COMPLETED.to_string(),
-                params: serde_json::to_value(&undo_result).ok(),
-            });
-
-            Response::ok_typed(req.id, &undo_result)
+    let (undo_result, new_repo_state) = match undo {
+        Ok((Ok(undo_result), repo_state)) => (undo_result, repo_state),
+        Ok((Err(err), _)) => {
+            return Response::err(req.id, errors::UNDO_FAILED, err.to_string());
         }
-        Err(err) => Response::err(req.id, errors::UNDO_FAILED, err.to_string()),
-    }
+        Err(err) => return Response::err(req.id, errors::UNDO_FAILED, err),
+    };
+
+    let ctx_state = {
+        {
+            let mut history = state.history.lock().await;
+            let _ = history.record_undo(
+                &undo_result.undone_commit,
+                undo_result.restored_checkpoint,
+            );
+        }
+        let mut ctx = state.context.write().await;
+        ctx.prune_missing_files();
+        ctx.get_state()
+    };
+
+    state.out.send_event(&Event {
+        method: events::GIT_STATE_CHANGED.to_string(),
+        params: Some(serde_json::json!({ "repository": new_repo_state })),
+    });
+
+    state.out.send_event(&Event {
+        method: events::CONTEXT_CHANGED.to_string(),
+        params: Some(serde_json::json!({ "state": ctx_state })),
+    });
+
+    state.out.send_event(&Event {
+        method: events::GIT_UNDO_COMPLETED.to_string(),
+        params: serde_json::to_value(&undo_result).ok(),
+    });
+
+    Response::ok_typed(req.id, &undo_result)
 }
 
-pub async fn handle_git_get_diff(req: Request, _state: &Arc<AppState>) -> Response {
+pub async fn handle_git_get_diff(req: Request, state: &Arc<AppState>) -> Response {
     let params: Option<GitDiffParams> = req.params.and_then(|p| serde_json::from_value(p).ok());
-    let target_path = params.as_ref().and_then(|p| p.path.as_deref());
+    let target_path = params.and_then(|p| p.path);
 
-    let repo_state = tauqe_core::git::get_repository_state(None);
-    let repo_dir = Path::new(&repo_state.root);
+    let repo_root = state.repo_root().await;
+    let diff = super::offload(move || {
+        tauqe_core::git::get_diff(repo_root.as_path(), target_path.as_deref())
+    })
+    .await;
 
-    match tauqe_core::git::get_diff(repo_dir, target_path) {
-        Ok(diff) => Response::ok_typed(req.id, &GitDiffResult { diff }),
-        Err(err) => Response::err(req.id, errors::GET_DIFF_FAILED, err.to_string()),
+    match diff {
+        Ok(Ok(diff)) => Response::ok_typed(req.id, &GitDiffResult { diff }),
+        Ok(Err(err)) => Response::err(req.id, errors::GET_DIFF_FAILED, err.to_string()),
+        Err(err) => Response::err(req.id, errors::GET_DIFF_FAILED, err),
     }
 }
 
 pub async fn handle_git_squash_preview(req: Request, state: &Arc<AppState>) -> Response {
-    if state.active_cancel.lock().await.is_some() {
+    if state.is_operation_active() {
         return Response::err(
             req.id,
             errors::OPERATION_IN_PROGRESS,
@@ -134,30 +170,50 @@ pub async fn handle_git_squash_preview(req: Request, state: &Arc<AppState>) -> R
     let params: Option<tauqe_protocol::GitSquashPreviewParams> =
         req.params.and_then(|p| serde_json::from_value(p).ok());
 
-    let repo_state = tauqe_core::git::get_repository_state(None);
-    let repo_dir = Path::new(&repo_state.root);
-
-    let configured_upstream = {
-        let cfg = state.config.lock().await;
-        cfg.git.upstream.clone()
-    };
-
-    let session_base = tauqe_core::git::find_last_non_ai_commit(repo_dir).unwrap_or(None);
-    let upstream_base =
-        tauqe_core::git::detect_upstream_branch(repo_dir, configured_upstream.as_deref());
-
-    let base_ref = params
+    let repo_root = state.repo_root().await;
+    let configured_upstream = state.config.lock().await.config.git.upstream.clone();
+    let requested_base = params
         .and_then(|p| p.base_ref)
-        .filter(|b| !b.trim().is_empty())
-        .or_else(|| session_base.clone())
-        .or_else(|| upstream_base.clone())
-        .unwrap_or_else(|| "HEAD~1".to_string());
+        .filter(|b| !b.trim().is_empty());
 
-    let commits_ahead =
-        tauqe_core::git::get_commits_ahead(repo_dir, &base_ref).unwrap_or_default();
-    let diff_stat = tauqe_core::git::get_diff_stat(repo_dir, &base_ref)
-        .unwrap_or_else(|_| "0 files changed".to_string());
-    let files = tauqe_core::git::get_cumulative_file_diffs(repo_dir, &base_ref).unwrap_or_default();
+    let preview = super::offload(move || {
+        let session_base =
+            tauqe_core::git::find_last_non_ai_commit(repo_root.as_path()).unwrap_or(None);
+        let upstream_base = tauqe_core::git::detect_upstream_branch(
+            repo_root.as_path(),
+            configured_upstream.as_deref(),
+        );
+
+        let base_ref = requested_base
+            .clone()
+            .or_else(|| session_base.clone())
+            .or_else(|| upstream_base.clone())
+            .unwrap_or_else(|| "HEAD~1".to_string());
+
+        // Propagate git failures instead of hiding them behind an empty
+        // preview; a swallowed error would silently corrupt the squash scope.
+        let commits_ahead = tauqe_core::git::get_commits_ahead(repo_root.as_path(), &base_ref)?;
+        let diff_stat = tauqe_core::git::get_diff_stat(repo_root.as_path(), &base_ref)?;
+        let files = tauqe_core::git::get_cumulative_file_diffs(repo_root.as_path(), &base_ref)?;
+
+        Ok::<_, anyhow::Error>((
+            base_ref,
+            session_base,
+            upstream_base,
+            commits_ahead,
+            diff_stat,
+            files,
+        ))
+    })
+    .await;
+
+    let (base_ref, session_base, upstream_base, commits_ahead, diff_stat, files) = match preview {
+        Ok(Ok(preview)) => preview,
+        Ok(Err(err)) => {
+            return Response::err(req.id, errors::SQUASH_PREVIEW_FAILED, err.to_string());
+        }
+        Err(err) => return Response::err(req.id, errors::SQUASH_PREVIEW_FAILED, err),
+    };
 
     let items: Vec<tauqe_protocol::GitSquashCommitItem> = commits_ahead
         .into_iter()
@@ -195,25 +251,28 @@ pub async fn handle_git_squash_generate_message(req: Request, state: &Arc<AppSta
             }
         };
 
-    let repo_state = tauqe_core::git::get_repository_state(None);
-    let repo_dir = Path::new(&repo_state.root);
+    let repo_root = state.repo_root().await;
+    let base_ref = params.base_ref.clone();
 
-    let commits_ahead = match tauqe_core::git::get_commits_ahead(repo_dir, &params.base_ref) {
-        Ok(c) => c,
-        Err(err) => {
+    let git_data = super::offload(move || {
+        let commits = tauqe_core::git::get_commits_ahead(repo_root.as_path(), &base_ref);
+        let diff = tauqe_core::git::get_cumulative_diff(repo_root.as_path(), &base_ref)
+            .unwrap_or_default();
+        (commits, diff)
+    })
+    .await;
+
+    let (commits_ahead, cumulative_diff) = match git_data {
+        Ok((Ok(commits), diff)) => (commits, diff),
+        Ok((Err(err), _)) => {
             return Response::err(
                 req.id,
                 errors::COMMITS_AHEAD_FAILED,
-                format!(
-                    "Failed to get commits ahead of {}: {}",
-                    params.base_ref, err
-                ),
+                format!("Failed to get commits ahead of {}: {}", params.base_ref, err),
             );
         }
+        Err(err) => return Response::err(req.id, errors::COMMITS_AHEAD_FAILED, err),
     };
-
-    let cumulative_diff =
-        tauqe_core::git::get_cumulative_diff(repo_dir, &params.base_ref).unwrap_or_default();
 
     let pinned_files = {
         let ctx = state.context.read().await;
@@ -238,21 +297,25 @@ pub async fn handle_git_squash_generate_message(req: Request, state: &Arc<AppSta
     );
 
     let (provider_res, model) = {
-        let cfg = state.config.lock().await;
+        let cfg = state.config.lock().await.config.clone();
         let m = cfg.resolve_role(ModelRole::Scribe);
         let p = create_provider(m.provider, &cfg);
         (p, m)
     };
 
     let (message, usage_info) = if let Ok(provider) = provider_res {
+        let operation = match state.try_begin_operation() {
+            Ok(guard) => guard,
+            Err(()) => {
+                return Response::err(
+                    req.id,
+                    errors::OPERATION_IN_PROGRESS,
+                    "Cannot generate a squash message while a model operation is in progress",
+                );
+            }
+        };
+        let cancel_rx = operation.cancel_receiver();
         let (tx, mut rx) = tokio::sync::mpsc::channel(50);
-        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
-        {
-            *state.active_cancel.lock().await = Some(crate::state::ActiveOperation {
-                cancel_tx,
-                abort_handle: None,
-            });
-        }
         let msgs = vec![ChatMessage::user(&prompt)];
         let model_name = model.name.clone();
         let stream_task =
@@ -261,6 +324,7 @@ pub async fn handle_git_squash_generate_message(req: Request, state: &Arc<AppSta
             );
         let mut full_text = String::new();
         let mut usage: Option<tauqe_protocol::ModelUsageInfo> = None;
+        let mut stream_error: Option<String> = None;
         while let Some(ev) = rx.recv().await {
             match ev {
                 StreamEvent::TextDelta(delta) => {
@@ -269,11 +333,31 @@ pub async fn handle_git_squash_generate_message(req: Request, state: &Arc<AppSta
                 StreamEvent::Usage(u) => {
                     usage = Some(u);
                 }
+                StreamEvent::Error(msg) => {
+                    stream_error = Some(msg);
+                }
                 _ => {}
             }
         }
-        let _ = stream_task.await;
-        *state.active_cancel.lock().await = None;
+
+        // Surface both a streamed provider error and a failed streaming task so
+        // a broken provider never masquerades as a successful fallback message.
+        if let Some(msg) = stream_error {
+            return Response::err(req.id, errors::INTERNAL_ERROR, msg);
+        }
+        match stream_task.await {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => {
+                return Response::err(req.id, errors::INTERNAL_ERROR, err.to_string());
+            }
+            Err(join_err) => {
+                return Response::err(
+                    req.id,
+                    errors::INTERNAL_ERROR,
+                    format!("Squash message stream task failed: {}", join_err),
+                );
+            }
+        }
         let trimmed = full_text.trim();
         let cleaned = trimmed
             .strip_prefix("```")
@@ -330,7 +414,7 @@ pub async fn handle_git_squash_generate_message(req: Request, state: &Arc<AppSta
 }
 
 pub async fn handle_git_squash_apply(req: Request, state: &Arc<AppState>) -> Response {
-    if state.active_cancel.lock().await.is_some() {
+    if state.is_operation_active() {
         return Response::err(
             req.id,
             errors::OPERATION_IN_PROGRESS,
@@ -350,67 +434,110 @@ pub async fn handle_git_squash_apply(req: Request, state: &Arc<AppState>) -> Res
             }
         };
 
-    let repo_state = tauqe_core::git::get_repository_state(None);
-    let repo_dir = Path::new(&repo_state.root);
+    // Squashing rewrites history, so the client-supplied inputs are validated
+    // before any git mutation: an empty message or a revision that looks like
+    // an option (leading '-') is rejected instead of being forwarded to git.
+    if params.message.trim().is_empty() {
+        return Response::err(
+            req.id,
+            errors::INVALID_PARAMS,
+            "Commit message cannot be empty",
+        );
+    }
+    let trimmed_base_ref = params.base_ref.trim();
+    if trimmed_base_ref.is_empty() || trimmed_base_ref.starts_with('-') {
+        return Response::err(
+            req.id,
+            errors::INVALID_PARAMS,
+            "Invalid base_ref: expected a non-empty revision not starting with '-'",
+        );
+    }
 
-    let commits_ahead = match tauqe_core::git::get_commits_ahead(repo_dir, &params.base_ref) {
-        Ok(c) => c,
-        Err(err) => {
+    let repo_root = state.repo_root().await;
+    let base_ref = trimmed_base_ref.to_string();
+    let message = params.message.clone();
+
+    let applied = super::offload(move || {
+        match tauqe_core::git::get_commits_ahead(repo_root.as_path(), &base_ref) {
+            Ok(commits_ahead) => {
+                let count = commits_ahead.len();
+                match tauqe_core::git::squash_to_single_commit(
+                    repo_root.as_path(),
+                    &base_ref,
+                    &message,
+                ) {
+                    Ok(hash) => Ok((count, hash)),
+                    Err(err) => Err(SquashApplyError::Squash(err)),
+                }
+            }
+            Err(err) => Err(SquashApplyError::Commits(err)),
+        }
+    })
+    .await;
+
+    let (commits_count, squashed_hash) = match applied {
+        Ok(Ok(pair)) => pair,
+        Ok(Err(SquashApplyError::Commits(err))) => {
             return Response::err(
                 req.id,
                 errors::COMMITS_AHEAD_FAILED,
-                format!(
-                    "Failed to get commits ahead of {}: {}",
-                    params.base_ref, err
-                ),
+                format!("Failed to get commits ahead of {}: {}", params.base_ref, err),
             );
         }
+        Ok(Err(SquashApplyError::Squash(err))) => {
+            return Response::err(req.id, errors::SQUASH_FAILED, err.to_string());
+        }
+        Err(err) => return Response::err(req.id, errors::SQUASH_FAILED, err),
     };
 
-    let commits_count = commits_ahead.len();
+    // The squash moved HEAD, so the repository state is read again on the
+    // blocking pool from the authoritative root.
+    let repo_root = state.repo_root().await;
+    let new_repo_state = match super::offload(move || {
+        tauqe_core::git::get_repository_state(Some(repo_root.as_path()))
+    })
+    .await
+    {
+        Ok(repo_state) => repo_state,
+        Err(err) => return Response::err(req.id, errors::SQUASH_FAILED, err),
+    };
 
-    match tauqe_core::git::squash_to_single_commit(repo_dir, &params.base_ref, &params.message) {
-        Ok(squashed_hash) => {
-            let first_line = params
-                .message
-                .lines()
-                .next()
-                .unwrap_or("Squash commits")
-                .to_string();
-            let msg_text = format!(
-                "Squashed {} commits ahead of {} into {}.",
-                commits_count, params.base_ref, squashed_hash
-            );
+    let first_line = params
+        .message
+        .lines()
+        .next()
+        .unwrap_or("Squash commits")
+        .to_string();
+    let msg_text = format!(
+        "Squashed {} commits ahead of {} into {}.",
+        commits_count, params.base_ref, squashed_hash
+    );
 
-            {
-                let mut history = state.history.lock().await;
-                let _ = history.record_response(
-                    &msg_text,
-                    Some(squashed_hash.clone()),
-                    Some(first_line),
-                    Vec::new(),
-                );
-            }
-
-            let new_repo_state = tauqe_core::git::get_repository_state(Some(repo_dir));
-            state.out.send_event(&Event {
-                method: events::GIT_STATE_CHANGED.to_string(),
-                params: Some(serde_json::json!({ "repository": new_repo_state })),
-            });
-
-            let apply_result = tauqe_protocol::GitSquashApplyResult {
-                squashed_commit: squashed_hash,
-                message: params.message,
-                base_ref: params.base_ref,
-            };
-
-            state.out.send_event(&Event {
-                method: events::GIT_SQUASH_COMPLETED.to_string(),
-                params: serde_json::to_value(&apply_result).ok(),
-            });
-
-            Response::ok_typed(req.id, &apply_result)
-        }
-        Err(err) => Response::err(req.id, errors::SQUASH_FAILED, err.to_string()),
+    {
+        let mut history = state.history.lock().await;
+        let _ = history.record_response(
+            &msg_text,
+            Some(squashed_hash.clone()),
+            Some(first_line),
+            Vec::new(),
+        );
     }
+
+    state.out.send_event(&Event {
+        method: events::GIT_STATE_CHANGED.to_string(),
+        params: Some(serde_json::json!({ "repository": new_repo_state })),
+    });
+
+    let apply_result = tauqe_protocol::GitSquashApplyResult {
+        squashed_commit: squashed_hash,
+        message: params.message,
+        base_ref: params.base_ref,
+    };
+
+    state.out.send_event(&Event {
+        method: events::GIT_SQUASH_COMPLETED.to_string(),
+        params: serde_json::to_value(&apply_result).ok(),
+    });
+
+    Response::ok_typed(req.id, &apply_result)
 }

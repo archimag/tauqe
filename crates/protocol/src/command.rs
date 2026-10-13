@@ -52,8 +52,6 @@ pub enum LlmCommand {
     Edit { operation: EditOperation },
     /// A request to add a file to the context at a given access level.
     ContextRequest { path: String, access: ContextAccess },
-    /// A request to drop a file from the auto context layer.
-    ContextDrop { path: String },
     /// A request for system documentation by topic.
     DocRequest { topic: String },
     /// A request to run deterministic toolchain verification.
@@ -170,13 +168,6 @@ mod tests {
         assert!(json.contains("\"type\":\"context_request\""));
         assert!(json.contains("\"access\":\"editable\""));
         assert_eq!(serde_json::from_str::<LlmCommand>(&json).unwrap(), request);
-
-        let drop = LlmCommand::ContextDrop {
-            path: "src/b.rs".to_string(),
-        };
-        let json = serde_json::to_string(&drop).unwrap();
-        assert!(json.contains("\"type\":\"context_drop\""));
-        assert_eq!(serde_json::from_str::<LlmCommand>(&json).unwrap(), drop);
 
         let doc = LlmCommand::DocRequest {
             topic: "workflow".to_string(),

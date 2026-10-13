@@ -1,12 +1,12 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use tauqe_core::config::{load_config, AppConfig};
 use tauqe_core::edits::EditProtocolFactory;
 use tauqe_core::workflow::WorkflowFactory;
 use tauqe_protocol::{
-    events, ConfigSetParams, ConfigState, Event, ModelSelection, Request, Response, ResponseError,
-    SystemStatusResult,
+    events, ConfigSetParams, ConfigState, CredentialsSaveParams, Event, ModelSelection, Request,
+    Response, ResponseError, SystemStatusResult,
 };
 
 use crate::state::AppState;
@@ -28,19 +28,70 @@ pub fn config_state(cfg: &AppConfig, selection: Option<&ModelSelection>) -> Conf
     }
 }
 
-pub async fn handle_config_get(req: Request, state: &Arc<AppState>) -> Response {
-    let cur_sel = state.current_selection.lock().await;
-    let cfg = state.config.lock().await;
-    let result = config_state(&cfg, Some(&cur_sel));
-    Response {
-        id: req.id,
-        result: serde_json::to_value(result).ok(),
-        error: None,
+/// Resolves the repository-bound configuration directory from the single
+/// authoritative repository root held by [`AppState`], instead of re-deriving it
+/// from the process CWD. Returns `None` when no repository is available yet.
+async fn resolved_repo_root(state: &Arc<AppState>) -> Option<PathBuf> {
+    let root = state.repo_root().await;
+    if root.as_os_str().is_empty() {
+        None
+    } else {
+        Some(root)
     }
 }
 
+/// Assembles the authoritative [`SystemStatusResult`] from a single source so
+/// derived fields such as `ready` (which requires both a Git repository and an
+/// API key) stay consistent across every status-producing handler.
+///
+/// `config_path` and `credentials_path` may be supplied with the freshly written
+/// path after a create/save operation; otherwise the discovered file is reported.
+fn build_system_status(
+    cfg: &AppConfig,
+    selection: &ModelSelection,
+    repo_opt: Option<&Path>,
+    config_path: Option<String>,
+    credentials_path: Option<String>,
+) -> SystemStatusResult {
+    let has_git = tauqe_core::git::is_git_repository(None);
+    let has_api_key = tauqe_core::config::has_openrouter_key(cfg);
+
+    let config_path = config_path.or_else(|| {
+        tauqe_core::config::find_config_file(repo_opt).map(|p| p.to_string_lossy().to_string())
+    });
+    let credentials_path = credentials_path.or_else(|| {
+        tauqe_core::config::find_credentials_file(repo_opt).map(|p| p.to_string_lossy().to_string())
+    });
+
+    SystemStatusResult {
+        has_git,
+        has_config: config_path.is_some(),
+        config_path,
+        default_config_path: tauqe_core::config::default_config_path(repo_opt)
+            .to_string_lossy()
+            .to_string(),
+        has_api_key,
+        credentials_path,
+        default_credentials_path: tauqe_core::config::default_credentials_path(repo_opt)
+            .to_string_lossy()
+            .to_string(),
+        ready: has_git && has_api_key,
+        model: cfg.resolve_model(selection),
+        selection: Some(selection.clone()),
+        roles: Some(cfg.roles_summary()),
+        history_model: Some(cfg.history_model()),
+        available_models: cfg.available_models(),
+    }
+}
+
+pub async fn handle_config_get(req: Request, state: &Arc<AppState>) -> Response {
+    let guard = state.config.lock().await;
+    let result = config_state(&guard.config, Some(&guard.selection));
+    Response::ok_typed(req.id, &result)
+}
+
 pub async fn handle_config_set(req: Request, state: &Arc<AppState>) -> Response {
-    if state.active_cancel.lock().await.is_some() {
+    if state.is_operation_active() {
         return Response {
             id: req.id,
             result: None,
@@ -70,11 +121,15 @@ pub async fn handle_config_set(req: Request, state: &Arc<AppState>) -> Response 
     };
 
     let updated_state = {
-        let mut cur_sel = state.current_selection.lock().await;
-        let mut cfg = state.config.lock().await;
+        let mut guard = state.config.lock().await;
+
+        // Validate every requested field into local candidates before mutating
+        // shared state, so a single invalid field cannot leave the config
+        // partially applied and desynchronized from the client.
+        let mut new_selection = guard.selection.clone();
         if let Some(ref sel) = params.selection {
-            let effective = cfg.resolve_model(sel);
-            let available = cfg.available_models();
+            let effective = guard.config.resolve_model(sel);
+            let available = guard.config.available_models();
             if !available.contains(&effective) {
                 return Response {
                     id: req.id,
@@ -94,9 +149,9 @@ pub async fn handle_config_set(req: Request, state: &Arc<AppState>) -> Response 
                     }),
                 };
             }
-            *cur_sel = sel.clone();
+            new_selection = sel.clone();
         } else if let Some(ref requested_model) = params.model {
-            let available = cfg.available_models();
+            let available = guard.config.available_models();
             if !available.contains(requested_model) {
                 return Response {
                     id: req.id,
@@ -116,11 +171,12 @@ pub async fn handle_config_set(req: Request, state: &Arc<AppState>) -> Response 
                     }),
                 };
             }
-            *cur_sel = ModelSelection::Specific(requested_model.clone());
+            new_selection = ModelSelection::Specific(requested_model.clone());
         }
 
+        let mut new_scribe = guard.config.models.scribe.clone();
         if let Some(ref hist_model) = params.history_model {
-            let available = cfg.available_models();
+            let available = guard.config.available_models();
             if !available.contains(hist_model) {
                 return Response {
                     id: req.id,
@@ -140,11 +196,12 @@ pub async fn handle_config_set(req: Request, state: &Arc<AppState>) -> Response 
                     }),
                 };
             }
-            cfg.models.scribe = Some(hist_model.clone());
+            new_scribe = Some(hist_model.clone());
         }
 
-        if let Some(wf) = params.workflow {
-            if !WorkflowFactory::is_valid(&wf) {
+        let mut new_workflow = guard.config.develop.workflow.clone();
+        if let Some(ref wf) = params.workflow {
+            if !WorkflowFactory::is_valid(wf) {
                 return Response {
                     id: req.id,
                     result: None,
@@ -159,13 +216,14 @@ pub async fn handle_config_set(req: Request, state: &Arc<AppState>) -> Response 
                     }),
                 };
             }
-            cfg.develop.workflow = wf;
+            new_workflow = wf.clone();
         }
 
-        if let Some(proto) = params.edit_protocol {
-            match EditProtocolFactory::canonical_name(&proto) {
+        let mut new_protocol = guard.config.develop.protocol.clone();
+        if let Some(ref proto) = params.edit_protocol {
+            match EditProtocolFactory::canonical_name(proto) {
                 Some(canonical) => {
-                    cfg.develop.protocol = canonical;
+                    new_protocol = canonical;
                 }
                 None => {
                     return Response {
@@ -185,7 +243,13 @@ pub async fn handle_config_set(req: Request, state: &Arc<AppState>) -> Response 
             }
         }
 
-        config_state(&cfg, Some(&cur_sel))
+        // Every requested field is valid: commit the whole change atomically.
+        guard.selection = new_selection;
+        guard.config.models.scribe = new_scribe;
+        guard.config.develop.workflow = new_workflow;
+        guard.config.develop.protocol = new_protocol;
+
+        config_state(&guard.config, Some(&guard.selection))
     };
 
     state.out.send_event(&Event {
@@ -193,82 +257,43 @@ pub async fn handle_config_set(req: Request, state: &Arc<AppState>) -> Response 
         params: serde_json::to_value(&updated_state).ok(),
     });
 
-    Response {
-        id: req.id,
-        result: serde_json::to_value(updated_state).ok(),
-        error: None,
-    }
+    Response::ok_typed(req.id, &updated_state)
 }
 
 pub async fn handle_system_status(req: Request, state: &Arc<AppState>) -> Response {
-    let repo_state = tauqe_core::git::get_repository_state(None);
-    let repo_path = Path::new(&repo_state.root);
-    let repo_opt = if !repo_path.as_os_str().is_empty() {
-        Some(repo_path)
-    } else {
-        None
-    };
+    let repo_root = resolved_repo_root(state).await;
+    let repo_opt = repo_root.as_deref();
 
-    let cur_sel = state.current_selection.lock().await;
-    let cfg = state.config.lock().await;
-    let config_file = tauqe_core::config::find_config_file(repo_opt);
-    let has_config = config_file.is_some();
-    let config_path = config_file.map(|p| p.to_string_lossy().to_string());
-    let default_config_path = tauqe_core::config::default_config_path(repo_opt)
-        .to_string_lossy()
-        .to_string();
+    let guard = state.config.lock().await;
+    let status = build_system_status(&guard.config, &guard.selection, repo_opt, None, None);
 
-    let has_api_key = tauqe_core::config::has_openrouter_key(&cfg);
-    let credentials_file = tauqe_core::config::find_credentials_file(repo_opt);
-    let credentials_path = credentials_file.map(|p| p.to_string_lossy().to_string());
-    let default_credentials_path = tauqe_core::config::default_credentials_path(repo_opt)
-        .to_string_lossy()
-        .to_string();
-
-    let has_git = tauqe_core::git::is_git_repository(None);
-    let ready = has_git && has_api_key;
-    let effective_model = cfg.resolve_model(&cur_sel);
-
-    let status = SystemStatusResult {
-        has_git,
-        has_config,
-        config_path,
-        default_config_path,
-        has_api_key,
-        credentials_path,
-        default_credentials_path,
-        ready,
-        model: effective_model,
-        selection: Some((*cur_sel).clone()),
-        roles: Some(cfg.roles_summary()),
-        history_model: Some(cfg.history_model()),
-        available_models: cfg.available_models(),
-    };
-
-    Response {
-        id: req.id,
-        result: serde_json::to_value(status).ok(),
-        error: None,
-    }
+    Response::ok_typed(req.id, &status)
 }
 
 pub async fn handle_config_reload(req: Request, state: &Arc<AppState>) -> Response {
-    let repo_state = tauqe_core::git::get_repository_state(None);
-    let repo_path = Path::new(&repo_state.root);
-    let repo_opt = if !repo_path.as_os_str().is_empty() {
-        Some(repo_path)
-    } else {
-        None
-    };
+    if state.is_operation_active() {
+        return Response {
+            id: req.id,
+            result: None,
+            error: Some(ResponseError {
+                code: "OPERATION_IN_PROGRESS".to_string(),
+                message: "Cannot reload configuration while a model operation is in progress"
+                    .to_string(),
+                data: None,
+            }),
+        };
+    }
+
+    let repo_root = resolved_repo_root(state).await;
+    let repo_opt = repo_root.as_deref();
 
     let new_cfg = load_config(repo_opt);
     let (updated_state, cur_sel_val) = {
-        let mut cur_sel = state.current_selection.lock().await;
-        *cur_sel = new_cfg.default_selection();
-        let mut cfg = state.config.lock().await;
-        *cfg = new_cfg;
-        let st = config_state(&cfg, Some(&cur_sel));
-        (st, cur_sel.clone())
+        let mut guard = state.config.lock().await;
+        guard.selection = new_cfg.default_selection();
+        guard.config = new_cfg;
+        let st = config_state(&guard.config, Some(&guard.selection));
+        (st, guard.selection.clone())
     };
 
     state.out.send_event(&Event {
@@ -276,56 +301,28 @@ pub async fn handle_config_reload(req: Request, state: &Arc<AppState>) -> Respon
         params: serde_json::to_value(&updated_state).ok(),
     });
 
-    let cfg = state.config.lock().await;
-    let config_file = tauqe_core::config::find_config_file(repo_opt);
-    let has_config = config_file.is_some();
-    let config_path = config_file.map(|p| p.to_string_lossy().to_string());
-    let default_config_path = tauqe_core::config::default_config_path(repo_opt)
-        .to_string_lossy()
-        .to_string();
+    let guard = state.config.lock().await;
+    let status = build_system_status(&guard.config, &cur_sel_val, repo_opt, None, None);
 
-    let has_api_key = tauqe_core::config::has_openrouter_key(&cfg);
-    let credentials_file = tauqe_core::config::find_credentials_file(repo_opt);
-    let credentials_path = credentials_file.map(|p| p.to_string_lossy().to_string());
-    let default_credentials_path = tauqe_core::config::default_credentials_path(repo_opt)
-        .to_string_lossy()
-        .to_string();
-
-    let has_git = tauqe_core::git::is_git_repository(None);
-    let ready = has_git && has_api_key;
-    let effective_model = cfg.resolve_model(&cur_sel_val);
-
-    let status = SystemStatusResult {
-        has_git,
-        has_config,
-        config_path,
-        default_config_path,
-        has_api_key,
-        credentials_path,
-        default_credentials_path,
-        ready,
-        model: effective_model,
-        selection: Some(cur_sel_val),
-        roles: Some(cfg.roles_summary()),
-        history_model: Some(cfg.history_model()),
-        available_models: cfg.available_models(),
-    };
-
-    Response {
-        id: req.id,
-        result: serde_json::to_value(status).ok(),
-        error: None,
-    }
+    Response::ok_typed(req.id, &status)
 }
 
 pub async fn handle_config_create(req: Request, state: &Arc<AppState>) -> Response {
-    let repo_state = tauqe_core::git::get_repository_state(None);
-    let repo_path = Path::new(&repo_state.root);
-    let repo_opt = if !repo_path.as_os_str().is_empty() {
-        Some(repo_path)
-    } else {
-        None
-    };
+    if state.is_operation_active() {
+        return Response {
+            id: req.id,
+            result: None,
+            error: Some(ResponseError {
+                code: "OPERATION_IN_PROGRESS".to_string(),
+                message: "Cannot create configuration while a model operation is in progress"
+                    .to_string(),
+                data: None,
+            }),
+        };
+    }
+
+    let repo_root = resolved_repo_root(state).await;
+    let repo_opt = repo_root.as_deref();
 
     let target_path = tauqe_core::config::default_config_path(repo_opt);
     if let Err(err) = tauqe_core::config::write_default_config(&target_path) {
@@ -342,12 +339,11 @@ pub async fn handle_config_create(req: Request, state: &Arc<AppState>) -> Respon
 
     let new_cfg = load_config(repo_opt);
     let (updated_state, cur_sel_val) = {
-        let mut cur_sel = state.current_selection.lock().await;
-        *cur_sel = new_cfg.default_selection();
-        let mut cfg = state.config.lock().await;
-        *cfg = new_cfg;
-        let st = config_state(&cfg, Some(&cur_sel));
-        (st, cur_sel.clone())
+        let mut guard = state.config.lock().await;
+        guard.selection = new_cfg.default_selection();
+        guard.config = new_cfg;
+        let st = config_state(&guard.config, Some(&guard.selection));
+        (st, guard.selection.clone())
     };
 
     state.out.send_event(&Event {
@@ -355,60 +351,34 @@ pub async fn handle_config_create(req: Request, state: &Arc<AppState>) -> Respon
         params: serde_json::to_value(&updated_state).ok(),
     });
 
-    let cfg = state.config.lock().await;
+    let guard = state.config.lock().await;
     let config_path = Some(target_path.to_string_lossy().to_string());
-    let default_config_path = target_path.to_string_lossy().to_string();
+    let status = build_system_status(&guard.config, &cur_sel_val, repo_opt, config_path, None);
 
-    let has_api_key = tauqe_core::config::has_openrouter_key(&cfg);
-    let credentials_file = tauqe_core::config::find_credentials_file(repo_opt);
-    let credentials_path = credentials_file.map(|p| p.to_string_lossy().to_string());
-    let default_credentials_path = tauqe_core::config::default_credentials_path(repo_opt)
-        .to_string_lossy()
-        .to_string();
-
-    let effective_model = cfg.resolve_model(&cur_sel_val);
-
-    let has_git = tauqe_core::git::is_git_repository(None);
-
-    let status = SystemStatusResult {
-        has_git,
-        has_config: true,
-        config_path,
-        default_config_path,
-        has_api_key,
-        credentials_path,
-        default_credentials_path,
-        ready: has_api_key,
-        model: effective_model,
-        selection: Some(cur_sel_val),
-        roles: Some(cfg.roles_summary()),
-        history_model: Some(cfg.history_model()),
-        available_models: cfg.available_models(),
-    };
-
-    Response {
-        id: req.id,
-        result: serde_json::to_value(status).ok(),
-        error: None,
-    }
+    Response::ok_typed(req.id, &status)
 }
 
 pub async fn handle_credentials_save(req: Request, state: &Arc<AppState>) -> Response {
-    let repo_state = tauqe_core::git::get_repository_state(None);
-    let repo_path = Path::new(&repo_state.root);
-    let repo_opt = if !repo_path.as_os_str().is_empty() {
-        Some(repo_path)
-    } else {
-        None
+    let repo_root = resolved_repo_root(state).await;
+    let repo_opt = repo_root.as_deref();
+
+    let params: CredentialsSaveParams = match req.params.and_then(|p| serde_json::from_value(p).ok())
+    {
+        Some(p) => p,
+        None => {
+            return Response {
+                id: req.id,
+                result: None,
+                error: Some(ResponseError {
+                    code: "INVALID_PARAMS".to_string(),
+                    message: "Missing or invalid parameters".to_string(),
+                    data: None,
+                }),
+            };
+        }
     };
 
-    let api_key = req
-        .params
-        .as_ref()
-        .and_then(|p| p.get("api_key"))
-        .and_then(|k| k.as_str())
-        .unwrap_or("")
-        .trim();
+    let api_key = params.api_key.trim();
 
     if api_key.is_empty() {
         return Response {
@@ -440,11 +410,10 @@ pub async fn handle_credentials_save(req: Request, state: &Arc<AppState>) -> Res
 
     let new_cfg = load_config(repo_opt);
     let (updated_state, cur_sel_val) = {
-        let cur_sel = state.current_selection.lock().await;
-        let mut cfg = state.config.lock().await;
-        *cfg = new_cfg;
-        let st = config_state(&cfg, Some(&cur_sel));
-        (st, cur_sel.clone())
+        let mut guard = state.config.lock().await;
+        guard.config = new_cfg;
+        let st = config_state(&guard.config, Some(&guard.selection));
+        (st, guard.selection.clone())
     };
 
     state.out.send_event(&Event {
@@ -452,52 +421,16 @@ pub async fn handle_credentials_save(req: Request, state: &Arc<AppState>) -> Res
         params: serde_json::to_value(&updated_state).ok(),
     });
 
-    let cfg = state.config.lock().await;
-    let config_file = tauqe_core::config::find_config_file(repo_opt);
-    let has_config = config_file.is_some();
-    let config_path = config_file.map(|p| p.to_string_lossy().to_string());
-    let default_config_path = tauqe_core::config::default_config_path(repo_opt)
-        .to_string_lossy()
-        .to_string();
-
-    let has_api_key = tauqe_core::config::has_openrouter_key(&cfg);
+    let guard = state.config.lock().await;
     let credentials_path = Some(target_path.to_string_lossy().to_string());
-    let default_credentials_path = target_path.to_string_lossy().to_string();
-    let effective_model = cfg.resolve_model(&cur_sel_val);
+    let status = build_system_status(&guard.config, &cur_sel_val, repo_opt, None, credentials_path);
 
-    let has_git = tauqe_core::git::is_git_repository(None);
-
-    let status = SystemStatusResult {
-        has_git,
-        has_config,
-        config_path,
-        default_config_path,
-        has_api_key,
-        credentials_path,
-        default_credentials_path,
-        ready: has_api_key,
-        model: effective_model,
-        selection: Some(cur_sel_val),
-        roles: Some(cfg.roles_summary()),
-        history_model: Some(cfg.history_model()),
-        available_models: cfg.available_models(),
-    };
-
-    Response {
-        id: req.id,
-        result: serde_json::to_value(status).ok(),
-        error: None,
-    }
+    Response::ok_typed(req.id, &status)
 }
 
 pub async fn handle_credentials_create_stub(req: Request, state: &Arc<AppState>) -> Response {
-    let repo_state = tauqe_core::git::get_repository_state(None);
-    let repo_path = Path::new(&repo_state.root);
-    let repo_opt = if !repo_path.as_os_str().is_empty() {
-        Some(repo_path)
-    } else {
-        None
-    };
+    let repo_root = resolved_repo_root(state).await;
+    let repo_opt = repo_root.as_deref();
 
     let target_path = tauqe_core::config::default_credentials_path(repo_opt);
     if let Err(err) = tauqe_core::config::write_credentials_stub(&target_path) {
@@ -515,43 +448,12 @@ pub async fn handle_credentials_create_stub(req: Request, state: &Arc<AppState>)
         };
     }
 
-    let cur_sel = state.current_selection.lock().await;
-    let cfg = state.config.lock().await;
-    let config_file = tauqe_core::config::find_config_file(repo_opt);
-    let has_config = config_file.is_some();
-    let config_path = config_file.map(|p| p.to_string_lossy().to_string());
-    let default_config_path = tauqe_core::config::default_config_path(repo_opt)
-        .to_string_lossy()
-        .to_string();
-
-    let has_api_key = tauqe_core::config::has_openrouter_key(&cfg);
+    let guard = state.config.lock().await;
     let credentials_path = Some(target_path.to_string_lossy().to_string());
-    let default_credentials_path = target_path.to_string_lossy().to_string();
-    let effective_model = cfg.resolve_model(&cur_sel);
+    let status =
+        build_system_status(&guard.config, &guard.selection, repo_opt, None, credentials_path);
 
-    let has_git = tauqe_core::git::is_git_repository(None);
-
-    let status = SystemStatusResult {
-        has_git,
-        has_config,
-        config_path,
-        default_config_path,
-        has_api_key,
-        credentials_path,
-        default_credentials_path,
-        ready: has_api_key,
-        model: effective_model,
-        selection: Some((*cur_sel).clone()),
-        roles: Some(cfg.roles_summary()),
-        history_model: Some(cfg.history_model()),
-        available_models: cfg.available_models(),
-    };
-
-    Response {
-        id: req.id,
-        result: serde_json::to_value(status).ok(),
-        error: None,
-    }
+    Response::ok_typed(req.id, &status)
 }
 
 #[cfg(test)]
@@ -564,9 +466,9 @@ mod tests {
         let mut cfg = AppConfig::default();
         cfg.models.scribe = Some(ModelRef::openrouter("anthropic/claude-3.5-haiku"));
         cfg.models.coder = Some(ModelRef::openrouter("anthropic/claude-3.7-sonnet").into());
-        cfg.models.architect = Some(ModelRef::openrouter("anthropic/claude-3.7-sonnet"));
+        cfg.models.architect = Some(ModelRef::openrouter("anthropic/claude-3.7-sonnet").into());
         cfg.models.advisor = Some(ModelRef::openrouter("google/gemini-2.5-flash"));
-        cfg.models.reviewer = Some(ModelRef::openrouter("anthropic/claude-3.7-sonnet"));
+        cfg.models.reviewer = Some(ModelRef::openrouter("anthropic/claude-3.7-sonnet").into());
 
         let st = config_state(&cfg, None);
         assert_eq!(

@@ -91,6 +91,22 @@ pub async fn handle_request(req: Request, state: &Arc<AppState>) -> Response {
 /// the batch is blocked synchronously before any LLM request or status change, so a broken
 /// tree never triggers a wasted self-healing loop. Repositories without a detected
 /// toolchain pass transparently.
+/// Executes a blocking closure on the Tokio blocking pool.
+///
+/// Repository handlers perform synchronous git subprocess and file I/O. Running
+/// that work directly on an async worker thread starves the runtime, so it is
+/// offloaded here. A cancelled or panicked task degrades to an error string
+/// instead of crashing the daemon.
+pub(crate) async fn offload<T, F>(f: F) -> Result<T, String>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(f)
+        .await
+        .map_err(|err| format!("blocking task failed: {}", err))
+}
+
 pub(crate) async fn run_preflight_verification(repo_root: &Path) -> Result<(), String> {
     let (ok, results) =
         tauqe_core::toolchain::run_verification_pipeline(repo_root, &VerifyTarget::All).await;
@@ -115,11 +131,16 @@ pub(crate) async fn run_preflight_verification(repo_root: &Path) -> Result<(), S
 async fn handle_client_initialize(req: Request, state: &Arc<AppState>) -> Response {
     let repo_state = tauqe_core::git::get_repository_state(None);
     let repo_path = Path::new(&repo_state.root);
-    let mut cfg = state.config.lock().await;
+
+    // Update configuration and the repo-bound managers under separate, short-lived
+    // guards: no guard is ever held across another subsystem's `.await`.
     if !repo_path.as_os_str().is_empty() {
         let loaded = load_config(Some(repo_path));
-        *state.current_selection.lock().await = loaded.default_selection();
-        *cfg = loaded;
+        {
+            let mut guard = state.config.lock().await;
+            guard.selection = loaded.default_selection();
+            guard.config = loaded;
+        }
         {
             let mut ctx = state.context.write().await;
             ctx.set_repo_root(repo_path.to_path_buf());
@@ -133,8 +154,15 @@ async fn handle_client_initialize(req: Request, state: &Arc<AppState>) -> Respon
         *history = hm;
     }
 
-    let selection = state.current_selection.lock().await.clone();
-    let effective_model = cfg.resolve_model(&selection);
+    let (effective_model, workflow, edit_protocol, available_models) = {
+        let guard = state.config.lock().await;
+        (
+            guard.config.resolve_model(&guard.selection),
+            guard.config.develop.workflow.clone(),
+            guard.config.develop.protocol.clone(),
+            guard.config.available_models(),
+        )
+    };
 
     let result = InitializeResult {
         protocol_version: PROTOCOL_VERSION.to_string(),
@@ -142,9 +170,9 @@ async fn handle_client_initialize(req: Request, state: &Arc<AppState>) -> Respon
         server_version: env!("CARGO_PKG_VERSION").to_string(),
         repository: Some(repo_state),
         model: effective_model,
-        workflow: Some(cfg.develop.workflow.clone()),
-        edit_protocol: Some(cfg.develop.protocol.clone()),
-        available_models: cfg.available_models(),
+        workflow: Some(workflow),
+        edit_protocol: Some(edit_protocol),
+        available_models,
         available_workflows: WorkflowFactory::available_workflows(),
         available_edit_protocols: EditProtocolFactory::available_protocols(),
     };

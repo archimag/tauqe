@@ -49,15 +49,12 @@ impl PromptProtocol for JsonPromptProtocol {
             }
         }
 
-        // Discovery: context requests and drops.
+        // Discovery: context requests.
         for request in structured.parse_context_requests(raw_text) {
             commands.push(LlmCommand::ContextRequest {
                 path: request.path,
                 access: request.access,
             });
-        }
-        for path in structured.parse_context_drops(raw_text) {
-            commands.push(LlmCommand::ContextDrop { path });
         }
 
         // Toolchain verification decoded from control tags when present.
@@ -185,9 +182,9 @@ mod tests {
     }
 
     #[test]
-    fn test_decode_discovery_requests_and_drops() {
+    fn test_decode_discovery_requests() {
         let protocol = JsonPromptProtocol;
-        let output = r#"{"message":"Need more context","changes":[],"context_requests":["src/a.rs","editable:src/b.rs"],"context_drops":["src/old.rs"],"suggested_actions":[]}"#;
+        let output = r#"{"message":"Need more context","changes":[],"context_requests":["src/a.rs","editable:src/b.rs"],"suggested_actions":[]}"#;
         let commands = protocol.decode(output);
 
         assert!(commands.contains(&LlmCommand::ContextRequest {
@@ -197,9 +194,6 @@ mod tests {
         assert!(commands.contains(&LlmCommand::ContextRequest {
             path: "src/b.rs".to_string(),
             access: ContextAccess::Editable,
-        }));
-        assert!(commands.contains(&LlmCommand::ContextDrop {
-            path: "src/old.rs".to_string(),
         }));
     }
 

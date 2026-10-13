@@ -687,8 +687,8 @@ mod tests {
         let dialog = ReviewDialogState {
             files_count: 2,
             estimated_tokens: 100,
-            models: vec![ModelRef::openrouter("test-model")],
-            model_index: 0,
+            reviewer_model: ModelRef::openrouter("test-model"),
+            reviewer_effort: None,
             prompt_editor: crate::editor::InputEditor::default(),
             confirm_button: crate::app::ConfirmDialogButton::Cancel,
         };

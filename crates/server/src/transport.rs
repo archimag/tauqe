@@ -14,14 +14,20 @@ impl OutChannel {
     }
 
     pub fn send_response(&self, resp: &Response) {
-        if let Ok(line) = serde_json::to_string(resp) {
-            let _ = self.tx.send(line + "\n");
+        match serde_json::to_string(resp) {
+            Ok(line) => {
+                let _ = self.tx.send(line + "\n");
+            }
+            Err(err) => tracing::error!("failed to serialize response {:?}: {}", resp.id, err),
         }
     }
 
     pub fn send_event(&self, event: &Event) {
-        if let Ok(line) = serde_json::to_string(event) {
-            let _ = self.tx.send(line + "\n");
+        match serde_json::to_string(event) {
+            Ok(line) => {
+                let _ = self.tx.send(line + "\n");
+            }
+            Err(err) => tracing::error!("failed to serialize event '{}': {}", event.method, err),
         }
     }
 }

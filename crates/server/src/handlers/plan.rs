@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -12,15 +13,16 @@ use tauqe_core::workflow::batch::{
 };
 use tauqe_core::workflow::common::apply_context_requests_detailed;
 use tauqe_protocol::{
-    events, BatchFinishStatus, BatchFinishSummary, ContextAccess, Event, ModelRole, ModelSelection,
-    Plan, PlanBatchFinishedEvent, PlanDeleteParams, PlanExecuteParams, PlanGetParams, PlanGetResult,
+    errors, events, BatchFinishStatus, BatchFinishSummary, ContextAccess, Event, ModelDeltaEvent,
+    ModelErrorEvent, ModelFinishedEvent, ModelRole, ModelSelection, ModelStartedEvent, Plan,
+    PlanBatchFinishedEvent, PlanDeleteParams, PlanExecuteParams, PlanGetParams, PlanGetResult,
     PlanItem, PlanItemStatus, PlanListChangedEvent, PlanListResult, PlanRefineParams,
     PlanRefineResult, PlanSaveParams, PlanScopeEvaluation, PlanSetActiveParams, PlanUpdateItemParams,
     PlanUpdatedEvent, Request, Response, TurnPhase, TurnPhaseEvent,
 };
 use tokio::sync::{mpsc, watch};
 
-use crate::state::{ActiveOperation, AppState};
+use crate::state::{AppState, OperationGuard};
 use crate::transport::OutChannel;
 
 fn emit(out: &OutChannel, method: &str, params: Option<serde_json::Value>) {
@@ -30,13 +32,44 @@ fn emit(out: &OutChannel, method: &str, params: Option<serde_json::Value>) {
     });
 }
 
+/// Returns the first duplicate or empty step ID found in a plan item tree, if any.
+///
+/// Architect and client payloads are not trusted: a repeated ID would make
+/// `Plan::find_item` ambiguous and let one step silently shadow another, while an
+/// empty ID cannot be addressed at all. Such a tree is rejected before persistence.
+fn find_duplicate_item_ids(items: &[PlanItem]) -> Option<String> {
+    fn walk(items: &[PlanItem], seen: &mut HashSet<String>) -> Option<String> {
+        for item in items {
+            let key = item.id.trim().to_ascii_lowercase();
+            if key.is_empty() || !seen.insert(key) {
+                return Some(item.id.clone());
+            }
+            if let Some(duplicate) = walk(&item.children, seen) {
+                return Some(duplicate);
+            }
+        }
+        None
+    }
+    walk(items, &mut HashSet::new())
+}
+
+/// Rejects plan IDs that are empty or contain path separators.
+///
+/// `PlanStorage` maps a plan ID onto `<repo>/.tauqe/plans/<id>.json` and sanitizes it
+/// before building the path, so directory traversal is already blocked. Rejecting
+/// separator-bearing and empty IDs at the boundary keeps the persisted ID and its file
+/// name consistent and gives a deterministic error.
+fn is_valid_plan_id(id: &str) -> bool {
+    !id.trim().is_empty() && !id.contains('/') && !id.contains('\\')
+}
+
 pub async fn handle_plan_list(req: Request, state: &Arc<AppState>) -> Response {
     let repo_root = state.context.read().await.repo_root().to_path_buf();
     match PlanStorage::load_all(&repo_root) {
         Ok(plans) => {
             Response::ok_typed(req.id, &PlanListResult { plans, active_id: None })
         }
-        Err(err) => Response::err(req.id, "PLAN_LIST_FAILED", format!("{:#}", err)),
+        Err(err) => Response::err(req.id, errors::PLAN_LIST_FAILED, format!("{:#}", err)),
     }
 }
 
@@ -81,7 +114,7 @@ pub async fn handle_plan_get(req: Request, state: &Arc<AppState>) -> Response {
     match plan_id {
         Some(id) => match PlanStorage::load_plan(&repo_root, &id) {
             Ok(plan) => Response::ok_typed(req.id, &PlanGetResult { plan }),
-            Err(err) => Response::err(req.id, "PLAN_GET_FAILED", format!("{:#}", err)),
+            Err(err) => Response::err(req.id, errors::PLAN_GET_FAILED, format!("{:#}", err)),
         },
         None => Response::ok_typed(req.id, &PlanGetResult { plan: None }),
     }
@@ -90,21 +123,37 @@ pub async fn handle_plan_get(req: Request, state: &Arc<AppState>) -> Response {
 pub async fn handle_plan_save(req: Request, state: &Arc<AppState>) -> Response {
     let params: PlanSaveParams = match req.params.and_then(|p| serde_json::from_value(p).ok()) {
         Some(p) => p,
-        None => return Response::err(req.id, "INVALID_PARAMS", "Missing or invalid plan payload"),
+        None => return Response::err(req.id, errors::INVALID_PARAMS, "Missing or invalid plan payload"),
     };
 
+    if !is_valid_plan_id(&params.plan.id) {
+        return Response::err(
+            req.id,
+            errors::INVALID_PLAN_ID,
+            "Plan ID must be non-empty and must not contain path separators",
+        );
+    }
+    if let Some(duplicate) = find_duplicate_item_ids(&params.plan.items) {
+        return Response::err(
+            req.id,
+            errors::INVALID_PLAN_TREE,
+            format!("Plan contains a duplicate or empty step ID: '{}'", duplicate),
+        );
+    }
+
+    // Normalize before persisting so the emitted event matches the stored plan.
+    let mut plan = params.plan;
+    plan.normalize_leaf_files();
+
     let repo_root = state.context.read().await.repo_root().to_path_buf();
-    if let Err(err) = PlanStorage::save_plan(&repo_root, &params.plan) {
-        return Response::err(req.id, "PLAN_SAVE_FAILED", format!("{:#}", err));
+    if let Err(err) = PlanStorage::save_plan(&repo_root, &plan) {
+        return Response::err(req.id, errors::PLAN_SAVE_FAILED, format!("{:#}", err));
     }
 
     emit(
         &state.out,
         events::PLAN_UPDATED,
-        serde_json::to_value(PlanUpdatedEvent {
-            plan: params.plan.clone(),
-        })
-        .ok(),
+        serde_json::to_value(PlanUpdatedEvent { plan: plan.clone() }).ok(),
     );
 
     if let Ok(plans) = PlanStorage::load_all(&repo_root) {
@@ -121,7 +170,7 @@ pub async fn handle_plan_save(req: Request, state: &Arc<AppState>) -> Response {
 pub async fn handle_plan_update_item(req: Request, state: &Arc<AppState>) -> Response {
     let params: PlanUpdateItemParams = match req.params.and_then(|p| serde_json::from_value(p).ok()) {
         Some(p) => p,
-        None => return Response::err(req.id, "INVALID_PARAMS", "Missing or invalid update item params"),
+        None => return Response::err(req.id, errors::INVALID_PARAMS, "Missing or invalid update item params"),
     };
 
     let repo_root = state.context.read().await.repo_root().to_path_buf();
@@ -151,17 +200,17 @@ pub async fn handle_plan_update_item(req: Request, state: &Arc<AppState>) -> Res
         }
         Ok(None) => Response::err(
             req.id,
-            "NOT_FOUND",
+            errors::NOT_FOUND,
             format!("Item '{}' not found in plan '{}'", params.item_id, params.plan_id),
         ),
-        Err(err) => Response::err(req.id, "PLAN_UPDATE_FAILED", format!("{:#}", err)),
+        Err(err) => Response::err(req.id, errors::PLAN_UPDATE_FAILED, format!("{:#}", err)),
     }
 }
 
 pub async fn handle_plan_delete(req: Request, state: &Arc<AppState>) -> Response {
     let params: PlanDeleteParams = match req.params.and_then(|p| serde_json::from_value(p).ok()) {
         Some(p) => p,
-        None => return Response::err(req.id, "INVALID_PARAMS", "Missing or invalid plan ID"),
+        None => return Response::err(req.id, errors::INVALID_PARAMS, "Missing or invalid plan ID"),
     };
 
     let repo_root = state.context.read().await.repo_root().to_path_buf();
@@ -178,19 +227,30 @@ pub async fn handle_plan_delete(req: Request, state: &Arc<AppState>) -> Response
             }
             Response::ok(req.id, serde_json::json!({ "deleted": deleted }))
         }
-        Err(err) => Response::err(req.id, "PLAN_DELETE_FAILED", format!("{:#}", err)),
+        Err(err) => Response::err(req.id, errors::PLAN_DELETE_FAILED, format!("{:#}", err)),
     }
 }
 
 pub async fn handle_plan_set_active(req: Request, state: &Arc<AppState>) -> Response {
+    // A present payload must parse cleanly: a silent fallback to the default would
+    // clear the active plan when the payload is malformed.
     let params: PlanSetActiveParams = match req.params {
-        Some(p) => serde_json::from_value(p).unwrap_or_default(),
+        Some(p) => match serde_json::from_value(p) {
+            Ok(params) => params,
+            Err(err) => {
+                return Response::err(
+                    req.id,
+                    errors::INVALID_PARAMS,
+                    format!("Invalid set active parameters: {}", err),
+                );
+            }
+        },
         None => PlanSetActiveParams::default(),
     };
 
     let repo_root = state.context.read().await.repo_root().to_path_buf();
     if let Err(err) = PlanStorage::save_active_id(&repo_root, params.id.as_deref()) {
-        return Response::err(req.id, "PLAN_SET_ACTIVE_FAILED", format!("{:#}", err));
+        return Response::err(req.id, errors::PLAN_SET_ACTIVE_FAILED, format!("{:#}", err));
     }
 
     if let Ok(plans) = PlanStorage::load_all(&repo_root) {
@@ -264,10 +324,11 @@ fn report_step_failure(state: &Arc<AppState>, operation_id: &str, message: &str)
     emit(
         &state.out,
         events::MODEL_ERROR,
-        Some(serde_json::json!({
-            "operation_id": operation_id,
-            "message": message,
-        })),
+        serde_json::to_value(ModelErrorEvent {
+            operation_id: operation_id.to_string(),
+            message: message.to_string(),
+        })
+        .ok(),
     );
 }
 
@@ -306,6 +367,207 @@ async fn preload_step_files(state: &Arc<AppState>, repo_root: &Path, item: &Plan
             Some(serde_json::json!({ "state": new_ctx_state })),
         );
     }
+}
+
+/// Resolves the LLM provider for architect plan operations (refine and replan),
+/// consulting the test override in test configurations before falling back to
+/// network provider construction.
+async fn resolve_architect_provider(
+    _state: &Arc<AppState>,
+    cfg: &tauqe_core::config::AppConfig,
+    provider_kind: tauqe_protocol::ProviderKind,
+) -> Result<Arc<dyn LlmProvider>, String> {
+    #[cfg(test)]
+    {
+        if let Some(p) = _state.provider_override.lock().await.clone() {
+            return Ok(p);
+        }
+    }
+    create_provider(provider_kind, cfg)
+        .map(Arc::from)
+        .map_err(|err| err.to_string())
+}
+
+struct ArchitectStreamOutcome {
+    raw_text: String,
+    streamed_explanation_bytes: usize,
+}
+
+enum ArchitectStreamError {
+    Cancelled,
+    ModelError(String),
+}
+
+/// Executes a streaming structured-chat turn with the architect model, streaming
+/// reasoning deltas and explanation text deltas to the client, handling cancellation
+/// and errors, and committing token usage to session state.
+#[allow(clippy::too_many_arguments)]
+async fn run_architect_stream(
+    state: &Arc<AppState>,
+    provider: Arc<dyn LlmProvider>,
+    model_name: String,
+    messages: Vec<ChatMessage>,
+    response_format: Option<ResponseFormat>,
+    reasoning_effort: Option<tauqe_protocol::ReasoningEffort>,
+    operation: &OperationGuard,
+    op_id: &str,
+) -> Result<ArchitectStreamOutcome, ArchitectStreamError> {
+    let cancel_rx = operation.cancel_receiver();
+    let (tx, mut rx) = mpsc::channel::<StreamEvent>(100);
+    let stream_cancel = cancel_rx.clone();
+    let provider_stream = Arc::clone(&provider);
+
+    let stream_task = tokio::spawn(async move {
+        provider_stream
+            .stream_chat_with_effort(
+                &model_name,
+                messages,
+                response_format,
+                reasoning_effort,
+                tx,
+                stream_cancel,
+            )
+            .await
+    });
+
+    operation.set_abort_handle(stream_task.abort_handle());
+
+    let mut raw_text = String::new();
+    let mut usage = None;
+    let mut failure = None;
+    let mut passthrough: Option<bool> = None;
+    let mut streamed_explanation_bytes = 0usize;
+
+    while let Some(event) = rx.recv().await {
+        match event {
+            StreamEvent::ReasoningDelta(delta) => {
+                state.out.send_event(&Event {
+                    method: events::MODEL_REASONING_DELTA.to_string(),
+                    params: Some(serde_json::json!({
+                        "operation_id": op_id,
+                        "delta": delta,
+                    })),
+                });
+            }
+            StreamEvent::TextDelta(delta) => {
+                raw_text.push_str(&delta);
+
+                if passthrough.is_none() {
+                    if let Some(c) = raw_text.chars().find(|c| !c.is_whitespace()) {
+                        let plain = c != '{' && c != '`';
+                        passthrough = Some(plain);
+                        if plain {
+                            state.out.send_event(&Event {
+                                method: events::MODEL_TEXT_DELTA.to_string(),
+                                params: serde_json::to_value(ModelDeltaEvent {
+                                    operation_id: op_id.to_string(),
+                                    delta: raw_text.clone(),
+                                })
+                                .ok(),
+                            });
+                        }
+                    }
+                } else if passthrough == Some(true) {
+                    state.out.send_event(&Event {
+                        method: events::MODEL_TEXT_DELTA.to_string(),
+                        params: serde_json::to_value(ModelDeltaEvent {
+                            operation_id: op_id.to_string(),
+                            delta,
+                        })
+                        .ok(),
+                    });
+                }
+
+                if passthrough != Some(true) {
+                    let (field_delta, new_streamed, _) =
+                        tauqe_core::edits::stream::json::extract_streamed_string_field(
+                            &raw_text,
+                            "explanation",
+                            streamed_explanation_bytes,
+                        );
+                    if let Some(d) = field_delta {
+                        if !d.is_empty() {
+                            state.out.send_event(&Event {
+                                method: events::MODEL_TEXT_DELTA.to_string(),
+                                params: serde_json::to_value(ModelDeltaEvent {
+                                    operation_id: op_id.to_string(),
+                                    delta: d,
+                                })
+                                .ok(),
+                            });
+                        }
+                    }
+                    streamed_explanation_bytes = new_streamed;
+                }
+            }
+            StreamEvent::Usage(u) => usage = Some(u),
+            StreamEvent::Done | StreamEvent::Cancelled => break,
+            StreamEvent::Error(err) => {
+                failure = Some(err);
+                break;
+            }
+            _ => {}
+        }
+    }
+
+    let cancelled = *cancel_rx.borrow();
+    if cancelled {
+        stream_task.abort();
+        state.out.send_event(&Event {
+            method: events::MODEL_CANCELLED.to_string(),
+            params: Some(serde_json::json!({ "operation_id": op_id })),
+        });
+        return Err(ArchitectStreamError::Cancelled);
+    }
+    if let Some(err) = failure {
+        stream_task.abort();
+        state.out.send_event(&Event {
+            method: events::MODEL_ERROR.to_string(),
+            params: serde_json::to_value(ModelErrorEvent {
+                operation_id: op_id.to_string(),
+                message: err.clone(),
+            })
+            .ok(),
+        });
+        return Err(ArchitectStreamError::ModelError(err));
+    }
+
+    if let Err(join_err) = stream_task.await {
+        let err_msg = join_err.to_string();
+        state.out.send_event(&Event {
+            method: events::MODEL_ERROR.to_string(),
+            params: serde_json::to_value(ModelErrorEvent {
+                operation_id: op_id.to_string(),
+                message: err_msg.clone(),
+            })
+            .ok(),
+        });
+        return Err(ArchitectStreamError::ModelError(err_msg));
+    }
+
+    let usage = usage.unwrap_or_default();
+    let cost = usage.cost.unwrap_or(0.0);
+    let total_cost = {
+        let mut total = state.total_cost.lock().await;
+        *total += cost;
+        *total
+    };
+
+    state.out.send_event(&Event {
+        method: events::MODEL_USAGE.to_string(),
+        params: serde_json::to_value(tauqe_protocol::ModelUsageEvent {
+            operation_id: op_id.to_string(),
+            usage,
+            session_total_cost: total_cost,
+            current_cost: Some(cost),
+        })
+        .ok(),
+    });
+
+    Ok(ArchitectStreamOutcome {
+        raw_text,
+        streamed_explanation_bytes,
+    })
 }
 
 /// Clears the transient auto context layer so a retried attempt starts from a
@@ -356,40 +618,48 @@ fn unmet_dependencies(plan: &Plan, item: &PlanItem) -> Vec<String> {
 
 /// Executes one step in an isolated turn, retrying with corrective feedback while
 /// the attempt budget lasts. The step becomes DONE only when a turn satisfies the
-/// success contract; once all attempts are exhausted it returns to TODO.
+/// success contract; once all attempts are exhausted it returns to TODO. The step
+/// reports a typed [`BatchStepOutcome`] so the supervisor can distinguish a
+/// completed step from a failed, semantically blocked, or cancelled one.
 async fn run_plan_step(
     state: &Arc<AppState>,
     repo_root: &Path,
     plan_id: &str,
     step_id: &str,
     batch_step_ids: &[String],
-) -> Result<(), String> {
+    operation: Arc<OperationGuard>,
+) -> BatchStepOutcome {
     let plan = match PlanStorage::load_plan(repo_root, plan_id) {
         Ok(Some(p)) => p,
-        Ok(None) => return Err(format!("Plan '{}' not found", plan_id)),
-        Err(err) => return Err(format!("{:#}", err)),
+        Ok(None) => return BatchStepOutcome::failed(format!("Plan '{}' not found", plan_id)),
+        Err(err) => return BatchStepOutcome::failed(format!("{:#}", err)),
     };
     let item = match plan.find_item(step_id) {
         Some(i) => i.clone(),
-        None => return Err(format!("Step '{}' not found in plan '{}'", step_id, plan_id)),
+        None => {
+            return BatchStepOutcome::failed(format!(
+                "Step '{}' not found in plan '{}'",
+                step_id, plan_id
+            ))
+        }
     };
 
     match item.status {
-        PlanItemStatus::Done => return Ok(()),
+        PlanItemStatus::Done => return BatchStepOutcome::succeeded(),
         PlanItemStatus::Discussion => {
-            return Err(format!(
+            return BatchStepOutcome::failed(format!(
                 "Step '{}' ({}) is in DISCUSSION status and cannot be executed until reviewed",
                 item.id, item.title
             ));
         }
         PlanItemStatus::Blocked => {
-            return Err(format!(
+            return BatchStepOutcome::failed(format!(
                 "Step '{}' ({}) is BLOCKED; resolve the reported blocker and replan before executing",
                 item.id, item.title
             ));
         }
         PlanItemStatus::Cancelled => {
-            return Err(format!(
+            return BatchStepOutcome::failed(format!(
                 "Step '{}' ({}) is CANCELLED and cannot be executed",
                 item.id, item.title
             ));
@@ -403,7 +673,7 @@ async fn run_plan_step(
     // between the steps of a single run.
     let unmet = unmet_dependencies(&plan, &item);
     if !unmet.is_empty() {
-        return Err(format!(
+        return BatchStepOutcome::failed(format!(
             "Step '{}' ({}) depends on step(s) that are not DONE: {}. Complete the prerequisites first",
             item.id,
             item.title,
@@ -430,12 +700,12 @@ async fn run_plan_step(
         Ok(p) => p,
         Err(err) => {
             set_step_status(state, repo_root, plan_id, step_id, PlanItemStatus::Todo);
-            return Err(err);
+            return BatchStepOutcome::failed(err);
         }
     };
 
     let (max_retries, auto_level_up, models_config) = {
-        let cfg = state.config.lock().await;
+        let cfg = state.config.lock().await.config.clone();
         (
             cfg.develop.max_retries,
             cfg.models.auto_level_up,
@@ -449,11 +719,8 @@ async fn run_plan_step(
     let mut attempt = 0usize;
 
     loop {
-        let workflow_name = state.config.lock().await.develop.workflow.trim().to_lowercase();
-        let policy: Box<dyn tauqe_core::workflow::policy::ApplyPolicy> = match workflow_name.as_str() {
-            "naive" => Box::new(tauqe_core::workflow::policy::DirectApplyPolicy::new()),
-            _ => Box::new(tauqe_core::workflow::git_policy::GitTransactionPolicy::new()),
-        };
+        let workflow_name = state.config.lock().await.config.develop.workflow.trim().to_lowercase();
+        let policy = crate::handlers::model::build_apply_policy(state, &workflow_name);
 
         let plan_context = tauqe_protocol::ModelTurnPlanContext {
             plan_id: plan_id.to_string(),
@@ -464,11 +731,14 @@ async fn run_plan_step(
         let turn_result = crate::handlers::model::execute_model_turn(
             state,
             prompt.clone(),
-            Some(selection.clone()),
-            Some(plan_context),
-            reasoning_effort,
-            marker.clone(),
             policy,
+            crate::handlers::model::StepTurnOptions {
+                custom_selection: Some(selection.clone()),
+                plan_context: Some(plan_context),
+                reasoning_effort,
+                marker: marker.clone(),
+                shared_operation: Some(Arc::clone(&operation)),
+            },
         )
         .await;
 
@@ -478,24 +748,34 @@ async fn run_plan_step(
                 set_step_status(state, repo_root, plan_id, step_id, PlanItemStatus::Todo);
                 let op_id = format!("op-{}", crate::state::next_operation_id());
                 report_step_failure(state, &op_id, &err.message);
-                return Err(err.message);
+                return BatchStepOutcome::failed(err.message);
             }
         };
 
         // Semantic block: the coder reports that the step preconditions cannot
         // be satisfied as stated. Record the step as BLOCKED, preserving the
-        // coder's report, and stop without a retry cycle.
+        // coder's report, and stop without a retry cycle. The block is reported
+        // to the supervisor as a distinct outcome so clients can tell a blocked
+        // step apart from a plain failure.
         if let Some(reason) = turn.blocked.clone() {
             set_step_status(state, repo_root, plan_id, step_id, PlanItemStatus::Blocked);
             report_step_failure(state, &turn.operation_id, &reason);
-            return Err(reason);
+            return BatchStepOutcome::blocked(reason);
         }
 
         let applied = turn_applied_edits(&turn);
 
         if turn.is_success() && applied {
             set_step_status(state, repo_root, plan_id, step_id, PlanItemStatus::Done);
-            return Ok(());
+            return BatchStepOutcome::succeeded();
+        }
+
+        // A cancelled turn ends the batch deterministically: the step returns to
+        // TODO and the supervisor stops with `BatchStop::Cancelled` instead of
+        // reporting a spurious failure.
+        if turn.is_cancelled {
+            set_step_status(state, repo_root, plan_id, step_id, PlanItemStatus::Todo);
+            return BatchStepOutcome::cancelled();
         }
 
         let reason = turn.error.clone().unwrap_or_else(|| {
@@ -506,12 +786,12 @@ async fn run_plan_step(
             }
         });
 
-        if turn.is_cancelled || attempt >= max_retries {
+        if attempt >= max_retries {
             set_step_status(state, repo_root, plan_id, step_id, PlanItemStatus::Todo);
-            if turn.error.is_none() && !turn.is_cancelled {
+            if turn.error.is_none() {
                 report_step_failure(state, &turn.operation_id, &reason);
             }
-            return Err(reason);
+            return BatchStepOutcome::failed(reason);
         }
 
         // Reset to a clean, deterministic basis before the corrective attempt.
@@ -543,6 +823,7 @@ struct PlanStepExecutor<'a> {
     repo_root: &'a Path,
     plan_id: &'a str,
     batch_step_ids: &'a [String],
+    operation: &'a Arc<OperationGuard>,
 }
 
 #[async_trait]
@@ -553,18 +834,15 @@ impl BatchStepExecutor for PlanStepExecutor<'_> {
         _stream_tx: mpsc::Sender<StreamEvent>,
         _cancel_rx: watch::Receiver<bool>,
     ) -> anyhow::Result<BatchStepOutcome> {
-        match run_plan_step(
+        Ok(run_plan_step(
             self.state,
             self.repo_root,
             self.plan_id,
             &step.id,
             self.batch_step_ids,
+            Arc::clone(self.operation),
         )
-        .await
-        {
-            Ok(()) => Ok(BatchStepOutcome::succeeded()),
-            Err(reason) => Ok(BatchStepOutcome::failed(reason)),
-        }
+        .await)
     }
 }
 
@@ -577,6 +855,7 @@ async fn run_plan_batch(
     state: &Arc<AppState>,
     plan_id: &str,
     step_ids: Vec<String>,
+    operation: Arc<OperationGuard>,
 ) -> BatchOutcome {
     let repo_root = state.context.read().await.repo_root().to_path_buf();
     let _ = PlanStorage::save_active_id(&repo_root, Some(plan_id));
@@ -589,13 +868,17 @@ async fn run_plan_batch(
         .collect();
 
     let (stream_tx, _stream_rx) = mpsc::channel::<StreamEvent>(1);
-    let (_cancel_tx, cancel_rx) = watch::channel(false);
+    // The whole batch shares one operation and one cancel channel: a cancel
+    // delivered between steps is honored instead of being lost, and the slot
+    // stays registered for the batch's entire lifetime.
+    let cancel_rx = operation.cancel_receiver();
 
     let mut executor = PlanStepExecutor {
         state,
         repo_root: &repo_root,
         plan_id,
         batch_step_ids: &step_ids,
+        operation: &operation,
     };
 
     let report = BatchExecution::new()
@@ -665,14 +948,14 @@ async fn run_plan_batch(
 pub async fn handle_plan_execute(req: Request, state: &Arc<AppState>) -> Response {
     let params: PlanExecuteParams = match req.params.and_then(|p| serde_json::from_value(p).ok()) {
         Some(p) => p,
-        None => return Response::err(req.id, "INVALID_PARAMS", "Missing or invalid plan execute params"),
+        None => return Response::err(req.id, errors::INVALID_PARAMS, "Missing or invalid plan execute params"),
     };
 
     let repo_root = state.context.read().await.repo_root().to_path_buf();
     let plan = match PlanStorage::load_plan(&repo_root, &params.plan_id) {
         Ok(Some(p)) => p,
-        Ok(None) => return Response::err(req.id, "NOT_FOUND", format!("Plan '{}' not found", params.plan_id)),
-        Err(err) => return Response::err(req.id, "PLAN_LOAD_FAILED", format!("{:#}", err)),
+        Ok(None) => return Response::err(req.id, errors::NOT_FOUND, format!("Plan '{}' not found", params.plan_id)),
+        Err(err) => return Response::err(req.id, errors::PLAN_LOAD_FAILED, format!("{:#}", err)),
     };
 
     let steps = match plan.evaluate_scope(params.step_id.as_deref()) {
@@ -680,9 +963,19 @@ pub async fn handle_plan_execute(req: Request, state: &Arc<AppState>) -> Respons
         PlanScopeEvaluation::BlockedByDiscussion(items) => {
             return Response::err(
                 req.id,
-                "STEP_IN_DISCUSSION",
+                errors::STEP_IN_DISCUSSION,
                 format!(
                     "Scope contains item(s) in DISCUSSION status: {}. Review them (change status to TODO) first",
+                    items.join(", ")
+                ),
+            );
+        }
+        PlanScopeEvaluation::BlockedByBlockers(items) => {
+            return Response::err(
+                req.id,
+                errors::STEP_BLOCKED,
+                format!(
+                    "Scope contains step(s) in BLOCKED status: {}. Resolve the reported blockers and replan before executing",
                     items.join(", ")
                 ),
             );
@@ -690,7 +983,7 @@ pub async fn handle_plan_execute(req: Request, state: &Arc<AppState>) -> Respons
         PlanScopeEvaluation::BlockedByDependencies(items) => {
             return Response::err(
                 req.id,
-                "STEP_BLOCKED_BY_DEPENDENCIES",
+                errors::STEP_BLOCKED_BY_DEPENDENCIES,
                 format!(
                     "Scope contains step(s) whose prerequisites are not yet DONE: {}. Complete the prerequisites first",
                     items.join(", ")
@@ -700,35 +993,41 @@ pub async fn handle_plan_execute(req: Request, state: &Arc<AppState>) -> Respons
         PlanScopeEvaluation::StepBlocked => {
             return Response::err(
                 req.id,
-                "STEP_BLOCKED",
+                errors::STEP_BLOCKED,
                 "Target step is BLOCKED; resolve the reported blocker and replan before executing",
             );
         }
         PlanScopeEvaluation::AllCompleted => {
-            return Response::err(req.id, "NOTHING_TO_EXECUTE", "All steps in this scope are already completed");
+            return Response::err(req.id, errors::NOTHING_TO_EXECUTE, "All steps in this scope are already completed");
         }
         PlanScopeEvaluation::Cancelled => {
-            return Response::err(req.id, "STEP_CANCELLED", "Step is CANCELLED and cannot be executed");
+            return Response::err(req.id, errors::STEP_CANCELLED, "Step is CANCELLED and cannot be executed");
         }
         PlanScopeEvaluation::NotFound => {
-            return Response::err(req.id, "NOT_FOUND", "Target item not found in plan");
+            return Response::err(req.id, errors::NOT_FOUND, "Target item not found in plan");
         }
     };
 
-    if state.active_cancel.lock().await.is_some() {
-        return Response::err(
-            req.id,
-            "OPERATION_IN_PROGRESS",
-            "Another operation is already running",
-        );
-    }
+    let operation = match state.try_begin_operation() {
+        Ok(guard) => Arc::new(guard),
+        Err(()) => {
+            return Response::err(
+                req.id,
+                errors::OPERATION_IN_PROGRESS,
+                "Another operation is already running",
+            );
+        }
+    };
 
+    // Pre-flight verification runs while the batch operation stays registered,
+    // so the slot is never briefly free and a concurrent `config/set`,
+    // `git/undo`, or a second `plan/execute` cannot slip in mid-verification.
     if let Err(report) = crate::handlers::run_preflight_verification(&repo_root).await {
         let message = format!(
             "Pre-flight verification failed: the repository does not build cleanly. Batch execution was blocked before starting any step.\n\n{}",
             report
         );
-        return Response::err(req.id, "PREFLIGHT_VERIFICATION_FAILED", message);
+        return Response::err(req.id, errors::PREFLIGHT_VERIFICATION_FAILED, message);
     }
 
     let step_ids: Vec<String> = steps.iter().map(|s| s.id.clone()).collect();
@@ -740,7 +1039,7 @@ pub async fn handle_plan_execute(req: Request, state: &Arc<AppState>) -> Respons
     let state = Arc::clone(state);
     let plan_id = plan.id.clone();
     tokio::spawn(async move {
-        match run_plan_batch(&state, &plan_id, step_ids).await {
+        match run_plan_batch(&state, &plan_id, step_ids, operation).await {
             BatchOutcome::Completed { steps } => {
                 tracing::info!("Plan '{}' batch completed: {} step(s)", plan_id, steps);
             }
@@ -802,10 +1101,10 @@ pub async fn handle_plan_refine(req: Request, state: &Arc<AppState>) -> Response
                     .map(String::from);
                 (id, model, instructions)
             } else {
-                return Response::err(req.id, "INVALID_PARAMS", "Invalid plan refine parameters");
+                return Response::err(req.id, errors::INVALID_PARAMS, "Invalid plan refine parameters");
             }
         }
-        None => return Response::err(req.id, "INVALID_PARAMS", "Missing plan refine parameters"),
+        None => return Response::err(req.id, errors::INVALID_PARAMS, "Missing plan refine parameters"),
     };
 
     let repo_root = state.context.read().await.repo_root().to_path_buf();
@@ -821,7 +1120,7 @@ pub async fn handle_plan_refine(req: Request, state: &Arc<AppState>) -> Response
     if effective_plan_id.trim().is_empty() {
         return Response::err(
             req.id,
-            "INVALID_PARAMS",
+            errors::INVALID_PARAMS,
             "Missing plan ID and no active plan is set",
         );
     }
@@ -831,55 +1130,34 @@ pub async fn handle_plan_refine(req: Request, state: &Arc<AppState>) -> Response
         Ok(None) => {
             return Response::err(
                 req.id,
-                "NOT_FOUND",
+                errors::NOT_FOUND,
                 format!("Plan '{}' not found", effective_plan_id),
             );
         }
-        Err(err) => return Response::err(req.id, "PLAN_LOAD_FAILED", format!("{:#}", err)),
+        Err(err) => return Response::err(req.id, errors::PLAN_LOAD_FAILED, format!("{:#}", err)),
     };
 
-    let (cancel_tx, cancel_rx) = watch::channel(false);
-    {
-        let mut active = state.active_cancel.lock().await;
-        if active.is_some() {
+    let operation = match state.try_begin_operation() {
+        Ok(guard) => guard,
+        Err(()) => {
             return Response::err(
                 req.id,
-                "OPERATION_IN_PROGRESS",
+                errors::OPERATION_IN_PROGRESS,
                 "Another operation is already running",
             );
         }
-        *active = Some(ActiveOperation {
-            cancel_tx,
-            abort_handle: None,
-        });
-    }
+    };
 
-    let (provider, model, reasoning_effort, repomap_budget, max_discovery_rounds, max_files) = {
-        let cfg = state.config.lock().await;
+    let (provider, model, reasoning_effort, repomap_budget, max_discovery_rounds, files_token_budget) = {
+        let cfg = state.config.lock().await.config.clone();
         let model = match custom_model {
             Some(m) => cfg.resolve_model(&m),
             None => cfg.resolve_role(ModelRole::Architect),
         };
         let reasoning_effort = cfg.models.resolve_effort(ModelRole::Architect);
-        #[cfg(test)]
-        let provider: Arc<dyn LlmProvider> = match state.provider_override.lock().await.clone() {
-            Some(p) => p,
-            None => match create_provider(model.provider, &cfg) {
-                Ok(p) => Arc::from(p),
-                Err(err) => {
-                    *state.active_cancel.lock().await = None;
-                    return Response::err(req.id, "NO_API_KEY", err.to_string());
-                }
-            },
-        };
-
-        #[cfg(not(test))]
-        let provider: Arc<dyn LlmProvider> = match create_provider(model.provider, &cfg) {
-            Ok(p) => Arc::from(p),
-            Err(err) => {
-                *state.active_cancel.lock().await = None;
-                return Response::err(req.id, "NO_API_KEY", err.to_string());
-            }
+        let provider = match resolve_architect_provider(state, &cfg, model.provider).await {
+            Ok(p) => p,
+            Err(err) => return Response::err(req.id, errors::NO_API_KEY, err),
         };
         (
             provider,
@@ -887,7 +1165,7 @@ pub async fn handle_plan_refine(req: Request, state: &Arc<AppState>) -> Response
             reasoning_effort,
             cfg.context.repomap_token_budget,
             cfg.context.max_discovery_rounds,
-            cfg.context.max_files,
+            cfg.context.files_token_budget,
         )
     };
 
@@ -897,10 +1175,13 @@ pub async fn handle_plan_refine(req: Request, state: &Arc<AppState>) -> Response
 
     state.out.send_event(&Event {
         method: events::MODEL_STARTED.to_string(),
-        params: Some(serde_json::json!({
-            "operation_id": op_id,
-            "model": model,
-        })),
+        params: serde_json::to_value(ModelStartedEvent {
+            operation_id: op_id.clone(),
+            model: model.to_string(),
+            plan_context: None,
+            is_batch: false,
+        })
+        .ok(),
     });
 
     let intro_header = format!(
@@ -909,10 +1190,11 @@ pub async fn handle_plan_refine(req: Request, state: &Arc<AppState>) -> Response
     );
     state.out.send_event(&Event {
         method: events::MODEL_TEXT_DELTA.to_string(),
-        params: Some(serde_json::json!({
-            "operation_id": op_id,
-            "delta": intro_header,
-        })),
+        params: serde_json::to_value(ModelDeltaEvent {
+            operation_id: op_id.clone(),
+            delta: intro_header.clone(),
+        })
+        .ok(),
     });
 
     {
@@ -990,177 +1272,67 @@ pub async fn handle_plan_refine(req: Request, state: &Arc<AppState>) -> Response
         let schema_def: JsonSchemaDefinition = match serde_json::from_value(schema_val) {
             Ok(s) => s,
             Err(err) => {
-                *state.active_cancel.lock().await = None;
-                return Response::err(req.id, "SCHEMA_ERROR", err.to_string());
+                let _ = state.take_active_operation();
+                return Response::err(req.id, errors::SCHEMA_ERROR, err.to_string());
             }
         };
         let response_format = Some(ResponseFormat::JsonSchema {
             json_schema: schema_def,
         });
 
-        let (tx, mut rx) = mpsc::channel::<StreamEvent>(100);
-        let model_name = model.name.clone();
-        let stream_cancel = cancel_rx.clone();
-        let provider_stream = Arc::clone(&provider);
-
-        let stream_task = tokio::spawn(async move {
-            provider_stream
-                .stream_chat_with_effort(
-                    &model_name,
-                    messages,
-                    response_format,
-                    reasoning_effort,
-                    tx,
-                    stream_cancel,
-                )
-                .await
-        });
-
-        if let Some(op) = state.active_cancel.lock().await.as_mut() {
-            op.abort_handle = Some(stream_task.abort_handle());
-        }
-
-        let mut raw_text = String::new();
-        let mut usage = None;
-        let mut failure = None;
-        let mut passthrough: Option<bool> = None;
-        let mut streamed_explanation_bytes = 0usize;
-
-        while let Some(event) = rx.recv().await {
-            match event {
-                StreamEvent::ReasoningDelta(delta) => {
-                    state.out.send_event(&Event {
-                        method: events::MODEL_REASONING_DELTA.to_string(),
-                        params: Some(serde_json::json!({
-                            "operation_id": op_id,
-                            "delta": delta,
-                        })),
-                    });
-                }
-                StreamEvent::TextDelta(delta) => {
-                    raw_text.push_str(&delta);
-
-                    if passthrough.is_none() {
-                        if let Some(c) = raw_text.chars().find(|c| !c.is_whitespace()) {
-                            let plain = c != '{' && c != '`';
-                            passthrough = Some(plain);
-                            if plain {
-                                state.out.send_event(&Event {
-                                    method: events::MODEL_TEXT_DELTA.to_string(),
-                                    params: Some(serde_json::json!({
-                                        "operation_id": op_id,
-                                        "delta": raw_text.clone(),
-                                    })),
-                                });
-                            }
-                        }
-                    } else if passthrough == Some(true) {
-                        state.out.send_event(&Event {
-                            method: events::MODEL_TEXT_DELTA.to_string(),
-                            params: Some(serde_json::json!({
-                                "operation_id": op_id,
-                                "delta": delta,
-                            })),
-                        });
-                    }
-
-                    if passthrough != Some(true) {
-                        let (field_delta, new_streamed, _) =
-                            tauqe_core::edits::stream::json::extract_streamed_string_field(
-                                &raw_text,
-                                "explanation",
-                                streamed_explanation_bytes,
-                            );
-                        if let Some(d) = field_delta {
-                            if !d.is_empty() {
-                                state.out.send_event(&Event {
-                                    method: events::MODEL_TEXT_DELTA.to_string(),
-                                    params: Some(serde_json::json!({
-                                        "operation_id": op_id,
-                                        "delta": d,
-                                    })),
-                                });
-                            }
-                        }
-                        streamed_explanation_bytes = new_streamed;
-                    }
-                }
-                StreamEvent::Usage(u) => usage = Some(u),
-                StreamEvent::Done | StreamEvent::Cancelled => break,
-                StreamEvent::Error(err) => {
-                    failure = Some(err);
-                    break;
-                }
-                _ => {}
+        let stream_outcome = match run_architect_stream(
+            state,
+            Arc::clone(&provider),
+            model.name.clone(),
+            messages,
+            response_format,
+            reasoning_effort,
+            &operation,
+            &op_id,
+        )
+        .await
+        {
+            Ok(outcome) => outcome,
+            Err(ArchitectStreamError::Cancelled) => {
+                clear_auto_context(state).await;
+                return Response::err(req.id, errors::CANCELLED, "Plan refinement was cancelled");
             }
-        }
-
-        let cancelled = *cancel_rx.borrow();
-        if cancelled {
-            *state.active_cancel.lock().await = None;
-            clear_auto_context(state).await;
-            state.out.send_event(&Event {
-                method: events::MODEL_CANCELLED.to_string(),
-                params: Some(serde_json::json!({ "operation_id": op_id })),
-            });
-            return Response::err(req.id, "CANCELLED", "Plan refinement was cancelled");
-        }
-        if let Some(err) = failure {
-            *state.active_cancel.lock().await = None;
-            clear_auto_context(state).await;
-            state.out.send_event(&Event {
-                method: events::MODEL_ERROR.to_string(),
-                params: Some(serde_json::json!({
-                    "operation_id": op_id,
-                    "message": err,
-                })),
-            });
-            return Response::err(req.id, "MODEL_ERROR", err);
-        }
-
-        let usage = usage.unwrap_or_default();
-        let cost = usage.cost.unwrap_or(0.0);
-        let total_cost = {
-            let mut total = state.total_cost.lock().await;
-            *total += cost;
-            *total
+            Err(ArchitectStreamError::ModelError(err)) => {
+                clear_auto_context(state).await;
+                return Response::err(req.id, errors::MODEL_ERROR, err);
+            }
         };
 
-        state.out.send_event(&Event {
-            method: events::MODEL_USAGE.to_string(),
-            params: serde_json::to_value(tauqe_protocol::ModelUsageEvent {
-                operation_id: op_id.clone(),
-                usage: usage.clone(),
-                session_total_cost: total_cost,
-                current_cost: Some(cost),
-            })
-            .ok(),
-        });
+        let ArchitectStreamOutcome {
+            raw_text,
+            streamed_explanation_bytes,
+        } = stream_outcome;
 
         let output = match tauqe_core::plan::prompt::parse_plan_refinement_output(&raw_text) {
             Ok(out) => out,
             Err(err) => {
-                *state.active_cancel.lock().await = None;
                 clear_auto_context(state).await;
                 let err_msg = format!("Failed to parse architect refinement output: {err}");
                 state.out.send_event(&Event {
                     method: events::MODEL_ERROR.to_string(),
-                    params: Some(serde_json::json!({
-                        "operation_id": op_id,
-                        "message": err_msg,
-                    })),
+                    params: serde_json::to_value(ModelErrorEvent {
+                        operation_id: op_id.clone(),
+                        message: err_msg.clone(),
+                    })
+                    .ok(),
                 });
-                return Response::err(req.id, "PARSE_ERROR", err_msg);
+                return Response::err(req.id, errors::PARSE_ERROR, err_msg);
             }
         };
 
         if streamed_explanation_bytes == 0 && !output.explanation.trim().is_empty() {
             state.out.send_event(&Event {
                 method: events::MODEL_TEXT_DELTA.to_string(),
-                params: Some(serde_json::json!({
-                    "operation_id": op_id,
-                    "delta": output.explanation.clone(),
-                })),
+                params: serde_json::to_value(ModelDeltaEvent {
+                    operation_id: op_id.clone(),
+                    delta: output.explanation.clone(),
+                })
+                .ok(),
             });
         }
         accumulated_full_text.push_str(&output.explanation);
@@ -1183,7 +1355,7 @@ pub async fn handle_plan_refine(req: Request, state: &Arc<AppState>) -> Response
                     &mut ctx,
                     &requests,
                     &available_files,
-                    max_files,
+                    files_token_budget,
                 );
                 let s = ctx.get_state();
                 (oc, s)
@@ -1191,33 +1363,34 @@ pub async fn handle_plan_refine(req: Request, state: &Arc<AppState>) -> Response
 
             if let Some(limit) = outcome.limit_exceeded {
                 let warn_msg = format!(
-                    "Context files limit exceeded (max_files = {}). Architect requested {} new file(s) [{}], but context already has {} files. The plan is too broad and should be manually decomposed or scoped down.",
-                    limit.max_files,
-                    limit.requested_count,
+                    "Context files token budget exceeded (files_token_budget = {}). Architect requested {} new token(s) in file(s) [{}], but context already has {} tokens. The plan is too broad and should be manually decomposed or scoped down.",
+                    limit.token_budget,
+                    limit.requested_tokens,
                     limit.requested_files.join(", "),
-                    limit.current_count
+                    limit.current_tokens
                 );
                 tracing::warn!("{}", warn_msg);
                 state.out.send_event(&Event {
                     method: events::MODEL_TEXT_DELTA.to_string(),
-                    params: Some(serde_json::json!({
-                        "operation_id": op_id,
-                        "delta": format!("\n\n⚠️ {}\n\n", warn_msg),
-                    })),
+                    params: serde_json::to_value(ModelDeltaEvent {
+                        operation_id: op_id.clone(),
+                        delta: format!("\n\n⚠️ {}\n\n", warn_msg),
+                    })
+                    .ok(),
                 });
                 state.out.send_event(&Event {
                     method: events::MODEL_FINISHED.to_string(),
-                    params: Some(serde_json::json!({
-                        "operation_id": op_id,
-                        "full_text": format!("{}\n\n⚠️ {}", accumulated_full_text, warn_msg),
-                    })),
+                    params: serde_json::to_value(ModelFinishedEvent {
+                        operation_id: op_id.clone(),
+                        full_text: format!("{}\n\n⚠️ {}", accumulated_full_text, warn_msg),
+                    })
+                    .ok(),
                 });
-                *state.active_cancel.lock().await = None;
                 clear_auto_context(state).await;
                 let _ = state.history.lock().await.record_response(
                     warn_msg.clone(),
                     None,
-                    Some(format!("Plan Refinement Exceeded File Limit: {}", plan.title)),
+                    Some(format!("Plan Refinement Exceeded Token Budget: {}", plan.title)),
                     Vec::new(),
                 );
                 return Response::ok_typed(req.id, &PlanRefineResult::Blocked { reason: warn_msg });
@@ -1275,10 +1448,11 @@ pub async fn handle_plan_refine(req: Request, state: &Arc<AppState>) -> Response
             accumulated_full_text.push_str(&round_banner);
             state.out.send_event(&Event {
                 method: events::MODEL_TEXT_DELTA.to_string(),
-                params: Some(serde_json::json!({
-                    "operation_id": op_id,
-                    "delta": round_banner,
-                })),
+                params: serde_json::to_value(ModelDeltaEvent {
+                    operation_id: op_id.clone(),
+                    delta: round_banner,
+                })
+                .ok(),
             });
 
             let mut fb = String::new();
@@ -1301,14 +1475,13 @@ pub async fn handle_plan_refine(req: Request, state: &Arc<AppState>) -> Response
         break output;
     };
 
-    *state.active_cancel.lock().await = None;
-
     state.out.send_event(&Event {
         method: events::MODEL_FINISHED.to_string(),
-        params: Some(serde_json::json!({
-            "operation_id": op_id,
-            "full_text": accumulated_full_text,
-        })),
+        params: serde_json::to_value(ModelFinishedEvent {
+            operation_id: op_id.clone(),
+            full_text: accumulated_full_text,
+        })
+        .ok(),
     });
 
     clear_auto_context(state).await;
@@ -1325,16 +1498,53 @@ pub async fn handle_plan_refine(req: Request, state: &Arc<AppState>) -> Response
         return Response::ok_typed(req.id, &PlanRefineResult::Blocked { reason });
     }
 
+    if output.status.eq_ignore_ascii_case("needs_context") {
+        return Response::err(
+            req.id,
+            errors::NEEDS_CONTEXT,
+            format!(
+                "Architect requested additional context but no discovery rounds remain (limit: {}). Narrow the plan scope or raise the discovery round limit, then refine again",
+                max_discovery_rounds
+            ),
+        );
+    }
+
+    // Accept only an explicit success: an unknown status (for example a stray
+    // `needs_context` that survived the round limit) must never be treated as a
+    // completed refinement, or it could overwrite the plan with an unvalidated tree.
+    if !output.status.eq_ignore_ascii_case("success") {
+        return Response::err(
+            req.id,
+            errors::UNEXPECTED_STATUS,
+            format!(
+                "Architect returned unsupported status '{}'; expected 'success' or 'blocked'",
+                output.status
+            ),
+        );
+    }
+
     if output.items.is_empty() {
         return Response::err(
             req.id,
-            "EMPTY_ITEMS",
+            errors::EMPTY_ITEMS,
             "Model returned success status but an empty items array",
+        );
+    }
+
+    if let Some(duplicate) = find_duplicate_item_ids(&output.items) {
+        return Response::err(
+            req.id,
+            errors::INVALID_PLAN_TREE,
+            format!(
+                "Architect returned a plan with a duplicate or empty step ID: '{}'",
+                duplicate
+            ),
         );
     }
 
     let mut updated_plan = plan.clone();
     updated_plan.items = output.items;
+    updated_plan.normalize_leaf_files();
     updated_plan.refresh_parent_statuses();
     updated_plan.updated_at = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1354,7 +1564,7 @@ pub async fn handle_plan_refine(req: Request, state: &Arc<AppState>) -> Response
     );
 
     if let Err(err) = PlanStorage::save_plan(&repo_root, &updated_plan) {
-        return Response::err(req.id, "PLAN_SAVE_FAILED", format!("{:#}", err));
+        return Response::err(req.id, errors::PLAN_SAVE_FAILED, format!("{:#}", err));
     }
 
     emit(
@@ -1421,10 +1631,10 @@ pub async fn handle_plan_replan(req: Request, state: &Arc<AppState>) -> Response
                 (plan_id, step_id, blocked_reason, custom_model, instructions)
             }
             None => {
-                return Response::err(req.id, "INVALID_PARAMS", "Invalid plan replan parameters")
+                return Response::err(req.id, errors::INVALID_PARAMS, "Invalid plan replan parameters")
             }
         },
-        None => return Response::err(req.id, "INVALID_PARAMS", "Missing plan replan parameters"),
+        None => return Response::err(req.id, errors::INVALID_PARAMS, "Missing plan replan parameters"),
     };
 
     let repo_root = state.context.read().await.repo_root().to_path_buf();
@@ -1440,12 +1650,12 @@ pub async fn handle_plan_replan(req: Request, state: &Arc<AppState>) -> Response
     if effective_plan_id.trim().is_empty() {
         return Response::err(
             req.id,
-            "INVALID_PARAMS",
+            errors::INVALID_PARAMS,
             "Missing plan ID and no active plan is set",
         );
     }
     if step_id.trim().is_empty() {
-        return Response::err(req.id, "INVALID_PARAMS", "Missing blocked step ID to replan");
+        return Response::err(req.id, errors::INVALID_PARAMS, "Missing blocked step ID to replan");
     }
 
     let plan = match PlanStorage::load_plan(&repo_root, &effective_plan_id) {
@@ -1453,11 +1663,11 @@ pub async fn handle_plan_replan(req: Request, state: &Arc<AppState>) -> Response
         Ok(None) => {
             return Response::err(
                 req.id,
-                "NOT_FOUND",
+                errors::NOT_FOUND,
                 format!("Plan '{}' not found", effective_plan_id),
             );
         }
-        Err(err) => return Response::err(req.id, "PLAN_LOAD_FAILED", format!("{:#}", err)),
+        Err(err) => return Response::err(req.id, errors::PLAN_LOAD_FAILED, format!("{:#}", err)),
     };
 
     let step = match plan.find_item(&step_id) {
@@ -1465,7 +1675,7 @@ pub async fn handle_plan_replan(req: Request, state: &Arc<AppState>) -> Response
         None => {
             return Response::err(
                 req.id,
-                "NOT_FOUND",
+                errors::NOT_FOUND,
                 format!("Step '{}' not found in plan '{}'", step_id, effective_plan_id),
             );
         }
@@ -1474,7 +1684,7 @@ pub async fn handle_plan_replan(req: Request, state: &Arc<AppState>) -> Response
     if !step.is_leaf() {
         return Response::err(
             req.id,
-            "NOT_A_LEAF",
+            errors::NOT_A_LEAF,
             format!(
                 "Step '{}' ({}) is not a leaf and cannot be replanned",
                 step.id, step.title
@@ -1484,7 +1694,7 @@ pub async fn handle_plan_replan(req: Request, state: &Arc<AppState>) -> Response
     if step.status == PlanItemStatus::Done {
         return Response::err(
             req.id,
-            "STEP_IMMUTABLE",
+            errors::STEP_IMMUTABLE,
             format!(
                 "Step '{}' is DONE and immutable; completed steps cannot be replanned",
                 step.id
@@ -1492,35 +1702,27 @@ pub async fn handle_plan_replan(req: Request, state: &Arc<AppState>) -> Response
         );
     }
 
-    let (cancel_tx, cancel_rx) = watch::channel(false);
-    {
-        let mut active = state.active_cancel.lock().await;
-        if active.is_some() {
+    let operation = match state.try_begin_operation() {
+        Ok(guard) => guard,
+        Err(()) => {
             return Response::err(
                 req.id,
-                "OPERATION_IN_PROGRESS",
+                errors::OPERATION_IN_PROGRESS,
                 "Another operation is already running",
             );
         }
-        *active = Some(ActiveOperation {
-            cancel_tx,
-            abort_handle: None,
-        });
-    }
+    };
 
     let (provider, model, reasoning_effort) = {
-        let cfg = state.config.lock().await;
+        let cfg = state.config.lock().await.config.clone();
         let model = match custom_model {
             Some(m) => cfg.resolve_model(&m),
             None => cfg.resolve_role(ModelRole::Architect),
         };
         let reasoning_effort = cfg.models.resolve_effort(ModelRole::Architect);
-        let provider: Arc<dyn LlmProvider> = match create_provider(model.provider, &cfg) {
-            Ok(p) => Arc::from(p),
-            Err(err) => {
-                *state.active_cancel.lock().await = None;
-                return Response::err(req.id, "NO_API_KEY", err.to_string());
-            }
+        let provider = match resolve_architect_provider(state, &cfg, model.provider).await {
+            Ok(p) => p,
+            Err(err) => return Response::err(req.id, errors::NO_API_KEY, err),
         };
         (provider, model, reasoning_effort)
     };
@@ -1529,10 +1731,13 @@ pub async fn handle_plan_replan(req: Request, state: &Arc<AppState>) -> Response
 
     state.out.send_event(&Event {
         method: events::MODEL_STARTED.to_string(),
-        params: Some(serde_json::json!({
-            "operation_id": op_id,
-            "model": model,
-        })),
+        params: serde_json::to_value(ModelStartedEvent {
+            operation_id: op_id.clone(),
+            model: model.to_string(),
+            plan_context: None,
+            is_batch: false,
+        })
+        .ok(),
     });
 
     let intro_header = format!(
@@ -1541,10 +1746,11 @@ pub async fn handle_plan_replan(req: Request, state: &Arc<AppState>) -> Response
     );
     state.out.send_event(&Event {
         method: events::MODEL_TEXT_DELTA.to_string(),
-        params: Some(serde_json::json!({
-            "operation_id": op_id,
-            "delta": intro_header,
-        })),
+        params: serde_json::to_value(ModelDeltaEvent {
+            operation_id: op_id.clone(),
+            delta: intro_header.clone(),
+        })
+        .ok(),
     });
 
     let sys_prompt = tauqe_core::plan::prompt::build_replan_system_prompt();
@@ -1571,152 +1777,39 @@ pub async fn handle_plan_replan(req: Request, state: &Arc<AppState>) -> Response
     let schema_def: JsonSchemaDefinition = match serde_json::from_value(schema_val) {
         Ok(s) => s,
         Err(err) => {
-            *state.active_cancel.lock().await = None;
-            return Response::err(req.id, "SCHEMA_ERROR", err.to_string());
+            let _ = state.take_active_operation();
+            return Response::err(req.id, errors::SCHEMA_ERROR, err.to_string());
         }
     };
     let response_format = Some(ResponseFormat::JsonSchema {
         json_schema: schema_def,
     });
 
-    let (tx, mut rx) = mpsc::channel::<StreamEvent>(100);
-    let model_name = model.name.clone();
-    let stream_cancel = cancel_rx.clone();
-    let provider_stream = Arc::clone(&provider);
-
-    let stream_task = tokio::spawn(async move {
-        provider_stream
-            .stream_chat_with_effort(
-                &model_name,
-                messages,
-                response_format,
-                reasoning_effort,
-                tx,
-                stream_cancel,
-            )
-            .await
-    });
-
-    if let Some(op) = state.active_cancel.lock().await.as_mut() {
-        op.abort_handle = Some(stream_task.abort_handle());
-    }
-
-    let mut raw_text = String::new();
-    let mut usage = None;
-    let mut failure = None;
-    let mut passthrough: Option<bool> = None;
-    let mut streamed_explanation_bytes = 0usize;
-
-    while let Some(event) = rx.recv().await {
-        match event {
-            StreamEvent::ReasoningDelta(delta) => {
-                state.out.send_event(&Event {
-                    method: events::MODEL_REASONING_DELTA.to_string(),
-                    params: Some(serde_json::json!({
-                        "operation_id": op_id,
-                        "delta": delta,
-                    })),
-                });
-            }
-            StreamEvent::TextDelta(delta) => {
-                raw_text.push_str(&delta);
-
-                if passthrough.is_none() {
-                    if let Some(c) = raw_text.chars().find(|c| !c.is_whitespace()) {
-                        let plain = c != '{' && c != '`';
-                        passthrough = Some(plain);
-                        if plain {
-                            state.out.send_event(&Event {
-                                method: events::MODEL_TEXT_DELTA.to_string(),
-                                params: Some(serde_json::json!({
-                                    "operation_id": op_id,
-                                    "delta": raw_text.clone(),
-                                })),
-                            });
-                        }
-                    }
-                } else if passthrough == Some(true) {
-                    state.out.send_event(&Event {
-                        method: events::MODEL_TEXT_DELTA.to_string(),
-                        params: Some(serde_json::json!({
-                            "operation_id": op_id,
-                            "delta": delta,
-                        })),
-                    });
-                }
-
-                if passthrough != Some(true) {
-                    let (field_delta, new_streamed, _) =
-                        tauqe_core::edits::stream::json::extract_streamed_string_field(
-                            &raw_text,
-                            "explanation",
-                            streamed_explanation_bytes,
-                        );
-                    if let Some(d) = field_delta {
-                        if !d.is_empty() {
-                            state.out.send_event(&Event {
-                                method: events::MODEL_TEXT_DELTA.to_string(),
-                                params: Some(serde_json::json!({
-                                    "operation_id": op_id,
-                                    "delta": d,
-                                })),
-                            });
-                        }
-                    }
-                    streamed_explanation_bytes = new_streamed;
-                }
-            }
-            StreamEvent::Usage(u) => usage = Some(u),
-            StreamEvent::Done | StreamEvent::Cancelled => break,
-            StreamEvent::Error(err) => {
-                failure = Some(err);
-                break;
-            }
-            _ => {}
+    let stream_outcome = match run_architect_stream(
+        state,
+        Arc::clone(&provider),
+        model.name.clone(),
+        messages,
+        response_format,
+        reasoning_effort,
+        &operation,
+        &op_id,
+    )
+    .await
+    {
+        Ok(outcome) => outcome,
+        Err(ArchitectStreamError::Cancelled) => {
+            return Response::err(req.id, errors::CANCELLED, "Plan replanning was cancelled");
         }
-    }
-
-    let cancelled = *cancel_rx.borrow();
-    if cancelled {
-        *state.active_cancel.lock().await = None;
-        state.out.send_event(&Event {
-            method: events::MODEL_CANCELLED.to_string(),
-            params: Some(serde_json::json!({ "operation_id": op_id })),
-        });
-        return Response::err(req.id, "CANCELLED", "Plan replanning was cancelled");
-    }
-    if let Some(err) = failure {
-        *state.active_cancel.lock().await = None;
-        state.out.send_event(&Event {
-            method: events::MODEL_ERROR.to_string(),
-            params: Some(serde_json::json!({
-                "operation_id": op_id,
-                "message": err,
-            })),
-        });
-        return Response::err(req.id, "MODEL_ERROR", err);
-    }
-
-    let usage = usage.unwrap_or_default();
-    let cost = usage.cost.unwrap_or(0.0);
-    let total_cost = {
-        let mut total = state.total_cost.lock().await;
-        *total += cost;
-        *total
+        Err(ArchitectStreamError::ModelError(err)) => {
+            return Response::err(req.id, errors::MODEL_ERROR, err);
+        }
     };
 
-    state.out.send_event(&Event {
-        method: events::MODEL_USAGE.to_string(),
-        params: serde_json::to_value(tauqe_protocol::ModelUsageEvent {
-            operation_id: op_id.clone(),
-            usage: usage.clone(),
-            session_total_cost: total_cost,
-            current_cost: Some(cost),
-        })
-        .ok(),
-    });
-
-    *state.active_cancel.lock().await = None;
+    let ArchitectStreamOutcome {
+        raw_text,
+        streamed_explanation_bytes,
+    } = stream_outcome;
 
     let output = match tauqe_core::plan::prompt::parse_plan_refinement_output(&raw_text) {
         Ok(out) => out,
@@ -1724,22 +1817,24 @@ pub async fn handle_plan_replan(req: Request, state: &Arc<AppState>) -> Response
             let err_msg = format!("Failed to parse architect replan output: {err}");
             state.out.send_event(&Event {
                 method: events::MODEL_ERROR.to_string(),
-                params: Some(serde_json::json!({
-                    "operation_id": op_id,
-                    "message": err_msg,
-                })),
+                params: serde_json::to_value(ModelErrorEvent {
+                    operation_id: op_id.clone(),
+                    message: err_msg.clone(),
+                })
+                .ok(),
             });
-            return Response::err(req.id, "PARSE_ERROR", err_msg);
+            return Response::err(req.id, errors::PARSE_ERROR, err_msg);
         }
     };
 
     if streamed_explanation_bytes == 0 && !output.explanation.trim().is_empty() {
         state.out.send_event(&Event {
             method: events::MODEL_TEXT_DELTA.to_string(),
-            params: Some(serde_json::json!({
-                "operation_id": op_id,
-                "delta": output.explanation.clone(),
-            })),
+            params: serde_json::to_value(ModelDeltaEvent {
+                operation_id: op_id.clone(),
+                delta: output.explanation.clone(),
+            })
+            .ok(),
         });
     }
 
@@ -1747,10 +1842,11 @@ pub async fn handle_plan_replan(req: Request, state: &Arc<AppState>) -> Response
     full_text.push_str(&output.explanation);
     state.out.send_event(&Event {
         method: events::MODEL_FINISHED.to_string(),
-        params: Some(serde_json::json!({
-            "operation_id": op_id,
-            "full_text": full_text,
-        })),
+        params: serde_json::to_value(ModelFinishedEvent {
+            operation_id: op_id.clone(),
+            full_text,
+        })
+        .ok(),
     });
 
     if output.status.eq_ignore_ascii_case("blocked") {
@@ -1774,7 +1870,7 @@ pub async fn handle_plan_replan(req: Request, state: &Arc<AppState>) -> Response
     if output.status.eq_ignore_ascii_case("needs_context") {
         return Response::err(
             req.id,
-            "NEEDS_CONTEXT",
+            errors::NEEDS_CONTEXT,
             "Architect requested additional context; local replanning does not run discovery rounds",
         );
     }
@@ -1782,7 +1878,7 @@ pub async fn handle_plan_replan(req: Request, state: &Arc<AppState>) -> Response
     if output.items.is_empty() {
         return Response::err(
             req.id,
-            "EMPTY_ITEMS",
+            errors::EMPTY_ITEMS,
             "Model returned success status but an empty items array",
         );
     }
@@ -1790,7 +1886,7 @@ pub async fn handle_plan_replan(req: Request, state: &Arc<AppState>) -> Response
     let updated_plan =
         match PlanStorage::graft_subtree(&repo_root, &plan.id, &step.id, output.items) {
             Ok(p) => p,
-            Err(err) => return Response::err(req.id, "PLAN_GRAFT_FAILED", format!("{:#}", err)),
+            Err(err) => return Response::err(req.id, errors::PLAN_GRAFT_FAILED, format!("{:#}", err)),
         };
 
     let (total_items, _) = updated_plan.count_stats();
@@ -1910,8 +2006,14 @@ mod tests {
         let state = test_state(&dir);
 
         // Without an API key the first turn cannot start: the batch must stop at step 1.
-        let outcome =
-            run_plan_batch(&state, "batch", vec!["1".to_string(), "2".to_string()]).await;
+        let operation = Arc::new(state.try_begin_operation().expect("register batch operation"));
+        let outcome = run_plan_batch(
+            &state,
+            "batch",
+            vec!["1".to_string(), "2".to_string()],
+            operation,
+        )
+        .await;
         match outcome {
             BatchOutcome::Failed {
                 completed, step_id, ..
@@ -1956,7 +2058,10 @@ mod tests {
         );
 
         // Without an API key the first turn cannot start: the batch fails at step 1.
-        let outcome = run_plan_batch(&state, "emit", vec!["1".to_string(), "2".to_string()]).await;
+        let operation = Arc::new(state.try_begin_operation().expect("register batch operation"));
+        let outcome =
+            run_plan_batch(&state, "emit", vec!["1".to_string(), "2".to_string()], operation)
+                .await;
         assert!(matches!(outcome, BatchOutcome::Failed { .. }));
 
         // The supervisor publishes a single typed completion event for the whole
@@ -1990,7 +2095,10 @@ mod tests {
         PlanStorage::save_plan(dir.path(), &plan).unwrap();
         let state = test_state(&dir);
 
-        let outcome = run_plan_batch(&state, "skip", vec!["1".to_string(), "2".to_string()]).await;
+        let operation = Arc::new(state.try_begin_operation().expect("register batch operation"));
+        let outcome =
+            run_plan_batch(&state, "skip", vec!["1".to_string(), "2".to_string()], operation)
+                .await;
         match outcome {
             BatchOutcome::Failed {
                 completed, step_id, ..
@@ -2022,10 +2130,12 @@ mod tests {
         PlanStorage::save_plan(dir.path(), &plan).unwrap();
         let state = test_state(&dir);
 
+        let operation = Arc::new(state.try_begin_operation().expect("register batch operation"));
         let outcome = run_plan_batch(
             &state,
             "blocked-batch",
             vec!["1".to_string(), "2".to_string(), "3".to_string()],
+            operation,
         )
         .await;
         match outcome {
@@ -2114,7 +2224,7 @@ mod tests {
         PlanStorage::save_plan(dir.path(), &plan).unwrap();
 
         let mut config = tauqe_core::config::AppConfig::default();
-        config.models.architect = Some(tauqe_protocol::ModelRef::openrouter("test/architect-model"));
+        config.models.architect = Some(tauqe_protocol::ModelRef::openrouter("test/architect-model").into());
         config.models.advisor = Some(tauqe_protocol::ModelRef::openrouter("test/advisor-model"));
 
         let (out, _rx) = OutChannel::new();
@@ -2254,7 +2364,7 @@ mod tests {
         assert!(err.message.contains("Pre-flight verification failed"));
 
         // The failure is detected before any turn starts: no active operation.
-        assert!(state.active_cancel.lock().await.is_none());
+        assert!(!state.is_operation_active());
 
         // No step was started: every status stays TODO.
         let reloaded = PlanStorage::load_plan(dir.path(), "preflight")
@@ -2442,6 +2552,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_handle_plan_replan_with_mock_provider() {
+        let dir = TestDir::new();
+        let plan = Plan {
+            id: "replan-mock".to_string(),
+            title: "Replan Mock".to_string(),
+            created_at: 1,
+            updated_at: 1,
+            items: vec![
+                test_item("1", PlanItemStatus::Done),
+                test_item("2", PlanItemStatus::Blocked),
+            ],
+            ..Default::default()
+        };
+        PlanStorage::save_plan(dir.path(), &plan).unwrap();
+
+        let replan_output = serde_json::json!({
+            "status": "success",
+            "explanation": "Replanned step 2",
+            "items": [
+                {
+                    "id": "2.1",
+                    "title": "Replacement step 2.1",
+                    "status": "todo",
+                    "files": [],
+                    "readonly_files": [],
+                    "concept_refs": [],
+                    "depends_on": [],
+                    "children": []
+                }
+            ]
+        });
+        let mock_provider = Arc::new(MockLlmProvider::scripted([
+            MockResponse::text(replan_output.to_string()),
+        ]));
+
+        let config = tauqe_core::config::AppConfig::default();
+        let state = test_state_with_provider(&dir, config, mock_provider).await;
+
+        let req = Request {
+            id: tauqe_protocol::RequestId::Number(1),
+            method: tauqe_protocol::methods::PLAN_REPLAN.to_string(),
+            params: Some(serde_json::json!({
+                "plan_id": "replan-mock",
+                "step_id": "2",
+                "reason": "Missing dependency"
+            })),
+        };
+        let res = handle_plan_replan(req, &state).await;
+        assert!(res.error.is_none(), "replan failed: {:?}", res.error);
+
+        let reloaded = PlanStorage::load_plan(dir.path(), "replan-mock").unwrap().unwrap();
+        assert!(reloaded.find_item("2.1").is_some());
+    }
+
+    #[tokio::test]
     async fn test_plan_step_execution_uses_turn_marker() {
         let dir = TestDir::new();
         tauqe_core::git::init_repository(Some(dir.path()), true).unwrap();
@@ -2478,7 +2643,8 @@ mod tests {
         let state = test_state_with_provider(&dir, config, provider.clone()).await;
         *state.marker_override.lock().await = Some(marker.to_string());
 
-        let outcome = run_plan_batch(&state, "marker-plan", vec!["1".to_string()]).await;
+        let operation = Arc::new(state.try_begin_operation().expect("register batch operation"));
+        let outcome = run_plan_batch(&state, "marker-plan", vec!["1".to_string()], operation).await;
         assert!(
             matches!(outcome, BatchOutcome::Completed { steps: 1 }),
             "expected a completed batch, got {:?}",

@@ -9,7 +9,7 @@ mod plan;
 mod scratchpad;
 mod verify;
 
-pub(crate) use context::{next_context_drop_tag, next_context_request_tag};
+pub(crate) use context::next_context_request_tag;
 pub(crate) use docs::next_doc_request_tag;
 pub(crate) use language::next_user_language_tag;
 pub(crate) use outcome::{next_blocked_tag, next_error_tag, next_success_tag};
@@ -20,7 +20,7 @@ pub(crate) use verify::next_verify_tag;
 pub(crate) use context::parse_context_request_tags;
 pub(crate) use docs::parse_doc_request_tags;
 
-pub use context::{parse_context_drop_tags, strip_context_drop_tags, strip_context_request_tags};
+pub use context::strip_context_request_tags;
 pub use docs::strip_doc_request_tags;
 pub use language::{extract_user_language, strip_user_language_tags};
 pub use outcome::{

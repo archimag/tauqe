@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -13,7 +14,7 @@ use tauqe_core::workflow::batch::{
 };
 use tauqe_core::workflow::common::apply_context_requests_detailed;
 use tauqe_protocol::{
-    events, BatchFinishStatus, BatchFinishSummary, ContextAccess, Event, ModelRole, ModelSelection,
+    errors, events, BatchFinishStatus, BatchFinishSummary, ContextAccess, Event, ModelRole, ModelSelection,
     ModelUsageEvent, ModelUsageInfo, Request, Response, ReviewBatchFinishedEvent,
     ReviewContentDeltaEvent, ReviewDeleteParams, ReviewDeleteResult, ReviewErrorEvent,
     ReviewExecuteParams, ReviewFinishedEvent, ReviewGetParams, ReviewGetResult, ReviewItemStatus,
@@ -23,8 +24,8 @@ use tauqe_protocol::{
 };
 use tokio::sync::{mpsc, watch};
 
-use crate::handlers::model::execute_model_turn;
-use crate::state::{next_operation_id, ActiveOperation, AppState};
+use crate::handlers::model::{execute_model_turn, StepTurnOptions};
+use crate::state::{next_operation_id, AppState, OperationGuard};
 use crate::transport::OutChannel;
 
 fn emit(out: &OutChannel, method: &str, params: Option<serde_json::Value>) {
@@ -53,7 +54,7 @@ pub async fn handle_review_start(req: Request, state: &Arc<AppState>) -> Respons
             Err(err) => {
                 return Response::err(
                     req.id,
-                    "INVALID_PARAMS",
+                    errors::INVALID_PARAMS,
                     format!("Invalid review parameters: {}", err),
                 );
             }
@@ -62,7 +63,7 @@ pub async fn handle_review_start(req: Request, state: &Arc<AppState>) -> Respons
     };
 
     let (provider, model, reasoning_effort) = {
-        let cfg = state.config.lock().await;
+        let cfg = state.config.lock().await.config.clone();
         let model = match params.model.clone() {
             Some(m) => m,
             None => cfg.resolve_role(ModelRole::Reviewer),
@@ -70,7 +71,7 @@ pub async fn handle_review_start(req: Request, state: &Arc<AppState>) -> Respons
         let reasoning_effort = cfg.models.resolve_effort(ModelRole::Reviewer);
         let provider: Arc<dyn LlmProvider> = match create_provider(model.provider, &cfg) {
             Ok(p) => Arc::from(p),
-            Err(err) => return Response::err(req.id, "NO_API_KEY", err.to_string()),
+            Err(err) => return Response::err(req.id, errors::NO_API_KEY, err.to_string()),
         };
         (provider, model, reasoning_effort)
     };
@@ -86,22 +87,17 @@ pub async fn handle_review_start(req: Request, state: &Arc<AppState>) -> Respons
     if files.is_empty() {
         return Response::err(
             req.id,
-            "EMPTY_CONTEXT",
+            errors::EMPTY_CONTEXT,
             "Context is empty: add files to review first",
         );
     }
 
-    let (cancel_tx, cancel_rx) = watch::channel(false);
-    {
-        let mut active = state.active_cancel.lock().await;
-        if active.is_some() {
-            return Response::err(req.id, "BUSY", "Another operation is already running");
+    let operation = match state.try_begin_operation() {
+        Ok(guard) => Arc::new(guard),
+        Err(()) => {
+            return Response::err(req.id, errors::BUSY, "Another operation is already running");
         }
-        *active = Some(ActiveOperation {
-            cancel_tx,
-            abort_handle: None,
-        });
-    }
+    };
 
     let op_id = format!("op-{}", next_operation_id());
     let created_at = SystemTime::now()
@@ -136,6 +132,7 @@ pub async fn handle_review_start(req: Request, state: &Arc<AppState>) -> Respons
     tokio::spawn(async move {
         let state = state_for_spawn;
         let op_id = op_id_for_spawn;
+        let cancel_rx = operation.cancel_receiver();
 
         let (tx, mut rx) = mpsc::channel::<StreamEvent>(100);
         let err_tx = tx.clone();
@@ -156,9 +153,7 @@ pub async fn handle_review_start(req: Request, state: &Arc<AppState>) -> Respons
                 let _ = err_tx.send(StreamEvent::Error(err.to_string())).await;
             }
         });
-        if let Some(op) = state.active_cancel.lock().await.as_mut() {
-            op.abort_handle = Some(stream_task.abort_handle());
-        }
+        operation.set_abort_handle(stream_task.abort_handle());
 
         let mut raw_markdown = String::new();
         let mut usage: Option<ModelUsageInfo> = None;
@@ -198,7 +193,6 @@ pub async fn handle_review_start(req: Request, state: &Arc<AppState>) -> Respons
         }
 
         let cancelled = *cancel_rx.borrow();
-        *state.active_cancel.lock().await = None;
 
         if cancelled {
             stream_task.abort();
@@ -309,13 +303,20 @@ pub async fn handle_review_start(req: Request, state: &Arc<AppState>) -> Respons
 }
 
 pub async fn handle_review_cancel(req: Request, state: &Arc<AppState>) -> Response {
-    let active_op = state.active_cancel.lock().await.take();
+    let active_op = state.take_active_operation();
     if let Some(op) = active_op {
         let _ = op.cancel_tx.send(true);
         if let Some(handle) = op.abort_handle {
+            // Aborting is a last resort: the streaming task unwinds
+            // cooperatively on the cancel signal, and a hard abort is deferred
+            // while a git transaction is still open so a half-finished
+            // checkpoint or step commit is never abandoned mid-transaction.
+            let state = Arc::clone(state);
             tokio::spawn(async move {
-                tokio::time::sleep(tokio::time::Duration::from_millis(600)).await;
-                handle.abort();
+                tokio::time::sleep(crate::handlers::model::CANCEL_UNWIND_GRACE).await;
+                if !state.git_transaction_active.load(Ordering::SeqCst) {
+                    handle.abort();
+                }
             });
         }
     }
@@ -329,7 +330,7 @@ pub async fn handle_review_list(req: Request, state: &Arc<AppState>) -> Response
             let active_id = ReviewStorage::load_active_id(&repo_root).ok().flatten();
             Response::ok_typed(req.id, &ReviewListResult { reviews, active_id })
         }
-        Err(err) => Response::err(req.id, "REVIEW_LIST_FAILED", format!("{:#}", err)),
+        Err(err) => Response::err(req.id, errors::REVIEW_LIST_FAILED, format!("{:#}", err)),
     }
 }
 
@@ -376,7 +377,7 @@ pub async fn handle_review_get(req: Request, state: &Arc<AppState>) -> Response 
     match review_id {
         Some(id) => match ReviewStorage::load_review(&repo_root, &id) {
             Ok(session) => Response::ok_typed(req.id, &ReviewGetResult { session }),
-            Err(err) => Response::err(req.id, "REVIEW_GET_FAILED", format!("{:#}", err)),
+            Err(err) => Response::err(req.id, errors::REVIEW_GET_FAILED, format!("{:#}", err)),
         },
         None => Response::ok_typed(req.id, &ReviewGetResult { session: None }),
     }
@@ -385,7 +386,7 @@ pub async fn handle_review_get(req: Request, state: &Arc<AppState>) -> Response 
 pub async fn handle_review_delete(req: Request, state: &Arc<AppState>) -> Response {
     let params: ReviewDeleteParams = match req.params.and_then(|p| serde_json::from_value(p).ok()) {
         Some(p) => p,
-        None => return Response::err(req.id, "INVALID_PARAMS", "Missing or invalid review ID"),
+        None => return Response::err(req.id, errors::INVALID_PARAMS, "Missing or invalid review ID"),
     };
 
     let repo_root = state.context.read().await.repo_root().to_path_buf();
@@ -403,7 +404,7 @@ pub async fn handle_review_delete(req: Request, state: &Arc<AppState>) -> Respon
             }
             Response::ok_typed(req.id, &ReviewDeleteResult { success: deleted })
         }
-        Err(err) => Response::err(req.id, "REVIEW_DELETE_FAILED", format!("{:#}", err)),
+        Err(err) => Response::err(req.id, errors::REVIEW_DELETE_FAILED, format!("{:#}", err)),
     }
 }
 
@@ -412,7 +413,7 @@ pub async fn handle_review_update_item(req: Request, state: &Arc<AppState>) -> R
     {
         Some(p) => p,
         None => {
-            return Response::err(req.id, "INVALID_PARAMS", "Missing or invalid review item update");
+            return Response::err(req.id, errors::INVALID_PARAMS, "Missing or invalid review item update");
         }
     };
 
@@ -453,10 +454,10 @@ pub async fn handle_review_update_item(req: Request, state: &Arc<AppState>) -> R
         }
         Ok(None) => Response::err(
             req.id,
-            "NOT_FOUND",
+            errors::NOT_FOUND,
             format!("Review item #{} not found", params.item_id),
         ),
-        Err(err) => Response::err(req.id, "REVIEW_UPDATE_FAILED", format!("{:#}", err)),
+        Err(err) => Response::err(req.id, errors::REVIEW_UPDATE_FAILED, format!("{:#}", err)),
     }
 }
 
@@ -525,7 +526,7 @@ async fn preload_item_file(state: &Arc<AppState>, repo_root: &Path, file_path: &
     if clean_path.is_empty() {
         return;
     }
-    let max_files = state.config.lock().await.context.max_files;
+    let files_token_budget = state.config.lock().await.config.context.files_token_budget;
     let available_files =
         tauqe_core::git::list_repository_files(Some(repo_root)).unwrap_or_default();
     let requests = vec![ContextRequest {
@@ -535,7 +536,7 @@ async fn preload_item_file(state: &Arc<AppState>, repo_root: &Path, file_path: &
 
     let (outcome, new_ctx_state) = {
         let mut ctx = state.context.write().await;
-        let oc = apply_context_requests_detailed(&mut ctx, &requests, &available_files, max_files);
+        let oc = apply_context_requests_detailed(&mut ctx, &requests, &available_files, files_token_budget);
         let s = ctx.get_state();
         (oc, s)
     };
@@ -584,6 +585,7 @@ async fn run_review_step(
     repo_root: &Path,
     review_id: &str,
     item_id: u32,
+    operation: Arc<OperationGuard>,
 ) -> Result<(), String> {
     let session = match ReviewStorage::load_review(repo_root, review_id) {
         Ok(Some(s)) => s,
@@ -640,7 +642,7 @@ async fn run_review_step(
     };
 
     let (max_retries, auto_level_up, models_config) = {
-        let cfg = state.config.lock().await;
+        let cfg = state.config.lock().await.config.clone();
         (
             cfg.develop.max_retries,
             cfg.models.auto_level_up,
@@ -660,21 +662,20 @@ async fn run_review_step(
     let mut attempt = 0usize;
 
     loop {
-        let workflow_name = state.config.lock().await.develop.workflow.trim().to_lowercase();
-        let policy: Box<dyn tauqe_core::workflow::policy::ApplyPolicy> =
-            match workflow_name.as_str() {
-                "naive" => Box::new(tauqe_core::workflow::policy::DirectApplyPolicy::new()),
-                _ => Box::new(tauqe_core::workflow::git_policy::GitTransactionPolicy::new()),
-            };
+        let workflow_name = state.config.lock().await.config.develop.workflow.trim().to_lowercase();
+        let policy = crate::handlers::model::build_apply_policy(state, &workflow_name);
 
         let turn_result = execute_model_turn(
             state,
             prompt.clone(),
-            Some(selection.clone()),
-            None,
-            reasoning_effort,
-            marker.clone(),
             policy,
+            StepTurnOptions {
+                custom_selection: Some(selection.clone()),
+                plan_context: None,
+                reasoning_effort,
+                marker: marker.clone(),
+                shared_operation: Some(Arc::clone(&operation)),
+            },
         )
         .await;
 
@@ -750,6 +751,7 @@ struct ReviewItemExecutor<'a> {
     state: &'a Arc<AppState>,
     repo_root: &'a Path,
     review_id: &'a str,
+    operation: &'a Arc<OperationGuard>,
 }
 
 #[async_trait]
@@ -769,7 +771,15 @@ impl BatchStepExecutor for ReviewItemExecutor<'_> {
                 )));
             }
         };
-        match run_review_step(self.state, self.repo_root, self.review_id, item_id).await {
+        match run_review_step(
+            self.state,
+            self.repo_root,
+            self.review_id,
+            item_id,
+            Arc::clone(self.operation),
+        )
+        .await
+        {
             Ok(()) => Ok(BatchStepOutcome::succeeded()),
             Err(reason) => Ok(BatchStepOutcome::failed(reason)),
         }
@@ -785,6 +795,7 @@ async fn run_review_batch(
     state: &Arc<AppState>,
     review_id: &str,
     item_ids: Vec<u32>,
+    operation: Arc<OperationGuard>,
 ) -> BatchOutcome {
     let repo_root = state.context.read().await.repo_root().to_path_buf();
     let _ = ReviewStorage::save_active_id(&repo_root, Some(review_id));
@@ -797,12 +808,16 @@ async fn run_review_batch(
         .collect();
 
     let (stream_tx, _stream_rx) = mpsc::channel::<StreamEvent>(1);
-    let (_cancel_tx, cancel_rx) = watch::channel(false);
+    // The whole batch shares one operation and one cancel channel: a cancel
+    // delivered between findings is honored instead of being lost, and the slot
+    // stays registered for the batch's entire lifetime.
+    let cancel_rx = operation.cancel_receiver();
 
     let mut executor = ReviewItemExecutor {
         state,
         repo_root: &repo_root,
         review_id,
+        operation: &operation,
     };
 
     let report = BatchExecution::new()
@@ -876,41 +891,41 @@ async fn run_review_batch(
 pub async fn handle_review_execute(req: Request, state: &Arc<AppState>) -> Response {
     let params: ReviewExecuteParams = match req.params.and_then(|p| serde_json::from_value(p).ok()) {
         Some(p) => p,
-        None => return Response::err(req.id, "INVALID_PARAMS", "Missing or invalid review execute params"),
+        None => return Response::err(req.id, errors::INVALID_PARAMS, "Missing or invalid review execute params"),
     };
 
     let repo_root = state.context.read().await.repo_root().to_path_buf();
     let session = match ReviewStorage::load_review(&repo_root, &params.review_id) {
         Ok(Some(s)) => s,
-        Ok(None) => return Response::err(req.id, "NOT_FOUND", format!("Review session '{}' not found", params.review_id)),
-        Err(err) => return Response::err(req.id, "REVIEW_LOAD_FAILED", format!("{:#}", err)),
+        Ok(None) => return Response::err(req.id, errors::NOT_FOUND, format!("Review session '{}' not found", params.review_id)),
+        Err(err) => return Response::err(req.id, errors::REVIEW_LOAD_FAILED, format!("{:#}", err)),
     };
 
     let item_ids: Vec<u32> = match params.item_id {
         Some(item_id) => {
             let item = match session.find_item(item_id) {
                 Some(i) => i,
-                None => return Response::err(req.id, "NOT_FOUND", format!("Review item #{} not found in session '{}'", item_id, params.review_id)),
+                None => return Response::err(req.id, errors::NOT_FOUND, format!("Review item #{} not found in session '{}'", item_id, params.review_id)),
             };
             match item.status {
                 ReviewItemStatus::Discussion => {
                     return Response::err(
                         req.id,
-                        "ITEM_IN_DISCUSSION",
+                        errors::ITEM_IN_DISCUSSION,
                         format!("Review item #{} is in DISCUSSION status and cannot be executed autonomously until reviewed (change status to TODO first)", item.id),
                     );
                 }
                 ReviewItemStatus::Rejected => {
                     return Response::err(
                         req.id,
-                        "ITEM_REJECTED",
+                        errors::ITEM_REJECTED,
                         format!("Review item #{} is REJECTED and cannot be executed", item.id),
                     );
                 }
                 ReviewItemStatus::Fixed => {
                     return Response::err(
                         req.id,
-                        "NOTHING_TO_EXECUTE",
+                        errors::NOTHING_TO_EXECUTE,
                         format!("Review item #{} is already FIXED", item.id),
                     );
                 }
@@ -929,7 +944,7 @@ pub async fn handle_review_execute(req: Request, state: &Arc<AppState>) -> Respo
             if ids.is_empty() {
                 return Response::err(
                     req.id,
-                    "NOTHING_TO_EXECUTE",
+                    errors::NOTHING_TO_EXECUTE,
                     "No TODO findings to execute in this review session",
                 );
             }
@@ -937,20 +952,26 @@ pub async fn handle_review_execute(req: Request, state: &Arc<AppState>) -> Respo
         }
     };
 
-    if state.active_cancel.lock().await.is_some() {
-        return Response::err(
-            req.id,
-            "OPERATION_IN_PROGRESS",
-            "Another operation is already running",
-        );
-    }
+    let operation = match state.try_begin_operation() {
+        Ok(guard) => Arc::new(guard),
+        Err(()) => {
+            return Response::err(
+                req.id,
+                errors::OPERATION_IN_PROGRESS,
+                "Another operation is already running",
+            );
+        }
+    };
 
+    // Pre-flight verification runs while the batch operation stays registered,
+    // so the slot is never briefly free and a concurrent `config/set`,
+    // `git/undo`, or a second `review/execute` cannot slip in mid-verification.
     if let Err(report) = crate::handlers::run_preflight_verification(&repo_root).await {
         let message = format!(
             "Pre-flight verification failed: the repository does not build cleanly. Batch execution was blocked before starting any finding.\n\n{}",
             report
         );
-        return Response::err(req.id, "PREFLIGHT_VERIFICATION_FAILED", message);
+        return Response::err(req.id, errors::PREFLIGHT_VERIFICATION_FAILED, message);
     }
 
     let response = Response::ok(
@@ -961,7 +982,7 @@ pub async fn handle_review_execute(req: Request, state: &Arc<AppState>) -> Respo
     let state = Arc::clone(state);
     let review_id = params.review_id.clone();
     tokio::spawn(async move {
-        match run_review_batch(&state, &review_id, item_ids).await {
+        match run_review_batch(&state, &review_id, item_ids, operation).await {
             BatchOutcome::Completed { items } => {
                 tracing::info!("Review '{}' batch completed: {} finding(s)", review_id, items);
             }
@@ -1096,7 +1117,7 @@ mod tests {
         std::fs::write(&target_file, "fn foo() {}\n").unwrap();
 
         let mut config = tauqe_core::config::AppConfig::default();
-        config.models.reviewer = Some(tauqe_protocol::ModelRef::openrouter("test/reviewer-model"));
+        config.models.reviewer = Some(tauqe_protocol::ModelRef::openrouter("test/reviewer-model").into());
         config.models.advisor = Some(tauqe_protocol::ModelRef::openrouter("test/advisor-model"));
 
         let (out, _rx) = OutChannel::new();
@@ -1204,7 +1225,8 @@ mod tests {
         let state = test_state(&dir);
 
         // Without an API key the first turn cannot start: the batch must stop at finding 1.
-        let outcome = run_review_batch(&state, "rev-exec-1", vec![1, 2]).await;
+        let operation = Arc::new(state.try_begin_operation().expect("register batch operation"));
+        let outcome = run_review_batch(&state, "rev-exec-1", vec![1, 2], operation).await;
         match outcome {
             BatchOutcome::Failed {
                 completed, item_id, ..
@@ -1244,7 +1266,8 @@ mod tests {
         ReviewStorage::save_session(dir.path(), &session).unwrap();
         let state = test_state(&dir);
 
-        let outcome = run_review_batch(&state, "rev-skip", vec![1, 2]).await;
+        let operation = Arc::new(state.try_begin_operation().expect("register batch operation"));
+        let outcome = run_review_batch(&state, "rev-skip", vec![1, 2], operation).await;
         match outcome {
             BatchOutcome::Failed {
                 completed, item_id, ..
@@ -1278,7 +1301,8 @@ mod tests {
         );
 
         // Without an API key the first turn cannot start: the batch fails at finding 1.
-        let outcome = run_review_batch(&state, "rev-emit", vec![1, 2]).await;
+        let operation = Arc::new(state.try_begin_operation().expect("register batch operation"));
+        let outcome = run_review_batch(&state, "rev-emit", vec![1, 2], operation).await;
         assert!(matches!(outcome, BatchOutcome::Failed { .. }));
 
         let mut raw_events = Vec::new();
@@ -1320,7 +1344,7 @@ mod tests {
         assert!(err.message.contains("Pre-flight verification failed"));
 
         // The failure is detected before any turn starts: no active operation.
-        assert!(state.active_cancel.lock().await.is_none());
+        assert!(!state.is_operation_active());
 
         // No finding was touched: every status stays TODO.
         let reloaded = ReviewStorage::load_review(dir.path(), "rev-preflight")
@@ -1411,7 +1435,8 @@ mod tests {
         config.develop.max_retries = 1;
         let state = test_state_with_provider(&dir, config, provider.clone()).await;
 
-        let outcome = run_review_batch(&state, "rev-retry-exhaust", vec![1]).await;
+        let operation = Arc::new(state.try_begin_operation().expect("register batch operation"));
+        let outcome = run_review_batch(&state, "rev-retry-exhaust", vec![1], operation).await;
         match outcome {
             BatchOutcome::Failed {
                 completed,
@@ -1458,7 +1483,8 @@ mod tests {
         config.develop.max_retries = 1;
         let state = test_state_with_provider(&dir, config, provider.clone()).await;
 
-        let outcome = run_review_batch(&state, "rev-no-change", vec![1, 2]).await;
+        let operation = Arc::new(state.try_begin_operation().expect("register batch operation"));
+        let outcome = run_review_batch(&state, "rev-no-change", vec![1, 2], operation).await;
         match outcome {
             BatchOutcome::Failed {
                 completed,
@@ -1500,7 +1526,8 @@ mod tests {
 
         let state = test_state_with_provider(&dir, test_config(), provider.clone()).await;
 
-        let outcome = run_review_batch(&state, "rev-blocked", vec![1]).await;
+        let operation = Arc::new(state.try_begin_operation().expect("register batch operation"));
+        let outcome = run_review_batch(&state, "rev-blocked", vec![1], operation).await;
         match outcome {
             BatchOutcome::Failed {
                 completed,
@@ -1549,7 +1576,8 @@ mod tests {
         config.models.auto_level_up = true;
         let state = test_state_with_provider(&dir, config, provider.clone()).await;
 
-        let outcome = run_review_batch(&state, "rev-explicit", vec![1]).await;
+        let operation = Arc::new(state.try_begin_operation().expect("register batch operation"));
+        let outcome = run_review_batch(&state, "rev-explicit", vec![1], operation).await;
         assert!(matches!(outcome, BatchOutcome::Failed { .. }));
 
         let requests = provider.requests();
@@ -1584,7 +1612,8 @@ mod tests {
         let state = test_state_with_provider(&dir, config, provider.clone()).await;
         *state.marker_override.lock().await = Some(marker.to_string());
 
-        let outcome = run_review_batch(&state, "rev-marker", vec![1]).await;
+        let operation = Arc::new(state.try_begin_operation().expect("register batch operation"));
+        let outcome = run_review_batch(&state, "rev-marker", vec![1], operation).await;
         assert!(
             matches!(outcome, BatchOutcome::Completed { items: 1 }),
             "expected a completed batch, got {:?}",

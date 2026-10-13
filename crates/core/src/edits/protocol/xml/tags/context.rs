@@ -1,4 +1,4 @@
-//! Parsers for the `<context_request>` and `<context_drop>` control tags.
+//! Parsers for the `<context_request>` control tags.
 
 use tauqe_protocol::ContextAccess;
 
@@ -11,19 +11,9 @@ pub(crate) fn next_context_request_tag(text: &str) -> Option<(usize, usize)> {
     next_simple_tag(text, "<context_request")
 }
 
-/// Locates the next complete `<context_drop .../>` tag (unsuffixed dialect).
-pub(crate) fn next_context_drop_tag(text: &str) -> Option<(usize, usize)> {
-    next_simple_tag(text, "<context_drop")
-}
-
 /// Removes all context request tags from text.
 pub fn strip_context_request_tags(text: &str) -> String {
     strip_tags(text, next_context_request_tag)
-}
-
-/// Removes all context drop tags from text.
-pub fn strip_context_drop_tags(text: &str) -> String {
-    strip_tags(text, next_context_drop_tag)
 }
 
 /// Parses all `<context_request>` tags into typed access requests.
@@ -58,45 +48,9 @@ pub(crate) fn parse_context_request_tags(text: &str) -> Vec<ContextRequest> {
     requests
 }
 
-/// Parses all `<context_drop>` tags into normalized repository-relative paths.
-pub fn parse_context_drop_tags(text: &str) -> Vec<String> {
-    let mut drops = Vec::new();
-    let mut pos = 0;
-    while let Some((start, end)) = next_context_drop_tag(&text[pos..]) {
-        let tag = &text[pos + start..pos + end];
-        let header_end = tag.find('>').unwrap_or(tag.len());
-        let header = &tag[..header_end];
-        if let Some(path) = extract_attribute(header, "path") {
-            let path = path
-                .trim()
-                .trim_start_matches("./")
-                .trim_start_matches('/')
-                .to_string();
-            if !path.is_empty() && !drops.contains(&path) {
-                drops.push(path);
-            }
-        }
-        pos += end;
-    }
-    drops
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_parse_and_strip_context_drop_tags() {
-        let text = "Dropping:\n<context_drop path=\"crates/a.rs\" />\nMiddle\n<context_drop_ABC path=\"crates/b.rs\"></context_drop_ABC>\nDone.";
-        assert_eq!(
-            parse_context_drop_tags(text),
-            vec!["crates/a.rs".to_string(), "crates/b.rs".to_string()]
-        );
-        assert_eq!(
-            strip_context_drop_tags(text).trim(),
-            "Dropping:\n\nMiddle\n\nDone."
-        );
-    }
 
     #[test]
     fn test_parse_context_request_ignores_code_fences_and_inline_backticks() {

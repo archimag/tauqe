@@ -35,6 +35,15 @@ pub fn review_dialog_geometry(term: Rect) -> (Rect, Rect, Rect) {
     (area, confirm_btn, cancel_btn)
 }
 
+/// Human-readable label for the configured Reviewer reasoning effort, falling
+/// back to a neutral placeholder when the role inherits the provider default.
+fn effort_label(effort: Option<tauqe_protocol::model::ReasoningEffort>) -> String {
+    match effort {
+        Some(effort) => effort.to_string(),
+        None => "default".to_string(),
+    }
+}
+
 pub fn render_review_dialog(frame: &mut ratatui::Frame, dialog: &crate::app::ReviewDialogState) {
     let area = review_dialog_geometry(frame.area()).0;
     frame.render_widget(Clear, area);
@@ -51,11 +60,6 @@ pub fn render_review_dialog(frame: &mut ratatui::Frame, dialog: &crate::app::Rev
         .constraints([Constraint::Min(6), Constraint::Length(3)])
         .split(inner_area);
 
-    let model = dialog
-        .models
-        .get(dialog.model_index)
-        .map(|m| m.to_string())
-        .unwrap_or_else(|| "(none)".to_string());
     let dim = Style::default().fg(Color::DarkGray);
 
     let mut lines = vec![
@@ -78,12 +82,16 @@ pub fn render_review_dialog(frame: &mut ratatui::Frame, dialog: &crate::app::Rev
             ),
         ]),
         Line::from(vec![
-            Span::styled("  Model: ", dim),
+            Span::styled("  Reviewer: ", dim),
             Span::styled(
-                format!("◄ {} ►", model),
+                dialog.reviewer_model.to_string(),
                 Style::default().fg(Color::Green).bold(),
             ),
-            Span::styled("  (↑/↓ to switch)", dim),
+            Span::styled("    Effort: ", dim),
+            Span::styled(
+                effort_label(dialog.reviewer_effort),
+                Style::default().fg(Color::White).bold(),
+            ),
         ]),
         Line::from(Span::styled(
             "  Only file contents are sent: history and repo map are excluded.",
@@ -134,7 +142,7 @@ pub fn render_review_dialog(frame: &mut ratatui::Frame, dialog: &crate::app::Rev
             Span::styled(format!(" {} ", REVIEW_DIALOG_CANCEL_LABEL), cancel_style),
         ]),
         Line::from(Span::styled(
-            "Tab / ←/→ focus • Enter confirm • Esc cancel • ↑/↓ switch model",
+            "Tab / ←/→ focus • Enter confirm • Esc cancel",
             Style::default().fg(Color::DarkGray),
         )),
     ];

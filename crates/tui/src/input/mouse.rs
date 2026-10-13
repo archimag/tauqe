@@ -312,7 +312,7 @@ pub async fn handle_mouse_event(
                             st.review_dialog = None;
                             let prompt = dialog.prompt_editor.get_text().trim().to_string();
                             let params = tauqe_protocol::ReviewStartParams {
-                                model: dialog.models.get(dialog.model_index).cloned(),
+                                model: None,
                                 user_prompt: if prompt.is_empty() { None } else { Some(prompt) },
                             };
                             st.review.begin();

@@ -380,8 +380,10 @@ pub enum ViewMode {
 pub struct ReviewDialogState {
     pub files_count: usize,
     pub estimated_tokens: usize,
-    pub models: Vec<ModelRef>,
-    pub model_index: usize,
+    /// Concrete Reviewer-role model resolved from configuration for display.
+    pub reviewer_model: ModelRef,
+    /// Configured Reviewer reasoning effort, if any.
+    pub reviewer_effort: Option<tauqe_protocol::model::ReasoningEffort>,
     pub prompt_editor: InputEditor,
     /// Which action-bar button holds focus. Defaults to the safe `Cancel`.
     pub confirm_button: ConfirmDialogButton,

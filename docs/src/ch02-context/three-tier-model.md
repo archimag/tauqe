@@ -32,7 +32,7 @@ The working context is organized into three distinct layers:
 3. **Auto Layer:**
    - Files autonomously requested by the model during multi-round Discovery via `<context_request>`.
    - Populated dynamically as the model detects missing symbols or definitions from the Tree-sitter Repo Map.
-   - **Disposable and evolving:** Files here can be promoted to the User layer (`p` in Context View), cleared in bulk (`c`), or retired individually via `<context_drop path="..." />` under the active discovery mode (see 2.5). The Auto layer is the model's working set, not a durable commitment.
+   - **Disposable and turn-scoped:** Files here can be promoted to the User layer (`p` in Context View) or cleared in bulk (`c`). The Auto layer accumulates monotonically during an active turn and is automatically cleared when the turn completes.
 
 ---
 
@@ -58,23 +58,12 @@ By combining explicit User layer curation with autonomous model Discovery, devel
 
 ---
 
-## 2.5 Discovery Modes: Context Growth Strategies
+## 2.5 Auto-Context Lifecycle: Append-Only Stack
 
-How the Auto layer evolves across discovery rounds is governed by a configurable strategy (`context.discovery_mode` in `tauqe.toml`). Each mode encodes a different trade-off between predictability and context economy.
-
-- **`monotonic` (default):**
-  - Pure append-only growth. Requested files accumulate until the turn ends; neither eviction nor `<context_drop>` removes anything.
-  - *Why:* The most conservative guarantee. Once the model has reasoned about a file, it keeps it for the rest of the turn, so no dependency can silently vanish mid-thought. The cost is a steadily growing context, which is acceptable for short, well-scoped turns.
-- **`incremental`:**
-  - Additive expansion with explicit eviction. The model may retire an investigated dead end by emitting `<context_drop path="..." />`.
-  - Only the Auto layer is affected. Attempts to drop a User or Pinned file are safely ignored, so the developer's explicit curation is never lost.
-  - *Why:* Lets the model prune branches it has ruled out and reinvest the freed token budget into productive lines of inquiry, without discarding the developer's committed context.
-- **`snapshot`:**
-  - The model declares the full desired working set on every round. Any Auto file omitted from the current round is evicted automatically.
-  - User and Pinned files are strictly preserved and never evicted.
-  - *Why:* Drives toward a precise, minimal working set each round. Powerful when the model can reliably restate its complete dependency list, but demanding: silently forgetting a still-needed file evicts it.
-
-In every mode the hard `max_files` limit is evaluated *after* eviction and reconciliation, so a snapshot that frees stale files can admit new ones within the same budget.
+The Auto layer operates with pure append-only semantics throughout the active turn:
+- When the model emits `<context_request path="..." access="..." />`, the file is added to the Auto layer and accumulates for the duration of the turn.
+- Once the turn completes (or rolls back), the transient Auto layer is cleared automatically, ensuring context hygiene and preventing stale dependencies from polluting future tasks.
+- If a task genuinely requires keeping a discovered file across multiple turns, the developer can promote it permanently to the User layer (`p` in Context View).
 
 ---
 
@@ -84,7 +73,7 @@ In every mode the hard `max_files` limit is evaluated *after* eviction and recon
 
 **Token budgets.** TAUQE never guesses what it can measure deterministically:
 - Per-file cost is estimated from file size (roughly `size_bytes / 4`), and the assembled context reports an aggregate `total_estimated_tokens`.
-- `context.max_files` bounds the number of tracked files (default 25).
+- `context.files_token_budget` bounds the total estimated tokens of all context files (default 300,000). If the model requests more context than fits within this budget, execution halts cleanly with a diagnostic asking to scope down or decompose the task.
 - `context.max_discovery_rounds` bounds discovery round-trips per turn (default 5), preventing unbounded exploration loops.
 - `context.repomap_token_budget` bounds the Tree-sitter Repo Map, keeping the architectural overview cheap.
 
@@ -98,5 +87,5 @@ The Auto layer is ephemeral by design: it reflects the model's current investiga
 
 - **Explicit clearing (`c`):** The developer can clear the entire Auto layer, leaving a context composed solely of Pinned and User files.
 - **Promotion is durable; discovery is not:** Promoting an Auto file to the User layer (`p`) turns it into a deliberate, surviving choice. Everything left behind in the Auto layer stays disposable.
-- **Turn merge:** When a turn completes, its Auto-layer state is merged back into the live context. Concurrent User-layer additions made while the turn was running are preserved, and the Auto layer is replaced by the turn's final state.
+- **Turn merge and mutation lock:** When a turn completes, its Auto-layer state is merged back into the live context, replacing the previous Auto layer. Because a turn reasons over a *snapshot* of the context, context mutations are refused for the entire duration of a turn or batch: `context/add` (including glob intake), `context/remove`, `context/set_access`, and `context/clear` all answer with `OPERATION_IN_PROGRESS` until the operation finishes. This keeps the merge operating on an untouched base, so the turn's frozen snapshot can never overwrite or resurrect the developer's live changes.
 - **Disk reconciliation:** After an apply, undo, or rollback, the context is pruned against the filesystem. Files that the model created and a rollback then removed no longer exist and are dropped from context automatically. This keeps the working set aligned with what Git and the filesystem actually contain, rather than with a stale in-memory snapshot.

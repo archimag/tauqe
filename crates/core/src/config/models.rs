@@ -56,6 +56,144 @@ where
     }
 }
 
+/// Configuration for a specialized semantic role (model and optional reasoning depth).
+///
+/// Accepts either a bare model string (`"openrouter:model"`) or a table
+/// (`{ model = "openrouter:model", effort = "high" }`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoleConfig {
+    pub model: ModelRef,
+    pub effort: Option<ReasoningEffort>,
+}
+
+impl RoleConfig {
+    pub fn new(model: ModelRef, effort: Option<ReasoningEffort>) -> Self {
+        Self { model, effort }
+    }
+}
+
+impl From<ModelRef> for RoleConfig {
+    fn from(model: ModelRef) -> Self {
+        Self {
+            model,
+            effort: None,
+        }
+    }
+}
+
+fn serialize_model_ref_as_str<S>(model: &ModelRef, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    serializer.serialize_str(&model.to_string())
+}
+
+fn deserialize_model_ref_field<'de, D>(deserializer: D) -> Result<ModelRef, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum ModelRefFieldRaw {
+        Str(String),
+        Struct(ModelRef),
+    }
+
+    match ModelRefFieldRaw::deserialize(deserializer)? {
+        ModelRefFieldRaw::Str(s) => {
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                Err(serde::de::Error::custom("model reference cannot be empty"))
+            } else {
+                parse_model_ref(trimmed).map_err(serde::de::Error::custom)
+            }
+        }
+        ModelRefFieldRaw::Struct(m) => Ok(m),
+    }
+}
+
+impl Serialize for RoleConfig {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        if let Some(effort) = self.effort {
+            #[derive(Serialize)]
+            struct RoleConfigTable<'a> {
+                #[serde(serialize_with = "serialize_model_ref_as_str")]
+                model: &'a ModelRef,
+                effort: ReasoningEffort,
+            }
+            RoleConfigTable {
+                model: &self.model,
+                effort,
+            }
+            .serialize(serializer)
+        } else {
+            serializer.serialize_str(&self.model.to_string())
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for RoleConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserialize_role_config_opt(deserializer)?
+            .ok_or_else(|| serde::de::Error::custom("expected role configuration"))
+    }
+}
+
+pub fn deserialize_role_config_opt<'de, D>(
+    deserializer: D,
+) -> Result<Option<RoleConfig>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum RoleConfigRaw {
+        Str(String),
+        Table {
+            #[serde(deserialize_with = "deserialize_model_ref_field")]
+            model: ModelRef,
+            #[serde(default)]
+            effort: Option<ReasoningEffort>,
+        },
+    }
+
+    match Option::<RoleConfigRaw>::deserialize(deserializer)? {
+        None => Ok(None),
+        Some(RoleConfigRaw::Str(s)) => {
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                Ok(None)
+            } else {
+                let model = parse_model_ref(trimmed).map_err(serde::de::Error::custom)?;
+                Ok(Some(RoleConfig {
+                    model,
+                    effort: None,
+                }))
+            }
+        }
+        Some(RoleConfigRaw::Table { model, effort }) => Ok(Some(RoleConfig { model, effort })),
+    }
+}
+
+pub fn serialize_role_config_opt<S>(
+    opt: &Option<RoleConfig>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    match opt {
+        Some(cfg) => cfg.serialize(serializer),
+        None => serializer.serialize_none(),
+    }
+}
+
 /// Polymorphic configuration of the coder escalation ladder.
 ///
 /// Accepts a single tier (a bare model string or a `{ model, effort }` table)
@@ -124,10 +262,10 @@ pub struct ModelsConfig {
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
-        deserialize_with = "deserialize_model_ref_opt",
-        serialize_with = "serialize_model_ref_opt"
+        deserialize_with = "deserialize_role_config_opt",
+        serialize_with = "serialize_role_config_opt"
     )]
-    pub architect: Option<ModelRef>,
+    pub architect: Option<RoleConfig>,
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
@@ -138,10 +276,10 @@ pub struct ModelsConfig {
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
-        deserialize_with = "deserialize_model_ref_opt",
-        serialize_with = "serialize_model_ref_opt"
+        deserialize_with = "deserialize_role_config_opt",
+        serialize_with = "serialize_role_config_opt"
     )]
-    pub reviewer: Option<ModelRef>,
+    pub reviewer: Option<RoleConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort: Option<ModelsEffortConfig>,
     #[serde(default)]
@@ -175,6 +313,15 @@ impl ModelsConfig {
     /// Returns `None` when no effort overrides are configured or when the
     /// requested role has no explicit effort, preserving the provider default.
     pub fn resolve_effort(&self, role: ModelRole) -> Option<ReasoningEffort> {
+        let inline_effort = match role {
+            ModelRole::Architect => self.architect.as_ref().and_then(|r| r.effort),
+            ModelRole::Reviewer => self.reviewer.as_ref().and_then(|r| r.effort),
+            _ => None,
+        };
+        if inline_effort.is_some() {
+            return inline_effort;
+        }
+
         let effort = self.effort.as_ref()?;
         match role {
             ModelRole::Scribe => effort.scribe,
@@ -183,6 +330,14 @@ impl ModelsConfig {
             ModelRole::Advisor => effort.advisor,
             ModelRole::Reviewer => effort.reviewer,
         }
+    }
+
+    fn architect_model(&self) -> Option<ModelRef> {
+        self.architect.as_ref().map(|r| r.model.clone())
+    }
+
+    fn reviewer_model(&self) -> Option<ModelRef> {
+        self.reviewer.as_ref().map(|r| r.model.clone())
     }
 
     /// Resolves a ModelRole with an optional external fallback model (e.g. from configured provider models).
@@ -197,23 +352,22 @@ impl ModelsConfig {
                 .clone()
                 .or_else(|| self.coder_base_model())
                 .or_else(|| self.advisor.clone())
-                .or_else(|| self.architect.clone())
-                .or_else(|| self.reviewer.clone())
+                .or_else(|| self.architect_model())
+                .or_else(|| self.reviewer_model())
                 .or(fallback)
                 .unwrap_or_else(|| ModelRef::openrouter(BUILTIN_DEFAULT_SCRIBE_MODEL)),
             ModelRole::Coder => self
                 .coder_base_model()
-                .or_else(|| self.architect.clone())
+                .or_else(|| self.architect_model())
                 .or_else(|| self.advisor.clone())
                 .or_else(|| self.scribe.clone())
-                .or_else(|| self.reviewer.clone())
+                .or_else(|| self.reviewer_model())
                 .or(fallback)
                 .unwrap_or_else(|| ModelRef::openrouter(BUILTIN_DEFAULT_CODER_MODEL)),
             ModelRole::Architect => self
-                .architect
-                .clone()
+                .architect_model()
                 .or_else(|| self.advisor.clone())
-                .or_else(|| self.reviewer.clone())
+                .or_else(|| self.reviewer_model())
                 .or_else(|| self.coder_base_model())
                 .or_else(|| self.scribe.clone())
                 .or(fallback)
@@ -221,16 +375,15 @@ impl ModelsConfig {
             ModelRole::Advisor => self
                 .advisor
                 .clone()
-                .or_else(|| self.architect.clone())
+                .or_else(|| self.architect_model())
                 .or_else(|| self.coder_base_model())
-                .or_else(|| self.reviewer.clone())
+                .or_else(|| self.reviewer_model())
                 .or_else(|| self.scribe.clone())
                 .or(fallback)
                 .unwrap_or_else(|| ModelRef::openrouter(BUILTIN_DEFAULT_ADVISOR_MODEL)),
             ModelRole::Reviewer => self
-                .reviewer
-                .clone()
-                .or_else(|| self.architect.clone())
+                .reviewer_model()
+                .or_else(|| self.architect_model())
                 .or_else(|| self.advisor.clone())
                 .or_else(|| self.coder_base_model())
                 .or_else(|| self.scribe.clone())
@@ -417,7 +570,7 @@ coder = [
     #[test]
     fn test_coder_ladder_falls_back_through_role_chain() {
         let config = ModelsConfig {
-            architect: Some(ModelRef::openrouter("only/architect")),
+            architect: Some(ModelRef::openrouter("only/architect").into()),
             ..Default::default()
         };
         let ladder = config.coder_ladder();
@@ -426,5 +579,67 @@ coder = [
         assert_eq!(ladder[0].effort, None);
         assert_eq!(config.coder_tier(0), ladder[0]);
         assert_eq!(config.coder_tier(3), ladder[0]);
+    }
+
+    #[test]
+    fn test_role_config_polymorphic_parsing_and_inline_effort_override() {
+        let toml_str = r#"
+architect = { model = "openrouter:anthropic/claude-sonnet-latest", effort = "high" }
+reviewer = "openrouter:google/gemini-flash-latest"
+
+[effort]
+architect = "low"
+reviewer = "medium"
+"#;
+        let config: ModelsConfig = toml::from_str(toml_str).expect("parse models config");
+        assert_eq!(
+            config.resolve_role(ModelRole::Architect),
+            ModelRef::openrouter("anthropic/claude-sonnet-latest")
+        );
+        // Inline effort overrides models.effort section
+        assert_eq!(
+            config.resolve_effort(ModelRole::Architect),
+            Some(ReasoningEffort::High)
+        );
+
+        assert_eq!(
+            config.resolve_role(ModelRole::Reviewer),
+            ModelRef::openrouter("google/gemini-flash-latest")
+        );
+        // Fallback to models.effort section when role has no inline effort
+        assert_eq!(
+            config.resolve_effort(ModelRole::Reviewer),
+            Some(ReasoningEffort::Medium)
+        );
+    }
+
+    #[test]
+    fn test_reviewer_inline_effort_overrides_models_effort_section() {
+        let toml_str = r#"
+reviewer = { model = "openrouter:google/gemini-flash-latest", effort = "xhigh" }
+
+[effort]
+reviewer = "low"
+"#;
+        let config: ModelsConfig = toml::from_str(toml_str).expect("parse models config");
+        assert_eq!(
+            config.resolve_role(ModelRole::Reviewer),
+            ModelRef::openrouter("google/gemini-flash-latest")
+        );
+        // An inline table effort wins over the global `[models.effort]` section.
+        // This is the same precedence the review/start handler relies on when it
+        // resolves the Reviewer role and its reasoning depth.
+        assert_eq!(
+            config.resolve_effort(ModelRole::Reviewer),
+            Some(ReasoningEffort::XHigh)
+        );
+    }
+
+    #[test]
+    fn test_role_config_blank_string_is_absent() {
+        let config: ModelsConfig =
+            toml::from_str("architect = \"\"\nreviewer = \"   \"").expect("parse blank role configs");
+        assert!(config.architect.is_none());
+        assert!(config.reviewer.is_none());
     }
 }

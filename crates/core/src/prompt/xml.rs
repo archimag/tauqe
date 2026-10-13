@@ -153,15 +153,12 @@ fn decode_xml_commands(xml: &dyn EditProtocol, raw_text: &str) -> Vec<LlmCommand
         }
     }
 
-    // Discovery: context requests and drops.
+    // Discovery: context requests.
     for request in xml.parse_context_requests(raw_text) {
         commands.push(LlmCommand::ContextRequest {
             path: request.path,
             access: request.access,
         });
-    }
-    for path in xml.parse_context_drops(raw_text) {
-        commands.push(LlmCommand::ContextDrop { path });
     }
 
     // Documentation requests.
@@ -355,7 +352,6 @@ mod tests {
         let output = concat!(
             "Working on it.\n",
             "<context_request path=\"src/a.rs\" access=\"editable\" />\n",
-            "<context_drop path=\"src/b.rs\" />\n",
             "<doc_request topic=\"workflow\" />\n",
             "<verify target=\"clippy\" on_success=\"silent\" />\n",
             "<scratchpad>Verified: parser works.</scratchpad>\n",
@@ -370,9 +366,6 @@ mod tests {
         assert!(commands.contains(&LlmCommand::ContextRequest {
             path: "src/a.rs".to_string(),
             access: ContextAccess::Editable,
-        }));
-        assert!(commands.contains(&LlmCommand::ContextDrop {
-            path: "src/b.rs".to_string(),
         }));
         assert!(commands.contains(&LlmCommand::DocRequest {
             topic: "workflow".to_string(),

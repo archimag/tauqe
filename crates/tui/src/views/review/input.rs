@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use crossterm::event::{KeyCode, KeyEvent};
-use tauqe_protocol::{methods, ReviewItem};
+use tauqe_protocol::{methods, ModelRole, ModelSelection, ReviewItem};
 use tokio::sync::Mutex;
 
 use crate::app::{AppState, KeyCommand, ReviewDialogState, ViewMode};
@@ -425,19 +425,24 @@ pub async fn handle_review_key(
                     "Context is empty: add files in the Context tab (Ctrl+2) first".to_string(),
                 );
             } else {
-                let models = st.available_models.clone();
-                let model_index = models
-                    .iter()
-                    .position(|m| m == &st.active_model)
-                    .unwrap_or(0);
+                let reviewer_model = st
+                    .model_choice
+                    .resolve(&ModelSelection::Role(ModelRole::Reviewer))
+                    .unwrap_or_else(|| st.active_model.clone());
+                let reviewer_effort = st
+                    .model_choice
+                    .roles
+                    .as_ref()
+                    .and_then(|roles| roles.efforts.as_ref())
+                    .and_then(|efforts| efforts.reviewer);
                 let files_count = st.context.items.len();
                 let estimated_tokens = st.context.total_estimated_tokens as usize;
                 st.review.error = None;
                 st.review_dialog = Some(ReviewDialogState {
                     files_count,
                     estimated_tokens,
-                    models,
-                    model_index,
+                    reviewer_model,
+                    reviewer_effort,
                     prompt_editor: crate::editor::InputEditor::default(),
                     confirm_button: crate::app::ConfirmDialogButton::Cancel,
                 });
@@ -472,5 +477,48 @@ mod tests {
             REVIEW_COMMANDS.len(),
             "duplicate key bindings in REVIEW_COMMANDS"
         );
+    }
+
+    #[tokio::test]
+    async fn test_review_dialog_uses_configured_reviewer_role() {
+        use tauqe_protocol::{ModelRef, ModelRolesEffort, ModelRolesSummary, ReasoningEffort};
+
+        let mut st = crate::app::test_state();
+        st.view_mode = ViewMode::Review;
+        st.context.items.push(tauqe_protocol::ContextItem {
+            path: "crates/core/src/lib.rs".to_string(),
+            access: tauqe_protocol::ContextAccess::ReadOnly,
+            size_bytes: 100,
+            estimated_tokens: 25,
+            layer: tauqe_protocol::ContextLayer::User,
+        });
+
+        let rev_model = ModelRef::openrouter("anthropic/claude-3.5-sonnet");
+        st.model_choice.roles = Some(ModelRolesSummary {
+            architect: ModelRef::openrouter("test-arch"),
+            coder: ModelRef::openrouter("test-coder"),
+            advisor: ModelRef::openrouter("test-adv"),
+            reviewer: rev_model.clone(),
+            scribe: ModelRef::openrouter("test-scribe"),
+            efforts: Some(ModelRolesEffort {
+                architect: None,
+                coder: None,
+                advisor: None,
+                reviewer: Some(ReasoningEffort::High),
+                scribe: None,
+            }),
+        });
+
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+
+        let key = KeyEvent::new(KeyCode::Char('r'), crossterm::event::KeyModifiers::NONE);
+        let res = handle_review_key(key, &state, &mut conn).await.unwrap();
+        assert_eq!(res, InputResult::Continue);
+
+        let st = state.lock().await;
+        let dialog = st.review_dialog.as_ref().expect("dialog should be opened");
+        assert_eq!(dialog.reviewer_model, rev_model);
+        assert_eq!(dialog.reviewer_effort, Some(ReasoningEffort::High));
     }
 }

@@ -161,8 +161,8 @@ All commits must follow the **Conventional Commits** specification:
 
 ## 9. Subsystem Conventions
 
-- **Terminal UI (`crates/tui`):**
-  The directives specified in `crates/tui/Conventions.md` are mandatory and strictly enforced. Whenever a task involves inspecting, modifying, or extending code inside `crates/tui/`, the model MUST explicitly request `crates/tui/Conventions.md` into context (via `<context_request>`) before proposing any modifications, unless it is already loaded in the active context. Proposing or making changes to `crates/tui/` without having `crates/tui/Conventions.md` loaded into context is strictly prohibited.
+Certain subsystems define mandatory engineering directives that supplement these repository-wide conventions. Whenever a task involves inspecting, modifying, or extending code within a subsystem that maintains local conventions, those directives MUST be requested into context before proposing any modifications, unless already loaded in the active context. Proposing or making changes to a subsystem without having its local conventions loaded in context is strictly prohibited.
 
-- **Core Engine (`crates/core`):**
-  The directives specified in `crates/core/Conventions.md` are mandatory and strictly enforced. Whenever a task involves inspecting, modifying, or extending code inside `crates/core/`, the model MUST explicitly request `crates/core/Conventions.md` into context (via `<context_request>`) before proposing any modifications, unless it is already loaded in the active context. In particular, all operations not directly involving code modifications MUST strictly adhere to the Structured Output paradigm specified therein. Proposing or making changes to `crates/core/` without having `crates/core/Conventions.md` loaded into context is strictly prohibited.
+Subsystems with mandatory local conventions:
+- **Terminal UI (`crates/tui`):** `crates/tui/Conventions.md`
+- **Core Engine (`crates/core`):** `crates/core/Conventions.md` (all operations not directly involving code modifications must strictly adhere to the Structured Output paradigm specified therein)

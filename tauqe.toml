@@ -27,8 +27,9 @@ coder = [
   "~deepseek/deepseek-flash-latest",
   { model = "~google/gemini-flash-latest", effort = "medium" }
 ]
-architect = "~google/gemini-flash-latest"    # conceptual design, plan refinement, blocked-step replanning
-reviewer = "~google/gemini-flash-latest"     # automated code review of active context files
+# architect and reviewer accept either a bare model string or a { model, effort } table:
+architect = { model = "~google/gemini-flash-latest", effort = "high" }    # conceptual design, plan refinement, blocked-step replanning
+reviewer = { model = "~google/gemini-flash-latest", effort = "high" }     # automated code review of active context files
 
 # Automatically escalate the Coder along its ladder when verification healing stalls,
 # when a patch retry budget is exceeded, or when a plan step must be re-prompted after
@@ -39,14 +40,16 @@ auto_level_up = true
 
 # Optional per-role reasoning depth: "low", "medium", "high", or "xhigh".
 # Effort stays orthogonal to model identity: the same model may be driven at a
-# different depth depending on the role it plays. Omitted roles fall back to the
-# provider default.
+# different depth depending on the role it plays. This section is the fallback for
+# roles that omit an inline effort: an effort declared directly in a role table
+# (for example reviewer = { model = "...", effort = "high" }) always takes
+# precedence, and roles with neither fall back to the provider default.
 [models.effort]
 # scribe = "low"        # cheap history compaction and commit message synthesis
 # coder = "medium"      # balanced patch generation and verification healing
-architect = "high"      # deep conceptual design and plan refinement
+# architect = "high"    # deep conceptual design and plan refinement (set inline above)
 # advisor = "medium"    # interactive engineering dialogue
-reviewer = "high"       # thorough automated code review
+# reviewer = "high"     # thorough automated code review (set inline above)
 
 [develop]
 # Retry budget for failed edit staging and for the plan step reprompt loop
@@ -69,9 +72,8 @@ budget_tokens = 20000  # session history token budget before compaction is trigg
 # tail_turns = 10        # number of recent turns kept uncompressed in original form (default: 10)
 
 [context]
-# discovery_mode = "monotonic"  # context discovery strategy: "monotonic" (pure append-only growth, default), "incremental" (additive with explicit drops), or "snapshot" (full active working set declared each round)
 max_discovery_rounds = 8  # maximum rounds for autonomous context discovery
-max_files = 60  # maximum total files in context before stopping execution (default: 25)
+files_token_budget = 300000  # token budget for files in active context (default: 300000)
 repomap_token_budget = 40000  # token budget for the repository map (default: 4000)
 pinned = [
     "Conventions.md",

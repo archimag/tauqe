@@ -20,11 +20,7 @@ pub async fn handle_history_get(req: Request, state: &Arc<AppState>) -> Response
                 total_count,
                 estimated_tokens,
             };
-            Response {
-                id: req.id,
-                result: serde_json::to_value(result).ok(),
-                error: None,
-            }
+            Response::ok_typed(req.id, &result)
         }
         Err(err) => Response {
             id: req.id,

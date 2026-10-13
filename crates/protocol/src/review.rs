@@ -35,8 +35,6 @@ pub enum ReviewItemStatus {
     Rejected,
 }
 
-pub type ReviewStatus = ReviewItemStatus;
-
 impl ReviewItemStatus {
     pub fn next(&self) -> Self {
         match self {
@@ -60,6 +58,13 @@ impl std::fmt::Display for ReviewItemStatus {
         }
     }
 }
+
+/// Convenience alias for [`ReviewItemStatus`].
+///
+/// Client surfaces and wire consumers refer to a review finding's status as
+/// `ReviewStatus`; the alias keeps that name resolvable at the crate root
+/// without duplicating the enum definition.
+pub type ReviewStatus = ReviewItemStatus;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReviewItem {
@@ -97,8 +102,6 @@ pub struct ReviewSession {
     #[serde(default)]
     pub raw_markdown: String,
 }
-
-pub type Review = ReviewSession;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReviewSummary {
@@ -272,12 +275,29 @@ pub const REVIEW_DISCUSSION_PREFIX: &str = "# Review Discussion:";
 
 /// Returns true if the prompt represents an explicit review discussion turn.
 pub fn is_review_discussion_prompt(prompt: &str) -> bool {
-    prompt.starts_with(REVIEW_DISCUSSION_PREFIX)
+    prompt.trim_start().starts_with(REVIEW_DISCUSSION_PREFIX)
 }
 
 /// Returns true if the prompt represents an explicit discussion turn (Plan or Review).
 pub fn is_discussion_prompt(prompt: &str) -> bool {
     crate::plan::is_plan_discussion_prompt(prompt) || is_review_discussion_prompt(prompt)
+}
+
+/// Extracts the target review session ID from an explicit review discussion prompt.
+pub fn extract_review_discussion_id(prompt: &str) -> Option<String> {
+    let trimmed = prompt.trim_start();
+    if !trimmed.starts_with(REVIEW_DISCUSSION_PREFIX) {
+        return None;
+    }
+    let rest = trimmed.strip_prefix(REVIEW_DISCUSSION_PREFIX)?.trim_start();
+    if let Some(rest) = rest.strip_prefix('[') {
+        let (spec, _) = rest.split_once(']')?;
+        let id = spec.trim();
+        if !id.is_empty() {
+            return Some(id.to_string());
+        }
+    }
+    None
 }
 
 /// Formats a targeted prompt for discussing and analyzing review findings in Structured Output mode.
@@ -297,10 +317,11 @@ pub fn format_review_discussion_prompt_items(
     user_comment: &str,
 ) -> String {
     let mut out = String::new();
-    let title = if session.title.trim().is_empty() {
+    let clean_title = session.title.replace(['\r', '\n'], " ").trim().to_string();
+    let title = if clean_title.is_empty() {
         &session.id
     } else {
-        session.title.trim()
+        &clean_title
     };
     out.push_str(&format!(
         "{} [{}] {}\n\n",
@@ -367,128 +388,10 @@ pub fn format_review_discussion_prompt_items(
     out.push_str("## Instructions for Model:\n");
     out.push_str("1. Address the developer's question or feedback regarding the code review findings.\n");
     out.push_str("2. Discuss the problem, edge cases, and potential solutions conceptually. Do NOT emit file edits or code patches in this discussion turn.\n");
-    out.push_str("3. If the review findings or their statuses should be updated based on this discussion, explain the proposed modifications in conversational text in `message` AND populate the structured `review_update` field in your response object. Never describe review changes solely in conversational text without populating `review_update`.\n");
+    out.push_str("3. If the review findings or their statuses should be updated based on this discussion, explain the proposed modifications clearly in conversational text in `message`; the developer applies status changes through the review interface.\n");
     out.push_str("4. If you need to inspect related files to verify your hypothesis, specify them in the `context_requests` array with `access: \"read_only\"`.\n");
 
     out
-}
-
-pub const REVIEW_STEP_EXECUTION_PREFIX: &str = "# Target Review Step Execution:";
-
-/// Target review and item identifiers parsed from an isolated review step execution prompt.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ReviewStepTarget {
-    pub review_id: Option<String>,
-    pub item_id: u32,
-}
-
-/// Returns true if the prompt represents an isolated review step execution turn.
-pub fn is_review_step_execution_prompt(prompt: &str) -> bool {
-    prompt.starts_with(REVIEW_STEP_EXECUTION_PREFIX)
-}
-
-/// Extracts the target review ID and item ID from an isolated review step execution prompt.
-pub fn extract_review_step_execution_target(prompt: &str) -> Option<ReviewStepTarget> {
-    if !prompt.starts_with(REVIEW_STEP_EXECUTION_PREFIX) {
-        return None;
-    }
-    let rest = prompt.strip_prefix(REVIEW_STEP_EXECUTION_PREFIX)?.trim_start();
-    if let Some(rest) = rest.strip_prefix('[') {
-        let (spec, _) = rest.split_once(']')?;
-        let spec = spec.trim();
-        if spec.is_empty() {
-            return None;
-        }
-        if let Some((rev_id, item_id_str)) = spec.split_once(':') {
-            let rev_id = rev_id.trim();
-            let item_id: u32 = item_id_str.trim().parse().ok()?;
-            return Some(ReviewStepTarget {
-                review_id: if rev_id.is_empty() { None } else { Some(rev_id.to_string()) },
-                item_id,
-            });
-        } else if let Ok(item_id) = spec.parse::<u32>() {
-            return Some(ReviewStepTarget {
-                review_id: None,
-                item_id,
-            });
-        }
-    }
-    None
-}
-
-/// Extracts the target item ID from an isolated review step execution prompt.
-pub fn extract_review_step_execution_id(prompt: &str) -> Option<u32> {
-    extract_review_step_execution_target(prompt).map(|t| t.item_id)
-}
-
-/// Formats a targeted prompt for resolving an isolated review finding.
-pub fn format_review_step_execution_prompt(
-    session: &ReviewSession,
-    item_id: u32,
-    marker_suffix: &str,
-) -> Result<String, String> {
-    let item = session
-        .items
-        .iter()
-        .find(|i| i.id == item_id)
-        .ok_or_else(|| format!("Review item #{} not found in review session '{}'", item_id, session.id))?;
-
-    let mut out = String::new();
-    out.push_str(&format!(
-        "{} [{}:{}] {}\n\n",
-        REVIEW_STEP_EXECUTION_PREFIX, session.id, item.id, item.title
-    ));
-
-    let title = if session.title.trim().is_empty() {
-        &session.id
-    } else {
-        session.title.trim()
-    };
-    out.push_str(&format!("## Review Session: {}\n", title));
-    if let Some(desc) = &session.description {
-        let trimmed = desc.trim();
-        if !trimmed.is_empty() {
-            out.push_str(&format!("{}\n\n", trimmed));
-        }
-    }
-
-    out.push_str("### Target Finding to Resolve:\n");
-    out.push_str(&format!("- **ID**: `#{}`\n", item.id));
-    out.push_str(&format!("- **Severity**: {}\n", item.severity));
-    out.push_str(&format!("- **Title**: {}\n", item.title));
-    if let Some(path) = &item.file_path {
-        if let Some((start, end)) = item.line_range {
-            out.push_str(&format!("- **Location**: `{}:{}-{}`\n", path, start, end));
-        } else {
-            out.push_str(&format!("- **Location**: `{}`\n", path));
-        }
-    }
-    if !item.body.trim().is_empty() {
-        out.push_str(&format!("- **Details / Recommendation**:\n{}\n", item.body.trim()));
-    }
-    out.push('\n');
-
-    out.push_str("## Execution Directives:\n");
-    out.push_str(&format!(
-        "1. Focus STRICTLY and EXCLUSIVELY on resolving review finding `#{}`.\n",
-        item.id
-    ));
-    out.push_str("2. Do NOT touch unrelated code or address other findings outside of this scope.\n");
-    out.push_str("3. Keep changes minimal, coherent, and verified with toolchain checks.\n");
-    out.push_str(&format!(
-        "4. When implementation and verification are complete, emit the completion tag: <success{0} summary=\"...\" />.\n",
-        marker_suffix
-    ));
-    out.push_str(&format!(
-        "5. Discovery Phase: If you need to inspect or edit files listed in <repo_map> that are not yet loaded in <context>, request them immediately using <context_request{0} path=\"...\" access=\"read_only|editable\" /> before writing code or explanations. Do NOT halt with conversational text if the necessary files can simply be requested.\n",
-        marker_suffix
-    ));
-    out.push_str(&format!(
-        "6. If you encounter an insurmountable technical blocker, contradictory requirements, or need developer decisions, emit the terminal error tag: <error{0} message=\"...\" /> explaining the exact blocker.\n",
-        marker_suffix
-    ));
-
-    Ok(out)
 }
 
 #[cfg(test)]
@@ -562,42 +465,12 @@ mod tests {
         assert!(prompt.contains("# Review Discussion: [rev-42] Security Audit"));
         assert!(prompt.contains("Race condition in cache"));
         assert!(prompt.contains("Is this really possible?"));
-        assert!(prompt.contains("populate the structured `review_update` field"));
-    }
-
-    #[test]
-    fn test_review_step_execution_prompt() {
-        let session = ReviewSession {
-            id: "rev-7".to_string(),
-            title: "Performance Review".to_string(),
-            created_at: 100,
-            model: "model-x".to_string(),
-            description: Some("Optimize string copies".to_string()),
-            user_prompt: None,
-            target_files: vec!["crates/tui/src/view.rs".to_string()],
-            items: vec![ReviewItem {
-                id: 3,
-                title: "Excessive clone in hot path".to_string(),
-                model: None,
-                severity: ReviewSeverity::Warning,
-                status: ReviewItemStatus::Todo,
-                file_path: Some("crates/tui/src/view.rs".to_string()),
-                line_range: Some((100, 110)),
-                body: "Replace clone with reference borrowing".to_string(),
-            }],
-            raw_markdown: String::new(),
-        };
-
-        let prompt = format_review_step_execution_prompt(&session, 3, "_TAG").unwrap();
-        assert!(is_review_step_execution_prompt(&prompt));
-        assert!(prompt.contains("# Target Review Step Execution: [rev-7:3] Excessive clone in hot path"));
-        assert!(prompt.contains("<success_TAG summary=\"...\" />"));
-        assert!(prompt.contains("<error_TAG message=\"...\" />"));
-
-        let target = extract_review_step_execution_target(&prompt).unwrap();
-        assert_eq!(target.review_id.as_deref(), Some("rev-7"));
-        assert_eq!(target.item_id, 3);
-        assert_eq!(extract_review_step_execution_id(&prompt), Some(3));
+        assert!(!prompt.contains("review_update"));
+        assert!(prompt.contains("explain the proposed modifications clearly in conversational text"));
+        assert!(is_review_discussion_prompt(&format!("\n  \t{}", prompt)));
+        assert_eq!(extract_review_discussion_id(&prompt), Some("rev-42".to_string()));
+        assert_eq!(extract_review_discussion_id(&format!("  \n{}", prompt)), Some("rev-42".to_string()));
+        assert_eq!(extract_review_discussion_id("Regular conversational prompt"), None);
     }
 
     #[test]

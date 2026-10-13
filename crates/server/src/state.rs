@@ -1,5 +1,5 @@
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use tokio::sync::{watch, Mutex};
@@ -11,20 +11,81 @@ use tauqe_protocol::{ModelSelection, UiHistoryItem};
 use crate::transport::OutChannel;
 
 pub struct ActiveOperation {
+    pub id: u64,
     pub cancel_tx: watch::Sender<bool>,
     pub abort_handle: Option<tokio::task::AbortHandle>,
 }
 
+/// RAII guard owning a registered active operation.
+///
+/// Registration is atomic through [`AppState::try_begin_operation`], which
+/// refuses to start a second operation while one is registered. The guard
+/// clears the shared slot on drop only when the slot still holds this
+/// operation's id, so a superseded or stale guard can never wipe a newer
+/// operation's registration or a cancellation delivered in between.
+pub struct OperationGuard {
+    state: Arc<AppState>,
+    id: u64,
+    cancel_rx: watch::Receiver<bool>,
+}
+
+impl OperationGuard {
+    /// Returns a receiver that observes this operation's cancellation signal.
+    pub fn cancel_receiver(&self) -> watch::Receiver<bool> {
+        self.cancel_rx.clone()
+    }
+
+    /// Installs the abort handle of the task currently driving this operation.
+    pub fn set_abort_handle(&self, handle: tokio::task::AbortHandle) {
+        let mut slot = self.state.lock_active_operation();
+        if let Some(op) = slot.as_mut() {
+            if op.id == self.id {
+                op.abort_handle = Some(handle);
+            }
+        }
+    }
+}
+
+impl Drop for OperationGuard {
+    fn drop(&mut self) {
+        let mut slot = self.state.lock_active_operation();
+        if slot.as_ref().map(|op| op.id) == Some(self.id) {
+            *slot = None;
+        }
+    }
+}
+
+/// Model configuration and the active model selection guarded by a single mutex.
+///
+/// Keeping both values behind one lock makes it impossible to acquire them in
+/// conflicting orders: a `model/ask` racing a `config/set` previously deadlocked
+/// on two separate guards. Callers clone the values they need and drop the guard
+/// before any unrelated `.await` instead of holding it across subsystems.
+pub struct ConfigAndSelection {
+    pub config: AppConfig,
+    pub selection: ModelSelection,
+}
+
 pub struct AppState {
-    pub config: Mutex<AppConfig>,
-    pub current_selection: Mutex<ModelSelection>,
+    pub config: Mutex<ConfigAndSelection>,
     pub context: tokio::sync::RwLock<ContextManager>,
     pub history: Mutex<HistoryManager>,
     pub session_lock: Mutex<()>,
-    pub active_cancel: Mutex<Option<ActiveOperation>>,
+    /// Single registration slot for the currently running operation.
+    ///
+    /// A synchronous mutex is used deliberately: an [`OperationGuard`] must
+    /// clear the slot from its `Drop`, and `std::sync::Mutex` can be locked
+    /// without an executor context. The lock is only ever held for brief,
+    /// non-awaiting critical sections.
+    pub active_cancel: std::sync::Mutex<Option<ActiveOperation>>,
     pub total_cost: Mutex<f64>,
     pub history_sender: tokio::sync::mpsc::UnboundedSender<UiHistoryItem>,
     pub out: OutChannel,
+    /// Shared flag set while a git-backed apply policy holds an open
+    /// transaction. Turn supervisors consult it before force-aborting a
+    /// workflow task so a half-finished checkpoint or step commit is never
+    /// abandoned mid-transaction.
+    pub git_transaction_active: Arc<AtomicBool>,
     /// Test-only seam letting deterministic unit tests inject a scripted
     /// provider instead of building a real network provider from config.
     #[cfg(test)]
@@ -57,15 +118,18 @@ impl AppState {
         });
 
         Arc::new(Self {
-            current_selection: Mutex::new(default_selection),
-            config: Mutex::new(config),
+            config: Mutex::new(ConfigAndSelection {
+                config,
+                selection: default_selection,
+            }),
             context: tokio::sync::RwLock::new(ContextManager::new(repo_path)),
             history: Mutex::new(initial_history_manager),
             session_lock: Mutex::new(()),
-            active_cancel: Mutex::new(None),
+            active_cancel: std::sync::Mutex::new(None),
             total_cost: Mutex::new(0.0),
             history_sender,
             out,
+            git_transaction_active: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
             provider_override: Mutex::new(None),
             #[cfg(test)]
@@ -73,8 +137,67 @@ impl AppState {
         })
     }
 
-    pub async fn current_selection(&self) -> ModelSelection {
-        self.current_selection.lock().await.clone()
+    /// Locks the active-operation slot, recovering from a poisoned mutex instead
+    /// of panicking so an unexpected panic elsewhere cannot wedge the daemon.
+    fn lock_active_operation(&self) -> std::sync::MutexGuard<'_, Option<ActiveOperation>> {
+        self.active_cancel
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Atomically registers a new active operation.
+    ///
+    /// Returns `Err(())` when another operation is already registered. On
+    /// success it returns an [`OperationGuard`] that owns the registration and
+    /// clears the slot on drop.
+    pub fn try_begin_operation(self: &Arc<Self>) -> Result<OperationGuard, ()> {
+        let mut slot = self.lock_active_operation();
+        if slot.is_some() {
+            return Err(());
+        }
+        let id = next_operation_id();
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+        *slot = Some(ActiveOperation {
+            id,
+            cancel_tx,
+            abort_handle: None,
+        });
+        drop(slot);
+        Ok(OperationGuard {
+            state: Arc::clone(self),
+            id,
+            cancel_rx,
+        })
+    }
+
+    /// Reports whether an operation is currently registered.
+    pub fn is_operation_active(&self) -> bool {
+        self.lock_active_operation().is_some()
+    }
+
+    /// Removes and returns the registered operation so its cancel signal can be
+    /// delivered while the slot is free for a later operation to register.
+    pub fn take_active_operation(&self) -> Option<ActiveOperation> {
+        self.lock_active_operation().take()
+    }
+
+    /// Delivers a cancellation signal to the active operation without clearing
+    /// its registration, so callers can still observe when the operation
+    /// finishes and unwinds its transaction.
+    pub fn cancel_active_operation(&self) {
+        let slot = self.lock_active_operation();
+        if let Some(op) = slot.as_ref() {
+            let _ = op.cancel_tx.send(true);
+        }
+    }
+
+    /// Returns the authoritative repository root shared by every handler.
+    ///
+    /// Git, context, plan, and review handlers must all resolve the repository
+    /// from this single source instead of re-deriving it from the process CWD,
+    /// which can drift from the initialized repository.
+    pub async fn repo_root(&self) -> PathBuf {
+        self.context.read().await.repo_root().to_path_buf()
     }
 
     /// Returns the turn marker for the current turn, or `None` when markers are

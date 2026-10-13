@@ -1,11 +1,10 @@
 use crate::context::ContextFileContent;
+use tauqe_protocol::review::ReviewSession;
 
 pub use tauqe_protocol::review::{
-    extract_review_step_execution_id, extract_review_step_execution_target,
-    format_review_discussion_prompt, format_review_discussion_prompt_items,
-    format_review_step_execution_prompt, is_discussion_prompt, is_review_discussion_prompt,
-    is_review_step_execution_prompt, ReviewStepTarget, REVIEW_DISCUSSION_PREFIX,
-    REVIEW_STEP_EXECUTION_PREFIX,
+    extract_review_discussion_id, format_review_discussion_prompt,
+    format_review_discussion_prompt_items, is_discussion_prompt, is_review_discussion_prompt,
+    REVIEW_DISCUSSION_PREFIX,
 };
 
 /// Builds the system prompt for the isolated code review session.
@@ -117,6 +116,146 @@ pub fn format_review_step_retry_prompt(assistant_text: &str, error: Option<&str>
     out
 }
 
+pub const REVIEW_STEP_EXECUTION_PREFIX: &str = "# Target Review Step Execution:";
+
+/// Target review and item identifiers parsed from an isolated review step execution prompt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewStepTarget {
+    pub review_id: Option<String>,
+    pub item_id: u32,
+}
+
+/// Returns true if the prompt represents an isolated review step execution turn.
+pub fn is_review_step_execution_prompt(prompt: &str) -> bool {
+    prompt
+        .trim_start()
+        .starts_with(REVIEW_STEP_EXECUTION_PREFIX)
+}
+
+/// Extracts the target review ID and item ID from an isolated review step execution prompt.
+pub fn extract_review_step_execution_target(prompt: &str) -> Option<ReviewStepTarget> {
+    let trimmed = prompt.trim_start();
+    if !trimmed.starts_with(REVIEW_STEP_EXECUTION_PREFIX) {
+        return None;
+    }
+    let rest = trimmed
+        .strip_prefix(REVIEW_STEP_EXECUTION_PREFIX)?
+        .trim_start();
+    if let Some(rest) = rest.strip_prefix('[') {
+        let (spec, _) = rest.split_once(']')?;
+        let spec = spec.trim();
+        if spec.is_empty() {
+            return None;
+        }
+        if let Some((rev_id, item_id_str)) = spec.split_once(':') {
+            let rev_id = rev_id.trim();
+            let item_id: u32 = item_id_str.trim().parse().ok()?;
+            return Some(ReviewStepTarget {
+                review_id: if rev_id.is_empty() {
+                    None
+                } else {
+                    Some(rev_id.to_string())
+                },
+                item_id,
+            });
+        } else if let Ok(item_id) = spec.parse::<u32>() {
+            return Some(ReviewStepTarget {
+                review_id: None,
+                item_id,
+            });
+        }
+    }
+    None
+}
+
+/// Extracts the target item ID from an isolated review step execution prompt.
+pub fn extract_review_step_execution_id(prompt: &str) -> Option<u32> {
+    extract_review_step_execution_target(prompt).map(|t| t.item_id)
+}
+
+/// Formats a targeted prompt for resolving an isolated review finding.
+///
+/// This builder embeds the concrete edit-protocol markers and therefore lives in
+/// the core engine beside the sibling plan step prompt rather than in the
+/// dependency-light wire crate.
+pub fn format_review_step_execution_prompt(
+    session: &ReviewSession,
+    item_id: u32,
+    marker_suffix: &str,
+) -> Result<String, String> {
+    let item = session
+        .items
+        .iter()
+        .find(|i| i.id == item_id)
+        .ok_or_else(|| {
+            format!(
+                "Review item #{} not found in review session '{}'",
+                item_id, session.id
+            )
+        })?;
+
+    let mut out = String::new();
+    let clean_title = item.title.replace(['\r', '\n'], " ").trim().to_string();
+    out.push_str(&format!(
+        "{} [{}:{}] {}\n\n",
+        REVIEW_STEP_EXECUTION_PREFIX, session.id, item.id, clean_title
+    ));
+
+    let title = if session.title.trim().is_empty() {
+        &session.id
+    } else {
+        session.title.trim()
+    };
+    out.push_str(&format!("## Review Session: {}\n", title));
+    if let Some(desc) = &session.description {
+        let trimmed = desc.trim();
+        if !trimmed.is_empty() {
+            out.push_str(&format!("{}\n\n", trimmed));
+        }
+    }
+
+    out.push_str("### Target Finding to Resolve:\n");
+    out.push_str(&format!("- **ID**: `#{}`\n", item.id));
+    out.push_str(&format!("- **Severity**: {}\n", item.severity));
+    out.push_str(&format!("- **Title**: {}\n", item.title));
+    if let Some(path) = &item.file_path {
+        if let Some((start, end)) = item.line_range {
+            out.push_str(&format!("- **Location**: `{}:{}-{}`\n", path, start, end));
+        } else {
+            out.push_str(&format!("- **Location**: `{}`\n", path));
+        }
+    }
+    if !item.body.trim().is_empty() {
+        out.push_str(&format!(
+            "- **Details / Recommendation**:\n{}\n",
+            item.body.trim()
+        ));
+    }
+    out.push('\n');
+
+    out.push_str("## Execution Directives:\n");
+    out.push_str(&format!(
+        "1. Focus STRICTLY and EXCLUSIVELY on resolving review finding `#{}`.\n",
+        item.id
+    ));
+    out.push_str("2. Do NOT touch unrelated code or address other findings outside of this scope.\n");
+    out.push_str("3. Keep changes minimal, coherent, and verified with toolchain checks.\n");
+    out.push_str(&format!(
+        "4. When implementation and verification are complete, emit the completion tag: <success{0} summary=\"...\" />.\n",
+        marker_suffix
+    ));
+    out.push_str(&format!(
+        "5. Discovery Phase: If you need to inspect or edit files listed in <repo_map> that are not yet loaded in <context>, request them immediately using <context_request{0} path=\"...\" access=\"read_only|editable\" /> before writing code or explanations. Do NOT halt with conversational text if the necessary files can simply be requested.\n",
+        marker_suffix
+    ));
+    out.push_str(&format!(
+        "6. If you encounter an insurmountable technical blocker, contradictory requirements, or need developer decisions, emit the terminal error tag: <error{0} message=\"...\" /> explaining the exact blocker.\n",
+        marker_suffix
+    ));
+
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -140,6 +279,43 @@ mod tests {
         assert!(!empty.contains("<previous_response>"));
         assert!(!empty.contains("Diagnostic Feedback"));
     }
-}
 
-    
+    #[test]
+    fn test_format_review_step_execution_prompt() {
+        use tauqe_protocol::review::{ReviewItem, ReviewItemStatus, ReviewSeverity};
+
+        let session = ReviewSession {
+            id: "rev-7".to_string(),
+            title: "Performance Review".to_string(),
+            created_at: 100,
+            model: "model-x".to_string(),
+            description: Some("Optimize string copies".to_string()),
+            user_prompt: None,
+            target_files: vec!["crates/tui/src/view.rs".to_string()],
+            items: vec![ReviewItem {
+                id: 3,
+                title: "Excessive clone in hot path".to_string(),
+                model: None,
+                severity: ReviewSeverity::Warning,
+                status: ReviewItemStatus::Todo,
+                file_path: Some("crates/tui/src/view.rs".to_string()),
+                line_range: Some((100, 110)),
+                body: "Replace clone with reference borrowing".to_string(),
+            }],
+            raw_markdown: String::new(),
+        };
+
+        let prompt = format_review_step_execution_prompt(&session, 3, "_TAG").unwrap();
+        assert!(is_review_step_execution_prompt(&prompt));
+        assert!(prompt.contains(
+            "# Target Review Step Execution: [rev-7:3] Excessive clone in hot path"
+        ));
+        assert!(prompt.contains("<success_TAG summary=\"...\" />"));
+        assert!(prompt.contains("<error_TAG message=\"...\" />"));
+
+        let target = extract_review_step_execution_target(&prompt).unwrap();
+        assert_eq!(target.review_id.as_deref(), Some("rev-7"));
+        assert_eq!(target.item_id, 3);
+        assert_eq!(extract_review_step_execution_id(&prompt), Some(3));
+    }
+}

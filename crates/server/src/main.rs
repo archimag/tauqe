@@ -7,7 +7,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tauqe_protocol::{events, Event, HistoryEntryAddedEvent, Request, RequestId, Response, ResponseError, UiHistoryItem};
+use tauqe_protocol::{
+    errors, events, methods, Event, HistoryEntryAddedEvent, Request, RequestId, Response,
+    UiHistoryItem,
+};
 
 mod handlers;
 mod state;
@@ -72,6 +75,13 @@ async fn main() -> anyhow::Result<()> {
     let stdin = tokio::io::stdin();
     let mut reader = BufReader::new(stdin).lines();
 
+    // Requests whose handlers block on long-running work (LLM turns, the
+    // deterministic pre-flight verification) are offloaded so the read loop
+    // keeps draining stdin and can observe cancels and EOF. Every other request
+    // is handled inline, which serializes state mutations in the exact order
+    // the client sent them and keeps responses ordered.
+    let mut offloaded = tokio::task::JoinSet::new();
+
     while let Ok(Some(line)) = reader.next_line().await {
         let line = line.trim();
         if line.is_empty() {
@@ -81,26 +91,90 @@ async fn main() -> anyhow::Result<()> {
         let request: Request = match serde_json::from_str(line) {
             Ok(req) => req,
             Err(err) => {
-                let err_resp = Response {
-                    id: RequestId::Number(0),
-                    result: None,
-                    error: Some(ResponseError {
-                        code: "PARSE_ERROR".to_string(),
-                        message: err.to_string(),
-                        data: None,
-                    }),
-                };
+                // A request that fails to parse has no correlatable id: answer
+                // with the explicit null id so it can never collide with a real
+                // request's id.
+                let err_resp =
+                    Response::err(RequestId::Null, errors::PARSE_ERROR, err.to_string());
                 state.out.send_response(&err_resp);
                 continue;
             }
         };
 
-        let state_for_req = Arc::clone(&state);
-        tokio::spawn(async move {
-            let response = handle_request(request, &state_for_req).await;
-            state_for_req.out.send_response(&response);
-        });
+        if is_long_running(&request.method) {
+            let state_for_req = Arc::clone(&state);
+            offloaded.spawn(async move {
+                let response = handle_request(request, &state_for_req).await;
+                state_for_req.out.send_response(&response);
+            });
+        } else {
+            let response = handle_request(request, &state).await;
+            state.out.send_response(&response);
+        }
     }
 
+    // stdin reached EOF (or failed): cancel the active operation and drain
+    // in-flight work so the process never exits mid-transaction.
+    drain_in_flight(&state, &mut offloaded).await;
+
     Ok(())
+}
+
+/// How long graceful shutdown waits for in-flight work before giving up.
+const SHUTDOWN_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Poll cadence while waiting for in-flight work to unwind during shutdown.
+const SHUTDOWN_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// Methods whose handlers block on long-running work — an LLM turn or the
+/// deterministic pre-flight toolchain verification — and must therefore be
+/// offloaded from the read loop. Offloading keeps the loop free to accept
+/// cancels and to observe stdin EOF. Every other method is short and runs
+/// inline to preserve request ordering.
+fn is_long_running(method: &str) -> bool {
+    matches!(
+        method,
+        methods::PLAN_REFINE
+            | methods::PLAN_REPLAN
+            | methods::PLAN_EXECUTE
+            | methods::REVIEW_EXECUTE
+            | methods::GIT_SQUASH_GENERATE_MESSAGE
+    )
+}
+
+/// Cancels the active operation and waits for in-flight work to finish so the
+/// process never exits mid-transaction.
+///
+/// A running turn holds the single operation slot for its whole duration and
+/// rolls its Git transaction back before releasing it, so an empty slot is a
+/// reliable "work finished" signal. Offloaded long-running handlers are drained
+/// as well. A bounded budget keeps a wedged provider from blocking shutdown
+/// forever; anything still running when it expires is aborted, and startup
+/// crash recovery covers any residue.
+async fn drain_in_flight(state: &Arc<AppState>, offloaded: &mut tokio::task::JoinSet<()>) {
+    let deadline = tokio::time::Instant::now() + SHUTDOWN_DRAIN_TIMEOUT;
+    loop {
+        // Re-signal on every pass so an operation that registers while we wait
+        // is cancelled too.
+        state.cancel_active_operation();
+
+        if !state.is_operation_active() && offloaded.is_empty() {
+            return;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            break;
+        }
+
+        if offloaded.is_empty() {
+            tokio::time::sleep(SHUTDOWN_POLL_INTERVAL).await;
+        } else {
+            tokio::select! {
+                _ = offloaded.join_next() => {}
+                _ = tokio::time::sleep(SHUTDOWN_POLL_INTERVAL) => {}
+            }
+        }
+    }
+
+    offloaded.abort_all();
+    while offloaded.join_next().await.is_some() {}
 }

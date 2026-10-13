@@ -50,6 +50,10 @@ impl std::str::FromStr for ModelRef {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let s = s.trim();
+        if s.is_empty() {
+            return Err("Model specification cannot be empty".to_string());
+        }
+
         if let Some((provider_str, model_name)) = s.split_once(':') {
             let provider_str = provider_str.trim().to_lowercase();
             let model_name = model_name.trim();
@@ -57,19 +61,21 @@ impl std::str::FromStr for ModelRef {
                 if model_name.is_empty() {
                     return Err("Model name cannot be empty".to_string());
                 }
-                Ok(ModelRef::openrouter(model_name))
-            } else {
-                Err(format!("Unsupported provider '{}'", provider_str))
+                return Ok(ModelRef::openrouter(model_name));
             }
-        } else if s.is_empty() {
-            Err("Model specification cannot be empty".to_string())
-        } else {
-            Ok(ModelRef::openrouter(s))
         }
+
+        Ok(ModelRef::openrouter(s))
     }
 }
 
 /// Five semantic model role specializations.
+///
+/// The legacy spellings `junior`, `middle`, and `senior` are still accepted as
+/// serde aliases and by the `FromStr` implementation. They are retained for a
+/// migration window so persisted plans, reviews, and legacy client payloads
+/// keep deserializing onto `Scribe`, `Coder`, and `Architect`; remove them once
+/// no stored artifact or external client emits the legacy names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ModelRole {
@@ -82,8 +88,6 @@ pub enum ModelRole {
     Advisor,
     Reviewer,
 }
-
-pub type ModelTier = ModelRole;
 
 impl std::fmt::Display for ModelRole {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -319,8 +323,6 @@ pub struct ModelRolesSummary {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub efforts: Option<ModelRolesEffort>,
 }
-
-pub type ModelTiersSummary = ModelRolesSummary;
 
 /// Target model selection: either an abstract semantic role or an explicit model reference.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -611,6 +613,25 @@ mod tests {
         let json = serde_json::to_string(&model).unwrap();
         let de: ModelRef = serde_json::from_str(&json).unwrap();
         assert_eq!(de, model);
+    }
+
+    #[test]
+    fn test_model_ref_from_str() {
+        let m1: ModelRef = "openrouter:anthropic/claude-3.7-sonnet".parse().unwrap();
+        assert_eq!(m1, ModelRef::openrouter("anthropic/claude-3.7-sonnet"));
+
+        let m2: ModelRef = "openrouter:meta-llama/llama-3.3-70b-instruct:free".parse().unwrap();
+        assert_eq!(m2, ModelRef::openrouter("meta-llama/llama-3.3-70b-instruct:free"));
+
+        let m3: ModelRef = "meta-llama/llama-3.3-70b-instruct:free".parse().unwrap();
+        assert_eq!(m3, ModelRef::openrouter("meta-llama/llama-3.3-70b-instruct:free"));
+
+        let m4: ModelRef = "anthropic/claude-3.7-sonnet".parse().unwrap();
+        assert_eq!(m4, ModelRef::openrouter("anthropic/claude-3.7-sonnet"));
+
+        assert!("".parse::<ModelRef>().is_err());
+        assert!("   ".parse::<ModelRef>().is_err());
+        assert!("openrouter:".parse::<ModelRef>().is_err());
     }
 
     #[test]

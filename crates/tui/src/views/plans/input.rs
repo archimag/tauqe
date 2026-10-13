@@ -59,6 +59,17 @@ fn execute_scope_action(st: &mut AppState, plan_id: &str, scope_id: Option<&str>
                 items.len(), preview
             ));
         }
+        tauqe_protocol::PlanScopeEvaluation::BlockedByBlockers(items) => {
+            let preview = if items.len() <= 2 {
+                items.join(", ")
+            } else {
+                format!("{}, and {} more", items[..2].join(", "), items.len() - 2)
+            };
+            st.notify_warning(format!(
+                "Scope contains {} step(s) in BLOCKED status ({}). Resolve the reported blockers and replan before executing.",
+                items.len(), preview
+            ));
+        }
         tauqe_protocol::PlanScopeEvaluation::AllCompleted => {
             st.notify_info("All steps in this scope are already completed.");
         }

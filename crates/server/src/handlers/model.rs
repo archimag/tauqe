@@ -1,6 +1,6 @@
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
-use tokio::sync::watch;
 use tauqe_core::prompt::json::JsonPromptProtocol;
 use tauqe_core::prompt::protocol::PromptProtocol;
 use tauqe_core::prompt::xml::XmlPromptProtocol;
@@ -13,7 +13,8 @@ use tauqe_protocol::{
     ResponseError,
 };
 
-use crate::state::{next_operation_id, ActiveOperation, AppState};
+use crate::handlers::offload;
+use crate::state::{next_operation_id, AppState, OperationGuard};
 use crate::transport::OutChannel;
 
 pub async fn handle_model_ask(req: Request, state: &Arc<AppState>) -> Response {
@@ -47,7 +48,7 @@ pub async fn handle_model_ask(req: Request, state: &Arc<AppState>) -> Response {
 }
 
 pub async fn handle_model_select(req: Request, state: &Arc<AppState>) -> Response {
-    if state.active_cancel.lock().await.is_some() {
+    if state.is_operation_active() {
         return Response {
             id: req.id,
             result: None,
@@ -75,12 +76,11 @@ pub async fn handle_model_select(req: Request, state: &Arc<AppState>) -> Respons
     };
 
     let (selection, effective_model, roles) = {
-        let mut cur = state.current_selection.lock().await;
-        *cur = params.selection.clone();
-        let cfg = state.config.lock().await;
-        let effective = cfg.resolve_model(&cur);
-        let roles = cfg.roles_summary();
-        (cur.clone(), effective, roles)
+        let mut guard = state.config.lock().await;
+        guard.selection = params.selection.clone();
+        let effective = guard.config.resolve_model(&guard.selection);
+        let roles = guard.config.roles_summary();
+        (guard.selection.clone(), effective, roles)
     };
 
     state.out.send_event(&Event {
@@ -104,11 +104,11 @@ pub async fn handle_model_select(req: Request, state: &Arc<AppState>) -> Respons
 }
 
 pub async fn handle_model_current(req: Request, state: &Arc<AppState>) -> Response {
-    let selection = state.current_selection().await;
-    let cfg = state.config.lock().await;
-    let effective_model = cfg.resolve_model(&selection);
-    let available_models = cfg.available_models();
-    let roles = cfg.roles_summary();
+    let guard = state.config.lock().await;
+    let selection = guard.selection.clone();
+    let effective_model = guard.config.resolve_model(&selection);
+    let available_models = guard.config.available_models();
+    let roles = guard.config.roles_summary();
 
     Response::ok_typed(
         req.id,
@@ -122,7 +122,6 @@ pub async fn handle_model_current(req: Request, state: &Arc<AppState>) -> Respon
 }
 
 /// Result of an executed model turn, capturing termination status, errors, and outcomes.
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct ModelTurnResult {
     pub operation_id: String,
@@ -136,7 +135,6 @@ pub struct ModelTurnResult {
     pub blocked: Option<String>,
 }
 
-#[allow(dead_code)]
 impl ModelTurnResult {
     /// Evaluates if the step executed successfully according to atomic completion invariants.
     ///
@@ -167,7 +165,10 @@ struct PreparedTurn {
     selection: tauqe_protocol::ModelSelection,
     reasoning_effort: Option<ReasoningEffort>,
     op_id: String,
-    cancel_rx: watch::Receiver<bool>,
+    /// Operation backing this turn. A turn that starts on its own owns the
+    /// registration; a batch step shares the batch-level registration so the
+    /// slot never lapses between steps.
+    operation: Arc<OperationGuard>,
     /// Active turn marker binding structural protocol tags to this turn.
     marker: Option<String>,
 }
@@ -187,6 +188,26 @@ fn build_configured_provider(
         })
 }
 
+/// Grace period granted to a workflow task to unwind cooperatively after a
+/// cancellation or stream error before a supervisor force-aborts it.
+pub(crate) const CANCEL_UNWIND_GRACE: std::time::Duration =
+    std::time::Duration::from_secs(30);
+
+/// Builds the apply policy for a turn, wiring the shared git-transaction guard
+/// into the Git-backed policy so a supervisor never force-aborts a workflow
+/// task while a transaction is open.
+pub(crate) fn build_apply_policy(
+    state: &Arc<AppState>,
+    workflow_name: &str,
+) -> Box<dyn tauqe_core::workflow::policy::ApplyPolicy> {
+    match workflow_name {
+        "naive" => Box::new(tauqe_core::workflow::policy::DirectApplyPolicy::new()),
+        _ => Box::new(tauqe_core::workflow::git_policy::GitTransactionPolicy::with_guard(
+            Arc::clone(&state.git_transaction_active),
+        )),
+    }
+}
+
 /// Resolves the provider and model for a turn, emits `model/started`, and
 /// registers the cancellable active operation. `is_batch` marks turns that run
 /// as members of a batch supervisor so clients can suppress per-step signals.
@@ -197,27 +218,41 @@ async fn prepare_turn(
     reasoning_effort: Option<ReasoningEffort>,
     is_batch: bool,
     marker: Option<String>,
+    shared_operation: Option<Arc<OperationGuard>>,
 ) -> Result<PreparedTurn, ResponseError> {
+    // Acquire (or borrow) the active operation first: registration is atomic,
+    // so a concurrent turn fails with BUSY instead of silently clobbering the
+    // running operation's cancel handle.
+    let operation = match shared_operation {
+        Some(operation) => operation,
+        None => Arc::new(state.try_begin_operation().map_err(|()| ResponseError {
+            code: "OPERATION_IN_PROGRESS".to_string(),
+            message: "Another operation is already running".to_string(),
+            data: None,
+        })?),
+    };
+
     let (provider, model, app_config, selection) = {
-        let cfg = state.config.lock().await;
+        let config_guard = state.config.lock().await;
         let selection = match custom_selection {
             Some(s) => s,
-            None => state.current_selection.lock().await.clone(),
+            None => config_guard.selection.clone(),
         };
-        let model = cfg.resolve_model(&selection);
+        let model = config_guard.config.resolve_model(&selection);
+        let config = &config_guard.config;
         // Deterministic unit tests inject a scripted provider through the
         // state's test seam; production builds always construct a real
         // network provider from configuration.
         #[cfg(test)]
         let provider: Arc<dyn LlmProvider> = match state.provider_override.lock().await.clone() {
             Some(provider) => provider,
-            None => build_configured_provider(&cfg, model.provider)?,
+            None => build_configured_provider(config, model.provider)?,
         };
 
         #[cfg(not(test))]
-        let provider: Arc<dyn LlmProvider> = build_configured_provider(&cfg, model.provider)?;
+        let provider: Arc<dyn LlmProvider> = build_configured_provider(config, model.provider)?;
 
-        (provider, model, cfg.clone(), selection)
+        (provider, model, config.clone(), selection)
     };
 
     let op_id = format!("op-{}", next_operation_id());
@@ -233,14 +268,6 @@ async fn prepare_turn(
         .ok(),
     });
 
-    let (cancel_tx, cancel_rx) = watch::channel(false);
-    {
-        *state.active_cancel.lock().await = Some(ActiveOperation {
-            cancel_tx,
-            abort_handle: None,
-        });
-    }
-
     Ok(PreparedTurn {
         provider,
         model,
@@ -248,7 +275,7 @@ async fn prepare_turn(
         selection,
         reasoning_effort,
         op_id,
-        cancel_rx,
+        operation,
         marker,
     })
 }
@@ -266,9 +293,11 @@ async fn run_prepared_turn(
         selection,
         reasoning_effort,
         op_id,
-        cancel_rx,
+        operation,
         marker,
     } = prepared;
+
+    let cancel_rx = operation.cancel_receiver();
 
     let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamEvent>(100);
 
@@ -322,11 +351,7 @@ async fn run_prepared_turn(
     };
 
     let wf_task = tokio::spawn(workflow_future);
-    {
-        if let Some(ref mut op) = *state.active_cancel.lock().await {
-            op.abort_handle = Some(wf_task.abort_handle());
-        }
-    }
+    operation.set_abort_handle(wf_task.abort_handle());
 
     let mut raw_streamed_text = String::new();
     let mut usage_info = None;
@@ -552,14 +577,40 @@ async fn run_prepared_turn(
     }
 
     if is_cancelled || is_error {
+        // Cooperative cancellation is the primary path: the workflow observes
+        // the cancel signal and unwinds its own transaction. Force-aborting is a
+        // last resort with a generous grace period, and it is skipped while a
+        // git transaction is still open, because an abort lands at the next
+        // `.await` and could otherwise strand a half-finished checkpoint or step
+        // commit until startup crash recovery runs.
         let abort_handle = wf_task.abort_handle();
-        if tokio::time::timeout(tokio::time::Duration::from_millis(500), wf_task)
+        let stalled = tokio::time::timeout(CANCEL_UNWIND_GRACE, wf_task)
             .await
-            .is_err()
-        {
+            .is_err();
+        if stalled && !state.git_transaction_active.load(Ordering::SeqCst) {
             abort_handle.abort();
         }
-        *state.active_cancel.lock().await = None;
+
+        // Flush usage accumulated before the turn was cancelled or failed:
+        // otherwise a turn that consumed tokens but never completed would
+        // silently under-report the session cost.
+        let usage_to_send = usage_info.unwrap_or_default();
+        let cost = usage_to_send.cost.unwrap_or(0.0);
+        let total_cost = {
+            let mut total = state.total_cost.lock().await;
+            *total += cost;
+            *total
+        };
+        state.out.send_event(&Event {
+            method: events::MODEL_USAGE.to_string(),
+            params: serde_json::to_value(tauqe_protocol::ModelUsageEvent {
+                operation_id: op_id.clone(),
+                usage: usage_to_send.clone(),
+                session_total_cost: total_cost,
+                current_cost: Some(cost),
+            })
+            .ok(),
+        });
 
         let error = if is_cancelled {
             Some("Operation cancelled".to_string())
@@ -646,49 +697,34 @@ async fn run_prepared_turn(
                 params: Some(serde_json::json!({ "state": ctx_state })),
             });
 
-            let repo_root = state.context.read().await.repo_root().to_path_buf();
-            let active_id = tauqe_core::plan::storage::PlanStorage::load_active_id(&repo_root)
-                .ok()
-                .flatten();
-            if let Ok(plans) = tauqe_core::plan::storage::PlanStorage::load_all(&repo_root) {
-                for plan in &plans {
-                    state.out.send_event(&Event {
-                        method: events::PLAN_UPDATED.to_string(),
-                        params: serde_json::to_value(tauqe_protocol::PlanUpdatedEvent {
-                            plan: plan.clone(),
-                        })
-                        .ok(),
-                    });
+            let repo_root = state.repo_root().await;
+            let (active_id, plans) = offload(move || {
+                let active = tauqe_core::plan::storage::PlanStorage::load_active_id(&repo_root)
+                    .ok()
+                    .flatten();
+                let plans = tauqe_core::plan::storage::PlanStorage::load_all(&repo_root).ok();
+                (active, plans)
+            })
+            .await
+            .unwrap_or((None, None));
+
+            if let Some(plans) = plans {
+                if let Some(ref aid) = active_id {
+                    if let Some(active_plan) = plans.iter().find(|p| &p.id == aid) {
+                        state.out.send_event(&Event {
+                            method: events::PLAN_UPDATED.to_string(),
+                            params: serde_json::to_value(tauqe_protocol::PlanUpdatedEvent {
+                                plan: active_plan.clone(),
+                            })
+                            .ok(),
+                        });
+                    }
                 }
                 state.out.send_event(&Event {
                     method: events::PLAN_LIST_CHANGED.to_string(),
                     params: serde_json::to_value(tauqe_protocol::PlanListChangedEvent {
                         plans,
                         active_id,
-                    })
-                    .ok(),
-                });
-            }
-
-            let active_review_id =
-                tauqe_core::review::storage::ReviewStorage::load_active_id(&repo_root)
-                    .ok()
-                    .flatten();
-            if let Ok(reviews) = tauqe_core::review::storage::ReviewStorage::load_all(&repo_root) {
-                for session in &reviews {
-                    state.out.send_event(&Event {
-                        method: events::REVIEW_UPDATED.to_string(),
-                        params: serde_json::to_value(tauqe_protocol::ReviewUpdatedEvent {
-                            session: session.clone(),
-                        })
-                        .ok(),
-                    });
-                }
-                state.out.send_event(&Event {
-                    method: events::REVIEW_LIST_CHANGED.to_string(),
-                    params: serde_json::to_value(tauqe_protocol::ReviewListChangedEvent {
-                        reviews,
-                        active_id: active_review_id,
                     })
                     .ok(),
                 });
@@ -802,7 +838,6 @@ async fn run_prepared_turn(
         }
     };
 
-    *state.active_cancel.lock().await = None;
     Ok(turn_result)
 }
 
@@ -817,43 +852,55 @@ pub async fn start_model_turn(
 ) -> Result<String, ResponseError> {
     let marker = state.next_turn_marker().await;
     let prepared =
-        prepare_turn(state, custom_selection, plan_context, None, false, marker).await?;
+        prepare_turn(state, custom_selection, plan_context, None, false, marker, None).await?;
     let op_id = prepared.op_id.clone();
     let state_clone = Arc::clone(state);
     let workflow_name = prepared.app_config.develop.workflow.trim().to_lowercase();
     tokio::spawn(async move {
-        let policy: Box<dyn tauqe_core::workflow::policy::ApplyPolicy> = match workflow_name.as_str() {
-            "naive" => Box::new(tauqe_core::workflow::policy::DirectApplyPolicy::new()),
-            _ => Box::new(tauqe_core::workflow::git_policy::GitTransactionPolicy::new()),
-        };
+        let policy = build_apply_policy(&state_clone, workflow_name.as_str());
         let _ = run_prepared_turn(&state_clone, prompt, prepared, policy).await;
     });
     Ok(op_id)
 }
 
+/// Optional controls for a programmatic batch step turn.
+///
+/// Bundles the per-step targeting, escalation, and cancellation wiring so the
+/// turn entry point keeps a compact signature. An explicit `reasoning_effort`
+/// overrides the effort derived from the selection, letting callers target a
+/// specific coder-ladder rung without changing the semantic role. An explicit
+/// `marker` binds the turn's structural protocol tags to a per-turn suffix so
+/// literal source tags are never mistaken for protocol commands. A
+/// `shared_operation` borrows the batch-level registration instead of opening a
+/// new one, so the batch slot never lapses between steps.
+pub struct StepTurnOptions {
+    pub custom_selection: Option<tauqe_protocol::ModelSelection>,
+    pub plan_context: Option<tauqe_protocol::ModelTurnPlanContext>,
+    pub reasoning_effort: Option<ReasoningEffort>,
+    pub marker: Option<String>,
+    pub shared_operation: Option<Arc<OperationGuard>>,
+}
+
 /// Executes an isolated model turn to completion and awaits its outcome.
 ///
 /// Returns the full `ModelTurnResult` representing the atomic turn lifecycle,
-/// enabling server-side step orchestration to inspect step success deterministically.
-///
-/// An explicit `reasoning_effort` overrides the effort derived from the
-/// selection, letting callers target a specific coder-ladder rung without
-/// changing the semantic role. Turns started here always execute inside a batch
-/// supervisor, so they are marked with `is_batch`. An explicit `marker` binds
-/// the turn's structural protocol tags to a per-turn suffix so literal source
-/// tags are never mistaken for protocol commands.
-#[allow(dead_code)]
+/// enabling server-side step orchestration to inspect step success
+/// deterministically. Turns started here always execute inside a batch
+/// supervisor, so they are marked as batch members to let clients suppress
+/// per-step signals.
 pub async fn execute_model_turn(
     state: &Arc<AppState>,
     prompt: String,
-    custom_selection: Option<tauqe_protocol::ModelSelection>,
-    plan_context: Option<tauqe_protocol::ModelTurnPlanContext>,
-    reasoning_effort: Option<ReasoningEffort>,
-    marker: Option<String>,
     policy: Box<dyn tauqe_core::workflow::policy::ApplyPolicy>,
+    options: StepTurnOptions,
 ) -> Result<ModelTurnResult, ResponseError> {
-    // Programmatic step turns always run inside a batch supervisor, so they are
-    // marked as batch members to let clients suppress per-step signals.
+    let StepTurnOptions {
+        custom_selection,
+        plan_context,
+        reasoning_effort,
+        marker,
+        shared_operation,
+    } = options;
     let prepared = prepare_turn(
         state,
         custom_selection,
@@ -861,19 +908,27 @@ pub async fn execute_model_turn(
         reasoning_effort,
         true,
         marker,
+        shared_operation,
     )
     .await?;
     run_prepared_turn(state, prompt, prepared, policy).await
 }
 
 pub async fn handle_model_cancel(req: Request, state: &Arc<AppState>) -> Response {
-    let active_op = state.active_cancel.lock().await.take();
+    let active_op = state.take_active_operation();
     if let Some(op) = active_op {
         let _ = op.cancel_tx.send(true);
         if let Some(handle) = op.abort_handle {
+            // Aborting is a last resort: the workflow unwinds cooperatively on
+            // the cancel signal, and a hard abort is deferred while a git
+            // transaction is still open so a half-finished checkpoint or step
+            // commit is never abandoned mid-transaction.
+            let state = Arc::clone(state);
             tokio::spawn(async move {
-                tokio::time::sleep(tokio::time::Duration::from_millis(600)).await;
-                handle.abort();
+                tokio::time::sleep(CANCEL_UNWIND_GRACE).await;
+                if !state.git_transaction_active.load(Ordering::SeqCst) {
+                    handle.abort();
+                }
             });
         }
     }
@@ -896,15 +951,22 @@ pub async fn handle_model_clear_history(req: Request, state: &Arc<AppState>) -> 
 
 fn accumulate_usage(accum: &mut Option<ModelUsageInfo>, new_usage: ModelUsageInfo) {
     if let Some(existing) = accum.as_mut() {
-        existing.prompt_tokens += new_usage.prompt_tokens;
-        existing.completion_tokens += new_usage.completion_tokens;
-        existing.total_tokens += new_usage.total_tokens;
+        // Token counters come from untrusted provider usage reports and add up
+        // across a multi-round turn. Saturating addition keeps a malformed or
+        // runaway report from panicking in debug builds or wrapping in release.
+        existing.prompt_tokens = existing.prompt_tokens.saturating_add(new_usage.prompt_tokens);
+        existing.completion_tokens = existing
+            .completion_tokens
+            .saturating_add(new_usage.completion_tokens);
+        existing.total_tokens = existing.total_tokens.saturating_add(new_usage.total_tokens);
 
         if let Some(r) = new_usage.reasoning_tokens {
-            *existing.reasoning_tokens.get_or_insert(0) += r;
+            let slot = existing.reasoning_tokens.get_or_insert(0);
+            *slot = slot.saturating_add(r);
         }
         if let Some(c) = new_usage.cached_tokens {
-            *existing.cached_tokens.get_or_insert(0) += c;
+            let slot = existing.cached_tokens.get_or_insert(0);
+            *slot = slot.saturating_add(c);
         }
         if let Some(c) = new_usage.cost {
             *existing.cost.get_or_insert(0.0) += c;
@@ -1079,9 +1141,9 @@ mod tests {
         let mut config = tauqe_core::config::AppConfig::default();
         config.models.scribe = Some(tauqe_protocol::ModelRef::openrouter("test/scribe"));
         config.models.coder = Some(tauqe_protocol::ModelRef::openrouter("test/coder").into());
-        config.models.architect = Some(tauqe_protocol::ModelRef::openrouter("test/architect"));
+        config.models.architect = Some(tauqe_protocol::ModelRef::openrouter("test/architect").into());
         config.models.advisor = Some(tauqe_protocol::ModelRef::openrouter("test/advisor"));
-        config.models.reviewer = Some(tauqe_protocol::ModelRef::openrouter("test/reviewer"));
+        config.models.reviewer = Some(tauqe_protocol::ModelRef::openrouter("test/reviewer").into());
 
         let state = AppState::new(
             config,
@@ -1151,9 +1213,19 @@ mod tests {
         assert_eq!(res_start.unwrap_err().code, "NO_API_KEY");
 
         let policy = Box::new(tauqe_core::workflow::policy::DirectApplyPolicy::new());
-        let res_exec =
-            execute_model_turn(&state, "test prompt".to_string(), None, None, None, None, policy)
-                .await;
+        let res_exec = execute_model_turn(
+            &state,
+            "test prompt".to_string(),
+            policy,
+            StepTurnOptions {
+                custom_selection: None,
+                plan_context: None,
+                reasoning_effort: None,
+                marker: None,
+                shared_operation: None,
+            },
+        )
+        .await;
         assert!(res_exec.is_err());
         assert_eq!(res_exec.unwrap_err().code, "NO_API_KEY");
     }

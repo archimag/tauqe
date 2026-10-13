@@ -10,8 +10,8 @@ pub use utils::{
 };
 pub use xml::{
     extract_error, extract_scratchpad, extract_success, extract_terminal_outcome,
-    generate_turn_marker, has_xml_edit_tags, MarkedXmlEditProtocol, parse_context_drop_tags,
-    strip_context_drop_tags, strip_error_tags, strip_scratchpad_tags, strip_success_tags,
+    generate_turn_marker, has_xml_edit_tags, MarkedXmlEditProtocol,
+    strip_error_tags, strip_scratchpad_tags, strip_success_tags,
     strip_terminal_outcome_tags, TerminalOutcome, VerifyOnSuccess, VerifyRequest, VerifyTarget,
     XmlEditProtocol,
 };
@@ -27,11 +27,10 @@ pub trait EditProtocol: Send + Sync {
     /// Identifier name of the edit protocol (e.g. "xml", "structured")
     fn name(&self) -> &'static str;
 
-    /// Returns system prompt instructions tailored for this edit protocol and discovery strategy.
+    /// Returns system prompt instructions tailored for this edit protocol.
     fn system_instructions(
         &self,
         editable_paths: &[String],
-        discovery_mode: crate::config::DiscoveryMode,
     ) -> String;
 
     /// Parses the model text output into a ModelResult.
@@ -39,11 +38,6 @@ pub trait EditProtocol: Send + Sync {
 
     /// Extracts context requests (files the model wants added to context) from raw output.
     fn parse_context_requests(&self, _raw_text: &str) -> Vec<ContextRequest> {
-        Vec::new()
-    }
-
-    /// Extracts context drops (files the model wants removed from auto context) from raw output.
-    fn parse_context_drops(&self, _raw_text: &str) -> Vec<String> {
         Vec::new()
     }
 

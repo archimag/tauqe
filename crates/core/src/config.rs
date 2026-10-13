@@ -13,14 +13,15 @@ mod providers;
 mod toolchain;
 
 pub use context::{
-    ContextConfig, DiscoveryMode, DEFAULT_MAX_CONTEXT_FILES, DEFAULT_MAX_DISCOVERY_ROUNDS,
+    ContextConfig, DEFAULT_FILES_TOKEN_BUDGET, DEFAULT_MAX_DISCOVERY_ROUNDS,
 };
 pub use credentials::default_credentials_path;
 pub use develop::{DevelopConfig, EditConfig};
 pub use git::GitConfig;
 pub use history::HistoryConfig;
 pub use models::{
-    deserialize_model_ref_opt, parse_model_ref, serialize_model_ref_opt, CoderConfig, ModelsConfig,
+    deserialize_model_ref_opt, deserialize_role_config_opt, parse_model_ref,
+    serialize_model_ref_opt, serialize_role_config_opt, CoderConfig, ModelsConfig, RoleConfig,
     BUILTIN_DEFAULT_ADVISOR_MODEL, BUILTIN_DEFAULT_ARCHITECT_MODEL, BUILTIN_DEFAULT_CODER_MODEL,
     BUILTIN_DEFAULT_MODEL, BUILTIN_DEFAULT_REVIEWER_MODEL, BUILTIN_DEFAULT_SCRIBE_MODEL,
 };
@@ -226,6 +227,27 @@ auto_level_up = true
     }
 
     #[test]
+    fn test_app_config_models_role_config_and_effort() {
+        let toml_str = r#"
+[models]
+architect = { model = "openrouter:anthropic/claude-sonnet-latest", effort = "high" }
+reviewer = "openrouter:google/gemini-flash-latest"
+
+[models.effort]
+reviewer = "medium"
+"#;
+        let config: AppConfig = toml::from_str(toml_str).expect("parse config");
+        assert_eq!(
+            config.models.resolve_effort(ModelRole::Architect),
+            Some(tauqe_protocol::ReasoningEffort::High)
+        );
+        assert_eq!(
+            config.models.resolve_effort(ModelRole::Reviewer),
+            Some(tauqe_protocol::ReasoningEffort::Medium)
+        );
+    }
+
+    #[test]
     fn test_models_config_validation() {
         let empty_cfg = ModelsConfig::default();
         assert!(empty_cfg.validate().is_err());
@@ -270,7 +292,7 @@ coder = "openrouter:anthropic/claude-3.7-sonnet"
 
         // 2. Only Architect
         let architect_only = ModelsConfig {
-            architect: Some(ModelRef::openrouter("model/architect")),
+            architect: Some(ModelRef::openrouter("model/architect").into()),
             ..Default::default()
         };
         let expected_architect = ModelRef::openrouter("model/architect");
@@ -293,7 +315,7 @@ coder = "openrouter:anthropic/claude-3.7-sonnet"
 
         // 4. Only Reviewer
         let reviewer_only = ModelsConfig {
-            reviewer: Some(ModelRef::openrouter("model/reviewer")),
+            reviewer: Some(ModelRef::openrouter("model/reviewer").into()),
             ..Default::default()
         };
         let expected_reviewer = ModelRef::openrouter("model/reviewer");
@@ -329,7 +351,7 @@ coder = "openrouter:anthropic/claude-3.7-sonnet"
         // Advisor -> Architect -> Coder(none) -> Scribe => Architect
         let cfg = ModelsConfig {
             scribe: Some(m_scribe.clone()),
-            architect: Some(m_architect.clone()),
+            architect: Some(m_architect.clone().into()),
             ..Default::default()
         };
         assert_eq!(cfg.resolve_role(ModelRole::Scribe), m_scribe);
@@ -355,7 +377,7 @@ coder = "openrouter:anthropic/claude-3.7-sonnet"
         // Advisor -> Architect -> Coder -> Scribe(none) => Architect
         let cfg = ModelsConfig {
             coder: Some(m_coder.clone().into()),
-            architect: Some(m_architect.clone()),
+            architect: Some(m_architect.clone().into()),
             ..Default::default()
         };
         assert_eq!(cfg.resolve_role(ModelRole::Scribe), m_coder);
@@ -380,7 +402,7 @@ coder = "openrouter:anthropic/claude-3.7-sonnet"
         // Scribe -> Coder(none) -> Advisor -> Architect => Advisor
         // Coder -> Architect -> Advisor -> Scribe(none) => Architect
         let cfg = ModelsConfig {
-            architect: Some(m_architect.clone()),
+            architect: Some(m_architect.clone().into()),
             advisor: Some(m_advisor.clone()),
             ..Default::default()
         };
@@ -402,7 +424,7 @@ coder = "openrouter:anthropic/claude-3.7-sonnet"
         let cfg = ModelsConfig {
             scribe: Some(m_scribe.clone()),
             coder: Some(m_coder.clone().into()),
-            architect: Some(m_architect.clone()),
+            architect: Some(m_architect.clone().into()),
             advisor: None,
             ..Default::default()
         };
@@ -424,7 +446,7 @@ coder = "openrouter:anthropic/claude-3.7-sonnet"
         let cfg = ModelsConfig {
             scribe: Some(m_scribe.clone()),
             coder: None,
-            architect: Some(m_architect.clone()),
+            architect: Some(m_architect.clone().into()),
             advisor: Some(m_advisor.clone()),
             ..Default::default()
         };
@@ -435,7 +457,7 @@ coder = "openrouter:anthropic/claude-3.7-sonnet"
         let cfg = ModelsConfig {
             scribe: None,
             coder: Some(m_coder.clone().into()),
-            architect: Some(m_architect.clone()),
+            architect: Some(m_architect.clone().into()),
             advisor: Some(m_advisor.clone()),
             ..Default::default()
         };
@@ -539,31 +561,15 @@ repomap_token_budget = 6000
         let toml_str = r#"
 [context]
 max_discovery_rounds = 8
-max_files = 40
-discovery_mode = "snapshot"
+files_token_budget = 150000
 "#;
         let config: AppConfig = toml::from_str(toml_str).expect("Failed to parse config");
         assert_eq!(config.context.max_discovery_rounds, 8);
-        assert_eq!(config.context.max_files, 40);
-        assert_eq!(config.context.discovery_mode, DiscoveryMode::Snapshot);
+        assert_eq!(config.context.files_token_budget, 150000);
 
         let default_cfg = ContextConfig::default();
         assert_eq!(default_cfg.max_discovery_rounds, 5);
-        assert_eq!(default_cfg.max_files, 25);
-        assert_eq!(default_cfg.discovery_mode, DiscoveryMode::Monotonic);
-
-        assert_eq!(
-            "monotonic".parse::<DiscoveryMode>().unwrap(),
-            DiscoveryMode::Monotonic
-        );
-        assert_eq!(
-            "cumulative".parse::<DiscoveryMode>().unwrap(),
-            DiscoveryMode::Monotonic
-        );
-        assert_eq!(
-            "append_only".parse::<DiscoveryMode>().unwrap(),
-            DiscoveryMode::Monotonic
-        );
+        assert_eq!(default_cfg.files_token_budget, 300_000);
     }
 
     #[test]
