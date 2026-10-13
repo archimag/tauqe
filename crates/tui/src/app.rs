@@ -1,14 +1,17 @@
+use ratatui::layout::Rect;
 use tauqe_protocol::{
     ContextState, ModelRef, ModelRole, ModelRolesSummary, ModelSelection, RepositoryState,
+    SystemStatusResult,
 };
 
+use crate::components::ListSelector;
 use crate::config::TuiConfig;
 use crate::editor::InputEditor;
-use crate::ui::context::ContextViewState;
-use crate::ui::develop::DevelopView;
-use crate::ui::history::HistoryViewState;
-use crate::ui::plans::PlansViewState;
-use crate::ui::review::ReviewViewState;
+use crate::views::context::ContextViewState;
+use crate::views::develop::{DevelopView, TurnStatus};
+use crate::views::history::HistoryViewState;
+use crate::views::plans::PlansViewState;
+use crate::views::review::ReviewViewState;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct KeyCommand {
@@ -21,6 +24,39 @@ pub enum ConfirmDialogButton {
     #[default]
     Cancel,
     Confirm,
+}
+
+/// The single source of truth for modal stacking order.
+///
+/// Every surface that must decide *which* modal is on top — keyboard dispatch,
+/// rendering, mouse hit-testing, and paste routing — derives its decision from
+/// [`AppState::active_modal`]. The variant order encodes priority: the first
+/// active variant wins. Centralizing the list here guarantees that the window a
+/// developer *sees* is always the window that receives keystrokes, mouse events,
+/// and pasted text, and that adding a modal no longer requires editing several
+/// divergent chains (Conventions §7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActiveModal {
+    /// Fatal transport state; blocks every other surface.
+    ServerDisconnected,
+    Squash,
+    Review,
+    ConfirmCancel,
+    ConfirmQuit,
+    ClearAuto,
+    ConfirmUndo,
+    DeletePlan,
+    DeleteReview,
+    ExecuteReview,
+    ExecuteScope,
+    DiscussPlan,
+    RefineDialog,
+    RefineBlocked,
+    Prompt,
+    ClearHistory,
+    Status,
+    Selection,
+    Help,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -174,6 +210,22 @@ pub fn role_badge(role: ModelRole) -> &'static str {
     }
 }
 
+/// Canonical Help-open chord, expressed with the abstract primary command modifier
+/// (`C-`). The header button and the Help dialog both derive their labels from this
+/// single value, so the advertised and documented keybindings cannot diverge
+/// (Conventions §4.1). Outside text-input contexts a bare `?` also opens Help.
+pub const HELP_OPEN_CHORD: &str = "C-H";
+
+/// Compact rendering of [`HELP_OPEN_CHORD`] for the header button
+/// (`C-H` for the Ctrl primary modifier, `M-H` for Alt).
+pub fn help_open_hint(primary: crate::config::PrimaryModifier) -> String {
+    let prefix = match primary {
+        crate::config::PrimaryModifier::Ctrl => "C-",
+        crate::config::PrimaryModifier::Alt => "M-",
+    };
+    HELP_OPEN_CHORD.replace("C-", prefix)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SelectionDialogKind {
     /// Quick menu: one row per semantic role plus `Others...`.
@@ -193,48 +245,17 @@ pub enum SelectionItem {
 pub struct SelectionDialogState {
     pub kind: SelectionDialogKind,
     pub items: Vec<SelectionItem>,
-    pub selected_index: usize,
-    pub scroll_offset: usize,
+    pub selector: ListSelector,
 }
 
 impl SelectionDialogState {
     pub fn new(kind: SelectionDialogKind, items: Vec<SelectionItem>, selected_index: usize) -> Self {
-        let mut state = Self {
+        let selector = ListSelector::new(items.len(), selected_index);
+        Self {
             kind,
             items,
-            selected_index,
-            scroll_offset: 0,
-        };
-        state.ensure_visible(10);
-        state
-    }
-
-    pub fn select_prev(&mut self, visible_height: usize) {
-        if self.selected_index > 0 {
-            self.selected_index -= 1;
-            self.ensure_visible(visible_height);
+            selector,
         }
-    }
-
-    pub fn select_next(&mut self, visible_height: usize) {
-        if !self.items.is_empty() && self.selected_index + 1 < self.items.len() {
-            self.selected_index += 1;
-            self.ensure_visible(visible_height);
-        }
-    }
-
-    pub fn ensure_visible(&mut self, visible_height: usize) {
-        if visible_height == 0 || self.items.is_empty() {
-            self.scroll_offset = 0;
-            return;
-        }
-        if self.selected_index < self.scroll_offset {
-            self.scroll_offset = self.selected_index;
-        } else if self.selected_index >= self.scroll_offset + visible_height {
-            self.scroll_offset = self.selected_index + 1 - visible_height;
-        }
-        let max_scroll = self.items.len().saturating_sub(visible_height);
-        self.scroll_offset = self.scroll_offset.min(max_scroll);
     }
 }
 
@@ -252,6 +273,16 @@ pub enum StatusDialogTarget {
         item_title: String,
         current_status: tauqe_protocol::ReviewStatus,
     },
+}
+
+impl StatusDialogTarget {
+    /// Number of selectable status options presented for this target.
+    pub fn options_count(&self) -> usize {
+        match self {
+            Self::PlanItem { .. } => 6,
+            Self::ReviewItem { .. } => 5,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -324,7 +355,14 @@ pub struct DiscussReviewDialogState {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StatusDialogState {
     pub target: StatusDialogTarget,
-    pub selected_index: usize,
+    pub selector: ListSelector,
+}
+
+impl StatusDialogState {
+    pub fn new(target: StatusDialogTarget, selected_index: usize) -> Self {
+        let selector = ListSelector::new(target.options_count(), selected_index);
+        Self { target, selector }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -344,6 +382,8 @@ pub struct ReviewDialogState {
     pub models: Vec<ModelRef>,
     pub model_index: usize,
     pub prompt_editor: InputEditor,
+    /// Which action-bar button holds focus. Defaults to the safe `Cancel`.
+    pub confirm_button: ConfirmDialogButton,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -357,27 +397,63 @@ pub enum OnboardingStep {
     Gatekeeper,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct OnboardingState {
     pub step: OnboardingStep,
     pub has_git: bool,
     pub has_config: bool,
+    pub config_skipped: bool,
     pub config_path: Option<String>,
     pub default_config_path: String,
     pub has_api_key: bool,
     pub credentials_path: Option<String>,
     pub default_credentials_path: String,
     pub has_tui_config: bool,
+    pub workstation_skipped: bool,
     pub default_tui_config_path: String,
     pub chosen_layout: crate::config::LayoutPreset,
     pub chosen_langmap: Option<String>,
     pub selected_index: usize,
-    pub input_buffer: String,
+    pub input_buffer: InputEditor,
     pub input_active: bool,
     pub input_langmap: bool,
     pub show_key: bool,
     pub status_message: Option<String>,
     pub error_message: Option<String>,
+}
+
+/// Redacts the credential buffer: the onboarding input holds the API key while
+/// the developer is typing it, so a raw `{:?}` must never reveal it.
+impl std::fmt::Debug for OnboardingState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let input_repr = format!(
+            "<redacted: {} chars>",
+            self.input_buffer.get_text().chars().count()
+        );
+        f.debug_struct("OnboardingState")
+            .field("step", &self.step)
+            .field("has_git", &self.has_git)
+            .field("has_config", &self.has_config)
+            .field("config_skipped", &self.config_skipped)
+            .field("config_path", &self.config_path)
+            .field("default_config_path", &self.default_config_path)
+            .field("has_api_key", &self.has_api_key)
+            .field("credentials_path", &self.credentials_path)
+            .field("default_credentials_path", &self.default_credentials_path)
+            .field("has_tui_config", &self.has_tui_config)
+            .field("workstation_skipped", &self.workstation_skipped)
+            .field("default_tui_config_path", &self.default_tui_config_path)
+            .field("chosen_layout", &self.chosen_layout)
+            .field("chosen_langmap", &self.chosen_langmap)
+            .field("selected_index", &self.selected_index)
+            .field("input_buffer", &input_repr)
+            .field("input_active", &self.input_active)
+            .field("input_langmap", &self.input_langmap)
+            .field("show_key", &self.show_key)
+            .field("status_message", &self.status_message)
+            .field("error_message", &self.error_message)
+            .finish()
+    }
 }
 
 impl Default for OnboardingState {
@@ -388,17 +464,19 @@ impl Default for OnboardingState {
             step: OnboardingStep::Config,
             has_git: true,
             has_config: false,
+            config_skipped: false,
             config_path: None,
             default_config_path: "tauqe.toml".to_string(),
             has_api_key: false,
             credentials_path: None,
             default_credentials_path: "~/.config/tauqe/credentials.toml".to_string(),
             has_tui_config: has_tui,
+            workstation_skipped: false,
             default_tui_config_path: default_tui,
             chosen_layout: crate::config::LayoutPreset::None,
             chosen_langmap: None,
             selected_index: 0,
-            input_buffer: String::new(),
+            input_buffer: InputEditor::default(),
             input_active: false,
             input_langmap: false,
             show_key: false,
@@ -409,6 +487,29 @@ impl Default for OnboardingState {
 }
 
 impl OnboardingState {
+    /// Determines the next onboarding step from the `has_*` completion flags.
+    ///
+    /// Canonical order: Git -> Config -> Credentials -> Workstation -> Ready.
+    /// The Modifier sub-step is entered explicitly after a layout choice on the
+    /// Workstation step. Optional phases the developer deliberately dismissed
+    /// are recorded via `config_skipped` / `workstation_skipped`, so the flow
+    /// never loops back to a phase the developer already left.
+    pub fn next_step(&self) -> OnboardingStep {
+        if !self.has_git {
+            return OnboardingStep::Git;
+        }
+        if !self.has_config && !self.config_skipped {
+            return OnboardingStep::Config;
+        }
+        if !self.has_api_key {
+            return OnboardingStep::Credentials;
+        }
+        if !self.has_tui_config && !self.workstation_skipped {
+            return OnboardingStep::Workstation;
+        }
+        OnboardingStep::Ready
+    }
+
     pub fn set_status(&mut self, msg: impl Into<String>) {
         self.status_message = Some(msg.into());
         self.error_message = None;
@@ -422,6 +523,19 @@ impl OnboardingState {
     pub fn clear_messages(&mut self) {
         self.status_message = None;
         self.error_message = None;
+    }
+
+    /// Applies the authoritative flags and paths reported by the server.
+    pub fn apply_status(&mut self, status: &SystemStatusResult) {
+        self.has_git = status.has_git;
+        self.has_config = status.has_config;
+        self.has_api_key = status.has_api_key;
+        if status.config_path.is_some() {
+            self.config_path = status.config_path.clone();
+        }
+        if status.credentials_path.is_some() {
+            self.credentials_path = status.credentials_path.clone();
+        }
     }
 }
 
@@ -518,6 +632,30 @@ impl Default for SquashDialogState {
     }
 }
 
+/// Inputs required to construct an [`AppState`].
+///
+/// Only the fields that carry initialization signal from the handshake are
+/// listed; [`AppState::new`] fills every transient or default-able field. This
+/// keeps one construction path shared by production and tests instead of a
+/// fifty-field struct literal duplicated across the crate.
+pub struct AppInit {
+    pub view_mode: ViewMode,
+    pub protocol_version: String,
+    pub repo_state: Option<RepositoryState>,
+    pub all_repo_files: Vec<String>,
+    pub workflow: String,
+    pub edit_protocol: String,
+    pub active_model: ModelRef,
+    pub available_models: Vec<ModelRef>,
+    pub available_workflows: Vec<String>,
+    pub available_edit_protocols: Vec<String>,
+    pub context: ContextState,
+    pub onboarding: OnboardingState,
+    pub input_editor: InputEditor,
+    pub tui_config: TuiConfig,
+    pub server_log_path: std::path::PathBuf,
+}
+
 pub struct AppState {
     pub view_mode: ViewMode,
     pub protocol_version: String,
@@ -561,6 +699,7 @@ pub struct AppState {
     pub server_disconnected: Option<String>,
     pub server_log_path: std::path::PathBuf,
     pub last_model_height: u16,
+    pub last_frame_area: Rect,
     pub header_clicks: HeaderClickAreas,
     pub terminal_focused: bool,
     pub shift_tip_shown: bool,
@@ -568,9 +707,67 @@ pub struct AppState {
 }
 
 impl AppState {
+    /// Builds an application state from its handshake-derived inputs, filling
+    /// every transient field with a default. Shared by production startup and
+    /// tests so the field set is defined in exactly one place.
+    pub fn new(init: AppInit) -> Self {
+        Self {
+            view_mode: init.view_mode,
+            protocol_version: init.protocol_version,
+            repo_state: init.repo_state,
+            all_repo_files: init.all_repo_files,
+            workflow: init.workflow,
+            edit_protocol: init.edit_protocol,
+            active_model: init.active_model,
+            available_models: init.available_models,
+            available_workflows: init.available_workflows,
+            available_edit_protocols: init.available_edit_protocols,
+            model: DevelopView::default(),
+            context: init.context,
+            context_view: ContextViewState::default(),
+            history_view: HistoryViewState::default(),
+            review: ReviewViewState::default(),
+            plans_view: PlansViewState::default(),
+            onboarding: init.onboarding,
+            input_editor: init.input_editor,
+            tui_config: init.tui_config,
+            show_help: false,
+            help_scroll: 0,
+            confirm_cancel: false,
+            confirm_quit: false,
+            confirm_undo: false,
+            confirm_clear_history: false,
+            confirm_delete_plan: None,
+            confirm_delete_review: None,
+            confirm_execute_scope: None,
+            confirm_execute_review: None,
+            confirm_button: ConfirmDialogButton::Cancel,
+            selection_dialog: None,
+            status_dialog: None,
+            squash_dialog: None,
+            review_dialog: None,
+            prompt_modal: None,
+            discuss_plan_dialog: None,
+            discuss_review_dialog: None,
+            notification: None,
+            turn_started_at: None,
+            server_disconnected: None,
+            server_log_path: init.server_log_path,
+            last_model_height: 10,
+            last_frame_area: Rect::new(0, 0, 80, 24),
+            header_clicks: HeaderClickAreas::default(),
+            terminal_focused: true,
+            shift_tip_shown: false,
+            model_choice: ModelChoice::default(),
+        }
+    }
+
     pub fn notify(&mut self, text: impl Into<String>, level: NotificationLevel, ttl: std::time::Duration) {
         if let Some(ref current) = self.notification {
-            if current.created_at.elapsed() < current.ttl && current.level > level {
+            if current.created_at.elapsed() < current.ttl
+                && level == NotificationLevel::Info
+                && current.level > level
+            {
                 return;
             }
         }
@@ -653,27 +850,78 @@ impl AppState {
         true
     }
 
+    /// Returns the highest-priority active modal surface, or `None` when no modal
+    /// is open. This is the canonical ordering consulted by keyboard dispatch,
+    /// rendering, mouse hit-testing, and paste routing.
+    pub fn active_modal(&self) -> Option<ActiveModal> {
+        if self.server_disconnected.is_some() {
+            return Some(ActiveModal::ServerDisconnected);
+        }
+        if self.squash_dialog.is_some() {
+            return Some(ActiveModal::Squash);
+        }
+        if self.review_dialog.is_some() {
+            return Some(ActiveModal::Review);
+        }
+        if self.confirm_cancel {
+            return Some(ActiveModal::ConfirmCancel);
+        }
+        if self.confirm_quit {
+            return Some(ActiveModal::ConfirmQuit);
+        }
+        if self.context_view.confirm_clear_auto {
+            return Some(ActiveModal::ClearAuto);
+        }
+        if self.confirm_undo {
+            return Some(ActiveModal::ConfirmUndo);
+        }
+        if self.confirm_delete_plan.is_some() {
+            return Some(ActiveModal::DeletePlan);
+        }
+        if self.confirm_delete_review.is_some() {
+            return Some(ActiveModal::DeleteReview);
+        }
+        if self.confirm_execute_review.is_some() {
+            return Some(ActiveModal::ExecuteReview);
+        }
+        if self.confirm_execute_scope.is_some() {
+            return Some(ActiveModal::ExecuteScope);
+        }
+        if self.discuss_plan_dialog.is_some() {
+            return Some(ActiveModal::DiscussPlan);
+        }
+        if self.plans_view.refine_dialog.is_some() {
+            return Some(ActiveModal::RefineDialog);
+        }
+        if self.plans_view.refine_blocked.is_some() {
+            return Some(ActiveModal::RefineBlocked);
+        }
+        if self.prompt_modal.is_some() {
+            return Some(ActiveModal::Prompt);
+        }
+        if self.confirm_clear_history {
+            return Some(ActiveModal::ClearHistory);
+        }
+        if self.status_dialog.is_some() {
+            return Some(ActiveModal::Status);
+        }
+        if self.selection_dialog.is_some() {
+            return Some(ActiveModal::Selection);
+        }
+        if self.show_help {
+            return Some(ActiveModal::Help);
+        }
+        None
+    }
+
+    /// Whether any modal surface (or the inline Context-view file input)
+    /// currently suppresses background interaction.
     pub fn has_active_modal(&self) -> bool {
-        self.server_disconnected.is_some()
-            || self.show_help
-            || self.selection_dialog.is_some()
-            || self.status_dialog.is_some()
-            || self.squash_dialog.is_some()
-            || self.review_dialog.is_some()
-            || self.prompt_modal.is_some()
-            || self.discuss_plan_dialog.is_some()
+        // `discuss_review_dialog` is retained for compatibility and `adding_file`
+        // is an inline Context-view input; neither participates in the modal
+        // stack, yet both still block background interaction.
+        self.active_modal().is_some()
             || self.discuss_review_dialog.is_some()
-            || self.plans_view.refine_dialog.is_some()
-            || self.plans_view.refine_blocked.is_some()
-            || self.confirm_cancel
-            || self.confirm_quit
-            || self.confirm_undo
-            || self.confirm_clear_history
-            || self.confirm_delete_plan.is_some()
-            || self.confirm_delete_review.is_some()
-            || self.confirm_execute_scope.is_some()
-            || self.confirm_execute_review.is_some()
-            || self.context_view.confirm_clear_auto
             || self.context_view.adding_file
     }
 
@@ -711,7 +959,7 @@ impl AppState {
         self.model.result = None;
         self.model.usage = None;
         self.model.scroll = 0;
-        self.model.status = "awaiting".to_string();
+        self.model.status = TurnStatus::Awaiting;
         self.model.auto_scroll = true;
         self.model.current_cost = Some(0.0);
 
@@ -722,10 +970,10 @@ impl AppState {
         self.model.edit_final_error = None;
         self.model.last_commit_hash = None;
         self.model.last_commit_summary = None;
-        self.model.toolchain_command = None;
-        self.model.toolchain_status = None;
+        self.model.toolchain = None;
         self.model.copy_flash = None;
         self.model.code_blocks.clear();
+        self.model.esc_clear_armed = None;
         self.turn_started_at = Some(std::time::Instant::now());
 
         Some(prompt)
@@ -736,14 +984,85 @@ impl AppState {
             .update_filtered_candidates(&self.context.items, &self.all_repo_files);
     }
 
+    /// Propagates the configured theme to every view that renders Markdown,
+    /// resolving `Auto` against the terminal background. Called on startup, on
+    /// configuration reload, and whenever a view is rebuilt from defaults.
     pub fn sync_theme_mode(&mut self) {
-        self.model.set_theme_mode(self.tui_config.theme.mode);
+        crate::markdown::set_color_depth_override(self.tui_config.theme.color_depth);
+        let mode = self.tui_config.theme.mode.resolve();
+        self.model.set_theme_mode(mode);
+        self.history_view.theme_mode = mode;
+        self.plans_view.theme_mode = mode;
+        self.review.theme_mode = mode;
     }
+}
+
+/// Shared test fixture: a fully constructed [`AppState`] with deterministic
+/// defaults that every unit test can adjust field by field.
+#[cfg(test)]
+pub(crate) fn test_state() -> AppState {
+    AppState::new(AppInit {
+        view_mode: ViewMode::Develop,
+        protocol_version: "1.0".to_string(),
+        repo_state: None,
+        all_repo_files: Vec::new(),
+        workflow: "git".to_string(),
+        edit_protocol: "xml".to_string(),
+        active_model: ModelRef::openrouter("test-model"),
+        available_models: Vec::new(),
+        available_workflows: Vec::new(),
+        available_edit_protocols: Vec::new(),
+        context: ContextState::default(),
+        onboarding: OnboardingState::default(),
+        input_editor: InputEditor::default(),
+        tui_config: TuiConfig::default(),
+        server_log_path: std::path::PathBuf::from(".tauqe/server.log"),
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_onboarding_next_step_deterministic_order() {
+        let mut state = OnboardingState {
+            has_git: false,
+            has_config: false,
+            has_api_key: false,
+            has_tui_config: false,
+            ..OnboardingState::default()
+        };
+        assert_eq!(state.next_step(), OnboardingStep::Git);
+
+        state.has_git = true;
+        assert_eq!(state.next_step(), OnboardingStep::Config);
+
+        state.has_config = true;
+        assert_eq!(state.next_step(), OnboardingStep::Credentials);
+
+        state.has_api_key = true;
+        assert_eq!(state.next_step(), OnboardingStep::Workstation);
+
+        state.has_tui_config = true;
+        assert_eq!(state.next_step(), OnboardingStep::Ready);
+    }
+
+    #[test]
+    fn test_onboarding_next_step_honors_skipped_optional_phases() {
+        let mut state = OnboardingState {
+            has_git: true,
+            has_config: false,
+            config_skipped: true,
+            has_api_key: true,
+            has_tui_config: false,
+            ..OnboardingState::default()
+        };
+        assert_eq!(state.next_step(), OnboardingStep::Workstation);
+
+        state.workstation_skipped = true;
+        assert_eq!(state.next_step(), OnboardingStep::Ready);
+    }
 
     #[test]
     fn test_modal_actions_state_defaults_to_cancel() {
@@ -777,58 +1096,16 @@ mod tests {
     }
 
     #[test]
+    fn test_help_open_hint_tracks_primary_modifier() {
+        assert_eq!(HELP_OPEN_CHORD, "C-H");
+        assert_eq!(help_open_hint(crate::config::PrimaryModifier::Ctrl), "C-H");
+        assert_eq!(help_open_hint(crate::config::PrimaryModifier::Alt), "M-H");
+    }
+
+    #[test]
     fn test_take_prompt_when_busy_preserves_input() {
-        let mut state = AppState {
-            view_mode: ViewMode::Develop,
-            protocol_version: "1.0".to_string(),
-            repo_state: None,
-            all_repo_files: Vec::new(),
-            workflow: "git".to_string(),
-            edit_protocol: "xml".to_string(),
-            active_model: ModelRef::openrouter("test-model"),
-            available_models: Vec::new(),
-            available_workflows: Vec::new(),
-            available_edit_protocols: Vec::new(),
-            model_choice: ModelChoice::default(),
-            model: DevelopView {
-                status: "thinking".to_string(),
-                ..Default::default()
-            },
-            context: ContextState::default(),
-            context_view: ContextViewState::default(),
-            history_view: HistoryViewState::default(),
-            review: ReviewViewState::default(),
-            plans_view: PlansViewState::default(),
-            review_dialog: None,
-            notification: None,
-            turn_started_at: None,
-            onboarding: OnboardingState::default(),
-            input_editor: InputEditor::default(),
-            tui_config: TuiConfig::default(),
-            show_help: false,
-            help_scroll: 0,
-            confirm_cancel: false,
-            confirm_quit: false,
-            confirm_undo: false,
-            confirm_clear_history: false,
-            confirm_delete_plan: None,
-            confirm_delete_review: None,
-            confirm_execute_scope: None,
-            confirm_execute_review: None,
-            confirm_button: ConfirmDialogButton::Cancel,
-            selection_dialog: None,
-            status_dialog: None,
-            squash_dialog: None,
-            prompt_modal: None,
-            discuss_plan_dialog: None,
-            discuss_review_dialog: None,
-            server_disconnected: None,
-            server_log_path: std::path::PathBuf::from(".tauqe/server.log"),
-            last_model_height: 10,
-            header_clicks: HeaderClickAreas::default(),
-            terminal_focused: true,
-            shift_tip_shown: false,
-        };
+        let mut state = test_state();
+        state.model.status = TurnStatus::Thinking;
 
         state.input_editor.insert_str("next planned prompt");
         assert!(state.model.is_busy());
@@ -838,7 +1115,7 @@ mod tests {
         assert_eq!(state.input_editor.get_text(), "next planned prompt");
         assert!(state.active_notification().is_some());
 
-        state.model.status = "done".to_string();
+        state.model.status = TurnStatus::Done;
         assert!(!state.model.is_busy());
 
         let result = state.take_prompt();
@@ -848,54 +1125,7 @@ mod tests {
 
     #[test]
     fn test_notification_level_priority_preserves_error() {
-        let mut state = AppState {
-            view_mode: ViewMode::Develop,
-            protocol_version: "1.0".to_string(),
-            repo_state: None,
-            all_repo_files: Vec::new(),
-            workflow: "git".to_string(),
-            edit_protocol: "xml".to_string(),
-            active_model: ModelRef::openrouter("test-model"),
-            available_models: Vec::new(),
-            available_workflows: Vec::new(),
-            available_edit_protocols: Vec::new(),
-            model_choice: ModelChoice::default(),
-            model: DevelopView::default(),
-            context: ContextState::default(),
-            context_view: ContextViewState::default(),
-            history_view: HistoryViewState::default(),
-            review: ReviewViewState::default(),
-            plans_view: PlansViewState::default(),
-            review_dialog: None,
-            notification: None,
-            turn_started_at: None,
-            onboarding: OnboardingState::default(),
-            input_editor: InputEditor::default(),
-            tui_config: TuiConfig::default(),
-            show_help: false,
-            help_scroll: 0,
-            confirm_cancel: false,
-            confirm_quit: false,
-            confirm_undo: false,
-            confirm_clear_history: false,
-            confirm_delete_plan: None,
-            confirm_delete_review: None,
-            confirm_execute_scope: None,
-            confirm_execute_review: None,
-            confirm_button: ConfirmDialogButton::Cancel,
-            selection_dialog: None,
-            status_dialog: None,
-            squash_dialog: None,
-            prompt_modal: None,
-            discuss_plan_dialog: None,
-            discuss_review_dialog: None,
-            server_disconnected: None,
-            server_log_path: std::path::PathBuf::from(".tauqe/server.log"),
-            last_model_height: 10,
-            header_clicks: HeaderClickAreas::default(),
-            terminal_focused: true,
-            shift_tip_shown: false,
-        };
+        let mut state = test_state();
 
         state.notify_error("Critical failure");
         assert_eq!(state.active_notification().unwrap().text, "Critical failure");
@@ -903,6 +1133,10 @@ mod tests {
         // Lower-priority info should not overwrite active error
         state.notify_info("Minor info");
         assert_eq!(state.active_notification().unwrap().text, "Critical failure");
+
+        // Success feedback is never swallowed by an active error
+        state.notify_success("Copied");
+        assert_eq!(state.active_notification().unwrap().text, "Copied");
 
         // Equal or higher priority replaces it
         state.notify_error("New critical failure");
@@ -917,34 +1151,34 @@ mod tests {
         let mut dialog = SelectionDialogState::new(SelectionDialogKind::ModelCatalog, items, 0);
         let visible_height = 5;
 
-        assert_eq!(dialog.selected_index, 0);
-        assert_eq!(dialog.scroll_offset, 0);
+        assert_eq!(dialog.selector.selected_index(), 0);
+        assert_eq!(dialog.selector.scroll_offset(), 0);
 
         for _ in 0..4 {
-            dialog.select_next(visible_height);
+            dialog.selector.select_next(visible_height);
         }
-        assert_eq!(dialog.selected_index, 4);
-        assert_eq!(dialog.scroll_offset, 0);
+        assert_eq!(dialog.selector.selected_index(), 4);
+        assert_eq!(dialog.selector.scroll_offset(), 0);
 
-        dialog.select_next(visible_height);
-        assert_eq!(dialog.selected_index, 5);
-        assert_eq!(dialog.scroll_offset, 1);
+        dialog.selector.select_next(visible_height);
+        assert_eq!(dialog.selector.selected_index(), 5);
+        assert_eq!(dialog.selector.scroll_offset(), 1);
 
         for _ in 0..20 {
-            dialog.select_next(visible_height);
+            dialog.selector.select_next(visible_height);
         }
-        assert_eq!(dialog.selected_index, 19);
-        assert_eq!(dialog.scroll_offset, 15);
+        assert_eq!(dialog.selector.selected_index(), 19);
+        assert_eq!(dialog.selector.scroll_offset(), 15);
 
-        dialog.select_prev(visible_height);
-        assert_eq!(dialog.selected_index, 18);
-        assert_eq!(dialog.scroll_offset, 15);
+        dialog.selector.select_prev(visible_height);
+        assert_eq!(dialog.selector.selected_index(), 18);
+        assert_eq!(dialog.selector.scroll_offset(), 15);
 
         for _ in 0..5 {
-            dialog.select_prev(visible_height);
+            dialog.selector.select_prev(visible_height);
         }
-        assert_eq!(dialog.selected_index, 13);
-        assert_eq!(dialog.scroll_offset, 13);
+        assert_eq!(dialog.selector.selected_index(), 13);
+        assert_eq!(dialog.selector.scroll_offset(), 13);
     }
 
     #[test]
@@ -985,69 +1219,65 @@ mod tests {
 
     #[test]
     fn test_open_model_dialog_prefers_roles() {
-        let mut state = AppState {
-            view_mode: ViewMode::Develop,
-            protocol_version: "1.0".to_string(),
-            repo_state: None,
-            all_repo_files: Vec::new(),
-            workflow: "git".to_string(),
-            edit_protocol: "xml".to_string(),
-            active_model: ModelRef::openrouter("test-model"),
-            available_models: Vec::new(),
-            available_workflows: Vec::new(),
-            available_edit_protocols: Vec::new(),
-            model_choice: ModelChoice {
-                selection: ModelSelection::Role(ModelRole::Coder),
-                roles: Some(ModelRolesSummary {
-                    scribe: ModelRef::openrouter("scribe-model"),
-                    coder: ModelRef::openrouter("coder-model"),
-                    architect: ModelRef::openrouter("architect-model"),
-                    advisor: ModelRef::openrouter("advisor-model"),
-                    reviewer: ModelRef::openrouter("reviewer-model"),
-                    efforts: None,
-                }),
-            },
-            model: DevelopView::default(),
-            context: ContextState::default(),
-            context_view: ContextViewState::default(),
-            history_view: HistoryViewState::default(),
-            review: ReviewViewState::default(),
-            plans_view: PlansViewState::default(),
-            review_dialog: None,
-            notification: None,
-            turn_started_at: None,
-            onboarding: OnboardingState::default(),
-            input_editor: InputEditor::default(),
-            tui_config: TuiConfig::default(),
-            show_help: false,
-            help_scroll: 0,
-            confirm_cancel: false,
-            confirm_quit: false,
-            confirm_undo: false,
-            confirm_clear_history: false,
-            confirm_delete_plan: None,
-            confirm_delete_review: None,
-            confirm_execute_scope: None,
-            confirm_execute_review: None,
-            confirm_button: ConfirmDialogButton::Cancel,
-            selection_dialog: None,
-            status_dialog: None,
-            squash_dialog: None,
-            prompt_modal: None,
-            discuss_plan_dialog: None,
-            discuss_review_dialog: None,
-            server_disconnected: None,
-            server_log_path: std::path::PathBuf::from(".tauqe/server.log"),
-            last_model_height: 10,
-            header_clicks: HeaderClickAreas::default(),
-            terminal_focused: true,
-            shift_tip_shown: false,
+        let mut state = test_state();
+        state.model_choice = ModelChoice {
+            selection: ModelSelection::Role(ModelRole::Coder),
+            roles: Some(ModelRolesSummary {
+                scribe: ModelRef::openrouter("scribe-model"),
+                coder: ModelRef::openrouter("coder-model"),
+                architect: ModelRef::openrouter("architect-model"),
+                advisor: ModelRef::openrouter("advisor-model"),
+                reviewer: ModelRef::openrouter("reviewer-model"),
+                efforts: None,
+            }),
         };
 
         assert!(state.open_model_dialog());
         let dialog = state.selection_dialog.expect("dialog should be opened");
         assert_eq!(dialog.kind, SelectionDialogKind::ModelRoles);
         assert_eq!(dialog.items.len(), 6);
-        assert_eq!(dialog.selected_index, 1); // Coder is index 1
+        assert_eq!(dialog.selector.selected_index(), 1); // Coder is index 1
+    }
+
+    #[test]
+    fn test_onboarding_debug_redacts_credential_buffer() {
+        let mut state = OnboardingState::default();
+        state.input_buffer.insert_str("sk-or-secret-key");
+
+        let rendered = format!("{:?}", state);
+        assert!(!rendered.contains("sk-or-secret-key"));
+        assert!(rendered.contains("redacted"));
+    }
+
+    #[test]
+    fn test_active_modal_single_source_of_truth() {
+        let mut st = test_state();
+
+        // No modal open: nothing is active.
+        assert_eq!(st.active_modal(), None);
+        assert!(!st.has_active_modal());
+
+        // Help is the lowest-priority surface.
+        st.show_help = true;
+        assert_eq!(st.active_modal(), Some(ActiveModal::Help));
+        assert!(st.has_active_modal());
+
+        // A confirmation outranks Help, so the visible window receives input.
+        st.confirm_quit = true;
+        assert_eq!(st.active_modal(), Some(ActiveModal::ConfirmQuit));
+
+        // A disconnected transport blocks every other surface.
+        st.server_disconnected = Some("closed".to_string());
+        assert_eq!(st.active_modal(), Some(ActiveModal::ServerDisconnected));
+
+        st.server_disconnected = None;
+        st.confirm_quit = false;
+        st.show_help = false;
+        assert_eq!(st.active_modal(), None);
+
+        // The inline Context input still suppresses background interaction.
+        st.context_view.adding_file = true;
+        assert_eq!(st.active_modal(), None);
+        assert!(st.has_active_modal());
     }
 }

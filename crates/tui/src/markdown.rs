@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::LazyLock;
 
 use pulldown_cmark::{Alignment, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
@@ -14,7 +15,33 @@ use latex::render_text_spans;
 static SYNTAX_SET: LazyLock<SyntaxSet> = LazyLock::new(SyntaxSet::load_defaults_newlines);
 static THEME_SET: LazyLock<ThemeSet> = LazyLock::new(ThemeSet::load_defaults);
 
+/// Process-wide color-depth override: `0` = auto, `1` = truecolor, `2` = 256.
+///
+/// `Auto` keeps environment-based detection. An explicit value from `tui.toml`
+/// forces the palette, so a terminal that supports 24-bit color without
+/// advertising it through `COLORTERM`/`TERM` can be enabled by hand.
+static COLOR_DEPTH_OVERRIDE: AtomicU8 = AtomicU8::new(0);
+
+/// Applies the configured color-depth override; `Auto` restores detection.
+pub fn set_color_depth_override(depth: crate::config::ColorDepth) {
+    let value = match depth {
+        crate::config::ColorDepth::Auto => 0,
+        crate::config::ColorDepth::Truecolor => 1,
+        crate::config::ColorDepth::Ansi256 => 2,
+    };
+    COLOR_DEPTH_OVERRIDE.store(value, Ordering::Relaxed);
+}
+
 pub fn supports_truecolor() -> bool {
+    match COLOR_DEPTH_OVERRIDE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => detect_truecolor_from_env(),
+    }
+}
+
+/// Environment-based truecolor detection, evaluated once per process.
+fn detect_truecolor_from_env() -> bool {
     static TRUECOLOR: LazyLock<bool> = LazyLock::new(|| {
         if let Ok(val) = std::env::var("COLORTERM") {
             let v = val.to_lowercase();
@@ -60,6 +87,29 @@ pub fn safe_rgb(r: u8, g: u8, b: u8) -> Color {
     }
 }
 
+/// Clickable label of the code-block copy button.
+///
+/// Kept ASCII so its display width is deterministic across terminals; emoji
+/// glyphs such as `📋` occupy an ambiguous number of columns.
+pub const COPY_BUTTON_LABEL: &str = "[ Copy ]";
+
+/// Inclusive display-column span `(start, end)` of the clickable copy button on
+/// a code-block header line that renders `lang`.
+///
+/// The header is `"  {lang} [ Copy ] "`. Deriving the span from
+/// [`COPY_BUTTON_LABEL`] keeps mouse hit-testing and rendering on one source of
+/// truth instead of a hand-tuned width.
+pub fn copy_button_span(lang: &str) -> (u16, u16) {
+    let lang_width = if lang.trim().is_empty() {
+        4
+    } else {
+        lang.trim().chars().count()
+    };
+    let start = (2 + lang_width + 1) as u16;
+    let end = start + (COPY_BUTTON_LABEL.len() + 1) as u16;
+    (start, end)
+}
+
 #[derive(Debug, Clone)]
 pub struct MarkdownTheme {
     pub text_style: Style,
@@ -89,6 +139,11 @@ pub struct MarkdownTheme {
     pub hard_breaks: bool,
     pub line_prefix: Option<Span<'static>>,
     pub max_width: Option<usize>,
+    /// Whether the active palette targets a light terminal background.
+    ///
+    /// The syntax-highlighting theme is selected from this explicit flag
+    /// instead of inferring the palette from individual color values.
+    pub is_light: bool,
 }
 
 impl Default for MarkdownTheme {
@@ -151,6 +206,7 @@ impl MarkdownTheme {
                 hard_breaks: false,
                 line_prefix: None,
                 max_width: None,
+                is_light: true,
             },
             _ => Self {
                 text_style: Style::default(),
@@ -203,6 +259,7 @@ impl MarkdownTheme {
                 hard_breaks: false,
                 line_prefix: None,
                 max_width: None,
+                is_light: false,
             },
         }
     }
@@ -261,6 +318,7 @@ impl MarkdownTheme {
                     hard_breaks: false,
                     line_prefix: None,
                     max_width: None,
+                    is_light: true,
                 }
             }
             _ => {
@@ -311,6 +369,7 @@ impl MarkdownTheme {
                     hard_breaks: false,
                     line_prefix: None,
                     max_width: None,
+                    is_light: false,
                 }
             }
         }
@@ -549,15 +608,15 @@ fn render_code_block(
         header_spans.push(Span::styled("⠋ streaming", theme.code_lang));
     } else if is_flashing {
         header_spans.push(Span::styled(
-            " [✓ Copied!] ",
+            " [ Copied ] ",
             Style::default().bg(Color::Green).fg(Color::Black).bold(),
         ));
     } else {
         header_spans.push(Span::styled(
-            " [📋 Copy] ",
+            format!(" {} ", COPY_BUTTON_LABEL),
             Style::default()
-                .bg(Color::Rgb(35, 45, 65))
-                .fg(Color::Rgb(170, 200, 240))
+                .bg(safe_rgb(35, 45, 65))
+                .fg(safe_rgb(170, 200, 240))
                 .bold(),
         ));
     }
@@ -576,7 +635,7 @@ fn render_code_block(
 
     let syntax = resolve_syntax(lang_trimmed);
 
-    let theme_name = if theme.code_text.fg == Some(safe_rgb(30, 35, 45)) {
+    let theme_name = if theme.is_light {
         "base16-ocean.light"
     } else {
         "base16-ocean.dark"
@@ -1925,5 +1984,19 @@ mod tests {
             .count();
         // One separator between header and row 1, and one separator between row 1 and row 2
         assert_eq!(sep_count, 2);
+    }
+
+    #[test]
+    fn copy_button_span_matches_the_ascii_header_layout() {
+        // The header line renders as "  {lang} [ Copy ] ".
+        assert!(COPY_BUTTON_LABEL.is_ascii());
+        let (start, end) = copy_button_span("rust");
+        assert_eq!(start, 2 + 4 + 1);
+        assert_eq!(end, start + 9);
+
+        // An empty language falls back to the four-column "code" label.
+        let (start, end) = copy_button_span("   ");
+        assert_eq!(start, 2 + 4 + 1);
+        assert_eq!(end, start + 9);
     }
 }

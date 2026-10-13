@@ -78,4 +78,68 @@ pub fn build_review_user_prompt(
     out
 }
 
+/// Builds a corrective reprompt for a review finding turn that ended without
+/// valid code edits and without a terminal success tag.
+///
+/// The prompt echoes the model's previous response and optional diagnostic
+/// feedback (such as a missing edit block or toolchain verification failure),
+/// then explicitly demands strict adherence to the active edit protocol on the
+/// next turn.
+pub fn format_review_step_retry_prompt(assistant_text: &str, error: Option<&str>) -> String {
+    let mut out = String::new();
+    out.push_str("# Correction Required: Review Finding Turn Incomplete\n\n");
+    out.push_str("Your previous turn ended without applying any verified code changes and without emitting the terminal success tag (`<success>`). This violates the execution protocol.\n\n");
+
+    out.push_str("## Previous Assistant Response:\n");
+    let previous = assistant_text.trim();
+    if previous.is_empty() {
+        out.push_str("(empty response)\n\n");
+    } else {
+        out.push_str("<previous_response>\n");
+        out.push_str(previous);
+        out.push_str("\n</previous_response>\n\n");
+    }
+
+    if let Some(err) = error {
+        let trimmed = err.trim();
+        if !trimmed.is_empty() {
+            out.push_str("## Diagnostic Feedback:\n");
+            out.push_str(trimmed);
+            out.push_str("\n\n");
+        }
+    }
+
+    out.push_str("## Required Actions:\n");
+    out.push_str("1. If the finding requires code changes, emit a valid edit block that strictly conforms to the active edit protocol.\n");
+    out.push_str("2. If no code changes are required to resolve the finding, confirm completion explicitly by emitting the terminal success tag.\n");
+    out.push_str("3. Do NOT replace protocol operations with conversational text, and do NOT end the turn without either a valid edit block or the terminal success tag.\n");
+
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_format_review_step_retry_prompt() {
+        let prompt = format_review_step_retry_prompt(
+            "I inspected the file and it looks correct.",
+            Some("No edits were applied"),
+        );
+        assert!(prompt.contains("# Correction Required: Review Finding Turn Incomplete"));
+        assert!(prompt.contains("<previous_response>"));
+        assert!(prompt.contains("I inspected the file and it looks correct."));
+        assert!(prompt.contains("## Diagnostic Feedback:"));
+        assert!(prompt.contains("No edits were applied"));
+        assert!(prompt.contains("emit a valid edit block"));
+        assert!(prompt.contains("terminal success tag"));
+
+        let empty = format_review_step_retry_prompt("   ", None);
+        assert!(empty.contains("(empty response)"));
+        assert!(!empty.contains("<previous_response>"));
+        assert!(!empty.contains("Diagnostic Feedback"));
+    }
+}
+
     

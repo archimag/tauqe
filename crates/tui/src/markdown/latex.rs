@@ -336,10 +336,12 @@ fn replace_blackboard(text: &str) -> String {
 }
 
 fn replace_latex_symbols(text: &str) -> String {
-    let mut s = text.to_string();
-
-    // Sorted by specificity (longer sequences first to prevent partial match collisions)
+    // Command tokens are matched in full (see `latex_command_len`), so the
+    // order of this table does not affect correctness.
     let mappings: &[(&str, &str)] = &[
+        // Sizing delimiters (no standalone symbol, stripped)
+        ("\\left", ""),
+        ("\\right", ""),
         // Arrows (long)
         ("\\longleftrightarrow", "⟷"),
         ("\\Longleftrightarrow", "⟺"),
@@ -482,11 +484,43 @@ fn replace_latex_symbols(text: &str) -> String {
         ("\\&", "&"),
     ];
 
-    for &(from, to) in mappings {
-        s = s.replace(from, to);
+    let mut out = String::with_capacity(text.len());
+    let mut s = text;
+
+    while let Some(pos) = s.find('\\') {
+        out.push_str(&s[..pos]);
+        let after = &s[pos..];
+        let token_len = latex_command_len(after);
+        let token = &after[..token_len];
+        if let Some(&(_, replacement)) = mappings.iter().find(|(from, _)| *from == token) {
+            out.push_str(replacement);
+            s = &after[token_len..];
+        } else {
+            out.push('\\');
+            s = &after[1..];
+        }
+    }
+    out.push_str(s);
+    out
+}
+
+/// Returns the byte length of the LaTeX command token that begins at `text`,
+/// which must start with a backslash. A letter command spans the backslash plus
+/// a maximal run of ASCII letters; a symbol command spans the backslash plus a
+/// single following character.
+fn latex_command_len(text: &str) -> usize {
+    let bytes = text.as_bytes();
+    let mut len = 1; // The leading backslash.
+
+    if bytes.get(1).is_some_and(|b| b.is_ascii_alphabetic()) {
+        while bytes.get(len).is_some_and(|b| b.is_ascii_alphabetic()) {
+            len += 1;
+        }
+    } else if let Some(c) = text[1..].chars().next() {
+        len += c.len_utf8();
     }
 
-    s
+    len
 }
 
 fn to_superscript(ch: char) -> Option<char> {
@@ -758,8 +792,15 @@ fn render_inline_math_or_plain(
         // Ensure opening $ is not followed immediately by space or digit (like $50) unless it's a closed formula
         if let Some(close_idx) = after_open.find('$') {
             let candidate = &after_open[..close_idx];
-            // Valid math formula: not empty, doesn't span multiple lines, and looks like math
-            if is_likely_math(candidate) {
+            // The closing `$` must not be glued to a following letter or digit;
+            // otherwise it is not a math delimiter (e.g. `$x$y`).
+            let after_close = &after_open[close_idx + 1..];
+            let closing_ok = after_close
+                .chars()
+                .next()
+                .is_none_or(|c| !c.is_ascii_alphanumeric());
+            // Valid math formula: not empty, tight delimiters, no line breaks.
+            if closing_ok && is_likely_math(candidate) {
                 let prefix = &remainder[..open_idx];
                 if !prefix.is_empty() {
                     let cleaned_prefix = clean_latex_in_plain_text(prefix);
@@ -803,30 +844,31 @@ fn render_inline_math_or_plain(
 }
 
 fn is_likely_math(s: &str) -> bool {
-    let trimmed = s.trim();
-    if trimmed.is_empty() || trimmed.contains('\n') {
+    if s.is_empty() || s.contains('\n') {
+        return false;
+    }
+
+    // Inline math delimiters are tight: no whitespace immediately after the
+    // opening `$` or before the closing `$`. This keeps shell variables and
+    // currency fragments such as `$MY_VAR then $OTHER_VAR` out of math mode.
+    if s.chars().next().is_some_and(|c| c.is_whitespace())
+        || s.chars().next_back().is_some_and(|c| c.is_whitespace())
+    {
         return false;
     }
 
     // Has explicit LaTeX macros or operators
-    if trimmed.contains('\\')
-        || trimmed.contains('^')
-        || trimmed.contains('_')
-        || trimmed.contains('=')
-    {
+    if s.contains('\\') || s.contains('^') || s.contains('_') || s.contains('=') {
         return true;
     }
 
-    // Common single-letter math variables or expressions (e.g. $x$, $y$, $O(n \log n)$)
-    if trimmed.len() <= 3 && trimmed.chars().all(|c| c.is_alphabetic()) {
+    // Common single-letter math variables or expressions (e.g. $x$, $y$)
+    if s.len() <= 3 && s.chars().all(|c| c.is_alphabetic()) {
         return true;
     }
 
     // Reject pure currency strings: e.g. "50", "100.00"
-    if trimmed
-        .chars()
-        .all(|c| c.is_ascii_digit() || c == '.' || c == ',')
-    {
+    if s.chars().all(|c| c.is_ascii_digit() || c == '.' || c == ',') {
         return false;
     }
 
@@ -910,5 +952,58 @@ mod tests {
         );
         let joined: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(joined, "Price is $50 and $100 today");
+    }
+
+    #[test]
+    fn test_int_and_command_boundaries() {
+        assert_eq!(convert_latex_to_unicode(r"\int_0^1 x \, dx"), "∫₀¹ x dx");
+        assert_eq!(convert_latex_to_unicode(r"x \in S"), "x ∈ S");
+        // Tokens that merely start with a macro name must stay untouched.
+        assert_eq!(convert_latex_to_unicode(r"\introduction"), r"\introduction");
+        assert_eq!(convert_latex_to_unicode(r"\index"), r"\index");
+        assert_eq!(convert_latex_to_unicode(r"\top"), r"\top");
+    }
+
+    #[test]
+    fn test_left_right_sizing_commands() {
+        assert_eq!(convert_latex_to_unicode(r"\left( x \right)"), "( x )");
+        assert_eq!(convert_latex_to_unicode(r"f \left[ x \right]"), "f [ x ]");
+        assert_eq!(convert_latex_to_unicode(r"a \le b"), "a ≤ b");
+    }
+
+    #[test]
+    fn test_windows_path_is_not_mangled() {
+        let spans = render_text_spans(
+            r"Path is C:\tmp\new here",
+            Style::default(),
+            &MarkdownTheme::answer(),
+            StyleModifier::default(),
+        );
+        let joined: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(joined, r"Path is C:\tmp\new here");
+    }
+
+    #[test]
+    fn test_shell_variables_are_not_math() {
+        let spans = render_text_spans(
+            "export $MY_VAR then $OTHER_VAR",
+            Style::default(),
+            &MarkdownTheme::answer(),
+            StyleModifier::default(),
+        );
+        let joined: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(joined, "export $MY_VAR then $OTHER_VAR");
+    }
+
+    #[test]
+    fn test_inline_math_still_rendered() {
+        let spans = render_text_spans(
+            r"let $x = 1$ and $y_2$ here",
+            Style::default(),
+            &MarkdownTheme::answer(),
+            StyleModifier::default(),
+        );
+        let joined: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(joined, "let x = 1 and y₂ here");
     }
 }

@@ -7,30 +7,30 @@ pub use events::{fail_safe_reject_edits, handle_event};
 pub use handshake::initialize_connection;
 pub use responses::{handle_response, messages};
 pub use transport::{
-    allocate_request_id, find_server_binary, record_optimistic_rollback, record_pending_request,
-    send_request, send_request_with_id, spawn_message_reader, start_server,
-    take_optimistic_rollback, take_pending_request, OptimisticRollback,
+    allocate_request_id, find_server_binary, send_request, send_request_with_id,
+    spawn_message_reader, start_server, OptimisticRollback, RpcConnection,
 };
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use tauqe_protocol::ModelRef;
-    use crate::ui::develop::{DevelopView, StreamingFileEdit};
+    use crate::views::develop::{DevelopView, EditOp, FileEditStatus, StreamingFileEdit};
 
     #[test]
     fn test_optimistic_rollback_storage() {
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
         let req_id = 9999;
-        record_optimistic_rollback(
+        conn.record_optimistic_rollback(
             req_id,
             OptimisticRollback::ActiveModel {
                 prev_model: ModelRef::openrouter("test/prev"),
                 prev_selection: tauqe_protocol::ModelSelection::default(),
             },
         );
-        let rollback = take_optimistic_rollback(req_id);
+        let rollback = conn.take_optimistic_rollback(req_id);
         assert!(matches!(rollback, Some(OptimisticRollback::ActiveModel { .. })));
-        assert!(take_optimistic_rollback(req_id).is_none());
+        assert!(conn.take_optimistic_rollback(req_id).is_none());
     }
 
     #[test]
@@ -53,8 +53,8 @@ mod tests {
             files: vec![
                 StreamingFileEdit {
                     path: "a.rs".to_string(),
-                    op_type: "replace".to_string(),
-                    status: "retrying".to_string(),
+                    op_type: EditOp::Replace,
+                    status: FileEditStatus::Retrying,
                     error: None,
                     hunks: Vec::new(),
                     expanded: false,
@@ -62,8 +62,8 @@ mod tests {
                 },
                 StreamingFileEdit {
                     path: "b.rs".to_string(),
-                    op_type: "replace".to_string(),
-                    status: "running".to_string(),
+                    op_type: EditOp::Replace,
+                    status: FileEditStatus::Running,
                     error: None,
                     hunks: Vec::new(),
                     expanded: false,
@@ -71,8 +71,8 @@ mod tests {
                 },
                 StreamingFileEdit {
                     path: "c.rs".to_string(),
-                    op_type: "replace".to_string(),
-                    status: "ok".to_string(),
+                    op_type: EditOp::Replace,
+                    status: FileEditStatus::Ok,
                     error: None,
                     hunks: Vec::new(),
                     expanded: false,
@@ -84,14 +84,14 @@ mod tests {
 
         fail_safe_reject_edits(&mut model, "Operation cancelled");
 
-        assert_eq!(model.files[0].status, "error");
+        assert_eq!(model.files[0].status, FileEditStatus::Error);
         assert_eq!(model.files[0].retry_info, None);
         assert_eq!(model.files[0].error.as_deref(), Some("Operation cancelled"));
 
-        assert_eq!(model.files[1].status, "error");
+        assert_eq!(model.files[1].status, FileEditStatus::Error);
         assert_eq!(model.files[1].error.as_deref(), Some("Operation cancelled"));
 
-        assert_eq!(model.files[2].status, "ok");
+        assert_eq!(model.files[2].status, FileEditStatus::Ok);
         assert_eq!(model.edit_final_applied, Some(false));
     }
 }

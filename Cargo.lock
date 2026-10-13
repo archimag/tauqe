@@ -1887,6 +1887,7 @@ dependencies = [
  "tauqe-protocol",
  "tokio",
  "toml",
+ "toml_edit",
 ]
 
 [[package]]

@@ -3,27 +3,14 @@ use ratatui::style::{Color, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
-use crate::app::{AppState, ViewMode};
+use crate::app::{ActiveModal, AppState, ViewMode};
 
-pub mod context;
-pub mod develop;
-pub mod dialogs;
 pub mod footer;
 pub mod geometry;
 pub mod header;
-pub mod history;
-pub mod onboarding;
-pub mod plans;
-pub mod review;
 pub mod wrap;
 
-use context::render_context_view;
-use develop::render::render_develop_view;
-use history::render_history_view;
-use plans::render_plans_view;
-use review::render_review_view;
-
-pub use dialogs::{
+use crate::dialogs::render::{
     render_confirm_cancel_popup, render_confirm_clear_auto_popup,
     render_confirm_clear_history_popup, render_confirm_delete_plan_popup,
     render_confirm_delete_review_popup, render_confirm_execute_review_popup,
@@ -31,16 +18,24 @@ pub use dialogs::{
     render_disconnected_popup, render_discuss_plan_dialog, render_help_popup,
     render_plan_refine_blocked_dialog, render_plan_refine_dialog, render_prompt_modal,
     render_review_dialog, render_selection_dialog, render_squash_popup, render_status_dialog,
-    selection_dialog_area,
 };
+use crate::views::context::render_context_view;
+use crate::views::develop::render::render_develop_view;
+use crate::views::history::render_history_view;
+use crate::views::onboarding::render_onboarding_view;
+use crate::views::plans::render_plans_view;
+use crate::views::review::render_review_view;
+
 pub use footer::{extract_current_round, format_footer_cost, render_footer};
 pub use geometry::centered_rect;
 pub use header::render_header;
-pub use onboarding::{format_masked_key, render_onboarding_view};
 pub use wrap::{wrap_line, wrap_lines};
 
 const MIN_TERM_WIDTH: u16 = 60;
-const MIN_TERM_HEIGHT: u16 = 24;
+const MIN_TERM_HEIGHT: u16 = 12;
+/// On terminals shorter than this the footer and the non-Develop info strip
+/// are dropped so the main area keeps enough rows to stay usable.
+const COMPACT_TERM_HEIGHT: u16 = 20;
 
 fn render_terminal_too_small(frame: &mut ratatui::Frame) {
     let area = frame.area();
@@ -58,32 +53,44 @@ fn render_terminal_too_small(frame: &mut ratatui::Frame) {
 }
 
 pub fn render_ui(frame: &mut ratatui::Frame, state: &mut AppState) {
-    if frame.area().width < MIN_TERM_WIDTH || frame.area().height < MIN_TERM_HEIGHT {
+    let area = frame.area();
+    state.last_frame_area = area;
+    if area.width < MIN_TERM_WIDTH || area.height < MIN_TERM_HEIGHT {
         render_terminal_too_small(frame);
         return;
     }
-    let term_height = frame.area().height;
-    let term_width = frame.area().width;
-    let max_input_height = (term_height * 4 / 10).clamp(6, 16);
-    let inner_input_width = (term_width.saturating_sub(2)) as usize;
-    let (prompt_lines, cursor_visual_line) = crate::ui::develop::render::build_prompt_lines(
-        &state.input_editor,
-        inner_input_width,
-        state.model.is_busy(),
-    );
+    let term_height = area.height;
+    let term_width = area.width;
+    let compact = term_height < COMPACT_TERM_HEIGHT;
 
-    let needed_input_height = (prompt_lines.len() as u16 + 2).max(3);
-    let input_height = needed_input_height.min(max_input_height);
+    // The bottom area is the prompt editor in Develop and a fixed telemetry
+    // strip elsewhere. Only Develop sizes it from the prompt draft, so a draft
+    // never inflates an unrelated view's info row (Conventions.md §2).
+    let is_busy = state.model.is_busy();
+    let (prompt_lines, cursor_visual_line, bottom_height) = if state.view_mode == ViewMode::Develop {
+        let max_input_height = (term_height * 4 / 10).clamp(6, 16);
+        let inner_input_width = (term_width.saturating_sub(2)) as usize;
+        let (lines, cursor) = state.input_editor.build_prompt_lines(inner_input_width, is_busy);
+        let height = (lines.len() as u16 + 2).max(3).min(max_input_height);
+        (lines, cursor, height)
+    } else if compact {
+        (Vec::new(), 0, 0)
+    } else {
+        (Vec::new(), 0, 3)
+    };
+
+    // Degrade gracefully on short terminals instead of refusing to render.
+    let footer_height = if compact { 0 } else { 3 };
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3),
             Constraint::Min(5),
-            Constraint::Length(input_height),
-            Constraint::Length(3),
+            Constraint::Length(bottom_height),
+            Constraint::Length(footer_height),
         ])
-        .split(frame.area());
+        .split(area);
 
     render_header(frame, state, chunks[0]);
 
@@ -119,48 +126,79 @@ pub fn render_ui(frame: &mut ratatui::Frame, state: &mut AppState) {
         render_footer(frame, state, chunks[3]);
     }
 
-    if let Some(msg) = &state.server_disconnected {
-        render_disconnected_popup(frame, msg);
-    } else if let Some(dialog) = &mut state.squash_dialog {
-        render_squash_popup(frame, dialog);
-    } else if let Some(dialog) = &state.review_dialog {
-        render_review_dialog(frame, dialog);
-    } else if state.confirm_cancel {
-        render_confirm_cancel_popup(frame, state);
-    } else if state.confirm_quit {
-        render_confirm_quit_popup(frame, state);
-    } else if state.confirm_undo {
-        render_confirm_undo_popup(frame, state);
-    } else if state.confirm_clear_history {
-        render_confirm_clear_history_popup(frame, state);
-    } else if state.context_view.confirm_clear_auto {
-        render_confirm_clear_auto_popup(frame, state);
-    } else if let Some(plan_id) = &state.confirm_delete_plan {
-        render_confirm_delete_plan_popup(frame, plan_id, state);
-    } else if let Some(session_id) = &state.confirm_delete_review {
-        render_confirm_delete_review_popup(frame, session_id, state);
-    } else if state.confirm_execute_scope.is_some() {
-        render_confirm_execute_scope_popup(frame, state);
-    } else if state.confirm_execute_review.is_some() {
-        render_confirm_execute_review_popup(frame, state);
-    } else if let Some(modal) = &state.prompt_modal {
-        render_prompt_modal(frame, modal);
-    } else if let Some(discuss) = &state.discuss_plan_dialog {
-        render_discuss_plan_dialog(frame, discuss);
-    } else if let Some(dialog) = &state.plans_view.refine_dialog {
-        render_plan_refine_dialog(frame, dialog);
-    } else if let Some(blocked) = &state.plans_view.refine_blocked {
-        render_plan_refine_blocked_dialog(frame, blocked);
-    } else if let Some(dialog) = &state.status_dialog {
-        render_status_dialog(frame, dialog);
-    } else if let Some(dialog) = &state.selection_dialog {
-        render_selection_dialog(frame, dialog);
-    } else if state.show_help {
-        render_help_popup(
-            frame,
-            state.view_mode,
-            &mut state.help_scroll,
-            state.tui_config.input.primary_modifier,
-        );
+    // Render exactly the modal the canonical ordering reports as top-most, so the
+    // visible window is always the window that receives input.
+    match state.active_modal() {
+        Some(ActiveModal::ServerDisconnected) => {
+            if let Some(msg) = &state.server_disconnected {
+                render_disconnected_popup(frame, msg);
+            }
+        }
+        Some(ActiveModal::Squash) => {
+            if let Some(dialog) = &mut state.squash_dialog {
+                render_squash_popup(frame, dialog);
+            }
+        }
+        Some(ActiveModal::Review) => {
+            if let Some(dialog) = &state.review_dialog {
+                render_review_dialog(frame, dialog);
+            }
+        }
+        Some(ActiveModal::ConfirmCancel) => render_confirm_cancel_popup(frame, state),
+        Some(ActiveModal::ConfirmQuit) => render_confirm_quit_popup(frame, state),
+        Some(ActiveModal::ClearAuto) => render_confirm_clear_auto_popup(frame, state),
+        Some(ActiveModal::ConfirmUndo) => render_confirm_undo_popup(frame, state),
+        Some(ActiveModal::DeletePlan) => {
+            if let Some(plan_id) = &state.confirm_delete_plan {
+                render_confirm_delete_plan_popup(frame, plan_id, state);
+            }
+        }
+        Some(ActiveModal::DeleteReview) => {
+            if let Some(session_id) = &state.confirm_delete_review {
+                render_confirm_delete_review_popup(frame, session_id, state);
+            }
+        }
+        Some(ActiveModal::ExecuteReview) => render_confirm_execute_review_popup(frame, state),
+        Some(ActiveModal::ExecuteScope) => render_confirm_execute_scope_popup(frame, state),
+        Some(ActiveModal::DiscussPlan) => {
+            if let Some(discuss) = &state.discuss_plan_dialog {
+                render_discuss_plan_dialog(frame, discuss);
+            }
+        }
+        Some(ActiveModal::RefineDialog) => {
+            if let Some(dialog) = &state.plans_view.refine_dialog {
+                render_plan_refine_dialog(frame, dialog);
+            }
+        }
+        Some(ActiveModal::RefineBlocked) => {
+            if let Some(blocked) = &state.plans_view.refine_blocked {
+                render_plan_refine_blocked_dialog(frame, blocked);
+            }
+        }
+        Some(ActiveModal::Prompt) => {
+            if let Some(modal) = &state.prompt_modal {
+                render_prompt_modal(frame, modal);
+            }
+        }
+        Some(ActiveModal::ClearHistory) => render_confirm_clear_history_popup(frame, state),
+        Some(ActiveModal::Status) => {
+            if let Some(dialog) = &state.status_dialog {
+                render_status_dialog(frame, dialog);
+            }
+        }
+        Some(ActiveModal::Selection) => {
+            if let Some(dialog) = &state.selection_dialog {
+                render_selection_dialog(frame, dialog);
+            }
+        }
+        Some(ActiveModal::Help) => {
+            render_help_popup(
+                frame,
+                state.view_mode,
+                &mut state.help_scroll,
+                state.tui_config.input.primary_modifier,
+            );
+        }
+        None => {}
     }
 }

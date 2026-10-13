@@ -11,7 +11,10 @@ use tauqe_protocol::{
 };
 
 use crate::app::AppState;
-use crate::ui::develop::{DevelopView, StreamingFileEdit, StreamingHunk};
+use crate::views::develop::{
+    DevelopView, EditOp, FileEditStatus, StreamingFileEdit, StreamingHunk, ToolchainState,
+    TurnStatus,
+};
 use super::responses::messages;
 
 pub fn fail_safe_reject_edits(model: &mut DevelopView, reason: &str) {
@@ -19,8 +22,8 @@ pub fn fail_safe_reject_edits(model: &mut DevelopView, reason: &str) {
         return;
     }
     for f in model.files.iter_mut() {
-        if f.status == "running" || f.status == "retrying" {
-            f.status = "error".to_string();
+        if matches!(f.status, FileEditStatus::Running | FileEditStatus::Retrying) {
+            f.status = FileEditStatus::Error;
             f.retry_info = None;
             if f.error.is_none() {
                 f.error = Some(reason.to_string());
@@ -31,12 +34,7 @@ pub fn fail_safe_reject_edits(model: &mut DevelopView, reason: &str) {
     model.edit_final_error = Some(reason.to_string());
 }
 
-pub async fn handle_event(
-    ev: Event,
-    state: &Arc<Mutex<AppState>>,
-    is_reasoning: &mut bool,
-    _server_writer: Option<&mut tokio::process::ChildStdin>,
-) {
+pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning: &mut bool) {
     let mut st = state.lock().await;
     match ev.method.as_str() {
         events::GIT_STATE_CHANGED => {
@@ -54,7 +52,7 @@ pub async fn handle_event(
                     st.model.last_commit_hash = Some(data.commit_hash);
                     st.model.last_commit_summary = Some(data.summary);
                     for f in st.model.files.iter_mut() {
-                        f.status = "ok".to_string();
+                        f.status = FileEditStatus::Ok;
                         f.error = None;
                         f.retry_info = None;
                     }
@@ -97,7 +95,7 @@ pub async fn handle_event(
                     st.history_view.total_count += 1;
                     if st.history_view.auto_scroll {
                         let view_height = st.last_model_height;
-                        let total_lines = crate::ui::history::compute_history_items_line_count(&st.history_view.items, None) as u16;
+                        let total_lines = crate::views::history::compute_history_items_line_count(&st.history_view.items, None) as u16;
                         st.history_view.scroll = total_lines.saturating_sub(view_height);
                         st.history_view.selected_item_index =
                             st.history_view.items.len().saturating_sub(1);
@@ -166,7 +164,7 @@ pub async fn handle_event(
                     st.model.result = None;
                     st.model.code_blocks.clear();
                     st.model.scroll = 0;
-                    st.model.status = "awaiting".to_string();
+                    st.model.status = TurnStatus::Awaiting;
                     st.model.edits_active = false;
                     st.model.files.clear();
                     st.model.selected_file_index = 0;
@@ -174,8 +172,7 @@ pub async fn handle_event(
                     st.model.edit_final_error = None;
                     st.model.last_commit_hash = None;
                     st.model.last_commit_summary = None;
-                    st.model.toolchain_command = None;
-                    st.model.toolchain_status = None;
+                    st.model.toolchain = None;
                     st.model.turn_phase = None;
                     st.model.turn_round = None;
                     st.model.turn_max_rounds = None;
@@ -196,17 +193,17 @@ pub async fn handle_event(
                     st.model.turn_max_rounds = data.max_rounds;
                     st.model.turn_phase_detail = data.detail;
                     st.model.status = match data.phase {
-                        tauqe_protocol::TurnPhase::Discovery => "discovery".to_string(),
+                        tauqe_protocol::TurnPhase::Discovery => TurnStatus::Discovery,
                         tauqe_protocol::TurnPhase::Proposal => {
                             if *is_reasoning {
-                                "thinking".to_string()
+                                TurnStatus::Thinking
                             } else {
-                                "responding".to_string()
+                                TurnStatus::Responding
                             }
                         }
-                        tauqe_protocol::TurnPhase::Staging => "staging".to_string(),
-                        tauqe_protocol::TurnPhase::Verification => "verifying".to_string(),
-                        tauqe_protocol::TurnPhase::Healing => "healing".to_string(),
+                        tauqe_protocol::TurnPhase::Staging => TurnStatus::Staging,
+                        tauqe_protocol::TurnPhase::Verification => TurnStatus::Verifying,
+                        tauqe_protocol::TurnPhase::Healing => TurnStatus::Healing,
                     };
                 }
             }
@@ -221,20 +218,25 @@ pub async fn handle_event(
         events::TOOLCHAIN_STARTED => {
             if let Some(params) = ev.params {
                 if let Ok(data) = serde_json::from_value::<tauqe_protocol::ToolchainStartedEvent>(params) {
-                    st.model.toolchain_command = Some(data.command.clone());
-                    st.model.toolchain_status = Some(format!("Running `{}`...", data.command));
-                    st.model.status = "verifying".to_string();
+                    st.model.toolchain = Some(ToolchainState::Running {
+                        command: data.command,
+                    });
+                    st.model.status = TurnStatus::Verifying;
                 }
             }
         }
         events::TOOLCHAIN_FINISHED => {
             if let Some(params) = ev.params {
                 if let Ok(data) = serde_json::from_value::<tauqe_protocol::ToolchainFinishedEvent>(params) {
-                    st.model.toolchain_command = None;
-                    st.model.toolchain_status = Some(if data.success {
-                        format!("`{}` passed", data.command)
+                    st.model.toolchain = Some(if data.success {
+                        ToolchainState::Passed {
+                            command: data.command,
+                        }
                     } else {
-                        data.message.unwrap_or_else(|| format!("`{}` failed", data.command))
+                        ToolchainState::Failed {
+                            command: data.command,
+                            message: data.message,
+                        }
                     });
                 }
             }
@@ -243,7 +245,7 @@ pub async fn handle_event(
             if let Some(params) = ev.params {
                 if let Ok(data) = serde_json::from_value::<ModelDeltaEvent>(params) {
                     if !data.delta.is_empty() {
-                        st.model.status = "thinking".to_string();
+                        st.model.status = TurnStatus::Thinking;
                         if !*is_reasoning {
                             *is_reasoning = true;
                             st.model.reasoning.show = true;
@@ -267,9 +269,9 @@ pub async fn handle_event(
                 if let Ok(data) = serde_json::from_value::<ModelDeltaEvent>(params) {
                     if !data.delta.is_empty() {
                         if st.model.edits_active {
-                            st.model.status = "editing".to_string();
+                            st.model.status = TurnStatus::Editing;
                         } else {
-                            st.model.status = "responding".to_string();
+                            st.model.status = TurnStatus::Responding;
                         }
                         if *is_reasoning {
                             *is_reasoning = false;
@@ -290,23 +292,23 @@ pub async fn handle_event(
         }
         events::EDIT_STARTED => {
             st.model.edits_active = true;
-            st.model.status = "editing".to_string();
+            st.model.status = TurnStatus::Editing;
         }
         events::EDIT_FILE_STARTED => {
             if let Some(params) = ev.params {
                 if let Ok(data) = serde_json::from_value::<EditFileStartedEvent>(params) {
                     st.model.edits_active = true;
-                    st.model.status = "editing".to_string();
+                    st.model.status = TurnStatus::Editing;
                     if let Some(existing) = st.model.files.iter_mut().find(|f| f.path == data.path)
                     {
-                        existing.status = "running".to_string();
-                        existing.op_type = data.op_type;
+                        existing.status = FileEditStatus::Running;
+                        existing.op_type = EditOp::from_wire(&data.op_type);
                         existing.retry_info = None;
                     } else {
                         st.model.files.push(StreamingFileEdit {
                             path: data.path,
-                            op_type: data.op_type,
-                            status: "running".to_string(),
+                            op_type: EditOp::from_wire(&data.op_type),
+                            status: FileEditStatus::Running,
                             error: None,
                             hunks: Vec::new(),
                             expanded: false,
@@ -335,9 +337,9 @@ pub async fn handle_event(
             if let Some(params) = ev.params {
                 if let Ok(data) = serde_json::from_value::<EditFileDoneEvent>(params) {
                     if let Some(f) = st.model.files.iter_mut().find(|f| f.path == data.path) {
-                        f.status = data.status;
+                        f.status = FileEditStatus::from_wire(&data.status);
                         f.error = data.error;
-                        if f.status == "ok" {
+                        if f.status == FileEditStatus::Ok {
                             f.retry_info = None;
                             f.error = None;
                         }
@@ -348,17 +350,17 @@ pub async fn handle_event(
         events::EDIT_FILE_RETRYING => {
             if let Some(params) = ev.params {
                 if let Ok(data) = serde_json::from_value::<EditFileRetryingEvent>(params) {
-                    st.model.status = "editing".to_string();
+                    st.model.status = TurnStatus::Editing;
                     let retry_msg = format!("{}/{} retrying: {}", data.attempt, data.max_retries, data.reason);
                     if let Some(f) = st.model.files.iter_mut().find(|f| f.path == data.path) {
-                        f.status = "retrying".to_string();
+                        f.status = FileEditStatus::Retrying;
                         f.retry_info = Some(retry_msg);
                         f.error = None;
                     } else {
                         st.model.files.push(StreamingFileEdit {
                             path: data.path,
-                            op_type: "replace".to_string(),
-                            status: "retrying".to_string(),
+                            op_type: EditOp::Replace,
+                            status: FileEditStatus::Retrying,
                             error: None,
                             hunks: Vec::new(),
                             expanded: false,
@@ -379,7 +381,7 @@ pub async fn handle_event(
                     }
                     if data.applied {
                         for f in st.model.files.iter_mut() {
-                            f.status = "ok".to_string();
+                            f.status = FileEditStatus::Ok;
                             f.error = None;
                             f.retry_info = None;
                         }
@@ -388,8 +390,9 @@ pub async fn handle_event(
                             Some(messages::EDIT_FAILED_FALLBACK.to_string())
                         });
                         for f in st.model.files.iter_mut() {
-                            if f.status == "running" || f.status == "retrying" {
-                                f.status = "error".to_string();
+                            if matches!(f.status, FileEditStatus::Running | FileEditStatus::Retrying)
+                            {
+                                f.status = FileEditStatus::Error;
                                 f.retry_info = None;
                                 if f.error.is_none() {
                                     f.error = fallback_err.clone();
@@ -427,7 +430,7 @@ pub async fn handle_event(
                             }
                             st.model.last_commit_summary = Some(summary.clone());
                             for f in st.model.files.iter_mut() {
-                                f.status = "ok".to_string();
+                                f.status = FileEditStatus::Ok;
                                 f.error = None;
                                 f.retry_info = None;
                             }
@@ -442,8 +445,9 @@ pub async fn handle_event(
                             st.model.edit_final_error = error.clone();
                             st.model.last_commit_summary = Some(summary.clone());
                             for f in st.model.files.iter_mut() {
-                                if f.status == "running" || f.status == "retrying" {
-                                    f.status = "error".to_string();
+                                if matches!(f.status, FileEditStatus::Running | FileEditStatus::Retrying)
+                                {
+                                    f.status = FileEditStatus::Error;
                                     f.retry_info = None;
                                     if f.error.is_none() {
                                         f.error = error.clone().or_else(|| {
@@ -501,8 +505,8 @@ pub async fn handle_event(
             }
             if let Some(params) = ev.params {
                 if let Ok(_data) = serde_json::from_value::<ModelFinishedEvent>(params) {
-                    st.model.status = "done".to_string();
-                    st.model.toolchain_command = None;
+                    st.model.status = TurnStatus::Done;
+                    st.model.toolchain = None;
                     st.model.turn_phase = None;
                     st.model.turn_phase_detail = None;
                     if let Some(c) = st.model.current_cost {
@@ -513,7 +517,7 @@ pub async fn handle_event(
                         || st.model.edit_final_applied == Some(true)
                     {
                         for f in st.model.files.iter_mut() {
-                            f.status = "ok".to_string();
+                            f.status = FileEditStatus::Ok;
                             f.error = None;
                             f.retry_info = None;
                         }
@@ -540,8 +544,8 @@ pub async fn handle_event(
             st.model.reasoning.finalize();
             st.confirm_cancel = false;
             st.turn_started_at = None;
-            st.model.status = "cancelled".to_string();
-            st.model.toolchain_command = None;
+            st.model.status = TurnStatus::Cancelled;
+            st.model.toolchain = None;
             st.model.turn_phase = None;
             st.model.turn_phase_detail = None;
             if let Some(c) = st.model.current_cost {
@@ -576,12 +580,12 @@ pub async fn handle_event(
                     );
                 }
             }
-            st.model.toolchain_command = None;
+            st.model.toolchain = None;
             st.model.turn_phase = None;
             st.model.turn_phase_detail = None;
             if let Some(params) = ev.params {
                 if let Ok(data) = serde_json::from_value::<ModelErrorEvent>(params) {
-                    st.model.status = "error".to_string();
+                    st.model.status = TurnStatus::Error;
                     if let Some(c) = st.model.current_cost {
                         if c > 0.0 {
                             st.model.prev_cost = Some(c);
@@ -633,9 +637,9 @@ pub async fn handle_event(
             }
             if let Some(started) = started {
                 let elapsed = started.elapsed().as_secs();
-                if elapsed >= st.tui_config.notifications.min_duration_seconds {
+                let focused = st.terminal_focused;
+                if st.tui_config.notifications.should_notify(elapsed, focused) {
                     let summary = format!("Code review completed ({} findings)", findings_count);
-                    let focused = st.terminal_focused;
                     crate::terminal::trigger_turn_notification(
                         "TAUQE Review",
                         &summary,
@@ -653,8 +657,8 @@ pub async fn handle_event(
         events::REVIEW_ERROR => {
             if let Some(started) = st.turn_started_at.take() {
                 let elapsed = started.elapsed().as_secs();
-                if elapsed >= st.tui_config.notifications.min_duration_seconds {
-                    let focused = st.terminal_focused;
+                let focused = st.terminal_focused;
+                if st.tui_config.notifications.should_notify(elapsed, focused) {
                     crate::terminal::trigger_turn_notification(
                         "TAUQE Review Error",
                         "Code review failed",

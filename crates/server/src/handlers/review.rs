@@ -61,17 +61,18 @@ pub async fn handle_review_start(req: Request, state: &Arc<AppState>) -> Respons
         None => ReviewStartParams::default(),
     };
 
-    let (provider, model) = {
+    let (provider, model, reasoning_effort) = {
         let cfg = state.config.lock().await;
         let model = match params.model.clone() {
             Some(m) => m,
             None => cfg.resolve_role(ModelRole::Reviewer),
         };
+        let reasoning_effort = cfg.models.resolve_effort(ModelRole::Reviewer);
         let provider: Arc<dyn LlmProvider> = match create_provider(model.provider, &cfg) {
             Ok(p) => Arc::from(p),
             Err(err) => return Response::err(req.id, "NO_API_KEY", err.to_string()),
         };
-        (provider, model)
+        (provider, model, reasoning_effort)
     };
 
     let (repo_root, files, estimated_tokens) = {
@@ -142,7 +143,14 @@ pub async fn handle_review_start(req: Request, state: &Arc<AppState>) -> Respons
         let stream_cancel = cancel_rx.clone();
         let stream_task = tokio::spawn(async move {
             if let Err(err) = provider
-                .stream_chat(&model_name, messages, None, tx, stream_cancel)
+                .stream_chat_with_effort(
+                    &model_name,
+                    messages,
+                    None,
+                    reasoning_effort,
+                    tx,
+                    stream_cancel,
+                )
                 .await
             {
                 let _ = err_tx.send(StreamEvent::Error(err.to_string())).await;
@@ -541,6 +549,21 @@ async fn preload_item_file(state: &Arc<AppState>, repo_root: &Path, file_path: &
     }
 }
 
+/// Clears the transient auto context layer so a retried attempt starts from a
+/// clean, deterministic basis, then notifies clients of the new snapshot.
+async fn clear_auto_context(state: &Arc<AppState>) {
+    let new_ctx_state = {
+        let mut ctx = state.context.write().await;
+        ctx.clear_auto();
+        ctx.get_state()
+    };
+    emit(
+        &state.out,
+        events::CONTEXT_CHANGED,
+        Some(serde_json::json!({ "state": new_ctx_state })),
+    );
+}
+
 /// Whether a completed turn actually applied code edits to disk.
 ///
 /// Review findings ask the model to fix code: explanatory text alone, even when
@@ -596,7 +619,7 @@ async fn run_review_step(
     }
     set_item_status(state, repo_root, review_id, item_id, ReviewItemStatus::InProgress);
 
-    let prompt = match tauqe_core::review::prompt::format_review_step_execution_prompt(
+    let mut prompt = match tauqe_core::review::prompt::format_review_step_execution_prompt(
         &session, item_id, "",
     ) {
         Ok(p) => p,
@@ -606,43 +629,104 @@ async fn run_review_step(
         }
     };
 
-    let step_selection = item
-        .model
-        .clone()
-        .unwrap_or(ModelSelection::Role(ModelRole::Coder));
-
-    let workflow_name = state.config.lock().await.develop.workflow.trim().to_lowercase();
-    let policy: Box<dyn tauqe_core::workflow::policy::ApplyPolicy> = match workflow_name.as_str() {
-        "naive" => Box::new(tauqe_core::workflow::policy::DirectApplyPolicy::new()),
-        _ => Box::new(tauqe_core::workflow::git_policy::GitTransactionPolicy::new()),
+    let (max_retries, auto_level_up, models_config) = {
+        let cfg = state.config.lock().await;
+        (
+            cfg.develop.max_retries,
+            cfg.models.auto_level_up,
+            cfg.models.clone(),
+        )
     };
 
-    match execute_model_turn(state, prompt, Some(step_selection), None, None, policy).await {
-        Ok(turn) if turn.is_success() && turn_applied_edits(&turn) => {
-            set_item_status(state, repo_root, review_id, item_id, ReviewItemStatus::Fixed);
-            Ok(())
-        }
-        Ok(turn) => {
+    // A finding with an explicitly assigned model keeps that model across every
+    // retry; an unassigned finding starts on the Coder role and may escalate
+    // through the coder ladder when `auto_level_up` is enabled.
+    let explicit_selection = item.model.clone();
+    let mut selection = explicit_selection
+        .clone()
+        .unwrap_or(ModelSelection::Role(ModelRole::Coder));
+    let mut reasoning_effort = None;
+    let mut ladder_idx = 0usize;
+    let mut attempt = 0usize;
+
+    loop {
+        let workflow_name = state.config.lock().await.develop.workflow.trim().to_lowercase();
+        let policy: Box<dyn tauqe_core::workflow::policy::ApplyPolicy> =
+            match workflow_name.as_str() {
+                "naive" => Box::new(tauqe_core::workflow::policy::DirectApplyPolicy::new()),
+                _ => Box::new(tauqe_core::workflow::git_policy::GitTransactionPolicy::new()),
+            };
+
+        let turn_result = execute_model_turn(
+            state,
+            prompt.clone(),
+            Some(selection.clone()),
+            None,
+            reasoning_effort,
+            policy,
+        )
+        .await;
+
+        let turn = match turn_result {
+            Ok(turn) => turn,
+            Err(err) => {
+                set_item_status(state, repo_root, review_id, item_id, ReviewItemStatus::Todo);
+                let op_id = format!("op-{}", next_operation_id());
+                report_item_failure(state, &op_id, &err.message);
+                return Err(err.message);
+            }
+        };
+
+        // Semantic block: the coder reports that the finding preconditions
+        // cannot be satisfied as stated. Review findings have no blocked status,
+        // so the item returns to TODO and the batch stops without a retry cycle.
+        if let Some(reason) = turn.blocked.clone() {
             set_item_status(state, repo_root, review_id, item_id, ReviewItemStatus::Todo);
-            let applied = turn_applied_edits(&turn);
-            let reason = turn.error.clone().unwrap_or_else(|| {
-                if applied {
-                    "Finding turn ended without verified changes or a success tag".to_string()
-                } else {
-                    "Finding turn applied no code changes".to_string()
-                }
-            });
+            report_item_failure(state, &turn.operation_id, &reason);
+            return Err(reason);
+        }
+
+        let applied = turn_applied_edits(&turn);
+
+        if turn.is_success() && applied {
+            set_item_status(state, repo_root, review_id, item_id, ReviewItemStatus::Fixed);
+            return Ok(());
+        }
+
+        let reason = turn.error.clone().unwrap_or_else(|| {
+            if applied {
+                "Finding turn ended without verified changes or a success tag".to_string()
+            } else {
+                "Finding turn applied no code changes".to_string()
+            }
+        });
+
+        if turn.is_cancelled || attempt >= max_retries {
+            set_item_status(state, repo_root, review_id, item_id, ReviewItemStatus::Todo);
             if turn.error.is_none() && !turn.is_cancelled {
                 report_item_failure(state, &turn.operation_id, &reason);
             }
-            Err(reason)
+            return Err(reason);
         }
-        Err(err) => {
-            set_item_status(state, repo_root, review_id, item_id, ReviewItemStatus::Todo);
-            let op_id = format!("op-{}", next_operation_id());
-            report_item_failure(state, &op_id, &err.message);
-            Err(err.message)
+
+        // Reset to a clean, deterministic basis before the corrective attempt.
+        clear_auto_context(state).await;
+        if let Some(file_path) = &item.file_path {
+            preload_item_file(state, repo_root, file_path).await;
         }
+
+        if explicit_selection.is_none() && auto_level_up {
+            ladder_idx += 1;
+            let tier = models_config.coder_tier(ladder_idx);
+            selection = ModelSelection::Specific(tier.model);
+            reasoning_effort = tier.effort;
+        }
+
+        prompt = tauqe_core::review::prompt::format_review_step_retry_prompt(
+            &turn.assistant_text,
+            turn.error.as_deref(),
+        );
+        attempt += 1;
     }
 }
 
@@ -916,6 +1000,8 @@ pub async fn handle_review_execute(req: Request, state: &Arc<AppState>) -> Respo
 mod tests {
     use super::*;
 
+    use tauqe_core::providers::mock::{MockLlmProvider, MockResponse};
+
     struct TestDir(std::path::PathBuf);
     impl TestDir {
         fn new() -> Self {
@@ -975,6 +1061,37 @@ mod tests {
             items,
             raw_markdown: String::new(),
         }
+    }
+
+    fn test_config() -> tauqe_core::config::AppConfig {
+        let mut config = tauqe_core::config::AppConfig::default();
+        config.develop.workflow = "naive".to_string();
+        config.develop.protocol = "xml".to_string();
+        config.models.auto_level_up = false;
+        config
+    }
+
+    fn init_repo_with_file(dir: &TestDir, path: &str) {
+        tauqe_core::git::init_repository(Some(dir.path()), true).unwrap();
+        let full = dir.path().join(path);
+        if let Some(parent) = full.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(&full, "pub fn target() {}\n").unwrap();
+        tauqe_core::git::cmd::stage_files(dir.path(), &[path.to_string()]).unwrap();
+        tauqe_core::git::cmd::commit_with_developer_author(dir.path(), "Add target", false).unwrap();
+    }
+
+    async fn test_state_with_provider(
+        dir: &TestDir,
+        config: tauqe_core::config::AppConfig,
+        provider: Arc<dyn LlmProvider>,
+    ) -> Arc<AppState> {
+        let (out, _rx) = OutChannel::new();
+        let (hist_tx, _hist_rx) = tokio::sync::mpsc::unbounded_channel();
+        let state = AppState::new(config, dir.path().to_path_buf(), hist_tx, out);
+        *state.provider_override.lock().await = Some(provider);
+        state
     }
 
     #[tokio::test]
@@ -1257,5 +1374,176 @@ mod tests {
             blocked: None,
         };
         assert!(!turn_applied_edits(&failed));
+    }
+
+    #[tokio::test]
+    async fn test_review_retry_exhaustion_resets_item_status_to_todo() {
+        let dir = TestDir::new();
+        init_repo_with_file(&dir, "src/target.rs");
+
+        let session = test_session(
+            "rev-retry-exhaust",
+            vec![test_item(1, ReviewItemStatus::Todo, "src/target.rs")],
+        );
+        ReviewStorage::save_session(dir.path(), &session).unwrap();
+
+        // One initial attempt plus one retry: both answer without any edits, so
+        // the finding never satisfies the code-modification contract.
+        let provider = Arc::new(MockLlmProvider::scripted([
+            MockResponse::text("I inspected the file but propose no edits."),
+            MockResponse::text("Still no edits to propose."),
+        ]));
+
+        let mut config = test_config();
+        config.develop.max_retries = 1;
+        let state = test_state_with_provider(&dir, config, provider.clone()).await;
+
+        let outcome = run_review_batch(&state, "rev-retry-exhaust", vec![1]).await;
+        match outcome {
+            BatchOutcome::Failed {
+                completed,
+                item_id,
+                reason,
+            } => {
+                assert_eq!(completed, 0);
+                assert_eq!(item_id, 1);
+                assert!(reason.contains("no code changes"), "reason: {reason}");
+            }
+            other => panic!("Expected Failed, got {other:?}"),
+        }
+
+        // Exhausting the attempt budget resets the finding back to TODO.
+        let updated = ReviewStorage::load_review(dir.path(), "rev-retry-exhaust")
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated.find_item(1).unwrap().status, ReviewItemStatus::Todo);
+
+        // The retry loop is bounded: one initial attempt plus `max_retries`.
+        assert_eq!(provider.requests().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_review_batch_stops_on_no_changes_without_hanging() {
+        let dir = TestDir::new();
+        init_repo_with_file(&dir, "src/target.rs");
+
+        let session = test_session(
+            "rev-no-change",
+            vec![
+                test_item(1, ReviewItemStatus::Todo, "src/target.rs"),
+                test_item(2, ReviewItemStatus::Todo, "src/target.rs"),
+            ],
+        );
+        ReviewStorage::save_session(dir.path(), &session).unwrap();
+
+        let provider = Arc::new(MockLlmProvider::scripted([
+            MockResponse::text("No edits."),
+            MockResponse::text("No edits."),
+        ]));
+
+        let mut config = test_config();
+        config.develop.max_retries = 1;
+        let state = test_state_with_provider(&dir, config, provider.clone()).await;
+
+        let outcome = run_review_batch(&state, "rev-no-change", vec![1, 2]).await;
+        match outcome {
+            BatchOutcome::Failed {
+                completed,
+                item_id,
+                ..
+            } => {
+                assert_eq!(completed, 0);
+                assert_eq!(item_id, 1);
+            }
+            other => panic!("Expected Failed, got {other:?}"),
+        }
+
+        // The batch terminates deterministically instead of hanging: the first
+        // finding is attempted `max_retries + 1` times and the second is never
+        // reached (fail-fast).
+        assert_eq!(provider.requests().len(), 2);
+
+        let updated = ReviewStorage::load_review(dir.path(), "rev-no-change")
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated.find_item(1).unwrap().status, ReviewItemStatus::Todo);
+        assert_eq!(updated.find_item(2).unwrap().status, ReviewItemStatus::Todo);
+    }
+
+    #[tokio::test]
+    async fn test_review_semantic_block_stops_batch_without_retry() {
+        let dir = TestDir::new();
+        init_repo_with_file(&dir, "src/target.rs");
+
+        let session = test_session(
+            "rev-blocked",
+            vec![test_item(1, ReviewItemStatus::Todo, "src/target.rs")],
+        );
+        ReviewStorage::save_session(dir.path(), &session).unwrap();
+
+        let provider = Arc::new(MockLlmProvider::scripted([MockResponse::text(
+            "Cannot fix this finding.\n<blocked reason=\"Target API was removed\" />",
+        )]));
+
+        let state = test_state_with_provider(&dir, test_config(), provider.clone()).await;
+
+        let outcome = run_review_batch(&state, "rev-blocked", vec![1]).await;
+        match outcome {
+            BatchOutcome::Failed {
+                completed,
+                item_id,
+                reason,
+            } => {
+                assert_eq!(completed, 0);
+                assert_eq!(item_id, 1);
+                assert!(reason.contains("Target API was removed"), "reason: {reason}");
+            }
+            other => panic!("Expected Failed, got {other:?}"),
+        }
+
+        // A semantic block aborts immediately: no patch-retry or healing cycle
+        // runs, so the provider is consulted exactly once.
+        assert_eq!(provider.requests().len(), 1);
+
+        let updated = ReviewStorage::load_review(dir.path(), "rev-blocked")
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated.find_item(1).unwrap().status, ReviewItemStatus::Todo);
+    }
+
+    #[tokio::test]
+    async fn test_review_explicit_model_disables_ladder_escalation() {
+        let dir = TestDir::new();
+        init_repo_with_file(&dir, "src/target.rs");
+
+        let mut item = test_item(1, ReviewItemStatus::Todo, "src/target.rs");
+        item.model = Some(ModelSelection::Specific(tauqe_protocol::ModelRef::openrouter(
+            "explicit/model",
+        )));
+
+        let session = test_session("rev-explicit", vec![item]);
+        ReviewStorage::save_session(dir.path(), &session).unwrap();
+
+        let provider = Arc::new(MockLlmProvider::scripted([
+            MockResponse::text("No edits."),
+            MockResponse::text("No edits."),
+        ]));
+
+        // Escalation is enabled, but an explicitly assigned model is pinned
+        // across every retry and must never be replaced by a ladder tier.
+        let mut config = test_config();
+        config.develop.max_retries = 1;
+        config.models.auto_level_up = true;
+        let state = test_state_with_provider(&dir, config, provider.clone()).await;
+
+        let outcome = run_review_batch(&state, "rev-explicit", vec![1]).await;
+        assert!(matches!(outcome, BatchOutcome::Failed { .. }));
+
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 2);
+        assert!(
+            requests.iter().all(|r| r.model == "explicit/model"),
+            "an explicit model must never be replaced by a ladder tier"
+        );
     }
 }

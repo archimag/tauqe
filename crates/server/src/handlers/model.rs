@@ -170,6 +170,21 @@ struct PreparedTurn {
     cancel_rx: watch::Receiver<bool>,
 }
 
+/// Builds a real network provider from configuration, mapping failures to a
+/// `NO_API_KEY` response error.
+fn build_configured_provider(
+    config: &tauqe_core::config::AppConfig,
+    kind: tauqe_protocol::ProviderKind,
+) -> Result<Arc<dyn LlmProvider>, ResponseError> {
+    create_provider(kind, config)
+        .map(Arc::from)
+        .map_err(|err| ResponseError {
+            code: "NO_API_KEY".to_string(),
+            message: err.to_string(),
+            data: None,
+        })
+}
+
 /// Resolves the provider and model for a turn, emits `model/started`, and
 /// registers the cancellable active operation. `is_batch` marks turns that run
 /// as members of a batch supervisor so clients can suppress per-step signals.
@@ -187,16 +202,17 @@ async fn prepare_turn(
             None => state.current_selection.lock().await.clone(),
         };
         let model = cfg.resolve_model(&selection);
-        let provider: Arc<dyn LlmProvider> = match create_provider(model.provider, &cfg) {
-            Ok(p) => Arc::from(p),
-            Err(err) => {
-                return Err(ResponseError {
-                    code: "NO_API_KEY".to_string(),
-                    message: err.to_string(),
-                    data: None,
-                });
-            }
+        // Deterministic unit tests inject a scripted provider through the
+        // state's test seam; production builds always construct a real
+        // network provider from configuration.
+        #[cfg(test)]
+        let provider: Arc<dyn LlmProvider> = match state.provider_override.lock().await.clone() {
+            Some(provider) => provider,
+            None => build_configured_provider(&cfg, model.provider)?,
         };
+
+        #[cfg(not(test))]
+        let provider: Arc<dyn LlmProvider> = build_configured_provider(&cfg, model.provider)?;
 
         (provider, model, cfg.clone(), selection)
     };

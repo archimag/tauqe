@@ -175,16 +175,20 @@ pub fn render_header(frame: &mut ratatui::Frame, state: &mut AppState, area: Rec
     let inner_header_width = area.width.saturating_sub(2) as usize;
     let max_col = area.x + area.width.saturating_sub(1);
 
-    // 1. Determine Right-Side configuration with guaranteed priority
-    let (max_model_len, squash_text, help_text) = if inner_header_width >= 125 {
-        (20, " [F6 Squash] ", " [?] Help ")
-    } else if inner_header_width >= 95 {
-        (12, " [F6 Squash] ", " [?] Help ")
-    } else if inner_header_width >= 75 {
-        (8, " [F6] ", " [?] Help ")
-    } else {
-        (6, " [F6] ", " [?] ")
-    };
+    // 1. Determine Right-Side configuration with guaranteed priority. The Help
+    // button advertises the real binding (primary-modifier chord) rather than `?`,
+    // which would be typed literally into the Develop prompt.
+    let help_hint = crate::app::help_open_hint(state.tui_config.input.primary_modifier);
+    let (max_model_len, squash_text, help_text): (usize, &str, String) =
+        if inner_header_width >= 125 {
+            (20, " [F6 Squash] ", format!(" [{}] Help ", help_hint))
+        } else if inner_header_width >= 95 {
+            (12, " [F6 Squash] ", format!(" [{}] Help ", help_hint))
+        } else if inner_header_width >= 75 {
+            (8, " [F6] ", format!(" [{}] Help ", help_hint))
+        } else {
+            (6, " [F6] ", format!(" [{}] ", help_hint))
+        };
 
     let model_label = model_selector_label(&state.model_choice.selection, max_model_len);
     let model_text = format!(" 🧠 {} ", model_label);
@@ -376,12 +380,12 @@ mod tests {
             available_models: Vec::new(),
             available_workflows: Vec::new(),
             available_edit_protocols: Vec::new(),
-            model: crate::ui::develop::DevelopView::default(),
+            model: crate::views::develop::DevelopView::default(),
             context: tauqe_protocol::ContextState::default(),
-            context_view: crate::ui::context::ContextViewState::default(),
-            history_view: crate::ui::history::HistoryViewState::default(),
-            review: crate::ui::review::ReviewViewState::default(),
-            plans_view: crate::ui::plans::PlansViewState::default(),
+            context_view: crate::views::context::ContextViewState::default(),
+            history_view: crate::views::history::HistoryViewState::default(),
+            review: crate::views::review::ReviewViewState::default(),
+            plans_view: crate::views::plans::PlansViewState::default(),
             onboarding: crate::app::OnboardingState::default(),
             input_editor: crate::editor::InputEditor::default(),
             tui_config: crate::config::TuiConfig::default(),
@@ -408,6 +412,7 @@ mod tests {
             server_disconnected: None,
             server_log_path: std::path::PathBuf::from(".tauqe/server.log"),
             last_model_height: 10,
+            last_frame_area: Rect::new(0, 0, 80, 24),
             header_clicks: HeaderClickAreas::default(),
             terminal_focused: true,
             shift_tip_shown: false,
@@ -514,5 +519,24 @@ mod tests {
             model_selector_label(&ModelSelection::Specific(short), 20),
             "gpt-4o"
         );
+    }
+
+    #[test]
+    fn test_header_renders_with_alt_primary_modifier() {
+        // The Help button label follows the configured primary modifier, so the
+        // header must still render and register its click targets under `alt`.
+        let backend = TestBackend::new(80, 3);
+        let mut terminal = Terminal::new(backend).expect("terminal created");
+        let mut state = test_app_state();
+        state.tui_config.input.primary_modifier = crate::config::PrimaryModifier::Alt;
+
+        terminal
+            .draw(|frame| {
+                render_header(frame, &mut state, frame.area());
+            })
+            .expect("draw succeeded");
+
+        assert_ne!(state.header_clicks.help_button, (0, 0));
+        assert_ne!(state.header_clicks.squash_button, (0, 0));
     }
 }

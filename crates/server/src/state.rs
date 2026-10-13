@@ -25,6 +25,10 @@ pub struct AppState {
     pub total_cost: Mutex<f64>,
     pub history_sender: tokio::sync::mpsc::UnboundedSender<UiHistoryItem>,
     pub out: OutChannel,
+    /// Test-only seam letting deterministic unit tests inject a scripted
+    /// provider instead of building a real network provider from config.
+    #[cfg(test)]
+    pub provider_override: Mutex<Option<Arc<dyn tauqe_core::providers::LlmProvider>>>,
 }
 
 impl AppState {
@@ -58,6 +62,8 @@ impl AppState {
             total_cost: Mutex::new(0.0),
             history_sender,
             out,
+            #[cfg(test)]
+            provider_override: Mutex::new(None),
         })
     }
 

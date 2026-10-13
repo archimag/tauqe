@@ -2,12 +2,13 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tauqe_protocol::{
     methods, ConfigState, ContextState, GitSquashApplyResult, GitSquashGenerateMessageResult,
-    GitSquashPreviewResult, GitUndoResult, HistoryGetResult, ModelRef,
-    RepositoryListFilesResult, RequestId, Response, ReviewGetResult, ReviewUpdateItemResult,
+    GitSquashPreviewResult, GitUndoResult, HistoryGetResult, RepositoryListFilesResult, RequestId,
+    Response, ReviewGetResult, ReviewUpdateItemResult, SystemStatusResult,
 };
 
-use crate::app::{AppState, OnboardingStep, ViewMode};
-use super::transport::{take_optimistic_rollback, take_pending_request, OptimisticRollback};
+use crate::app::{AppState, ViewMode};
+use crate::views::develop::TurnStatus;
+use super::transport::{OptimisticRollback, RpcConnection};
 
 /// RPC error code returned by the server when the pre-flight toolchain
 /// verification blocks a plan or review batch before any step starts.
@@ -28,100 +29,87 @@ pub mod messages {
     pub const EDIT_FAILED_FALLBACK: &str = "Edit proposal failed to apply";
 }
 
-pub fn apply_system_status_response(st: &mut AppState, val: &serde_json::Value) {
-    let ready = val.get("ready").and_then(|v| v.as_bool()).unwrap_or(false);
-    let has_git = val.get("has_git").and_then(|v| v.as_bool()).unwrap_or(true);
-    let has_config = val.get("has_config").and_then(|v| v.as_bool()).unwrap_or(false);
-    let has_api_key = val.get("has_api_key").and_then(|v| v.as_bool()).unwrap_or(false);
-    let config_path = val.get("config_path").and_then(|v| v.as_str()).map(|s| s.to_string());
-    let credentials_path = val
-        .get("credentials_path")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
-    if let Some(m) = val
-        .get("model")
-        .and_then(|v| serde_json::from_value::<ModelRef>(v.clone()).ok())
-    {
-        st.active_model = m;
+/// How the server produced a [`SystemStatusResult`]. The payload is identical
+/// across these operations; the originating method selects the onboarding
+/// feedback to surface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SystemStatusAction {
+    Query,
+    Reloaded,
+    Created,
+    Saved,
+    StubCreated,
+}
+
+/// Applies a typed system status payload to the client state.
+pub(crate) fn apply_system_status_response(
+    st: &mut AppState,
+    status: &SystemStatusResult,
+    action: SystemStatusAction,
+) {
+    st.active_model = status.model.clone();
+    if let Some(selection) = status.selection.clone() {
+        st.model_choice.selection = selection;
     }
-    if let Some(sel) = val
-        .get("selection")
-        .and_then(|v| serde_json::from_value::<tauqe_protocol::ModelSelection>(v.clone()).ok())
-    {
-        st.model_choice.selection = sel;
-    }
-    if let Some(roles) = val
-        .get("roles")
-        .and_then(|v| serde_json::from_value::<tauqe_protocol::ModelRolesSummary>(v.clone()).ok())
-    {
+    if let Some(roles) = status.roles.clone() {
         st.model_choice.roles = Some(roles);
     }
-    if let Some(av) = val
-        .get("available_models")
-        .and_then(|v| serde_json::from_value::<Vec<ModelRef>>(v.clone()).ok())
-    {
-        if !av.is_empty() {
-            st.available_models = av;
-        }
+    if !status.available_models.is_empty() {
+        st.available_models = status.available_models.clone();
     }
 
-    st.onboarding.has_git = has_git;
-    st.onboarding.has_config = has_config;
-    st.onboarding.has_api_key = has_api_key;
-    if config_path.is_some() {
-        st.onboarding.config_path = config_path;
-    }
-    if credentials_path.is_some() {
-        st.onboarding.credentials_path = credentials_path;
-    }
+    st.onboarding.apply_status(status);
 
-    if val.get("stub_created").and_then(|v| v.as_bool()).unwrap_or(false) {
-        st.onboarding.set_status(messages::stub_credentials_created(
-            &st.onboarding.default_credentials_path,
-        ));
-    } else if val.get("created").and_then(|v| v.as_bool()).unwrap_or(false) {
-        st.onboarding.set_status(messages::CONFIG_CREATED.to_string());
-        if !has_api_key {
-            st.onboarding.step = OnboardingStep::Credentials;
-            st.onboarding.selected_index = 0;
-        } else {
-            st.onboarding.step = OnboardingStep::Ready;
+    match action {
+        SystemStatusAction::StubCreated => {
+            st.onboarding.set_status(messages::stub_credentials_created(
+                &st.onboarding.default_credentials_path,
+            ));
+        }
+        SystemStatusAction::Created => {
+            st.onboarding.set_status(messages::CONFIG_CREATED.to_string());
+            st.onboarding.step = st.onboarding.next_step();
             st.onboarding.selected_index = 0;
         }
-    } else if val.get("saved").and_then(|v| v.as_bool()).unwrap_or(false) {
-        st.onboarding.set_status(messages::API_KEY_SAVED.to_string());
-        st.onboarding.step = OnboardingStep::Ready;
-        st.onboarding.selected_index = 0;
-    } else if val.get("reloaded").and_then(|v| v.as_bool()).unwrap_or(false) {
-        if ready {
-            st.onboarding.set_status(messages::CONFIG_RELOADED_OK.to_string());
-            if st.view_mode == ViewMode::Onboarding {
-                st.onboarding.step = OnboardingStep::Ready;
-                st.onboarding.selected_index = 0;
+        SystemStatusAction::Saved => {
+            st.onboarding.set_status(messages::API_KEY_SAVED.to_string());
+            st.onboarding.step = st.onboarding.next_step();
+            st.onboarding.selected_index = 0;
+        }
+        SystemStatusAction::Reloaded => {
+            if status.ready {
+                st.onboarding
+                    .set_status(messages::CONFIG_RELOADED_OK.to_string());
+                if st.view_mode == ViewMode::Onboarding {
+                    st.onboarding.step = st.onboarding.next_step();
+                    st.onboarding.selected_index = 0;
+                }
+            } else {
+                st.onboarding
+                    .set_error(messages::API_KEY_NOT_FOUND.to_string());
             }
-        } else {
-            st.onboarding.set_error(messages::API_KEY_NOT_FOUND.to_string());
         }
+        SystemStatusAction::Query => {}
     }
 }
 
-pub async fn handle_response(resp: Response, state: &Arc<Mutex<AppState>>) {
+pub async fn handle_response(
+    resp: Response,
+    state: &Arc<Mutex<AppState>>,
+    conn: &mut RpcConnection,
+) {
     let method = match &resp.id {
-        RequestId::Number(id) => take_pending_request(*id),
+        RequestId::Number(id) => conn.take_pending_request(*id),
         _ => None,
     };
 
     let mut st = state.lock().await;
     if let Some(err) = resp.error {
         if let RequestId::Number(id) = resp.id {
-            if let Some(rollback) = take_optimistic_rollback(id) {
+            if let Some(rollback) = conn.take_optimistic_rollback(id) {
                 match rollback {
                     OptimisticRollback::ReviewItemStatus { item_id, prev_status } => {
-                        if let Some(session) = st.review.session.as_mut() {
-                            if let Some(item) = session.items.iter_mut().find(|i| i.id == item_id) {
-                                item.status = prev_status;
-                            }
-                        }
+                        st.review.set_item_status(None, item_id, prev_status);
                     }
                     OptimisticRollback::PlanItemStatus { plan_id, item_id, prev_status } => {
                         if let Some(plan) = st.plans_view.plans.iter_mut().find(|p| p.id == plan_id) {
@@ -137,8 +125,8 @@ pub async fn handle_response(resp: Response, state: &Arc<Mutex<AppState>>) {
         }
         if err.code == PREFLIGHT_VERIFICATION_FAILED {
             st.turn_started_at = None;
-            st.model.status = "error".to_string();
-            st.model.toolchain_command = None;
+            st.model.status = TurnStatus::Error;
+            st.model.toolchain = None;
             st.model.turn_phase = None;
             st.model.turn_phase_detail = None;
             st.model.error = Some(err.message.clone());
@@ -191,7 +179,7 @@ pub async fn handle_response(resp: Response, state: &Arc<Mutex<AppState>>) {
     }
 
     if let RequestId::Number(id) = resp.id {
-        take_optimistic_rollback(id);
+        conn.take_optimistic_rollback(id);
     }
 
     if method.as_deref() == Some(methods::PLAN_DELETE) {
@@ -292,7 +280,7 @@ pub async fn handle_response(resp: Response, state: &Arc<Mutex<AppState>>) {
                         && !st.history_view.items.is_empty()
                     {
                         let fetched_count = history_res.items.len();
-                        let added_lines = crate::ui::history::compute_history_items_line_count(
+                        let added_lines = crate::views::history::compute_history_items_line_count(
                             &history_res.items,
                             Some(st.history_view.content_width),
                         );
@@ -379,16 +367,8 @@ pub async fn handle_response(resp: Response, state: &Arc<Mutex<AppState>>) {
                     st.repo_state = Some(init_res.repository);
                     st.onboarding.has_git = true;
                     st.onboarding.set_status(messages::GIT_INIT_OK.to_string());
-                    if !st.onboarding.has_config {
-                        st.onboarding.step = OnboardingStep::Config;
-                        st.onboarding.selected_index = 0;
-                    } else if !st.onboarding.has_api_key {
-                        st.onboarding.step = OnboardingStep::Credentials;
-                        st.onboarding.selected_index = 0;
-                    } else {
-                        st.onboarding.step = OnboardingStep::Ready;
-                        st.onboarding.selected_index = 0;
-                    }
+                    st.onboarding.step = st.onboarding.next_step();
+                    st.onboarding.selected_index = 0;
                 }
             }
             methods::CONFIG_GET | methods::CONFIG_SET => {
@@ -443,7 +423,7 @@ pub async fn handle_response(resp: Response, state: &Arc<Mutex<AppState>>) {
             }
             methods::REVIEW_UPDATE_ITEM => {
                 if let Ok(res) = serde_json::from_value::<ReviewUpdateItemResult>(val) {
-                    st.review.apply_item(res.item);
+                    st.review.apply_item(None, res.item);
                 }
             }
             methods::REVIEW_LIST => {
@@ -508,7 +488,7 @@ pub async fn handle_response(resp: Response, state: &Arc<Mutex<AppState>>) {
                                 .find(|p| p.id == target_plan_id)
                                 .map(|p| p.title.clone())
                                 .unwrap_or_else(|| "Plan".to_string());
-                            st.plans_view.refine_blocked = Some(crate::ui::plans::PlanRefineBlockedState {
+                            st.plans_view.refine_blocked = Some(crate::views::plans::PlanRefineBlockedState {
                                 plan_id: target_plan_id,
                                 plan_title,
                                 reason,
@@ -524,7 +504,16 @@ pub async fn handle_response(resp: Response, state: &Arc<Mutex<AppState>>) {
             | methods::CONFIG_CREATE
             | methods::CREDENTIALS_SAVE
             | methods::CREDENTIALS_CREATE_STUB => {
-                apply_system_status_response(&mut st, &val);
+                if let Ok(status) = serde_json::from_value::<SystemStatusResult>(val) {
+                    let action = match method_name {
+                        methods::CONFIG_RELOAD => SystemStatusAction::Reloaded,
+                        methods::CONFIG_CREATE => SystemStatusAction::Created,
+                        methods::CREDENTIALS_SAVE => SystemStatusAction::Saved,
+                        methods::CREDENTIALS_CREATE_STUB => SystemStatusAction::StubCreated,
+                        _ => SystemStatusAction::Query,
+                    };
+                    apply_system_status_response(&mut st, &status, action);
+                }
             }
             _ => {}
         }
@@ -534,67 +523,11 @@ pub async fn handle_response(resp: Response, state: &Arc<Mutex<AppState>>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::{
-        ConfirmDialogButton, HeaderClickAreas, ModelChoice, NotificationLevel, OnboardingState,
-    };
-    use crate::config::TuiConfig;
-    use crate::editor::InputEditor;
-    use crate::ui::context::ContextViewState;
-    use crate::ui::develop::DevelopView;
-    use crate::ui::history::HistoryViewState;
-    use crate::ui::plans::PlansViewState;
-    use crate::ui::review::ReviewViewState;
+    use crate::app::NotificationLevel;
     use tauqe_protocol::ResponseError;
 
     fn test_state() -> Arc<Mutex<AppState>> {
-        Arc::new(Mutex::new(AppState {
-            view_mode: ViewMode::Develop,
-            protocol_version: "1.0".to_string(),
-            repo_state: None,
-            all_repo_files: Vec::new(),
-            workflow: "git".to_string(),
-            edit_protocol: "xml".to_string(),
-            active_model: ModelRef::openrouter("test-model"),
-            available_models: Vec::new(),
-            available_workflows: Vec::new(),
-            available_edit_protocols: Vec::new(),
-            model_choice: ModelChoice::default(),
-            model: DevelopView::default(),
-            context: ContextState::default(),
-            context_view: ContextViewState::default(),
-            history_view: HistoryViewState::default(),
-            review: ReviewViewState::default(),
-            plans_view: PlansViewState::default(),
-            review_dialog: None,
-            notification: None,
-            turn_started_at: None,
-            onboarding: OnboardingState::default(),
-            input_editor: InputEditor::default(),
-            tui_config: TuiConfig::default(),
-            show_help: false,
-            help_scroll: 0,
-            confirm_cancel: false,
-            confirm_quit: false,
-            confirm_undo: false,
-            confirm_clear_history: false,
-            confirm_delete_plan: None,
-            confirm_delete_review: None,
-            confirm_execute_scope: None,
-            confirm_execute_review: None,
-            confirm_button: ConfirmDialogButton::Cancel,
-            selection_dialog: None,
-            status_dialog: None,
-            squash_dialog: None,
-            prompt_modal: None,
-            discuss_plan_dialog: None,
-            discuss_review_dialog: None,
-            server_disconnected: None,
-            server_log_path: std::path::PathBuf::from(".tauqe/server.log"),
-            last_model_height: 10,
-            header_clicks: HeaderClickAreas::default(),
-            terminal_focused: true,
-            shift_tip_shown: false,
-        }))
+        Arc::new(Mutex::new(crate::app::test_state()))
     }
 
     #[tokio::test]
@@ -602,7 +535,7 @@ mod tests {
         let state = test_state();
         {
             let mut st = state.lock().await;
-            st.model.status = "awaiting".to_string();
+            st.model.status = TurnStatus::Awaiting;
             st.turn_started_at = Some(std::time::Instant::now());
             assert!(st.model.is_busy());
         }
@@ -615,10 +548,11 @@ mod tests {
                 "Pre-flight verification failed: the repository does not build cleanly.",
             )),
         };
-        handle_response(resp, &state).await;
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+        handle_response(resp, &state, &mut conn).await;
 
         let st = state.lock().await;
-        assert_eq!(st.model.status, "error");
+        assert_eq!(st.model.status, TurnStatus::Error);
         assert!(!st.model.is_busy());
         assert!(st.turn_started_at.is_none());
         assert!(st

@@ -2,7 +2,6 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use tauqe_protocol::{
     methods, GitSquashApplyParams, GitSquashGenerateMessageParams, GitSquashPreviewParams,
 };
-use tokio::process::ChildStdin;
 use tokio::sync::MutexGuard;
 
 use crate::app::{
@@ -11,7 +10,7 @@ use crate::app::{
 };
 use crate::config::PrimaryModifier;
 use crate::input::{is_char_typing, InputResult};
-use crate::rpc::send_request;
+use crate::rpc::{send_request, RpcConnection};
 
 /// Side effect requested by a key press; performed after the state lock is released.
 enum SquashAction {
@@ -25,7 +24,7 @@ enum SquashAction {
 pub async fn handle_squash_key(
     key: KeyEvent,
     mut st: MutexGuard<'_, AppState>,
-    server_writer: &mut ChildStdin,
+    server_writer: &mut RpcConnection,
 ) -> anyhow::Result<InputResult> {
     let primary = st.tui_config.input.primary_modifier;
     let Some(dialog) = st.squash_dialog.as_mut() else {

@@ -13,6 +13,8 @@ TAUQE holds the model in a firm grip:
 - **Bit & Bridle (Strict Protocol):** The model has no arbitrary shell or bash access. It interacts with the world solely through typed protocol operations (virtual in-memory staging, declarative file discovery requests, deterministic toolchain verification).
 - **Reins (Git Transactions):** The developer steers the objective, while Git ensures an instant, atomic rollback if the model deviates from course.
 
+> **Maximum execution autonomy. Minimum procedural autonomy.**
+>
 > **TAUQE is not an agent. It is an environment where the model is autonomous within a strictly bounded turn, yet completely stripped of agentic drift.**
 
 ### 1.1. The Fundamental Duality: "What" versus "How"
@@ -153,4 +155,6 @@ Developer             → Task specification and absolute control
 LLM                   → Semantic transformation engine
 ```
 
-> **Eliminating cognitive burden from the developer without stripping away control.**
+> **Maximum execution autonomy. Minimum procedural autonomy.**
+>
+> Eliminating cognitive burden from the developer without stripping away control.

@@ -4,7 +4,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 
 use crate::app::{AppState, ViewMode};
-use crate::ui::develop::SPINNER_FRAMES;
+use crate::views::develop::{FileEditStatus, ToolchainState, TurnStatus, SPINNER_FRAMES};
 
 pub fn render_footer(frame: &mut ratatui::Frame, state: &AppState, area: Rect) {
     let mut footer_spans = Vec::new();
@@ -54,7 +54,7 @@ pub fn render_footer(frame: &mut ratatui::Frame, state: &AppState, area: Rect) {
         let (status_name, status_color) = match state.model.turn_phase {
             Some(tauqe_protocol::TurnPhase::Discovery) => ("Discovery", Color::Cyan),
             Some(tauqe_protocol::TurnPhase::Proposal) => {
-                if state.model.status == "thinking" {
+                if state.model.status == TurnStatus::Thinking {
                     ("Thinking", Color::Rgb(130, 170, 220))
                 } else {
                     ("Proposal", Color::Yellow)
@@ -63,13 +63,13 @@ pub fn render_footer(frame: &mut ratatui::Frame, state: &AppState, area: Rect) {
             Some(tauqe_protocol::TurnPhase::Staging) => ("Staging", Color::Magenta),
             Some(tauqe_protocol::TurnPhase::Verification) => ("Verifying", Color::Cyan),
             Some(tauqe_protocol::TurnPhase::Healing) => ("Healing", Color::LightRed),
-            None => match state.model.status.as_str() {
-                "thinking" => ("Thinking", Color::Rgb(130, 170, 220)),
-                "editing" => ("Editing", Color::Magenta),
-                "verifying" => ("Verifying", Color::Cyan),
-                "responding" | "streaming" => ("Responding", Color::Yellow),
-                "awaiting" | "starting" => ("Awaiting", Color::Yellow),
-                _ => (state.model.status.as_str(), Color::Yellow),
+            None => match state.model.status {
+                TurnStatus::Thinking => ("Thinking", Color::Rgb(130, 170, 220)),
+                TurnStatus::Editing => ("Editing", Color::Magenta),
+                TurnStatus::Verifying => ("Verifying", Color::Cyan),
+                TurnStatus::Responding => ("Responding", Color::Yellow),
+                TurnStatus::Awaiting => ("Awaiting", Color::Yellow),
+                other => (other.label(), Color::Yellow),
             },
         };
 
@@ -125,7 +125,7 @@ pub fn render_footer(frame: &mut ratatui::Frame, state: &AppState, area: Rect) {
                 .files
                 .iter()
                 .rev()
-                .find(|f| f.status == "running" || f.status == "retrying");
+                .find(|f| matches!(f.status, FileEditStatus::Running | FileEditStatus::Retrying));
 
             if let Some(f) = active_file {
                 if let Some(retry) = &f.retry_info {
@@ -140,7 +140,12 @@ pub fn render_footer(frame: &mut ratatui::Frame, state: &AppState, area: Rect) {
                     format!("→ {}", f.path),
                     Style::default().fg(Color::White).bold(),
                 ));
-            } else if let Some(cmd) = &state.model.toolchain_command {
+            } else if let Some(cmd) = state
+                .model
+                .toolchain
+                .as_ref()
+                .and_then(ToolchainState::running_command)
+            {
                 footer_spans.push(Span::raw(" "));
                 footer_spans.push(Span::styled(
                     format!("→ {}", cmd),
@@ -155,10 +160,10 @@ pub fn render_footer(frame: &mut ratatui::Frame, state: &AppState, area: Rect) {
             Style::default().fg(color).bold(),
         ));
     } else {
-        let (status_lbl, status_style) = match state.model.status.as_str() {
-            "done" => ("Done", Style::default().fg(Color::Green).bold()),
-            "cancelled" => ("Cancelled", Style::default().fg(Color::Red).bold()),
-            "error" => ("Error", Style::default().fg(Color::Red).bold()),
+        let (status_lbl, status_style) = match state.model.status {
+            TurnStatus::Done => ("Done", Style::default().fg(Color::Green).bold()),
+            TurnStatus::Cancelled => ("Cancelled", Style::default().fg(Color::Red).bold()),
+            TurnStatus::Error => ("Error", Style::default().fg(Color::Red).bold()),
             _ => ("Ready", Style::default().fg(Color::Green)),
         };
         footer_spans.push(Span::styled(status_lbl, status_style));

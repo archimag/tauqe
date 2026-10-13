@@ -28,4 +28,4 @@ Thumbs.db
 .tauqe/
 
 # mdBook build artifacts
-book/book/
+docs/book/

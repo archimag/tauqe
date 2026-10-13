@@ -1,6 +1,8 @@
 # TAUQE
 
 > **T**he **A**nswer to the **U**ltimate **Q**uestion of **E**ngineering. *(pronounced /tɔːk/ or /taʊk/)*
+>
+> **Maximum execution autonomy. Minimum procedural autonomy.**
 
 **TAUQE** is an AI-native engineering control environment designed around a **literal semantic harness** for large language models, inspired by the stateful, keyboard-driven heritage of **Magit** and **SLIME**.
 
@@ -26,6 +28,19 @@ Instead of uncontrolled agentic loops with arbitrary shell access or tedious man
 
 ## Quick Start
 
+### Prerequisites
+
+1. **Rust Toolchain:**
+   ```bash
+   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+   ```
+   Or follow the installation guide at [rust-lang.org/tools/install](https://www.rust-lang.org/tools/install/).
+
+2. **Just command runner:**
+   ```bash
+   cargo install just
+   ```
+
 ### Installation & Launch
 
 ```bash
@@ -49,6 +64,18 @@ On first launch, an interactive onboarding wizard automatically checks your Git 
 | `Ctrl+5` | **History** | Chronological session audit trail, token metrics, and commit inspect |
 
 > **Ask TAUQE directly:** Launch the interface and ask anything about the system, shortcuts, or concepts—TAUQE queries its own authoritative manuals on the fly.
+
+---
+
+## Contributing
+
+Pull requests containing raw code are not accepted. In the modern LLM paradigm, synthesizing raw code carries negligible marginal cost—code is no longer the scarce resource. What truly matters is conceptual clarity, invariant design, and cohesive system architecture.
+
+If you would like to contribute:
+- Open an issue to discuss conceptual ideas, architectural trade-offs, or UX workflows.
+- Better yet, contribute well-defined, ready-to-implement engineering specifications and formal invariants.
+
+Once a specification is sound, implementing it within TAUQE's semantic harness is a matter of deterministic bounded execution.
 
 ---
 

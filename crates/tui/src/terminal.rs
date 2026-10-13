@@ -152,17 +152,41 @@ pub fn trigger_turn_notification(
     if let Some(ref cmd) = config.command {
         let trimmed = cmd.trim();
         if !trimmed.is_empty() {
-            let cmd_str = trimmed.to_string();
-            #[cfg(unix)]
-            let _ = std::process::Command::new("sh")
-                .arg("-c")
-                .arg(&cmd_str)
-                .spawn();
-            #[cfg(windows)]
-            let _ = std::process::Command::new("cmd")
-                .arg("/C")
-                .arg(&cmd_str)
-                .spawn();
+            spawn_notification_command(trimmed);
+        }
+    }
+}
+
+/// Launches the configured notification command hook and reaps it in a
+/// background task.
+///
+/// The child is waited on asynchronously so a finished hook never lingers as a
+/// zombie for the lifetime of the TUI process. The hook is best-effort: a
+/// spawn failure is silently ignored rather than surfacing into the turn
+/// lifecycle.
+fn spawn_notification_command(command: &str) {
+    #[cfg(unix)]
+    {
+        if let Ok(mut child) = tokio::process::Command::new("sh")
+            .arg("-c")
+            .arg(command)
+            .spawn()
+        {
+            tokio::spawn(async move {
+                let _ = child.wait().await;
+            });
+        }
+    }
+    #[cfg(windows)]
+    {
+        if let Ok(mut child) = tokio::process::Command::new("cmd")
+            .arg("/C")
+            .arg(command)
+            .spawn()
+        {
+            tokio::spawn(async move {
+                let _ = child.wait().await;
+            });
         }
     }
 }

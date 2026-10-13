@@ -1,17 +1,20 @@
 #![cfg_attr(
     not(test),
-    warn(clippy::unwrap_used, clippy::expect_used, clippy::panic)
+    deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)
 )]
 
 pub mod app;
 pub mod clipboard;
+pub mod components;
 pub mod config;
+pub mod dialogs;
 pub mod editor;
 pub mod input;
 pub mod markdown;
 pub mod rpc;
 pub mod terminal;
 pub mod ui;
+pub mod views;
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -19,124 +22,95 @@ use std::time::{Duration, Instant};
 use tauqe_protocol::{methods, HistoryGetParams, Message};
 use tokio::sync::Mutex;
 
-use crate::app::AppState;
+use crate::app::{AppInit, AppState};
 use crate::editor::InputEditor;
 use crate::input::InputResult;
-use crate::ui::context::ContextViewState;
-use crate::ui::develop::{DevelopView, SPINNER_FRAMES};
-use crate::ui::history::HistoryViewState;
-use crate::ui::plans::PlansViewState;
-use crate::ui::review::ReviewViewState;
 use crate::ui::render_ui;
+use crate::views::develop::SPINNER_FRAMES;
 
 const SPINNER_INTERVAL: Duration = Duration::from_millis(100);
 const FRAME_INTERVAL: Duration = Duration::from_millis(16);
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let (mut server_child, mut server_writer, mut server_reader, server_log_path) =
+    let (mut server_child, server_stdin, mut server_reader, server_log_path) =
         rpc::start_server().await?;
+    let mut conn = rpc::RpcConnection::new(server_stdin);
 
-    let (
-        init_result,
-        initial_context,
-        initial_files,
-        onboarding_state,
-        initial_view_mode,
-        init_events,
-    ) = rpc::initialize_connection(&mut server_writer, &mut server_reader).await?;
+    let init = rpc::initialize_connection(&mut conn, &mut server_reader).await?;
+    let handshake = init.handshake;
 
-    let repo_state = init_result.repository;
-    let protocol_version = init_result.protocol_version.clone();
-    let workflow = init_result
+    let repo_state = handshake.repository;
+    let protocol_version = handshake.protocol_version.clone();
+    let workflow = handshake
         .workflow
         .unwrap_or_else(|| "toolchain".to_string());
-    let edit_protocol = init_result
+    let edit_protocol = handshake
         .edit_protocol
         .unwrap_or_else(|| "xml".to_string());
-    let available_workflows = if init_result.available_workflows.is_empty() {
+    let available_workflows = if handshake.available_workflows.is_empty() {
         vec![
             "toolchain".to_string(),
             "git".to_string(),
             "naive".to_string(),
         ]
     } else {
-        init_result.available_workflows
+        handshake.available_workflows
     };
-    let available_edit_protocols = if init_result.available_edit_protocols.is_empty() {
+    let available_edit_protocols = if handshake.available_edit_protocols.is_empty() {
         vec!["xml".to_string(), "structured".to_string()]
     } else {
-        init_result.available_edit_protocols
+        handshake.available_edit_protocols
     };
-    let active_model = init_result.model;
-    let available_models = if init_result.available_models.is_empty() {
+    let active_model = handshake.model;
+    let available_models = if handshake.available_models.is_empty() {
         vec![active_model.clone()]
     } else {
-        init_result.available_models
+        handshake.available_models
     };
 
-    let tui_config = config::TuiConfig::load();
+    let (tui_config, tui_config_error) = match config::TuiConfig::load_checked() {
+        Ok(cfg) => (cfg, None),
+        Err(err) => (config::TuiConfig::default(), Some(err)),
+    };
 
     let mut input_editor = InputEditor::default();
     input_editor.set_history_path(editor::default_prompt_history_path());
 
-    let state = Arc::new(Mutex::new(AppState {
-        view_mode: initial_view_mode,
+    let state = Arc::new(Mutex::new(AppState::new(AppInit {
+        view_mode: init.view_mode,
         protocol_version,
         repo_state,
-        all_repo_files: initial_files,
+        all_repo_files: init.files,
         workflow,
         edit_protocol,
         available_workflows,
         available_edit_protocols,
         active_model,
         available_models,
-        model: DevelopView::default(),
-        context: initial_context,
-        context_view: ContextViewState::default(),
-        history_view: HistoryViewState::default(),
-        review: ReviewViewState::default(),
-        plans_view: PlansViewState::default(),
-        review_dialog: None,
-        notification: None,
-        turn_started_at: None,
-        onboarding: onboarding_state,
+        context: init.context,
+        onboarding: init.onboarding,
         input_editor,
         tui_config,
-        show_help: false,
-        help_scroll: 0,
-        confirm_cancel: false,
-        confirm_quit: false,
-        confirm_undo: false,
-        confirm_clear_history: false,
-        confirm_delete_plan: None,
-        confirm_delete_review: None,
-        confirm_execute_scope: None,
-        confirm_execute_review: None,
-        confirm_button: crate::app::ConfirmDialogButton::Cancel,
-        selection_dialog: None,
-        status_dialog: None,
-        squash_dialog: None,
-        prompt_modal: None,
-        discuss_plan_dialog: None,
-        discuss_review_dialog: None,
-        server_disconnected: None,
         server_log_path: server_log_path.clone(),
-        last_model_height: 10,
-        header_clicks: crate::app::HeaderClickAreas::default(),
-        terminal_focused: true,
-        shift_tip_shown: false,
-        model_choice: crate::app::ModelChoice::default(),
-    }));
+    })));
+
+    {
+        let mut st = state.lock().await;
+        st.sync_theme_mode();
+        if let Some(err) = tui_config_error {
+            st.notify_error(format!("{}; using default TUI settings", err));
+        }
+    }
 
     let mut is_reasoning = false;
-    for ev in init_events {
-        rpc::handle_event(ev, &state, &mut is_reasoning, Some(&mut server_writer)).await;
+    for ev in init.events {
+        rpc::handle_event(ev, &state, &mut is_reasoning).await;
     }
 
     // Initial history fetch
     rpc::send_request(
-        &mut server_writer,
+        &mut conn,
         methods::HISTORY_GET,
         serde_json::to_value(HistoryGetParams {
             limit: Some(10),
@@ -146,14 +120,14 @@ async fn main() -> anyhow::Result<()> {
     .await?;
 
     // Restore the latest saved review (if any)
-    rpc::send_request(&mut server_writer, methods::REVIEW_GET, serde_json::json!({})).await?;
+    rpc::send_request(&mut conn, methods::REVIEW_GET, serde_json::json!({})).await?;
 
     // Initial model selection and tier assignments
-    rpc::send_request(&mut server_writer, methods::MODEL_CURRENT, serde_json::json!({})).await?;
+    rpc::send_request(&mut conn, methods::MODEL_CURRENT, serde_json::json!({})).await?;
 
     // Initial plans fetch
-    rpc::send_request(&mut server_writer, methods::PLAN_LIST, serde_json::json!({})).await?;
-    rpc::send_request(&mut server_writer, methods::PLAN_GET, serde_json::json!({})).await?;
+    rpc::send_request(&mut conn, methods::PLAN_LIST, serde_json::json!({})).await?;
+    rpc::send_request(&mut conn, methods::PLAN_GET, serde_json::json!({})).await?;
 
     // Safety net: restore the terminal before reporting any unexpected panic
     let original_hook = std::panic::take_hook();
@@ -216,7 +190,7 @@ async fn main() -> anyhow::Result<()> {
 
         tokio::select! {
             Some(terminal_event) = event_rx.recv() => {
-                match input::handle_terminal_event(terminal_event, &state, &mut server_writer).await {
+                match input::handle_terminal_event(terminal_event, &state, &mut conn).await {
                     Ok(InputResult::Continue) => {
                         dirty = true;
                     }
@@ -231,9 +205,9 @@ async fn main() -> anyhow::Result<()> {
             msg = msg_rx.recv() => {
                 match msg {
                     Some(msg) => {
-                        dispatch_server_message(msg, &state, &mut is_reasoning, &mut server_writer).await;
+                        dispatch_server_message(msg, &state, &mut is_reasoning, &mut conn).await;
                         while let Ok(msg) = msg_rx.try_recv() {
-                            dispatch_server_message(msg, &state, &mut is_reasoning, &mut server_writer).await;
+                            dispatch_server_message(msg, &state, &mut is_reasoning, &mut conn).await;
                         }
                         dirty = true;
                     }
@@ -272,7 +246,7 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    drop(server_writer);
+    drop(conn);
     let shutdown_timeout = Duration::from_millis(1500);
     if tokio::time::timeout(shutdown_timeout, server_child.wait())
         .await
@@ -293,14 +267,14 @@ async fn dispatch_server_message(
     msg: Message,
     state: &Arc<Mutex<AppState>>,
     is_reasoning: &mut bool,
-    server_writer: &mut tokio::process::ChildStdin,
+    conn: &mut rpc::RpcConnection,
 ) {
     match msg {
         Message::Event(ev) => {
-            rpc::handle_event(ev, state, is_reasoning, Some(server_writer)).await;
+            rpc::handle_event(ev, state, is_reasoning).await;
         }
         Message::Response(resp) => {
-            rpc::handle_response(resp, state).await;
+            rpc::handle_response(resp, state, conn).await;
         }
         Message::Request(_) => {}
     }

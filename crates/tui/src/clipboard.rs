@@ -115,8 +115,16 @@ pub fn copy_to_clipboard(text: &str) -> CopyResult {
         }
     }
 
-    if in_ssh && osc52_ok {
-        CopyResult::Osc52Only
+    // In an SSH session the native clipboard belongs to the remote host and is
+    // unreachable from the user's terminal, so only the OSC 52 sequence is
+    // meaningful. Report success solely when it was actually emitted, instead
+    // of claiming a native copy the user cannot observe.
+    if in_ssh {
+        if osc52_ok {
+            CopyResult::Osc52Only
+        } else {
+            CopyResult::Failed
+        }
     } else if native_ok {
         CopyResult::Native
     } else if osc52_ok {

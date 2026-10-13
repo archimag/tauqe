@@ -6,6 +6,7 @@ use tauqe_core::edits::EditProtocolFactory;
 use tauqe_core::workflow::WorkflowFactory;
 use tauqe_protocol::{
     events, ConfigSetParams, ConfigState, Event, ModelSelection, Request, Response, ResponseError,
+    SystemStatusResult,
 };
 
 use crate::state::AppState;
@@ -228,25 +229,25 @@ pub async fn handle_system_status(req: Request, state: &Arc<AppState>) -> Respon
     let ready = has_git && has_api_key;
     let effective_model = cfg.resolve_model(&cur_sel);
 
-    let status_json = serde_json::json!({
-        "has_git": has_git,
-        "has_config": has_config,
-        "config_path": config_path,
-        "default_config_path": default_config_path,
-        "has_api_key": has_api_key,
-        "credentials_path": credentials_path,
-        "default_credentials_path": default_credentials_path,
-        "ready": ready,
-        "model": effective_model,
-        "selection": *cur_sel,
-        "roles": cfg.roles_summary(),
-        "history_model": cfg.history_model(),
-        "available_models": cfg.available_models(),
-    });
+    let status = SystemStatusResult {
+        has_git,
+        has_config,
+        config_path,
+        default_config_path,
+        has_api_key,
+        credentials_path,
+        default_credentials_path,
+        ready,
+        model: effective_model,
+        selection: Some((*cur_sel).clone()),
+        roles: Some(cfg.roles_summary()),
+        history_model: Some(cfg.history_model()),
+        available_models: cfg.available_models(),
+    };
 
     Response {
         id: req.id,
-        result: Some(status_json),
+        result: serde_json::to_value(status).ok(),
         error: None,
     }
 }
@@ -294,26 +295,25 @@ pub async fn handle_config_reload(req: Request, state: &Arc<AppState>) -> Respon
     let ready = has_git && has_api_key;
     let effective_model = cfg.resolve_model(&cur_sel_val);
 
-    let status_json = serde_json::json!({
-        "reloaded": true,
-        "has_git": has_git,
-        "has_config": has_config,
-        "config_path": config_path,
-        "default_config_path": default_config_path,
-        "has_api_key": has_api_key,
-        "credentials_path": credentials_path,
-        "default_credentials_path": default_credentials_path,
-        "ready": ready,
-        "model": effective_model,
-        "selection": cur_sel_val,
-        "roles": cfg.roles_summary(),
-        "history_model": cfg.history_model(),
-        "available_models": cfg.available_models(),
-    });
+    let status = SystemStatusResult {
+        has_git,
+        has_config,
+        config_path,
+        default_config_path,
+        has_api_key,
+        credentials_path,
+        default_credentials_path,
+        ready,
+        model: effective_model,
+        selection: Some(cur_sel_val),
+        roles: Some(cfg.roles_summary()),
+        history_model: Some(cfg.history_model()),
+        available_models: cfg.available_models(),
+    };
 
     Response {
         id: req.id,
-        result: Some(status_json),
+        result: serde_json::to_value(status).ok(),
         error: None,
     }
 }
@@ -368,23 +368,27 @@ pub async fn handle_config_create(req: Request, state: &Arc<AppState>) -> Respon
 
     let effective_model = cfg.resolve_model(&cur_sel_val);
 
+    let has_git = tauqe_core::git::is_git_repository(None);
+
+    let status = SystemStatusResult {
+        has_git,
+        has_config: true,
+        config_path,
+        default_config_path,
+        has_api_key,
+        credentials_path,
+        default_credentials_path,
+        ready: has_api_key,
+        model: effective_model,
+        selection: Some(cur_sel_val),
+        roles: Some(cfg.roles_summary()),
+        history_model: Some(cfg.history_model()),
+        available_models: cfg.available_models(),
+    };
+
     Response {
         id: req.id,
-        result: Some(serde_json::json!({
-            "created": true,
-            "has_config": true,
-            "config_path": config_path,
-            "default_config_path": default_config_path,
-            "has_api_key": has_api_key,
-            "credentials_path": credentials_path,
-            "default_credentials_path": default_credentials_path,
-            "ready": has_api_key,
-            "model": effective_model,
-            "selection": cur_sel_val,
-            "roles": cfg.roles_summary(),
-            "history_model": cfg.history_model(),
-            "available_models": cfg.available_models(),
-        })),
+        result: serde_json::to_value(status).ok(),
         error: None,
     }
 }
@@ -461,23 +465,27 @@ pub async fn handle_credentials_save(req: Request, state: &Arc<AppState>) -> Res
     let default_credentials_path = target_path.to_string_lossy().to_string();
     let effective_model = cfg.resolve_model(&cur_sel_val);
 
+    let has_git = tauqe_core::git::is_git_repository(None);
+
+    let status = SystemStatusResult {
+        has_git,
+        has_config,
+        config_path,
+        default_config_path,
+        has_api_key,
+        credentials_path,
+        default_credentials_path,
+        ready: has_api_key,
+        model: effective_model,
+        selection: Some(cur_sel_val),
+        roles: Some(cfg.roles_summary()),
+        history_model: Some(cfg.history_model()),
+        available_models: cfg.available_models(),
+    };
+
     Response {
         id: req.id,
-        result: Some(serde_json::json!({
-            "saved": true,
-            "has_config": has_config,
-            "config_path": config_path,
-            "default_config_path": default_config_path,
-            "has_api_key": has_api_key,
-            "credentials_path": credentials_path,
-            "default_credentials_path": default_credentials_path,
-            "ready": has_api_key,
-            "model": effective_model,
-            "selection": cur_sel_val,
-            "roles": cfg.roles_summary(),
-            "history_model": cfg.history_model(),
-            "available_models": cfg.available_models(),
-        })),
+        result: serde_json::to_value(status).ok(),
         error: None,
     }
 }
@@ -521,23 +529,27 @@ pub async fn handle_credentials_create_stub(req: Request, state: &Arc<AppState>)
     let default_credentials_path = target_path.to_string_lossy().to_string();
     let effective_model = cfg.resolve_model(&cur_sel);
 
+    let has_git = tauqe_core::git::is_git_repository(None);
+
+    let status = SystemStatusResult {
+        has_git,
+        has_config,
+        config_path,
+        default_config_path,
+        has_api_key,
+        credentials_path,
+        default_credentials_path,
+        ready: has_api_key,
+        model: effective_model,
+        selection: Some((*cur_sel).clone()),
+        roles: Some(cfg.roles_summary()),
+        history_model: Some(cfg.history_model()),
+        available_models: cfg.available_models(),
+    };
+
     Response {
         id: req.id,
-        result: Some(serde_json::json!({
-            "stub_created": true,
-            "has_config": has_config,
-            "config_path": config_path,
-            "default_config_path": default_config_path,
-            "has_api_key": has_api_key,
-            "credentials_path": credentials_path,
-            "default_credentials_path": default_credentials_path,
-            "ready": has_api_key,
-            "model": effective_model,
-            "selection": *cur_sel,
-            "roles": cfg.roles_summary(),
-            "history_model": cfg.history_model(),
-            "available_models": cfg.available_models(),
-        })),
+        result: serde_json::to_value(status).ok(),
         error: None,
     }
 }

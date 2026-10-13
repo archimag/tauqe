@@ -93,6 +93,7 @@ In the Develop view, TAUQE resolves the tension between text editing and inspect
 - **Commands require modifiers:** Destructive or state-changing actions use explicit modifiers (`Ctrl+Z` / `Alt+U` for Undo, `F6` / `Ctrl+S` for Squash, `Alt+C` for copying responses).
 - **Draft protection on exit:** Pressing `Ctrl+Q` prompts for confirmation whenever a prompt draft is non-empty, a model turn is active, or an unapplied squash diff exists, preventing accidental loss of uncommitted work.
 - **Onboarding isolation:** During initial configuration (`ViewMode::Onboarding`), view switching keys (`F1..F5`, `Ctrl+1..5`, `Alt+1..5`) and header mouse clicks are locked until setup is completed, preventing accidental bypass of credential verification.
+- **Deterministic onboarding sequence:** Initial setup advances through a fixed order — Git, Configuration, Credentials, Layout, Command Modifier, Ready — derived solely from completion flags. Optional phases the developer deliberately skips are recorded, so the flow never loops back and no step is silently dropped.
 - **Contextual help:** Press `Ctrl+H` / `Alt+H` from any view or `?` in navigation views to open the contextual help dialog.
 
 ---

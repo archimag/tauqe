@@ -25,11 +25,11 @@ advisor = "~google/gemini-flash-latest"      # interactive engineering dialogue,
 #
 coder = [
   "~deepseek/deepseek-flash-latest",
-  { model = "~deepseek/deepseek-flash-latest", effort = "medium" },
-  "~anthropic/claude-sonnet-latest",
+  { model = "~google/gemini-flash-latest", effort = "medium" },
+  "~anthropic/claude-sonnet-latest"
 ]
 architect = "~google/gemini-flash-latest"    # conceptual design, plan refinement, blocked-step replanning
-reviewer = "~anthropic/claude-sonnet-latest" # automated code review of active context files
+reviewer = "~google/gemini-flash-latest"     # automated code review of active context files
 
 # Automatically escalate the Coder along its ladder when verification healing stalls,
 # when a patch retry budget is exceeded, or when a plan step must be re-prompted after
@@ -47,7 +47,7 @@ auto_level_up = true
 # coder = "medium"      # balanced patch generation and verification healing
 architect = "high"      # deep conceptual design and plan refinement
 # advisor = "medium"    # interactive engineering dialogue
-# reviewer = "high"     # thorough automated code review
+reviewer = "high"       # thorough automated code review
 
 [develop]
 # Retry budget for failed edit staging and for the plan step reprompt loop
@@ -72,7 +72,7 @@ budget_tokens = 20000  # session history token budget before compaction is trigg
 [context]
 # discovery_mode = "monotonic"  # context discovery strategy: "monotonic" (pure append-only growth, default), "incremental" (additive with explicit drops), or "snapshot" (full active working set declared each round)
 max_discovery_rounds = 8  # maximum rounds for autonomous context discovery
-max_files = 30  # maximum total files in context before stopping execution (default: 25)
+max_files = 60  # maximum total files in context before stopping execution (default: 25)
 repomap_token_budget = 40000  # token budget for the repository map (default: 4000)
 pinned = [
     "Conventions.md",
