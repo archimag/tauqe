@@ -15,28 +15,32 @@ use crate::views::develop::{DevelopFocus, DevelopView, TurnStatus};
 const ESC_CLEAR_WINDOW: Duration = Duration::from_secs(2);
 
 pub const DEVELOP_COMMANDS: &[KeyCommand] = &[
+    // Core Actions
     KeyCommand { key: "Enter / C-Enter", description: "Send prompt" },
-    KeyCommand { key: "Shift+Enter / Alt+Enter / C-J", description: "Insert newline into prompt" },
-    KeyCommand { key: "Tab", description: "Insert two spaces into the prompt (Viewport: fold / unfold selected file diff)" },
-    KeyCommand { key: "C-P / C-N / Alt+P / Alt+N", description: "Navigate prompt history backward / forward (Viewport: select previous / next file)" },
-    KeyCommand { key: "↑ / ↓", description: "Move cursor between prompt lines; navigate history at the first / last line (Viewport: select previous / next file or scroll)" },
+    KeyCommand { key: "C-Z / Alt+U", description: "Undo last AI commit" },
+    KeyCommand { key: "F6 / C-S", description: "Squash commits dialog" },
+    // Navigation & Inspection
     KeyCommand { key: "C-Space / Shift+Tab", description: "Switch focus between prompt and Viewport (typing returns focus to prompt)" },
     KeyCommand { key: "C-T / Enter (Viewport)", description: "Fold / unfold selected file diff" },
     KeyCommand { key: "C-[ / C-] / Alt+[/]", description: "Select previous / next modified file" },
+    KeyCommand { key: "C-P / C-N / Alt+P / Alt+N", description: "Navigate prompt history backward / forward (Viewport: select previous / next file)" },
+    KeyCommand { key: "↑ / ↓", description: "Move cursor between prompt lines; navigate history at the first / last line (Viewport: select previous / next file or scroll)" },
+    KeyCommand { key: "PgUp / PgDn", description: "Page scroll response view" },
+    KeyCommand { key: "Alt+↑ / Alt+↓", description: "Scroll model response up / down" },
+    // Editing & Clipboard
+    KeyCommand { key: "Shift+Enter / Alt+Enter / C-J", description: "Insert newline into prompt" },
+    KeyCommand { key: "Tab", description: "Insert two spaces into the prompt (Viewport: fold / unfold selected file diff)" },
     KeyCommand { key: "C-Left / C-Right / Alt+B / Alt+F", description: "Move cursor word backward / forward" },
+    KeyCommand { key: "C-B / C-F / Left / Right", description: "Move cursor character backward / forward" },
     KeyCommand { key: "C-A / C-E / Home / End", description: "Move cursor to beginning / end of line (Viewport: scroll to top / bottom)" },
     KeyCommand { key: "C-K / C-U", description: "Kill line to end / beginning into kill ring" },
     KeyCommand { key: "C-W / Alt+Backspace", description: "Kill word backward into kill ring" },
     KeyCommand { key: "Alt+D", description: "Kill word forward into kill ring" },
     KeyCommand { key: "C-D / Delete", description: "Delete character forward" },
-    KeyCommand { key: "C-B / C-F / Left / Right", description: "Move cursor character backward / forward" },
     KeyCommand { key: "C-Y", description: "Yank (paste) text from the kill ring (falls back to the system clipboard when empty)" },
-    KeyCommand { key: "Esc", description: "Interrupt generation; press twice to clear the prompt (saved to kill ring); leave Viewport" },
-    KeyCommand { key: "C-Z / Alt+U", description: "Undo last AI commit" },
-    KeyCommand { key: "F6 / C-S", description: "Squash commits dialog" },
     KeyCommand { key: "Alt+C / Alt+Y", description: "Copy model response to clipboard" },
-    KeyCommand { key: "PgUp / PgDn", description: "Page scroll response view" },
-    KeyCommand { key: "Alt+↑ / Alt+↓", description: "Scroll model response up / down" },
+    // Auxiliary & Destructive
+    KeyCommand { key: "Esc", description: "Interrupt generation; press twice to clear the prompt (saved to kill ring); leave Viewport" },
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -844,6 +848,18 @@ mod tests {
         assert_ne!(
             resolve_develop_action(key(KeyCode::Char('n'), KeyModifiers::CONTROL), p),
             Some(DevelopAction::InsertNewline)
+        );
+    }
+
+    #[test]
+    fn test_command_bindings_are_unique() {
+        use std::collections::HashSet;
+        let keys: HashSet<&str> = DEVELOP_COMMANDS.iter().map(|c| c.key).collect();
+        assert!(!DEVELOP_COMMANDS.is_empty());
+        assert_eq!(
+            keys.len(),
+            DEVELOP_COMMANDS.len(),
+            "duplicate key bindings in DEVELOP_COMMANDS"
         );
     }
 }

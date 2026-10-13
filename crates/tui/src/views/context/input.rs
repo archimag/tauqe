@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use tokio::sync::Mutex;
 use tauqe_protocol::{
     methods, ContextAccess, ContextAddParams, ContextAddPatternParams, ContextLayer,
@@ -14,16 +14,20 @@ use crate::rpc::{send_request, RpcConnection};
 use super::ContextRow;
 
 pub const CONTEXT_COMMANDS: &[KeyCommand] = &[
+    // Core Actions
     KeyCommand { key: "e", description: "Add file to context as editable" },
     KeyCommand { key: "r / a", description: "Add file to context as read-only" },
     KeyCommand { key: "t", description: "Toggle access (Editable ↔ Read-Only)" },
     KeyCommand { key: "u", description: "Promote Auto file to persistent User file" },
-    KeyCommand { key: "c / C", description: "Clear all auto-requested files (Auto)" },
-    KeyCommand { key: "d / x / Del", description: "Remove file from context" },
-    KeyCommand { key: "Space / Tab", description: "Fold / unfold section" },
-    KeyCommand { key: "n / p (or j/k, ↑/↓)", description: "Move selection down / up" },
     KeyCommand { key: "Enter", description: "Promote Auto file or toggle section" },
+    // Navigation & Inspection
+    KeyCommand { key: "n / p (or j/k, ↑/↓)", description: "Move selection down / up" },
+    KeyCommand { key: "Space / Tab", description: "Fold / unfold section" },
     KeyCommand { key: "Esc / q", description: "Return to Develop view" },
+    // Auxiliary & Destructive
+    KeyCommand { key: "d / x / Del", description: "Remove file from context" },
+    KeyCommand { key: "c", description: "Clear all Auto-requested files (Auto)" },
+    KeyCommand { key: "C / Shift+C", description: "Clear all persistent User files (User)" },
 ];
 
 pub async fn handle_context_key(
@@ -207,17 +211,34 @@ pub async fn handle_context_key(
                 }
             }
             KeyCode::Char('c') | KeyCode::Char('C') => {
-                let auto_count = st
+                // Lowercase `c` clears the Auto layer; uppercase `C` (Shift+C)
+                // clears the persistent User layer, mirroring the Auto flow.
+                let clear_user = key.code == KeyCode::Char('C')
+                    || key.modifiers.contains(KeyModifiers::SHIFT);
+                let layer = if clear_user {
+                    ContextLayer::User
+                } else {
+                    ContextLayer::Auto
+                };
+                let count = st
                     .context
                     .items
                     .iter()
-                    .filter(|i| i.layer == ContextLayer::Auto)
+                    .filter(|i| i.layer == layer)
                     .count();
-                if auto_count == 0 {
-                    st.notify_info("No auto files to clear");
+                if count == 0 {
+                    if clear_user {
+                        st.notify_info("No user files to clear");
+                    } else {
+                        st.notify_info("No auto files to clear");
+                    }
                 } else {
-                    st.context_view.confirm_clear_auto = true;
                     st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
+                    if clear_user {
+                        st.context_view.confirm_clear_user = true;
+                    } else {
+                        st.context_view.confirm_clear_auto = true;
+                    }
                 }
             }
             KeyCode::Char('e') => {
@@ -319,7 +340,18 @@ pub async fn handle_context_key(
                     );
                 }
                 Some(ContextRow::Header(ContextLayer::User)) => {
-                    st.notify_info("To remove a User file, select the file and press 'd'");
+                    let user_count = st
+                        .context
+                        .items
+                        .iter()
+                        .filter(|i| i.layer == ContextLayer::User)
+                        .count();
+                    if user_count == 0 {
+                        st.notify_info("No user files to clear");
+                    } else {
+                        st.context_view.confirm_clear_user = true;
+                        st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
+                    }
                 }
                 _ => {}
             },
@@ -328,4 +360,65 @@ pub async fn handle_context_key(
     }
 
     Ok(InputResult::Continue)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::test_state;
+
+    fn item(path: &str, layer: ContextLayer) -> tauqe_protocol::ContextItem {
+        tauqe_protocol::ContextItem {
+            path: path.to_string(),
+            access: ContextAccess::ReadOnly,
+            size_bytes: 128,
+            estimated_tokens: 32,
+            layer,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_shift_c_opens_clear_user_confirmation() {
+        let mut st = test_state();
+        st.view_mode = ViewMode::Context;
+        st.context.items.push(item("src/lib.rs", ContextLayer::User));
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+
+        let key = KeyEvent::new(KeyCode::Char('C'), KeyModifiers::SHIFT);
+        handle_context_key(key, &state, &mut conn).await.unwrap();
+
+        let st = state.lock().await;
+        assert!(st.context_view.confirm_clear_user);
+        assert!(!st.context_view.confirm_clear_auto);
+    }
+
+    #[tokio::test]
+    async fn test_lowercase_c_clears_auto_not_user() {
+        let mut st = test_state();
+        st.view_mode = ViewMode::Context;
+        st.context.items.push(item("src/lib.rs", ContextLayer::User));
+        st.context.items.push(item("auto.rs", ContextLayer::Auto));
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+
+        let key = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE);
+        handle_context_key(key, &state, &mut conn).await.unwrap();
+
+        let st = state.lock().await;
+        assert!(st.context_view.confirm_clear_auto);
+        assert!(!st.context_view.confirm_clear_user);
+    }
+
+    #[test]
+    fn test_command_bindings_are_unique() {
+        use std::collections::HashSet;
+        let keys: HashSet<&str> = CONTEXT_COMMANDS.iter().map(|c| c.key).collect();
+        assert!(!CONTEXT_COMMANDS.is_empty());
+        assert_eq!(
+            keys.len(),
+            CONTEXT_COMMANDS.len(),
+            "duplicate key bindings in CONTEXT_COMMANDS"
+        );
+    }
 }

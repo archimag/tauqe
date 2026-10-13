@@ -37,15 +37,18 @@ pub async fn request_older_history(
 }
 
 pub const HISTORY_COMMANDS: &[KeyCommand] = &[
+    // Core Actions
     KeyCommand { key: "Enter / Tab / Space", description: "Fold / unfold active history item" },
+    // Navigation & Inspection
     KeyCommand { key: "n / p (or [ / ])", description: "Navigate between history items" },
     KeyCommand { key: "l", description: "Recenter active item (Emacs C-l style)" },
-    KeyCommand { key: "c", description: "Copy code block from active item" },
-    KeyCommand { key: "y", description: "Copy selected item text to clipboard" },
     KeyCommand { key: "↑/↓ or k/j", description: "Scroll history (fetches older turns)" },
     KeyCommand { key: "PgUp / PgDn", description: "Page scroll history view" },
     KeyCommand { key: "Home / End", description: "Jump to oldest / newest message" },
     KeyCommand { key: "Esc / q", description: "Return to Develop view" },
+    // Editing & Clipboard
+    KeyCommand { key: "c", description: "Copy code block from active item" },
+    KeyCommand { key: "y", description: "Copy selected item text to clipboard" },
 ];
 
 pub async fn handle_history_key(
@@ -266,4 +269,21 @@ pub async fn handle_history_key(
     }
 
     Ok(InputResult::Continue)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    #[test]
+    fn test_command_bindings_are_unique() {
+        let keys: HashSet<&str> = HISTORY_COMMANDS.iter().map(|c| c.key).collect();
+        assert!(!HISTORY_COMMANDS.is_empty());
+        assert_eq!(
+            keys.len(),
+            HISTORY_COMMANDS.len(),
+            "duplicate key bindings in HISTORY_COMMANDS"
+        );
+    }
 }

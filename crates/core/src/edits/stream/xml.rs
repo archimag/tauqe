@@ -393,6 +393,7 @@ impl EditStreamFilter for XmlStreamFilter {
             let prefix = crate::edits::protocol::xml::normalize_marked_xml(
                 &self.raw_buffer, marker, false,
             );
+            let prefix = activate_unmarked_scratchpad(&prefix, marker);
             let delta = prefix[self.normalized_bytes..].to_string();
             self.normalized_bytes = prefix.len();
             delta
@@ -410,6 +411,7 @@ impl EditStreamFilter for XmlStreamFilter {
             let normalized = crate::edits::protocol::xml::normalize_marked_xml(
                 &self.raw_buffer, marker, true,
             );
+            let normalized = activate_unmarked_scratchpad(&normalized, marker);
             let remaining = normalized[self.normalized_bytes..].to_string();
             events.extend(self.push_normalized_chunk(&remaining));
         }
@@ -434,6 +436,20 @@ impl EditStreamFilter for XmlStreamFilter {
         self.restore_events(&mut events);
         events
     }
+}
+
+/// Re-activates unmarked `<scratchpad>` tags that normalization protected as
+/// literal text. Working memory is never user-facing, so the stream filter must
+/// suppress it even when the model omits the turn-marker suffix. The protection
+/// prefix is produced by [`normalize_marked_xml`](crate::edits::protocol::xml::normalize_marked_xml).
+fn activate_unmarked_scratchpad(normalized: &str, marker: &str) -> String {
+    let protection = format!("\u{e000}{}\u{e001}", marker);
+    if !normalized.contains(&protection) {
+        return normalized.to_string();
+    }
+    normalized
+        .replace(&format!("{}/scratchpad", protection), "</scratchpad")
+        .replace(&format!("{}scratchpad", protection), "<scratchpad")
 }
 
 fn find_next_control_tag(buf: &str) -> Option<(usize, usize)> {
@@ -761,6 +777,29 @@ mod tests {
             .collect();
         assert_eq!(text, "Intro.\n\nOutro.");
         assert!(!text.contains("Working notes"));
+    }
+
+    #[test]
+    fn test_marked_stream_suppresses_unmarked_scratchpad() {
+        let marker = "M123456";
+        let input = "Intro.\n<scratchpad>\nUnmarked working note.\n</scratchpad>\nOutro.";
+        let mut filter = XmlStreamFilter::new(vec![], std::env::temp_dir())
+            .with_marker(Some(marker.to_string()));
+        let mut events = Vec::new();
+        for ch in input.chars() {
+            events.extend(filter.push_chunk(&ch.to_string()));
+        }
+        events.extend(Box::new(filter).finish());
+        let text: String = events
+            .iter()
+            .filter_map(|event| match event {
+                StreamEvent::TextDelta(delta) => Some(delta.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text, "Intro.\n\nOutro.");
+        assert!(!text.contains("Unmarked working note"));
+        assert!(!text.contains("scratchpad"));
     }
 
     #[test]

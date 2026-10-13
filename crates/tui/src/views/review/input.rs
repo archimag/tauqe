@@ -11,23 +11,27 @@ use crate::rpc::RpcConnection;
 use super::VisibleReviewRow;
 
 pub const REVIEW_COMMANDS: &[KeyCommand] = &[
+    // Core Actions
+    KeyCommand { key: "x", description: "Execute target finding or all Todo findings in session (with confirmation)" },
+    KeyCommand { key: "Enter", description: "Execute finding; fold/unfold on session headers" },
+    KeyCommand { key: "r", description: "Run code review on current context" },
+    KeyCommand { key: "d", description: "Discuss selected finding or entire session in Develop" },
+    KeyCommand { key: "t / s", description: "Change finding status (Discussion / Todo / InProgress...)" },
+    // Navigation & Inspection
     KeyCommand { key: "n / p (or ↑/↓)", description: "Navigate review sessions and findings" },
     KeyCommand { key: "C-n / C-p", description: "Inspect next / previous finding (accordion walk)" },
     KeyCommand { key: "Tab / Space", description: "Fold / unfold session or finding details" },
-    KeyCommand { key: "x", description: "Execute target finding or all Todo findings in session (with confirmation)" },
-    KeyCommand { key: "Enter", description: "Execute finding; fold/unfold on session headers" },
-    KeyCommand { key: "d", description: "Discuss selected finding or entire session in Develop" },
-    KeyCommand { key: "t / s", description: "Change finding status (Discussion / Todo / InProgress...)" },
-    KeyCommand { key: "f", description: "Toggle filter: show all / hide closed (FIXED/REJECTED)" },
     KeyCommand { key: "a", description: "Toggle fold / unfold all sessions and findings" },
-    KeyCommand { key: "r", description: "Run code review on current context" },
-    KeyCommand { key: "Shift+R", description: "Refresh review sessions from server" },
-    KeyCommand { key: "c / y", description: "Copy selected finding or session to clipboard" },
-    KeyCommand { key: "Delete", description: "Delete review session (with confirmation)" },
+    KeyCommand { key: "f", description: "Toggle filter: show all / hide closed (FIXED/REJECTED)" },
     KeyCommand { key: "Ctrl+R", description: "Fold / unfold thinking stream" },
     KeyCommand { key: "PgUp / PgDn", description: "Page scroll review view" },
     KeyCommand { key: "Home / End", description: "Select first / last row" },
     KeyCommand { key: "Esc / q", description: "Return to Develop view" },
+    // Editing & Clipboard
+    KeyCommand { key: "c / y", description: "Copy selected finding or session to clipboard" },
+    // Auxiliary & Destructive
+    KeyCommand { key: "Shift+R", description: "Refresh review sessions from server" },
+    KeyCommand { key: "Delete", description: "Delete review session (with confirmation)" },
 ];
 
 fn execute_review_scope_action(
@@ -102,38 +106,6 @@ fn execute_review_scope_action(
             }
         }
     } else {
-        let discussion_items: Vec<_> = session
-            .items
-            .iter()
-            .filter(|i| i.status == tauqe_protocol::ReviewStatus::Discussion)
-            .collect();
-
-        if !discussion_items.is_empty() {
-            let preview = if discussion_items.len() <= 2 {
-                discussion_items
-                    .iter()
-                    .map(|i| format!("#{}", i.id))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            } else {
-                format!(
-                    "{}, and {} more",
-                    discussion_items[..2]
-                        .iter()
-                        .map(|i| format!("#{}", i.id))
-                        .collect::<Vec<_>>()
-                        .join(", "),
-                    discussion_items.len() - 2
-                )
-            };
-            st.notify_warning(format!(
-                "Review session contains {} item(s) in DISCUSSION ({}). Review or approve (t) before executing batch.",
-                discussion_items.len(),
-                preview
-            ));
-            return;
-        }
-
         let todo_items: Vec<_> = session
             .items
             .iter()
@@ -484,4 +456,21 @@ pub async fn handle_review_key(
     }
 
     Ok(InputResult::Continue)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    #[test]
+    fn test_command_bindings_are_unique() {
+        let keys: HashSet<&str> = REVIEW_COMMANDS.iter().map(|c| c.key).collect();
+        assert!(!REVIEW_COMMANDS.is_empty());
+        assert_eq!(
+            keys.len(),
+            REVIEW_COMMANDS.len(),
+            "duplicate key bindings in REVIEW_COMMANDS"
+        );
+    }
 }

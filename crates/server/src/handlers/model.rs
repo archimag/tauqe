@@ -168,6 +168,8 @@ struct PreparedTurn {
     reasoning_effort: Option<ReasoningEffort>,
     op_id: String,
     cancel_rx: watch::Receiver<bool>,
+    /// Active turn marker binding structural protocol tags to this turn.
+    marker: Option<String>,
 }
 
 /// Builds a real network provider from configuration, mapping failures to a
@@ -194,6 +196,7 @@ async fn prepare_turn(
     plan_context: Option<tauqe_protocol::ModelTurnPlanContext>,
     reasoning_effort: Option<ReasoningEffort>,
     is_batch: bool,
+    marker: Option<String>,
 ) -> Result<PreparedTurn, ResponseError> {
     let (provider, model, app_config, selection) = {
         let cfg = state.config.lock().await;
@@ -246,6 +249,7 @@ async fn prepare_turn(
         reasoning_effort,
         op_id,
         cancel_rx,
+        marker,
     })
 }
 
@@ -263,14 +267,23 @@ async fn run_prepared_turn(
         reasoning_effort,
         op_id,
         cancel_rx,
+        marker,
     } = prepared;
 
     let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamEvent>(100);
 
     let protocol_str = app_config.develop.protocol.trim().to_lowercase();
-    let protocol: Box<dyn PromptProtocol> = match protocol_str.as_str() {
+    let base_protocol: Box<dyn PromptProtocol> = match protocol_str.as_str() {
         "structured" | "json" => Box::new(JsonPromptProtocol),
         _ => Box::new(XmlPromptProtocol),
+    };
+    // Bind the active turn marker so structural protocol tags carry a per-turn
+    // suffix and literal source tags are never mistaken for protocol commands.
+    let protocol: Box<dyn PromptProtocol> = match marker {
+        Some(marker) => base_protocol
+            .with_turn_marker(&marker)
+            .unwrap_or(base_protocol),
+        None => base_protocol,
     };
 
     let mut workflow_opts = tauqe_core::workflow::WorkflowOptions::from_app_config(&app_config);
@@ -802,7 +815,9 @@ pub async fn start_model_turn(
     custom_selection: Option<tauqe_protocol::ModelSelection>,
     plan_context: Option<tauqe_protocol::ModelTurnPlanContext>,
 ) -> Result<String, ResponseError> {
-    let prepared = prepare_turn(state, custom_selection, plan_context, None, false).await?;
+    let marker = state.next_turn_marker().await;
+    let prepared =
+        prepare_turn(state, custom_selection, plan_context, None, false, marker).await?;
     let op_id = prepared.op_id.clone();
     let state_clone = Arc::clone(state);
     let workflow_name = prepared.app_config.develop.workflow.trim().to_lowercase();
@@ -824,7 +839,9 @@ pub async fn start_model_turn(
 /// An explicit `reasoning_effort` overrides the effort derived from the
 /// selection, letting callers target a specific coder-ladder rung without
 /// changing the semantic role. Turns started here always execute inside a batch
-/// supervisor, so they are marked with `is_batch`.
+/// supervisor, so they are marked with `is_batch`. An explicit `marker` binds
+/// the turn's structural protocol tags to a per-turn suffix so literal source
+/// tags are never mistaken for protocol commands.
 #[allow(dead_code)]
 pub async fn execute_model_turn(
     state: &Arc<AppState>,
@@ -832,12 +849,20 @@ pub async fn execute_model_turn(
     custom_selection: Option<tauqe_protocol::ModelSelection>,
     plan_context: Option<tauqe_protocol::ModelTurnPlanContext>,
     reasoning_effort: Option<ReasoningEffort>,
+    marker: Option<String>,
     policy: Box<dyn tauqe_core::workflow::policy::ApplyPolicy>,
 ) -> Result<ModelTurnResult, ResponseError> {
     // Programmatic step turns always run inside a batch supervisor, so they are
     // marked as batch members to let clients suppress per-step signals.
-    let prepared =
-        prepare_turn(state, custom_selection, plan_context, reasoning_effort, true).await?;
+    let prepared = prepare_turn(
+        state,
+        custom_selection,
+        plan_context,
+        reasoning_effort,
+        true,
+        marker,
+    )
+    .await?;
     run_prepared_turn(state, prompt, prepared, policy).await
 }
 
@@ -1126,7 +1151,9 @@ mod tests {
         assert_eq!(res_start.unwrap_err().code, "NO_API_KEY");
 
         let policy = Box::new(tauqe_core::workflow::policy::DirectApplyPolicy::new());
-        let res_exec = execute_model_turn(&state, "test prompt".to_string(), None, None, None, policy).await;
+        let res_exec =
+            execute_model_turn(&state, "test prompt".to_string(), None, None, None, None, policy)
+                .await;
         assert!(res_exec.is_err());
         assert_eq!(res_exec.unwrap_err().code, "NO_API_KEY");
     }

@@ -83,13 +83,20 @@ fn tab_label(
     mode: ViewMode,
     active_mode: ViewMode,
     ctx_count: usize,
+    review_count: usize,
     plans_count: usize,
 ) -> String {
     match tier {
         HeaderTier::Full => match mode {
             ViewMode::Develop => " 1: Develop ".to_string(),
             ViewMode::Context => format!(" 2: Context ({}) ", ctx_count),
-            ViewMode::Review => " 3: Review ".to_string(),
+            ViewMode::Review => {
+                if review_count > 0 {
+                    format!(" 3: Review ({}) ", review_count)
+                } else {
+                    " 3: Review ".to_string()
+                }
+            }
             ViewMode::Plans => {
                 if plans_count > 0 {
                     format!(" 4: Plans ({}) ", plans_count)
@@ -103,7 +110,13 @@ fn tab_label(
         HeaderTier::Medium => match mode {
             ViewMode::Develop => " 1: Dev ".to_string(),
             ViewMode::Context => format!(" 2: Ctx ({}) ", ctx_count),
-            ViewMode::Review => " 3: Rev ".to_string(),
+            ViewMode::Review => {
+                if review_count > 0 {
+                    format!(" 3: Rev ({}) ", review_count)
+                } else {
+                    " 3: Rev ".to_string()
+                }
+            }
             ViewMode::Plans => {
                 if plans_count > 0 {
                     format!(" 4: Plan ({}) ", plans_count)
@@ -133,7 +146,11 @@ fn tab_label(
                 }
                 ViewMode::Review => {
                     if is_active {
-                        " 3: Rev ".to_string()
+                        if review_count > 0 {
+                            format!(" 3: Rev ({}) ", review_count)
+                        } else {
+                            " 3: Rev ".to_string()
+                        }
                     } else {
                         " 3 ".to_string()
                     }
@@ -221,6 +238,11 @@ pub fn render_header(frame: &mut ratatui::Frame, state: &mut AppState, area: Rec
     let avail_for_left = inner_header_width.saturating_sub(right_width + 1);
 
     let ctx_count = state.context.items.len();
+    let review_count = if state.review.sessions.is_empty() && state.review.session.is_some() {
+        1
+    } else {
+        state.review.sessions.len()
+    };
     let plans_count = state.plans_view.plans.len();
 
     let tabs = [
@@ -234,11 +256,30 @@ pub fn render_header(frame: &mut ratatui::Frame, state: &mut AppState, area: Rec
     let calc_tabs_width = |tier: HeaderTier| -> usize {
         let mut w: usize = tabs
             .iter()
-            .map(|(mode, _)| tab_label(tier, *mode, state.view_mode, ctx_count, plans_count).len())
+            .map(|(mode, _)| {
+                tab_label(
+                    tier,
+                    *mode,
+                    state.view_mode,
+                    ctx_count,
+                    review_count,
+                    plans_count,
+                )
+                .len()
+            })
             .sum();
         w += tabs.len().saturating_sub(1);
         if state.view_mode == ViewMode::Onboarding {
-            w += 1 + tab_label(tier, ViewMode::Onboarding, state.view_mode, ctx_count, plans_count).len();
+            w += 1
+                + tab_label(
+                    tier,
+                    ViewMode::Onboarding,
+                    state.view_mode,
+                    ctx_count,
+                    review_count,
+                    plans_count,
+                )
+                .len();
         }
         w
     };
@@ -288,7 +329,14 @@ pub fn render_header(frame: &mut ratatui::Frame, state: &mut AppState, area: Rec
         if i > 0 {
             left_items.push((Span::raw(" "), None));
         }
-        let label = tab_label(tier, *mode, state.view_mode, ctx_count, plans_count);
+        let label = tab_label(
+            tier,
+            *mode,
+            state.view_mode,
+            ctx_count,
+            review_count,
+            plans_count,
+        );
         let style = if state.view_mode == *mode {
             active_style
         } else {
@@ -299,7 +347,14 @@ pub fn render_header(frame: &mut ratatui::Frame, state: &mut AppState, area: Rec
 
     if state.view_mode == ViewMode::Onboarding {
         left_items.push((Span::raw(" "), None));
-        let ob_label = tab_label(tier, ViewMode::Onboarding, state.view_mode, ctx_count, plans_count);
+        let ob_label = tab_label(
+            tier,
+            ViewMode::Onboarding,
+            state.view_mode,
+            ctx_count,
+            review_count,
+            plans_count,
+        );
         left_items.push((
             Span::styled(
                 ob_label,
@@ -418,6 +473,30 @@ mod tests {
             shift_tip_shown: false,
             model_choice: crate::app::ModelChoice::default(),
         }
+    }
+
+    #[test]
+    fn test_tab_label_review_count() {
+        assert_eq!(
+            tab_label(HeaderTier::Full, ViewMode::Review, ViewMode::Develop, 0, 0, 0),
+            " 3: Review "
+        );
+        assert_eq!(
+            tab_label(HeaderTier::Full, ViewMode::Review, ViewMode::Develop, 0, 2, 0),
+            " 3: Review (2) "
+        );
+        assert_eq!(
+            tab_label(HeaderTier::Medium, ViewMode::Review, ViewMode::Develop, 0, 3, 0),
+            " 3: Rev (3) "
+        );
+        assert_eq!(
+            tab_label(HeaderTier::Compact, ViewMode::Review, ViewMode::Review, 0, 1, 0),
+            " 3: Rev (1) "
+        );
+        assert_eq!(
+            tab_label(HeaderTier::Compact, ViewMode::Review, ViewMode::Develop, 0, 1, 0),
+            " 3 "
+        );
     }
 
     #[test]

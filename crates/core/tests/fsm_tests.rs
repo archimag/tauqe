@@ -507,7 +507,7 @@ async fn scratchpad_from_discovery_reaches_verification_healing() {
     let healing_request = &provider.requests()[2];
     assert!(healing_request.messages[0]
         .content
-        .contains("<turn_scratchpad>"));
+        .contains("<scratchpad>"));
     assert!(healing_request.messages[0]
         .content
         .contains("Hypothesis: repair both return types"));
@@ -770,7 +770,7 @@ async fn scratchpad_persists_between_proposal_rounds() {
     assert!(matches!(&output.result, ModelResult::Edit { edits, .. } if !edits.is_empty()));
     assert_eq!(provider.requests().len(), 2);
     let follow_up = &provider.requests()[1];
-    assert!(follow_up.messages[0].content.contains("<turn_scratchpad>"));
+    assert!(follow_up.messages[0].content.contains("<scratchpad>"));
     assert!(follow_up.messages[0]
         .content
         .contains("Finding: helper.rs holds ANSWER"));

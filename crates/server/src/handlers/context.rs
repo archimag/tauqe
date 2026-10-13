@@ -230,13 +230,14 @@ pub async fn handle_context_clear(req: Request, state: &Arc<AppState>) -> Respon
 
     let ctx_state = {
         let mut ctx = state.context.write().await;
-        if let Some(ContextClearParams {
-            layer: Some(ContextLayer::Auto),
-        }) = params
-        {
-            ctx.clear_auto();
-        } else {
-            ctx.clear();
+        match params {
+            Some(ContextClearParams {
+                layer: Some(ContextLayer::Auto),
+            }) => ctx.clear_auto(),
+            Some(ContextClearParams {
+                layer: Some(ContextLayer::User),
+            }) => ctx.clear_user(),
+            _ => ctx.clear(),
         }
         ctx.get_state()
     };

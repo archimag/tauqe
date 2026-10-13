@@ -1616,7 +1616,7 @@ mod tests {
         ));
         assert_eq!(provider.requests().len(), 2);
         let follow_up = &provider.requests()[1];
-        assert!(follow_up.messages[0].content.contains("<turn_scratchpad>"));
+        assert!(follow_up.messages[0].content.contains("<scratchpad>"));
         assert!(follow_up.messages[0]
             .content
             .contains("Hypothesis: helper.rs holds ANSWER"));
@@ -1673,7 +1673,7 @@ mod tests {
         let retry_request = &provider.requests()[2];
         assert!(retry_request.messages[0]
             .content
-            .contains("<turn_scratchpad>"));
+            .contains("<scratchpad>"));
         assert!(retry_request.messages[0]
             .content
             .contains("Hypothesis: helper.rs holds ANSWER"));

@@ -190,6 +190,7 @@ pub fn handle_paste(st: &mut AppState, text: &str) {
         // No modal: route to the active view's text target.
         None => match st.view_mode {
             ViewMode::Develop => {
+                st.model.focus = develop::DevelopFocus::Editor;
                 st.input_editor.insert_paste(text);
             }
             ViewMode::Context => {
@@ -524,6 +525,18 @@ mod tests {
     fn test_handle_paste_routes_to_develop_editor() {
         let mut st = test_state();
         handle_paste(&mut st, "hello world");
+        assert_eq!(st.input_editor.get_text(), "hello world");
+    }
+
+    #[test]
+    fn test_handle_paste_into_develop_returns_focus_to_editor() {
+        let mut st = test_state();
+        st.model.focus = crate::views::develop::DevelopFocus::Viewport;
+        handle_paste(&mut st, "hello world");
+        assert!(matches!(
+            &st.model.focus,
+            crate::views::develop::DevelopFocus::Editor
+        ));
         assert_eq!(st.input_editor.get_text(), "hello world");
     }
 

@@ -44,6 +44,7 @@ pub enum ActiveModal {
     ConfirmCancel,
     ConfirmQuit,
     ClearAuto,
+    ClearUser,
     ConfirmUndo,
     DeletePlan,
     DeleteReview,
@@ -872,6 +873,9 @@ impl AppState {
         if self.context_view.confirm_clear_auto {
             return Some(ActiveModal::ClearAuto);
         }
+        if self.context_view.confirm_clear_user {
+            return Some(ActiveModal::ClearUser);
+        }
         if self.confirm_undo {
             return Some(ActiveModal::ConfirmUndo);
         }
@@ -1279,5 +1283,18 @@ mod tests {
         st.context_view.adding_file = true;
         assert_eq!(st.active_modal(), None);
         assert!(st.has_active_modal());
+    }
+
+    #[test]
+    fn test_clear_user_modal_priority() {
+        let mut st = test_state();
+
+        // The User-context clear confirmation owns its own surface.
+        st.context_view.confirm_clear_user = true;
+        assert_eq!(st.active_modal(), Some(ActiveModal::ClearUser));
+
+        // Help stays a lower-priority surface than the confirmation.
+        st.show_help = true;
+        assert_eq!(st.active_modal(), Some(ActiveModal::ClearUser));
     }
 }

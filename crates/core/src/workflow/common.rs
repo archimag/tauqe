@@ -350,7 +350,7 @@ mod tests {
         assembly.turn_scratchpad = pad1;
         let messages = assembly.assemble_chat_messages("Continue", &proto);
         let prompt_text = &messages[0].content;
-        assert!(prompt_text.contains("<turn_scratchpad>"));
+        assert!(prompt_text.contains("<scratchpad>"));
         assert!(prompt_text.contains("- Hypothesis: missing timeout field"));
 
         // Round 2 response: Model updates scratchpad with verified conclusion

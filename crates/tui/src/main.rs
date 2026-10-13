@@ -119,7 +119,8 @@ async fn main() -> anyhow::Result<()> {
     )
     .await?;
 
-    // Restore the latest saved review (if any)
+    // Restore saved reviews and the active session
+    rpc::send_request(&mut conn, methods::REVIEW_LIST, serde_json::json!({})).await?;
     rpc::send_request(&mut conn, methods::REVIEW_GET, serde_json::json!({})).await?;
 
     // Initial model selection and tier assignments

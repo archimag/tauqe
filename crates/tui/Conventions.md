@@ -42,6 +42,15 @@ Whenever modifying or extending code within `crates/tui/`, this conventions docu
    - Bottom status areas are reserved strictly for operational telemetry, entity metadata, and progress indicators.
    - Keybinding hints are permissible only inside temporary, contextual modal dialogs (confirmations, selection popups) where immediate contextual guidance is required.
 
+3. **Four-Level Cognitive Ordering of Help Commands:**
+   - Command lists in the Help modal (both global and per-mode) must be ranked strictly by cognitive importance, from the primary work cycle down to rare or destructive actions:
+     1. **Core Actions** — the primary work cycle the user repeats constantly (sending and cancelling turns, squashing, executing).
+     2. **Navigation & Inspection** — switching views, scrolling, folding, and inspecting state.
+     3. **Editing & Clipboard** — text editing, prompt history, copy, and paste.
+     4. **Auxiliary & Destructive** — model selection, context or history resets, configuration reload, and quitting.
+   - Arbitrary or chronological insertion is forbidden: each command belongs to the level matching its daily cognitive weight, not the order in which it was implemented.
+   - Levels without applicable commands are omitted; the remaining levels keep their relative order.
+
 ---
 
 ## 5. Hierarchical Tree Navigation and Org-Mode Paradigm

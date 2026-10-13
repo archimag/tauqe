@@ -19,10 +19,11 @@ pub(crate) mod squash;
 pub(crate) mod status;
 
 pub(crate) use confirm::{
-    clear_auto_params, clear_history_params, confirm_cancel_params, confirm_quit_params,
-    confirm_undo_params, delete_plan_params, delete_review_params, execute_review_params,
-    execute_scope_params, render_confirm_cancel_popup, render_confirm_clear_auto_popup,
-    render_confirm_clear_history_popup, render_confirm_delete_plan_popup,
+    clear_auto_params, clear_history_params, clear_user_params, confirm_cancel_params,
+    confirm_quit_params, confirm_undo_params, delete_plan_params, delete_review_params,
+    execute_review_params, execute_scope_params, render_confirm_cancel_popup,
+    render_confirm_clear_auto_popup, render_confirm_clear_history_popup,
+    render_confirm_clear_user_popup, render_confirm_delete_plan_popup,
     render_confirm_delete_review_popup, render_confirm_execute_review_popup,
     render_confirm_execute_scope_popup, render_confirm_quit_popup, render_confirm_undo_popup,
 };

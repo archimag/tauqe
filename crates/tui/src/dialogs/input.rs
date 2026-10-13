@@ -283,6 +283,26 @@ pub(crate) async fn handle_dialog_event(
             }
             return Ok(Some(InputResult::Continue));
         }
+        Some(ActiveModal::ClearUser) => {
+            match resolve_confirm(&mut st, key) {
+                ConfirmOutcome::Toggled => {}
+                ConfirmOutcome::Dismissed => st.context_view.confirm_clear_user = false,
+                ConfirmOutcome::Accepted => {
+                    st.context_view.confirm_clear_user = false;
+                    drop(st);
+                    let params = tauqe_protocol::ContextClearParams {
+                        layer: Some(tauqe_protocol::ContextLayer::User),
+                    };
+                    send_request(
+                        server_writer,
+                        methods::CONTEXT_CLEAR,
+                        serde_json::to_value(params)?,
+                    )
+                    .await?;
+                }
+            }
+            return Ok(Some(InputResult::Continue));
+        }
         Some(ActiveModal::ConfirmUndo) => {
             match resolve_confirm(&mut st, key) {
                 ConfirmOutcome::Toggled => {}

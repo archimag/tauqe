@@ -619,8 +619,18 @@ async fn run_review_step(
     }
     set_item_status(state, repo_root, review_id, item_id, ReviewItemStatus::InProgress);
 
+    // Generate the active turn marker before assembling prompts so the target
+    // finding prompt and the model turn share the same marker-bound protocol.
+    let marker = state.next_turn_marker().await;
+    let marker_suffix = marker
+        .as_ref()
+        .map(|m| format!("_{}", m))
+        .unwrap_or_default();
+
     let mut prompt = match tauqe_core::review::prompt::format_review_step_execution_prompt(
-        &session, item_id, "",
+        &session,
+        item_id,
+        &marker_suffix,
     ) {
         Ok(p) => p,
         Err(err) => {
@@ -663,6 +673,7 @@ async fn run_review_step(
             Some(selection.clone()),
             None,
             reasoning_effort,
+            marker.clone(),
             policy,
         )
         .await;
@@ -907,22 +918,6 @@ pub async fn handle_review_execute(req: Request, state: &Arc<AppState>) -> Respo
             }
         }
         None => {
-            let discussion: Vec<String> = session
-                .items
-                .iter()
-                .filter(|i| i.status == ReviewItemStatus::Discussion)
-                .map(|i| format!("#{}", i.id))
-                .collect();
-            if !discussion.is_empty() {
-                return Response::err(
-                    req.id,
-                    "ITEM_IN_DISCUSSION",
-                    format!(
-                        "Review session contains item(s) in DISCUSSION status: {}. Review them (change status to TODO) before executing the batch",
-                        discussion.join(", ")
-                    ),
-                );
-            }
             let ids: Vec<u32> = session
                 .items
                 .iter()
@@ -1160,13 +1155,31 @@ mod tests {
             (Some(2), "ITEM_REJECTED"),
             (Some(3), "NOTHING_TO_EXECUTE"),
             (Some(9), "NOT_FOUND"),
-            (None, "ITEM_IN_DISCUSSION"),
+            (None, "NOTHING_TO_EXECUTE"),
         ];
         for (idx, (item_id, code)) in cases.iter().enumerate() {
             let params = serde_json::json!({ "review_id": "rev-val-1", "item_id": item_id });
             let res = handle_review_execute(make_req(10 + idx as u64, Some(params)), &state).await;
             assert_eq!(res.error.unwrap().code, *code);
         }
+
+        // A session with mixed Discussion and Todo items executes only Todo items without blocking.
+        let mixed_session = test_session(
+            "rev-mixed",
+            vec![
+                test_item(1, ReviewItemStatus::Discussion, "foo.rs"),
+                test_item(2, ReviewItemStatus::Todo, "foo.rs"),
+            ],
+        );
+        ReviewStorage::save_session(dir.path(), &mixed_session).unwrap();
+        let res = handle_review_execute(
+            make_req(20, Some(serde_json::json!({ "review_id": "rev-mixed" }))),
+            &state,
+        )
+        .await;
+        assert!(res.error.is_none());
+        let val: serde_json::Value = res.result.unwrap();
+        assert_eq!(val["item_ids"], serde_json::json!([2]));
     }
 
     #[tokio::test]
@@ -1545,5 +1558,52 @@ mod tests {
             requests.iter().all(|r| r.model == "explicit/model"),
             "an explicit model must never be replaced by a ladder tier"
         );
+    }
+
+    #[tokio::test]
+    async fn test_review_step_execution_uses_turn_marker() {
+        let dir = TestDir::new();
+        init_repo_with_file(&dir, "src/target.rs");
+
+        let session = test_session(
+            "rev-marker",
+            vec![test_item(1, ReviewItemStatus::Todo, "src/target.rs")],
+        );
+        ReviewStorage::save_session(dir.path(), &session).unwrap();
+
+        let marker = "REVMARKER1";
+        let response = format!(
+            "<tauqe_edits_{m} summary=\"Fix finding\">\n<edit_{m} path=\"src/target.rs\">\n<search_{m}>\npub fn target() {{}}\n</search_{m}>\n<replace_{m}>\npub fn target() {{ }}\n</replace_{m}>\n</edit_{m}>\n</tauqe_edits_{m}>",
+            m = marker
+        );
+        let provider = Arc::new(MockLlmProvider::scripted([MockResponse::text(response)]));
+
+        let mut config = test_config();
+        config.develop.workflow = "naive".to_string();
+
+        let state = test_state_with_provider(&dir, config, provider.clone()).await;
+        *state.marker_override.lock().await = Some(marker.to_string());
+
+        let outcome = run_review_batch(&state, "rev-marker", vec![1]).await;
+        assert!(
+            matches!(outcome, BatchOutcome::Completed { items: 1 }),
+            "expected a completed batch, got {:?}",
+            outcome
+        );
+
+        // Both the system prompt and the finding prompt must carry the marker suffix.
+        let request = &provider.requests()[0];
+        assert!(request.messages[0]
+            .content
+            .contains(&format!("scratchpad_{}", marker)));
+        assert!(request.messages[0]
+            .content
+            .contains(&format!("success_{}", marker)));
+
+        // The marker-bound edit fixed the finding.
+        let reloaded = ReviewStorage::load_review(dir.path(), "rev-marker")
+            .unwrap()
+            .unwrap();
+        assert_eq!(reloaded.find_item(1).unwrap().status, ReviewItemStatus::Fixed);
     }
 }

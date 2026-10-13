@@ -29,6 +29,10 @@ pub struct AppState {
     /// provider instead of building a real network provider from config.
     #[cfg(test)]
     pub provider_override: Mutex<Option<Arc<dyn tauqe_core::providers::LlmProvider>>>,
+    /// Test-only seam pinning the active turn marker so deterministic tests can
+    /// exercise marker-bound protocol output without generating a fresh marker.
+    #[cfg(test)]
+    pub marker_override: Mutex<Option<String>>,
 }
 
 impl AppState {
@@ -64,11 +68,34 @@ impl AppState {
             out,
             #[cfg(test)]
             provider_override: Mutex::new(None),
+            #[cfg(test)]
+            marker_override: Mutex::new(None),
         })
     }
 
     pub async fn current_selection(&self) -> ModelSelection {
         self.current_selection.lock().await.clone()
+    }
+
+    /// Returns the turn marker for the current turn, or `None` when markers are
+    /// disabled.
+    ///
+    /// The marker binds structural protocol tags to a single turn so literal
+    /// source tags are never mistaken for protocol commands. Production turns
+    /// always generate a fresh marker; deterministic tests may pin it through
+    /// the `marker_override` seam or disable it by injecting a scripted
+    /// provider.
+    pub async fn next_turn_marker(&self) -> Option<String> {
+        #[cfg(test)]
+        {
+            if let Some(marker) = self.marker_override.lock().await.clone() {
+                return Some(marker);
+            }
+            if self.provider_override.lock().await.is_some() {
+                return None;
+            }
+        }
+        Some(tauqe_core::edits::protocol::xml::generate_turn_marker())
     }
 }
 

@@ -17,6 +17,8 @@ TAUQE holds the model in a firm grip:
 >
 > **TAUQE is not an agent. It is an environment where the model is autonomous within a strictly bounded turn, yet completely stripped of agentic drift.**
 
+Unlike open-ended coding agents (such as Claude Code or OpenCode) that delegate the development lifecycle, toolchain dispatch, and operational decision-making to an unconstrained LLM loop, TAUQE hardcodes development workflows, state transitions, invariant checks, and Git transactions in deterministic Rust. Language models act as specialized cognitive components within a deterministic harness rather than autonomous process controllers.
+
 ### 1.1. The Fundamental Duality: "What" versus "How"
 
 Software engineering has always hinged upon two foundational questions: **What** to build and **How** to build it.
@@ -37,6 +39,22 @@ TAUQE splits the *What*/*How* duality across dedicated, non-overlapping model ro
 
 The Architect/Coder boundary is deliberately rigid. The Architect defines the invariant; the Coder implements it. When code generation fails repeatedly, the harness **never switches the Coder into the Architect role**. Instead, escalation is intra-role: the *coder ladder* (`CoderTier`, each tier pairing a model with a reasoning effort) promotes execution to a stronger coder tier within the same *How* competence. Crossing back into the *What* role on a compile failure would blur the boundary the harness exists to enforce and would reintroduce the drift the paradigm is designed to prevent.
 
+### 1.3. Decision Immutability and Guided Autonomy
+
+A prevalent failure mode of autonomous agent loops is silent requirement drift: when an agent encounters friction during code generation, it frequently "changes its mind", weakens acceptance criteria, or alters unrelated subsystems to make tests pass.
+
+TAUQE enforces strict **decision immutability**:
+- Conceptual invariants (`concept`) and finished steps (`Done`) are immutable during plan execution.
+- The Coder role cannot unilaterally relax requirements or re-architect boundaries.
+- When an invariant cannot be satisfied or an unexpected dependency fails, the model emits a structured `<blocked>` protocol outcome, initiating a controlled replanning cycle rather than speculative drift.
+
+### 1.4. Economic Efficiency via Role-Based Escalation
+
+Separating high-level intent from low-level implementation delivers structural cost and token efficiencies:
+- **Frontier reasoning models** are engaged where leverage is highest: initial problem formulation, invariant synthesis, and architectural refinement (Architect / Advisor).
+- **Cost-effective models** execute localized leaf implementation steps (Coder) within bounded turns guided by Repo Map blinkers.
+- Compute escalates dynamically: the harness advances through the `CoderTier` ladder (deepening reasoning effort or promoting to stronger coder models) only when compiler verification catches errors.
+
 ---
 
 ## 2. Three Paradigms of AI-Assisted Development
@@ -47,9 +65,9 @@ Modern software engineering is caught between two ineffective extremes:
 The developer manually manages files: `/add`, `/drop`, `/read-only`. The human acts as a "context logistician", counting tokens and guessing which types the model will need.
 - **The flaw:** Cognitive load on the developer increases rather than decreases.
 
-### 2.2. Uncontrolled Agentic Loops (Devin / Bash Agents)
-The model is granted a shell terminal, file system access, and an open-ended goal. The agent runs in an infinite loop: running grep across the disk, installing packages, breaking system libraries, and spinning in circles.
-- **The flaw:** Loss of determinism, shell hallucinations, zero safety guarantees, and broken trust.
+### 2.2. Uncontrolled Agentic Loops (Claude Code / OpenCode / Shell Agents)
+The model is granted an interactive shell or open tool dispatch and an open-ended goal. The agent runs in an autonomous loop: executing shell commands, guessing file paths across the disk, and attempting to steer the engineering process itself.
+- **The flaw:** Loss of determinism, generative drift, shell hallucinations, zero safety guarantees, and broken trust when the model alters process invariants mid-flight.
 
 ### 2.3. The Semantic Harness (The TAUQE Paradigm)
 The developer states the engineering task in natural language without spending time manually assembling files. The system executes an **autonomous bounded turn**:
@@ -130,6 +148,8 @@ Because these tags are parsed deterministically, the harness can enforce boundar
    Modifications are made via localized search/replace blocks and atomic file operations. Gratuitous reformatting and unrelated refactoring are strictly avoided.
 5. **Dual-Use Documentation as Concept Ontology**  
    Documentation serves a dual purpose: authoritative technical reference for developers and high-density semantic concept ontology for the AI model. When asked about system architecture, shortcuts, or workflows, the model requests authoritative documentation via `<doc_request>` rather than hallucinating.
+6. **Deterministic Process Over Agentic Delegation**  
+   Workflow lifecycles, state transitions, invariant checks, and Git transactions are hardcoded in environment software (Rust), never delegated to probabilistic LLM decision-making. The model is an intellectual transformation engine within a disciplined harness, not a process dispatcher.
 
 ---
 

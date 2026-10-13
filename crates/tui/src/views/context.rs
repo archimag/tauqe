@@ -28,6 +28,7 @@ pub struct ContextViewState {
     pub total_matching: usize,
     pub selected_candidate_index: usize,
     pub confirm_clear_auto: bool,
+    pub confirm_clear_user: bool,
 }
 
 impl Default for ContextViewState {
@@ -45,6 +46,7 @@ impl Default for ContextViewState {
             total_matching: 0,
             selected_candidate_index: 0,
             confirm_clear_auto: false,
+            confirm_clear_user: false,
         }
     }
 }

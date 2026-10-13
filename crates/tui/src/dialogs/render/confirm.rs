@@ -487,6 +487,54 @@ pub fn render_confirm_clear_auto_popup(frame: &mut ratatui::Frame, state: &AppSt
     render_modal_confirm(frame, clear_auto_params(state));
 }
 
+/// Presentation parameters for the "clear User context" confirmation. Mirrors the
+/// Auto-layer reset: a guarded confirmation whose safe default is `Cancel`, while
+/// the protected Pinned and regenerable Auto layers stay untouched.
+pub fn clear_user_params(state: &AppState) -> ConfirmModalParams<'_> {
+    let user_count = state
+        .context
+        .items
+        .iter()
+        .filter(|i| i.layer == tauqe_protocol::ContextLayer::User)
+        .count();
+
+    let body_lines = vec![
+        Line::raw(""),
+        Line::from(Span::styled(
+            "Clear all User-context files?",
+            Style::default().bold().fg(Color::Yellow),
+        )),
+        Line::raw(""),
+        Line::from(vec![
+            Span::raw("Are you sure you want to remove all "),
+            Span::styled(
+                format!("{} file(s)", user_count),
+                Style::default().bold().fg(Color::Magenta),
+            ),
+            Span::raw(" from the User layer?"),
+        ]),
+        Line::from(Span::styled(
+            "Protected Pinned files and Auto-requested files will not be affected.",
+            Style::default().fg(Color::DarkGray),
+        )),
+    ];
+
+    ConfirmModalParams {
+        title: "Confirm Clear User Context",
+        border_color: Color::Yellow,
+        body_lines,
+        confirm_label: "Confirm Clear (Y)",
+        cancel_label: "Cancel (Esc)",
+        confirm_button: state.confirm_button,
+        destructive: false,
+        width: 58,
+    }
+}
+
+pub fn render_confirm_clear_user_popup(frame: &mut ratatui::Frame, state: &AppState) {
+    render_modal_confirm(frame, clear_user_params(state));
+}
+
 /// Presentation parameters for the "clear history" confirmation.
 pub fn clear_history_params(state: &AppState) -> ConfirmModalParams<'_> {
     let body_lines = vec![

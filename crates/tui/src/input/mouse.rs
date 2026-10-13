@@ -407,6 +407,35 @@ pub async fn handle_mouse_event(
                         }
                     }
                 }
+                Some(ActiveModal::ClearUser) => {
+                    if st.context_view.confirm_clear_user {
+                        let geom = geometry_of(
+                            term_rect,
+                            &crate::dialogs::render::clear_user_params(&st),
+                        );
+                        match check_confirm_hit(&geom, mouse.column, mouse.row) {
+                            ModalHit::Confirm => {
+                                st.context_view.confirm_clear_user = false;
+                                st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
+                                drop(st);
+                                let params = tauqe_protocol::ContextClearParams {
+                                    layer: Some(tauqe_protocol::ContextLayer::User),
+                                };
+                                send_request(
+                                    server_writer,
+                                    methods::CONTEXT_CLEAR,
+                                    serde_json::to_value(params)?,
+                                )
+                                .await?;
+                            }
+                            ModalHit::Cancel | ModalHit::Outside => {
+                                st.context_view.confirm_clear_user = false;
+                                st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
+                            }
+                            ModalHit::InsideBody => {}
+                        }
+                    }
+                }
                 Some(ActiveModal::ConfirmUndo) => {
                     if st.confirm_undo {
                         let geom = geometry_of(
@@ -834,6 +863,15 @@ pub async fn handle_mouse_event(
             }
             Ok(InputResult::Continue)
         }
+        MouseEventKind::Down(MouseButton::Middle) => {
+            // Middle-click pastes the terminal Primary Selection. Routing the
+            // text through `handle_paste` keeps the modal stack authoritative:
+            // only the visible, top-most surface ever receives the paste.
+            if let Some(text) = crate::clipboard::get_primary_or_clipboard() {
+                crate::input::handle_paste(&mut st, &text);
+            }
+            Ok(InputResult::Continue)
+        }
         _ => Ok(InputResult::Continue),
     }
 }
@@ -867,5 +905,23 @@ mod tests {
         // Click inside modal body (above button row)
         let hit = check_confirm_hit(&geom, geom.area.x + 5, geom.area.y + 2);
         assert_eq!(hit, ModalHit::InsideBody);
+    }
+
+    #[tokio::test]
+    async fn test_middle_click_routes_primary_selection_paste() {
+        let state = Arc::new(Mutex::new(crate::app::test_state()));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+
+        let mouse = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Middle),
+            column: 5,
+            row: 5,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        };
+
+        // The handler must never panic regardless of the clipboard contents;
+        // in a headless environment the paste source degrades to `None`.
+        let res = handle_mouse_event(mouse, &state, &mut conn).await.unwrap();
+        assert_eq!(res, InputResult::Continue);
     }
 }

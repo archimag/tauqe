@@ -414,7 +414,19 @@ async fn run_plan_step(
     preload_step_files(state, repo_root, &item).await;
     set_step_status(state, repo_root, plan_id, step_id, PlanItemStatus::InProgress);
 
-    let mut prompt = match tauqe_core::plan::prompt::format_plan_step_execution_prompt(&plan, step_id, "") {
+    // Generate the active turn marker before assembling prompts so the target
+    // step prompt and the model turn share the same marker-bound protocol.
+    let marker = state.next_turn_marker().await;
+    let marker_suffix = marker
+        .as_ref()
+        .map(|m| format!("_{}", m))
+        .unwrap_or_default();
+
+    let mut prompt = match tauqe_core::plan::prompt::format_plan_step_execution_prompt(
+        &plan,
+        step_id,
+        &marker_suffix,
+    ) {
         Ok(p) => p,
         Err(err) => {
             set_step_status(state, repo_root, plan_id, step_id, PlanItemStatus::Todo);
@@ -455,6 +467,7 @@ async fn run_plan_step(
             Some(selection.clone()),
             Some(plan_context),
             reasoning_effort,
+            marker.clone(),
             policy,
         )
         .await;
@@ -848,6 +861,19 @@ pub async fn handle_plan_refine(req: Request, state: &Arc<AppState>) -> Response
             None => cfg.resolve_role(ModelRole::Architect),
         };
         let reasoning_effort = cfg.models.resolve_effort(ModelRole::Architect);
+        #[cfg(test)]
+        let provider: Arc<dyn LlmProvider> = match state.provider_override.lock().await.clone() {
+            Some(p) => p,
+            None => match create_provider(model.provider, &cfg) {
+                Ok(p) => Arc::from(p),
+                Err(err) => {
+                    *state.active_cancel.lock().await = None;
+                    return Response::err(req.id, "NO_API_KEY", err.to_string());
+                }
+            },
+        };
+
+        #[cfg(not(test))]
         let provider: Arc<dyn LlmProvider> = match create_provider(model.provider, &cfg) {
             Ok(p) => Arc::from(p),
             Err(err) => {
@@ -864,6 +890,8 @@ pub async fn handle_plan_refine(req: Request, state: &Arc<AppState>) -> Response
             cfg.context.max_files,
         )
     };
+
+    clear_auto_context(state).await;
 
     let op_id = format!("op-{}", crate::state::next_operation_id());
 
@@ -1070,6 +1098,7 @@ pub async fn handle_plan_refine(req: Request, state: &Arc<AppState>) -> Response
         let cancelled = *cancel_rx.borrow();
         if cancelled {
             *state.active_cancel.lock().await = None;
+            clear_auto_context(state).await;
             state.out.send_event(&Event {
                 method: events::MODEL_CANCELLED.to_string(),
                 params: Some(serde_json::json!({ "operation_id": op_id })),
@@ -1078,6 +1107,7 @@ pub async fn handle_plan_refine(req: Request, state: &Arc<AppState>) -> Response
         }
         if let Some(err) = failure {
             *state.active_cancel.lock().await = None;
+            clear_auto_context(state).await;
             state.out.send_event(&Event {
                 method: events::MODEL_ERROR.to_string(),
                 params: Some(serde_json::json!({
@@ -1111,6 +1141,7 @@ pub async fn handle_plan_refine(req: Request, state: &Arc<AppState>) -> Response
             Ok(out) => out,
             Err(err) => {
                 *state.active_cancel.lock().await = None;
+                clear_auto_context(state).await;
                 let err_msg = format!("Failed to parse architect refinement output: {err}");
                 state.out.send_event(&Event {
                     method: events::MODEL_ERROR.to_string(),
@@ -1182,6 +1213,7 @@ pub async fn handle_plan_refine(req: Request, state: &Arc<AppState>) -> Response
                     })),
                 });
                 *state.active_cancel.lock().await = None;
+                clear_auto_context(state).await;
                 let _ = state.history.lock().await.record_response(
                     warn_msg.clone(),
                     None,
@@ -1278,6 +1310,8 @@ pub async fn handle_plan_refine(req: Request, state: &Arc<AppState>) -> Response
             "full_text": accumulated_full_text,
         })),
     });
+
+    clear_auto_context(state).await;
 
     if output.status.eq_ignore_ascii_case("blocked") {
         let reason = output.reason.unwrap_or(output.explanation);
@@ -1801,6 +1835,7 @@ pub async fn handle_plan_replan(req: Request, state: &Arc<AppState>) -> Response
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tauqe_core::providers::mock::{MockLlmProvider, MockResponse};
 
     struct TestDir(std::path::PathBuf);
     impl TestDir {
@@ -1843,6 +1878,18 @@ mod tests {
             hist_tx,
             out,
         )
+    }
+
+    async fn test_state_with_provider(
+        dir: &TestDir,
+        config: tauqe_core::config::AppConfig,
+        provider: Arc<dyn tauqe_core::providers::LlmProvider>,
+    ) -> Arc<AppState> {
+        let (out, _rx) = OutChannel::new();
+        let (hist_tx, _hist_rx) = tokio::sync::mpsc::unbounded_channel();
+        let state = AppState::new(config, dir.path().to_path_buf(), hist_tx, out);
+        *state.provider_override.lock().await = Some(provider);
+        state
     }
 
     #[tokio::test]
@@ -2118,6 +2165,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_handle_plan_refine_clears_auto_context() {
+        let dir = TestDir::new();
+        let plan = Plan {
+            id: "refine-auto".to_string(),
+            title: "Refine Auto".to_string(),
+            created_at: 1,
+            updated_at: 1,
+            items: vec![test_item("1", PlanItemStatus::Todo)],
+            ..Default::default()
+        };
+        PlanStorage::save_plan(dir.path(), &plan).unwrap();
+        std::fs::write(dir.path().join("file.rs"), "pub fn foo() {}\n").unwrap();
+
+        let refine_output = serde_json::json!({
+            "status": "success",
+            "explanation": "Refined successfully",
+            "items": [
+                {
+                    "id": "1",
+                    "title": "Refined step 1",
+                    "status": "todo",
+                    "files": ["file.rs"],
+                    "readonly_files": [],
+                    "concept_refs": [],
+                    "depends_on": [],
+                    "children": []
+                }
+            ]
+        });
+        let mock_provider = Arc::new(MockLlmProvider::scripted([
+            MockResponse::text(refine_output.to_string()),
+        ]));
+
+        let config = tauqe_core::config::AppConfig::default();
+        let state = test_state_with_provider(&dir, config, mock_provider).await;
+
+        state
+            .context
+            .write()
+            .await
+            .add_auto_file("file.rs", ContextAccess::ReadOnly)
+            .unwrap();
+        assert_eq!(state.context.read().await.auto_files().len(), 1);
+
+        let req = Request {
+            id: tauqe_protocol::RequestId::Number(1),
+            method: tauqe_protocol::methods::PLAN_REFINE.to_string(),
+            params: Some(serde_json::json!({ "plan_id": "refine-auto" })),
+        };
+        let res = handle_plan_refine(req, &state).await;
+        assert!(res.error.is_none(), "plan_refine failed: {:?}", res.error);
+
+        assert!(
+            state.context.read().await.auto_files().is_empty(),
+            "auto context should be cleared after plan refinement"
+        );
+    }
+
+    #[tokio::test]
     async fn test_plan_execute_blocked_by_failed_preflight() {
         let dir = TestDir::new();
         let plan = Plan {
@@ -2333,5 +2439,69 @@ mod tests {
         )
         .await;
         assert_eq!(res.error.unwrap().code, "NOT_A_LEAF");
+    }
+
+    #[tokio::test]
+    async fn test_plan_step_execution_uses_turn_marker() {
+        let dir = TestDir::new();
+        tauqe_core::git::init_repository(Some(dir.path()), true).unwrap();
+        std::fs::write(dir.path().join("src.rs"), "pub fn compute() -> i32 { 0 }\n").unwrap();
+        tauqe_core::git::cmd::stage_files(dir.path(), &["src.rs".to_string()]).unwrap();
+        tauqe_core::git::cmd::commit_with_developer_author(dir.path(), "Add src", false)
+            .unwrap();
+
+        let mut item = test_item("1", PlanItemStatus::Todo);
+        item.title = "Implement compute".to_string();
+        item.files = vec!["src.rs".to_string()];
+        let plan = Plan {
+            id: "marker-plan".to_string(),
+            title: "Marker Plan".to_string(),
+            created_at: 1,
+            updated_at: 1,
+            items: vec![item],
+            ..Default::default()
+        };
+        PlanStorage::save_plan(dir.path(), &plan).unwrap();
+
+        let marker = "TESTMARKER1";
+        let response = format!(
+            "<tauqe_edits_{m} summary=\"Implement compute\">\n<edit_{m} path=\"src.rs\">\n<search_{m}>\npub fn compute() -> i32 {{ 0 }}\n</search_{m}>\n<replace_{m}>\npub fn compute() -> i32 {{ 42 }}\n</replace_{m}>\n</edit_{m}>\n<success_{m} summary=\"done\" />\n</tauqe_edits_{m}>",
+            m = marker
+        );
+        let provider = Arc::new(MockLlmProvider::scripted([MockResponse::text(response)]));
+
+        let mut config = tauqe_core::config::AppConfig::default();
+        config.develop.workflow = "naive".to_string();
+        config.develop.protocol = "xml".to_string();
+        config.models.auto_level_up = false;
+
+        let state = test_state_with_provider(&dir, config, provider.clone()).await;
+        *state.marker_override.lock().await = Some(marker.to_string());
+
+        let outcome = run_plan_batch(&state, "marker-plan", vec!["1".to_string()]).await;
+        assert!(
+            matches!(outcome, BatchOutcome::Completed { steps: 1 }),
+            "expected a completed batch, got {:?}",
+            outcome
+        );
+
+        // Both the system prompt and the step prompt must carry the marker suffix.
+        let request = &provider.requests()[0];
+        assert!(request.messages[0]
+            .content
+            .contains(&format!("scratchpad_{}", marker)));
+        assert!(request.messages[0]
+            .content
+            .contains(&format!("success_{}", marker)));
+
+        // The marker-bound edits were applied and the step reached DONE.
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("src.rs")).unwrap(),
+            "pub fn compute() -> i32 { 42 }\n"
+        );
+        let reloaded = PlanStorage::load_plan(dir.path(), "marker-plan")
+            .unwrap()
+            .unwrap();
+        assert_eq!(reloaded.find_item("1").unwrap().status, PlanItemStatus::Done);
     }
 }

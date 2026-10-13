@@ -221,7 +221,7 @@ impl PromptAssembly {
             crate::docs::TOPICS.join("|")
         ));
         prompt.push_str(&format!(
-            "10a. Turn Scratchpad (Working Memory): To retain working hypotheses, verified findings, or focus across multi-round discovery and verification healing cycles, you may emit <scratchpad{0}>...</scratchpad{0}>. Keep scratchpad notes concise (bullet points of what is verified, current hypothesis, and purpose of requested files). Notes are preserved within the current turn in <turn_scratchpad> and isolated from persistent history.\n",
+            "10a. Turn Scratchpad (Working Memory): To retain working hypotheses, verified findings, or focus across multi-round discovery and verification healing cycles, you may emit <scratchpad{0}>...</scratchpad{0}>. Keep scratchpad notes concise (bullet points of what is verified, current hypothesis, and purpose of requested files). Notes are preserved within the current turn in <scratchpad> and isolated from persistent history.\n",
             marker_suffix
         ));
         if !self.is_isolated_step {
@@ -378,7 +378,7 @@ impl PromptAssembly {
                 } else {
                     trimmed.to_string()
                 };
-                Some(format!("<turn_scratchpad>\n{}\n</turn_scratchpad>", text))
+                Some(format!("<scratchpad>\n{}\n</scratchpad>", text))
             }
         })
     }
@@ -447,7 +447,7 @@ impl PromptAssembly {
     /// protocol and delegates to [`PromptAssembly::build_system_prompt`], keeping
     /// the existing [`EditProtocol`]-based call sites fully backward compatible.
     pub fn build_system_prompt_for(&self, protocol: &dyn PromptProtocol) -> String {
-        let edit_protocol = create_edit_protocol(protocol.name());
+        let edit_protocol = resolve_marked_edit_protocol(protocol);
         self.build_system_prompt(edit_protocol.as_ref())
     }
 
@@ -461,8 +461,22 @@ impl PromptAssembly {
         current_prompt: &str,
         protocol: &dyn PromptProtocol,
     ) -> Vec<ChatMessage> {
-        let edit_protocol = create_edit_protocol(protocol.name());
+        let edit_protocol = resolve_marked_edit_protocol(protocol);
         self.assemble_chat_messages(current_prompt, edit_protocol.as_ref())
+    }
+}
+
+/// Resolves a [`PromptProtocol`] to its underlying [`EditProtocol`], preserving
+/// the active turn marker.
+///
+/// Dropping the marker here would emit unmarked system instructions and streams
+/// for a marker-bound turn, so the marker-bound variant is reconstructed
+/// whenever the protocol advertises one.
+fn resolve_marked_edit_protocol(protocol: &dyn PromptProtocol) -> Box<dyn EditProtocol> {
+    let base = create_edit_protocol(protocol.name());
+    match protocol.turn_marker() {
+        Some(marker) => base.with_turn_marker(marker).unwrap_or(base),
+        None => base,
     }
 }
 
@@ -698,9 +712,9 @@ mod tests {
 
         assembly.turn_scratchpad = Some("- Hypothesis: Foo needs Bar\n- Status: Inspecting bar.rs".to_string());
         let block = assembly.format_scratchpad_block().unwrap();
-        assert!(block.contains("<turn_scratchpad>"));
+        assert!(block.contains("<scratchpad>"));
         assert!(block.contains("- Hypothesis: Foo needs Bar"));
-        assert!(block.contains("</turn_scratchpad>"));
+        assert!(block.contains("</scratchpad>"));
 
         let messages = assembly.assemble_chat_messages("Continue", &proto);
         assert!(messages[0].content.contains("## Turn Scratchpad (Working Memory)"));
@@ -749,5 +763,22 @@ mod tests {
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0].role, "system");
         assert_eq!(messages[1], ChatMessage::user("Explain this code"));
+    }
+
+    #[test]
+    fn test_prompt_assembly_bridge_preserves_turn_marker() {
+        use crate::prompt::xml::XmlPromptProtocol;
+
+        let assembly = PromptAssembly::new(None, 1, vec![], "git", "xml", None, None);
+        let marked = XmlPromptProtocol
+            .with_turn_marker("M12345")
+            .expect("marker-bound protocol");
+
+        let prompt = assembly.build_system_prompt_for(&*marked);
+        assert!(prompt.contains("<scratchpad_M12345>"));
+        assert!(prompt.contains("</scratchpad_M12345>"));
+
+        let messages = assembly.assemble_chat_messages_for("Go", &*marked);
+        assert!(messages[0].content.contains("<scratchpad_M12345>"));
     }
 }

@@ -248,6 +248,15 @@ impl ContextManager {
         }
     }
 
+    /// Drops all files strictly from the user context layer.
+    /// The `pinned` and `auto` layers are never affected.
+    pub fn clear_user(&mut self) {
+        if !self.user.is_empty() {
+            self.user.clear();
+            self.revision += 1;
+        }
+    }
+
     /// Drops a file strictly from the auto context layer.
     /// Files present in `user` or `pinned` layers are never removed and return `Ok(false)`.
     pub fn drop_auto_file(&mut self, relative_path: &str) -> Result<bool> {
@@ -789,5 +798,43 @@ mod tests {
         // pinned and user preserved
         assert!(primary.contains("pinned.rs").unwrap());
         assert!(primary.contains("user.rs").unwrap());
+    }
+
+    #[test]
+    fn test_clear_user_removes_only_user_layer_and_preserves_others() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        std::fs::write(root.join("pinned.rs"), "fn pinned() {}").unwrap();
+        std::fs::write(root.join("user.rs"), "fn user() {}").unwrap();
+        std::fs::write(root.join("auto.rs"), "fn auto() {}").unwrap();
+
+        let mut cm = ContextManager::new(root);
+        cm.load_pinned(&["pinned.rs".to_string()]);
+        cm.add_file("user.rs", ContextAccess::Editable).unwrap();
+        cm.add_auto_file("auto.rs", ContextAccess::ReadOnly).unwrap();
+
+        let rev_before = cm.get_state().revision;
+        cm.clear_user();
+
+        assert!(!cm.contains("user.rs").unwrap());
+        assert!(cm.contains("pinned.rs").unwrap());
+        assert!(cm.contains("auto.rs").unwrap());
+        assert!(cm.get_state().revision > rev_before);
+    }
+
+    #[test]
+    fn test_clear_user_on_empty_layer_is_noop() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        std::fs::write(root.join("auto.rs"), "fn auto() {}").unwrap();
+
+        let mut cm = ContextManager::new(root);
+        cm.add_auto_file("auto.rs", ContextAccess::ReadOnly).unwrap();
+        let rev_before = cm.get_state().revision;
+
+        cm.clear_user();
+
+        assert_eq!(cm.get_state().revision, rev_before);
+        assert!(cm.contains("auto.rs").unwrap());
     }
 }

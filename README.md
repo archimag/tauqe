@@ -8,6 +8,8 @@
 
 Instead of uncontrolled agentic loops with arbitrary shell access or tedious manual file juggling, TAUQE confines the model within an autonomous bounded turn—liberating you to focus entirely on **What** to build while the harness strictly controls **How**.
 
+Unlike open-ended coding agents (such as Claude Code or OpenCode) that delegate the entire engineering lifecycle, tool invocation, and process control to an unconstrained LLM loop, TAUQE hardcodes workflows, state machines, and Git transactions in deterministic Rust. Language models serve as specialized cognitive components inside a disciplined harness, not autonomous process dispatchers.
+
 ---
 
 ## Core Pillars
@@ -18,8 +20,11 @@ Instead of uncontrolled agentic loops with arbitrary shell access or tedious man
 - **Transactional Git Reality:**  
   Git is the single source of truth. Every bounded turn wraps into an atomic Git commit. Working trees are protected by pre-edit checkpoints and automatic crash recovery. Revert any turn instantly with a single keypress (`u`).
 
-- **Hierarchical Engineering Plans:**  
-  Turn complex objectives into structured architectures. Plans separate immutable system invariants (`concept`) from actionable steps (`items`). Every leaf step runs in an isolated turn with DAG prerequisite checks, pre-loaded context, and local replanning on blockers.
+- **Hierarchical Plans & Decision Immutability:**  
+  Turn complex objectives into structured architectures. Plans separate immutable system invariants (`concept`) from actionable steps (`items`). Completed steps and invariants remain frozen during execution—preventing the model from silently altering requirements when an implementation hits friction.
+
+- **Role Specialization & Economic Efficiency:**  
+  High-leverage planning and architectural design are assigned to frontier reasoning models (Architect), while concrete code edits run on faster, cost-effective models (Coder) with automated tier escalation on compiler failures.
 
 - **Integrated Code Review:**  
   Audit diffs and working trees directly inside the environment. Triage findings by severity (`TODO` / `FIXED` / `REJECTED`), debate trade-offs in structured discussions, and execute batch remediation with compiler verification.
@@ -64,6 +69,13 @@ On first launch, an interactive onboarding wizard automatically checks your Git 
 | `Ctrl+5` | **History** | Chronological session audit trail, token metrics, and commit inspect |
 
 > **Ask TAUQE directly:** Launch the interface and ask anything about the system, shortcuts, or concepts—TAUQE queries its own authoritative manuals on the fly.
+
+---
+
+## Current Limitations
+
+- **Provider Support:** Currently, only [OpenRouter](https://openrouter.ai/) is supported as the LLM provider.
+- **Terminal Compatibility:** The interactive client has been tested and verified specifically with [kitty](https://sw.kovidgoyal.net/kitty/).
 
 ---
 

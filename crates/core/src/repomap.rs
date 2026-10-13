@@ -320,16 +320,15 @@ fn format_symbol_into_lines(
             let header = extract_header_from_sig(sig);
             lines.push(format!("{}{}", indent, header));
 
-            if level == DetailLevel::Full || level == DetailLevel::PublicWithDetails {
-                for field in extract_body_lines(sig) {
-                    lines.push(format!("{}{}", child_indent, field));
-                }
-            }
-
             if level != DetailLevel::TopLevelOnly {
                 for m in &sym.children {
-                    let m_sig = m.signature.as_deref().unwrap_or(&m.name);
-                    lines.push(format!("{}{}", child_indent, m_sig));
+                    if level == DetailLevel::Full || m.is_public {
+                        lines.push(format!(
+                            "{}{}",
+                            child_indent,
+                            format_func_signature(m, false)
+                        ));
+                    }
                 }
             }
         }
@@ -339,19 +338,25 @@ fn format_symbol_into_lines(
             lines.push(format!("{}{}", indent, header));
 
             if level == DetailLevel::Full || level == DetailLevel::PublicWithDetails {
-                for variant in extract_body_lines(sig) {
+                for variant in extract_enum_variants(sig) {
                     lines.push(format!("{}{}", child_indent, variant));
                 }
             }
         }
         SymbolKind::Trait => {
             let header = sym.signature.as_deref().unwrap_or(&sym.name);
+            let header = extract_header_from_sig(header);
             lines.push(format!("{}{}", indent, header));
 
             if level != DetailLevel::TopLevelOnly {
                 for m in &sym.children {
-                    let m_sig = m.signature.as_deref().unwrap_or(&m.name);
-                    lines.push(format!("{}{}", child_indent, m_sig));
+                    if level == DetailLevel::Full || m.is_public {
+                        lines.push(format!(
+                            "{}{}",
+                            child_indent,
+                            format_func_signature(m, true)
+                        ));
+                    }
                 }
             }
         }
@@ -368,25 +373,29 @@ fn format_symbol_into_lines(
             }
 
             let header = sym.signature.as_deref().unwrap_or(&sym.name);
+            let header = extract_header_from_sig(header);
             lines.push(format!("{}{}", indent, header));
 
             if level != DetailLevel::TopLevelOnly {
                 for m in methods {
-                    let m_sig = m.signature.as_deref().unwrap_or(&m.name);
-                    lines.push(format!("{}{}", child_indent, m_sig));
+                    lines.push(format!(
+                        "{}{}",
+                        child_indent,
+                        format_func_signature(m, is_trait_impl)
+                    ));
                 }
             }
         }
-        SymbolKind::Function => {
-            let sig = sym.signature.as_deref().unwrap_or(&sym.name);
-            lines.push(format!("{}{}", indent, sig));
-        }
-        SymbolKind::Method => {
-            let sig = sym.signature.as_deref().unwrap_or(&sym.name);
-            lines.push(format!("{}{}", indent, sig));
+        SymbolKind::Function | SymbolKind::Method => {
+            lines.push(format!(
+                "{}{}",
+                indent,
+                format_func_signature(sym, false)
+            ));
         }
         SymbolKind::Mod => {
             let header = sym.signature.as_deref().unwrap_or(&sym.name);
+            let header = extract_header_from_sig(header);
             lines.push(format!("{}{}", indent, header));
 
             for child in &sym.children {
@@ -394,6 +403,42 @@ fn format_symbol_into_lines(
             }
         }
     }
+}
+
+fn format_func_signature(sym: &Symbol, is_trait_context: bool) -> String {
+    let name = if sym.name.is_empty() {
+        sym.signature.as_deref().unwrap_or("fn")
+    } else {
+        &sym.name
+    };
+
+    if is_trait_context {
+        format!("fn {}", name)
+    } else if sym.is_public {
+        format!("pub fn {}", name)
+    } else {
+        format!("fn {}", name)
+    }
+}
+
+fn extract_enum_variants(sig: &str) -> Vec<String> {
+    let mut res = Vec::new();
+    for line in extract_body_lines(sig) {
+        let name = line
+            .split(&['(', '{', '='][..])
+            .next()
+            .unwrap_or(line)
+            .trim();
+        let name = name.trim_end_matches(',').trim();
+        if !name.is_empty()
+            && !name.starts_with("//")
+            && !name.starts_with("/*")
+            && !name.starts_with('#')
+        {
+            res.push(name.to_string());
+        }
+    }
+    res
 }
 
 fn extract_header_from_sig(sig: &str) -> &str {
@@ -465,19 +510,20 @@ mod tests {
             line_count: 10,
         }];
 
-        // Generous budget: includes full details and private symbols
+        // Generous budget: includes full outlines and private symbols
         let full = format_symbols_with_budget(&syms, 500);
         assert!(full.contains("src/sample.rs (10 lines)"));
         assert!(full.contains("pub struct PublicStruct"));
-        assert!(full.contains("pub id: u64"));
-        assert!(full.contains("fn private_func()"));
-        assert!(full.contains("pub fn public_func() -> bool"));
+        assert!(!full.contains("pub id: u64"));
+        assert!(full.contains("fn private_func"));
+        assert!(full.contains("pub fn public_func"));
+        assert!(!full.contains("pub fn public_func() -> bool"));
 
-        // Tight budget: drops private symbols and struct fields
-        let restricted = format_symbols_with_budget(&syms, 25);
+        // Tight budget: drops private symbols
+        let restricted = format_symbols_with_budget(&syms, 20);
         assert!(restricted.contains("src/sample.rs"));
-        assert!(!restricted.contains("fn private_func()"));
-        assert!(!restricted.contains("pub id: u64"));
+        assert!(!restricted.contains("fn private_func"));
+        assert!(restricted.contains("pub fn public_func"));
     }
 
     #[test]
@@ -537,7 +583,8 @@ mod tests {
 
         let outline = format_symbols_with_budget(&syms, 100);
         assert!(outline.contains("impl Greeter for User"));
-        assert!(outline.contains("fn greet(&self) -> String"));
+        assert!(outline.contains("fn greet"));
+        assert!(!outline.contains("fn greet(&self) -> String"));
     }
 
     #[test]
@@ -561,9 +608,32 @@ mod tests {
 
         let outline = format_repo_map_with_budget(&syms, &all_files, 500);
         assert!(outline.contains("src/main.rs (1 line)"));
-        assert!(outline.contains("fn main()"));
+        assert!(outline.contains("pub fn main"));
         assert!(outline.contains("Cargo.toml"));
         assert!(outline.contains("README.md"));
+    }
+
+    #[test]
+    fn test_format_enum_variants_minimalistic() {
+        let syms = vec![RepoFileSymbols {
+            path: "src/status.rs".to_string(),
+            symbols: vec![Symbol {
+                name: "Status".to_string(),
+                kind: SymbolKind::Enum,
+                signature: Some("pub enum Status {\n    Ready,\n    Running(u32),\n    Done,\n}".to_string()),
+                is_public: true,
+                line: 1,
+                children: Vec::new(),
+            }],
+            line_count: 6,
+        }];
+
+        let outline = format_symbols_with_budget(&syms, 100);
+        assert!(outline.contains("pub enum Status"));
+        assert!(outline.contains("Ready"));
+        assert!(outline.contains("Running"));
+        assert!(outline.contains("Done"));
+        assert!(!outline.contains("Running(u32)"));
     }
 
     #[test]

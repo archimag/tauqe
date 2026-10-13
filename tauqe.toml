@@ -25,8 +25,7 @@ advisor = "~google/gemini-flash-latest"      # interactive engineering dialogue,
 #
 coder = [
   "~deepseek/deepseek-flash-latest",
-  { model = "~google/gemini-flash-latest", effort = "medium" },
-  "~anthropic/claude-sonnet-latest"
+  { model = "~google/gemini-flash-latest", effort = "medium" }
 ]
 architect = "~google/gemini-flash-latest"    # conceptual design, plan refinement, blocked-step replanning
 reviewer = "~google/gemini-flash-latest"     # automated code review of active context files

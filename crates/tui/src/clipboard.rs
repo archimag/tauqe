@@ -29,8 +29,17 @@ pub fn is_ssh_session() -> bool {
         || std::env::var_os("SSH_CLIENT").is_some()
 }
 
-/// Reads plain text from the native OS clipboard, re-initializing the handle if necessary.
+/// Reads plain text for a standard paste, re-initializing the shared handle if
+/// necessary. When the standard clipboard holds no text, the X11/Wayland
+/// Primary Selection is consulted as a fallback so that a recent mouse
+/// selection remains pasteable.
 pub fn get_from_clipboard() -> Option<String> {
+    read_standard_clipboard().or_else(get_from_primary_selection)
+}
+
+/// Reads plain text from the standard OS clipboard only, re-initializing the
+/// shared handle once if it has gone stale.
+fn read_standard_clipboard() -> Option<String> {
     if let Ok(mut guard) = CLIPBOARD.lock() {
         if guard.is_none() {
             *guard = arboard::Clipboard::new().ok();
@@ -55,6 +64,43 @@ pub fn get_from_clipboard() -> Option<String> {
         }
     }
     None
+}
+
+/// Reads text from the X11/Wayland Primary Selection buffer.
+///
+/// The Primary Selection is the ephemeral buffer that the most recent mouse
+/// selection populates and that terminals paste on a middle-click. It has no
+/// equivalent on macOS, Windows, or Android, where this always returns `None`.
+pub fn get_from_primary_selection() -> Option<String> {
+    #[cfg(all(unix, not(target_os = "macos"), not(target_os = "android"), not(target_os = "emscripten")))]
+    {
+        use arboard::GetExtLinux;
+
+        if let Ok(mut guard) = CLIPBOARD.lock() {
+            if guard.is_none() {
+                *guard = arboard::Clipboard::new().ok();
+            }
+
+            if let Some(clipboard) = guard.as_mut() {
+                let primary = clipboard
+                    .get()
+                    .clipboard(arboard::LinuxClipboardKind::Primary)
+                    .text()
+                    .ok()
+                    .filter(|text| !text.is_empty());
+                if let Some(text) = primary {
+                    return Some(text);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Reads the best available paste buffer for a middle-click, preferring the
+/// Primary Selection and falling back to the standard clipboard.
+pub fn get_primary_or_clipboard() -> Option<String> {
+    get_from_primary_selection().or_else(read_standard_clipboard)
 }
 
 pub fn copy_to_clipboard(text: &str) -> CopyResult {
@@ -160,6 +206,16 @@ fn base64_encode(data: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_selection_accessors_degrade_gracefully() {
+        // A headless environment has no display server, so the accessors must
+        // return `None` instead of panicking. Where a display exists they read
+        // whatever the developer currently has selected.
+        let _ = get_from_clipboard();
+        let _ = get_from_primary_selection();
+        let _ = get_primary_or_clipboard();
+    }
 
     #[test]
     fn test_base64_encode() {

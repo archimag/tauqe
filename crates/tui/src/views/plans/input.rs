@@ -12,21 +12,25 @@ use crate::rpc::{send_request, RpcConnection};
 use super::VisiblePlanRow;
 
 pub const PLANS_COMMANDS: &[KeyCommand] = &[
-    KeyCommand { key: "n / p (or ↑/↓)", description: "Navigate plans, concept, and steps" },
-    KeyCommand { key: "C-n / C-p", description: "Inspect next / previous item (accordion walk)" },
-    KeyCommand { key: "Tab / Space", description: "Fold / unfold plan, section, or subtasks" },
+    // Core Actions
     KeyCommand { key: "x", description: "Execute target step, group, or entire plan (with confirmation)" },
     KeyCommand { key: "Enter", description: "Execute leaf step; fold/unfold on groups and plan headers" },
     KeyCommand { key: "d", description: "Discuss selected concept/step or entire plan with AI in Develop" },
     KeyCommand { key: "R", description: "Deep refine plan architecture & steps with AI (Architect)" },
     KeyCommand { key: "t / s", description: "Change step status (Todo / InProgress / Done / Cancelled)" },
+    // Navigation & Inspection
+    KeyCommand { key: "n / p (or ↑/↓)", description: "Navigate plans, concept, and steps" },
+    KeyCommand { key: "C-n / C-p", description: "Inspect next / previous item (accordion walk)" },
+    KeyCommand { key: "Tab / Space", description: "Fold / unfold plan, section, or subtasks" },
     KeyCommand { key: "a", description: "Toggle fold / unfold all plans, sections, and items" },
-    KeyCommand { key: "Delete", description: "Delete plan (with confirmation)" },
-    KeyCommand { key: "c / y", description: "Copy plan as Markdown to clipboard" },
     KeyCommand { key: "PgUp / PgDn", description: "Page scroll plan view" },
     KeyCommand { key: "Home / End", description: "Select first / last row" },
-    KeyCommand { key: "r", description: "Refresh plans from server" },
     KeyCommand { key: "Esc / q", description: "Return to Develop view" },
+    // Editing & Clipboard
+    KeyCommand { key: "c / y", description: "Copy plan as Markdown to clipboard" },
+    // Auxiliary & Destructive
+    KeyCommand { key: "r", description: "Refresh plans from server" },
+    KeyCommand { key: "Delete", description: "Delete plan (with confirmation)" },
 ];
 
 fn execute_scope_action(st: &mut AppState, plan_id: &str, scope_id: Option<&str>, scope_title: &str) {
@@ -400,4 +404,21 @@ pub async fn handle_plans_key(
     }
 
     Ok(InputResult::Continue)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    #[test]
+    fn test_command_bindings_are_unique() {
+        let keys: HashSet<&str> = PLANS_COMMANDS.iter().map(|c| c.key).collect();
+        assert!(!PLANS_COMMANDS.is_empty());
+        assert_eq!(
+            keys.len(),
+            PLANS_COMMANDS.len(),
+            "duplicate key bindings in PLANS_COMMANDS"
+        );
+    }
 }
