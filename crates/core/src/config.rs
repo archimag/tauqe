@@ -20,7 +20,7 @@ pub use develop::{DevelopConfig, EditConfig};
 pub use git::GitConfig;
 pub use history::HistoryConfig;
 pub use models::{
-    deserialize_model_ref_opt, parse_model_ref, serialize_model_ref_opt, ModelsConfig,
+    deserialize_model_ref_opt, parse_model_ref, serialize_model_ref_opt, CoderConfig, ModelsConfig,
     BUILTIN_DEFAULT_ADVISOR_MODEL, BUILTIN_DEFAULT_ARCHITECT_MODEL, BUILTIN_DEFAULT_CODER_MODEL,
     BUILTIN_DEFAULT_MODEL, BUILTIN_DEFAULT_REVIEWER_MODEL, BUILTIN_DEFAULT_SCRIBE_MODEL,
 };
@@ -231,7 +231,7 @@ auto_level_up = true
         assert!(empty_cfg.validate().is_err());
 
         let one_role = ModelsConfig {
-            coder: Some(ModelRef::openrouter("qwen/coder")),
+            coder: Some(ModelRef::openrouter("qwen/coder").into()),
             ..Default::default()
         };
         assert!(one_role.validate().is_ok());
@@ -316,7 +316,7 @@ coder = "openrouter:anthropic/claude-3.7-sonnet"
         // Advisor -> Architect(none) -> Coder -> Scribe => Coder
         let cfg = ModelsConfig {
             scribe: Some(m_scribe.clone()),
-            coder: Some(m_coder.clone()),
+            coder: Some(m_coder.clone().into()),
             ..Default::default()
         };
         assert_eq!(cfg.resolve_role(ModelRole::Scribe), m_scribe);
@@ -354,7 +354,7 @@ coder = "openrouter:anthropic/claude-3.7-sonnet"
         // Scribe -> Coder -> Advisor(none) -> Architect => Coder
         // Advisor -> Architect -> Coder -> Scribe(none) => Architect
         let cfg = ModelsConfig {
-            coder: Some(m_coder.clone()),
+            coder: Some(m_coder.clone().into()),
             architect: Some(m_architect.clone()),
             ..Default::default()
         };
@@ -367,7 +367,7 @@ coder = "openrouter:anthropic/claude-3.7-sonnet"
         // Scribe -> Coder -> Advisor -> Architect(none) => Coder
         // Architect -> Advisor -> Coder -> Scribe(none) => Advisor
         let cfg = ModelsConfig {
-            coder: Some(m_coder.clone()),
+            coder: Some(m_coder.clone().into()),
             advisor: Some(m_advisor.clone()),
             ..Default::default()
         };
@@ -401,7 +401,7 @@ coder = "openrouter:anthropic/claude-3.7-sonnet"
         // Advisor -> Architect -> Coder -> Scribe => Architect
         let cfg = ModelsConfig {
             scribe: Some(m_scribe.clone()),
-            coder: Some(m_coder.clone()),
+            coder: Some(m_coder.clone().into()),
             architect: Some(m_architect.clone()),
             advisor: None,
             ..Default::default()
@@ -412,7 +412,7 @@ coder = "openrouter:anthropic/claude-3.7-sonnet"
         // Architect -> Advisor -> Coder -> Scribe => Advisor
         let cfg = ModelsConfig {
             scribe: Some(m_scribe.clone()),
-            coder: Some(m_coder.clone()),
+            coder: Some(m_coder.clone().into()),
             architect: None,
             advisor: Some(m_advisor.clone()),
             ..Default::default()
@@ -434,7 +434,7 @@ coder = "openrouter:anthropic/claude-3.7-sonnet"
         // Scribe -> Coder -> Advisor -> Architect => Coder
         let cfg = ModelsConfig {
             scribe: None,
-            coder: Some(m_coder.clone()),
+            coder: Some(m_coder.clone().into()),
             architect: Some(m_architect.clone()),
             advisor: Some(m_advisor.clone()),
             ..Default::default()

@@ -412,6 +412,9 @@ fn build_item_body(
         if item.kind == UiHistoryKind::Assistant {
             let mut history_theme = crate::markdown::MarkdownTheme::answer();
             history_theme.line_prefix = Some(Span::raw("  "));
+            if let Some(w) = max_width {
+                history_theme.max_width = Some(w.saturating_sub(2));
+            }
             let (md_lines, blocks) =
                 crate::markdown::render_markdown_with_blocks(&item.text, &history_theme, flash_id);
             md_start_idx = raw_lines.len();

@@ -551,7 +551,7 @@ mod tests {
     async fn test_config_state_roles_and_scribe_history() {
         let mut cfg = AppConfig::default();
         cfg.models.scribe = Some(ModelRef::openrouter("anthropic/claude-3.5-haiku"));
-        cfg.models.coder = Some(ModelRef::openrouter("anthropic/claude-3.7-sonnet"));
+        cfg.models.coder = Some(ModelRef::openrouter("anthropic/claude-3.7-sonnet").into());
         cfg.models.architect = Some(ModelRef::openrouter("anthropic/claude-3.7-sonnet"));
         cfg.models.advisor = Some(ModelRef::openrouter("google/gemini-2.5-flash"));
         cfg.models.reviewer = Some(ModelRef::openrouter("anthropic/claude-3.7-sonnet"));
@@ -589,7 +589,7 @@ mod tests {
     async fn test_handle_config_set_model_role_selection() {
         let mut cfg = AppConfig::default();
         cfg.models.scribe = Some(ModelRef::openrouter("model/scribe"));
-        cfg.models.coder = Some(ModelRef::openrouter("model/coder"));
+        cfg.models.coder = Some(ModelRef::openrouter("model/coder").into());
 
         let (out, _rx) = crate::transport::OutChannel::new();
         let (history_sender, _hrx) = tokio::sync::mpsc::unbounded_channel();

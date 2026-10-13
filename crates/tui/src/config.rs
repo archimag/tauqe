@@ -92,6 +92,18 @@ impl Default for NotificationConfig {
     }
 }
 
+impl NotificationConfig {
+    /// Whether a completed operation (a single turn or a whole batch) should
+    /// raise a notification, applying the configured minimum duration and
+    /// terminal focus policy.
+    pub fn should_notify(&self, elapsed_seconds: u64, focused: bool) -> bool {
+        if self.only_unfocused && focused {
+            return false;
+        }
+        elapsed_seconds >= self.min_duration_seconds
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ThemeMode {
@@ -221,4 +233,28 @@ pub fn find_tui_config_path() -> Option<PathBuf> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_should_notify_respects_duration_and_focus() {
+        let focused_aware = NotificationConfig {
+            min_duration_seconds: 5,
+            only_unfocused: true,
+            ..NotificationConfig::default()
+        };
+        assert!(!focused_aware.should_notify(4, false));
+        assert!(focused_aware.should_notify(5, false));
+        assert!(!focused_aware.should_notify(30, true));
+
+        let always = NotificationConfig {
+            only_unfocused: false,
+            ..NotificationConfig::default()
+        };
+        assert!(always.should_notify(30, true));
+        assert!(!always.should_notify(1, true));
+    }
 }

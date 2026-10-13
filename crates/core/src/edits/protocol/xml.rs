@@ -306,10 +306,11 @@ impl EditProtocol for MarkedXmlEditProtocol {
     }
 
     fn clean_assistant_text(&self, raw_text: &str) -> String {
-        // Strip terminal outcome tags (both marker-suffixed and unmarked, while
+        // Strip terminal outcome and scratchpad tags (both marker-suffixed and unmarked, while
         // respecting markdown code) so they never leak into conversational text.
         let without_terminal = strip_terminal_outcome_tags(raw_text);
-        let normalized = normalize_marked_xml(&without_terminal, &self.marker, true);
+        let without_scratchpad = strip_scratchpad_tags(&without_terminal);
+        let normalized = normalize_marked_xml(&without_scratchpad, &self.marker, true);
         restore_xml_literals(&extract_conversational_text(&normalized), &self.marker)
     }
 
@@ -1260,6 +1261,19 @@ Everything is tested and working properly."#;
         );
 
         let cleaned = proto.clean_assistant_text(&output);
+        assert_eq!(
+            cleaned,
+            "Conversational response before.\n\nConversational response after."
+        );
+    }
+
+    #[test]
+    fn test_marked_xml_clean_assistant_text_strips_unmarked_scratchpad() {
+        let marker = "M12345";
+        let proto = MarkedXmlEditProtocol::new(marker);
+
+        let output = "Conversational response before.\n<scratchpad>\nUnmarked scratchpad note.\n</scratchpad>\nConversational response after.";
+        let cleaned = proto.clean_assistant_text(output);
         assert_eq!(
             cleaned,
             "Conversational response before.\n\nConversational response after."

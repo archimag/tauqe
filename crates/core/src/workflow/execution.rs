@@ -13,7 +13,7 @@
 use async_trait::async_trait;
 use tokio::sync::mpsc;
 use tokio::sync::watch;
-use tauqe_protocol::{ModelRef, ModelResult, ModelRole, ReasoningEffort};
+use tauqe_protocol::{CoderTier, ModelRef, ModelResult, ModelRole, ReasoningEffort};
 
 use crate::context::ContextManager;
 use crate::history::HistoryManager;
@@ -91,11 +91,24 @@ impl WorkflowOptions {
     }
 }
 
-/// Returns the next semantic role in the `auto_level_up` escalation chain.
-fn next_role(role: ModelRole) -> Option<ModelRole> {
-    match role {
-        ModelRole::Coder => Some(ModelRole::Architect),
-        _ => None,
+/// Advances the coder escalation ladder by one rung.
+///
+/// Returns the next ladder index with its tier, or `None` when the ladder is
+/// already at its strongest rung so escalation terminates deterministically.
+/// A rung counts as an advance when either the model or the reasoning effort
+/// changes, which lets the ladder deepen reasoning on the same model before
+/// switching to a stronger model.
+fn next_coder_tier(
+    models_config: &crate::config::ModelsConfig,
+    current_idx: usize,
+) -> Option<(usize, CoderTier)> {
+    let current = models_config.coder_tier(current_idx);
+    let next_idx = current_idx + 1;
+    let next = models_config.coder_tier(next_idx);
+    if next.model == current.model && next.effort == current.effort {
+        None
+    } else {
+        Some((next_idx, next))
     }
 }
 
@@ -159,10 +172,11 @@ impl ExecutionMode for SingleExecution {
         cancel_rx: watch::Receiver<bool>,
     ) -> anyhow::Result<WorkflowExecutionResult> {
         let mut current_model = model.clone();
-        let mut current_role = match self.options.initial_selection {
+        let current_role = match self.options.initial_selection {
             Some(tauqe_protocol::ModelSelection::Role(role)) => Some(role),
             _ => None,
         };
+        let mut ladder_idx: usize = 0;
         let mut dynamic_provider: Option<Box<dyn LlmProvider>> = None;
         let mut turn_options = self.options.clone();
 
@@ -189,52 +203,51 @@ impl ExecutionMode for SingleExecution {
             let loop_task = AnswerEditLoop::new(prompt);
             let out = loop_task.execute(&mut env).await?;
 
-            let escalation = if turn_options.auto_level_up {
-                current_role.and_then(|cur| next_role(cur).map(|next| (cur, next)))
-            } else {
-                None
-            };
-
             let is_blocked = out.blocked.is_some();
             let is_error = matches!(&out.result, ModelResult::Edit { error: Some(_), applied: false, .. });
             let is_empty_edit = matches!(&out.result, ModelResult::Edit { edits, error: None, .. } if edits.is_empty());
 
-            if (is_error || is_empty_edit) && !out.is_cancelled && !is_blocked {
-                if let Some((cur_r, next_r)) = escalation {
-                    let next_m = turn_options.models_config.resolve_role(next_r);
-                    if next_m != current_model {
-                        let _ = policy.rollback(context_manager.repo_root());
-                        context_manager.prune_missing_files();
+            if (is_error || is_empty_edit)
+                && !out.is_cancelled
+                && !is_blocked
+                && turn_options.auto_level_up
+                && current_role == Some(ModelRole::Coder)
+            {
+                if let Some((next_idx, next_tier)) =
+                    next_coder_tier(&turn_options.models_config, ladder_idx)
+                {
+                    let next_m = next_tier.model.clone();
+                    let _ = policy.rollback(context_manager.repo_root());
+                    context_manager.prune_missing_files();
 
-                        let reason = if is_error {
-                            if let ModelResult::Edit { error: Some(ref err_msg), .. } = out.result {
-                                err_msg.clone()
-                            } else {
-                                "Unknown error".to_string()
-                            }
+                    let reason = if is_error {
+                        if let ModelResult::Edit { error: Some(ref err_msg), .. } = out.result {
+                            err_msg.clone()
                         } else {
-                            "No valid edits".to_string()
-                        };
+                            "Unknown error".to_string()
+                        }
+                    } else {
+                        "No valid edits".to_string()
+                    };
 
-                        let notice = format!(
-                            "\n\n> ⚠️ **Level Up Escalation:** Turn failed on `{}` ({}: {}). Escalating to `{}` ({})...\n\n",
-                            cur_r, current_model, reason, next_r, next_m
-                        );
-                        let _ = stream_tx.send(StreamEvent::TextDelta(notice)).await;
+                    let notice = format!(
+                        "\n\n> ⚠️ **Level Up Escalation:** Turn failed on coder tier {} (`{}`, {}). Escalating to tier {} (`{}`)...\n\n",
+                        ladder_idx, current_model, reason, next_idx, next_m
+                    );
+                    let _ = stream_tx.send(StreamEvent::TextDelta(notice)).await;
 
-                        current_role = Some(next_r);
-                        turn_options.reasoning_effort = turn_options.models_config.resolve_effort(next_r);
+                    ladder_idx = next_idx;
+                    turn_options.reasoning_effort = next_tier.effort;
 
-                        if next_m.provider != current_model.provider {
-                            if let Some(ref app_cfg) = turn_options.app_config {
-                                if let Ok(np) = crate::providers::create_provider(next_m.provider, app_cfg) {
-                                    dynamic_provider = Some(np);
-                                }
+                    if next_m.provider != current_model.provider {
+                        if let Some(ref app_cfg) = turn_options.app_config {
+                            if let Ok(np) = crate::providers::create_provider(next_m.provider, app_cfg) {
+                                dynamic_provider = Some(np);
                             }
                         }
-                        current_model = next_m;
-                        continue;
                     }
+                    current_model = next_m;
+                    continue;
                 }
             }
 
@@ -250,7 +263,7 @@ impl ExecutionMode for SingleExecution {
 #[cfg(test)]
 mod tests {
     use tokio::sync::{mpsc, watch};
-    use tauqe_protocol::{ContextAccess, ModelRef, ModelResult, ProviderKind};
+    use tauqe_protocol::{ContextAccess, ModelRef, ModelResult, ProviderKind, ReasoningEffort};
 
     use crate::context::ContextManager;
     use crate::history::HistoryManager;
@@ -259,7 +272,7 @@ mod tests {
     use crate::workflow::policy::DirectApplyPolicy;
     use crate::workflow::WorkflowOptions;
 
-    use super::{ExecutionMode, SingleExecution};
+    use super::{next_coder_tier, ExecutionMode, SingleExecution};
 
     const MARKER: &str = "EXEC";
 
@@ -302,6 +315,33 @@ mod tests {
     fn single_execution_reports_stable_name() {
         let exec = SingleExecution::new(WorkflowOptions::default());
         assert_eq!(exec.name(), "single");
+    }
+
+    #[test]
+    fn next_coder_tier_deepens_effort_then_model_and_saturates() {
+        let config: crate::config::ModelsConfig = toml::from_str(
+            r#"
+coder = [
+    "openrouter:base/model",
+    { model = "openrouter:base/model", effort = "high" },
+    { model = "openrouter:strong/model", effort = "xhigh" },
+]
+"#,
+        )
+        .expect("parse coder ladder");
+
+        let (first_idx, first) = next_coder_tier(&config, 0).expect("deepen reasoning first");
+        assert_eq!(first_idx, 1);
+        assert_eq!(first.model, ModelRef::openrouter("base/model"));
+        assert_eq!(first.effort, Some(ReasoningEffort::High));
+
+        let (second_idx, second) = next_coder_tier(&config, 1).expect("switch to stronger model");
+        assert_eq!(second_idx, 2);
+        assert_eq!(second.model, ModelRef::openrouter("strong/model"));
+        assert_eq!(second.effort, Some(ReasoningEffort::XHigh));
+
+        assert!(next_coder_tier(&config, 2).is_none(), "ladder saturates");
+        assert!(next_coder_tier(&config, 9).is_none(), "beyond the last rung saturates");
     }
 
     #[tokio::test]

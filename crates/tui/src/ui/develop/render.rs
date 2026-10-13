@@ -144,6 +144,15 @@ fn render_model_pane(frame: &mut ratatui::Frame, state: &mut AppState, area: Rec
         content_height,
     );
 
+    if state.model.content_width != content_width {
+        state.model.content_width = content_width;
+        state.model.reasoning.max_width = Some(content_width);
+        state.model.render_markdown_now();
+        if !state.model.reasoning.is_empty() {
+            state.model.reasoning.update_markdown();
+        }
+    }
+
     if let Some((_, inst)) = state.model.copy_flash {
         if inst.elapsed().as_secs_f32() >= 2.0 {
             state.model.copy_flash = None;

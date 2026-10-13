@@ -17,12 +17,25 @@ models = [
 # At least one role must be defined.
 scribe = "~anthropic/claude-haiku-latest"    # history compaction, git squash commit messages, diff summarization
 advisor = "~google/gemini-flash-latest"      # interactive engineering dialogue, develop consultation
-coder = "~deepseek/deepseek-flash-latest"    # code modification, patch generation, verification healing, plan step execution
-architect = "~google/gemini-flash-latest"      # conceptual design, plan refinement, escalation target
+# The coder value is polymorphic. A bare model string or a { model, effort } table
+# yields a one-rung ladder; an ordered array of such entries expresses an explicit
+# Coder Ladder, where each rung pairs a model with an optional reasoning depth.
+# Escalation can therefore first deepen reasoning on the same model and only then
+# switch to a stronger or more specialized one:
+#
+coder = [
+  "~deepseek/deepseek-flash-latest",
+  { model = "~deepseek/deepseek-flash-latest", effort = "medium" },
+  "~anthropic/claude-sonnet-latest",
+]
+architect = "~google/gemini-flash-latest"    # conceptual design, plan refinement, blocked-step replanning
 reviewer = "~anthropic/claude-sonnet-latest" # automated code review of active context files
 
-# Automatically escalate from Coder to Architect when verification healing stalls,
-# when retry limits are exceeded, or when a plan step must be re-prompted after protocol drift
+# Automatically escalate the Coder along its ladder when verification healing stalls,
+# when a patch retry budget is exceeded, or when a plan step must be re-prompted after
+# protocol drift. Escalation advances one rung at a time within the Coder role and never
+# switches to Architect, preserving the strict What vs How role isolation. A terminal
+# <blocked> report short-circuits escalation entirely.
 auto_level_up = true
 
 # Optional per-role reasoning depth: "low", "medium", "high", or "xhigh".

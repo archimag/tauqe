@@ -40,6 +40,35 @@ impl std::fmt::Display for ModelRef {
     }
 }
 
+/// Parses a model reference from its configuration string form.
+///
+/// Accepts an optional `provider:` prefix (`openrouter:`) or a bare
+/// provider-native name, which defaults to OpenRouter. Surrounding whitespace
+/// is ignored.
+impl std::str::FromStr for ModelRef {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let s = s.trim();
+        if let Some((provider_str, model_name)) = s.split_once(':') {
+            let provider_str = provider_str.trim().to_lowercase();
+            let model_name = model_name.trim();
+            if provider_str == "openrouter" {
+                if model_name.is_empty() {
+                    return Err("Model name cannot be empty".to_string());
+                }
+                Ok(ModelRef::openrouter(model_name))
+            } else {
+                Err(format!("Unsupported provider '{}'", provider_str))
+            }
+        } else if s.is_empty() {
+            Err("Model specification cannot be empty".to_string())
+        } else {
+            Ok(ModelRef::openrouter(s))
+        }
+    }
+}
+
 /// Five semantic model role specializations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -205,6 +234,80 @@ pub struct ModelRolesEffort {
     pub reviewer: Option<ReasoningEffort>,
 }
 
+/// A single rung of the coder escalation ladder.
+///
+/// Pairs a concrete model with an optional reasoning depth. Deserializes from
+/// either a bare model string or a `{ model, effort }` table, so a ladder may
+/// mix terse and detailed rungs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CoderTier {
+    pub model: ModelRef,
+    pub effort: Option<ReasoningEffort>,
+}
+
+impl CoderTier {
+    /// Creates a coder rung from a model and an optional reasoning depth.
+    pub fn new(model: ModelRef, effort: Option<ReasoningEffort>) -> Self {
+        Self { model, effort }
+    }
+}
+
+impl From<ModelRef> for CoderTier {
+    fn from(model: ModelRef) -> Self {
+        Self {
+            model,
+            effort: None,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for CoderTier {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            Str(String),
+            Table {
+                model: String,
+                #[serde(default, deserialize_with = "deserialize_effort_opt")]
+                effort: Option<ReasoningEffort>,
+            },
+        }
+
+        match Raw::deserialize(deserializer)? {
+            Raw::Str(s) => {
+                let model = s.parse::<ModelRef>().map_err(serde::de::Error::custom)?;
+                Ok(CoderTier::new(model, None))
+            }
+            Raw::Table { model, effort } => {
+                let model = model.parse::<ModelRef>().map_err(serde::de::Error::custom)?;
+                Ok(CoderTier::new(model, effort))
+            }
+        }
+    }
+}
+
+impl Serialize for CoderTier {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self.effort {
+            Some(effort) => {
+                use serde::ser::SerializeStruct;
+                let mut state = serializer.serialize_struct("CoderTier", 2)?;
+                state.serialize_field("model", &self.model.to_string())?;
+                state.serialize_field("effort", &effort)?;
+                state.end()
+            }
+            None => serializer.serialize_str(&self.model.to_string()),
+        }
+    }
+}
+
 /// Summary of effective concrete models assigned to each semantic role.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelRolesSummary {
@@ -297,6 +400,60 @@ pub struct ModelStartedEvent {
     pub model: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan_context: Option<ModelTurnPlanContext>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub is_batch: bool,
+}
+
+/// Terminal status of a batch supervisor run.
+///
+/// Batch supervisors execute a bounded sequence of isolated turns (plan steps or
+/// review findings). Their terminal state is distinct from a single turn's
+/// outcome because a batch may stop early while already-completed members remain
+/// committed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BatchFinishStatus {
+    /// Every scheduled member completed successfully.
+    Completed,
+    /// A member failed and the batch stopped early.
+    Failed,
+    /// A member emitted a semantic blocker and the batch stopped early.
+    Blocked,
+    /// The batch was cancelled by the user.
+    Cancelled,
+}
+
+/// Compact summary of a completed batch run.
+///
+/// Carries the identifiers and progress counters shared by plan and review
+/// batches so clients can render a single aggregated completion notice.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BatchFinishSummary {
+    /// Identifier of the owning plan or review session.
+    pub owner_id: String,
+    pub status: BatchFinishStatus,
+    /// Members executed before the batch stopped.
+    pub executed_count: usize,
+    /// Total members scheduled for the batch.
+    pub total_count: usize,
+    /// Wall-clock duration of the batch in seconds.
+    pub elapsed_seconds: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Emitted once when a plan batch supervisor terminates.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlanBatchFinishedEvent {
+    pub operation_id: String,
+    pub summary: BatchFinishSummary,
+}
+
+/// Emitted once when a review batch supervisor terminates.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewBatchFinishedEvent {
+    pub operation_id: String,
+    pub summary: BatchFinishSummary,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

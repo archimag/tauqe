@@ -13,12 +13,13 @@ use tauqe_core::workflow::batch::{
 };
 use tauqe_core::workflow::common::apply_context_requests_detailed;
 use tauqe_protocol::{
-    events, ContextAccess, Event, ModelRole, ModelSelection, ModelUsageEvent, ModelUsageInfo,
-    Request, Response, ReviewContentDeltaEvent, ReviewDeleteParams, ReviewDeleteResult,
-    ReviewErrorEvent, ReviewExecuteParams, ReviewFinishedEvent, ReviewGetParams, ReviewGetResult,
-    ReviewItemStatus, ReviewListChangedEvent, ReviewListResult, ReviewReasoningDeltaEvent,
-    ReviewSession, ReviewStartParams, ReviewStartedEvent, ReviewUpdateItemParams,
-    ReviewUpdateItemResult, ReviewUpdatedEvent,
+    events, BatchFinishStatus, BatchFinishSummary, ContextAccess, Event, ModelRole, ModelSelection,
+    ModelUsageEvent, ModelUsageInfo, Request, Response, ReviewBatchFinishedEvent,
+    ReviewContentDeltaEvent, ReviewDeleteParams, ReviewDeleteResult, ReviewErrorEvent,
+    ReviewExecuteParams, ReviewFinishedEvent, ReviewGetParams, ReviewGetResult, ReviewItemStatus,
+    ReviewListChangedEvent, ReviewListResult, ReviewReasoningDeltaEvent, ReviewSession,
+    ReviewStartParams, ReviewStartedEvent, ReviewUpdateItemParams, ReviewUpdateItemResult,
+    ReviewUpdatedEvent,
 };
 use tokio::sync::{mpsc, watch};
 
@@ -616,7 +617,7 @@ async fn run_review_step(
         _ => Box::new(tauqe_core::workflow::git_policy::GitTransactionPolicy::new()),
     };
 
-    match execute_model_turn(state, prompt, Some(step_selection), None, policy).await {
+    match execute_model_turn(state, prompt, Some(step_selection), None, None, policy).await {
         Ok(turn) if turn.is_success() && turn_applied_edits(&turn) => {
             set_item_status(state, repo_root, review_id, item_id, ReviewItemStatus::Fixed);
             Ok(())
@@ -682,7 +683,9 @@ impl BatchStepExecutor for ReviewItemExecutor<'_> {
 
 /// Runs the review findings through the core [`BatchExecution`] supervisor, which
 /// enforces ordered, fail-fast traversal. Findings fixed before the first failure
-/// stay FIXED.
+/// stay FIXED. Once the supervisor terminates, a typed `review/batch_finished`
+/// event carries the aggregate status, finding counters, and elapsed time, so
+/// clients can raise a single notice for the whole batch.
 async fn run_review_batch(
     state: &Arc<AppState>,
     review_id: &str,
@@ -690,6 +693,8 @@ async fn run_review_batch(
 ) -> BatchOutcome {
     let repo_root = state.context.read().await.repo_root().to_path_buf();
     let _ = ReviewStorage::save_active_id(&repo_root, Some(review_id));
+
+    let started_at = std::time::Instant::now();
 
     let steps: Vec<BatchStep> = item_ids
         .iter()
@@ -709,20 +714,30 @@ async fn run_review_batch(
         .run(&steps, &mut executor, &stream_tx, &cancel_rx)
         .await;
 
-    match report.stop {
+    let executed_count = report.executed.len();
+    let total_count = report.scheduled;
+    let (status, error) = match &report.stop {
+        BatchStop::Completed => (BatchFinishStatus::Completed, None),
+        BatchStop::Failed { .. } => (
+            BatchFinishStatus::Failed,
+            report.executed.last().and_then(|r| r.outcome.error.clone()),
+        ),
+        BatchStop::Blocked { reason, .. } => (BatchFinishStatus::Blocked, Some(reason.clone())),
+        BatchStop::Cancelled => (BatchFinishStatus::Cancelled, None),
+    };
+
+    let outcome = match report.stop {
         BatchStop::Completed => BatchOutcome::Completed {
-            items: report.executed.len(),
+            items: executed_count,
         },
         BatchStop::Cancelled => BatchOutcome::Cancelled {
-            completed: report.executed.len(),
+            completed: executed_count,
         },
         BatchStop::Failed { step_id } => {
-            let completed = report.executed.len().saturating_sub(1);
+            let completed = executed_count.saturating_sub(1);
             let item_id = step_id.parse::<u32>().unwrap_or(0);
-            let reason = report
-                .executed
-                .last()
-                .and_then(|r| r.outcome.error.clone())
+            let reason = error
+                .clone()
                 .unwrap_or_else(|| "finding failed without diagnostics".to_string());
             BatchOutcome::Failed {
                 completed,
@@ -733,7 +748,7 @@ async fn run_review_batch(
         BatchStop::Blocked { step_id, reason } => {
             // Review findings have no blocked status; a semantic block stops
             // the batch and is reported as a failed finding.
-            let completed = report.executed.len().saturating_sub(1);
+            let completed = executed_count.saturating_sub(1);
             let item_id = step_id.parse::<u32>().unwrap_or(0);
             BatchOutcome::Failed {
                 completed,
@@ -741,7 +756,26 @@ async fn run_review_batch(
                 reason,
             }
         }
-    }
+    };
+
+    emit(
+        &state.out,
+        events::REVIEW_BATCH_FINISHED,
+        serde_json::to_value(ReviewBatchFinishedEvent {
+            operation_id: format!("op-{}", next_operation_id()),
+            summary: BatchFinishSummary {
+                owner_id: review_id.to_string(),
+                status,
+                executed_count,
+                total_count,
+                elapsed_seconds: started_at.elapsed().as_secs(),
+                error,
+            },
+        })
+        .ok(),
+    );
+
+    outcome
 }
 
 pub async fn handle_review_execute(req: Request, state: &Arc<AppState>) -> Response {
@@ -1090,6 +1124,43 @@ mod tests {
             }
             other => panic!("Expected Failed, got {:?}", other),
         }
+    }
+
+    #[tokio::test]
+    async fn test_review_batch_emits_finished_event() {
+        let dir = TestDir::new();
+        let session = test_session(
+            "rev-emit",
+            vec![
+                test_item(1, ReviewItemStatus::Todo, "foo.rs"),
+                test_item(2, ReviewItemStatus::Todo, "foo.rs"),
+            ],
+        );
+        ReviewStorage::save_session(dir.path(), &session).unwrap();
+
+        let (out, mut rx) = OutChannel::new();
+        let (hist_tx, _hist_rx) = tokio::sync::mpsc::unbounded_channel();
+        let state = AppState::new(
+            tauqe_core::config::AppConfig::default(),
+            dir.path().to_path_buf(),
+            hist_tx,
+            out,
+        );
+
+        // Without an API key the first turn cannot start: the batch fails at finding 1.
+        let outcome = run_review_batch(&state, "rev-emit", vec![1, 2]).await;
+        assert!(matches!(outcome, BatchOutcome::Failed { .. }));
+
+        let mut raw_events = Vec::new();
+        while let Ok(raw) = rx.try_recv() {
+            raw_events.push(raw);
+        }
+        let finished = raw_events
+            .iter()
+            .find(|e| e.contains(events::REVIEW_BATCH_FINISHED))
+            .expect("review/batch_finished must be emitted");
+        assert!(finished.contains("\"rev-emit\""));
+        assert!(finished.contains("\"failed\""));
     }
 
     #[tokio::test]

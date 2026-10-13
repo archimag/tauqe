@@ -23,6 +23,18 @@ Large language models are remarkably adept at answering *How*—synthesizing boi
 
 TAUQE's primary objective is to **liberate the developer's cognitive bandwidth so they can concentrate entirely on 'What'.** The engineer determines the objective, architectural intent, and requirements; the harness firmly steers and confines the model through a bounded turn to solve the *How*, deterministically and safely.
 
+### 1.2. Model Role Specialization
+
+TAUQE splits the *What*/*How* duality across dedicated, non-overlapping model roles. Each role keeps a single mandate and never absorbs the responsibility of another:
+
+- **Architect** owns the *What*: high-level decomposition, system invariants, and conceptual boundaries. It produces plans and concept nodes, not concrete source lines.
+- **Coder** owns the *How*: minimal, coherent, compiling code changes that resolve one well-posed step.
+- **Advisor** provides strategic guidance and design trade-offs when the objective or its constraints are ambiguous.
+- **Reviewer** performs analytical, read-only inspection and emits findings; it never modifies files.
+- **Scribe** handles history compaction, turning long multi-turn transcripts into dense, lossless context.
+
+The Architect/Coder boundary is deliberately rigid. The Architect defines the invariant; the Coder implements it. When code generation fails repeatedly, the harness **never switches the Coder into the Architect role**. Instead, escalation is intra-role: the *coder ladder* (`CoderTier`, each tier pairing a model with a reasoning effort) promotes execution to a stronger coder tier within the same *How* competence. Crossing back into the *What* role on a compile failure would blur the boundary the harness exists to enforce and would reintroduce the drift the paradigm is designed to prevent.
+
 ---
 
 ## 2. Three Paradigms of AI-Assisted Development
@@ -79,6 +91,29 @@ Every phase in the turn is deterministic:
 3. **Healing:** If the compiler detects an error, the model receives clean toolchain output and fixes only the offending lines without touching unrelated code.
 4. **Git Transaction:** The turn is transactional. Issuing an undo command (`C-Z`) rolls back the working tree to its exact pre-turn state.
 
+### 3.1. Isolated Working Memory: The Turn Scratchpad
+
+Every bounded turn exposes a private, turn-local working-memory channel: the **scratchpad**. It is a hidden notebook where the model records working hypotheses, verified findings, and the purpose of context it still needs.
+
+The scratchpad is strictly isolated from every other layer:
+- It lives only inside the current turn and is discarded when the turn ends; it never enters persisted history.
+- It is never rendered in the interface and is excluded from the streamed assistant text.
+- It grants no capabilities and touches no bytes on disk. It is memory, not a tool.
+
+Its purpose is to let the model hold state across multi-round discovery and verification-healing cycles without polluting the persistent conversation or the user-facing surface.
+
+### 3.2. Deterministic Protocol Tags
+
+The model communicates its intent exclusively through typed protocol tags. Each tag is a deterministic command rather than free-form prose:
+
+- Discovery tags (`<context_request>`, `<doc_request>`) request missing files or authoritative reference material.
+- The scratchpad tag (`<scratchpad>`) records isolated, turn-local working memory.
+- The verification tag (`<verify>`) requests deterministic toolchain execution.
+- Terminal outcome tags (`<success>`, `<error>`, `<blocked>`) declare how the turn ends; the `<blocked>` outcome triggers semantic recovery instead of a blind retry.
+- The language tag (`<user_language>`) pins the natural language for user-facing output.
+
+Because these tags are parsed deterministically, the harness can enforce boundaries, react to declared outcomes, and guarantee that no unrecognized side effect ever reaches the operating system. There is no arbitrary shell: interaction with the world happens solely through typed, auditable protocol operations.
+
 ---
 
 ## 4. Fundamental Architectural Invariants
@@ -113,6 +148,7 @@ Project Files         → Manifests and toolchain capabilities
 Tree-sitter Repo Map  → Deterministic symbol awareness
 Bounded Turn          → Autonomous turn lifecycle (Discovery + Staging + Healing)
 Strict Harness        → Enforcing boundaries without shell access
+Model Roles           → Architect (What) + Coder (How) + Advisor + Reviewer + Scribe
 Developer             → Task specification and absolute control
 LLM                   → Semantic transformation engine
 ```

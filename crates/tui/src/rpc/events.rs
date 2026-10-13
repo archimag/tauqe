@@ -1,12 +1,13 @@
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tauqe_protocol::{
-    events, ConfigState, ContextState, EditFileDoneEvent, EditFileRetryingEvent,
-    EditFileStartedEvent, EditFinishedEvent, EditHunkEvent, Event, GitCommitCreatedEvent,
-    GitSquashApplyResult, GitUndoResult, HistoryEntryAddedEvent, ModelDeltaEvent,
-    ModelErrorEvent, ModelFinishedEvent, ModelResult, ModelResultEvent, ModelStartedEvent,
-    ModelUsageEvent, RepositoryState, ReviewContentDeltaEvent, ReviewErrorEvent,
-    ReviewFinishedEvent, ReviewReasoningDeltaEvent,
+    events, BatchFinishStatus, BatchFinishSummary, ConfigState, ContextState, EditFileDoneEvent,
+    EditFileRetryingEvent, EditFileStartedEvent, EditFinishedEvent, EditHunkEvent, Event,
+    GitCommitCreatedEvent, GitSquashApplyResult, GitUndoResult, HistoryEntryAddedEvent,
+    ModelDeltaEvent, ModelErrorEvent, ModelFinishedEvent, ModelResult, ModelResultEvent,
+    ModelStartedEvent, ModelUsageEvent, PlanBatchFinishedEvent, RepositoryState,
+    ReviewBatchFinishedEvent, ReviewContentDeltaEvent, ReviewErrorEvent, ReviewFinishedEvent,
+    ReviewReasoningDeltaEvent,
 };
 
 use crate::app::AppState;
@@ -180,6 +181,7 @@ pub async fn handle_event(
                     st.model.turn_max_rounds = None;
                     st.model.turn_phase_detail = None;
                     st.model.plan_context = data.plan_context;
+                    st.model.is_batch = data.is_batch;
                     st.model.repomap_tokens = None;
                     st.model.auto_scroll = true;
                     st.model.current_cost = Some(0.0);
@@ -482,9 +484,13 @@ pub async fn handle_event(
             st.confirm_cancel = false;
             if let Some(started) = st.turn_started_at.take() {
                 let elapsed = started.elapsed().as_secs();
-                if elapsed >= st.tui_config.notifications.min_duration_seconds {
+                let focused = st.terminal_focused;
+                // Batch members stay silent: only the supervisor's final event
+                // raises a notification for the whole operation.
+                if !st.model.is_batch
+                    && st.tui_config.notifications.should_notify(elapsed, focused)
+                {
                     let summary = st.model.last_commit_summary.as_deref().unwrap_or("Turn completed");
-                    let focused = st.terminal_focused;
                     crate::terminal::trigger_turn_notification(
                         "TAUQE",
                         summary,
@@ -557,8 +563,11 @@ pub async fn handle_event(
             st.confirm_cancel = false;
             if let Some(started) = st.turn_started_at.take() {
                 let elapsed = started.elapsed().as_secs();
-                if elapsed >= st.tui_config.notifications.min_duration_seconds {
-                    let focused = st.terminal_focused;
+                let focused = st.terminal_focused;
+                // Batch member failures are aggregated into the batch summary.
+                if !st.model.is_batch
+                    && st.tui_config.notifications.should_notify(elapsed, focused)
+                {
                     crate::terminal::trigger_turn_notification(
                         "TAUQE Error",
                         "Turn failed with error",
@@ -694,6 +703,131 @@ pub async fn handle_event(
                 }
             }
         }
+        events::PLAN_BATCH_FINISHED => {
+            if let Some(params) = ev.params {
+                if let Ok(data) = serde_json::from_value::<PlanBatchFinishedEvent>(params) {
+                    notify_batch_finished(&st, "Plan", &data.summary);
+                }
+            }
+        }
+        events::REVIEW_BATCH_FINISHED => {
+            if let Some(params) = ev.params {
+                if let Ok(data) = serde_json::from_value::<ReviewBatchFinishedEvent>(params) {
+                    notify_batch_finished(&st, "Review", &data.summary);
+                }
+            }
+        }
         _ => {}
+    }
+}
+
+/// Raises exactly one aggregate notification when a batch supervisor finishes.
+///
+/// Batch members run as a single unit of waiting: their individual turns stay
+/// silent, and only this terminal event produces a sound or desktop alert.
+fn notify_batch_finished(st: &AppState, kind: &str, summary: &BatchFinishSummary) {
+    let focused = st.terminal_focused;
+    if !st
+        .tui_config
+        .notifications
+        .should_notify(summary.elapsed_seconds, focused)
+    {
+        return;
+    }
+    let (title, body) = format_batch_summary(kind, summary);
+    crate::terminal::trigger_turn_notification(
+        &title,
+        &body,
+        &st.tui_config.notifications,
+        focused,
+    );
+}
+
+/// Builds the title and body for a batch completion notification from its
+/// aggregate outcome, progress counters, and elapsed time.
+fn format_batch_summary(kind: &str, summary: &BatchFinishSummary) -> (String, String) {
+    let status_word = match summary.status {
+        BatchFinishStatus::Completed => "completed",
+        BatchFinishStatus::Failed => "failed",
+        BatchFinishStatus::Blocked => "blocked",
+        BatchFinishStatus::Cancelled => "cancelled",
+    };
+    let title = format!("TAUQE {} batch {}", kind, status_word);
+    let mut body = format!(
+        "{} '{}': {}/{} steps in {}",
+        kind,
+        summary.owner_id,
+        summary.executed_count,
+        summary.total_count,
+        format_elapsed(summary.elapsed_seconds),
+    );
+    if let Some(err) = summary.error.as_deref() {
+        let first_line = err.lines().next().unwrap_or("").trim();
+        if !first_line.is_empty() {
+            body.push_str(" - ");
+            body.push_str(first_line);
+        }
+    }
+    (title, body)
+}
+
+/// Formats an elapsed duration as `Ns` under a minute, otherwise `Nm Ss`.
+fn format_elapsed(seconds: u64) -> String {
+    if seconds < 60 {
+        format!("{}s", seconds)
+    } else {
+        format!("{}m {}s", seconds / 60, seconds % 60)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn batch_summary(
+        status: BatchFinishStatus,
+        executed: usize,
+        total: usize,
+        elapsed: u64,
+    ) -> BatchFinishSummary {
+        BatchFinishSummary {
+            owner_id: "plan-1".to_string(),
+            status,
+            executed_count: executed,
+            total_count: total,
+            elapsed_seconds: elapsed,
+            error: None,
+        }
+    }
+
+    #[test]
+    fn test_format_elapsed() {
+        assert_eq!(format_elapsed(0), "0s");
+        assert_eq!(format_elapsed(59), "59s");
+        assert_eq!(format_elapsed(60), "1m 0s");
+        assert_eq!(format_elapsed(125), "2m 5s");
+    }
+
+    #[test]
+    fn test_format_batch_summary_completed() {
+        let (title, body) = format_batch_summary(
+            "Plan",
+            &batch_summary(BatchFinishStatus::Completed, 3, 3, 42),
+        );
+        assert_eq!(title, "TAUQE Plan batch completed");
+        assert!(body.contains("3/3"));
+        assert!(body.contains("42s"));
+    }
+
+    #[test]
+    fn test_format_batch_summary_failed_keeps_first_error_line() {
+        let mut summary = batch_summary(BatchFinishStatus::Failed, 1, 3, 90);
+        summary.error = Some("compiler error\nlong details".to_string());
+        let (title, body) = format_batch_summary("Plan", &summary);
+        assert_eq!(title, "TAUQE Plan batch failed");
+        assert!(body.contains("1/3"));
+        assert!(body.contains("1m 30s"));
+        assert!(body.contains("compiler error"));
+        assert!(!body.contains("long details"));
     }
 }

@@ -29,6 +29,8 @@ Instead of an unbounded background agent loop, TAUQE operates as a **finite-stat
 
 - **Discovery & Exploration Phase:** The model inspects the task and navigates the Tree-sitter repository map to locate missing symbols and type signatures, or requests internal system documentation via `<doc_request topic="...">`. If required files are missing from context, the system autonomously fetches them into the `auto` layer and proceeds to the next round. Throughout multi-round discovery, the model retains intermediate findings and working hypotheses in the ephemeral Turn Scratchpad. Code generation is deferred until the model has sufficient clarity to avoid blind speculation.
 
+The five phases of the turn are surfaced to the interface as `TurnPhase` stream events (`Discovery`, `Proposal`, `Staging`, `Verification`, and `Healing`), so the footer pipeline can render which stage is currently active. `Discovery`, `Staging`, and `Healing` carry a `round` counter and a `max_rounds` bound because they may repeat, whereas `Proposal` is emitted for every model interaction and `Verification` runs once per applied proposal.
+
 ---
 
 ## 3.2 In-Memory Staging & Patch Retry
@@ -49,13 +51,17 @@ Modifications never touch disk unverified:
 - TAUQE executes project-specific toolchain checks (`cargo check`, `npm test`).
 - If compilation fails, compiler diagnostics are parsed and returned to the model for an immediate **Self-Healing Loop**, fixing syntax and type errors automatically before concluding the turn.
 
-### Verification Healing and Role Escalation
+### Verification Healing and Coder Ladder Escalation
 
 When verification errors occur, the model enters a targeted healing cycle:
 1. Compiler error messages and diagnostic line spans are parsed and formatted into a targeted healing prompt.
 2. Missing error paths are automatically staged into the context working set.
 3. The prompt is presented to the active role (typically `Coder`).
-4. **Escalation to Architect:** If verification fails repeatedly or patch staging errors persist across retries, superficial syntactic adjustments are often insufficient because the failure stems from a deeper architectural contradiction or missing dependency. When `auto_level_up` is enabled in configuration, the harness automatically escalates the healing turn from `Coder` to `Architect`. The `Architect` model re-evaluates the problem with higher-order reasoning, adjusting types and signatures to resolve the blocker before the turn concludes.
+4. **Escalation along the Coder Ladder:** When a bounded turn concludes with an unresolved failure — an error result from staging or verification, or a proposal that yielded no valid edits — superficial syntactic adjustments are often insufficient because the failure stems from a deeper contradiction or a missing dependency. When `auto_level_up` is enabled in configuration, the harness advances the turn to the next rung of the configured **Coder Ladder** instead of leaving the `Coder` role. Escalation is strictly intra-role, so the `What` versus `How` separation between `Coder` and `Architect` is never violated.
+
+The Coder Ladder is an ordered list of rungs, each pairing a model with an optional reasoning depth. Escalation advances one rung at a time and treats a rung as an advance whenever either the model or the reasoning depth changes, so recovery can first deepen reasoning on the same model and only then switch to a stronger or more specialized one. Before advancing, the failed turn's transaction is rolled back and the transient `auto` context is pruned, so every rung starts from a clean pre-turn state. The ladder saturates on its final rung, so escalation always terminates deterministically. A terminal `<blocked>` report short-circuits escalation entirely: no rung is consumed and the failure is reported instead of retried.
+
+The ladder is configured polymorphically under `[models].coder` in `tauqe.toml`: a bare model string or a `{ model, effort }` table yields a one-rung ladder, while an ordered array of such entries expresses an explicit multi-rung ladder. Plan step reprompting uses the exact same ladder, as described in §7.3.3.
 
 ---
 
@@ -72,15 +78,16 @@ However, recording intermediate reasoning or scratch notes into persistent sessi
 
 ---
 
-## 3.5 Unified Terminal Outcome Protocol (`<success>` / `<error>`)
+## 3.5 Unified Terminal Outcome Protocol (`<success>` / `<error>` / `<blocked>`)
 
-To eliminate ambiguity at turn conclusion and prevent speculative execution cascades, every code-modifying turn and isolated task step adheres to a binary terminal outcome contract:
+To eliminate ambiguity at turn conclusion and prevent speculative execution cascades, every code-modifying turn and isolated task step adheres to a strict, three-way terminal outcome contract:
 
 - **Protocol Rationale (Why & How):** Free-form conversational text is nondeterministic and fragile for automated task runners. When executing isolated plan steps or triaging review findings in batch queues, the system requires an unambiguous, machine-readable signal indicating whether the task was fully accomplished or blocked.
-- **Binary Outcome Tags:**
+- **Terminal Outcome Tags:**
   - `<success summary="...">` (or `<success>...</success>`): Signifies that the target goal was fully implemented, staged, and verified by compiler checks. In batch execution (e.g. executing all steps of an implementation plan or resolving code review findings), `<success>` signals the runner to transition the item to `Done`/`Fixed` and advance to the next queued item.
-  - `<error message="...">` (or `<error>...</error>`): Signifies that the model encountered an insurmountable architectural contradiction, missing prerequisite, or unresolvable toolchain failure. In batch pipelines, `<error>` immediately halts execution to prevent cascading corruption, marks the current item as blocked, and reports the structured error message to the developer.
-- **Turn-Marker Protection:** Like all operational tags, `<success>` and `<error>` are suffixed with the active turn marker (e.g., `<success_MARKER>`), preventing accidental invocation from literal source code, git diffs, or markdown examples.
+  - `<error message="...">` (or `<error>...</error>`): Signifies that the model encountered an insurmountable architectural contradiction, missing prerequisite, or unresolvable toolchain failure. In batch pipelines, `<error>` immediately halts execution to prevent cascading corruption, marks the current item as failed, and reports the structured error message to the developer.
+  - `<blocked reason="..." details="...">` (or `<blocked reason="...">...</blocked>`): Signifies that the model has determined the current step's preconditions or assumptions cannot be satisfied as stated. A block is a deliberate semantic assertion, not a transient failure, so the harness treats it as **semantic recovery** instead of a blind retry: the turn transaction is rolled back, no patch retry or verification-healing cycle runs, and the plan supervisor moves the step to `Blocked` so the remaining subtree can be re-planned locally (`plan/replan`) rather than repeating failing turns or restarting the entire plan.
+- **Turn-Marker Protection:** Like all operational tags, `<success>`, `<error>`, and `<blocked>` are suffixed with the active turn marker (e.g., `<success_MARKER>`), preventing accidental invocation from literal source code, git diffs, or markdown examples.
 
 ---
 
@@ -144,7 +151,7 @@ The bounded turn is deliberately not implemented as one monolithic routine. The 
 
 `ExecutionMode` (`workflow/execution.rs`) owns the lifecycle of one or more turns and is the seam between "run one objective" and "run a queue of objectives".
 
-- **`SingleExecution`** drives one complete FSM cycle. It is responsible for role escalation — when `auto_level_up` is enabled and healing stalls, the turn is escalated from `Coder` to `Architect` — and for cost accounting. The session cost observed before the turn is recorded as *previous*, while the cost accumulated during the turn is recorded as *current*, so the interface can attribute spend to a single turn rather than a blurred running total.
+- **`SingleExecution`** drives one complete FSM cycle. It is responsible for Coder Ladder escalation — when `auto_level_up` is enabled and healing stalls, the turn is advanced to the next ladder rung within the `Coder` role (see §3.3) — and for cost accounting. The session cost observed before the turn is recorded as *previous*, while the cost accumulated during the turn is recorded as *current*, so the interface can attribute spend to a single turn rather than a blurred running total.
 - **`BatchExecution`** (`workflow/batch.rs`) is a supervisor over a queue of independent steps (implementation plan steps or code review findings). It synchronizes entity statuses (`InProgress`, `Done`, `Todo`), stops the queue on the first failure or cancellation to avoid cascading corruption, and accumulates token and cost usage across the whole chain via `BatchUsage`.
 
 Both modes are parameterized by `WorkflowOptions`, which carries retry limits, discovery budgets, history budget, and model configuration. This keeps execution strategy independent of the concrete task being executed.

@@ -12,11 +12,11 @@ use tauqe_core::workflow::batch::{
 };
 use tauqe_core::workflow::common::apply_context_requests_detailed;
 use tauqe_protocol::{
-    events, ContextAccess, Event, ModelRole, ModelSelection, Plan, PlanDeleteParams,
-    PlanExecuteParams, PlanGetParams, PlanGetResult, PlanItem, PlanItemStatus, PlanListChangedEvent,
-    PlanListResult, PlanRefineParams, PlanRefineResult, PlanSaveParams, PlanScopeEvaluation,
-    PlanSetActiveParams, PlanUpdateItemParams, PlanUpdatedEvent, Request, Response, TurnPhase,
-    TurnPhaseEvent,
+    events, BatchFinishStatus, BatchFinishSummary, ContextAccess, Event, ModelRole, ModelSelection,
+    Plan, PlanBatchFinishedEvent, PlanDeleteParams, PlanExecuteParams, PlanGetParams, PlanGetResult,
+    PlanItem, PlanItemStatus, PlanListChangedEvent, PlanListResult, PlanRefineParams,
+    PlanRefineResult, PlanSaveParams, PlanScopeEvaluation, PlanSetActiveParams, PlanUpdateItemParams,
+    PlanUpdatedEvent, Request, Response, TurnPhase, TurnPhaseEvent,
 };
 use tokio::sync::{mpsc, watch};
 
@@ -422,12 +422,18 @@ async fn run_plan_step(
         }
     };
 
-    let (max_retries, auto_level_up) = {
+    let (max_retries, auto_level_up, models_config) = {
         let cfg = state.config.lock().await;
-        (cfg.develop.max_retries, cfg.models.auto_level_up)
+        (
+            cfg.develop.max_retries,
+            cfg.models.auto_level_up,
+            cfg.models.clone(),
+        )
     };
 
     let mut selection = ModelSelection::Role(ModelRole::Coder);
+    let mut reasoning_effort = None;
+    let mut ladder_idx = 0usize;
     let mut attempt = 0usize;
 
     loop {
@@ -448,6 +454,7 @@ async fn run_plan_step(
             prompt.clone(),
             Some(selection.clone()),
             Some(plan_context),
+            reasoning_effort,
             policy,
         )
         .await;
@@ -499,7 +506,10 @@ async fn run_plan_step(
         preload_step_files(state, repo_root, &item).await;
 
         if auto_level_up {
-            selection = ModelSelection::Role(ModelRole::Architect);
+            ladder_idx += 1;
+            let tier = models_config.coder_tier(ladder_idx);
+            selection = ModelSelection::Specific(tier.model);
+            reasoning_effort = tier.effort;
         }
 
         prompt = tauqe_core::plan::prompt::format_plan_step_retry_prompt(
@@ -547,7 +557,9 @@ impl BatchStepExecutor for PlanStepExecutor<'_> {
 
 /// Runs the plan steps through the core [`BatchExecution`] supervisor, which
 /// enforces ordered, fail-fast traversal. Steps completed before the first
-/// failure stay DONE.
+/// failure stay DONE. Once the supervisor terminates, a typed
+/// `plan/batch_finished` event carries the aggregate status, step counters, and
+/// elapsed time, so clients can raise a single notice for the whole batch.
 async fn run_plan_batch(
     state: &Arc<AppState>,
     plan_id: &str,
@@ -555,6 +567,8 @@ async fn run_plan_batch(
 ) -> BatchOutcome {
     let repo_root = state.context.read().await.repo_root().to_path_buf();
     let _ = PlanStorage::save_active_id(&repo_root, Some(plan_id));
+
+    let started_at = std::time::Instant::now();
 
     let steps: Vec<BatchStep> = step_ids
         .iter()
@@ -575,19 +589,29 @@ async fn run_plan_batch(
         .run(&steps, &mut executor, &stream_tx, &cancel_rx)
         .await;
 
-    match report.stop {
+    let executed_count = report.executed.len();
+    let total_count = report.scheduled;
+    let (status, error) = match &report.stop {
+        BatchStop::Completed => (BatchFinishStatus::Completed, None),
+        BatchStop::Failed { .. } => (
+            BatchFinishStatus::Failed,
+            report.executed.last().and_then(|r| r.outcome.error.clone()),
+        ),
+        BatchStop::Blocked { reason, .. } => (BatchFinishStatus::Blocked, Some(reason.clone())),
+        BatchStop::Cancelled => (BatchFinishStatus::Cancelled, None),
+    };
+
+    let outcome = match report.stop {
         BatchStop::Completed => BatchOutcome::Completed {
-            steps: report.executed.len(),
+            steps: executed_count,
         },
         BatchStop::Cancelled => BatchOutcome::Cancelled {
-            completed: report.executed.len(),
+            completed: executed_count,
         },
         BatchStop::Failed { step_id } => {
-            let completed = report.executed.len().saturating_sub(1);
-            let reason = report
-                .executed
-                .last()
-                .and_then(|r| r.outcome.error.clone())
+            let completed = executed_count.saturating_sub(1);
+            let reason = error
+                .clone()
                 .unwrap_or_else(|| "step failed without diagnostics".to_string());
             BatchOutcome::Failed {
                 completed,
@@ -596,14 +620,33 @@ async fn run_plan_batch(
             }
         }
         BatchStop::Blocked { step_id, reason } => {
-            let completed = report.executed.len().saturating_sub(1);
+            let completed = executed_count.saturating_sub(1);
             BatchOutcome::Blocked {
                 completed,
                 step_id,
                 reason,
             }
         }
-    }
+    };
+
+    emit(
+        &state.out,
+        events::PLAN_BATCH_FINISHED,
+        serde_json::to_value(PlanBatchFinishedEvent {
+            operation_id: format!("op-{}", crate::state::next_operation_id()),
+            summary: BatchFinishSummary {
+                owner_id: plan_id.to_string(),
+                status,
+                executed_count,
+                total_count,
+                elapsed_seconds: started_at.elapsed().as_secs(),
+                error,
+            },
+        })
+        .ok(),
+    );
+
+    outcome
 }
 
 pub async fn handle_plan_execute(req: Request, state: &Arc<AppState>) -> Response {
@@ -1838,6 +1881,49 @@ mod tests {
             PlanStorage::load_active_id(dir.path()).unwrap().as_deref(),
             Some("batch")
         );
+    }
+
+    #[tokio::test]
+    async fn test_plan_batch_emits_finished_event() {
+        let dir = TestDir::new();
+        let plan = Plan {
+            id: "emit".to_string(),
+            title: "Emit".to_string(),
+            created_at: 1,
+            updated_at: 1,
+            items: vec![
+                test_item("1", PlanItemStatus::Todo),
+                test_item("2", PlanItemStatus::Todo),
+            ],
+            ..Default::default()
+        };
+        PlanStorage::save_plan(dir.path(), &plan).unwrap();
+
+        let (out, mut rx) = OutChannel::new();
+        let (hist_tx, _hist_rx) = tokio::sync::mpsc::unbounded_channel();
+        let state = AppState::new(
+            tauqe_core::config::AppConfig::default(),
+            dir.path().to_path_buf(),
+            hist_tx,
+            out,
+        );
+
+        // Without an API key the first turn cannot start: the batch fails at step 1.
+        let outcome = run_plan_batch(&state, "emit", vec!["1".to_string(), "2".to_string()]).await;
+        assert!(matches!(outcome, BatchOutcome::Failed { .. }));
+
+        // The supervisor publishes a single typed completion event for the whole
+        // batch, carrying the aggregate status and step counters.
+        let mut raw_events = Vec::new();
+        while let Ok(raw) = rx.try_recv() {
+            raw_events.push(raw);
+        }
+        let finished = raw_events
+            .iter()
+            .find(|e| e.contains(events::PLAN_BATCH_FINISHED))
+            .expect("plan/batch_finished must be emitted");
+        assert!(finished.contains("\"emit\""));
+        assert!(finished.contains("\"failed\""));
     }
 
     #[tokio::test]

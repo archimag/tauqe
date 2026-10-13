@@ -441,6 +441,9 @@ fn find_next_control_tag(buf: &str) -> Option<(usize, usize)> {
     if let Some(cr) = crate::edits::protocol::xml::next_context_request_tag(buf) {
         candidates.push(cr);
     }
+    if let Some(cd) = crate::edits::protocol::xml::tags::next_context_drop_tag(buf) {
+        candidates.push(cd);
+    }
     if let Some(ul) = crate::edits::protocol::xml::next_user_language_tag(buf) {
         candidates.push(ul);
     }
@@ -462,6 +465,9 @@ fn find_next_control_tag(buf: &str) -> Option<(usize, usize)> {
     if let Some(err) = crate::edits::protocol::xml::tags::next_error_tag(buf) {
         candidates.push(err);
     }
+    if let Some(blk) = crate::edits::protocol::xml::tags::next_blocked_tag(buf) {
+        candidates.push(blk);
+    }
     candidates.into_iter().min_by_key(|(start, _)| *start)
 }
 
@@ -474,6 +480,7 @@ fn safe_text_emit_len(buf: &str) -> usize {
         "<move",
         "<overwrite",
         "<context_request",
+        "<context_drop",
         "<doc_request",
         "<user_language",
         "<verify",
@@ -481,6 +488,7 @@ fn safe_text_emit_len(buf: &str) -> usize {
         "<scratchpad",
         "<success",
         "<error",
+        "<blocked",
     ];
     let mut limit = buf.len();
     if let Some(last_lt) = buf.rfind('<') {
@@ -503,11 +511,13 @@ fn safe_text_emit_len(buf: &str) -> usize {
                     "<user_language" => crate::edits::protocol::xml::next_user_language_tag(&buf[idx..]).is_some(),
                     "<verify" => crate::edits::protocol::xml::next_verify_tag(&buf[idx..]).is_some(),
                     "<context_request" => crate::edits::protocol::xml::next_context_request_tag(&buf[idx..]).is_some(),
+                    "<context_drop" => crate::edits::protocol::xml::tags::next_context_drop_tag(&buf[idx..]).is_some(),
                     "<doc_request" => crate::edits::protocol::xml::tags::next_doc_request_tag(&buf[idx..]).is_some(),
                     "<plan" => crate::edits::protocol::xml::tags::next_plan_tag(&buf[idx..]).is_some(),
                     "<scratchpad" => crate::edits::protocol::xml::tags::next_scratchpad_tag(&buf[idx..]).is_some(),
                     "<success" => crate::edits::protocol::xml::tags::next_success_tag(&buf[idx..]).is_some(),
                     "<error" => crate::edits::protocol::xml::tags::next_error_tag(&buf[idx..]).is_some(),
+                    "<blocked" => crate::edits::protocol::xml::tags::next_blocked_tag(&buf[idx..]).is_some(),
                     _ => rest.contains('>'),
                 };
                 if !is_closed {
@@ -708,6 +718,49 @@ mod tests {
             .collect();
         assert_eq!(text, "Step done.\n\nReady");
         assert!(!text.contains("success"));
+    }
+
+    #[test]
+    fn test_scratchpad_tags_hidden_from_stream_text() {
+        let input = "Intro.\n<scratchpad>\nWorking hypothesis and notes.\n</scratchpad>\nOutro.";
+        let mut filter = XmlStreamFilter::new(vec![], std::env::temp_dir());
+        let mut events = Vec::new();
+        for ch in input.chars() {
+            events.extend(filter.push_chunk(&ch.to_string()));
+        }
+        events.extend(Box::new(filter).finish());
+        let text: String = events
+            .iter()
+            .filter_map(|event| match event {
+                StreamEvent::TextDelta(delta) => Some(delta.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text, "Intro.\n\nOutro.");
+        assert!(!text.contains("Working hypothesis"));
+        assert!(!text.contains("scratchpad"));
+    }
+
+    #[test]
+    fn test_marked_scratchpad_hidden_from_stream_text() {
+        let marker = "M999";
+        let input = "Intro.\n<scratchpad_M999>\nWorking notes.\n</scratchpad_M999>\nOutro.";
+        let mut filter = XmlStreamFilter::new(vec![], std::env::temp_dir())
+            .with_marker(Some(marker.to_string()));
+        let mut events = Vec::new();
+        for ch in input.chars() {
+            events.extend(filter.push_chunk(&ch.to_string()));
+        }
+        events.extend(Box::new(filter).finish());
+        let text: String = events
+            .iter()
+            .filter_map(|event| match event {
+                StreamEvent::TextDelta(delta) => Some(delta.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text, "Intro.\n\nOutro.");
+        assert!(!text.contains("Working notes"));
     }
 
     #[test]

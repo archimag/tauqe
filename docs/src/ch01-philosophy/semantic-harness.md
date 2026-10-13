@@ -19,22 +19,31 @@ TAUQE resolves this dilemma by holding the model in a firm grip:
 
 > **TAUQE is not an agent. It is an environment where the model operates autonomously within a single bounded turn, completely stripped of persistent agentic drift.**
 
+Autonomy exists only inside one bounded turn; the moment it concludes, control returns to the developer. This is what eliminates **agentic drift**: an unconstrained model, given an open-ended shell and an unbounded goal, tends to wander, repeat failed loops, and reach beyond its mandate.
+
 ---
 
-## 1.2 The Semantic Quartet: Model Roles and Specialization
+## 1.2 Model Roles: The "What" and the "How"
 
 Modern engineering workflows demand distinct cognitive strengths depending on the operational context. Rather than categorizing models into arbitrary difficulty tiers (*junior*, *middle*, *senior*), TAUQE structures model interactions around **semantic functional roles**:
 
 - **Scribe:** Dedicated to history compaction, session summarization, and Git squash commit messages. Requires high speed, concise output, and minimal token cost without complex code reasoning overhead.
-- **Coder:** Dedicated to patch generation, code editing, and toolchain verification healing. Specialized in syntactically sound diffs, surgical search/replace operations, and minimal blast radius.
-- **Architect:** Dedicated to conceptual design, plan refinement (`plan/refine`), deep code review, and architectural reasoning. Serves as the escalation target when implementation-level heuristics stall.
+- **Coder:** Dedicated to patch generation, code editing, and toolchain verification healing. Specialized in syntactically sound diffs, surgical search/replace operations, and minimal blast radius. Owns the *How*.
+- **Architect:** Dedicated to conceptual design, plan refinement (`plan/refine`), and architectural reasoning. It defines system invariants and decomposition — the *What* — and does not produce concrete source lines.
 - **Advisor:** Dedicated to conversational engineering consultation, brainstorming, and interactive develop sessions with the human engineer.
+- **Reviewer:** Dedicated to analytical, read-only code inspection. It emits findings and never modifies files.
+
+### The Rigid Architect/Coder Boundary and Intra-Role Escalation
+
+The Architect/Coder boundary is deliberately rigid: the Architect defines the invariant, the Coder implements it. When code generation fails repeatedly, the harness **never promotes the Coder into the Architect role**. Such a switch would blur the very boundary the harness exists to enforce and would reintroduce the drift the paradigm is designed to prevent.
+
+Escalation is therefore **intra-role**. The *coder ladder* (`CoderTier`, each tier pairing a model with a reasoning effort) promotes execution to a stronger coder tier within the same *How* competence, governed by `auto_level_up`. The Architect remains an escalation target only for conceptual work — plan refinement and architectural reasoning — never for compile failures.
 
 ### Deterministic Fallback Resolution
 
 TAUQE rejects speculative `default` configurations. A project configuration is valid as long as at least one semantic role is defined:
 - Any unconfigured role is deterministically inferred along a fixed proximity chain across the specified roles (e.g. resolving `coder` -> `advisor` -> `architect` -> `scribe`).
-- This invariant ensures zero configuration friction: teams can configure four purpose-tuned models for maximum efficiency, or specify a single model that predictably serves all four roles.
+- This invariant ensures zero configuration friction: teams can configure a purpose-tuned model per role for maximum efficiency, or specify a single model that predictably serves all roles.
 
 ### Role-Scoped Reasoning Depth
 
@@ -59,5 +68,17 @@ coder = "medium"      # balanced patch generation and verification healing
 Core subsystems automatically dispatch tasks to their designated semantic role:
 - Compaction and Git squash commit generation invoke **Scribe**.
 - Batch plan step execution and code review remediation invoke **Coder**.
-- Plan refinement and review session creation invoke **Architect**.
+- Plan refinement invokes **Architect**.
+- Review session creation and analytical inspection invoke **Reviewer**.
 - Interactive prompts in the Develop pane invoke **Advisor** (or the engineer's manual override).
+
+---
+
+## 1.3 Architectural Heritage: Magit and SLIME
+
+TAUQE's interface and transport model are not invented in a vacuum; they inherit directly from two long-standing engineering tools:
+
+- **Magit UX Heritage:** The interface is not a chat stream with bubbles, but a **structured, live document of state**. It is high density and fully keyboard-driven, with collapsible sections, contextual cursor operations, and rich interactive diffs.
+- **SLIME / Swank Protocol:** Clean decoupling of client and server. The server encapsulates the project model, Git transactions, and model orchestration; clients (the TUI, and future frontends such as an Emacs package) are lightweight interactive frontends communicating via typed RPC.
+
+This heritage reinforces the core harness principle: the environment exposes state and capabilities through a structured, inspectable surface, never through an open-ended command line.

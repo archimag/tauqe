@@ -8,8 +8,9 @@ use tauqe_core::providers::{create_provider, LlmProvider, StreamEvent};
 use tauqe_core::workflow::{ExecutionMode, SingleExecution};
 use tauqe_protocol::{
     events, EditFileDoneEvent, EditFileRetryingEvent, EditFileStartedEvent, EditFinishedEvent,
-    EditHunkEvent, EditStartedEvent, Event, GitCommitCreatedEvent, ModelAskParams, ModelResultEvent,
-    ModelUsageInfo, Request, Response, ResponseError,
+    EditHunkEvent, EditStartedEvent, Event, GitCommitCreatedEvent, ModelAskParams,
+    ModelResultEvent, ModelStartedEvent, ModelUsageInfo, ReasoningEffort, Request, Response,
+    ResponseError,
 };
 
 use crate::state::{next_operation_id, ActiveOperation, AppState};
@@ -164,14 +165,20 @@ struct PreparedTurn {
     model: tauqe_protocol::ModelRef,
     app_config: tauqe_core::config::AppConfig,
     selection: tauqe_protocol::ModelSelection,
+    reasoning_effort: Option<ReasoningEffort>,
     op_id: String,
     cancel_rx: watch::Receiver<bool>,
 }
 
+/// Resolves the provider and model for a turn, emits `model/started`, and
+/// registers the cancellable active operation. `is_batch` marks turns that run
+/// as members of a batch supervisor so clients can suppress per-step signals.
 async fn prepare_turn(
     state: &Arc<AppState>,
     custom_selection: Option<tauqe_protocol::ModelSelection>,
     plan_context: Option<tauqe_protocol::ModelTurnPlanContext>,
+    reasoning_effort: Option<ReasoningEffort>,
+    is_batch: bool,
 ) -> Result<PreparedTurn, ResponseError> {
     let (provider, model, app_config, selection) = {
         let cfg = state.config.lock().await;
@@ -198,11 +205,13 @@ async fn prepare_turn(
 
     state.out.send_event(&Event {
         method: events::MODEL_STARTED.to_string(),
-        params: Some(serde_json::json!({
-            "operation_id": op_id.clone(),
-            "model": model,
-            "plan_context": plan_context,
-        })),
+        params: serde_json::to_value(ModelStartedEvent {
+            operation_id: op_id.clone(),
+            model: model.to_string(),
+            plan_context,
+            is_batch,
+        })
+        .ok(),
     });
 
     let (cancel_tx, cancel_rx) = watch::channel(false);
@@ -218,6 +227,7 @@ async fn prepare_turn(
         model,
         app_config,
         selection,
+        reasoning_effort,
         op_id,
         cancel_rx,
     })
@@ -234,6 +244,7 @@ async fn run_prepared_turn(
         model,
         app_config,
         selection,
+        reasoning_effort,
         op_id,
         cancel_rx,
     } = prepared;
@@ -247,10 +258,10 @@ async fn run_prepared_turn(
     };
 
     let mut workflow_opts = tauqe_core::workflow::WorkflowOptions::from_app_config(&app_config);
-    workflow_opts.reasoning_effort = match &selection {
+    workflow_opts.reasoning_effort = reasoning_effort.or_else(|| match &selection {
         tauqe_protocol::ModelSelection::Role(role) => app_config.models.resolve_effort(*role),
         tauqe_protocol::ModelSelection::Specific(_) => None,
-    };
+    });
     workflow_opts.initial_selection = Some(selection);
     let execution = SingleExecution::new(workflow_opts);
     let (wf_tx, wf_rx) = (tx.clone(), cancel_rx.clone());
@@ -775,7 +786,7 @@ pub async fn start_model_turn(
     custom_selection: Option<tauqe_protocol::ModelSelection>,
     plan_context: Option<tauqe_protocol::ModelTurnPlanContext>,
 ) -> Result<String, ResponseError> {
-    let prepared = prepare_turn(state, custom_selection, plan_context).await?;
+    let prepared = prepare_turn(state, custom_selection, plan_context, None, false).await?;
     let op_id = prepared.op_id.clone();
     let state_clone = Arc::clone(state);
     let workflow_name = prepared.app_config.develop.workflow.trim().to_lowercase();
@@ -793,15 +804,24 @@ pub async fn start_model_turn(
 ///
 /// Returns the full `ModelTurnResult` representing the atomic turn lifecycle,
 /// enabling server-side step orchestration to inspect step success deterministically.
+///
+/// An explicit `reasoning_effort` overrides the effort derived from the
+/// selection, letting callers target a specific coder-ladder rung without
+/// changing the semantic role. Turns started here always execute inside a batch
+/// supervisor, so they are marked with `is_batch`.
 #[allow(dead_code)]
 pub async fn execute_model_turn(
     state: &Arc<AppState>,
     prompt: String,
     custom_selection: Option<tauqe_protocol::ModelSelection>,
     plan_context: Option<tauqe_protocol::ModelTurnPlanContext>,
+    reasoning_effort: Option<ReasoningEffort>,
     policy: Box<dyn tauqe_core::workflow::policy::ApplyPolicy>,
 ) -> Result<ModelTurnResult, ResponseError> {
-    let prepared = prepare_turn(state, custom_selection, plan_context).await?;
+    // Programmatic step turns always run inside a batch supervisor, so they are
+    // marked as batch members to let clients suppress per-step signals.
+    let prepared =
+        prepare_turn(state, custom_selection, plan_context, reasoning_effort, true).await?;
     run_prepared_turn(state, prompt, prepared, policy).await
 }
 
@@ -1017,7 +1037,7 @@ mod tests {
         let (hist_tx, _hist_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut config = tauqe_core::config::AppConfig::default();
         config.models.scribe = Some(tauqe_protocol::ModelRef::openrouter("test/scribe"));
-        config.models.coder = Some(tauqe_protocol::ModelRef::openrouter("test/coder"));
+        config.models.coder = Some(tauqe_protocol::ModelRef::openrouter("test/coder").into());
         config.models.architect = Some(tauqe_protocol::ModelRef::openrouter("test/architect"));
         config.models.advisor = Some(tauqe_protocol::ModelRef::openrouter("test/advisor"));
         config.models.reviewer = Some(tauqe_protocol::ModelRef::openrouter("test/reviewer"));
@@ -1090,7 +1110,7 @@ mod tests {
         assert_eq!(res_start.unwrap_err().code, "NO_API_KEY");
 
         let policy = Box::new(tauqe_core::workflow::policy::DirectApplyPolicy::new());
-        let res_exec = execute_model_turn(&state, "test prompt".to_string(), None, None, policy).await;
+        let res_exec = execute_model_turn(&state, "test prompt".to_string(), None, None, None, policy).await;
         assert!(res_exec.is_err());
         assert_eq!(res_exec.unwrap_err().code, "NO_API_KEY");
     }

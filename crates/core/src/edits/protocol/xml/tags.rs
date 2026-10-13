@@ -9,10 +9,10 @@ mod plan;
 mod scratchpad;
 mod verify;
 
-pub(crate) use context::next_context_request_tag;
+pub(crate) use context::{next_context_drop_tag, next_context_request_tag};
 pub(crate) use docs::next_doc_request_tag;
 pub(crate) use language::next_user_language_tag;
-pub(crate) use outcome::{next_error_tag, next_success_tag};
+pub(crate) use outcome::{next_blocked_tag, next_error_tag, next_success_tag};
 pub(crate) use plan::next_plan_tag;
 pub(crate) use scratchpad::next_scratchpad_tag;
 pub(crate) use verify::next_verify_tag;
@@ -116,7 +116,8 @@ fn next_control_tag(text: &str, open: &str) -> Option<(usize, usize)> {
                 let end = end_open + close_offset + close_tag.len();
                 return Some((start, end));
             } else {
-                return Some((start, end_open));
+                from = after;
+                continue;
             }
         }
         from = after;

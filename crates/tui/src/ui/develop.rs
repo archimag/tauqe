@@ -51,6 +51,7 @@ pub struct ReasoningState {
     pub lines: Vec<Line<'static>>,
     pub show: bool,
     pub theme_mode: crate::config::ThemeMode,
+    pub max_width: Option<usize>,
     streaming: bool,
     tail: Vec<Line<'static>>,
     pending: String,
@@ -65,6 +66,7 @@ impl Default for ReasoningState {
             lines: Vec::new(),
             show: true,
             theme_mode: crate::config::ThemeMode::default(),
+            max_width: None,
             streaming: false,
             tail: Vec::new(),
             pending: String::new(),
@@ -111,10 +113,9 @@ impl ReasoningState {
     }
 
     pub fn update_markdown(&mut self) {
-        self.lines = crate::markdown::render_markdown(
-            &self.text,
-            &crate::markdown::MarkdownTheme::reasoning_themed(self.theme_mode),
-        );
+        let mut theme = crate::markdown::MarkdownTheme::reasoning_themed(self.theme_mode);
+        theme.max_width = self.max_width;
+        self.lines = crate::markdown::render_markdown(&self.text, &theme);
     }
 
     /// Folds newly appended text into the rolling tail window.
@@ -280,12 +281,14 @@ pub struct DevelopView {
     pub turn_max_rounds: Option<usize>,
     pub turn_phase_detail: Option<String>,
     pub plan_context: Option<tauqe_protocol::ModelTurnPlanContext>,
+    pub is_batch: bool,
     pub repomap_tokens: Option<usize>,
     pub spinner_frame: usize,
     pub rendered_lines_count: usize,
     pub copy_flash: Option<(usize, std::time::Instant)>,
     pub code_blocks: Vec<ModelCodeBlock>,
     pub content_rect: (u16, u16, u16, u16),
+    pub content_width: usize,
     pub(crate) markdown_dirty: bool,
     pub(crate) last_markdown_render: Option<Instant>,
 }
@@ -323,12 +326,14 @@ impl Default for DevelopView {
             turn_max_rounds: None,
             turn_phase_detail: None,
             plan_context: None,
+            is_batch: false,
             repomap_tokens: None,
             spinner_frame: 0,
             rendered_lines_count: 0,
             copy_flash: None,
             code_blocks: Vec::new(),
             content_rect: (0, 0, 0, 0),
+            content_width: 0,
             markdown_dirty: false,
             last_markdown_render: None,
         }
@@ -362,9 +367,13 @@ impl DevelopView {
 
     fn render_markdown_now(&mut self) {
         let flashing_id = self.copy_flash.as_ref().map(|(id, _)| *id);
+        let mut theme = crate::markdown::MarkdownTheme::answer_themed(self.theme_mode);
+        if self.content_width > 0 {
+            theme.max_width = Some(self.content_width);
+        }
         let (lines, blocks) = crate::markdown::render_markdown_with_blocks(
             &self.text,
-            &crate::markdown::MarkdownTheme::answer_themed(self.theme_mode),
+            &theme,
             flashing_id,
         );
         self.markdown_lines = lines;
@@ -385,6 +394,9 @@ impl DevelopView {
     }
 
     pub fn update_reasoning_markdown(&mut self) {
+        if self.content_width > 0 {
+            self.reasoning.max_width = Some(self.content_width);
+        }
         self.reasoning.update_markdown();
     }
 

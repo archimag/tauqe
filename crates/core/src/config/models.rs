@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use tauqe_protocol::{
-    ModelRef, ModelRole, ModelRolesEffort, ModelRolesSummary, ModelSelection, ReasoningEffort,
+    CoderTier, ModelRef, ModelRole, ModelRolesEffort, ModelRolesSummary, ModelSelection,
+    ReasoningEffort,
 };
 
 pub const BUILTIN_DEFAULT_SCRIBE_MODEL: &str = "~anthropic/claude-haiku-latest";
@@ -17,23 +18,7 @@ pub const BUILTIN_DEFAULT_MODEL: &str = BUILTIN_DEFAULT_ADVISOR_MODEL;
 pub type ModelsEffortConfig = ModelRolesEffort;
 
 pub fn parse_model_ref(s: &str) -> Result<ModelRef, String> {
-    let s = s.trim();
-    if let Some((provider_str, model_name)) = s.split_once(':') {
-        let provider_str = provider_str.trim().to_lowercase();
-        let model_name = model_name.trim();
-        if provider_str == "openrouter" {
-            if model_name.is_empty() {
-                return Err("Model name cannot be empty".to_string());
-            }
-            Ok(ModelRef::openrouter(model_name))
-        } else {
-            Err(format!("Unsupported provider '{}'", provider_str))
-        }
-    } else if !s.is_empty() {
-        Ok(ModelRef::openrouter(s))
-    } else {
-        Err("Model specification cannot be empty".to_string())
-    }
+    s.parse()
 }
 
 pub fn deserialize_model_ref_opt<'de, D>(deserializer: D) -> Result<Option<ModelRef>, D::Error>
@@ -71,6 +56,56 @@ where
     }
 }
 
+/// Polymorphic configuration of the coder escalation ladder.
+///
+/// Accepts a single tier (a bare model string or a `{ model, effort }` table)
+/// or an ordered array of tiers. The array form expresses an explicit
+/// escalation ladder; the single form yields a one-rung ladder.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum CoderConfig {
+    Single(CoderTier),
+    Ladder(Vec<CoderTier>),
+}
+
+impl From<ModelRef> for CoderConfig {
+    fn from(model: ModelRef) -> Self {
+        CoderConfig::Single(CoderTier::from(model))
+    }
+}
+
+/// Deserializes the optional coder configuration, treating blank strings as absence.
+///
+/// Mirrors the tolerant model-reference parsing: a blank `coder = ""` disables
+/// the override instead of failing configuration load.
+fn deserialize_coder_config_opt<'de, D>(
+    deserializer: D,
+) -> Result<Option<CoderConfig>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum CoderConfigRaw {
+        Str(String),
+        Config(CoderConfig),
+    }
+
+    match Option::<CoderConfigRaw>::deserialize(deserializer)? {
+        None => Ok(None),
+        Some(CoderConfigRaw::Str(s)) => {
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                Ok(None)
+            } else {
+                let model = parse_model_ref(trimmed).map_err(serde::de::Error::custom)?;
+                Ok(Some(CoderConfig::from(model)))
+            }
+        }
+        Some(CoderConfigRaw::Config(config)) => Ok(Some(config)),
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ModelsConfig {
     #[serde(
@@ -83,10 +118,9 @@ pub struct ModelsConfig {
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
-        deserialize_with = "deserialize_model_ref_opt",
-        serialize_with = "serialize_model_ref_opt"
+        deserialize_with = "deserialize_coder_config_opt"
     )]
-    pub coder: Option<ModelRef>,
+    pub coder: Option<CoderConfig>,
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
@@ -161,15 +195,14 @@ impl ModelsConfig {
             ModelRole::Scribe => self
                 .scribe
                 .clone()
-                .or_else(|| self.coder.clone())
+                .or_else(|| self.coder_base_model())
                 .or_else(|| self.advisor.clone())
                 .or_else(|| self.architect.clone())
                 .or_else(|| self.reviewer.clone())
                 .or(fallback)
                 .unwrap_or_else(|| ModelRef::openrouter(BUILTIN_DEFAULT_SCRIBE_MODEL)),
             ModelRole::Coder => self
-                .coder
-                .clone()
+                .coder_base_model()
                 .or_else(|| self.architect.clone())
                 .or_else(|| self.advisor.clone())
                 .or_else(|| self.scribe.clone())
@@ -181,7 +214,7 @@ impl ModelsConfig {
                 .clone()
                 .or_else(|| self.advisor.clone())
                 .or_else(|| self.reviewer.clone())
-                .or_else(|| self.coder.clone())
+                .or_else(|| self.coder_base_model())
                 .or_else(|| self.scribe.clone())
                 .or(fallback)
                 .unwrap_or_else(|| ModelRef::openrouter(BUILTIN_DEFAULT_ARCHITECT_MODEL)),
@@ -189,7 +222,7 @@ impl ModelsConfig {
                 .advisor
                 .clone()
                 .or_else(|| self.architect.clone())
-                .or_else(|| self.coder.clone())
+                .or_else(|| self.coder_base_model())
                 .or_else(|| self.reviewer.clone())
                 .or_else(|| self.scribe.clone())
                 .or(fallback)
@@ -199,11 +232,58 @@ impl ModelsConfig {
                 .clone()
                 .or_else(|| self.architect.clone())
                 .or_else(|| self.advisor.clone())
-                .or_else(|| self.coder.clone())
+                .or_else(|| self.coder_base_model())
                 .or_else(|| self.scribe.clone())
                 .or(fallback)
                 .unwrap_or_else(|| ModelRef::openrouter(BUILTIN_DEFAULT_REVIEWER_MODEL)),
         }
+    }
+
+    /// Base coder model: the first rung of the configured ladder, if any.
+    ///
+    /// The deterministic role fallback chains treat this as the coder's model,
+    /// so a multi-rung ladder still exposes a single base for cross-role
+    /// resolution.
+    fn coder_base_model(&self) -> Option<ModelRef> {
+        match &self.coder {
+            Some(CoderConfig::Single(tier)) => Some(tier.model.clone()),
+            Some(CoderConfig::Ladder(tiers)) => tiers.first().map(|tier| tier.model.clone()),
+            None => None,
+        }
+    }
+
+    /// Returns the ordered coder escalation ladder.
+    ///
+    /// A single-tier configuration yields a one-rung ladder; when no coder is
+    /// configured the ladder degrades to one fallback rung resolved through the
+    /// deterministic role chain, so escalation always has a base.
+    pub fn coder_ladder(&self) -> Vec<CoderTier> {
+        match &self.coder {
+            Some(CoderConfig::Single(tier)) => vec![tier.clone()],
+            Some(CoderConfig::Ladder(tiers)) if !tiers.is_empty() => tiers.clone(),
+            _ => vec![self.fallback_coder_tier()],
+        }
+    }
+
+    /// Returns the coder rung at `idx`, saturating at the strongest tier.
+    ///
+    /// Out-of-range indices clamp to the last rung, so escalation never panics
+    /// once the ladder is exhausted.
+    pub fn coder_tier(&self, idx: usize) -> CoderTier {
+        let ladder = self.coder_ladder();
+        let last = ladder.len().saturating_sub(1);
+        ladder
+            .get(idx.min(last))
+            .cloned()
+            .unwrap_or_else(|| self.fallback_coder_tier())
+    }
+
+    /// Fallback coder rung derived from the deterministic role resolution chain.
+    fn fallback_coder_tier(&self) -> CoderTier {
+        CoderTier::new(
+            self.resolve_role_with_fallback(ModelRole::Coder, None),
+            self.resolve_effort(ModelRole::Coder),
+        )
     }
 
     /// Resolves a ModelSelection to a concrete ModelRef.
@@ -273,5 +353,78 @@ coder = "low"
         assert_eq!(config.resolve_effort(ModelRole::Scribe), None);
         assert_eq!(config.resolve_effort(ModelRole::Advisor), None);
         assert_eq!(config.resolve_effort(ModelRole::Reviewer), None);
+    }
+
+    #[test]
+    fn test_coder_single_string_yields_one_rung() {
+        let config: ModelsConfig =
+            toml::from_str("coder = \"openrouter:anthropic/claude-3.7-sonnet\"")
+                .expect("parse coder string");
+        let ladder = config.coder_ladder();
+        assert_eq!(ladder.len(), 1);
+        assert_eq!(
+            ladder[0].model,
+            ModelRef::openrouter("anthropic/claude-3.7-sonnet")
+        );
+        assert_eq!(ladder[0].effort, None);
+        assert_eq!(config.resolve_role(ModelRole::Coder), ladder[0].model);
+        assert_eq!(config.coder_tier(0), ladder[0]);
+        assert_eq!(config.coder_tier(7), ladder[0]);
+    }
+
+    #[test]
+    fn test_coder_single_table_carries_effort() {
+        let config: ModelsConfig = toml::from_str(
+            "coder = { model = \"openrouter:deepseek/deepseek-chat\", effort = \"high\" }",
+        )
+        .expect("parse coder table");
+        let ladder = config.coder_ladder();
+        assert_eq!(ladder.len(), 1);
+        assert_eq!(ladder[0].model, ModelRef::openrouter("deepseek/deepseek-chat"));
+        assert_eq!(ladder[0].effort, Some(ReasoningEffort::High));
+        assert_eq!(config.resolve_role(ModelRole::Coder), ladder[0].model);
+    }
+
+    #[test]
+    fn test_coder_array_builds_ordered_ladder() {
+        let config: ModelsConfig = toml::from_str(
+            r#"
+coder = [
+    "openrouter:base/model",
+    { model = "openrouter:strong/model", effort = "xhigh" },
+]
+"#,
+        )
+        .expect("parse coder array");
+        let ladder = config.coder_ladder();
+        assert_eq!(ladder.len(), 2);
+        assert_eq!(ladder[0].model, ModelRef::openrouter("base/model"));
+        assert_eq!(ladder[0].effort, None);
+        assert_eq!(ladder[1].model, ModelRef::openrouter("strong/model"));
+        assert_eq!(ladder[1].effort, Some(ReasoningEffort::XHigh));
+        assert_eq!(config.resolve_role(ModelRole::Coder), ladder[0].model);
+        assert_eq!(config.coder_tier(1), ladder[1]);
+        assert_eq!(config.coder_tier(9), ladder[1]);
+    }
+
+    #[test]
+    fn test_coder_blank_string_is_absent() {
+        let config: ModelsConfig =
+            toml::from_str("coder = \"\"").expect("parse blank coder");
+        assert!(config.coder.is_none());
+    }
+
+    #[test]
+    fn test_coder_ladder_falls_back_through_role_chain() {
+        let config = ModelsConfig {
+            architect: Some(ModelRef::openrouter("only/architect")),
+            ..Default::default()
+        };
+        let ladder = config.coder_ladder();
+        assert_eq!(ladder.len(), 1);
+        assert_eq!(ladder[0].model, ModelRef::openrouter("only/architect"));
+        assert_eq!(ladder[0].effort, None);
+        assert_eq!(config.coder_tier(0), ladder[0]);
+        assert_eq!(config.coder_tier(3), ladder[0]);
     }
 }
