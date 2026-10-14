@@ -20,10 +20,9 @@ pub const REVIEW_COMMANDS: &[KeyCommand] = &[
     // Navigation & Inspection
     KeyCommand { key: "n / p (or ↑/↓)", description: "Navigate review sessions and findings" },
     KeyCommand { key: "C-n / C-p", description: "Inspect next / previous finding (accordion walk)" },
-    KeyCommand { key: "Tab / Space", description: "Fold / unfold session or finding details" },
+    KeyCommand { key: "Tab / Space", description: "Fold / unfold session, summary, or finding details" },
     KeyCommand { key: "a", description: "Toggle fold / unfold all sessions and findings" },
     KeyCommand { key: "f", description: "Toggle filter: show all / hide closed (FIXED/REJECTED)" },
-    KeyCommand { key: "Ctrl+R", description: "Fold / unfold thinking stream" },
     KeyCommand { key: "PgUp / PgDn", description: "Page scroll review view" },
     KeyCommand { key: "Home / End", description: "Select first / last row" },
     KeyCommand { key: "Esc / q", description: "Return to Develop view" },
@@ -40,7 +39,7 @@ fn execute_review_scope_action(
     target_item_id: Option<u32>,
     scope_title: &str,
 ) {
-    if st.model.is_busy() || st.review.running {
+    if st.model.is_busy() {
         st.notify_warning("Model is currently busy; wait for turn to finish or press Esc to cancel");
         return;
     }
@@ -164,21 +163,6 @@ pub async fn handle_review_key(
 ) -> anyhow::Result<InputResult> {
     let mut st = state.lock().await;
 
-    if key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL)
-        && matches!(key.code, KeyCode::Char('r') | KeyCode::Char('R'))
-    {
-        st.review.reasoning.toggle_fold();
-        return Ok(InputResult::Continue);
-    }
-
-    if st.review.running {
-        if key.code == KeyCode::Esc || key.code == KeyCode::Char('q') {
-            st.confirm_cancel = true;
-            st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
-        }
-        return Ok(InputResult::Continue);
-    }
-
     let primary_mod = st.tui_config.input.primary_modifier;
     let is_ctrl_alt = key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL)
         && key.modifiers.contains(crossterm::event::KeyModifiers::ALT);
@@ -246,6 +230,11 @@ pub async fn handle_review_key(
                         st.review.clamp_selection();
                         st.review.scroll_to_selected();
                     }
+                    VisibleReviewRow::SessionSummary { session_id, .. } => {
+                        st.review.toggle_summary_expanded(&session_id);
+                        st.review.clamp_selection();
+                        st.review.scroll_to_selected();
+                    }
                     VisibleReviewRow::ReviewItem {
                         session_id,
                         item_id,
@@ -267,6 +256,11 @@ pub async fn handle_review_key(
                         st.review.clamp_selection();
                         st.review.scroll_to_selected();
                     }
+                    VisibleReviewRow::SessionSummary { session_id, .. } => {
+                        st.review.toggle_summary_expanded(&session_id);
+                        st.review.clamp_selection();
+                        st.review.scroll_to_selected();
+                    }
                     VisibleReviewRow::ReviewItem {
                         session_id,
                         item_id,
@@ -284,6 +278,9 @@ pub async fn handle_review_key(
                 match row {
                     VisibleReviewRow::SessionHeader { session_id, title, .. } => {
                         execute_review_scope_action(&mut st, &session_id, None, &title);
+                    }
+                    VisibleReviewRow::SessionSummary { session_id, .. } => {
+                        execute_review_scope_action(&mut st, &session_id, None, &session_id);
                     }
                     VisibleReviewRow::ReviewItem {
                         session_id,
@@ -396,6 +393,7 @@ pub async fn handle_review_key(
                     let s_opt = st.review.sessions.iter().find(|s| s.id == session_id).or(st.review.session.as_ref());
                     s_opt.map(|s| s.raw_markdown.clone())
                 }
+                Some(VisibleReviewRow::SessionSummary { description, .. }) => Some(description),
                 None => None,
             };
 
@@ -452,11 +450,16 @@ pub async fn handle_review_key(
                 let files_count = st.context.items.len();
                 let estimated_tokens = st.context.total_estimated_tokens as usize;
                 st.review.error = None;
-                st.review_dialog = Some(ReviewDialogState::new(
-                    files_count,
-                    estimated_tokens,
-                    reviewer_entries,
-                ));
+                let mut dialog =
+                    ReviewDialogState::new(files_count, estimated_tokens, reviewer_entries);
+                // Open on the reviewer list when more than one model is
+                // configured so it can be picked instantly with the digit
+                // shortcuts; a single model leaves focus on the editor
+                // (c-magit-key-navigation).
+                if dialog.selector.len() > 1 {
+                    dialog.focus = crate::app::ReviewDialogFocus::ModelList;
+                }
+                st.review_dialog = Some(dialog);
             }
         }
         KeyCode::Char('R') | KeyCode::Char('r') if key.modifiers.contains(crossterm::event::KeyModifiers::SHIFT) => {
@@ -570,6 +573,7 @@ mod tests {
                 status: ReviewStatus::Todo,
                 file_path: None,
                 line_range: None,
+                resolution_notes: None,
                 body: String::new(),
             }],
             raw_markdown: String::new(),

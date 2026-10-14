@@ -1,12 +1,6 @@
 use super::item::{ConceptItem, PlanItem};
 use super::node::Plan;
-
-fn escape_xml_attr(val: &str) -> String {
-    val.replace('&', "&amp;")
-        .replace('"', "&quot;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-}
+use crate::escape::{escape_xml_attr, escape_xml_text, single_line};
 
 pub const PLAN_DISCUSSION_PREFIX: &str = "# Plan Discussion:";
 
@@ -44,13 +38,18 @@ pub fn format_plan_discussion_prompt(
     let mut out = String::new();
     out.push_str(&format!(
         "{} [{}] {}\n\n",
-        PLAN_DISCUSSION_PREFIX, plan.id, plan.title
+        PLAN_DISCUSSION_PREFIX,
+        single_line(&plan.id),
+        single_line(&plan.title)
     ));
 
     if let Some(desc) = &plan.description {
         let trimmed = desc.trim();
         if !trimmed.is_empty() {
-            out.push_str(&format!("## Plan Architecture & Context:\n{}\n\n", trimmed));
+            out.push_str(&format!(
+                "## Plan Architecture & Context:\n{}\n\n",
+                escape_xml_text(trimmed)
+            ));
         }
     }
 
@@ -64,7 +63,10 @@ pub fn format_plan_discussion_prompt(
         total
     ));
     if let Some(desc) = &plan.description {
-        out.push_str(&format!("  <description>{}</description>\n", desc.trim()));
+        out.push_str(&format!(
+            "  <description>{}</description>\n",
+            escape_xml_text(desc.trim())
+        ));
     }
 
     if !plan.concept.is_empty() {
@@ -79,11 +81,17 @@ pub fn format_plan_discussion_prompt(
             for item in items {
                 let is_focused = focused_item_ids.iter().any(|id| id == &item.id);
                 let focus_marker = if is_focused { " [FOCUSED]" } else { "" };
-                out.push_str(&format!("{}- #{}{} {}", indent, item.id, focus_marker, item.title));
+                out.push_str(&format!(
+                    "{}- #{}{} {}",
+                    indent,
+                    item.id,
+                    focus_marker,
+                    escape_xml_text(&item.title)
+                ));
                 if let Some(details) = &item.details {
                     let trimmed = details.trim();
                     if !trimmed.is_empty() {
-                        out.push_str(&format!(": {}", trimmed));
+                        out.push_str(&format!(": {}", escape_xml_text(trimmed)));
                     }
                 }
                 out.push('\n');
@@ -108,12 +116,16 @@ pub fn format_plan_discussion_prompt(
             let focus_marker = if is_focused { " [FOCUSED]" } else { "" };
             out.push_str(&format!(
                 "{}- {}{} (id: \"{}\", status: {})",
-                indent, item.title, focus_marker, item.id, item.status
+                indent,
+                escape_xml_text(&item.title),
+                focus_marker,
+                item.id,
+                item.status
             ));
             if let Some(details) = &item.details {
                 let trimmed = details.trim();
                 if !trimmed.is_empty() {
-                    out.push_str(&format!(": {}", trimmed));
+                    out.push_str(&format!(": {}", escape_xml_text(trimmed)));
                 }
             }
             out.push('\n');
@@ -129,19 +141,28 @@ pub fn format_plan_discussion_prompt(
         out.push_str("### Items Focused by User for Discussion:\n");
         for id in focused_item_ids {
             if let Some(item) = plan.find_item(id) {
-                out.push_str(&format!("- **#{} {}** (status: {})\n", item.id, item.title, item.status));
+                out.push_str(&format!(
+                    "- **#{} {}** (status: {})\n",
+                    item.id,
+                    escape_xml_text(&item.title),
+                    item.status
+                ));
                 if let Some(details) = &item.details {
                     let trimmed = details.trim();
                     if !trimmed.is_empty() {
-                        out.push_str(&format!("  {}\n", trimmed));
+                        out.push_str(&format!("  {}\n", escape_xml_text(trimmed)));
                     }
                 }
             } else if let Some(concept) = plan.find_concept_item(id) {
-                out.push_str(&format!("- **[CONCEPT] #{} {}**\n", concept.id, concept.title));
+                out.push_str(&format!(
+                    "- **[CONCEPT] #{} {}**\n",
+                    concept.id,
+                    escape_xml_text(&concept.title)
+                ));
                 if let Some(details) = &concept.details {
                     let trimmed = details.trim();
                     if !trimmed.is_empty() {
-                        out.push_str(&format!("  {}\n", trimmed));
+                        out.push_str(&format!("  {}\n", escape_xml_text(trimmed)));
                     }
                 }
             }

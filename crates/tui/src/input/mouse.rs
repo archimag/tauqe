@@ -3,7 +3,7 @@ use std::sync::Arc;
 use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
 use tokio::sync::Mutex;
-use tauqe_protocol::methods;
+use tauqe_protocol::{methods, DiscussionFocus};
 
 use crate::app::{ActiveModal, AppState, ViewMode};
 use crate::input::InputResult;
@@ -304,17 +304,23 @@ pub async fn handle_mouse_event(
                     }
                 }
                 Some(ActiveModal::Review) => {
-                    if let Some(dialog) = st.review_dialog.clone() {
-                        let (area, confirm_btn, cancel_btn) =
-                            crate::dialogs::render::review_dialog_geometry(term_rect);
+                    if let Some(mut dialog) = st.review_dialog.take() {
+                        let geo = crate::dialogs::render::review_dialog_geometry(
+                            term_rect,
+                            dialog.selector.len(),
+                        );
 
-                        if rect_contains(confirm_btn, mouse.column, mouse.row) {
-                            st.review_dialog = None;
+                        if rect_contains(geo.confirm_button, mouse.column, mouse.row) {
                             let prompt = dialog.prompt_editor.get_text().trim().to_string();
-                            let selected_model = dialog.selected_entry().map(|e| e.model.clone());
+                            let selected_model =
+                                dialog.selected_entry().map(|e| e.model.clone());
                             let params = tauqe_protocol::ReviewStartParams {
                                 model: selected_model,
-                                user_prompt: if prompt.is_empty() { None } else { Some(prompt) },
+                                user_prompt: if prompt.is_empty() {
+                                    None
+                                } else {
+                                    Some(prompt)
+                                },
                             };
                             st.review.begin();
                             drop(st);
@@ -324,11 +330,30 @@ pub async fn handle_mouse_event(
                                 serde_json::to_value(params)?,
                             )
                             .await?;
-                        } else if rect_contains(cancel_btn, mouse.column, mouse.row)
-                            || !rect_contains(area, mouse.column, mouse.row)
-                        {
-                            st.review_dialog = None;
+                            return Ok(InputResult::Continue);
                         }
+
+                        if rect_contains(geo.cancel_button, mouse.column, mouse.row)
+                            || !rect_contains(geo.area, mouse.column, mouse.row)
+                        {
+                            // Safe cancellation: dismiss without restoring.
+                            return Ok(InputResult::Continue);
+                        }
+
+                        // Clicking a reviewer row selects it and moves focus to
+                        // the list, mirroring keyboard navigation.
+                        if rect_contains(geo.model_rows, mouse.column, mouse.row) {
+                            let visible = geo.model_rows.height as usize;
+                            let start = dialog.selector.visible_start(visible);
+                            let clicked_row = (mouse.row - geo.model_rows.y) as usize;
+                            let index = start + clicked_row;
+                            if index < dialog.selector.len() {
+                                dialog.selector.select_index(index);
+                            }
+                            dialog.focus = crate::app::ReviewDialogFocus::ModelList;
+                        }
+
+                        st.review_dialog = Some(dialog);
                     }
                 }
                 Some(ActiveModal::ConfirmCancel) => {
@@ -452,6 +477,33 @@ pub async fn handle_mouse_event(
                             }
                             ModalHit::Cancel | ModalHit::Outside => {
                                 st.confirm_undo = false;
+                                st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
+                            }
+                            ModalHit::InsideBody => {}
+                        }
+                    }
+                }
+                Some(ActiveModal::ConfirmDetachFocus) => {
+                    if st.confirm_detach_focus {
+                        let geom = geometry_of(
+                            term_rect,
+                            &crate::dialogs::render::confirm_detach_focus_params(&st),
+                        );
+                        match check_confirm_hit(&geom, mouse.column, mouse.row) {
+                            ModalHit::Confirm => {
+                                st.confirm_detach_focus = false;
+                                st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
+                                st.discussion_focus = DiscussionFocus::None;
+                                drop(st);
+                                send_request(
+                                    server_writer,
+                                    methods::DISCUSSION_CLEAR_FOCUS,
+                                    serde_json::json!({}),
+                                )
+                                .await?;
+                            }
+                            ModalHit::Cancel | ModalHit::Outside => {
+                                st.confirm_detach_focus = false;
                                 st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
                             }
                             ModalHit::InsideBody => {}
@@ -621,9 +673,47 @@ pub async fn handle_mouse_event(
                         }
                     }
                 }
-                Some(ActiveModal::RefineDialog)
-                | Some(ActiveModal::RefineBlocked)
-                | Some(ActiveModal::Prompt) => {
+                Some(ActiveModal::RefineDialog) => {
+                    if let Some(mut dialog) = st.plans_view.refine_dialog.take() {
+                        let geo = crate::dialogs::render::refine_dialog_geometry(
+                            term_rect,
+                            dialog.selector.len(),
+                        );
+
+                        if rect_contains(geo.confirm_button, mouse.column, mouse.row) {
+                            crate::dialogs::input::submit_refine_dialog(
+                                st,
+                                dialog,
+                                server_writer,
+                            )
+                            .await?;
+                            return Ok(InputResult::Continue);
+                        }
+
+                        if rect_contains(geo.cancel_button, mouse.column, mouse.row)
+                            || !rect_contains(geo.area, mouse.column, mouse.row)
+                        {
+                            // Safe cancellation: dismiss without starting a turn.
+                            return Ok(InputResult::Continue);
+                        }
+
+                        // Clicking an architect row selects it and moves focus to
+                        // the list, mirroring keyboard navigation.
+                        if rect_contains(geo.model_rows, mouse.column, mouse.row) {
+                            let visible = geo.model_rows.height as usize;
+                            let start = dialog.selector.visible_start(visible);
+                            let clicked_row = (mouse.row - geo.model_rows.y) as usize;
+                            let index = start + clicked_row;
+                            if index < dialog.selector.len() {
+                                dialog.selector.select_index(index);
+                            }
+                            dialog.focus = crate::views::plans::RefineDialogFocus::ModelList;
+                        }
+
+                        st.plans_view.refine_dialog = Some(dialog);
+                    }
+                }
+                Some(ActiveModal::RefineBlocked) | Some(ActiveModal::Prompt) => {
                     // These surfaces have no dedicated mouse targets; the click is
                     // swallowed so it never reaches the background.
                 }

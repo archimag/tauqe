@@ -137,6 +137,42 @@ pub fn render_confirm_undo_popup(frame: &mut ratatui::Frame, state: &AppState) {
     render_modal_confirm(frame, confirm_undo_params(state));
 }
 
+/// Presentation parameters for the discussion-focus detach confirmation.
+///
+/// Detaching is non-destructive to the working tree, so the confirmation
+/// guards against accidental loss of conversational context rather than data:
+/// the safe `Cancel` default keeps the active plan or review anchor in place.
+pub fn confirm_detach_focus_params(state: &AppState) -> ConfirmModalParams<'_> {
+    let body_lines = vec![
+        Line::raw(""),
+        Line::from(Span::styled(
+            "Detach the active discussion focus?",
+            Style::default().bold().fg(Color::Yellow),
+        )),
+        Line::raw(""),
+        Line::from("The REPL will return to the free codebase context."),
+        Line::from(Span::styled(
+            "The plan or review anchor is released until you focus on it again.",
+            Style::default().fg(Color::DarkGray),
+        )),
+    ];
+
+    ConfirmModalParams {
+        title: "Confirm Detach Focus",
+        border_color: Color::Yellow,
+        body_lines,
+        confirm_label: "Detach (Y)",
+        cancel_label: "Cancel (Esc)",
+        confirm_button: state.confirm_button,
+        destructive: false,
+        width: 58,
+    }
+}
+
+pub fn render_confirm_detach_focus_popup(frame: &mut ratatui::Frame, state: &AppState) {
+    render_modal_confirm(frame, confirm_detach_focus_params(state));
+}
+
 /// Presentation parameters for the review-execution confirmation.
 pub fn execute_review_params(state: &AppState) -> Option<ConfirmModalParams<'_>> {
     let target = state.confirm_execute_review.as_ref()?;

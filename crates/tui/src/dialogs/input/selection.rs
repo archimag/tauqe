@@ -81,27 +81,30 @@ pub(super) async fn handle_selection_dialog_key(
         return Ok(Some(InputResult::Continue));
     }
 
-    match key.code {
-        KeyCode::Esc | KeyCode::Char('q') => {}
-        KeyCode::Enter => {
-            if let Some(item) = dialog.items.get(dialog.selector.selected_index()).cloned() {
-                activate_selection_item(st, item, server_writer).await?;
-                return Ok(Some(InputResult::Continue));
-            }
-            st.selection_dialog = Some(dialog);
-        }
-        // Quick-select digits are derived from the row position and bounds-checked
-        // against the item list, so the mapping stays correct as the entries evolve.
+    // `Enter` activates the highlighted row; a `1..9` digit quick-selects the
+    // row printed with that number (Primary picker only). Both resolve to a row
+    // index and share one activation path, and the digit equals the `[N]`
+    // number produced by the shared `numbered_entry_label`, so the rendered
+    // rows and the quick-select keys cannot drift apart.
+    let target_index = match key.code {
         KeyCode::Char(c @ '1'..='9') if dialog.kind == SelectionDialogKind::PrimaryModels => {
-            if let Some(item) = dialog.items.get(c as usize - '1' as usize).cloned() {
-                activate_selection_item(st, item, server_writer).await?;
-                return Ok(Some(InputResult::Continue));
-            }
-            st.selection_dialog = Some(dialog);
+            Some(c as usize - '1' as usize)
         }
-        _ => {
-            st.selection_dialog = Some(dialog);
+        KeyCode::Enter => Some(dialog.selector.selected_index()),
+        _ => None,
+    };
+
+    if let Some(index) = target_index {
+        if let Some(item) = dialog.items.get(index).cloned() {
+            activate_selection_item(st, item, server_writer).await?;
+            return Ok(Some(InputResult::Continue));
         }
+    }
+
+    match key.code {
+        // `Esc` and `q` dismiss the dialog; any other key keeps it open.
+        KeyCode::Esc | KeyCode::Char('q') => {}
+        _ => st.selection_dialog = Some(dialog),
     }
     Ok(Some(InputResult::Continue))
 }

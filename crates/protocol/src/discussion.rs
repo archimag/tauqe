@@ -75,6 +75,114 @@ impl DiscussionContextRequest {
     }
 }
 
+/// Active focus anchor for continuous multi-turn discussion in REPL.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum DiscussionFocus {
+    #[default]
+    None,
+    Plan {
+        plan_id: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        focused_items: Vec<String>,
+    },
+    Review {
+        review_id: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        focused_items: Vec<String>,
+    },
+}
+
+impl DiscussionFocus {
+    pub fn plan(plan_id: impl Into<String>, focused_items: Vec<String>) -> Self {
+        Self::Plan {
+            plan_id: plan_id.into(),
+            focused_items,
+        }
+    }
+
+    pub fn review(review_id: impl Into<String>, focused_items: Vec<String>) -> Self {
+        Self::Review {
+            review_id: review_id.into(),
+            focused_items,
+        }
+    }
+
+    pub fn is_none(&self) -> bool {
+        matches!(self, Self::None)
+    }
+
+    pub fn is_active(&self) -> bool {
+        !self.is_none()
+    }
+}
+
+/// Parameters for setting the active discussion focus.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiscussionSetFocusParams {
+    pub focus: DiscussionFocus,
+}
+
+/// Result of setting the active discussion focus.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiscussionSetFocusResult {
+    pub focus: DiscussionFocus,
+}
+
+/// Parameters for getting the active discussion focus.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct DiscussionGetFocusParams {}
+
+/// Result of querying the active discussion focus.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiscussionGetFocusResult {
+    pub focus: DiscussionFocus,
+}
+
+/// Parameters for clearing the active discussion focus.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct DiscussionClearFocusParams {}
+
+/// Result of clearing the active discussion focus.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiscussionClearFocusResult {
+    pub focus: DiscussionFocus,
+}
+
+/// Notification emitted when discussion focus state changes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiscussionFocusChangedEvent {
+    pub focus: DiscussionFocus,
+}
+
+/// Explicit target of a discussion turn.
+///
+/// The discussion mode and its target are carried as typed request fields rather
+/// than inferred from a magic prefix inside user-controlled prompt text, so a
+/// message whose body merely resembles a discussion heading can never enter
+/// discussion mode, and identifiers are transported verbatim.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum DiscussionTarget {
+    /// Discussion focused on a plan, addressed by plan identifier.
+    Plan { id: String },
+    /// Discussion focused on a review session, addressed by session identifier.
+    Review { id: String },
+}
+
+/// Structured input of a discussion turn.
+///
+/// The server generates the discussion prompt from these typed fields, so the
+/// wire request never relies on parsing free-form prompt text.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiscussionRequest {
+    pub target: DiscussionTarget,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub focused_items: Vec<String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub comment: String,
+}
+
 /// Top-level response structure for discussion and plan refinement modes.
 ///
 /// The `message` field is placed first both in Rust definition and in generated JSON Schema
@@ -117,16 +225,6 @@ impl DiscussionResponse {
     pub fn with_user_language(mut self, language: impl Into<String>) -> Self {
         self.user_language = Some(language.into());
         self
-    }
-
-    /// Returns the raw strict JSON Schema for `DiscussionResponse`.
-    pub fn schema() -> serde_json::Value {
-        discussion_response_schema()
-    }
-
-    /// Returns the complete JSON schema definition object suitable for `response_format: JsonSchema`.
-    pub fn schema_definition() -> serde_json::Value {
-        discussion_response_schema_definition()
     }
 }
 
@@ -359,6 +457,88 @@ mod tests {
     use crate::plan::PlanItemStatus;
 
     #[test]
+    fn test_discussion_focus_lifecycle_and_serde() {
+        let none_focus = DiscussionFocus::None;
+        assert!(none_focus.is_none());
+        assert!(!none_focus.is_active());
+        let none_json = serde_json::to_string(&none_focus).unwrap();
+        assert_eq!(none_json, "{\"kind\":\"none\"}");
+        let de_none: DiscussionFocus = serde_json::from_str(&none_json).unwrap();
+        assert_eq!(de_none, DiscussionFocus::None);
+
+        let plan_focus = DiscussionFocus::plan("plan-1", vec!["1.1".to_string()]);
+        assert!(!plan_focus.is_none());
+        assert!(plan_focus.is_active());
+        let plan_json = serde_json::to_string(&plan_focus).unwrap();
+        assert!(plan_json.contains("\"kind\":\"plan\""));
+        assert!(plan_json.contains("\"plan_id\":\"plan-1\""));
+        assert!(plan_json.contains("\"focused_items\":[\"1.1\"]"));
+        let de_plan: DiscussionFocus = serde_json::from_str(&plan_json).unwrap();
+        assert_eq!(de_plan, plan_focus);
+
+        let review_focus = DiscussionFocus::review("rev-1", vec!["1".to_string(), "2".to_string()]);
+        assert!(!review_focus.is_none());
+        assert!(review_focus.is_active());
+        let review_json = serde_json::to_string(&review_focus).unwrap();
+        assert!(review_json.contains("\"kind\":\"review\""));
+        assert!(review_json.contains("\"review_id\":\"rev-1\""));
+        let de_review: DiscussionFocus = serde_json::from_str(&review_json).unwrap();
+        assert_eq!(de_review, review_focus);
+    }
+
+    #[test]
+    fn test_discussion_focus_rpc_types_serde() {
+        let set_params = DiscussionSetFocusParams {
+            focus: DiscussionFocus::plan("p-1", vec![]),
+        };
+        let set_json = serde_json::to_string(&set_params).unwrap();
+        let de_set: DiscussionSetFocusParams = serde_json::from_str(&set_json).unwrap();
+        assert_eq!(de_set, set_params);
+
+        let set_res = DiscussionSetFocusResult {
+            focus: DiscussionFocus::None,
+        };
+        let res_json = serde_json::to_string(&set_res).unwrap();
+        let de_res: DiscussionSetFocusResult = serde_json::from_str(&res_json).unwrap();
+        assert_eq!(de_res, set_res);
+
+        let event = DiscussionFocusChangedEvent {
+            focus: DiscussionFocus::review("rev-2", vec!["3".to_string()]),
+        };
+        let event_json = serde_json::to_string(&event).unwrap();
+        let de_event: DiscussionFocusChangedEvent = serde_json::from_str(&event_json).unwrap();
+        assert_eq!(de_event, event);
+    }
+
+    #[test]
+    fn test_discussion_request_serde() {
+        let request = DiscussionRequest {
+            target: DiscussionTarget::Plan {
+                id: "p-1".to_string(),
+            },
+            focused_items: vec!["1".to_string()],
+            comment: "Review the concept".to_string(),
+        };
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(json.contains("\"kind\":\"plan\""));
+        assert!(json.contains("\"id\":\"p-1\""));
+        assert!(json.contains("\"comment\":\"Review the concept\""));
+        let de: DiscussionRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(de, request);
+
+        let review_json = r#"{"target":{"kind":"review","id":"rev-9"}}"#;
+        let de_review: DiscussionRequest = serde_json::from_str(review_json).unwrap();
+        assert_eq!(
+            de_review.target,
+            DiscussionTarget::Review {
+                id: "rev-9".to_string()
+            }
+        );
+        assert!(de_review.focused_items.is_empty());
+        assert!(de_review.comment.is_empty());
+    }
+
+    #[test]
     fn test_discussion_plan_action_display_and_serde() {
         assert_eq!(DiscussionPlanAction::Update.to_string(), "update");
         assert_eq!(DiscussionPlanAction::Save.to_string(), "save");
@@ -465,7 +645,6 @@ mod tests {
     /// otherwise forbid the model from expressing fields that exist in the model.
     #[test]
     fn test_schema_matches_data_model() {
-        use crate::plan::PlanItemStatus;
         use std::collections::BTreeSet;
 
         fn keys(value: &serde_json::Value) -> BTreeSet<String> {

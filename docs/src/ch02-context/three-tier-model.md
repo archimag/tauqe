@@ -24,6 +24,7 @@ The working context is organized into three distinct layers:
    - Permanent project guidelines and index files configured in `tauqe.toml` (such as `Conventions.md`, `Vision.md`, and `docs/src/SUMMARY.md`).
    - Injected into every prompt to maintain continuous adherence to project standards.
    - **Strictly protected:** Pinned files are read-only by default and cannot be removed or renamed from the interface. Only an explicit change to project configuration can alter this layer.
+   - **Hierarchical Resolution:** In addition to root-level entries, `context.pinned` resolution is hierarchical: for every file present in the active context (User or Auto layers), the harness traverses its parent directories up to the repository root. At each level, it resolves every pinned entry as a relative path and includes all existing matches in the Pinned layer (deduplicated, read-only, never escaping the project root). This deterministically guarantees that subsystem conventions (e.g. `crates/tui/Conventions.md` or `crates/core/Conventions.md`) are present whenever relevant code is in context, without requiring manual requests or discovery round-trips.
 2. **User Layer:**
    - Files explicitly designated by the developer as relevant to the current work session.
    - Preserved across turns until manually cleared or promoted.

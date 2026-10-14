@@ -99,12 +99,63 @@ pub struct Event {
     pub params: Option<serde_json::Value>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(untagged)]
 pub enum Message {
     Request(Request),
     Response(Response),
     Event(Event),
+}
+
+/// Permissive capture of every field a wire message may carry.
+///
+/// A message is classified by field presence rather than by untagged
+/// trial-and-error. Deserializing into this intermediate shape first lets a
+/// malformed request (for example one whose `method` is not a string) surface
+/// as a parse error instead of being silently absorbed by the broader
+/// [`Response`] shape.
+#[derive(Deserialize)]
+struct RawMessage {
+    #[serde(default)]
+    id: Option<RequestId>,
+    #[serde(default)]
+    method: Option<String>,
+    #[serde(default)]
+    params: Option<serde_json::Value>,
+    #[serde(default)]
+    result: Option<serde_json::Value>,
+    #[serde(default)]
+    error: Option<ResponseError>,
+}
+
+impl<'de> Deserialize<'de> for Message {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = RawMessage::deserialize(deserializer)?;
+
+        // A message carrying `method` is a client request (when it has an id)
+        // or a server event (when it does not). Any other object is a response.
+        match raw.method {
+            Some(method) => match raw.id {
+                Some(id) => Ok(Message::Request(Request {
+                    id,
+                    method,
+                    params: raw.params,
+                })),
+                None => Ok(Message::Event(Event {
+                    method,
+                    params: raw.params,
+                })),
+            },
+            None => Ok(Message::Response(Response {
+                id: raw.id.unwrap_or(RequestId::Null),
+                result: raw.result,
+                error: raw.error,
+            })),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -203,6 +254,28 @@ mod tests {
                 assert_eq!(e.method, "model/delta");
             }
             _ => panic!("Expected Event"),
+        }
+    }
+
+    #[test]
+    fn test_message_rejects_malformed_request_instead_of_misclassifying() {
+        // A request whose `method` is not a string must surface as a parse
+        // error rather than being silently absorbed by the response shape.
+        assert!(serde_json::from_str::<Message>(r#"{"id":1,"method":123}"#).is_err());
+
+        // A request carrying a null id is not a valid request; it is routed to a
+        // server event, so no reply is ever produced on a null correlation id.
+        match serde_json::from_str::<Message>(r#"{"id":null,"method":"ping"}"#).unwrap() {
+            Message::Event(event) => assert_eq!(event.method, "ping"),
+            other => panic!("Expected Event, got {other:?}"),
+        }
+
+        // An uncorrelated error response still round-trips with a null id.
+        let uncorrelated = Response::err(RequestId::Null, "PARSE_ERROR", "bad request");
+        let json = serde_json::to_string(&uncorrelated).unwrap();
+        match serde_json::from_str::<Message>(&json).unwrap() {
+            Message::Response(response) => assert_eq!(response.id, RequestId::Null),
+            other => panic!("Expected Response, got {other:?}"),
         }
     }
 }

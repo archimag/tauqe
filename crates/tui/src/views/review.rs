@@ -5,7 +5,6 @@ use ratatui::text::{Line, Span};
 use tauqe_protocol::{ModelSelection, ReviewItem, ReviewSession, ReviewSeverity, ReviewStatus};
 
 use crate::ui::wrap_lines;
-use crate::views::develop::ReasoningState;
 
 pub mod input;
 pub mod render;
@@ -29,6 +28,11 @@ pub enum VisibleReviewRow {
         rejected: usize,
         is_expanded: bool,
     },
+    SessionSummary {
+        session_id: String,
+        description: String,
+        is_expanded: bool,
+    },
     ReviewItem {
         session_id: String,
         item_id: u32,
@@ -47,6 +51,7 @@ impl VisibleReviewRow {
     pub fn session_id(&self) -> &str {
         match self {
             Self::SessionHeader { session_id, .. } => session_id,
+            Self::SessionSummary { session_id, .. } => session_id,
             Self::ReviewItem { session_id, .. } => session_id,
         }
     }
@@ -54,16 +59,15 @@ impl VisibleReviewRow {
 
 #[derive(Debug, Clone, Default)]
 pub struct ReviewViewState {
+    pub running: bool,
     pub sessions: Vec<ReviewSession>,
     pub session: Option<ReviewSession>,
     pub selected_index: usize,
     pub scroll: u16,
     pub collapsed_sessions: HashSet<String>,
+    pub collapsed_summaries: HashSet<String>,
     pub expanded_items: HashSet<String>,
     pub hide_closed: bool,
-    pub running: bool,
-    pub reasoning: ReasoningState,
-    pub content: String,
     pub error: Option<String>,
     pub view_height: u16,
     pub content_width: usize,
@@ -74,19 +78,18 @@ pub struct ReviewViewState {
 impl ReviewViewState {
     pub fn begin(&mut self) {
         self.running = true;
-        self.reasoning.clear();
-        self.content.clear();
         self.error = None;
-        self.scroll = 0;
     }
 
     pub fn set_session(&mut self, session: ReviewSession) {
         self.running = false;
+        let session_id = session.id.clone();
         self.update_session(session);
-        self.error = None;
         // The freshly finished session's header (with its Executive Summary
-        // block) must be visible immediately, so reset the viewport instead of
-        // leaving it scrolled to wherever the streaming view left it.
+        // block) must be visible immediately, so unfold the summary and reset
+        // the viewport instead of leaving it where the streaming view left it.
+        self.collapsed_summaries.remove(&session_id);
+        self.error = None;
         self.selected_index = 0;
         self.scroll = 0;
     }
@@ -170,6 +173,18 @@ impl ReviewViewState {
         }
     }
 
+    /// The Executive Summary block folds independently of the session's
+    /// finding list; it defaults to expanded so a loaded session shows it.
+    pub fn is_summary_expanded(&self, session_id: &str) -> bool {
+        !self.collapsed_summaries.contains(session_id)
+    }
+
+    pub fn toggle_summary_expanded(&mut self, session_id: &str) {
+        if !self.collapsed_summaries.remove(session_id) {
+            self.collapsed_summaries.insert(session_id.to_string());
+        }
+    }
+
     pub fn is_item_expanded(&self, session_id: &str, item_id: u32) -> bool {
         self.expanded_items
             .contains(&format!("{}:{}", session_id, item_id))
@@ -184,6 +199,7 @@ impl ReviewViewState {
 
     pub fn expand_all(&mut self) {
         self.collapsed_sessions.clear();
+        self.collapsed_summaries.clear();
         let effective = self.effective_sessions();
         for s in &effective {
             for item in &s.items {
@@ -214,10 +230,11 @@ impl ReviewViewState {
             return false;
         }
         effective.iter().all(|s| {
-            s.items.iter().all(|item| {
-                self.expanded_items
-                    .contains(&format!("{}:{}", s.id, item.id))
-            })
+            self.is_summary_expanded(&s.id)
+                && s.items.iter().all(|item| {
+                    self.expanded_items
+                        .contains(&format!("{}:{}", s.id, item.id))
+                })
         })
     }
 
@@ -299,6 +316,16 @@ impl ReviewViewState {
             });
 
             if is_expanded {
+                if let Some(desc) = session.description.as_deref() {
+                    let trimmed = desc.trim();
+                    if !trimmed.is_empty() {
+                        rows.push(VisibleReviewRow::SessionSummary {
+                            session_id: session.id.clone(),
+                            description: trimmed.to_string(),
+                            is_expanded: self.is_summary_expanded(&session.id),
+                        });
+                    }
+                }
                 for item in &session.items {
                     if self.hide_closed
                         && (item.status == ReviewStatus::Fixed
@@ -402,6 +429,9 @@ impl ReviewViewState {
         let sel_row = self.selected_row();
         let cur_idx = match sel_row {
             Some(VisibleReviewRow::SessionHeader { session_id, .. }) => {
+                all_nodes.iter().position(|n| n.session_id == session_id && n.item_id.is_none()).unwrap_or(0)
+            }
+            Some(VisibleReviewRow::SessionSummary { session_id, .. }) => {
                 all_nodes.iter().position(|n| n.session_id == session_id && n.item_id.is_none()).unwrap_or(0)
             }
             Some(VisibleReviewRow::ReviewItem { session_id, item_id, .. }) => {
@@ -569,7 +599,6 @@ fn compute_unified_review_lines(
             VisibleReviewRow::SessionHeader {
                 session_id,
                 title,
-                description,
                 model,
                 total,
                 fixed,
@@ -605,39 +634,53 @@ fn compute_unified_review_lines(
                     header_line = pad_line_to_width(header_line, width, row_style);
                 }
                 all_lines.extend(wrap_lines(vec![header_line], width));
+            }
+            VisibleReviewRow::SessionSummary {
+                description,
+                is_expanded,
+                ..
+            } => {
+                let fold_icon = if *is_expanded { "▼ " } else { "▶ " };
+                let spans = vec![
+                    gutter,
+                    Span::raw("  "),
+                    Span::styled(fold_icon, Style::default().fg(Color::Yellow).bold()),
+                    Span::styled(
+                        "Executive Summary:",
+                        Style::default().fg(Color::Green).bold(),
+                    ),
+                ];
+
+                let mut summary_line = Line::from(spans).style(row_style);
+                if is_selected {
+                    summary_line = pad_line_to_width(summary_line, width, row_style);
+                }
+                let mut row_lines = vec![summary_line];
 
                 if *is_expanded {
-                    if let Some(desc) = description {
-                        let trimmed = desc.trim();
-                        if !trimmed.is_empty() {
-                            let mut desc_lines = vec![Line::from(vec![
-                                Span::styled("    │ ", Style::default().fg(Color::DarkGray)),
-                                Span::styled(
-                                    "Executive Summary:",
-                                    Style::default().fg(Color::Green).bold(),
-                                ),
-                            ])];
-                            let mut theme =
-                                crate::markdown::MarkdownTheme::answer_themed(theme_mode);
-                            theme.text_style = Style::default().fg(Color::Gray);
-                            theme.hard_breaks = true;
-                            theme.compact = true;
-                            theme.line_prefix = Some(Span::styled("    │ ", Style::default().fg(Color::DarkGray)));
-                            let md = crate::markdown::render_markdown(trimmed, &theme);
-                            if !md.is_empty() {
-                                desc_lines.extend(md);
-                            } else {
-                                for line in trimmed.lines() {
-                                    desc_lines.push(Line::from(vec![
-                                        Span::styled("    │ ", Style::default().fg(Color::DarkGray)),
-                                        Span::styled(line.to_string(), Style::default().fg(Color::Gray)),
-                                    ]));
-                                }
+                    let trimmed = description.trim();
+                    if !trimmed.is_empty() {
+                        let mut theme =
+                            crate::markdown::MarkdownTheme::answer_themed(theme_mode);
+                        theme.text_style = Style::default().fg(Color::Gray);
+                        theme.hard_breaks = true;
+                        theme.compact = true;
+                        theme.line_prefix = Some(Span::styled("    │ ", Style::default().fg(Color::DarkGray)));
+                        let md = crate::markdown::render_markdown(trimmed, &theme);
+                        if !md.is_empty() {
+                            row_lines.extend(md);
+                        } else {
+                            for line in trimmed.lines() {
+                                row_lines.push(Line::from(vec![
+                                    Span::styled("    │ ", Style::default().fg(Color::DarkGray)),
+                                    Span::styled(line.to_string(), Style::default().fg(Color::Gray)),
+                                ]));
                             }
-                            all_lines.extend(wrap_lines(desc_lines, width));
                         }
                     }
                 }
+
+                all_lines.extend(wrap_lines(row_lines, width));
             }
             VisibleReviewRow::ReviewItem {
                 item_id,
@@ -735,6 +778,7 @@ mod tests {
             status: ReviewStatus::Todo,
             file_path: None,
             line_range: None,
+            resolution_notes: None,
             body: String::new(),
         }
     }
@@ -878,5 +922,81 @@ mod tests {
             !texts.iter().any(|t| t.contains("Executive Summary:")),
             "a collapsed session must not render the Executive Summary block, got: {texts:?}"
         );
+    }
+
+    #[test]
+    fn test_summary_fold_is_independent_of_findings() {
+        let session = make_session_with_description(
+            "rev-summary",
+            "## Overview\n\nThe architecture is sound.",
+            &[1],
+        );
+        let mut view = ReviewViewState {
+            sessions: vec![session],
+            ..Default::default()
+        };
+
+        // Expanded session exposes an expanded summary row by default.
+        let rows = view.flatten_rows();
+        assert!(matches!(
+            rows.get(1),
+            Some(VisibleReviewRow::SessionSummary {
+                is_expanded: true,
+                ..
+            })
+        ));
+
+        let (lines, _) =
+            compute_unified_review_lines(&rows, 0, 80, crate::config::ThemeMode::Dark);
+        let texts: Vec<String> = lines.iter().map(|line| line.to_string()).collect();
+        assert!(texts.iter().any(|t| t.contains("Executive Summary:")));
+        assert!(texts.iter().any(|t| t.contains("The architecture is sound.")));
+
+        // Folding the summary hides only its body; findings stay visible.
+        view.toggle_summary_expanded("rev-summary");
+        assert!(!view.is_summary_expanded("rev-summary"));
+
+        let rows = view.flatten_rows();
+        assert!(matches!(
+            rows.get(1),
+            Some(VisibleReviewRow::SessionSummary {
+                is_expanded: false,
+                ..
+            })
+        ));
+        let (lines, _) =
+            compute_unified_review_lines(&rows, 0, 80, crate::config::ThemeMode::Dark);
+        let texts: Vec<String> = lines.iter().map(|line| line.to_string()).collect();
+        assert!(texts.iter().any(|t| t.contains("Executive Summary:")));
+        assert!(
+            !texts.iter().any(|t| t.contains("The architecture is sound.")),
+            "a folded summary must hide its body, got: {texts:?}"
+        );
+        assert!(
+            texts.iter().any(|t| t.contains("#1")),
+            "findings must stay visible when the summary is folded, got: {texts:?}"
+        );
+    }
+
+    #[test]
+    fn test_toggle_fold_all_is_bound_to_summary_state() {
+        let session = make_session_with_description("rev-summary", "Summary body.", &[1]);
+        let mut view = ReviewViewState {
+            sessions: vec![session],
+            ..Default::default()
+        };
+
+        // A folded summary makes the tree "not fully expanded".
+        view.collapsed_summaries.insert("rev-summary".to_string());
+        assert!(!view.is_all_expanded());
+
+        // Expanding all also unfolds summaries.
+        view.toggle_fold_all();
+        assert!(view.is_summary_expanded("rev-summary"));
+        assert!(view.is_all_expanded());
+
+        // Collapsing all hides the session and its summary again.
+        view.toggle_fold_all();
+        assert!(!view.is_all_expanded());
     }
 }

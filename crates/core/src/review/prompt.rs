@@ -2,10 +2,14 @@ use crate::context::ContextFileContent;
 use tauqe_protocol::review::ReviewSession;
 
 pub use tauqe_protocol::review::{
-    extract_review_discussion_id, format_review_discussion_prompt,
-    format_review_discussion_prompt_items, is_discussion_prompt, is_review_discussion_prompt,
+    format_review_discussion_prompt, format_review_discussion_prompt_items,
     REVIEW_DISCUSSION_PREFIX,
 };
+
+/// Returns true if the prompt represents an explicit review discussion turn.
+pub fn is_review_discussion_prompt(prompt: &str) -> bool {
+    prompt.trim_start().starts_with(REVIEW_DISCUSSION_PREFIX)
+}
 
 /// Builds the system prompt for the isolated code review session.
 /// Focuses purely on architectural soundness, safety, edge cases, and performance.
@@ -233,6 +237,15 @@ pub fn format_review_step_execution_prompt(
             item.body.trim()
         ));
     }
+    if let Some(notes) = &item.resolution_notes {
+        let trimmed = notes.trim();
+        if !trimmed.is_empty() {
+            out.push_str(&format!(
+                "- **Solution Strategy (from discussion)**:\n{}\n",
+                trimmed
+            ));
+        }
+    }
     out.push('\n');
 
     out.push_str("## Execution Directives:\n");
@@ -302,6 +315,7 @@ mod tests {
                 status: ReviewItemStatus::Todo,
                 file_path: Some("crates/tui/src/view.rs".to_string()),
                 line_range: Some((100, 110)),
+                resolution_notes: None,
                 body: "Replace clone with reference borrowing".to_string(),
             }],
             raw_markdown: String::new(),

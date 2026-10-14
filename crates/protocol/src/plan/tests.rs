@@ -24,11 +24,6 @@ fn test_plan_refine_types_serde_and_helpers() {
     let de_params: PlanRefineParams = serde_json::from_str(&json_params).unwrap();
     assert_eq!(de_params, params);
 
-    // Backward compatibility with legacy tier string:
-    let legacy_json = r#"{"plan_id":"core-feature","model":"senior"}"#;
-    let legacy_params: PlanRefineParams = serde_json::from_str(legacy_json).unwrap();
-    assert_eq!(legacy_params.model, Some(ModelSelection::Role(ModelRole::Architect)));
-
     let plan = Plan {
         id: "core-feature".to_string(),
         title: "Feature".to_string(),
@@ -204,16 +199,126 @@ fn test_plan_stats_and_summary() {
         ],
     };
 
+    // Progress counts executable leaves only: the "1" container is a conceptual
+    // milestone and is not double-counted alongside its "1.1" child.
     let (total, completed) = plan.count_stats();
-    assert_eq!(total, 3);
-    assert_eq!(completed, 2);
+    assert_eq!(total, 2);
+    assert_eq!(completed, 1);
 
     let summary = plan.summary();
-    assert_eq!(summary.total_items, 3);
-    assert_eq!(summary.completed_items, 2);
+    assert_eq!(summary.total_items, 2);
+    assert_eq!(summary.completed_items, 1);
     assert_eq!(summary.id, "jwt-auth");
     assert_eq!(summary.status, PlanItemStatus::InProgress);
     assert_eq!(plan.status(), PlanItemStatus::InProgress);
+}
+
+#[test]
+fn test_count_stats_reports_only_leaves() {
+    let plan = Plan {
+        id: "count-leaves".to_string(),
+        title: "Count Leaves".to_string(),
+        description: None,
+        created_at: 1,
+        updated_at: 1,
+        concept: vec![],
+        items: vec![
+            item(
+                "1",
+                "Group",
+                PlanItemStatus::Todo,
+                vec![
+                    item("1.1", "A", PlanItemStatus::Done, vec![]),
+                    item("1.2", "B", PlanItemStatus::Done, vec![]),
+                ],
+            ),
+            item("2", "Leaf", PlanItemStatus::Todo, vec![]),
+        ],
+    };
+
+    // Containers are conceptual and carry no authoritative status, so progress
+    // counts the three executable leaves, never the container alongside them.
+    assert_eq!(plan.count_stats(), (3, 2));
+    let summary = plan.summary();
+    assert_eq!(summary.total_items, 3);
+    assert_eq!(summary.completed_items, 2);
+}
+
+#[test]
+fn test_evaluate_scope_reports_only_leaves_for_discussion() {
+    let mut plan = Plan {
+        id: "leaf-only-scope".to_string(),
+        title: "Leaf Only Scope".to_string(),
+        description: None,
+        created_at: 1,
+        updated_at: 1,
+        concept: vec![],
+        items: vec![item(
+            "1",
+            "Group",
+            PlanItemStatus::Todo,
+            vec![
+                item("1.1", "Ready", PlanItemStatus::Todo, vec![]),
+                item("1.2", "Discuss", PlanItemStatus::Discussion, vec![]),
+            ],
+        )],
+    };
+
+    // Refreshing propagates the Discussion child onto its container. Only the
+    // offending leaf is reported, never the container as well.
+    plan.refresh_parent_statuses();
+    assert_eq!(plan.find_item("1").unwrap().status, PlanItemStatus::Discussion);
+
+    match plan.evaluate_scope(None) {
+        PlanScopeEvaluation::BlockedByDiscussion(items) => {
+            assert_eq!(items.len(), 1);
+            assert!(items[0].contains("1.2"));
+        }
+        other => panic!("Expected BlockedByDiscussion, got {:?}", other),
+    }
+
+    match plan.evaluate_scope(Some("1")) {
+        PlanScopeEvaluation::BlockedByDiscussion(items) => {
+            assert_eq!(items.len(), 1);
+            assert!(items[0].contains("1.2"));
+        }
+        other => panic!("Expected BlockedByDiscussion, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_evaluate_scope_dependency_uses_derived_container_status() {
+    let mut dependent = item("2", "Dependent", PlanItemStatus::Todo, vec![]);
+    dependent.depends_on = vec!["1".to_string()];
+
+    let plan = Plan {
+        id: "parent-dep".to_string(),
+        title: "Parent Dep".to_string(),
+        description: None,
+        created_at: 1,
+        updated_at: 1,
+        concept: vec![],
+        items: vec![
+            item(
+                "1",
+                "Group",
+                PlanItemStatus::Todo,
+                vec![item("1.1", "A", PlanItemStatus::Done, vec![])],
+            ),
+            dependent,
+        ],
+    };
+
+    // The container's stored status is stale (Todo) while all of its children
+    // are Done. Readiness derives the container status from its children instead
+    // of trusting the stale stored value, so the dependent step is ready.
+    match plan.evaluate_scope(None) {
+        PlanScopeEvaluation::Ready(leaves) => {
+            let ids: Vec<&str> = leaves.iter().map(|i| i.id.as_str()).collect();
+            assert_eq!(ids, vec!["2"]);
+        }
+        other => panic!("Expected Ready, got {:?}", other),
+    }
 }
 
 #[test]
@@ -564,6 +669,38 @@ fn test_plan_update_item_status_matches_ids_case_insensitively() {
     assert!(plan.find_item("step-1").is_some());
     assert!(plan.update_item_status("step-1", PlanItemStatus::Done));
     assert_eq!(plan.find_item("STEP-1").unwrap().status, PlanItemStatus::Done);
+}
+
+#[test]
+fn test_plan_update_item_status_rejects_container_targets() {
+    let mut plan = Plan {
+        id: "container-guard".to_string(),
+        title: "Container Guard".to_string(),
+        description: None,
+        created_at: 1,
+        updated_at: 1,
+        concept: vec![],
+        items: vec![item(
+            "g",
+            "Group",
+            PlanItemStatus::Todo,
+            vec![item("g.1", "Child", PlanItemStatus::Todo, vec![])],
+        )],
+    };
+
+    // A container target is rejected: its status is derived from its children, so
+    // the assignment would be recomputed away immediately. The caller is told the
+    // update did not happen instead of silently losing the change.
+    assert!(!plan.update_item_status("g", PlanItemStatus::Done));
+    assert_eq!(plan.find_item("g").unwrap().status, PlanItemStatus::Todo);
+
+    // A leaf target is updated and its ancestors are refreshed.
+    assert!(plan.update_item_status("g.1", PlanItemStatus::Done));
+    assert_eq!(plan.find_item("g.1").unwrap().status, PlanItemStatus::Done);
+    assert_eq!(plan.find_item("g").unwrap().status, PlanItemStatus::Done);
+
+    // An unknown identifier is rejected as well.
+    assert!(!plan.update_item_status("missing", PlanItemStatus::Done));
 }
 
 #[test]

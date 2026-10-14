@@ -136,6 +136,7 @@ pub fn parse_review_output(raw: &str) -> (Option<String>, Vec<ReviewItem>) {
                     model: None,
                     file_path: finding.file_path,
                     line_range: combine_line_range(finding.line_start, finding.line_end),
+                    resolution_notes: None,
                     body: finding.body.trim().to_string(),
                 })
                 .collect();
@@ -156,6 +157,7 @@ pub fn parse_review_output(raw: &str) -> (Option<String>, Vec<ReviewItem>) {
                         status: ReviewItemStatus::Discussion,
                         file_path: None,
                         line_range: None,
+                        resolution_notes: None,
                         body: trimmed.to_string(),
                     }],
                 )

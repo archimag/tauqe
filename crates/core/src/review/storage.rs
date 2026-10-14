@@ -404,6 +404,7 @@ mod tests {
                 status: ReviewItemStatus::Discussion,
                 file_path: Some("crates/core/src/lib.rs".to_string()),
                 line_range: Some((10, 20)),
+                resolution_notes: None,
                 body: "Check input validation".to_string(),
             }],
             raw_markdown: "## [CRITICAL] Security finding\n...".to_string(),

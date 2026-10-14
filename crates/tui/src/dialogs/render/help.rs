@@ -18,7 +18,6 @@ pub const GLOBAL_COMMANDS: &[crate::app::KeyCommand] = &[
     // Auxiliary & Destructive.
     crate::app::KeyCommand { key: "C-M / Alt+M", description: "Select active model" },
     crate::app::KeyCommand { key: "C-O", description: "Reload configuration from disk" },
-    crate::app::KeyCommand { key: "C-L", description: "Clear conversation history" },
     crate::app::KeyCommand { key: "Ctrl+Q", description: "Quit TAUQE" },
 ];
 

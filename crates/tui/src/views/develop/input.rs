@@ -23,11 +23,12 @@ pub const DEVELOP_COMMANDS: &[KeyCommand] = &[
     KeyCommand { key: "C-Space / Shift+Tab", description: "Switch focus between prompt and Viewport (typing returns focus to prompt)" },
     KeyCommand { key: "C-T / Enter (Viewport)", description: "Fold / unfold selected file diff" },
     KeyCommand { key: "C-[ / C-] / Alt+[/]", description: "Select previous / next modified file" },
-    KeyCommand { key: "C-P / C-N / Alt+P / Alt+N", description: "Navigate prompt history backward / forward (Viewport: select previous / next file)" },
+    KeyCommand { key: "C-P / C-N", description: "Move cursor line up / down (Viewport: select previous / next file)" },
     KeyCommand { key: "↑ / ↓", description: "Move cursor between prompt lines; navigate history at the first / last line (Viewport: select previous / next file or scroll)" },
     KeyCommand { key: "PgUp / PgDn", description: "Page scroll response view" },
     KeyCommand { key: "Alt+↑ / Alt+↓", description: "Scroll model response up / down" },
     // Editing & Clipboard
+    KeyCommand { key: "Alt+P / Alt+N", description: "Navigate prompt history backward / forward" },
     KeyCommand { key: "Shift+Enter / Alt+Enter / C-J", description: "Insert newline into prompt" },
     KeyCommand { key: "Tab", description: "Insert two spaces into the prompt (Viewport: fold / unfold selected file diff)" },
     KeyCommand { key: "C-Left / C-Right / Alt+B / Alt+F", description: "Move cursor word backward / forward" },
@@ -40,6 +41,7 @@ pub const DEVELOP_COMMANDS: &[KeyCommand] = &[
     KeyCommand { key: "C-Y", description: "Yank (paste) text from the kill ring (falls back to the system clipboard when empty)" },
     KeyCommand { key: "Alt+C / Alt+Y", description: "Copy model response to clipboard" },
     // Auxiliary & Destructive
+    KeyCommand { key: "C-G", description: "Detach the active discussion focus (with confirmation)" },
     KeyCommand { key: "Esc", description: "Interrupt generation; press twice to clear the prompt (saved to kill ring); leave Viewport" },
 ];
 
@@ -61,6 +63,8 @@ pub enum DevelopAction {
     MoveCharForward,
     MoveWordBackward,
     MoveWordForward,
+    MoveLineUp,
+    MoveLineDown,
     Yank,
     ClearPromptSaving,
     HistoryPrev,
@@ -71,6 +75,7 @@ pub enum DevelopAction {
     // Workflow actions
     SendPrompt,
     UndoCommit,
+    DetachFocus,
     OpenSquashDialog,
     CopyModelResponse,
     PrevModifiedFile,
@@ -111,6 +116,8 @@ fn is_editor_action(action: DevelopAction) -> bool {
             | DevelopAction::MoveCharForward
             | DevelopAction::MoveWordBackward
             | DevelopAction::MoveWordForward
+            | DevelopAction::MoveLineUp
+            | DevelopAction::MoveLineDown
             | DevelopAction::Yank
     )
 }
@@ -131,12 +138,12 @@ pub fn resolve_viewport_action(key: KeyEvent, primary_mod: PrimaryModifier) -> O
         {
             DevelopAction::ToggleSelectedFileFold
         }
-        DevelopAction::HistoryPrev | DevelopAction::LineUpOrHistoryPrev => {
-            DevelopAction::ViewportPrev
-        }
-        DevelopAction::HistoryNext | DevelopAction::LineDownOrHistoryNext => {
-            DevelopAction::ViewportNext
-        }
+        DevelopAction::HistoryPrev
+        | DevelopAction::LineUpOrHistoryPrev
+        | DevelopAction::MoveLineUp => DevelopAction::ViewportPrev,
+        DevelopAction::HistoryNext
+        | DevelopAction::LineDownOrHistoryNext
+        | DevelopAction::MoveLineDown => DevelopAction::ViewportNext,
         DevelopAction::InsertSpaces => DevelopAction::ToggleSelectedFileFold,
         DevelopAction::MoveBeginningOfLine if key.code == KeyCode::Home => {
             DevelopAction::ScrollResponseHome
@@ -193,11 +200,10 @@ pub fn resolve_develop_action(key: KeyEvent, primary_mod: PrimaryModifier) -> Op
     if is_primary {
         match key.code {
             KeyCode::Enter => return Some(DevelopAction::SendPrompt),
+            KeyCode::Char('g') => return Some(DevelopAction::DetachFocus),
             KeyCode::Char('s') => return Some(DevelopAction::OpenSquashDialog),
             KeyCode::Char('z') => return Some(DevelopAction::UndoCommit),
             KeyCode::Char('j') => return Some(DevelopAction::InsertNewline),
-            KeyCode::Char('p') | KeyCode::Char('P') => return Some(DevelopAction::HistoryPrev),
-            KeyCode::Char('n') | KeyCode::Char('N') => return Some(DevelopAction::HistoryNext),
             KeyCode::Char('t') | KeyCode::Char('T') => return Some(DevelopAction::ToggleSelectedFileFold),
             KeyCode::Char('[') => return Some(DevelopAction::PrevModifiedFile),
             KeyCode::Char(']') => return Some(DevelopAction::NextModifiedFile),
@@ -210,6 +216,18 @@ pub fn resolve_develop_action(key: KeyEvent, primary_mod: PrimaryModifier) -> Op
             KeyCode::Left => return Some(DevelopAction::MoveWordBackward),
             KeyCode::Right => return Some(DevelopAction::MoveWordForward),
             // Mode-specific character actions
+            KeyCode::Char('p') | KeyCode::Char('P') if primary_mod == PrimaryModifier::Ctrl => {
+                return Some(DevelopAction::MoveLineUp);
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') if primary_mod == PrimaryModifier::Ctrl => {
+                return Some(DevelopAction::MoveLineDown);
+            }
+            KeyCode::Char('p') | KeyCode::Char('P') if primary_mod == PrimaryModifier::Alt => {
+                return Some(DevelopAction::HistoryPrev);
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') if primary_mod == PrimaryModifier::Alt => {
+                return Some(DevelopAction::HistoryNext);
+            }
             KeyCode::Char('u') if primary_mod == PrimaryModifier::Ctrl => {
                 return Some(DevelopAction::KillToBeginningOfLine);
             }
@@ -249,8 +267,8 @@ pub fn resolve_develop_action(key: KeyEvent, primary_mod: PrimaryModifier) -> Op
             KeyCode::Char('b') => return Some(DevelopAction::MoveCharBackward),
             KeyCode::Char('f') => return Some(DevelopAction::MoveCharForward),
             KeyCode::Char('j') => return Some(DevelopAction::InsertNewline),
-            KeyCode::Char('p') | KeyCode::Char('P') => return Some(DevelopAction::HistoryPrev),
-            KeyCode::Char('n') | KeyCode::Char('N') => return Some(DevelopAction::HistoryNext),
+            KeyCode::Char('p') | KeyCode::Char('P') => return Some(DevelopAction::MoveLineUp),
+            KeyCode::Char('n') | KeyCode::Char('N') => return Some(DevelopAction::MoveLineDown),
             KeyCode::Char('t') | KeyCode::Char('T') => return Some(DevelopAction::ToggleSelectedFileFold),
             KeyCode::Left => return Some(DevelopAction::MoveWordBackward),
             KeyCode::Right => return Some(DevelopAction::MoveWordForward),
@@ -414,7 +432,10 @@ pub async fn handle_develop_key(
             st.model.focus = DevelopFocus::Editor;
             if let Some(prompt) = st.take_prompt() {
                 drop(st);
-                let params = ModelAskParams { prompt: prompt.clone() };
+                let params = ModelAskParams {
+                    prompt: prompt.clone(),
+                    discussion: None,
+                };
                 if let Err(err) = send_request(server_writer, methods::MODEL_ASK, serde_json::to_value(params)?).await {
                     let mut st = state.lock().await;
                     st.input_editor.clear();
@@ -432,6 +453,14 @@ pub async fn handle_develop_key(
             } else {
                 st.confirm_undo = true;
                 st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
+            }
+        }
+        DevelopAction::DetachFocus => {
+            if st.discussion_focus.is_active() {
+                st.confirm_detach_focus = true;
+                st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
+            } else {
+                st.notify_info("No active discussion focus to detach");
             }
         }
         DevelopAction::OpenSquashDialog => {
@@ -510,6 +539,12 @@ pub async fn handle_develop_key(
         DevelopAction::ScrollResponseEnd => {
             st.model.auto_scroll = true;
             st.model.scroll = st.model.max_scroll(view_height);
+        }
+        DevelopAction::MoveLineUp => {
+            st.input_editor.move_line_up();
+        }
+        DevelopAction::MoveLineDown => {
+            st.input_editor.move_line_down();
         }
         DevelopAction::HistoryPrev => {
             st.input_editor.history_prev();
@@ -603,13 +638,21 @@ mod tests {
             Some(DevelopAction::UndoCommit)
         );
 
-        // Prompt history and diff folding
+        // Line navigation, prompt history and diff folding
         assert_eq!(
             resolve_develop_action(key(KeyCode::Char('p'), KeyModifiers::CONTROL), p),
-            Some(DevelopAction::HistoryPrev)
+            Some(DevelopAction::MoveLineUp)
         );
         assert_eq!(
             resolve_develop_action(key(KeyCode::Char('n'), KeyModifiers::CONTROL), p),
+            Some(DevelopAction::MoveLineDown)
+        );
+        assert_eq!(
+            resolve_develop_action(key(KeyCode::Char('p'), KeyModifiers::ALT), p),
+            Some(DevelopAction::HistoryPrev)
+        );
+        assert_eq!(
+            resolve_develop_action(key(KeyCode::Char('n'), KeyModifiers::ALT), p),
             Some(DevelopAction::HistoryNext)
         );
         assert_eq!(
@@ -714,6 +757,24 @@ mod tests {
         assert_eq!(
             resolve_develop_action(key(KeyCode::Char('d'), KeyModifiers::CONTROL), p),
             Some(DevelopAction::DeleteForward)
+        );
+
+        // Alt+P / Alt+N trigger HistoryPrev / HistoryNext; Ctrl+P / Ctrl+N move lines
+        assert_eq!(
+            resolve_develop_action(key(KeyCode::Char('p'), KeyModifiers::ALT), p),
+            Some(DevelopAction::HistoryPrev)
+        );
+        assert_eq!(
+            resolve_develop_action(key(KeyCode::Char('n'), KeyModifiers::ALT), p),
+            Some(DevelopAction::HistoryNext)
+        );
+        assert_eq!(
+            resolve_develop_action(key(KeyCode::Char('p'), KeyModifiers::CONTROL), p),
+            Some(DevelopAction::MoveLineUp)
+        );
+        assert_eq!(
+            resolve_develop_action(key(KeyCode::Char('n'), KeyModifiers::CONTROL), p),
+            Some(DevelopAction::MoveLineDown)
         );
     }
 
@@ -839,11 +900,11 @@ mod tests {
         // C-p / C-n navigate symmetrically and never insert a newline.
         assert_eq!(
             resolve_develop_action(key(KeyCode::Char('p'), KeyModifiers::CONTROL), p),
-            Some(DevelopAction::HistoryPrev)
+            Some(DevelopAction::MoveLineUp)
         );
         assert_eq!(
             resolve_develop_action(key(KeyCode::Char('n'), KeyModifiers::CONTROL), p),
-            Some(DevelopAction::HistoryNext)
+            Some(DevelopAction::MoveLineDown)
         );
         assert_ne!(
             resolve_develop_action(key(KeyCode::Char('n'), KeyModifiers::CONTROL), p),

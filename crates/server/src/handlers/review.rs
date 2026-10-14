@@ -124,7 +124,11 @@ pub async fn handle_review_start(req: Request, state: &Arc<AppState>) -> Respons
     let operation = match state.try_begin_operation() {
         Ok(guard) => Arc::new(guard),
         Err(()) => {
-            return Response::err(req.id, errors::BUSY, "Another operation is already running");
+            return Response::err(
+                req.id,
+                errors::OPERATION_IN_PROGRESS,
+                "Another operation is already running",
+            );
         }
     };
 
@@ -483,6 +487,9 @@ pub async fn handle_review_update_item(req: Request, state: &Arc<AppState>) -> R
         |item| {
             if let Some(status) = params.status {
                 item.status = status;
+            }
+            if let Some(notes) = params.resolution_notes.clone() {
+                item.resolution_notes = Some(notes);
             }
         },
     );
@@ -1032,6 +1039,10 @@ pub async fn handle_review_execute(req: Request, state: &Arc<AppState>) -> Respo
         return Response::err(req.id, errors::PREFLIGHT_VERIFICATION_FAILED, message);
     }
 
+    // Execution hands control to the Coder role: the discussion focus is reset
+    // unconditionally so no discussion anchor survives into code generation.
+    state.clear_discussion_focus().await;
+
     let response = Response::ok(
         req.id,
         serde_json::json!({ "review_id": params.review_id, "item_ids": item_ids }),
@@ -1119,6 +1130,7 @@ mod tests {
             status,
             file_path: Some(file.to_string()),
             line_range: None,
+            resolution_notes: None,
             body: "Details".to_string(),
         }
     }

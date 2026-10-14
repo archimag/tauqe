@@ -5,36 +5,11 @@ use ratatui::widgets::{Block, Padding, Paragraph};
 use tauqe_protocol::ReviewStatus;
 
 use crate::app::AppState;
-use crate::ui::wrap_lines;
 
 use super::{
     compute_unified_review_lines, location, model_badge, severity_style, status_label,
-    status_style, ReviewViewState, VisibleReviewRow,
+    status_style, VisibleReviewRow,
 };
-
-fn streaming_lines(review: &ReviewViewState, width: usize) -> Vec<Line<'static>> {
-    let mut lines = vec![Line::from(Span::styled(
-        " Reviewing active context...",
-        Style::default().fg(Color::Yellow).bold(),
-    ))];
-    if !review.reasoning.is_empty() {
-        lines.push(Line::raw(""));
-        lines.extend(review.reasoning.render_lines());
-        lines.push(Line::raw(""));
-    }
-    if !review.content.is_empty() {
-        lines.push(Line::from(Span::styled(
-            " Executive Summary:",
-            Style::default().fg(Color::Green).bold(),
-        )));
-        let md = crate::markdown::render_markdown(
-            &review.content,
-            &crate::markdown::MarkdownTheme::answer_themed(review.theme_mode),
-        );
-        lines.extend(md);
-    }
-    wrap_lines(lines, width)
-}
 
 pub fn render_review_view(
     frame: &mut ratatui::Frame,
@@ -49,29 +24,23 @@ pub fn render_review_view(
     state.review.view_height = height;
     state.review.content_width = width;
 
-    if state.review.running {
-        let lines = streaming_lines(&state.review, width);
-        state.review.rendered_lines = lines.len();
-        let max_scroll = (lines.len() as u16).saturating_sub(height);
-        if state.review.scroll > max_scroll {
-            state.review.scroll = max_scroll;
-        }
-        let paragraph = Paragraph::new(lines).block(block).scroll((state.review.scroll, 0));
-        frame.render_widget(paragraph, main_area);
-
-        let status_line = Line::from(vec![
-            Span::styled(" Reviewing... ", Style::default().fg(Color::Yellow).bold()),
-        ]);
-        let info = Paragraph::new(vec![status_line]).block(Block::default().padding(Padding::horizontal(1)));
-        frame.render_widget(info, info_area);
-        return;
-    }
-
     let rows = state.review.flatten_rows();
     state.review.clamp_selection();
 
     let (lines, offsets) = if rows.is_empty() {
-        (
+        let empty_lines = if state.model.is_busy() {
+            vec![
+                Line::raw(""),
+                Line::from(Span::styled(
+                    "  Review in progress...",
+                    Style::default().fg(Color::Yellow).bold(),
+                )),
+                Line::from(Span::styled(
+                    "  Streaming findings and summary in Develop view (Ctrl+1).",
+                    Style::default().fg(Color::DarkGray),
+                )),
+            ]
+        } else {
             vec![
                 Line::raw(""),
                 Line::from(Span::styled(
@@ -82,9 +51,9 @@ pub fn render_review_view(
                     "  Add files to Context (Ctrl+2), then press 'r' to run a code review.",
                     Style::default().fg(Color::DarkGray),
                 )),
-            ],
-            Vec::new(),
-        )
+            ]
+        };
+        (empty_lines, Vec::new())
     } else {
         compute_unified_review_lines(
             &rows,
@@ -134,6 +103,12 @@ pub fn render_review_view(
     if let Some(err) = &state.review.error {
         status_spans.push(Span::styled(format!(" {}", err), Style::default().fg(Color::Red).bold()));
     } else {
+        if state.model.is_busy() {
+            status_spans.push(Span::styled(
+                " Review in progress... ",
+                Style::default().fg(Color::Yellow).bold(),
+            ));
+        }
         if let Some(row) = state.review.selected_row() {
             status_spans.extend(describe_review_row(&row));
         }
@@ -205,6 +180,26 @@ fn describe_review_row(row: &VisibleReviewRow) -> Vec<Span<'static>> {
             }
             spans
         }
+        VisibleReviewRow::SessionSummary {
+            description,
+            is_expanded,
+            ..
+        } => {
+            let mut spans = vec![Span::styled(
+                format!(
+                    " Executive Summary{}",
+                    if *is_expanded { "" } else { " (folded)" }
+                ),
+                Style::default().fg(Color::Green).bold(),
+            )];
+            if let Some(desc) = first_content_line(Some(description.as_str())) {
+                spans.push(Span::styled(
+                    format!("  —  {}", desc),
+                    Style::default().fg(Color::DarkGray),
+                ));
+            }
+            spans
+        }
         VisibleReviewRow::ReviewItem {
             item_id,
             title,
@@ -249,57 +244,9 @@ fn describe_review_row(row: &VisibleReviewRow) -> Vec<Span<'static>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ratatui::text::Line;
-
-    fn line_texts(lines: &[Line<'static>]) -> Vec<String> {
-        lines.iter().map(|line| line.to_string()).collect()
-    }
-
-    #[test]
-    fn streaming_lines_show_review_summary_header_with_markdown() {
-        let review = ReviewViewState {
-            content: "## Overview\n\nThe architecture is sound.\n\n- Point one\n- Point two"
-                .to_string(),
-            ..Default::default()
-        };
-
-        let lines = streaming_lines(&review, 80);
-        let texts = line_texts(&lines);
-
-        assert!(
-            texts.iter().any(|t| t.contains("Executive Summary:")),
-            "expected the Executive Summary header, got: {texts:?}"
-        );
-        assert!(
-            !texts.iter().any(|t| t.contains("Live Findings Draft:")),
-            "the legacy JSON draft header must be gone"
-        );
-        assert!(
-            texts.iter().any(|t| t.contains("The architecture is sound.")),
-            "expected the rendered Markdown summary body, got: {texts:?}"
-        );
-        assert!(
-            texts.iter().any(|t| t.contains("Point one")),
-            "expected Markdown list items to render, got: {texts:?}"
-        );
-        assert!(
-            !texts.iter().any(|t| t.contains('`') || t.contains('{')),
-            "raw JSON syntax must never leak into the streamed summary"
-        );
-    }
-
-    #[test]
-    fn streaming_lines_omit_summary_header_without_content() {
-        let review = ReviewViewState::default();
-
-        let lines = streaming_lines(&review, 80);
-        let texts = line_texts(&lines);
-
-        assert!(
-            !texts.iter().any(|t| t.contains("Executive Summary:")),
-            "the summary header must not appear without content"
-        );
-    }
+    use crate::views::review::ReviewViewState;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
 
     #[test]
     fn describe_review_row_surfaces_session_description() {
@@ -330,17 +277,11 @@ mod tests {
     }
 
     #[test]
-    fn executive_summary_remains_visible_after_stream_completes() {
+    fn executive_summary_remains_visible_after_session_set() {
         use tauqe_protocol::{ReviewItem, ReviewSeverity, ReviewSession, ReviewStatus};
 
-        let mut review = ReviewViewState {
-            running: true,
-            ..Default::default()
-        };
-        review.content.push_str("Streaming the summary...");
+        let mut review = ReviewViewState::default();
 
-        // The server finalizes the review session; the TUI stores it and leaves
-        // the streaming mode, so the persistent tree view takes over.
         let session = ReviewSession {
             id: "rev-1".to_string(),
             title: "Audit".to_string(),
@@ -357,13 +298,12 @@ mod tests {
                 status: ReviewStatus::Todo,
                 file_path: None,
                 line_range: None,
+                resolution_notes: None,
                 body: String::new(),
             }],
             raw_markdown: String::new(),
         };
         review.set_session(session);
-
-        assert!(!review.running, "streaming must stop once the session is set");
 
         let rows = review.flatten_rows();
         let (lines, _offsets) =
@@ -372,11 +312,35 @@ mod tests {
 
         assert!(
             texts.iter().any(|t| t.contains("Executive Summary:")),
-            "the Executive Summary block must remain visible after streaming, got: {texts:?}"
+            "the Executive Summary block must remain visible after setting session, got: {texts:?}"
         );
         assert!(
             texts.iter().any(|t| t.contains("The architecture is sound.")),
             "the summary body must render in the session header, got: {texts:?}"
+        );
+    }
+
+    #[test]
+    fn render_review_view_shows_in_progress_indicator_when_model_busy() {
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut state = crate::app::test_state();
+        state.model.status = crate::views::develop::TurnStatus::Responding;
+
+        terminal
+            .draw(|f| {
+                let area = f.area();
+                let main_area = Rect::new(0, 0, area.width, area.height.saturating_sub(1));
+                let info_area = Rect::new(0, area.height.saturating_sub(1), area.width, 1);
+                render_review_view(f, &mut state, main_area, info_area);
+            })
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let content: String = buffer.content().iter().map(|c| c.symbol()).collect();
+        assert!(
+            content.contains("Review in progress..."),
+            "expected 'Review in progress...' indicator in buffer"
         );
     }
 }

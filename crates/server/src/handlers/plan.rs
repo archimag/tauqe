@@ -1030,6 +1030,10 @@ pub async fn handle_plan_execute(req: Request, state: &Arc<AppState>) -> Respons
         return Response::err(req.id, errors::PREFLIGHT_VERIFICATION_FAILED, message);
     }
 
+    // Execution hands control to the Coder role: the discussion focus is reset
+    // unconditionally so no discussion anchor survives into code generation.
+    state.clear_discussion_focus().await;
+
     let step_ids: Vec<String> = steps.iter().map(|s| s.id.clone()).collect();
     let response = Response::ok(
         req.id,

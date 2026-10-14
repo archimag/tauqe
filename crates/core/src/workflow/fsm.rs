@@ -350,6 +350,18 @@ fn merge_text(accumulated: String, banner: &str, new_text: &str) -> String {
     )
 }
 
+/// Whether a prompt opens a discussion turn rather than a develop turn.
+///
+/// Discussion turns are assembled by the server with a typed discussion heading,
+/// so prompt assembly activates discussion mode from the heading instead of
+/// re-deriving the mode from free-form text. The server also consults this
+/// predicate to route discussion turns through the structured discussion
+/// protocol regardless of the configured base protocol.
+pub fn is_discussion_prompt(prompt: &str) -> bool {
+    crate::plan::prompt::is_plan_discussion_prompt(prompt)
+        || crate::review::prompt::is_review_discussion_prompt(prompt)
+}
+
 fn apply_turn_plans(
     repo_root: &Path,
     plans: &[tauqe_protocol::DiscussionPlanUpdate],
@@ -1354,6 +1366,7 @@ async fn run_proposal_step(
     );
     assembly.target_language = target_language.map(|language| language.to_string());
     assembly.is_isolated_step = is_isolated_step;
+    assembly.is_discussion = is_discussion_prompt(prompt);
     assembly.turn_scratchpad = turn_scratchpad.map(|notes| notes.to_string());
 
     let messages = assembly.assemble_chat_messages(prompt, protocol);

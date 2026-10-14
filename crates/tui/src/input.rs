@@ -461,26 +461,10 @@ async fn handle_global_shortcuts(
                 reload_configuration(&mut st, server_writer).await?;
                 return Ok(Some(InputResult::Continue));
             }
-            KeyCode::Char('l') => {
-                if st.model.is_busy() {
-                    st.notify_warning("Cannot clear history while model is generating");
-                } else {
-                    st.confirm_clear_history = true;
-                    st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
-                }
-                return Ok(Some(InputResult::Continue));
-            }
             KeyCode::Char('r') => {
-                match st.view_mode {
-                    ViewMode::Review => {
-                        st.review.reasoning.toggle_fold();
-                    }
-                    _ => {
-                        st.model.reasoning.toggle_fold();
-                        let h = st.last_model_height;
-                        st.model.clamp_scroll(h);
-                    }
-                }
+                st.model.reasoning.toggle_fold();
+                let h = st.last_model_height;
+                st.model.clamp_scroll(h);
                 return Ok(Some(InputResult::Continue));
             }
             _ => {}
@@ -836,24 +820,16 @@ mod tests {
     #[tokio::test]
     async fn test_confirmation_modals_default_to_cancel_even_if_leaked() {
         let mut st = test_state();
+        // A leaked non-default button focus must be forced back to the safe
+        // Cancel whenever a global shortcut arms a confirmation.
         st.confirm_button = ConfirmDialogButton::Confirm;
+        st.model.status = crate::views::develop::TurnStatus::Thinking;
 
         let state = Arc::new(Mutex::new(st));
         let mut conn = RpcConnection::new(Vec::<u8>::new());
 
-        // 1. Clear history shortcut (Ctrl+L) resets confirm_button to Cancel
-        let key_ctrl_l = KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL);
-        let res = handle_global_shortcuts(key_ctrl_l, &state, &mut conn, true).await.unwrap();
-        assert_eq!(res, Some(InputResult::Continue));
-        assert!(state.lock().await.confirm_clear_history);
-        assert_eq!(state.lock().await.confirm_button, ConfirmDialogButton::Cancel);
-
-        // Reset
-        state.lock().await.confirm_clear_history = false;
-        state.lock().await.confirm_button = ConfirmDialogButton::Confirm;
-
-        // 2. Cancel shortcut (Ctrl+C) when busy resets confirm_button to Cancel
-        state.lock().await.model.status = crate::views::develop::TurnStatus::Thinking;
+        // Cancel shortcut (Ctrl+C) when busy arms the confirmation and resets
+        // the focused button to the safe Cancel.
         let key_ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
         let res = handle_global_shortcuts(key_ctrl_c, &state, &mut conn, true).await.unwrap();
         assert_eq!(res, Some(InputResult::Continue));
@@ -890,7 +866,8 @@ mod tests {
         assert_eq!(res, None);
         assert!(state.lock().await.squash_dialog.is_none());
 
-        // Ctrl+L (clear history) must not arm its confirmation.
+        // Ctrl+L is no longer a global shortcut (history clearing is isolated
+        // to the History view), so onboarding must stay unaffected by it.
         let key_ctrl_l = KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL);
         let res = handle_global_shortcuts(key_ctrl_l, &state, &mut conn, false)
             .await

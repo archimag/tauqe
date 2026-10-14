@@ -109,6 +109,7 @@ pub(crate) async fn apply_status_dialog(
                     review_id: target_review_id,
                     item_id,
                     status: Some(new_status),
+                    resolution_notes: None,
                 };
                 crate::rpc::send_request_with_id(
                     server_writer,

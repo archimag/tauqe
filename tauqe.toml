@@ -1,7 +1,7 @@
 [providers.openrouter]
 models = [
   "~google/gemini-flash-latest",
-  "~google/gemini-pro-latest",
+  "google/gemini-4-argon",
   "~openai/gpt-luna-latest",
   "~openai/gpt-sol-latest",
   "~anthropic/claude-opus-latest",
@@ -22,7 +22,8 @@ models = [
 # replaces the raw model name in the model picker; `effort` sets the reasoning
 # depth ("low", "medium", "high", "xhigh") for that entry.
 primary = [
-  "~google/gemini-flash-latest",
+  { model = "~google/gemini-flash-latest", alias = "Gemini Flash" },
+  "~deepseek/deepseek-flash-latest",
 ]
 scribe = "~anthropic/claude-haiku-latest"    # history compaction, git squash commit messages, diff summarization
 # The coder list is the natural escalation ladder (level up): on verification
@@ -31,10 +32,19 @@ scribe = "~anthropic/claude-haiku-latest"    # history compaction, git squash co
 # never switches to Architect, preserving the What vs How role isolation.
 coder = [
   "~deepseek/deepseek-flash-latest",
-  { model = "~google/gemini-flash-latest", effort = "medium" }
+  { model = "~google/gemini-flash-latest", effort = "medium" },
+  "google/gemini-4-argon"
 ]
-architect = [{ model = "~google/gemini-flash-latest", effort = "high" }]    # conceptual design, plan refinement, blocked-step replanning
-reviewer = [{ model = "~anthropic/claude-sonnet-latest", alias = "Sonnet" }]   # automated code review of active context files
+architect = [
+  { model = "~google/gemini-flash-latest", effort = "high", alias = "Gemini Flash" },
+  { model = "google/gemini-4-argon", alias = "Gemini Argon" },
+  { model = "~anthropic/claude-sonnet-latest", alias = "Sonnet" }
+]    # conceptual design, plan refinement, blocked-step replanning
+reviewer = [
+  { model = "~google/gemini-flash-latest", effort = "high", alias = "Gemini Flash" },
+  "google/gemini-4-argon",
+  { model = "~anthropic/claude-sonnet-latest", alias = "Sonnet" }
+]   # automated code review of active context files
 
 # Automatically escalate the Coder along its ladder when verification healing stalls,
 # when a patch retry budget is exceeded, or when a plan step must be re-prompted after
@@ -67,11 +77,11 @@ budget_tokens = 20000  # session history token budget before compaction is trigg
 
 [context]
 max_discovery_rounds = 8  # maximum rounds for autonomous context discovery
-files_token_budget = 300000  # token budget for files in active context (default: 300000)
+files_token_budget = 500000  # token budget for files in active context (default: 300000)
 repomap_token_budget = 40000  # token budget for the repository map (default: 4000)
 # max_pattern_batch = 150  # maximum files added per glob pattern request (default: 150)
 pinned = [
     "Conventions.md",
     "Vision.md",
-    "book/src/SUMMARY.md"
+    "docs/src/SUMMARY.md"
 ]

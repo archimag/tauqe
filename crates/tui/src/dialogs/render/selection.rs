@@ -4,7 +4,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
 use crate::app::{
-    compact_entry_label, compact_model_name, SelectionDialogKind, SelectionItem,
+    compact_model_name, numbered_entry_label, SelectionDialogKind, SelectionItem,
 };
 
 /// Select button label as drawn by [`render_selection_dialog`], including its
@@ -28,12 +28,16 @@ pub fn selection_dialog_area(term: Rect, item_count: usize) -> Rect {
     )
 }
 
-/// Row text for the model picker. Primary model rows carry their quick-select number and label.
+/// Row text for the model picker.
+///
+/// Primary rows reuse [`numbered_entry_label`], the single numbering and
+/// presentation rule shared with the embedded model list, so their `[N]`
+/// number, alias, provider, and reasoning effort cannot drift from the Review
+/// and Refine dialogs. Catalog rows stay plain model names, matching the shared
+/// model presentation without a number.
 fn selection_item_label(item: &SelectionItem, index: usize) -> String {
     match item {
-        SelectionItem::Primary(entry) => {
-            format!("[{}] {}", index + 1, compact_entry_label(entry))
-        }
+        SelectionItem::Primary(entry) => numbered_entry_label(index, entry),
         SelectionItem::Model(model) => compact_model_name(model).to_string(),
     }
 }
@@ -130,20 +134,24 @@ pub fn render_selection_dialog(
 
     for (idx, item) in visible_items {
         let is_selected = idx == dialog.selector.selected_index();
-        let prefix = if is_selected { " ▶ " } else { "   " };
+        // The marker and row styles mirror the embedded model list row, so the
+        // `▶` selection indicator reads identically across all three dialogs.
+        let marker = if is_selected { " ▶ " } else { "   " };
+        let marker_style = if is_selected {
+            Style::default().fg(Color::Green).bold()
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
         let line_style = if is_selected {
             Style::default().bg(Color::DarkGray).fg(Color::White).bold()
         } else {
             Style::default().fg(Color::Gray)
         };
 
-        lines.push(
-            Line::from(vec![
-                Span::styled(prefix, Style::default().fg(Color::Green).bold()),
-                Span::styled(selection_item_label(item, idx), line_style),
-            ])
-            .style(line_style),
-        );
+        lines.push(Line::from(vec![
+            Span::styled(marker, marker_style),
+            Span::styled(selection_item_label(item, idx), line_style),
+        ]));
     }
 
     let list_widget = Paragraph::new(lines);
@@ -211,5 +219,24 @@ mod tests {
             cancel_text.contains("Cancel"),
             "cancel row text: {cancel_text:?}"
         );
+    }
+
+    /// Primary rows must render through the shared `numbered_entry_label`, so
+    /// the Review, Refine, and Primary pickers share one numbering and one
+    /// presentation rule for aliases, provider, and reasoning effort.
+    #[test]
+    fn primary_rows_reuse_shared_numbered_label() {
+        let entry = tauqe_protocol::ModelEntry::new(
+            tauqe_protocol::ModelRef::openrouter("anthropic/claude-3-7-sonnet"),
+            Some(tauqe_protocol::ReasoningEffort::High),
+            Some("Claude Auditor".to_string()),
+        );
+
+        let label = selection_item_label(&SelectionItem::Primary(entry.clone()), 0);
+
+        assert_eq!(label, crate::app::numbered_entry_label(0, &entry));
+        assert!(label.starts_with("[1] "), "label: {label:?}");
+        assert!(label.contains("Claude Auditor"));
+        assert!(label.contains("[high]"));
     }
 }

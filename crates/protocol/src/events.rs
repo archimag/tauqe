@@ -45,3 +45,5 @@ pub const REVIEW_BATCH_FINISHED: &str = "review/batchFinished";
 pub const PLAN_UPDATED: &str = "plan/updated";
 pub const PLAN_LIST_CHANGED: &str = "plan/listChanged";
 pub const PLAN_BATCH_FINISHED: &str = "plan/batchFinished";
+
+pub const DISCUSSION_FOCUS_CHANGED: &str = "discussion/focusChanged";

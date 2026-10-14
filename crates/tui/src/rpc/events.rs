@@ -132,6 +132,15 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
                 }
             }
         }
+        events::DISCUSSION_FOCUS_CHANGED => {
+            if let Some(params) = ev.params {
+                if let Ok(data) =
+                    serde_json::from_value::<tauqe_protocol::DiscussionFocusChangedEvent>(params)
+                {
+                    st.discussion_focus = data.focus;
+                }
+            }
+        }
         events::CONTEXT_CHANGED => {
             if let Some(params) = ev.params {
                 if let Some(val) = params.get("state") {
@@ -623,7 +632,6 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
         events::REVIEW_REASONING_DELTA => {
             if let Some(params) = ev.params {
                 if let Ok(data) = serde_json::from_value::<ReviewReasoningDeltaEvent>(params) {
-                    st.review.reasoning.append_delta(&data.delta);
                     apply_review_reasoning(&mut st.model, &data.delta);
                     if st.model.auto_scroll {
                         let h = st.last_model_height;
@@ -635,7 +643,6 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
         events::REVIEW_CONTENT_DELTA => {
             if let Some(params) = ev.params {
                 if let Ok(data) = serde_json::from_value::<ReviewContentDeltaEvent>(params) {
-                    st.review.content.push_str(&data.delta);
                     apply_review_content(&mut st.model, &data.delta);
                     if st.model.auto_scroll {
                         let h = st.last_model_height;
@@ -645,6 +652,7 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
             }
         }
         events::REVIEW_FINISHED => {
+            st.review.running = false;
             let started = st.turn_started_at.take();
             let mut findings_count = 0;
             if let Some(params) = ev.params {
@@ -675,12 +683,13 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
             }
         }
         events::REVIEW_CANCELLED => {
-            st.turn_started_at = None;
             st.review.running = false;
+            st.turn_started_at = None;
             st.review.error = Some("Review cancelled".to_string());
             end_review_turn(&mut st.model, TurnStatus::Cancelled, None);
         }
         events::REVIEW_ERROR => {
+            st.review.running = false;
             if let Some(started) = st.turn_started_at.take() {
                 let elapsed = started.elapsed().as_secs();
                 let focused = st.terminal_focused;
@@ -695,7 +704,6 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
             }
             if let Some(params) = ev.params {
                 if let Ok(data) = serde_json::from_value::<ReviewErrorEvent>(params) {
-                    st.review.running = false;
                     st.review.error = Some(data.message.clone());
                     end_review_turn(&mut st.model, TurnStatus::Error, Some(data.message));
                 }
@@ -796,10 +804,20 @@ fn apply_review_reasoning(model: &mut DevelopView, delta: &str) {
 }
 
 /// Streams a Reviewer summary delta into the REPL answer buffer.
+///
+/// The first non-empty fragment settles the reviewer's reasoning stream exactly
+/// once, mirroring `MODEL_TEXT_DELTA`: the live tail window is finalized and the
+/// block folds into "▶ Thinking hidden", so the reasoning lifecycle stays
+/// identical across ordinary, discussion, and review turns.
 fn apply_review_content(model: &mut DevelopView, delta: &str) {
-    if !delta.is_empty() {
-        model.status = TurnStatus::Responding;
+    if delta.is_empty() {
+        return;
     }
+    if model.reasoning.is_streaming() {
+        model.reasoning.finalize();
+        model.reasoning.show = false;
+    }
+    model.status = TurnStatus::Responding;
     model.text.push_str(delta);
     model.update_markdown();
 }
@@ -991,6 +1009,25 @@ mod tests {
         assert_eq!(model.status, TurnStatus::Responding);
         assert!(model.text.contains("Executive Summary"));
         assert!(!model.markdown_lines.is_empty());
+    }
+
+    #[test]
+    fn test_review_content_delta_finalizes_and_folds_reasoning() {
+        let mut model = DevelopView::default();
+        apply_review_reasoning(&mut model, "weighing the options");
+        assert!(model.reasoning.is_streaming());
+        assert!(model.reasoning.show);
+
+        apply_review_content(&mut model, "Executive Summary");
+
+        assert!(
+            !model.reasoning.is_streaming(),
+            "the reasoning stream must finalize when the answer begins"
+        );
+        assert!(
+            !model.reasoning.show,
+            "the reasoning block must fold into 'Thinking hidden'"
+        );
     }
 
     #[test]

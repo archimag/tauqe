@@ -1,7 +1,7 @@
 use ratatui::layout::Rect;
 use tauqe_protocol::{
-    ContextState, ModelRef, ModelRole, ModelRolesSummary, ModelSelection, ReasoningEffort,
-    RepositoryState, SystemStatusResult,
+    ContextState, DiscussionFocus, ModelRef, ModelRole, ModelRolesSummary, ModelSelection,
+    ReasoningEffort, RepositoryState, SystemStatusResult,
 };
 
 use crate::components::model_selector::ModelSelector;
@@ -47,6 +47,7 @@ pub enum ActiveModal {
     ClearAuto,
     ClearUser,
     ConfirmUndo,
+    ConfirmDetachFocus,
     DeletePlan,
     DeleteReview,
     ExecuteReview,
@@ -292,6 +293,28 @@ pub fn compact_entry_label(entry: &tauqe_protocol::ModelEntry) -> String {
     }
 }
 
+/// Numbered row label for the embedded model lists: `[N] <label>`, where the
+/// label follows the shared model presentation (alias when configured,
+/// otherwise `provider:model`) with the reasoning effort appended.
+///
+/// The reusable [`crate::components::model_selector::ModelSelector`] list and
+/// the primary model picker share this one numbering rule so their rows cannot
+/// drift apart.
+#[allow(dead_code)] // Consumed by the embedded model lists as they are integrated.
+pub fn numbered_entry_label(index: usize, entry: &tauqe_protocol::ModelEntry) -> String {
+    let mut label = format!("[{}] {}", index + 1, entry.display_label());
+    let aliased = entry
+        .alias
+        .as_deref()
+        .is_some_and(|alias| !alias.trim().is_empty());
+    if aliased {
+        if let Some(effort) = entry.effort {
+            label.push_str(&format!(" [{}]", effort));
+        }
+    }
+    label
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SelectionDialogKind {
     /// List of models configured for the Primary role.
@@ -440,14 +463,64 @@ pub enum ViewMode {
     Onboarding,
 }
 
+/// Focus section of the review launch dialog.
+///
+/// The dialog exposes three keyboard targets — the embedded Reviewer model
+/// list, the instruction editor, and the action buttons — and `Tab` cycles
+/// through them in visual order. Making the section explicit replaces the old
+/// heuristic that inferred the target from whether the editor was empty, so
+/// list navigation and text editing never fight over the same keys
+/// (Conventions §6, §7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ReviewDialogFocus {
+    ModelList,
+    #[default]
+    PromptEditor,
+    Actions,
+}
+
+impl ReviewDialogFocus {
+    /// Advances focus to the next section in visual order.
+    pub fn cycle_next(&mut self) {
+        *self = match self {
+            Self::ModelList => Self::PromptEditor,
+            Self::PromptEditor => Self::Actions,
+            Self::Actions => Self::ModelList,
+        };
+    }
+
+    /// Moves focus to the previous section in visual order.
+    pub fn cycle_prev(&mut self) {
+        *self = match self {
+            Self::ModelList => Self::Actions,
+            Self::PromptEditor => Self::ModelList,
+            Self::Actions => Self::PromptEditor,
+        };
+    }
+
+    pub fn is_model_list(&self) -> bool {
+        matches!(self, Self::ModelList)
+    }
+
+    pub fn is_prompt_editor(&self) -> bool {
+        matches!(self, Self::PromptEditor)
+    }
+
+    pub fn is_actions(&self) -> bool {
+        matches!(self, Self::Actions)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ReviewDialogState {
     pub files_count: usize,
     pub estimated_tokens: usize,
-    /// Reviewer-role model selector: role badge, configured entries, cyclic
-    /// navigation, and the shared stepper presentation (c-1, c-2).
+    /// Reviewer-role model selector: configured entries, cyclic navigation,
+    /// embedded-list rendering, and the shared scroll arithmetic (c-1, c-2).
     pub selector: ModelSelector,
     pub prompt_editor: InputEditor,
+    /// Section that currently owns the keyboard.
+    pub focus: ReviewDialogFocus,
     /// Which action-bar button holds focus. Defaults to the safe `Cancel`.
     pub confirm_button: ConfirmDialogButton,
 }
@@ -465,6 +538,7 @@ impl ReviewDialogState {
             estimated_tokens,
             selector: ModelSelector::new(ModelRole::Reviewer, reviewer_entries, 0),
             prompt_editor: InputEditor::default(),
+            focus: ReviewDialogFocus::default(),
             confirm_button: ConfirmDialogButton::Cancel,
         }
     }
@@ -770,6 +844,7 @@ pub struct AppState {
     pub confirm_cancel: bool,
     pub confirm_quit: bool,
     pub confirm_undo: bool,
+    pub confirm_detach_focus: bool,
     pub confirm_clear_history: bool,
     pub confirm_delete_plan: Option<String>,
     pub confirm_delete_review: Option<String>,
@@ -795,6 +870,12 @@ pub struct AppState {
     pub model_choice: ModelChoice,
     /// Structured identity of the model currently executing a turn, if any.
     pub running_model: Option<RunningModel>,
+    /// Active discussion focus anchor mirrored from the server.
+    ///
+    /// Drives the REPL focus banner and the empty-prompt `Esc` detach shortcut.
+    /// The server owns the authoritative value and broadcasts every change via
+    /// `discussion/focusChanged`; the client only mirrors it for rendering.
+    pub discussion_focus: DiscussionFocus,
 }
 
 impl AppState {
@@ -827,6 +908,7 @@ impl AppState {
             confirm_cancel: false,
             confirm_quit: false,
             confirm_undo: false,
+            confirm_detach_focus: false,
             confirm_clear_history: false,
             confirm_delete_plan: None,
             confirm_delete_review: None,
@@ -851,6 +933,7 @@ impl AppState {
             shift_tip_shown: false,
             model_choice: ModelChoice::default(),
             running_model: None,
+            discussion_focus: DiscussionFocus::None,
         }
     }
 
@@ -969,6 +1052,9 @@ impl AppState {
         }
         if self.confirm_undo {
             return Some(ActiveModal::ConfirmUndo);
+        }
+        if self.confirm_detach_focus {
+            return Some(ActiveModal::ConfirmDetachFocus);
         }
         if self.confirm_delete_plan.is_some() {
             return Some(ActiveModal::DeletePlan);

@@ -1116,7 +1116,9 @@ mod tests {
         let list = PlanStorage::list_plans(root).unwrap();
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].id, "auth-flow");
-        assert_eq!(list[0].total_items, 3);
+        // Progress counts executable leaves: items "1.1" and "2" (the "1" parent
+        // is a conceptual container and is not counted).
+        assert_eq!(list[0].total_items, 2);
 
         // 3. Load
         let loaded = PlanStorage::load_plan(root, "auth-flow").unwrap().unwrap();

@@ -667,7 +667,7 @@ mod tests {
         let xml_prompt = assembly.build_system_prompt(&xml);
         assert!(xml_prompt.contains("Code Modification Protocol (XML Edits)"));
 
-        let json = JsonPromptProtocol;
+        let json = JsonPromptProtocol::default();
         let json_prompt = assembly.build_system_prompt(&json);
         assert!(json_prompt.contains("Code Modification Protocol (Structured Output JSON)"));
 

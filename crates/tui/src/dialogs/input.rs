@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use tauqe_protocol::{methods, ReviewStartParams};
+use tauqe_protocol::{methods, DiscussionFocus, ReviewStartParams};
 use tokio::sync::{Mutex, MutexGuard};
 
 use crate::app::{ActiveModal, AppState, ViewMode};
@@ -19,6 +19,7 @@ mod status;
 
 use confirm::{resolve_confirm, ConfirmOutcome};
 pub(crate) use discuss::submit_discuss_plan;
+pub(crate) use refine::submit_refine_dialog;
 pub(crate) use selection::activate_selection_item;
 pub(crate) use status::apply_status_dialog;
 
@@ -27,6 +28,9 @@ pub(crate) use status::apply_status_dialog;
 /// review execution) so the state transition stays consistent.
 fn begin_develop_turn(st: &mut AppState) {
     st.view_mode = ViewMode::Develop;
+    // Executing code hands control to the Coder role: detach the discussion
+    // focus locally so no anchor survives into the new turn.
+    st.discussion_focus = DiscussionFocus::None;
     st.model.reasoning.clear();
     st.model.text.clear();
     st.model.markdown_lines.clear();
@@ -152,26 +156,71 @@ pub(crate) async fn handle_dialog_event(
         Some(ActiveModal::Review) => {
             if let Some(mut dialog) = st.review_dialog.take() {
                 let primary = st.tui_config.input.primary_modifier;
-                let is_ctrl_alt = key.modifiers.contains(KeyModifiers::CONTROL)
-                    && key.modifiers.contains(KeyModifiers::ALT);
-                let is_cmd = !is_ctrl_alt
-                    && (primary.matches(key.modifiers)
-                        || key.modifiers.contains(KeyModifiers::CONTROL));
+                let visible_rows = crate::dialogs::render::review_dialog_geometry(
+                    st.last_frame_area,
+                    dialog.selector.len(),
+                )
+                .model_rows
+                .height as usize;
 
-                // Model switching is unified through the shared selector: the
-                // C-M / Alt+M chord always switches, and the arrows browse the
-                // reviewer list while the instruction editor is empty (c-1, c-3).
-                let editor_focused = !dialog.prompt_editor.is_empty();
-                if dialog.selector.handle_key(key, primary, editor_focused) {
+                // The C-M / Alt+M chord always switches the reviewer; the arrows
+                // browse the list only while the list owns focus, so list
+                // navigation and text editing never fight over the same keys
+                // (c-magit-key-navigation).
+                if dialog
+                    .selector
+                    .handle_key(key, primary, !dialog.focus.is_model_list())
+                {
                     st.review_dialog = Some(dialog);
                     return Ok(Some(InputResult::Continue));
                 }
 
-                match key.code {
-                    KeyCode::Esc => {
-                        return Ok(Some(InputResult::Continue));
+                // Bare digits, arrows, and paging act on the model list only
+                // while it owns focus; elsewhere the editor keeps those keys.
+                if dialog.focus.is_model_list()
+                    && dialog.selector.handle_list_key(key, visible_rows)
+                {
+                    st.review_dialog = Some(dialog);
+                    return Ok(Some(InputResult::Continue));
+                }
+
+                let is_ctrl_alt = key.modifiers.contains(KeyModifiers::CONTROL)
+                    && key.modifiers.contains(KeyModifiers::ALT);
+
+                // Alt+digit picks a reviewer by position without moving the
+                // cursor out of the instruction editor (c-magit-key-navigation).
+                if dialog.focus.is_prompt_editor()
+                    && !is_ctrl_alt
+                    && !key.modifiers.contains(KeyModifiers::CONTROL)
+                    && key.modifiers.contains(KeyModifiers::ALT)
+                {
+                    if let KeyCode::Char(c @ '1'..='9') = key.code {
+                        let index = c as usize - '1' as usize;
+                        if index < dialog.selector.len() {
+                            dialog.selector.select_index(index);
+                            st.review_dialog = Some(dialog);
+                            return Ok(Some(InputResult::Continue));
+                        }
                     }
-                    KeyCode::Tab | KeyCode::BackTab | KeyCode::Left | KeyCode::Right => {
+                }
+
+                let is_cmd = !is_ctrl_alt
+                    && (primary.matches(key.modifiers)
+                        || key.modifiers.contains(KeyModifiers::CONTROL));
+
+                match key.code {
+                    // Esc always dismisses the dialog (safe cancellation).
+                    KeyCode::Esc => {}
+                    KeyCode::Tab => {
+                        dialog.focus.cycle_next();
+                        st.review_dialog = Some(dialog);
+                    }
+                    KeyCode::BackTab => {
+                        dialog.focus.cycle_prev();
+                        st.review_dialog = Some(dialog);
+                    }
+                    // Horizontal stepping moves between the action buttons.
+                    KeyCode::Left | KeyCode::Right if dialog.focus.is_actions() => {
                         dialog.confirm_button = match dialog.confirm_button {
                             crate::app::ConfirmDialogButton::Cancel => {
                                 crate::app::ConfirmDialogButton::Confirm
@@ -181,18 +230,19 @@ pub(crate) async fn handle_dialog_event(
                             }
                         };
                         st.review_dialog = Some(dialog);
-                        return Ok(Some(InputResult::Continue));
                     }
                     KeyCode::Enter
                         if !key.modifiers.contains(KeyModifiers::SHIFT)
-                            && !key.modifiers.contains(KeyModifiers::ALT) =>
+                            && !key.modifiers.contains(KeyModifiers::ALT)
+                            && dialog.focus.is_actions() =>
                     {
-                        // Starting a review is a long-running operation: it only
-                        // begins when the focused button is `Confirm`. With the
-                        // safe `Cancel` default, `Enter` dismisses the dialog.
+                        // Starting a review is a long-running operation: it
+                        // begins only from the focused `Confirm` button. The safe
+                        // `Cancel` default dismisses the dialog (Conventions §7).
                         if dialog.confirm_button == crate::app::ConfirmDialogButton::Confirm {
                             let prompt = dialog.prompt_editor.get_text().trim().to_string();
-                            let selected_model = dialog.selected_entry().map(|e| e.model.clone());
+                            let selected_model =
+                                dialog.selected_entry().map(|e| e.model.clone());
                             let params = ReviewStartParams {
                                 model: selected_model,
                                 user_prompt: if prompt.is_empty() {
@@ -210,18 +260,19 @@ pub(crate) async fn handle_dialog_event(
                                 |st| st.review.begin(),
                             )
                             .await;
+                            return Ok(Some(InputResult::Continue));
                         }
-                        return Ok(Some(InputResult::Continue));
                     }
                     _ => {
-                        crate::input::handle_editor_key(
-                            &mut dialog.prompt_editor,
-                            key,
-                            is_cmd,
-                            true,
-                        );
+                        if dialog.focus.is_prompt_editor() {
+                            crate::input::handle_editor_key(
+                                &mut dialog.prompt_editor,
+                                key,
+                                is_cmd,
+                                true,
+                            );
+                        }
                         st.review_dialog = Some(dialog);
-                        return Ok(Some(InputResult::Continue));
                     }
                 }
             }
@@ -315,6 +366,24 @@ pub(crate) async fn handle_dialog_event(
                     st.confirm_undo = false;
                     drop(st);
                     send_request(server_writer, methods::GIT_UNDO, serde_json::json!({})).await?;
+                }
+            }
+            return Ok(Some(InputResult::Continue));
+        }
+        Some(ActiveModal::ConfirmDetachFocus) => {
+            match resolve_confirm(&mut st, key) {
+                ConfirmOutcome::Toggled => {}
+                ConfirmOutcome::Dismissed => st.confirm_detach_focus = false,
+                ConfirmOutcome::Accepted => {
+                    st.confirm_detach_focus = false;
+                    st.discussion_focus = DiscussionFocus::None;
+                    drop(st);
+                    send_request(
+                        server_writer,
+                        methods::DISCUSSION_CLEAR_FOCUS,
+                        serde_json::json!({}),
+                    )
+                    .await?;
                 }
             }
             return Ok(Some(InputResult::Continue));
@@ -522,6 +591,7 @@ mod tests {
             status: ReviewStatus::Todo,
             file_path: None,
             line_range: None,
+            resolution_notes: None,
             body: String::new(),
         }
     }

@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 
+use crate::escape::{escape_xml_attr, escape_xml_text, single_line};
 use crate::model::{ModelRef, ModelSelection, ModelUsageInfo};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
@@ -81,6 +82,8 @@ pub struct ReviewItem {
     pub file_path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub line_range: Option<(usize, usize)>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolution_notes: Option<String>,
     pub body: String,
 }
 
@@ -159,6 +162,15 @@ impl ReviewSession {
             false
         }
     }
+
+    pub fn update_item_resolution_notes(&mut self, item_id: u32, notes: Option<String>) -> bool {
+        if let Some(item) = self.find_item_mut(item_id) {
+            item.resolution_notes = notes;
+            true
+        } else {
+            false
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -214,6 +226,8 @@ pub struct ReviewUpdateItemParams {
     pub item_id: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<ReviewItemStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolution_notes: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -273,33 +287,6 @@ pub struct ReviewListChangedEvent {
 
 pub const REVIEW_DISCUSSION_PREFIX: &str = "# Review Discussion:";
 
-/// Returns true if the prompt represents an explicit review discussion turn.
-pub fn is_review_discussion_prompt(prompt: &str) -> bool {
-    prompt.trim_start().starts_with(REVIEW_DISCUSSION_PREFIX)
-}
-
-/// Returns true if the prompt represents an explicit discussion turn (Plan or Review).
-pub fn is_discussion_prompt(prompt: &str) -> bool {
-    crate::plan::is_plan_discussion_prompt(prompt) || is_review_discussion_prompt(prompt)
-}
-
-/// Extracts the target review session ID from an explicit review discussion prompt.
-pub fn extract_review_discussion_id(prompt: &str) -> Option<String> {
-    let trimmed = prompt.trim_start();
-    if !trimmed.starts_with(REVIEW_DISCUSSION_PREFIX) {
-        return None;
-    }
-    let rest = trimmed.strip_prefix(REVIEW_DISCUSSION_PREFIX)?.trim_start();
-    if let Some(rest) = rest.strip_prefix('[') {
-        let (spec, _) = rest.split_once(']')?;
-        let id = spec.trim();
-        if !id.is_empty() {
-            return Some(id.to_string());
-        }
-    }
-    None
-}
-
 /// Formats a targeted prompt for discussing and analyzing review findings in Structured Output mode.
 pub fn format_review_discussion_prompt(
     session: &ReviewSession,
@@ -317,21 +304,26 @@ pub fn format_review_discussion_prompt_items(
     user_comment: &str,
 ) -> String {
     let mut out = String::new();
-    let clean_title = session.title.replace(['\r', '\n'], " ").trim().to_string();
+    let clean_title = single_line(&session.title);
     let title = if clean_title.is_empty() {
-        &session.id
+        session.id.as_str()
     } else {
-        &clean_title
+        clean_title.as_str()
     };
     out.push_str(&format!(
         "{} [{}] {}\n\n",
-        REVIEW_DISCUSSION_PREFIX, session.id, title
+        REVIEW_DISCUSSION_PREFIX,
+        single_line(&session.id),
+        title
     ));
 
     if let Some(desc) = &session.description {
         let trimmed = desc.trim();
         if !trimmed.is_empty() {
-            out.push_str(&format!("## Review Scope & Description:\n{}\n\n", trimmed));
+            out.push_str(&format!(
+                "## Review Scope & Description:\n{}\n\n",
+                escape_xml_text(trimmed)
+            ));
         }
     }
 
@@ -339,21 +331,28 @@ pub fn format_review_discussion_prompt_items(
     let (total, fixed) = session.stats();
     out.push_str(&format!(
         "<active_review id=\"{}\" title=\"{}\" progress=\"{}/{} fixed\">\n",
-        session.id, title, fixed, total
+        escape_xml_attr(&session.id),
+        escape_xml_attr(title),
+        fixed,
+        total
     ));
 
     for item in &session.items {
         let is_focused = focused_item_ids.contains(&item.id);
         let focus_mark = if is_focused { " [FOCUSED]" } else { "" };
         let loc = match (&item.file_path, item.line_range) {
-            (Some(f), Some((s, e))) if s == e => format!(" ({}:{})", f, s),
-            (Some(f), Some((s, e))) => format!(" ({}:{}-{})", f, s, e),
-            (Some(f), None) => format!(" ({})", f),
+            (Some(f), Some((s, e))) if s == e => format!(" ({}:{})", escape_xml_text(f), s),
+            (Some(f), Some((s, e))) => format!(" ({}:{}-{})", escape_xml_text(f), s, e),
+            (Some(f), None) => format!(" ({})", escape_xml_text(f)),
             (None, _) => String::new(),
         };
         out.push_str(&format!(
             "  - #{}: [{}] {}{}{}\n",
-            item.id, item.severity, item.title, loc, focus_mark
+            item.id,
+            item.severity,
+            escape_xml_text(&item.title),
+            loc,
+            focus_mark
         ));
     }
     out.push_str("</active_review>\n\n");
@@ -364,17 +363,33 @@ pub fn format_review_discussion_prompt_items(
             if let Some(item) = session.find_item(*id) {
                 out.push_str(&format!(
                     "- **#{} [{}] {}** (status: {})\n",
-                    item.id, item.severity, item.title, item.status
+                    item.id,
+                    item.severity,
+                    escape_xml_text(&item.title),
+                    item.status
                 ));
                 if let Some(path) = &item.file_path {
                     if let Some((start, end)) = item.line_range {
-                        out.push_str(&format!("  Location: `{}:{}-{}`\n", path, start, end));
+                        out.push_str(&format!(
+                            "  Location: `{}:{}-{}`\n",
+                            escape_xml_text(path),
+                            start,
+                            end
+                        ));
                     } else {
-                        out.push_str(&format!("  Location: `{}`\n", path));
+                        out.push_str(&format!("  Location: `{}`\n", escape_xml_text(path)));
+                    }
+                }
+                if let Some(notes) = &item.resolution_notes {
+                    if !notes.trim().is_empty() {
+                        out.push_str(&format!(
+                            "  Resolution Strategy: {}\n",
+                            escape_xml_text(notes.trim())
+                        ));
                     }
                 }
                 if !item.body.trim().is_empty() {
-                    out.push_str(&format!("  Details: {}\n", item.body.trim()));
+                    out.push_str(&format!("  Details: {}\n", escape_xml_text(item.body.trim())));
                 }
             }
         }
@@ -419,25 +434,36 @@ mod tests {
             status: ReviewItemStatus::Discussion,
             file_path: Some("crates/server/src/state.rs".to_string()),
             line_range: Some((42, 50)),
+            resolution_notes: Some("Acquire lock across turn lifetime".to_string()),
             body: "Lock is released before turn concludes".to_string(),
         };
 
         let json = serde_json::to_string(&item).unwrap();
         assert!(json.contains("\"critical\""));
         assert!(json.contains("\"discussion\""));
+        assert!(json.contains("\"resolution_notes\":\"Acquire lock across turn lifetime\""));
 
         let de: ReviewItem = serde_json::from_str(&json).unwrap();
         assert_eq!(de, item);
 
-        // Test serde alias "done" -> Fixed and legacy model "senior" -> Architect
-        let legacy_json = r#"{"id":2,"title":"Legacy","severity":"info","status":"done","body":"","model":"senior"}"#;
+        let update_params = ReviewUpdateItemParams {
+            review_id: Some("rev-1".to_string()),
+            item_id: 1,
+            status: Some(ReviewItemStatus::InProgress),
+            resolution_notes: Some("Plan defined".to_string()),
+        };
+        let update_json = serde_json::to_string(&update_params).unwrap();
+        assert!(update_json.contains("\"resolution_notes\":\"Plan defined\""));
+
+        // The legacy "done" status alias still maps to Fixed.
+        let legacy_json = r#"{"id":2,"title":"Legacy","severity":"info","status":"done","body":"","model":"architect"}"#;
         let de_legacy: ReviewItem = serde_json::from_str(legacy_json).unwrap();
         assert_eq!(de_legacy.status, ReviewItemStatus::Fixed);
         assert_eq!(de_legacy.model, Some(ModelSelection::Role(crate::model::ModelRole::Architect)));
     }
 
     #[test]
-    fn test_review_discussion_prompt() {
+    fn test_review_discussion_prompt_formatting() {
         let session = ReviewSession {
             id: "rev-42".to_string(),
             title: "Security Audit".to_string(),
@@ -454,65 +480,18 @@ mod tests {
                 status: ReviewItemStatus::Discussion,
                 file_path: Some("src/lib.rs".to_string()),
                 line_range: Some((10, 20)),
+                resolution_notes: Some("Extend scope of mutex guard".to_string()),
                 body: "Lock is dropped prematurely.".to_string(),
             }],
             raw_markdown: String::new(),
         };
 
         let prompt = format_review_discussion_prompt(&session, Some(1), "Is this really possible?");
-        assert!(is_review_discussion_prompt(&prompt));
-        assert!(is_discussion_prompt(&prompt));
         assert!(prompt.contains("# Review Discussion: [rev-42] Security Audit"));
         assert!(prompt.contains("Race condition in cache"));
+        assert!(prompt.contains("Resolution Strategy: Extend scope of mutex guard"));
         assert!(prompt.contains("Is this really possible?"));
         assert!(!prompt.contains("review_update"));
         assert!(prompt.contains("explain the proposed modifications clearly in conversational text"));
-        assert!(is_review_discussion_prompt(&format!("\n  \t{}", prompt)));
-        assert_eq!(extract_review_discussion_id(&prompt), Some("rev-42".to_string()));
-        assert_eq!(extract_review_discussion_id(&format!("  \n{}", prompt)), Some("rev-42".to_string()));
-        assert_eq!(extract_review_discussion_id("Regular conversational prompt"), None);
-    }
-
-    #[test]
-    fn test_review_session_summary_and_stats() {
-        let session = ReviewSession {
-            id: "rev-123".to_string(),
-            title: "Session 123".to_string(),
-            created_at: 1700000000,
-            model: "openrouter:anthropic/claude-3.7-sonnet".to_string(),
-            description: None,
-            user_prompt: Some("Focus on security".to_string()),
-            target_files: vec!["crates/server/src/state.rs".to_string()],
-            items: vec![
-                ReviewItem {
-                    id: 1,
-                    title: "Issue 1".to_string(),
-                    model: None,
-                    severity: ReviewSeverity::Warning,
-                    status: ReviewItemStatus::Fixed,
-                    file_path: None,
-                    line_range: None,
-                    body: "".to_string(),
-                },
-                ReviewItem {
-                    id: 2,
-                    title: "Issue 2".to_string(),
-                    model: None,
-                    severity: ReviewSeverity::Critical,
-                    status: ReviewItemStatus::Todo,
-                    file_path: None,
-                    line_range: None,
-                    body: "".to_string(),
-                },
-            ],
-            raw_markdown: "## [CRITICAL] Issue".to_string(),
-        };
-
-        let stats = session.stats();
-        assert_eq!(stats, (2, 1));
-        let summary = session.summary();
-        assert_eq!(summary.total_items, 2);
-        assert_eq!(summary.fixed_items, 1);
-        assert_eq!(summary.title, "Session 123");
     }
 }

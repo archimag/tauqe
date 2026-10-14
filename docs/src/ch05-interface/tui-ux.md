@@ -14,8 +14,8 @@ Throughout this chapter, `Ctrl+<key>` denotes the abstract **Primary Command Mod
   - The central engineering cockpit and execution canvas where coding turns take place.
   - Displays turn progression as a structured, live document: collapsible reasoning blocks (`Ctrl+R`), streaming markdown explanations, and interactive proposed file diffs.
   - **Dual-Focus Architecture:** Switch focus seamlessly between the prompt editor and the response/diffs viewport using `Ctrl+Space` or `Shift+Tab`.
-  - Multi-line intent editor with auto-growing height and Emacs navigation (`Ctrl+A`, `Ctrl+E`, `Alt+B`, `Alt+F`, `Ctrl+K`, `Ctrl+Y`, `Ctrl+W` / `Alt+Backspace` to kill word backward, `Tab` for 2-space indentation).
-  - Persistent prompt history: Use `Ctrl+P` / `Ctrl+N` (or `Alt+P` / `Alt+N`) to cycle through previous prompt inputs. History is saved to `.tauqe/prompts.history` and persists across sessions.
+  - Multi-line intent editor with auto-growing height and Emacs navigation (`Ctrl+A`, `Ctrl+E`, `Alt+B`, `Alt+F`, `Ctrl+P`, `Ctrl+N` to move between lines, `Ctrl+K`, `Ctrl+Y`, `Ctrl+W` / `Alt+Backspace` to kill word backward, `Tab` for 2-space indentation).
+  - Persistent prompt history: Use `Alt+P` / `Alt+N` to cycle through previous prompt inputs. History is saved to `.tauqe/prompts.history` and persists across sessions.
   - Newline insertion: `Shift+Enter`, `Alt+Enter`, or `Ctrl+J`.
   - Response clipboard: Press `Alt+C` or `Alt+Y` while idle to copy the model's markdown response to the system clipboard.
   - Undo AI commit: Press `Ctrl+Z` or `Alt+U` to trigger safe rollback. If no AI commit exists, TAUQE displays a status notice without opening unnecessary dialogs.
@@ -87,8 +87,8 @@ In the Develop view, TAUQE resolves the tension between text editing and inspect
 
 ### 1. Editor Focus (Default Mode)
 - **Typing always types:** Every printable character is unconditionally inserted into the text buffer. Single-letter command keys are never intercepted during text entry.
-- **Emacs navigation:** `Ctrl+A` / `Ctrl+E` for start/end of line, `Alt+B` / `Alt+F` for words backward/forward, `Ctrl+K` to kill to end of line, `Ctrl+Y` to yank from kill-ring, `Ctrl+W` / `Alt+Backspace` to kill word backward.
-- **Persistent prompt history:** `Ctrl+P` and `Ctrl+N` cycle backward and forward through previous prompt inputs.
+- **Emacs navigation:** `Ctrl+A` / `Ctrl+E` for start/end of line, `Alt+B` / `Alt+F` for words backward/forward, `Ctrl+P` / `Ctrl+N` for moving between lines, `Ctrl+K` to kill to end of line, `Ctrl+Y` to yank from kill-ring, `Ctrl+W` / `Alt+Backspace` to kill word backward.
+- **Persistent prompt history:** `Alt+P` and `Alt+N` cycle backward and forward through previous prompt inputs.
 - **Switching focus:** Press `Ctrl+Space` or `Shift+Tab` to move focus to the response and diffs viewport.
 
 ### 2. Viewport Focus (Response & Diffs Inspection)

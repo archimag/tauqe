@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 
 use super::item::{PlanItem, PlanItemStatus};
-use super::node::Plan;
+use super::node::{compute_items_status, Plan};
 
 /// Evaluation result of a targeted plan execution scope.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -21,6 +21,10 @@ pub enum PlanScopeEvaluation {
 /// Collects DISCUSSION markers, executable candidate leaves, and blocked leaves
 /// from a plan subtree.
 ///
+/// Only executable leaf items are inspected. A container's status is derived from
+/// its children, so reporting the container too would list a `Discussion` (or
+/// blocked) child twice and could depend on a stale in-memory container status.
+///
 /// A candidate leaf is an executable step whose status is `Todo` or `InProgress`.
 /// A blocked leaf is a step whose status is `Blocked`; it is surfaced separately
 /// instead of being silently skipped, so a stalled scope is never mistaken for a
@@ -32,11 +36,11 @@ fn walk_candidate_leaves(
     candidates: &mut Vec<PlanItem>,
 ) {
     for item in items {
-        if item.status == PlanItemStatus::Discussion {
-            discussion.push(format!("#{} {}", item.id, item.title));
-        }
         if item.is_leaf() {
             match item.status {
+                PlanItemStatus::Discussion => {
+                    discussion.push(format!("#{} {}", item.id, item.title))
+                }
                 PlanItemStatus::Todo | PlanItemStatus::InProgress => candidates.push(item.clone()),
                 PlanItemStatus::Blocked => blocked.push(format!("#{} {}", item.id, item.title)),
                 _ => {}
@@ -97,9 +101,6 @@ impl Plan {
                     let mut blocked = Vec::new();
                     let mut candidates = Vec::new();
 
-                    if target.status == PlanItemStatus::Discussion {
-                        discussion.push(format!("#{} {}", target.id, target.title));
-                    }
                     walk_candidate_leaves(&target.children, &mut discussion, &mut blocked, &mut candidates);
 
                     if !discussion.is_empty() {
@@ -134,9 +135,19 @@ impl Plan {
     /// leaves that remain blocked by unmet dependencies.
     fn resolve_dependency_readiness(&self, candidates: Vec<PlanItem>) -> (Vec<PlanItem>, Vec<String>) {
         let mut satisfied: HashSet<String> = HashSet::new();
+        // An item satisfies a dependency when it is effectively `Done`: a leaf
+        // carries its own authoritative status, while a container is `Done`
+        // exactly when its children aggregate to `Done`. Deriving the container
+        // status here keeps readiness independent of a possibly stale stored
+        // value that was never refreshed in memory.
         fn collect_done(items: &[PlanItem], satisfied: &mut HashSet<String>) {
             for item in items {
-                if item.status == PlanItemStatus::Done {
+                let is_done = if item.is_leaf() {
+                    item.status == PlanItemStatus::Done
+                } else {
+                    compute_items_status(&item.children) == PlanItemStatus::Done
+                };
+                if is_done {
                     satisfied.insert(item.id.to_ascii_lowercase());
                 }
                 collect_done(&item.children, satisfied);

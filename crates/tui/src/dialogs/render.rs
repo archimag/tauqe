@@ -20,11 +20,12 @@ pub(crate) mod status;
 
 pub(crate) use confirm::{
     clear_auto_params, clear_history_params, clear_user_params, confirm_cancel_params,
-    confirm_quit_params, confirm_undo_params, delete_plan_params, delete_review_params,
-    execute_review_params, execute_scope_params, render_confirm_cancel_popup,
-    render_confirm_clear_auto_popup, render_confirm_clear_history_popup,
-    render_confirm_clear_user_popup, render_confirm_delete_plan_popup,
-    render_confirm_delete_review_popup, render_confirm_execute_review_popup,
+    confirm_detach_focus_params, confirm_quit_params, confirm_undo_params, delete_plan_params,
+    delete_review_params, execute_review_params, execute_scope_params,
+    render_confirm_cancel_popup, render_confirm_clear_auto_popup,
+    render_confirm_clear_history_popup, render_confirm_clear_user_popup,
+    render_confirm_delete_plan_popup, render_confirm_delete_review_popup,
+    render_confirm_detach_focus_popup, render_confirm_execute_review_popup,
     render_confirm_execute_scope_popup, render_confirm_quit_popup, render_confirm_undo_popup,
 };
 pub(crate) use disconnected::render_disconnected_popup;
@@ -33,7 +34,9 @@ pub(crate) use discuss::{
 };
 pub(crate) use help::render_help_popup;
 pub(crate) use prompt::render_prompt_modal;
-pub(crate) use refine::{render_plan_refine_blocked_dialog, render_plan_refine_dialog};
+pub(crate) use refine::{
+    refine_dialog_geometry, render_plan_refine_blocked_dialog, render_plan_refine_dialog,
+};
 pub(crate) use review::{render_review_dialog, review_dialog_geometry};
 pub(crate) use selection::{
     render_selection_dialog, selection_dialog_area, selection_dialog_visible_height,

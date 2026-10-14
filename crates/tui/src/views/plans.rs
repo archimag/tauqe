@@ -75,12 +75,61 @@ impl VisiblePlanRow {
     }
 }
 
+/// Focus section of the plan refine dialog.
+///
+/// The dialog exposes three keyboard targets — the embedded Architect model
+/// list, the instructions editor, and the action buttons — and `Tab` cycles
+/// through them in visual order. Making the section explicit mirrors the review
+/// launcher (`ReviewDialogFocus`) and keeps list navigation, text editing, and
+/// button activation from fighting over the same keys (Conventions §6, §7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RefineDialogFocus {
+    ModelList,
+    #[default]
+    InstructionsEditor,
+    Actions,
+}
+
+impl RefineDialogFocus {
+    /// Advances focus to the next section in visual order.
+    pub fn cycle_next(&mut self) {
+        *self = match self {
+            Self::ModelList => Self::InstructionsEditor,
+            Self::InstructionsEditor => Self::Actions,
+            Self::Actions => Self::ModelList,
+        };
+    }
+
+    /// Moves focus to the previous section in visual order.
+    pub fn cycle_prev(&mut self) {
+        *self = match self {
+            Self::ModelList => Self::Actions,
+            Self::InstructionsEditor => Self::ModelList,
+            Self::Actions => Self::InstructionsEditor,
+        };
+    }
+
+    pub fn is_model_list(&self) -> bool {
+        matches!(self, Self::ModelList)
+    }
+
+    pub fn is_instructions_editor(&self) -> bool {
+        matches!(self, Self::InstructionsEditor)
+    }
+
+    pub fn is_actions(&self) -> bool {
+        matches!(self, Self::Actions)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct PlanRefineDialogState {
     pub plan_id: String,
     pub plan_title: String,
     pub selector: ModelSelector,
     pub instructions_editor: crate::editor::InputEditor,
+    /// Section that currently owns the keyboard.
+    pub focus: RefineDialogFocus,
     pub confirm_button: crate::app::ConfirmDialogButton,
 }
 
@@ -97,6 +146,7 @@ impl PlanRefineDialogState {
             plan_title,
             selector: ModelSelector::new(ModelRole::Architect, architect_entries, 0),
             instructions_editor: crate::editor::InputEditor::default(),
+            focus: RefineDialogFocus::default(),
             confirm_button: crate::app::ConfirmDialogButton::Cancel,
         }
     }

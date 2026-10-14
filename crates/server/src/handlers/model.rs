@@ -5,9 +5,12 @@ use tauqe_core::prompt::json::JsonPromptProtocol;
 use tauqe_core::prompt::protocol::PromptProtocol;
 use tauqe_core::prompt::xml::XmlPromptProtocol;
 use tauqe_core::providers::{create_provider, LlmProvider, StreamEvent};
+use tauqe_core::workflow::fsm::is_discussion_prompt;
 use tauqe_core::workflow::{ExecutionMode, SingleExecution};
 use tauqe_protocol::{
-    events, EditFileDoneEvent, EditFileRetryingEvent, EditFileStartedEvent, EditFinishedEvent,
+    events, DiscussionClearFocusResult, DiscussionFocus, DiscussionGetFocusResult,
+    DiscussionRequest, DiscussionSetFocusParams, DiscussionSetFocusResult, DiscussionTarget,
+    EditFileDoneEvent, EditFileRetryingEvent, EditFileStartedEvent, EditFinishedEvent,
     EditHunkEvent, EditStartedEvent, Event, GitCommitCreatedEvent, ModelAskParams,
     ModelResultEvent, ModelStartedEvent, ModelUsageInfo, ReasoningEffort, Request, Response,
     ResponseError,
@@ -33,7 +36,18 @@ pub async fn handle_model_ask(req: Request, state: &Arc<AppState>) -> Response {
         }
     };
 
-    match start_model_turn(state, params.prompt, None, None).await {
+    let prompt = match build_model_ask_prompt(state, params).await {
+        Ok(prompt) => prompt,
+        Err(err) => {
+            return Response {
+                id: req.id,
+                result: None,
+                error: Some(err),
+            };
+        }
+    };
+
+    match start_model_turn(state, prompt, None, None).await {
         Ok(op_id) => Response {
             id: req.id,
             result: Some(serde_json::json!({ "operation_id": op_id })),
@@ -44,6 +58,179 @@ pub async fn handle_model_ask(req: Request, state: &Arc<AppState>) -> Response {
             result: None,
             error: Some(err),
         },
+    }
+}
+
+/// Resolves the turn prompt for a model ask request.
+///
+/// A structured discussion turn carries its target explicitly, so the server
+/// generates the discussion prompt from those typed fields and replaces the
+/// focus anchor. A plain ask continues the anchored discussion instead: while a
+/// focus is active, the current state of the focused plan or review session is
+/// injected into the prompt on every turn. Neither path inspects the prompt text
+/// to decide the mode, so text that merely resembles a discussion heading can
+/// never enter discussion mode.
+async fn build_model_ask_prompt(
+    state: &Arc<AppState>,
+    params: ModelAskParams,
+) -> Result<String, ResponseError> {
+    match params.discussion {
+        Some(discussion) => {
+            let prompt = build_discussion_prompt(
+                state,
+                &discussion.target,
+                &discussion.focused_items,
+                &discussion.comment,
+            )
+            .await?;
+            // An explicit discussion target immediately replaces the focus
+            // anchor without resetting the REPL history.
+            state
+                .set_discussion_focus(focus_from_target(&discussion))
+                .await;
+            Ok(prompt)
+        }
+        None => {
+            if params.prompt.trim().is_empty() {
+                return Err(ResponseError {
+                    code: tauqe_protocol::errors::INVALID_PARAMS.to_string(),
+                    message: "Model ask requires a non-empty prompt or a discussion target"
+                        .to_string(),
+                    data: None,
+                });
+            }
+            match focus_to_target(&state.discussion_focus().await) {
+                Some((target, focused_items)) => {
+                    match build_discussion_prompt(state, &target, &focused_items, &params.prompt)
+                        .await
+                    {
+                        Ok(prompt) => Ok(prompt),
+                        Err(err) => {
+                            // The focused entity is gone (for example the plan
+                            // was deleted elsewhere): drop the stale anchor and
+                            // answer the raw prompt instead of failing the turn.
+                            tracing::warn!(
+                                "Discussion focus target could not be loaded ({}); clearing focus",
+                                err.message
+                            );
+                            state.clear_discussion_focus().await;
+                            Ok(params.prompt)
+                        }
+                    }
+                }
+                None => Ok(params.prompt),
+            }
+        }
+    }
+}
+
+/// Maps an explicit discussion target onto the focus anchor it establishes.
+fn focus_from_target(discussion: &DiscussionRequest) -> DiscussionFocus {
+    match &discussion.target {
+        DiscussionTarget::Plan { id } => {
+            DiscussionFocus::plan(id.clone(), discussion.focused_items.clone())
+        }
+        DiscussionTarget::Review { id } => {
+            DiscussionFocus::review(id.clone(), discussion.focused_items.clone())
+        }
+    }
+}
+
+/// Maps an active focus anchor onto the discussion target it addresses.
+///
+/// Returns `None` for the free (unfocused) mode, so a plain prompt stays as-is.
+fn focus_to_target(focus: &DiscussionFocus) -> Option<(DiscussionTarget, Vec<String>)> {
+    match focus {
+        DiscussionFocus::None => None,
+        DiscussionFocus::Plan {
+            plan_id,
+            focused_items,
+        } => Some((
+            DiscussionTarget::Plan {
+                id: plan_id.clone(),
+            },
+            focused_items.clone(),
+        )),
+        DiscussionFocus::Review {
+            review_id,
+            focused_items,
+        } => Some((
+            DiscussionTarget::Review {
+                id: review_id.clone(),
+            },
+            focused_items.clone(),
+        )),
+    }
+}
+
+/// Builds the discussion prompt for a typed target, loading the referenced plan
+/// or review session from storage.
+async fn build_discussion_prompt(
+    state: &Arc<AppState>,
+    target: &DiscussionTarget,
+    focused_items: &[String],
+    comment: &str,
+) -> Result<String, ResponseError> {
+    let repo_root = state.repo_root().await;
+    match target {
+        DiscussionTarget::Plan { id } => {
+            let loaded = {
+                let repo_root = repo_root.clone();
+                let id = id.clone();
+                offload(move || tauqe_core::plan::storage::PlanStorage::load_plan(&repo_root, &id))
+                    .await
+                    .map_err(internal_error)?
+            };
+            let plan = match loaded {
+                Ok(Some(plan)) => plan,
+                Ok(None) => return Err(not_found(format!("Plan '{}' not found", id))),
+                Err(err) => return Err(internal_error(format!("{:#}", err))),
+            };
+            Ok(tauqe_core::plan::prompt::format_plan_discussion_prompt(
+                &plan,
+                focused_items,
+                comment,
+            ))
+        }
+        DiscussionTarget::Review { id } => {
+            let loaded = {
+                let repo_root = repo_root.clone();
+                let id = id.clone();
+                offload(move || {
+                    tauqe_core::review::storage::ReviewStorage::load_review(&repo_root, &id)
+                })
+                .await
+                .map_err(internal_error)?
+            };
+            let session = match loaded {
+                Ok(Some(session)) => session,
+                Ok(None) => return Err(not_found(format!("Review session '{}' not found", id))),
+                Err(err) => return Err(internal_error(format!("{:#}", err))),
+            };
+            let focused: Vec<u32> = focused_items
+                .iter()
+                .filter_map(|raw| raw.trim().parse::<u32>().ok())
+                .collect();
+            Ok(tauqe_core::review::prompt::format_review_discussion_prompt_items(
+                &session, &focused, comment,
+            ))
+        }
+    }
+}
+
+fn not_found(message: String) -> ResponseError {
+    ResponseError {
+        code: tauqe_protocol::errors::NOT_FOUND.to_string(),
+        message,
+        data: None,
+    }
+}
+
+fn internal_error(message: String) -> ResponseError {
+    ResponseError {
+        code: tauqe_protocol::errors::INTERNAL_ERROR.to_string(),
+        message,
+        data: None,
     }
 }
 
@@ -142,6 +329,35 @@ pub async fn handle_model_current(req: Request, state: &Arc<AppState>) -> Respon
             available_models,
         },
     )
+}
+
+/// Sets the active discussion focus anchor and broadcasts the change.
+pub async fn handle_discussion_set_focus(req: Request, state: &Arc<AppState>) -> Response {
+    let params: DiscussionSetFocusParams = match req.params.and_then(|p| serde_json::from_value(p).ok())
+    {
+        Some(p) => p,
+        None => {
+            return Response::err(
+                req.id,
+                tauqe_protocol::errors::INVALID_PARAMS,
+                "Missing or invalid discussion focus",
+            );
+        }
+    };
+    let focus = state.set_discussion_focus(params.focus).await;
+    Response::ok_typed(req.id, &DiscussionSetFocusResult { focus })
+}
+
+/// Returns the active discussion focus anchor.
+pub async fn handle_discussion_get_focus(req: Request, state: &Arc<AppState>) -> Response {
+    let focus = state.discussion_focus().await;
+    Response::ok_typed(req.id, &DiscussionGetFocusResult { focus })
+}
+
+/// Clears the active discussion focus anchor, returning the resulting focus.
+pub async fn handle_discussion_clear_focus(req: Request, state: &Arc<AppState>) -> Response {
+    let focus = state.clear_discussion_focus().await;
+    Response::ok_typed(req.id, &DiscussionClearFocusResult { focus })
 }
 
 /// Result of an executed model turn, capturing termination status, errors, and outcomes.
@@ -317,6 +533,39 @@ async fn prepare_turn(
     })
 }
 
+/// Resolves the prompt protocol for a turn.
+///
+/// Discussion turns (plan or review refinement) are always routed through the
+/// structured discussion protocol, regardless of the configured
+/// `develop.protocol`. The discussion system prompt instructs the model to
+/// answer with the discussion JSON schema, so pairing it with an XML stream
+/// filter would leak the raw JSON scaffolding into the REPL. Non-discussion
+/// turns keep using the configured base protocol. The active turn marker is
+/// bound onto the chosen protocol when its wire format supports it; the
+/// structured discussion protocol encodes its structure in JSON Schema and
+/// therefore declines the marker.
+fn resolve_turn_protocol(
+    prompt: &str,
+    develop_protocol: &str,
+    marker: Option<&str>,
+) -> Box<dyn PromptProtocol> {
+    let base_protocol: Box<dyn PromptProtocol> = if is_discussion_prompt(prompt) {
+        Box::new(JsonPromptProtocol::discussion())
+    } else {
+        let protocol_str = develop_protocol.trim().to_lowercase();
+        match protocol_str.as_str() {
+            "structured" | "json" => Box::new(JsonPromptProtocol::default()),
+            _ => Box::new(XmlPromptProtocol),
+        }
+    };
+    match marker {
+        Some(marker) => base_protocol
+            .with_turn_marker(marker)
+            .unwrap_or(base_protocol),
+        None => base_protocol,
+    }
+}
+
 async fn run_prepared_turn(
     state: &Arc<AppState>,
     prompt: String,
@@ -338,19 +587,8 @@ async fn run_prepared_turn(
 
     let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamEvent>(100);
 
-    let protocol_str = app_config.develop.protocol.trim().to_lowercase();
-    let base_protocol: Box<dyn PromptProtocol> = match protocol_str.as_str() {
-        "structured" | "json" => Box::new(JsonPromptProtocol),
-        _ => Box::new(XmlPromptProtocol),
-    };
-    // Bind the active turn marker so structural protocol tags carry a per-turn
-    // suffix and literal source tags are never mistaken for protocol commands.
-    let protocol: Box<dyn PromptProtocol> = match marker {
-        Some(marker) => base_protocol
-            .with_turn_marker(&marker)
-            .unwrap_or(base_protocol),
-        None => base_protocol,
-    };
+    let protocol =
+        resolve_turn_protocol(&prompt, &app_config.develop.protocol, marker.as_deref());
 
     let mut workflow_opts = tauqe_core::workflow::WorkflowOptions::from_app_config(&app_config);
     workflow_opts.reasoning_effort = reasoning_effort.or_else(|| match &selection {
@@ -979,6 +1217,10 @@ pub async fn handle_model_cancel(req: Request, state: &Arc<AppState>) -> Respons
 pub async fn handle_model_clear_history(req: Request, state: &Arc<AppState>) -> Response {
     let mut history = state.history.lock().await;
     let _ = history.clear();
+    drop(history);
+    // Clearing the dialogue session also detaches the discussion focus so the
+    // REPL returns to the free, unfocused mode.
+    state.clear_discussion_focus().await;
     Response {
         id: req.id,
         result: Some(serde_json::json!({ "cleared": true })),
@@ -1295,5 +1537,49 @@ mod tests {
         .await;
         assert!(res_exec.is_err());
         assert_eq!(res_exec.unwrap_err().code, "NO_API_KEY");
+    }
+
+    #[test]
+    fn test_discussion_turn_forces_structured_protocol() {
+        // Plan and review discussions must select the structured discussion
+        // protocol even when the configured base protocol is XML.
+        let plan_prompt = "# Plan Discussion: [p-1] Refine plan\n".to_string();
+        let review_prompt = format!(
+            "{} [rev-1] Fix issue\n",
+            tauqe_protocol::review::REVIEW_DISCUSSION_PREFIX
+        );
+
+        for prompt in [plan_prompt, review_prompt] {
+            let protocol = resolve_turn_protocol(&prompt, "xml", None);
+
+            // The discussion protocol carries plan capabilities while hiding
+            // file editing and toolchain verification from the model.
+            assert!(protocol.supports(tauqe_protocol::LlmCapability::PlanCreation));
+            assert!(protocol.supports(tauqe_protocol::LlmCapability::PlanUpdate));
+            assert!(!protocol.supports(tauqe_protocol::LlmCapability::FileEdits));
+            assert!(!protocol.supports(tauqe_protocol::LlmCapability::ToolchainVerify));
+
+            // The model must be told to answer with the discussion JSON schema.
+            match protocol.response_format(&[]) {
+                Some(tauqe_core::providers::ResponseFormat::JsonSchema { json_schema, .. }) => {
+                    assert_eq!(json_schema.name, "discussion_response");
+                }
+                _ => panic!("discussion turn must advertise the discussion_response schema"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_non_discussion_turn_respects_configured_protocol() {
+        // A plain develop turn keeps the configured base protocol.
+        let xml_protocol = resolve_turn_protocol("Change compute to 42", "xml", None);
+        assert!(xml_protocol.supports(tauqe_protocol::LlmCapability::FileEdits));
+        assert!(xml_protocol.supports(tauqe_protocol::LlmCapability::ToolchainVerify));
+
+        let json_protocol = resolve_turn_protocol("Change compute to 42", "structured", None);
+        assert!(json_protocol.supports(tauqe_protocol::LlmCapability::FileEdits));
+        assert!(json_protocol.supports(tauqe_protocol::LlmCapability::ToolchainVerify));
+        // The structured edits protocol never advertises plan capabilities.
+        assert!(!json_protocol.supports(tauqe_protocol::LlmCapability::PlanUpdate));
     }
 }

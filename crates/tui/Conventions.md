@@ -4,13 +4,7 @@ This document specifies mandatory architectural and UX invariants for the Tauqe 
 
 ---
 
-## 1. Context Requirement
-
-Whenever modifying or extending code within `crates/tui/`, this conventions document must be included in the context and strictly observed.
-
----
-
-## 2. Layout Semantics: Header vs Footer
+## 1. Layout Semantics: Header vs Footer
 
 1. **Header is for Actions:**
    - The top header is reserved conceptually for navigation, mode switching, and direct user actions.
@@ -22,7 +16,7 @@ Whenever modifying or extending code within `crates/tui/`, this conventions docu
 
 ---
 
-## 3. Tab Hierarchy and History Invariant
+## 2. Tab Hierarchy and History Invariant
 
 - **History is always the last tab:**
   - The History tab represents the chronological session audit log and must remain the final tab in the navigation order.
@@ -30,7 +24,7 @@ Whenever modifying or extending code within `crates/tui/`, this conventions docu
 
 ---
 
-## 4. Single Source of Truth for Keyboard Commands and Clean Views
+## 3. Single Source of Truth for Keyboard Commands and Clean Views
 
 1. **Automatic Help Generation:**
    - Every view mode must define its keyboard commands via a structured command registry.
@@ -53,7 +47,7 @@ Whenever modifying or extending code within `crates/tui/`, this conventions docu
 
 ---
 
-## 5. Hierarchical Tree Navigation and Org-Mode Paradigm
+## 4. Hierarchical Tree Navigation and Org-Mode Paradigm
 
 - **Hierarchical Tree Structures (Plans, Review):**
   - Implement the conceptual Org-mode paradigm for structured trees without burdening navigation with complex Emacs-specific modifier chords.
@@ -64,7 +58,7 @@ Whenever modifying or extending code within `crates/tui/`, this conventions docu
 
 ---
 
-## 6. Unified Emacs & Magit Paradigm: Direct Structural Navigation vs Readline Editing
+## 5. Unified Emacs & Magit Paradigm: Direct Structural Navigation vs Readline Editing
 
 1. **Two Distinct Interaction Modes:**
    - **Magit / Org-Mode Structural Navigation (Non-Input Contexts):**
@@ -88,14 +82,16 @@ Whenever modifying or extending code within `crates/tui/`, this conventions docu
      - `C-S` — open squash commits dialog;
      - `C-W` — kill word backward;
      - `C-A`, `C-E`, `C-K`, `C-U`, `C-Y`, `C-D`, `C-B`, `C-F` — standard line editing and yank;
-     - `C-P`, `C-N` — navigate prompt history backward / forward;
+     - `C-P`, `C-N` — move cursor line up / down;
+     - `Alt+P`, `Alt+N` — navigate prompt history backward / forward;
      - `C-T` — toggle file diff folding;
      - `C-Space` / `Shift+Tab` — switch Develop focus between the prompt and the Viewport;
      - `C-J` — insert newline;
      - `C-1` … `C-5` — switch tabs;
      - `C-M` / `Alt+M` — model selection picker;
      - `C-C` — cancel generation;
-     - `C-L` — clear history;
+     - `C-G` — detach the active discussion focus (Develop) or clear conversation history (History);
+     - `C-L` — recenter the active item or viewport (Emacs `recenter-top-bottom`);
      - `C-R` — toggle reasoning block;
      - `C-O` — reload configuration;
      - `C-[` / `C-]` — navigate response file diffs;
@@ -112,7 +108,7 @@ Whenever modifying or extending code within `crates/tui/`, this conventions docu
 
 ---
 
-## 7. Modal Dialog Architecture & Interaction Standard
+## 6. Modal Dialog Architecture & Interaction Standard
 
 1. **Three-Tier Dialog Structure (Header, Body, Actions):**
    - Every modal dialog must follow a consistent three-tier layout:
@@ -130,18 +126,18 @@ Whenever modifying or extending code within `crates/tui/`, this conventions docu
 
 ---
 
-## 8. Develop Focus Model (Prompt vs Viewport)
+## 7. Develop Focus Model (Prompt vs Viewport)
 
 1. **Two Focus Targets:**
   - The Develop tab has two focus targets: the prompt editor (default) and the Viewport (model response and file diffs).
   - `C-Space` and `Shift+Tab` switch focus between them. `Esc` in the Viewport returns focus to the prompt.
-  - Reason: arrow keys and `C-P` / `C-N` have different meanings in the editor (cursor, prompt history) and in the response (file selection, scrolling). Separate focus removes this conflict without adding bare-letter shortcuts.
+  - Reason: arrow keys and `C-P` / `C-N` have different meanings in the editor (cursor navigation) and in the response (file selection, scrolling). Separate focus removes this conflict without adding bare-letter shortcuts.
 
 2. **Viewport Navigation:**
   - `C-N` / `C-P` and `↓` / `↑` select the next / previous modified file, or scroll the response when there are no files.
   - `Tab`, `Enter`, and `C-T` fold or unfold the selected diff.
   - `PgUp`, `PgDn`, `Home`, and `End` scroll the response.
-  - Bare letters and `Space` are never Viewport commands. This keeps the unconditional character insertion rule from §6.
+  - Bare letters and `Space` are never Viewport commands. This keeps the unconditional character insertion rule from §5.
 
 3. **Automatic Return to the Prompt:**
   - Any key that types text or edits the prompt moves focus back to the prompt and is applied there. No keystroke is lost.

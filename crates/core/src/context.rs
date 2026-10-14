@@ -31,6 +31,7 @@ pub struct PatternAddOutcome {
 pub struct ContextManager {
     repo_root: PathBuf,
     revision: u64,
+    pinned_patterns: Vec<String>,
     pinned: BTreeMap<String, ContextItem>,
     user: BTreeMap<String, ContextItem>,
     auto: BTreeMap<String, ContextItem>,
@@ -63,6 +64,7 @@ impl ContextManager {
         let mut cm = Self {
             repo_root,
             revision: 1,
+            pinned_patterns: Vec::new(),
             pinned: BTreeMap::new(),
             user: BTreeMap::new(),
             auto: BTreeMap::new(),
@@ -73,6 +75,10 @@ impl ContextManager {
 
     pub fn repo_root(&self) -> &Path {
         &self.repo_root
+    }
+
+    pub fn pinned_patterns(&self) -> &[String] {
+        &self.pinned_patterns
     }
 
     pub fn set_repo_root(&mut self, repo_root: PathBuf) {
@@ -86,26 +92,86 @@ impl ContextManager {
     }
 
     pub fn load_pinned(&mut self, pinned_paths: &[String]) {
-        self.pinned.clear();
-        for path in pinned_paths {
-            if let Ok(clean_path) = self.normalize_path(path) {
-                let full_path = self.repo_root.join(&clean_path);
-                if full_path.is_file() {
-                    if let Ok(meta) = std::fs::metadata(&full_path) {
-                        let size = meta.len();
-                        let tokens = estimate_tokens_from_bytes(size);
-                        self.pinned.insert(
-                            clean_path.clone(),
-                            ContextItem {
-                                path: clean_path,
-                                access: ContextAccess::ReadOnly,
-                                size_bytes: size,
-                                estimated_tokens: tokens,
-                                layer: ContextLayer::Pinned,
-                            },
-                        );
+        self.pinned_patterns = pinned_paths.to_vec();
+        self.recompute_pinned();
+    }
+
+    /// Recomputes the pinned context layer with hierarchical resolution.
+    ///
+    /// Root-level pinned files matching `pinned_patterns` from `repo_root` are always
+    /// included. Additionally, for every file present in the `user` or `auto` context
+    /// layers, all parent directories up to the project root are traversed: at each level,
+    /// every pinned pattern is resolved as a relative path and any existing file is added
+    /// to the pinned layer (read-only, deduplicated, never escaping repo root).
+    fn recompute_pinned(&mut self) -> bool {
+        let mut new_pinned = BTreeMap::new();
+
+        // 1. Root-level pinned files
+        for pattern in &self.pinned_patterns {
+            if let Ok(clean_path) = self.normalize_path(pattern) {
+                self.insert_pinned_candidate(&mut new_pinned, clean_path);
+            }
+        }
+
+        // 2. Hierarchical pinned files for all items in user and auto layers
+        let context_paths: Vec<String> = self
+            .user
+            .keys()
+            .chain(self.auto.keys())
+            .cloned()
+            .collect();
+
+        for file_path in context_paths {
+            let path_obj = Path::new(&file_path);
+            let mut curr = path_obj.parent();
+            while let Some(parent) = curr {
+                if parent.as_os_str().is_empty() {
+                    break;
+                }
+                for pattern in &self.pinned_patterns {
+                    let candidate = parent.join(pattern);
+                    let candidate_str = candidate.to_string_lossy().to_string();
+                    if let Ok(clean_candidate) = self.normalize_path(&candidate_str) {
+                        self.insert_pinned_candidate(&mut new_pinned, clean_candidate);
                     }
                 }
+                curr = parent.parent();
+            }
+        }
+
+        if self.pinned != new_pinned {
+            self.pinned = new_pinned;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn insert_pinned_candidate(
+        &self,
+        target_map: &mut BTreeMap<String, ContextItem>,
+        clean_path: String,
+    ) {
+        if target_map.contains_key(&clean_path) {
+            return;
+        }
+        let full_path = self.repo_root.join(&clean_path);
+        if full_path.is_file() {
+            if let Some(existing) = self.pinned.get(&clean_path) {
+                target_map.insert(clean_path, existing.clone());
+            } else if let Ok(meta) = std::fs::metadata(&full_path) {
+                let size = meta.len();
+                let tokens = estimate_tokens_from_bytes(size);
+                target_map.insert(
+                    clean_path.clone(),
+                    ContextItem {
+                        path: clean_path,
+                        access: ContextAccess::ReadOnly,
+                        size_bytes: size,
+                        estimated_tokens: tokens,
+                        layer: ContextLayer::Pinned,
+                    },
+                );
             }
         }
     }
@@ -260,7 +326,9 @@ impl ContextManager {
             }
         };
 
-        if changed {
+        let pinned_changed = self.recompute_pinned();
+
+        if changed || pinned_changed {
             self.revision += 1;
         }
         Ok(item)
@@ -289,15 +357,17 @@ impl ContextManager {
     pub fn clear_auto(&mut self) {
         if !self.auto.is_empty() {
             self.auto.clear();
+            self.recompute_pinned();
             self.revision += 1;
         }
     }
 
     /// Drops all files strictly from the user context layer.
-    /// The `pinned` and `auto` layers are never affected.
+    /// Root pinned files are never affected; hierarchical pinned files are recomputed.
     pub fn clear_user(&mut self) {
         if !self.user.is_empty() {
             self.user.clear();
+            self.recompute_pinned();
             self.revision += 1;
         }
     }
@@ -307,6 +377,7 @@ impl ContextManager {
     pub fn drop_auto_file(&mut self, relative_path: &str) -> Result<bool> {
         let clean_path = self.normalize_path(relative_path)?;
         if self.auto.remove(&clean_path).is_some() {
+            self.recompute_pinned();
             self.revision += 1;
             Ok(true)
         } else {
@@ -403,6 +474,7 @@ impl ContextManager {
         let removed_user = self.user.remove(&clean_path).is_some();
         let removed_auto = self.auto.remove(&clean_path).is_some();
         if removed_user || removed_auto {
+            self.recompute_pinned();
             self.revision += 1;
             Ok(true)
         } else {
@@ -447,6 +519,7 @@ impl ContextManager {
                 }
                 ContextLayer::Pinned => {}
             }
+            self.recompute_pinned();
             self.revision += 1;
         }
 
@@ -502,6 +575,7 @@ impl ContextManager {
         if had_items {
             self.user.clear();
             self.auto.clear();
+            self.recompute_pinned();
             self.revision += 1;
         }
     }
@@ -525,7 +599,9 @@ impl ContextManager {
         removed.extend(prune_layer(&mut self.user, &self.repo_root));
         removed.extend(prune_layer(&mut self.auto, &self.repo_root));
 
-        if !removed.is_empty() {
+        let pinned_changed = self.recompute_pinned();
+
+        if !removed.is_empty() || pinned_changed {
             self.revision += 1;
         }
 
@@ -569,6 +645,9 @@ impl ContextManager {
                 changed = true;
             }
         }
+
+        // Recompute hierarchical pinned files after merging user and auto layers.
+        changed |= self.recompute_pinned();
 
         // 4. Refresh metadata for all files in context.
         for layer in [&mut self.pinned, &mut self.user, &mut self.auto] {
@@ -943,5 +1022,47 @@ mod tests {
 
         assert_eq!(cm.get_state().revision, rev_before);
         assert!(cm.contains("auto.rs").unwrap());
+    }
+
+    #[test]
+    fn test_hierarchical_pinned_resolution() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+
+        std::fs::write(root.join("Conventions.md"), "# Root Conventions").unwrap();
+        std::fs::create_dir_all(root.join("crates/tui/src/views")).unwrap();
+        std::fs::write(root.join("crates/tui/Conventions.md"), "# TUI Conventions").unwrap();
+        std::fs::write(root.join("crates/tui/src/views/develop.rs"), "pub fn view() {}").unwrap();
+        std::fs::create_dir_all(root.join("crates/core/src")).unwrap();
+        std::fs::write(root.join("crates/core/Conventions.md"), "# Core Conventions").unwrap();
+        std::fs::write(root.join("crates/core/src/lib.rs"), "pub fn core() {}").unwrap();
+
+        let mut cm = ContextManager::new(root);
+        cm.load_pinned(&["Conventions.md".to_string()]);
+
+        // Initially only root Conventions.md is pinned
+        assert!(cm.contains("Conventions.md").unwrap());
+        assert!(!cm.contains("crates/tui/Conventions.md").unwrap());
+        assert!(!cm.contains("crates/core/Conventions.md").unwrap());
+
+        // Adding a file in crates/tui automatically includes crates/tui/Conventions.md in pinned
+        cm.add_file("crates/tui/src/views/develop.rs", ContextAccess::Editable).unwrap();
+        assert!(cm.contains("crates/tui/Conventions.md").unwrap());
+        assert!(!cm.is_editable("crates/tui/Conventions.md").unwrap());
+        assert!(!cm.contains("crates/core/Conventions.md").unwrap());
+
+        // Adding a file in crates/core to auto layer automatically includes crates/core/Conventions.md
+        cm.add_auto_file("crates/core/src/lib.rs", ContextAccess::ReadOnly).unwrap();
+        assert!(cm.contains("crates/core/Conventions.md").unwrap());
+
+        // Clearing auto removes crates/core/Conventions.md, but retains crates/tui/Conventions.md
+        cm.clear_auto();
+        assert!(!cm.contains("crates/core/Conventions.md").unwrap());
+        assert!(cm.contains("crates/tui/Conventions.md").unwrap());
+
+        // Removing the user file removes crates/tui/Conventions.md
+        cm.remove_file("crates/tui/src/views/develop.rs").unwrap();
+        assert!(!cm.contains("crates/tui/Conventions.md").unwrap());
+        assert!(cm.contains("Conventions.md").unwrap());
     }
 }

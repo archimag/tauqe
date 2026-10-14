@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use tokio::sync::Mutex;
 use tauqe_protocol::{methods, HistoryGetParams};
 
@@ -41,7 +41,7 @@ pub const HISTORY_COMMANDS: &[KeyCommand] = &[
     KeyCommand { key: "Enter / Tab / Space", description: "Fold / unfold active history item" },
     // Navigation & Inspection
     KeyCommand { key: "n / p (or [ / ])", description: "Navigate between history items" },
-    KeyCommand { key: "l", description: "Recenter active item (Emacs C-l style)" },
+    KeyCommand { key: "l / C-l", description: "Recenter active history item (Emacs C-l style)" },
     KeyCommand { key: "↑/↓ or k/j", description: "Scroll history (fetches older turns)" },
     KeyCommand { key: "PgUp / PgDn", description: "Page scroll history view" },
     KeyCommand { key: "Home / End", description: "Jump to oldest / newest message" },
@@ -49,6 +49,8 @@ pub const HISTORY_COMMANDS: &[KeyCommand] = &[
     // Editing & Clipboard
     KeyCommand { key: "c", description: "Copy code block from active item" },
     KeyCommand { key: "y", description: "Copy selected item text to clipboard" },
+    // Auxiliary & Destructive
+    KeyCommand { key: "C-G", description: "Clear conversation history (with confirmation)" },
 ];
 
 pub async fn handle_history_key(
@@ -61,6 +63,26 @@ pub async fn handle_history_key(
     let content_width = st.history_view.content_width;
     let total_lines = st.history_view.rendered_lines_count as u16;
     let max_scroll = total_lines.saturating_sub(view_height);
+
+    // History clearing is isolated to this view: it requires the primary
+    // command modifier (C-g) and arms the existing confirmation dialog, so the
+    // destructive action can never fire from a bare key or a background view
+    // (c-history-clear-isolation). The global shortcut layer no longer owns it.
+    let primary_mod = st.tui_config.input.primary_modifier;
+    let is_ctrl_alt = key.modifiers.contains(KeyModifiers::CONTROL)
+        && key.modifiers.contains(KeyModifiers::ALT);
+    if !is_ctrl_alt
+        && primary_mod.matches(key.modifiers)
+        && matches!(key.code, KeyCode::Char('g') | KeyCode::Char('G'))
+    {
+        if st.model.is_busy() {
+            st.notify_warning("Cannot clear history while model is generating");
+        } else {
+            st.confirm_clear_history = true;
+            st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
+        }
+        return Ok(InputResult::Continue);
+    }
 
     match key.code {
         KeyCode::Esc | KeyCode::Char('q') => {
@@ -285,5 +307,50 @@ mod tests {
             HISTORY_COMMANDS.len(),
             "duplicate key bindings in HISTORY_COMMANDS"
         );
+    }
+
+    /// Dispatches one key into the History handler with a deliberately unsafe
+    /// button focus, returning the confirmation flags and the resulting focus.
+    async fn dispatch(key: KeyEvent) -> (bool, bool, crate::app::ConfirmDialogButton) {
+        let mut st = crate::app::test_state();
+        st.view_mode = ViewMode::History;
+        st.confirm_button = crate::app::ConfirmDialogButton::Confirm;
+
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+        let res = handle_history_key(key, &state, &mut conn)
+            .await
+            .expect("in-memory dispatch never fails");
+        assert_eq!(res, InputResult::Continue);
+
+        let guard = state.lock().await;
+        (
+            guard.confirm_clear_history,
+            guard.confirm_cancel,
+            guard.confirm_button,
+        )
+    }
+
+    #[tokio::test]
+    async fn test_primary_g_arms_history_clear_with_safe_cancel() {
+        let key = KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL);
+        let (clear, _cancel, button) = dispatch(key).await;
+        assert!(clear, "C-g in History must arm the clear confirmation");
+        assert_eq!(button, crate::app::ConfirmDialogButton::Cancel);
+    }
+
+    #[tokio::test]
+    async fn test_bare_g_is_inert_in_history() {
+        let key = KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE);
+        let (clear, _cancel, _button) = dispatch(key).await;
+        assert!(!clear, "a bare g must never arm the destructive clear");
+    }
+
+    #[tokio::test]
+    async fn test_ctrl_l_no_longer_clears_history() {
+        let key = KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL);
+        let (clear, cancel, _button) = dispatch(key).await;
+        assert!(!clear, "C-l must recenter and never clear history");
+        assert!(!cancel);
     }
 }

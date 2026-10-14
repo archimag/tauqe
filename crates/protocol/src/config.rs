@@ -41,9 +41,22 @@ pub struct ConfigCreateParams {
     pub model: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct CredentialsSaveParams {
     pub api_key: String,
+}
+
+/// Manual `Debug` that never prints the plaintext API key.
+///
+/// A derived `Debug` would leak the secret into any `tracing` span or `{:?}`
+/// log of request params (or of an enclosing `Request`/`Message`). The key is
+/// therefore replaced with a fixed placeholder.
+impl std::fmt::Debug for CredentialsSaveParams {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CredentialsSaveParams")
+            .field("api_key", &"<redacted>")
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -104,5 +117,15 @@ mod tests {
         assert!(json.contains("\"coder\""));
         let de: ConfigState = serde_json::from_str(&json).unwrap();
         assert_eq!(de.roles.unwrap().coder, ModelRef::openrouter("coder-model"));
+    }
+
+    #[test]
+    fn test_credentials_save_params_debug_redacts_key() {
+        let params = CredentialsSaveParams {
+            api_key: "sk-secret-value".to_string(),
+        };
+        let rendered = format!("{params:?}");
+        assert!(!rendered.contains("sk-secret-value"));
+        assert!(rendered.contains("<redacted>"));
     }
 }

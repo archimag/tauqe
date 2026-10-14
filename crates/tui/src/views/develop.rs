@@ -476,6 +476,14 @@ impl ReasoningState {
         self.newline_count + usize::from(!self.pending.is_empty())
     }
 
+    /// True while a reasoning stream is active and not yet finalized.
+    ///
+    /// Text channels use this to settle and fold the reasoning block exactly
+    /// once when the answer begins, so the lifecycle stays identical everywhere.
+    pub fn is_streaming(&self) -> bool {
+        self.streaming
+    }
+
     pub fn is_empty(&self) -> bool {
         self.text.is_empty()
     }

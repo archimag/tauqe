@@ -2,6 +2,7 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Padding, Paragraph};
+use tauqe_protocol::DiscussionFocus;
 
 use crate::app::AppState;
 use crate::ui::wrap_line;
@@ -19,6 +20,20 @@ pub fn render_develop_view(
     prompt_lines: Vec<Line<'static>>,
     cursor_visual_line: usize,
 ) {
+    // While a discussion focus is active, reserve the single row directly above
+    // the prompt for its status banner. The banner is a pure indicator, so it is
+    // carved out of the response area rather than the prompt itself
+    // (c-visual-anchor).
+    let (model_area, focus_banner_area) = if state.discussion_focus.is_active()
+        && model_area.height > 1
+    {
+        let chunks =
+            Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(model_area);
+        (chunks[0], Some(chunks[1]))
+    } else {
+        (model_area, None)
+    };
+
     if let Some(lines) = plan_stepper_lines(state) {
         let body = u16::try_from(lines.len()).unwrap_or(u16::MAX);
         let desired = body.saturating_add(2);
@@ -40,7 +55,91 @@ pub fn render_develop_view(
         render_model_pane(frame, state, model_area);
     }
 
+    if let Some(banner_area) = focus_banner_area {
+        render_discussion_focus_banner(frame, state, banner_area);
+    }
+
     render_prompt_input(frame, state, input_area, prompt_lines, cursor_visual_line);
+}
+
+/// Renders the active discussion focus as a one-line status banner above the prompt.
+///
+/// The banner is a pure indicator (Conventions.md §2): it names the focused
+/// entity, its title, the number of targeted items, and the detach shortcut, but
+/// carries no command of its own. The server owns the authoritative focus; this
+/// only mirrors it for display.
+fn render_discussion_focus_banner(frame: &mut ratatui::Frame, state: &AppState, area: Rect) {
+    let (badge, badge_bg, id, title, focused_count) = match &state.discussion_focus {
+        DiscussionFocus::Plan {
+            plan_id,
+            focused_items,
+        } => {
+            let title = state
+                .plans_view
+                .plans
+                .iter()
+                .find(|plan| &plan.id == plan_id)
+                .map(|plan| plan.title.clone())
+                .unwrap_or_else(|| plan_id.clone());
+            (
+                "[PLAN]",
+                Color::Cyan,
+                plan_id.clone(),
+                title,
+                focused_items.len(),
+            )
+        }
+        DiscussionFocus::Review {
+            review_id,
+            focused_items,
+        } => {
+            let title = state
+                .review
+                .sessions
+                .iter()
+                .find(|session| &session.id == review_id)
+                .map(|session| session.title.clone())
+                .unwrap_or_else(|| review_id.clone());
+            (
+                "[REVIEW]",
+                Color::Magenta,
+                review_id.clone(),
+                title,
+                focused_items.len(),
+            )
+        }
+        DiscussionFocus::None => return,
+    };
+
+    let mut spans = vec![
+        Span::styled(
+            format!(" {} ", badge),
+            Style::default().bg(badge_bg).fg(Color::Black).bold(),
+        ),
+        Span::raw(" "),
+        Span::styled(id, Style::default().fg(Color::Cyan).bold()),
+        Span::raw(" \u{2014} "),
+        Span::styled(
+            title.replace(['\r', '\n'], " "),
+            Style::default().fg(Color::White),
+        ),
+    ];
+
+    if focused_count > 0 {
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(
+            format!("({} focused)", focused_count),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+
+    spans.push(Span::raw("  "));
+    spans.push(Span::styled(
+        "[Esc to detach]",
+        Style::default().fg(Color::DarkGray).bold(),
+    ));
+
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 /// Builds the compact Plan Stepper header for the active plan execution context.

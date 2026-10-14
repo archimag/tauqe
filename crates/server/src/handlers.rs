@@ -47,6 +47,10 @@ pub async fn handle_request(req: Request, state: &Arc<AppState>) -> Response {
         methods::MODEL_SELECT => model::handle_model_select(req, state).await,
         methods::MODEL_CURRENT => model::handle_model_current(req, state).await,
 
+        methods::DISCUSSION_SET_FOCUS => model::handle_discussion_set_focus(req, state).await,
+        methods::DISCUSSION_GET_FOCUS => model::handle_discussion_get_focus(req, state).await,
+        methods::DISCUSSION_CLEAR_FOCUS => model::handle_discussion_clear_focus(req, state).await,
+
         methods::REVIEW_START => review::handle_review_start(req, state).await,
         methods::REVIEW_CANCEL => review::handle_review_cancel(req, state).await,
         methods::REVIEW_LIST => review::handle_review_list(req, state).await,

@@ -6,7 +6,9 @@ use tokio::sync::{watch, Mutex};
 use tauqe_core::config::AppConfig;
 use tauqe_core::context::ContextManager;
 use tauqe_core::history::HistoryManager;
-use tauqe_protocol::{ModelSelection, UiHistoryItem};
+use tauqe_protocol::{
+    events, DiscussionFocus, DiscussionFocusChangedEvent, Event, ModelSelection, UiHistoryItem,
+};
 
 use crate::transport::OutChannel;
 
@@ -79,6 +81,12 @@ pub struct AppState {
     /// non-awaiting critical sections.
     pub active_cancel: std::sync::Mutex<Option<ActiveOperation>>,
     pub total_cost: Mutex<f64>,
+    /// Active discussion focus anchor shared by REPL discussion turns.
+    ///
+    /// While a focus is set, every plain discussion prompt is enriched with the
+    /// current state of the focused plan or review session, turning one-shot
+    /// comments into a continuous multi-turn dialogue.
+    pub discussion_focus: Mutex<DiscussionFocus>,
     pub history_sender: tokio::sync::mpsc::UnboundedSender<UiHistoryItem>,
     pub out: OutChannel,
     /// Shared flag set while a git-backed apply policy holds an open
@@ -132,6 +140,7 @@ impl AppState {
             session_lock: Mutex::new(()),
             active_cancel: std::sync::Mutex::new(None),
             total_cost: Mutex::new(0.0),
+            discussion_focus: Mutex::new(DiscussionFocus::None),
             history_sender,
             out,
             git_transaction_active: Arc::new(AtomicBool::new(false)),
@@ -203,6 +212,40 @@ impl AppState {
     /// which can drift from the initialized repository.
     pub async fn repo_root(&self) -> PathBuf {
         self.context.read().await.repo_root().to_path_buf()
+    }
+
+    /// Returns the current discussion focus anchor.
+    pub async fn discussion_focus(&self) -> DiscussionFocus {
+        self.discussion_focus.lock().await.clone()
+    }
+
+    /// Replaces the discussion focus anchor, broadcasting a change event only
+    /// when the anchor actually changes, and returns the resulting focus.
+    pub async fn set_discussion_focus(&self, focus: DiscussionFocus) -> DiscussionFocus {
+        let changed = {
+            let mut guard = self.discussion_focus.lock().await;
+            if *guard == focus {
+                false
+            } else {
+                *guard = focus.clone();
+                true
+            }
+        };
+        if changed {
+            self.out.send_event(&Event {
+                method: events::DISCUSSION_FOCUS_CHANGED.to_string(),
+                params: serde_json::to_value(DiscussionFocusChangedEvent {
+                    focus: focus.clone(),
+                })
+                .ok(),
+            });
+        }
+        focus
+    }
+
+    /// Clears the discussion focus anchor, returning the resulting focus.
+    pub async fn clear_discussion_focus(&self) -> DiscussionFocus {
+        self.set_discussion_focus(DiscussionFocus::None).await
     }
 
     /// Returns the turn marker for the current turn, or `None` when markers are

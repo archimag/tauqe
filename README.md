@@ -16,6 +16,9 @@ TAUQE is actively self-hosted: starting from the second day of its development, 
 
 ## Core Pillars
 
+- **Declarative Invariants Over Imperative Drift:**  
+  Contemporary agents often rely on fragile chains of imperative shell commands where error probabilities compound at every step. TAUQE upholds the classical engineering principle of describing *what* the system must satisfy rather than micromanaging *how* to do it. Declarative constraints, immutable concepts, and typed contracts guide the model without procedural babysitting.
+
 - **Deterministic Execution Control:**  
   No arbitrary shell commands or terminal hallucinations. The model navigates codebase contours via a Tree-sitter Repo Map, validates patches in virtual in-memory staging, and self-heals compiler and linter errors (`cargo check`, `npm test`) before writing changes.
 

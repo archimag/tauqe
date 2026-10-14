@@ -111,14 +111,24 @@ impl Plan {
         PlanStats { total, completed }
     }
 
+    /// Counts executable leaf items and how many of them are `Done`.
+    ///
+    /// Only leaves carry an explicit, authoritative status; a container's status
+    /// is derived from its children and may be stale in memory. Counting leaves
+    /// keeps the progress metric consistent with [`Self::status`], which also
+    /// derives from the leaves, and never double-counts a container alongside the
+    /// children it aggregates.
     pub fn count_stats(&self) -> (usize, usize) {
         fn walk(items: &[PlanItem], total: &mut usize, completed: &mut usize) {
             for item in items {
-                *total += 1;
-                if item.status == PlanItemStatus::Done {
-                    *completed += 1;
+                if item.is_leaf() {
+                    *total += 1;
+                    if item.status == PlanItemStatus::Done {
+                        *completed += 1;
+                    }
+                } else {
+                    walk(&item.children, total, completed);
                 }
-                walk(&item.children, total, completed);
             }
         }
         let mut total = 0;
@@ -212,23 +222,41 @@ impl Plan {
         walk(&mut self.items);
     }
 
+    /// Updates the status of a plan item and refreshes the aggregated status of
+    /// its ancestors.
+    ///
+    /// Only executable leaf items hold an explicit status. A non-leaf item is a
+    /// conceptual container whose status is derived deterministically from its
+    /// children by [`Self::refresh_parent_statuses`], so assigning a status to a
+    /// container would be recomputed away immediately. Such a container target is
+    /// therefore rejected. The method returns `true` only when a leaf item matched
+    /// and its status was durably changed; it returns `false` both for an unknown
+    /// identifier and for a container target, so a caller never mistakes a
+    /// discarded assignment for a successful update.
     pub fn update_item_status(&mut self, item_id: &str, status: PlanItemStatus) -> bool {
-        fn walk(items: &mut [PlanItem], item_id: &str, status: PlanItemStatus) -> bool {
+        // Locates the target and classifies it: `Some(true)` for an assignable
+        // leaf, `Some(false)` for a non-assignable container, `None` when absent.
+        fn walk(items: &mut [PlanItem], item_id: &str, status: PlanItemStatus) -> Option<bool> {
             for item in items {
                 if item.id.eq_ignore_ascii_case(item_id) {
-                    item.status = status;
-                    return true;
+                    if item.is_leaf() {
+                        item.status = status;
+                        return Some(true);
+                    }
+                    return Some(false);
                 }
-                if walk(&mut item.children, item_id, status) {
-                    return true;
+                if let Some(updated) = walk(&mut item.children, item_id, status) {
+                    return Some(updated);
                 }
             }
+            None
+        }
+
+        if walk(&mut self.items, item_id, status) == Some(true) {
+            self.refresh_parent_statuses();
+            true
+        } else {
             false
         }
-        let updated = walk(&mut self.items, item_id, status);
-        if updated {
-            self.refresh_parent_statuses();
-        }
-        updated
     }
 }

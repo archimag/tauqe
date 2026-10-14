@@ -13,32 +13,71 @@ This document specifies mandatory engineering and architectural conventions for 
    - Write in clean, concise, plain engineering English.
    - The primary audience consists of global software engineers—many of whom are non-native speakers—and large language models.
    - Avoid flowery prose, baroque vocabulary, archaic turns of phrase, metaphors, and convoluted sentence structures.
+   - Exception: the project's defining paradigm metaphor—the model "harness" and its bridle, bit, and reins vocabulary, introduced in `Vision.md`—is a deliberate term of art, not decorative prose. It may name the paradigm, but it must never be extended into incidental ornamentation.
    - Prefer direct active voice, short unambiguous sentences, standard industry terminology, and straightforward syntax.
 
 ---
 
-## 1. YAGNI and Minimalism (No Speculative Code)
+## 1. YAGNI, KISS, and DRY (Minimalism and Single Source of Truth)
 
-1. **No speculative features:**
+1. **YAGNI (No Speculative Features):**
    - Never add unused enum variants, unneeded struct fields, dummy stub methods, or parameters "just in case" or "for future flexibility".
    - Code must be written strictly for the current step and immediate requirements.
-2. **Minimum sufficient complexity:**
-   - If a problem can be solved with a flat list or standalone helper functions without introducing abstract factories, complex traits, or indirection layers, implement it directly.
-3. **Dead code removal:**
+2. **KISS (Minimum Sufficient Complexity):**
+   - If a problem can be solved with a flat list, concrete types, or standalone helper functions without introducing abstract factories, speculative traits, or indirection layers, implement it directly.
+   - Keep data models and execution control flows simple, explicit, and easy to trace.
+3. **DRY and Single Source of Truth (SSOT):**
+   - Every protocol schema, configuration parameter, domain state transition, and invariant must have a single authoritative definition.
+   - Never duplicate wire-contract parsers, validation rules, or ad-hoc converters across crates. Derive, share via `protocol`/`core`, or compute from the single source of truth.
+4. **Dead code removal:**
    - Code that is superseded or rendered obsolete (such as legacy protocols, abandoned memory concepts, or deprecated modes) must be deleted completely, never commented out or hidden behind dormant feature flags.
 
 ---
 
-## 2. Module Design and Architecture
+## 2. Workspace Architecture and Crate Responsibilities
+
+The TAUQE workspace is decomposed into four specialized crates with strict, unidirectional dependency boundaries. Code must never drift across these boundaries:
+
+1. **`crates/protocol` (Pure Wire Contract and Shared Domain DTOs):**
+   - **Mandate:** Authoritative single source of truth for all external and inter-process communication contracts. Contains JSON-RPC request, response, and event data structures, protocol commands (`LlmCommand`), capability flags, error codes, and pure data transfer objects (DTOs).
+   - **Allowed:** Serde serialization and deserialization, JSON schema generators, pure validation logic, and self-contained stateless string/path helpers (e.g., glob matching, XML escaping).
+   - **Strict Prohibitions:** Strictly NO file system or disk I/O, NO OS command execution, NO network or HTTP clients, NO async runtime (`tokio`) dependencies, and NO workspace dependencies. Must remain a lightweight, fast-compiling leaf crate.
+
+2. **`crates/core` (Deterministic Harness and Domain Engine):**
+   - **Mandate:** The headless engine implementing the literal harness paradigm. Owns the bounded turn FSM, virtual staging and fuzzy patching, Git transactions and checkpoints, LLM provider communication and streaming, Tree-sitter repo map generation, toolchain verification runners, prompt assembly, and plan/review storage engines.
+   - **Allowed:** Interacting with Git, the file system, toolchain processes, and provider HTTP endpoints. Exposing domain traits (`PromptProtocol`, `LlmProvider`, `ApplyPolicy`) and headless domain workflows.
+   - **Strict Prohibitions:** Strictly headless; NO presentation or terminal UI dependencies (`ratatui`, `crossterm`). NO RPC transport server or socket listening code.
+
+3. **`crates/server` (RPC Daemon and Orchestration Gateway):**
+   - **Mandate:** Persistent background daemon bridging client frontends with the core engine. Manages RPC transport (stdin/stdout or socket), client handshake, concurrency control (`OperationGuard`), request dispatching, and event streaming via `OutChannel`.
+   - **Allowed:** Routing protocol requests to `core` workflows, translating operation lifecycles into protocol events, and managing active process state.
+   - **Strict Prohibitions:** Must NEVER duplicate or re-implement domain logic (such as plan status evaluation, patch retry loops, prompt assembly, or Git diff computation). Domain transitions belong exclusively in `core`. Must NEVER contain terminal UI code.
+
+4. **`crates/tui` (Interactive Terminal Presentation and Client Frontend):**
+   - **Mandate:** High-density keyboard-driven terminal frontend inspired by Magit and SLIME. Owns terminal views (Develop, Context, Review, Plans, History, Onboarding), layout geometry, keyboard navigation, input event translation, and local text editor state.
+   - **Allowed:** Ratatui and crossterm integration, local UI state management, and RPC transport communication with `tauqe-server`.
+   - **Strict Prohibitions:** Strictly a client frontend. Must NEVER run Git commands directly, touch LLM provider APIs, execute toolchain verifications, or manipulate working tree files directly on disk. All domain operations must be dispatched through RPC requests to the server daemon.
+
+5. **Anti-Drift Architectural Invariants:**
+   - **Single Source of Wire Types:** All wire events, RPC parameter types, and model protocol objects must be defined in `crates/protocol`. Writing ad-hoc JSON structs or re-parsing raw wire payloads in `server` or `tui` is strictly forbidden.
+   - **Unidirectional Dependency Flow:** Dependencies strictly flow downward (`tui` -> `protocol`, `server` -> `core` -> `protocol`). Cyclic dependencies or reverse couplings are forbidden.
+   - **Strict Separation of Presentation and Domain:** Presentation logic belongs exclusively in `tui`; domain execution belongs exclusively in `core`.
+
+---
+
+## 3. Module Design and Architecture
 
 1. **Modules as Black Boxes (Information Hiding & Minimal Visibility):**
    - **Encapsulation:** A module must expose strictly what external callers need to interact with it. Internal helper functions, intermediate data structures, and algorithmic details must stay hidden.
    - **Principle of least visibility:** Items are private by default. Promote only to `pub(super)` or `pub(crate)` when required across sibling files within a subsystem. Unrestricted `pub` is reserved strictly for public API entry points.
    - **Clean facades:** Module facades (e.g., `ui.rs`, `git.rs`) orchestrate subsystems. Never leak or re-export internal implementation helpers (such as string formatting, geometry math, or ad-hoc converters) through the facade.
-2. **Single Responsibility and High Cohesion:**
-   - Every module must have a single, cohesive reason to change. Never mix transport/RPC, input handling, state mutations, and presentation logic in one place.
+2. **Single Responsibility Principle (SRP) and High Cohesion:**
+   - Every module, struct, and routine must have a single, cohesive reason to change. Never mix transport/RPC handling, user input processing, domain mutations, and presentation logic in one place.
    - Avoid "God Objects" or dumping miscellaneous logic into `main.rs` or monolithic facades.
-3. **Rust 2018+ Module Layout (Prohibition of `mod.rs`):**
+3. **Dependency Inversion & Trait Interchangeability:**
+   - High-level orchestration (such as the workflow engine and FSM) depends on abstract protocol and engine contracts (`PromptProtocol`, `LlmProvider`, `ApplyPolicy`) rather than concrete implementations.
+   - All implementations of a trait contract must be strictly interchangeable without caller-side type branching or ad-hoc special-casing.
+4. **Rust 2018+ Module Layout (Prohibition of `mod.rs`):**
    - Using `mod.rs` files in new or refactored subsystems is **strictly forbidden**. Having numerous identical `mod.rs` files degrades editor navigation, stack traces, and debugging clarity.
    - For any module with submodules, place `foo.rs` alongside the `foo/` directory:
      ```text
@@ -55,7 +94,7 @@ This document specifies mandatory engineering and architectural conventions for 
      pub mod storage;
      pub mod compaction;
      ```
-4. **Cohesive Sizing as a Health Metric (AI-Friendly Architecture):**
+5. **Cohesive Sizing as a Health Metric (AI-Friendly Architecture):**
    - File size is an indicator of cohesion, not an arbitrary bureaucratic quota:
      - **Target size:** 150–400 lines of code. Modules of this size are easy to reason about, review, and maintain.
      - **Soft limit:** 600 lines. Crossing this threshold is a strong signal that the module contains mixed responsibilities and should be decomposed into focused submodules.
@@ -64,7 +103,7 @@ This document specifies mandatory engineering and architectural conventions for 
 
 ---
 
-## 3. Robustness and Panic-Free Invariants
+## 4. Robustness and Panic-Free Invariants
 
 1. **Strict Prohibition of Panics in Server and Runtime Logic:**
    - TAUQE operates as a persistent engineering control environment (server daemon and interactive TUI). A panic in any handler, background turn, or parsing routine crashes the process, drops in-flight work, and breaks transactional safety.
@@ -77,18 +116,17 @@ This document specifies mandatory engineering and architectural conventions for 
 
 ---
 
-## 4. Mandatory Code Verification
+## 5. Test Coverage and Code Quality
 
-1. **Always verify after changes:**
-   - After any modifications to code, tests, or build configuration, execute full project verification (`check`, `clippy`, `test`).
-   - The model must always request verification (`target="all"`) when proposing code edits.
-2. **Zero linter warnings and clean test suites:**
-   - No compiler errors or `cargo clippy` warnings are permitted (clippy runs strictly with `-D warnings`).
-   - All unit and integration tests across all workspace crates must pass cleanly (`test result: ok`).
+1. **Mandatory Test Coverage:**
+   - All new functionality, bug fixes, and behavioral changes must be covered by automated unit or integration tests verifying their contract.
+   - Regression tests must accompany every bug fix to prevent regressions.
+2. **Zero Warnings Standard:**
+   - All code across workspace crates must compile cleanly without compiler errors or Clippy warnings (`cargo clippy` runs strictly with `-D warnings`).
 
 ---
 
-## 5. Commit Message Format (Conventional Commits)
+## 6. Commit Message Format (Conventional Commits)
 
 All commits must follow the **Conventional Commits** specification:
 
@@ -101,7 +139,7 @@ All commits must follow the **Conventional Commits** specification:
 ```
 
 - **Types:** `feat`, `fix`, `refactor`, `test`, `docs`, `perf`, `chore`.
-- **Scopes (crates & subsystems):** `core`, `server`, `tui`, `workflow` (or omitted for cross-cutting changes).
+- **Scopes (crates & subsystems):** `core`, `protocol`, `server`, `tui`, `workflow` (or omitted for cross-cutting changes).
 - **Header Line:**
   - Written in English, imperative mood (*add*, *fix*, *update*), lowercase, no trailing period.
   - Maximum 72 characters in the header line.
@@ -113,7 +151,7 @@ All commits must follow the **Conventional Commits** specification:
 
 ---
 
-## 6. Living Configuration Reference (`tauqe.toml` and User Config)
+## 7. Living Configuration Reference (`tauqe.toml` and User Config)
 
 1. **Authoritative Example for Project Configuration:**
    - The root `tauqe.toml` file in this repository serves as the authoritative, living reference example of project-level configuration options.
@@ -129,7 +167,7 @@ All commits must follow the **Conventional Commits** specification:
 
 ---
 
-## 7. Living Documentation and Conceptual Ontology (`docs/`)
+## 8. Living Documentation and Conceptual Ontology (`docs/`)
 
 1. **Dual-Use Documentation as First-Class Artifact:**
    - The user guide and architecture documentation located in `docs/` serve both as the authoritative reference for human developers and as the high-density semantic concept ontology for the AI model.
@@ -147,7 +185,7 @@ All commits must follow the **Conventional Commits** specification:
 
 ---
 
-## 8. System Prompts and Generalization (Anti-Overfitting)
+## 9. System Prompts and Generalization (Anti-Overfitting)
 
 1. **Generalized Rules over Discussion Artifacts:**
    - When authoring, modifying, or refining prompts generated by or built into the system (such as system instructions, code review prompts, patch-retry templates, or compaction prompts), all instructions, constraints, and requirements must be formulated strictly in a general, robust, and conceptual manner.
@@ -159,10 +197,10 @@ All commits must follow the **Conventional Commits** specification:
 
 ---
 
-## 9. Subsystem Conventions
+## 10. Subsystem Conventions
 
-Certain subsystems define mandatory engineering directives that supplement these repository-wide conventions. Whenever a task involves inspecting, modifying, or extending code within a subsystem that maintains local conventions, those directives MUST be requested into context before proposing any modifications, unless already loaded in the active context. Proposing or making changes to a subsystem without having its local conventions loaded in context is strictly prohibited.
+Subsystems may define local conventions that supplement these repository-wide rules:
+- **Terminal UI (`crates/tui`):** `crates/tui/Conventions.md` (layout semantics, Magit/Readline navigation, modal dialog architecture, and focus model).
+- **Core Engine (`crates/core`):** `crates/core/Conventions.md` (dual-contour structured output and storage persistence invariants).
 
-Subsystems with mandatory local conventions:
-- **Terminal UI (`crates/tui`):** `crates/tui/Conventions.md`
-- **Core Engine (`crates/core`):** `crates/core/Conventions.md` (all operations not directly involving code modifications must strictly adhere to the Structured Output paradigm specified therein)
+Subsystem conventions are resolved and included in the Pinned context layer automatically by the harness whenever files within that subsystem are loaded into context.

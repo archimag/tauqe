@@ -25,7 +25,9 @@ Software engineering has always hinged upon two foundational questions: **What**
 
 Large language models are remarkably adept at answering *How*—synthesizing boilerplate, applying idioms, refactoring data pipelines, and implementing concrete routines. Yet they excel only when provided with a well-posed question and guided within disciplined structural boundaries. When released into open-ended, autonomous bash loops without guardrails, an LLM quickly drifts into generative hallucinations and speculative bloat.
 
-TAUQE's primary objective is to **liberate the developer's cognitive bandwidth so they can concentrate entirely on 'What'.** The engineer determines the objective, architectural intent, and requirements; the harness firmly steers and confines the model through a bounded turn to solve the *How*, deterministically and safely.
+In contemporary agentic practices, it is frequently asserted that imperative instructions must take precedence over declarative specifications. This contradicts a foundational principle of software engineering: specify *what* a system must achieve rather than micromanaging *how* it should execute. The emergence of large language models does not weaken this classical principle; it strongly reinforces it. Because an LLM is a probabilistic engine, long chains of imperative step-by-step instructions suffer from compounding error probabilities—one misstep in an imperative sequence quickly derails the entire operational trajectory. Conversely, language models demonstrate exceptional reasoning fidelity when bounded by explicit declarative constraints, architectural invariants, and typed schemas.
+
+TAUQE's primary objective is to **liberate the developer's cognitive bandwidth so they can concentrate entirely on 'What'.** The engineer determines the objective, architectural intent, and requirements; the harness firmly steers and confines the model through a bounded turn to solve the *How*, deterministically and safely. TAUQE emphasizes declarative descriptions of the project, its boundaries, and its contracts, eliminating the need for fragile imperative micromanagement.
 
 ### 1.2. Model Role Specialization
 
@@ -53,7 +55,7 @@ TAUQE enforces strict **decision immutability**:
 ### 1.4. Economic Efficiency via Role-Based Escalation
 
 Separating high-level intent from low-level implementation delivers structural cost and token efficiencies:
-- **Frontier reasoning models** are engaged where leverage is highest: initial problem formulation, invariant synthesis, and architectural refinement (Architect / Advisor).
+- **Frontier reasoning models** are engaged where leverage is highest: initial problem formulation, invariant synthesis, and architectural refinement (Architect).
 - **Cost-effective models** execute localized leaf implementation steps (Coder) within bounded turns guided by Repo Map blinkers.
 - Compute escalates dynamically: the harness advances through the `CoderTier` ladder (deepening reasoning effort or promoting to stronger coder models) only when compiler verification catches errors.
 
@@ -152,6 +154,8 @@ Because these tags are parsed deterministically, the harness can enforce boundar
    Documentation serves a dual purpose: authoritative technical reference for developers and high-density semantic concept ontology for the AI model. When asked about system architecture, shortcuts, or workflows, the model requests authoritative documentation via `<doc_request>` rather than hallucinating.
 6. **Deterministic Process Over Agentic Delegation**  
    Workflow lifecycles, state transitions, invariant checks, and Git transactions are hardcoded in environment software (Rust), never delegated to probabilistic LLM decision-making. The model is an intellectual transformation engine within a disciplined harness, not a process dispatcher.
+7. **Declarative Invariants Over Imperative Steering**  
+   The environment prioritizes declarative specifications, typed contracts, and architectural invariants over imperative step-by-step micro-instructions. Specifying *what* properties and invariants must hold allows the harness and model to resolve *how* with maximum autonomy while eliminating the compounding errors inherent in procedural agentic steering.
 
 ---
 
@@ -172,6 +176,7 @@ Project Files         → Manifests and toolchain capabilities
 Tree-sitter Repo Map  → Deterministic symbol awareness
 Bounded Turn          → Autonomous turn lifecycle (Discovery + Staging + Healing)
 Strict Harness        → Enforcing boundaries without shell access
+Declarative Contracts → Invariant specifications over imperative steering
 Model Roles           → Primary + Architect (What) + Coder (How) + Reviewer + Scribe
 Developer             → Task specification and absolute control
 LLM                   → Semantic transformation engine

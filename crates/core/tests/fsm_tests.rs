@@ -1055,3 +1055,221 @@ async fn plan_semantic_recovery_lifecycle_end_to_end() {
         other => panic!("Expected Ready for 3, got {:?}", other),
     }
 }
+
+/// Streaming a Structured Output discussion response must keep the REPL clean:
+/// only the human-readable `message` reaches the interface, while the JSON
+/// scaffolding, control fields, and Markdown fences stay hidden.
+#[tokio::test]
+async fn discussion_turn_streams_clean_markdown_without_json_leakage() {
+    let (_dir, repo_root) = init_repo();
+    std::fs::write(repo_root.join("target.rs"), "pub fn compute() -> i32 { 0 }\n")
+        .expect("write target fixture");
+    commit_fixture(&repo_root, &["target.rs"]);
+
+    let mut context = ContextManager::new(repo_root.clone());
+    // Pre-satisfy the discussion's context request so discovery never re-runs
+    // the proposal and the single scripted response is consumed exactly once.
+    context
+        .add_file("target.rs", ContextAccess::ReadOnly)
+        .expect("add reference file to context");
+    let mut history = HistoryManager::new(repo_root.clone());
+
+    let message = "Отличный план! Давайте уточним инварианты.";
+    let discussion_json = serde_json::json!({
+        "message": message,
+        "plan_update": null,
+        "context_requests": [
+            { "path": "target.rs", "access": "read_only" }
+        ],
+        "user_language": "Russian"
+    })
+    .to_string();
+
+    let provider = MockLlmProvider::scripted([MockResponse::text(discussion_json)]);
+    let model = ModelRef::openrouter("mock/model");
+    let protocol = tauqe_core::prompt::json::JsonPromptProtocol::discussion();
+
+    let plan_prompt = "# Plan Discussion: [discussion-plan] Refine plan\n";
+    assert!(
+        tauqe_core::workflow::fsm::is_discussion_prompt(plan_prompt),
+        "a plan discussion heading must be detected as a discussion turn"
+    );
+
+    let mut policy = tauqe_core::workflow::policy::DirectApplyPolicy::new();
+    let options = WorkflowOptions::default();
+    let (stream_tx, mut stream_rx, cancel_rx) = event_channel_with_rx();
+
+    let outcome = tauqe_core::workflow::fsm::run_fsm_turn(
+        plan_prompt,
+        &provider,
+        &model,
+        &mut context,
+        &mut history,
+        &protocol,
+        &mut policy,
+        "git",
+        stream_tx,
+        cancel_rx,
+        &options,
+    )
+    .await
+    .expect("discussion turn executes");
+
+    let mut streamed = String::new();
+    while let Ok(event) = stream_rx.try_recv() {
+        if let StreamEvent::TextDelta(delta) = event {
+            streamed.push_str(&delta);
+        }
+    }
+
+    assert_eq!(
+        streamed, message,
+        "only the human-readable message must reach the REPL stream"
+    );
+    for forbidden in ['{', '}', '"'] {
+        assert!(
+            !streamed.contains(forbidden),
+            "protocol JSON scaffolding must never leak into the REPL stream: {streamed:?}"
+        );
+    }
+    for forbidden in ["message", "plan_update", "context_requests", "user_language"] {
+        assert!(
+            !streamed.contains(forbidden),
+            "control metadata must never leak into the REPL stream: {streamed:?}"
+        );
+    }
+
+    assert!(matches!(outcome.result, ModelResult::Answer { .. }));
+    assert_eq!(outcome.assistant_text.trim(), message);
+}
+
+/// A discussion turn must route the extracted `plan_update` into control
+/// commands and persist it, activating the resulting plan, rather than
+/// surfacing any structured metadata in the REPL.
+#[tokio::test]
+async fn discussion_turn_persists_plan_update_and_active_marker() {
+    let (_dir, repo_root) = init_repo();
+
+    let mut context = ContextManager::new(repo_root.clone());
+    let mut history = HistoryManager::new(repo_root.clone());
+
+    let message = "План сохранён и активирован.";
+    let discussion_json = serde_json::json!({
+        "message": message,
+        "plan_update": {
+            "action": "save",
+            "id": "discussion-plan",
+            "title": "Discussion Plan",
+            "description": "Plan produced by a discussion turn",
+            "concept": [
+                {
+                    "id": "c-1",
+                    "title": "Discussion invariant",
+                    "details": "Responses stream clean Markdown only",
+                    "children": []
+                }
+            ],
+            "items": [
+                {
+                    "id": "1",
+                    "title": "First step",
+                    "details": "Concrete work",
+                    "status": "todo",
+                    "files": [],
+                    "readonly_files": [],
+                    "concept_refs": ["c-1"],
+                    "depends_on": [],
+                    "children": []
+                }
+            ]
+        },
+        "context_requests": [],
+        "user_language": "Russian"
+    })
+    .to_string();
+
+    let provider = MockLlmProvider::scripted([MockResponse::text(discussion_json)]);
+    let model = ModelRef::openrouter("mock/model");
+    let protocol = tauqe_core::prompt::json::JsonPromptProtocol::discussion();
+    let plan_prompt = "# Plan Discussion: [discussion-plan] Refine plan\n";
+
+    let mut policy = tauqe_core::workflow::policy::DirectApplyPolicy::new();
+    let options = WorkflowOptions::default();
+    let (stream_tx, mut stream_rx, cancel_rx) = event_channel_with_rx();
+
+    let outcome = tauqe_core::workflow::fsm::run_fsm_turn(
+        plan_prompt,
+        &provider,
+        &model,
+        &mut context,
+        &mut history,
+        &protocol,
+        &mut policy,
+        "git",
+        stream_tx,
+        cancel_rx,
+        &options,
+    )
+    .await
+    .expect("discussion turn executes");
+
+    let mut streamed = String::new();
+    while let Ok(event) = stream_rx.try_recv() {
+        if let StreamEvent::TextDelta(delta) = event {
+            streamed.push_str(&delta);
+        }
+    }
+    assert_eq!(streamed, message);
+    assert!(matches!(outcome.result, ModelResult::Answer { .. }));
+
+    let plan = tauqe_core::plan::storage::PlanStorage::load_plan(&repo_root, "discussion-plan")
+        .expect("load plan")
+        .expect("plan_update must be persisted from a discussion turn");
+    assert_eq!(plan.title, "Discussion Plan");
+    assert_eq!(plan.concept.len(), 1);
+    assert_eq!(plan.items.len(), 1);
+    assert_eq!(plan.items[0].concept_refs, vec!["c-1".to_string()]);
+
+    let active = tauqe_core::plan::storage::PlanStorage::load_active_id(&repo_root)
+        .expect("load active plan id");
+    assert_eq!(active.as_deref(), Some("discussion-plan"));
+}
+
+/// Discussion prompts must be detected deterministically and routed to the
+/// structured discussion protocol regardless of the configured base protocol
+/// (which may be `xml`). That protocol hides code editing and advertises the
+/// discussion JSON schema, so the REPL stays isolated from service markup.
+#[test]
+fn discussion_prompt_selects_structured_discussion_protocol() {
+    let plan_prompt = "# Plan Discussion: [p-1] Refine plan\n";
+    let review_prompt = format!(
+        "{} [rev-1] Fix issue\n",
+        tauqe_protocol::review::REVIEW_DISCUSSION_PREFIX
+    );
+
+    for prompt in [plan_prompt, review_prompt.as_str()] {
+        assert!(
+            tauqe_core::workflow::fsm::is_discussion_prompt(prompt),
+            "discussion prompt must be detected: {prompt:?}"
+        );
+    }
+
+    // The core-level contract the server's protocol resolver relies on: a
+    // discussion turn always uses the structured discussion protocol, whose
+    // stream filter strips the JSON scaffolding and whose capabilities exclude
+    // code editing.
+    let protocol = tauqe_core::prompt::json::JsonPromptProtocol::discussion();
+    assert!(protocol.supports(tauqe_protocol::LlmCapability::PlanUpdate));
+    assert!(protocol.supports(tauqe_protocol::LlmCapability::PlanCreation));
+    assert!(!protocol.supports(tauqe_protocol::LlmCapability::FileEdits));
+    assert!(!protocol.supports(tauqe_protocol::LlmCapability::ToolchainVerify));
+
+    match protocol.response_format(&[]) {
+        Some(tauqe_core::providers::ResponseFormat::JsonSchema { json_schema, .. }) => {
+            assert_eq!(json_schema.name, "discussion_response");
+        }
+        other => panic!(
+            "discussion protocol must advertise the discussion_response schema, got {other:?}"
+        ),
+    }
+}

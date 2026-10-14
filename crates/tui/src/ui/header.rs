@@ -499,6 +499,7 @@ mod tests {
             confirm_cancel: false,
             confirm_quit: false,
             confirm_undo: false,
+            confirm_detach_focus: false,
             confirm_clear_history: false,
             confirm_delete_plan: None,
             confirm_delete_review: None,
@@ -523,6 +524,7 @@ mod tests {
             shift_tip_shown: false,
             model_choice: crate::app::ModelChoice::default(),
             running_model: None,
+            discussion_focus: tauqe_protocol::DiscussionFocus::None,
         }
     }
 

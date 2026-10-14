@@ -1,5 +1,5 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use tauqe_protocol::methods;
+use tauqe_protocol::{methods, DiscussionFocus};
 use tokio::sync::MutexGuard;
 
 use crate::app::{AppState, ModalFocus, PromptModalState, PromptModalTarget};
@@ -106,83 +106,53 @@ async fn submit_prompt_modal(
         return Ok(Some(InputResult::Continue));
     }
 
-    match &dialog.target {
+    let (target, focused_items, focus) = match &dialog.target {
         PromptModalTarget::Review {
             review_id,
             focused_items,
             ..
         } => {
-            let session = st
-                .review
-                .sessions
+            let ids = focused_items
                 .iter()
-                .find(|s| &s.id == review_id)
-                .cloned()
-                .or_else(|| {
-                    st.review
-                        .session
-                        .as_ref()
-                        .filter(|s| &s.id == review_id)
-                        .cloned()
-                });
-
-            if let Some(session) = session {
-                let focused_ids: Vec<u32> = focused_items.iter().map(|(id, _)| *id).collect();
-                let prompt = tauqe_protocol::review::format_review_discussion_prompt_items(
-                    &session,
-                    &focused_ids,
-                    &user_comment,
-                );
-
-                super::begin_develop_turn(&mut st);
-                drop(st);
-                send_request(
-                    server_writer,
-                    methods::MODEL_ASK,
-                    serde_json::json!({ "prompt": prompt }),
-                )
-                .await?;
-                Ok(Some(InputResult::Continue))
-            } else {
-                st.notify_error(format!("Review session '{}' not found", review_id));
-                st.prompt_modal = Some(dialog);
-                Ok(Some(InputResult::Continue))
-            }
+                .map(|(id, _)| id.to_string())
+                .collect::<Vec<String>>();
+            (
+                serde_json::json!({ "kind": "review", "id": review_id }),
+                ids.clone(),
+                DiscussionFocus::review(review_id.clone(), ids),
+            )
         }
         PromptModalTarget::Plan {
             plan_id,
             focused_items,
             ..
         } => {
-            let plan = st
-                .plans_view
-                .plans
+            let ids = focused_items
                 .iter()
-                .find(|p| &p.id == plan_id)
-                .cloned();
-            if let Some(plan) = plan {
-                let focused_ids: Vec<String> =
-                    focused_items.iter().map(|(id, _)| id.clone()).collect();
-                let prompt = tauqe_protocol::plan::format_plan_discussion_prompt(
-                    &plan,
-                    &focused_ids,
-                    &user_comment,
-                );
-
-                super::begin_develop_turn(&mut st);
-                drop(st);
-                send_request(
-                    server_writer,
-                    methods::MODEL_ASK,
-                    serde_json::json!({ "prompt": prompt }),
-                )
-                .await?;
-                Ok(Some(InputResult::Continue))
-            } else {
-                st.notify_error(format!("Plan '{}' not found", plan_id));
-                st.prompt_modal = Some(dialog);
-                Ok(Some(InputResult::Continue))
-            }
+                .map(|(id, _)| id.clone())
+                .collect::<Vec<String>>();
+            (
+                serde_json::json!({ "kind": "plan", "id": plan_id }),
+                ids.clone(),
+                DiscussionFocus::plan(plan_id.clone(), ids),
+            )
         }
-    }
+    };
+
+    super::begin_develop_turn(&mut st);
+    st.discussion_focus = focus;
+    drop(st);
+    send_request(
+        server_writer,
+        methods::MODEL_ASK,
+        serde_json::json!({
+            "discussion": {
+                "target": target,
+                "focused_items": focused_items,
+                "comment": user_comment,
+            }
+        }),
+    )
+    .await?;
+    Ok(Some(InputResult::Continue))
 }

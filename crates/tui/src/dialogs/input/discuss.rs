@@ -1,5 +1,5 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use tauqe_protocol::methods;
+use tauqe_protocol::{methods, DiscussionFocus};
 use tokio::sync::MutexGuard;
 
 use crate::app::AppState;
@@ -71,16 +71,21 @@ pub(crate) async fn submit_discuss_plan(
     };
 
     let focused_ids: Vec<String> = dialog.focused_items.iter().map(|(id, _)| id.clone()).collect();
-    let prompt =
-        tauqe_protocol::plan::format_plan_discussion_prompt(&plan, &focused_ids, &user_comment);
 
     st.discuss_plan_dialog = None;
     super::begin_develop_turn(&mut st);
+    st.discussion_focus = DiscussionFocus::plan(plan.id.clone(), focused_ids.clone());
     drop(st);
     send_request(
         server_writer,
         methods::MODEL_ASK,
-        serde_json::json!({ "prompt": prompt }),
+        serde_json::json!({
+            "discussion": {
+                "target": { "kind": "plan", "id": plan.id },
+                "focused_items": focused_ids,
+                "comment": user_comment,
+            }
+        }),
     )
     .await?;
     Ok(Some(InputResult::Continue))

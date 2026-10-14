@@ -1,17 +1,18 @@
 use tauqe_protocol::{DiscussionContextRequest, DiscussionPlanUpdate, DiscussionResponse};
 use tracing::{info, warn};
 
-use super::json::extract_streamed_message;
+use super::json::extract_streamed_string_field;
 use super::EditStreamFilter;
 use crate::providers::StreamEvent;
 
 /// Streaming filter for Structured Output in discussion and planning modes.
 ///
-/// It streams the top-level `"message"` field on the fly as `StreamEvent::TextDelta`
-/// while buffering the payload to parse structured commands (`DiscussionResponse`)
-/// at the end of the turn.
-#[derive(Debug, Default)]
+/// It streams a target top-level string field (by default `"message"`) on the fly
+/// as `StreamEvent::TextDelta` while buffering the payload to parse structured
+/// commands (`DiscussionResponse`) at the end of the turn.
+#[derive(Debug)]
 pub struct DiscussionStreamFilter {
+    target_field: String,
     passthrough: Option<bool>,
     buffer: String,
     message_streamed_bytes: usize,
@@ -19,9 +20,27 @@ pub struct DiscussionStreamFilter {
     response: Option<DiscussionResponse>,
 }
 
+impl Default for DiscussionStreamFilter {
+    fn default() -> Self {
+        Self::with_target_field("message")
+    }
+}
+
 impl DiscussionStreamFilter {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Creates a filter streaming the specified top-level JSON string field.
+    pub fn with_target_field(target_field: impl Into<String>) -> Self {
+        Self {
+            target_field: target_field.into(),
+            passthrough: None,
+            buffer: String::new(),
+            message_streamed_bytes: 0,
+            message_finished: false,
+            response: None,
+        }
     }
 
     /// Pushes a delta chunk and yields any unescaped `TextDelta` stream events.
@@ -59,10 +78,10 @@ impl DiscussionStreamFilter {
             return events;
         }
 
-        // 1. Stream message field deltas on the fly
+        // 1. Stream target field deltas on the fly
         if !self.message_finished {
             let (delta, new_streamed, finished) =
-                extract_streamed_message(&self.buffer, self.message_streamed_bytes);
+                extract_streamed_string_field(&self.buffer, &self.target_field, self.message_streamed_bytes);
             if let Some(d) = delta {
                 if !d.is_empty() {
                     events.push(StreamEvent::TextDelta(d));
@@ -85,7 +104,7 @@ impl DiscussionStreamFilter {
 
         if !self.message_finished {
             let (delta, new_streamed, finished) =
-                extract_streamed_message(&self.buffer, self.message_streamed_bytes);
+                extract_streamed_string_field(&self.buffer, &self.target_field, self.message_streamed_bytes);
             if let Some(d) = delta {
                 if !d.is_empty() {
                     events.push(StreamEvent::TextDelta(d));
@@ -99,11 +118,29 @@ impl DiscussionStreamFilter {
 
         // Finalization guard: residual message text must never stay trapped in the
         // buffer when the stream closes. If the on-the-fly scanner surfaced nothing
-        // as the message, emit the parsed message exactly once. Emitting only
-        // `parsed.message` also keeps JSON scaffolding (such as `{"message":""}` or
-        // payloads without a message field) out of the text stream.
-        if self.message_streamed_bytes == 0 && !parsed.message.is_empty() {
-            events.push(StreamEvent::TextDelta(parsed.message.clone()));
+        // as the target field, emit the parsed content exactly once.
+        if self.message_streamed_bytes == 0 {
+            let fallback_text = if self.target_field == "message" {
+                if !parsed.message.is_empty() {
+                    Some(parsed.message.clone())
+                } else {
+                    None
+                }
+            } else {
+                serde_json::from_str::<serde_json::Value>(extract_json_str(&self.buffer))
+                    .ok()
+                    .and_then(|v| {
+                        v.get(&self.target_field)
+                            .and_then(|s| s.as_str())
+                            .map(ToString::to_string)
+                    })
+            };
+
+            if let Some(text) = fallback_text {
+                if !text.is_empty() {
+                    events.push(StreamEvent::TextDelta(text));
+                }
+            }
         }
 
         self.response = Some(parsed);
@@ -487,5 +524,25 @@ mod tests {
         }
 
         assert_eq!(streamed, "Hello wor");
+    }
+
+    #[test]
+    fn test_discussion_stream_filter_custom_field() {
+        let mut filter = DiscussionStreamFilter::with_target_field("summary");
+        let json = r#"{"summary":"Executive summary text","items":[]}"#;
+        let mut streamed = String::new();
+        for c in json.chars() {
+            for ev in filter.push_chunk(&c.to_string()) {
+                if let StreamEvent::TextDelta(d) = ev {
+                    streamed.push_str(&d);
+                }
+            }
+        }
+        for ev in filter.finish_internal() {
+            if let StreamEvent::TextDelta(d) = ev {
+                streamed.push_str(&d);
+            }
+        }
+        assert_eq!(streamed, "Executive summary text");
     }
 }

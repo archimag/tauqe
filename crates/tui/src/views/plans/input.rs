@@ -413,11 +413,19 @@ pub async fn handle_plans_key(
                             )]
                         });
 
-                    st.plans_view.refine_dialog = Some(super::PlanRefineDialogState::new(
+                    let mut dialog = super::PlanRefineDialogState::new(
                         plan.id,
                         plan.title,
                         architect_entries,
-                    ));
+                    );
+                    // Open on the architect list when more than one model is
+                    // configured so it can be picked instantly with the digit
+                    // shortcuts; a single model leaves focus on the editor
+                    // (c-magit-key-navigation).
+                    if dialog.selector.len() > 1 {
+                        dialog.focus = super::RefineDialogFocus::ModelList;
+                    }
+                    st.plans_view.refine_dialog = Some(dialog);
                 }
             }
         }

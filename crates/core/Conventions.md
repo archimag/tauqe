@@ -4,22 +4,16 @@ This document specifies mandatory architectural and operational conventions for 
 
 ---
 
-## 1. Context Requirement
-
-Whenever inspecting, modifying, or extending code within `crates/core/`, this conventions document must be included in context and strictly observed.
-
----
-
-## 2. Dual-Contour Architecture: Structured Output vs XML Edits
+## 1. Dual-Contour Architecture: Structured Output vs XML Edits
 
 The interaction protocol between Tauqe and large language models is strictly divided into two orthogonal operational contours:
 
-### 2.1. Code Modification Contour (Develop & Step Execution)
+### 1.1. Code Modification Contour (Develop & Step Execution)
 - **Protocol:** Strict XML marker protocol (`<tauqe_edits_...>`, `<context_request_...>`, `<verify_...>`, `<plan_...>`, etc.).
 - **Purpose:** Virtual in-memory staging, atomic search/replace patch application, toolchain verification healing, and deterministic Git transactions.
 - **Scope:** Used exclusively when the model is tasked with creating, editing, renaming, or deleting codebase files.
 
-### 2.2. Structured Output Contour (All Non-Code Operations)
+### 1.2. Structured Output Contour (All Non-Code Operations)
 - **Protocol:** Enforced Structured Output (`response_format: json_schema` or typed JSON deserialization).
 - **Mandatory Invariant:** Any operation, subsystem, or workflow that does **NOT** directly produce code modifications MUST use Structured Output. Free-form text with heuristic markdown parsing for machine-consumed data is strictly prohibited.
 - **Covered Subsystems & Operations:**
@@ -33,6 +27,21 @@ The interaction protocol between Tauqe and large language models is strictly div
   - Prevents prompt injection and instruction drift.
   - Guarantees compile-time schema conformance and deterministic deserialization.
   - Decouples cognitive reasoning and conversational workflows from file-patching machinery.
+
+---
+
+## 2. PromptProtocol Interchangeability Invariant
+
+1. **Fundamental Equivalence of Protocols:**
+   - All implementations of `PromptProtocol` (`XmlPromptProtocol`, `JsonPromptProtocol`, and any future protocol variants) must be strictly interchangeable architectural peers.
+   - The workflow engine, FSM turn runner, and server handlers must interact with LLM communication strictly through the generic `PromptProtocol` trait contract (`capabilities()`, `system_instructions()`, `response_format()`, `decode()`, `create_stream_filter()`).
+   - Branching on the concrete protocol type or hardcoding protocol-specific control paths in workflow loops or turn execution routines is strictly prohibited.
+2. **Unified Semantic Representation (`Vec<LlmCommand>`):**
+   - Every protocol implementation is responsible for completely decoding raw model outputs into strongly typed semantic commands (`LlmCommand`), including text answers, file edits, plan operations, discovery requests, verification triggers, and terminal outcomes.
+   - Consumers of protocol output must never inspect raw wire markup, XML tags, or unparsed JSON keys.
+3. **Clean Streaming Isolation:**
+   - Every protocol implementation must provide an `EditStreamFilter` that isolates the user-facing interface from protocol scaffolding.
+   - In structured protocols, the target textual response field (such as `message` in discussion mode) must be streamed on the fly via `StreamEvent::TextDelta` with real-time unescaping, while structural metadata (`plan_update`, context requests, language tags) remains completely hidden from the REPL stream.
 
 ---
 
