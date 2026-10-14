@@ -9,7 +9,6 @@ pub mod review;
 use std::path::Path;
 use std::sync::Arc;
 
-use tauqe_core::config::load_config;
 use tauqe_core::edits::protocol::VerifyTarget;
 use tauqe_core::edits::EditProtocolFactory;
 use tauqe_core::history::HistoryManager;
@@ -135,7 +134,7 @@ async fn handle_client_initialize(req: Request, state: &Arc<AppState>) -> Respon
     // Update configuration and the repo-bound managers under separate, short-lived
     // guards: no guard is ever held across another subsystem's `.await`.
     if !repo_path.as_os_str().is_empty() {
-        let loaded = load_config(Some(repo_path));
+        let loaded = config::reload_config_with_overrides(state, Some(repo_path)).await;
         {
             let mut guard = state.config.lock().await;
             guard.selection = loaded.default_selection();

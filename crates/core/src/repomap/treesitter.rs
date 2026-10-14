@@ -1,76 +1,188 @@
-use std::path::Path;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::time::SystemTime;
+
 use anyhow::Result;
 use tree_sitter::{Node, Parser};
 
 use crate::repomap::{RepoFileSymbols, Symbol, SymbolExtractor, SymbolKind};
 
+/// Extracts top-level symbols from a parsed syntax tree.
+type SymbolExtraction = for<'tree, 'source> fn(Node<'tree>, &'source [u8]) -> Vec<Symbol>;
+
+/// Tree-sitter language support entry covering a set of file extensions.
+struct LanguageSupport {
+    extensions: &'static [&'static str],
+    language: fn() -> tree_sitter::Language,
+    extract: SymbolExtraction,
+}
+
+/// Registry of languages the repo map can parse.
+///
+/// The map stays language-agnostic: supporting a new language means adding an
+/// entry here with its grammar and top-level symbol extractor. Files without a
+/// registered extension still appear in the map as plain paths, which is the
+/// expected fallback for languages without symbol support.
+const LANGUAGE_REGISTRY: &[LanguageSupport] = &[LanguageSupport {
+    extensions: &["rs"],
+    language: tree_sitter_rust::language,
+    extract: extract_container_symbols,
+}];
+
+/// Returns whether `path` carries an extension the registry can parse.
+pub fn is_supported_path(path: &str) -> bool {
+    language_for_path(path).is_some()
+}
+
+/// Returns the registry entry registered for `path`'s extension, if any.
+fn language_for_path(path: &str) -> Option<&'static LanguageSupport> {
+    let extension = Path::new(path).extension()?.to_str()?;
+    LANGUAGE_REGISTRY
+        .iter()
+        .find(|support| support.extensions.contains(&extension))
+}
+
+/// Symbols cached for a single file, validated against its modification state.
+struct CachedSymbols {
+    modified: Option<SystemTime>,
+    size: u64,
+    symbols: Option<RepoFileSymbols>,
+}
+
+/// Reusable parser and the symbol cache it fills.
+struct ExtractorState {
+    parser: Parser,
+    cache: HashMap<PathBuf, CachedSymbols>,
+}
+
 /// Default repository symbol extractor backed by Tree-sitter.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct TreeSitterExtractor;
+///
+/// Holds one reusable parser and an mtime/size-validated symbol cache. The map
+/// is regenerated whenever the active context changes, which would otherwise
+/// re-parse every file outside that context on each round; the cache turns
+/// those passes into lookups for files whose modification time and size are
+/// unchanged.
+pub struct TreeSitterExtractor {
+    state: Mutex<ExtractorState>,
+}
+
+impl Default for TreeSitterExtractor {
+    fn default() -> Self {
+        Self {
+            state: Mutex::new(ExtractorState {
+                parser: Parser::new(),
+                cache: HashMap::new(),
+            }),
+        }
+    }
+}
+
+impl std::fmt::Debug for TreeSitterExtractor {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("TreeSitterExtractor")
+            .finish_non_exhaustive()
+    }
+}
+
+impl TreeSitterExtractor {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
 
 impl SymbolExtractor for TreeSitterExtractor {
     fn extract_symbols(&self, repo_root: &Path, files: &[String]) -> Result<Vec<RepoFileSymbols>> {
-        extract_treesitter_symbols(repo_root, files)
+        let mut state = match self.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        Ok(extract_treesitter_symbols(&mut state, repo_root, files))
     }
 }
 
-/// Extracts symbols from multiple repository files using Tree-sitter.
-pub fn extract_treesitter_symbols(
+/// Extracts symbols from repository files, reusing the parser and symbol cache.
+fn extract_treesitter_symbols(
+    state: &mut ExtractorState,
     repo_root: &Path,
     files: &[String],
-) -> Result<Vec<RepoFileSymbols>> {
-    let mut parser = Parser::new();
-    let language = tree_sitter_rust::language();
-    parser
-        .set_language(&language)
-        .map_err(|e| anyhow::anyhow!("Failed to set tree-sitter language: {:?}", e))?;
-
+) -> Vec<RepoFileSymbols> {
     let mut result = Vec::new();
     for rel_path in files {
         let full_path = repo_root.join(rel_path);
-        if let Ok(source) = std::fs::read_to_string(&full_path) {
-            if let Some(file_symbols) = extract_symbols_from_source(&mut parser, rel_path, &source) {
-                if !file_symbols.symbols.is_empty() {
-                    result.push(file_symbols);
+        let metadata = match std::fs::metadata(&full_path) {
+            Ok(metadata) => metadata,
+            Err(_) => continue,
+        };
+        let modified = metadata.modified().ok();
+        let size = metadata.len();
+
+        if let Some(cached) = state.cache.get(&full_path) {
+            if cached.modified == modified && cached.size == size {
+                if let Some(symbols) = cached.symbols.clone() {
+                    result.push(symbols);
                 }
+                continue;
             }
         }
+
+        let support = match language_for_path(rel_path) {
+            Some(support) => support,
+            None => continue,
+        };
+        let source = match std::fs::read_to_string(&full_path) {
+            Ok(source) => source,
+            Err(_) => continue,
+        };
+        let symbols = extract_symbols_with_support(&mut state.parser, support, rel_path, &source)
+            .filter(|file| !file.symbols.is_empty());
+        if let Some(symbols) = &symbols {
+            result.push(symbols.clone());
+        }
+        state.cache.insert(
+            full_path,
+            CachedSymbols {
+                modified,
+                size,
+                symbols,
+            },
+        );
     }
 
     result.sort_by(|a, b| a.path.cmp(&b.path));
-    Ok(result)
+    result
 }
 
-/// Extracts symbols from an in-memory Rust source code string.
+/// Extracts symbols from an in-memory source string using the registry entry
+/// registered for `path`'s extension.
 pub fn extract_symbols_from_str(path: &str, source: &str) -> Result<RepoFileSymbols> {
+    let support = language_for_path(path)
+        .ok_or_else(|| anyhow::anyhow!("Unsupported source extension for path: {}", path))?;
     let mut parser = Parser::new();
-    let language = tree_sitter_rust::language();
-    parser
-        .set_language(&language)
-        .map_err(|e| anyhow::anyhow!("Failed to set tree-sitter language: {:?}", e))?;
-
-    let syms = extract_symbols_from_source(&mut parser, path, source)
+    let symbols = extract_symbols_with_support(&mut parser, support, path, source)
         .unwrap_or_else(|| RepoFileSymbols {
             path: path.to_string(),
             symbols: Vec::new(),
             line_count: source.lines().count(),
         });
-    Ok(syms)
+    Ok(symbols)
 }
 
-fn extract_symbols_from_source(
+fn extract_symbols_with_support(
     parser: &mut Parser,
+    support: &LanguageSupport,
     rel_path: &str,
     source: &str,
 ) -> Option<RepoFileSymbols> {
+    parser.set_language(&(support.language)()).ok()?;
     let tree = parser.parse(source, None)?;
     let root = tree.root_node();
-    let symbols = extract_container_symbols(root, source.as_bytes());
-    let line_count = source.lines().count();
+    let symbols = (support.extract)(root, source.as_bytes());
     Some(RepoFileSymbols {
         path: rel_path.to_string(),
         symbols,
-        line_count,
+        line_count: source.lines().count(),
     })
 }
 
@@ -601,5 +713,44 @@ pub fn valid_after_error() -> bool {
         let res = extract_symbols_from_str("src/broken.rs", code).unwrap();
         assert!(res.symbols.iter().any(|s| s.name == "ValidOne"));
         assert!(res.symbols.iter().any(|s| s.name == "valid_after_error"));
+    }
+
+    #[test]
+    fn test_is_supported_path_registry() {
+        assert!(is_supported_path("src/lib.rs"));
+        assert!(is_supported_path("nested/dir/module.rs"));
+        assert!(!is_supported_path("src/index.ts"));
+        assert!(!is_supported_path("scripts/build.py"));
+        assert!(!is_supported_path("Makefile"));
+    }
+
+    #[test]
+    fn test_extract_symbols_from_str_rejects_unsupported_extension() {
+        assert!(extract_symbols_from_str("src/app.ts", "export const value = 1;\n").is_err());
+    }
+
+    #[test]
+    fn test_extractor_cache_reuses_unchanged_and_invalidates_on_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        std::fs::write(root.join("a.rs"), "pub fn first() -> i32 { 1 }\n").unwrap();
+        let extractor = TreeSitterExtractor::new();
+        let files = vec!["a.rs".to_string()];
+
+        let first = extractor.extract_symbols(&root, &files).unwrap();
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].symbols[0].name, "first");
+        assert_eq!(extractor.state.lock().unwrap().cache.len(), 1);
+
+        // An unchanged file is served from the cache without a new entry.
+        let second = extractor.extract_symbols(&root, &files).unwrap();
+        assert_eq!(second, first);
+        assert_eq!(extractor.state.lock().unwrap().cache.len(), 1);
+
+        // Rewriting the file with a different size invalidates the entry.
+        std::fs::write(root.join("a.rs"), "pub fn second_value() -> i32 { 2 }\n").unwrap();
+        let third = extractor.extract_symbols(&root, &files).unwrap();
+        assert_eq!(third.len(), 1);
+        assert_eq!(third[0].symbols[0].name, "second_value");
     }
 }

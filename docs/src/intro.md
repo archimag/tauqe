@@ -29,9 +29,11 @@ Autonomy is granted only inside a single bounded turn. The moment the turn concl
 TAUQE splits the *What*/*How* duality across dedicated, non-overlapping model roles. Each role keeps a single mandate and never absorbs the responsibility of another:
 - **Architect** owns the *What*: high-level decomposition, system invariants, and conceptual boundaries. It produces plans and concept nodes, not concrete source lines.
 - **Coder** owns the *How*: minimal, coherent, compiling code changes that resolve one well-posed step.
-- **Advisor** provides strategic guidance and design trade-offs when the objective or its constraints are ambiguous.
+- **Primary** owns the interactive engineering dialogue and is the mandatory base role: its first entry is the idle active model and the deterministic default for every specialized role that omits its own list.
 - **Reviewer** performs analytical, read-only inspection and emits findings; it never modifies files.
 - **Scribe** handles history compaction, turning long multi-turn transcripts into dense, lossless context.
+
+Each role is configured as an ordered list of model entries. `primary` is mandatory, and any specialized role without its own list inherits the full `primary` list.
 
 The Architect/Coder boundary is deliberately rigid. When code generation fails repeatedly, the harness **never switches the Coder into the Architect role**. Escalation stays intra-role: the *coder ladder* promotes execution to a stronger coder tier (a model paired with a reasoning effort) within the same *How* competence. Crossing back into the *What* role on a compile failure would blur the boundary the harness exists to enforce.
 

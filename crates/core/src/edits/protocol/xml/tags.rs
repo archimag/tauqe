@@ -42,7 +42,7 @@ fn next_simple_tag(text: &str, open: &str) -> Option<(usize, usize)> {
     while let Some(rel) = text[from..].find(open) {
         let start = from + rel;
         let after = start + open.len();
-        let bytes = &text.as_bytes()[after..];
+        let bytes = text.get(after..).unwrap_or_default().as_bytes();
         let mut idx = 0;
         if idx < bytes.len() && (bytes[idx] == b'_' || bytes[idx] == b'-') {
             idx += 1;
@@ -52,8 +52,8 @@ fn next_simple_tag(text: &str, open: &str) -> Option<(usize, usize)> {
                 idx += 1;
             }
         }
-        let tag_name = &text[start + 1..after + idx];
-        let rest = &text[after + idx..];
+        let tag_name = text.get(start + 1..after + idx).unwrap_or_default();
+        let rest = text.get(after + idx..).unwrap_or_default();
         let boundary = rest
             .chars()
             .next()
@@ -67,7 +67,7 @@ fn next_simple_tag(text: &str, open: &str) -> Option<(usize, usize)> {
             let mut end = after + idx + gt + 1;
             if !rest[..gt].trim_end().ends_with('/') {
                 let close_tag = format!("</{}>", tag_name);
-                let after_open = &text[end..];
+                let after_open = text.get(end..).unwrap_or_default();
                 let trimmed = after_open.trim_start();
                 if trimmed.starts_with(&close_tag) {
                     end += (after_open.len() - trimmed.len()) + close_tag.len();
@@ -85,7 +85,7 @@ fn next_control_tag(text: &str, open: &str) -> Option<(usize, usize)> {
     while let Some(rel) = text[from..].find(open) {
         let start = from + rel;
         let after = start + open.len();
-        let bytes = &text.as_bytes()[after..];
+        let bytes = text.get(after..).unwrap_or_default().as_bytes();
         let mut idx = 0;
         if idx < bytes.len() && (bytes[idx] == b'_' || bytes[idx] == b'-') {
             idx += 1;
@@ -95,8 +95,8 @@ fn next_control_tag(text: &str, open: &str) -> Option<(usize, usize)> {
                 idx += 1;
             }
         }
-        let tag_name = &text[start + 1..after + idx];
-        let rest = &text[after + idx..];
+        let tag_name = text.get(start + 1..after + idx).unwrap_or_default();
+        let rest = text.get(after + idx..).unwrap_or_default();
         let boundary = rest
             .chars()
             .next()
@@ -112,7 +112,7 @@ fn next_control_tag(text: &str, open: &str) -> Option<(usize, usize)> {
                 return Some((start, end_open));
             }
             let close_tag = format!("</{}>", tag_name);
-            if let Some(close_offset) = text[end_open..].find(&close_tag) {
+            if let Some(close_offset) = text.get(end_open..).unwrap_or_default().find(&close_tag) {
                 let end = end_open + close_offset + close_tag.len();
                 return Some((start, end));
             } else {

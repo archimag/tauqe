@@ -12,7 +12,7 @@ pub const GLOBAL_COMMANDS: &[crate::app::KeyCommand] = &[
     crate::app::KeyCommand { key: "F6 / C-S", description: "Squash commits dialog" },
     crate::app::KeyCommand { key: "Ctrl+C", description: "Cancel active generation" },
     // Navigation & Inspection.
-    crate::app::KeyCommand { key: "C-1..5 / F1..F5", description: "Switch views: Develop │ Context │ Review │ Plans │ History" },
+    crate::app::KeyCommand { key: "C-1..5 / F1..F5", description: "Switch views: REPL │ Context │ Review │ Plans │ History" },
     crate::app::KeyCommand { key: "C-R", description: "Fold / unfold thinking (reasoning) stream" },
     crate::app::KeyCommand { key: crate::app::HELP_OPEN_CHORD, description: "Open this help dialog (? also opens it outside text input); Esc / q close it" },
     // Auxiliary & Destructive.
@@ -37,7 +37,7 @@ pub const ONBOARDING_COMMANDS: &[crate::app::KeyCommand] = &[
 
 pub fn get_mode_key_commands(mode: ViewMode) -> (&'static str, &'static [crate::app::KeyCommand]) {
     match mode {
-        ViewMode::Develop => (" Help: Develop ", crate::views::develop::DEVELOP_COMMANDS),
+        ViewMode::Develop => (" Help: REPL ", crate::views::develop::DEVELOP_COMMANDS),
         ViewMode::Context => (" Help: Context ", crate::views::context::CONTEXT_COMMANDS),
         ViewMode::History => (" Help: History ", crate::views::history::HISTORY_COMMANDS),
         ViewMode::Review => (" Help: Review ", crate::views::review::REVIEW_COMMANDS),

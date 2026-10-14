@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use super::{current_file_content, normalize_hunk, resolve_path, EditStreamFilter};
+use super::{normalize_hunk, resolve_path, EditStreamFilter, StagingSimulator};
+use crate::edits::protocol::xml::is_valid_turn_marker;
 use crate::providers::StreamEvent;
 
 /// State-machine streaming parser for XML edits.
@@ -17,8 +18,7 @@ pub struct XmlStreamFilter {
     current_file: Option<CurrentStreamingFile>,
     file_hunks_count: usize,
     editable_paths: Vec<String>,
-    repo_root: PathBuf,
-    staged_contents: HashMap<String, String>,
+    staging: StagingSimulator,
 }
 
 struct CurrentStreamingFile {
@@ -37,23 +37,33 @@ impl XmlStreamFilter {
             current_file: None,
             file_hunks_count: 0,
             editable_paths,
-            repo_root,
-            staged_contents: HashMap::new(),
+            staging: StagingSimulator::new(HashMap::new(), repo_root),
         }
     }
 
     pub fn with_staged_contents(mut self, staged_contents: HashMap<String, String>) -> Self {
-        self.staged_contents = staged_contents;
+        self.staging.set_staged_contents(staged_contents);
         self
     }
 
     /// Sets the active XML marker before any chunks are processed.
+    ///
+    /// A late call after streaming has begun is ignored and a malformed marker
+    /// is dropped, both with a warning rather than a panic: the stream filter
+    /// runs inside the long-lived daemon and must never abort the process.
     pub fn with_marker(mut self, marker: Option<String>) -> Self {
-        assert!(self.raw_buffer.is_empty() && self.buffer.is_empty());
-        if let Some(value) = &marker {
-            assert!(!value.is_empty() && value.bytes().all(|b| b.is_ascii_alphanumeric()));
+        if !self.raw_buffer.is_empty() || !self.buffer.is_empty() {
+            tracing::warn!("ignoring with_marker call after streaming began");
+            return self;
         }
-        self.marker = marker;
+        match marker {
+            Some(value) if is_valid_turn_marker(&value) => self.marker = Some(value),
+            Some(value) => {
+                tracing::warn!(marker = %value, "dropping malformed turn marker");
+                self.marker = None;
+            }
+            None => self.marker = None,
+        }
         self
     }
 
@@ -171,14 +181,7 @@ impl XmlStreamFilter {
                                     op_type: "move".to_string(),
                                 });
                                 self.buffer.drain(..tag_start + close_bracket + 1);
-                                if let Some(content) = self.staged_contents.remove(&resolved_from) {
-                                    self.staged_contents.insert(resolved_to.clone(), content);
-                                } else {
-                                    let full_from = self.repo_root.join(&resolved_from);
-                                    if let Ok(content) = std::fs::read_to_string(&full_from) {
-                                        self.staged_contents.insert(resolved_to.clone(), content);
-                                    }
-                                }
+                                self.staging.apply_move(&resolved_from, &resolved_to);
                                 events.push(StreamEvent::EditFileDone {
                                     path: display_path,
                                     status: "ok".to_string(),
@@ -256,11 +259,7 @@ impl XmlStreamFilter {
                         let norm_content = self.restore_content(&normalize_hunk(&content));
 
                         let old_text = if curr_op_type == "overwrite" {
-                            match current_file_content(
-                                &self.staged_contents,
-                                &self.repo_root,
-                                &curr_path,
-                            ) {
+                            match self.staging.current_content(&curr_path) {
                                 Ok(text) => text,
                                 Err(err_msg) => {
                                     events.push(StreamEvent::EditFileDone {
@@ -284,7 +283,7 @@ impl XmlStreamFilter {
                             new_text: norm_content.clone(),
                         });
 
-                        self.staged_contents.insert(curr_path.clone(), norm_content);
+                        self.staging.overwrite(&curr_path, norm_content);
 
                         events.push(StreamEvent::EditFileDone {
                             path: curr_path,
@@ -305,8 +304,7 @@ impl XmlStreamFilter {
                         let hunk_idx = self.file_hunks_count;
                         self.file_hunks_count += 1;
 
-                        let val_res =
-                            self.validate_hunk_in_memory(&curr_path, &old_text, &new_text);
+                        let val_res = self.staging.apply_hunk(&curr_path, &old_text, &new_text);
 
                         events.push(StreamEvent::EditHunk {
                             path: curr_path.clone(),
@@ -350,40 +348,6 @@ impl XmlStreamFilter {
         events
     }
 
-    fn validate_hunk_in_memory(
-        &mut self,
-        path: &str,
-        old_text: &str,
-        new_text: &str,
-    ) -> Result<(), String> {
-        let current_content = if let Some(content) = self.staged_contents.get(path) {
-            content.clone()
-        } else {
-            let full_path = self.repo_root.join(path);
-            std::fs::read_to_string(&full_path)
-                .map_err(|e| format!("Cannot read file '{}': {}", path, e))?
-        };
-
-        let matches: Vec<(usize, &str)> = current_content.match_indices(old_text).collect();
-        if matches.is_empty() {
-            return Err("Search block not found in file".to_string());
-        }
-        if matches.len() > 1 {
-            return Err(format!(
-                "Search block matches {} times (ambiguous)",
-                matches.len()
-            ));
-        }
-
-        let (idx, _) = matches[0];
-        let mut updated = String::new();
-        updated.push_str(&current_content[..idx]);
-        updated.push_str(new_text);
-        updated.push_str(&current_content[idx + old_text.len()..]);
-        self.staged_contents.insert(path.to_string(), updated);
-
-        Ok(())
-    }
 }
 
 impl EditStreamFilter for XmlStreamFilter {
@@ -890,8 +854,8 @@ mod tests {
     }
 
     #[test]
-    fn test_xml_marker_soft_matching() {
-        let input = "<tauqe_edits-k7q2zy>\n<create_k7q2zx path=\"new.rs\">\nliteral <edit> and </search>\n</create_k7q2zx>\n</tauqe_edits-k7q2zy>";
+    fn test_xml_marker_accepts_case_insensitive_exact_match() {
+        let input = "<tauqe_edits-k7q2zx>\n<create_K7Q2ZX path=\"new.rs\">\nliteral <edit> and </search>\n</create_K7Q2ZX>\n</tauqe_edits-k7q2zx>";
         let mut filter = XmlStreamFilter::new(vec![], std::env::temp_dir())
             .with_marker(Some("K7Q2ZX".to_string()));
         let mut events = Vec::new();
@@ -906,6 +870,29 @@ mod tests {
             StreamEvent::EditHunk { new_text, .. }
                 if new_text == "literal <edit> and </search>\n"
         )));
+    }
+
+    #[test]
+    fn test_xml_marker_rejects_near_miss_suffix() {
+        // A suffix differing from the marker by even one character must be
+        // treated as literal content: tolerating near-misses would let
+        // resembling source text forge marker-bound protocol tags.
+        let input = "<tauqe_edits-k7q2zy>\n<create_k7q2zy path=\"new.rs\">\nliteral\n</create_k7q2zy>\n</tauqe_edits-k7q2zy>";
+        let mut filter = XmlStreamFilter::new(vec![], std::env::temp_dir())
+            .with_marker(Some("K7Q2ZX".to_string()));
+        let mut events = Vec::new();
+        for ch in input.chars() {
+            events.extend(filter.push_chunk(&ch.to_string()));
+        }
+        events.extend(Box::new(filter).finish());
+        assert!(!events.iter().any(|event| matches!(event,
+            StreamEvent::EditFileStarted { .. }
+        )));
+        let text: String = events.iter().filter_map(|event| match event {
+            StreamEvent::TextDelta(delta) => Some(delta.as_str()),
+            _ => None,
+        }).collect();
+        assert!(text.contains("tauqe_edits-k7q2zy"));
     }
 
     #[test]
@@ -956,5 +943,35 @@ mod tests {
         }).collect();
         assert_eq!(text, input);
         assert!(!events.iter().any(|event| matches!(event, StreamEvent::EditStarted)));
+    }
+
+    #[test]
+    fn test_with_marker_drops_malformed_marker_without_panicking() {
+        // A malformed marker must not panic; it is dropped so legacy tags apply.
+        let mut filter = XmlStreamFilter::new(vec![], std::env::temp_dir())
+            .with_marker(Some("not a valid marker".to_string()));
+        let mut events =
+            filter.push_chunk("<tauqe_edits><create path=\"new.rs\">hello</create></tauqe_edits>");
+        events.extend(Box::new(filter).finish());
+        assert!(events.iter().any(|event| matches!(event,
+            StreamEvent::EditHunk { new_text, .. } if new_text == "hello"
+        )));
+    }
+
+    #[test]
+    fn test_with_marker_after_streaming_is_ignored_without_panicking() {
+        // A marker arriving after streaming began is ignored, not fatal.
+        let mut filter = XmlStreamFilter::new(vec![], std::env::temp_dir());
+        let _ = filter.push_chunk("<ed");
+        filter = filter.with_marker(Some("LATE123".to_string()));
+        let events = Box::new(filter).finish();
+        let text: String = events
+            .iter()
+            .filter_map(|event| match event {
+                StreamEvent::TextDelta(delta) => Some(delta.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text, "<ed");
     }
 }

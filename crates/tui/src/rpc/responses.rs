@@ -91,6 +91,13 @@ pub(crate) fn apply_system_status_response(
         }
         SystemStatusAction::Query => {}
     }
+
+    // A malformed or unreadable `tauqe.toml` falls back to built-in defaults;
+    // surface the diagnostic so the user is not silently switched to other
+    // models, budgets, and context limits.
+    if let Some(err) = status.config_error.as_deref() {
+        st.notify_warning(format!("Configuration error: {}", err));
+    }
 }
 
 pub async fn handle_response(
@@ -314,10 +321,17 @@ pub async fn handle_response(
                     serde_json::from_value::<tauqe_protocol::ContextAddPatternResult>(val)
                 {
                     st.context = pattern_res.state;
-                    st.notify_success(format!(
-                        "Added {} files (~{} tokens)",
-                        pattern_res.added_count, pattern_res.added_tokens
-                    ));
+                    if pattern_res.truncated {
+                        st.notify_warning(format!(
+                            "Added {} files (~{} tokens); the match set exceeded the configured batch limit and remaining files were skipped",
+                            pattern_res.added_count, pattern_res.added_tokens
+                        ));
+                    } else {
+                        st.notify_success(format!(
+                            "Added {} files (~{} tokens)",
+                            pattern_res.added_count, pattern_res.added_tokens
+                        ));
+                    }
                     if st.context_view.adding_file {
                         st.update_filtered_candidates();
                     }

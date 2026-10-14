@@ -20,13 +20,12 @@ pub use develop::{DevelopConfig, EditConfig};
 pub use git::GitConfig;
 pub use history::HistoryConfig;
 pub use models::{
-    deserialize_model_ref_opt, deserialize_role_config_opt, parse_model_ref,
-    serialize_model_ref_opt, serialize_role_config_opt, CoderConfig, ModelsConfig, RoleConfig,
-    BUILTIN_DEFAULT_ADVISOR_MODEL, BUILTIN_DEFAULT_ARCHITECT_MODEL, BUILTIN_DEFAULT_CODER_MODEL,
-    BUILTIN_DEFAULT_MODEL, BUILTIN_DEFAULT_REVIEWER_MODEL, BUILTIN_DEFAULT_SCRIBE_MODEL,
+    deserialize_model_ref_opt, parse_model_ref, serialize_model_ref_opt, ModelsConfig,
+    BUILTIN_DEFAULT_ARCHITECT_MODEL, BUILTIN_DEFAULT_CODER_MODEL, BUILTIN_DEFAULT_MODEL,
+    BUILTIN_DEFAULT_PRIMARY_MODEL, BUILTIN_DEFAULT_REVIEWER_MODEL, BUILTIN_DEFAULT_SCRIBE_MODEL,
 };
 pub use paths::{
-    cli_arg_value, cli_arg_value_from, config_candidates, default_config_path, find_config_file,
+    cli_arg_value_from, config_candidates, default_config_path, find_config_file,
     write_default_config, write_default_conventions, DEFAULT_CONFIG_TEMPLATE,
 };
 pub use providers::{
@@ -34,7 +33,7 @@ pub use providers::{
     write_credentials_file, write_credentials_stub, Credentials, OpenRouterConfig,
     OpenRouterCredentials, ProvidersConfig,
 };
-pub use toolchain::ToolchainConfig;
+pub use toolchain::{ToolchainConfig, DEFAULT_TOOLCHAIN_TIMEOUT_SECS};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AppConfig {
@@ -52,6 +51,30 @@ pub struct AppConfig {
     pub git: GitConfig,
     #[serde(default)]
     pub history: HistoryConfig,
+    /// Explicit configuration file path supplied on the command line.
+    ///
+    /// Recorded so a running session re-applies the same override whenever it
+    /// reloads configuration. The library never reads process arguments; the
+    /// server binary parses them and passes them through the config load
+    /// options. Never serialized into `tauqe.toml`.
+    #[serde(skip)]
+    pub explicit_config_path: Option<PathBuf>,
+    /// Explicit credentials file path supplied on the command line.
+    ///
+    /// Recorded alongside `explicit_config_path` so credential discovery keeps
+    /// honoring the `--credentials` override across reloads. Never serialized
+    /// into `tauqe.toml`.
+    #[serde(skip)]
+    pub explicit_credentials_path: Option<PathBuf>,
+    /// Diagnostic captured when a discovered or explicit configuration file
+    /// existed but could not be read or parsed.
+    ///
+    /// The loader falls back to built-in defaults rather than aborting, but
+    /// records the reason here so the UI can warn the user instead of silently
+    /// switching to other models and budgets. Never serialized into
+    /// `tauqe.toml`.
+    #[serde(skip)]
+    pub config_error: Option<String>,
 }
 
 impl AppConfig {
@@ -97,14 +120,14 @@ impl AppConfig {
         self.models.roles_summary_with_fallback(fallback)
     }
 
-    /// The default active model based on `Advisor` role.
+    /// The default active model based on `Primary` role.
     pub fn active_model(&self) -> ModelRef {
-        self.resolve_role(ModelRole::Advisor)
+        self.resolve_role(ModelRole::Primary)
     }
 
-    /// The default model selection based on `Advisor` role.
+    /// The default model selection based on `Primary` role.
     pub fn default_selection(&self) -> ModelSelection {
-        ModelSelection::Role(ModelRole::Advisor)
+        ModelSelection::Role(ModelRole::Primary)
     }
 
     /// The model used for history summarization and squash commit message generation.
@@ -112,19 +135,24 @@ impl AppConfig {
         self.resolve_role(ModelRole::Scribe)
     }
 
-    /// Models the user may switch between. Always contains all role models and configured models.
+    /// Models the user may switch between.
+    ///
+    /// Includes every configured provider model and every entry of every role
+    /// list, so a model that appears only as a non-primary rung of a role ladder
+    /// stays selectable.
     pub fn available_models(&self) -> Vec<ModelRef> {
         let mut models = self.configured_models();
-        let summary = self.roles_summary();
-        for m in [
-            summary.scribe,
-            summary.coder,
-            summary.architect,
-            summary.advisor,
-            summary.reviewer,
+        for role in [
+            ModelRole::Scribe,
+            ModelRole::Coder,
+            ModelRole::Architect,
+            ModelRole::Primary,
+            ModelRole::Reviewer,
         ] {
-            if !models.contains(&m) {
-                models.push(m);
+            for entry in self.models.role_entries(role) {
+                if !models.contains(&entry.model) {
+                    models.push(entry.model);
+                }
             }
         }
         models
@@ -148,37 +176,101 @@ pub fn load_config_with_options(opts: ConfigLoadOptions) -> AppConfig {
     let config_path = opts
         .explicit_config
         .map(PathBuf::from)
-        .or_else(|| find_config_file(opts.repo_root));
+        .or_else(|| find_config_file(opts.repo_root, opts.explicit_config));
 
-    let mut config = config_path
-        .and_then(|p| match std::fs::read_to_string(&p) {
+    let mut config = AppConfig::default();
+    if let Some(p) = config_path.as_deref().filter(|p| !p.as_os_str().is_empty()) {
+        match std::fs::read_to_string(p) {
             Ok(content) => match toml::from_str::<AppConfig>(&content) {
-                Ok(cfg) => Some(cfg),
+                Ok(parsed) => config = parsed,
                 Err(err) => {
-                    tracing::warn!("Failed to parse config file {:?}: {}", p, err);
-                    None
+                    tracing::warn!("Failed to parse config file {}: {}", p.display(), err);
+                    config.config_error =
+                        Some(format!("Failed to parse {}: {}", p.display(), err));
                 }
             },
             Err(err) => {
-                tracing::warn!("Failed to read config file {:?}: {}", p, err);
-                None
+                tracing::warn!("Failed to read config file {}: {}", p.display(), err);
+                config.config_error = Some(format!("Failed to read {}: {}", p.display(), err));
             }
-        })
-        .unwrap_or_default();
+        }
+    }
 
     credentials::apply_credentials(&mut config, opts.explicit_credentials, opts.repo_root);
+
+    config.explicit_config_path = opts
+        .explicit_config
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(PathBuf::from);
+    config.explicit_credentials_path = opts
+        .explicit_credentials
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(PathBuf::from);
 
     config
 }
 
+/// Loads configuration for `repo_root` without any command-line overrides.
+///
+/// Callers that must honor explicit `--config` / `--credentials` paths build a
+/// [`ConfigLoadOptions`] themselves and call [`load_config_with_options`].
 pub fn load_config(repo_root: Option<&Path>) -> AppConfig {
-    let cli_config = cli_arg_value("--config");
-    let cli_credentials = cli_arg_value("--credentials");
     load_config_with_options(ConfigLoadOptions {
         repo_root,
-        explicit_config: cli_config.as_deref(),
-        explicit_credentials: cli_credentials.as_deref(),
+        explicit_config: None,
+        explicit_credentials: None,
     })
+}
+
+/// Resolves repository-local `[git]` integration settings for a repository root.
+///
+/// Only the `[git]` table is parsed: commit-path helpers need a single
+/// deterministic flag and must not pay for credential resolution or unrelated
+/// configuration sections on every commit. A missing, unreadable, or malformed
+/// configuration resolves to the built-in defaults.
+pub fn load_git_config(repo_root: &Path) -> GitConfig {
+    let Some(path) = find_config_file(Some(repo_root), None) else {
+        return GitConfig::default();
+    };
+    let Ok(content) = std::fs::read_to_string(&path) else {
+        return GitConfig::default();
+    };
+
+    #[derive(Deserialize)]
+    struct GitSection {
+        #[serde(default)]
+        git: GitConfig,
+    }
+
+    toml::from_str::<GitSection>(&content)
+        .map(|section| section.git)
+        .unwrap_or_default()
+}
+
+/// Resolves repository-local `[toolchain]` settings for a repository root.
+///
+/// Mirrors [`load_git_config`]: only the `[toolchain]` table is parsed so the
+/// verification pipeline can honor a custom `check_command` and the configured
+/// per-command timeout without paying for the whole application configuration.
+/// A missing, unreadable, or malformed configuration resolves to the built-in
+/// defaults.
+pub fn load_toolchain_config(repo_root: &Path) -> ToolchainConfig {
+    let Some(path) = find_config_file(Some(repo_root), None) else {
+        return ToolchainConfig::default();
+    };
+    let Ok(content) = std::fs::read_to_string(&path) else {
+        return ToolchainConfig::default();
+    };
+
+    #[derive(Deserialize)]
+    struct ToolchainSection {
+        #[serde(default)]
+        toolchain: ToolchainConfig,
+    }
+
+    toml::from_str::<ToolchainSection>(&content)
+        .map(|section| section.toolchain)
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -189,32 +281,32 @@ mod tests {
     fn test_models_config_and_roles_resolution() {
         let toml_str = r#"
 [models]
+primary = ["openrouter:google/gemini-flash-latest"]
 scribe = "openrouter:anthropic/claude-haiku-latest"
-coder = "openrouter:google/gemini-flash-latest"
-architect = "openrouter:anthropic/claude-sonnet-latest"
-advisor = "openrouter:google/gemini-flash-latest"
-reviewer = "openrouter:anthropic/claude-sonnet-latest"
+coder = ["openrouter:google/gemini-flash-latest"]
+architect = ["openrouter:anthropic/claude-sonnet-latest"]
+reviewer = ["openrouter:anthropic/claude-sonnet-latest"]
 auto_level_up = true
 "#;
         let config: AppConfig = toml::from_str(toml_str).expect("Failed to parse config");
         assert!(config.models.validate().is_ok());
         assert!(config.models.auto_level_up);
         assert_eq!(config.active_model(), ModelRef::openrouter("google/gemini-flash-latest"));
-        assert_eq!(config.default_selection(), ModelSelection::Role(ModelRole::Advisor));
+        assert_eq!(config.default_selection(), ModelSelection::Role(ModelRole::Primary));
         assert_eq!(config.history_model(), ModelRef::openrouter("anthropic/claude-haiku-latest"));
 
         let roles = config.roles_summary();
         assert_eq!(roles.scribe, ModelRef::openrouter("anthropic/claude-haiku-latest"));
         assert_eq!(roles.coder, ModelRef::openrouter("google/gemini-flash-latest"));
         assert_eq!(roles.architect, ModelRef::openrouter("anthropic/claude-sonnet-latest"));
-        assert_eq!(roles.advisor, ModelRef::openrouter("google/gemini-flash-latest"));
+        assert_eq!(roles.primary, ModelRef::openrouter("google/gemini-flash-latest"));
         assert_eq!(roles.reviewer, ModelRef::openrouter("anthropic/claude-sonnet-latest"));
 
         let models_summary = config.models.roles_summary();
         assert_eq!(models_summary.scribe, roles.scribe);
         assert_eq!(models_summary.coder, roles.coder);
         assert_eq!(models_summary.architect, roles.architect);
-        assert_eq!(models_summary.advisor, roles.advisor);
+        assert_eq!(models_summary.primary, roles.primary);
         assert_eq!(models_summary.reviewer, roles.reviewer);
 
         let specific = ModelRef::openrouter("custom/model");
@@ -222,19 +314,21 @@ auto_level_up = true
         assert_eq!(config.resolve_model(&ModelSelection::Role(ModelRole::Scribe)), roles.scribe);
         assert_eq!(config.resolve_model(&ModelSelection::Role(ModelRole::Coder)), roles.coder);
         assert_eq!(config.resolve_model(&ModelSelection::Role(ModelRole::Architect)), roles.architect);
-        assert_eq!(config.resolve_model(&ModelSelection::Role(ModelRole::Advisor)), roles.advisor);
+        assert_eq!(config.resolve_model(&ModelSelection::Role(ModelRole::Primary)), roles.primary);
         assert_eq!(config.resolve_model(&ModelSelection::Role(ModelRole::Reviewer)), roles.reviewer);
     }
 
     #[test]
-    fn test_app_config_models_role_config_and_effort() {
+    fn test_app_config_models_effort_resolution() {
         let toml_str = r#"
 [models]
-architect = { model = "openrouter:anthropic/claude-sonnet-latest", effort = "high" }
-reviewer = "openrouter:google/gemini-flash-latest"
-
-[models.effort]
-reviewer = "medium"
+primary = ["openrouter:google/gemini-flash-latest"]
+coder = [
+    { model = "openrouter:deepseek/deepseek-chat", effort = "medium" },
+    { model = "openrouter:google/gemini-flash-latest", effort = "high" },
+]
+architect = [{ model = "openrouter:anthropic/claude-sonnet-latest", effort = "high" }]
+reviewer = ["openrouter:google/gemini-flash-latest"]
 "#;
         let config: AppConfig = toml::from_str(toml_str).expect("parse config");
         assert_eq!(
@@ -242,9 +336,11 @@ reviewer = "medium"
             Some(tauqe_protocol::ReasoningEffort::High)
         );
         assert_eq!(
-            config.models.resolve_effort(ModelRole::Reviewer),
+            config.models.resolve_effort(ModelRole::Coder),
             Some(tauqe_protocol::ReasoningEffort::Medium)
         );
+        assert_eq!(config.models.resolve_effort(ModelRole::Reviewer), None);
+        assert_eq!(config.models.resolve_effort(ModelRole::Primary), None);
     }
 
     #[test]
@@ -252,18 +348,25 @@ reviewer = "medium"
         let empty_cfg = ModelsConfig::default();
         assert!(empty_cfg.validate().is_err());
 
-        let one_role = ModelsConfig {
-            coder: Some(ModelRef::openrouter("qwen/coder").into()),
+        let primary_only = ModelsConfig {
+            primary: vec![ModelRef::openrouter("qwen/coder").into()],
             ..Default::default()
         };
-        assert!(one_role.validate().is_ok());
+        assert!(primary_only.validate().is_ok());
+
+        let empty_coder = ModelsConfig {
+            primary: vec![ModelRef::openrouter("qwen/coder").into()],
+            coder: Some(Vec::new()),
+            ..Default::default()
+        };
+        assert!(empty_coder.validate().is_err());
     }
 
     #[test]
     fn test_single_model_fallback_closes_all_roles() {
         let toml_str = r#"
 [models]
-coder = "openrouter:anthropic/claude-3.7-sonnet"
+primary = ["openrouter:anthropic/claude-3.7-sonnet"]
 "#;
         let config: AppConfig = toml::from_str(toml_str).expect("Failed to parse config");
         assert!(config.models.validate().is_ok());
@@ -271,197 +374,35 @@ coder = "openrouter:anthropic/claude-3.7-sonnet"
         assert_eq!(config.resolve_role(ModelRole::Scribe), expected);
         assert_eq!(config.resolve_role(ModelRole::Coder), expected);
         assert_eq!(config.resolve_role(ModelRole::Architect), expected);
-        assert_eq!(config.resolve_role(ModelRole::Advisor), expected);
+        assert_eq!(config.resolve_role(ModelRole::Primary), expected);
         assert_eq!(config.resolve_role(ModelRole::Reviewer), expected);
         assert_eq!(config.active_model(), expected);
         assert_eq!(config.history_model(), expected);
     }
 
     #[test]
-    fn test_role_resolution_single_role_each() {
-        // 1. Only Scribe
-        let scribe_only = ModelsConfig {
-            scribe: Some(ModelRef::openrouter("model/scribe")),
-            ..Default::default()
-        };
-        let expected_scribe = ModelRef::openrouter("model/scribe");
-        assert_eq!(scribe_only.resolve_role(ModelRole::Scribe), expected_scribe);
-        assert_eq!(scribe_only.resolve_role(ModelRole::Coder), expected_scribe);
-        assert_eq!(scribe_only.resolve_role(ModelRole::Architect), expected_scribe);
-        assert_eq!(scribe_only.resolve_role(ModelRole::Advisor), expected_scribe);
+    fn test_specialized_roles_inherit_primary_list() {
+        let config: AppConfig = toml::from_str(
+            r#"
+[models]
+primary = ["openrouter:alpha/model", "openrouter:beta/model"]
+"#,
+        )
+        .expect("parse config");
 
-        // 2. Only Architect
-        let architect_only = ModelsConfig {
-            architect: Some(ModelRef::openrouter("model/architect").into()),
-            ..Default::default()
-        };
-        let expected_architect = ModelRef::openrouter("model/architect");
-        assert_eq!(architect_only.resolve_role(ModelRole::Scribe), expected_architect);
-        assert_eq!(architect_only.resolve_role(ModelRole::Coder), expected_architect);
-        assert_eq!(architect_only.resolve_role(ModelRole::Architect), expected_architect);
-        assert_eq!(architect_only.resolve_role(ModelRole::Advisor), expected_architect);
+        // A specialized role without its own list inherits the primary list.
+        let expected = ModelRef::openrouter("alpha/model");
+        assert_eq!(config.resolve_role(ModelRole::Scribe), expected);
+        assert_eq!(config.resolve_role(ModelRole::Coder), expected);
+        assert_eq!(config.resolve_role(ModelRole::Architect), expected);
+        assert_eq!(config.resolve_role(ModelRole::Primary), expected);
+        assert_eq!(config.resolve_role(ModelRole::Reviewer), expected);
 
-        // 3. Only Advisor
-        let advisor_only = ModelsConfig {
-            advisor: Some(ModelRef::openrouter("model/advisor")),
-            ..Default::default()
-        };
-        let expected_advisor = ModelRef::openrouter("model/advisor");
-        assert_eq!(advisor_only.resolve_role(ModelRole::Scribe), expected_advisor);
-        assert_eq!(advisor_only.resolve_role(ModelRole::Coder), expected_advisor);
-        assert_eq!(advisor_only.resolve_role(ModelRole::Architect), expected_advisor);
-        assert_eq!(advisor_only.resolve_role(ModelRole::Advisor), expected_advisor);
-        assert_eq!(advisor_only.resolve_role(ModelRole::Reviewer), expected_advisor);
-
-        // 4. Only Reviewer
-        let reviewer_only = ModelsConfig {
-            reviewer: Some(ModelRef::openrouter("model/reviewer").into()),
-            ..Default::default()
-        };
-        let expected_reviewer = ModelRef::openrouter("model/reviewer");
-        assert_eq!(reviewer_only.resolve_role(ModelRole::Scribe), expected_reviewer);
-        assert_eq!(reviewer_only.resolve_role(ModelRole::Coder), expected_reviewer);
-        assert_eq!(reviewer_only.resolve_role(ModelRole::Architect), expected_reviewer);
-        assert_eq!(reviewer_only.resolve_role(ModelRole::Advisor), expected_reviewer);
-        assert_eq!(reviewer_only.resolve_role(ModelRole::Reviewer), expected_reviewer);
-    }
-
-    #[test]
-    fn test_role_resolution_two_roles_proximity() {
-        let m_scribe = ModelRef::openrouter("model/scribe");
-        let m_coder = ModelRef::openrouter("model/coder");
-        let m_architect = ModelRef::openrouter("model/architect");
-        let m_advisor = ModelRef::openrouter("model/advisor");
-
-        // Pair 1: Scribe + Coder
-        // Architect -> Advisor(none) -> Coder -> Scribe => Coder
-        // Advisor -> Architect(none) -> Coder -> Scribe => Coder
-        let cfg = ModelsConfig {
-            scribe: Some(m_scribe.clone()),
-            coder: Some(m_coder.clone().into()),
-            ..Default::default()
-        };
-        assert_eq!(cfg.resolve_role(ModelRole::Scribe), m_scribe);
-        assert_eq!(cfg.resolve_role(ModelRole::Coder), m_coder);
-        assert_eq!(cfg.resolve_role(ModelRole::Architect), m_coder);
-        assert_eq!(cfg.resolve_role(ModelRole::Advisor), m_coder);
-
-        // Pair 2: Scribe + Architect
-        // Coder -> Architect -> Advisor(none) -> Scribe => Architect
-        // Advisor -> Architect -> Coder(none) -> Scribe => Architect
-        let cfg = ModelsConfig {
-            scribe: Some(m_scribe.clone()),
-            architect: Some(m_architect.clone().into()),
-            ..Default::default()
-        };
-        assert_eq!(cfg.resolve_role(ModelRole::Scribe), m_scribe);
-        assert_eq!(cfg.resolve_role(ModelRole::Coder), m_architect);
-        assert_eq!(cfg.resolve_role(ModelRole::Architect), m_architect);
-        assert_eq!(cfg.resolve_role(ModelRole::Advisor), m_architect);
-
-        // Pair 3: Scribe + Advisor
-        // Coder -> Architect(none) -> Advisor -> Scribe => Advisor
-        // Architect -> Advisor -> Coder(none) -> Scribe => Advisor
-        let cfg = ModelsConfig {
-            scribe: Some(m_scribe.clone()),
-            advisor: Some(m_advisor.clone()),
-            ..Default::default()
-        };
-        assert_eq!(cfg.resolve_role(ModelRole::Scribe), m_scribe);
-        assert_eq!(cfg.resolve_role(ModelRole::Coder), m_advisor);
-        assert_eq!(cfg.resolve_role(ModelRole::Architect), m_advisor);
-        assert_eq!(cfg.resolve_role(ModelRole::Advisor), m_advisor);
-
-        // Pair 4: Coder + Architect
-        // Scribe -> Coder -> Advisor(none) -> Architect => Coder
-        // Advisor -> Architect -> Coder -> Scribe(none) => Architect
-        let cfg = ModelsConfig {
-            coder: Some(m_coder.clone().into()),
-            architect: Some(m_architect.clone().into()),
-            ..Default::default()
-        };
-        assert_eq!(cfg.resolve_role(ModelRole::Scribe), m_coder);
-        assert_eq!(cfg.resolve_role(ModelRole::Coder), m_coder);
-        assert_eq!(cfg.resolve_role(ModelRole::Architect), m_architect);
-        assert_eq!(cfg.resolve_role(ModelRole::Advisor), m_architect);
-
-        // Pair 5: Coder + Advisor
-        // Scribe -> Coder -> Advisor -> Architect(none) => Coder
-        // Architect -> Advisor -> Coder -> Scribe(none) => Advisor
-        let cfg = ModelsConfig {
-            coder: Some(m_coder.clone().into()),
-            advisor: Some(m_advisor.clone()),
-            ..Default::default()
-        };
-        assert_eq!(cfg.resolve_role(ModelRole::Scribe), m_coder);
-        assert_eq!(cfg.resolve_role(ModelRole::Coder), m_coder);
-        assert_eq!(cfg.resolve_role(ModelRole::Architect), m_advisor);
-        assert_eq!(cfg.resolve_role(ModelRole::Advisor), m_advisor);
-
-        // Pair 6: Architect + Advisor
-        // Scribe -> Coder(none) -> Advisor -> Architect => Advisor
-        // Coder -> Architect -> Advisor -> Scribe(none) => Architect
-        let cfg = ModelsConfig {
-            architect: Some(m_architect.clone().into()),
-            advisor: Some(m_advisor.clone()),
-            ..Default::default()
-        };
-        assert_eq!(cfg.resolve_role(ModelRole::Scribe), m_advisor);
-        assert_eq!(cfg.resolve_role(ModelRole::Coder), m_architect);
-        assert_eq!(cfg.resolve_role(ModelRole::Architect), m_architect);
-        assert_eq!(cfg.resolve_role(ModelRole::Advisor), m_advisor);
-    }
-
-    #[test]
-    fn test_role_resolution_three_roles_proximity() {
-        let m_scribe = ModelRef::openrouter("model/scribe");
-        let m_coder = ModelRef::openrouter("model/coder");
-        let m_architect = ModelRef::openrouter("model/architect");
-        let m_advisor = ModelRef::openrouter("model/advisor");
-
-        // Missing Advisor: Scribe + Coder + Architect
-        // Advisor -> Architect -> Coder -> Scribe => Architect
-        let cfg = ModelsConfig {
-            scribe: Some(m_scribe.clone()),
-            coder: Some(m_coder.clone().into()),
-            architect: Some(m_architect.clone().into()),
-            advisor: None,
-            ..Default::default()
-        };
-        assert_eq!(cfg.resolve_role(ModelRole::Advisor), m_architect);
-
-        // Missing Architect: Scribe + Coder + Advisor
-        // Architect -> Advisor -> Coder -> Scribe => Advisor
-        let cfg = ModelsConfig {
-            scribe: Some(m_scribe.clone()),
-            coder: Some(m_coder.clone().into()),
-            architect: None,
-            advisor: Some(m_advisor.clone()),
-            ..Default::default()
-        };
-        assert_eq!(cfg.resolve_role(ModelRole::Architect), m_advisor);
-
-        // Missing Coder: Scribe + Architect + Advisor
-        // Coder -> Architect -> Advisor -> Scribe => Architect
-        let cfg = ModelsConfig {
-            scribe: Some(m_scribe.clone()),
-            coder: None,
-            architect: Some(m_architect.clone().into()),
-            advisor: Some(m_advisor.clone()),
-            ..Default::default()
-        };
-        assert_eq!(cfg.resolve_role(ModelRole::Coder), m_architect);
-
-        // Missing Scribe: Coder + Architect + Advisor
-        // Scribe -> Coder -> Advisor -> Architect => Coder
-        let cfg = ModelsConfig {
-            scribe: None,
-            coder: Some(m_coder.clone().into()),
-            architect: Some(m_architect.clone().into()),
-            advisor: Some(m_advisor.clone()),
-            ..Default::default()
-        };
-        assert_eq!(cfg.resolve_role(ModelRole::Scribe), m_coder);
+        // The coder escalation ladder inherits the full primary list.
+        let ladder = config.models.coder_ladder();
+        assert_eq!(ladder.len(), 2);
+        assert_eq!(ladder[0].model, ModelRef::openrouter("alpha/model"));
+        assert_eq!(ladder[1].model, ModelRef::openrouter("beta/model"));
     }
 
     #[test]
@@ -475,7 +416,7 @@ models = ["custom/external-fallback"]
         assert_eq!(config.resolve_role(ModelRole::Scribe), expected);
         assert_eq!(config.resolve_role(ModelRole::Coder), expected);
         assert_eq!(config.resolve_role(ModelRole::Architect), expected);
-        assert_eq!(config.resolve_role(ModelRole::Advisor), expected);
+        assert_eq!(config.resolve_role(ModelRole::Primary), expected);
         assert_eq!(config.resolve_role(ModelRole::Reviewer), expected);
         assert_eq!(config.active_model(), expected);
         assert_eq!(config.history_model(), expected);
@@ -485,11 +426,11 @@ models = ["custom/external-fallback"]
     fn test_available_models_include_all_roles() {
         let toml_str = r#"
 [models]
+primary = ["openrouter:d/primary"]
 scribe = "openrouter:a/scribe"
-coder = "openrouter:b/coder"
-architect = "openrouter:c/architect"
-advisor = "openrouter:d/advisor"
-reviewer = "openrouter:r/reviewer"
+coder = ["openrouter:b/coder"]
+architect = ["openrouter:c/architect"]
+reviewer = ["openrouter:r/reviewer"]
 
 [providers.openrouter]
 models = ["e/extra", "a/scribe"]
@@ -500,7 +441,7 @@ models = ["e/extra", "a/scribe"]
         assert!(available.contains(&ModelRef::openrouter("a/scribe")));
         assert!(available.contains(&ModelRef::openrouter("b/coder")));
         assert!(available.contains(&ModelRef::openrouter("c/architect")));
-        assert!(available.contains(&ModelRef::openrouter("d/advisor")));
+        assert!(available.contains(&ModelRef::openrouter("d/primary")));
         assert!(available.contains(&ModelRef::openrouter("r/reviewer")));
     }
 
@@ -576,7 +517,7 @@ files_token_budget = 150000
     fn test_typed_provider_models_config() {
         let toml_str = r#"
 [models]
-coder = "openrouter:openai/gpt-4o"
+primary = ["openrouter:openai/gpt-4o"]
 
 [providers.openrouter]
 models = ["deepseek/deepseek-chat", " ", "openai/gpt-4o"]
@@ -593,7 +534,7 @@ models = ["deepseek/deepseek-chat", " ", "openai/gpt-4o"]
         let config = AppConfig::default();
         assert_eq!(
             config.active_model(),
-            ModelRef::openrouter(BUILTIN_DEFAULT_ADVISOR_MODEL)
+            ModelRef::openrouter(BUILTIN_DEFAULT_PRIMARY_MODEL)
         );
         assert_eq!(config.develop.workflow, "git");
         assert_eq!(config.develop.protocol, "xml");
@@ -607,7 +548,7 @@ models = ["deepseek/deepseek-chat", " ", "openai/gpt-4o"]
         let temp_dir = tempfile::tempdir().unwrap();
         std::fs::write(
             temp_dir.path().join("tauqe.toml"),
-            "[models]\ncoder = \"openrouter:anthropic/claude-3.5-sonnet\"\n",
+            "[models]\nprimary = [\"openrouter:anthropic/claude-3.5-sonnet\"]\n",
         )
         .unwrap();
 
@@ -636,7 +577,7 @@ models = ["deepseek/deepseek-chat", " ", "openai/gpt-4o"]
         let custom_cfg = temp_dir.path().join("my-custom.toml");
         std::fs::write(
             &custom_cfg,
-            "[models]\ncoder = \"openrouter:deepseek/deepseek-chat\"\n",
+            "[models]\nprimary = [\"openrouter:deepseek/deepseek-chat\"]\n",
         )
         .unwrap();
 
@@ -664,6 +605,45 @@ models = ["deepseek/deepseek-chat", " ", "openai/gpt-4o"]
                 .as_ref()
                 .and_then(|o| o.api_key.as_deref()),
             Some("sk-explicit-creds")
+        );
+    }
+
+    #[test]
+    fn test_load_toolchain_config_reads_custom_command_and_timeout() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            temp_dir.path().join("tauqe.toml"),
+            "[toolchain]\ncheck_command = \"make verify\"\nauto_heal = false\ntimeout_secs = 42\n",
+        )
+        .unwrap();
+
+        let cfg = load_toolchain_config(temp_dir.path());
+        assert_eq!(cfg.check_command.as_deref(), Some("make verify"));
+        assert_eq!(cfg.auto_heal, Some(false));
+        assert_eq!(cfg.effective_timeout_secs(), 42);
+    }
+
+    #[test]
+    fn test_load_toolchain_config_defaults_when_absent() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let cfg = load_toolchain_config(temp_dir.path());
+        assert!(cfg.check_command.is_none());
+        assert_eq!(cfg.effective_timeout_secs(), DEFAULT_TOOLCHAIN_TIMEOUT_SECS);
+    }
+
+    #[test]
+    fn test_malformed_config_surfaces_diagnostic() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            temp_dir.path().join("tauqe.toml"),
+            "[models]\ncoder = = \"broken\"\n",
+        )
+        .unwrap();
+
+        let config = load_config(Some(temp_dir.path()));
+        assert!(
+            config.config_error.is_some(),
+            "a malformed config must record a diagnostic instead of silently defaulting"
         );
     }
 }

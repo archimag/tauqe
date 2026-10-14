@@ -152,7 +152,7 @@ In accordance with TAUQE's dual-contour architecture, review findings are not du
 
 ## 6.8 Finding Model Assignment and Coder Ladder Escalation
 
-A finding can carry a model assignment: a semantic role (`scribe`, `coder`, `architect`, `advisor`, `reviewer`) or an explicit model reference. It is shown as a badge next to the status. Simple findings can then run on a cheap model, while hard ones use a stronger one. A finding without an assignment runs on the **Coder** role, never on whatever model happens to be selected in Develop.
+A finding can carry a model assignment: a semantic role (`scribe`, `coder`, `architect`, `primary`, `reviewer`) or an explicit model reference. It is shown as a badge next to the status. Simple findings can then run on a cheap model, while hard ones use a stronger one. A finding without an assignment runs on the **Coder** role, never on whatever model happens to be selected in Develop.
 
 Fixing a finding is intra-role escalation only. When `auto_level_up = true` in the `[models]` section of `tauqe.toml`, a finding that fails verification does not stop the queue immediately. TAUQE first rolls the working tree back to the pre-step checkpoint, then restarts the finding on the next rung of the coder ladder (`CoderTier`, each rung pairing a model with a reasoning effort). Files already found during discovery stay in context. Only when the ladder is exhausted does the Fail-Fast policy from section 6.6 apply: the tree stays rolled back, the finding returns to `TODO`, and the batch stops.
 

@@ -9,6 +9,12 @@ use tauqe_protocol::{ModelUsageInfo, ProviderKind};
 use super::types::{ChatMessage, ReasoningEffort, ResponseFormat, StreamEvent};
 use super::LlmProvider;
 
+/// Maximum time to establish a connection to OpenRouter.
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// Maximum idle time between reads on an open stream. Bounds a stalled
+/// provider so a hung connection cannot block the turn indefinitely.
+const READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
 pub struct OpenRouterProvider {
     api_key: String,
     base_url: String,
@@ -144,10 +150,18 @@ struct OpenRouterError {
 
 impl OpenRouterProvider {
     pub fn new(api_key: String) -> Self {
+        let http_client = reqwest::Client::builder()
+            .connect_timeout(CONNECT_TIMEOUT)
+            .read_timeout(READ_TIMEOUT)
+            .build()
+            .unwrap_or_else(|err| {
+                tracing::warn!("Failed to build HTTP client with timeouts: {}", err);
+                reqwest::Client::new()
+            });
         Self {
             api_key,
             base_url: "https://openrouter.ai/api/v1".to_string(),
-            http_client: reqwest::Client::new(),
+            http_client,
         }
     }
 
@@ -184,7 +198,10 @@ impl OpenRouterProvider {
                 .await
             {
                 Ok(r) => r,
-                Err(_) => continue,
+                Err(err) => {
+                    tracing::warn!("OpenRouter generation stats request failed: {}", err);
+                    continue;
+                }
             };
 
             let status = resp.status();
@@ -272,12 +289,15 @@ impl OpenRouterProvider {
         }
 
         let mut byte_stream = response.bytes_stream();
-        let mut buffer = String::new();
+        let mut buffer: Vec<u8> = Vec::new();
         let mut finished = false;
         let mut generation_id: Option<String> = None;
         let mut latest_usage: Option<ModelUsageInfo> = None;
 
         while !finished {
+            if tx.is_closed() {
+                return Ok(());
+            }
             tokio::select! {
                 _ = cancel_rx.changed() => {
                     if *cancel_rx.borrow() {
@@ -288,12 +308,12 @@ impl OpenRouterProvider {
                 chunk_res = byte_stream.next() => {
                     match chunk_res {
                         Some(Ok(chunk)) => {
-                            let text = String::from_utf8_lossy(&chunk);
-                            buffer.push_str(&text);
+                            buffer.extend_from_slice(&chunk);
 
-                            while let Some(pos) = buffer.find("\n\n") {
-                                let event_block = buffer[..pos].to_string();
-                                buffer.drain(..pos + 2);
+                            while let Some((pos, delim_len)) = find_sse_event_boundary(&buffer) {
+                                let event_bytes = buffer[..pos].to_vec();
+                                buffer.drain(..pos + delim_len);
+                                let event_block = String::from_utf8_lossy(&event_bytes);
 
                                 for line in event_block.lines() {
                                     let line = line.trim();
@@ -307,7 +327,12 @@ impl OpenRouterProvider {
                                             continue;
                                         }
 
-                                        if let Ok(chunk) = serde_json::from_str::<StreamingChunk>(payload_str) {
+                                        let chunk_result =
+                                            serde_json::from_str::<StreamingChunk>(payload_str);
+                                        if let Err(err) = &chunk_result {
+                                            tracing::warn!("OpenRouter SSE parse error: {}", err);
+                                        }
+                                        if let Ok(chunk) = chunk_result {
                                             if let Some(id) = chunk.id {
                                                 if !id.is_empty() {
                                                     generation_id = Some(id);
@@ -397,6 +422,10 @@ impl OpenRouterProvider {
             }
         }
 
+        if tx.is_closed() {
+            return Ok(());
+        }
+
         if let Some(gen_id) = generation_id {
             let needs_cost = latest_usage.as_ref().is_none_or(|u| u.cost.is_none());
             if needs_cost {
@@ -426,6 +455,31 @@ impl OpenRouterProvider {
         let _ = tx.send(StreamEvent::Done).await;
         Ok(())
     }
+}
+
+fn find_sse_event_boundary(buf: &[u8]) -> Option<(usize, usize)> {
+    let pos_lf = find_subslice(buf, b"\n\n").map(|p| (p, 2));
+    let pos_crlf = find_subslice(buf, b"\r\n\r\n").map(|p| (p, 4));
+
+    match (pos_lf, pos_crlf) {
+        (Some((p1, l1)), Some((p2, l2))) => {
+            if p1 <= p2 {
+                Some((p1, l1))
+            } else {
+                Some((p2, l2))
+            }
+        }
+        (Some(res), None) => Some(res),
+        (None, Some(res)) => Some(res),
+        (None, None) => None,
+    }
+}
+
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return None;
+    }
+    haystack.windows(needle.len()).position(|w| w == needle)
 }
 
 #[async_trait]
@@ -656,7 +710,7 @@ mod tests {
 
         let mock_server = MockServer::start().await;
 
-        let sse_body = "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndn\n";
+        let sse_body = "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n";
 
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
@@ -696,14 +750,90 @@ mod tests {
                 .await
         });
 
-        while let Some(_event) = rx.recv().await {}
+        let mut got_done = false;
+        while let Some(event) = rx.recv().await {
+            if matches!(event, StreamEvent::Done) {
+                got_done = true;
+            }
+        }
         assert!(provider_task.await.expect("task join failed").is_ok());
+        assert!(got_done, "stream should terminate with a Done event");
 
         let requests = mock_server.received_requests().await.unwrap();
         let req_json: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
         assert_eq!(req_json["reasoning"]["enabled"], true);
         assert_eq!(req_json["reasoning"]["effort"], "xhigh");
         assert_eq!(req_json["provider"]["require_parameters"], true);
+    }
+
+    #[test]
+    fn test_find_sse_event_boundary() {
+        assert_eq!(find_sse_event_boundary(b""), None);
+        assert_eq!(find_sse_event_boundary(b"abc"), None);
+        assert_eq!(find_sse_event_boundary(b"abc\n\ndef"), Some((3, 2)));
+        assert_eq!(find_sse_event_boundary(b"abc\r\n\r\ndef"), Some((3, 4)));
+        assert_eq!(find_sse_event_boundary(b"abc\r\n\r\ndef\n\n"), Some((3, 4)));
+        assert_eq!(find_sse_event_boundary(b"abc\n\ndef\r\n\r\n"), Some((3, 2)));
+    }
+
+    #[test]
+    fn test_multibyte_utf8_split_across_chunks() {
+        let mut buffer = Vec::new();
+        let text = "data: {\"choices\":[{\"delta\":{\"content\":\"Привет\"}}]}\n\n";
+        let bytes = text.as_bytes();
+        let mid = bytes.len() / 2;
+        buffer.extend_from_slice(&bytes[..mid]);
+        assert_eq!(find_sse_event_boundary(&buffer), None);
+        buffer.extend_from_slice(&bytes[mid..]);
+        let (pos, len) = find_sse_event_boundary(&buffer).expect("found boundary");
+        assert_eq!(pos, bytes.len() - 2);
+        assert_eq!(len, 2);
+        let event_str = String::from_utf8(buffer[..pos].to_vec()).expect("valid utf-8");
+        assert!(event_str.contains("Привет"));
+    }
+
+    #[tokio::test]
+    async fn test_stream_chat_crlf_and_multibyte_utf8() {
+        let mock_server = MockServer::start().await;
+
+        let sse_body = "data: {\"choices\":[{\"delta\":{\"content\":\"Привет, \"}}]}\r\n\r\n\
+                        data: {\"choices\":[{\"delta\":{\"content\":\"мир!\"}}]}\r\n\r\n\
+                        data: [DONE]\r\n\r\n";
+
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(sse_body, "text/event-stream"),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let provider =
+            OpenRouterProvider::new("test-api-key".to_string()).with_base_url(mock_server.uri());
+
+        let (tx, mut rx) = mpsc::channel(10);
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+
+        let messages = vec![ChatMessage::user("Ping")];
+
+        let provider_task = tokio::spawn(async move {
+            provider
+                .stream_text("test-model", messages, tx, cancel_rx)
+                .await
+        });
+
+        let mut text_chunks = Vec::new();
+        while let Some(event) = rx.recv().await {
+            if let StreamEvent::TextDelta(delta) = event {
+                text_chunks.push(delta);
+            }
+        }
+
+        let res = provider_task.await.expect("task join failed");
+        assert!(res.is_ok());
+        assert_eq!(text_chunks.concat(), "Привет, мир!");
     }
 
     #[tokio::test]

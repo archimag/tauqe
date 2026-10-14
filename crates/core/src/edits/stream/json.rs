@@ -1,11 +1,12 @@
 use std::collections::HashMap;
+use std::marker::PhantomData;
 use std::path::PathBuf;
 
 use serde::Deserialize;
 use struson::reader::{JsonReader, JsonStreamReader};
 use tauqe_protocol::StructuredChangeProposal;
 
-use super::{current_file_content, normalize_hunk, resolve_path, EditStreamFilter};
+use super::{normalize_hunk, resolve_path, EditStreamFilter, StagingSimulator};
 use crate::providers::StreamEvent;
 
 /// State-machine streaming parser for Structured Output JSON edits using struson.
@@ -23,8 +24,7 @@ pub struct JsonStreamFilter {
     has_emitted_edit_started: bool,
     started_change_index: Option<usize>,
     editable_paths: Vec<String>,
-    repo_root: PathBuf,
-    staged_contents: HashMap<String, String>,
+    staging: StagingSimulator,
 }
 
 impl JsonStreamFilter {
@@ -38,13 +38,12 @@ impl JsonStreamFilter {
             has_emitted_edit_started: false,
             started_change_index: None,
             editable_paths,
-            repo_root,
-            staged_contents: HashMap::new(),
+            staging: StagingSimulator::new(HashMap::new(), repo_root),
         }
     }
 
     pub fn with_staged_contents(mut self, staged_contents: HashMap<String, String>) -> Self {
-        self.staged_contents = staged_contents;
+        self.staging.set_staged_contents(staged_contents);
         self
     }
 
@@ -79,7 +78,7 @@ impl JsonStreamFilter {
                     old_text: String::new(),
                     new_text: content.clone(),
                 });
-                self.staged_contents.insert(resolved_path.clone(), content);
+                self.staging.overwrite(&resolved_path, content);
                 events.push(StreamEvent::EditFileDone {
                     path: resolved_path,
                     status: "ok".to_string(),
@@ -89,7 +88,7 @@ impl JsonStreamFilter {
             }
             "overwrite" => {
                 let new_content = normalize_hunk(change.content.as_deref().unwrap_or_default());
-                match current_file_content(&self.staged_contents, &self.repo_root, &resolved_path) {
+                match self.staging.current_content(&resolved_path) {
                     Ok(old_text) => {
                         events.push(StreamEvent::EditHunk {
                             path: resolved_path.clone(),
@@ -97,7 +96,7 @@ impl JsonStreamFilter {
                             old_text,
                             new_text: new_content.clone(),
                         });
-                        self.staged_contents.insert(resolved_path.clone(), new_content);
+                        self.staging.overwrite(&resolved_path, new_content);
                         events.push(StreamEvent::EditFileDone {
                             path: resolved_path,
                             status: "ok".to_string(),
@@ -127,14 +126,7 @@ impl JsonStreamFilter {
                 let to_raw = change.to.as_deref().unwrap_or_default();
                 let resolved_to = resolve_path(to_raw, &self.editable_paths, true);
                 let display_path = format!("{} -> {}", resolved_path, resolved_to);
-                if let Some(content) = self.staged_contents.remove(&resolved_path) {
-                    self.staged_contents.insert(resolved_to.clone(), content);
-                } else {
-                    let full_from = self.repo_root.join(&resolved_path);
-                    if let Ok(content) = std::fs::read_to_string(&full_from) {
-                        self.staged_contents.insert(resolved_to.clone(), content);
-                    }
-                }
+                self.staging.apply_move(&resolved_path, &resolved_to);
                 events.push(StreamEvent::EditFileDone {
                     path: display_path,
                     status: "ok".to_string(),
@@ -160,7 +152,7 @@ impl JsonStreamFilter {
                     new_text: new_text.clone(),
                 });
 
-                let val_res = self.validate_hunk_in_memory(&resolved_path, &old_text, &new_text);
+                let val_res = self.staging.apply_hunk(&resolved_path, &old_text, &new_text);
                 match val_res {
                     Ok(()) => {
                         events.push(StreamEvent::EditFileDone {
@@ -183,40 +175,6 @@ impl JsonStreamFilter {
         }
     }
 
-    fn validate_hunk_in_memory(
-        &mut self,
-        path: &str,
-        old_text: &str,
-        new_text: &str,
-    ) -> Result<(), String> {
-        let current_content = if let Some(content) = self.staged_contents.get(path) {
-            content.clone()
-        } else {
-            let full_path = self.repo_root.join(path);
-            std::fs::read_to_string(&full_path)
-                .map_err(|e| format!("Cannot read file '{}': {}", path, e))?
-        };
-
-        let matches: Vec<(usize, &str)> = current_content.match_indices(old_text).collect();
-        if matches.is_empty() {
-            return Err("Search block not found in file".to_string());
-        }
-        if matches.len() > 1 {
-            return Err(format!(
-                "Search block matches {} times (ambiguous)",
-                matches.len()
-            ));
-        }
-
-        let (idx, _) = matches[0];
-        let mut updated = String::new();
-        updated.push_str(&current_content[..idx]);
-        updated.push_str(new_text);
-        updated.push_str(&current_content[idx + old_text.len()..]);
-        self.staged_contents.insert(path.to_string(), updated);
-
-        Ok(())
-    }
 }
 
 impl EditStreamFilter for JsonStreamFilter {
@@ -357,6 +315,147 @@ impl EditStreamFilter for JsonStreamFilter {
             }
         }
         events
+    }
+}
+
+/// Generic streaming filter for a single top-level string field of a JSON
+/// Structured Output payload.
+///
+/// The filter accumulates raw provider chunks, decodes the requested string
+/// field (`message`, `summary`, ...) on the fly without leaking JSON syntax to
+/// the user, and, once streaming ends, deserializes the full buffered payload
+/// into a strictly typed structure `T`. Reusing
+/// [`extract_streamed_string_field`] keeps escape decoding, UTF-16 surrogate
+/// pairing and code fence tolerance identical to the edit streaming contour.
+pub struct JsonFieldStreamFilter<T> {
+    target_field: String,
+    buffer: String,
+    streamed_bytes: usize,
+    finished: bool,
+    _marker: PhantomData<fn() -> T>,
+}
+
+impl<T> JsonFieldStreamFilter<T>
+where
+    T: for<'de> Deserialize<'de>,
+{
+    /// Creates a filter that streams the top-level string field `target_field`.
+    pub fn new(target_field: impl Into<String>) -> Self {
+        Self {
+            target_field: target_field.into(),
+            buffer: String::new(),
+            streamed_bytes: 0,
+            finished: false,
+            _marker: PhantomData,
+        }
+    }
+
+    /// Appends a raw chunk and returns the freshly decoded text of the target
+    /// field, or `None` when no new readable text is available.
+    ///
+    /// Empty deltas are filtered out. Once the closing quote of the target
+    /// field has streamed in, no further deltas are produced, yet the raw
+    /// buffer keeps accumulating so [`finish`](Self::finish) can deserialize
+    /// the complete payload.
+    pub fn push_chunk(&mut self, chunk: &str) -> Option<String> {
+        self.buffer.push_str(chunk);
+        if self.finished {
+            return None;
+        }
+        let (delta, new_streamed, finished) =
+            extract_streamed_string_field(&self.buffer, &self.target_field, self.streamed_bytes);
+        self.streamed_bytes = new_streamed;
+        self.finished = finished;
+        delta.filter(|text| !text.is_empty())
+    }
+
+    /// Returns the accumulated raw JSON buffer received so far.
+    pub fn buffer(&self) -> &str {
+        &self.buffer
+    }
+
+    /// Returns the accumulated raw JSON buffer received so far, including any
+    /// surrounding markdown code fence.
+    pub fn raw_buffer(&self) -> &str {
+        &self.buffer
+    }
+
+    /// Deserializes the accumulated payload into `T`.
+    ///
+    /// The buffer is first unwrapped from any markdown code fence and trimmed
+    /// to the outermost balanced JSON object, so wrapper prose around the
+    /// payload does not break decoding.
+    pub fn finish(self) -> Result<T, serde_json::Error> {
+        let payload = prepare_json_payload(&self.buffer);
+        serde_json::from_str(&payload)
+    }
+}
+
+/// Removes a surrounding markdown code fence from `input`, returning the inner
+/// payload. Input without a leading fence is returned trimmed and unchanged.
+fn strip_code_fence(input: &str) -> &str {
+    let trimmed = input.trim();
+    let inner = match trimmed.strip_prefix("```") {
+        Some(rest) => match rest.find('\n') {
+            Some(newline) => &rest[newline + 1..],
+            None => rest,
+        },
+        None => return trimmed,
+    };
+    match inner.rfind("```") {
+        Some(idx) => inner[..idx].trim(),
+        None => inner.trim(),
+    }
+}
+
+/// Returns the byte offset just past the outermost balanced JSON object in `s`,
+/// or `None` when the object is not closed. String and escape state is tracked
+/// so braces inside string literals are ignored.
+fn balanced_object_end(s: &str) -> Option<usize> {
+    let bytes = s.as_bytes();
+    let start = s.find('{')?;
+    let mut depth: i32 = 0;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (offset, &byte) in bytes[start..].iter().enumerate() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match byte {
+            b'"' => in_string = true,
+            b'{' | b'[' => depth += 1,
+            b'}' | b']' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(start + offset + 1);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Strips markdown fences and trims `buffer` to the outermost balanced JSON
+/// object so a strictly typed payload can be deserialized.
+fn prepare_json_payload(buffer: &str) -> String {
+    let unfenced = strip_code_fence(buffer);
+    match unfenced.find('{') {
+        Some(start) => {
+            let candidate = &unfenced[start..];
+            match balanced_object_end(candidate) {
+                Some(end) => candidate[..end].to_string(),
+                None => candidate.to_string(),
+            }
+        }
+        None => unfenced.to_string(),
     }
 }
 
@@ -526,49 +625,20 @@ pub fn extract_streamed_string_field(
     };
 
     let content_slice = &buffer[value_start..];
-    let mut decoded = String::new();
-    let mut chars = content_slice.char_indices().peekable();
-    let mut is_finished = false;
 
-    while let Some((_, c)) = chars.next() {
-        if c == '\\' {
-            if let Some((_, next_c)) = chars.next() {
-                match next_c {
-                    '"' => decoded.push('"'),
-                    '\\' => decoded.push('\\'),
-                    '/' => decoded.push('/'),
-                    'b' => decoded.push('\x08'),
-                    'f' => decoded.push('\x0c'),
-                    'n' => decoded.push('\n'),
-                    'r' => decoded.push('\r'),
-                    't' => decoded.push('\t'),
-                    'u' => {
-                        let mut hex = String::new();
-                        for _ in 0..4 {
-                            if let Some((_, h)) = chars.next() {
-                                hex.push(h);
-                            }
-                        }
-                        if hex.len() == 4 {
-                            if let Ok(code) = u32::from_str_radix(&hex, 16) {
-                                if let Some(ch) = char::from_u32(code) {
-                                    decoded.push(ch);
-                                }
-                            }
-                        }
-                    }
-                    other => decoded.push(other),
-                }
-            } else {
-                break;
-            }
-        } else if c == '"' {
-            is_finished = true;
-            break;
-        } else {
-            decoded.push(c);
-        }
-    }
+    // Split the raw JSON string body at the first unescaped closing quote. When
+    // the quote has not streamed in yet, the body is a partial prefix and
+    // `is_finished` stays false.
+    let (raw_body, is_finished) = match find_json_string_end(content_slice) {
+        Some(end) => (&content_slice[..end], true),
+        None => (content_slice, false),
+    };
+
+    // Decode the body into UTF-8. Decoding stops before any trailing escape that
+    // is not yet complete, so the decoded prefix stays byte-identical between
+    // successive chunks. That invariant makes the byte-length delta below exact:
+    // every decoded byte is emitted to the stream exactly once.
+    let decoded = decode_json_string_body(raw_body);
 
     if decoded.len() > already_streamed && decoded.is_char_boundary(already_streamed) {
         let delta = decoded[already_streamed..].to_string();
@@ -584,6 +654,162 @@ pub fn extract_streamed_string_field(
     } else {
         (None, already_streamed, is_finished)
     }
+}
+
+/// Returns the byte offset of the first unescaped `"` in a JSON string body,
+/// or `None` while the closing quote has not streamed in yet.
+fn find_json_string_end(raw: &str) -> Option<usize> {
+    let bytes = raw.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => i += 2,
+            b'"' => return Some(i),
+            _ => i += 1,
+        }
+    }
+    None
+}
+
+/// Parses exactly four hexadecimal digits into a `u32` code unit.
+fn parse_hex4(hex: &[u8]) -> Option<u32> {
+    if hex.len() < 4 {
+        return None;
+    }
+    let mut value = 0u32;
+    for &byte in &hex[..4] {
+        let digit = match byte {
+            b'0'..=b'9' => u32::from(byte - b'0'),
+            b'a'..=b'f' => u32::from(byte - b'a') + 10,
+            b'A'..=b'F' => u32::from(byte - b'A') + 10,
+            _ => return None,
+        };
+        value = value * 16 + digit;
+    }
+    Some(value)
+}
+
+/// Decodes a JSON string body (the text between the surrounding quotes) into
+/// UTF-8, tolerating a body that is still streaming in.
+///
+/// When the body ends inside an escape sequence, decoding stops before that
+/// escape so the caller can wait for the remaining bytes. UTF-16 surrogate
+/// pairs (`\uD800`..`\uDBFF` followed by `\uDC00`..`\uDFFF`) are combined into
+/// their scalar value; unpaired surrogates and invalid escapes are replaced
+/// with U+FFFD so every decoded byte maps deterministically to one code point.
+fn decode_json_string_body(raw: &str) -> String {
+    let bytes = raw.as_bytes();
+    let mut decoded = String::with_capacity(raw.len());
+    let mut i = 0;
+
+    while i < bytes.len() {
+        if bytes[i] != b'\\' {
+            match raw[i..].chars().next() {
+                Some(ch) => {
+                    decoded.push(ch);
+                    i += ch.len_utf8();
+                }
+                None => break,
+            }
+            continue;
+        }
+
+        if i + 1 >= bytes.len() {
+            break;
+        }
+
+        match bytes[i + 1] {
+            b'"' => {
+                decoded.push('"');
+                i += 2;
+            }
+            b'\\' => {
+                decoded.push('\\');
+                i += 2;
+            }
+            b'/' => {
+                decoded.push('/');
+                i += 2;
+            }
+            b'b' => {
+                decoded.push('\x08');
+                i += 2;
+            }
+            b'f' => {
+                decoded.push('\x0c');
+                i += 2;
+            }
+            b'n' => {
+                decoded.push('\n');
+                i += 2;
+            }
+            b'r' => {
+                decoded.push('\r');
+                i += 2;
+            }
+            b't' => {
+                decoded.push('\t');
+                i += 2;
+            }
+            b'u' => {
+                let hex_start = i + 2;
+                if hex_start + 4 > bytes.len() {
+                    break;
+                }
+                let code = match parse_hex4(&bytes[hex_start..hex_start + 4]) {
+                    Some(code) => code,
+                    None => {
+                        decoded.push('\u{FFFD}');
+                        i = hex_start + 4;
+                        continue;
+                    }
+                };
+
+                if (0xD800..=0xDBFF).contains(&code) {
+                    let low_escape = hex_start + 4;
+                    if low_escape + 2 > bytes.len() {
+                        break;
+                    }
+                    if bytes[low_escape] != b'\\' || bytes[low_escape + 1] != b'u' {
+                        decoded.push('\u{FFFD}');
+                        i = low_escape;
+                        continue;
+                    }
+                    let low_hex = low_escape + 2;
+                    if low_hex + 4 > bytes.len() {
+                        break;
+                    }
+                    match parse_hex4(&bytes[low_hex..low_hex + 4]) {
+                        Some(low) if (0xDC00..=0xDFFF).contains(&low) => {
+                            let scalar = 0x1_0000 + ((code - 0xD800) << 10) + (low - 0xDC00);
+                            decoded.push(char::from_u32(scalar).unwrap_or('\u{FFFD}'));
+                            i = low_hex + 4;
+                        }
+                        _ => {
+                            decoded.push('\u{FFFD}');
+                            i = low_escape;
+                        }
+                    }
+                } else if let Some(ch) = char::from_u32(code) {
+                    decoded.push(ch);
+                    i = hex_start + 4;
+                } else {
+                    decoded.push('\u{FFFD}');
+                    i = hex_start + 4;
+                }
+            }
+            other if other.is_ascii() => {
+                decoded.push(char::from(other));
+                i += 2;
+            }
+            _ => {
+                decoded.push('\\');
+                i += 1;
+            }
+        }
+    }
+
+    decoded
 }
 
 /// Helper function to scan unescaped characters of the "message" string property in raw JSON.
@@ -793,5 +1019,134 @@ mod tests {
                 "split {split}"
             );
         }
+    }
+
+    #[test]
+    fn test_extract_streamed_string_field_combines_surrogate_pairs() {
+        let json = r#"{"message":"Hi \uD83D\uDE00 there"}"#;
+        let mut buf = String::new();
+        let mut streamed = String::new();
+        let mut streamed_bytes = 0;
+        for c in json.chars() {
+            buf.push(c);
+            let (delta, new_bytes, _) =
+                extract_streamed_string_field(&buf, "message", streamed_bytes);
+            if let Some(d) = delta {
+                streamed.push_str(&d);
+            }
+            streamed_bytes = new_bytes;
+        }
+        assert_eq!(streamed, "Hi \u{1F600} there");
+    }
+
+    #[test]
+    fn test_extract_streamed_string_field_handles_lone_and_invalid_surrogates() {
+        // A lone high surrogate, a lone low surrogate and an invalid hex escape
+        // must not panic and must decode deterministically as U+FFFD.
+        let json = r#"{"message":"a\uD83Db\uDE00c\uZZZZd"}"#;
+        let (delta, _, finished) = extract_streamed_string_field(json, "message", 0);
+        assert!(finished);
+        assert_eq!(
+            delta.unwrap_or_default(),
+            "a\u{FFFD}b\u{FFFD}c\u{FFFD}d"
+        );
+    }
+
+    #[test]
+    fn test_json_stream_filter_message_surrogate_pair_emoji() {
+        let root = std::env::temp_dir();
+        let mut filter = JsonStreamFilter::new(vec![], root);
+        let json = r#"{"message":"Hi \uD83D\uDE00!","changes":[]}"#;
+        let mut events = Vec::new();
+        for c in json.chars() {
+            events.extend(filter.push_chunk(&c.to_string()));
+        }
+        events.extend(Box::new(filter).finish());
+        let text: String = events
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::TextDelta(d) => Some(d.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text, "Hi \u{1F600}!");
+    }
+
+    #[derive(Deserialize)]
+    struct FieldSample {
+        message: String,
+        count: u32,
+    }
+
+    #[test]
+    fn json_field_stream_filter_decodes_escapes_char_by_char() {
+        let json = r#"{"message":"Hello\nWorld\t\"quoted\"","count":7}"#;
+        let mut filter = JsonFieldStreamFilter::<FieldSample>::new("message");
+        let mut streamed = String::new();
+        for c in json.chars() {
+            if let Some(delta) = filter.push_chunk(&c.to_string()) {
+                streamed.push_str(&delta);
+            }
+        }
+        assert_eq!(streamed, "Hello\nWorld\t\"quoted\"");
+
+        let decoded = filter.finish().expect("payload must deserialize");
+        assert_eq!(decoded.message, "Hello\nWorld\t\"quoted\"");
+        assert_eq!(decoded.count, 7);
+    }
+
+    #[test]
+    fn json_field_stream_filter_combines_utf16_surrogate_pairs() {
+        let json = r#"{"message":"Hi \uD83D\uDE00!","count":1}"#;
+        let mut filter = JsonFieldStreamFilter::<FieldSample>::new("message");
+        let mut streamed = String::new();
+        for c in json.chars() {
+            if let Some(delta) = filter.push_chunk(&c.to_string()) {
+                streamed.push_str(&delta);
+            }
+        }
+        assert_eq!(streamed, "Hi \u{1F600}!");
+    }
+
+    #[test]
+    fn json_field_stream_filter_ignores_fields_after_target_closes() {
+        let json = r#"{"message":"done","other":"leak?","count":2}"#;
+        let mut filter = JsonFieldStreamFilter::<FieldSample>::new("message");
+        let mut streamed = String::new();
+        for c in json.chars() {
+            if let Some(delta) = filter.push_chunk(&c.to_string()) {
+                streamed.push_str(&delta);
+            }
+        }
+        assert_eq!(streamed, "done");
+        // Trailing fields must never bleed into the streamed text.
+        assert!(!streamed.contains("leak"));
+    }
+
+    #[test]
+    fn json_field_stream_filter_finish_strips_code_fence() {
+        let fenced = "```json\n{\"message\":\"ok\",\"count\":5}\n```";
+        let mut filter = JsonFieldStreamFilter::<FieldSample>::new("message");
+        let mut streamed = String::new();
+        for c in fenced.chars() {
+            if let Some(delta) = filter.push_chunk(&c.to_string()) {
+                streamed.push_str(&delta);
+            }
+        }
+        assert_eq!(streamed, "ok");
+        let decoded = filter.finish().expect("fenced payload must deserialize");
+        assert_eq!(decoded.message, "ok");
+        assert_eq!(decoded.count, 5);
+    }
+
+    #[test]
+    fn json_field_stream_filter_accessors_expose_accumulated_buffer() {
+        let json = r#"{"message":"abc","count":9}"#;
+        let mut filter = JsonFieldStreamFilter::<FieldSample>::new("message");
+        assert_eq!(filter.buffer(), "");
+        assert_eq!(filter.raw_buffer(), "");
+        let _ = filter.push_chunk(json);
+        assert_eq!(filter.raw_buffer(), json);
+        assert_eq!(filter.buffer(), json);
     }
 }

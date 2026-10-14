@@ -1,8 +1,36 @@
-//! Turn-marker support for the XML edit protocol: marker generation, fuzzy matching
-//! and normalization of marker-suffixed tags into the plain dialect.
+//! Turn-marker support for the XML edit protocol: unpredictable marker
+//! generation, exact marker matching, and normalization of marker-suffixed tags
+//! into the plain dialect.
 
-/// Generates a process-unique alphanumeric marker without an additional dependency.
+/// Generates a process-unique, unpredictable alphanumeric turn marker.
+///
+/// The marker binds structural protocol tags to a single turn so that literal
+/// source tags are never mistaken for protocol commands. That guarantee holds
+/// only while the marker cannot be guessed: repository content, including a
+/// previous turn's transcript, must not be able to pre-embed the next marker and
+/// forge protocol tags. The value is therefore drawn from the operating system
+/// CSPRNG instead of a time-seeded counter, which was monotonic and guessable.
 pub fn generate_turn_marker() -> String {
+    let mut bytes = [0u8; 8];
+    match getrandom::getrandom(&mut bytes) {
+        Ok(()) => format!("{:016X}", u64::from_be_bytes(bytes)),
+        Err(err) => {
+            // CSPRNG failure is not expected on supported platforms. Degrade to a
+            // time-seeded marker rather than panicking, so a turn can still run.
+            tracing::warn!(
+                "OS random number generator unavailable ({}); falling back to a time-seeded turn marker",
+                err
+            );
+            fallback_turn_marker()
+        }
+    }
+}
+
+/// Produces a time-seeded, monotonic fallback marker.
+///
+/// Used only when the OS CSPRNG is unavailable. It is weaker than the primary
+/// path, but keeps the daemon alive instead of aborting the turn.
+fn fallback_turn_marker() -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::OnceLock;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -37,27 +65,15 @@ pub(crate) fn restore_xml_literals(text: &str, marker: &str) -> String {
     text.replace(&literal_prefix(marker), "<")
 }
 
-/// Case-insensitive marker matching with at most one insertion, deletion or substitution.
-/// Base tag names remain exact: fuzziness must not turn arbitrary source tags into edits.
+/// Case-insensitive exact marker matching.
+///
+/// The marker suffix must equal the active marker exactly, modulo ASCII case,
+/// which does not reduce the entropy an attacker must guess. Tolerating
+/// near-misses (an edit distance of one) would let content that merely resembles
+/// the marker turn literal source tags into protocol commands, weakening the
+/// anti-injection guarantee.
 fn marker_matches(candidate: &str, marker: &str) -> bool {
-    let a = candidate.to_ascii_lowercase();
-    let b = marker.to_ascii_lowercase();
-    if a == b { return true; }
-    if a.len().abs_diff(b.len()) > 1 || b.len() < 4 { return false; }
-    let (a, b) = (a.as_bytes(), b.as_bytes());
-    let (mut i, mut j, mut errors) = (0, 0, 0);
-    while i < a.len() && j < b.len() {
-        if a[i] == b[j] {
-            i += 1;
-            j += 1;
-        } else {
-            errors += 1;
-            if errors > 1 { return false; }
-            if a.len() >= b.len() { i += 1; }
-            if b.len() >= a.len() { j += 1; }
-        }
-    }
-    errors + (a.len() - i) + (b.len() - j) <= 1
+    candidate.eq_ignore_ascii_case(marker)
 }
 
 /// Converts only active structural tags to the legacy parser's dialect, protecting
@@ -190,5 +206,27 @@ mod tests {
         assert!(normalized.contains("</concept>"));
         assert!(normalized.contains("<item id=\"1\" title=\"Step\" status=\"todo\" />"));
         assert!(normalized.contains("</plan>"));
+    }
+
+    #[test]
+    fn test_generate_turn_marker_is_alphanumeric_and_unique() {
+        let first = generate_turn_marker();
+        let second = generate_turn_marker();
+        assert!(!first.is_empty());
+        assert!(first.bytes().all(|b| b.is_ascii_alphanumeric()));
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn test_marker_matches_is_exact_and_case_insensitive() {
+        assert!(marker_matches("K7Q2ZX", "K7Q2ZX"));
+        assert!(marker_matches("k7q2zx", "K7Q2ZX"));
+        assert!(marker_matches("K7Q2ZX", "k7q2zx"));
+        // A single-character difference must not match: near-misses would let
+        // resembling content forge marker-bound tags.
+        assert!(!marker_matches("K7Q2ZY", "K7Q2ZX"));
+        assert!(!marker_matches("K7Q2Z", "K7Q2ZX"));
+        assert!(!marker_matches("K7Q2ZXX", "K7Q2ZX"));
+        assert!(!marker_matches("", "K7Q2ZX"));
     }
 }

@@ -7,6 +7,7 @@
 pub mod confirm;
 pub mod editor;
 pub mod modal;
+pub mod model_selector;
 pub mod selector;
 
 pub use confirm::{
@@ -15,4 +16,5 @@ pub use confirm::{
 };
 pub use editor::{default_prompt_history_path, is_char_typing, TextEditor};
 pub use modal::{render_modal_frame, ModalFrame, ModalFrameParams};
+pub use model_selector::ModelSelector;
 pub use selector::ListSelector;

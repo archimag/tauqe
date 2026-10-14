@@ -314,6 +314,13 @@ impl EditProtocol for StructuredEditProtocol {
 }
 
 /// Robustly deserializes a proposal regardless of key order or surrounding text.
+///
+/// UTF-8 Slicing Invariant:
+/// Offsets `start` and `end` are derived strictly from ASCII byte matches:
+/// - `find('{')` locates the ASCII byte `0x7B`, so both `start` and `start + 1` are valid UTF-8 boundaries.
+/// - `balanced_object_end` terminates on matching ASCII `}` (`0x7D`), returning `i + 1`, which is also a valid UTF-8 boundary.
+///
+/// Thus `&raw[start..end]` and `raw[from..]` never split multi-byte characters.
 fn parse_proposal(raw: &str) -> Option<ModelResultProposal> {
     let clean = extract_json_str(raw);
     if let Ok(p) = serde_json::from_str::<ModelResultProposal>(clean) {
@@ -334,6 +341,10 @@ fn parse_proposal(raw: &str) -> Option<ModelResultProposal> {
 }
 
 /// Returns the exclusive end offset of the JSON object starting at `start`, if complete.
+///
+/// UTF-8 Slicing Invariant:
+/// When returning `Some(i + 1)`, byte `bytes[i]` is guaranteed to be an ASCII closing delimiter
+/// (`b'}'` or `b']'`), which is single-byte ASCII. Therefore `i + 1` is always a valid UTF-8 char boundary.
 fn balanced_object_end(raw: &str, start: usize) -> Option<usize> {
     let bytes = raw.as_bytes();
     let mut depth = 0usize;
@@ -613,5 +624,42 @@ mod tests {
         let instr = proto.system_instructions(&paths);
         assert!(!instr.contains("context_drops"));
         assert!(instr.contains("context_requests"));
+    }
+
+    #[test]
+    fn test_structured_protocol_multibyte_utf8_slicing_safety() {
+        let proto = StructuredEditProtocol;
+        let editable = vec!["src/lib.rs".to_string()];
+
+        // Surrounding text contains multi-byte Cyrillic, emoji, and escaped characters
+        // directly adjacent to the JSON structure boundaries.
+        let raw = "Привет, мир! 🚀 Тестируем UTF-8 границы: {\"message\":\"Всё отлично! ✨\",\"changes\":[{\"op\":\"replace\",\"path\":\"src/lib.rs\",\"old_text\":\"старый\",\"new_text\":\"новый\",\"to\":\"\",\"content\":\"\"}],\"context_requests\":[],\"suggested_actions\":[]} Конец сообщения. 🦀";
+
+        let res = proto.parse_output(raw, &editable);
+        match res {
+            ModelResult::Edit { summary, edits, .. } => {
+                assert_eq!(summary, "Всё отлично! ✨");
+                assert_eq!(edits.len(), 1);
+                match &edits[0] {
+                    EditOperation::Replace { old_text, new_text, .. } => {
+                        assert_eq!(old_text, "старый");
+                        assert_eq!(new_text, "новый");
+                    }
+                    _ => panic!("Expected Replace operation"),
+                }
+            }
+            _ => panic!("Expected ModelResult::Edit"),
+        }
+    }
+
+    #[test]
+    fn test_extract_json_messages_multibyte_safety() {
+        let raw = "Текст до: {\"message\":\"Сообщение с кириллицей и экранированием \\\"кавычек\\\"\",\"changes\":[]}\nТекст после.";
+        let messages = extract_json_messages(raw);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(
+            messages[0],
+            "Сообщение с кириллицей и экранированием \"кавычек\""
+        );
     }
 }

@@ -20,7 +20,9 @@ pub fn extract_scratchpad(text: &str) -> Option<String> {
         let header = &tag[..header_end];
         let is_self_closing = header.trim_end().ends_with('/');
 
-        let tag_name = header[1..]
+        let tag_name = header
+            .strip_prefix('<')
+            .unwrap_or_default()
             .chars()
             .take_while(|c| !c.is_whitespace() && *c != '>' && *c != '/')
             .collect::<String>();

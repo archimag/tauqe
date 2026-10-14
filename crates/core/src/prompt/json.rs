@@ -73,6 +73,10 @@ impl PromptProtocol for JsonPromptProtocol {
         commands
     }
 
+    fn system_instructions(&self, editable_paths: &[String]) -> String {
+        StructuredEditProtocol.system_instructions(editable_paths)
+    }
+
     fn turn_marker(&self) -> Option<&str> {
         StructuredEditProtocol.turn_marker()
     }

@@ -31,11 +31,11 @@ pub fn resolve_verification_commands(
         ToolchainKind::Cargo => match target {
             VerifyTarget::Check => vec!["cargo check --all-targets".to_string()],
             VerifyTarget::Clippy => vec!["cargo clippy --all-targets -- -D warnings".to_string()],
-            VerifyTarget::Test => vec!["cargo test".to_string()],
+            VerifyTarget::Test => vec!["cargo test --quiet".to_string()],
             VerifyTarget::All => vec![
                 "cargo check --all-targets".to_string(),
                 "cargo clippy --all-targets -- -D warnings".to_string(),
-                "cargo test".to_string(),
+                "cargo test --quiet".to_string(),
             ],
         },
         ToolchainKind::Npm => {
@@ -100,16 +100,22 @@ pub fn resolve_verification_commands(
 }
 
 /// Runs verification pipeline for the given target, stopping on first failure (fail-fast).
+///
+/// The `[toolchain]` configuration is resolved from the repository so a custom
+/// `check_command` and the configured per-command `timeout_secs` are honored
+/// instead of always falling back to auto-detection with a hardcoded timeout.
 pub async fn run_verification_pipeline(
     repo_root: &Path,
     target: &VerifyTarget,
 ) -> (bool, Vec<ToolchainCheckResult>) {
-    let (kind, _) = detect_toolchain(repo_root, None);
+    let config = crate::config::load_toolchain_config(repo_root);
+    let (kind, _) = detect_toolchain(repo_root, config.check_command.as_deref());
     let commands = resolve_verification_commands(repo_root, &kind, target);
+    let timeout_secs = config.effective_timeout_secs();
     let mut results = Vec::new();
 
     for cmd in commands {
-        let res = run_toolchain_check(repo_root, &cmd).await;
+        let res = run_toolchain_check_with_timeout(repo_root, &cmd, timeout_secs).await;
         let success = res.success;
         results.push(res);
         if !success {
@@ -167,10 +173,29 @@ pub fn detect_toolchain(
     (ToolchainKind::None, None)
 }
 
-/// Executes a toolchain verification command in repo root with a timeout.
+/// Executes a toolchain verification command with the default wall-clock timeout.
 pub async fn run_toolchain_check(repo_root: &Path, command_str: &str) -> ToolchainCheckResult {
-    let parts: Vec<&str> = command_str.split_whitespace().collect();
-    if parts.is_empty() {
+    run_toolchain_check_with_timeout(
+        repo_root,
+        command_str,
+        crate::config::DEFAULT_TOOLCHAIN_TIMEOUT_SECS,
+    )
+    .await
+}
+
+/// Executes a toolchain verification command in repo root with a wall-clock timeout.
+///
+/// The command string is tokenized with shell-style quoting so arguments that
+/// contain spaces survive intact, and the child process is configured to be
+/// killed when the timeout drops its handle instead of lingering as background
+/// load after the turn moves on.
+pub async fn run_toolchain_check_with_timeout(
+    repo_root: &Path,
+    command_str: &str,
+    timeout_secs: u64,
+) -> ToolchainCheckResult {
+    let tokens = tokenize_command(command_str);
+    let Some((program, args)) = tokens.split_first() else {
         return ToolchainCheckResult {
             success: true,
             command: command_str.to_string(),
@@ -178,16 +203,17 @@ pub async fn run_toolchain_check(repo_root: &Path, command_str: &str) -> Toolcha
             stderr: String::new(),
             combined_output: String::new(),
         };
-    }
-
-    let program = parts[0];
-    let args = &parts[1..];
+    };
 
     let mut cmd = tokio::process::Command::new(program);
     cmd.args(args);
     cmd.current_dir(repo_root);
+    // Terminate the child when the timeout drops its future; otherwise a long
+    // `cargo test` keeps running in the background after the turn gave up.
+    cmd.kill_on_drop(true);
 
-    let output_res = tokio::time::timeout(std::time::Duration::from_secs(60), cmd.output()).await;
+    let output_res =
+        tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), cmd.output()).await;
 
     match output_res {
         Ok(Ok(output)) => {
@@ -223,10 +249,86 @@ pub async fn run_toolchain_check(repo_root: &Path, command_str: &str) -> Toolcha
             success: false,
             command: command_str.to_string(),
             stdout: String::new(),
-            stderr: "Execution timed out (60s)".to_string(),
-            combined_output: format!("Command '{}' timed out after 60s", command_str),
+            stderr: format!("Execution timed out ({}s)", timeout_secs),
+            combined_output: format!("Command '{}' timed out after {}s", command_str, timeout_secs),
         },
     }
+}
+
+/// Splits a command line into program and arguments honoring shell-style quoting.
+///
+/// Custom verification commands frequently carry quoted arguments
+/// (`make test ARGS='a b'`) that a plain whitespace split tears apart. This
+/// tokenizer understands single quotes, double quotes, and backslash escapes so
+/// the intended argument boundaries reach the process. An unmatched quote or a
+/// dangling escape is taken literally rather than treated as fatal, keeping
+/// malformed configuration from aborting the pipeline.
+fn tokenize_command(input: &str) -> Vec<String> {
+    #[derive(PartialEq)]
+    enum Quote {
+        None,
+        Single,
+        Double,
+    }
+
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut has_token = false;
+    let mut quote = Quote::None;
+    let mut chars = input.chars();
+
+    while let Some(ch) = chars.next() {
+        match quote {
+            Quote::None => match ch {
+                '\'' => {
+                    quote = Quote::Single;
+                    has_token = true;
+                }
+                '"' => {
+                    quote = Quote::Double;
+                    has_token = true;
+                }
+                '\\' => {
+                    match chars.next() {
+                        Some(escaped) => current.push(escaped),
+                        None => current.push('\\'),
+                    }
+                    has_token = true;
+                }
+                ch if ch.is_whitespace() => {
+                    if has_token {
+                        tokens.push(std::mem::take(&mut current));
+                        has_token = false;
+                    }
+                }
+                ch => {
+                    current.push(ch);
+                    has_token = true;
+                }
+            },
+            Quote::Single => {
+                if ch == '\'' {
+                    quote = Quote::None;
+                } else {
+                    current.push(ch);
+                }
+            }
+            Quote::Double => match ch {
+                '"' => quote = Quote::None,
+                '\\' => match chars.next() {
+                    Some(escaped) => current.push(escaped),
+                    None => current.push('\\'),
+                },
+                ch => current.push(ch),
+            },
+        }
+    }
+
+    if has_token {
+        tokens.push(current);
+    }
+
+    tokens
 }
 
 #[cfg(test)]
@@ -278,6 +380,13 @@ mod tests {
             &VerifyTarget::Clippy,
         );
         assert_eq!(cmds, vec!["cargo clippy --all-targets -- -D warnings"]);
+
+        let test_cmds = resolve_verification_commands(
+            dir.path(),
+            &ToolchainKind::Cargo,
+            &VerifyTarget::Test,
+        );
+        assert_eq!(test_cmds, vec!["cargo test --quiet"]);
     }
 
     #[tokio::test]
@@ -286,5 +395,46 @@ mod tests {
         let res = run_toolchain_check(dir.path(), "git --version").await;
         assert!(res.success);
         assert!(res.stdout.contains("git version"));
+    }
+
+    #[test]
+    fn test_tokenize_command_splits_plain_arguments() {
+        assert_eq!(
+            tokenize_command("cargo test -- --nocapture"),
+            vec!["cargo", "test", "--", "--nocapture"]
+        );
+    }
+
+    #[test]
+    fn test_tokenize_command_preserves_quoted_arguments() {
+        assert_eq!(
+            tokenize_command("make test ARGS='a b'"),
+            vec!["make", "test", "ARGS=a b"]
+        );
+        assert_eq!(
+            tokenize_command("echo \"double quoted\""),
+            vec!["echo", "double quoted"]
+        );
+        assert_eq!(tokenize_command("run 'a b' c"), vec!["run", "a b", "c"]);
+    }
+
+    #[test]
+    fn test_tokenize_command_handles_escapes_empty_and_unmatched_quotes() {
+        assert_eq!(tokenize_command("a\\ b"), vec!["a b"]);
+        assert_eq!(tokenize_command(""), Vec::<String>::new());
+        assert_eq!(tokenize_command("   "), Vec::<String>::new());
+        assert_eq!(tokenize_command("''"), vec![""]);
+        assert_eq!(
+            tokenize_command("git commit -m 'unterminated"),
+            vec!["git", "commit", "-m", "unterminated"]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_run_toolchain_check_with_timeout_preserves_quoted_arguments() {
+        let dir = tempdir().unwrap();
+        let res = run_toolchain_check_with_timeout(dir.path(), "printf '%s' 'a b c'", 10).await;
+        assert!(res.success, "command failed: {}", res.combined_output);
+        assert_eq!(res.stdout, "a b c");
     }
 }

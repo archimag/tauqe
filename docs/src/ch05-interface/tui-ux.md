@@ -10,7 +10,7 @@ To guarantee universal compatibility across modern and legacy terminal emulators
 
 Throughout this chapter, `Ctrl+<key>` denotes the abstract **Primary Command Modifier** (`C-<key>`). It defaults to `Ctrl` and can be remapped to `Alt` in `tui.toml` (see section 5.5). Function keys (`F1`..`F6`) and arrow keys are universal fallbacks that stay active on every terminal.
 
-- **`F1` / `Alt+1` / `Ctrl+1` (Develop View):**
+- **`F1` / `Alt+1` / `Ctrl+1` (REPL View):**
   - The central engineering cockpit and execution canvas where coding turns take place.
   - Displays turn progression as a structured, live document: collapsible reasoning blocks (`Ctrl+R`), streaming markdown explanations, and interactive proposed file diffs.
   - **Dual-Focus Architecture:** Switch focus seamlessly between the prompt editor and the response/diffs viewport using `Ctrl+Space` or `Shift+Tab`.
@@ -23,7 +23,7 @@ Throughout this chapter, `Ctrl+<key>` denotes the abstract **Primary Command Mod
   - Contextual help: Press `Ctrl+H` / `Alt+H` from any view or `?` in navigation views to open the interactive help dialog.
   - Configuration reload: Press `Ctrl+O` to reload `tui.toml` settings without restarting TAUQE.
 
-### What Happens in Develop When You Submit a Prompt
+### What Happens in REPL When You Submit a Prompt
 When you submit an engineering intent, TAUQE does not simply invoke a single-shot completion. Instead, it guides the model through an **autonomous, multi-round bounded turn**:
 1. **Exploration & Discovery Rounds:** The model analyzes the task against the Tree-sitter symbol map. If critical type definitions, helper modules, or project documentation are missing from context, it autonomously requests them via protocol tags (`<context_request>`, `<doc_request>`). The footer reflects the active discovery round (`Round 1`, `Round 2`...). Control does not bother the user with context logistics; the model gathers facts until the architectural picture is crystal clear.
 2. **Code Generation & Virtual Staging:** Once equipped with the necessary context, the model drafts minimal, coherent changes (search/replace blocks, new files, renames). These edits are applied to an **in-memory virtual staging tree** first, ensuring zero disk corruption from speculative failures.
@@ -34,18 +34,18 @@ When you submit an engineering intent, TAUQE does not simply invoke a single-sho
 ### Live Reasoning Display During Streaming
 Reasoning output during an active turn is a progress indicator, not a document that must be read while it grows. TAUQE uses this distinction to keep the interface responsive even when the reasoning stream is long and contains draft code:
 
-- **Sliding window (Reasoning Tail Stream):** While reasoning is actively streaming, the Develop view renders only a compact slice of the most recent lines (ten lines by default) below the `[REASONING]` badge. The badge shows the running total line count (`Thinking… (N lines)`), so forward progress stays visible without re-wrapping the entire, ever-growing transcript on every update.
+- **Sliding window (Reasoning Tail Stream):** While reasoning is actively streaming, the REPL view renders only a compact slice of the most recent lines (ten lines by default) below the `[REASONING]` badge. The badge shows the running total line count (`Thinking… (N lines)`), so forward progress stays visible without re-wrapping the entire, ever-growing transcript on every update.
 - **Deferred deep rendering:** The tail uses lightweight per-line styling. The full Markdown parse and `syntect` code-block highlighting are not restarted against the still-open stream; they run exactly once, when the reasoning stage finalizes.
 - **Finalized transcript:** When reasoning completes, the sliding window is replaced by the complete reasoning transcript rendered through the standard Markdown pipeline, including syntax-highlighted code fences. The `Ctrl+R` fold/unfold toggle applies to both the live tail and the finalized transcript.
 
 - **`F2` / `Alt+2` / `Ctrl+2` (Context View):**
   - Displays Pinned, User, and Auto context layers with token metrics.
   - Quick keys: `e` (add file as editable), `r` / `a` (add file as read-only), `t` (toggle access Editable ↔ Read-Only), `u` (promote an Auto file to persistent User), `c` / `C` (clear all auto-requested files), `d` / `x` / `Del` (remove a file from context).
-  - Navigation and folding: `n` / `p` (or `j` / `k`, `↑` / `↓`) move the selection; `Space` / `Tab` or `Enter` fold or unfold a section; `Enter` also promotes an Auto file to User. `Esc` / `q` return to the Develop view.
+  - Navigation and folding: `n` / `p` (or `j` / `k`, `↑` / `↓`) move the selection; `Space` / `Tab` or `Enter` fold or unfold a section; `Enter` also promotes an Auto file to User. `Esc` / `q` return to the REPL view.
 - **`F3` / `Alt+3` / `Ctrl+3` (Review View):**
   - Dedicated code review workspace for static architectural and security audits.
   - Unified navigation: `n` / `p` (or `↑` / `↓`), with `Ctrl+N` / `Ctrl+P` for accordion inspection of the next / previous finding.
-  - Interactive findings checklist: fold/unfold items (`Tab` / `Space`), execute the selected finding or every Todo finding in the session (`x`, with confirmation), and discuss the finding or the whole session in Develop (`d`).
+  - Interactive findings checklist: fold/unfold items (`Tab` / `Space`), execute the selected finding or every Todo finding in the session (`x`, with confirmation), and discuss the finding or the whole session in REPL (`d`).
   - Intentional status assignment: Press `t` or `s` to open the status selection dialog (`1` Discussion, `2` Todo, `3` InProgress, `4` Fixed, `5` Rejected).
   - Filtering and bulk folding: `f` toggles between all findings and hide-closed (FIXED / REJECTED); `a` folds or unfolds every session and finding.
   - Run and refresh: `r` starts a new review of the current context; `Shift+R` refreshes the session list from the server.
@@ -55,7 +55,20 @@ Reasoning output during an active turn is a progress indicator, not a document t
   - Unified navigation: `n` / `p` (or `↑` / `↓`), with `Ctrl+N` / `Ctrl+P` for accordion inspection of the next / previous item.
   - Interactive tree of tasks with explicit statuses: Discussion, Todo, InProgress, Done, Blocked, and Cancelled.
   - Execution: `x` executes the target step, group, or entire plan (with confirmation); `Enter` executes a leaf step and folds/unfolds on groups and plan headers.
-  - Discussion and refinement: `d` discusses the selected concept/step or the whole plan in Develop; `R` deep-refines plan architecture and steps with the Architect.
+  - Discussion and refinement: `d` discusses the selected concept/step or the whole plan in REPL; `R` deep-refines plan architecture and steps with the Architect.
+    </replace>
+  </edit>
+
+  <edit path="docs/src/ch05-interface/tui-ux.md">
+    <search>
+## 5.2 Dual-Focus Architecture in Develop (Editor vs. Viewport)
+
+In the Develop view, TAUQE resolves the tension between text editing and inspection through a clean two-focus model without modal traps:
+    </search>
+    <replace>
+## 5.2 Dual-Focus Architecture in REPL (Editor vs. Viewport)
+
+In the REPL view, TAUQE resolves the tension between text editing and inspection through a clean two-focus model without modal traps:
   - Intentional status assignment: Press `t` or `s` to open the status dialog (`1` Discussion, `2` Todo, `3` InProgress, `4` Done, `5` Blocked, `6` Cancelled).
   - Bulk folding (`a`), plan refresh (`r`), deletion (`Delete`, with confirmation), and Markdown copy (`c` / `y`).
 - **`F5` / `Alt+5` / `Ctrl+5` (History View):**
@@ -180,7 +193,7 @@ Engineering tasks (discovery rounds, toolchain verifications, test suites) can t
 
 The natural unit of waiting differs between an interactive Develop turn and a batch supervisor:
 
-- **Single interactive turn (Develop):** One prompt maps to one turn, so the notification fires as soon as that turn finishes. Nothing is aggregated away.
+- **Single interactive turn (REPL):** One prompt maps to one turn, so the notification fires as soon as that turn finishes. Nothing is aggregated away.
 - **Batch supervisors (Plan Execution, Review Execution):** One launch runs many steps, and the developer waits for the *whole batch*, not for each individual step. To avoid per-step noise, intermediate batch steps never raise desktop banners or sound alerts.
 
 ### 5.6.2 Aggregated Batch Notifications
@@ -188,7 +201,7 @@ The natural unit of waiting differs between an interactive Develop turn and a ba
 Batch supervisors emit a typed completion event (`plan/batch_finished`, `review/batch_finished`) once the internal `BatchExecution` loop ends. This event carries the final status (`Completed`, `Failed`, `Blocked`, `Cancelled`), the executed and scheduled step counts, and the elapsed time. The TUI marks batch turns, suppresses the usual per-turn signal on each step's `MODEL_FINISHED`, and fires exactly one aggregated notification from this final event:
 
 - **Normal completion (`Completed`):** A single notification reports the finished status together with the step tally, so the developer learns the outcome of the entire operation at a glance instead of reconstructing it from dozens of individual signals.
-- **Failure or block stop (`Failed` / `Blocked`):** When the batch halts early on a failed or blocked step, the aggregated notification reports the halted status rather than a plain success. The offending step and any blocker reason remain inspectable in the Develop view; the notification only signals that the batch did not run to completion.
+- **Failure or block stop (`Failed` / `Blocked`):** When the batch halts early on a failed or blocked step, the aggregated notification reports the halted status rather than a plain success. The offending step and any blocker reason remain inspectable in the REPL view; the notification only signals that the batch did not run to completion.
 - **Cancellation (`Cancelled`):** A cancelled batch reports the `Cancelled` status through the same single notification.
 
 The aggregated notification is gated by the same `tui.toml` settings as single-turn signals (`sound`, `desktop`, `desktop_protocol`, `only_unfocused`, and `min_duration_seconds`), so batching changes only *when* the signal fires — never *how* it is delivered.
@@ -201,19 +214,22 @@ Tasks differ in their nature: interactive dialogue, conceptual planning, concret
 
 ```toml
 [models]
+# `primary` is mandatory and must list at least one model; its first entry is the
+# idle active model and the deterministic default for the other roles.
+primary = ["~google/gemini-flash-latest"]
 scribe = "~anthropic/claude-haiku-latest"      # history compaction, commit messages
-coder = "~deepseek/deepseek-flash-latest"      # concrete code generation
-architect = "~google/gemini-flash-latest"      # conceptual design, plan refinement
-advisor = "~google/gemini-flash-latest"        # interactive engineering dialogue
-reviewer = "~anthropic/claude-sonnet-latest"   # automated code review
+# Optional specialized lists; when omitted, coder, architect and reviewer inherit
+# the entire primary list. The `coder` list doubles as the escalation ladder.
+coder = [
+  "~deepseek/deepseek-flash-latest",
+  { model = "~google/gemini-flash-latest", effort = "medium" },
+]
+architect = [{ model = "~google/gemini-flash-latest", effort = "high" }]
+reviewer = ["~anthropic/claude-sonnet-latest"]
 auto_level_up = true                           # escalate the coder ladder on failure
-
-# Optional per-role reasoning depth: "low", "medium", "high", or "xhigh".
-[models.effort]
-architect = "high"
 ```
 
-- **Selection model:** The active choice is either a role (`Scribe`, `Coder`, `Architect`, `Advisor`, `Reviewer`) or one specific model. A role is resolved to a concrete model by the server, so the TUI never guesses the mapping. When a role is omitted, it is inferred through a deterministic proximity fallback chain instead of failing configuration load.
+- **Selection model:** The active choice is either a role (`Primary`, `Scribe`, `Coder`, `Architect`, `Reviewer`) or one specific model. A role is resolved to a concrete model by the server, so the TUI never guesses the mapping. `primary` is mandatory; an omitted specialized role inherits the entire `primary` list instead of failing configuration load.
 - **Coder ladder:** The `coder` value is polymorphic. A bare model string or a `{ model, effort }` table yields a one-rung ladder; an ordered array expresses an explicit escalation ladder, where each rung pairs a model with an optional reasoning depth:
   ```toml
   coder = [
@@ -222,16 +238,16 @@ architect = "high"
     "~anthropic/claude-sonnet-latest",
   ]
   ```
-- **Picker (`Alt+M` / `Ctrl+M`, or a click on the model in the header):** The first screen lists the semantic roles with their resolved models. Selecting `Others...` opens the full catalog to pin one specific model. `Esc` closes the picker.
+- **Picker (`Alt+M` / `Ctrl+M`, or a click on the model in the header):** The first screen lists the semantic roles with their resolved models, shown by their `alias` when set and otherwise by provider and name. Selecting `Others...` opens the full catalog to pin one specific model. `Esc` closes the picker.
 - **Header:** A semantic role is rendered as its title only, for example `Coder`. The concrete model name is deliberately omitted to keep the header free of provider-level noise; the resolved role-to-model mapping stays visible in the picker. A pinned specific model is shown by its own name instead (truncated on narrow terminals).
 - **Background work:** Squash commit messages and history compaction always use the Scribe role. They are routine tasks, so they should not spend the budget of a stronger model.
-- **Level Up:** When `auto_level_up = true`, a plan step or review fix that still fails after verification healing is rolled back to the Git checkpoint taken before the step. Execution then advances one rung along the **coder ladder** within the same Coder role — it never switches to the Architect role. Deepening reasoning on the same model and promoting to a stronger coder tier are both intra-role moves, so the strict What / How separation is preserved. Files found during discovery stay in context, so the stronger coder tier does not search again. When the ladder is exhausted, or Level Up is off, the normal Fail-Fast stop applies. Develop never escalates automatically: the developer's explicit choice in the picker is always respected.
+- **Level Up:** When `auto_level_up = true`, a plan step or review fix that still fails after verification healing is rolled back to the Git checkpoint taken before the step. Execution then advances one rung along the **coder ladder** within the same Coder role — it never switches to the Architect role. Deepening reasoning on the same model and promoting to a stronger coder tier are both intra-role moves, so the strict What / How separation is preserved. Files found during discovery stay in context, so the stronger coder tier does not search again. When the ladder is exhausted, or Level Up is off, the normal Fail-Fast stop applies. REPL never escalates automatically: the developer's explicit choice in the picker is always respected.
 
 ---
 
-## 5.8 Plan Stepper in Develop (Batch Step Progress)
+## 5.8 Plan Stepper in REPL (Batch Step Progress)
 
-When a Develop turn belongs to a plan execution (a single step or a server-orchestrated batch), the Develop view renders a compact **Plan Stepper** above the model output. Its role is to keep the developer oriented during a multi-step scope without leaving Develop and without switching to the Plans view (`F4`).
+When a REPL turn belongs to a plan execution (a single step or a server-orchestrated batch), the REPL view renders a compact **Plan Stepper** above the model output. Its role is to keep the developer oriented during a multi-step scope without leaving REPL and without switching to the Plans view (`F4`).
 
 - **Title-only by design:** The stepper shows only step identifiers, a concise status (`Done`, `InProgress`, `Todo`), and short step titles, fitting in a 2–4 line header. It never renders expanded diffs, detail text, or concept nodes. Keeping the header terse preserves the reasoning and code output as the visual focus and avoids the noise of a full plan tree.
 - **Zero overhead for ad-hoc turns:** The stepper appears only when the turn carries plan-step metadata. A plain ad-hoc prompt renders exactly as before, with no extra header.

@@ -684,14 +684,15 @@ mod tests {
     #[test]
     fn test_handle_paste_into_review_dialog_editor() {
         let mut st = test_state();
-        let dialog = ReviewDialogState {
-            files_count: 2,
-            estimated_tokens: 100,
-            reviewer_model: ModelRef::openrouter("test-model"),
-            reviewer_effort: None,
-            prompt_editor: crate::editor::InputEditor::default(),
-            confirm_button: crate::app::ConfirmDialogButton::Cancel,
-        };
+        let dialog = ReviewDialogState::new(
+            2,
+            100,
+            vec![tauqe_protocol::ModelEntry::new(
+                ModelRef::openrouter("test-model"),
+                None,
+                None,
+            )],
+        );
         st.review_dialog = Some(dialog);
         handle_paste(&mut st, "focus on security and memory leaks");
         assert_eq!(

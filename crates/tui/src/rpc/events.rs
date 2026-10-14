@@ -7,10 +7,10 @@ use tauqe_protocol::{
     ModelDeltaEvent, ModelErrorEvent, ModelFinishedEvent, ModelResult, ModelResultEvent,
     ModelStartedEvent, ModelUsageEvent, PlanBatchFinishedEvent, RepositoryState,
     ReviewBatchFinishedEvent, ReviewContentDeltaEvent, ReviewErrorEvent, ReviewFinishedEvent,
-    ReviewReasoningDeltaEvent,
+    ReviewReasoningDeltaEvent, ReviewStartedEvent,
 };
 
-use crate::app::AppState;
+use crate::app::{AppState, RunningModel};
 use crate::views::develop::{
     DevelopView, EditOp, FileEditStatus, StreamingFileEdit, StreamingHunk, ToolchainState,
     TurnStatus,
@@ -155,6 +155,12 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
             st.turn_started_at.get_or_insert_with(std::time::Instant::now);
             if let Some(params) = ev.params {
                 if let Ok(data) = serde_json::from_value::<ModelStartedEvent>(params) {
+                    st.running_model = Some(RunningModel {
+                        model: data.model.clone(),
+                        role: data.role,
+                        alias: data.alias.clone(),
+                        effort: data.effort,
+                    });
                     st.model.operation_id = Some(data.operation_id);
                     st.model.model = Some(data.model);
                     st.model.reasoning.clear();
@@ -486,6 +492,7 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
             *is_reasoning = false;
             st.model.reasoning.finalize();
             st.confirm_cancel = false;
+            st.running_model = None;
             if let Some(started) = st.turn_started_at.take() {
                 let elapsed = started.elapsed().as_secs();
                 let focused = st.terminal_focused;
@@ -543,6 +550,7 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
             *is_reasoning = false;
             st.model.reasoning.finalize();
             st.confirm_cancel = false;
+            st.running_model = None;
             st.turn_started_at = None;
             st.model.status = TurnStatus::Cancelled;
             st.model.toolchain = None;
@@ -565,6 +573,7 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
             *is_reasoning = false;
             st.model.reasoning.finalize();
             st.confirm_cancel = false;
+            st.running_model = None;
             if let Some(started) = st.turn_started_at.take() {
                 let elapsed = started.elapsed().as_secs();
                 let focused = st.terminal_focused;
@@ -605,11 +614,21 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
         events::REVIEW_STARTED => {
             st.review.running = true;
             st.turn_started_at = Some(std::time::Instant::now());
+            if let Some(params) = ev.params {
+                if let Ok(data) = serde_json::from_value::<ReviewStartedEvent>(params) {
+                    begin_review_turn(&mut st.model, &data);
+                }
+            }
         }
         events::REVIEW_REASONING_DELTA => {
             if let Some(params) = ev.params {
                 if let Ok(data) = serde_json::from_value::<ReviewReasoningDeltaEvent>(params) {
                     st.review.reasoning.append_delta(&data.delta);
+                    apply_review_reasoning(&mut st.model, &data.delta);
+                    if st.model.auto_scroll {
+                        let h = st.last_model_height;
+                        st.model.scroll = st.model.max_scroll(h);
+                    }
                 }
             }
         }
@@ -617,6 +636,11 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
             if let Some(params) = ev.params {
                 if let Ok(data) = serde_json::from_value::<ReviewContentDeltaEvent>(params) {
                     st.review.content.push_str(&data.delta);
+                    apply_review_content(&mut st.model, &data.delta);
+                    if st.model.auto_scroll {
+                        let h = st.last_model_height;
+                        st.model.scroll = st.model.max_scroll(h);
+                    }
                 }
             }
         }
@@ -635,6 +659,7 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
                     st.review.set_session(data.session);
                 }
             }
+            finish_review_turn(&mut st.model);
             if let Some(started) = started {
                 let elapsed = started.elapsed().as_secs();
                 let focused = st.terminal_focused;
@@ -653,6 +678,7 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
             st.turn_started_at = None;
             st.review.running = false;
             st.review.error = Some("Review cancelled".to_string());
+            end_review_turn(&mut st.model, TurnStatus::Cancelled, None);
         }
         events::REVIEW_ERROR => {
             if let Some(started) = st.turn_started_at.take() {
@@ -670,7 +696,8 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
             if let Some(params) = ev.params {
                 if let Ok(data) = serde_json::from_value::<ReviewErrorEvent>(params) {
                     st.review.running = false;
-                    st.review.error = Some(data.message);
+                    st.review.error = Some(data.message.clone());
+                    end_review_turn(&mut st.model, TurnStatus::Error, Some(data.message));
                 }
             }
         }
@@ -722,6 +749,73 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
             }
         }
         _ => {}
+    }
+}
+
+/// Resets the REPL buffer so it mirrors a freshly started Reviewer stream.
+///
+/// The review summary is streamed into the main develop canvas, so the buffer
+/// must shed any state left by a prior turn before the reviewer's reasoning and
+/// summary begin to arrive.
+fn begin_review_turn(model: &mut DevelopView, data: &ReviewStartedEvent) {
+    model.operation_id = Some(data.operation_id.clone());
+    model.model = Some(data.model.clone());
+    model.reasoning.clear();
+    model.text.clear();
+    model.markdown_lines.clear();
+    model.code_blocks.clear();
+    model.error = None;
+    model.result = None;
+    model.scroll = 0;
+    model.status = TurnStatus::Responding;
+    model.edits_active = false;
+    model.files.clear();
+    model.selected_file_index = 0;
+    model.edit_final_applied = None;
+    model.edit_final_error = None;
+    model.last_commit_hash = None;
+    model.last_commit_summary = None;
+    model.toolchain = None;
+    model.turn_phase = None;
+    model.turn_round = None;
+    model.turn_max_rounds = None;
+    model.turn_phase_detail = None;
+    model.plan_context = None;
+    model.is_batch = false;
+    model.repomap_tokens = None;
+    model.auto_scroll = true;
+    model.current_cost = Some(0.0);
+}
+
+/// Streams a Reviewer reasoning delta into the REPL reasoning buffer.
+fn apply_review_reasoning(model: &mut DevelopView, delta: &str) {
+    if !delta.is_empty() {
+        model.status = TurnStatus::Thinking;
+    }
+    model.reasoning.append_delta(delta);
+}
+
+/// Streams a Reviewer summary delta into the REPL answer buffer.
+fn apply_review_content(model: &mut DevelopView, delta: &str) {
+    if !delta.is_empty() {
+        model.status = TurnStatus::Responding;
+    }
+    model.text.push_str(delta);
+    model.update_markdown();
+}
+
+/// Finalizes a completed Reviewer stream into the REPL buffer.
+fn finish_review_turn(model: &mut DevelopView) {
+    end_review_turn(model, TurnStatus::Done, None);
+    model.update_markdown();
+}
+
+/// Settles the REPL buffer into a terminal status and finalizes reasoning.
+fn end_review_turn(model: &mut DevelopView, status: TurnStatus, error: Option<String>) {
+    model.reasoning.finalize();
+    model.status = status;
+    if let Some(message) = error {
+        model.error = Some(message);
     }
 }
 
@@ -833,5 +927,94 @@ mod tests {
         assert!(body.contains("1m 30s"));
         assert!(body.contains("compiler error"));
         assert!(!body.contains("long details"));
+    }
+
+    fn review_started_event() -> ReviewStartedEvent {
+        ReviewStartedEvent {
+            operation_id: "rev-op-1".to_string(),
+            model: "reviewer".to_string(),
+            files_count: 2,
+            estimated_tokens: 128,
+        }
+    }
+
+    #[test]
+    fn test_review_started_resets_repl_buffer() {
+        let mut model = DevelopView::default();
+        apply_review_content(&mut model, "# Stale summary");
+        model.error = Some("old error".to_string());
+        model.status = TurnStatus::Editing;
+        model.edits_active = true;
+        model.auto_scroll = false;
+        model.files.push(StreamingFileEdit {
+            path: "crates/tui/src/lib.rs".to_string(),
+            op_type: EditOp::Replace,
+            status: FileEditStatus::Running,
+            error: None,
+            hunks: Vec::new(),
+            expanded: false,
+            retry_info: None,
+        });
+
+        begin_review_turn(&mut model, &review_started_event());
+
+        assert_eq!(model.operation_id.as_deref(), Some("rev-op-1"));
+        assert_eq!(model.model.as_deref(), Some("reviewer"));
+        assert_eq!(model.status, TurnStatus::Responding);
+        assert!(model.text.is_empty());
+        assert!(model.markdown_lines.is_empty());
+        assert!(model.error.is_none());
+        assert!(model.files.is_empty());
+        assert!(!model.edits_active);
+        assert!(model.auto_scroll);
+    }
+
+    #[test]
+    fn test_review_reasoning_delta_streams_into_repl() {
+        let mut model = DevelopView {
+            status: TurnStatus::Responding,
+            ..Default::default()
+        };
+
+        apply_review_reasoning(&mut model, "weighing the options\n");
+
+        assert_eq!(model.status, TurnStatus::Thinking);
+        assert!(model.reasoning.text.contains("weighing the options"));
+    }
+
+    #[test]
+    fn test_review_content_delta_renders_markdown_in_repl() {
+        let mut model = DevelopView::default();
+
+        apply_review_content(&mut model, "# Executive Summary\n\nNo critical issues.");
+
+        assert_eq!(model.status, TurnStatus::Responding);
+        assert!(model.text.contains("Executive Summary"));
+        assert!(!model.markdown_lines.is_empty());
+    }
+
+    #[test]
+    fn test_review_finished_rerenders_markdown_and_marks_done() {
+        let mut model = DevelopView::default();
+        apply_review_reasoning(&mut model, "reasoning");
+        apply_review_content(&mut model, "# Summary");
+        model.markdown_lines.clear();
+
+        finish_review_turn(&mut model);
+
+        assert_eq!(model.status, TurnStatus::Done);
+        assert!(!model.markdown_lines.is_empty());
+    }
+
+    #[test]
+    fn test_review_terminal_statuses_map_to_repl() {
+        let mut cancelled = DevelopView::default();
+        end_review_turn(&mut cancelled, TurnStatus::Cancelled, None);
+        assert_eq!(cancelled.status, TurnStatus::Cancelled);
+
+        let mut failed = DevelopView::default();
+        end_review_turn(&mut failed, TurnStatus::Error, Some("boom".to_string()));
+        assert_eq!(failed.status, TurnStatus::Error);
+        assert_eq!(failed.error.as_deref(), Some("boom"));
     }
 }

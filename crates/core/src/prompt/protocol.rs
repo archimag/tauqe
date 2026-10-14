@@ -37,6 +37,12 @@ pub trait PromptProtocol: Send + Sync {
     /// Only commands corresponding to advertised capabilities are produced.
     fn decode(&self, raw_text: &str) -> Vec<LlmCommand>;
 
+    /// Renders protocol-specific instructions appended to the system prompt.
+    ///
+    /// The active protocol renders its own guidance directly, so prompt assembly
+    /// never reconstructs a protocol from its name.
+    fn system_instructions(&self, editable_paths: &[String]) -> String;
+
     /// Returns the active per-turn marker bound to this protocol, if any.
     ///
     /// Marker-bound protocols tag structural elements with a unique marker so
@@ -104,6 +110,10 @@ mod tests {
             vec![LlmCommand::Text {
                 content: raw_text.to_string(),
             }]
+        }
+
+        fn system_instructions(&self, _editable_paths: &[String]) -> String {
+            String::new()
         }
     }
 

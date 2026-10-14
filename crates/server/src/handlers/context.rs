@@ -110,6 +110,13 @@ pub async fn handle_context_add_pattern(req: Request, state: &Arc<AppState>) -> 
             }
         };
 
+    // Read the configurable batch limit before taking the context write lock so
+    // the two locks are never held at the same time.
+    let max_batch = {
+        let guard = state.config.lock().await;
+        guard.config.context.max_pattern_batch
+    };
+
     let repo_root = state.repo_root().await;
     let available_files = super::offload(move || {
         tauqe_core::git::list_repository_files(Some(repo_root.as_path()))
@@ -118,16 +125,22 @@ pub async fn handle_context_add_pattern(req: Request, state: &Arc<AppState>) -> 
     .map(|result| result.unwrap_or_default())
     .unwrap_or_default();
 
-    let (added_count, added_tokens, ctx_state) = {
+    let (added_count, added_tokens, truncated, ctx_state) = {
         let mut ctx = state.context.write().await;
         match ctx.add_files_by_pattern(
             &params.pattern,
             params.access,
             &available_files,
+            max_batch,
         ) {
-            Ok((items, tokens)) => {
+            Ok(outcome) => {
                 let state = ctx.get_state();
-                (items.len(), tokens, state)
+                (
+                    outcome.added_items.len(),
+                    outcome.added_tokens,
+                    outcome.truncated,
+                    state,
+                )
             }
             Err(err) => {
                 return Response {
@@ -151,6 +164,7 @@ pub async fn handle_context_add_pattern(req: Request, state: &Arc<AppState>) -> 
     let result = ContextAddPatternResult {
         added_count,
         added_tokens,
+        truncated,
         state: ctx_state,
     };
 

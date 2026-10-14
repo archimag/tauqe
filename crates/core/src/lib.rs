@@ -1,10 +1,11 @@
 #![cfg_attr(
     not(test),
-    warn(clippy::unwrap_used, clippy::expect_used, clippy::panic)
+    deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)
 )]
 
 pub use tauqe_protocol as protocol;
 
+pub(crate) mod blocking;
 pub mod config;
 pub mod context;
 pub(crate) mod docs;

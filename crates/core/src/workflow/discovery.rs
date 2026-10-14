@@ -70,17 +70,15 @@ pub fn reconcile_discovery_context(
     }
 
     // 2. Check files_token_budget limit
-    let current_tokens: usize = context_manager
-        .read_context_files()
-        .iter()
-        .map(|f| crate::prompt::estimate_tokens(&f.content))
-        .sum();
+    // Token estimates rely on cached context sizes and file metadata instead of
+    // reading full file contents, avoiding heavy blocking I/O on the async worker.
+    let current_tokens: usize = context_manager.get_state().total_estimated_tokens as usize;
 
     let mut new_tokens = 0usize;
     for path in &valid_new_files {
         let full_path = context_manager.repo_root().join(path);
-        if let Ok(content) = std::fs::read_to_string(&full_path) {
-            new_tokens += crate::prompt::estimate_tokens(&content);
+        if let Ok(meta) = std::fs::metadata(&full_path) {
+            new_tokens += crate::prompt::estimate_tokens_from_bytes(meta.len()) as usize;
         }
     }
 

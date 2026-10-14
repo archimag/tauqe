@@ -1,189 +1,272 @@
+use serde::Deserialize;
 use tauqe_protocol::{ReviewItem, ReviewItemStatus, ReviewSeverity};
 
-/// Parses raw markdown review output into structured `ReviewItem` instances.
-/// Uses a robust line-oriented state machine that handles slight formatting variances.
-pub fn parse_review_findings(raw_markdown: &str) -> Vec<ReviewItem> {
-    let mut items = Vec::new();
-    let mut current_id = 1u32;
+use crate::providers::{JsonSchemaDefinition, ResponseFormat};
 
-    let mut current_title: Option<String> = None;
-    let mut current_severity = ReviewSeverity::Warning;
-    let mut current_file_path: Option<String> = None;
-    let mut current_line_range: Option<(usize, usize)> = None;
-    let mut current_body_lines: Vec<String> = Vec::new();
-
-    let flush_item = |items: &mut Vec<ReviewItem>,
-                      id: &mut u32,
-                      title: &mut Option<String>,
-                      severity: ReviewSeverity,
-                      file_path: &mut Option<String>,
-                      line_range: &mut Option<(usize, usize)>,
-                      body_lines: &mut Vec<String>| {
-        if let Some(t) = title.take() {
-            let body = body_lines.join("\n").trim().to_string();
-            items.push(ReviewItem {
-                id: *id,
-                title: t,
-                severity,
-                status: ReviewItemStatus::Discussion,
-                model: None,
-                file_path: file_path.take(),
-                line_range: line_range.take(),
-                body,
-            });
-            *id += 1;
-            body_lines.clear();
-        }
-    };
-
-    for line in raw_markdown.lines() {
-        let trimmed = line.trim();
-
-        // Check for finding section headers:
-        // Examples: "## [CRITICAL] Race condition", "* [WARN] Inefficient clone", "### [SUGGESTION] Refactor"
-        if let Some((severity, title)) = parse_header_line(trimmed) {
-            flush_item(
-                &mut items,
-                &mut current_id,
-                &mut current_title,
-                current_severity,
-                &mut current_file_path,
-                &mut current_line_range,
-                &mut current_body_lines,
-            );
-            current_title = Some(title);
-            current_severity = severity;
-            continue;
-        }
-
-        // If inside an item, check for file metadata lines:
-        // Examples: "- **File**: src/main.rs:10-20", "- File: src/main.rs:15", ":FILE: src/main.rs"
-        if current_title.is_some() && current_file_path.is_none() {
-            if let Some((path, range)) = parse_file_line(trimmed) {
-                current_file_path = Some(path);
-                current_line_range = range;
-                continue;
+/// Strict JSON Schema for the review synthesis output.
+///
+/// Review synthesis never produces code changes, so it is a Structured Output
+/// operation (see `crates/core/Conventions.md`, section 2.2). Findings, severity
+/// classifications, and file locations are exchanged as machine-readable JSON
+/// instead of free-form markdown recovered by line heuristics.
+pub fn review_findings_response_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "summary": {
+                "type": "string",
+                "description": "High-level Markdown conclusion covering architectural integrity, concurrency and safety risks, error handling, and overall reliability, in the primary natural language of the user's instructions"
+            },
+            "findings": {
+                "type": "array",
+                "description": "Structured code review findings",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "title": {
+                            "type": "string",
+                            "description": "Concise finding title in the primary natural language of the user's instructions"
+                        },
+                        "severity": {
+                            "type": "string",
+                            "enum": ["critical", "warning", "suggestion", "info"],
+                            "description": "Finding severity: 'critical' (bug, panic, leak, or security flaw), 'warning' (architecture or runtime risk), 'suggestion' (cleanup or optimization), 'info' (general insight)"
+                        },
+                        "file_path": {
+                            "anyOf": [
+                                { "type": "string" },
+                                { "type": "null" }
+                            ],
+                            "description": "Repository-relative path of the affected file, or null when the finding is not file-specific"
+                        },
+                        "line_start": {
+                            "anyOf": [
+                                { "type": "integer" },
+                                { "type": "null" }
+                            ],
+                            "description": "1-based start line of the affected range, or null when unknown"
+                        },
+                        "line_end": {
+                            "anyOf": [
+                                { "type": "integer" },
+                                { "type": "null" }
+                            ],
+                            "description": "1-based end line of the affected range, or null when unknown"
+                        },
+                        "body": {
+                            "type": "string",
+                            "description": "Clear explanation of the problem, why it occurs, and concrete remediation advice"
+                        }
+                    },
+                    "required": ["title", "severity", "file_path", "line_start", "line_end", "body"],
+                    "additionalProperties": false
+                }
             }
-        }
+        },
+        "required": ["summary", "findings"],
+        "additionalProperties": false
+    })
+}
 
-        if current_title.is_some() {
-            // Strip leading "- **Details**:" prefix if present
-            let content_line = if let Some(rest) = trimmed.strip_prefix("- **Details**:") {
-                rest.trim()
-            } else if let Some(rest) = trimmed.strip_prefix("**Details**:") {
-                rest.trim()
+/// Builds the provider [`ResponseFormat`] that enforces the review JSON schema.
+pub fn review_findings_response_format() -> ResponseFormat {
+    ResponseFormat::JsonSchema {
+        json_schema: JsonSchemaDefinition {
+            name: "review_findings".to_string(),
+            description: Some(
+                "Structured code review findings with severity classification and file locations"
+                    .to_string(),
+            ),
+            schema: review_findings_response_schema(),
+            strict: Some(true),
+        },
+    }
+}
+
+/// Model-emitted review synthesis payload.
+///
+/// The `summary` field carries the reviewer's high-level Markdown narrative and
+/// is deserialized alongside the structured `findings` array.
+#[derive(Debug, Deserialize)]
+pub struct ReviewFindingsOutput {
+    #[serde(default)]
+    pub summary: String,
+    #[serde(default)]
+    pub findings: Vec<ReviewFindingOutput>,
+}
+
+/// A single model-emitted finding before server-side normalization.
+#[derive(Debug, Deserialize)]
+pub struct ReviewFindingOutput {
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub severity: ReviewSeverity,
+    #[serde(default)]
+    pub file_path: Option<String>,
+    #[serde(default)]
+    pub line_start: Option<usize>,
+    #[serde(default)]
+    pub line_end: Option<usize>,
+    #[serde(default)]
+    pub body: String,
+}
+
+/// Parses the model's review synthesis output into a high-level summary and
+/// structured findings.
+///
+/// The payload is decoded by deserializing strict JSON. Surrounding markdown
+/// code fences or wrapper prose are tolerated, but the payload itself must form
+/// a valid JSON document. The returned summary is `None` when the model produced
+/// no textual conclusion. When no structured payload can be recovered, the raw
+/// text is preserved as a single informational finding so review output is never
+/// silently discarded.
+pub fn parse_review_output(raw: &str) -> (Option<String>, Vec<ReviewItem>) {
+    match parse_findings_output(raw) {
+        Some(output) => {
+            let ReviewFindingsOutput { summary, findings } = output;
+            let items = findings
+                .into_iter()
+                .enumerate()
+                .map(|(index, finding)| ReviewItem {
+                    id: index as u32 + 1,
+                    title: normalize_title(finding.title, finding.severity),
+                    severity: finding.severity,
+                    status: ReviewItemStatus::Discussion,
+                    model: None,
+                    file_path: finding.file_path,
+                    line_range: combine_line_range(finding.line_start, finding.line_end),
+                    body: finding.body.trim().to_string(),
+                })
+                .collect();
+            (normalize_summary(summary), items)
+        }
+        None => {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                (None, Vec::new())
             } else {
-                line
-            };
-            if !content_line.is_empty() || !current_body_lines.is_empty() {
-                current_body_lines.push(content_line.to_string());
+                (
+                    None,
+                    vec![ReviewItem {
+                        id: 1,
+                        title: "General Review Findings".to_string(),
+                        model: None,
+                        severity: ReviewSeverity::Info,
+                        status: ReviewItemStatus::Discussion,
+                        file_path: None,
+                        line_range: None,
+                        body: trimmed.to_string(),
+                    }],
+                )
             }
         }
     }
-
-    // Flush last pending item
-    flush_item(
-        &mut items,
-        &mut current_id,
-        &mut current_title,
-        current_severity,
-        &mut current_file_path,
-        &mut current_line_range,
-        &mut current_body_lines,
-    );
-
-    // If no structured items were matched, treat the whole non-empty text as a single general item
-    if items.is_empty() {
-        let trimmed = raw_markdown.trim();
-        if !trimmed.is_empty() {
-            items.push(ReviewItem {
-                id: 1,
-                title: "General Review Findings".to_string(),
-                model: None,
-                severity: ReviewSeverity::Info,
-                status: ReviewItemStatus::Discussion,
-                file_path: None,
-                line_range: None,
-                body: trimmed.to_string(),
-            });
-        }
-    }
-
-    items
 }
 
-fn parse_header_line(trimmed: &str) -> Option<(ReviewSeverity, String)> {
-    if let Some(rest) = trimmed.strip_prefix("### ") {
-        parse_bracketed_severity(rest.trim())
-    } else if let Some(rest) = trimmed.strip_prefix("## ") {
-        parse_bracketed_severity(rest.trim())
+/// Parses the model's review synthesis output into structured `ReviewItem` instances.
+///
+/// Compatibility wrapper around [`parse_review_output`] that discards the
+/// high-level summary.
+pub fn parse_review_findings(raw: &str) -> Vec<ReviewItem> {
+    parse_review_output(raw).1
+}
+
+fn normalize_title(title: String, severity: ReviewSeverity) -> String {
+    let trimmed = title.trim();
+    if trimmed.is_empty() {
+        format!("{} Finding", severity)
     } else {
-        let rest = trimmed.strip_prefix("* [")?;
-        parse_bracketed_severity(&format!("[{}", rest))
+        trimmed.to_string()
     }
 }
 
-fn parse_bracketed_severity(text: &str) -> Option<(ReviewSeverity, String)> {
-    if !text.starts_with('[') {
-        return None;
-    }
-
-    let closing_idx = text.find(']')?;
-    let tag = text[1..closing_idx].trim().to_uppercase();
-    let rest_title = text[closing_idx + 1..].trim();
-
-    let title = rest_title
-        .strip_prefix(':')
-        .or_else(|| rest_title.strip_prefix('-'))
-        .unwrap_or(rest_title)
-        .trim()
-        .to_string();
-
-    let severity = match tag.as_str() {
-        "CRITICAL" | "ERROR" | "FATAL" => ReviewSeverity::Critical,
-        "WARN" | "WARNING" => ReviewSeverity::Warning,
-        "SUGGESTION" | "SUGGEST" | "IMPROVEMENT" => ReviewSeverity::Suggestion,
-        "INFO" | "NOTE" => ReviewSeverity::Info,
-        _ => ReviewSeverity::Warning,
-    };
-
-    if title.is_empty() {
-        Some((severity, format!("{:?} Finding", severity)))
+/// Trims a model-emitted summary, yielding `None` when it is empty.
+fn normalize_summary(summary: String) -> Option<String> {
+    let trimmed = summary.trim();
+    if trimmed.is_empty() {
+        None
     } else {
-        Some((severity, title))
+        Some(trimmed.to_string())
     }
 }
 
-fn parse_file_line(trimmed: &str) -> Option<(String, Option<(usize, usize)>)> {
-    let raw = trimmed
-        .strip_prefix("- **File**:")
-        .or_else(|| trimmed.strip_prefix("- **file**:"))
-        .or_else(|| trimmed.strip_prefix("- File:"))
-        .or_else(|| trimmed.strip_prefix("- file:"))
-        .or_else(|| trimmed.strip_prefix(":FILE:"))
-        .or_else(|| trimmed.strip_prefix("File:"))
-        .or_else(|| trimmed.strip_prefix("file:"))?;
+fn combine_line_range(start: Option<usize>, end: Option<usize>) -> Option<(usize, usize)> {
+    match (start, end) {
+        (Some(s), Some(e)) => Some((s, e.max(s))),
+        (Some(s), None) => Some((s, s)),
+        (None, Some(e)) => Some((e, e)),
+        (None, None) => None,
+    }
+}
 
-    let spec = raw.trim().trim_matches('`').trim();
-    if spec.is_empty() {
-        return None;
+/// Deserializes a review payload, tolerating code fences and wrapper prose.
+fn parse_findings_output(raw: &str) -> Option<ReviewFindingsOutput> {
+    let cleaned = strip_code_fence(raw);
+    if let Ok(output) = serde_json::from_str::<ReviewFindingsOutput>(cleaned) {
+        return Some(output);
     }
 
-    // Parse path:line or path:start-end
-    if let Some((path, lines)) = spec.rsplit_once(':') {
-        let trimmed_path = path.trim().to_string();
-        let trimmed_lines = lines.trim();
-        if let Some((start_s, end_s)) = trimmed_lines.split_once('-') {
-            if let (Ok(start), Ok(end)) = (start_s.trim().parse::<usize>(), end_s.trim().parse::<usize>()) {
-                return Some((trimmed_path, Some((start, end))));
+    let mut from = 0;
+    while let Some(rel) = raw[from..].find('{') {
+        let start = from + rel;
+        if let Some(end) = balanced_object_end(raw, start) {
+            if let Ok(output) = serde_json::from_str::<ReviewFindingsOutput>(&raw[start..end]) {
+                return Some(output);
             }
-        } else if let Ok(line) = trimmed_lines.parse::<usize>() {
-            return Some((trimmed_path, Some((line, line))));
         }
-        Some((trimmed_path, None))
-    } else {
-        Some((spec.to_string(), None))
+        from = start + 1;
     }
+    None
+}
+
+/// Returns the trimmed contents of the first markdown code fence, if present.
+fn strip_code_fence(raw: &str) -> &str {
+    let trimmed = raw.trim();
+    if let Some(idx) = trimmed.find("```json") {
+        let after = &trimmed[idx + 7..];
+        if let Some(end) = after.find("```") {
+            return after[..end].trim();
+        }
+    } else if let Some(idx) = trimmed.find("```") {
+        let after = &trimmed[idx + 3..];
+        if let Some(end) = after.find("```") {
+            return after[..end].trim();
+        }
+    }
+    trimmed
+}
+
+/// Returns the exclusive end offset of the JSON object starting at `start`, if complete.
+fn balanced_object_end(raw: &str, start: usize) -> Option<usize> {
+    let bytes = raw.as_bytes();
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut i = start;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if in_string {
+            match b {
+                b'\\' => i += 1,
+                b'"' => in_string = false,
+                _ => {}
+            }
+        } else {
+            match b {
+                b'"' => in_string = true,
+                b'{' | b'[' => depth += 1,
+                b'}' | b']' => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        return Some(i + 1);
+                    }
+                }
+                _ => {}
+            }
+        }
+        i += 1;
+    }
+    None
 }
 
 #[cfg(test)]
@@ -191,40 +274,77 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_parse_structured_review() {
-        let md = r#"
-## [CRITICAL] Race condition in state mutex
-- **File**: crates/server/src/state.rs:42-50
-- **Details**:
-Multiple background tasks acquire read locks concurrently while writing.
+    fn test_parse_structured_json_review() {
+        let raw = r#"{
+            "findings": [
+                {
+                    "title": "Race condition in state mutex",
+                    "severity": "critical",
+                    "file_path": "crates/server/src/state.rs",
+                    "line_start": 42,
+                    "line_end": 50,
+                    "body": "Multiple background tasks acquire read locks concurrently while writing."
+                },
+                {
+                    "title": "Inefficient string cloning",
+                    "severity": "warning",
+                    "file_path": "crates/tui/src/ui/wrap.rs",
+                    "line_start": 115,
+                    "line_end": 115,
+                    "body": "Cloning strings inside loop creates memory churn."
+                },
+                {
+                    "title": "Use SmallVec for items",
+                    "severity": "suggestion",
+                    "file_path": "crates/core/src/edits.rs",
+                    "line_start": null,
+                    "line_end": null,
+                    "body": "Can reduce heap allocations for small hunk counts."
+                }
+            ]
+        }"#;
 
-## [WARNING] Inefficient string cloning
-- **File**: crates/tui/src/ui/wrap.rs:115
-Cloning strings inside loop creates memory churn.
-
-### [SUGGESTION] Use SmallVec for items
-- **File**: crates/core/src/edits.rs
-Can reduce heap allocations for small hunk counts.
-"#;
-
-        let items = parse_review_findings(md);
+        let items = parse_review_findings(raw);
         assert_eq!(items.len(), 3);
 
+        assert_eq!(items[0].id, 1);
         assert_eq!(items[0].severity, ReviewSeverity::Critical);
         assert_eq!(items[0].title, "Race condition in state mutex");
-        assert_eq!(items[0].file_path.as_deref(), Some("crates/server/src/state.rs"));
+        assert_eq!(
+            items[0].file_path.as_deref(),
+            Some("crates/server/src/state.rs")
+        );
         assert_eq!(items[0].line_range, Some((42, 50)));
+        assert_eq!(items[0].status, ReviewItemStatus::Discussion);
         assert!(items[0].body.contains("Multiple background tasks"));
 
         assert_eq!(items[1].severity, ReviewSeverity::Warning);
         assert_eq!(items[1].title, "Inefficient string cloning");
-        assert_eq!(items[1].file_path.as_deref(), Some("crates/tui/src/ui/wrap.rs"));
         assert_eq!(items[1].line_range, Some((115, 115)));
 
         assert_eq!(items[2].severity, ReviewSeverity::Suggestion);
-        assert_eq!(items[2].title, "Use SmallVec for items");
-        assert_eq!(items[2].file_path.as_deref(), Some("crates/core/src/edits.rs"));
+        assert_eq!(
+            items[2].file_path.as_deref(),
+            Some("crates/core/src/edits.rs")
+        );
         assert_eq!(items[2].line_range, None);
+    }
+
+    #[test]
+    fn test_parse_review_findings_tolerates_fences_and_wrapper_prose() {
+        let raw = "Here is the review:\n```json\n{\"findings\":[{\"title\":\"Bug\",\"severity\":\"warning\",\"file_path\":null,\"line_start\":null,\"line_end\":null,\"body\":\"details\"}]}\n```\nHope this helps!";
+        let items = parse_review_findings(raw);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].title, "Bug");
+        assert_eq!(items[0].severity, ReviewSeverity::Warning);
+        assert_eq!(items[0].file_path, None);
+        assert_eq!(items[0].body, "details");
+    }
+
+    #[test]
+    fn test_parse_review_findings_empty_array_yields_no_items() {
+        let items = parse_review_findings("{\"findings\": []}");
+        assert!(items.is_empty());
     }
 
     #[test]
@@ -235,5 +355,107 @@ Can reduce heap allocations for small hunk counts.
         assert_eq!(items[0].title, "General Review Findings");
         assert_eq!(items[0].severity, ReviewSeverity::Info);
         assert_eq!(items[0].body, md);
+    }
+
+    #[test]
+    fn test_review_findings_schema_is_strict_and_non_recursive() {
+        let schema = review_findings_response_schema();
+        let text = schema.to_string();
+        assert!(
+            !text.contains("$ref"),
+            "schema must not contain recursive $ref"
+        );
+        assert_eq!(schema["additionalProperties"], serde_json::json!(false));
+        assert_eq!(schema["required"], serde_json::json!(["summary", "findings"]));
+        let required = schema["properties"]["findings"]["items"]["required"]
+            .as_array()
+            .unwrap();
+        assert_eq!(required.len(), 6);
+    }
+
+    #[test]
+    fn test_summary_is_first_schema_property() {
+        let schema = review_findings_response_schema();
+        let properties = schema["properties"]
+            .as_object()
+            .expect("properties object must exist");
+        let first_key = properties.keys().next().expect("first property must exist");
+        assert_eq!(first_key, "summary", "summary MUST be the first property");
+
+        let required = schema["required"].as_array().expect("required array");
+        assert_eq!(required[0], serde_json::json!("summary"));
+        assert_eq!(required[1], serde_json::json!("findings"));
+
+        let schema_str = serde_json::to_string(&schema).unwrap();
+        let summary_idx = schema_str.find("\"summary\"").expect("summary present");
+        let findings_idx = schema_str.find("\"findings\"").expect("findings present");
+        assert!(summary_idx < findings_idx);
+    }
+
+    #[test]
+    fn test_parse_review_output_extracts_summary_and_findings() {
+        let raw = r#"{
+            "summary": "The architecture is sound, but locking is racy.",
+            "findings": [
+                {
+                    "title": "Race condition",
+                    "severity": "critical",
+                    "file_path": "crates/server/src/state.rs",
+                    "line_start": 10,
+                    "line_end": 12,
+                    "body": "Lock ordering is inconsistent."
+                }
+            ]
+        }"#;
+
+        let (summary, items) = parse_review_output(raw);
+        assert_eq!(
+            summary.as_deref(),
+            Some("The architecture is sound, but locking is racy.")
+        );
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].title, "Race condition");
+        assert_eq!(items[0].severity, ReviewSeverity::Critical);
+        assert_eq!(items[0].line_range, Some((10, 12)));
+    }
+
+    #[test]
+    fn test_parse_review_output_blank_or_missing_summary_is_none() {
+        let (blank, blank_items) = parse_review_output(r#"{"summary":"   ","findings":[]}"#);
+        assert!(blank.is_none());
+        assert!(blank_items.is_empty());
+
+        let (missing, missing_items) = parse_review_output(r#"{"findings":[]}"#);
+        assert!(missing.is_none());
+        assert!(missing_items.is_empty());
+    }
+
+    #[test]
+    fn test_parse_review_output_unstructured_fallback_has_no_summary() {
+        let (summary, items) = parse_review_output("Just prose, no JSON payload.");
+        assert!(summary.is_none());
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].severity, ReviewSeverity::Info);
+    }
+
+    #[test]
+    fn test_parse_review_findings_wrapper_discards_summary() {
+        let raw = r#"{
+            "summary": "High-level conclusion.",
+            "findings": [
+                {
+                    "title": "Cloning in loop",
+                    "severity": "warning",
+                    "file_path": null,
+                    "line_start": null,
+                    "line_end": null,
+                    "body": "Avoid clones."
+                }
+            ]
+        }"#;
+        let items = parse_review_findings(raw);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].title, "Cloning in loop");
+        assert_eq!(items[0].severity, ReviewSeverity::Warning);
     }
 }

@@ -24,7 +24,7 @@ fn streaming_lines(review: &ReviewViewState, width: usize) -> Vec<Line<'static>>
     }
     if !review.content.is_empty() {
         lines.push(Line::from(Span::styled(
-            " Live Findings Draft:",
+            " Executive Summary:",
             Style::default().fg(Color::Green).bold(),
         )));
         let md = crate::markdown::render_markdown(
@@ -243,5 +243,140 @@ fn describe_review_row(row: &VisibleReviewRow) -> Vec<Span<'static>> {
             }
             spans
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::text::Line;
+
+    fn line_texts(lines: &[Line<'static>]) -> Vec<String> {
+        lines.iter().map(|line| line.to_string()).collect()
+    }
+
+    #[test]
+    fn streaming_lines_show_review_summary_header_with_markdown() {
+        let review = ReviewViewState {
+            content: "## Overview\n\nThe architecture is sound.\n\n- Point one\n- Point two"
+                .to_string(),
+            ..Default::default()
+        };
+
+        let lines = streaming_lines(&review, 80);
+        let texts = line_texts(&lines);
+
+        assert!(
+            texts.iter().any(|t| t.contains("Executive Summary:")),
+            "expected the Executive Summary header, got: {texts:?}"
+        );
+        assert!(
+            !texts.iter().any(|t| t.contains("Live Findings Draft:")),
+            "the legacy JSON draft header must be gone"
+        );
+        assert!(
+            texts.iter().any(|t| t.contains("The architecture is sound.")),
+            "expected the rendered Markdown summary body, got: {texts:?}"
+        );
+        assert!(
+            texts.iter().any(|t| t.contains("Point one")),
+            "expected Markdown list items to render, got: {texts:?}"
+        );
+        assert!(
+            !texts.iter().any(|t| t.contains('`') || t.contains('{')),
+            "raw JSON syntax must never leak into the streamed summary"
+        );
+    }
+
+    #[test]
+    fn streaming_lines_omit_summary_header_without_content() {
+        let review = ReviewViewState::default();
+
+        let lines = streaming_lines(&review, 80);
+        let texts = line_texts(&lines);
+
+        assert!(
+            !texts.iter().any(|t| t.contains("Executive Summary:")),
+            "the summary header must not appear without content"
+        );
+    }
+
+    #[test]
+    fn describe_review_row_surfaces_session_description() {
+        let row = VisibleReviewRow::SessionHeader {
+            session_id: "rev-1".to_string(),
+            title: "Architecture audit".to_string(),
+            description: Some("High level summary line.\nMore detail.".to_string()),
+            created_at: 0,
+            model: "reviewer-model".to_string(),
+            total: 2,
+            fixed: 0,
+            todo: 2,
+            in_progress: 0,
+            discussion: 0,
+            rejected: 0,
+            is_expanded: true,
+        };
+
+        let text: String = describe_review_row(&row)
+            .iter()
+            .map(|span| span.content.to_string())
+            .collect();
+
+        assert!(
+            text.contains("High level summary line."),
+            "expected the first description line in the info area, got: {text}"
+        );
+    }
+
+    #[test]
+    fn executive_summary_remains_visible_after_stream_completes() {
+        use tauqe_protocol::{ReviewItem, ReviewSeverity, ReviewSession, ReviewStatus};
+
+        let mut review = ReviewViewState {
+            running: true,
+            ..Default::default()
+        };
+        review.content.push_str("Streaming the summary...");
+
+        // The server finalizes the review session; the TUI stores it and leaves
+        // the streaming mode, so the persistent tree view takes over.
+        let session = ReviewSession {
+            id: "rev-1".to_string(),
+            title: "Audit".to_string(),
+            created_at: 0,
+            model: "reviewer".to_string(),
+            description: Some("## Executive overview\n\nThe architecture is sound.".to_string()),
+            user_prompt: None,
+            target_files: Vec::new(),
+            items: vec![ReviewItem {
+                id: 1,
+                title: "Finding".to_string(),
+                model: None,
+                severity: ReviewSeverity::Warning,
+                status: ReviewStatus::Todo,
+                file_path: None,
+                line_range: None,
+                body: String::new(),
+            }],
+            raw_markdown: String::new(),
+        };
+        review.set_session(session);
+
+        assert!(!review.running, "streaming must stop once the session is set");
+
+        let rows = review.flatten_rows();
+        let (lines, _offsets) =
+            compute_unified_review_lines(&rows, review.selected_index, 80, review.theme_mode);
+        let texts: Vec<String> = lines.iter().map(|line| line.to_string()).collect();
+
+        assert!(
+            texts.iter().any(|t| t.contains("Executive Summary:")),
+            "the Executive Summary block must remain visible after streaming, got: {texts:?}"
+        );
+        assert!(
+            texts.iter().any(|t| t.contains("The architecture is sound.")),
+            "the summary body must render in the session header, got: {texts:?}"
+        );
     }
 }

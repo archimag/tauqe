@@ -1,9 +1,10 @@
 use ratatui::layout::Rect;
 use tauqe_protocol::{
-    ContextState, ModelRef, ModelRole, ModelRolesSummary, ModelSelection, RepositoryState,
-    SystemStatusResult,
+    ContextState, ModelRef, ModelRole, ModelRolesSummary, ModelSelection, ReasoningEffort,
+    RepositoryState, SystemStatusResult,
 };
 
+use crate::components::model_selector::ModelSelector;
 use crate::components::ListSelector;
 use crate::config::TuiConfig;
 use crate::editor::InputEditor;
@@ -183,7 +184,7 @@ impl ModelChoice {
                     ModelRole::Scribe => roles.scribe.clone(),
                     ModelRole::Coder => roles.coder.clone(),
                     ModelRole::Architect => roles.architect.clone(),
-                    ModelRole::Advisor => roles.advisor.clone(),
+                    ModelRole::Primary => roles.primary.clone(),
                     ModelRole::Reviewer => roles.reviewer.clone(),
                 })
             }
@@ -191,12 +192,60 @@ impl ModelChoice {
     }
 }
 
+/// Structured identity of the model currently executing a turn.
+///
+/// Populated from the `model/started` event so the header can render the live
+/// model together with its semantic role while a turn owns the interface, and
+/// cleared once the turn settles. This keeps "what runs right now" in the
+/// header (an action surface) without duplicating server-side state.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RunningModel {
+    /// Wire model reference (`provider:name`).
+    pub model: String,
+    /// Semantic role that launched the turn, when it was role-driven.
+    pub role: Option<ModelRole>,
+    /// Configured human-readable alias, when one exists.
+    pub alias: Option<String>,
+    /// Effective reasoning effort, when one was requested.
+    pub effort: Option<ReasoningEffort>,
+}
+
+impl RunningModel {
+    /// Human-readable label for the header.
+    ///
+    /// The configured alias wins; otherwise the redundant `provider:` prefix is
+    /// dropped and the reasoning effort is appended when set (`name [effort]`).
+    pub fn label(&self) -> String {
+        if let Some(alias) = self.alias.as_deref() {
+            let trimmed = alias.trim();
+            if !trimmed.is_empty() {
+                return trimmed.to_string();
+            }
+        }
+        let short = self
+            .model
+            .split_once(':')
+            .map(|(_, name)| name)
+            .unwrap_or(self.model.as_str());
+        match self.effort {
+            Some(effort) => format!("{} [{}]", short, effort),
+            None => short.to_string(),
+        }
+    }
+}
+
+/// Compact display name of a concrete model, dropping the redundant
+/// `provider:` prefix so the pickers and the header share one formatting rule.
+pub fn compact_model_name(model: &ModelRef) -> &str {
+    &model.name
+}
+
 pub fn role_title(role: ModelRole) -> &'static str {
     match role {
         ModelRole::Scribe => "Scribe",
         ModelRole::Coder => "Coder",
         ModelRole::Architect => "Architect",
-        ModelRole::Advisor => "Advisor",
+        ModelRole::Primary => "Primary",
         ModelRole::Reviewer => "Reviewer",
     }
 }
@@ -206,7 +255,7 @@ pub fn role_badge(role: ModelRole) -> &'static str {
         ModelRole::Scribe => "[Scr]",
         ModelRole::Coder => "[Cod]",
         ModelRole::Architect => "[Arc]",
-        ModelRole::Advisor => "[Adv]",
+        ModelRole::Primary => "[Pri]",
         ModelRole::Reviewer => "[Rev]",
     }
 }
@@ -227,19 +276,34 @@ pub fn help_open_hint(primary: crate::config::PrimaryModifier) -> String {
     HELP_OPEN_CHORD.replace("C-", prefix)
 }
 
+/// Compact label for a model entry, preferring its alias when configured
+/// and falling back to `name [effort]` or bare `name`.
+pub fn compact_entry_label(entry: &tauqe_protocol::ModelEntry) -> String {
+    if let Some(alias) = entry.alias.as_deref() {
+        let trimmed = alias.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+    let short = compact_model_name(&entry.model);
+    match entry.effort {
+        Some(effort) => format!("{} [{}]", short, effort),
+        None => short.to_string(),
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SelectionDialogKind {
-    /// Quick menu: one row per semantic role plus `Others...`.
-    ModelRoles,
+    /// List of models configured for the Primary role.
+    PrimaryModels,
     /// Full list of available models.
     ModelCatalog,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SelectionItem {
-    Role(ModelRole, ModelRef),
+    Primary(tauqe_protocol::ModelEntry),
     Model(ModelRef),
-    Others,
 }
 
 #[derive(Debug, Clone)]
@@ -380,13 +444,35 @@ pub enum ViewMode {
 pub struct ReviewDialogState {
     pub files_count: usize,
     pub estimated_tokens: usize,
-    /// Concrete Reviewer-role model resolved from configuration for display.
-    pub reviewer_model: ModelRef,
-    /// Configured Reviewer reasoning effort, if any.
-    pub reviewer_effort: Option<tauqe_protocol::model::ReasoningEffort>,
+    /// Reviewer-role model selector: role badge, configured entries, cyclic
+    /// navigation, and the shared stepper presentation (c-1, c-2).
+    pub selector: ModelSelector,
     pub prompt_editor: InputEditor,
     /// Which action-bar button holds focus. Defaults to the safe `Cancel`.
     pub confirm_button: ConfirmDialogButton,
+}
+
+impl ReviewDialogState {
+    /// Builds a review launch dialog selecting among the configured
+    /// `reviewer_entries` for the Reviewer role.
+    pub fn new(
+        files_count: usize,
+        estimated_tokens: usize,
+        reviewer_entries: Vec<tauqe_protocol::ModelEntry>,
+    ) -> Self {
+        Self {
+            files_count,
+            estimated_tokens,
+            selector: ModelSelector::new(ModelRole::Reviewer, reviewer_entries, 0),
+            prompt_editor: InputEditor::default(),
+            confirm_button: ConfirmDialogButton::Cancel,
+        }
+    }
+
+    /// Currently selected reviewer entry, if any.
+    pub fn selected_entry(&self) -> Option<&tauqe_protocol::ModelEntry> {
+        self.selector.selected_entry()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -707,6 +793,8 @@ pub struct AppState {
     pub terminal_focused: bool,
     pub shift_tip_shown: bool,
     pub model_choice: ModelChoice,
+    /// Structured identity of the model currently executing a turn, if any.
+    pub running_model: Option<RunningModel>,
 }
 
 impl AppState {
@@ -762,6 +850,7 @@ impl AppState {
             terminal_focused: true,
             shift_tip_shown: false,
             model_choice: ModelChoice::default(),
+            running_model: None,
         }
     }
 
@@ -798,35 +887,35 @@ impl AppState {
         self.notify(text, NotificationLevel::Error, std::time::Duration::from_secs(6));
     }
 
-    /// Opens the model picker: the semantic role menu when roles are known,
-    /// otherwise the full catalog. Returns false when there is nothing to choose from.
+    /// Opens the primary model picker presenting models configured under
+    /// `[models.primary]`. Falls back to the full model catalog when no primary
+    /// entries are configured.
     pub fn open_model_dialog(&mut self) -> bool {
-        if let Some(roles) = &self.model_choice.roles {
-            let items = vec![
-                SelectionItem::Role(ModelRole::Scribe, roles.scribe.clone()),
-                SelectionItem::Role(ModelRole::Coder, roles.coder.clone()),
-                SelectionItem::Role(ModelRole::Architect, roles.architect.clone()),
-                SelectionItem::Role(ModelRole::Advisor, roles.advisor.clone()),
-                SelectionItem::Role(ModelRole::Reviewer, roles.reviewer.clone()),
-                SelectionItem::Others,
-            ];
-            let selected = match &self.model_choice.selection {
-                ModelSelection::Role(ModelRole::Scribe) => 0,
-                ModelSelection::Role(ModelRole::Coder) => 1,
-                ModelSelection::Role(ModelRole::Architect) => 2,
-                ModelSelection::Role(ModelRole::Advisor) => 3,
-                ModelSelection::Role(ModelRole::Reviewer) => 4,
-                _ => 5,
-            };
-            self.selection_dialog = Some(SelectionDialogState::new(
-                SelectionDialogKind::ModelRoles,
-                items,
-                selected,
-            ));
-            return true;
+        let entries = self
+            .model_choice
+            .roles
+            .as_ref()
+            .and_then(|r| r.entries.as_ref())
+            .map(|e| e.primary.clone())
+            .unwrap_or_default();
+
+        if entries.is_empty() {
+            return self.open_model_catalog();
         }
 
-        self.open_model_catalog()
+        let selected = match &self.model_choice.selection {
+            ModelSelection::Specific(m) => entries.iter().position(|e| &e.model == m).unwrap_or(0),
+            ModelSelection::Role(ModelRole::Primary) => 0,
+            _ => 0,
+        };
+
+        let items: Vec<SelectionItem> = entries.into_iter().map(SelectionItem::Primary).collect();
+        self.selection_dialog = Some(SelectionDialogState::new(
+            SelectionDialogKind::PrimaryModels,
+            items,
+            selected,
+        ));
+        true
     }
 
     /// Opens the full list of available models. Returns false when the list is empty.
@@ -1195,9 +1284,10 @@ mod tests {
                 scribe: ModelRef::openrouter("scribe-model"),
                 coder: ModelRef::openrouter("coder-model"),
                 architect: ModelRef::openrouter("architect-model"),
-                advisor: ModelRef::openrouter("advisor-model"),
+                primary: ModelRef::openrouter("primary-model"),
                 reviewer: ModelRef::openrouter("reviewer-model"),
                 efforts: None,
+                entries: None,
             }),
         };
 
@@ -1214,8 +1304,8 @@ mod tests {
             Some(ModelRef::openrouter("architect-model"))
         );
         assert_eq!(
-            choice.resolve(&ModelSelection::Role(ModelRole::Advisor)),
-            Some(ModelRef::openrouter("advisor-model"))
+            choice.resolve(&ModelSelection::Role(ModelRole::Primary)),
+            Some(ModelRef::openrouter("primary-model"))
         );
         assert_eq!(
             choice.resolve(&ModelSelection::Role(ModelRole::Reviewer)),
@@ -1224,25 +1314,35 @@ mod tests {
     }
 
     #[test]
-    fn test_open_model_dialog_prefers_roles() {
+    fn test_open_model_dialog_presents_primary_entries() {
         let mut state = test_state();
+        let primary_entry = tauqe_protocol::ModelEntry::new(
+            ModelRef::openrouter("primary-model"),
+            None,
+            Some("Primary Alias".to_string()),
+        );
         state.model_choice = ModelChoice {
-            selection: ModelSelection::Role(ModelRole::Coder),
+            selection: ModelSelection::Role(ModelRole::Primary),
             roles: Some(ModelRolesSummary {
                 scribe: ModelRef::openrouter("scribe-model"),
                 coder: ModelRef::openrouter("coder-model"),
                 architect: ModelRef::openrouter("architect-model"),
-                advisor: ModelRef::openrouter("advisor-model"),
+                primary: ModelRef::openrouter("primary-model"),
                 reviewer: ModelRef::openrouter("reviewer-model"),
                 efforts: None,
+                entries: Some(tauqe_protocol::ModelRolesEntries {
+                    primary: vec![primary_entry.clone()],
+                    ..Default::default()
+                }),
             }),
         };
 
         assert!(state.open_model_dialog());
         let dialog = state.selection_dialog.expect("dialog should be opened");
-        assert_eq!(dialog.kind, SelectionDialogKind::ModelRoles);
-        assert_eq!(dialog.items.len(), 6);
-        assert_eq!(dialog.selector.selected_index(), 1); // Coder is index 1
+        assert_eq!(dialog.kind, SelectionDialogKind::PrimaryModels);
+        assert_eq!(dialog.items.len(), 1);
+        assert_eq!(dialog.items[0], SelectionItem::Primary(primary_entry));
+        assert_eq!(dialog.selector.selected_index(), 0);
     }
 
     #[test]

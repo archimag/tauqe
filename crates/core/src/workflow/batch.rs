@@ -62,8 +62,10 @@ pub struct BatchStepOutcome {
     pub status: BatchStepStatus,
     /// Token usage reported for the step, when the transport provides it.
     pub usage: Option<ModelUsageInfo>,
-    /// Diagnostic message describing a failure, when present.
+    /// Failure diagnostic reported for a failed step, when present.
     pub error: Option<String>,
+    /// Block reason reported for a blocked step, when present.
+    pub blocked_reason: Option<String>,
 }
 
 impl BatchStepOutcome {
@@ -73,15 +75,17 @@ impl BatchStepOutcome {
             status: BatchStepStatus::Succeeded,
             usage: None,
             error: None,
+            blocked_reason: None,
         }
     }
 
-    /// Reports a failed step carrying a diagnostic message.
+    /// Reports a failed step carrying a failure diagnostic.
     pub fn failed(error: impl Into<String>) -> Self {
         Self {
             status: BatchStepStatus::Failed,
             usage: None,
             error: Some(error.into()),
+            blocked_reason: None,
         }
     }
 
@@ -90,7 +94,8 @@ impl BatchStepOutcome {
         Self {
             status: BatchStepStatus::Blocked,
             usage: None,
-            error: Some(reason.into()),
+            error: None,
+            blocked_reason: Some(reason.into()),
         }
     }
 
@@ -100,6 +105,7 @@ impl BatchStepOutcome {
             status: BatchStepStatus::Cancelled,
             usage: None,
             error: None,
+            blocked_reason: None,
         }
     }
 
@@ -125,7 +131,7 @@ pub struct BatchStepReport {
 }
 
 /// Aggregated token and cost usage for an entire batch run.
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct BatchUsage {
     /// Sum of prompt tokens across executed steps.
     pub prompt_tokens: u32,
@@ -134,16 +140,38 @@ pub struct BatchUsage {
     /// Sum of total tokens across executed steps.
     pub total_tokens: u32,
     /// Sum of reported cost across executed steps.
-    pub cost: f64,
+    ///
+    /// The total is known (`Some`) only while every executed step reports a
+    /// cost. As soon as one step omits it, the total becomes `None` so callers
+    /// can distinguish "cost unknown" from "cost is exactly zero".
+    pub cost: Option<f64>,
+}
+
+impl Default for BatchUsage {
+    fn default() -> Self {
+        Self {
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            total_tokens: 0,
+            cost: Some(0.0),
+        }
+    }
 }
 
 impl BatchUsage {
     /// Folds a single step's usage into the running totals.
+    ///
+    /// Token counters saturate. The cost total stays known only while every
+    /// accumulated step reports a cost; once a step omits it, the total
+    /// degrades to `None`.
     pub fn accumulate(&mut self, usage: &ModelUsageInfo) {
         self.prompt_tokens = self.prompt_tokens.saturating_add(usage.prompt_tokens);
         self.completion_tokens = self.completion_tokens.saturating_add(usage.completion_tokens);
         self.total_tokens = self.total_tokens.saturating_add(usage.total_tokens);
-        self.cost += usage.cost.unwrap_or(0.0);
+        self.cost = match (self.cost, usage.cost) {
+            (Some(total), Some(cost)) => Some(total + cost),
+            _ => None,
+        };
     }
 }
 
@@ -249,7 +277,7 @@ impl BatchExecution {
             }
 
             let status = outcome.status;
-            let block_reason = outcome.error.clone();
+            let block_reason = outcome.blocked_reason.clone();
             executed.push(BatchStepReport {
                 id: step.id.clone(),
                 outcome,
@@ -386,7 +414,34 @@ mod tests {
         assert_eq!(report.usage.prompt_tokens, 60);
         assert_eq!(report.usage.completion_tokens, 25);
         assert_eq!(report.usage.total_tokens, 85);
-        assert!((report.usage.cost - 0.06).abs() < 1e-9);
+        let cost = report.usage.cost.unwrap();
+        assert!((cost - 0.06).abs() < 1e-9);
+    }
+
+    #[tokio::test]
+    async fn marks_batch_cost_unknown_when_a_step_omits_it() {
+        let steps = make_steps(&["1", "2"]);
+        let mut executor = ScriptedExecutor::new(vec![
+            BatchStepOutcome::succeeded().with_usage(ModelUsageInfo {
+                prompt_tokens: 20,
+                completion_tokens: 8,
+                total_tokens: 28,
+                reasoning_tokens: None,
+                cached_tokens: None,
+                cost: None,
+            }),
+            BatchStepOutcome::succeeded().with_usage(usage(10, 5, 0.01)),
+        ]);
+        let (stream_tx, _stream_rx) = channel();
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+
+        let report = BatchExecution::new()
+            .run(&steps, &mut executor, &stream_tx, &cancel_rx)
+            .await;
+
+        assert!(report.is_success());
+        assert_eq!(report.usage.total_tokens, 43);
+        assert_eq!(report.usage.cost, None);
     }
 
     #[tokio::test]

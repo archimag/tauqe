@@ -1148,13 +1148,34 @@ pub async fn handle_plan_refine(req: Request, state: &Arc<AppState>) -> Response
         }
     };
 
-    let (provider, model, reasoning_effort, repomap_budget, max_discovery_rounds, files_token_budget) = {
+    let (
+        provider,
+        model,
+        reasoning_effort,
+        alias,
+        repomap_budget,
+        max_discovery_rounds,
+        files_token_budget,
+    ) = {
         let cfg = state.config.lock().await.config.clone();
-        let model = match custom_model {
-            Some(m) => cfg.resolve_model(&m),
+        // The architect role list is the single source for the planning model
+        // and its reasoning depth. Its base entry also carries the display alias
+        // reported to the client; an explicit model override replaces both.
+        let architect_entry = cfg
+            .models
+            .role_entries(ModelRole::Architect)
+            .into_iter()
+            .next();
+        let model = match &custom_model {
+            Some(m) => cfg.resolve_model(m),
             None => cfg.resolve_role(ModelRole::Architect),
         };
         let reasoning_effort = cfg.models.resolve_effort(ModelRole::Architect);
+        let alias = if custom_model.is_some() {
+            None
+        } else {
+            architect_entry.and_then(|entry| entry.alias)
+        };
         let provider = match resolve_architect_provider(state, &cfg, model.provider).await {
             Ok(p) => p,
             Err(err) => return Response::err(req.id, errors::NO_API_KEY, err),
@@ -1163,6 +1184,7 @@ pub async fn handle_plan_refine(req: Request, state: &Arc<AppState>) -> Response
             provider,
             model,
             reasoning_effort,
+            alias,
             cfg.context.repomap_token_budget,
             cfg.context.max_discovery_rounds,
             cfg.context.files_token_budget,
@@ -1178,6 +1200,9 @@ pub async fn handle_plan_refine(req: Request, state: &Arc<AppState>) -> Response
         params: serde_json::to_value(ModelStartedEvent {
             operation_id: op_id.clone(),
             model: model.to_string(),
+            role: Some(ModelRole::Architect),
+            alias,
+            effort: reasoning_effort,
             plan_context: None,
             is_batch: false,
         })
@@ -1713,18 +1738,28 @@ pub async fn handle_plan_replan(req: Request, state: &Arc<AppState>) -> Response
         }
     };
 
-    let (provider, model, reasoning_effort) = {
+    let (provider, model, reasoning_effort, alias) = {
         let cfg = state.config.lock().await.config.clone();
-        let model = match custom_model {
-            Some(m) => cfg.resolve_model(&m),
+        let architect_entry = cfg
+            .models
+            .role_entries(ModelRole::Architect)
+            .into_iter()
+            .next();
+        let model = match &custom_model {
+            Some(m) => cfg.resolve_model(m),
             None => cfg.resolve_role(ModelRole::Architect),
         };
         let reasoning_effort = cfg.models.resolve_effort(ModelRole::Architect);
+        let alias = if custom_model.is_some() {
+            None
+        } else {
+            architect_entry.and_then(|entry| entry.alias)
+        };
         let provider = match resolve_architect_provider(state, &cfg, model.provider).await {
             Ok(p) => p,
             Err(err) => return Response::err(req.id, errors::NO_API_KEY, err),
         };
-        (provider, model, reasoning_effort)
+        (provider, model, reasoning_effort, alias)
     };
 
     let op_id = format!("op-{}", crate::state::next_operation_id());
@@ -1734,6 +1769,9 @@ pub async fn handle_plan_replan(req: Request, state: &Arc<AppState>) -> Response
         params: serde_json::to_value(ModelStartedEvent {
             operation_id: op_id.clone(),
             model: model.to_string(),
+            role: Some(ModelRole::Architect),
+            alias,
+            effort: reasoning_effort,
             plan_context: None,
             is_batch: false,
         })
@@ -2224,8 +2262,10 @@ mod tests {
         PlanStorage::save_plan(dir.path(), &plan).unwrap();
 
         let mut config = tauqe_core::config::AppConfig::default();
-        config.models.architect = Some(tauqe_protocol::ModelRef::openrouter("test/architect-model").into());
-        config.models.advisor = Some(tauqe_protocol::ModelRef::openrouter("test/advisor-model"));
+        config.models.architect =
+            Some(vec![tauqe_protocol::ModelRef::openrouter("test/architect-model").into()]);
+        config.models.primary =
+            vec![tauqe_protocol::ModelRef::openrouter("test/primary-model").into()];
 
         let (out, _rx) = OutChannel::new();
         let (hist_tx, _hist_rx) = tokio::sync::mpsc::unbounded_channel();

@@ -44,6 +44,8 @@ pub enum HistoryEntry {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         files: Vec<String>,
         findings_count: usize,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        summary: Option<String>,
     },
 }
 
@@ -157,11 +159,34 @@ mod tests {
             user_prompt: Some("Focus on security".to_string()),
             files: vec!["crates/server/src/main.rs".to_string()],
             findings_count: 3,
+            summary: Some("The design is sound but locking is racy.".to_string()),
         };
         let json = entry.to_jsonl_line().unwrap();
         assert_eq!(
             json,
-            r#"{"type":"review","id":5,"model":"anthropic/claude-3.7-sonnet","user_prompt":"Focus on security","files":["crates/server/src/main.rs"],"findings_count":3}"#
+            r#"{"type":"review","id":5,"model":"anthropic/claude-3.7-sonnet","user_prompt":"Focus on security","files":["crates/server/src/main.rs"],"findings_count":3,"summary":"The design is sound but locking is racy."}"#
+        );
+
+        let parsed = HistoryEntry::from_jsonl_line(&json).unwrap();
+        assert_eq!(parsed, entry);
+    }
+
+    #[test]
+    fn test_review_serialization_omits_absent_summary() {
+        // Legacy records written before the summary field existed must still
+        // deserialize, and a review without a summary must not emit the key.
+        let entry = HistoryEntry::Review {
+            id: Some(1),
+            model: "test/model".to_string(),
+            user_prompt: None,
+            files: Vec::new(),
+            findings_count: 0,
+            summary: None,
+        };
+        let json = entry.to_jsonl_line().unwrap();
+        assert_eq!(
+            json,
+            r#"{"type":"review","id":1,"model":"test/model","findings_count":0}"#
         );
 
         let parsed = HistoryEntry::from_jsonl_line(&json).unwrap();

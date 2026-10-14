@@ -117,6 +117,7 @@ impl HistoryManager {
                 user_prompt,
                 files,
                 findings_count,
+                summary,
                 ..
             } => {
                 let mut text = format!(
@@ -127,6 +128,12 @@ impl HistoryManager {
                 );
                 if let Some(prompt) = user_prompt {
                     text.push_str(&format!("\nFocus: {}", prompt));
+                }
+                if let Some(summary) = summary {
+                    if !summary.trim().is_empty() {
+                        text.push_str("\n\n");
+                        text.push_str(summary.trim());
+                    }
                 }
                 UiHistoryItem {
                     id: final_id,
@@ -208,6 +215,7 @@ impl HistoryManager {
         &mut self,
         model: impl Into<String>,
         user_prompt: Option<String>,
+        summary: Option<String>,
         files: Vec<String>,
         findings_count: usize,
     ) -> Result<HistoryEntry> {
@@ -218,6 +226,7 @@ impl HistoryManager {
             user_prompt,
             files,
             findings_count,
+            summary,
         };
         self.storage.append_entry(&entry)?;
         self.notify_entry(&entry);
@@ -429,6 +438,25 @@ mod tests {
         assert_eq!(item4.kind, UiHistoryKind::System);
         assert!(item4.text.contains("a1b2c3d"));
         assert_eq!(item4.commit_hash, Some("a1b2c3d".to_string()));
+
+        // A review record maps its summary into the history item text so the
+        // analytical report survives the streaming turn.
+        let entry5 = HistoryEntry::Review {
+            id: Some(5),
+            model: "test/reviewer".to_string(),
+            user_prompt: Some("Focus on locking".to_string()),
+            files: vec!["src/lib.rs".to_string()],
+            findings_count: 2,
+            summary: Some("Locking is racy under load.".to_string()),
+        };
+        let item5 = HistoryManager::entry_to_ui_item(5, &entry5);
+        assert_eq!(item5.id, 5);
+        assert_eq!(item5.kind, UiHistoryKind::System);
+        assert!(item5.text.contains("2 findings"));
+        assert!(item5.text.contains("Focus on locking"));
+        assert!(item5.text.contains("Locking is racy under load."));
+        assert_eq!(item5.summary, Some("Review: 2 findings".to_string()));
+        assert_eq!(item5.files, vec!["src/lib.rs"]);
     }
 
     #[test]

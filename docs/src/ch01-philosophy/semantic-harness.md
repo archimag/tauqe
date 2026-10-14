@@ -30,7 +30,7 @@ Modern engineering workflows demand distinct cognitive strengths depending on th
 - **Scribe:** Dedicated to history compaction, session summarization, and Git squash commit messages. Requires high speed, concise output, and minimal token cost without complex code reasoning overhead.
 - **Coder:** Dedicated to patch generation, code editing, and toolchain verification healing. Specialized in syntactically sound diffs, surgical search/replace operations, and minimal blast radius. Owns the *How*.
 - **Architect:** Dedicated to conceptual design, plan refinement (`plan/refine`), and architectural reasoning. It defines system invariants and decomposition — the *What* — and does not produce concrete source lines.
-- **Advisor:** Dedicated to conversational engineering consultation, brainstorming, and interactive develop sessions with the human engineer.
+- **Primary:** The mandatory base role and the default active model. It drives interactive engineering dialogue and development sessions with the human engineer, and its first entry is the deterministic default for every specialized role that omits its own list.
 - **Reviewer:** Dedicated to analytical, read-only code inspection. It emits findings and never modifies files.
 
 ### The Rigid Architect/Coder Boundary and Intra-Role Escalation
@@ -39,28 +39,36 @@ The Architect/Coder boundary is deliberately rigid: the Architect defines the in
 
 Escalation is therefore **intra-role**. The *coder ladder* (`CoderTier`, each tier pairing a model with a reasoning effort) promotes execution to a stronger coder tier within the same *How* competence, governed by `auto_level_up`. The Architect remains an escalation target only for conceptual work — plan refinement and architectural reasoning — never for compile failures.
 
-### Deterministic Fallback Resolution
+### Mandatory Primary and List Inheritance
 
-TAUQE rejects speculative `default` configurations. A project configuration is valid as long as at least one semantic role is defined:
-- Any unconfigured role is deterministically inferred along a fixed proximity chain across the specified roles (e.g. resolving `coder` -> `advisor` -> `architect` -> `scribe`).
-- This invariant ensures zero configuration friction: teams can configure a purpose-tuned model per role for maximum efficiency, or specify a single model that predictably serves all roles.
+TAUQE rejects speculative `default` configurations and requires an explicit anchor. A project configuration is valid exactly when `models.primary` is present and lists at least one entry:
+- `primary` is the mandatory base role, and its first entry is the idle active model.
+- `coder`, `architect`, and `reviewer` are optional ordered lists. When a specialized role omits its own list, it inherits the entire `primary` list, so it never silently loses access to the configured models.
+- `scribe` is a single utility model that defaults to the first `primary` entry.
 
-### Role-Scoped Reasoning Depth
+This invariant ensures zero configuration friction: teams can attach a purpose-tuned list of models to each role for maximum efficiency, or specify a single `primary` model that predictably serves every role.
 
-Reasoning depth is configured **per semantic role**, never bound to a model name. The optional `[models.effort]` subsection of `tauqe.toml` stays fully orthogonal to model identity: `[models]` answers *who thinks*, while `[models.effort]` answers *how deeply it thinks*.
+### Reasoning Depth and Aliases per Entry
+
+Reasoning depth and human-readable aliases are attached **per model entry**, never bound to a model name. Each list entry is a `ModelEntry` that pairs a concrete model with an optional reasoning depth and an optional alias:
 
 - **Typed levels.** Effort is a strictly typed `ReasoningEffort` value (`low`, `medium`, `high`, `xhigh`), deserialized from lowercase strings rather than free-form text.
-- **Conservative defaults.** Any role omitted from the subsection falls back to the provider default, and the subsection itself is optional. Existing configurations remain 100% valid without edits, so role-scoped effort never forces a migration.
-- **Role reuse without duplication.** Because depth is role-scoped, the same concrete model can run shallowly in one role and deeply in another; there is no need to register a duplicate model entry per cognitive depth.
+- **Conservative defaults.** Effort is optional; an entry that omits it uses the provider default. Existing configurations remain 100% valid without edits.
+- **Role reuse without duplication.** Because depth is attached to the entry, the same concrete model can run shallowly in one role and deeply in another; there is no need to register a duplicate model entry per cognitive depth.
+- **Readable aliases.** An entry may carry an `alias` that replaces the raw model name wherever the model is presented, keeping cryptic provider identifiers out of the picker.
 
 ```toml
 [models]
-architect = "~google/gemini-pro-latest"
+primary = ["~google/gemini-flash-latest"]
 
-# Optional per-role reasoning depth; omitted roles use the provider default.
-[models.effort]
-architect = "xhigh"   # deep conceptual design and plan refinement
-coder = "medium"      # balanced patch generation and verification healing
+architect = [
+  { model = "~google/gemini-pro-latest", effort = "xhigh", alias = "Deep Architect" },
+]
+
+coder = [
+  "~deepseek/deepseek-flash-latest",
+  { model = "~anthropic/claude-sonnet-latest", effort = "medium" },
+]
 ```
 
 ### Contextual Routing
@@ -70,7 +78,7 @@ Core subsystems automatically dispatch tasks to their designated semantic role:
 - Batch plan step execution and code review remediation invoke **Coder**.
 - Plan refinement invokes **Architect**.
 - Review session creation and analytical inspection invoke **Reviewer**.
-- Interactive prompts in the Develop pane invoke **Advisor** (or the engineer's manual override).
+- Interactive prompts in the Develop pane invoke **Primary** (or the engineer's manual override).
 
 ---
 

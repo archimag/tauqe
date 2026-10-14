@@ -4,8 +4,6 @@ pub mod stream;
 pub mod xml;
 
 use crate::context::ContextFileContent;
-use crate::edits::protocol::create_edit_protocol;
-use crate::edits::EditProtocol;
 use crate::prompt::protocol::PromptProtocol;
 use crate::providers::ChatMessage;
 use tauqe_protocol::{ContextAccess, ModelRole, Plan, RepositoryState};
@@ -72,12 +70,23 @@ pub fn build_squash_commit_prompt(
     prompt
 }
 
+/// Estimates a token count from a raw byte length.
+///
+/// The whole engine shares a single heuristic of roughly four bytes per
+/// token. Basing the estimate on bytes keeps the on-disk sizing (only known
+/// in bytes) and the in-memory sizing consistent, so multi-byte UTF-8
+/// (Cyrillic, CJK, emoji) is never counted two to three times heavier by one
+/// code path than by another.
+pub fn estimate_tokens_from_bytes(byte_len: u64) -> u64 {
+    byte_len.div_ceil(4)
+}
+
+/// Estimates a token count for an in-memory string.
+///
+/// Delegates to [`estimate_tokens_from_bytes`] so that string content and
+/// file metadata share one consistent heuristic.
 pub fn estimate_tokens(text: &str) -> usize {
-    if text.is_empty() {
-        return 0;
-    }
-    // Heuristic: ~4 characters per token
-    text.chars().count().div_ceil(4)
+    estimate_tokens_from_bytes(text.len() as u64) as usize
 }
 
 pub struct PromptAssembly {
@@ -146,7 +155,7 @@ impl PromptAssembly {
         self
     }
 
-    pub fn build_system_prompt(&self, protocol: &dyn EditProtocol) -> String {
+    pub fn build_system_prompt(&self, protocol: &dyn PromptProtocol) -> String {
         let mut prompt = String::new();
         prompt.push_str("You are Tauqe AI, an expert programming assistant operating inside TAUQE (The Answer to the Ultimate Question of Engineering), an AI-native engineering control environment built on the literal harness paradigm.\n\n");
         prompt.push_str("## Core System Contract\n");
@@ -365,7 +374,7 @@ impl PromptAssembly {
     pub fn assemble_chat_messages(
         &self,
         current_prompt: &str,
-        protocol: &dyn EditProtocol,
+        protocol: &dyn PromptProtocol,
     ) -> Vec<ChatMessage> {
         let mut messages = Vec::new();
 
@@ -420,49 +429,12 @@ impl PromptAssembly {
         messages
     }
 
-    /// Builds the system prompt using the protocol-agnostic [`PromptProtocol`] abstraction.
-    ///
-    /// This bridging entry point resolves the protocol to its underlying edit
-    /// protocol and delegates to [`PromptAssembly::build_system_prompt`], keeping
-    /// the existing [`EditProtocol`]-based call sites fully backward compatible.
-    pub fn build_system_prompt_for(&self, protocol: &dyn PromptProtocol) -> String {
-        let edit_protocol = resolve_marked_edit_protocol(protocol);
-        self.build_system_prompt(edit_protocol.as_ref())
-    }
-
-    /// Assembles chat messages using the protocol-agnostic [`PromptProtocol`] abstraction.
-    ///
-    /// Bridging counterpart of [`PromptAssembly::assemble_chat_messages`] so the
-    /// core pipeline can migrate to [`PromptProtocol`] without breaking existing
-    /// callers.
-    pub fn assemble_chat_messages_for(
-        &self,
-        current_prompt: &str,
-        protocol: &dyn PromptProtocol,
-    ) -> Vec<ChatMessage> {
-        let edit_protocol = resolve_marked_edit_protocol(protocol);
-        self.assemble_chat_messages(current_prompt, edit_protocol.as_ref())
-    }
-}
-
-/// Resolves a [`PromptProtocol`] to its underlying [`EditProtocol`], preserving
-/// the active turn marker.
-///
-/// Dropping the marker here would emit unmarked system instructions and streams
-/// for a marker-bound turn, so the marker-bound variant is reconstructed
-/// whenever the protocol advertises one.
-fn resolve_marked_edit_protocol(protocol: &dyn PromptProtocol) -> Box<dyn EditProtocol> {
-    let base = create_edit_protocol(protocol.name());
-    match protocol.turn_marker() {
-        Some(marker) => base.with_turn_marker(marker).unwrap_or(base),
-        None => base,
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::edits::XmlEditProtocol;
+    use crate::prompt::xml::XmlPromptProtocol;
 
     #[test]
     fn test_build_squash_commit_prompt() {
@@ -512,7 +484,7 @@ mod tests {
     fn test_prompt_assembly_with_target_language() {
         let mut assembly = PromptAssembly::new(None, 1, vec![], "git", "xml", None, None);
         assembly.target_language = Some("Russian".to_string());
-        let proto = XmlEditProtocol;
+        let proto = XmlPromptProtocol;
         let messages = assembly.assemble_chat_messages("Привет", &proto);
         assert!(messages[0].content.contains("## Language Directive"));
         assert!(messages[0].content.contains("Target Response Language: Russian"));
@@ -529,7 +501,7 @@ mod tests {
         let history = Some("<history>\n{\"type\":\"summary\",\"text\":\"Initial\"}\n</history>".to_string());
         let repo_map = Some("crates/core/src/git.rs\n  pub fn get_repository_state()".to_string());
         let assembly = PromptAssembly::new(None, 1, files, "git", "xml", history, repo_map);
-        let proto = XmlEditProtocol;
+        let proto = XmlPromptProtocol;
         let messages = assembly.assemble_chat_messages("Explain this code", &proto);
 
         assert_eq!(messages.len(), 2);
@@ -556,7 +528,7 @@ mod tests {
         }];
         let mut assembly = PromptAssembly::new(None, 1, files, "git", "xml", None, None);
         assembly.is_discussion = true;
-        let proto = XmlEditProtocol;
+        let proto = XmlPromptProtocol;
         let messages = assembly.assemble_chat_messages("Let's discuss architecture", &proto);
         let sys = &messages[0].content;
 
@@ -572,12 +544,16 @@ mod tests {
         assert_eq!(estimate_tokens(""), 0);
         assert_eq!(estimate_tokens("abcd"), 1);
         assert_eq!(estimate_tokens("abcde"), 2);
-        assert_eq!(estimate_tokens("абвг"), 1);
+        // Multi-byte UTF-8 is sized by encoded byte length, not scalar count.
+        assert_eq!(estimate_tokens("абвг"), 2);
+        assert_eq!(estimate_tokens_from_bytes(0), 0);
+        assert_eq!(estimate_tokens_from_bytes(4), 1);
+        assert_eq!(estimate_tokens_from_bytes(5), 2);
     }
 
     #[test]
     fn test_prompt_assembly_isolated_step() {
-        let proto = XmlEditProtocol;
+        let proto = XmlPromptProtocol;
         let mut assembly = PromptAssembly::new(
             None,
             1,
@@ -607,7 +583,7 @@ mod tests {
 
     #[test]
     fn test_planning_prompt_instructions() {
-        let proto = XmlEditProtocol;
+        let proto = XmlPromptProtocol;
 
         // Develop mode
         let dev_assembly = PromptAssembly::new(None, 1, vec![], "git", "xml", None, None);
@@ -633,7 +609,7 @@ mod tests {
 
     #[test]
     fn test_prompt_assembly_discovery_instructions() {
-        let proto = XmlEditProtocol;
+        let proto = XmlPromptProtocol;
 
         let assembly = PromptAssembly::new(None, 1, vec![], "git", "xml", None, None);
         let prompt = assembly.build_system_prompt(&proto);
@@ -645,7 +621,7 @@ mod tests {
 
     #[test]
     fn test_prompt_assembly_with_turn_scratchpad() {
-        let proto = XmlEditProtocol;
+        let proto = XmlPromptProtocol;
         let mut assembly = PromptAssembly::new(None, 1, vec![], "git", "xml", None, None);
         assert!(assembly.format_scratchpad_block().is_none());
 
@@ -675,9 +651,8 @@ mod tests {
     }
 
     #[test]
-    fn test_prompt_assembly_prompt_protocol_bridge() {
+    fn test_prompt_assembly_renders_protocol_instructions() {
         use crate::prompt::json::JsonPromptProtocol;
-        use crate::prompt::xml::XmlPromptProtocol;
 
         let files = vec![ContextFileContent {
             path: "src/main.rs".to_string(),
@@ -686,41 +661,35 @@ mod tests {
         }];
         let assembly = PromptAssembly::new(None, 1, files, "git", "xml", None, None);
 
-        // The XML PromptProtocol bridges to the XML edit protocol.
+        // Each protocol renders its own edit reference directly instead of being
+        // reconstructed from its name.
         let xml = XmlPromptProtocol;
-        assert_eq!(
-            assembly.build_system_prompt_for(&xml),
-            assembly.build_system_prompt(&XmlEditProtocol)
-        );
+        let xml_prompt = assembly.build_system_prompt(&xml);
+        assert!(xml_prompt.contains("Code Modification Protocol (XML Edits)"));
 
-        // The structured PromptProtocol bridges to the structured edit protocol.
         let json = JsonPromptProtocol;
-        assert_eq!(
-            assembly.build_system_prompt_for(&json),
-            assembly.build_system_prompt(&crate::edits::protocol::StructuredEditProtocol)
-        );
+        let json_prompt = assembly.build_system_prompt(&json);
+        assert!(json_prompt.contains("Code Modification Protocol (Structured Output JSON)"));
 
-        // Chat assembly delegates equivalently and yields system + user messages.
-        let messages = assembly.assemble_chat_messages_for("Explain this code", &xml);
+        // Chat assembly yields system + user messages.
+        let messages = assembly.assemble_chat_messages("Explain this code", &xml);
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0].role, "system");
         assert_eq!(messages[1], ChatMessage::user("Explain this code"));
     }
 
     #[test]
-    fn test_prompt_assembly_bridge_preserves_turn_marker() {
-        use crate::prompt::xml::XmlPromptProtocol;
-
+    fn test_prompt_assembly_preserves_turn_marker() {
         let assembly = PromptAssembly::new(None, 1, vec![], "git", "xml", None, None);
         let marked = XmlPromptProtocol
             .with_turn_marker("M12345")
             .expect("marker-bound protocol");
 
-        let prompt = assembly.build_system_prompt_for(&*marked);
+        let prompt = assembly.build_system_prompt(&*marked);
         assert!(prompt.contains("<scratchpad_M12345>"));
         assert!(prompt.contains("</scratchpad_M12345>"));
 
-        let messages = assembly.assemble_chat_messages_for("Go", &*marked);
+        let messages = assembly.assemble_chat_messages("Go", &*marked);
         assert!(messages[0].content.contains("<scratchpad_M12345>"));
     }
 }

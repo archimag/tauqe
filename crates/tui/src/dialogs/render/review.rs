@@ -3,6 +3,7 @@ use ratatui::style::{Color, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 
+use crate::config::PrimaryModifier;
 use crate::ui::centered_rect;
 use super::editor_lines;
 
@@ -35,16 +36,11 @@ pub fn review_dialog_geometry(term: Rect) -> (Rect, Rect, Rect) {
     (area, confirm_btn, cancel_btn)
 }
 
-/// Human-readable label for the configured Reviewer reasoning effort, falling
-/// back to a neutral placeholder when the role inherits the provider default.
-fn effort_label(effort: Option<tauqe_protocol::model::ReasoningEffort>) -> String {
-    match effort {
-        Some(effort) => effort.to_string(),
-        None => "default".to_string(),
-    }
-}
-
-pub fn render_review_dialog(frame: &mut ratatui::Frame, dialog: &crate::app::ReviewDialogState) {
+pub fn render_review_dialog(
+    frame: &mut ratatui::Frame,
+    dialog: &crate::app::ReviewDialogState,
+    primary: PrimaryModifier,
+) {
     let area = review_dialog_geometry(frame.area()).0;
     frame.render_widget(Clear, area);
 
@@ -81,28 +77,24 @@ pub fn render_review_dialog(frame: &mut ratatui::Frame, dialog: &crate::app::Rev
                 Style::default().fg(Color::White).bold(),
             ),
         ]),
-        Line::from(vec![
-            Span::styled("  Reviewer: ", dim),
-            Span::styled(
-                dialog.reviewer_model.to_string(),
-                Style::default().fg(Color::Green).bold(),
-            ),
-            Span::styled("    Effort: ", dim),
-            Span::styled(
-                effort_label(dialog.reviewer_effort),
-                Style::default().fg(Color::White).bold(),
-            ),
-        ]),
-        Line::from(Span::styled(
-            "  Only file contents are sent: history and repo map are excluded.",
-            dim,
-        )),
-        Line::raw(""),
-        Line::from(Span::styled(
-            "  Additional review instructions (optional):",
-            Style::default().fg(Color::Cyan).bold(),
-        )),
     ];
+
+    // Single source of truth for the reviewer presentation: the shared
+    // ModelSelector stepper renders the role badge, the selected entry's
+    // display label, its reasoning effort, and the [X of Y] counter (c-2).
+    let mut model_spans = vec![Span::styled("  Reviewer: ", dim)];
+    model_spans.extend(dialog.selector.render_stepper_spans(primary));
+    lines.push(Line::from(model_spans));
+
+    lines.push(Line::from(Span::styled(
+        "  Only file contents are sent: history and repo map are excluded.",
+        dim,
+    )));
+    lines.push(Line::raw(""));
+    lines.push(Line::from(Span::styled(
+        "  Additional review instructions (optional):",
+        Style::default().fg(Color::Cyan).bold(),
+    )));
 
     if dialog.prompt_editor.is_empty() {
         lines.push(Line::from(vec![
@@ -135,6 +127,11 @@ pub fn render_review_dialog(frame: &mut ratatui::Frame, dialog: &crate::app::Rev
     } else {
         Style::default().bg(Color::Cyan).fg(Color::Black).bold()
     };
+    let nav_hint = if dialog.selector.len() > 1 {
+        "Tab / ←/→ focus • C-M switch model • Enter confirm • Esc cancel"
+    } else {
+        "Tab / ←/→ focus • Enter confirm • Esc cancel"
+    };
     let actions = vec![
         Line::from(vec![
             Span::styled(format!(" {} ", REVIEW_DIALOG_CONFIRM_LABEL), confirm_style),
@@ -142,7 +139,7 @@ pub fn render_review_dialog(frame: &mut ratatui::Frame, dialog: &crate::app::Rev
             Span::styled(format!(" {} ", REVIEW_DIALOG_CANCEL_LABEL), cancel_style),
         ]),
         Line::from(Span::styled(
-            "Tab / ←/→ focus • Enter confirm • Esc cancel",
+            nav_hint,
             Style::default().fg(Color::DarkGray),
         )),
     ];

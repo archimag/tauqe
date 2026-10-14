@@ -2,8 +2,9 @@ use std::collections::HashSet;
 
 use ratatui::style::{Color, Style, Stylize};
 use ratatui::text::{Line, Span};
-use tauqe_protocol::{ConceptItem, ModelSelection, Plan, PlanItem, PlanItemStatus};
+use tauqe_protocol::{ConceptItem, ModelEntry, ModelRole, Plan, PlanItem, PlanItemStatus};
 
+use crate::components::model_selector::ModelSelector;
 use crate::ui::wrap_lines;
 
 pub mod input;
@@ -78,10 +79,32 @@ impl VisiblePlanRow {
 pub struct PlanRefineDialogState {
     pub plan_id: String,
     pub plan_title: String,
-    pub models: Vec<(String, Option<ModelSelection>)>,
-    pub selected_model_index: usize,
+    pub selector: ModelSelector,
     pub instructions_editor: crate::editor::InputEditor,
     pub confirm_button: crate::app::ConfirmDialogButton,
+}
+
+impl PlanRefineDialogState {
+    /// Builds a plan refinement dialog selecting among the configured
+    /// `architect_entries` for the Architect role.
+    pub fn new(
+        plan_id: String,
+        plan_title: String,
+        architect_entries: Vec<ModelEntry>,
+    ) -> Self {
+        Self {
+            plan_id,
+            plan_title,
+            selector: ModelSelector::new(ModelRole::Architect, architect_entries, 0),
+            instructions_editor: crate::editor::InputEditor::default(),
+            confirm_button: crate::app::ConfirmDialogButton::Cancel,
+        }
+    }
+
+    /// Currently selected architect entry, if any.
+    pub fn selected_entry(&self) -> Option<&ModelEntry> {
+        self.selector.selected_entry()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -375,7 +398,7 @@ impl PlansViewState {
         self.scroll = new_scroll as u16;
     }
 
-    /// Accordion-style navigation: moves to the next or previous item in the plan hierarchy,
+    /// Accordion-style navigation: moves to the next or previous leaf item in the plan hierarchy,
     /// closing previous siblings/branches and opening the new target item.
     pub fn accordion_navigate(&mut self, forward: bool) {
         #[derive(Clone)]
@@ -387,113 +410,185 @@ impl PlansViewState {
             is_expandable: bool,
         }
 
-        fn collect_concept_nodes(
+        fn collect_concept_leaves(
             plan_id: &str,
             item: &ConceptItem,
             ancestors: &mut Vec<String>,
             out: &mut Vec<PlanNodeRef>,
         ) {
-            let has_children = !item.children.is_empty();
-            let has_details = item.details.as_deref().map(|s| !s.trim().is_empty()).unwrap_or(false);
-            let is_expandable = has_children || has_details;
-
-            out.push(PlanNodeRef {
-                plan_id: plan_id.to_string(),
-                item_id: Some(item.id.clone()),
-                is_concept: true,
-                ancestor_item_ids: ancestors.clone(),
-                is_expandable,
-            });
-
-            ancestors.push(item.id.clone());
-            for child in &item.children {
-                collect_concept_nodes(plan_id, child, ancestors, out);
+            if item.children.is_empty() {
+                let has_details =
+                    item.details.as_deref().map(|s| !s.trim().is_empty()).unwrap_or(false);
+                out.push(PlanNodeRef {
+                    plan_id: plan_id.to_string(),
+                    item_id: Some(item.id.clone()),
+                    is_concept: true,
+                    ancestor_item_ids: ancestors.clone(),
+                    is_expandable: has_details,
+                });
+            } else {
+                ancestors.push(item.id.clone());
+                for child in &item.children {
+                    collect_concept_leaves(plan_id, child, ancestors, out);
+                }
+                ancestors.pop();
             }
-            ancestors.pop();
         }
 
-        fn collect_plan_nodes(
+        fn collect_item_leaves(
             plan_id: &str,
             item: &PlanItem,
             ancestors: &mut Vec<String>,
             out: &mut Vec<PlanNodeRef>,
         ) {
-            let has_children = !item.children.is_empty();
-            let has_details = item.details.as_deref().map(|s| !s.trim().is_empty()).unwrap_or(false);
-            let has_meta = !item.files.is_empty()
-                || !item.readonly_files.is_empty()
-                || !item.concept_refs.is_empty();
-            let is_expandable = has_children || has_details || has_meta;
-
-            out.push(PlanNodeRef {
-                plan_id: plan_id.to_string(),
-                item_id: Some(item.id.clone()),
-                is_concept: false,
-                ancestor_item_ids: ancestors.clone(),
-                is_expandable,
-            });
-
-            ancestors.push(item.id.clone());
-            for child in &item.children {
-                collect_plan_nodes(plan_id, child, ancestors, out);
+            if item.children.is_empty() {
+                let has_details =
+                    item.details.as_deref().map(|s| !s.trim().is_empty()).unwrap_or(false);
+                let has_meta = !item.files.is_empty()
+                    || !item.readonly_files.is_empty()
+                    || !item.concept_refs.is_empty();
+                let is_expandable = has_details || has_meta;
+                out.push(PlanNodeRef {
+                    plan_id: plan_id.to_string(),
+                    item_id: Some(item.id.clone()),
+                    is_concept: false,
+                    ancestor_item_ids: ancestors.clone(),
+                    is_expandable,
+                });
+            } else {
+                ancestors.push(item.id.clone());
+                for child in &item.children {
+                    collect_item_leaves(plan_id, child, ancestors, out);
+                }
+                ancestors.pop();
             }
-            ancestors.pop();
         }
 
-        let mut all_nodes = Vec::new();
+        let mut leaves = Vec::new();
         for plan in &self.plans {
-            all_nodes.push(PlanNodeRef {
-                plan_id: plan.id.clone(),
-                item_id: None,
-                is_concept: false,
-                ancestor_item_ids: Vec::new(),
-                is_expandable: !plan.items.is_empty()
-                    || !plan.concept.is_empty()
-                    || plan.description.as_deref().map(|d| !d.trim().is_empty()).unwrap_or(false),
-            });
+            let mut plan_leaves = Vec::new();
 
             let mut concept_ancestors = Vec::new();
             for item in &plan.concept {
-                collect_concept_nodes(&plan.id, item, &mut concept_ancestors, &mut all_nodes);
+                collect_concept_leaves(&plan.id, item, &mut concept_ancestors, &mut plan_leaves);
             }
 
-            let mut plan_ancestors = Vec::new();
+            let mut item_ancestors = Vec::new();
             for item in &plan.items {
-                collect_plan_nodes(&plan.id, item, &mut plan_ancestors, &mut all_nodes);
+                collect_item_leaves(&plan.id, item, &mut item_ancestors, &mut plan_leaves);
             }
+
+            if plan_leaves.is_empty() {
+                plan_leaves.push(PlanNodeRef {
+                    plan_id: plan.id.clone(),
+                    item_id: None,
+                    is_concept: false,
+                    ancestor_item_ids: Vec::new(),
+                    is_expandable: plan
+                        .description
+                        .as_deref()
+                        .map(|d| !d.trim().is_empty())
+                        .unwrap_or(false),
+                });
+            }
+
+            leaves.extend(plan_leaves);
         }
 
-        if all_nodes.is_empty() {
+        if leaves.is_empty() {
             return;
         }
 
         let sel_row = self.selected_row();
-        let cur_idx = match sel_row {
-            Some(VisiblePlanRow::PlanHeader { plan_id, .. }) => {
-                all_nodes.iter().position(|n| n.plan_id == plan_id && n.item_id.is_none()).unwrap_or(0)
+        let target_idx = match sel_row {
+            Some(VisiblePlanRow::ConceptItem { ref plan_id, ref item_id, .. }) => {
+                if let Some(pos) = leaves.iter().position(|l| {
+                    l.plan_id == *plan_id && l.is_concept && l.item_id.as_deref() == Some(item_id)
+                }) {
+                    if forward {
+                        if pos + 1 < leaves.len() { pos + 1 } else { return; }
+                    } else if pos > 0 {
+                        pos - 1
+                    } else {
+                        return;
+                    }
+                } else {
+                    let first_descendant = leaves.iter().position(|l| {
+                        l.plan_id == *plan_id
+                            && l.is_concept
+                            && l.ancestor_item_ids.iter().any(|a| a == item_id)
+                    });
+                    if forward {
+                        if let Some(first) = first_descendant { first } else { return; }
+                    } else if let Some(first) = first_descendant {
+                        if first > 0 { first - 1 } else { return; }
+                    } else {
+                        return;
+                    }
+                }
             }
-            Some(VisiblePlanRow::ConceptItem { plan_id, item_id, .. }) => {
-                all_nodes.iter().position(|n| n.plan_id == plan_id && n.is_concept && n.item_id.as_deref() == Some(&item_id)).unwrap_or(0)
+            Some(VisiblePlanRow::PlanItem { ref plan_id, ref item_id, .. }) => {
+                if let Some(pos) = leaves.iter().position(|l| {
+                    l.plan_id == *plan_id && !l.is_concept && l.item_id.as_deref() == Some(item_id)
+                }) {
+                    if forward {
+                        if pos + 1 < leaves.len() { pos + 1 } else { return; }
+                    } else if pos > 0 {
+                        pos - 1
+                    } else {
+                        return;
+                    }
+                } else {
+                    let first_descendant = leaves.iter().position(|l| {
+                        l.plan_id == *plan_id
+                            && !l.is_concept
+                            && l.ancestor_item_ids.iter().any(|a| a == item_id)
+                    });
+                    if forward {
+                        if let Some(first) = first_descendant { first } else { return; }
+                    } else if let Some(first) = first_descendant {
+                        if first > 0 { first - 1 } else { return; }
+                    } else {
+                        return;
+                    }
+                }
             }
-            Some(VisiblePlanRow::PlanItem { plan_id, item_id, .. }) => {
-                all_nodes.iter().position(|n| n.plan_id == plan_id && !n.is_concept && n.item_id.as_deref() == Some(&item_id)).unwrap_or(0)
+            Some(VisiblePlanRow::ImplementationHeader { ref plan_id, .. }) => {
+                let first_impl = leaves.iter().position(|l| l.plan_id == *plan_id && !l.is_concept);
+                if forward {
+                    if let Some(first) = first_impl { first } else { return; }
+                } else if let Some(first) = first_impl {
+                    if first > 0 { first - 1 } else { return; }
+                } else {
+                    return;
+                }
             }
-            _ => 0,
+            Some(VisiblePlanRow::ConceptHeader { ref plan_id, .. }) => {
+                let first_concept = leaves.iter().position(|l| l.plan_id == *plan_id && l.is_concept);
+                if forward {
+                    if let Some(first) = first_concept { first } else { return; }
+                } else if let Some(first) = first_concept {
+                    if first > 0 { first - 1 } else { return; }
+                } else {
+                    return;
+                }
+            }
+            Some(VisiblePlanRow::PlanHeader { ref plan_id, .. }) => {
+                let first_in_plan = leaves.iter().position(|l| l.plan_id == *plan_id);
+                if forward {
+                    if let Some(first) = first_in_plan { first } else { return; }
+                } else if let Some(first) = first_in_plan {
+                    if first > 0 { first - 1 } else { return; }
+                } else {
+                    return;
+                }
+            }
+            None => {
+                if forward { 0 } else { leaves.len().saturating_sub(1) }
+            }
         };
 
-        let target_idx = if forward {
-            if cur_idx + 1 < all_nodes.len() {
-                cur_idx + 1
-            } else {
-                return;
-            }
-        } else if cur_idx > 0 {
-            cur_idx - 1
-        } else {
-            return;
-        };
-
-        let target = all_nodes[target_idx].clone();
+        let target = leaves[target_idx].clone();
 
         self.expanded_plans.clear();
         if target.item_id.is_some() {
@@ -503,21 +598,23 @@ impl PlansViewState {
         self.expanded_items.clear();
         self.collapsed_sections.clear();
 
-        if let Some(ref tid) = target.item_id {
-            if target.is_concept {
-                for anc in &target.ancestor_item_ids {
-                    self.expanded_items.insert(format!("c:{}:{}", target.plan_id, anc));
-                }
-                if target.is_expandable {
-                    self.expanded_items.insert(format!("c:{}:{}", target.plan_id, tid));
-                }
+        for anc in &target.ancestor_item_ids {
+            let key = if target.is_concept {
+                format!("c:{}:{}", target.plan_id, anc)
             } else {
-                for anc in &target.ancestor_item_ids {
-                    self.expanded_items.insert(format!("{}:{}", target.plan_id, anc));
-                }
-                if target.is_expandable {
-                    self.expanded_items.insert(format!("{}:{}", target.plan_id, tid));
-                }
+                format!("{}:{}", target.plan_id, anc)
+            };
+            self.expanded_items.insert(key);
+        }
+
+        if let Some(ref tid) = target.item_id {
+            if target.is_expandable {
+                let key = if target.is_concept {
+                    format!("c:{}:{}", target.plan_id, tid)
+                } else {
+                    format!("{}:{}", target.plan_id, tid)
+                };
+                self.expanded_items.insert(key);
             }
         }
 
@@ -1136,5 +1233,157 @@ mod tests {
         let raw = "Title\n line one\n\u{00A0}\n line three";
         let prepared = prepare_plan_markdown(raw);
         assert_eq!(prepared, "Title\nline one\n\nline three");
+    }
+
+    #[test]
+    fn test_accordion_navigation_navigates_strictly_across_leaves() {
+        let mut view = PlansViewState::default();
+        let plan = Plan {
+            id: "nested-plan".to_string(),
+            title: "Nested Plan".to_string(),
+            description: None,
+            created_at: 0,
+            updated_at: 0,
+            concept: vec![ConceptItem {
+                id: "c-1".to_string(),
+                title: "Concept Root".to_string(),
+                details: None,
+                children: vec![
+                    ConceptItem {
+                        id: "c-1.1".to_string(),
+                        title: "Concept Leaf 1".to_string(),
+                        details: None,
+                        children: vec![],
+                    },
+                    ConceptItem {
+                        id: "c-1.2".to_string(),
+                        title: "Concept Leaf 2".to_string(),
+                        details: None,
+                        children: vec![],
+                    },
+                ],
+            }],
+            items: vec![
+                PlanItem {
+                    id: "1".to_string(),
+                    title: "Parent Step 1".to_string(),
+                    details: None,
+                    status: PlanItemStatus::Todo,
+                    files: vec![],
+                    readonly_files: vec![],
+                    concept_refs: vec![],
+                    depends_on: vec![],
+                    children: vec![
+                        PlanItem {
+                            id: "1.1".to_string(),
+                            title: "Step 1.1 Leaf".to_string(),
+                            details: None,
+                            status: PlanItemStatus::Todo,
+                            files: vec![],
+                            readonly_files: vec![],
+                            concept_refs: vec![],
+                            depends_on: vec![],
+                            children: vec![],
+                        },
+                        PlanItem {
+                            id: "1.2".to_string(),
+                            title: "Step 1.2 Leaf".to_string(),
+                            details: None,
+                            status: PlanItemStatus::Todo,
+                            files: vec![],
+                            readonly_files: vec![],
+                            concept_refs: vec![],
+                            depends_on: vec![],
+                            children: vec![],
+                        },
+                    ],
+                },
+                PlanItem {
+                    id: "2".to_string(),
+                    title: "Parent Step 2".to_string(),
+                    details: None,
+                    status: PlanItemStatus::Todo,
+                    files: vec![],
+                    readonly_files: vec![],
+                    concept_refs: vec![],
+                    depends_on: vec![],
+                    children: vec![PlanItem {
+                        id: "2.1".to_string(),
+                        title: "Step 2.1 Leaf".to_string(),
+                        details: None,
+                        status: PlanItemStatus::Todo,
+                        files: vec![],
+                        readonly_files: vec![],
+                        concept_refs: vec![],
+                        depends_on: vec![],
+                        children: vec![],
+                    }],
+                },
+            ],
+        };
+        view.plans = vec![plan];
+
+        // 1. Initial navigation forward lands on the first leaf: c-1.1
+        view.accordion_navigate(true);
+        assert!(matches!(
+            view.selected_row(),
+            Some(VisiblePlanRow::ConceptItem { ref item_id, .. }) if item_id == "c-1.1"
+        ));
+
+        // 2. Next leaf in same concept parent: c-1.2
+        view.accordion_navigate(true);
+        assert!(matches!(
+            view.selected_row(),
+            Some(VisiblePlanRow::ConceptItem { ref item_id, .. }) if item_id == "c-1.2"
+        ));
+
+        // 3. At boundary of concept c-1, C-n ascends and descends to Implementation first leaf: 1.1 (skipping parent 1)
+        view.accordion_navigate(true);
+        assert!(matches!(
+            view.selected_row(),
+            Some(VisiblePlanRow::PlanItem { ref item_id, .. }) if item_id == "1.1"
+        ));
+
+        // 4. Next sibling leaf inside Step 1: 1.2
+        view.accordion_navigate(true);
+        assert!(matches!(
+            view.selected_row(),
+            Some(VisiblePlanRow::PlanItem { ref item_id, .. }) if item_id == "1.2"
+        ));
+
+        // 5. At boundary of Step 1, C-n ascends to Step 1 parent, finds Step 2, and descends into Step 2.1 leaf
+        view.accordion_navigate(true);
+        assert!(matches!(
+            view.selected_row(),
+            Some(VisiblePlanRow::PlanItem { ref item_id, .. }) if item_id == "2.1"
+        ));
+
+        // 6. At the last leaf of the entire tree, forward does not cycle
+        view.accordion_navigate(true);
+        assert!(matches!(
+            view.selected_row(),
+            Some(VisiblePlanRow::PlanItem { ref item_id, .. }) if item_id == "2.1"
+        ));
+
+        // 7. Backward navigation from 2.1 ascends to Step 2, moves to previous sibling Step 1 and descends to its last leaf: 1.2
+        view.accordion_navigate(false);
+        assert!(matches!(
+            view.selected_row(),
+            Some(VisiblePlanRow::PlanItem { ref item_id, .. }) if item_id == "1.2"
+        ));
+
+        // 8. Backward again: 1.1
+        view.accordion_navigate(false);
+        assert!(matches!(
+            view.selected_row(),
+            Some(VisiblePlanRow::PlanItem { ref item_id, .. }) if item_id == "1.1"
+        ));
+
+        // 9. Backward from 1.1 ascends out of Implementation into Concept's last leaf: c-1.2
+        view.accordion_navigate(false);
+        assert!(matches!(
+            view.selected_row(),
+            Some(VisiblePlanRow::ConceptItem { ref item_id, .. }) if item_id == "c-1.2"
+        ));
     }
 }

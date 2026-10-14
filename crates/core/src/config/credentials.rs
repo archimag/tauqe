@@ -1,13 +1,18 @@
 use std::path::{Path, PathBuf};
 
-use super::paths::{cli_arg_value, dirs_config, dirs_home};
+use super::paths::{dirs_config, dirs_home};
 use super::providers;
 use super::AppConfig;
 
 /// Default path for the credentials file following the deterministic resolution order.
-pub fn default_credentials_path(repo_root: Option<&Path>) -> PathBuf {
-    if let Some(cli_creds) = cli_arg_value("--credentials") {
-        return cli_creds;
+pub fn default_credentials_path(
+    repo_root: Option<&Path>,
+    explicit_credentials: Option<&Path>,
+) -> PathBuf {
+    if let Some(cli_creds) = explicit_credentials {
+        if !cli_creds.as_os_str().is_empty() {
+            return cli_creds.to_path_buf();
+        }
     }
     if let Some(cfg) = dirs_config() {
         return cfg.join("tauqe").join("credentials.toml");
@@ -32,7 +37,7 @@ pub(crate) fn apply_credentials(
 ) {
     let creds = explicit_credentials
         .and_then(providers::read_credentials_file)
-        .or_else(|| providers::load_credentials(repo_root));
+        .or_else(|| providers::load_credentials(repo_root, None));
 
     if let Some(creds) = creds {
         if let Some(or_creds) = creds.openrouter {

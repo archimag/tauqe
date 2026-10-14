@@ -53,6 +53,10 @@ pub struct ContextAddPatternParams {
 pub struct ContextAddPatternResult {
     pub added_count: usize,
     pub added_tokens: u64,
+    /// Set when the match set exceeded the configured batch limit and some
+    /// matching files were not added, so clients can surface the cap.
+    #[serde(default)]
+    pub truncated: bool,
     pub state: ContextState,
 }
 

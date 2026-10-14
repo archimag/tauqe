@@ -13,23 +13,28 @@ models = [
 
 [models]
 # Semantic model roles: specialized domain roles instead of generic difficulty tiers.
-# If any role is omitted, it is deterministically inferred via a proximity fallback chain.
-# At least one role must be defined.
+# `primary` is mandatory and must list at least one model; its first entry is the
+# active model in the idle state and the deterministic default for the other roles.
+# If coder, architect or reviewer are omitted, they inherit the entire primary list.
+# `scribe` is a single utility model and defaults to the first primary model.
+# Every entry accepts either a bare model string ("~provider/model") or a table
+# ({ model = "...", effort = "high", alias = "Alias" }). An optional `alias`
+# replaces the raw model name in the model picker; `effort` sets the reasoning
+# depth ("low", "medium", "high", "xhigh") for that entry.
+primary = [
+  "~google/gemini-flash-latest",
+]
 scribe = "~anthropic/claude-haiku-latest"    # history compaction, git squash commit messages, diff summarization
-advisor = "~google/gemini-flash-latest"      # interactive engineering dialogue, develop consultation
-# The coder value is polymorphic. A bare model string or a { model, effort } table
-# yields a one-rung ladder; an ordered array of such entries expresses an explicit
-# Coder Ladder, where each rung pairs a model with an optional reasoning depth.
-# Escalation can therefore first deepen reasoning on the same model and only then
-# switch to a stronger or more specialized one:
-#
+# The coder list is the natural escalation ladder (level up): on verification
+# healing stalls or exhausted retries the turn advances to the next coder entry,
+# saturating on the last one. Escalation stays strictly within the Coder role and
+# never switches to Architect, preserving the What vs How role isolation.
 coder = [
   "~deepseek/deepseek-flash-latest",
   { model = "~google/gemini-flash-latest", effort = "medium" }
 ]
-# architect and reviewer accept either a bare model string or a { model, effort } table:
-architect = { model = "~google/gemini-flash-latest", effort = "high" }    # conceptual design, plan refinement, blocked-step replanning
-reviewer = { model = "~google/gemini-flash-latest", effort = "high" }     # automated code review of active context files
+architect = [{ model = "~google/gemini-flash-latest", effort = "high" }]    # conceptual design, plan refinement, blocked-step replanning
+reviewer = [{ model = "~anthropic/claude-sonnet-latest", alias = "Sonnet" }]   # automated code review of active context files
 
 # Automatically escalate the Coder along its ladder when verification healing stalls,
 # when a patch retry budget is exceeded, or when a plan step must be re-prompted after
@@ -37,19 +42,6 @@ reviewer = { model = "~google/gemini-flash-latest", effort = "high" }     # auto
 # switches to Architect, preserving the strict What vs How role isolation. A terminal
 # <blocked> report short-circuits escalation entirely.
 auto_level_up = true
-
-# Optional per-role reasoning depth: "low", "medium", "high", or "xhigh".
-# Effort stays orthogonal to model identity: the same model may be driven at a
-# different depth depending on the role it plays. This section is the fallback for
-# roles that omit an inline effort: an effort declared directly in a role table
-# (for example reviewer = { model = "...", effort = "high" }) always takes
-# precedence, and roles with neither fall back to the provider default.
-[models.effort]
-# scribe = "low"        # cheap history compaction and commit message synthesis
-# coder = "medium"      # balanced patch generation and verification healing
-# architect = "high"    # deep conceptual design and plan refinement (set inline above)
-# advisor = "medium"    # interactive engineering dialogue
-# reviewer = "high"     # thorough automated code review (set inline above)
 
 [develop]
 # Retry budget for failed edit staging and for the plan step reprompt loop
@@ -60,12 +52,14 @@ max_retries = 5
 # protocol = "xml"   # active edit protocol: "xml" (default: "xml")
 
 [toolchain]
-# check_command = ""  # custom project verification command (auto-detected by default)
-# max_retries = 5     # maximum retry attempts for compiler/linter self-healing
-# auto_heal = false   # automatically trigger verification healing loop on check failures
+# check_command = ""   # custom project verification command (auto-detected by default)
+# max_retries = 5      # maximum retry attempts for compiler/linter self-healing
+# auto_heal = true     # automatically trigger the verification healing loop on check failures (default: true)
+# timeout_secs = 600   # wall-clock timeout in seconds for each verification command (default: 600)
 
 [git]
 # upstream = "origin/master"  # base upstream branch for calculating diffs (auto-detected by default)
+# bypass_hooks = true         # pass --no-verify so Tauqe commits skip project pre-commit/commit-msg hooks (default: true)
 
 [history]
 budget_tokens = 20000  # session history token budget before compaction is triggered (default: 20000)
@@ -75,6 +69,7 @@ budget_tokens = 20000  # session history token budget before compaction is trigg
 max_discovery_rounds = 8  # maximum rounds for autonomous context discovery
 files_token_budget = 300000  # token budget for files in active context (default: 300000)
 repomap_token_budget = 40000  # token budget for the repository map (default: 4000)
+# max_pattern_batch = 150  # maximum files added per glob pattern request (default: 150)
 pinned = [
     "Conventions.md",
     "Vision.md",

@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
-use super::paths::{cli_arg_value, dirs_config, dirs_home};
+use super::paths::{dirs_config, dirs_home};
 use super::AppConfig;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -44,13 +44,15 @@ pub fn has_openrouter_key(config: &AppConfig) -> bool {
         .unwrap_or(false)
 }
 
-pub fn find_credentials_file(repo_root: Option<&Path>) -> Option<PathBuf> {
-    let cli_path = cli_arg_value("--credentials");
+pub fn find_credentials_file(
+    repo_root: Option<&Path>,
+    explicit_credentials: Option<&Path>,
+) -> Option<PathBuf> {
     find_credentials_file_internal(
         repo_root,
         dirs_home().as_deref(),
         dirs_config().as_deref(),
-        cli_path.as_deref(),
+        explicit_credentials,
     )
 }
 
@@ -93,13 +95,15 @@ pub(crate) fn find_credentials_file_internal(
     candidates.into_iter().find(|p| p.is_file())
 }
 
-pub fn load_credentials(repo_root: Option<&Path>) -> Option<Credentials> {
-    let cli_path = cli_arg_value("--credentials");
+pub fn load_credentials(
+    repo_root: Option<&Path>,
+    explicit_credentials: Option<&Path>,
+) -> Option<Credentials> {
     load_credentials_internal(
         repo_root,
         dirs_home().as_deref(),
         dirs_config().as_deref(),
-        cli_path.as_deref(),
+        explicit_credentials,
     )
 }
 
@@ -129,46 +133,61 @@ pub fn read_credentials_file(path: &Path) -> Option<Credentials> {
     }
 }
 
-pub fn write_credentials_file(path: &Path, api_key: &str) -> std::io::Result<()> {
+/// Writes `content` to `path`, creating the file with owner-only permissions
+/// before any bytes are written so the secret is never briefly world-readable.
+fn write_private_file(path: &Path, content: &str) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent)?;
         }
     }
-    let content = format!("[openrouter]\napi_key = \"{}\"\n", api_key.trim());
-    std::fs::write(path, content)?;
 
     #[cfg(unix)]
     {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
         use std::os::unix::fs::PermissionsExt;
+
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        file.write_all(content.as_bytes())?;
+
+        // Tighten permissions on a pre-existing file that an earlier version
+        // may have created with a looser mode.
         let perms = std::fs::Permissions::from_mode(0o600);
         let _ = std::fs::set_permissions(path, perms);
+    }
+
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, content)?;
     }
 
     Ok(())
 }
 
+pub fn write_credentials_file(path: &Path, api_key: &str) -> std::io::Result<()> {
+    let credentials = Credentials {
+        openrouter: Some(OpenRouterCredentials {
+            api_key: Some(api_key.trim().to_string()),
+        }),
+    };
+    let content = toml::to_string(&credentials)
+        .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidInput, err))?;
+    write_private_file(path, &content)
+}
+
 pub fn write_credentials_stub(path: &Path) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)?;
-        }
-    }
     let content = r#"# Tauqe credentials
 # OpenRouter API key (get one at https://openrouter.ai/keys)
 [openrouter]
 api_key = "sk-or-v1-YOUR-KEY-HERE"
 "#;
-    std::fs::write(path, content)?;
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let perms = std::fs::Permissions::from_mode(0o600);
-        let _ = std::fs::set_permissions(path, perms);
-    }
-
-    Ok(())
+    write_private_file(path, content)
 }
 
 #[cfg(test)]
@@ -293,6 +312,34 @@ api_key = "sk-or-v1-secret-token"
             creds.openrouter.as_ref().and_then(|o| o.api_key.as_deref()),
             Some("sk-or-v1-YOUR-KEY-HERE")
         );
+    }
+
+    #[test]
+    fn test_write_credentials_file_escapes_special_characters() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let creds_path = temp_dir.path().join("credentials.toml");
+        let tricky_key = "sk-\"injected\"\napi_key = \"evil\"";
+
+        write_credentials_file(&creds_path, tricky_key).unwrap();
+
+        let creds = read_credentials_file(&creds_path).expect("credentials must round-trip");
+        assert_eq!(
+            creds.openrouter.as_ref().and_then(|o| o.api_key.as_deref()),
+            Some(tricky_key)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_write_credentials_file_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let creds_path = temp_dir.path().join("credentials.toml");
+        write_credentials_file(&creds_path, "sk-secret").unwrap();
+
+        let mode = std::fs::metadata(&creds_path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
     }
 
     #[test]

@@ -1,20 +1,46 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use tauqe_core::config::{load_config, AppConfig};
+use tauqe_core::config::{load_config_with_options, AppConfig, ConfigLoadOptions};
 use tauqe_core::edits::EditProtocolFactory;
 use tauqe_core::workflow::WorkflowFactory;
 use tauqe_protocol::{
-    events, ConfigSetParams, ConfigState, CredentialsSaveParams, Event, ModelSelection, Request,
-    Response, ResponseError, SystemStatusResult,
+    events, ConfigSetParams, ConfigState, CredentialsSaveParams, Event, ModelRole,
+    ModelRolesEffort, ModelRolesEntries, ModelRolesSummary, ModelSelection, Request, Response,
+    ResponseError, SystemStatusResult,
 };
 
 use crate::state::AppState;
 
+/// Builds the client-facing role summary, enriching each role's effective
+/// concrete model with the reasoning effort resolved from its role list.
+///
+/// Every role-bearing response and event carries this summary so a client can
+/// render each semantic role and its reasoning depth without re-reading the
+/// configuration.
+pub(crate) fn effective_roles_summary(cfg: &AppConfig) -> ModelRolesSummary {
+    let mut summary = cfg.roles_summary();
+    summary.efforts = Some(ModelRolesEffort {
+        scribe: cfg.models.resolve_effort(ModelRole::Scribe),
+        coder: cfg.models.resolve_effort(ModelRole::Coder),
+        architect: cfg.models.resolve_effort(ModelRole::Architect),
+        primary: cfg.models.resolve_effort(ModelRole::Primary),
+        reviewer: cfg.models.resolve_effort(ModelRole::Reviewer),
+    });
+    summary.entries = Some(ModelRolesEntries {
+        scribe: cfg.models.role_entries(ModelRole::Scribe),
+        coder: cfg.models.role_entries(ModelRole::Coder),
+        architect: cfg.models.role_entries(ModelRole::Architect),
+        primary: cfg.models.role_entries(ModelRole::Primary),
+        reviewer: cfg.models.role_entries(ModelRole::Reviewer),
+    });
+    summary
+}
+
 pub fn config_state(cfg: &AppConfig, selection: Option<&ModelSelection>) -> ConfigState {
     let sel = selection.cloned().unwrap_or_else(|| cfg.default_selection());
     let effective = cfg.resolve_model(&sel);
-    let roles = cfg.roles_summary();
+    let roles = effective_roles_summary(cfg);
     ConfigState {
         workflow: cfg.develop.workflow.clone(),
         edit_protocol: cfg.develop.protocol.clone(),
@@ -40,6 +66,36 @@ async fn resolved_repo_root(state: &Arc<AppState>) -> Option<PathBuf> {
     }
 }
 
+/// Returns the explicit `--config` and `--credentials` paths captured by the
+/// server binary at startup.
+///
+/// The core engine never reads process arguments; the binary parses them once
+/// and records them in the loaded [`AppConfig`] so every later reload keeps
+/// honoring the same overrides.
+pub(crate) async fn explicit_cli_paths(
+    state: &Arc<AppState>,
+) -> (Option<PathBuf>, Option<PathBuf>) {
+    let guard = state.config.lock().await;
+    (
+        guard.config.explicit_config_path.clone(),
+        guard.config.explicit_credentials_path.clone(),
+    )
+}
+
+/// Reloads configuration for `repo_root`, re-applying the explicit path
+/// overrides captured at startup.
+pub(crate) async fn reload_config_with_overrides(
+    state: &Arc<AppState>,
+    repo_root: Option<&Path>,
+) -> AppConfig {
+    let (explicit_config, explicit_credentials) = explicit_cli_paths(state).await;
+    load_config_with_options(ConfigLoadOptions {
+        repo_root,
+        explicit_config: explicit_config.as_deref(),
+        explicit_credentials: explicit_credentials.as_deref(),
+    })
+}
+
 /// Assembles the authoritative [`SystemStatusResult`] from a single source so
 /// derived fields such as `ready` (which requires both a Git repository and an
 /// API key) stay consistent across every status-producing handler.
@@ -56,31 +112,40 @@ fn build_system_status(
     let has_git = tauqe_core::git::is_git_repository(None);
     let has_api_key = tauqe_core::config::has_openrouter_key(cfg);
 
+    let explicit_config = cfg.explicit_config_path.as_deref();
+    let explicit_credentials = cfg.explicit_credentials_path.as_deref();
+
     let config_path = config_path.or_else(|| {
-        tauqe_core::config::find_config_file(repo_opt).map(|p| p.to_string_lossy().to_string())
+        tauqe_core::config::find_config_file(repo_opt, explicit_config)
+            .map(|p| p.to_string_lossy().to_string())
     });
     let credentials_path = credentials_path.or_else(|| {
-        tauqe_core::config::find_credentials_file(repo_opt).map(|p| p.to_string_lossy().to_string())
+        tauqe_core::config::find_credentials_file(repo_opt, explicit_credentials)
+            .map(|p| p.to_string_lossy().to_string())
     });
 
     SystemStatusResult {
         has_git,
         has_config: config_path.is_some(),
         config_path,
-        default_config_path: tauqe_core::config::default_config_path(repo_opt)
+        default_config_path: tauqe_core::config::default_config_path(repo_opt, explicit_config)
             .to_string_lossy()
             .to_string(),
         has_api_key,
         credentials_path,
-        default_credentials_path: tauqe_core::config::default_credentials_path(repo_opt)
-            .to_string_lossy()
-            .to_string(),
+        default_credentials_path: tauqe_core::config::default_credentials_path(
+            repo_opt,
+            explicit_credentials,
+        )
+        .to_string_lossy()
+        .to_string(),
         ready: has_git && has_api_key,
         model: cfg.resolve_model(selection),
         selection: Some(selection.clone()),
-        roles: Some(cfg.roles_summary()),
+        roles: Some(effective_roles_summary(cfg)),
         history_model: Some(cfg.history_model()),
         available_models: cfg.available_models(),
+        config_error: cfg.config_error.clone(),
     }
 }
 
@@ -287,7 +352,7 @@ pub async fn handle_config_reload(req: Request, state: &Arc<AppState>) -> Respon
     let repo_root = resolved_repo_root(state).await;
     let repo_opt = repo_root.as_deref();
 
-    let new_cfg = load_config(repo_opt);
+    let new_cfg = reload_config_with_overrides(state, repo_opt).await;
     let (updated_state, cur_sel_val) = {
         let mut guard = state.config.lock().await;
         guard.selection = new_cfg.default_selection();
@@ -324,7 +389,9 @@ pub async fn handle_config_create(req: Request, state: &Arc<AppState>) -> Respon
     let repo_root = resolved_repo_root(state).await;
     let repo_opt = repo_root.as_deref();
 
-    let target_path = tauqe_core::config::default_config_path(repo_opt);
+    let (explicit_config, _) = explicit_cli_paths(state).await;
+    let target_path =
+        tauqe_core::config::default_config_path(repo_opt, explicit_config.as_deref());
     if let Err(err) = tauqe_core::config::write_default_config(&target_path) {
         return Response {
             id: req.id,
@@ -337,7 +404,7 @@ pub async fn handle_config_create(req: Request, state: &Arc<AppState>) -> Respon
         };
     }
 
-    let new_cfg = load_config(repo_opt);
+    let new_cfg = reload_config_with_overrides(state, repo_opt).await;
     let (updated_state, cur_sel_val) = {
         let mut guard = state.config.lock().await;
         guard.selection = new_cfg.default_selection();
@@ -392,7 +459,9 @@ pub async fn handle_credentials_save(req: Request, state: &Arc<AppState>) -> Res
         };
     }
 
-    let target_path = tauqe_core::config::default_credentials_path(repo_opt);
+    let (_, explicit_credentials) = explicit_cli_paths(state).await;
+    let target_path =
+        tauqe_core::config::default_credentials_path(repo_opt, explicit_credentials.as_deref());
     if let Err(err) = tauqe_core::config::write_credentials_file(&target_path, api_key) {
         return Response {
             id: req.id,
@@ -408,7 +477,7 @@ pub async fn handle_credentials_save(req: Request, state: &Arc<AppState>) -> Res
         };
     }
 
-    let new_cfg = load_config(repo_opt);
+    let new_cfg = reload_config_with_overrides(state, repo_opt).await;
     let (updated_state, cur_sel_val) = {
         let mut guard = state.config.lock().await;
         guard.config = new_cfg;
@@ -432,7 +501,9 @@ pub async fn handle_credentials_create_stub(req: Request, state: &Arc<AppState>)
     let repo_root = resolved_repo_root(state).await;
     let repo_opt = repo_root.as_deref();
 
-    let target_path = tauqe_core::config::default_credentials_path(repo_opt);
+    let (_, explicit_credentials) = explicit_cli_paths(state).await;
+    let target_path =
+        tauqe_core::config::default_credentials_path(repo_opt, explicit_credentials.as_deref());
     if let Err(err) = tauqe_core::config::write_credentials_stub(&target_path) {
         return Response {
             id: req.id,
@@ -465,10 +536,12 @@ mod tests {
     async fn test_config_state_roles_and_scribe_history() {
         let mut cfg = AppConfig::default();
         cfg.models.scribe = Some(ModelRef::openrouter("anthropic/claude-3.5-haiku"));
-        cfg.models.coder = Some(ModelRef::openrouter("anthropic/claude-3.7-sonnet").into());
-        cfg.models.architect = Some(ModelRef::openrouter("anthropic/claude-3.7-sonnet").into());
-        cfg.models.advisor = Some(ModelRef::openrouter("google/gemini-2.5-flash"));
-        cfg.models.reviewer = Some(ModelRef::openrouter("anthropic/claude-3.7-sonnet").into());
+        cfg.models.coder = Some(vec![ModelRef::openrouter("anthropic/claude-3.7-sonnet").into()]);
+        cfg.models.architect =
+            Some(vec![ModelRef::openrouter("anthropic/claude-3.7-sonnet").into()]);
+        cfg.models.primary = vec![ModelRef::openrouter("google/gemini-2.5-flash").into()];
+        cfg.models.reviewer =
+            Some(vec![ModelRef::openrouter("anthropic/claude-3.7-sonnet").into()]);
 
         let st = config_state(&cfg, None);
         assert_eq!(
@@ -490,7 +563,7 @@ mod tests {
             ModelRef::openrouter("anthropic/claude-3.7-sonnet")
         );
         assert_eq!(
-            roles.advisor,
+            roles.primary,
             ModelRef::openrouter("google/gemini-2.5-flash")
         );
         assert_eq!(
@@ -503,7 +576,7 @@ mod tests {
     async fn test_handle_config_set_model_role_selection() {
         let mut cfg = AppConfig::default();
         cfg.models.scribe = Some(ModelRef::openrouter("model/scribe"));
-        cfg.models.coder = Some(ModelRef::openrouter("model/coder").into());
+        cfg.models.coder = Some(vec![ModelRef::openrouter("model/coder").into()]);
 
         let (out, _rx) = crate::transport::OutChannel::new();
         let (history_sender, _hrx) = tokio::sync::mpsc::unbounded_channel();

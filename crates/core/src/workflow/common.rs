@@ -82,7 +82,16 @@ pub async fn compact_history_if_needed_with_budget(
 
     match client_call.await {
         Ok(_) => {
-            let summary_text = collect_task.await.unwrap_or_default();
+            let summary_text = collect_task.await.map_err(|join_error| {
+                tracing::error!(
+                    "History compaction task terminated unexpectedly: {}",
+                    join_error
+                );
+                anyhow::anyhow!(
+                    "History compaction task terminated unexpectedly: {}",
+                    join_error
+                )
+            })?;
             let trimmed = summary_text.trim();
             if !trimmed.is_empty() {
                 history_manager.apply_compaction(trimmed, tail)?;
@@ -123,7 +132,12 @@ pub fn record_workflow_response(
             } else {
                 None
             };
-            let _ = history_manager.record_response(msg, None, summary, extra_files);
+            if let Err(err) = history_manager.record_response(msg, None, summary, extra_files) {
+                tracing::warn!(
+                    "Failed to record the assistant answer in session history: {}",
+                    err
+                );
+            }
         }
         ModelResult::Edit {
             summary,
@@ -172,12 +186,17 @@ pub fn record_workflow_response(
                 None
             };
 
-            let _ = history_manager.record_response(
+            if let Err(err) = history_manager.record_response(
                 &msg,
                 commit,
                 Some(summary.clone()),
                 files,
-            );
+            ) {
+                tracing::warn!(
+                    "Failed to record the assistant response in session history: {}",
+                    err
+                );
+            }
         }
     }
 }
@@ -348,7 +367,8 @@ mod tests {
         // Round 2: Prompt assembly injects scratchpad into next round
         let mut assembly = PromptAssembly::new(None, 1, vec![], "git", "xml", None, None);
         assembly.turn_scratchpad = pad1;
-        let messages = assembly.assemble_chat_messages("Continue", &proto);
+        let messages =
+            assembly.assemble_chat_messages("Continue", &crate::prompt::xml::XmlPromptProtocol);
         let prompt_text = &messages[0].content;
         assert!(prompt_text.contains("<scratchpad>"));
         assert!(prompt_text.contains("- Hypothesis: missing timeout field"));

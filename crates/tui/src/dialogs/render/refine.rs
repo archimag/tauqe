@@ -6,12 +6,14 @@ use ratatui::style::{Color, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 
+use crate::config::PrimaryModifier;
 use crate::ui::centered_rect;
 use super::{editor_lines, render_modal_confirm, ConfirmModalParams};
 
 pub fn render_plan_refine_dialog(
     frame: &mut ratatui::Frame,
     dialog: &crate::views::plans::PlanRefineDialogState,
+    primary: PrimaryModifier,
 ) {
     let area = centered_rect(68, 56, frame.area());
     frame.render_widget(Clear, area);
@@ -28,12 +30,13 @@ pub fn render_plan_refine_dialog(
         .constraints([Constraint::Length(5), Constraint::Min(6), Constraint::Length(3)])
         .split(inner_area);
 
-    let (model_label, _) = dialog
-        .models
-        .get(dialog.selected_model_index)
-        .cloned()
-        .unwrap_or_else(|| ("Default".to_string(), None));
     let dim = Style::default().fg(Color::DarkGray);
+
+    // Single source of truth for the architect presentation: the shared
+    // ModelSelector stepper renders the role badge, the selected entry's
+    // display label, its reasoning effort, and the [X of Y] counter (c-2).
+    let mut model_spans = vec![Span::styled(" Model: ", dim)];
+    model_spans.extend(dialog.selector.render_stepper_spans(primary));
 
     let header_lines = vec![
         Line::from(vec![
@@ -41,14 +44,7 @@ pub fn render_plan_refine_dialog(
             Span::styled(&dialog.plan_title, Style::default().bold().fg(Color::White)),
             Span::styled(format!(" [{}]", dialog.plan_id), dim),
         ]),
-        Line::from(vec![
-            Span::styled(" Model: ", dim),
-            Span::styled(
-                format!("◄ {} ►", model_label),
-                Style::default().fg(Color::Green).bold(),
-            ),
-            Span::styled("  (Tab / Shift+Tab to switch)", dim),
-        ]),
+        Line::from(model_spans),
         Line::from(Span::styled(
             " Decomposes high-level tasks into verified atomic engineering steps without altering agreed architecture.",
             dim,
@@ -87,6 +83,11 @@ pub fn render_plan_refine_dialog(
         ),
     };
 
+    let nav_hint = if dialog.selector.len() > 1 {
+        "Tab / ← / → switch button • C-M / Alt+M switch model • Enter execute focused • Esc cancel"
+    } else {
+        "Tab / ← / → switch button • Enter execute focused • Esc cancel"
+    };
     let actions = vec![
         Line::from(vec![
             Span::styled(" [ Start Refinement ] ", confirm_style),
@@ -94,7 +95,7 @@ pub fn render_plan_refine_dialog(
             Span::styled(" [ Cancel ] ", cancel_style),
         ]),
         Line::from(Span::styled(
-            "Tab / ← / → switch button • Enter execute focused • Esc cancel • ↑ / ↓ switch model",
+            nav_hint,
             Style::default().fg(Color::DarkGray),
         )),
     ];

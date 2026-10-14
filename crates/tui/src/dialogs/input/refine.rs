@@ -27,6 +27,16 @@ pub(super) async fn handle_refine_dialog(
     let has_shift = key.modifiers.contains(KeyModifiers::SHIFT);
     let has_alt = key.modifiers.contains(KeyModifiers::ALT);
 
+    // Model switching is unified through the shared selector: the C-M / Alt+M
+    // chord always switches, and the arrows browse the architect list while the
+    // instructions editor is empty, so vertical editor navigation stays intact
+    // once the editor holds text (c-1, c-3).
+    let editor_focused = !dialog.instructions_editor.is_empty();
+    if dialog.selector.handle_key(key, primary, editor_focused) {
+        st.plans_view.refine_dialog = Some(dialog);
+        return Ok(Some(InputResult::Continue));
+    }
+
     match key.code {
         KeyCode::Esc => Ok(Some(InputResult::Continue)),
         KeyCode::Left | KeyCode::Right | KeyCode::Tab | KeyCode::BackTab => {
@@ -34,22 +44,6 @@ pub(super) async fn handle_refine_dialog(
                 ConfirmDialogButton::Cancel => ConfirmDialogButton::Confirm,
                 ConfirmDialogButton::Confirm => ConfirmDialogButton::Cancel,
             };
-            st.plans_view.refine_dialog = Some(dialog);
-            Ok(Some(InputResult::Continue))
-        }
-        KeyCode::Up => {
-            let count = dialog.models.len();
-            if count > 0 {
-                dialog.selected_model_index = (dialog.selected_model_index + count - 1) % count;
-            }
-            st.plans_view.refine_dialog = Some(dialog);
-            Ok(Some(InputResult::Continue))
-        }
-        KeyCode::Down => {
-            let count = dialog.models.len();
-            if count > 0 {
-                dialog.selected_model_index = (dialog.selected_model_index + 1) % count;
-            }
             st.plans_view.refine_dialog = Some(dialog);
             Ok(Some(InputResult::Continue))
         }
@@ -65,9 +59,9 @@ pub(super) async fn handle_refine_dialog(
                 Some(instructions_raw)
             };
             let selected_model = dialog
-                .models
-                .get(dialog.selected_model_index)
-                .and_then(|(_, m)| m.clone());
+                .selector
+                .selected_entry()
+                .map(|entry| tauqe_protocol::ModelSelection::Specific(entry.model.clone()));
 
             let params = tauqe_protocol::PlanRefineParams {
                 plan_id: dialog.plan_id.clone(),

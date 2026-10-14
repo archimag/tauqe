@@ -3,7 +3,9 @@ use ratatui::style::{Color, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
-use crate::app::{role_badge, role_title, SelectionDialogKind, SelectionItem};
+use crate::app::{
+    compact_entry_label, compact_model_name, SelectionDialogKind, SelectionItem,
+};
 
 /// Select button label as drawn by [`render_selection_dialog`], including its
 /// surrounding `[ ]` decoration.
@@ -26,14 +28,13 @@ pub fn selection_dialog_area(term: Rect, item_count: usize) -> Rect {
     )
 }
 
-/// Row text for the model picker. Role rows carry their quick-select number and role badge.
+/// Row text for the model picker. Primary model rows carry their quick-select number and label.
 fn selection_item_label(item: &SelectionItem, index: usize) -> String {
     match item {
-        SelectionItem::Role(role, model) => {
-            format!("[{}] {} {:<9} {}", index + 1, role_badge(*role), role_title(*role), model)
+        SelectionItem::Primary(entry) => {
+            format!("[{}] {}", index + 1, compact_entry_label(entry))
         }
-        SelectionItem::Model(model) => model.to_string(),
-        SelectionItem::Others => format!("[{}] Others...  browse all models", index + 1),
+        SelectionItem::Model(model) => compact_model_name(model).to_string(),
     }
 }
 
@@ -83,7 +84,7 @@ pub fn render_selection_dialog(
     frame.render_widget(Clear, area);
 
     let title = match dialog.kind {
-        SelectionDialogKind::ModelRoles => " Select Model Role ".to_string(),
+        SelectionDialogKind::PrimaryModels => " Select Primary Model ".to_string(),
         SelectionDialogKind::ModelCatalog => format!(
             " Select Model ({}/{}) ",
             dialog.selector.selected_index() + 1,
@@ -108,7 +109,7 @@ pub fn render_selection_dialog(
         .split(inner_area);
 
     let intro = match dialog.kind {
-        SelectionDialogKind::ModelRoles => " Semantic roles map to [models] in tauqe.toml",
+        SelectionDialogKind::PrimaryModels => " Models configured under [models.primary] in tauqe.toml",
         SelectionDialogKind::ModelCatalog => " All available models",
     };
     frame.render_widget(
@@ -156,7 +157,7 @@ pub fn render_selection_dialog(
         ]),
         Line::from(Span::styled(
             match dialog.kind {
-                SelectionDialogKind::ModelRoles => "1-5 quick select roles • 6 Others • n/p navigate • Esc close",
+                SelectionDialogKind::PrimaryModels => "1-9 quick select • n/p navigate • Enter select • Esc close",
                 SelectionDialogKind::ModelCatalog => "n/p navigate • Enter select • Esc/q dismiss",
             },
             Style::default().fg(Color::DarkGray),
@@ -180,9 +181,9 @@ mod tests {
         let dialog = crate::app::SelectionDialogState::new(
             SelectionDialogKind::ModelCatalog,
             vec![
-                SelectionItem::Others,
-                SelectionItem::Others,
-                SelectionItem::Others,
+                SelectionItem::Model(tauqe_protocol::ModelRef::openrouter("model-1")),
+                SelectionItem::Model(tauqe_protocol::ModelRef::openrouter("model-2")),
+                SelectionItem::Model(tauqe_protocol::ModelRef::openrouter("model-3")),
             ],
             0,
         );

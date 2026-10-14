@@ -142,7 +142,7 @@ pub fn render_ui(frame: &mut ratatui::Frame, state: &mut AppState) {
         }
         Some(ActiveModal::Review) => {
             if let Some(dialog) = &state.review_dialog {
-                render_review_dialog(frame, dialog);
+                render_review_dialog(frame, dialog, state.tui_config.input.primary_modifier);
             }
         }
         Some(ActiveModal::ConfirmCancel) => render_confirm_cancel_popup(frame, state),
@@ -169,7 +169,7 @@ pub fn render_ui(frame: &mut ratatui::Frame, state: &mut AppState) {
         }
         Some(ActiveModal::RefineDialog) => {
             if let Some(dialog) = &state.plans_view.refine_dialog {
-                render_plan_refine_dialog(frame, dialog);
+                render_plan_refine_dialog(frame, dialog, state.tui_config.input.primary_modifier);
             }
         }
         Some(ActiveModal::RefineBlocked) => {

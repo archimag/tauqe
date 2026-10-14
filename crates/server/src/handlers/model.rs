@@ -77,9 +77,32 @@ pub async fn handle_model_select(req: Request, state: &Arc<AppState>) -> Respons
 
     let (selection, effective_model, roles) = {
         let mut guard = state.config.lock().await;
+        // Restrict the selection to the configured model pools: a role resolves
+        // to its base model and an explicit model must already be configured,
+        // so a client can only activate a model it was offered.
+        let effective = guard.config.resolve_model(&params.selection);
+        let available = guard.config.available_models();
+        if !available.contains(&effective) {
+            return Response {
+                id: req.id,
+                result: None,
+                error: Some(ResponseError {
+                    code: "INVALID_MODEL".to_string(),
+                    message: format!(
+                        "Unknown model '{}'. Available models: {}",
+                        effective,
+                        available
+                            .iter()
+                            .map(ToString::to_string)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                    data: None,
+                }),
+            };
+        }
         guard.selection = params.selection.clone();
-        let effective = guard.config.resolve_model(&guard.selection);
-        let roles = guard.config.roles_summary();
+        let roles = crate::handlers::config::effective_roles_summary(&guard.config);
         (guard.selection.clone(), effective, roles)
     };
 
@@ -108,7 +131,7 @@ pub async fn handle_model_current(req: Request, state: &Arc<AppState>) -> Respon
     let selection = guard.selection.clone();
     let effective_model = guard.config.resolve_model(&selection);
     let available_models = guard.config.available_models();
-    let roles = guard.config.roles_summary();
+    let roles = crate::handlers::config::effective_roles_summary(&guard.config);
 
     Response::ok_typed(
         req.id,
@@ -257,11 +280,25 @@ async fn prepare_turn(
 
     let op_id = format!("op-{}", next_operation_id());
 
+    let role = match &selection {
+        tauqe_protocol::ModelSelection::Role(r) => Some(*r),
+        tauqe_protocol::ModelSelection::Specific(_) => None,
+    };
+    // Report the running model as structured data: the configured alias (when
+    // present) and the effective reasoning effort, so the client can render the
+    // active role and model without re-deriving them from configuration.
+    let entry = resolve_model_entry(&app_config, &selection);
+    let alias = entry.as_ref().and_then(|entry| entry.alias.clone());
+    let effort = reasoning_effort.or_else(|| entry.as_ref().and_then(|entry| entry.effort));
+
     state.out.send_event(&Event {
         method: events::MODEL_STARTED.to_string(),
         params: serde_json::to_value(ModelStartedEvent {
             operation_id: op_id.clone(),
             model: model.to_string(),
+            role,
+            alias,
+            effort,
             plan_context,
             is_batch,
         })
@@ -273,7 +310,7 @@ async fn prepare_turn(
         model,
         app_config,
         selection,
-        reasoning_effort,
+        reasoning_effort: effort,
         op_id,
         operation,
         marker,
@@ -949,6 +986,33 @@ pub async fn handle_model_clear_history(req: Request, state: &Arc<AppState>) -> 
     }
 }
 
+/// Resolves the configured role entry backing a turn's model selection.
+///
+/// A role selection maps to the base entry of that role's list. An explicit
+/// selection (such as a coder escalation rung) carries no role of its own, so
+/// its entry is recovered by matching the resolved model against the configured
+/// role lists, which is where escalation rungs come from.
+fn resolve_model_entry(
+    config: &tauqe_core::config::AppConfig,
+    selection: &tauqe_protocol::ModelSelection,
+) -> Option<tauqe_protocol::ModelEntry> {
+    match selection {
+        tauqe_protocol::ModelSelection::Role(role) => {
+            config.models.role_entries(*role).into_iter().next()
+        }
+        tauqe_protocol::ModelSelection::Specific(model) => [
+            tauqe_protocol::ModelRole::Primary,
+            tauqe_protocol::ModelRole::Coder,
+            tauqe_protocol::ModelRole::Architect,
+            tauqe_protocol::ModelRole::Reviewer,
+            tauqe_protocol::ModelRole::Scribe,
+        ]
+        .into_iter()
+        .flat_map(|role| config.models.role_entries(role))
+        .find(|entry| &entry.model == model),
+    }
+}
+
 fn accumulate_usage(accum: &mut Option<ModelUsageInfo>, new_usage: ModelUsageInfo) {
     if let Some(existing) = accum.as_mut() {
         // Token counters come from untrusted provider usage reports and add up
@@ -1140,10 +1204,13 @@ mod tests {
         let (hist_tx, _hist_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut config = tauqe_core::config::AppConfig::default();
         config.models.scribe = Some(tauqe_protocol::ModelRef::openrouter("test/scribe"));
-        config.models.coder = Some(tauqe_protocol::ModelRef::openrouter("test/coder").into());
-        config.models.architect = Some(tauqe_protocol::ModelRef::openrouter("test/architect").into());
-        config.models.advisor = Some(tauqe_protocol::ModelRef::openrouter("test/advisor"));
-        config.models.reviewer = Some(tauqe_protocol::ModelRef::openrouter("test/reviewer").into());
+        config.models.coder =
+            Some(vec![tauqe_protocol::ModelRef::openrouter("test/coder").into()]);
+        config.models.architect =
+            Some(vec![tauqe_protocol::ModelRef::openrouter("test/architect").into()]);
+        config.models.primary = vec![tauqe_protocol::ModelRef::openrouter("test/primary").into()];
+        config.models.reviewer =
+            Some(vec![tauqe_protocol::ModelRef::openrouter("test/reviewer").into()]);
 
         let state = AppState::new(
             config,
@@ -1152,7 +1219,7 @@ mod tests {
             out,
         );
 
-        // 1. Initial selection defaults to Advisor
+        // 1. Initial selection defaults to Primary
         let req_current = Request {
             id: tauqe_protocol::RequestId::Number(1),
             method: tauqe_protocol::methods::MODEL_CURRENT.to_string(),
@@ -1164,13 +1231,13 @@ mod tests {
             serde_json::from_value(res_current.result.unwrap()).unwrap();
         assert_eq!(
             current_val.selection,
-            tauqe_protocol::ModelSelection::Role(tauqe_protocol::ModelRole::Advisor)
+            tauqe_protocol::ModelSelection::Role(tauqe_protocol::ModelRole::Primary)
         );
         let roles = current_val.roles.unwrap();
         assert_eq!(roles.scribe, tauqe_protocol::ModelRef::openrouter("test/scribe"));
         assert_eq!(roles.coder, tauqe_protocol::ModelRef::openrouter("test/coder"));
         assert_eq!(roles.architect, tauqe_protocol::ModelRef::openrouter("test/architect"));
-        assert_eq!(roles.advisor, tauqe_protocol::ModelRef::openrouter("test/advisor"));
+        assert_eq!(roles.primary, tauqe_protocol::ModelRef::openrouter("test/primary"));
         assert_eq!(roles.reviewer, tauqe_protocol::ModelRef::openrouter("test/reviewer"));
 
         // 2. Select Coder role
@@ -1194,7 +1261,7 @@ mod tests {
             tauqe_protocol::ModelRef::openrouter("test/coder")
         );
         let selected_roles = select_val.roles.unwrap();
-        assert_eq!(selected_roles.advisor, tauqe_protocol::ModelRef::openrouter("test/advisor"));
+        assert_eq!(selected_roles.primary, tauqe_protocol::ModelRef::openrouter("test/primary"));
     }
 
     #[tokio::test]

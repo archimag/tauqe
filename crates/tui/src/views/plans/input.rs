@@ -383,27 +383,41 @@ pub async fn handle_plans_key(
             if let Some(row) = sel_row {
                 let plan_id = row.plan_id().to_string();
                 if let Some(plan) = st.plans_view.plans.iter().find(|p| p.id == plan_id).cloned() {
-                    let mut models = vec![
-                        (format!("Default ({})", st.active_model), None),
-                    ];
-                    let architect_label = if let Some(roles) = &st.model_choice.roles {
-                        format!("[Arc] Architect ({})", roles.architect)
-                    } else {
-                        "[Arc] Architect".to_string()
-                    };
-                    models.push((
-                        architect_label,
-                        Some(tauqe_protocol::ModelSelection::Role(tauqe_protocol::ModelRole::Architect)),
-                    ));
+                    // Prefer the configured Architect entries; fall back to the
+                    // resolved Architect role (or the active model) when none
+                    // are configured, so the dialog always offers a valid pick.
+                    let architect_entries = st
+                        .model_choice
+                        .roles
+                        .as_ref()
+                        .and_then(|roles| roles.entries.as_ref())
+                        .map(|entries| entries.architect.clone())
+                        .filter(|entries| !entries.is_empty())
+                        .unwrap_or_else(|| {
+                            let fallback_model = st
+                                .model_choice
+                                .resolve(&tauqe_protocol::ModelSelection::Role(
+                                    tauqe_protocol::ModelRole::Architect,
+                                ))
+                                .unwrap_or_else(|| st.active_model.clone());
+                            let fallback_effort = st
+                                .model_choice
+                                .roles
+                                .as_ref()
+                                .and_then(|roles| roles.efforts.as_ref())
+                                .and_then(|efforts| efforts.architect);
+                            vec![tauqe_protocol::ModelEntry::new(
+                                fallback_model,
+                                fallback_effort,
+                                None,
+                            )]
+                        });
 
-                    st.plans_view.refine_dialog = Some(super::PlanRefineDialogState {
-                        plan_id: plan.id,
-                        plan_title: plan.title,
-                        models,
-                        selected_model_index: 0,
-                        instructions_editor: InputEditor::default(),
-                        confirm_button: crate::app::ConfirmDialogButton::Cancel,
-                    });
+                    st.plans_view.refine_dialog = Some(super::PlanRefineDialogState::new(
+                        plan.id,
+                        plan.title,
+                        architect_entries,
+                    ));
                 }
             }
         }

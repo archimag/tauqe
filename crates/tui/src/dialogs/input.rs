@@ -50,6 +50,16 @@ fn begin_develop_turn(st: &mut AppState) {
     st.turn_started_at = Some(std::time::Instant::now());
 }
 
+/// Switches the active view to the REPL and announces a review-execution turn.
+///
+/// Executing review findings runs the Coder role through a full FSM turn with
+/// file edits, Git checkpoints, and toolchain verification. Surfacing the REPL
+/// keeps that batch fixing fully transparent.
+fn begin_review_execution_turn(st: &mut AppState) {
+    begin_develop_turn(st);
+    st.notify_info("Executing review finding(s): switched to REPL for coder execution");
+}
+
 /// Snapshot of the optimistic UI state applied when a turn is launched.
 ///
 /// It is captured before the local transition runs and restored if the request
@@ -148,6 +158,15 @@ pub(crate) async fn handle_dialog_event(
                     && (primary.matches(key.modifiers)
                         || key.modifiers.contains(KeyModifiers::CONTROL));
 
+                // Model switching is unified through the shared selector: the
+                // C-M / Alt+M chord always switches, and the arrows browse the
+                // reviewer list while the instruction editor is empty (c-1, c-3).
+                let editor_focused = !dialog.prompt_editor.is_empty();
+                if dialog.selector.handle_key(key, primary, editor_focused) {
+                    st.review_dialog = Some(dialog);
+                    return Ok(Some(InputResult::Continue));
+                }
+
                 match key.code {
                     KeyCode::Esc => {
                         return Ok(Some(InputResult::Continue));
@@ -173,8 +192,9 @@ pub(crate) async fn handle_dialog_event(
                         // safe `Cancel` default, `Enter` dismisses the dialog.
                         if dialog.confirm_button == crate::app::ConfirmDialogButton::Confirm {
                             let prompt = dialog.prompt_editor.get_text().trim().to_string();
+                            let selected_model = dialog.selected_entry().map(|e| e.model.clone());
                             let params = ReviewStartParams {
-                                model: None,
+                                model: selected_model,
                                 user_prompt: if prompt.is_empty() {
                                     None
                                 } else {
@@ -341,7 +361,7 @@ pub(crate) async fn handle_dialog_event(
                             server_writer,
                             methods::REVIEW_EXECUTE,
                             serde_json::to_value(params)?,
-                            begin_develop_turn,
+                            begin_review_execution_turn,
                         )
                         .await;
                     }
@@ -482,4 +502,87 @@ pub(crate) async fn handle_dialog_event(
     }
 
     Ok(None)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use tauqe_protocol::{ReviewItem, ReviewSeverity, ReviewStatus};
+
+    use super::*;
+    use crate::app::{ConfirmDialogButton, ConfirmExecuteReviewState};
+
+    fn review_item(id: u32) -> ReviewItem {
+        ReviewItem {
+            id,
+            title: format!("Finding {}", id),
+            model: None,
+            severity: ReviewSeverity::Warning,
+            status: ReviewStatus::Todo,
+            file_path: None,
+            line_range: None,
+            body: String::new(),
+        }
+    }
+
+    fn execute_review_target() -> ConfirmExecuteReviewState {
+        ConfirmExecuteReviewState {
+            review_id: "rev-1".to_string(),
+            review_title: "Session rev-1".to_string(),
+            scope_title: "All remaining TODO findings".to_string(),
+            item_id: Some(1),
+            items: vec![review_item(1)],
+        }
+    }
+
+    /// Drives the ExecuteReview confirmation through `handle_dialog_event` and
+    /// returns the resulting view mode, the active notification text, and
+    /// whether a confirmation is still pending.
+    async fn launch_execute_review(key: KeyEvent) -> (ViewMode, Option<String>, bool) {
+        let mut st = crate::app::test_state();
+        st.view_mode = ViewMode::Review;
+        st.confirm_execute_review = Some(execute_review_target());
+        st.confirm_button = ConfirmDialogButton::Confirm;
+
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+        handle_dialog_event(key, &state, &mut conn)
+            .await
+            .expect("in-memory dispatch never fails");
+
+        let guard = state.lock().await;
+        let notification = guard.active_notification().map(|n| n.text.clone());
+        (
+            guard.view_mode,
+            notification,
+            guard.confirm_execute_review.is_some(),
+        )
+    }
+
+    #[tokio::test]
+    async fn confirm_button_switches_to_repl_and_notifies() {
+        let key = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        let (view, notification, pending) = launch_execute_review(key).await;
+
+        assert_eq!(view, ViewMode::Develop);
+        assert_eq!(
+            notification.as_deref(),
+            Some("Executing review finding(s): switched to REPL for coder execution")
+        );
+        assert!(!pending, "confirmation state must be consumed");
+    }
+
+    #[tokio::test]
+    async fn confirm_accelerator_switches_to_repl_and_notifies() {
+        let key = KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE);
+        let (view, notification, pending) = launch_execute_review(key).await;
+
+        assert_eq!(view, ViewMode::Develop);
+        assert_eq!(
+            notification.as_deref(),
+            Some("Executing review finding(s): switched to REPL for coder execution")
+        );
+        assert!(!pending, "confirmation state must be consumed");
+    }
 }

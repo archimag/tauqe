@@ -30,66 +30,124 @@ impl ReviewStorage {
         }
     }
 
-    /// Automatically migrates legacy monolithic `review.json` or `latest.json` into multi-file `.tauqe/reviews/{id}.json`.
-    pub fn migrate_legacy_if_needed(repo_root: &Path) -> Result<()> {
+    /// Migrates legacy monolithic `review.json` or `latest.json` files into the
+    /// multi-file `.tauqe/reviews/{id}.json` layout.
+    ///
+    /// Migration is a startup-only, one-shot operation: read paths never invoke
+    /// it, so listing and loading reviews carry no write side effects (CQS).
+    /// Every failure is logged and degrades gracefully, leaving the legacy
+    /// source file in place instead of aborting the process.
+    pub fn migrate_legacy_if_needed(repo_root: &Path) {
         let dir = Self::reviews_dir(repo_root);
 
-        // 1. Check legacy `.tauqe/review.json`
+        // 1. Legacy `.tauqe/review.json`
         let legacy_root = repo_root.join(".tauqe").join("review.json");
-        if legacy_root.is_file() {
-            if let Ok(content) = std::fs::read_to_string(&legacy_root) {
-                if let Ok(mut session) = serde_json::from_str::<ReviewSession>(&content) {
-                    if session.id.trim().is_empty() {
-                        session.id = "migrated-review".to_string();
-                    }
-                    let _ = Self::save_session(repo_root, &session);
-                    let _ = std::fs::remove_file(&legacy_root);
-                }
+        if let Some(mut session) = Self::read_legacy_session(&legacy_root) {
+            if session.id.trim().is_empty() {
+                session.id = "migrated-review".to_string();
             }
+            Self::store_migrated_session(repo_root, &session, &legacy_root);
         }
 
-        // 2. Check legacy `.tauqe/reviews/review.json`
+        // 2. Legacy `.tauqe/reviews/review.json`
         let legacy_reviews_file = dir.join("review.json");
-        if legacy_reviews_file.is_file() {
-            if let Ok(content) = std::fs::read_to_string(&legacy_reviews_file) {
-                if let Ok(mut session) = serde_json::from_str::<ReviewSession>(&content) {
-                    if session.id.trim().is_empty() {
-                        session.id = "default".to_string();
-                    }
-                    let _ = Self::save_session(repo_root, &session);
-                    let _ = std::fs::remove_file(&legacy_reviews_file);
-                }
+        if let Some(mut session) = Self::read_legacy_session(&legacy_reviews_file) {
+            if session.id.trim().is_empty() {
+                session.id = "default".to_string();
             }
+            Self::store_migrated_session(repo_root, &session, &legacy_reviews_file);
         }
 
-        // 3. Check legacy `.tauqe/reviews/latest.json`
+        // 3. Legacy `.tauqe/reviews/latest.json`
         let legacy_latest_file = dir.join("latest.json");
-        if legacy_latest_file.is_file() {
-            if let Ok(content) = std::fs::read_to_string(&legacy_latest_file) {
-                if let Ok(mut session) = serde_json::from_str::<ReviewSession>(&content) {
-                    if session.id.trim().is_empty() || session.id == "latest" {
-                        session.id = format!("review-{}", session.created_at);
+        if let Some(mut session) = Self::read_legacy_session(&legacy_latest_file) {
+            if session.id.trim().is_empty() || session.id == "latest" {
+                session.id = format!("review-{}", session.created_at);
+            }
+            if Self::store_migrated_session(repo_root, &session, &legacy_latest_file) {
+                let active_file = dir.join("active");
+                if !active_file.is_file() {
+                    if let Err(err) = Self::save_active_id(repo_root, Some(&session.id)) {
+                        tracing::warn!(
+                            "Failed to mark migrated review '{}' as active: {:#}",
+                            session.id,
+                            err
+                        );
                     }
-                    let safe_id = Self::sanitize_id(&session.id);
-                    let target_file = dir.join(format!("{safe_id}.json"));
-                    if !target_file.is_file() {
-                        let _ = Self::save_session(repo_root, &session);
-                    }
-                    let active_file = dir.join("active");
-                    if !active_file.is_file() {
-                        let _ = Self::save_active_id(repo_root, Some(&session.id));
-                    }
-                    let _ = std::fs::remove_file(&legacy_latest_file);
                 }
             }
         }
+    }
 
-        Ok(())
+    /// Reads and parses a legacy review file.
+    ///
+    /// Returns `None` when the file is absent, and logs a diagnostic (without
+    /// propagating) when it exists but cannot be read or parsed, so a single
+    /// malformed legacy file never blocks startup.
+    fn read_legacy_session(legacy_file: &Path) -> Option<ReviewSession> {
+        let content = match std::fs::read_to_string(legacy_file) {
+            Ok(content) => content,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return None,
+            Err(err) => {
+                tracing::warn!(
+                    "Failed to read legacy review file {}: {}",
+                    legacy_file.display(),
+                    err
+                );
+                return None;
+            }
+        };
+        match serde_json::from_str::<ReviewSession>(&content) {
+            Ok(session) => Some(session),
+            Err(err) => {
+                tracing::warn!(
+                    "Failed to parse legacy review file {}: {}",
+                    legacy_file.display(),
+                    err
+                );
+                None
+            }
+        }
+    }
+
+    /// Stores a migrated session in the multi-file layout and removes the legacy
+    /// source file once the target exists.
+    ///
+    /// Returns `true` when the target session file is present after the call.
+    /// Failures are logged; the legacy source is preserved on failure so no
+    /// review data is silently lost.
+    fn store_migrated_session(
+        repo_root: &Path,
+        session: &ReviewSession,
+        legacy_file: &Path,
+    ) -> bool {
+        let dir = Self::reviews_dir(repo_root);
+        let safe_id = Self::sanitize_id(&session.id);
+        let target_file = dir.join(format!("{safe_id}.json"));
+
+        if !target_file.is_file() {
+            if let Err(err) = Self::save_session(repo_root, session) {
+                tracing::warn!(
+                    "Failed to migrate legacy review file {}: {:#}",
+                    legacy_file.display(),
+                    err
+                );
+                return false;
+            }
+        }
+
+        if let Err(err) = std::fs::remove_file(legacy_file) {
+            tracing::warn!(
+                "Migrated legacy review file {} but failed to remove it: {}",
+                legacy_file.display(),
+                err
+            );
+        }
+        true
     }
 
     /// Lists summaries of all review sessions, ordered by `created_at` descending.
     pub fn list_summaries(repo_root: &Path) -> Result<Vec<ReviewSummary>> {
-        let _ = Self::migrate_legacy_if_needed(repo_root);
         let reviews = Self::load_all(repo_root)?;
         Ok(reviews.into_iter().map(|r| r.summary()).collect())
     }
@@ -101,7 +159,6 @@ impl ReviewStorage {
 
     /// Loads all review sessions from disk.
     pub fn load_all(repo_root: &Path) -> Result<Vec<ReviewSession>> {
-        let _ = Self::migrate_legacy_if_needed(repo_root);
         let dir = Self::reviews_dir(repo_root);
         if !dir.is_dir() {
             return Ok(Vec::new());
@@ -128,7 +185,6 @@ impl ReviewStorage {
 
     /// Loads a specific review session by ID.
     pub fn load_review(repo_root: &Path, id: &str) -> Result<Option<ReviewSession>> {
-        let _ = Self::migrate_legacy_if_needed(repo_root);
         let dir = Self::reviews_dir(repo_root);
         let safe_id = Self::sanitize_id(id);
         let file_path = dir.join(format!("{safe_id}.json"));
@@ -153,8 +209,6 @@ impl ReviewStorage {
 
     /// Loads the active or latest review session.
     pub fn load_latest(repo_root: &Path) -> Result<Option<ReviewSession>> {
-        let _ = Self::migrate_legacy_if_needed(repo_root);
-
         // 1. Try active review marker
         if let Ok(Some(active_id)) = Self::load_active_id(repo_root) {
             if let Ok(Some(session)) = Self::load_review(repo_root, &active_id) {
@@ -413,7 +467,9 @@ mod tests {
         };
         std::fs::write(&legacy_file, serde_json::to_string(&legacy_session).unwrap()).unwrap();
 
-        // Migration should run transparently on load_latest or load_all
+        // Migration is a startup-only operation: it no longer runs on reads.
+        ReviewStorage::migrate_legacy_if_needed(root);
+
         let loaded = ReviewStorage::load_latest(root).unwrap().unwrap();
         assert_eq!(loaded.id, "legacy-session-9");
         assert!(!legacy_file.is_file());

@@ -425,27 +425,38 @@ pub async fn handle_review_key(
                     "Context is empty: add files in the Context tab (Ctrl+2) first".to_string(),
                 );
             } else {
-                let reviewer_model = st
-                    .model_choice
-                    .resolve(&ModelSelection::Role(ModelRole::Reviewer))
-                    .unwrap_or_else(|| st.active_model.clone());
-                let reviewer_effort = st
+                let reviewer_entries = st
                     .model_choice
                     .roles
                     .as_ref()
-                    .and_then(|roles| roles.efforts.as_ref())
-                    .and_then(|efforts| efforts.reviewer);
+                    .and_then(|roles| roles.entries.as_ref())
+                    .map(|entries| entries.reviewer.clone())
+                    .filter(|entries| !entries.is_empty())
+                    .unwrap_or_else(|| {
+                        let fallback_model = st
+                            .model_choice
+                            .resolve(&ModelSelection::Role(ModelRole::Reviewer))
+                            .unwrap_or_else(|| st.active_model.clone());
+                        let fallback_effort = st
+                            .model_choice
+                            .roles
+                            .as_ref()
+                            .and_then(|roles| roles.efforts.as_ref())
+                            .and_then(|efforts| efforts.reviewer);
+                        vec![tauqe_protocol::ModelEntry::new(
+                            fallback_model,
+                            fallback_effort,
+                            None,
+                        )]
+                    });
                 let files_count = st.context.items.len();
                 let estimated_tokens = st.context.total_estimated_tokens as usize;
                 st.review.error = None;
-                st.review_dialog = Some(ReviewDialogState {
+                st.review_dialog = Some(ReviewDialogState::new(
                     files_count,
                     estimated_tokens,
-                    reviewer_model,
-                    reviewer_effort,
-                    prompt_editor: crate::editor::InputEditor::default(),
-                    confirm_button: crate::app::ConfirmDialogButton::Cancel,
-                });
+                    reviewer_entries,
+                ));
             }
         }
         KeyCode::Char('R') | KeyCode::Char('r') if key.modifiers.contains(crossterm::event::KeyModifiers::SHIFT) => {
@@ -494,18 +505,27 @@ mod tests {
         });
 
         let rev_model = ModelRef::openrouter("anthropic/claude-3.5-sonnet");
+        let rev_entry = tauqe_protocol::ModelEntry::new(
+            rev_model.clone(),
+            Some(ReasoningEffort::High),
+            Some("Claude Auditor".to_string()),
+        );
         st.model_choice.roles = Some(ModelRolesSummary {
             architect: ModelRef::openrouter("test-arch"),
             coder: ModelRef::openrouter("test-coder"),
-            advisor: ModelRef::openrouter("test-adv"),
+            primary: ModelRef::openrouter("test-pri"),
             reviewer: rev_model.clone(),
             scribe: ModelRef::openrouter("test-scribe"),
             efforts: Some(ModelRolesEffort {
                 architect: None,
                 coder: None,
-                advisor: None,
+                primary: None,
                 reviewer: Some(ReasoningEffort::High),
                 scribe: None,
+            }),
+            entries: Some(tauqe_protocol::ModelRolesEntries {
+                reviewer: vec![rev_entry],
+                ..Default::default()
             }),
         });
 
@@ -518,7 +538,58 @@ mod tests {
 
         let st = state.lock().await;
         let dialog = st.review_dialog.as_ref().expect("dialog should be opened");
-        assert_eq!(dialog.reviewer_model, rev_model);
-        assert_eq!(dialog.reviewer_effort, Some(ReasoningEffort::High));
+        assert_eq!(dialog.selector.role(), ModelRole::Reviewer);
+        let selected = dialog.selected_entry().expect("entry must exist");
+        assert_eq!(selected.model, rev_model);
+        assert_eq!(selected.effort, Some(ReasoningEffort::High));
+        assert_eq!(selected.alias.as_deref(), Some("Claude Auditor"));
+    }
+
+    #[test]
+    fn test_execute_review_scope_action_defaults_to_safe_cancel() {
+        use tauqe_protocol::{ReviewItem, ReviewSession, ReviewSeverity, ReviewStatus};
+
+        let mut st = crate::app::test_state();
+        st.model.status = crate::views::develop::TurnStatus::Idle;
+        // Start on the destructive button to prove the action resets the focus.
+        st.confirm_button = crate::app::ConfirmDialogButton::Confirm;
+
+        let session = ReviewSession {
+            id: "rev-1".to_string(),
+            title: "Session rev-1".to_string(),
+            created_at: 0,
+            model: "test-model".to_string(),
+            description: None,
+            user_prompt: None,
+            target_files: Vec::new(),
+            items: vec![ReviewItem {
+                id: 1,
+                title: "Finding".to_string(),
+                model: None,
+                severity: ReviewSeverity::Warning,
+                status: ReviewStatus::Todo,
+                file_path: None,
+                line_range: None,
+                body: String::new(),
+            }],
+            raw_markdown: String::new(),
+        };
+        st.review.sessions = vec![session.clone()];
+        st.review.session = Some(session);
+
+        execute_review_scope_action(&mut st, "rev-1", Some(1), "Finding");
+
+        assert_eq!(
+            st.confirm_button,
+            crate::app::ConfirmDialogButton::Cancel,
+            "the confirmation must default to safe cancellation"
+        );
+        let target = st
+            .confirm_execute_review
+            .as_ref()
+            .expect("confirmation state should be armed");
+        assert_eq!(target.review_id, "rev-1");
+        assert_eq!(target.item_id, Some(1));
+        assert_eq!(target.items.len(), 1);
     }
 }

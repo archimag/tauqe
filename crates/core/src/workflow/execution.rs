@@ -13,7 +13,7 @@
 use async_trait::async_trait;
 use tokio::sync::mpsc;
 use tokio::sync::watch;
-use tauqe_protocol::{CoderTier, ModelRef, ModelResult, ModelRole, ReasoningEffort};
+use tauqe_protocol::{ModelEntry, ModelRef, ModelResult, ModelRole, ReasoningEffort};
 
 use crate::context::ContextManager;
 use crate::history::HistoryManager;
@@ -22,8 +22,7 @@ use crate::prompt::protocol::PromptProtocol;
 use crate::workflow::policy::ApplyPolicy;
 
 use super::WorkflowExecutionResult;
-use crate::workflow::task::{Task, TaskEnv};
-use crate::workflow::loops::AnswerEditLoop;
+use crate::workflow::fsm::{begin_session_turn, record_session_response, run_fsm_turn_body};
 
 /// Execution options and token budgets for edit workflows.
 #[derive(Debug, Clone)]
@@ -98,7 +97,7 @@ impl WorkflowOptions {
 fn next_coder_tier(
     models_config: &crate::config::ModelsConfig,
     current_idx: usize,
-) -> Option<(usize, CoderTier)> {
+) -> Option<(usize, ModelEntry)> {
     let current = models_config.coder_tier(current_idx);
     let next_idx = current_idx + 1;
     let next = models_config.coder_tier(next_idx);
@@ -168,11 +167,25 @@ impl ExecutionMode for SingleExecution {
         stream_tx: mpsc::Sender<StreamEvent>,
         cancel_rx: watch::Receiver<bool>,
     ) -> anyhow::Result<WorkflowExecutionResult> {
-        let mut current_model = model.clone();
+        // Session bookkeeping runs once for the whole bounded turn. Coder-tier
+        // escalation replays the turn body on a stronger tier, so recording the
+        // prompt and response here, rather than inside every attempt, keeps a
+        // retried turn from leaving duplicate history entries behind.
+        let is_isolated_step = begin_session_turn(
+            prompt,
+            context_manager,
+            history_manager,
+            provider,
+            &cancel_rx,
+            &self.options,
+        )
+        .await;
+
         let current_role = match self.options.initial_selection {
             Some(tauqe_protocol::ModelSelection::Role(role)) => Some(role),
             _ => None,
         };
+        let mut current_model = model.clone();
         let mut ladder_idx: usize = 0;
         let mut dynamic_provider: Option<Box<dyn LlmProvider>> = None;
         let mut turn_options = self.options.clone();
@@ -184,28 +197,34 @@ impl ExecutionMode for SingleExecution {
                 provider
             };
 
-            let mut env = TaskEnv {
-                provider: active_provider,
-                model: &current_model,
-                context: context_manager,
-                history: history_manager,
+            let turn = run_fsm_turn_body(
+                prompt,
+                active_provider,
+                &current_model,
+                context_manager,
+                history_manager,
                 protocol,
                 policy,
-                workflow_name: self.name(),
-                stream_tx: stream_tx.clone(),
-                cancel_rx: cancel_rx.clone(),
-                options: &turn_options,
-            };
+                self.name(),
+                stream_tx.clone(),
+                cancel_rx.clone(),
+                &turn_options,
+                is_isolated_step,
+            )
+            .await?;
 
-            let loop_task = AnswerEditLoop::new(prompt);
-            let out = loop_task.execute(&mut env).await?;
-
-            let is_blocked = out.blocked.is_some();
-            let is_error = matches!(&out.result, ModelResult::Edit { error: Some(_), applied: false, .. });
-            let is_empty_edit = matches!(&out.result, ModelResult::Edit { edits, error: None, .. } if edits.is_empty());
+            let is_blocked = turn.blocked.is_some();
+            let is_error = matches!(
+                &turn.result,
+                ModelResult::Edit { error: Some(_), applied: false, .. }
+            );
+            let is_empty_edit = matches!(
+                &turn.result,
+                ModelResult::Edit { edits, error: None, .. } if edits.is_empty()
+            );
 
             if (is_error || is_empty_edit)
-                && !out.is_cancelled
+                && !turn.is_cancelled
                 && !is_blocked
                 && turn_options.auto_level_up
                 && current_role == Some(ModelRole::Coder)
@@ -214,44 +233,78 @@ impl ExecutionMode for SingleExecution {
                     next_coder_tier(&turn_options.models_config, ladder_idx)
                 {
                     let next_m = next_tier.model.clone();
-                    let _ = policy.rollback(context_manager.repo_root());
-                    context_manager.prune_missing_files();
 
-                    let reason = if is_error {
-                        if let ModelResult::Edit { error: Some(ref err_msg), .. } = out.result {
-                            err_msg.clone()
-                        } else {
-                            "Unknown error".to_string()
-                        }
-                    } else {
-                        "No valid edits".to_string()
-                    };
-
-                    let notice = format!(
-                        "\n\n> ⚠️ **Level Up Escalation:** Turn failed on coder tier {} (`{}`, {}). Escalating to tier {} (`{}`)...\n\n",
-                        ladder_idx, current_model, reason, next_idx, next_m
-                    );
-                    let _ = stream_tx.send(StreamEvent::TextDelta(notice)).await;
-
-                    ladder_idx = next_idx;
-                    turn_options.reasoning_effort = next_tier.effort;
-
-                    if next_m.provider != current_model.provider {
-                        if let Some(ref app_cfg) = turn_options.app_config {
-                            if let Ok(np) = crate::providers::create_provider(next_m.provider, app_cfg) {
-                                dynamic_provider = Some(np);
+                    // Build the destination provider before committing to the
+                    // escalation. A provider-construction failure must never
+                    // leave the harness retrying a foreign model on the current
+                    // provider, so the escalation is skipped and the failure is
+                    // surfaced as a diagnostic instead of silently reusing the
+                    // previous provider.
+                    let new_provider = if next_m.provider != current_model.provider {
+                        match turn_options.app_config.as_ref().map(|config| {
+                            crate::providers::create_provider(next_m.provider, config)
+                        }) {
+                            Some(Ok(built)) => Some(built),
+                            Some(Err(err)) => {
+                                tracing::error!(
+                                    "Failed to create a provider for escalation tier {} (`{}`): {}. Skipping escalation and returning the current turn outcome.",
+                                    next_idx, next_m, err
+                                );
+                                None
+                            }
+                            None => {
+                                tracing::error!(
+                                    "Cannot escalate to tier {} (`{}`): no application configuration is available to build its provider. Skipping escalation and returning the current turn outcome.",
+                                    next_idx, next_m
+                                );
+                                None
                             }
                         }
+                    } else {
+                        None
+                    };
+
+                    let provider_ready =
+                        next_m.provider == current_model.provider || new_provider.is_some();
+                    if provider_ready {
+                        let _ = policy.rollback(context_manager.repo_root());
+                        context_manager.prune_missing_files();
+
+                        let reason = if is_error {
+                            if let ModelResult::Edit { error: Some(ref err_msg), .. } = turn.result {
+                                err_msg.clone()
+                            } else {
+                                "Unknown error".to_string()
+                            }
+                        } else {
+                            "No valid edits".to_string()
+                        };
+
+                        let notice = format!(
+                            "\n\n> ⚠️ **Level Up Escalation:** Turn failed on coder tier {} (`{}`, {}). Escalating to tier {} (`{}`)...\n\n",
+                            ladder_idx, current_model, reason, next_idx, next_m
+                        );
+                        let _ = stream_tx.send(StreamEvent::TextDelta(notice)).await;
+
+                        ladder_idx = next_idx;
+                        turn_options.reasoning_effort = next_tier.effort;
+
+                        if let Some(built) = new_provider {
+                            dynamic_provider = Some(built);
+                        }
+                        current_model = next_m;
+                        continue;
                     }
-                    current_model = next_m;
-                    continue;
                 }
             }
 
+            if !turn.is_cancelled {
+                record_session_response(history_manager, &turn);
+            }
             return Ok(WorkflowExecutionResult {
-                result: out.result,
-                assistant_text: out.assistant_text,
-                blocked: out.blocked,
+                result: turn.result,
+                assistant_text: turn.assistant_text,
+                blocked: turn.blocked,
             });
         }
     }
@@ -318,6 +371,7 @@ mod tests {
     fn next_coder_tier_deepens_effort_then_model_and_saturates() {
         let config: crate::config::ModelsConfig = toml::from_str(
             r#"
+primary = ["openrouter:base/primary"]
 coder = [
     "openrouter:base/model",
     { model = "openrouter:base/model", effort = "high" },

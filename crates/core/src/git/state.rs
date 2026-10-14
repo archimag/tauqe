@@ -125,7 +125,10 @@ mod tests {
 
     #[test]
     fn test_get_repository_state_no_panic() {
-        let state = get_repository_state(None);
+        let dir = tempfile::tempdir().unwrap();
+        init_repository(Some(dir.path()), true).unwrap();
+
+        let state = get_repository_state(Some(dir.path()));
         assert!(!state.root.is_empty());
         assert!(!state.branch.is_empty());
         assert!(!state.head.is_empty());
@@ -144,7 +147,13 @@ mod tests {
 
     #[test]
     fn test_list_repository_files() {
-        let files = list_repository_files(None).unwrap();
-        assert!(!files.is_empty());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+
+        std::fs::write(path.join("tracked.txt"), "content\n").unwrap();
+        init_repository(Some(path), true).unwrap();
+
+        let files = list_repository_files(Some(path)).unwrap();
+        assert!(files.iter().any(|file| file == "tracked.txt"));
     }
 }

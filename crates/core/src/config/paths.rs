@@ -3,10 +3,10 @@ use std::path::{Path, PathBuf};
 pub const DEFAULT_CONFIG_TEMPLATE: &str = include_str!("../../../../tauqe.toml");
 
 /// Parses a command line option value supporting both `--flag value` and `--flag=value`.
-pub fn cli_arg_value(flag: &str) -> Option<PathBuf> {
-    cli_arg_value_from(std::env::args(), flag)
-}
-
+///
+/// A pure helper over an explicit argument iterator: the library never reads
+/// the process command line itself. Binary crates parse their own arguments
+/// and pass the resolved paths explicitly.
 pub fn cli_arg_value_from<I, S>(args: I, flag: &str) -> Option<PathBuf>
 where
     I: IntoIterator<Item = S>,
@@ -47,12 +47,12 @@ pub(crate) fn dirs_home() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-pub fn config_candidates(repo_root: Option<&Path>) -> Vec<PathBuf> {
+pub fn config_candidates(repo_root: Option<&Path>, explicit_config: Option<&Path>) -> Vec<PathBuf> {
     config_candidates_internal(
         repo_root,
         dirs_home().as_deref(),
         dirs_config().as_deref(),
-        cli_arg_value("--config").as_deref(),
+        explicit_config,
     )
 }
 
@@ -97,12 +97,15 @@ pub(crate) fn config_candidates_internal(
     candidates
 }
 
-pub fn find_config_file(repo_root: Option<&Path>) -> Option<PathBuf> {
+pub fn find_config_file(
+    repo_root: Option<&Path>,
+    explicit_config: Option<&Path>,
+) -> Option<PathBuf> {
     find_config_file_internal(
         repo_root,
         dirs_home().as_deref(),
         dirs_config().as_deref(),
-        cli_arg_value("--config").as_deref(),
+        explicit_config,
     )
 }
 
@@ -117,9 +120,11 @@ pub(crate) fn find_config_file_internal(
         .find(|p| p.is_file())
 }
 
-pub fn default_config_path(repo_root: Option<&Path>) -> PathBuf {
-    if let Some(cli_cfg) = cli_arg_value("--config") {
-        return cli_cfg;
+pub fn default_config_path(repo_root: Option<&Path>, explicit_config: Option<&Path>) -> PathBuf {
+    if let Some(cli_cfg) = explicit_config {
+        if !cli_cfg.as_os_str().is_empty() {
+            return cli_cfg.to_path_buf();
+        }
     }
     if let Some(root) = repo_root {
         if !root.as_os_str().is_empty() {
@@ -235,7 +240,7 @@ mod tests {
         use crate::config::{load_config, AppConfig};
 
         let temp_dir = tempfile::tempdir().unwrap();
-        let cfg_path = default_config_path(Some(temp_dir.path()));
+        let cfg_path = default_config_path(Some(temp_dir.path()), None);
         assert_eq!(cfg_path, temp_dir.path().join("tauqe.toml"));
 
         assert!(find_config_file_internal(Some(temp_dir.path()), None, None, None).is_none());

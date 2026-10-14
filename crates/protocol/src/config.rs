@@ -66,6 +66,10 @@ pub struct SystemStatusResult {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub history_model: Option<ModelRef>,
     pub available_models: Vec<ModelRef>,
+    /// Diagnostic describing why configuration could not be fully loaded and
+    /// built-in defaults were applied instead. Absent when loading succeeded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_error: Option<String>,
 }
 
 #[cfg(test)]
@@ -84,9 +88,10 @@ mod tests {
                 scribe: ModelRef::openrouter("scribe-model"),
                 coder: ModelRef::openrouter("coder-model"),
                 architect: ModelRef::openrouter("architect-model"),
-                advisor: ModelRef::openrouter("advisor-model"),
+                primary: ModelRef::openrouter("primary-model"),
                 reviewer: ModelRef::openrouter("reviewer-model"),
                 efforts: None,
+                entries: None,
             }),
             history_model: Some(ModelRef::openrouter("scribe-model")),
             available_workflows: vec!["git".to_string()],

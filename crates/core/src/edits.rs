@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use thiserror::Error;
 use tauqe_protocol::{EditOperation, EditProposal};
 
@@ -73,6 +73,20 @@ impl StageEditsResult {
 /// fails. Other files can succeed independently. Pass the returned staged state
 /// into the next attempt to retain earlier successes.
 pub fn stage_and_validate_edits(
+    repo_root: &Path,
+    context_manager: &ContextManager,
+    edits: &[EditOperation],
+    initial_staged: Option<&StagedEditsState>,
+) -> StageEditsResult {
+    // Staging reads the original file contents, which is blocking file I/O.
+    // Run it through the blocking helper so a large file never stalls an async
+    // worker thread.
+    crate::blocking::run_blocking(|| {
+        stage_and_validate_edits_inner(repo_root, context_manager, edits, initial_staged)
+    })
+}
+
+fn stage_and_validate_edits_inner(
     repo_root: &Path,
     context_manager: &ContextManager,
     edits: &[EditOperation],
@@ -474,9 +488,16 @@ fn try_fuzzy_replace(
     let p_len = pattern_lines.len();
     let old_ends_with_newline = effective_old.ends_with('\n');
 
+    // Compute the highest valid start index once. The guard above already
+    // ensures `file_lines.len() >= p_len`, but a `checked_sub` keeps the
+    // subtraction underflow-safe if that guard is ever relaxed.
+    let Some(max_start) = file_lines.len().checked_sub(p_len) else {
+        return Ok(None);
+    };
+
     // 1. Level 1: Trim-End matching (trailing whitespace and empty line normalization)
     let mut trim_end_matches = Vec::new();
-    for i in 0..=file_lines.len() - p_len {
+    for i in 0..=max_start {
         let mut matched = true;
         for k in 0..p_len {
             let file_line = &current[file_lines[i + k].start..file_lines[i + k].content_end];
@@ -517,7 +538,7 @@ fn try_fuzzy_replace(
 
     // 2. Level 2: Indentation shift matching
     let mut indent_matches = Vec::new();
-    for i in 0..=file_lines.len() - p_len {
+    for i in 0..=max_start {
         let mut matched = true;
         for k in 0..p_len {
             let file_line = &current[file_lines[i + k].start..file_lines[i + k].content_end];
@@ -565,7 +586,7 @@ fn try_fuzzy_replace(
     Ok(None)
 }
 
-fn apply_replace(
+pub(crate) fn apply_replace(
     current: &str,
     old_text: &str,
     new_text: &str,
@@ -611,9 +632,24 @@ fn apply_replace(
 
 /// Applies an EditProposal after validating every file in memory.
 ///
-/// If ANY edit fails validation, no files on disk are modified. As before,
-/// disk IO failures during commit are returned but are not transactionally rolled back.
+/// If ANY edit fails validation, no files on disk are modified. The commit is
+/// atomic: new contents are staged in temporary sibling files and renamed into
+/// place, and a mid-commit IO failure rolls the working tree back to its
+/// pre-commit state.
 pub fn apply_edit_proposal(
+    repo_root: &Path,
+    context_manager: &mut ContextManager,
+    proposal: &EditProposal,
+) -> Result<Vec<String>, EditError> {
+    // Writing the validated change set, including creating parent directories,
+    // is blocking file I/O. Run it through the blocking helper so a burst of
+    // writes never stalls an async worker thread.
+    crate::blocking::run_blocking(|| {
+        apply_edit_proposal_inner(repo_root, context_manager, proposal)
+    })
+}
+
+fn apply_edit_proposal_inner(
     repo_root: &Path,
     context_manager: &mut ContextManager,
     proposal: &EditProposal,
@@ -636,17 +672,13 @@ pub fn apply_edit_proposal(
         }
     }
 
-    // Commit only after all files have passed validation.
-    for path in &result.successful_paths {
-        let full_path = repo_root.join(path);
-        if let Some(content) = result.staged_state.staged_files.get(path) {
-            if let Some(parent) = full_path.parent() {
-                std::fs::create_dir_all(parent)
-                    .map_err(|err| EditError::Io(path.clone(), err))?;
-            }
-            std::fs::write(&full_path, content)
-                .map_err(|err| EditError::Io(path.clone(), err))?;
+    // Commit the validated change set to disk with all-or-nothing semantics.
+    // The context layer is only touched after every file is committed, so a
+    // disk failure never leaves context and disk out of sync.
+    commit_staged_edits(repo_root, &result.staged_state, &result.successful_paths)?;
 
+    for path in &result.successful_paths {
+        if result.staged_state.staged_files.contains_key(path) {
             if context_manager.contains(path).unwrap_or(false) {
                 let _ = context_manager.update_file_metadata(path);
                 let _ = context_manager.set_access(path, tauqe_protocol::ContextAccess::Editable);
@@ -654,15 +686,201 @@ pub fn apply_edit_proposal(
                 let _ = context_manager.add_auto_file(path, tauqe_protocol::ContextAccess::Editable);
             }
         } else {
-            match std::fs::remove_file(&full_path) {
-                Ok(()) => {}
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-                Err(err) => return Err(EditError::Io(path.clone(), err)),
-            }
             let _ = context_manager.remove_file(path);
         }
     }
     Ok(result.successful_paths)
+}
+
+/// A validated disk change prepared for an atomic commit.
+///
+/// A write stages its new content in a temporary sibling file. The commit then
+/// moves any existing target aside to a backup sibling and moves the staged
+/// content into place. Moving rather than copying preserves the original's
+/// permissions, timestamps and symlinks, and keeps rollback independent of file
+/// size.
+struct PreparedChange {
+    path: String,
+    final_path: PathBuf,
+    backup_path: PathBuf,
+    /// Staged new content, present only for a write.
+    temp_path: Option<PathBuf>,
+    /// Set once the original was moved aside to `backup_path`.
+    had_original: bool,
+}
+
+/// Returns the temporary sibling path used to stage a write before commit.
+///
+/// The temporary file lives in the same directory as its target so the final
+/// rename stays on a single filesystem and is therefore atomic.
+fn temp_sibling_path(final_path: &Path) -> PathBuf {
+    sibling_path(final_path, ".tauqe-tmp")
+}
+
+/// Returns the backup sibling path used to move an original target aside.
+///
+/// The backup lives in the same directory as its target so moving the original
+/// aside and restoring it stay on a single filesystem and are therefore atomic.
+fn backup_sibling_path(final_path: &Path) -> PathBuf {
+    sibling_path(final_path, ".tauqe-bak")
+}
+
+fn sibling_path(final_path: &Path, suffix: &str) -> PathBuf {
+    let mut path = final_path.as_os_str().to_owned();
+    path.push(suffix);
+    PathBuf::from(path)
+}
+
+/// Removes the staged temporary files of every change that still has one.
+fn remove_temp_files(changes: &[PreparedChange]) {
+    for change in changes {
+        if let Some(temp_path) = &change.temp_path {
+            let _ = std::fs::remove_file(temp_path);
+        }
+    }
+}
+
+/// Removes the backup files created while committing the given changes.
+fn remove_backup_files(changes: &[PreparedChange]) {
+    for change in changes {
+        if change.had_original {
+            let _ = std::fs::remove_file(&change.backup_path);
+        }
+    }
+}
+
+/// Creates the parent directories of a staged write, recording the ones this
+/// commit actually created so rollback can remove them again.
+fn create_parent_dirs(parent: &Path, created: &mut Vec<PathBuf>) -> std::io::Result<()> {
+    // Walk upward and collect the ancestors that do not exist yet, deepest
+    // first, so rollback removes exactly the directories this commit created.
+    let mut missing = Vec::new();
+    let mut current = Some(parent);
+    while let Some(dir) = current {
+        if dir.as_os_str().is_empty() || dir.exists() {
+            break;
+        }
+        missing.push(dir.to_path_buf());
+        current = dir.parent();
+    }
+    if missing.is_empty() {
+        return Ok(());
+    }
+    std::fs::create_dir_all(parent)?;
+    created.extend(missing);
+    Ok(())
+}
+
+/// Removes directories created during the commit, deepest first so parents are
+/// only removed once their children are gone. A non-empty directory is left in
+/// place because it was not created exclusively by this commit.
+fn remove_created_dirs(created: &[PathBuf]) {
+    let mut dirs: Vec<&PathBuf> = created.iter().collect();
+    dirs.sort_by_key(|dir| std::cmp::Reverse(dir.components().count()));
+    for dir in dirs {
+        let _ = std::fs::remove_dir(dir);
+    }
+}
+
+/// Moves the original target aside (if any) and moves the staged content into
+/// place. Both steps are renames on a single filesystem, so a failure at any
+/// point leaves enough information for [`rollback_change`] to restore the
+/// target exactly.
+fn commit_change(change: &mut PreparedChange) -> std::io::Result<()> {
+    if change.final_path.symlink_metadata().is_ok() {
+        // Drop any stale backup left by an interrupted earlier commit before
+        // moving the current original aside.
+        let _ = std::fs::remove_file(&change.backup_path);
+        std::fs::rename(&change.final_path, &change.backup_path)?;
+        change.had_original = true;
+    }
+    if let Some(temp_path) = &change.temp_path {
+        std::fs::rename(temp_path, &change.final_path)?;
+    }
+    Ok(())
+}
+
+/// Restores a single target to its pre-commit state.
+///
+/// Staged content that reached the target is removed, and an original moved to
+/// a backup is restored by a single rename, which preserves its permissions,
+/// timestamps and symlink target.
+fn rollback_change(change: &PreparedChange) {
+    if let Some(temp_path) = &change.temp_path {
+        let _ = std::fs::remove_file(&change.final_path);
+        let _ = std::fs::remove_file(temp_path);
+    }
+    if change.had_original {
+        let _ = std::fs::rename(&change.backup_path, &change.final_path);
+    }
+}
+
+/// Commits a fully validated change set to disk with all-or-nothing semantics.
+///
+/// New contents are first materialized in temporary sibling files, so a
+/// mid-write failure (for example, a full disk) surfaces before any target file
+/// is touched and never leaves a half-written target. Existing targets are moved
+/// aside to backup siblings rather than read into memory, so the commit does not
+/// duplicate large files and rollback restores permissions, timestamps and
+/// symlinks exactly. A rare rename or removal failure rolls the working tree
+/// back to its pre-commit state, including any directories this commit created.
+fn commit_staged_edits(
+    repo_root: &Path,
+    staged: &StagedEditsState,
+    paths: &[String],
+) -> Result<(), EditError> {
+    let mut prepared = Vec::with_capacity(paths.len());
+    let mut created_dirs: Vec<PathBuf> = Vec::new();
+
+    for path in paths {
+        let final_path = repo_root.join(path);
+        let backup_path = backup_sibling_path(&final_path);
+        let temp_path = if let Some(content) = staged.staged_files.get(path) {
+            if let Some(parent) = final_path.parent() {
+                if let Err(err) = create_parent_dirs(parent, &mut created_dirs) {
+                    remove_temp_files(&prepared);
+                    remove_created_dirs(&created_dirs);
+                    return Err(EditError::Io(path.clone(), err));
+                }
+            }
+            let temp_path = temp_sibling_path(&final_path);
+            if let Err(err) = std::fs::write(&temp_path, content) {
+                let _ = std::fs::remove_file(&temp_path);
+                remove_temp_files(&prepared);
+                remove_created_dirs(&created_dirs);
+                return Err(EditError::Io(path.clone(), err));
+            }
+            // Carry the original's permissions over to the staged content so a
+            // write never silently widens or narrows access.
+            if let Ok(metadata) = std::fs::metadata(&final_path) {
+                let _ = std::fs::set_permissions(&temp_path, metadata.permissions());
+            }
+            Some(temp_path)
+        } else {
+            None
+        };
+        prepared.push(PreparedChange {
+            path: path.clone(),
+            final_path,
+            backup_path,
+            temp_path,
+            had_original: false,
+        });
+    }
+
+    for index in 0..prepared.len() {
+        if let Err(err) = commit_change(&mut prepared[index]) {
+            for change in &prepared[..=index] {
+                rollback_change(change);
+            }
+            remove_temp_files(&prepared[index + 1..]);
+            remove_created_dirs(&created_dirs);
+            return Err(EditError::Io(prepared[index].path.clone(), err));
+        }
+    }
+
+    remove_backup_files(&prepared);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -940,5 +1158,38 @@ mod staging_tests {
         assert!(empty.is_success());
         assert_eq!(empty.staged_state, result.staged_state);
         assert!(empty.successful_edits.is_empty());
+    }
+
+    #[test]
+    fn commit_writes_all_files_atomically_and_leaves_no_temporary_files() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("a.rs"), "one").unwrap();
+        std::fs::write(root.join("b.rs"), "two").unwrap();
+        let mut cm = ContextManager::new(root.to_path_buf());
+        cm.add_file("a.rs", ContextAccess::Editable).unwrap();
+        cm.add_file("b.rs", ContextAccess::Editable).unwrap();
+
+        let proposal = EditProposal {
+            summary: "multi".into(),
+            edits: vec![
+                replace("a.rs", "one", "alpha"),
+                EditOperation::Create { path: "c.rs".into(), content: "gamma".into() },
+                EditOperation::Delete { path: "b.rs".into() },
+            ],
+        };
+        let changed = apply_edit_proposal(root, &mut cm, &proposal).unwrap();
+        assert!(changed.contains(&"a.rs".to_string()));
+        assert!(changed.contains(&"c.rs".to_string()));
+        assert!(changed.contains(&"b.rs".to_string()));
+        assert_eq!(std::fs::read_to_string(root.join("a.rs")).unwrap(), "alpha");
+        assert_eq!(std::fs::read_to_string(root.join("c.rs")).unwrap(), "gamma");
+        assert!(!root.join("b.rs").exists());
+
+        let leftover = std::fs::read_dir(root)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .any(|entry| entry.file_name().to_string_lossy().contains(".tauqe-tmp"));
+        assert!(!leftover, "commit must not leave temporary files behind");
     }
 }

@@ -5,9 +5,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use tauqe_core::edits::protocol::ContextRequest;
+use tauqe_core::edits::stream::json::JsonFieldStreamFilter;
 use tauqe_core::providers::{create_provider, ChatMessage, LlmProvider, StreamEvent};
+use tauqe_core::review::parser::ReviewFindingsOutput;
 use tauqe_core::review::{
-    build_review_system_prompt, build_review_user_prompt, parse_review_findings, ReviewStorage,
+    build_review_system_prompt, build_review_user_prompt, parse_review_findings,
+    parse_review_output, review_findings_response_format, ReviewStorage,
 };
 use tauqe_core::workflow::batch::{
     BatchExecution, BatchStep, BatchStepExecutor, BatchStepOutcome, BatchStop,
@@ -64,15 +67,41 @@ pub async fn handle_review_start(req: Request, state: &Arc<AppState>) -> Respons
 
     let (provider, model, reasoning_effort) = {
         let cfg = state.config.lock().await.config.clone();
+        // The reviewer role list is the single source for the audit model and
+        // its reasoning depth; an explicit model override replaces only the
+        // model and leaves the role's reasoning effort in place.
+        let reviewer_entries = cfg.models.role_entries(ModelRole::Reviewer);
+        let reviewer_entry = reviewer_entries
+            .iter()
+            .find(|entry| params.model.as_ref().is_none_or(|m| &entry.model == m))
+            .cloned()
+            .or_else(|| reviewer_entries.into_iter().next());
         let model = match params.model.clone() {
             Some(m) => m,
-            None => cfg.resolve_role(ModelRole::Reviewer),
+            None => reviewer_entry
+                .as_ref()
+                .map(|entry| entry.model.clone())
+                .unwrap_or_else(|| cfg.resolve_role(ModelRole::Reviewer)),
         };
-        let reasoning_effort = cfg.models.resolve_effort(ModelRole::Reviewer);
+        let reasoning_effort = reviewer_entry.and_then(|entry| entry.effort);
+        // Deterministic unit tests inject a scripted provider through the
+        // state's test seam; production builds construct a real network
+        // provider from configuration.
+        #[cfg(test)]
+        let provider: Arc<dyn LlmProvider> = match state.provider_override.lock().await.clone() {
+            Some(provider) => provider,
+            None => match create_provider(model.provider, &cfg) {
+                Ok(p) => Arc::from(p),
+                Err(err) => return Response::err(req.id, errors::NO_API_KEY, err.to_string()),
+            },
+        };
+
+        #[cfg(not(test))]
         let provider: Arc<dyn LlmProvider> = match create_provider(model.provider, &cfg) {
             Ok(p) => Arc::from(p),
             Err(err) => return Response::err(req.id, errors::NO_API_KEY, err.to_string()),
         };
+
         (provider, model, reasoning_effort)
     };
 
@@ -125,6 +154,9 @@ pub async fn handle_review_start(req: Request, state: &Arc<AppState>) -> Respons
             params.user_prompt.as_deref(),
         )),
     ];
+    // Review synthesis is a non-code operation: the enforced JSON schema turns
+    // the model output into machine-readable findings instead of parsed markdown.
+    let response_format = review_findings_response_format();
 
     let state_for_spawn = Arc::clone(state);
     let op_id_for_spawn = op_id.clone();
@@ -143,7 +175,7 @@ pub async fn handle_review_start(req: Request, state: &Arc<AppState>) -> Respons
                 .stream_chat_with_effort(
                     &model_name,
                     messages,
-                    None,
+                    Some(response_format),
                     reasoning_effort,
                     tx,
                     stream_cancel,
@@ -155,7 +187,9 @@ pub async fn handle_review_start(req: Request, state: &Arc<AppState>) -> Respons
         });
         operation.set_abort_handle(stream_task.abort_handle());
 
-        let mut raw_markdown = String::new();
+        // The provider streams raw Structured Output JSON; this filter decodes
+        // only the `summary` string so JSON syntax never reaches the client.
+        let mut filter = JsonFieldStreamFilter::<ReviewFindingsOutput>::new("summary");
         let mut usage: Option<ModelUsageInfo> = None;
         let mut failure: Option<String> = None;
 
@@ -170,17 +204,20 @@ pub async fn handle_review_start(req: Request, state: &Arc<AppState>) -> Respons
                     })
                     .ok(),
                 ),
-                StreamEvent::TextDelta(delta) => {
-                    raw_markdown.push_str(&delta);
-                    emit(
-                        &state.out,
-                        events::REVIEW_CONTENT_DELTA,
-                        serde_json::to_value(ReviewContentDeltaEvent {
-                            operation_id: op_id.clone(),
-                            delta,
-                        })
-                        .ok(),
-                    );
+                StreamEvent::TextDelta(chunk) => {
+                    // Forward only cleaned summary text; raw JSON deltas are
+                    // consumed by the filter and never leave the server.
+                    if let Some(delta) = filter.push_chunk(&chunk) {
+                        emit(
+                            &state.out,
+                            events::REVIEW_CONTENT_DELTA,
+                            serde_json::to_value(ReviewContentDeltaEvent {
+                                operation_id: op_id.clone(),
+                                delta,
+                            })
+                            .ok(),
+                        );
+                    }
                 }
                 StreamEvent::Usage(u) => usage = Some(u),
                 StreamEvent::Done | StreamEvent::Cancelled => break,
@@ -208,10 +245,30 @@ pub async fn handle_review_start(req: Request, state: &Arc<AppState>) -> Respons
             emit_error(&state.out, &op_id, message);
             return;
         }
-        if raw_markdown.trim().is_empty() {
+        // Capture the raw payload before finalizing: `finish` consumes the
+        // filter, while the full response is still needed for the tolerant
+        // fallback parser and the persisted `raw_markdown`.
+        let raw_buffer = filter.buffer().to_string();
+        if raw_buffer.trim().is_empty() {
             emit_error(&state.out, &op_id, "Model returned an empty review".to_string());
             return;
         }
+
+        // A clean deserialization yields the typed payload; a malformed tail
+        // degrades gracefully to the tolerant text parser instead of dropping
+        // an otherwise usable review.
+        let (summary, items) = match filter.finish() {
+            Ok(output) => {
+                let trimmed = output.summary.trim();
+                let summary = if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed.to_string())
+                };
+                (summary, parse_review_findings(&raw_buffer))
+            }
+            Err(_) => parse_review_output(&raw_buffer),
+        };
 
         let title = params
             .user_prompt
@@ -227,11 +284,11 @@ pub async fn handle_review_start(req: Request, state: &Arc<AppState>) -> Respons
             title,
             created_at,
             model: model.to_string(),
-            description: params.user_prompt.clone(),
+            description: summary.or_else(|| params.user_prompt.clone()),
             user_prompt: params.user_prompt.clone(),
             target_files,
-            items: parse_review_findings(&raw_markdown),
-            raw_markdown,
+            items,
+            raw_markdown: raw_buffer,
         };
         if let Err(err) = ReviewStorage::save_session(&repo_root, &session) {
             emit_error(&state.out, &op_id, format!("{:#}", err));
@@ -261,6 +318,7 @@ pub async fn handle_review_start(req: Request, state: &Arc<AppState>) -> Respons
             let _ = history.record_review(
                 model.to_string(),
                 params.user_prompt.clone(),
+                session.description.clone(),
                 session.target_files.clone(),
                 session.items.len(),
             );
@@ -1117,8 +1175,10 @@ mod tests {
         std::fs::write(&target_file, "fn foo() {}\n").unwrap();
 
         let mut config = tauqe_core::config::AppConfig::default();
-        config.models.reviewer = Some(tauqe_protocol::ModelRef::openrouter("test/reviewer-model").into());
-        config.models.advisor = Some(tauqe_protocol::ModelRef::openrouter("test/advisor-model"));
+        config.models.reviewer =
+            Some(vec![tauqe_protocol::ModelRef::openrouter("test/reviewer-model").into()]);
+        config.models.primary =
+            vec![tauqe_protocol::ModelRef::openrouter("test/primary-model").into()];
 
         let (out, _rx) = OutChannel::new();
         let (hist_tx, _hist_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -1139,6 +1199,93 @@ mod tests {
         let res = handle_review_start(req, &state).await;
         let err = res.error.expect("should fail without api key");
         assert_eq!(err.code, "NO_API_KEY");
+    }
+
+    #[tokio::test]
+    async fn test_review_start_streams_clean_summary_without_json_leakage() {
+        let dir = TestDir::new();
+        let target_file = dir.path().join("file.rs");
+        std::fs::write(&target_file, "fn foo() {}\n").unwrap();
+
+        let payload = r#"{"summary":"The architecture is sound, but locking is racy.","findings":[{"title":"Race condition","severity":"critical","file_path":"file.rs","line_start":1,"line_end":2,"body":"Lock ordering is inconsistent."}]}"#;
+        let provider: Arc<dyn LlmProvider> =
+            Arc::new(MockLlmProvider::scripted([MockResponse::text(payload)]));
+
+        let (out, mut rx) = OutChannel::new();
+        let (hist_tx, _hist_rx) = tokio::sync::mpsc::unbounded_channel();
+        let state = AppState::new(
+            tauqe_core::config::AppConfig::default(),
+            dir.path().to_path_buf(),
+            hist_tx,
+            out,
+        );
+        *state.provider_override.lock().await = Some(provider);
+
+        state
+            .context
+            .write()
+            .await
+            .add_file("file.rs", ContextAccess::ReadOnly)
+            .unwrap();
+
+        let req = Request {
+            id: tauqe_protocol::RequestId::Number(1),
+            method: tauqe_protocol::methods::REVIEW_START.to_string(),
+            params: None,
+        };
+        let res = handle_review_start(req, &state).await;
+        assert!(res.error.is_none(), "review start must succeed");
+
+        // Drain streamed events until the review terminates.
+        let mut lines = Vec::new();
+        while let Ok(Some(line)) =
+            tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv()).await
+        {
+            let terminal = line.contains(events::REVIEW_FINISHED)
+                || line.contains(events::REVIEW_ERROR);
+            lines.push(line);
+            if terminal {
+                break;
+            }
+        }
+
+        // Only cleaned summary deltas reach the client: raw JSON syntax never
+        // leaks into the content stream.
+        let mut streamed = String::new();
+        for line in &lines {
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(line) {
+                if val.get("method").and_then(|m| m.as_str()) == Some(events::REVIEW_CONTENT_DELTA)
+                {
+                    if let Some(delta) = val
+                        .get("params")
+                        .and_then(|p| p.get("delta"))
+                        .and_then(|d| d.as_str())
+                    {
+                        streamed.push_str(delta);
+                    }
+                }
+            }
+        }
+        assert_eq!(streamed, "The architecture is sound, but locking is racy.");
+        assert!(!streamed.contains('{'));
+        assert!(!streamed.contains('"'));
+        assert!(!streamed.contains("summary"));
+        assert!(!streamed.contains("findings"));
+
+        // The summary is persisted as the session description and the findings
+        // are stored structurally.
+        let session = ReviewStorage::load_latest(dir.path())
+            .unwrap()
+            .expect("review session must be saved");
+        assert_eq!(
+            session.description.as_deref(),
+            Some("The architecture is sound, but locking is racy.")
+        );
+        assert_eq!(session.items.len(), 1);
+        assert_eq!(
+            session.items[0].severity,
+            tauqe_protocol::ReviewSeverity::Critical
+        );
     }
 
     #[tokio::test]

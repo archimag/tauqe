@@ -1,4 +1,5 @@
 use anyhow::{bail, Result};
+use crate::prompt::estimate_tokens_from_bytes;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::collections::BTreeSet;
@@ -12,6 +13,20 @@ pub struct ContextFileContent {
     pub content: String,
 }
 
+/// Outcome of adding files by glob pattern in a single batch.
+#[derive(Debug, Clone)]
+pub struct PatternAddOutcome {
+    /// Files newly added to the context layer.
+    pub added_items: Vec<ContextItem>,
+    /// Total estimated tokens contributed by the added files.
+    pub added_tokens: u64,
+    /// Whether the match set exceeded the batch limit and was capped.
+    ///
+    /// When `true`, some matching files were skipped because `max_batch` was
+    /// reached. Callers should surface this so the cap is never silent.
+    pub truncated: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct ContextManager {
     repo_root: PathBuf,
@@ -19,6 +34,28 @@ pub struct ContextManager {
     pinned: BTreeMap<String, ContextItem>,
     user: BTreeMap<String, ContextItem>,
     auto: BTreeMap<String, ContextItem>,
+}
+
+/// Stores `item` in `layer`, returning `true` only when the layer contents
+/// actually changed. Centralizing this check keeps every mutation path from
+/// advancing the context revision on a no-op.
+fn store_item(layer: &mut BTreeMap<String, ContextItem>, item: ContextItem) -> bool {
+    if layer.get(&item.path) == Some(&item) {
+        return false;
+    }
+    layer.insert(item.path.clone(), item);
+    true
+}
+
+/// Promotes an existing entry to `Editable` in place. Auto-layer discovery
+/// only ever upgrades access, so a read-only request is a no-op.
+fn upgrade_access(item: &mut ContextItem, access: ContextAccess) -> bool {
+    if access == ContextAccess::Editable && item.access != ContextAccess::Editable {
+        item.access = ContextAccess::Editable;
+        true
+    } else {
+        false
+    }
 }
 
 impl ContextManager {
@@ -56,7 +93,7 @@ impl ContextManager {
                 if full_path.is_file() {
                     if let Ok(meta) = std::fs::metadata(&full_path) {
                         let size = meta.len();
-                        let tokens = size.div_ceil(4);
+                        let tokens = estimate_tokens_from_bytes(size);
                         self.pinned.insert(
                             clean_path.clone(),
                             ContextItem {
@@ -132,24 +169,30 @@ impl ContextManager {
     }
 
     pub fn read_context_files(&self) -> Vec<ContextFileContent> {
-        let mut distinct_paths = BTreeSet::new();
-        distinct_paths.extend(self.pinned.keys().cloned());
-        distinct_paths.extend(self.user.keys().cloned());
-        distinct_paths.extend(self.auto.keys().cloned());
+        // Reading every context file is blocking file I/O. Run it through the
+        // blocking helper so a large context never stalls an async worker.
+        crate::blocking::run_blocking(|| {
+            let mut distinct_paths = BTreeSet::new();
+            distinct_paths.extend(self.pinned.keys().cloned());
+            distinct_paths.extend(self.user.keys().cloned());
+            distinct_paths.extend(self.auto.keys().cloned());
 
-        let mut files = Vec::new();
-        for path in distinct_paths {
-            let full_path = self.repo_root.join(&path);
-            if let Ok(content) = std::fs::read_to_string(&full_path) {
-                let access = self.effective_access_for(&path).unwrap_or(ContextAccess::ReadOnly);
-                files.push(ContextFileContent {
-                    path,
-                    access,
-                    content,
-                });
+            let mut files = Vec::new();
+            for path in distinct_paths {
+                let full_path = self.repo_root.join(&path);
+                if let Ok(content) = std::fs::read_to_string(&full_path) {
+                    let access = self
+                        .effective_access_for(&path)
+                        .unwrap_or(ContextAccess::ReadOnly);
+                    files.push(ContextFileContent {
+                        path,
+                        access,
+                        content,
+                    });
+                }
             }
-        }
-        files
+            files
+        })
     }
 
     pub fn contains(&self, relative_path: &str) -> Result<bool> {
@@ -183,7 +226,7 @@ impl ContextManager {
 
         let metadata = std::fs::metadata(&full_path)?;
         let size_bytes = metadata.len();
-        let estimated_tokens = size_bytes.div_ceil(4);
+        let estimated_tokens = estimate_tokens_from_bytes(size_bytes);
 
         let item = ContextItem {
             path: clean_path.clone(),
@@ -193,31 +236,33 @@ impl ContextManager {
             layer,
         };
 
-        match layer {
-            ContextLayer::Pinned => {
-                self.pinned.insert(clean_path, item.clone());
-            }
+        let changed = match layer {
+            ContextLayer::Pinned => store_item(&mut self.pinned, item.clone()),
             ContextLayer::User => {
-                // If previously in auto, user adding it promotes it out of auto
-                self.auto.remove(&clean_path);
-                self.user.insert(clean_path, item.clone());
+                // Adding to the user layer promotes the path out of auto, so
+                // the eviction is itself a change.
+                let evicted = self.auto.remove(&clean_path).is_some();
+                store_item(&mut self.user, item.clone()) || evicted
             }
             ContextLayer::Auto => {
                 if let Some(user_item) = self.user.get_mut(&clean_path) {
-                    if access == ContextAccess::Editable {
-                        user_item.access = ContextAccess::Editable;
-                    }
-                } else if let Some(pinned_item) = self.pinned.get_mut(&clean_path) {
-                    if access == ContextAccess::Editable {
-                        pinned_item.access = ContextAccess::Editable;
-                    }
+                    upgrade_access(user_item, access)
+                } else if self.pinned.contains_key(&clean_path) {
+                    // Pinned entries are owned by configuration and are rebuilt
+                    // on reload, so an editable override is tracked in the auto
+                    // layer instead of mutating the pinned entry in place. A
+                    // read-only request is a no-op because pinned is already
+                    // read-only.
+                    access == ContextAccess::Editable && store_item(&mut self.auto, item.clone())
                 } else {
-                    self.auto.insert(clean_path, item.clone());
+                    store_item(&mut self.auto, item.clone())
                 }
             }
-        }
+        };
 
-        self.revision += 1;
+        if changed {
+            self.revision += 1;
+        }
         Ok(item)
     }
 
@@ -276,14 +321,17 @@ impl ContextManager {
 
     /// Adds all repository files matching a glob pattern or directory prefix.
     ///
-    /// Skips files already present in context.
-    /// Returns (list of newly added items, total added estimated tokens).
+    /// Skips files already present in context. The number of files added in a
+    /// single call is bounded by `max_batch`; when the match set exceeds it the
+    /// batch is capped and the outcome reports `truncated = true` so the caller
+    /// can surface the cap instead of silently dropping files.
     pub fn add_files_by_pattern(
         &mut self,
         pattern: &str,
         access: ContextAccess,
         available_files: &[String],
-    ) -> Result<(Vec<ContextItem>, u64)> {
+        max_batch: usize,
+    ) -> Result<PatternAddOutcome> {
         let trimmed_pat = pattern.trim();
         if trimmed_pat.is_empty() {
             bail!("Empty pattern is not allowed");
@@ -299,10 +347,11 @@ impl ContextManager {
         // Sort for deterministic addition order
         matched_files.sort();
 
-        // Safety cap: max 150 files per batch
-        const MAX_BATCH_LIMIT: usize = 150;
-        if matched_files.len() > MAX_BATCH_LIMIT {
-            matched_files.truncate(MAX_BATCH_LIMIT);
+        // Cap the batch at the configured limit and remember whether files were
+        // left out so the truncation is never silent.
+        let truncated = matched_files.len() > max_batch;
+        if truncated {
+            matched_files.truncate(max_batch);
         }
 
         let mut added_items = Vec::new();
@@ -315,7 +364,11 @@ impl ContextManager {
             }
         }
 
-        Ok((added_items, total_added_tokens))
+        Ok(PatternAddOutcome {
+            added_items,
+            added_tokens: total_added_tokens,
+            truncated,
+        })
     }
 
     pub fn update_file_metadata(&mut self, relative_path: &str) -> Result<()> {
@@ -324,7 +377,7 @@ impl ContextManager {
         let mut updated = false;
         if let Ok(metadata) = std::fs::metadata(&full_path) {
             let size = metadata.len();
-            let tokens = size.div_ceil(4);
+            let tokens = estimate_tokens_from_bytes(size);
             for layer in [&mut self.pinned, &mut self.user, &mut self.auto] {
                 if let Some(item) = layer.get_mut(&clean_path) {
                     item.size_bytes = size;
@@ -339,6 +392,12 @@ impl ContextManager {
         Ok(())
     }
 
+    /// Removes a path from the mutable context layers.
+    ///
+    /// Only the `user` and `auto` layers are emptied here. Pinned files are
+    /// owned by project configuration and are deliberately left in place, so
+    /// removing a pinned-only path reports `Ok(false)` (no change) instead of
+    /// silently succeeding.
     pub fn remove_file(&mut self, relative_path: &str) -> Result<bool> {
         let clean_path = self.normalize_path(relative_path)?;
         let removed_user = self.user.remove(&clean_path).is_some();
@@ -377,7 +436,7 @@ impl ContextManager {
             let full_to = self.repo_root.join(&clean_to);
             if let Ok(meta) = std::fs::metadata(&full_to) {
                 item.size_bytes = meta.len();
-                item.estimated_tokens = item.size_bytes.div_ceil(4);
+                item.estimated_tokens = estimate_tokens_from_bytes(item.size_bytes);
             }
             match layer {
                 ContextLayer::User => {
@@ -396,29 +455,46 @@ impl ContextManager {
 
     pub fn set_access(&mut self, relative_path: &str, access: ContextAccess) -> Result<bool> {
         let clean_path = self.normalize_path(relative_path)?;
-        let mut changed = false;
+
+        // User and auto entries own their access directly.
         if let Some(item) = self.user.get_mut(&clean_path) {
-            if item.access != access {
-                item.access = access;
-                changed = true;
+            if item.access == access {
+                return Ok(false);
             }
-        } else if let Some(item) = self.auto.get_mut(&clean_path) {
-            if item.access != access {
-                item.access = access;
-                changed = true;
-            }
-        } else if let Some(item) = self.pinned.get_mut(&clean_path) {
-            if item.access != access {
-                item.access = access;
-                changed = true;
-            }
-        }
-        if changed {
+            item.access = access;
             self.revision += 1;
-            Ok(true)
-        } else {
-            Ok(false)
+            return Ok(true);
         }
+        if let Some(item) = self.auto.get_mut(&clean_path) {
+            if item.access == access {
+                return Ok(false);
+            }
+            item.access = access;
+            self.revision += 1;
+            return Ok(true);
+        }
+
+        // Pinned entries are owned by project configuration and are rebuilt
+        // from `tauqe.toml` on reload, so writing the override into the pinned
+        // layer would be silently discarded. Persist a user-layer override
+        // instead; a read-only request matches the pinned base access and is
+        // reported as no change.
+        if let Some(pinned_item) = self.pinned.get(&clean_path).cloned() {
+            if pinned_item.access == access {
+                return Ok(false);
+            }
+            let user_item = ContextItem {
+                access,
+                layer: ContextLayer::User,
+                ..pinned_item
+            };
+            if store_item(&mut self.user, user_item) {
+                self.revision += 1;
+                return Ok(true);
+            }
+        }
+
+        Ok(false)
     }
 
     pub fn clear(&mut self) {
@@ -460,49 +536,59 @@ impl ContextManager {
     /// Preserves user layer changes made concurrently. Updates the auto layer,
     /// syncs file renames/removals, and refreshes metadata.
     pub fn merge_turn_context(&mut self, turn_context: &ContextManager) {
-        // 1. Sync auto layer: replace with turn_context.auto (excluding any path already in user layer)
-        self.auto.clear();
+        let mut changed = false;
+
+        // 1. Sync auto layer: replace with turn_context.auto (excluding any path
+        // already in the user layer).
+        let previous_auto = std::mem::take(&mut self.auto);
         for (path, item) in &turn_context.auto {
             if !self.user.contains_key(path) {
                 self.auto.insert(path.clone(), item.clone());
             }
         }
+        changed |= previous_auto != self.auto;
 
-        // 2. Remove files that no longer exist on disk (prunes deleted files)
+        // 2. Remove files that no longer exist on disk (prunes deleted files).
+        // The prune advances the revision itself when it drops anything, so its
+        // outcome is not counted again here.
         self.prune_missing_files();
 
-        // 3. Mirror any file renamed/moved into user layer by the turn,
-        // and sync access upgrades from the turn.
+        // 3. Mirror any file renamed/moved into the user layer by the turn and
+        // sync access upgrades from the turn. The pinned layer is configuration
+        // owned and is never upgraded at runtime, so it needs no sync here.
         for (path, item) in &turn_context.user {
             if let Some(existing) = self.user.get_mut(path) {
-                if existing.access == ContextAccess::ReadOnly && item.access == ContextAccess::Editable {
+                if existing.access == ContextAccess::ReadOnly
+                    && item.access == ContextAccess::Editable
+                {
                     existing.access = ContextAccess::Editable;
+                    changed = true;
                 }
             } else if self.repo_root.join(path).is_file() {
                 self.user.insert(path.clone(), item.clone());
-            }
-        }
-        for (path, item) in &turn_context.pinned {
-            if let Some(existing) = self.pinned.get_mut(path) {
-                if existing.access == ContextAccess::ReadOnly && item.access == ContextAccess::Editable {
-                    existing.access = ContextAccess::Editable;
-                }
+                changed = true;
             }
         }
 
-        // 4. Refresh metadata for all files in context
+        // 4. Refresh metadata for all files in context.
         for layer in [&mut self.pinned, &mut self.user, &mut self.auto] {
             for (path, item) in layer.iter_mut() {
                 let full_path = self.repo_root.join(path);
                 if let Ok(meta) = std::fs::metadata(&full_path) {
                     let size = meta.len();
-                    item.size_bytes = size;
-                    item.estimated_tokens = size.div_ceil(4);
+                    let tokens = estimate_tokens_from_bytes(size);
+                    if item.size_bytes != size || item.estimated_tokens != tokens {
+                        item.size_bytes = size;
+                        item.estimated_tokens = tokens;
+                        changed = true;
+                    }
                 }
             }
         }
 
-        self.revision += 1;
+        if changed {
+            self.revision += 1;
+        }
     }
 
     pub fn normalize_path(&self, p: &str) -> Result<String> {
@@ -571,15 +657,36 @@ mod tests {
         ];
 
         let mut cm = ContextManager::new(root);
-        let (added, tokens) = cm
-            .add_files_by_pattern("src/*.rs", ContextAccess::ReadOnly, &repo_files)
+        let outcome = cm
+            .add_files_by_pattern("src/*.rs", ContextAccess::ReadOnly, &repo_files, 150)
             .unwrap();
 
-        assert_eq!(added.len(), 2);
-        assert!(tokens > 0);
+        assert_eq!(outcome.added_items.len(), 2);
+        assert!(outcome.added_tokens > 0);
+        assert!(!outcome.truncated);
         assert!(cm.contains("src/lib.rs").unwrap());
         assert!(cm.contains("src/main.rs").unwrap());
         assert!(!cm.contains("docs/Readme.md").unwrap());
+    }
+
+    #[test]
+    fn test_add_files_by_pattern_reports_truncation() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/a.rs"), "pub fn a() {}").unwrap();
+        std::fs::write(root.join("src/b.rs"), "pub fn b() {}").unwrap();
+
+        let repo_files = vec!["src/a.rs".to_string(), "src/b.rs".to_string()];
+
+        let mut cm = ContextManager::new(root);
+        let outcome = cm
+            .add_files_by_pattern("src/*.rs", ContextAccess::ReadOnly, &repo_files, 1)
+            .unwrap();
+
+        assert_eq!(outcome.added_items.len(), 1);
+        assert!(outcome.truncated);
     }
 
     #[test]

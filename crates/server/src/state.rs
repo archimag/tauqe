@@ -110,6 +110,11 @@ impl AppState {
             eprintln!("[tauqe-recovery] {}", recovery_msg);
         }
 
+        // Review legacy migration runs exactly once at startup, so listing or
+        // loading reviews never writes to disk and stays free of read side
+        // effects. Failures are logged by the core.
+        tauqe_core::review::ReviewStorage::migrate_legacy_if_needed(&repo_path);
+
         let default_selection = config.default_selection();
         let history_sender_init = history_sender.clone();
         let mut initial_history_manager = HistoryManager::new(repo_path.clone());

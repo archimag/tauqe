@@ -68,6 +68,82 @@ pub(crate) fn next_blocked_tag(text: &str) -> Option<(usize, usize)> {
     next_control_tag(text, "<blocked")
 }
 
+/// Splits a control tag into its header and optional body content.
+fn split_tag_parts(tag: &str) -> (&str, Option<&str>) {
+    let header_end = tag.find('>').unwrap_or(tag.len());
+    let header = &tag[..header_end];
+    let is_self_closing = header.trim_end().ends_with('/');
+    let body = if is_self_closing || header_end >= tag.len() {
+        None
+    } else {
+        let after_header = &tag[header_end + 1..];
+        let body = if let Some(close_idx) = after_header.rfind("</") {
+            after_header[..close_idx].trim()
+        } else {
+            after_header.trim()
+        };
+        if body.is_empty() {
+            None
+        } else {
+            Some(body)
+        }
+    };
+    (header, body)
+}
+
+/// Parses a single `<success ...>` tag, preferring attributes over body text.
+fn parse_success_tag(tag: &str) -> Option<String> {
+    let (header, body) = split_tag_parts(tag);
+    extract_attribute(header, "summary")
+        .or_else(|| extract_attribute(header, "note"))
+        .or_else(|| extract_attribute(header, "message"))
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .or_else(|| body.map(|s| s.to_string()))
+}
+
+/// Parses a single `<error ...>` tag, preferring attributes over body text.
+fn parse_error_tag(tag: &str) -> Option<String> {
+    let (header, body) = split_tag_parts(tag);
+    extract_attribute(header, "message")
+        .or_else(|| extract_attribute(header, "reason"))
+        .or_else(|| extract_attribute(header, "details"))
+        .or_else(|| extract_attribute(header, "note"))
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .or_else(|| body.map(|s| s.to_string()))
+}
+
+/// Parses a single `<blocked ...>` tag into a reason and optional details.
+fn parse_blocked_tag(tag: &str) -> (String, Option<String>) {
+    let (header, body) = split_tag_parts(tag);
+
+    let mut reason = extract_attribute(header, "reason")
+        .or_else(|| extract_attribute(header, "message"))
+        .or_else(|| extract_attribute(header, "violated_assumption"))
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
+    let mut details = extract_attribute(header, "details")
+        .or_else(|| extract_attribute(header, "note"))
+        .or_else(|| extract_attribute(header, "suggested_action"))
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
+    if let Some(body) = body {
+        if reason.is_none() {
+            reason = Some(body.to_string());
+        } else if details.is_none() {
+            details = Some(body.to_string());
+        }
+    }
+
+    (
+        reason.unwrap_or_else(|| "Execution blocked".to_string()),
+        details,
+    )
+}
+
 /// Extracts `<success ...>` completion signal from model output if present.
 pub fn extract_success(text: &str) -> Option<Option<String>> {
     let mut last_summary = None;
@@ -76,29 +152,7 @@ pub fn extract_success(text: &str) -> Option<Option<String>> {
     while let Some((start, end)) = next_success_tag(&text[pos..]) {
         let abs_start = pos + start;
         let abs_end = pos + end;
-        let tag = &text[abs_start..abs_end];
-        let header_end = tag.find('>').unwrap_or(tag.len());
-        let header = &tag[..header_end];
-        let is_self_closing = header.trim_end().ends_with('/');
-
-        let mut summary = extract_attribute(header, "summary")
-            .or_else(|| extract_attribute(header, "note"))
-            .or_else(|| extract_attribute(header, "message"))
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty());
-
-        if summary.is_none() && !is_self_closing && header_end < tag.len() {
-            let after_header = &tag[header_end + 1..];
-            let body = if let Some(close_idx) = after_header.rfind("</") {
-                after_header[..close_idx].trim()
-            } else {
-                after_header.trim()
-            };
-            if !body.is_empty() {
-                summary = Some(body.to_string());
-            }
-        }
-        last_summary = summary;
+        last_summary = parse_success_tag(&text[abs_start..abs_end]);
         found = true;
         pos = abs_end;
     }
@@ -116,30 +170,10 @@ pub fn extract_error(text: &str) -> Option<String> {
     while let Some((start, end)) = next_error_tag(&text[pos..]) {
         let abs_start = pos + start;
         let abs_end = pos + end;
-        let tag = &text[abs_start..abs_end];
-        let header_end = tag.find('>').unwrap_or(tag.len());
-        let header = &tag[..header_end];
-        let is_self_closing = header.trim_end().ends_with('/');
-
-        let mut msg = extract_attribute(header, "message")
-            .or_else(|| extract_attribute(header, "reason"))
-            .or_else(|| extract_attribute(header, "details"))
-            .or_else(|| extract_attribute(header, "note"))
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty());
-
-        if msg.is_none() && !is_self_closing && header_end < tag.len() {
-            let after_header = &tag[header_end + 1..];
-            let body = if let Some(close_idx) = after_header.rfind("</") {
-                after_header[..close_idx].trim()
-            } else {
-                after_header.trim()
-            };
-            if !body.is_empty() {
-                msg = Some(body.to_string());
-            }
-        }
-        last_error = Some(msg.unwrap_or_else(|| "Execution error".to_string()));
+        last_error = Some(
+            parse_error_tag(&text[abs_start..abs_end])
+                .unwrap_or_else(|| "Execution error".to_string()),
+        );
         pos = abs_end;
     }
     last_error
@@ -152,43 +186,7 @@ pub fn extract_blocked(text: &str) -> Option<(String, Option<String>)> {
     while let Some((start, end)) = next_blocked_tag(&text[pos..]) {
         let abs_start = pos + start;
         let abs_end = pos + end;
-        let tag = &text[abs_start..abs_end];
-        let header_end = tag.find('>').unwrap_or(tag.len());
-        let header = &tag[..header_end];
-        let is_self_closing = header.trim_end().ends_with('/');
-
-        let mut reason = extract_attribute(header, "reason")
-            .or_else(|| extract_attribute(header, "message"))
-            .or_else(|| extract_attribute(header, "violated_assumption"))
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty());
-
-        let mut details = extract_attribute(header, "details")
-            .or_else(|| extract_attribute(header, "note"))
-            .or_else(|| extract_attribute(header, "suggested_action"))
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty());
-
-        if !is_self_closing && header_end < tag.len() {
-            let after_header = &tag[header_end + 1..];
-            let body = if let Some(close_idx) = after_header.rfind("</") {
-                after_header[..close_idx].trim()
-            } else {
-                after_header.trim()
-            };
-            if !body.is_empty() {
-                if reason.is_none() {
-                    reason = Some(body.to_string());
-                } else if details.is_none() {
-                    details = Some(body.to_string());
-                }
-            }
-        }
-
-        last_blocked = Some((
-            reason.unwrap_or_else(|| "Execution blocked".to_string()),
-            details,
-        ));
+        last_blocked = Some(parse_blocked_tag(&text[abs_start..abs_end]));
         pos = abs_end;
     }
     last_blocked
@@ -202,28 +200,7 @@ pub fn extract_terminal_outcome(text: &str) -> Option<TerminalOutcome> {
     while let Some((start, end)) = next_success_tag(&text[pos..]) {
         let abs_start = pos + start;
         let abs_end = pos + end;
-        let tag = &text[abs_start..abs_end];
-        let header_end = tag.find('>').unwrap_or(tag.len());
-        let header = &tag[..header_end];
-        let is_self_closing = header.trim_end().ends_with('/');
-
-        let mut summary = extract_attribute(header, "summary")
-            .or_else(|| extract_attribute(header, "note"))
-            .or_else(|| extract_attribute(header, "message"))
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty());
-
-        if summary.is_none() && !is_self_closing && header_end < tag.len() {
-            let after_header = &tag[header_end + 1..];
-            let body = if let Some(close_idx) = after_header.rfind("</") {
-                after_header[..close_idx].trim()
-            } else {
-                after_header.trim()
-            };
-            if !body.is_empty() {
-                summary = Some(body.to_string());
-            }
-        }
+        let summary = parse_success_tag(&text[abs_start..abs_end]);
         outcomes.push((abs_start, TerminalOutcome::Success { summary }));
         pos = abs_end;
     }
@@ -232,35 +209,9 @@ pub fn extract_terminal_outcome(text: &str) -> Option<TerminalOutcome> {
     while let Some((start, end)) = next_error_tag(&text[pos..]) {
         let abs_start = pos + start;
         let abs_end = pos + end;
-        let tag = &text[abs_start..abs_end];
-        let header_end = tag.find('>').unwrap_or(tag.len());
-        let header = &tag[..header_end];
-        let is_self_closing = header.trim_end().ends_with('/');
-
-        let mut msg = extract_attribute(header, "message")
-            .or_else(|| extract_attribute(header, "reason"))
-            .or_else(|| extract_attribute(header, "details"))
-            .or_else(|| extract_attribute(header, "note"))
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty());
-
-        if msg.is_none() && !is_self_closing && header_end < tag.len() {
-            let after_header = &tag[header_end + 1..];
-            let body = if let Some(close_idx) = after_header.rfind("</") {
-                after_header[..close_idx].trim()
-            } else {
-                after_header.trim()
-            };
-            if !body.is_empty() {
-                msg = Some(body.to_string());
-            }
-        }
-        outcomes.push((
-            abs_start,
-            TerminalOutcome::Error {
-                message: msg.unwrap_or_else(|| "Execution error".to_string()),
-            },
-        ));
+        let message = parse_error_tag(&text[abs_start..abs_end])
+            .unwrap_or_else(|| "Execution error".to_string());
+        outcomes.push((abs_start, TerminalOutcome::Error { message }));
         pos = abs_end;
     }
 
@@ -268,46 +219,8 @@ pub fn extract_terminal_outcome(text: &str) -> Option<TerminalOutcome> {
     while let Some((start, end)) = next_blocked_tag(&text[pos..]) {
         let abs_start = pos + start;
         let abs_end = pos + end;
-        let tag = &text[abs_start..abs_end];
-        let header_end = tag.find('>').unwrap_or(tag.len());
-        let header = &tag[..header_end];
-        let is_self_closing = header.trim_end().ends_with('/');
-
-        let mut reason = extract_attribute(header, "reason")
-            .or_else(|| extract_attribute(header, "message"))
-            .or_else(|| extract_attribute(header, "violated_assumption"))
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty());
-
-        let mut details = extract_attribute(header, "details")
-            .or_else(|| extract_attribute(header, "note"))
-            .or_else(|| extract_attribute(header, "suggested_action"))
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty());
-
-        if !is_self_closing && header_end < tag.len() {
-            let after_header = &tag[header_end + 1..];
-            let body = if let Some(close_idx) = after_header.rfind("</") {
-                after_header[..close_idx].trim()
-            } else {
-                after_header.trim()
-            };
-            if !body.is_empty() {
-                if reason.is_none() {
-                    reason = Some(body.to_string());
-                } else if details.is_none() {
-                    details = Some(body.to_string());
-                }
-            }
-        }
-
-        outcomes.push((
-            abs_start,
-            TerminalOutcome::Blocked {
-                reason: reason.unwrap_or_else(|| "Execution blocked".to_string()),
-                details,
-            },
-        ));
+        let (reason, details) = parse_blocked_tag(&text[abs_start..abs_end]);
+        outcomes.push((abs_start, TerminalOutcome::Blocked { reason, details }));
         pos = abs_end;
     }
 

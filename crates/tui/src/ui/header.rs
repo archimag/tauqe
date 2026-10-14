@@ -5,7 +5,7 @@ use ratatui::style::{Color, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 
-use crate::app::{role_title, AppState, HeaderClickAreas, ViewMode};
+use crate::app::{role_badge, role_title, AppState, HeaderClickAreas, ViewMode};
 
 /// Helper to truncate a string to a max visual display width, appending `…` if needed.
 pub(crate) fn truncate_to_width(s: &str, max_width: usize) -> String {
@@ -34,14 +34,64 @@ pub(crate) fn truncate_to_width(s: &str, max_width: usize) -> String {
 /// Builds the model selector label strictly from the active selection.
 /// Semantic roles render cleanly as the role title (e.g. `Coder`),
 /// while an explicit model selection renders the concrete model name.
-fn model_selector_label(
-    selection: &tauqe_protocol::ModelSelection,
-    max_model_len: usize,
-) -> String {
-    match selection {
-        tauqe_protocol::ModelSelection::Role(role) => role_title(*role).to_string(),
+/// Builds the model selector label from the live turn state.
+///
+/// While a turn owns the interface the header mirrors the model that is
+/// actually running together with its semantic role. The background Scribe role
+/// never owns the interface, so its work must not replace the developer's
+/// visible model. When no turn is active the header shows the current selection.
+fn model_selector_label(state: &AppState, max_model_len: usize) -> String {
+    if state.model.is_busy() {
+        if let Some(running) = state.running_model.as_ref() {
+            if running.role != Some(tauqe_protocol::ModelRole::Scribe) {
+                let label = truncate_to_width(&running.label(), max_model_len);
+                return match running.role {
+                    Some(role) => format!("{} {}", label, role_badge(role)),
+                    None => label,
+                };
+            }
+        }
+    }
+
+    match &state.model_choice.selection {
         tauqe_protocol::ModelSelection::Specific(model_ref) => {
-            truncate_to_width(&model_ref.name, max_model_len)
+            let primary_entry = state
+                .model_choice
+                .roles
+                .as_ref()
+                .and_then(|r| r.entries.as_ref())
+                .and_then(|e| e.primary.iter().find(|entry| &entry.model == model_ref));
+
+            let name = if let Some(entry) = primary_entry {
+                crate::app::compact_entry_label(entry)
+            } else {
+                crate::app::compact_model_name(model_ref).to_string()
+            };
+            truncate_to_width(&name, max_model_len)
+        }
+        tauqe_protocol::ModelSelection::Role(role) => {
+            let role_entry = state
+                .model_choice
+                .roles
+                .as_ref()
+                .and_then(|r| r.entries.as_ref())
+                .and_then(|e| match role {
+                    tauqe_protocol::ModelRole::Primary => e.primary.first(),
+                    tauqe_protocol::ModelRole::Coder => e.coder.first(),
+                    tauqe_protocol::ModelRole::Architect => e.architect.first(),
+                    tauqe_protocol::ModelRole::Reviewer => e.reviewer.first(),
+                    tauqe_protocol::ModelRole::Scribe => e.scribe.first(),
+                });
+
+            if let Some(entry) = role_entry {
+                truncate_to_width(&crate::app::compact_entry_label(entry), max_model_len)
+            } else if let Some(model_ref) =
+                state.model_choice.resolve(&tauqe_protocol::ModelSelection::Role(*role))
+            {
+                truncate_to_width(crate::app::compact_model_name(&model_ref), max_model_len)
+            } else {
+                role_title(*role).to_string()
+            }
         }
     }
 }
@@ -88,7 +138,7 @@ fn tab_label(
 ) -> String {
     match tier {
         HeaderTier::Full => match mode {
-            ViewMode::Develop => " 1: Develop ".to_string(),
+            ViewMode::Develop => " 1: REPL ".to_string(),
             ViewMode::Context => format!(" 2: Context ({}) ", ctx_count),
             ViewMode::Review => {
                 if review_count > 0 {
@@ -108,7 +158,7 @@ fn tab_label(
             ViewMode::Onboarding => " ! Setup ".to_string(),
         },
         HeaderTier::Medium => match mode {
-            ViewMode::Develop => " 1: Dev ".to_string(),
+            ViewMode::Develop => " 1: REPL ".to_string(),
             ViewMode::Context => format!(" 2: Ctx ({}) ", ctx_count),
             ViewMode::Review => {
                 if review_count > 0 {
@@ -132,7 +182,7 @@ fn tab_label(
             match mode {
                 ViewMode::Develop => {
                     if is_active {
-                        " 1: Dev ".to_string()
+                        " 1: REPL ".to_string()
                     } else {
                         " 1 ".to_string()
                     }
@@ -207,7 +257,7 @@ pub fn render_header(frame: &mut ratatui::Frame, state: &mut AppState, area: Rec
             (6, " [F6] ", format!(" [{}] ", help_hint))
         };
 
-    let model_label = model_selector_label(&state.model_choice.selection, max_model_len);
+    let model_label = model_selector_label(state, max_model_len);
     let model_text = format!(" 🧠 {} ", model_label);
     let model_span = Span::styled(model_text, Style::default().fg(Color::Green).bold());
 
@@ -472,11 +522,28 @@ mod tests {
             terminal_focused: true,
             shift_tip_shown: false,
             model_choice: crate::app::ModelChoice::default(),
+            running_model: None,
         }
     }
 
     #[test]
     fn test_tab_label_review_count() {
+        assert_eq!(
+            tab_label(HeaderTier::Full, ViewMode::Develop, ViewMode::Develop, 0, 0, 0),
+            " 1: REPL "
+        );
+        assert_eq!(
+            tab_label(HeaderTier::Medium, ViewMode::Develop, ViewMode::Develop, 0, 0, 0),
+            " 1: REPL "
+        );
+        assert_eq!(
+            tab_label(HeaderTier::Compact, ViewMode::Develop, ViewMode::Develop, 0, 0, 0),
+            " 1: REPL "
+        );
+        assert_eq!(
+            tab_label(HeaderTier::Compact, ViewMode::Develop, ViewMode::Context, 0, 0, 0),
+            " 1 "
+        );
         assert_eq!(
             tab_label(HeaderTier::Full, ViewMode::Review, ViewMode::Develop, 0, 0, 0),
             " 3: Review "
@@ -570,34 +637,99 @@ mod tests {
 
     #[test]
     fn test_model_selector_label_role_shows_title_only() {
-        assert_eq!(
-            model_selector_label(&ModelSelection::Role(ModelRole::Coder), 20),
-            "Coder"
-        );
-        assert_eq!(
-            model_selector_label(&ModelSelection::Role(ModelRole::Architect), 20),
-            "Architect"
-        );
+        let mut state = test_app_state();
+        state.model_choice.selection = ModelSelection::Role(ModelRole::Coder);
+        assert_eq!(model_selector_label(&state, 20), "Coder");
+
+        state.model_choice.selection = ModelSelection::Role(ModelRole::Architect);
+        assert_eq!(model_selector_label(&state, 20), "Architect");
+
         // Roles are never truncated by the model-length budget.
-        assert_eq!(
-            model_selector_label(&ModelSelection::Role(ModelRole::Reviewer), 6),
-            "Reviewer"
+        state.model_choice.selection = ModelSelection::Role(ModelRole::Reviewer);
+        assert_eq!(model_selector_label(&state, 6), "Reviewer");
+    }
+
+    #[test]
+    fn test_model_selector_label_idle_prefers_primary_entry_label() {
+        let mut state = test_app_state();
+        let entry = tauqe_protocol::ModelEntry::new(
+            ModelRef::openrouter("google/gemini-2.0-flash"),
+            None,
+            Some("Gemini Flash".to_string()),
         );
+        state.model_choice = crate::app::ModelChoice {
+            selection: ModelSelection::Role(ModelRole::Primary),
+            roles: Some(tauqe_protocol::ModelRolesSummary {
+                scribe: ModelRef::openrouter("scribe-model"),
+                coder: ModelRef::openrouter("coder-model"),
+                architect: ModelRef::openrouter("architect-model"),
+                primary: ModelRef::openrouter("google/gemini-2.0-flash"),
+                reviewer: ModelRef::openrouter("reviewer-model"),
+                efforts: None,
+                entries: Some(tauqe_protocol::ModelRolesEntries {
+                    primary: vec![entry],
+                    ..Default::default()
+                }),
+            }),
+        };
+
+        assert_eq!(model_selector_label(&state, 20), "Gemini Flash");
     }
 
     #[test]
     fn test_model_selector_label_specific_shows_model_name() {
-        let long = ModelRef::openrouter("anthropic/claude-3-7-sonnet");
-        let label = model_selector_label(&ModelSelection::Specific(long), 20);
+        let mut state = test_app_state();
+        state.model_choice.selection =
+            ModelSelection::Specific(ModelRef::openrouter("anthropic/claude-3-7-sonnet"));
+        let label = model_selector_label(&state, 20);
         assert!(label.starts_with("anthropic/claude-3"));
         assert!(label.ends_with('…'));
         assert!(Span::raw(&label).width() <= 20);
 
-        let short = ModelRef::openrouter("gpt-4o");
+        state.model_choice.selection = ModelSelection::Specific(ModelRef::openrouter("gpt-4o"));
+        assert_eq!(model_selector_label(&state, 20), "gpt-4o");
+    }
+
+    #[test]
+    fn test_model_selector_label_tracks_running_turn() {
+        let mut state = test_app_state();
+        state.model_choice.selection = ModelSelection::Role(ModelRole::Primary);
+        state.model.status = crate::views::develop::TurnStatus::Thinking;
+
+        // The live model and its semantic role replace the idle selection.
+        state.running_model = Some(crate::app::RunningModel {
+            model: "openrouter:anthropic/claude-3-7-sonnet".to_string(),
+            role: Some(ModelRole::Coder),
+            alias: None,
+            effort: None,
+        });
         assert_eq!(
-            model_selector_label(&ModelSelection::Specific(short), 20),
-            "gpt-4o"
+            model_selector_label(&state, 40),
+            "anthropic/claude-3-7-sonnet [Cod]"
         );
+
+        // A configured alias wins over the provider-qualified name.
+        state.running_model = Some(crate::app::RunningModel {
+            model: "openrouter:anthropic/claude-3-7-sonnet".to_string(),
+            role: Some(ModelRole::Architect),
+            alias: Some("Sonnet".to_string()),
+            effort: None,
+        });
+        assert_eq!(model_selector_label(&state, 40), "Sonnet [Arc]");
+
+        // The background Scribe role never replaces the visible model.
+        state.running_model = Some(crate::app::RunningModel {
+            model: "openrouter:scribe".to_string(),
+            role: Some(ModelRole::Scribe),
+            alias: None,
+            effort: None,
+        });
+        assert_eq!(model_selector_label(&state, 40), "Primary");
+
+        // Once the turn settles the header returns to the developer's selection.
+        state.model.status = crate::views::develop::TurnStatus::Done;
+        state.running_model = None;
+        assert_eq!(model_selector_label(&state, 40), "Primary");
     }
 
     #[test]

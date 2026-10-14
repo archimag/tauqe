@@ -47,6 +47,10 @@ impl PromptProtocol for XmlPromptProtocol {
         decode_xml_commands(&XmlEditProtocol, raw_text)
     }
 
+    fn system_instructions(&self, editable_paths: &[String]) -> String {
+        XmlEditProtocol.system_instructions(editable_paths)
+    }
+
     fn turn_marker(&self) -> Option<&str> {
         XmlEditProtocol.turn_marker()
     }
@@ -103,6 +107,10 @@ impl PromptProtocol for MarkedXmlPromptProtocol {
 
     fn decode(&self, raw_text: &str) -> Vec<LlmCommand> {
         decode_xml_commands(&self.inner, raw_text)
+    }
+
+    fn system_instructions(&self, editable_paths: &[String]) -> String {
+        self.inner.system_instructions(editable_paths)
     }
 
     fn turn_marker(&self) -> Option<&str> {
@@ -189,16 +197,7 @@ fn decode_xml_commands(xml: &dyn EditProtocol, raw_text: &str) -> Vec<LlmCommand
 
     // Explicit terminal outcome or semantic blocker.
     if let Some(outcome) = xml.parse_terminal_outcome(raw_text) {
-        match outcome {
-            crate::edits::protocol::TerminalOutcome::Blocked { reason, details } => {
-                commands.push(LlmCommand::Blocked { reason, details });
-            }
-            other => {
-                commands.push(LlmCommand::Outcome {
-                    outcome: map_terminal_outcome(other),
-                });
-            }
-        }
+        commands.push(terminal_outcome_to_command(outcome));
     }
 
     // Detected user language.
@@ -252,16 +251,24 @@ pub(super) fn map_verify_on_success(
     }
 }
 
-/// Maps the edit-protocol terminal outcome onto the normalized command outcome.
-fn map_terminal_outcome(outcome: crate::edits::protocol::TerminalOutcome) -> LlmOutcome {
+/// Normalizes a parsed terminal outcome into the matching normalized command.
+///
+/// The match is exhaustive over the edit-protocol terminal outcome, so a
+/// semantic blocker can never be collapsed into an error: blockers stay as
+/// `LlmCommand::Blocked` and keep their details, preserving the "blocked is not
+/// an error" invariant that drives semantic recovery.
+fn terminal_outcome_to_command(
+    outcome: crate::edits::protocol::TerminalOutcome,
+) -> LlmCommand {
+    use crate::edits::protocol::TerminalOutcome;
     match outcome {
-        crate::edits::protocol::TerminalOutcome::Success { summary } => {
-            LlmOutcome::Success { summary }
-        }
-        crate::edits::protocol::TerminalOutcome::Error { message } => LlmOutcome::Error { message },
-        crate::edits::protocol::TerminalOutcome::Blocked { reason, .. } => {
-            LlmOutcome::Error { message: reason }
-        }
+        TerminalOutcome::Blocked { reason, details } => LlmCommand::Blocked { reason, details },
+        TerminalOutcome::Success { summary } => LlmCommand::Outcome {
+            outcome: LlmOutcome::Success { summary },
+        },
+        TerminalOutcome::Error { message } => LlmCommand::Outcome {
+            outcome: LlmOutcome::Error { message },
+        },
     }
 }
 

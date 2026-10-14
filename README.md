@@ -10,6 +10,8 @@ Instead of uncontrolled agentic loops with arbitrary shell access or tedious man
 
 Unlike open-ended coding agents (such as Claude Code or OpenCode) that delegate the entire engineering lifecycle, tool invocation, and process control to an unconstrained LLM loop, TAUQE hardcodes workflows, state machines, and Git transactions in deterministic Rust. Language models serve as specialized cognitive components inside a disciplined harness, not autonomous process dispatchers.
 
+TAUQE is actively self-hosted: starting from the second day of its development, the system has been developed and maintained exclusively using TAUQE itself. As such, the repository serves as a living reference implementation of AI-native engineering under strict harness constraints, aiming to set an architectural and operational standard for reproducible, deterministic workflows and decision immutability.
+
 ---
 
 ## Core Pillars
@@ -62,7 +64,7 @@ On first launch, an interactive onboarding wizard automatically checks your Git 
 
 | Shortcut | View | Description |
 | :--- | :--- | :--- |
-| `Ctrl+1` | **Develop** | Conversational harness, streaming diffs, toolchain healing, and instant undo |
+| `Ctrl+1` | **REPL** | Conversational harness, streaming diffs, toolchain healing, and instant undo |
 | `Ctrl+2` | **Context** | Three-tier context manager (`Pinned`, `User`, `Auto`) with glob patterns |
 | `Ctrl+3` | **Review** | Code audit sessions, finding triage, and autonomous batch fixes |
 | `Ctrl+4` | **Plans** | Hierarchical task trees, deep refinement, and isolated step execution |
@@ -89,6 +91,7 @@ The simplest way, however, is to **ask TAUQE directly** in the interactive envir
 ## Current Limitations
 
 - **Provider Support:** Currently, only [OpenRouter](https://openrouter.ai/) is supported as the LLM provider.
+- **Tested Models:** Models that have been actively tested and verified in real workflows are documented directly in the project configuration file (`tauqe.toml`).
 - **Terminal Compatibility:** The interactive client has been tested and verified specifically with [kitty](https://sw.kovidgoyal.net/kitty/).
 
 ---

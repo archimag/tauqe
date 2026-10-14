@@ -131,6 +131,9 @@ pub fn parse_plan_refinement_output(raw_json: &str) -> anyhow::Result<PlanRefine
 /// Maximum supported hierarchy nesting depth for structured plan refinement output.
 pub const MAX_PLAN_REFINEMENT_DEPTH: usize = 5;
 
+/// Target size range (in changed lines) for one cohesive leaf implementation step.
+const LEAF_STEP_TARGET_LINES: (usize, usize) = (150, 400);
+
 /// Helper that builds an unrolled, non-recursive PlanItem JSON Schema up to `max_depth`.
 fn plan_item_schema(depth: usize, max_depth: usize) -> serde_json::Value {
     let mut properties = serde_json::Map::new();
@@ -237,9 +240,13 @@ fn plan_item_schema(depth: usize, max_depth: usize) -> serde_json::Value {
 
 /// Strict JSON Schema for deep plan refinement output.
 ///
-/// Unrolls nested plan items up to `MAX_PLAN_REFINEMENT_DEPTH` (5 levels) to guarantee
+/// Unrolls nested plan items up to `MAX_PLAN_REFINEMENT_DEPTH` to guarantee
 /// compliance with LLM Structured Output engines that forbid recursive `$ref` schemas.
 pub fn plan_refine_response_schema() -> serde_json::Value {
+    let items_description = format!(
+        "Refined hierarchical list of plan items (up to {} levels of nesting). If status is 'blocked' or 'needs_context', this must be empty.",
+        MAX_PLAN_REFINEMENT_DEPTH
+    );
     serde_json::json!({
         "type": "object",
         "properties": {
@@ -269,7 +276,7 @@ pub fn plan_refine_response_schema() -> serde_json::Value {
             },
             "items": {
                 "type": "array",
-                "description": "Refined hierarchical list of plan items (up to 5 levels of nesting). If status is 'blocked' or 'needs_context', this must be empty.",
+                "description": items_description,
                 "items": plan_item_schema(1, MAX_PLAN_REFINEMENT_DEPTH)
             }
         },
@@ -306,14 +313,20 @@ pub fn build_plan_refine_system_prompt(_plan: &Plan) -> String {
     out.push_str("3. Step Granularity, Grouping and Compilability Invariants:\n");
     out.push_str("   - Execution Lifecycle Contract: EVERY leaf step is executed in an isolated turn with its own toolchain verification gates (check, clippy, test).\n");
     out.push_str("   - Target File Precision (Leaf-Only Files Invariant): For every executable leaf step, you MUST populate `files: [\"path/to/file\"]` with exact repository-relative file paths. Parent items and task groups are conceptual containers and MUST have empty `files: []`. Only leaf steps (`children: []`) pre-load files into context upon execution.\n");
-    out.push_str("   - Reference Files Contract (Read-Only Context): For every executable leaf step, identify and populate `readonly_files: [\"path/to/reference\"]` with existing interfaces, protocol types, or subsystem conventions (e.g. `crates/tui/Conventions.md`, `crates/core/Conventions.md`) needed as context during implementation. These files are pre-loaded as read-only context during step execution. Invariant: parent items must have empty `readonly_files: []`.\n");
+    out.push_str("   - Reference Files Contract (Read-Only Context): For every executable leaf step, identify and populate `readonly_files: [\"path/to/reference\"]` with existing interfaces, protocol types, or subsystem conventions needed as context during implementation. These files are pre-loaded as read-only context during step execution. Invariant: parent items must have empty `readonly_files: []`.\n");
     out.push_str("   - Concept Traceability: For each step, link it to the relevant architectural concept IDs via `concept_refs: [\"concept_id\"]`.\n");
     out.push_str("   - DAG Dependency Contract: For every executable leaf step, declare prerequisite step IDs in `depends_on: [\"step_id\"]`. A step runs only after every dependency reaches DONE status. Reference only earlier steps; steps without prerequisites must use `depends_on: []`.\n");
     out.push_str("   - Avoid Micro-Fragmentation: Strictly avoid splitting adjacent, closely related edits into separate microscopic steps. Group cohesive changes across 1-4 related files under a single leaf step if they form a logical unit of work and carry no risk of patch conflicts.\n");
-    out.push_str("   - Avoid Unmanageable Monoliths: Do not bundle 10-20 unrelated files into a single step; keep each leaf step calibrated to a cohesive unit (targeting 150-400 lines of change).\n");
+    out.push_str(&format!(
+        "   - Avoid Unmanageable Monoliths: Do not bundle numerous unrelated files into a single step; keep each leaf step calibrated to a cohesive unit (targeting {}-{} lines of change).\n",
+        LEAF_STEP_TARGET_LINES.0, LEAF_STEP_TARGET_LINES.1
+    ));
     out.push_str("   - Compilability Invariant: The codebase MUST remain in a compiling, fully verified state at the end of EVERY leaf step. Never create broken intermediate steps.\n");
     out.push_str("   - Order steps strictly by prerequisite dependencies.\n");
-    out.push_str("   - The plan hierarchy supports up to 5 levels of nesting. Leaf steps at the 5th level must not contain sub-items.\n\n");
+    out.push_str(&format!(
+        "   - The plan hierarchy supports up to {} levels of nesting. Leaf steps at the maximum depth must not contain sub-items.\n\n",
+        MAX_PLAN_REFINEMENT_DEPTH
+    ));
     out.push_str("4. Strict Language Consistency Invariant:\n");
     out.push_str("   - Detect the primary natural language used in the plan's title and description.\n");
     out.push_str("   - You MUST formulate all titles, step details, explanations, and reasons strictly in that SAME natural language.\n");

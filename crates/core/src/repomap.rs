@@ -95,7 +95,7 @@ pub fn generate_repo_map(
     context_files: &[String],
     token_budget: usize,
 ) -> Result<String> {
-    let extractor = TreeSitterExtractor;
+    let extractor = TreeSitterExtractor::new();
     generate_repo_map_with_extractor(
         repo_root,
         available_files,
@@ -108,7 +108,7 @@ pub fn generate_repo_map(
 /// Generates a semantic repository map outline formatted within `token_budget` using a custom extractor.
 ///
 /// 1. Excludes files already in active context (`context_files`).
-/// 2. Queries the provided `SymbolExtractor` for code files (`.rs`).
+/// 2. Queries the provided `SymbolExtractor` for supported code files.
 /// 3. Discovers all Git files missing from the symbol outline and includes them in the map.
 /// 4. Formats symbols and file paths into a coherent outline with adaptive token budgeting.
 pub fn generate_repo_map_with_extractor(
@@ -136,7 +136,7 @@ pub fn generate_repo_map_with_extractor(
 
     let eligible_files: Vec<String> = all_git_files
         .iter()
-        .filter(|p| p.ends_with(".rs"))
+        .filter(|p| treesitter::is_supported_path(p.as_str()))
         .cloned()
         .collect();
 

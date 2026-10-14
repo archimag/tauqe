@@ -27,5 +27,9 @@ Thumbs.db
 # Tauqe runtime artifacts
 .tauqe/
 
+# Transient file-operation siblings (staged writes and rollback backups)
+*.tauqe-tmp
+*.tauqe-bak
+
 # mdBook build artifacts
 docs/book/

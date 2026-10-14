@@ -26,7 +26,9 @@ use async_trait::async_trait;
 
 use crate::providers::StreamEvent;
 
-use super::fsm::{run_fsm_turn, FsmTurnOutcome};
+use super::fsm::{
+    begin_session_turn, record_session_response, run_fsm_turn, run_fsm_turn_body, FsmTurnOutcome,
+};
 use super::task::{DiscoveryStep, StagingStep, Task, TaskEnv, TurnCycle};
 
 /// FSM task that runs a discovery/edit/healing cycle while allowing the model
@@ -84,7 +86,19 @@ impl Task for EditLoop {
     }
 
     async fn execute(&self, env: &mut TaskEnv<'_>) -> anyhow::Result<FsmTurnOutcome> {
-        let mut output = run_task_turn(&self.prompt, env).await?;
+        // Session bookkeeping runs once for the whole task so retried attempts
+        // never duplicate the user prompt in history or re-run compaction.
+        let is_isolated_step = begin_session_turn(
+            &self.prompt,
+            env.context,
+            env.history,
+            env.provider,
+            &env.cancel_rx,
+            env.options,
+        )
+        .await;
+
+        let mut output = run_task_turn_body(&self.prompt, is_isolated_step, env).await?;
 
         let mut attempt = 0;
         while !output.is_cancelled
@@ -102,7 +116,7 @@ impl Task for EditLoop {
                 .await;
 
             let retry_prompt = build_edit_retry_prompt(None);
-            let next = run_task_turn(&retry_prompt, env).await?;
+            let next = run_task_turn_body(&retry_prompt, is_isolated_step, env).await?;
             let cancelled = next.is_cancelled;
             merge_output(&mut output, next, &banner);
             if cancelled {
@@ -110,6 +124,9 @@ impl Task for EditLoop {
             }
         }
 
+        if !output.is_cancelled {
+            record_session_response(env.history, &output);
+        }
         Ok(output)
     }
 }
@@ -206,6 +223,33 @@ async fn run_task_turn(prompt: &str, env: &mut TaskEnv<'_>) -> anyhow::Result<Fs
         env.stream_tx.clone(),
         env.cancel_rx.clone(),
         env.options,
+    )
+    .await
+}
+
+/// Runs one bounded FSM turn body without session bookkeeping.
+///
+/// Used by tasks that issue several attempts within a single bounded turn; the
+/// caller performs the session bookkeeping once so retries never duplicate the
+/// user prompt or the response in history.
+async fn run_task_turn_body(
+    prompt: &str,
+    is_isolated_step: bool,
+    env: &mut TaskEnv<'_>,
+) -> anyhow::Result<FsmTurnOutcome> {
+    run_fsm_turn_body(
+        prompt,
+        env.provider,
+        env.model,
+        env.context,
+        env.history,
+        env.protocol,
+        env.policy,
+        env.workflow_name,
+        env.stream_tx.clone(),
+        env.cancel_rx.clone(),
+        env.options,
+        is_isolated_step,
     )
     .await
 }
@@ -423,6 +467,57 @@ mod tests {
             other => panic!("expected edits after retry, got {:?}", other),
         }
         assert!(out.assistant_text.contains("Edit Retry 1/3"));
+    }
+
+    #[tokio::test]
+    async fn test_edit_loop_retry_records_single_turn_and_response() {
+        let (_dir, repo_root) = init_repo_with_target();
+        let mut context = ContextManager::new(repo_root.clone());
+        context.add_file("target.rs", ContextAccess::Editable).unwrap();
+        let mut history = HistoryManager::new(repo_root.clone());
+        let protocol = crate::prompt::xml::XmlPromptProtocol;
+        let protocol = protocol.with_turn_marker("MOCK").unwrap();
+
+        let no_edit = "Here is an explanation with no edits at all.".to_string();
+        let with_edit = "<tauqe_edits_MOCK summary=\"Fix compute\">\n<edit_MOCK path=\"target.rs\">\n<search_MOCK>\npub fn compute() -> i32 { 0 }\n</search_MOCK>\n<replace_MOCK>\npub fn compute() -> i32 { 42 }\n</replace_MOCK>\n</edit_MOCK>\n</tauqe_edits_MOCK>".to_string();
+
+        let provider = MockScriptProvider::new(vec![no_edit, with_edit]);
+        let model = ModelRef::openrouter("test/model");
+        let (tx, _rx) = mpsc::channel(100);
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+        let options = WorkflowOptions::default();
+        let mut policy = DirectApplyPolicy::new();
+
+        let mut env = TaskEnv {
+            provider: &provider,
+            model: &model,
+            context: &mut context,
+            history: &mut history,
+            protocol: protocol.as_ref(),
+            policy: &mut policy,
+            workflow_name: "git",
+            stream_tx: tx,
+            cancel_rx,
+            options: &options,
+        };
+
+        let task = EditLoop::new("Change compute to return 42");
+        let out = task.execute(&mut env).await.unwrap();
+
+        assert!(matches!(out.result, ModelResult::Edit { ref edits, .. } if !edits.is_empty()));
+        assert!(out.assistant_text.contains("Edit Retry 1/3"));
+
+        let entries = history.get_entries().unwrap();
+        let turns = entries
+            .iter()
+            .filter(|entry| matches!(entry, crate::history::entry::HistoryEntry::Turn { .. }))
+            .count();
+        let responses = entries
+            .iter()
+            .filter(|entry| matches!(entry, crate::history::entry::HistoryEntry::Response { .. }))
+            .count();
+        assert_eq!(turns, 1, "retries must not record extra user turns");
+        assert_eq!(responses, 1, "retries must not record extra responses");
     }
 
     #[tokio::test]

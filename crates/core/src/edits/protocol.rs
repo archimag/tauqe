@@ -5,14 +5,8 @@ pub mod utils;
 pub mod xml;
 
 pub use structured::StructuredEditProtocol;
-pub use utils::{
-    normalize_content, parse_context_request_spec, resolve_target_path, resolve_target_path_for_op,
-};
 pub use xml::{
-    extract_error, extract_scratchpad, extract_success, extract_terminal_outcome,
-    generate_turn_marker, has_xml_edit_tags, MarkedXmlEditProtocol,
-    strip_error_tags, strip_scratchpad_tags, strip_success_tags,
-    strip_terminal_outcome_tags, TerminalOutcome, VerifyOnSuccess, VerifyRequest, VerifyTarget,
+    MarkedXmlEditProtocol, TerminalOutcome, VerifyOnSuccess, VerifyRequest, VerifyTarget,
     XmlEditProtocol,
 };
 

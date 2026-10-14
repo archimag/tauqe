@@ -1,5 +1,6 @@
 use anyhow::{bail, Context, Result};
-use std::path::Path;
+use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
 use tauqe_protocol::GitUndoResult;
 
 use super::cmd::{commit_with_developer_author, run_git, stage_files};
@@ -7,6 +8,11 @@ use super::cmd::{commit_with_developer_author, run_git, stage_files};
 pub const TAUQE_CO_AUTHOR_TRAILER: &str = "Co-authored-by: Tauqe AI <noreply@tauqe.dev>";
 pub const CHECKPOINT_PREFIX: &str = "tauqe-checkpoint:";
 pub const STEP_PREFIX: &str = "tauqe-step:";
+
+/// On-disk marker recording an open Git transaction, relative to the repository
+/// root. It lives under the gitignored `.tauqe/` directory so it never becomes
+/// part of a checkpoint or step commit.
+const TRANSACTION_MARKER_FILE: &str = ".tauqe/active-transaction.json";
 
 /// Checks whether a commit was generated or co-authored by Tauqe AI.
 pub fn is_tauqe_commit(subject: &str, body: &str, author: &str, trailers: &str) -> bool {
@@ -22,10 +28,43 @@ pub fn is_tauqe_commit(subject: &str, body: &str, author: &str, trailers: &str) 
 }
 
 /// Checkpoint information representing saved pre-edit developer state.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CheckpointInfo {
     pub created_checkpoint_commit: bool,
     pub previous_head: String,
+}
+
+/// Resolves the path of the transaction marker for the given repository root.
+fn transaction_marker_path(dir: &Path) -> PathBuf {
+    dir.join(TRANSACTION_MARKER_FILE)
+}
+
+/// Persists the checkpoint of an open transaction so crash recovery can tell a
+/// genuine interrupted Tauqe transaction apart from an unrelated commit that
+/// merely shares the step-commit subject prefix.
+fn write_transaction_marker(dir: &Path, checkpoint: &CheckpointInfo) -> Result<()> {
+    let path = transaction_marker_path(dir);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).with_context(|| {
+            format!("Failed to create transaction marker directory: {:?}", parent)
+        })?;
+    }
+    let json =
+        serde_json::to_string(checkpoint).context("Failed to serialize transaction marker")?;
+    std::fs::write(&path, json)
+        .with_context(|| format!("Failed to write transaction marker: {:?}", path))?;
+    Ok(())
+}
+
+/// Removes the transaction marker once a transaction is committed or rolled back.
+fn clear_transaction_marker(dir: &Path) {
+    let _ = std::fs::remove_file(transaction_marker_path(dir));
+}
+
+/// Reads the transaction marker left behind by an interrupted transaction.
+fn read_transaction_marker(dir: &Path) -> Option<CheckpointInfo> {
+    let content = std::fs::read_to_string(transaction_marker_path(dir)).ok()?;
+    serde_json::from_str(&content).ok()
 }
 
 /// Unwinds a temporary checkpoint commit at HEAD if present via mixed reset.
@@ -44,36 +83,71 @@ pub fn unwind_checkpoint_if_present(dir: &Path) -> Result<bool> {
     }
 }
 
-/// Recovers repository state from an interrupted/crashed workflow:
-/// 1. Unwinds any dangling intermediate step commits (tauqe-step:).
-/// 2. Unwinds any temporary checkpoint commit (tauqe-checkpoint:), restoring
-///    uncommitted developer changes safely into the working tree.
+/// Recovers repository state from an interrupted/crashed workflow.
+///
+/// Recovery is driven strictly by the on-disk transaction marker written when a
+/// checkpoint is opened. Without that marker the repository is left untouched,
+/// so an unrelated commit that merely shares the `tauqe-step:` subject prefix —
+/// a hand-written commit or a step commit from another branch after a checkout —
+/// is never mistaken for a dangling transaction.
+///
+/// When the marker is present, every commit between the recorded base and HEAD
+/// must carry the Tauqe co-author trailer; otherwise recovery refuses and
+/// reports the reason instead of rewriting history. A successful recovery resets
+/// to the recorded base via `previous_head` and unwinds a temporary checkpoint
+/// commit so uncommitted developer changes are restored safely.
 pub fn recover_interrupted_workflow(dir: &Path) -> Result<Option<String>> {
     if !crate::git::state::is_git_repository(Some(dir)) {
         return Ok(None);
     }
 
-    let mut unwound_steps = 0;
-    loop {
-        let head_subject = run_git(Some(dir), &["log", "-1", "--format=%s"])
-            .unwrap_or_default()
-            .trim()
-            .to_string();
-        if head_subject.starts_with(STEP_PREFIX) {
-            run_git(Some(dir), &["reset", "--hard", "HEAD~1"])
-                .context("Failed to unwind dangling tauqe-step commit")?;
-            unwound_steps += 1;
-        } else {
-            break;
+    let checkpoint = match read_transaction_marker(dir) {
+        Some(checkpoint) => checkpoint,
+        None => return Ok(None),
+    };
+
+    // Collect the commits recorded on top of the transaction base. They must all
+    // be Tauqe-created; anything else means this is not a dangling Tauqe
+    // transaction and must be left alone.
+    let range = format!("{}..HEAD", checkpoint.previous_head);
+    let listed = run_git(Some(dir), &["log", "--format=%H", &range]).unwrap_or_default();
+    let commits: Vec<String> = listed
+        .lines()
+        .map(|line| line.trim().to_string())
+        .filter(|line| !line.is_empty())
+        .collect();
+
+    for commit in &commits {
+        let trailers = run_git(
+            Some(dir),
+            &["log", "-1", "--format=%(trailers:key=Co-authored-by)", commit],
+        )
+        .unwrap_or_default();
+        if !trailers.contains("Tauqe AI") {
+            return Ok(Some(format!(
+                "Skipped crash recovery: commit {} in the recorded transaction range was not created by Tauqe AI; repository left untouched.",
+                commit
+            )));
         }
     }
 
-    let unwound_checkpoint = unwind_checkpoint_if_present(dir)?;
+    let unwound_steps = commits.len();
 
-    if unwound_steps > 0 || unwound_checkpoint {
+    // Reset to the recorded base and unwind a temporary checkpoint commit so the
+    // developer's uncommitted changes return to the working tree. `git reset
+    // --hard` leaves untracked files alone, matching the previous recovery
+    // semantics.
+    run_git(Some(dir), &["reset", "--hard", &checkpoint.previous_head])
+        .context("Failed to reset to the recorded transaction base")?;
+    if checkpoint.created_checkpoint_commit {
+        let _ = unwind_checkpoint_if_present(dir)?;
+    }
+    clear_transaction_marker(dir);
+
+    if unwound_steps > 0 || checkpoint.created_checkpoint_commit {
         let msg = format!(
             "Recovered interrupted workflow: unwound {} step commit(s), restored checkpoint: {}",
-            unwound_steps, unwound_checkpoint
+            unwound_steps, checkpoint.created_checkpoint_commit
         );
         Ok(Some(msg))
     } else {
@@ -92,10 +166,12 @@ pub fn create_checkpoint(dir: &Path) -> Result<CheckpointInfo> {
     let is_dirty = !status.trim().is_empty();
 
     if !is_dirty {
-        return Ok(CheckpointInfo {
+        let checkpoint = CheckpointInfo {
             created_checkpoint_commit: false,
             previous_head: head,
-        });
+        };
+        write_transaction_marker(dir, &checkpoint)?;
+        return Ok(checkpoint);
     }
 
     // Stage and commit uncommitted user changes into a checkpoint commit
@@ -109,10 +185,12 @@ pub fn create_checkpoint(dir: &Path) -> Result<CheckpointInfo> {
         .trim()
         .to_string();
 
-    Ok(CheckpointInfo {
+    let checkpoint = CheckpointInfo {
         created_checkpoint_commit: true,
         previous_head: new_head,
-    })
+    };
+    write_transaction_marker(dir, &checkpoint)?;
+    Ok(checkpoint)
 }
 
 /// Restores working tree back to pre-checkpoint state (used on workflow failure/cancellation).
@@ -125,6 +203,8 @@ pub fn restore_checkpoint(dir: &Path, checkpoint: &CheckpointInfo) -> Result<()>
     if checkpoint.created_checkpoint_commit {
         let _ = unwind_checkpoint_if_present(dir)?;
     }
+
+    clear_transaction_marker(dir);
     Ok(())
 }
 
@@ -176,6 +256,7 @@ pub fn finalize_ai_commit(
         .trim()
         .to_string();
 
+    clear_transaction_marker(dir);
     Ok(short_hash)
 }
 
@@ -197,6 +278,7 @@ pub fn create_ai_commit(dir: &Path, changed_files: &[String], summary: &str) -> 
         .trim()
         .to_string();
 
+    clear_transaction_marker(dir);
     Ok(short_hash)
 }
 
@@ -245,15 +327,22 @@ pub fn undo_last_ai_commit(dir: &Path) -> Result<GitUndoResult> {
     // 3. Mixed reset to HEAD~1
     run_git(Some(dir), &["reset", "HEAD~1"]).context("Failed to reset AI commit")?;
 
-    // 4. Revert only the touched files in the working tree to the new HEAD
+    // 4. Revert only the touched files in the working tree to the new HEAD.
+    // Failures are collected rather than silently ignored so a partial rollback
+    // is never reported as a clean success.
+    let mut rollback_errors: Vec<String> = Vec::new();
     for file in &touched_files {
         let exists_in_head =
             run_git(Some(dir), &["cat-file", "-e", &format!("HEAD:{}", file)]).is_ok();
         if exists_in_head {
-            let _ = run_git(Some(dir), &["checkout", "HEAD", "--", file]);
+            if let Err(err) = run_git(Some(dir), &["checkout", "HEAD", "--", file]) {
+                rollback_errors.push(format!("{} ({})", file, err));
+            }
         } else {
             let full = dir.join(file);
-            let _ = std::fs::remove_file(&full);
+            if let Err(err) = std::fs::remove_file(&full) {
+                rollback_errors.push(format!("{} ({})", file, err));
+            }
         }
     }
 
@@ -265,7 +354,7 @@ pub fn undo_last_ai_commit(dir: &Path) -> Result<GitUndoResult> {
         .trim()
         .to_string();
 
-    let msg = if restored_checkpoint {
+    let mut msg = if restored_checkpoint {
         format!(
             "Undid AI commit {} ('{}') and restored original uncommitted changes.",
             head_hash, subject
@@ -273,6 +362,14 @@ pub fn undo_last_ai_commit(dir: &Path) -> Result<GitUndoResult> {
     } else {
         format!("Undid AI commit {} ('{}').", head_hash, subject)
     };
+
+    if !rollback_errors.is_empty() {
+        msg.push_str(&format!(
+            " Warning: failed to restore {} file(s): {}",
+            rollback_errors.len(),
+            rollback_errors.join("; ")
+        ));
+    }
 
     Ok(GitUndoResult {
         undone_commit: head_hash,
@@ -365,5 +462,69 @@ mod tests {
         );
         assert!(!path.join("step_one.txt").exists());
         assert!(!path.join("step_two.txt").exists());
+    }
+
+    #[test]
+    fn test_recover_ignores_manual_step_commit_without_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+        crate::git::state::init_repository(Some(path), true).unwrap();
+
+        // A commit that merely shares the step-commit subject prefix must never
+        // be treated as a dangling Tauqe transaction when no marker is present.
+        fs::write(path.join("manual.txt"), "manual work").unwrap();
+        crate::git::cmd::run_git(Some(path), &["add", "manual.txt"]).unwrap();
+        crate::git::cmd::commit_with_developer_author(
+            path,
+            "tauqe-step: hand-written by developer",
+            false,
+        )
+        .unwrap();
+        let head_before = crate::git::cmd::run_git(Some(path), &["rev-parse", "HEAD"])
+            .unwrap()
+            .trim()
+            .to_string();
+
+        let recovery = recover_interrupted_workflow(path).unwrap();
+        assert!(recovery.is_none());
+
+        let head_after = crate::git::cmd::run_git(Some(path), &["rev-parse", "HEAD"])
+            .unwrap()
+            .trim()
+            .to_string();
+        assert_eq!(head_before, head_after);
+        assert!(path.join("manual.txt").exists());
+    }
+
+    #[test]
+    fn test_recover_refuses_when_range_contains_foreign_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+        crate::git::state::init_repository(Some(path), true).unwrap();
+
+        // Open a transaction so the marker records the pre-turn base.
+        let checkpoint = create_checkpoint(path).unwrap();
+        assert!(!checkpoint.created_checkpoint_commit);
+
+        // A developer commit without the Tauqe trailer lands inside the range.
+        fs::write(path.join("foreign.txt"), "foreign work").unwrap();
+        crate::git::cmd::run_git(Some(path), &["add", "foreign.txt"]).unwrap();
+        crate::git::cmd::commit_with_developer_author(path, "fix: developer commit", false)
+            .unwrap();
+        let head_before = crate::git::cmd::run_git(Some(path), &["rev-parse", "HEAD"])
+            .unwrap()
+            .trim()
+            .to_string();
+
+        let recovery = recover_interrupted_workflow(path).unwrap();
+        let msg = recovery.unwrap_or_default();
+        assert!(msg.contains("Skipped crash recovery"));
+
+        // The foreign commit is preserved and HEAD is untouched.
+        let head_after = crate::git::cmd::run_git(Some(path), &["rev-parse", "HEAD"])
+            .unwrap()
+            .trim()
+            .to_string();
+        assert_eq!(head_before, head_after);
     }
 }

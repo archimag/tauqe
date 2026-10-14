@@ -311,8 +311,9 @@ pub async fn handle_mouse_event(
                         if rect_contains(confirm_btn, mouse.column, mouse.row) {
                             st.review_dialog = None;
                             let prompt = dialog.prompt_editor.get_text().trim().to_string();
+                            let selected_model = dialog.selected_entry().map(|e| e.model.clone());
                             let params = tauqe_protocol::ReviewStartParams {
-                                model: None,
+                                model: selected_model,
                                 user_prompt: if prompt.is_empty() { None } else { Some(prompt) },
                             };
                             st.review.begin();

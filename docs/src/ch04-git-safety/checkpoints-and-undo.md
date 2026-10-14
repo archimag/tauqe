@@ -34,11 +34,15 @@ Reverting the most recent model commit is instant and deterministic:
 
 ## 4.4 Crash Recovery on Startup
 
-If a workflow is interrupted mid-turn (process termination or power loss), the turn's synthetic commits would otherwise linger at HEAD. On startup, TAUQE detects and unwinds them deterministically:
-- Dangling intermediate `tauqe-step:` commits are reset away (hard reset), discarding half-applied model changes.
-- A trailing `tauqe-checkpoint:` commit is unwound (mixed reset), returning the developer's uncommitted work to the working tree.
+If a workflow is interrupted mid-turn (process termination or power loss), the turn's synthetic commits would otherwise linger at HEAD. On startup, TAUQE recovers deterministically — but only when it can prove the commits belong to its own interrupted transaction.
 
-This restores the repository to the exact state it held before the interrupted turn, with no manual cleanup required.
+When a checkpoint is opened, TAUQE writes a transaction marker under the gitignored `.tauqe/` directory recording the base revision (`previous_head`) and whether a checkpoint commit was created. Crash recovery reads that marker and acts only when it is present:
+
+- Without a marker, recovery leaves the repository untouched. A commit whose subject merely begins with `tauqe-step:` — a hand-written commit or a step commit from another branch after a checkout — is never mistaken for a dangling transaction.
+- With a marker, every commit between the recorded base and HEAD must carry the `Co-authored-by: Tauqe AI` trailer. If any commit in that range was not created by Tauqe, recovery refuses and reports the reason instead of rewriting history.
+- A validated recovery resets to the recorded base, unwinds a temporary `tauqe-checkpoint:` commit (mixed reset), and clears the marker, returning the developer's uncommitted work to the working tree.
+
+This restores the repository to the exact state it held before the interrupted turn, with no manual cleanup required — and no risk of discarding commits TAUQE did not create.
 
 ---
 

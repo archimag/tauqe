@@ -22,23 +22,25 @@ pub fn build_review_system_prompt() -> String {
     prompt.push_str("5. Idiomatic conventions and testability.\n\n");
 
     prompt.push_str("## Language Invariant\n");
-    prompt.push_str("Formulate finding titles, descriptions, and actionable advice in the primary natural language established by the user's instructions or prompt, while keeping code identifiers, symbols, and keywords exact.\n\n");
+    prompt.push_str("Formulate the `summary` Markdown narrative and all finding titles and descriptions in the primary natural language established by the user's instructions or prompt, while keeping code identifiers, symbols, and keywords exact.\n\n");
 
     prompt.push_str("## Output Format Specification\n");
-    prompt.push_str("You MUST format each finding as a structured section with at most 2 levels of hierarchy:\n\n");
-    prompt.push_str("## [SEVERITY] Concise Finding Title\n");
-    prompt.push_str("- **File**: relative/path/to/file.rs:start_line-end_line\n");
-    prompt.push_str("- **Details**:\n");
-    prompt.push_str("Clear explanation of the problem, why it occurs, and concrete recommendations for how to resolve it.\n\n");
+    prompt.push_str("You MUST respond with a single JSON object that conforms to the enforced structured output schema. Do not wrap the JSON in markdown code fences and do not add any prose outside the JSON object.\n\n");
+    prompt.push_str("The object contains exactly two fields, emitted in this order:\n");
+    prompt.push_str("- `summary`: a high-level conclusion formatted as Markdown. Before enumerating concrete findings, synthesize the overall assessment of architectural integrity, separation of concerns, concurrency and safety risks, error handling, and reliability across the reviewed files. Do not merely restate the findings list.\n");
+    prompt.push_str("- `findings`: an array of finding objects with the following fields:\n");
+    prompt.push_str("- `title`: concise finding title.\n");
+    prompt.push_str("- `severity`: exactly one of the following string values:\n");
+    prompt.push_str("  - `critical`: severe bug, panic, data corruption, memory leak, or security flaw.\n");
+    prompt.push_str("  - `warning`: architecture violation, potential runtime issue, or poor error handling.\n");
+    prompt.push_str("  - `suggestion`: code cleanup, optimization, or idiomatic improvement.\n");
+    prompt.push_str("  - `info`: general observation or architectural insight.\n");
+    prompt.push_str("- `file_path`: repository-relative path of the affected file, or null when the finding is not file-specific.\n");
+    prompt.push_str("- `line_start` and `line_end`: 1-based start and end line of the affected range, or null when unknown.\n");
+    prompt.push_str("- `body`: clear explanation of the problem, why it occurs, and concrete recommendations for how to resolve it.\n\n");
 
-    prompt.push_str("SEVERITY must be exactly one of:\n");
-    prompt.push_str("- `CRITICAL`: Severe bug, panic, data corruption, memory leak, or security flaw.\n");
-    prompt.push_str("- `WARNING`: Architecture violation, potential runtime issue, or poor error handling.\n");
-    prompt.push_str("- `SUGGESTION`: Code cleanup, optimization, or idiomatic improvement.\n");
-    prompt.push_str("- `INFO`: General observation or architectural insight.\n\n");
-
-    prompt.push_str("If there are no critical issues, state that clearly and focus on architectural suggestions.\n");
-    prompt.push_str("Do NOT output diffs or XML edit tags; this is an audit-only review.\n");
+    prompt.push_str("If there are no issues, respond with an empty `findings` array.\n");
+    prompt.push_str("Do NOT output markdown headers, diffs, or XML edit tags; this is an audit-only review.\n");
 
     prompt
 }
@@ -317,5 +319,22 @@ mod tests {
         assert_eq!(target.review_id.as_deref(), Some("rev-7"));
         assert_eq!(target.item_id, 3);
         assert_eq!(extract_review_step_execution_id(&prompt), Some(3));
+    }
+
+    #[test]
+    fn test_build_review_system_prompt_requires_structured_output() {
+        let prompt = build_review_system_prompt();
+        assert!(prompt.contains("structured output schema"));
+        assert!(prompt.contains("`summary`"));
+        assert!(prompt.contains("`findings`"));
+        assert!(prompt.contains("`severity`"));
+        assert!(!prompt.contains("## [SEVERITY]"));
+
+        let summary_idx = prompt.find("`summary`").expect("summary documented");
+        let findings_idx = prompt.find("`findings`").expect("findings documented");
+        assert!(
+            summary_idx < findings_idx,
+            "summary must be specified before findings"
+        );
     }
 }

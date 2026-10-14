@@ -42,22 +42,16 @@ async fn apply_model_selection(
 /// Applies the chosen picker row (shared by keyboard and mouse): a role or a model is
 /// selected, `Others...` opens the full model catalog.
 pub(crate) async fn activate_selection_item(
-    mut st: MutexGuard<'_, AppState>,
+    st: MutexGuard<'_, AppState>,
     item: SelectionItem,
     server_writer: &mut RpcConnection,
 ) -> anyhow::Result<()> {
     match item {
-        SelectionItem::Role(role, _) => {
-            apply_model_selection(st, ModelSelection::Role(role), server_writer).await
+        SelectionItem::Primary(entry) => {
+            apply_model_selection(st, ModelSelection::Specific(entry.model), server_writer).await
         }
         SelectionItem::Model(model) => {
             apply_model_selection(st, ModelSelection::Specific(model), server_writer).await
-        }
-        SelectionItem::Others => {
-            if !st.open_model_catalog() {
-                st.notify_warning("No other models are available");
-            }
-            Ok(())
         }
     }
 }
@@ -96,7 +90,9 @@ pub(super) async fn handle_selection_dialog_key(
             }
             st.selection_dialog = Some(dialog);
         }
-        KeyCode::Char(c @ '1'..='6') if dialog.kind == SelectionDialogKind::ModelRoles => {
+        // Quick-select digits are derived from the row position and bounds-checked
+        // against the item list, so the mapping stays correct as the entries evolve.
+        KeyCode::Char(c @ '1'..='9') if dialog.kind == SelectionDialogKind::PrimaryModels => {
             if let Some(item) = dialog.items.get(c as usize - '1' as usize).cloned() {
                 activate_selection_item(st, item, server_writer).await?;
                 return Ok(Some(InputResult::Continue));

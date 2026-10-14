@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 
 pub const DEFAULT_MAX_DISCOVERY_ROUNDS: usize = 5;
 pub const DEFAULT_FILES_TOKEN_BUDGET: usize = 300_000;
+pub const DEFAULT_MAX_PATTERN_BATCH: usize = 150;
 
 fn default_max_discovery_rounds() -> usize {
     DEFAULT_MAX_DISCOVERY_ROUNDS
@@ -9,6 +10,10 @@ fn default_max_discovery_rounds() -> usize {
 
 fn default_files_token_budget() -> usize {
     DEFAULT_FILES_TOKEN_BUDGET
+}
+
+fn default_max_pattern_batch() -> usize {
+    DEFAULT_MAX_PATTERN_BATCH
 }
 
 fn default_repomap_token_budget() -> usize {
@@ -25,6 +30,8 @@ pub struct ContextConfig {
     pub files_token_budget: usize,
     #[serde(default = "default_repomap_token_budget")]
     pub repomap_token_budget: usize,
+    #[serde(default = "default_max_pattern_batch")]
+    pub max_pattern_batch: usize,
 }
 
 impl Default for ContextConfig {
@@ -34,6 +41,7 @@ impl Default for ContextConfig {
             max_discovery_rounds: DEFAULT_MAX_DISCOVERY_ROUNDS,
             files_token_budget: DEFAULT_FILES_TOKEN_BUDGET,
             repomap_token_budget: default_repomap_token_budget(),
+            max_pattern_batch: DEFAULT_MAX_PATTERN_BATCH,
         }
     }
 }

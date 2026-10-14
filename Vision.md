@@ -33,9 +33,11 @@ TAUQE splits the *What*/*How* duality across dedicated, non-overlapping model ro
 
 - **Architect** owns the *What*: high-level decomposition, system invariants, and conceptual boundaries. It produces plans and concept nodes, not concrete source lines.
 - **Coder** owns the *How*: minimal, coherent, compiling code changes that resolve one well-posed step.
-- **Advisor** provides strategic guidance and design trade-offs when the objective or its constraints are ambiguous.
+- **Primary** owns the interactive engineering dialogue and is the mandatory base role: its first entry is the idle active model and the deterministic default for every specialized role that omits its own list.
 - **Reviewer** performs analytical, read-only inspection and emits findings; it never modifies files.
 - **Scribe** handles history compaction, turning long multi-turn transcripts into dense, lossless context.
+
+Each functional role is backed by an ordered list of model entries rather than a single model name. `primary` is mandatory and must list at least one entry; `coder`, `architect`, and `reviewer` are optional and inherit the entire `primary` list when omitted, so a specialized role never silently loses access to the configured models. Every entry may carry an optional reasoning depth (`effort`) and a human-readable `alias`, so the same model can run shallowly in one role and deeply in another without registering a duplicate.
 
 The Architect/Coder boundary is deliberately rigid. The Architect defines the invariant; the Coder implements it. When code generation fails repeatedly, the harness **never switches the Coder into the Architect role**. Instead, escalation is intra-role: the *coder ladder* (`CoderTier`, each tier pairing a model with a reasoning effort) promotes execution to a stronger coder tier within the same *How* competence. Crossing back into the *What* role on a compile failure would blur the boundary the harness exists to enforce and would reintroduce the drift the paradigm is designed to prevent.
 
@@ -170,7 +172,7 @@ Project Files         → Manifests and toolchain capabilities
 Tree-sitter Repo Map  → Deterministic symbol awareness
 Bounded Turn          → Autonomous turn lifecycle (Discovery + Staging + Healing)
 Strict Harness        → Enforcing boundaries without shell access
-Model Roles           → Architect (What) + Coder (How) + Advisor + Reviewer + Scribe
+Model Roles           → Primary + Architect (What) + Coder (How) + Reviewer + Scribe
 Developer             → Task specification and absolute control
 LLM                   → Semantic transformation engine
 ```

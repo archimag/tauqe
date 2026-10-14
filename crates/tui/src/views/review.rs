@@ -84,6 +84,11 @@ impl ReviewViewState {
         self.running = false;
         self.update_session(session);
         self.error = None;
+        // The freshly finished session's header (with its Executive Summary
+        // block) must be visible immediately, so reset the viewport instead of
+        // leaving it scrolled to wherever the streaming view left it.
+        self.selected_index = 0;
+        self.scroll = 0;
     }
 
     pub fn set_sessions(&mut self, sessions: Vec<ReviewSession>, active_id: Option<String>) {
@@ -483,8 +488,8 @@ fn model_badge(selection: &ModelSelection) -> Span<'static> {
             tauqe_protocol::ModelRole::Architect => {
                 Span::styled(" [Arc]", Style::default().fg(Color::Red))
             }
-            tauqe_protocol::ModelRole::Advisor => {
-                Span::styled(" [Adv]", Style::default().fg(Color::Cyan))
+            tauqe_protocol::ModelRole::Primary => {
+                Span::styled(" [Pri]", Style::default().fg(Color::Cyan))
             }
             tauqe_protocol::ModelRole::Reviewer => {
                 Span::styled(" [Rev]", Style::default().fg(Color::Magenta))
@@ -605,7 +610,13 @@ fn compute_unified_review_lines(
                     if let Some(desc) = description {
                         let trimmed = desc.trim();
                         if !trimmed.is_empty() {
-                            let mut desc_lines = Vec::new();
+                            let mut desc_lines = vec![Line::from(vec![
+                                Span::styled("    │ ", Style::default().fg(Color::DarkGray)),
+                                Span::styled(
+                                    "Executive Summary:",
+                                    Style::default().fg(Color::Green).bold(),
+                                ),
+                            ])];
                             let mut theme =
                                 crate::markdown::MarkdownTheme::answer_themed(theme_mode);
                             theme.text_style = Style::default().fg(Color::Gray);
@@ -808,5 +819,64 @@ mod tests {
         assert!(view.is_all_expanded());
         assert!(view.is_item_expanded("rev-1", 1));
         assert!(view.is_session_expanded("rev-2"));
+    }
+
+    fn make_session_with_description(
+        id: &str,
+        description: &str,
+        item_ids: &[u32],
+    ) -> ReviewSession {
+        let mut session = make_session(id, item_ids);
+        session.description = Some(description.to_string());
+        session
+    }
+
+    #[test]
+    fn test_expanded_session_header_renders_executive_summary_block() {
+        let session = make_session_with_description(
+            "rev-summary",
+            "## Overview\n\nThe architecture is sound.",
+            &[1],
+        );
+        let view = ReviewViewState {
+            sessions: vec![session],
+            ..Default::default()
+        };
+        let rows = view.flatten_rows();
+        let (lines, _offsets) =
+            compute_unified_review_lines(&rows, 0, 80, crate::config::ThemeMode::Dark);
+        let texts: Vec<String> = lines.iter().map(|line| line.to_string()).collect();
+
+        assert!(
+            texts.iter().any(|t| t.contains("Executive Summary:")),
+            "expected the Executive Summary header, got: {texts:?}"
+        );
+        assert!(
+            texts.iter().any(|t| t.contains("The architecture is sound.")),
+            "expected the rendered summary body, got: {texts:?}"
+        );
+    }
+
+    #[test]
+    fn test_collapsed_session_header_hides_executive_summary() {
+        let session = make_session_with_description(
+            "rev-collapsed",
+            "## Overview\n\nThe architecture is sound.",
+            &[1],
+        );
+        let mut view = ReviewViewState {
+            sessions: vec![session],
+            ..Default::default()
+        };
+        view.collapsed_sessions.insert("rev-collapsed".to_string());
+        let rows = view.flatten_rows();
+        let (lines, _offsets) =
+            compute_unified_review_lines(&rows, 0, 80, crate::config::ThemeMode::Dark);
+        let texts: Vec<String> = lines.iter().map(|line| line.to_string()).collect();
+
+        assert!(
+            !texts.iter().any(|t| t.contains("Executive Summary:")),
+            "a collapsed session must not render the Executive Summary block, got: {texts:?}"
+        );
     }
 }
