@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
 use anyhow::Result;
@@ -63,17 +63,18 @@ struct ExtractorState {
 /// re-parse every file outside that context on each round; the cache turns
 /// those passes into lookups for files whose modification time and size are
 /// unchanged.
+#[derive(Clone)]
 pub struct TreeSitterExtractor {
-    state: Mutex<ExtractorState>,
+    state: Arc<Mutex<ExtractorState>>,
 }
 
 impl Default for TreeSitterExtractor {
     fn default() -> Self {
         Self {
-            state: Mutex::new(ExtractorState {
+            state: Arc::new(Mutex::new(ExtractorState {
                 parser: Parser::new(),
                 cache: HashMap::new(),
-            }),
+            })),
         }
     }
 }

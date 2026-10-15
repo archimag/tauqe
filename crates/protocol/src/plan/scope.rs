@@ -181,7 +181,24 @@ impl Plan {
 
         let blocked = pending
             .into_iter()
-            .map(|leaf| format!("#{} {}", leaf.id, leaf.title))
+            .map(|leaf| {
+                let unmet: Vec<String> = leaf
+                    .depends_on
+                    .iter()
+                    .filter(|dep| !satisfied.contains(&dep.to_ascii_lowercase()))
+                    .map(|dep| format!("#{dep}"))
+                    .collect();
+                if unmet.is_empty() {
+                    format!("#{} {}", leaf.id, leaf.title)
+                } else {
+                    format!(
+                        "#{} {} (unmet dependencies: {})",
+                        leaf.id,
+                        leaf.title,
+                        unmet.join(", ")
+                    )
+                }
+            })
             .collect();
         (ready, blocked)
     }

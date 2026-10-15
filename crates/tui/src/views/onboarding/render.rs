@@ -349,10 +349,17 @@ pub fn render_onboarding_view(
                 format_masked_key(ob.input_buffer.get_text())
             };
 
+            let prefix = state.tui_config.input.primary_modifier.prefix_str();
             let hint = if ob.show_key {
-                "  (Ctrl+R: Hide, Ctrl+V: Paste, Enter: Save, Esc: Cancel)"
+                format!(
+                    "  ({}R: Hide, {}V: Paste, Enter: Save, Esc: Cancel)",
+                    prefix, prefix
+                )
             } else {
-                "  (Ctrl+R: Show, Ctrl+V: Paste, Enter: Save, Esc: Cancel)"
+                format!(
+                    "  ({}R: Show, {}V: Paste, Enter: Save, Esc: Cancel)",
+                    prefix, prefix
+                )
             };
 
             lines.push(Line::from(vec![

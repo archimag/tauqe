@@ -15,7 +15,7 @@ pub const REFINE_DIALOG_WIDTH: u16 = 68;
 /// Height of the refine dialog, as a percentage of the terminal height.
 pub const REFINE_DIALOG_HEIGHT: u16 = 56;
 /// Action-bar label for starting a refinement.
-pub const REFINE_DIALOG_CONFIRM_LABEL: &str = "[ Start Refinement ]";
+pub const REFINE_DIALOG_CONFIRM_LABEL: &str = "[ Start Refinement (C-Enter) ]";
 /// Action-bar label for cancelling the refine dialog.
 pub const REFINE_DIALOG_CANCEL_LABEL: &str = "[ Cancel ]";
 
@@ -198,10 +198,15 @@ pub fn render_plan_refine_dialog(
             editor_content.push(Line::from(spans));
         }
     }
+    let editor_border = if dialog.focus.is_instructions_editor() {
+        Style::default().fg(Color::Green).bold()
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
     let editor_block = Block::default()
         .title(" Architect Instructions (optional) ")
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Green));
+        .border_style(editor_border);
     frame.render_widget(
         Paragraph::new(editor_content)
             .block(editor_block)
@@ -210,22 +215,32 @@ pub fn render_plan_refine_dialog(
     );
 
     // Action bar with a focus-aware navigation hint.
+    let in_actions = dialog.focus.is_actions();
     let confirm_selected = dialog.confirm_button == crate::app::ConfirmDialogButton::Confirm;
-    let confirm_style = if confirm_selected {
-        Style::default().bg(Color::Green).fg(Color::Black).bold()
+    let (confirm_style, cancel_style) = if in_actions {
+        if confirm_selected {
+            (
+                Style::default().bg(Color::Green).fg(Color::Black).bold(),
+                Style::default().bg(Color::DarkGray).fg(Color::White),
+            )
+        } else {
+            (
+                Style::default().bg(Color::DarkGray).fg(Color::White),
+                Style::default().bg(Color::Cyan).fg(Color::Black).bold(),
+            )
+        }
     } else {
-        Style::default().fg(Color::Green)
-    };
-    let cancel_style = if confirm_selected {
-        Style::default().fg(Color::Cyan)
-    } else {
-        Style::default().bg(Color::Cyan).fg(Color::Black).bold()
+        (
+            Style::default().bg(Color::DarkGray).fg(Color::White),
+            Style::default().bg(Color::DarkGray).fg(Color::White),
+        )
     };
     let nav_hint = if dialog.focus.is_actions() {
         "Enter: confirm • ←/→: button • Esc: cancel".to_string()
     } else {
         format!(
-            "Tab: focus • {}: model • Esc: cancel",
+            "{}Enter: start • Tab: focus • {}: model • Esc: cancel",
+            primary.prefix_str(),
             crate::components::model_selector::model_select_hint(primary)
         )
     };
@@ -235,7 +250,7 @@ pub fn render_plan_refine_dialog(
             Span::raw("    "),
             Span::styled(format!(" {} ", REFINE_DIALOG_CANCEL_LABEL), cancel_style),
         ]),
-        Line::from(Span::styled(nav_hint, Style::default().fg(Color::DarkGray))),
+        Line::from(Span::styled(nav_hint, Style::default().fg(Color::Gray))),
     ];
     let footer = Paragraph::new(actions).alignment(Alignment::Center);
     frame.render_widget(footer, footer_area);
@@ -244,6 +259,7 @@ pub fn render_plan_refine_dialog(
 pub fn render_plan_refine_blocked_dialog(
     frame: &mut ratatui::Frame,
     blocked: &crate::views::plans::PlanRefineBlockedState,
+    confirm_button: crate::app::ConfirmDialogButton,
 ) {
     let mut body_lines = vec![
         Line::raw(""),
@@ -269,7 +285,7 @@ pub fn render_plan_refine_blocked_dialog(
 
     body_lines.push(Line::raw(""));
     body_lines.push(Line::from(Span::styled(
-        "TAUQE prohibits speculative guessing. Resolve architectural blockers with AI in Develop.",
+        "TAUQE prohibits speculative guessing. Replan uncompleted horizon addressing architectural blockers.",
         Style::default().fg(Color::DarkGray),
     )));
 
@@ -279,9 +295,9 @@ pub fn render_plan_refine_blocked_dialog(
             title: "Plan Refinement Blocked",
             border_color: Color::Red,
             body_lines,
-            confirm_label: "Discuss in Develop (D)",
+            confirm_label: "Replan Horizon (Y)",
             cancel_label: "Dismiss (Esc)",
-            confirm_button: crate::app::ConfirmDialogButton::Cancel,
+            confirm_button,
             destructive: false,
             width: 70,
         },

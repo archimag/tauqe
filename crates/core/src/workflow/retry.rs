@@ -24,6 +24,7 @@ pub fn format_patch_retry_reason(err: &EditError) -> String {
 pub fn build_patch_retry_prompt(
     succeeded_files: &HashSet<String>,
     failed_files: &HashMap<String, EditError>,
+    protocol_errors: &[String],
     target_language: Option<&str>,
 ) -> String {
     let mut prompt = String::new();
@@ -39,26 +40,40 @@ pub fn build_patch_retry_prompt(
         prompt.push_str("(Do NOT regenerate changes for the above files; their updated versions are already present in <context>).\n\n");
     }
 
-    prompt.push_str("Failed files and errors:\n");
-    let mut failed_sorted: Vec<(&String, &EditError)> = failed_files.iter().collect();
-    failed_sorted.sort_by_key(|(p, _)| *p);
-    for (path, err) in failed_sorted {
-        let explanation = match err {
-            EditError::NoMatch { .. } => {
-                "Search block not found (0 matches). Verify exact line content, indentation, and context."
-            }
-            EditError::AmbiguousMatch { count, .. } => {
-                &format!(
-                    "Search block matches {} times. Include more surrounding lines to make the match uniquely identifiable.",
-                    count
-                )
-            }
-            other => &other.to_string(),
-        };
-        prompt.push_str(&format!("- `{}`: {}\n", path, explanation));
+    if !protocol_errors.is_empty() {
+        prompt.push_str("Protocol parsing errors encountered in your edit blocks:\n");
+        for err in protocol_errors {
+            prompt.push_str(&format!("- {}\n", err));
+        }
+        prompt.push('\n');
     }
 
-    prompt.push_str("\nPlease provide corrected edit blocks ONLY for the failed files listed above.");
+    if !failed_files.is_empty() {
+        prompt.push_str("Failed files and errors:\n");
+        let mut failed_sorted: Vec<(&String, &EditError)> = failed_files.iter().collect();
+        failed_sorted.sort_by_key(|(p, _)| *p);
+        for (path, err) in failed_sorted {
+            let explanation = match err {
+                EditError::NoMatch { .. } => {
+                    "Search block not found (0 matches). Verify exact line content, indentation, and context."
+                }
+                EditError::AmbiguousMatch { count, .. } => {
+                    &format!(
+                        "Search block matches {} times. Include more surrounding lines to make the match uniquely identifiable.",
+                        count
+                    )
+                }
+                other => &other.to_string(),
+            };
+            prompt.push_str(&format!("- `{}`: {}\n", path, explanation));
+        }
+    }
+
+    if failed_files.is_empty() {
+        prompt.push_str("\nPlease provide corrected edit blocks strictly following the required protocol format.");
+    } else {
+        prompt.push_str("\nPlease provide corrected edit blocks ONLY for the failed files listed above.");
+    }
     if let Some(lang) = target_language {
         prompt.push_str(&format!(
             "\n\nNote: Formulate your explanations in {} (the language of the user's request), while conducting all reasoning strictly in English.",
@@ -181,7 +196,11 @@ mod tests {
             },
         );
 
-        let prompt = build_patch_retry_prompt(&succeeded, &failed, Some("Russian"));
+        let proto_errors = vec!["Malformed XML edit block: Unclosed tag".to_string()];
+        let prompt = build_patch_retry_prompt(&succeeded, &failed, &proto_errors, Some("Russian"));
+
+        assert!(prompt.contains("Protocol parsing errors encountered in your edit blocks:"));
+        assert!(prompt.contains("Malformed XML edit block: Unclosed tag"));
 
         assert!(prompt.contains("Russian"));
         assert!(prompt.contains("Successfully applied edits for:"));

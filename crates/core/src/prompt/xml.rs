@@ -7,7 +7,7 @@
 //! parsing is delegated to the edit protocol so the XML grammar keeps a single
 //! source of truth.
 
-use crate::edits::protocol::xml::tags::ParsedPlanTag;
+use crate::edits::protocol::xml::tags::{ParsedPlanItem, ParsedPlanTag};
 use crate::edits::protocol::{EditProtocol, MarkedXmlEditProtocol, XmlEditProtocol};
 use tauqe_protocol::{
     DiscussionPlanAction, DiscussionPlanUpdate, LlmCapability, LlmCommand, LlmOutcome, ModelResult,
@@ -155,10 +155,16 @@ fn decode_xml_commands(xml: &dyn EditProtocol, raw_text: &str) -> Vec<LlmCommand
     }
 
     // File edit operations decoded from XML edit blocks.
-    if let ModelResult::Edit { edits, .. } = xml.parse_output(raw_text, &[]) {
-        for operation in edits {
-            commands.push(LlmCommand::Edit { operation });
+    match xml.parse_output(raw_text, &[]) {
+        ModelResult::Edit { edits, error, .. } => {
+            if let Some(message) = error {
+                commands.push(LlmCommand::ProtocolError { message });
+            }
+            for operation in edits {
+                commands.push(LlmCommand::Edit { operation });
+            }
         }
+        ModelResult::Answer { .. } => {}
     }
 
     // Discovery: context requests.
@@ -221,7 +227,7 @@ fn plan_tag_to_update(tag: ParsedPlanTag) -> DiscussionPlanUpdate {
         title: tag.title,
         description: tag.description,
         concept: tag.concept,
-        items: tag.items,
+        items: tag.items.into_iter().map(ParsedPlanItem::into_plan_item).collect(),
     }
 }
 
@@ -275,7 +281,7 @@ fn terminal_outcome_to_command(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tauqe_protocol::{ContextAccess, EditOperation, VerifyOnSuccess, VerifyTarget};
+    use tauqe_protocol::{ContextAccess, DocTopic, EditOperation, VerifyOnSuccess, VerifyTarget};
 
     #[test]
     fn test_name_and_capabilities() {
@@ -375,7 +381,7 @@ mod tests {
             access: ContextAccess::Editable,
         }));
         assert!(commands.contains(&LlmCommand::DocRequest {
-            topic: "workflow".to_string(),
+            topic: DocTopic::Workflow,
         }));
         assert!(commands.contains(&LlmCommand::Verify {
             target: VerifyTarget::Clippy,
@@ -392,6 +398,22 @@ mod tests {
                 summary: Some("All checks pass".to_string()),
             },
         }));
+    }
+
+    #[test]
+    fn test_decode_malformed_xml_emits_protocol_error() {
+        let protocol = XmlPromptProtocol;
+        let output = concat!(
+            "Here are my changes:\n",
+            "<tauqe_edits summary=\"Broken\">\n",
+            "  <edit path=\"src/lib.rs\">\n",
+            "    <search>\nfoo\n",
+        );
+        let commands = protocol.decode(output);
+        let has_error = commands
+            .iter()
+            .any(|cmd| matches!(cmd, LlmCommand::ProtocolError { .. }));
+        assert!(has_error, "Malformed XML should produce ProtocolError command");
     }
 
     #[test]

@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use tauqe_protocol::ModelUsageInfo;
+use tauqe_protocol::{EditFileOp, EditFileStatus, ModelUsageInfo};
 
 pub use tauqe_protocol::ReasoningEffort;
 
@@ -90,7 +90,7 @@ pub enum StreamEvent {
     EditStarted,
     EditFileStarted {
         path: String,
-        op_type: String,
+        op_type: EditFileOp,
     },
     EditHunk {
         path: String,
@@ -100,7 +100,7 @@ pub enum StreamEvent {
     },
     EditFileDone {
         path: String,
-        status: String,
+        status: EditFileStatus,
         error: Option<String>,
         hunks_count: usize,
     },

@@ -83,6 +83,66 @@ pub fn unwind_checkpoint_if_present(dir: &Path) -> Result<bool> {
     }
 }
 
+/// Scans the repository for orphaned staging artifacts (`*.tauqe-tmp` and `*.tauqe-bak`)
+/// left behind by interrupted or crashed edit commits, cleaning them up or restoring
+/// original files if interrupted before the new file could be renamed into place.
+pub fn cleanup_orphaned_staging_files(root: &Path) -> usize {
+    let mut cleaned = 0;
+    let mut dirs_to_visit = vec![root.to_path_buf()];
+
+    while let Some(current_dir) = dirs_to_visit.pop() {
+        let entries = match std::fs::read_dir(&current_dir) {
+            Ok(entries) => entries,
+            Err(_) => continue,
+        };
+
+        for entry in entries.filter_map(|e| e.ok()) {
+            let path = entry.path();
+            let file_type = match entry.file_type() {
+                Ok(ft) => ft,
+                Err(_) => continue,
+            };
+
+            if file_type.is_symlink() {
+                continue;
+            }
+
+            if file_type.is_dir() {
+                let file_name = entry.file_name();
+                if file_name == ".git" || file_name == ".tauqe" {
+                    continue;
+                }
+                dirs_to_visit.push(path);
+            } else if file_type.is_file() {
+                let file_name = entry.file_name();
+                let name_str = file_name.to_string_lossy();
+                if name_str.ends_with(".tauqe-tmp") {
+                    if std::fs::remove_file(&path).is_ok() {
+                        cleaned += 1;
+                    }
+                } else if let Some(orig_name) = name_str.strip_suffix(".tauqe-bak") {
+                    if orig_name.is_empty() {
+                        if std::fs::remove_file(&path).is_ok() {
+                            cleaned += 1;
+                        }
+                        continue;
+                    }
+                    let target = current_dir.join(orig_name);
+                    if !target.exists() {
+                        if std::fs::rename(&path, &target).is_ok() {
+                            cleaned += 1;
+                        }
+                    } else if std::fs::remove_file(&path).is_ok() {
+                        cleaned += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    cleaned
+}
+
 /// Recovers repository state from an interrupted/crashed workflow.
 ///
 /// Recovery is driven strictly by the on-disk transaction marker written when a
@@ -101,9 +161,19 @@ pub fn recover_interrupted_workflow(dir: &Path) -> Result<Option<String>> {
         return Ok(None);
     }
 
+    let cleaned_artifacts = cleanup_orphaned_staging_files(dir);
+
     let checkpoint = match read_transaction_marker(dir) {
         Some(checkpoint) => checkpoint,
-        None => return Ok(None),
+        None => {
+            if cleaned_artifacts > 0 {
+                return Ok(Some(format!(
+                    "Cleaned up {} orphaned staging artifact(s).",
+                    cleaned_artifacts
+                )));
+            }
+            return Ok(None);
+        }
     };
 
     // Collect the commits recorded on top of the transaction base. They must all
@@ -133,6 +203,20 @@ pub fn recover_interrupted_workflow(dir: &Path) -> Result<Option<String>> {
 
     let unwound_steps = commits.len();
 
+    // If there were no step commits and no checkpoint commit created, there is
+    // no transaction state to unwind. Resetting --hard in this case would destroy
+    // legitimate uncommitted working tree changes.
+    if unwound_steps == 0 && !checkpoint.created_checkpoint_commit {
+        clear_transaction_marker(dir);
+        if cleaned_artifacts > 0 {
+            return Ok(Some(format!(
+                "Cleaned up {} orphaned staging artifact(s).",
+                cleaned_artifacts
+            )));
+        }
+        return Ok(None);
+    }
+
     // Reset to the recorded base and unwind a temporary checkpoint commit so the
     // developer's uncommitted changes return to the working tree. `git reset
     // --hard` leaves untracked files alone, matching the previous recovery
@@ -145,18 +229,86 @@ pub fn recover_interrupted_workflow(dir: &Path) -> Result<Option<String>> {
     clear_transaction_marker(dir);
 
     if unwound_steps > 0 || checkpoint.created_checkpoint_commit {
-        let msg = format!(
+        let mut msg = format!(
             "Recovered interrupted workflow: unwound {} step commit(s), restored checkpoint: {}",
             unwound_steps, checkpoint.created_checkpoint_commit
         );
+        if cleaned_artifacts > 0 {
+            msg.push_str(&format!(
+                ", cleaned up {} orphaned staging artifact(s)",
+                cleaned_artifacts
+            ));
+        }
         Ok(Some(msg))
+    } else if cleaned_artifacts > 0 {
+        Ok(Some(format!(
+            "Cleaned up {} orphaned staging artifact(s).",
+            cleaned_artifacts
+        )))
     } else {
         Ok(None)
     }
 }
 
+/// Ensures that `.tauqe` and sensitive credential/runtime files are ignored by Git in the
+/// repository's local exclude configuration (`.git/info/exclude`), protecting them without
+/// modifying tracked project files.
+pub fn ensure_tauqe_ignored(dir: &Path) -> Result<()> {
+    let git_dir_res = run_git(Some(dir), &["rev-parse", "--git-dir"]);
+    if let Ok(git_dir_str) = git_dir_res {
+        let trimmed = git_dir_str.trim();
+        if !trimmed.is_empty() {
+            let git_dir = if Path::new(trimmed).is_absolute() {
+                PathBuf::from(trimmed)
+            } else {
+                dir.join(trimmed)
+            };
+            let info_dir = git_dir.join("info");
+            let exclude_path = info_dir.join("exclude");
+            let _ = std::fs::create_dir_all(&info_dir);
+            let content = std::fs::read_to_string(&exclude_path).unwrap_or_default();
+            let patterns = [
+                ".tauqe",
+                "credentials.toml",
+                ".credentials.toml",
+                "*.tauqe-tmp",
+                "*.tauqe-bak",
+            ];
+            let mut to_append = Vec::new();
+            for pat in patterns {
+                let already_ignored = content.lines().any(|line| {
+                    let t = line.trim();
+                    t == pat
+                        || t == format!("{pat}/")
+                        || t == format!("/{pat}")
+                        || t == format!("/{pat}/")
+                });
+                if !already_ignored {
+                    to_append.push(pat);
+                }
+            }
+            if !to_append.is_empty() {
+                use std::io::Write;
+                let mut file = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&exclude_path)?;
+                if !content.is_empty() && !content.ends_with('\n') {
+                    writeln!(file)?;
+                }
+                for pat in to_append {
+                    writeln!(file, "{pat}")?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Creates a safe checkpoint of uncommitted changes before applying AI modifications.
 pub fn create_checkpoint(dir: &Path) -> Result<CheckpointInfo> {
+    let _ = ensure_tauqe_ignored(dir);
+
     let head = run_git(Some(dir), &["rev-parse", "HEAD"])
         .unwrap_or_else(|_| "HEAD".to_string())
         .trim()
@@ -174,7 +326,9 @@ pub fn create_checkpoint(dir: &Path) -> Result<CheckpointInfo> {
         return Ok(checkpoint);
     }
 
-    // Stage and commit uncommitted user changes into a checkpoint commit
+    // Stage and commit uncommitted user changes into a checkpoint commit.
+    // Ignored paths (.tauqe, credentials, temporary files) in .git/info/exclude
+    // are automatically skipped by git add -A without argument pathspec errors.
     run_git(Some(dir), &["add", "-A"])
         .context("Failed to stage uncommitted changes for checkpoint")?;
 
@@ -197,7 +351,19 @@ pub fn create_checkpoint(dir: &Path) -> Result<CheckpointInfo> {
 pub fn restore_checkpoint(dir: &Path, checkpoint: &CheckpointInfo) -> Result<()> {
     // 1. Reset working tree to checkpoint base commit
     run_git(Some(dir), &["reset", "--hard", &checkpoint.previous_head])?;
-    let _ = run_git(Some(dir), &["clean", "-fd"]);
+    let _ = run_git(
+        Some(dir),
+        &[
+            "clean",
+            "-fd",
+            "-e",
+            ".tauqe",
+            "-e",
+            "credentials.toml",
+            "-e",
+            ".credentials.toml",
+        ],
+    );
 
     // 2. If a checkpoint commit was created, unwind it so user modifications are restored
     if checkpoint.created_checkpoint_commit {
@@ -205,6 +371,7 @@ pub fn restore_checkpoint(dir: &Path, checkpoint: &CheckpointInfo) -> Result<()>
     }
 
     clear_transaction_marker(dir);
+    cleanup_orphaned_staging_files(dir);
     Ok(())
 }
 
@@ -246,6 +413,12 @@ pub fn finalize_ai_commit(
         let _ = unwind_checkpoint_if_present(dir)?;
     }
 
+    // Step commits and temporary checkpoint commits have been unwound back to the
+    // working tree. Clear the transaction marker now so an error during staging
+    // or committing does not leave a dangling marker that would reset --hard and
+    // destroy working tree changes on startup.
+    clear_transaction_marker(dir);
+
     // 3. Stage touched files
     stage_files(dir, changed_files)?;
 
@@ -256,7 +429,6 @@ pub fn finalize_ai_commit(
         .trim()
         .to_string();
 
-    clear_transaction_marker(dir);
     Ok(short_hash)
 }
 
@@ -269,6 +441,8 @@ pub fn create_ai_commit(dir: &Path, changed_files: &[String], summary: &str) -> 
     // If HEAD is a temporary checkpoint commit, unwind it so user dirty changes remain in working tree
     let _ = unwind_checkpoint_if_present(dir)?;
 
+    clear_transaction_marker(dir);
+
     stage_files(dir, changed_files)?;
 
     let commit_message = format!("{}\n\n{}", summary.trim(), TAUQE_CO_AUTHOR_TRAILER);
@@ -278,7 +452,6 @@ pub fn create_ai_commit(dir: &Path, changed_files: &[String], summary: &str) -> 
         .trim()
         .to_string();
 
-    clear_transaction_marker(dir);
     Ok(short_hash)
 }
 
@@ -395,6 +568,157 @@ mod tests {
     }
 
     #[test]
+    fn test_cleanup_orphaned_staging_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+
+        let tmp_file = path.join("orphan.rs.tauqe-tmp");
+        fs::write(&tmp_file, "temporary").unwrap();
+
+        let existing_orig = path.join("existing.rs");
+        fs::write(&existing_orig, "existing content").unwrap();
+        let existing_bak = path.join("existing.rs.tauqe-bak");
+        fs::write(&existing_bak, "stale backup").unwrap();
+
+        let missing_bak = path.join("missing.rs.tauqe-bak");
+        fs::write(&missing_bak, "original content to restore").unwrap();
+
+        let sub_dir = path.join("subdir");
+        fs::create_dir_all(&sub_dir).unwrap();
+        let sub_tmp = sub_dir.join("sub.rs.tauqe-tmp");
+        fs::write(&sub_tmp, "sub temporary").unwrap();
+
+        let git_dir = path.join(".git");
+        fs::create_dir_all(&git_dir).unwrap();
+        let git_tmp = git_dir.join("internal.tauqe-tmp");
+        fs::write(&git_tmp, "do not touch").unwrap();
+
+        let cleaned = cleanup_orphaned_staging_files(path);
+        assert_eq!(cleaned, 4);
+
+        assert!(!tmp_file.exists());
+        assert!(!existing_bak.exists());
+        assert_eq!(fs::read_to_string(&existing_orig).unwrap(), "existing content");
+        assert!(!missing_bak.exists());
+        assert_eq!(
+            fs::read_to_string(path.join("missing.rs")).unwrap(),
+            "original content to restore"
+        );
+        assert!(!sub_tmp.exists());
+        assert!(git_tmp.exists());
+    }
+
+    #[test]
+    fn test_recover_interrupted_workflow_cleans_orphaned_artifacts() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+        crate::git::state::init_repository(Some(path), true).unwrap();
+
+        let tmp_file = path.join("orphan.rs.tauqe-tmp");
+        fs::write(&tmp_file, "staged").unwrap();
+
+        let recovery = recover_interrupted_workflow(path).unwrap();
+        assert!(recovery.is_some());
+        assert!(recovery.unwrap().contains("Cleaned up 1 orphaned staging artifact(s)"));
+        assert!(!tmp_file.exists());
+    }
+
+    #[test]
+    fn test_checkpoint_ignores_and_preserves_tauqe_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+        crate::git::state::init_repository(Some(path), true).unwrap();
+
+        // Simulate internal .tauqe directory with credentials and history
+        let tauqe_dir = path.join(".tauqe");
+        fs::create_dir_all(&tauqe_dir).unwrap();
+        let creds_file = tauqe_dir.join("credentials.toml");
+        fs::write(&creds_file, "openrouter_key = \"secret\"").unwrap();
+        let history_file = tauqe_dir.join("history.jsonl");
+        fs::write(&history_file, "{\"type\":\"turn\",\"prompt\":\"test\"}\n").unwrap();
+
+        // Root credentials file should also be ignored and preserved
+        let root_creds = path.join("credentials.toml");
+        fs::write(&root_creds, "root_key = \"secret\"").unwrap();
+
+        // User uncommitted change in a tracked/project file
+        let user_file = path.join("user_code.rs");
+        fs::write(&user_file, "fn main() {}").unwrap();
+
+        // 1. Create checkpoint
+        let chk = create_checkpoint(path).unwrap();
+        assert!(chk.created_checkpoint_commit);
+
+        // Verify that .tauqe files and credentials were NOT committed into checkpoint
+        let committed_files = crate::git::cmd::run_git(
+            Some(path),
+            &["diff-tree", "--no-commit-id", "--name-only", "-r", "HEAD"],
+        )
+        .unwrap();
+        assert!(committed_files.contains("user_code.rs"));
+        assert!(!committed_files.contains(".tauqe"));
+        assert!(!committed_files.contains("credentials.toml"));
+
+        // 2. AI creates a new file during the turn
+        let ai_file = path.join("ai_generated.rs");
+        fs::write(&ai_file, "pub fn ai() {}").unwrap();
+
+        // 3. Restore checkpoint (e.g. on error or undo)
+        restore_checkpoint(path, &chk).unwrap();
+
+        // User file must be restored
+        assert!(user_file.exists());
+        assert_eq!(fs::read_to_string(&user_file).unwrap(), "fn main() {}");
+
+        // AI generated file must be cleaned
+        assert!(!ai_file.exists());
+
+        // CRITICAL: .tauqe credentials, root credentials and history must STILL exist and be intact
+        assert!(creds_file.exists());
+        assert_eq!(
+            fs::read_to_string(&creds_file).unwrap(),
+            "openrouter_key = \"secret\""
+        );
+        assert!(root_creds.exists());
+        assert_eq!(
+            fs::read_to_string(&root_creds).unwrap(),
+            "root_key = \"secret\""
+        );
+        assert!(history_file.exists());
+        assert_eq!(
+            fs::read_to_string(&history_file).unwrap(),
+            "{\"type\":\"turn\",\"prompt\":\"test\"}\n"
+        );
+    }
+
+    #[test]
+    fn test_checkpoint_clean_repo_with_only_tauqe_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+        crate::git::state::init_repository(Some(path), true).unwrap();
+
+        // Only .tauqe exists (no user code changes)
+        let tauqe_dir = path.join(".tauqe");
+        fs::create_dir_all(&tauqe_dir).unwrap();
+        let creds_file = tauqe_dir.join("credentials.toml");
+        fs::write(&creds_file, "key = \"secret\"").unwrap();
+
+        // Checkpoint must consider repo clean (created_checkpoint_commit = false)
+        let chk = create_checkpoint(path).unwrap();
+        assert!(!chk.created_checkpoint_commit);
+
+        // AI generates files
+        let ai_file = path.join("ai.rs");
+        fs::write(&ai_file, "code").unwrap();
+
+        // Restore checkpoint
+        restore_checkpoint(path, &chk).unwrap();
+
+        assert!(!ai_file.exists());
+        assert!(creds_file.exists());
+    }
+
+    #[test]
     fn test_recover_interrupted_workflow_with_checkpoint_and_steps() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path();
@@ -494,6 +818,36 @@ mod tests {
             .to_string();
         assert_eq!(head_before, head_after);
         assert!(path.join("manual.txt").exists());
+    }
+
+    #[test]
+    fn test_recover_skips_when_no_steps_and_no_checkpoint_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+        crate::git::state::init_repository(Some(path), true).unwrap();
+
+        // Simulate an open marker without checkpoint commit (clean repo at start)
+        let checkpoint = CheckpointInfo {
+            created_checkpoint_commit: false,
+            previous_head: crate::git::cmd::run_git(Some(path), &["rev-parse", "HEAD"])
+                .unwrap()
+                .trim()
+                .to_string(),
+        };
+        write_transaction_marker(path, &checkpoint).unwrap();
+
+        // User or turn leaves verified changes uncommitted in the working tree
+        let dirty_file = path.join("dirty.txt");
+        fs::write(&dirty_file, "valuable uncommitted edits").unwrap();
+
+        let recovery = recover_interrupted_workflow(path).unwrap();
+        assert!(recovery.is_none());
+        assert!(read_transaction_marker(path).is_none());
+        // Uncommitted edits must remain completely untouched
+        assert_eq!(
+            fs::read_to_string(&dirty_file).unwrap(),
+            "valuable uncommitted edits"
+        );
     }
 
     #[test]

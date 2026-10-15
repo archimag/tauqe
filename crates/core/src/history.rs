@@ -325,6 +325,22 @@ impl HistoryManager {
         Ok(())
     }
 
+    /// Removes an entry by ID, rewriting storage and updating `current_max_id`.
+    pub fn rollback_entry(&mut self, entry_id: u64) -> Result<()> {
+        let mut entries = self.storage.read_entries()?;
+        if let Some(pos) = entries.iter().rposition(|e| e.id() == Some(entry_id)) {
+            entries.remove(pos);
+            self.storage.rewrite_entries(&entries)?;
+            self.current_max_id = entries
+                .iter()
+                .enumerate()
+                .map(|(idx, e)| e.id().unwrap_or((idx + 1) as u64))
+                .max()
+                .unwrap_or(0);
+        }
+        Ok(())
+    }
+
     pub fn clear(&mut self) -> Result<()> {
         self.current_max_id = 0;
         self.storage.clear()
@@ -334,6 +350,7 @@ impl HistoryManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
     use tempfile::tempdir;
 
     #[test]
@@ -392,6 +409,25 @@ mod tests {
             }
             _ => panic!("Expected summary entry first"),
         }
+    }
+
+    #[test]
+    fn test_history_manager_rollback_entry() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let mut hm = HistoryManager::new(root);
+
+        let entry1 = hm.record_turn("Task 1", vec![]).unwrap();
+        let entry2 = hm.record_turn("Task 2", vec![]).unwrap();
+        assert_eq!(hm.get_entries().unwrap().len(), 2);
+
+        hm.rollback_entry(entry2.id().unwrap()).unwrap();
+        let entries = hm.get_entries().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].id(), entry1.id());
+
+        hm.rollback_entry(999).unwrap();
+        assert_eq!(hm.get_entries().unwrap().len(), 1);
     }
 
     #[test]
@@ -491,5 +527,41 @@ mod tests {
         assert!(!has_more3);
         assert_eq!(items3.len(), 1);
         assert_eq!(items3[0].id, 1);
+    }
+
+    #[test]
+    fn test_history_manager_initialization_with_corrupted_lines() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let storage = SessionStorage::new(root.clone());
+
+        let entry1 = HistoryEntry::Turn {
+            id: Some(10),
+            prompt: "Prompt 10".to_string(),
+            context: vec![],
+        };
+        let entry2 = HistoryEntry::Turn {
+            id: Some(20),
+            prompt: "Prompt 20".to_string(),
+            context: vec![],
+        };
+
+        storage.append_entry(&entry1).unwrap();
+        let history_file = storage.history_path();
+        let mut file = std::fs::OpenOptions::new().append(true).open(&history_file).unwrap();
+        writeln!(file, "not valid jsonl").unwrap();
+        file.flush().unwrap();
+        storage.append_entry(&entry2).unwrap();
+
+        // Create a new HistoryManager and verify max_id and prompt injection
+        let mut hm = HistoryManager::new(root);
+        assert_eq!(hm.current_max_id, 20);
+
+        let history_tag = hm.format_history_tag().unwrap();
+        assert!(history_tag.contains("Prompt 10"));
+        assert!(history_tag.contains("Prompt 20"));
+
+        let next_entry = hm.record_turn("Prompt 21", vec![]).unwrap();
+        assert_eq!(next_entry.id(), Some(21));
     }
 }

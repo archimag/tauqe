@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+use tauqe_protocol::{EditFileOp, EditFileStatus};
+
 use super::{normalize_hunk, resolve_path, EditStreamFilter, StagingSimulator};
 use crate::edits::protocol::xml::is_valid_turn_marker;
 use crate::providers::StreamEvent;
@@ -13,7 +15,7 @@ pub struct XmlStreamFilter {
     buffer: String,
     marker: Option<String>,
     raw_buffer: String,
-    normalized_bytes: usize,
+    marker_stack: Vec<&'static str>,
     in_edits_block: bool,
     current_file: Option<CurrentStreamingFile>,
     file_hunks_count: usize,
@@ -23,7 +25,7 @@ pub struct XmlStreamFilter {
 
 struct CurrentStreamingFile {
     path: String,
-    op_type: String,
+    op_type: EditFileOp,
 }
 
 impl XmlStreamFilter {
@@ -32,7 +34,7 @@ impl XmlStreamFilter {
             buffer: String::new(),
             marker: None,
             raw_buffer: String::new(),
-            normalized_bytes: 0,
+            marker_stack: Vec::new(),
             in_edits_block: false,
             current_file: None,
             file_hunks_count: 0,
@@ -178,13 +180,13 @@ impl XmlStreamFilter {
                                 let display_path = format!("{} -> {}", resolved_from, resolved_to);
                                 events.push(StreamEvent::EditFileStarted {
                                     path: display_path.clone(),
-                                    op_type: "move".to_string(),
+                                    op_type: EditFileOp::Move,
                                 });
                                 self.buffer.drain(..tag_start + close_bracket + 1);
                                 self.staging.apply_move(&resolved_from, &resolved_to);
                                 events.push(StreamEvent::EditFileDone {
                                     path: display_path,
-                                    status: "ok".to_string(),
+                                    status: EditFileStatus::Ok,
                                     error: None,
                                     hunks_count: 0,
                                 });
@@ -199,15 +201,15 @@ impl XmlStreamFilter {
                             let is_create = tag_name == "create";
                             let resolved = resolve_path(&path_attr, &self.editable_paths, is_create);
                             let op_type = match tag_name.as_str() {
-                                "create" => "create".to_string(),
-                                "overwrite" => "overwrite".to_string(),
-                                "delete" => "delete".to_string(),
-                                _ => "replace".to_string(),
+                                "create" => EditFileOp::Create,
+                                "overwrite" => EditFileOp::Overwrite,
+                                "delete" => EditFileOp::Delete,
+                                _ => EditFileOp::Replace,
                             };
 
                             events.push(StreamEvent::EditFileStarted {
                                 path: resolved.clone(),
-                                op_type: op_type.clone(),
+                                op_type,
                             });
 
                             self.buffer.drain(..tag_start + close_bracket + 1);
@@ -216,7 +218,7 @@ impl XmlStreamFilter {
                             if is_self_closing || tag_name == "delete" {
                                 events.push(StreamEvent::EditFileDone {
                                     path: resolved,
-                                    status: "ok".to_string(),
+                                    status: EditFileStatus::Ok,
                                     error: None,
                                     hunks_count: 0,
                                 });
@@ -243,28 +245,28 @@ impl XmlStreamFilter {
             if let Some((curr_path, curr_op_type)) = self
                 .current_file
                 .as_ref()
-                .map(|c| (c.path.clone(), c.op_type.clone()))
+                .map(|c| (c.path.clone(), c.op_type))
             {
-                let close_tag = match curr_op_type.as_str() {
-                    "create" => "</create>",
-                    "overwrite" => "</overwrite>",
+                let close_tag = match curr_op_type {
+                    EditFileOp::Create => "</create>",
+                    EditFileOp::Overwrite => "</overwrite>",
                     _ => "</edit>",
                 };
 
-                if curr_op_type == "create" || curr_op_type == "overwrite" {
+                if curr_op_type == EditFileOp::Create || curr_op_type == EditFileOp::Overwrite {
                     if let Some(close_pos) = self.buffer.find(close_tag) {
                         let content = self.buffer[..close_pos].to_string();
                         self.buffer.drain(..close_pos + close_tag.len());
 
                         let norm_content = self.restore_content(&normalize_hunk(&content));
 
-                        let old_text = if curr_op_type == "overwrite" {
+                        let old_text = if curr_op_type == EditFileOp::Overwrite {
                             match self.staging.current_content(&curr_path) {
                                 Ok(text) => text,
                                 Err(err_msg) => {
                                     events.push(StreamEvent::EditFileDone {
                                         path: curr_path.clone(),
-                                        status: "error".to_string(),
+                                        status: EditFileStatus::Error,
                                         error: Some(err_msg),
                                         hunks_count: 0,
                                     });
@@ -287,7 +289,7 @@ impl XmlStreamFilter {
 
                         events.push(StreamEvent::EditFileDone {
                             path: curr_path,
-                            status: "ok".to_string(),
+                            status: EditFileStatus::Ok,
                             error: None,
                             hunks_count: 1,
                         });
@@ -318,7 +320,7 @@ impl XmlStreamFilter {
                         if let Err(err_msg) = val_res {
                             events.push(StreamEvent::EditFileDone {
                                 path: curr_path,
-                                status: "error".to_string(),
+                                status: EditFileStatus::Error,
                                 error: Some(err_msg),
                                 hunks_count: self.file_hunks_count,
                             });
@@ -332,7 +334,7 @@ impl XmlStreamFilter {
                         self.buffer.drain(..close_pos + close_tag.len());
                         events.push(StreamEvent::EditFileDone {
                             path: curr_path,
-                            status: "ok".to_string(),
+                            status: EditFileStatus::Ok,
                             error: None,
                             hunks_count: self.file_hunks_count,
                         });
@@ -354,13 +356,13 @@ impl EditStreamFilter for XmlStreamFilter {
     fn push_chunk(&mut self, chunk: &str) -> Vec<StreamEvent> {
         let normalized = if let Some(marker) = &self.marker {
             self.raw_buffer.push_str(chunk);
-            let prefix = crate::edits::protocol::xml::normalize_marked_xml(
-                &self.raw_buffer, marker, false,
+            let delta = crate::edits::protocol::xml::normalize_marked_xml_incremental(
+                &mut self.raw_buffer,
+                marker,
+                &mut self.marker_stack,
+                false,
             );
-            let prefix = activate_unmarked_scratchpad(&prefix, marker);
-            let delta = prefix[self.normalized_bytes..].to_string();
-            self.normalized_bytes = prefix.len();
-            delta
+            activate_unmarked_scratchpad(&delta, marker)
         } else {
             chunk.to_string()
         };
@@ -372,18 +374,20 @@ impl EditStreamFilter for XmlStreamFilter {
     fn finish(mut self: Box<Self>) -> Vec<StreamEvent> {
         let mut events = Vec::new();
         if let Some(marker) = &self.marker {
-            let normalized = crate::edits::protocol::xml::normalize_marked_xml(
-                &self.raw_buffer, marker, true,
+            let delta = crate::edits::protocol::xml::normalize_marked_xml_incremental(
+                &mut self.raw_buffer,
+                marker,
+                &mut self.marker_stack,
+                true,
             );
-            let normalized = activate_unmarked_scratchpad(&normalized, marker);
-            let remaining = normalized[self.normalized_bytes..].to_string();
+            let remaining = activate_unmarked_scratchpad(&delta, marker);
             events.extend(self.push_normalized_chunk(&remaining));
         }
         if !self.buffer.is_empty() {
             if let Some(curr) = self.current_file.take() {
                 events.push(StreamEvent::EditFileDone {
                     path: curr.path,
-                    status: "ok".to_string(),
+                    status: EditFileStatus::Ok,
                     error: None,
                     hunks_count: self.file_hunks_count,
                 });
@@ -405,7 +409,7 @@ impl EditStreamFilter for XmlStreamFilter {
 /// Re-activates unmarked `<scratchpad>` tags that normalization protected as
 /// literal text. Working memory is never user-facing, so the stream filter must
 /// suppress it even when the model omits the turn-marker suffix. The protection
-/// prefix is produced by [`normalize_marked_xml`](crate::edits::protocol::xml::normalize_marked_xml).
+/// prefix is produced by [`normalize_marked_xml_incremental`](crate::edits::protocol::xml::normalize_marked_xml_incremental).
 fn activate_unmarked_scratchpad(normalized: &str, marker: &str) -> String {
     let protection = format!("\u{e000}{}\u{e001}", marker);
     if !normalized.contains(&protection) {
@@ -840,10 +844,10 @@ mod tests {
             }).collect();
             assert_eq!(hunks, vec![(&expected_old, &expected_new)], "split {split}");
             assert!(events.iter().any(|event| matches!(event,
-                StreamEvent::EditFileDone { status, .. } if status == "ok"
+                StreamEvent::EditFileDone { status, .. } if *status == EditFileStatus::Ok
             )));
             assert!(!events.iter().any(|event| matches!(event,
-                StreamEvent::EditFileDone { status, .. } if status == "error"
+                StreamEvent::EditFileDone { status, .. } if *status == EditFileStatus::Error
             )));
             let text: String = events.iter().filter_map(|event| match event {
                 StreamEvent::TextDelta(delta) => Some(delta.as_str()),

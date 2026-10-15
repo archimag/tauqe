@@ -64,7 +64,61 @@ pub(super) fn next_item_tag_bounds(text: &str) -> Option<(usize, usize)> {
     None
 }
 
-pub(super) fn parse_plan_items_with_diagnostics(content: &str) -> (Vec<tauqe_protocol::PlanItem>, Vec<String>) {
+/// Parsed representation of an `<item>` tag within a plan block.
+///
+/// Preserves whether `status` was explicitly provided or omitted, enabling
+/// partial updates to retain existing item status without regressing to `Todo`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedPlanItem {
+    pub id: String,
+    pub title: String,
+    pub details: Option<String>,
+    pub status: Option<tauqe_protocol::PlanItemStatus>,
+    pub files: Vec<String>,
+    pub readonly_files: Vec<String>,
+    pub concept_refs: Vec<String>,
+    pub depends_on: Vec<String>,
+    pub children: Vec<ParsedPlanItem>,
+}
+
+impl ParsedPlanItem {
+    /// Converts into a standard [`PlanItem`], defaulting omitted status to [`PlanItemStatus::Todo`].
+    pub fn into_plan_item(self) -> tauqe_protocol::PlanItem {
+        tauqe_protocol::PlanItem {
+            id: self.id,
+            title: self.title,
+            details: self.details,
+            status: self.status.unwrap_or(tauqe_protocol::PlanItemStatus::Todo),
+            files: self.files,
+            readonly_files: self.readonly_files,
+            concept_refs: self.concept_refs,
+            depends_on: self.depends_on,
+            children: self
+                .children
+                .into_iter()
+                .map(ParsedPlanItem::into_plan_item)
+                .collect(),
+        }
+    }
+}
+
+impl From<tauqe_protocol::PlanItem> for ParsedPlanItem {
+    fn from(item: tauqe_protocol::PlanItem) -> Self {
+        Self {
+            id: item.id,
+            title: item.title,
+            details: item.details,
+            status: Some(item.status),
+            files: item.files,
+            readonly_files: item.readonly_files,
+            concept_refs: item.concept_refs,
+            depends_on: item.depends_on,
+            children: item.children.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+pub(super) fn parse_plan_items_with_diagnostics(content: &str) -> (Vec<ParsedPlanItem>, Vec<String>) {
     let mut items = Vec::new();
     let mut errors = Vec::new();
     let mut pos = 0;
@@ -92,8 +146,8 @@ pub(super) fn parse_plan_items_with_diagnostics(content: &str) -> (Vec<tauqe_pro
         let header = &content[start..header_end];
         let id = extract_attribute(header, "id").unwrap_or_default().trim().to_string();
         let raw_title = extract_attribute(header, "title").unwrap_or_default().trim().to_string();
-        let status_str = extract_attribute(header, "status").unwrap_or_default();
-        let status = match status_str.trim().to_lowercase().as_str() {
+        let status_str = extract_attribute(header, "status");
+        let status = status_str.map(|s| match s.trim().to_lowercase().as_str() {
             "discussion" | "discuss" | "question" | "?" | "обсуждение" => tauqe_protocol::PlanItemStatus::Discussion,
             "in_progress" | "inprogress" | "doing" => tauqe_protocol::PlanItemStatus::InProgress,
             "done" | "completed" | "finished" => tauqe_protocol::PlanItemStatus::Done,
@@ -104,7 +158,7 @@ pub(super) fn parse_plan_items_with_diagnostics(content: &str) -> (Vec<tauqe_pro
                 errors.push(format!("Unrecognized status '{other}' for item '{}', defaulting to 'todo'", if id.is_empty() { &raw_title } else { &id }));
                 tauqe_protocol::PlanItemStatus::Todo
             }
-        };
+        });
 
         let attr_details = extract_attribute(header, "details")
             .or_else(|| extract_attribute(header, "description"))
@@ -178,7 +232,7 @@ pub(super) fn parse_plan_items_with_diagnostics(content: &str) -> (Vec<tauqe_pro
         if rest[..gt].trim_end().ends_with('/') {
             // Self-closing item
             if !id.is_empty() || !raw_title.is_empty() {
-                items.push(tauqe_protocol::PlanItem {
+                items.push(ParsedPlanItem {
                     id: if id.is_empty() { format!("{}", items.len() + 1) } else { id.clone() },
                     title: raw_title,
                     details: attr_details,
@@ -282,7 +336,7 @@ pub(super) fn parse_plan_items_with_diagnostics(content: &str) -> (Vec<tauqe_pro
                 }
 
                 if !id.is_empty() || !title.is_empty() {
-                    items.push(tauqe_protocol::PlanItem {
+                    items.push(ParsedPlanItem {
                         id: if id.is_empty() { format!("{}", items.len() + 1) } else { id.clone() },
                         title: if title.is_empty() { id } else { title },
                         details,

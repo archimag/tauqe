@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use serde::Deserialize;
 use struson::reader::{JsonReader, JsonStreamReader};
-use tauqe_protocol::StructuredChangeProposal;
+use tauqe_protocol::{EditFileOp, EditFileStatus, StructuredChangeProposal};
 
 use super::{normalize_hunk, resolve_path, EditStreamFilter, StagingSimulator};
 use crate::providers::StreamEvent;
@@ -18,9 +18,12 @@ pub struct JsonStreamFilter {
     /// None = undecided; Some(true) = provider returned plain text (not JSON), stream as-is.
     passthrough: Option<bool>,
     buffer: String,
-    message_streamed_bytes: usize,
+    message_value_start: Option<usize>,
+    message_raw_decoded_pos: usize,
+    message_end_scanned_pos: usize,
     message_finished: bool,
     processed_changes_count: usize,
+    changes_finished: bool,
     has_emitted_edit_started: bool,
     started_change_index: Option<usize>,
     editable_paths: Vec<String>,
@@ -32,9 +35,12 @@ impl JsonStreamFilter {
         Self {
             passthrough: None,
             buffer: String::new(),
-            message_streamed_bytes: 0,
+            message_value_start: None,
+            message_raw_decoded_pos: 0,
+            message_end_scanned_pos: 0,
             message_finished: false,
             processed_changes_count: 0,
+            changes_finished: false,
             has_emitted_edit_started: false,
             started_change_index: None,
             editable_paths,
@@ -58,19 +64,19 @@ impl JsonStreamFilter {
             self.has_emitted_edit_started = true;
         }
 
-        let is_create = change.op.eq_ignore_ascii_case("create");
+        let op = change.op.parse::<EditFileOp>().unwrap_or(EditFileOp::Replace);
+        let is_create = op == EditFileOp::Create;
         let resolved_path = resolve_path(&change.path, &self.editable_paths, is_create);
-        let op_type = change.op.to_lowercase();
 
         if !already_started {
             events.push(StreamEvent::EditFileStarted {
                 path: resolved_path.clone(),
-                op_type: op_type.clone(),
+                op_type: op,
             });
         }
 
-        match op_type.as_str() {
-            "create" => {
+        match op {
+            EditFileOp::Create => {
                 let content = normalize_hunk(change.content.as_deref().unwrap_or_default());
                 events.push(StreamEvent::EditHunk {
                     path: resolved_path.clone(),
@@ -81,12 +87,12 @@ impl JsonStreamFilter {
                 self.staging.overwrite(&resolved_path, content);
                 events.push(StreamEvent::EditFileDone {
                     path: resolved_path,
-                    status: "ok".to_string(),
+                    status: EditFileStatus::Ok,
                     error: None,
                     hunks_count: 1,
                 });
             }
-            "overwrite" => {
+            EditFileOp::Overwrite => {
                 let new_content = normalize_hunk(change.content.as_deref().unwrap_or_default());
                 match self.staging.current_content(&resolved_path) {
                     Ok(old_text) => {
@@ -99,7 +105,7 @@ impl JsonStreamFilter {
                         self.staging.overwrite(&resolved_path, new_content);
                         events.push(StreamEvent::EditFileDone {
                             path: resolved_path,
-                            status: "ok".to_string(),
+                            status: EditFileStatus::Ok,
                             error: None,
                             hunks_count: 1,
                         });
@@ -107,34 +113,34 @@ impl JsonStreamFilter {
                     Err(err_msg) => {
                         events.push(StreamEvent::EditFileDone {
                             path: resolved_path,
-                            status: "error".to_string(),
+                            status: EditFileStatus::Error,
                             error: Some(err_msg),
                             hunks_count: 0,
                         });
                     }
                 }
             }
-            "delete" => {
+            EditFileOp::Delete => {
                 events.push(StreamEvent::EditFileDone {
                     path: resolved_path,
-                    status: "ok".to_string(),
+                    status: EditFileStatus::Ok,
                     error: None,
                     hunks_count: 0,
                 });
             }
-            "move" => {
+            EditFileOp::Move => {
                 let to_raw = change.to.as_deref().unwrap_or_default();
                 let resolved_to = resolve_path(to_raw, &self.editable_paths, true);
                 let display_path = format!("{} -> {}", resolved_path, resolved_to);
                 self.staging.apply_move(&resolved_path, &resolved_to);
                 events.push(StreamEvent::EditFileDone {
                     path: display_path,
-                    status: "ok".to_string(),
+                    status: EditFileStatus::Ok,
                     error: None,
                     hunks_count: 0,
                 });
             }
-            _ => {
+            EditFileOp::Replace => {
                 let old_text = normalize_hunk(change.old_text.as_deref().unwrap_or_default());
                 let new_text = normalize_hunk(
                     change
@@ -157,7 +163,7 @@ impl JsonStreamFilter {
                     Ok(()) => {
                         events.push(StreamEvent::EditFileDone {
                             path: resolved_path,
-                            status: "ok".to_string(),
+                            status: EditFileStatus::Ok,
                             error: None,
                             hunks_count: 1,
                         });
@@ -165,7 +171,7 @@ impl JsonStreamFilter {
                     Err(err_msg) => {
                         events.push(StreamEvent::EditFileDone {
                             path: resolved_path,
-                            status: "error".to_string(),
+                            status: EditFileStatus::Error,
                             error: Some(err_msg),
                             hunks_count: 1,
                         });
@@ -203,65 +209,84 @@ impl EditStreamFilter for JsonStreamFilter {
             return events;
         }
 
-        // 1. Stream message field deltas on the fly
+        // 1. Stream message field deltas on the fly using incremental decoding
         if !self.message_finished {
-            let (delta, new_streamed, finished) =
-                extract_streamed_message(&self.buffer, self.message_streamed_bytes);
-            if let Some(d) = delta {
-                if !d.is_empty() {
-                    events.push(StreamEvent::TextDelta(d));
+            if self.message_value_start.is_none() {
+                self.message_value_start = find_string_field_value_start(&self.buffer, "message");
+            }
+            if let Some(val_start) = self.message_value_start {
+                let content_slice = &self.buffer[val_start..];
+                let (raw_body, is_finished) =
+                    match find_json_string_end_from(content_slice, &mut self.message_end_scanned_pos) {
+                        Some(end) => (&content_slice[..end], true),
+                        None => (content_slice, false),
+                    };
+
+                let delta = decode_json_string_body_incremental(
+                    raw_body,
+                    &mut self.message_raw_decoded_pos,
+                );
+                if is_finished && self.message_raw_decoded_pos >= raw_body.len() {
+                    self.message_finished = true;
+                }
+                if !delta.is_empty() {
+                    events.push(StreamEvent::TextDelta(delta));
                 }
             }
-            self.message_streamed_bytes = new_streamed;
-            self.message_finished = finished;
         }
 
         // 2. Parse top-level JSON and extract completed changes[i] via struson
         let mut new_changes = Vec::new();
-        if let Some(brace_idx) = self.buffer.find('{') {
-            let json_bytes = &self.buffer.as_bytes()[brace_idx..];
-            let mut reader = JsonStreamReader::new(json_bytes);
-            if reader.begin_object().is_ok() {
-                'outer: while let Ok(true) = reader.has_next() {
-                    let name = match reader.next_name() {
-                        Ok(n) => n.to_string(),
-                        Err(_) => break 'outer,
-                    };
+        let should_scan_changes = !self.changes_finished
+            && (chunk.contains('}') || chunk.contains(']') || self.processed_changes_count == 0);
 
-                    if name == "changes" {
-                        if reader.begin_array().is_ok() {
-                            let mut current_idx = 0;
-                            while let Ok(true) = reader.has_next() {
-                                if current_idx < self.processed_changes_count {
-                                    if reader.skip_value().is_err() {
-                                        break 'outer;
-                                    }
-                                    current_idx += 1;
-                                } else {
-                                    let mut de =
-                                        struson::serde::JsonReaderDeserializer::new(&mut reader);
-                                    match StructuredChangeProposal::deserialize(&mut de) {
-                                        Ok(change) => {
-                                            self.processed_changes_count += 1;
-                                            current_idx += 1;
-                                            new_changes.push(change);
-                                        }
-                                        Err(_) => {
-                                            // Incomplete element in stream; wait for more data
+        if should_scan_changes {
+            if let Some(brace_idx) = self.buffer.find('{') {
+                let json_bytes = &self.buffer.as_bytes()[brace_idx..];
+                let mut reader = JsonStreamReader::new(json_bytes);
+                if reader.begin_object().is_ok() {
+                    'outer: while let Ok(true) = reader.has_next() {
+                        let name = match reader.next_name() {
+                            Ok(n) => n.to_string(),
+                            Err(_) => break 'outer,
+                        };
+
+                        if name == "changes" {
+                            if reader.begin_array().is_ok() {
+                                let mut current_idx = 0;
+                                while let Ok(true) = reader.has_next() {
+                                    if current_idx < self.processed_changes_count {
+                                        if reader.skip_value().is_err() {
                                             break 'outer;
+                                        }
+                                        current_idx += 1;
+                                    } else {
+                                        let mut de =
+                                            struson::serde::JsonReaderDeserializer::new(&mut reader);
+                                        match StructuredChangeProposal::deserialize(&mut de) {
+                                            Ok(change) => {
+                                                self.processed_changes_count += 1;
+                                                current_idx += 1;
+                                                new_changes.push(change);
+                                            }
+                                            Err(_) => {
+                                                // Incomplete element in stream; wait for more data
+                                                break 'outer;
+                                            }
                                         }
                                     }
                                 }
+                                if let Ok(false) = reader.has_next() {
+                                    let _ = reader.end_array();
+                                    self.changes_finished = true;
+                                }
+                            } else {
+                                break 'outer;
                             }
-                            if let Ok(false) = reader.has_next() {
-                                let _ = reader.end_array();
-                            }
-                        } else {
+                        } else if reader.skip_value().is_err() {
+                            // Value for this property is not fully received yet
                             break 'outer;
                         }
-                    } else if reader.skip_value().is_err() {
-                        // Value for this property is not fully received yet
-                        break 'outer;
                     }
                 }
             }
@@ -280,7 +305,7 @@ impl EditStreamFilter for JsonStreamFilter {
         }
 
         // 3. Early detection of active file in incomplete change
-        if self.started_change_index != Some(self.processed_changes_count) {
+        if self.started_change_index != Some(self.processed_changes_count) && !self.changes_finished {
             if let Some((op, path)) =
                 extract_incomplete_change_op_and_path(&self.buffer, self.processed_changes_count)
             {
@@ -288,11 +313,11 @@ impl EditStreamFilter for JsonStreamFilter {
                     events.push(StreamEvent::EditStarted);
                     self.has_emitted_edit_started = true;
                 }
-                let is_create = op.eq_ignore_ascii_case("create");
+                let is_create = op == EditFileOp::Create;
                 let resolved_path = resolve_path(&path, &self.editable_paths, is_create);
                 events.push(StreamEvent::EditFileStarted {
                     path: resolved_path,
-                    op_type: op.to_lowercase(),
+                    op_type: op,
                 });
                 self.started_change_index = Some(self.processed_changes_count);
             }
@@ -301,16 +326,20 @@ impl EditStreamFilter for JsonStreamFilter {
         events
     }
 
-    fn finish(self: Box<Self>) -> Vec<StreamEvent> {
+    fn finish(mut self: Box<Self>) -> Vec<StreamEvent> {
         let mut events = Vec::new();
         if self.passthrough == Some(true) {
             return events;
         }
         if !self.message_finished {
-            let (delta, _, _) = extract_streamed_message(&self.buffer, self.message_streamed_bytes);
-            if let Some(d) = delta {
-                if !d.is_empty() {
-                    events.push(StreamEvent::TextDelta(d));
+            if let Some(val_start) = self.message_value_start {
+                let content_slice = &self.buffer[val_start..];
+                let delta = decode_json_string_body_incremental(
+                    content_slice,
+                    &mut self.message_raw_decoded_pos,
+                );
+                if !delta.is_empty() {
+                    events.push(StreamEvent::TextDelta(delta));
                 }
             }
         }
@@ -330,7 +359,9 @@ impl EditStreamFilter for JsonStreamFilter {
 pub struct JsonFieldStreamFilter<T> {
     target_field: String,
     buffer: String,
-    streamed_bytes: usize,
+    value_start: Option<usize>,
+    raw_decoded_pos: usize,
+    end_scanned_pos: usize,
     finished: bool,
     _marker: PhantomData<fn() -> T>,
 }
@@ -344,7 +375,9 @@ where
         Self {
             target_field: target_field.into(),
             buffer: String::new(),
-            streamed_bytes: 0,
+            value_start: None,
+            raw_decoded_pos: 0,
+            end_scanned_pos: 0,
             finished: false,
             _marker: PhantomData,
         }
@@ -362,11 +395,29 @@ where
         if self.finished {
             return None;
         }
-        let (delta, new_streamed, finished) =
-            extract_streamed_string_field(&self.buffer, &self.target_field, self.streamed_bytes);
-        self.streamed_bytes = new_streamed;
-        self.finished = finished;
-        delta.filter(|text| !text.is_empty())
+        if self.value_start.is_none() {
+            self.value_start = find_string_field_value_start(&self.buffer, &self.target_field);
+        }
+        let val_start = self.value_start?;
+        let content_slice = &self.buffer[val_start..];
+        let (raw_body, is_finished) =
+            match find_json_string_end_from(content_slice, &mut self.end_scanned_pos) {
+                Some(end) => (&content_slice[..end], true),
+                None => (content_slice, false),
+            };
+
+        let delta = decode_json_string_body_incremental(
+            raw_body,
+            &mut self.raw_decoded_pos,
+        );
+        if is_finished && self.raw_decoded_pos >= raw_body.len() {
+            self.finished = true;
+        }
+        if delta.is_empty() {
+            None
+        } else {
+            Some(delta)
+        }
     }
 
     /// Returns the accumulated raw JSON buffer received so far.
@@ -459,22 +510,15 @@ fn prepare_json_payload(buffer: &str) -> String {
     }
 }
 
-/// Recognized structured edit operation names.
-///
-/// Confirms that a partially streamed change element carries a valid,
-/// unambiguous edit signature before file edit reporting starts, avoiding
-/// false edit starts on malformed or partial operations.
-fn is_known_edit_op(op: &str) -> bool {
-    const KNOWN_OPS: [&str; 5] = ["create", "overwrite", "delete", "move", "replace"];
-    let op = op.trim();
-    KNOWN_OPS.iter().any(|known| op.eq_ignore_ascii_case(known))
-}
-
 /// Extracts `(op, path)` for an incomplete element at `target_idx` in `changes` array.
+///
+/// The operation is parsed into the strict [`EditFileOp`], so file edit
+/// reporting starts only once a partially streamed element carries a valid,
+/// unambiguous edit signature.
 fn extract_incomplete_change_op_and_path(
     buffer: &str,
     target_idx: usize,
-) -> Option<(String, String)> {
+) -> Option<(EditFileOp, String)> {
     let brace_idx = buffer.find('{')?;
     let json_bytes = &buffer.as_bytes()[brace_idx..];
     let mut reader = JsonStreamReader::new(json_bytes);
@@ -521,9 +565,14 @@ fn extract_incomplete_change_op_and_path(
                     }
                     if let (Some(op), Some(path)) = (op, path) {
                         let trimmed_path = path.trim().to_string();
-                        if is_known_edit_op(&op) && !trimmed_path.is_empty() {
-                            return Some((op, trimmed_path));
+                        if trimmed_path.is_empty() {
+                            return None;
                         }
+                        return op
+                            .trim()
+                            .parse::<EditFileOp>()
+                            .ok()
+                            .map(|op| (op, trimmed_path));
                     }
                     return None;
                 }
@@ -657,18 +706,35 @@ pub fn extract_streamed_string_field(
 }
 
 /// Returns the byte offset of the first unescaped `"` in a JSON string body,
-/// or `None` while the closing quote has not streamed in yet.
-fn find_json_string_end(raw: &str) -> Option<usize> {
+/// resuming from `from` to avoid O(n^2) rescanning across chunks.
+pub(crate) fn find_json_string_end_from(raw: &str, from: &mut usize) -> Option<usize> {
     let bytes = raw.as_bytes();
-    let mut i = 0;
+    let mut i = *from;
     while i < bytes.len() {
         match bytes[i] {
-            b'\\' => i += 2,
-            b'"' => return Some(i),
+            b'\\' => {
+                if i + 1 < bytes.len() {
+                    i += 2;
+                } else {
+                    break;
+                }
+            }
+            b'"' => {
+                *from = i;
+                return Some(i);
+            }
             _ => i += 1,
         }
     }
+    *from = i;
     None
+}
+
+/// Returns the byte offset of the first unescaped `"` in a JSON string body,
+/// or `None` while the closing quote has not streamed in yet.
+fn find_json_string_end(raw: &str) -> Option<usize> {
+    let mut from = 0;
+    find_json_string_end_from(raw, &mut from)
 }
 
 /// Parses exactly four hexadecimal digits into a `u32` code unit.
@@ -689,18 +755,14 @@ fn parse_hex4(hex: &[u8]) -> Option<u32> {
     Some(value)
 }
 
-/// Decodes a JSON string body (the text between the surrounding quotes) into
-/// UTF-8, tolerating a body that is still streaming in.
+/// Decodes a JSON string body incrementally starting from `raw_pos`.
 ///
-/// When the body ends inside an escape sequence, decoding stops before that
-/// escape so the caller can wait for the remaining bytes. UTF-16 surrogate
-/// pairs (`\uD800`..`\uDBFF` followed by `\uDC00`..`\uDFFF`) are combined into
-/// their scalar value; unpaired surrogates and invalid escapes are replaced
-/// with U+FFFD so every decoded byte maps deterministically to one code point.
-fn decode_json_string_body(raw: &str) -> String {
+/// It mutates `raw_pos` up to the last fully decoded character or escape, withholding
+/// incomplete trailing escapes so chunks can be appended without re-decoding from zero.
+pub(crate) fn decode_json_string_body_incremental(raw: &str, raw_pos: &mut usize) -> String {
     let bytes = raw.as_bytes();
-    let mut decoded = String::with_capacity(raw.len());
-    let mut i = 0;
+    let mut decoded = String::new();
+    let mut i = *raw_pos;
 
     while i < bytes.len() {
         if bytes[i] != b'\\' {
@@ -809,15 +871,15 @@ fn decode_json_string_body(raw: &str) -> String {
         }
     }
 
+    *raw_pos = i;
     decoded
 }
 
-/// Helper function to scan unescaped characters of the "message" string property in raw JSON.
-pub(crate) fn extract_streamed_message(
-    buffer: &str,
-    already_streamed: usize,
-) -> (Option<String>, usize, bool) {
-    extract_streamed_string_field(buffer, "message", already_streamed)
+/// Decodes a JSON string body (the text between the surrounding quotes) into
+/// UTF-8, tolerating a body that is still streaming in.
+fn decode_json_string_body(raw: &str) -> String {
+    let mut pos = 0;
+    decode_json_string_body_incremental(raw, &mut pos)
 }
 
 #[cfg(test)]
@@ -833,7 +895,7 @@ mod tests {
         assert!(events1
             .iter()
             .any(|e| matches!(e, StreamEvent::EditStarted)));
-        assert!(events1.iter().any(|e| matches!(e, StreamEvent::EditFileStarted { path, op_type } if path == "crates/foo.rs" && op_type == "replace")));
+        assert!(events1.iter().any(|e| matches!(e, StreamEvent::EditFileStarted { path, op_type } if path == "crates/foo.rs" && *op_type == EditFileOp::Replace)));
         assert!(!events1
             .iter()
             .any(|e| matches!(e, StreamEvent::EditFileDone { .. })));
@@ -975,7 +1037,7 @@ mod tests {
         assert!(events.iter().any(|e| matches!(
             e,
             StreamEvent::EditFileStarted { path, op_type }
-                if path == "a.rs" && op_type == "create"
+                if path == "a.rs" && *op_type == EditFileOp::Create
         )));
     }
 
@@ -1014,7 +1076,7 @@ mod tests {
             assert!(
                 events.iter().any(|e| matches!(
                     e,
-                    StreamEvent::EditFileDone { status, .. } if status == "ok"
+                    StreamEvent::EditFileDone { status, .. } if *status == EditFileStatus::Ok
                 )),
                 "split {split}"
             );

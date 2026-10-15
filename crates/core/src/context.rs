@@ -59,6 +59,78 @@ fn upgrade_access(item: &mut ContextItem, access: ContextAccess) -> bool {
     }
 }
 
+/// Verifies that `relative_path` does not traverse or resolve to a symlink
+/// outside `repo_root`.
+///
+/// If `relative_path` (or its deepest existing ancestor) points outside the
+/// canonical repository root, returns an error.
+pub fn verify_path_within_repo(repo_root: &Path, relative_path: &str) -> Result<()> {
+    let Ok(canonical_root) = repo_root.canonicalize() else {
+        // If repo_root cannot be canonicalized (e.g. does not exist in a synthetic test),
+        // we cannot inspect symlinks on disk.
+        return Ok(());
+    };
+
+    let full_path = repo_root.join(relative_path);
+
+    // 1. If full_path exists (or is a symlink on disk):
+    // symlink_metadata().is_ok() detects broken symlinks as well as existing files/dirs.
+    if full_path.symlink_metadata().is_ok() {
+        match full_path.canonicalize() {
+            Ok(canonical_target) => {
+                if !canonical_target.starts_with(&canonical_root) {
+                    bail!(
+                        "Path '{}' escapes repository root via symlink pointing to '{}'",
+                        relative_path,
+                        canonical_target.display()
+                    );
+                }
+            }
+            Err(err) => {
+                bail!(
+                    "Path '{}' cannot be canonicalized (broken symlink or inaccessible): {}",
+                    relative_path,
+                    err
+                );
+            }
+        }
+    } else {
+        // 2. If full_path does not exist yet (e.g. a new file to create):
+        // Walk up to find the deepest existing ancestor directory.
+        let mut ancestor = full_path.as_path();
+        while !ancestor.exists() && ancestor.symlink_metadata().is_err() {
+            match ancestor.parent() {
+                Some(p) if !p.as_os_str().is_empty() => ancestor = p,
+                _ => break,
+            }
+        }
+
+        if ancestor.exists() || ancestor.symlink_metadata().is_ok() {
+            match ancestor.canonicalize() {
+                Ok(canonical_ancestor) => {
+                    if !canonical_ancestor.starts_with(&canonical_root) {
+                        bail!(
+                            "Path '{}' parent directory escapes repository root via symlink pointing to '{}'",
+                            relative_path,
+                            canonical_ancestor.display()
+                        );
+                    }
+                }
+                Err(err) => {
+                    bail!(
+                        "Path '{}' ancestor directory '{}' cannot be canonicalized: {}",
+                        relative_path,
+                        ancestor.display(),
+                        err
+                    );
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
 impl ContextManager {
     pub fn new(repo_root: PathBuf) -> Self {
         let mut cm = Self {
@@ -70,6 +142,19 @@ impl ContextManager {
             auto: BTreeMap::new(),
         };
         cm.load_pinned_from_repo();
+        cm
+    }
+
+    pub fn with_pinned(repo_root: PathBuf, pinned_patterns: &[String]) -> Self {
+        let mut cm = Self {
+            repo_root,
+            revision: 1,
+            pinned_patterns: Vec::new(),
+            pinned: BTreeMap::new(),
+            user: BTreeMap::new(),
+            auto: BTreeMap::new(),
+        };
+        cm.load_pinned(pinned_patterns);
         cm
     }
 
@@ -87,8 +172,8 @@ impl ContextManager {
     }
 
     pub fn load_pinned_from_repo(&mut self) {
-        let config = crate::config::load_config(Some(&self.repo_root));
-        self.load_pinned(&config.context.pinned);
+        let config = crate::config::load_context_config(&self.repo_root);
+        self.load_pinned(&config.pinned);
     }
 
     pub fn load_pinned(&mut self, pinned_paths: &[String]) {
@@ -114,18 +199,15 @@ impl ContextManager {
         }
 
         // 2. Hierarchical pinned files for all items in user and auto layers
-        let context_paths: Vec<String> = self
-            .user
-            .keys()
-            .chain(self.auto.keys())
-            .cloned()
-            .collect();
-
-        for file_path in context_paths {
-            let path_obj = Path::new(&file_path);
-            let mut curr = path_obj.parent();
+        let mut checked_dirs = BTreeSet::new();
+        for file_path in self.user.keys().chain(self.auto.keys()) {
+            let mut curr = Path::new(file_path).parent();
             while let Some(parent) = curr {
                 if parent.as_os_str().is_empty() {
+                    break;
+                }
+                if !checked_dirs.insert(parent.to_path_buf()) {
+                    // This directory and all its parent ancestors were already checked
                     break;
                 }
                 for pattern in &self.pinned_patterns {
@@ -153,6 +235,9 @@ impl ContextManager {
         clean_path: String,
     ) {
         if target_map.contains_key(&clean_path) {
+            return;
+        }
+        if verify_path_within_repo(&self.repo_root, &clean_path).is_err() {
             return;
         }
         let full_path = self.repo_root.join(&clean_path);
@@ -245,6 +330,9 @@ impl ContextManager {
 
             let mut files = Vec::new();
             for path in distinct_paths {
+                if verify_path_within_repo(&self.repo_root, &path).is_err() {
+                    continue;
+                }
                 let full_path = self.repo_root.join(&path);
                 if let Ok(content) = std::fs::read_to_string(&full_path) {
                     let access = self
@@ -283,7 +371,18 @@ impl ContextManager {
         access: ContextAccess,
         layer: ContextLayer,
     ) -> Result<ContextItem> {
+        self.add_file_to_layer_internal(relative_path, access, layer, true)
+    }
+
+    fn add_file_to_layer_internal(
+        &mut self,
+        relative_path: &str,
+        access: ContextAccess,
+        layer: ContextLayer,
+        recompute: bool,
+    ) -> Result<ContextItem> {
         let clean_path = self.normalize_path(relative_path)?;
+        verify_path_within_repo(&self.repo_root, &clean_path)?;
         let full_path = self.repo_root.join(&clean_path);
 
         if !full_path.is_file() {
@@ -326,7 +425,11 @@ impl ContextManager {
             }
         };
 
-        let pinned_changed = self.recompute_pinned();
+        let pinned_changed = if recompute {
+            self.recompute_pinned()
+        } else {
+            false
+        };
 
         if changed || pinned_changed {
             self.revision += 1;
@@ -427,12 +530,22 @@ impl ContextManager {
 
         let mut added_items = Vec::new();
         let mut total_added_tokens = 0u64;
+        let mut any_changed = false;
 
         for path in matched_files {
-            if let Ok(item) = self.add_file(&path, access) {
+            let rev_before = self.revision;
+            if let Ok(item) = self.add_file_to_layer_internal(&path, access, ContextLayer::User, false) {
                 total_added_tokens += item.estimated_tokens;
                 added_items.push(item);
+                if self.revision > rev_before {
+                    any_changed = true;
+                }
             }
+        }
+
+        let pinned_changed = self.recompute_pinned();
+        if pinned_changed && !any_changed {
+            self.revision += 1;
         }
 
         Ok(PatternAddOutcome {
@@ -693,7 +806,9 @@ impl ContextManager {
             bail!("Empty path is not allowed");
         }
 
-        Ok(components.join("/"))
+        let clean = components.join("/");
+        verify_path_within_repo(&self.repo_root, &clean)?;
+        Ok(clean)
     }
 }
 
@@ -1064,5 +1179,74 @@ mod tests {
         cm.remove_file("crates/tui/src/views/develop.rs").unwrap();
         assert!(!cm.contains("crates/tui/Conventions.md").unwrap());
         assert!(cm.contains("Conventions.md").unwrap());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_symlink_escaping_repo_is_rejected() {
+        let dir = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let repo_root = dir.path().to_path_buf();
+        let outside_root = outside.path().to_path_buf();
+
+        let secret_file = outside_root.join("secret.txt");
+        std::fs::write(&secret_file, "super secret").unwrap();
+
+        // Symlink pointing to a file outside repo
+        let sym_file = repo_root.join("sym_file.txt");
+        std::os::unix::fs::symlink(&secret_file, &sym_file).unwrap();
+
+        // Symlink pointing to a directory outside repo
+        let sym_dir = repo_root.join("sym_dir");
+        std::os::unix::fs::symlink(&outside_root, &sym_dir).unwrap();
+
+        let mut cm = ContextManager::new(repo_root.clone());
+
+        // File symlink escapes repo
+        assert!(cm.normalize_path("sym_file.txt").is_err());
+        assert!(cm.add_file("sym_file.txt", ContextAccess::ReadOnly).is_err());
+
+        // Directory symlink escapes repo (both existing and non-existing files under it)
+        assert!(cm.normalize_path("sym_dir/secret.txt").is_err());
+        assert!(cm.normalize_path("sym_dir/new_file.txt").is_err());
+        assert!(cm.add_file("sym_dir/secret.txt", ContextAccess::ReadOnly).is_err());
+
+        // Symlink pointing inside repo is allowed
+        let internal_dir = repo_root.join("src");
+        std::fs::create_dir_all(&internal_dir).unwrap();
+        let internal_file = internal_dir.join("lib.rs");
+        std::fs::write(&internal_file, "pub fn ok() {}").unwrap();
+
+        let internal_sym = repo_root.join("sym_lib.rs");
+        std::os::unix::fs::symlink(&internal_file, &internal_sym).unwrap();
+
+        assert!(cm.normalize_path("sym_lib.rs").is_ok());
+        assert!(cm.add_file("sym_lib.rs", ContextAccess::ReadOnly).is_ok());
+
+        // Reading context files ignores any file that escapes repo
+        let files = cm.read_context_files();
+        assert!(files.iter().any(|f| f.path == "sym_lib.rs"));
+        assert!(!files.iter().any(|f| f.path == "sym_file.txt"));
+    }
+
+    #[test]
+    fn test_context_manager_with_pinned_and_scoped_config_loader() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        std::fs::write(root.join("pinned.md"), "# Pinned").unwrap();
+        std::fs::write(
+            root.join("tauqe.toml"),
+            "[context]\npinned = [\"pinned.md\"]\n",
+        )
+        .unwrap();
+
+        // ContextManager::new reads exclusively [context] via load_context_config
+        let cm_auto = ContextManager::new(root.clone());
+        assert_eq!(cm_auto.pinned_patterns(), &["pinned.md".to_string()]);
+        assert!(cm_auto.contains("pinned.md").unwrap());
+
+        // ContextManager::with_pinned sets patterns explicitly without disk config lookup
+        let cm_explicit = ContextManager::with_pinned(root, &["other.md".to_string()]);
+        assert_eq!(cm_explicit.pinned_patterns(), &["other.md".to_string()]);
     }
 }

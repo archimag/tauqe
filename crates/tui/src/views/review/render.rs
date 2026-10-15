@@ -98,6 +98,10 @@ pub fn render_review_view(
         .iter()
         .map(|s| s.items.iter().filter(|i| i.status == ReviewStatus::Fixed).count())
         .sum();
+    let skipped_items: usize = effective
+        .iter()
+        .map(|s| s.items.iter().filter(|i| i.status == ReviewStatus::Skipped).count())
+        .sum();
 
     let mut status_spans = Vec::new();
     if let Some(err) = &state.review.error {
@@ -114,8 +118,8 @@ pub fn render_review_view(
         }
         status_spans.push(Span::styled(
             format!(
-                "  |  {} session(s), {} finding(s) ({} fixed)",
-                total_sessions, total_items, fixed_items
+                "  |  {} session(s), {} finding(s) ({} fixed, {} skipped)",
+                total_sessions, total_items, fixed_items, skipped_items
             ),
             Style::default().fg(Color::DarkGray),
         ));
@@ -155,6 +159,7 @@ fn describe_review_row(row: &VisibleReviewRow) -> Vec<Span<'static>> {
             todo,
             in_progress,
             discussion,
+            skipped,
             rejected,
             ..
         } => {
@@ -166,8 +171,8 @@ fn describe_review_row(row: &VisibleReviewRow) -> Vec<Span<'static>> {
                 Span::styled(format!(" ({})", model), Style::default().fg(Color::DarkGray)),
                 Span::styled(
                     format!(
-                        "  {}/{} fixed ({} todo, {} prog, {} disc, {} rej)",
-                        fixed, total, todo, in_progress, discussion, rejected
+                        "  {}/{} fixed ({} todo, {} prog, {} disc, {} skip, {} rej)",
+                        fixed, total, todo, in_progress, discussion, skipped, rejected
                     ),
                     Style::default().fg(Color::Gray),
                 ),
@@ -207,8 +212,7 @@ fn describe_review_row(row: &VisibleReviewRow) -> Vec<Span<'static>> {
             severity,
             status,
             model,
-            file_path,
-            line_range,
+            files,
             ..
         } => {
             let mut spans = vec![
@@ -224,7 +228,7 @@ fn describe_review_row(row: &VisibleReviewRow) -> Vec<Span<'static>> {
             if let Some(selection) = model {
                 spans.push(model_badge(selection));
             }
-            if let Some(loc) = location(file_path.as_deref(), *line_range) {
+            if let Some(loc) = location(files) {
                 spans.push(Span::styled(
                     format!("  {}", loc),
                     Style::default().fg(Color::Cyan),
@@ -255,12 +259,13 @@ mod tests {
             title: "Architecture audit".to_string(),
             description: Some("High level summary line.\nMore detail.".to_string()),
             created_at: 0,
-            model: "reviewer-model".to_string(),
+            model: tauqe_protocol::ModelRef::openrouter("reviewer-model"),
             total: 2,
             fixed: 0,
             todo: 2,
             in_progress: 0,
             discussion: 0,
+            skipped: 0,
             rejected: 0,
             is_expanded: true,
         };
@@ -286,7 +291,7 @@ mod tests {
             id: "rev-1".to_string(),
             title: "Audit".to_string(),
             created_at: 0,
-            model: "reviewer".to_string(),
+            model: tauqe_protocol::ModelRef::openrouter("reviewer"),
             description: Some("## Executive overview\n\nThe architecture is sound.".to_string()),
             user_prompt: None,
             target_files: Vec::new(),
@@ -296,8 +301,7 @@ mod tests {
                 model: None,
                 severity: ReviewSeverity::Warning,
                 status: ReviewStatus::Todo,
-                file_path: None,
-                line_range: None,
+                files: Vec::new(),
                 resolution_notes: None,
                 body: String::new(),
             }],

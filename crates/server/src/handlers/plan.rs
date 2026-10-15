@@ -719,8 +719,8 @@ async fn run_plan_step(
     let mut attempt = 0usize;
 
     loop {
-        let workflow_name = state.config.lock().await.config.develop.workflow.trim().to_lowercase();
-        let policy = crate::handlers::model::build_apply_policy(state, &workflow_name);
+        let workflow = state.config.lock().await.config.develop.workflow;
+        let policy = crate::handlers::model::build_apply_policy(state, workflow);
 
         let plan_context = tauqe_protocol::ModelTurnPlanContext {
             plan_id: plan_id.to_string(),
@@ -848,13 +848,15 @@ impl BatchStepExecutor for PlanStepExecutor<'_> {
 
 /// Runs the plan steps through the core [`BatchExecution`] supervisor, which
 /// enforces ordered, fail-fast traversal. Steps completed before the first
-/// failure stay DONE. Once the supervisor terminates, a typed
-/// `plan/batch_finished` event carries the aggregate status, step counters, and
-/// elapsed time, so clients can raise a single notice for the whole batch.
+/// failure stay DONE. When a coder step reports a semantic block (`<blocked>`),
+/// an automated closed-loop replanning cycle engages: the architect synthesizes a
+/// new horizon around the failure diagnostics up to `max_replans` times.
+/// Once the supervisor terminates, a typed `plan/batch_finished` event carries
+/// the aggregate status, step counters, and elapsed time.
 async fn run_plan_batch(
     state: &Arc<AppState>,
     plan_id: &str,
-    step_ids: Vec<String>,
+    mut current_step_ids: Vec<String>,
     operation: Arc<OperationGuard>,
 ) -> BatchOutcome {
     let repo_root = state.context.read().await.repo_root().to_path_buf();
@@ -862,63 +864,271 @@ async fn run_plan_batch(
 
     let started_at = std::time::Instant::now();
 
-    let steps: Vec<BatchStep> = step_ids
-        .iter()
-        .map(|id| BatchStep::new(id.clone(), format!("Execute plan step {}", id)))
-        .collect();
-
     let (stream_tx, _stream_rx) = mpsc::channel::<StreamEvent>(1);
     // The whole batch shares one operation and one cancel channel: a cancel
     // delivered between steps is honored instead of being lost, and the slot
     // stays registered for the batch's entire lifetime.
     let cancel_rx = operation.cancel_receiver();
 
-    let mut executor = PlanStepExecutor {
-        state,
-        repo_root: &repo_root,
-        plan_id,
-        batch_step_ids: &step_ids,
-        operation: &operation,
-    };
+    let max_replans = state.config.lock().await.config.develop.max_replans;
+    let mut replans_count = 0usize;
+    let mut total_executed_count = 0usize;
+    let mut total_completed = 0usize;
+    let mut total_scheduled = current_step_ids.len();
 
-    let report = BatchExecution::new()
-        .run(&steps, &mut executor, &stream_tx, &cancel_rx)
-        .await;
+    let final_stop;
+    let mut last_error: Option<String> = None;
 
-    let executed_count = report.executed.len();
-    let total_count = report.scheduled;
-    let (status, error) = match &report.stop {
+    loop {
+        if *cancel_rx.borrow() {
+            final_stop = BatchStop::Cancelled;
+            break;
+        }
+
+        if current_step_ids.is_empty() {
+            final_stop = BatchStop::Completed;
+            break;
+        }
+
+        let steps: Vec<BatchStep> = current_step_ids
+            .iter()
+            .map(|id| BatchStep::new(id.clone(), format!("Execute plan step {}", id)))
+            .collect();
+
+        let mut executor = PlanStepExecutor {
+            state,
+            repo_root: &repo_root,
+            plan_id,
+            batch_step_ids: &current_step_ids,
+            operation: &operation,
+        };
+
+        let report = BatchExecution::new()
+            .run(&steps, &mut executor, &stream_tx, &cancel_rx)
+            .await;
+
+        let run_executed = report.executed.len();
+        total_executed_count += run_executed;
+
+        match report.stop {
+            BatchStop::Completed => {
+                total_completed += run_executed;
+                final_stop = BatchStop::Completed;
+                break;
+            }
+            BatchStop::Cancelled => {
+                total_completed += report
+                    .executed
+                    .iter()
+                    .filter(|r| r.outcome.is_success())
+                    .count();
+                final_stop = BatchStop::Cancelled;
+                break;
+            }
+            BatchStop::Failed { step_id } => {
+                total_completed += run_executed.saturating_sub(1);
+                last_error = report.executed.last().and_then(|r| r.outcome.error.clone());
+                final_stop = BatchStop::Failed { step_id };
+                break;
+            }
+            BatchStop::Blocked { step_id, reason } => {
+                total_completed += run_executed.saturating_sub(1);
+
+                if replans_count < max_replans {
+                    replans_count += 1;
+
+                    emit(
+                        &state.out,
+                        events::TURN_PHASE,
+                        serde_json::to_value(TurnPhaseEvent {
+                            operation_id: format!("op-{}", crate::state::next_operation_id()),
+                            phase: TurnPhase::Proposal,
+                            round: Some(replans_count),
+                            max_rounds: Some(max_replans),
+                            detail: Some(format!(
+                                "Automated replanning round {}/{} around blocked step #{}",
+                                replans_count, max_replans, step_id
+                            )),
+                        })
+                        .ok(),
+                    );
+
+                    let plan = match PlanStorage::load_plan(&repo_root, plan_id) {
+                        Ok(Some(p)) => p,
+                        Ok(None) => {
+                            let err_msg = format!("Plan '{}' not found", plan_id);
+                            last_error = Some(err_msg.clone());
+                            final_stop = BatchStop::Blocked { step_id, reason: err_msg };
+                            break;
+                        }
+                        Err(err) => {
+                            let err_msg = format!("{:#}", err);
+                            last_error = Some(err_msg.clone());
+                            final_stop = BatchStop::Blocked { step_id, reason: err_msg };
+                            break;
+                        }
+                    };
+
+                    let diagnostics = PlanHorizonDiagnosticsOwned {
+                        blocked_step_id: step_id.clone(),
+                        blocked_reason: Some(reason.clone()),
+                        toolchain_status: None,
+                    };
+
+                    let res = execute_plan_horizon_synthesis(
+                        tauqe_protocol::RequestId::Null,
+                        state,
+                        plan,
+                        Some(diagnostics),
+                        None,
+                        None,
+                        "Automated Plan Replanning",
+                        &operation,
+                    )
+                    .await;
+
+                    if *cancel_rx.borrow() {
+                        final_stop = BatchStop::Cancelled;
+                        break;
+                    }
+
+                    if let Some(err) = res.error {
+                        if err.code == errors::CANCELLED {
+                            final_stop = BatchStop::Cancelled;
+                            break;
+                        }
+                        let failure_msg = format!(
+                            "Automated replanning failed around step '{}': {}",
+                            step_id, err.message
+                        );
+                        last_error = Some(failure_msg.clone());
+                        final_stop = BatchStop::Blocked {
+                            step_id,
+                            reason: failure_msg,
+                        };
+                        break;
+                    }
+
+                    let refine_res = res
+                        .result
+                        .and_then(|v| serde_json::from_value::<PlanRefineResult>(v).ok());
+
+                    match refine_res {
+                        Some(PlanRefineResult::Success { plan: updated_plan, .. }) => {
+                            match updated_plan.evaluate_scope(None) {
+                                PlanScopeEvaluation::Ready(new_steps) => {
+                                    current_step_ids =
+                                        new_steps.into_iter().map(|s| s.id).collect();
+                                    total_scheduled = total_completed + current_step_ids.len();
+                                    continue;
+                                }
+                                PlanScopeEvaluation::AllCompleted => {
+                                    final_stop = BatchStop::Completed;
+                                    break;
+                                }
+                                PlanScopeEvaluation::BlockedByDiscussion(items) => {
+                                    let msg = format!(
+                                        "Scope contains item(s) in DISCUSSION status: {}. Review them first",
+                                        items.join(", ")
+                                    );
+                                    last_error = Some(msg.clone());
+                                    final_stop = BatchStop::Blocked { step_id, reason: msg };
+                                    break;
+                                }
+                                PlanScopeEvaluation::BlockedByBlockers(items) => {
+                                    let msg = format!(
+                                        "Scope contains step(s) in BLOCKED status: {}. Manual intervention required",
+                                        items.join(", ")
+                                    );
+                                    last_error = Some(msg.clone());
+                                    final_stop = BatchStop::Blocked { step_id, reason: msg };
+                                    break;
+                                }
+                                PlanScopeEvaluation::BlockedByDependencies(items) => {
+                                    let msg = format!(
+                                        "Scope contains step(s) whose prerequisites are not DONE: {}",
+                                        items.join(", ")
+                                    );
+                                    last_error = Some(msg.clone());
+                                    final_stop = BatchStop::Blocked { step_id, reason: msg };
+                                    break;
+                                }
+                                other => {
+                                    let msg = format!(
+                                        "Replanned scope cannot be executed: {:?}",
+                                        other
+                                    );
+                                    last_error = Some(msg.clone());
+                                    final_stop = BatchStop::Blocked { step_id, reason: msg };
+                                    break;
+                                }
+                            }
+                        }
+                        Some(PlanRefineResult::Blocked { reason: architect_reason }) => {
+                            let msg = format!(
+                                "Architect reported blockers during automated replanning for step '{}': {}",
+                                step_id, architect_reason
+                            );
+                            last_error = Some(msg.clone());
+                            final_stop = BatchStop::Blocked { step_id, reason: msg };
+                            break;
+                        }
+                        None => {
+                            let msg = format!(
+                                "Automated replanning returned unrecognized result for step '{}'",
+                                step_id
+                            );
+                            last_error = Some(msg.clone());
+                            final_stop = BatchStop::Blocked { step_id, reason: msg };
+                            break;
+                        }
+                    }
+                } else {
+                    let limit_msg = format!(
+                        "Automated replanning limit reached (max_replans = {}). Step '{}' remains blocked: {}. Manual developer intervention required.",
+                        max_replans, step_id, reason
+                    );
+                    last_error = Some(limit_msg.clone());
+                    final_stop = BatchStop::Blocked {
+                        step_id,
+                        reason: limit_msg,
+                    };
+                    break;
+                }
+            }
+        }
+    }
+
+    let (status, error) = match &final_stop {
         BatchStop::Completed => (BatchFinishStatus::Completed, None),
         BatchStop::Failed { .. } => (
             BatchFinishStatus::Failed,
-            report.executed.last().and_then(|r| r.outcome.error.clone()),
+            last_error.or_else(|| Some("step failed without diagnostics".to_string())),
         ),
         BatchStop::Blocked { reason, .. } => (BatchFinishStatus::Blocked, Some(reason.clone())),
         BatchStop::Cancelled => (BatchFinishStatus::Cancelled, None),
     };
 
-    let outcome = match report.stop {
+    let outcome = match final_stop {
         BatchStop::Completed => BatchOutcome::Completed {
-            steps: executed_count,
+            steps: total_completed,
         },
         BatchStop::Cancelled => BatchOutcome::Cancelled {
-            completed: executed_count,
+            completed: total_completed,
         },
         BatchStop::Failed { step_id } => {
-            let completed = executed_count.saturating_sub(1);
             let reason = error
                 .clone()
                 .unwrap_or_else(|| "step failed without diagnostics".to_string());
             BatchOutcome::Failed {
-                completed,
+                completed: total_completed,
                 step_id,
                 reason,
             }
         }
         BatchStop::Blocked { step_id, reason } => {
-            let completed = executed_count.saturating_sub(1);
             BatchOutcome::Blocked {
-                completed,
+                completed: total_completed,
                 step_id,
                 reason,
             }
@@ -933,8 +1143,8 @@ async fn run_plan_batch(
             summary: BatchFinishSummary {
                 owner_id: plan_id.to_string(),
                 status,
-                executed_count,
-                total_count,
+                executed_count: total_executed_count,
+                total_count: total_scheduled.max(total_executed_count),
                 elapsed_seconds: started_at.elapsed().as_secs(),
                 error,
             },
@@ -1086,71 +1296,34 @@ pub async fn handle_plan_execute(req: Request, state: &Arc<AppState>) -> Respons
     response
 }
 
-pub async fn handle_plan_refine(req: Request, state: &Arc<AppState>) -> Response {
-    let (plan_id, custom_model, instructions) = match req.params {
-        Some(val) => {
-            if let Ok(params) = serde_json::from_value::<PlanRefineParams>(val.clone()) {
-                (params.plan_id, params.model, params.instructions)
-            } else if let Some(obj) = val.as_object() {
-                let id = obj
-                    .get("plan_id")
-                    .or_else(|| obj.get("id"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default()
-                    .to_string();
-                let model = obj.get("model").and_then(|v| serde_json::from_value(v.clone()).ok());
-                let instructions = obj
-                    .get("instructions")
-                    .and_then(|v| v.as_str())
-                    .map(String::from);
-                (id, model, instructions)
-            } else {
-                return Response::err(req.id, errors::INVALID_PARAMS, "Invalid plan refine parameters");
-            }
-        }
-        None => return Response::err(req.id, errors::INVALID_PARAMS, "Missing plan refine parameters"),
-    };
+/// Diagnostics describing a failed or blocked step for horizon synthesis.
+pub struct PlanHorizonDiagnosticsOwned {
+    pub blocked_step_id: String,
+    pub blocked_reason: Option<String>,
+    pub toolchain_status: Option<String>,
+}
 
+/// Unified engine for architect plan horizon synthesis.
+///
+/// Drives streaming structured communication with the architect model, runs multi-round
+/// context discovery on `needs_context`, validates the synthesized horizon, and applies it
+/// atomically via `PlanStorage::replace_uncompleted_horizon`.
+///
+/// Enforces strict session history transactionality: `state.history.record_response` is
+/// called strictly AFTER `replace_uncompleted_horizon` succeeds on disk. Any persistence
+/// or validation error returns early without poisoning the interaction audit trail.
+#[allow(clippy::too_many_arguments)]
+async fn execute_plan_horizon_synthesis(
+    req_id: tauqe_protocol::RequestId,
+    state: &Arc<AppState>,
+    plan: Plan,
+    diagnostics: Option<PlanHorizonDiagnosticsOwned>,
+    custom_model: Option<ModelSelection>,
+    instructions: Option<String>,
+    operation_title: &str,
+    operation: &OperationGuard,
+) -> Response {
     let repo_root = state.context.read().await.repo_root().to_path_buf();
-    let effective_plan_id = if plan_id.trim().is_empty() {
-        PlanStorage::load_active_id(&repo_root)
-            .ok()
-            .flatten()
-            .unwrap_or_default()
-    } else {
-        plan_id
-    };
-
-    if effective_plan_id.trim().is_empty() {
-        return Response::err(
-            req.id,
-            errors::INVALID_PARAMS,
-            "Missing plan ID and no active plan is set",
-        );
-    }
-
-    let plan = match PlanStorage::load_plan(&repo_root, &effective_plan_id) {
-        Ok(Some(p)) => p,
-        Ok(None) => {
-            return Response::err(
-                req.id,
-                errors::NOT_FOUND,
-                format!("Plan '{}' not found", effective_plan_id),
-            );
-        }
-        Err(err) => return Response::err(req.id, errors::PLAN_LOAD_FAILED, format!("{:#}", err)),
-    };
-
-    let operation = match state.try_begin_operation() {
-        Ok(guard) => guard,
-        Err(()) => {
-            return Response::err(
-                req.id,
-                errors::OPERATION_IN_PROGRESS,
-                "Another operation is already running",
-            );
-        }
-    };
 
     let (
         provider,
@@ -1162,9 +1335,6 @@ pub async fn handle_plan_refine(req: Request, state: &Arc<AppState>) -> Response
         files_token_budget,
     ) = {
         let cfg = state.config.lock().await.config.clone();
-        // The architect role list is the single source for the planning model
-        // and its reasoning depth. Its base entry also carries the display alias
-        // reported to the client; an explicit model override replaces both.
         let architect_entry = cfg
             .models
             .role_entries(ModelRole::Architect)
@@ -1182,7 +1352,7 @@ pub async fn handle_plan_refine(req: Request, state: &Arc<AppState>) -> Response
         };
         let provider = match resolve_architect_provider(state, &cfg, model.provider).await {
             Ok(p) => p,
-            Err(err) => return Response::err(req.id, errors::NO_API_KEY, err),
+            Err(err) => return Response::err(req_id, errors::NO_API_KEY, err),
         };
         (
             provider,
@@ -1203,7 +1373,7 @@ pub async fn handle_plan_refine(req: Request, state: &Arc<AppState>) -> Response
         method: events::MODEL_STARTED.to_string(),
         params: serde_json::to_value(ModelStartedEvent {
             operation_id: op_id.clone(),
-            model: model.to_string(),
+            model: model.clone(),
             role: Some(ModelRole::Architect),
             alias,
             effort: reasoning_effort,
@@ -1213,10 +1383,16 @@ pub async fn handle_plan_refine(req: Request, state: &Arc<AppState>) -> Response
         .ok(),
     });
 
-    let intro_header = format!(
-        "# Deep Plan Refinement: [{}] {}\n*Analyzing codebase contours and decomposing architectural plan...*\n\n---\n\n",
-        plan.id, plan.title
-    );
+    let intro_header = match &diagnostics {
+        Some(diag) => format!(
+            "# {}: [{}] {}\n*Replanning uncompleted horizon around blocked step `{}`...*\n\n---\n\n",
+            operation_title, plan.id, plan.title, diag.blocked_step_id
+        ),
+        None => format!(
+            "# {}: [{}] {}\n*Analyzing codebase contours and decomposing architectural plan...*\n\n---\n\n",
+            operation_title, plan.id, plan.title
+        ),
+    };
     state.out.send_event(&Event {
         method: events::MODEL_TEXT_DELTA.to_string(),
         params: serde_json::to_value(ModelDeltaEvent {
@@ -1228,15 +1404,31 @@ pub async fn handle_plan_refine(req: Request, state: &Arc<AppState>) -> Response
 
     {
         let ctx = state.context.read().await;
-        let context_paths: Vec<String> = ctx.get_state().items.into_iter().map(|it| it.path).collect();
-        let mut history_turn_prompt = format!("# Deep Plan Refinement: [{}] {}\n", plan.id, plan.title);
+        let context_paths: Vec<String> = ctx
+            .get_state()
+            .items
+            .into_iter()
+            .map(|it| it.path)
+            .collect();
+        let mut history_turn_prompt =
+            format!("# {}: [{}] {}\n", operation_title, plan.id, plan.title);
+        if let Some(ref diag) = diagnostics {
+            history_turn_prompt.push_str(&format!("\nBlocked Step: #{}", diag.blocked_step_id));
+            if let Some(ref r) = diag.blocked_reason {
+                history_turn_prompt.push_str(&format!("\nReason: {}", r));
+            }
+        }
         if let Some(ins) = &instructions {
             let trimmed = ins.trim();
             if !trimmed.is_empty() {
                 history_turn_prompt.push_str(&format!("\nDirectives: {}\n", trimmed));
             }
         }
-        let _ = state.history.lock().await.record_turn(history_turn_prompt, context_paths);
+        let _ = state
+            .history
+            .lock()
+            .await
+            .record_turn(history_turn_prompt, context_paths);
     }
 
     let mut discovery_round = 0usize;
@@ -1251,7 +1443,7 @@ pub async fn handle_plan_refine(req: Request, state: &Arc<AppState>) -> Response
                 phase: TurnPhase::Proposal,
                 round: Some(discovery_round + 1),
                 max_rounds: None,
-                detail: Some("Deep Refinement".to_string()),
+                detail: Some(operation_title.to_string()),
             })
             .ok(),
         });
@@ -1272,11 +1464,20 @@ pub async fn handle_plan_refine(req: Request, state: &Arc<AppState>) -> Response
             (files, rmap)
         };
 
-        let sys_prompt = tauqe_core::plan::prompt::build_plan_refine_system_prompt(&plan);
-        let mut user_prompt = tauqe_core::plan::prompt::build_plan_refine_user_prompt(
+        let sys_prompt = tauqe_core::plan::prompt::build_plan_horizon_system_prompt();
+        let diag_ref = diagnostics
+            .as_ref()
+            .map(|d| tauqe_core::plan::prompt::PlanHorizonDiagnostics {
+                blocked_step_id: &d.blocked_step_id,
+                blocked_reason: d.blocked_reason.as_deref(),
+                toolchain_status: d.toolchain_status.as_deref(),
+            });
+
+        let mut user_prompt = tauqe_core::plan::prompt::build_plan_horizon_user_prompt(
             &plan,
             &context_files,
             repo_map.as_deref(),
+            diag_ref,
             instructions.as_deref(),
         );
 
@@ -1301,8 +1502,7 @@ pub async fn handle_plan_refine(req: Request, state: &Arc<AppState>) -> Response
         let schema_def: JsonSchemaDefinition = match serde_json::from_value(schema_val) {
             Ok(s) => s,
             Err(err) => {
-                let _ = state.take_active_operation();
-                return Response::err(req.id, errors::SCHEMA_ERROR, err.to_string());
+                return Response::err(req_id, errors::SCHEMA_ERROR, err.to_string());
             }
         };
         let response_format = Some(ResponseFormat::JsonSchema {
@@ -1316,7 +1516,7 @@ pub async fn handle_plan_refine(req: Request, state: &Arc<AppState>) -> Response
             messages,
             response_format,
             reasoning_effort,
-            &operation,
+            operation,
             &op_id,
         )
         .await
@@ -1324,11 +1524,15 @@ pub async fn handle_plan_refine(req: Request, state: &Arc<AppState>) -> Response
             Ok(outcome) => outcome,
             Err(ArchitectStreamError::Cancelled) => {
                 clear_auto_context(state).await;
-                return Response::err(req.id, errors::CANCELLED, "Plan refinement was cancelled");
+                return Response::err(
+                    req_id,
+                    errors::CANCELLED,
+                    format!("{} was cancelled", operation_title),
+                );
             }
             Err(ArchitectStreamError::ModelError(err)) => {
                 clear_auto_context(state).await;
-                return Response::err(req.id, errors::MODEL_ERROR, err);
+                return Response::err(req_id, errors::MODEL_ERROR, err);
             }
         };
 
@@ -1350,7 +1554,7 @@ pub async fn handle_plan_refine(req: Request, state: &Arc<AppState>) -> Response
                     })
                     .ok(),
                 });
-                return Response::err(req.id, errors::PARSE_ERROR, err_msg);
+                return Response::err(req_id, errors::PARSE_ERROR, err_msg);
             }
         };
 
@@ -1366,7 +1570,9 @@ pub async fn handle_plan_refine(req: Request, state: &Arc<AppState>) -> Response
         }
         accumulated_full_text.push_str(&output.explanation);
 
-        if output.status.eq_ignore_ascii_case("needs_context") && discovery_round < max_discovery_rounds {
+        if output.status.eq_ignore_ascii_case("needs_context")
+            && discovery_round < max_discovery_rounds
+        {
             let requests: Vec<ContextRequest> = output
                 .context_requests
                 .iter()
@@ -1419,10 +1625,13 @@ pub async fn handle_plan_refine(req: Request, state: &Arc<AppState>) -> Response
                 let _ = state.history.lock().await.record_response(
                     warn_msg.clone(),
                     None,
-                    Some(format!("Plan Refinement Exceeded Token Budget: {}", plan.title)),
+                    Some(format!(
+                        "{}: Token Budget Exceeded ({})",
+                        operation_title, plan.title
+                    )),
                     Vec::new(),
                 );
-                return Response::ok_typed(req.id, &PlanRefineResult::Blocked { reason: warn_msg });
+                return Response::ok_typed(req_id, &PlanRefineResult::Blocked { reason: warn_msg });
             }
 
             if !outcome.added.is_empty() {
@@ -1517,19 +1726,20 @@ pub async fn handle_plan_refine(req: Request, state: &Arc<AppState>) -> Response
 
     if output.status.eq_ignore_ascii_case("blocked") {
         let reason = output.reason.unwrap_or(output.explanation);
-        let blocked_msg = format!("Architect reported blockers for plan [{}]:\n\n{}", plan.id, reason);
+        let blocked_msg =
+            format!("Architect reported blockers for plan [{}]:\n\n{}", plan.id, reason);
         let _ = state.history.lock().await.record_response(
             blocked_msg,
             None,
-            Some(format!("Plan Refinement Blocked: {}", plan.title)),
+            Some(format!("{}: Blocked ({})", operation_title, plan.title)),
             Vec::new(),
         );
-        return Response::ok_typed(req.id, &PlanRefineResult::Blocked { reason });
+        return Response::ok_typed(req_id, &PlanRefineResult::Blocked { reason });
     }
 
     if output.status.eq_ignore_ascii_case("needs_context") {
         return Response::err(
-            req.id,
+            req_id,
             errors::NEEDS_CONTEXT,
             format!(
                 "Architect requested additional context but no discovery rounds remain (limit: {}). Narrow the plan scope or raise the discovery round limit, then refine again",
@@ -1543,7 +1753,7 @@ pub async fn handle_plan_refine(req: Request, state: &Arc<AppState>) -> Response
     // completed refinement, or it could overwrite the plan with an unvalidated tree.
     if !output.status.eq_ignore_ascii_case("success") {
         return Response::err(
-            req.id,
+            req_id,
             errors::UNEXPECTED_STATUS,
             format!(
                 "Architect returned unsupported status '{}'; expected 'success' or 'blocked'",
@@ -1554,7 +1764,7 @@ pub async fn handle_plan_refine(req: Request, state: &Arc<AppState>) -> Response
 
     if output.items.is_empty() {
         return Response::err(
-            req.id,
+            req_id,
             errors::EMPTY_ITEMS,
             "Model returned success status but an empty items array",
         );
@@ -1562,7 +1772,7 @@ pub async fn handle_plan_refine(req: Request, state: &Arc<AppState>) -> Response
 
     if let Some(duplicate) = find_duplicate_item_ids(&output.items) {
         return Response::err(
-            req.id,
+            req_id,
             errors::INVALID_PLAN_TREE,
             format!(
                 "Architect returned a plan with a duplicate or empty step ID: '{}'",
@@ -1571,30 +1781,28 @@ pub async fn handle_plan_refine(req: Request, state: &Arc<AppState>) -> Response
         );
     }
 
-    let mut updated_plan = plan.clone();
-    updated_plan.items = output.items;
-    updated_plan.normalize_leaf_files();
-    updated_plan.refresh_parent_statuses();
-    updated_plan.updated_at = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
+    // Replace the uncompleted horizon while preserving the immutable Done foundation.
+    let updated_plan =
+        match PlanStorage::replace_uncompleted_horizon(&repo_root, &plan.id, output.items) {
+            Ok(p) => p,
+            Err(err) => {
+                return Response::err(req_id, errors::PLAN_SAVE_FAILED, format!("{:#}", err))
+            }
+        };
 
-    let (total_items, _) = updated_plan.count_stats();
+    // Strict history transactionality: record the assistant response ONLY after
+    // the synthesized horizon has been atomically written to disk.
+    let (total_items, completed_items) = updated_plan.count_stats();
     let history_response = format!(
-        "Plan [{}] refined successfully into {} items.\n\n{}",
-        updated_plan.id, total_items, output.explanation
+        "Plan [{}] horizon synthesized successfully ({} total, {} completed).\n\n{}",
+        updated_plan.id, total_items, completed_items, output.explanation
     );
     let _ = state.history.lock().await.record_response(
         history_response,
         None,
-        Some(format!("Plan Refinement: {}", updated_plan.title)),
+        Some(format!("{}: {}", operation_title, updated_plan.title)),
         Vec::new(),
     );
-
-    if let Err(err) = PlanStorage::save_plan(&repo_root, &updated_plan) {
-        return Response::err(req.id, errors::PLAN_SAVE_FAILED, format!("{:#}", err));
-    }
 
     emit(
         &state.out,
@@ -1615,7 +1823,7 @@ pub async fn handle_plan_refine(req: Request, state: &Arc<AppState>) -> Response
     }
 
     Response::ok_typed(
-        req.id,
+        req_id,
         &PlanRefineResult::Success {
             plan: updated_plan,
             explanation: Some(output.explanation),
@@ -1623,47 +1831,155 @@ pub async fn handle_plan_refine(req: Request, state: &Arc<AppState>) -> Response
     )
 }
 
-/// Handles an addressed (local) replanning request for a blocked plan step.
-///
-/// The Architect receives a targeted diagnostic packet (immutable DONE foundation,
-/// blocked step diagnostics, remaining horizon, and concept invariants) and returns a
-/// replacement sub-tree. The sub-tree is grafted atomically over the blocked leaf via
-/// `PlanStorage::graft_subtree`, preserving the rest of the plan and re-pointing the
-/// dependent tail at the new work.
-pub async fn handle_plan_replan(req: Request, state: &Arc<AppState>) -> Response {
-    let (plan_id, step_id, blocked_reason, custom_model, instructions) = match req.params {
-        Some(val) => match val.as_object() {
-            Some(obj) => {
-                let plan_id = obj
+pub async fn handle_plan_refine(req: Request, state: &Arc<AppState>) -> Response {
+    let (plan_id, custom_model, instructions) = match req.params {
+        Some(val) => {
+            if let Ok(params) = serde_json::from_value::<PlanRefineParams>(val.clone()) {
+                (params.plan_id, params.model, params.instructions)
+            } else if let Some(obj) = val.as_object() {
+                let id = obj
                     .get("plan_id")
                     .or_else(|| obj.get("id"))
                     .and_then(|v| v.as_str())
                     .unwrap_or_default()
                     .to_string();
-                let step_id = obj
-                    .get("step_id")
-                    .or_else(|| obj.get("item_id"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default()
-                    .to_string();
-                let blocked_reason = obj
-                    .get("reason")
-                    .and_then(|v| v.as_str())
-                    .map(String::from);
-                let custom_model = obj
+                let model = obj
                     .get("model")
                     .and_then(|v| serde_json::from_value(v.clone()).ok());
                 let instructions = obj
                     .get("instructions")
                     .and_then(|v| v.as_str())
                     .map(String::from);
-                (plan_id, step_id, blocked_reason, custom_model, instructions)
+                (id, model, instructions)
+            } else {
+                return Response::err(
+                    req.id,
+                    errors::INVALID_PARAMS,
+                    "Invalid plan refine parameters",
+                );
             }
-            None => {
-                return Response::err(req.id, errors::INVALID_PARAMS, "Invalid plan replan parameters")
-            }
+        }
+        None => {
+            return Response::err(
+                req.id,
+                errors::INVALID_PARAMS,
+                "Missing plan refine parameters",
+            )
+        }
+    };
+
+    let repo_root = state.context.read().await.repo_root().to_path_buf();
+    let effective_plan_id = if plan_id.trim().is_empty() {
+        PlanStorage::load_active_id(&repo_root)
+            .ok()
+            .flatten()
+            .unwrap_or_default()
+    } else {
+        plan_id
+    };
+
+    if effective_plan_id.trim().is_empty() {
+        return Response::err(
+            req.id,
+            errors::INVALID_PARAMS,
+            "Missing plan ID and no active plan is set",
+        );
+    }
+
+    let plan = match PlanStorage::load_plan(&repo_root, &effective_plan_id) {
+        Ok(Some(p)) => p,
+        Ok(None) => {
+            return Response::err(
+                req.id,
+                errors::NOT_FOUND,
+                format!("Plan '{}' not found", effective_plan_id),
+            );
+        }
+        Err(err) => return Response::err(req.id, errors::PLAN_LOAD_FAILED, format!("{:#}", err)),
+    };
+
+    let operation = match state.try_begin_operation() {
+        Ok(guard) => guard,
+        Err(()) => {
+            return Response::err(
+                req.id,
+                errors::OPERATION_IN_PROGRESS,
+                "Another operation is already running",
+            );
+        }
+    };
+
+    execute_plan_horizon_synthesis(
+        req.id,
+        state,
+        plan,
+        None,
+        custom_model,
+        instructions,
+        "Deep Plan Refinement",
+        &operation,
+    )
+    .await
+}
+
+/// Handles an addressed replanning request for a blocked plan step.
+///
+/// Synthesizes the unfinished horizon of the plan around the failure diagnostics of the
+/// blocked step, preserving the completed (DONE) foundation and updating the plan
+/// atomically via `execute_plan_horizon_synthesis`.
+pub async fn handle_plan_replan(req: Request, state: &Arc<AppState>) -> Response {
+    let (plan_id, step_id, blocked_reason, custom_model, instructions) = match req.params {
+        Some(val) => match serde_json::from_value::<tauqe_protocol::PlanReplanParams>(val.clone()) {
+            Ok(params) => (
+                params.plan_id,
+                params.step_id,
+                params.reason,
+                params.model,
+                params.instructions,
+            ),
+            Err(_) => match val.as_object() {
+                Some(obj) => {
+                    let plan_id = obj
+                        .get("plan_id")
+                        .or_else(|| obj.get("id"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    let step_id = obj
+                        .get("step_id")
+                        .or_else(|| obj.get("item_id"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    let blocked_reason = obj
+                        .get("reason")
+                        .and_then(|v| v.as_str())
+                        .map(String::from);
+                    let custom_model = obj
+                        .get("model")
+                        .and_then(|v| serde_json::from_value(v.clone()).ok());
+                    let instructions = obj
+                        .get("instructions")
+                        .and_then(|v| v.as_str())
+                        .map(String::from);
+                    (plan_id, step_id, blocked_reason, custom_model, instructions)
+                }
+                None => {
+                    return Response::err(
+                        req.id,
+                        errors::INVALID_PARAMS,
+                        "Invalid plan replan parameters",
+                    )
+                }
+            },
         },
-        None => return Response::err(req.id, errors::INVALID_PARAMS, "Missing plan replan parameters"),
+        None => {
+            return Response::err(
+                req.id,
+                errors::INVALID_PARAMS,
+                "Missing plan replan parameters",
+            )
+        }
     };
 
     let repo_root = state.context.read().await.repo_root().to_path_buf();
@@ -1742,232 +2058,23 @@ pub async fn handle_plan_replan(req: Request, state: &Arc<AppState>) -> Response
         }
     };
 
-    let (provider, model, reasoning_effort, alias) = {
-        let cfg = state.config.lock().await.config.clone();
-        let architect_entry = cfg
-            .models
-            .role_entries(ModelRole::Architect)
-            .into_iter()
-            .next();
-        let model = match &custom_model {
-            Some(m) => cfg.resolve_model(m),
-            None => cfg.resolve_role(ModelRole::Architect),
-        };
-        let reasoning_effort = cfg.models.resolve_effort(ModelRole::Architect);
-        let alias = if custom_model.is_some() {
-            None
-        } else {
-            architect_entry.and_then(|entry| entry.alias)
-        };
-        let provider = match resolve_architect_provider(state, &cfg, model.provider).await {
-            Ok(p) => p,
-            Err(err) => return Response::err(req.id, errors::NO_API_KEY, err),
-        };
-        (provider, model, reasoning_effort, alias)
+    let diagnostics = PlanHorizonDiagnosticsOwned {
+        blocked_step_id: step.id.clone(),
+        blocked_reason,
+        toolchain_status: None,
     };
 
-    let op_id = format!("op-{}", crate::state::next_operation_id());
-
-    state.out.send_event(&Event {
-        method: events::MODEL_STARTED.to_string(),
-        params: serde_json::to_value(ModelStartedEvent {
-            operation_id: op_id.clone(),
-            model: model.to_string(),
-            role: Some(ModelRole::Architect),
-            alias,
-            effort: reasoning_effort,
-            plan_context: None,
-            is_batch: false,
-        })
-        .ok(),
-    });
-
-    let intro_header = format!(
-        "# Local Plan Replanning: [{}] {}\n*Replanning blocked step `{}`...*\n\n---\n\n",
-        plan.id, plan.title, step.id
-    );
-    state.out.send_event(&Event {
-        method: events::MODEL_TEXT_DELTA.to_string(),
-        params: serde_json::to_value(ModelDeltaEvent {
-            operation_id: op_id.clone(),
-            delta: intro_header.clone(),
-        })
-        .ok(),
-    });
-
-    let sys_prompt = tauqe_core::plan::prompt::build_replan_system_prompt();
-    let mut user_prompt = tauqe_core::plan::prompt::build_replan_diagnostic_packet(
-        &plan,
-        &step.id,
-        blocked_reason.as_deref(),
-    );
-    if let Some(ins) = &instructions {
-        let trimmed = ins.trim();
-        if !trimmed.is_empty() {
-            user_prompt.push_str("\n\n## Developer Replanning Directives:\n");
-            user_prompt.push_str(trimmed);
-            user_prompt.push('\n');
-        }
-    }
-
-    let messages = vec![
-        ChatMessage::system(sys_prompt),
-        ChatMessage::user(user_prompt),
-    ];
-
-    let schema_val = tauqe_core::plan::prompt::plan_refine_response_schema_definition();
-    let schema_def: JsonSchemaDefinition = match serde_json::from_value(schema_val) {
-        Ok(s) => s,
-        Err(err) => {
-            let _ = state.take_active_operation();
-            return Response::err(req.id, errors::SCHEMA_ERROR, err.to_string());
-        }
-    };
-    let response_format = Some(ResponseFormat::JsonSchema {
-        json_schema: schema_def,
-    });
-
-    let stream_outcome = match run_architect_stream(
+    execute_plan_horizon_synthesis(
+        req.id,
         state,
-        Arc::clone(&provider),
-        model.name.clone(),
-        messages,
-        response_format,
-        reasoning_effort,
+        plan,
+        Some(diagnostics),
+        custom_model,
+        instructions,
+        "Plan Replanning",
         &operation,
-        &op_id,
     )
     .await
-    {
-        Ok(outcome) => outcome,
-        Err(ArchitectStreamError::Cancelled) => {
-            return Response::err(req.id, errors::CANCELLED, "Plan replanning was cancelled");
-        }
-        Err(ArchitectStreamError::ModelError(err)) => {
-            return Response::err(req.id, errors::MODEL_ERROR, err);
-        }
-    };
-
-    let ArchitectStreamOutcome {
-        raw_text,
-        streamed_explanation_bytes,
-    } = stream_outcome;
-
-    let output = match tauqe_core::plan::prompt::parse_plan_refinement_output(&raw_text) {
-        Ok(out) => out,
-        Err(err) => {
-            let err_msg = format!("Failed to parse architect replan output: {err}");
-            state.out.send_event(&Event {
-                method: events::MODEL_ERROR.to_string(),
-                params: serde_json::to_value(ModelErrorEvent {
-                    operation_id: op_id.clone(),
-                    message: err_msg.clone(),
-                })
-                .ok(),
-            });
-            return Response::err(req.id, errors::PARSE_ERROR, err_msg);
-        }
-    };
-
-    if streamed_explanation_bytes == 0 && !output.explanation.trim().is_empty() {
-        state.out.send_event(&Event {
-            method: events::MODEL_TEXT_DELTA.to_string(),
-            params: serde_json::to_value(ModelDeltaEvent {
-                operation_id: op_id.clone(),
-                delta: output.explanation.clone(),
-            })
-            .ok(),
-        });
-    }
-
-    let mut full_text = intro_header.clone();
-    full_text.push_str(&output.explanation);
-    state.out.send_event(&Event {
-        method: events::MODEL_FINISHED.to_string(),
-        params: serde_json::to_value(ModelFinishedEvent {
-            operation_id: op_id.clone(),
-            full_text,
-        })
-        .ok(),
-    });
-
-    if output.status.eq_ignore_ascii_case("blocked") {
-        let reason = output
-            .reason
-            .clone()
-            .unwrap_or_else(|| output.explanation.clone());
-        let blocked_msg = format!(
-            "Architect reported the blocked step [{}] is not replannable:\n\n{}",
-            step.id, reason
-        );
-        let _ = state.history.lock().await.record_response(
-            blocked_msg,
-            None,
-            Some(format!("Plan Replan Blocked: {}", plan.title)),
-            Vec::new(),
-        );
-        return Response::ok_typed(req.id, &PlanRefineResult::Blocked { reason });
-    }
-
-    if output.status.eq_ignore_ascii_case("needs_context") {
-        return Response::err(
-            req.id,
-            errors::NEEDS_CONTEXT,
-            "Architect requested additional context; local replanning does not run discovery rounds",
-        );
-    }
-
-    if output.items.is_empty() {
-        return Response::err(
-            req.id,
-            errors::EMPTY_ITEMS,
-            "Model returned success status but an empty items array",
-        );
-    }
-
-    let updated_plan =
-        match PlanStorage::graft_subtree(&repo_root, &plan.id, &step.id, output.items) {
-            Ok(p) => p,
-            Err(err) => return Response::err(req.id, errors::PLAN_GRAFT_FAILED, format!("{:#}", err)),
-        };
-
-    let (total_items, _) = updated_plan.count_stats();
-    let history_response = format!(
-        "Plan [{}] locally replanned step `{}` into {} item(s).\n\n{}",
-        updated_plan.id, step.id, total_items, output.explanation
-    );
-    let _ = state.history.lock().await.record_response(
-        history_response,
-        None,
-        Some(format!("Plan Replan: {}", updated_plan.title)),
-        Vec::new(),
-    );
-
-    emit(
-        &state.out,
-        events::PLAN_UPDATED,
-        serde_json::to_value(PlanUpdatedEvent {
-            plan: updated_plan.clone(),
-        })
-        .ok(),
-    );
-
-    if let Ok(plans) = PlanStorage::load_all(&repo_root) {
-        let active_id = PlanStorage::load_active_id(&repo_root).ok().flatten();
-        emit(
-            &state.out,
-            events::PLAN_LIST_CHANGED,
-            serde_json::to_value(PlanListChangedEvent { plans, active_id }).ok(),
-        );
-    }
-
-    Response::ok_typed(
-        req.id,
-        &PlanRefineResult::Success {
-            plan: updated_plan,
-            explanation: Some(output.explanation),
-        },
-    )
 }
 
 #[cfg(test)]
@@ -2647,7 +2754,73 @@ mod tests {
         assert!(res.error.is_none(), "replan failed: {:?}", res.error);
 
         let reloaded = PlanStorage::load_plan(dir.path(), "replan-mock").unwrap().unwrap();
+        // The Done foundation is preserved, the uncompleted horizon is replaced.
+        assert_eq!(reloaded.find_item("1").unwrap().status, PlanItemStatus::Done);
         assert!(reloaded.find_item("2.1").is_some());
+        assert!(reloaded.find_item("2").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_plan_horizon_synthesis_history_transactionality() {
+        let dir = TestDir::new();
+        let plan = Plan {
+            id: "tx-history".to_string(),
+            title: "Tx History".to_string(),
+            created_at: 1,
+            updated_at: 1,
+            items: vec![test_item("1", PlanItemStatus::Todo)],
+            ..Default::default()
+        };
+        PlanStorage::save_plan(dir.path(), &plan).unwrap();
+
+        // Synthesize an invalid horizon that introduces a circular dependency
+        // to force `replace_uncompleted_horizon` to fail during persistence.
+        let cyclic_output = serde_json::json!({
+            "status": "success",
+            "explanation": "Cyclic horizon",
+            "items": [
+                {
+                    "id": "a",
+                    "title": "Step A",
+                    "status": "todo",
+                    "depends_on": ["b"],
+                    "children": []
+                },
+                {
+                    "id": "b",
+                    "title": "Step B",
+                    "status": "todo",
+                    "depends_on": ["a"],
+                    "children": []
+                }
+            ]
+        });
+        let mock_provider = Arc::new(MockLlmProvider::scripted([
+            MockResponse::text(cyclic_output.to_string()),
+        ]));
+
+        let config = tauqe_core::config::AppConfig::default();
+        let state = test_state_with_provider(&dir, config, mock_provider).await;
+
+        let req = Request {
+            id: tauqe_protocol::RequestId::Number(1),
+            method: tauqe_protocol::methods::PLAN_REFINE.to_string(),
+            params: Some(serde_json::json!({ "plan_id": "tx-history" })),
+        };
+        let res = handle_plan_refine(req, &state).await;
+
+        let err = res.error.expect("should fail due to dependency cycle");
+        assert_eq!(err.code, errors::PLAN_SAVE_FAILED);
+        assert!(err.message.contains("Dependency cycle detected"));
+
+        // Strict history transactionality invariant: no assistant response was recorded
+        // into session history because persistence failed.
+        let entries = state.history.lock().await.get_entries().unwrap();
+        let responses = entries
+            .iter()
+            .filter(|e| matches!(e, tauqe_core::history::HistoryEntry::Response { .. }))
+            .count();
+        assert_eq!(responses, 0, "no response entry should be committed on persistence failure");
     }
 
     #[tokio::test]
@@ -2680,8 +2853,8 @@ mod tests {
         let provider = Arc::new(MockLlmProvider::scripted([MockResponse::text(response)]));
 
         let mut config = tauqe_core::config::AppConfig::default();
-        config.develop.workflow = "naive".to_string();
-        config.develop.protocol = "xml".to_string();
+        config.develop.workflow = tauqe_protocol::WorkflowKind::Naive;
+        config.develop.protocol = tauqe_protocol::EditProtocolKind::Xml;
         config.models.auto_level_up = false;
 
         let state = test_state_with_provider(&dir, config, provider.clone()).await;
@@ -2713,5 +2886,169 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(reloaded.find_item("1").unwrap().status, PlanItemStatus::Done);
+    }
+
+    #[tokio::test]
+    async fn test_plan_batch_automated_replanning_on_blocked_step() {
+        let dir = TestDir::new();
+        tauqe_core::git::init_repository(Some(dir.path()), true).unwrap();
+        std::fs::write(dir.path().join("src.rs"), "pub fn value() -> i32 { 0 }\n").unwrap();
+        tauqe_core::git::cmd::stage_files(dir.path(), &["src.rs".to_string()]).unwrap();
+        tauqe_core::git::cmd::commit_with_developer_author(dir.path(), "Initial", false).unwrap();
+
+        let mut item = test_item("1", PlanItemStatus::Todo);
+        item.title = "Step 1".to_string();
+        item.files = vec!["src.rs".to_string()];
+        let plan = Plan {
+            id: "auto-replan".to_string(),
+            title: "Auto Replan".to_string(),
+            created_at: 1,
+            updated_at: 1,
+            items: vec![item],
+            ..Default::default()
+        };
+        PlanStorage::save_plan(dir.path(), &plan).unwrap();
+
+        let marker = "AUTOREPLANM1";
+        // 1. Coder turn returns a semantic blocked outcome:
+        let blocked_response = format!(
+            "<blocked_{m} reason=\"Precondition missing: value signature invalid\" />",
+            m = marker
+        );
+        // 2. Architect replanning turn returns a new horizon with replacement step "1.1":
+        let replan_output = serde_json::json!({
+            "status": "success",
+            "explanation": "Replanned step 1 into replacement 1.1",
+            "items": [
+                {
+                    "id": "1.1",
+                    "title": "Step 1.1 replacement",
+                    "status": "todo",
+                    "files": ["src.rs"],
+                    "readonly_files": [],
+                    "concept_refs": [],
+                    "depends_on": [],
+                    "children": []
+                }
+            ]
+        });
+        // 3. Coder turn for step "1.1" succeeds:
+        let success_response = format!(
+            "<tauqe_edits_{m} summary=\"Fix value\">\n<edit_{m} path=\"src.rs\">\n<search_{m}>\npub fn value() -> i32 {{ 0 }}\n</search_{m}>\n<replace_{m}>\npub fn value() -> i32 {{ 100 }}\n</replace_{m}>\n</edit_{m}>\n<success_{m} summary=\"done\" />\n</tauqe_edits_{m}>",
+            m = marker
+        );
+
+        let provider = Arc::new(MockLlmProvider::scripted([
+            MockResponse::text(blocked_response),
+            MockResponse::text(replan_output.to_string()),
+            MockResponse::text(success_response),
+        ]));
+
+        let mut config = tauqe_core::config::AppConfig::default();
+        config.develop.workflow = tauqe_protocol::WorkflowKind::Naive;
+        config.develop.protocol = tauqe_protocol::EditProtocolKind::Xml;
+        config.develop.max_replans = 2;
+        config.models.auto_level_up = false;
+
+        let state = test_state_with_provider(&dir, config, provider).await;
+        *state.marker_override.lock().await = Some(marker.to_string());
+
+        let operation = Arc::new(state.try_begin_operation().expect("register batch operation"));
+        let outcome = run_plan_batch(&state, "auto-replan", vec!["1".to_string()], operation).await;
+
+        assert_eq!(outcome, BatchOutcome::Completed { steps: 1 });
+
+        let reloaded = PlanStorage::load_plan(dir.path(), "auto-replan").unwrap().unwrap();
+        assert!(reloaded.find_item("1.1").is_some());
+        assert_eq!(reloaded.find_item("1.1").unwrap().status, PlanItemStatus::Done);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("src.rs")).unwrap(),
+            "pub fn value() -> i32 { 100 }\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_plan_batch_automated_replanning_limit_exhausted() {
+        let dir = TestDir::new();
+        tauqe_core::git::init_repository(Some(dir.path()), true).unwrap();
+        std::fs::write(dir.path().join("src.rs"), "pub fn value() -> i32 { 0 }\n").unwrap();
+        tauqe_core::git::cmd::stage_files(dir.path(), &["src.rs".to_string()]).unwrap();
+        tauqe_core::git::cmd::commit_with_developer_author(dir.path(), "Initial", false).unwrap();
+
+        let mut item = test_item("1", PlanItemStatus::Todo);
+        item.title = "Step 1".to_string();
+        item.files = vec!["src.rs".to_string()];
+        let plan = Plan {
+            id: "limit-replan".to_string(),
+            title: "Limit Replan".to_string(),
+            created_at: 1,
+            updated_at: 1,
+            items: vec![item],
+            ..Default::default()
+        };
+        PlanStorage::save_plan(dir.path(), &plan).unwrap();
+
+        let marker = "LIMITREPLANM1";
+        // 1. First coder turn blocks:
+        let blocked_1 = format!("<blocked_{m} reason=\"First blocker\" />", m = marker);
+        // 2. Architect replanning replaces step 1 with 1.1:
+        let replan_output = serde_json::json!({
+            "status": "success",
+            "explanation": "Replanned into 1.1",
+            "items": [
+                {
+                    "id": "1.1",
+                    "title": "Step 1.1",
+                    "status": "todo",
+                    "files": ["src.rs"],
+                    "readonly_files": [],
+                    "concept_refs": [],
+                    "depends_on": [],
+                    "children": []
+                }
+            ]
+        });
+        // 3. Second coder turn on step 1.1 also blocks:
+        let blocked_2 = format!("<blocked_{m} reason=\"Second blocker\" />", m = marker);
+
+        let provider = Arc::new(MockLlmProvider::scripted([
+            MockResponse::text(blocked_1),
+            MockResponse::text(replan_output.to_string()),
+            MockResponse::text(blocked_2),
+        ]));
+
+        let mut config = tauqe_core::config::AppConfig::default();
+        config.develop.workflow = tauqe_protocol::WorkflowKind::Naive;
+        config.develop.protocol = tauqe_protocol::EditProtocolKind::Xml;
+        // Limit max_replans to 1:
+        config.develop.max_replans = 1;
+        config.models.auto_level_up = false;
+
+        let state = test_state_with_provider(&dir, config, provider).await;
+        *state.marker_override.lock().await = Some(marker.to_string());
+
+        let operation = Arc::new(state.try_begin_operation().expect("register batch operation"));
+        let outcome = run_plan_batch(&state, "limit-replan", vec!["1".to_string()], operation).await;
+
+        match outcome {
+            BatchOutcome::Blocked {
+                completed,
+                step_id,
+                reason,
+            } => {
+                assert_eq!(completed, 0);
+                assert_eq!(step_id, "1.1");
+                assert!(
+                    reason.contains("Automated replanning limit reached (max_replans = 1)"),
+                    "unexpected block reason: {}",
+                    reason
+                );
+                assert!(reason.contains("Manual developer intervention required"));
+            }
+            other => panic!("Expected Blocked outcome with limit reached, got {:?}", other),
+        }
+
+        let reloaded = PlanStorage::load_plan(dir.path(), "limit-replan").unwrap().unwrap();
+        assert_eq!(reloaded.find_item("1.1").unwrap().status, PlanItemStatus::Blocked);
     }
 }

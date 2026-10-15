@@ -71,8 +71,8 @@ impl ModalFrame<'_> {
             }
         } else {
             (
-                Style::default().bg(Color::DarkGray).fg(Color::Gray),
-                Style::default().bg(Color::DarkGray).fg(Color::Gray),
+                Style::default().bg(Color::DarkGray).fg(Color::White),
+                Style::default().bg(Color::DarkGray).fg(Color::White),
             )
         };
 
@@ -86,7 +86,7 @@ impl ModalFrame<'_> {
                 Span::raw("    "),
                 Span::styled(format!(" [ {} ] ", self.cancel_label), cancel_style),
             ]),
-            Line::from(Span::styled(hint, Style::default().fg(Color::DarkGray))),
+            Line::from(Span::styled(hint, Style::default().fg(Color::Gray))),
         ];
         let actions_widget = Paragraph::new(actions_lines).alignment(Alignment::Center);
         frame.render_widget(actions_widget, chunks[1]);

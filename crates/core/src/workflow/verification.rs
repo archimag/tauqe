@@ -1,11 +1,12 @@
 use std::path::Path;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 use crate::edits::protocol::{VerifyOnSuccess, VerifyRequest, VerifyTarget};
 use crate::providers::StreamEvent;
 
 pub struct VerificationOutcome {
     pub success: bool,
+    pub is_cancelled: bool,
     pub report: String,
 }
 
@@ -15,6 +16,7 @@ pub async fn run_workflow_verification(
     verify_req: &VerifyRequest,
     stream_tx: &mpsc::Sender<StreamEvent>,
     stream_output: bool,
+    cancel_rx: Option<&watch::Receiver<bool>>,
 ) -> VerificationOutcome {
     let target_str = match verify_req.target {
         VerifyTarget::Check => "check",
@@ -34,7 +36,49 @@ pub async fn run_workflow_verification(
         let _ = stream_tx.send(StreamEvent::TextDelta(start_msg)).await;
     }
 
-    let (ok, results) = crate::toolchain::run_verification_pipeline(repo_root, &verify_req.target).await;
+    let (ok, results) =
+        crate::toolchain::run_verification_pipeline(repo_root, &verify_req.target, cancel_rx).await;
+
+    if results.is_empty() {
+        let note = "⚠️ No build/test toolchain detected in repository for verification.\n".to_string();
+        let _ = stream_tx
+            .send(StreamEvent::ToolchainFinished {
+                command: target_str.to_string(),
+                success: true,
+                message: Some("No build/test toolchain detected".to_string()),
+            })
+            .await;
+        if stream_output || verify_req.on_success == VerifyOnSuccess::Report {
+            let _ = stream_tx.send(StreamEvent::TextDelta(note.clone())).await;
+        }
+        return VerificationOutcome {
+            success: true,
+            is_cancelled: false,
+            report: note,
+        };
+    }
+
+    let is_cancelled = results.iter().any(|r| r.is_cancelled);
+    if is_cancelled {
+        let cancel_msg = format!("Verification (`{}`) cancelled", target_str);
+        let _ = stream_tx
+            .send(StreamEvent::ToolchainFinished {
+                command: target_str.to_string(),
+                success: false,
+                message: Some(cancel_msg),
+            })
+            .await;
+        let _ = stream_tx.send(StreamEvent::Cancelled).await;
+        let report = format!("Verification (`{}`) was cancelled.\n", target_str);
+        if stream_output {
+            let _ = stream_tx.send(StreamEvent::TextDelta(report.clone())).await;
+        }
+        return VerificationOutcome {
+            success: false,
+            is_cancelled: true,
+            report,
+        };
+    }
 
     let _ = stream_tx
         .send(StreamEvent::ToolchainFinished {
@@ -47,17 +91,6 @@ pub async fn run_workflow_verification(
             },
         })
         .await;
-
-    if results.is_empty() {
-        let note = "⚠️ No build/test toolchain detected in repository for verification.\n".to_string();
-        if stream_output {
-            let _ = stream_tx.send(StreamEvent::TextDelta(note.clone())).await;
-        }
-        return VerificationOutcome {
-            success: true,
-            report: note,
-        };
-    }
 
     let mut report = String::new();
     if ok {
@@ -90,7 +123,39 @@ pub async fn run_workflow_verification(
 
     VerificationOutcome {
         success: ok,
+        is_cancelled: false,
         report,
+    }
+}
+
+#[cfg(test)]
+mod verification_outcome_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_run_workflow_verification_no_toolchain_detected() {
+        let dir = tempfile::tempdir().unwrap();
+        let (tx, mut rx) = mpsc::channel(10);
+        let req = VerifyRequest {
+            target: VerifyTarget::All,
+            on_success: VerifyOnSuccess::Silent,
+        };
+        let outcome = run_workflow_verification(dir.path(), &req, &tx, false, None).await;
+        assert!(outcome.success);
+        assert!(!outcome.is_cancelled);
+        assert!(outcome.report.contains("No build/test toolchain detected"));
+
+        let mut saw_finished = false;
+        while let Ok(event) = rx.try_recv() {
+            if let StreamEvent::ToolchainFinished { message, .. } = event {
+                assert_eq!(
+                    message.as_deref(),
+                    Some("No build/test toolchain detected")
+                );
+                saw_finished = true;
+            }
+        }
+        assert!(saw_finished);
     }
 }
 
@@ -137,8 +202,33 @@ pub fn build_verification_retry_prompt(
     prompt
 }
 
+/// Constructs a prompt reminding the model that it must provide code edits when fixing verification failures.
+pub fn build_verification_missing_edits_prompt(
+    report: &str,
+    target_language: Option<&str>,
+) -> String {
+    let mut prompt = String::new();
+    prompt.push_str("Your previous response contained explanations but did not include any code edits in `<tauqe_edits>...</tauqe_edits>` blocks.\n\nCode verification is still failing with the following errors:\n\n```\n");
+    prompt.push_str(report.trim());
+    prompt.push_str("\n```\n\nYou MUST propose concrete code edits to resolve the compilation or verification errors. If you need additional files, request them using `<context_request path=\"...\" access=\"editable|read_only\" />`.");
+    if let Some(lang) = target_language {
+        prompt.push_str(&format!(
+            "\n\nNote: Formulate your explanations in {} (the language of the user's request), while conducting all reasoning strictly in English.",
+            lang
+        ));
+    }
+    prompt
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn test_build_verification_missing_edits_prompt() {
+        let prompt = build_verification_missing_edits_prompt("error: mismatched types", Some("Russian"));
+        assert!(prompt.contains("did not include any code edits"));
+        assert!(prompt.contains("error: mismatched types"));
+        assert!(prompt.contains("Russian"));
+    }
     use super::*;
 
     #[test]

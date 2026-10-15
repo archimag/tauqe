@@ -11,7 +11,6 @@
 mod dto;
 mod item;
 mod node;
-mod prompt;
 mod render;
 mod scope;
 
@@ -21,5 +20,4 @@ mod tests;
 pub use dto::*;
 pub use item::*;
 pub use node::*;
-pub use prompt::*;
 pub use scope::*;

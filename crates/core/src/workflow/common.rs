@@ -72,17 +72,31 @@ pub async fn compact_history_if_needed_with_budget(
 
     let collect_task = tokio::spawn(async move {
         let mut text = String::new();
+        let mut completed = false;
+        let mut had_error = false;
+        let mut was_cancelled = false;
         while let Some(ev) = rx.recv().await {
-            if let StreamEvent::TextDelta(d) = ev {
-                text.push_str(&d);
+            match ev {
+                StreamEvent::TextDelta(d) => text.push_str(&d),
+                StreamEvent::Done => completed = true,
+                StreamEvent::Cancelled => was_cancelled = true,
+                StreamEvent::Error(err) => {
+                    tracing::warn!("Stream error during history compaction: {}", err);
+                    had_error = true;
+                }
+                _ => {}
             }
         }
-        text
+        if completed && !had_error && !was_cancelled {
+            Some(text)
+        } else {
+            None
+        }
     });
 
     match client_call.await {
         Ok(_) => {
-            let summary_text = collect_task.await.map_err(|join_error| {
+            let maybe_summary = collect_task.await.map_err(|join_error| {
                 tracing::error!(
                     "History compaction task terminated unexpectedly: {}",
                     join_error
@@ -92,9 +106,15 @@ pub async fn compact_history_if_needed_with_budget(
                     join_error
                 )
             })?;
-            let trimmed = summary_text.trim();
-            if !trimmed.is_empty() {
-                history_manager.apply_compaction(trimmed, tail)?;
+            if let Some(summary_text) = maybe_summary {
+                let trimmed = summary_text.trim();
+                if !trimmed.is_empty() {
+                    history_manager.apply_compaction(trimmed, tail)?;
+                }
+            } else {
+                tracing::warn!(
+                    "History compaction stream did not complete cleanly; skipping compaction to preserve history"
+                );
             }
         }
         Err(err) => {
@@ -206,6 +226,52 @@ mod tests {
     use super::*;
     use crate::edits::protocol::EditProtocol;
     use crate::prompt::PromptAssembly;
+
+    #[tokio::test]
+    async fn test_compaction_aborted_on_stream_error_preserves_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut hm = HistoryManager::new(dir.path().to_path_buf());
+        hm.record_turn("Prompt 1", vec![]).unwrap();
+        hm.record_response("Resp 1".to_string(), None, None, vec![]).unwrap();
+        hm.record_turn("Prompt 2", vec![]).unwrap();
+        hm.record_response("Resp 2".to_string(), None, None, vec![]).unwrap();
+
+        let provider = crate::providers::mock::MockLlmProvider::scripted([
+            crate::providers::mock::MockResponse::error("Connection reset"),
+        ]);
+        let model = ModelRef::openrouter("mock/model");
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+
+        let res = compact_history_if_needed_with_budget(&mut hm, &provider, &model, cancel_rx, 1, 1).await;
+        assert!(res.is_ok());
+
+        let entries = hm.get_entries().unwrap();
+        assert_eq!(entries.len(), 4);
+        assert!(!matches!(entries[0], crate::history::entry::HistoryEntry::Summary { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_compaction_aborted_on_cancellation_preserves_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut hm = HistoryManager::new(dir.path().to_path_buf());
+        hm.record_turn("Prompt 1", vec![]).unwrap();
+        hm.record_response("Resp 1".to_string(), None, None, vec![]).unwrap();
+        hm.record_turn("Prompt 2", vec![]).unwrap();
+        hm.record_response("Resp 2".to_string(), None, None, vec![]).unwrap();
+
+        let provider = crate::providers::mock::MockLlmProvider::scripted([
+            crate::providers::mock::MockResponse::text("Partial summary that was cut off"),
+        ]);
+        let model = ModelRef::openrouter("mock/model");
+        let (_cancel_tx, cancel_rx) = watch::channel(true);
+
+        let res = compact_history_if_needed_with_budget(&mut hm, &provider, &model, cancel_rx, 1, 1).await;
+        assert!(res.is_ok());
+
+        let entries = hm.get_entries().unwrap();
+        assert_eq!(entries.len(), 4);
+        assert!(!matches!(entries[0], crate::history::entry::HistoryEntry::Summary { .. }));
+    }
 
     #[test]
     fn test_record_workflow_response_structured_strips_edits() {

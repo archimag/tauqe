@@ -1,7 +1,32 @@
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
-use crate::escape::{escape_xml_attr, escape_xml_text, single_line};
 use crate::model::{ModelRef, ModelSelection, ModelUsageInfo};
+
+/// Leniently deserializes a [`ModelRef`] from either a structured JSON object
+/// (`{"provider":"openrouter","name":"..."}`) or a legacy string representation
+/// (`"openrouter:..."` or `"vendor/model"`).
+pub fn deserialize_model_ref_lenient<'de, D>(deserializer: D) -> Result<ModelRef, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum ModelRefOrString {
+        Structured(ModelRef),
+        Raw(String),
+    }
+
+    match ModelRefOrString::deserialize(deserializer)? {
+        ModelRefOrString::Structured(m) => Ok(m),
+        ModelRefOrString::Raw(s) => {
+            if s.trim().is_empty() {
+                Ok(ModelRef::default())
+            } else {
+                s.parse::<ModelRef>().map_err(serde::de::Error::custom)
+            }
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -33,6 +58,7 @@ pub enum ReviewItemStatus {
     InProgress,
     #[serde(alias = "done")]
     Fixed,
+    Skipped,
     Rejected,
 }
 
@@ -42,7 +68,8 @@ impl ReviewItemStatus {
             Self::Discussion => Self::Todo,
             Self::Todo => Self::InProgress,
             Self::InProgress => Self::Fixed,
-            Self::Fixed => Self::Rejected,
+            Self::Fixed => Self::Skipped,
+            Self::Skipped => Self::Rejected,
             Self::Rejected => Self::Discussion,
         }
     }
@@ -55,6 +82,7 @@ impl std::fmt::Display for ReviewItemStatus {
             Self::Todo => write!(f, "TODO"),
             Self::InProgress => write!(f, "IN_PROGRESS"),
             Self::Fixed => write!(f, "FIXED"),
+            Self::Skipped => write!(f, "SKIPPED"),
             Self::Rejected => write!(f, "REJECTED"),
         }
     }
@@ -68,6 +96,7 @@ impl std::fmt::Display for ReviewItemStatus {
 pub type ReviewStatus = ReviewItemStatus;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "ReviewItemRaw")]
 pub struct ReviewItem {
     pub id: u32,
     pub title: String,
@@ -78,13 +107,58 @@ pub struct ReviewItem {
     pub severity: ReviewSeverity,
     #[serde(default)]
     pub status: ReviewItemStatus,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub file_path: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub line_range: Option<(usize, usize)>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub files: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolution_notes: Option<String>,
     pub body: String,
+}
+
+#[derive(Deserialize)]
+struct ReviewItemRaw {
+    pub id: u32,
+    pub title: String,
+    #[serde(default)]
+    pub model: Option<ModelSelection>,
+    #[serde(default)]
+    pub severity: ReviewSeverity,
+    #[serde(default)]
+    pub status: ReviewItemStatus,
+    #[serde(default)]
+    pub files: Vec<String>,
+    #[serde(default)]
+    pub file_path: Option<String>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub line_range: Option<(usize, usize)>,
+    #[serde(default)]
+    pub resolution_notes: Option<String>,
+    #[serde(default)]
+    pub body: String,
+}
+
+impl From<ReviewItemRaw> for ReviewItem {
+    fn from(raw: ReviewItemRaw) -> Self {
+        let mut files = raw.files;
+        if files.is_empty() {
+            if let Some(path) = raw.file_path {
+                let trimmed = path.trim();
+                if !trimmed.is_empty() {
+                    files.push(trimmed.to_string());
+                }
+            }
+        }
+        Self {
+            id: raw.id,
+            title: raw.title,
+            model: raw.model,
+            severity: raw.severity,
+            status: raw.status,
+            files,
+            resolution_notes: raw.resolution_notes,
+            body: raw.body,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -93,7 +167,8 @@ pub struct ReviewSession {
     #[serde(default)]
     pub title: String,
     pub created_at: u64,
-    pub model: String,
+    #[serde(default, deserialize_with = "deserialize_model_ref_lenient")]
+    pub model: ModelRef,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -113,7 +188,8 @@ pub struct ReviewSummary {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     pub created_at: u64,
-    pub model: String,
+    #[serde(default, deserialize_with = "deserialize_model_ref_lenient")]
+    pub model: ModelRef,
     pub total_items: usize,
     pub fixed_items: usize,
 }
@@ -214,7 +290,8 @@ pub struct ReviewDeleteResult {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct ReviewExecuteParams {
-    pub review_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub item_id: Option<u32>,
 }
@@ -233,7 +310,8 @@ pub struct ReviewUpdateItemParams {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReviewStartedEvent {
     pub operation_id: String,
-    pub model: String,
+    #[serde(default, deserialize_with = "deserialize_model_ref_lenient")]
+    pub model: ModelRef,
     pub files_count: usize,
     pub estimated_tokens: usize,
 }
@@ -285,133 +363,29 @@ pub struct ReviewListChangedEvent {
     pub active_id: Option<String>,
 }
 
-pub const REVIEW_DISCUSSION_PREFIX: &str = "# Review Discussion:";
-
-/// Formats a targeted prompt for discussing and analyzing review findings in Structured Output mode.
-pub fn format_review_discussion_prompt(
-    session: &ReviewSession,
-    focused_item_id: Option<u32>,
-    user_comment: &str,
-) -> String {
-    let ids: Vec<u32> = focused_item_id.into_iter().collect();
-    format_review_discussion_prompt_items(session, &ids, user_comment)
-}
-
-/// Formats a targeted prompt for discussing multiple focused review findings in Structured Output mode.
-pub fn format_review_discussion_prompt_items(
-    session: &ReviewSession,
-    focused_item_ids: &[u32],
-    user_comment: &str,
-) -> String {
-    let mut out = String::new();
-    let clean_title = single_line(&session.title);
-    let title = if clean_title.is_empty() {
-        session.id.as_str()
-    } else {
-        clean_title.as_str()
-    };
-    out.push_str(&format!(
-        "{} [{}] {}\n\n",
-        REVIEW_DISCUSSION_PREFIX,
-        single_line(&session.id),
-        title
-    ));
-
-    if let Some(desc) = &session.description {
-        let trimmed = desc.trim();
-        if !trimmed.is_empty() {
-            out.push_str(&format!(
-                "## Review Scope & Description:\n{}\n\n",
-                escape_xml_text(trimmed)
-            ));
-        }
-    }
-
-    out.push_str("## Target Review Session Context:\n");
-    let (total, fixed) = session.stats();
-    out.push_str(&format!(
-        "<active_review id=\"{}\" title=\"{}\" progress=\"{}/{} fixed\">\n",
-        escape_xml_attr(&session.id),
-        escape_xml_attr(title),
-        fixed,
-        total
-    ));
-
-    for item in &session.items {
-        let is_focused = focused_item_ids.contains(&item.id);
-        let focus_mark = if is_focused { " [FOCUSED]" } else { "" };
-        let loc = match (&item.file_path, item.line_range) {
-            (Some(f), Some((s, e))) if s == e => format!(" ({}:{})", escape_xml_text(f), s),
-            (Some(f), Some((s, e))) => format!(" ({}:{}-{})", escape_xml_text(f), s, e),
-            (Some(f), None) => format!(" ({})", escape_xml_text(f)),
-            (None, _) => String::new(),
-        };
-        out.push_str(&format!(
-            "  - #{}: [{}] {}{}{}\n",
-            item.id,
-            item.severity,
-            escape_xml_text(&item.title),
-            loc,
-            focus_mark
-        ));
-    }
-    out.push_str("</active_review>\n\n");
-
-    if !focused_item_ids.is_empty() {
-        out.push_str("### Items Focused by User for Discussion:\n");
-        for id in focused_item_ids {
-            if let Some(item) = session.find_item(*id) {
-                out.push_str(&format!(
-                    "- **#{} [{}] {}** (status: {})\n",
-                    item.id,
-                    item.severity,
-                    escape_xml_text(&item.title),
-                    item.status
-                ));
-                if let Some(path) = &item.file_path {
-                    if let Some((start, end)) = item.line_range {
-                        out.push_str(&format!(
-                            "  Location: `{}:{}-{}`\n",
-                            escape_xml_text(path),
-                            start,
-                            end
-                        ));
-                    } else {
-                        out.push_str(&format!("  Location: `{}`\n", escape_xml_text(path)));
-                    }
-                }
-                if let Some(notes) = &item.resolution_notes {
-                    if !notes.trim().is_empty() {
-                        out.push_str(&format!(
-                            "  Resolution Strategy: {}\n",
-                            escape_xml_text(notes.trim())
-                        ));
-                    }
-                }
-                if !item.body.trim().is_empty() {
-                    out.push_str(&format!("  Details: {}\n", escape_xml_text(item.body.trim())));
-                }
-            }
-        }
-        out.push('\n');
-    }
-
-    out.push_str("## Developer Comment / Instructions:\n");
-    out.push_str(user_comment.trim());
-    out.push_str("\n\n");
-
-    out.push_str("## Instructions for Model:\n");
-    out.push_str("1. Address the developer's question or feedback regarding the code review findings.\n");
-    out.push_str("2. Discuss the problem, edge cases, and potential solutions conceptually. Do NOT emit file edits or code patches in this discussion turn.\n");
-    out.push_str("3. If the review findings or their statuses should be updated based on this discussion, explain the proposed modifications clearly in conversational text in `message`; the developer applies status changes through the review interface.\n");
-    out.push_str("4. If you need to inspect related files to verify your hypothesis, specify them in the `context_requests` array with `access: \"read_only\"`.\n");
-
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_review_execute_params_serde() {
+        let single: ReviewExecuteParams =
+            serde_json::from_str(r#"{"review_id":"rev-1","item_id":2}"#).unwrap();
+        assert_eq!(single.review_id.as_deref(), Some("rev-1"));
+        assert_eq!(single.item_id, Some(2));
+
+        let cross_session: ReviewExecuteParams = serde_json::from_str(r#"{}"#).unwrap();
+        assert_eq!(cross_session.review_id, None);
+        assert_eq!(cross_session.item_id, None);
+
+        let json = serde_json::to_string(&cross_session).unwrap();
+        assert_eq!(json, "{}");
+
+        let single_session_only: ReviewExecuteParams =
+            serde_json::from_str(r#"{"review_id":"rev-2"}"#).unwrap();
+        assert_eq!(single_session_only.review_id.as_deref(), Some("rev-2"));
+        assert_eq!(single_session_only.item_id, None);
+    }
 
     #[test]
     fn test_review_status_lifecycle() {
@@ -419,9 +393,19 @@ mod tests {
         assert_eq!(status.next(), ReviewItemStatus::Todo);
         assert_eq!(status.next().next(), ReviewItemStatus::InProgress);
         assert_eq!(status.next().next().next(), ReviewItemStatus::Fixed);
-        assert_eq!(status.next().next().next().next(), ReviewItemStatus::Rejected);
-        assert_eq!(status.next().next().next().next().next(), ReviewItemStatus::Discussion);
+        assert_eq!(status.next().next().next().next(), ReviewItemStatus::Skipped);
+        assert_eq!(status.next().next().next().next().next(), ReviewItemStatus::Rejected);
+        assert_eq!(status.next().next().next().next().next().next(), ReviewItemStatus::Discussion);
         assert_eq!(status.to_string(), "DISCUSSION");
+        assert_eq!(ReviewItemStatus::Skipped.to_string(), "SKIPPED");
+        assert_eq!(
+            serde_json::to_string(&ReviewItemStatus::Skipped).unwrap(),
+            "\"skipped\""
+        );
+        assert_eq!(
+            serde_json::from_str::<ReviewItemStatus>("\"skipped\"").unwrap(),
+            ReviewItemStatus::Skipped
+        );
     }
 
     #[test]
@@ -432,8 +416,7 @@ mod tests {
             model: Some(ModelSelection::Role(crate::model::ModelRole::Architect)),
             severity: ReviewSeverity::Critical,
             status: ReviewItemStatus::Discussion,
-            file_path: Some("crates/server/src/state.rs".to_string()),
-            line_range: Some((42, 50)),
+            files: vec!["crates/server/src/state.rs".to_string()],
             resolution_notes: Some("Acquire lock across turn lifetime".to_string()),
             body: "Lock is released before turn concludes".to_string(),
         };
@@ -441,6 +424,7 @@ mod tests {
         let json = serde_json::to_string(&item).unwrap();
         assert!(json.contains("\"critical\""));
         assert!(json.contains("\"discussion\""));
+        assert!(json.contains("\"files\":[\"crates/server/src/state.rs\"]"));
         assert!(json.contains("\"resolution_notes\":\"Acquire lock across turn lifetime\""));
 
         let de: ReviewItem = serde_json::from_str(&json).unwrap();
@@ -460,38 +444,151 @@ mod tests {
         let de_legacy: ReviewItem = serde_json::from_str(legacy_json).unwrap();
         assert_eq!(de_legacy.status, ReviewItemStatus::Fixed);
         assert_eq!(de_legacy.model, Some(ModelSelection::Role(crate::model::ModelRole::Architect)));
+        assert!(de_legacy.files.is_empty());
     }
 
     #[test]
-    fn test_review_discussion_prompt_formatting() {
-        let session = ReviewSession {
-            id: "rev-42".to_string(),
-            title: "Security Audit".to_string(),
-            created_at: 100,
-            model: "test-model".to_string(),
-            description: Some("Security review for core crate".to_string()),
-            user_prompt: None,
-            target_files: vec!["src/lib.rs".to_string()],
-            items: vec![ReviewItem {
-                id: 1,
-                title: "Race condition in cache".to_string(),
-                model: None,
-                severity: ReviewSeverity::Critical,
-                status: ReviewItemStatus::Discussion,
-                file_path: Some("src/lib.rs".to_string()),
-                line_range: Some((10, 20)),
-                resolution_notes: Some("Extend scope of mutex guard".to_string()),
-                body: "Lock is dropped prematurely.".to_string(),
-            }],
-            raw_markdown: String::new(),
-        };
+    fn test_review_item_legacy_file_path_backward_compatibility() {
+        let legacy_json = r#"{
+            "id": 1,
+            "title": "Legacy Finding",
+            "severity": "warning",
+            "status": "todo",
+            "file_path": "crates/core/src/review.rs",
+            "line_range": [10, 25],
+            "body": "Legacy issue description"
+        }"#;
 
-        let prompt = format_review_discussion_prompt(&session, Some(1), "Is this really possible?");
-        assert!(prompt.contains("# Review Discussion: [rev-42] Security Audit"));
-        assert!(prompt.contains("Race condition in cache"));
-        assert!(prompt.contains("Resolution Strategy: Extend scope of mutex guard"));
-        assert!(prompt.contains("Is this really possible?"));
-        assert!(!prompt.contains("review_update"));
-        assert!(prompt.contains("explain the proposed modifications clearly in conversational text"));
+        let item: ReviewItem = serde_json::from_str(legacy_json).unwrap();
+        assert_eq!(item.id, 1);
+        assert_eq!(item.title, "Legacy Finding");
+        assert_eq!(item.severity, ReviewSeverity::Warning);
+        assert_eq!(item.status, ReviewItemStatus::Todo);
+        assert_eq!(item.files, vec!["crates/core/src/review.rs"]);
+        assert_eq!(item.body, "Legacy issue description");
+
+        // Explicit empty files array falls back to file_path
+        let empty_files_json = r#"{
+            "id": 2,
+            "title": "Empty files fallback",
+            "severity": "info",
+            "status": "discussion",
+            "files": [],
+            "file_path": "crates/tui/src/views.rs",
+            "body": "Empty files details"
+        }"#;
+        let item_empty: ReviewItem = serde_json::from_str(empty_files_json).unwrap();
+        assert_eq!(item_empty.files, vec!["crates/tui/src/views.rs"]);
+
+        // Multi-file finding preserves all paths and Skipped status
+        let multi_json = r#"{
+            "id": 3,
+            "title": "Multi-file Finding",
+            "severity": "critical",
+            "status": "skipped",
+            "files": ["crates/protocol/src/review.rs", "crates/core/src/review.rs"],
+            "resolution_notes": "Skipped because already fixed",
+            "body": "Details"
+        }"#;
+
+        let multi_item: ReviewItem = serde_json::from_str(multi_json).unwrap();
+        assert_eq!(multi_item.id, 3);
+        assert_eq!(multi_item.status, ReviewItemStatus::Skipped);
+        assert_eq!(
+            multi_item.files,
+            vec![
+                "crates/protocol/src/review.rs",
+                "crates/core/src/review.rs"
+            ]
+        );
+        assert_eq!(
+            multi_item.resolution_notes.as_deref(),
+            Some("Skipped because already fixed")
+        );
+    }
+
+    #[test]
+    fn test_review_session_and_summary_model_ref_lenient_serde() {
+        // 1. Structured ModelRef JSON
+        let structured_session_json = r#"{
+            "id": "rev-1",
+            "title": "Structured",
+            "created_at": 100,
+            "model": {"provider": "openrouter", "name": "anthropic/claude-3.7-sonnet"}
+        }"#;
+        let session: ReviewSession = serde_json::from_str(structured_session_json).unwrap();
+        assert_eq!(
+            session.model,
+            ModelRef::openrouter("anthropic/claude-3.7-sonnet")
+        );
+
+        let structured_summary_json = r#"{
+            "id": "rev-1",
+            "title": "Structured",
+            "created_at": 100,
+            "model": {"provider": "openrouter", "name": "anthropic/claude-3.7-sonnet"},
+            "total_items": 5,
+            "fixed_items": 2
+        }"#;
+        let summary: ReviewSummary = serde_json::from_str(structured_summary_json).unwrap();
+        assert_eq!(
+            summary.model,
+            ModelRef::openrouter("anthropic/claude-3.7-sonnet")
+        );
+
+        // 2. Legacy string JSON (bare model name)
+        let legacy_bare_session = r#"{
+            "id": "rev-2",
+            "title": "Legacy Bare",
+            "created_at": 200,
+            "model": "anthropic/claude-3.7-sonnet"
+        }"#;
+        let session: ReviewSession = serde_json::from_str(legacy_bare_session).unwrap();
+        assert_eq!(
+            session.model,
+            ModelRef::openrouter("anthropic/claude-3.7-sonnet")
+        );
+
+        let legacy_bare_summary = r#"{
+            "id": "rev-2",
+            "title": "Legacy Bare",
+            "created_at": 200,
+            "model": "anthropic/claude-3.7-sonnet",
+            "total_items": 3,
+            "fixed_items": 1
+        }"#;
+        let summary: ReviewSummary = serde_json::from_str(legacy_bare_summary).unwrap();
+        assert_eq!(
+            summary.model,
+            ModelRef::openrouter("anthropic/claude-3.7-sonnet")
+        );
+
+        // 3. Legacy string JSON with provider prefix
+        let legacy_prefixed_session = r#"{
+            "id": "rev-3",
+            "title": "Legacy Prefixed",
+            "created_at": 300,
+            "model": "openrouter:openai/gpt-4o"
+        }"#;
+        let session: ReviewSession = serde_json::from_str(legacy_prefixed_session).unwrap();
+        assert_eq!(session.model, ModelRef::openrouter("openai/gpt-4o"));
+
+        // 4. Missing model falls back to default
+        let missing_model_session = r#"{
+            "id": "rev-4",
+            "title": "Missing Model",
+            "created_at": 400
+        }"#;
+        let session: ReviewSession = serde_json::from_str(missing_model_session).unwrap();
+        assert_eq!(session.model, ModelRef::default());
+
+        // 5. Summary method derives ModelRef
+        let derived_summary = session.summary();
+        assert_eq!(derived_summary.model, ModelRef::default());
+
+        // 6. Serialized session roundtrips cleanly
+        let serialized = serde_json::to_string(&session).unwrap();
+        let de: ReviewSession = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(de.model, session.model);
     }
 }

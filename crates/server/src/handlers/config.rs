@@ -42,8 +42,8 @@ pub fn config_state(cfg: &AppConfig, selection: Option<&ModelSelection>) -> Conf
     let effective = cfg.resolve_model(&sel);
     let roles = effective_roles_summary(cfg);
     ConfigState {
-        workflow: cfg.develop.workflow.clone(),
-        edit_protocol: cfg.develop.protocol.clone(),
+        workflow: cfg.develop.workflow,
+        edit_protocol: cfg.develop.protocol,
         model: effective,
         selection: Some(sel),
         roles: Some(roles),
@@ -264,48 +264,14 @@ pub async fn handle_config_set(req: Request, state: &Arc<AppState>) -> Response 
             new_scribe = Some(hist_model.clone());
         }
 
-        let mut new_workflow = guard.config.develop.workflow.clone();
-        if let Some(ref wf) = params.workflow {
-            if !WorkflowFactory::is_valid(wf) {
-                return Response {
-                    id: req.id,
-                    result: None,
-                    error: Some(ResponseError {
-                        code: "INVALID_WORKFLOW".to_string(),
-                        message: format!(
-                            "Unknown workflow '{}'. Available workflows: {}",
-                            wf,
-                            WorkflowFactory::available_workflows().join(", ")
-                        ),
-                        data: None,
-                    }),
-                };
-            }
-            new_workflow = wf.clone();
+        let mut new_workflow = guard.config.develop.workflow;
+        if let Some(wf) = params.workflow {
+            new_workflow = wf;
         }
 
-        let mut new_protocol = guard.config.develop.protocol.clone();
-        if let Some(ref proto) = params.edit_protocol {
-            match EditProtocolFactory::canonical_name(proto) {
-                Some(canonical) => {
-                    new_protocol = canonical;
-                }
-                None => {
-                    return Response {
-                        id: req.id,
-                        result: None,
-                        error: Some(ResponseError {
-                            code: "INVALID_PROTOCOL".to_string(),
-                            message: format!(
-                                "Unknown edit protocol '{}'. Available protocols: {}",
-                                proto,
-                                EditProtocolFactory::available_protocols().join(", ")
-                            ),
-                            data: None,
-                        }),
-                    };
-                }
-            }
+        let mut new_protocol = guard.config.develop.protocol;
+        if let Some(proto) = params.edit_protocol {
+            new_protocol = proto;
         }
 
         // Every requested field is valid: commit the whole change atomically.
@@ -530,7 +496,7 @@ pub async fn handle_credentials_create_stub(req: Request, state: &Arc<AppState>)
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tauqe_protocol::{ModelRef, ModelRole};
+    use tauqe_protocol::{EditProtocolKind, ModelRef, ModelRole, WorkflowKind};
 
     #[tokio::test]
     async fn test_config_state_roles_and_scribe_history() {
@@ -603,5 +569,31 @@ mod tests {
             Some(ModelSelection::Role(ModelRole::Scribe))
         );
         assert_eq!(res_state.model, ModelRef::openrouter("model/scribe"));
+    }
+
+    #[tokio::test]
+    async fn test_handle_config_set_workflow_and_protocol() {
+        let (out, _rx) = crate::transport::OutChannel::new();
+        let (history_sender, _hrx) = tokio::sync::mpsc::unbounded_channel();
+        let state = AppState::new(AppConfig::default(), std::env::temp_dir(), history_sender, out);
+
+        let req = Request {
+            id: tauqe_protocol::RequestId::Number(2),
+            method: "config/set".to_string(),
+            params: Some(serde_json::to_value(ConfigSetParams {
+                workflow: Some(WorkflowKind::Naive),
+                edit_protocol: Some(EditProtocolKind::Structured),
+                model: None,
+                selection: None,
+                history_model: None,
+            }).unwrap()),
+        };
+
+        let resp = handle_config_set(req, &state).await;
+        assert!(resp.error.is_none());
+
+        let res_state: ConfigState = serde_json::from_value(resp.result.unwrap()).unwrap();
+        assert_eq!(res_state.workflow, WorkflowKind::Naive);
+        assert_eq!(res_state.edit_protocol, EditProtocolKind::Structured);
     }
 }

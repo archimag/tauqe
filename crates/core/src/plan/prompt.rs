@@ -1,12 +1,178 @@
 use crate::context::ContextFileContent;
+use crate::escape::{escape_xml_attr, escape_xml_text, single_line};
 use serde::{Deserialize, Serialize};
-use tauqe_protocol::{Plan, PlanItem, PlanItemStatus};
+use tauqe_protocol::{ConceptItem, Plan, PlanItem, PlanItemStatus};
 
-fn escape_xml_attr(val: &str) -> String {
-    val.replace('&', "&amp;")
-        .replace('"', "&quot;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
+pub const PLAN_STEP_EXECUTION_PREFIX: &str = "# Target Plan Step Execution:";
+
+pub const PLAN_STEP_RETRY_PREFIX: &str = "# Correction Required: Plan Step Turn Incomplete";
+
+pub const PLAN_DISCUSSION_PREFIX: &str = "# Plan Discussion:";
+
+/// Returns true if the prompt represents an explicit plan discussion turn.
+pub fn is_plan_discussion_prompt(prompt: &str) -> bool {
+    prompt.trim_start().starts_with(PLAN_DISCUSSION_PREFIX)
+}
+
+/// Formats a targeted prompt for discussing and refining a plan or specific marked items.
+///
+/// Preserves session history and passes the targeted plan structure, focused items,
+/// and developer question or instructions for architectural refinement.
+pub fn format_plan_discussion_prompt(
+    plan: &Plan,
+    focused_item_ids: &[String],
+    user_comment: &str,
+) -> String {
+    let mut out = String::new();
+    out.push_str(&format!(
+        "{} [{}] {}\n\n",
+        PLAN_DISCUSSION_PREFIX,
+        single_line(&plan.id),
+        single_line(&plan.title)
+    ));
+
+    if let Some(desc) = &plan.description {
+        let trimmed = desc.trim();
+        if !trimmed.is_empty() {
+            out.push_str(&format!(
+                "## Plan Architecture & Context:\n{}\n\n",
+                escape_xml_text(trimmed)
+            ));
+        }
+    }
+
+    out.push_str("## Target Plan Context:\n");
+    let (total, completed) = plan.count_stats();
+    out.push_str(&format!(
+        "<active_plan id=\"{}\" title=\"{}\" progress=\"{}/{} completed\">\n",
+        escape_xml_attr(&plan.id),
+        escape_xml_attr(&plan.title),
+        completed,
+        total
+    ));
+    if let Some(desc) = &plan.description {
+        out.push_str(&format!(
+            "  <description>{}</description>\n",
+            escape_xml_text(desc.trim())
+        ));
+    }
+
+    if !plan.concept.is_empty() {
+        out.push_str("  <concept>\n");
+        fn render_concept_xml(
+            out: &mut String,
+            items: &[ConceptItem],
+            depth: usize,
+            focused_item_ids: &[String],
+        ) {
+            let indent = "  ".repeat(depth + 2);
+            for item in items {
+                let is_focused =
+                    focused_item_ids.iter().any(|id| id.eq_ignore_ascii_case(&item.id));
+                let focus_marker = if is_focused { " [FOCUSED]" } else { "" };
+                out.push_str(&format!(
+                    "{}- #{}{} {}",
+                    indent,
+                    item.id,
+                    focus_marker,
+                    escape_xml_text(&item.title)
+                ));
+                if let Some(details) = &item.details {
+                    let trimmed = details.trim();
+                    if !trimmed.is_empty() {
+                        out.push_str(&format!(": {}", escape_xml_text(trimmed)));
+                    }
+                }
+                out.push('\n');
+                if !item.children.is_empty() {
+                    render_concept_xml(out, &item.children, depth + 1, focused_item_ids);
+                }
+            }
+        }
+        render_concept_xml(&mut out, &plan.concept, 0, focused_item_ids);
+        out.push_str("  </concept>\n");
+    }
+
+    fn render_discussion_items(
+        out: &mut String,
+        items: &[PlanItem],
+        depth: usize,
+        focused_item_ids: &[String],
+    ) {
+        let indent = "  ".repeat(depth + 1);
+        for item in items {
+            let is_focused =
+                focused_item_ids.iter().any(|id| id.eq_ignore_ascii_case(&item.id));
+            let focus_marker = if is_focused { " [FOCUSED]" } else { "" };
+            out.push_str(&format!(
+                "{}- {}{} (id: \"{}\", status: {})",
+                indent,
+                escape_xml_text(&item.title),
+                focus_marker,
+                item.id,
+                item.status
+            ));
+            if let Some(details) = &item.details {
+                let trimmed = details.trim();
+                if !trimmed.is_empty() {
+                    out.push_str(&format!(": {}", escape_xml_text(trimmed)));
+                }
+            }
+            out.push('\n');
+            if !item.children.is_empty() {
+                render_discussion_items(out, &item.children, depth + 1, focused_item_ids);
+            }
+        }
+    }
+    render_discussion_items(&mut out, &plan.items, 0, focused_item_ids);
+    out.push_str("</active_plan>\n\n");
+
+    if !focused_item_ids.is_empty() {
+        out.push_str("### Items Focused by User for Discussion:\n");
+        for id in focused_item_ids {
+            if let Some(item) = plan.find_item(id) {
+                out.push_str(&format!(
+                    "- **#{} {}** (status: {})\n",
+                    item.id,
+                    escape_xml_text(&item.title),
+                    item.status
+                ));
+                if let Some(details) = &item.details {
+                    let trimmed = details.trim();
+                    if !trimmed.is_empty() {
+                        out.push_str(&format!("  {}\n", escape_xml_text(trimmed)));
+                    }
+                }
+            } else if let Some(concept) = plan.find_concept_item(id) {
+                out.push_str(&format!(
+                    "- **[CONCEPT] #{} {}**\n",
+                    concept.id,
+                    escape_xml_text(&concept.title)
+                ));
+                if let Some(details) = &concept.details {
+                    let trimmed = details.trim();
+                    if !trimmed.is_empty() {
+                        out.push_str(&format!("  {}\n", escape_xml_text(trimmed)));
+                    }
+                }
+            }
+        }
+        out.push('\n');
+    }
+
+    out.push_str("## Developer Comment / Instructions:\n");
+    out.push_str(user_comment.trim());
+    out.push_str("\n\n");
+
+    out.push_str("## Instructions for Model:\n");
+    out.push_str("1. Address the developer's question or feedback regarding the plan architecture and steps.\n");
+    out.push_str("2. Reins Invariant: Never mutate the plan (keep `plan_update: null`) without an explicit user instruction to modify it. Questions, analysis, trade-off reviews, and critique must be answered strictly in conversational text in `message`.\n");
+    out.push_str("3. When explicitly instructed to update the plan, explain the proposed modifications in `message` and populate the structured `plan_update` field.\n");
+    out.push_str("4. Plan Action Semantics: Use `action: \"save\"` to create or completely overwrite the plan (mandatory `concept` tree defining architectural intent, with optional implementation `items`). Use `action: \"update\"` to modify individual existing items or concept nodes by ID without altering unmentioned items. Use `action: \"delete\"` to remove the plan.\n");
+    out.push_str("5. Keep explanations clear, rigorous, and directly aligned with codebase design.\n");
+    out.push_str("6. Language Consistency Directive: Detect the natural language of the plan title and description. Formulate all plan titles, descriptions, step titles, step details, and conversational explanations strictly in that same language.\n");
+
+    out
 }
 
 /// Formats the plan, its concept tree, and implementation items into a prompt block for LLM context.
@@ -244,7 +410,7 @@ fn plan_item_schema(depth: usize, max_depth: usize) -> serde_json::Value {
 /// compliance with LLM Structured Output engines that forbid recursive `$ref` schemas.
 pub fn plan_refine_response_schema() -> serde_json::Value {
     let items_description = format!(
-        "Refined hierarchical list of plan items (up to {} levels of nesting). If status is 'blocked' or 'needs_context', this must be empty.",
+        "New unfinished horizon: the hierarchical list of NEW executable steps (up to {} levels of nesting). Do NOT include already-DONE steps; the harness preserves and prepends the completed foundation. If status is 'blocked' or 'needs_context', this must be empty.",
         MAX_PLAN_REFINEMENT_DEPTH
     );
     serde_json::json!({
@@ -253,7 +419,7 @@ pub fn plan_refine_response_schema() -> serde_json::Value {
             "status": {
                 "type": "string",
                 "enum": ["success", "blocked", "needs_context"],
-                "description": "Result status: 'success' if the plan was refined into actionable steps, 'blocked' if architectural blockers exist, or 'needs_context' if specific source files from repo_map must be inspected before designing the roadmap."
+                "description": "Result status: 'success' if the unfinished horizon was synthesized into actionable steps, 'blocked' if architectural blockers exist, or 'needs_context' if specific source files from repo_map must be inspected before designing the roadmap."
             },
             "explanation": {
                 "type": "string",
@@ -289,33 +455,43 @@ pub fn plan_refine_response_schema() -> serde_json::Value {
 pub fn plan_refine_response_schema_definition() -> serde_json::Value {
     serde_json::json!({
         "name": "plan_refinement",
-        "description": "Deep plan refinement output: decomposition into actionable steps or blocker report",
+        "description": "Plan horizon synthesis output: the new unfinished steps or a blocker report",
         "strict": true,
         "schema": plan_refine_response_schema()
     })
 }
 
-/// Builds the system prompt for deep plan refinement (Principal Architect).
-pub fn build_plan_refine_system_prompt(_plan: &Plan) -> String {
+/// Builds the unified system prompt for Architect horizon synthesis.
+///
+/// One prompt governs every Architect planning call — initial refinement, manual
+/// re-projection, and automatic recovery after a blocked step — because all three
+/// are the same operation: reprojecting the unfinished horizon from the immutable
+/// concept and the completed (DONE) foundation. The prompt therefore never asks the
+/// Architect to restate finished work; it demands only the new, unfinished steps.
+pub fn build_plan_horizon_system_prompt() -> String {
     let mut out = String::new();
     out.push_str("You are a Principal Software Architect in TAUQE (The Answer to the Ultimate Question of Engineering).\n\n");
-    out.push_str("Your mission is Deep Plan Refinement: converting an established architectural objective into a rigorous, production-grade engineering roadmap.\n\n");
+    out.push_str("Your mission is Wave Horizon Planning: synthesizing the entire unfinished horizon of a plan — the ordered, executable steps that still remain — from an immutable architectural concept, the completed (DONE) foundation, and, when present, the diagnostics of a blocked step.\n\n");
 
     out.push_str("## Core Invariants & Rules:\n\n");
-    out.push_str("1. Strict Prohibition of Conceptual Drift (\"How\" vs \"What\"):\n");
-    out.push_str("   - The developer has already defined the conceptual intent and architectural concept tree (`concept`).\n");
-    out.push_str("   - The concept tree is strictly immutable and read-only for you. You MUST NOT alter, expand, dilute, or contradict it.\n");
-    out.push_str("   - Your exclusive responsibility is engineering decomposition (\"How\"): determining the exact modules, interfaces, contracts, types, and sequence of implementation.\n\n");
-    out.push_str("2. Strict Blocker Protocol (Refusal to Plan):\n");
-    out.push_str("   - If you discover an insurmountable contradiction, technical blocker, missing prerequisite, or flawed assumption in the codebase or plan requirements:\n");
+    out.push_str("1. Concept Immutability (\"What\" vs \"How\"):\n");
+    out.push_str("   - The architectural concept tree (`concept`) captures the developer's intent and is the immutable source of truth.\n");
+    out.push_str("   - You MUST NOT alter, expand, dilute, or contradict it.\n");
+    out.push_str("   - Your exclusive responsibility is engineering decomposition (\"How\"): the exact modules, interfaces, contracts, types, and sequence of implementation.\n\n");
+    out.push_str("2. Horizon Synthesis Contract:\n");
+    out.push_str("   - Return ONLY the new, unfinished steps of the horizon; every returned step carries `status: \"todo\"`.\n");
+    out.push_str("   - Do NOT restate, re-emit, or reorder the completed (DONE) steps shown to you: the harness preserves them verbatim and concatenates them ahead of your output. Emitting a DONE step is a hard contract violation.\n");
+    out.push_str("   - Reproject the WHOLE remaining horizon on every call: the horizon is a fresh, coherent plan for the remaining work, not a patch layered on an earlier draft.\n\n");
+    out.push_str("3. Strict Blocker Protocol (Refusal to Plan):\n");
+    out.push_str("   - If you discover an insurmountable contradiction, technical blocker, missing prerequisite, or flawed assumption in the codebase or requirements:\n");
     out.push_str("   - You MUST NOT invent a compromised, broken, or speculative plan.\n");
     out.push_str("   - You MUST set `status: \"blocked\"`, provide empty `items: []`, and document a comprehensive, rigorous technical explanation in `reason` detailing the exact contradiction, codebase evidence, and recommended developer action.\n\n");
-    out.push_str("3. Step Granularity, Grouping and Compilability Invariants:\n");
+    out.push_str("4. Step Granularity, Grouping and Compilability Invariants:\n");
     out.push_str("   - Execution Lifecycle Contract: EVERY leaf step is executed in an isolated turn with its own toolchain verification gates (check, clippy, test).\n");
     out.push_str("   - Target File Precision (Leaf-Only Files Invariant): For every executable leaf step, you MUST populate `files: [\"path/to/file\"]` with exact repository-relative file paths. Parent items and task groups are conceptual containers and MUST have empty `files: []`. Only leaf steps (`children: []`) pre-load files into context upon execution.\n");
     out.push_str("   - Reference Files Contract (Read-Only Context): For every executable leaf step, identify and populate `readonly_files: [\"path/to/reference\"]` with existing interfaces, protocol types, or subsystem conventions needed as context during implementation. These files are pre-loaded as read-only context during step execution. Invariant: parent items must have empty `readonly_files: []`.\n");
     out.push_str("   - Concept Traceability: For each step, link it to the relevant architectural concept IDs via `concept_refs: [\"concept_id\"]`.\n");
-    out.push_str("   - DAG Dependency Contract: For every executable leaf step, declare prerequisite step IDs in `depends_on: [\"step_id\"]`. A step runs only after every dependency reaches DONE status. Reference only earlier steps; steps without prerequisites must use `depends_on: []`.\n");
+    out.push_str("   - DAG Dependency Contract: For every executable leaf step, declare prerequisite step IDs in `depends_on: [\"step_id\"]`. A step runs only after every dependency reaches DONE status. Reference only steps within this horizon; steps without prerequisites must use `depends_on: []`.\n");
     out.push_str("   - Avoid Micro-Fragmentation: Strictly avoid splitting adjacent, closely related edits into separate microscopic steps. Group cohesive changes across 1-4 related files under a single leaf step if they form a logical unit of work and carry no risk of patch conflicts.\n");
     out.push_str(&format!(
         "   - Avoid Unmanageable Monoliths: Do not bundle numerous unrelated files into a single step; keep each leaf step calibrated to a cohesive unit (targeting {}-{} lines of change).\n",
@@ -327,28 +503,50 @@ pub fn build_plan_refine_system_prompt(_plan: &Plan) -> String {
         "   - The plan hierarchy supports up to {} levels of nesting. Leaf steps at the maximum depth must not contain sub-items.\n\n",
         MAX_PLAN_REFINEMENT_DEPTH
     ));
-    out.push_str("4. Strict Language Consistency Invariant:\n");
+    out.push_str("5. Strict Language Consistency Invariant:\n");
     out.push_str("   - Detect the primary natural language used in the plan's title and description.\n");
     out.push_str("   - You MUST formulate all titles, step details, explanations, and reasons strictly in that SAME natural language.\n");
     out.push_str("   - Do NOT switch languages unless the plan itself is written in that language.\n\n");
-    out.push_str("5. Output Format:\n");
-    out.push_str("   - Output strictly according to the specified JSON schema.\n\n");
     out.push_str("6. Codebase Exploration & Discovery Contract:\n");
     out.push_str("   - You have access to symbol contours in `<repo_map>` and already loaded files in `Active Context Files`.\n");
-    out.push_str("   - If you need to inspect exact implementations, contracts, existing toolchains, or interfaces before designing the roadmap, set `status: \"needs_context\"`, specify the repository-relative file paths in `context_requests: [...]`, leave `items: []`, and explain in `explanation` what you are analyzing and why these files are required.\n");
-    out.push_str("   - When all required context files are loaded, set `status: \"success\"` (or `status: \"blocked\"` if blockers found), set `context_requests: []`, and provide the decomposed `items`.\n");
+    out.push_str("   - If you need to inspect exact implementations, contracts, existing toolchains, or interfaces before synthesizing the horizon, set `status: \"needs_context\"`, specify the repository-relative file paths in `context_requests: [...]`, leave `items: []`, and explain in `explanation` what you are analyzing and why these files are required.\n");
+    out.push_str("   - When all required context files are loaded, set `status: \"success\"` (or `status: \"blocked\"` if blockers found), set `context_requests: []`, and provide the synthesized `items`.\n\n");
+    out.push_str("7. Output Format:\n");
+    out.push_str("   - Output strictly according to the specified JSON schema.\n");
     out
 }
 
-/// Builds the user prompt for deep plan refinement, incorporating context files and repo map.
-pub fn build_plan_refine_user_prompt(
+/// Diagnostics describing a failed or blocked plan step that triggered horizon recovery.
+///
+/// The unified horizon synthesis prompt carries these diagnostics so the Architect can
+/// reproject the unfinished horizon around the failure: the blocked step identifier, the
+/// coder's blocker report, and the last observed toolchain status.
+#[derive(Debug, Clone)]
+pub struct PlanHorizonDiagnostics<'a> {
+    pub blocked_step_id: &'a str,
+    pub blocked_reason: Option<&'a str>,
+    pub toolchain_status: Option<&'a str>,
+}
+
+/// Builds the unified user prompt for Architect horizon synthesis.
+///
+/// Structures the input in a fixed order: the immutable architectural concept, the
+/// completed (DONE) foundation, the optional diagnostics of a blocked step, the codebase
+/// contours (`<repo_map>`) and active context files, and the developer's directives. The
+/// Architect returns only the NEW unfinished horizon; the harness preserves the DONE
+/// foundation and concatenates it ahead of the synthesized steps.
+pub fn build_plan_horizon_user_prompt(
     plan: &Plan,
     context_files: &[ContextFileContent],
     repo_map: Option<&str>,
+    diagnostics: Option<PlanHorizonDiagnostics<'_>>,
     instructions: Option<&str>,
 ) -> String {
     let mut out = String::new();
-    out.push_str(&format!("# Deep Plan Refinement: [{}] {}\n\n", plan.id, plan.title));
+    out.push_str(&format!(
+        "# Plan Horizon Synthesis: [{}] {}\n\n",
+        plan.id, plan.title
+    ));
 
     if let Some(desc) = &plan.description {
         let trimmed = desc.trim();
@@ -360,8 +558,8 @@ pub fn build_plan_refine_user_prompt(
     }
 
     if !plan.concept.is_empty() {
-        out.push_str("## Architectural Concept Tree (\"What\" - Immutable Source of Truth):\n");
-        fn render_concept(out: &mut String, items: &[tauqe_protocol::ConceptItem], depth: usize) {
+        out.push_str("## Architectural Concept (\"What\" - Immutable Source of Truth):\n");
+        fn render_concept(out: &mut String, items: &[ConceptItem], depth: usize) {
             let indent = "  ".repeat(depth);
             for item in items {
                 out.push_str(&format!("{}- **#{}** {}", indent, item.id, item.title));
@@ -379,21 +577,59 @@ pub fn build_plan_refine_user_prompt(
         out.push('\n');
     }
 
-    if let Some(ins) = instructions {
-        let trimmed = ins.trim();
-        if !trimmed.is_empty() {
-            out.push_str("## Developer Refinement Directives:\n");
-            out.push_str(trimmed);
-            out.push_str("\n\n");
+    out.push_str("## Completed Foundation (DONE steps - immutable; do NOT repeat them in `items`):\n");
+    fn collect_done<'a>(items: &'a [PlanItem], acc: &mut Vec<&'a PlanItem>) {
+        for item in items {
+            if item.status == PlanItemStatus::Done {
+                acc.push(item);
+            }
+            collect_done(&item.children, acc);
         }
     }
-
-    out.push_str("## Current Plan Draft:\n");
-    if let Some(active_fmt) = format_active_plan_context(plan) {
-        out.push_str(&active_fmt);
-        out.push_str("\n\n");
+    let mut done = Vec::new();
+    collect_done(&plan.items, &mut done);
+    if done.is_empty() {
+        out.push_str("*(No completed steps yet)*\n");
     } else {
-        out.push_str("*(No initial steps defined)*\n\n");
+        for item in &done {
+            out.push_str(&format!("- [x] #{} {}", item.id, item.title));
+            if !item.files.is_empty() {
+                out.push_str(&format!(" (files: {})", item.files.join(", ")));
+            }
+            out.push('\n');
+        }
+    }
+    out.push('\n');
+
+    if let Some(diag) = diagnostics {
+        out.push_str("## Blocked Step Diagnostics:\n");
+        let blocked = plan.find_item(diag.blocked_step_id);
+        match &blocked {
+            Some(item) => out.push_str(&format!("- **Blocked Step**: #{} {}\n", item.id, item.title)),
+            None => out.push_str(&format!("- **Blocked Step**: #{}\n", diag.blocked_step_id)),
+        }
+        if let Some(item) = &blocked {
+            if !item.files.is_empty() {
+                out.push_str(&format!(
+                    "- **Declared Target Files**: {}\n",
+                    item.files.join(", ")
+                ));
+            }
+            if let Some(details) = &item.details {
+                let trimmed = details.trim();
+                if !trimmed.is_empty() {
+                    out.push_str(&format!("- **Declared Contract**:\n{}\n", trimmed));
+                }
+            }
+        }
+        match diag.blocked_reason.map(str::trim).filter(|s| !s.is_empty()) {
+            Some(reason) => out.push_str(&format!("- **Coder Blocker Report**: {}\n", reason)),
+            None => out.push_str("- **Coder Blocker Report**: (no diagnostics provided)\n"),
+        }
+        if let Some(status) = diag.toolchain_status.map(str::trim).filter(|s| !s.is_empty()) {
+            out.push_str(&format!("- **Toolchain Status**: {}\n", status));
+        }
+        out.push('\n');
     }
 
     if let Some(rm) = repo_map {
@@ -412,22 +648,25 @@ pub fn build_plan_refine_user_prompt(
         }
     }
 
+    if let Some(ins) = instructions {
+        let trimmed = ins.trim();
+        if !trimmed.is_empty() {
+            out.push_str("## Developer Directives:\n");
+            out.push_str(trimmed);
+            out.push_str("\n\n");
+        }
+    }
+
     out.push_str("## Architect Instructions:\n");
     out.push_str("1. Conduct deep technical dependency analysis using the codebase contours and context files.\n");
-    out.push_str("2. If you need to inspect specific file implementations before decomposing the plan, request them by setting `status: \"needs_context\"` with `context_requests: [\"path/to/file\"]` and empty `items: []`.\n");
-    out.push_str("3. Check for any blockers, circular dependencies, or contradictions. If blocked, report `status: \"blocked\"` with exact `reason`.\n");
-    out.push_str("4. If viable, decompose the plan into actionable, dependency-ordered leaf steps with `status: \"todo\"`. Specify target files in `files`, reference contracts/types/conventions in `readonly_files`, and declare prerequisite step IDs in `depends_on`. Calibrate leaf step granularity to cohesive units: group closely related adjacent edits together under one step to avoid micro-fragmentation, while avoiding monolithic multi-file dumps.\n");
-    out.push_str("5. Language Directive: Detect the natural language of the plan title and description. Formulate all titles, details, explanations, and reasons strictly in that same language.\n");
+    out.push_str("2. Synthesize the COMPLETE unfinished horizon as dependency-ordered leaf steps with `status: \"todo\"`. Do NOT include any DONE step; the harness preserves the completed foundation verbatim and prepends it.\n");
+    out.push_str("3. If you need to inspect specific file implementations before synthesizing, request them by setting `status: \"needs_context\"` with `context_requests: [\"path/to/file\"]` and empty `items: []`.\n");
+    out.push_str("4. Check for any blockers, circular dependencies, or contradictions. If blocked, report `status: \"blocked\"` with an exact `reason`.\n");
+    out.push_str("5. For every executable leaf step, specify target files in `files`, reference contracts/types/conventions in `readonly_files`, addressed concept IDs in `concept_refs`, and prerequisite step IDs in `depends_on`. Calibrate leaf step granularity to cohesive units: group closely related adjacent edits under one step to avoid micro-fragmentation, while avoiding monolithic multi-file dumps.\n");
+    out.push_str("6. Language Directive: Detect the natural language of the plan title and description. Formulate all titles, details, explanations, and reasons strictly in that same language.\n");
 
     out
 }
-
-pub const PLAN_STEP_EXECUTION_PREFIX: &str = "# Target Plan Step Execution:";
-
-pub use tauqe_protocol::plan::{
-    extract_plan_discussion_id, format_plan_discussion_prompt, is_plan_discussion_prompt,
-    PLAN_DISCUSSION_PREFIX,
-};
 
 /// Target plan and step identifiers parsed from an isolated plan step execution prompt.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -438,7 +677,9 @@ pub struct PlanStepTarget {
 
 /// Returns true if the prompt represents an isolated plan step execution turn.
 pub fn is_plan_step_execution_prompt(prompt: &str) -> bool {
-    prompt.trim_start().starts_with(PLAN_STEP_EXECUTION_PREFIX)
+    let trimmed = prompt.trim_start();
+    trimmed.starts_with(PLAN_STEP_EXECUTION_PREFIX)
+        || trimmed.starts_with(PLAN_STEP_RETRY_PREFIX)
 }
 
 /// Extracts the target plan ID and step ID from an isolated plan step execution prompt.
@@ -614,7 +855,8 @@ pub fn format_plan_step_execution_prompt(
 /// protocol on the next turn.
 pub fn format_plan_step_retry_prompt(assistant_text: &str, error: Option<&str>) -> String {
     let mut out = String::new();
-    out.push_str("# Correction Required: Plan Step Turn Incomplete\n\n");
+    out.push_str(PLAN_STEP_RETRY_PREFIX);
+    out.push_str("\n\n");
     out.push_str("Your previous turn ended without applying any verified code changes and without emitting the terminal success tag (`<success>`). This violates the execution protocol.\n\n");
 
     out.push_str("## Previous Assistant Response:\n");
@@ -644,202 +886,7 @@ pub fn format_plan_step_retry_prompt(assistant_text: &str, error: Option<&str>) 
     out
 }
 
-/// Builds a targeted diagnostic packet for the Architect during semantic recovery.
-///
-/// The packet frames a strictly local replanning request around a blocked step: it
-/// presents the immutable foundation of completed (DONE) steps, the diagnostics of the
-/// blocked step (its declared contract plus the coder's blocker report), the remaining
-/// plan horizon, and the architectural concept invariants the replacement sub-tree must
-/// uphold. The returned text is embedded as the user prompt of a structured Architect
-/// call that returns the replacement sub-tree.
-pub fn build_replan_diagnostic_packet(
-    plan: &Plan,
-    blocked_step_id: &str,
-    blocked_reason: Option<&str>,
-) -> String {
-    let mut out = String::new();
-    out.push_str(&format!(
-        "# Local Plan Replanning: [{}] {}\n\n",
-        plan.id, plan.title
-    ));
 
-    if let Some(desc) = &plan.description {
-        let trimmed = desc.trim();
-        if !trimmed.is_empty() {
-            out.push_str("## Architectural Intent (\"What\"):\n");
-            out.push_str(trimmed);
-            out.push_str("\n\n");
-        }
-    }
-
-    out.push_str("## Mission:\n");
-    out.push_str(&format!(
-        "Step `{}` could not be executed as declared. Redesign ONLY this step by replacing it with a concrete, dependency-ordered sub-tree of executable leaf steps. Preserve the immutable DONE foundation and the remaining plan horizon; do not redesign the rest of the plan.\n\n",
-        blocked_step_id
-    ));
-
-    if !plan.concept.is_empty() {
-        out.push_str("## Architectural Concept (Invariants the replacement must uphold):\n");
-        fn render_concept(out: &mut String, items: &[tauqe_protocol::ConceptItem], depth: usize) {
-            let indent = "  ".repeat(depth);
-            for item in items {
-                out.push_str(&format!("{}- **#{}** {}", indent, item.id, item.title));
-                if let Some(details) = &item.details {
-                    let trimmed = details.trim();
-                    if !trimmed.is_empty() {
-                        out.push_str(&format!(": {}", trimmed));
-                    }
-                }
-                out.push('\n');
-                render_concept(out, &item.children, depth + 1);
-            }
-        }
-        render_concept(&mut out, &plan.concept, 0);
-        out.push('\n');
-    }
-
-    out.push_str("## Immutable Foundation (DONE steps - read-only, already committed):\n");
-    let mut has_done = false;
-    fn render_done(out: &mut String, items: &[PlanItem], depth: usize, has_done: &mut bool) {
-        let indent = "  ".repeat(depth);
-        for item in items {
-            if item.status == PlanItemStatus::Done {
-                *has_done = true;
-                out.push_str(&format!("{}- [x] #{} {}\n", indent, item.id, item.title));
-                if !item.files.is_empty() {
-                    out.push_str(&format!("{}    files: {}\n", indent, item.files.join(", ")));
-                }
-            }
-            render_done(out, &item.children, depth + 1, has_done);
-        }
-    }
-    render_done(&mut out, &plan.items, 0, &mut has_done);
-    if !has_done {
-        out.push_str("*(No completed steps yet)*\n");
-    }
-    out.push('\n');
-
-    out.push_str("## Blocked Step Diagnostics:\n");
-    if let Some(step) = plan.find_item(blocked_step_id) {
-        out.push_str(&format!("- **ID**: `{}`\n", step.id));
-        out.push_str(&format!("- **Title**: {}\n", step.title));
-        if !step.concept_refs.is_empty() {
-            out.push_str(&format!(
-                "- **Addressed Concept Nodes**: {}\n",
-                step.concept_refs.join(", ")
-            ));
-        }
-        if !step.files.is_empty() {
-            out.push_str(&format!(
-                "- **Declared Target Files**: {}\n",
-                step.files.join(", ")
-            ));
-        }
-        if !step.readonly_files.is_empty() {
-            out.push_str(&format!(
-                "- **Declared Reference Files**: {}\n",
-                step.readonly_files.join(", ")
-            ));
-        }
-        if !step.depends_on.is_empty() {
-            out.push_str(&format!(
-                "- **Prerequisites**: {}\n",
-                step.depends_on.join(", ")
-            ));
-        }
-        if let Some(details) = &step.details {
-            let trimmed = details.trim();
-            if !trimmed.is_empty() {
-                out.push_str(&format!("- **Declared Contract**:\n{}\n", trimmed));
-            }
-        }
-    } else {
-        out.push_str(&format!(
-            "*(Step `{}` not found in the plan)*\n",
-            blocked_step_id
-        ));
-    }
-    match blocked_reason.map(str::trim).filter(|s| !s.is_empty()) {
-        Some(reason) => out.push_str(&format!("- **Blocker reported by coder**: {}\n", reason)),
-        None => out.push_str("- **Blocker reported by coder**: (no diagnostics provided)\n"),
-    }
-    out.push('\n');
-
-    out.push_str("## Remaining Plan Horizon (non-DONE steps to preserve):\n");
-    let mut has_remaining = false;
-    fn render_remaining(
-        out: &mut String,
-        items: &[PlanItem],
-        depth: usize,
-        blocked_step_id: &str,
-        has_remaining: &mut bool,
-    ) {
-        let indent = "  ".repeat(depth);
-        for item in items {
-            let is_blocked = item.id.eq_ignore_ascii_case(blocked_step_id);
-            if item.status != PlanItemStatus::Done && !is_blocked {
-                *has_remaining = true;
-                out.push_str(&format!(
-                    "{}- #{} {} (status: {})\n",
-                    indent, item.id, item.title, item.status
-                ));
-                if !item.depends_on.is_empty() {
-                    out.push_str(&format!(
-                        "{}    depends_on: {}\n",
-                        indent,
-                        item.depends_on.join(", ")
-                    ));
-                }
-            }
-            render_remaining(out, &item.children, depth + 1, blocked_step_id, has_remaining);
-        }
-    }
-    render_remaining(&mut out, &plan.items, 0, blocked_step_id, &mut has_remaining);
-    if !has_remaining {
-        out.push_str("*(No remaining steps)*\n");
-    }
-    out.push('\n');
-
-    out.push_str("## Architect Instructions:\n");
-    out.push_str(&format!(
-        "1. Return ONLY the replacement sub-tree for step `{}` in `items`; do not restate or redesign other steps.\n",
-        blocked_step_id
-    ));
-    out.push_str("2. Decompose the blocked work into concrete, dependency-ordered executable leaf steps with `status: \"todo\"`.\n");
-    out.push_str("3. Populate `files` (target) and `readonly_files` (reference) on leaf steps only; parent containers must leave them empty. Declare prerequisite step IDs in `depends_on`.\n");
-    out.push_str("4. Link each new step to the relevant concept nodes via `concept_refs`.\n");
-    out.push_str("5. Keep the codebase compiling: the replacement must be implementable as a sequence of self-contained, verifiable steps.\n");
-    out.push_str("6. If the blocker is insurmountable, set `status: \"blocked\"` with an exact `reason` instead of inventing a broken plan.\n");
-    out.push_str("7. Language Directive: detect the natural language of the plan title and description and formulate all titles, details, explanations, and reasons strictly in that same language.\n");
-
-    out
-}
-
-/// Builds the system prompt for local plan recovery (Architect replanning of a blocked step).
-pub fn build_replan_system_prompt() -> String {
-    let mut out = String::new();
-    out.push_str("You are a Principal Software Architect in TAUQE (The Answer to the Ultimate Question of Engineering).\n\n");
-    out.push_str("Your mission is Local Plan Recovery: a previously planned step was reported blocked, and you must redesign ONLY that step as a concrete, dependency-ordered sub-tree of executable leaf steps.\n\n");
-
-    out.push_str("## Core Invariants & Rules:\n\n");
-    out.push_str("1. Strict Locality:\n");
-    out.push_str("   - Redesign ONLY the blocked step. The immutable DONE foundation and the remaining plan horizon are read-only and must be preserved.\n");
-    out.push_str("   - Return the replacement sub-tree in `items`; never restate or redesign the rest of the plan.\n\n");
-    out.push_str("2. Strict Blocker Protocol:\n");
-    out.push_str("   - If the blocker is insurmountable, set `status: \"blocked\"`, leave `items: []`, and document the exact contradiction and recommended developer action in `reason`.\n");
-    out.push_str("   - Never invent a compromised or speculative plan.\n\n");
-    out.push_str("3. Step Granularity and Compilability:\n");
-    out.push_str("   - EVERY leaf step is executed in an isolated turn with its own toolchain verification gates; the codebase must remain compiling after each step.\n");
-    out.push_str("   - Leaf-Only Files Invariant: populate `files` and `readonly_files` only on executable leaf steps without children; parent containers must leave them empty.\n");
-    out.push_str("   - DAG Dependency Contract: declare prerequisite step IDs in `depends_on`, referencing only earlier steps. Steps without prerequisites use `depends_on: []`.\n");
-    out.push_str("   - Concept Traceability: link each step to relevant concept node IDs via `concept_refs`.\n");
-    out.push_str("   - Avoid micro-fragmentation and unmanageable monoliths; group cohesive edits into calibrated leaf steps.\n\n");
-    out.push_str("4. Strict Language Consistency:\n");
-    out.push_str("   - Detect the primary natural language of the plan and formulate all titles, details, explanations, and reasons strictly in that same language.\n\n");
-    out.push_str("5. Output Format:\n");
-    out.push_str("   - Output strictly according to the specified JSON schema, using status \"success\" for a valid replacement sub-tree.\n");
-    out
-}
 
 #[cfg(test)]
 mod tests {
@@ -928,6 +975,7 @@ mod tests {
     fn test_format_plan_step_retry_prompt() {
         let prompt =
             format_plan_step_retry_prompt("I think we are done.", Some("No edits were applied"));
+        assert!(is_plan_step_execution_prompt(&prompt));
         assert!(prompt.contains("Correction Required"));
         assert!(prompt.contains("<previous_response>"));
         assert!(prompt.contains("I think we are done."));
@@ -941,10 +989,12 @@ mod tests {
     }
 
     #[test]
-    fn test_plan_refine_prompts_and_schema() {
+    fn test_plan_horizon_prompts_and_schema() {
         let plan = sample_plan();
-        let sys = build_plan_refine_system_prompt(&plan);
-        assert!(sys.contains("Strict Prohibition of Conceptual Drift"));
+        let sys = build_plan_horizon_system_prompt();
+        assert!(sys.contains("Wave Horizon Planning"));
+        assert!(sys.contains("Concept Immutability"));
+        assert!(sys.contains("Horizon Synthesis Contract"));
         assert!(sys.contains("Strict Blocker Protocol"));
         assert!(sys.contains("Compilability Invariants"));
         assert!(sys.contains("Leaf-Only Files Invariant"));
@@ -956,13 +1006,17 @@ mod tests {
             content: "pub fn init() {}".to_string(),
             access: tauqe_protocol::ContextAccess::ReadOnly,
         }];
-        let user_prompt = build_plan_refine_user_prompt(
+        let user_prompt = build_plan_horizon_user_prompt(
             &plan,
             &ctx_files,
             Some("fn generate_token()"),
+            None,
             Some("Focus on EdDSA"),
         );
-        assert!(user_prompt.contains("# Deep Plan Refinement: [jwt-auth] JWT Authentication"));
+        assert!(user_prompt.contains("# Plan Horizon Synthesis: [jwt-auth] JWT Authentication"));
+        assert!(user_prompt.contains("Immutable Source of Truth"));
+        assert!(user_prompt.contains("## Completed Foundation"));
+        assert!(user_prompt.contains("- [x] #1 Models"));
         assert!(user_prompt.contains("Focus on EdDSA"));
         assert!(user_prompt.contains("crates/core/src/lib.rs"));
         assert!(user_prompt.contains("fn generate_token()"));
@@ -973,6 +1027,7 @@ mod tests {
         assert!(!schema.to_string().contains("$ref"), "Schema must not contain recursive $ref");
         assert!(schema.to_string().contains("readonly_files"));
         assert!(schema.to_string().contains("depends_on"));
+        assert!(schema.to_string().contains("New unfinished horizon"));
         let def = plan_refine_response_schema_definition();
         assert_eq!(def["name"], "plan_refinement");
 
@@ -1095,22 +1150,49 @@ mod tests {
     }
 
     #[test]
-    fn test_build_replan_diagnostic_packet_and_system_prompt() {
-        let plan = sample_plan();
-        let packet =
-            build_replan_diagnostic_packet(&plan, "2", Some("Missing crypto dependency"));
-        assert!(packet.contains("# Local Plan Replanning: [jwt-auth] JWT Authentication"));
-        assert!(packet.contains("## Immutable Foundation"));
-        assert!(packet.contains("#1 Models"));
-        assert!(packet.contains("## Blocked Step Diagnostics"));
-        assert!(packet.contains("Missing crypto dependency"));
-        assert!(packet.contains("## Remaining Plan Horizon"));
-        assert!(packet.contains("## Architectural Concept"));
-        assert!(packet.contains("Architect Instructions"));
+    fn test_plan_discussion_prompt_detection_and_attribute_escaping() {
+        let plan = Plan {
+            id: "auth-v2".to_string(),
+            title: "OAuth & JWT".to_string(),
+            description: Some("Tokens & Refresh".to_string()),
+            ..Default::default()
+        };
+        let prompt = format_plan_discussion_prompt(&plan, &[], "Clarify signing");
+        assert!(is_plan_discussion_prompt(&prompt));
+        assert!(is_plan_discussion_prompt(&format!(" \n\t{}", prompt)));
+        assert!(!is_plan_discussion_prompt("regular message"));
+        assert!(prompt.contains("<active_plan id=\"auth-v2\" title=\"OAuth &amp; JWT\""));
+    }
 
-        let sys = build_replan_system_prompt();
-        assert!(sys.contains("Local Plan Recovery"));
-        assert!(sys.contains("Strict Locality"));
-        assert!(sys.contains("Strict Blocker Protocol"));
+    #[test]
+    fn test_build_plan_horizon_user_prompt_with_diagnostics() {
+        let plan = sample_plan();
+        let diagnostics = PlanHorizonDiagnostics {
+            blocked_step_id: "2",
+            blocked_reason: Some("Missing crypto dependency"),
+            toolchain_status: Some("cargo check: 1 error"),
+        };
+        let prompt = build_plan_horizon_user_prompt(&plan, &[], None, Some(diagnostics), None);
+        assert!(prompt.contains("# Plan Horizon Synthesis: [jwt-auth] JWT Authentication"));
+        assert!(prompt.contains("## Architectural Concept"));
+        assert!(prompt.contains("## Completed Foundation"));
+        assert!(prompt.contains("- [x] #1 Models"));
+        assert!(prompt.contains("## Blocked Step Diagnostics"));
+        assert!(prompt.contains("- **Blocked Step**: #2 Endpoint"));
+        assert!(prompt.contains("- **Coder Blocker Report**: Missing crypto dependency"));
+        assert!(prompt.contains("- **Toolchain Status**: cargo check: 1 error"));
+        assert!(prompt.contains("Architect Instructions"));
+
+        // Without diagnostics the failure section is omitted entirely.
+        let plain = build_plan_horizon_user_prompt(&plan, &[], None, None, None);
+        assert!(!plain.contains("Blocked Step Diagnostics"));
+
+        // A plan with no DONE steps reports an empty foundation.
+        let mut no_done = sample_plan();
+        for item in &mut no_done.items {
+            item.status = PlanItemStatus::Todo;
+        }
+        let no_done_prompt = build_plan_horizon_user_prompt(&no_done, &[], None, None, None);
+        assert!(no_done_prompt.contains("*(No completed steps yet)*"));
     }
 }

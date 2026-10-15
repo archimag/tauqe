@@ -12,7 +12,7 @@ pub const GLOBAL_COMMANDS: &[crate::app::KeyCommand] = &[
     crate::app::KeyCommand { key: "F6 / C-S", description: "Squash commits dialog" },
     crate::app::KeyCommand { key: "Ctrl+C", description: "Cancel active generation" },
     // Navigation & Inspection.
-    crate::app::KeyCommand { key: "C-1..5 / F1..F5", description: "Switch views: REPL │ Context │ Review │ Plans │ History" },
+    crate::app::KeyCommand { key: "C-1..5 / F1..F5", description: "Switch views: REPL │ Plans │ Review │ Context │ History" },
     crate::app::KeyCommand { key: "C-R", description: "Fold / unfold thinking (reasoning) stream" },
     crate::app::KeyCommand { key: crate::app::HELP_OPEN_CHORD, description: "Open this help dialog (? also opens it outside text input); Esc / q close it" },
     // Auxiliary & Destructive.
@@ -26,12 +26,12 @@ pub const ONBOARDING_COMMANDS: &[crate::app::KeyCommand] = &[
     crate::app::KeyCommand { key: "Enter", description: "Execute selected onboarding action" },
     // Navigation & Inspection.
     crate::app::KeyCommand { key: "Esc", description: "Exit help dialog" },
-    crate::app::KeyCommand { key: "Ctrl+R", description: "Show / hide entered key" },
+    crate::app::KeyCommand { key: "C-R", description: "Show / hide entered key" },
     // Editing & Clipboard.
-    crate::app::KeyCommand { key: "Ctrl+V", description: "Paste API key from clipboard" },
-    crate::app::KeyCommand { key: "Ctrl+U", description: "Clear key input buffer" },
+    crate::app::KeyCommand { key: "C-V", description: "Paste API key from clipboard" },
+    crate::app::KeyCommand { key: "C-U", description: "Clear key input buffer" },
     // Auxiliary & Destructive.
-    crate::app::KeyCommand { key: "Ctrl+O", description: "Reload configuration from disk" },
+    crate::app::KeyCommand { key: "C-O", description: "Reload configuration from disk" },
 ];
 
 pub fn get_mode_key_commands(mode: ViewMode) -> (&'static str, &'static [crate::app::KeyCommand]) {

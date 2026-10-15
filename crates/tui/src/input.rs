@@ -102,9 +102,12 @@ pub fn is_text_input_active(st: &AppState) -> bool {
         Some(ActiveModal::Prompt) => {
             st.prompt_modal.as_ref().is_some_and(|modal| modal.focus.is_editor())
         }
-        Some(ActiveModal::Review)
-        | Some(ActiveModal::DiscussPlan)
-        | Some(ActiveModal::RefineDialog) => true,
+        Some(ActiveModal::Review) => {
+            st.review_dialog.as_ref().is_some_and(|d| d.focus.is_prompt_editor())
+        }
+        Some(ActiveModal::RefineDialog) => {
+            st.plans_view.refine_dialog.as_ref().is_some_and(|d| d.focus.is_instructions_editor())
+        }
         Some(_) => false,
         None => match st.view_mode {
             ViewMode::Develop => true,
@@ -165,11 +168,6 @@ pub fn handle_paste(st: &mut AppState, text: &str) {
         }
         Some(ActiveModal::Review) => {
             if let Some(dialog) = st.review_dialog.as_mut() {
-                dialog.prompt_editor.insert_paste(text);
-            }
-        }
-        Some(ActiveModal::DiscussPlan) => {
-            if let Some(dialog) = st.discuss_plan_dialog.as_mut() {
                 dialog.prompt_editor.insert_paste(text);
             }
         }
@@ -408,14 +406,14 @@ async fn handle_global_shortcuts(
     // Tab switching via F1..F5 (universal hardware fallback) or C-1..5 (Primary Command Modifier) or Alt+1..5
     let switch_tab = match key.code {
         KeyCode::F(1) => Some(ViewMode::Develop),
-        KeyCode::F(2) => Some(ViewMode::Context),
+        KeyCode::F(2) => Some(ViewMode::Plans),
         KeyCode::F(3) => Some(ViewMode::Review),
-        KeyCode::F(4) => Some(ViewMode::Plans),
+        KeyCode::F(4) => Some(ViewMode::Context),
         KeyCode::F(5) => Some(ViewMode::History),
         KeyCode::Char('1') if is_primary || is_alt_tab => Some(ViewMode::Develop),
-        KeyCode::Char('2') if is_primary || is_alt_tab => Some(ViewMode::Context),
+        KeyCode::Char('2') if is_primary || is_alt_tab => Some(ViewMode::Plans),
         KeyCode::Char('3') if is_primary || is_alt_tab => Some(ViewMode::Review),
-        KeyCode::Char('4') if is_primary || is_alt_tab => Some(ViewMode::Plans),
+        KeyCode::Char('4') if is_primary || is_alt_tab => Some(ViewMode::Context),
         KeyCode::Char('5') if is_primary || is_alt_tab => Some(ViewMode::History),
         _ => None,
     };
@@ -590,17 +588,16 @@ mod tests {
     }
 
     #[test]
-    fn test_is_text_input_active_in_discuss_plan_dialog() {
+    fn test_is_text_input_active_in_plan_prompt_modal() {
         let mut st = test_state();
         st.view_mode = ViewMode::Plans;
         assert!(!is_text_input_active(&st));
 
-        st.discuss_plan_dialog = Some(DiscussPlanDialogState {
+        st.prompt_modal = Some(PromptModalState::new(PromptModalTarget::Plan {
             plan_id: "test".to_string(),
             plan_title: "Test".to_string(),
             focused_items: Vec::new(),
-            prompt_editor: crate::editor::InputEditor::default(),
-        });
+        }));
         assert!(is_text_input_active(&st));
     }
 
@@ -648,18 +645,17 @@ mod tests {
     }
 
     #[test]
-    fn test_handle_paste_into_discuss_plan_dialog() {
+    fn test_handle_paste_into_plan_prompt_modal() {
         let mut st = test_state();
         st.view_mode = ViewMode::Plans;
-        st.discuss_plan_dialog = Some(DiscussPlanDialogState {
+        st.prompt_modal = Some(PromptModalState::new(PromptModalTarget::Plan {
             plan_id: "p1".to_string(),
             plan_title: "Plan 1".to_string(),
             focused_items: Vec::new(),
-            prompt_editor: crate::editor::InputEditor::default(),
-        });
+        }));
         handle_paste(&mut st, "русский текст с переносом\nвторая строка");
         assert_eq!(
-            st.discuss_plan_dialog.as_ref().unwrap().prompt_editor.get_text(),
+            st.prompt_modal.as_ref().unwrap().prompt_editor.get_text(),
             "русский текст с переносом\nвторая строка"
         );
         assert_eq!(st.input_editor.get_text(), "");

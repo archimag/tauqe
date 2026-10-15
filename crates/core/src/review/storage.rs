@@ -1,10 +1,28 @@
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard};
 use tauqe_protocol::{ReviewItem, ReviewItemStatus, ReviewSession, ReviewSummary};
 
 pub struct ReviewStorage;
 
+/// Process-global lock serializing review storage mutations.
+///
+/// Review storage performs non-atomic read-modify-write cycles (load, mutate, save).
+/// Without serialization, concurrent tasks (UI RPC handlers and batch execution)
+/// race on the same review file and silently overwrite each other's changes.
+static REVIEW_STORAGE_LOCK: Mutex<()> = Mutex::new(());
+
 impl ReviewStorage {
+    /// Acquires the process-global review storage lock.
+    ///
+    /// Recovers the guard if the lock was poisoned by a previous panic, so a single
+    /// failure never permanently wedges review storage.
+    fn lock() -> MutexGuard<'static, ()> {
+        REVIEW_STORAGE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     /// Returns the directory path for local review sessions: `<repo_root>/.tauqe/reviews`.
     pub fn reviews_dir(repo_root: &Path) -> PathBuf {
         repo_root.join(".tauqe").join("reviews")
@@ -38,6 +56,12 @@ impl ReviewStorage {
     /// Every failure is logged and degrades gracefully, leaving the legacy
     /// source file in place instead of aborting the process.
     pub fn migrate_legacy_if_needed(repo_root: &Path) {
+        let _guard = Self::lock();
+        Self::migrate_legacy_if_needed_unlocked(repo_root);
+    }
+
+    /// Lock-free core of [`Self::migrate_legacy_if_needed`]; caller must hold storage lock.
+    fn migrate_legacy_if_needed_unlocked(repo_root: &Path) {
         let dir = Self::reviews_dir(repo_root);
 
         // 1. Legacy `.tauqe/review.json`
@@ -46,7 +70,7 @@ impl ReviewStorage {
             if session.id.trim().is_empty() {
                 session.id = "migrated-review".to_string();
             }
-            Self::store_migrated_session(repo_root, &session, &legacy_root);
+            Self::store_migrated_session_unlocked(repo_root, &session, &legacy_root);
         }
 
         // 2. Legacy `.tauqe/reviews/review.json`
@@ -55,7 +79,7 @@ impl ReviewStorage {
             if session.id.trim().is_empty() {
                 session.id = "default".to_string();
             }
-            Self::store_migrated_session(repo_root, &session, &legacy_reviews_file);
+            Self::store_migrated_session_unlocked(repo_root, &session, &legacy_reviews_file);
         }
 
         // 3. Legacy `.tauqe/reviews/latest.json`
@@ -64,10 +88,10 @@ impl ReviewStorage {
             if session.id.trim().is_empty() || session.id == "latest" {
                 session.id = format!("review-{}", session.created_at);
             }
-            if Self::store_migrated_session(repo_root, &session, &legacy_latest_file) {
+            if Self::store_migrated_session_unlocked(repo_root, &session, &legacy_latest_file) {
                 let active_file = dir.join("active");
                 if !active_file.is_file() {
-                    if let Err(err) = Self::save_active_id(repo_root, Some(&session.id)) {
+                    if let Err(err) = Self::save_active_id_unlocked(repo_root, Some(&session.id)) {
                         tracing::warn!(
                             "Failed to mark migrated review '{}' as active: {:#}",
                             session.id,
@@ -116,7 +140,7 @@ impl ReviewStorage {
     /// Returns `true` when the target session file is present after the call.
     /// Failures are logged; the legacy source is preserved on failure so no
     /// review data is silently lost.
-    fn store_migrated_session(
+    fn store_migrated_session_unlocked(
         repo_root: &Path,
         session: &ReviewSession,
         legacy_file: &Path,
@@ -126,7 +150,7 @@ impl ReviewStorage {
         let target_file = dir.join(format!("{safe_id}.json"));
 
         if !target_file.is_file() {
-            if let Err(err) = Self::save_session(repo_root, session) {
+            if let Err(err) = Self::save_session_unlocked(repo_root, session) {
                 tracing::warn!(
                     "Failed to migrate legacy review file {}: {:#}",
                     legacy_file.display(),
@@ -171,10 +195,20 @@ impl ReviewStorage {
         for entry in entries.flatten() {
             let path = entry.path();
             if path.is_file() && path.extension().and_then(|s| s.to_str()) == Some("json") {
-                if let Ok(content) = std::fs::read_to_string(&path) {
-                    if let Ok(review) = serde_json::from_str::<ReviewSession>(&content) {
-                        reviews.push(review);
-                    }
+                match std::fs::read_to_string(&path) {
+                    Ok(content) => match serde_json::from_str::<ReviewSession>(&content) {
+                        Ok(review) => reviews.push(review),
+                        Err(err) => tracing::warn!(
+                            path = %path.display(),
+                            error = %err,
+                            "Skipping corrupted review file"
+                        ),
+                    },
+                    Err(err) => tracing::warn!(
+                        path = %path.display(),
+                        error = %err,
+                        "Failed to read review file"
+                    ),
                 }
             }
         }
@@ -223,6 +257,12 @@ impl ReviewStorage {
 
     /// Saves a review session into `.tauqe/reviews/<id>.json` atomically.
     pub fn save_session(repo_root: &Path, session: &ReviewSession) -> Result<()> {
+        let _guard = Self::lock();
+        Self::save_session_unlocked(repo_root, session)
+    }
+
+    /// Lock-free core of [`Self::save_session`]; caller must hold storage lock.
+    fn save_session_unlocked(repo_root: &Path, session: &ReviewSession) -> Result<()> {
         let dir = Self::reviews_dir(repo_root);
         std::fs::create_dir_all(&dir).with_context(|| {
             format!("Failed to create reviews directory at {}", dir.display())
@@ -244,7 +284,7 @@ impl ReviewStorage {
 
         // If no active review is set, make this session active
         if let Ok(None) = Self::load_active_id(repo_root) {
-            let _ = Self::save_active_id(repo_root, Some(&session.id));
+            let _ = Self::save_active_id_unlocked(repo_root, Some(&session.id));
         }
 
         Ok(())
@@ -252,6 +292,12 @@ impl ReviewStorage {
 
     /// Deletes a review session from storage. Returns `true` if a file was deleted.
     pub fn delete_review(repo_root: &Path, id: &str) -> Result<bool> {
+        let _guard = Self::lock();
+        Self::delete_review_unlocked(repo_root, id)
+    }
+
+    /// Lock-free core of [`Self::delete_review`]; caller must hold storage lock.
+    fn delete_review_unlocked(repo_root: &Path, id: &str) -> Result<bool> {
         let dir = Self::reviews_dir(repo_root);
         let safe_id = Self::sanitize_id(id);
         let target_file = dir.join(format!("{safe_id}.json"));
@@ -262,7 +308,7 @@ impl ReviewStorage {
 
             if let Ok(Some(active)) = Self::load_active_id(repo_root) {
                 if active == id || active == safe_id {
-                    let _ = Self::save_active_id(repo_root, None);
+                    let _ = Self::save_active_id_unlocked(repo_root, None);
                 }
             }
             Ok(true)
@@ -290,6 +336,12 @@ impl ReviewStorage {
 
     /// Saves or clears the active review ID in `.tauqe/reviews/active`.
     pub fn save_active_id(repo_root: &Path, id: Option<&str>) -> Result<()> {
+        let _guard = Self::lock();
+        Self::save_active_id_unlocked(repo_root, id)
+    }
+
+    /// Lock-free core of [`Self::save_active_id`]; caller must hold storage lock.
+    fn save_active_id_unlocked(repo_root: &Path, id: Option<&str>) -> Result<()> {
         let dir = Self::reviews_dir(repo_root);
         std::fs::create_dir_all(&dir).with_context(|| {
             format!("Failed to create reviews directory at {}", dir.display())
@@ -312,6 +364,20 @@ impl ReviewStorage {
 
     /// Updates a review item by id within a specific session (or active/latest session if None).
     pub fn update_session_item<F>(
+        repo_root: &Path,
+        review_id: Option<&str>,
+        item_id: u32,
+        updater: F,
+    ) -> Result<Option<ReviewItem>>
+    where
+        F: FnMut(&mut ReviewItem),
+    {
+        let _guard = Self::lock();
+        Self::update_session_item_unlocked(repo_root, review_id, item_id, updater)
+    }
+
+    /// Lock-free core of [`Self::update_session_item`]; caller must hold storage lock.
+    fn update_session_item_unlocked<F>(
         repo_root: &Path,
         review_id: Option<&str>,
         item_id: u32,
@@ -341,7 +407,7 @@ impl ReviewStorage {
         }
 
         if updated_item.is_some() {
-            Self::save_session(repo_root, &session)?;
+            Self::save_session_unlocked(repo_root, &session)?;
         }
 
         Ok(updated_item)
@@ -392,7 +458,7 @@ mod tests {
             id: "rev-sec-1".to_string(),
             title: "Security Audit".to_string(),
             created_at: 1000,
-            model: "anthropic/claude-3.7-sonnet".to_string(),
+            model: tauqe_protocol::ModelRef::openrouter("anthropic/claude-3.7-sonnet"),
             description: Some("Initial security scan".to_string()),
             user_prompt: Some("focus on security".to_string()),
             target_files: vec!["crates/core/src/lib.rs".to_string()],
@@ -402,8 +468,7 @@ mod tests {
                 model: None,
                 severity: ReviewSeverity::Critical,
                 status: ReviewItemStatus::Discussion,
-                file_path: Some("crates/core/src/lib.rs".to_string()),
-                line_range: Some((10, 20)),
+                files: vec!["crates/core/src/lib.rs".to_string()],
                 resolution_notes: None,
                 body: "Check input validation".to_string(),
             }],
@@ -455,18 +520,16 @@ mod tests {
         std::fs::create_dir_all(&reviews_dir).unwrap();
 
         let legacy_file = reviews_dir.join("latest.json");
-        let legacy_session = ReviewSession {
-            id: "legacy-session-9".to_string(),
-            title: "Legacy Audit".to_string(),
-            created_at: 12345,
-            model: "test-model".to_string(),
-            description: None,
-            user_prompt: None,
-            target_files: vec![],
-            items: vec![],
-            raw_markdown: "".to_string(),
-        };
-        std::fs::write(&legacy_file, serde_json::to_string(&legacy_session).unwrap()).unwrap();
+        let legacy_raw_json = r#"{
+            "id": "legacy-session-9",
+            "title": "Legacy Audit",
+            "created_at": 12345,
+            "model": "test-model",
+            "target_files": [],
+            "items": [],
+            "raw_markdown": ""
+        }"#;
+        std::fs::write(&legacy_file, legacy_raw_json).unwrap();
 
         // Migration is a startup-only operation: it no longer runs on reads.
         ReviewStorage::migrate_legacy_if_needed(root);
@@ -475,5 +538,91 @@ mod tests {
         assert_eq!(loaded.id, "legacy-session-9");
         assert!(!legacy_file.is_file());
         assert!(reviews_dir.join("legacy-session-9.json").is_file());
+    }
+
+    #[test]
+    fn test_concurrent_review_updates_are_serialized_without_lost_writes() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+
+        let items: Vec<ReviewItem> = (0..16)
+            .map(|i| ReviewItem {
+                id: i,
+                title: format!("Item {i}"),
+                model: None,
+                severity: tauqe_protocol::ReviewSeverity::Suggestion,
+                status: ReviewItemStatus::Todo,
+                files: vec![],
+                resolution_notes: None,
+                body: "Check".to_string(),
+            })
+            .collect();
+
+        let session = ReviewSession {
+            id: "concurrent-review".to_string(),
+            title: "Concurrent Review".to_string(),
+            created_at: 100,
+            model: tauqe_protocol::ModelRef::openrouter("test-model"),
+            description: None,
+            user_prompt: None,
+            target_files: vec![],
+            items,
+            raw_markdown: String::new(),
+        };
+        ReviewStorage::save_session(&root, &session).unwrap();
+
+        let handles: Vec<_> = (0..16)
+            .map(|i| {
+                let root = root.clone();
+                std::thread::spawn(move || {
+                    let _ = ReviewStorage::update_session_item_status(
+                        &root,
+                        Some("concurrent-review"),
+                        i,
+                        ReviewItemStatus::Fixed,
+                    );
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        let loaded = ReviewStorage::load_review(&root, "concurrent-review")
+            .unwrap()
+            .unwrap();
+        let fixed = loaded
+            .items
+            .iter()
+            .filter(|item| item.status == ReviewItemStatus::Fixed)
+            .count();
+        assert_eq!(fixed, 16);
+    }
+
+    #[test]
+    fn test_load_all_skips_corrupted_files() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+
+        let session = ReviewSession {
+            id: "valid-review".to_string(),
+            title: "Valid Review".to_string(),
+            created_at: 100,
+            model: tauqe_protocol::ModelRef::openrouter("test-model"),
+            description: None,
+            user_prompt: None,
+            target_files: vec![],
+            items: vec![],
+            raw_markdown: String::new(),
+        };
+        ReviewStorage::save_session(root, &session).unwrap();
+
+        let corrupt_path = ReviewStorage::reviews_dir(root).join("broken.json");
+        std::fs::write(&corrupt_path, b"{ not a valid review session }").unwrap();
+
+        let all = ReviewStorage::load_all(root).unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].id, "valid-review");
     }
 }

@@ -42,7 +42,7 @@ async fn apply_model_selection(
 /// Applies the chosen picker row (shared by keyboard and mouse): a role or a model is
 /// selected, `Others...` opens the full model catalog.
 pub(crate) async fn activate_selection_item(
-    st: MutexGuard<'_, AppState>,
+    mut st: MutexGuard<'_, AppState>,
     item: SelectionItem,
     server_writer: &mut RpcConnection,
 ) -> anyhow::Result<()> {
@@ -52,6 +52,13 @@ pub(crate) async fn activate_selection_item(
         }
         SelectionItem::Model(model) => {
             apply_model_selection(st, ModelSelection::Specific(model), server_writer).await
+        }
+        // Swap the primary picker for the full catalog, keeping the configured
+        // primary models reachable while restoring access to every available
+        // provider model.
+        SelectionItem::Catalog => {
+            st.open_model_catalog();
+            Ok(())
         }
     }
 }
@@ -90,7 +97,7 @@ pub(super) async fn handle_selection_dialog_key(
         KeyCode::Char(c @ '1'..='9') if dialog.kind == SelectionDialogKind::PrimaryModels => {
             Some(c as usize - '1' as usize)
         }
-        KeyCode::Enter => Some(dialog.selector.selected_index()),
+        KeyCode::Enter | KeyCode::Char(' ') => Some(dialog.selector.selected_index()),
         _ => None,
     };
 
@@ -107,4 +114,47 @@ pub(super) async fn handle_selection_dialog_key(
         _ => st.selection_dialog = Some(dialog),
     }
     Ok(Some(InputResult::Continue))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use tauqe_protocol::ModelRef;
+    use tokio::sync::Mutex;
+
+    use crate::app::{test_state, SelectionDialogKind, SelectionDialogState, SelectionItem};
+    use crate::rpc::RpcConnection;
+
+    use super::activate_selection_item;
+
+    #[tokio::test]
+    async fn catalog_pseudo_entry_opens_full_model_catalog() {
+        let mut st = test_state();
+        st.available_models = vec![ModelRef::openrouter("catalog-model")];
+        st.selection_dialog = Some(SelectionDialogState::new(
+            SelectionDialogKind::PrimaryModels,
+            vec![SelectionItem::Catalog],
+            0,
+        ));
+
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+
+        let guard = state.lock().await;
+        activate_selection_item(guard, SelectionItem::Catalog, &mut conn)
+            .await
+            .expect("catalog activation never fails");
+
+        let guard = state.lock().await;
+        let dialog = guard
+            .selection_dialog
+            .as_ref()
+            .expect("the catalog dialog must replace the primary picker");
+        assert_eq!(dialog.kind, SelectionDialogKind::ModelCatalog);
+        assert_eq!(
+            dialog.items,
+            vec![SelectionItem::Model(ModelRef::openrouter("catalog-model"))]
+        );
+    }
 }

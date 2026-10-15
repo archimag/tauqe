@@ -2,7 +2,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use tauqe_protocol::methods;
 use tokio::sync::MutexGuard;
 
-use crate::app::{AppState, ConfirmDialogButton, DiscussPlanDialogState};
+use crate::app::{AppState, ConfirmDialogButton};
 use crate::input::InputResult;
 use crate::rpc::{send_request, RpcConnection};
 
@@ -73,15 +73,35 @@ pub(super) async fn handle_refine_dialog(
     let has_shift = key.modifiers.contains(KeyModifiers::SHIFT);
     let has_alt = key.modifiers.contains(KeyModifiers::ALT);
 
+    // C-Enter accelerator unconditionally submits from any section.
+    if matches!(key.code, KeyCode::Enter) && is_cmd {
+        return submit_refine_dialog(st, dialog, server_writer).await;
+    }
+
     match key.code {
         KeyCode::Esc => Ok(Some(InputResult::Continue)),
+        KeyCode::Char('q') if dialog.focus.is_actions() => Ok(Some(InputResult::Continue)),
         KeyCode::Tab => {
-            dialog.focus.cycle_next();
+            if dialog.focus.is_actions() && dialog.confirm_button == ConfirmDialogButton::Cancel {
+                dialog.confirm_button = ConfirmDialogButton::Confirm;
+            } else {
+                if dialog.focus.is_actions() {
+                    dialog.confirm_button = ConfirmDialogButton::Cancel;
+                }
+                dialog.focus.cycle_next(dialog.selector.len());
+            }
             st.plans_view.refine_dialog = Some(dialog);
             Ok(Some(InputResult::Continue))
         }
         KeyCode::BackTab => {
-            dialog.focus.cycle_prev();
+            if dialog.focus.is_actions() && dialog.confirm_button == ConfirmDialogButton::Confirm {
+                dialog.confirm_button = ConfirmDialogButton::Cancel;
+            } else {
+                dialog.focus.cycle_prev(dialog.selector.len());
+                if dialog.focus.is_actions() {
+                    dialog.confirm_button = ConfirmDialogButton::Confirm;
+                }
+            }
             st.plans_view.refine_dialog = Some(dialog);
             Ok(Some(InputResult::Continue))
         }
@@ -94,15 +114,16 @@ pub(super) async fn handle_refine_dialog(
             st.plans_view.refine_dialog = Some(dialog);
             Ok(Some(InputResult::Continue))
         }
-        // Starting a refinement is a long-running operation: it begins only from
-        // the focused `Confirm` button. The safe `Cancel` default dismisses
-        // without starting (Conventions §7).
-        KeyCode::Enter if !has_shift && !has_alt && dialog.focus.is_actions() => {
+        // Starting a refinement begins from `Confirm`. Safe `Cancel` dismisses the dialog.
+        KeyCode::Enter | KeyCode::Char(' ')
+            if !has_shift && !has_alt && dialog.focus.is_actions() =>
+        {
             if dialog.confirm_button == ConfirmDialogButton::Confirm {
-                return submit_refine_dialog(st, dialog, server_writer).await;
+                submit_refine_dialog(st, dialog, server_writer).await
+            } else {
+                // Safe cancel dismisses without re-attaching the dialog.
+                Ok(Some(InputResult::Continue))
             }
-            st.plans_view.refine_dialog = Some(dialog);
-            Ok(Some(InputResult::Continue))
         }
         _ => {
             if dialog.focus.is_instructions_editor() {
@@ -166,44 +187,181 @@ pub(crate) async fn submit_refine_dialog(
     Ok(Some(InputResult::Continue))
 }
 
-/// Handles the "refine blocked" modal. `d` opens a discussion dialog seeded with
-/// the architect's blocker reason; any other key dismisses the modal.
-pub(super) fn handle_refine_blocked(
+/// Handles the "refine blocked" modal through the shared confirmation contract.
+///
+/// The modal is rendered by `render_modal_confirm`, so its keyboard contract is
+/// the standard one: `Tab` / `←` / `→` move the focused button, `Enter` /
+/// `Space` activate it, `y` accepts, and `n` / `Esc` dismiss. Routing the key
+/// through `resolve_confirm` keeps a single source of truth for that contract:
+/// accepting `Replan Horizon (Y)` triggers horizon replanning with the blocker
+/// context, while dismissing simply closes the modal safely.
+pub(super) async fn handle_refine_blocked(
     key: KeyEvent,
     mut st: MutexGuard<'_, AppState>,
+    server_writer: &mut RpcConnection,
 ) -> anyhow::Result<Option<InputResult>> {
     let blocked = match st.plans_view.refine_blocked.take() {
         Some(b) => b,
         None => return Ok(None),
     };
 
-    match key.code {
-        KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => Ok(Some(InputResult::Continue)),
-        KeyCode::Char('d') | KeyCode::Char('D') => {
-            let plan = st
-                .plans_view
-                .plans
-                .iter()
-                .find(|p| p.id == blocked.plan_id)
-                .cloned();
-            if let Some(plan) = plan {
-                let mut editor = crate::editor::InputEditor::default();
-                editor.insert_str(&format!(
-                    "The architect reported blockers during plan refinement:\n{}\n\nHow should we resolve these requirements or architecture contradictions?",
-                    blocked.reason
-                ));
-                st.discuss_plan_dialog = Some(DiscussPlanDialogState {
-                    plan_id: plan.id,
-                    plan_title: plan.title,
-                    focused_items: Vec::new(),
-                    prompt_editor: editor,
-                });
-            }
-            Ok(Some(InputResult::Continue))
-        }
-        _ => {
+    match super::resolve_confirm(&mut st, key) {
+        super::ConfirmOutcome::Toggled => {
             st.plans_view.refine_blocked = Some(blocked);
-            Ok(Some(InputResult::Continue))
         }
+        super::ConfirmOutcome::Dismissed => {}
+        super::ConfirmOutcome::Accepted => {
+            if st.model.is_busy() || st.review.running || st.plans_view.refining {
+                st.notify_warning("Model is currently busy; wait for operation to finish");
+                st.plans_view.refine_blocked = Some(blocked);
+                return Ok(Some(InputResult::Continue));
+            }
+
+            let instructions = Some(format!(
+                "Replan uncompleted horizon addressing blockers:\n{}",
+                blocked.reason
+            ));
+            let params = tauqe_protocol::PlanRefineParams {
+                plan_id: blocked.plan_id.clone(),
+                model: None,
+                instructions,
+            };
+
+            st.plans_view.refining = true;
+            st.plans_view.refining_plan_id = Some(blocked.plan_id);
+            super::begin_develop_turn(&mut st);
+
+            drop(st);
+            send_request(
+                server_writer,
+                methods::PLAN_REFINE,
+                serde_json::to_value(params)?,
+            )
+            .await?;
+        }
+    }
+
+    Ok(Some(InputResult::Continue))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use tokio::sync::Mutex;
+
+    use crate::app::{test_state, AppState, ConfirmDialogButton, ViewMode};
+    use crate::rpc::RpcConnection;
+    use crate::views::plans::PlanRefineBlockedState;
+
+    fn blocked_state() -> AppState {
+        let mut st = test_state();
+        st.plans_view.plans = vec![tauqe_protocol::Plan {
+            id: "plan-1".to_string(),
+            title: "Test Plan".to_string(),
+            description: None,
+            created_at: 0,
+            updated_at: 0,
+            concept: vec![],
+            items: vec![],
+        }];
+        st.plans_view.refine_blocked = Some(PlanRefineBlockedState {
+            plan_id: "plan-1".to_string(),
+            plan_title: "Test Plan".to_string(),
+            reason: "Blocking contradiction".to_string(),
+        });
+        st
+    }
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    async fn press(state: &Arc<Mutex<AppState>>, conn: &mut RpcConnection, code: KeyCode) {
+        let guard = state.lock().await;
+        super::handle_refine_blocked(key(code), guard, conn)
+            .await
+            .expect("in-memory dispatch never fails");
+    }
+
+    #[tokio::test]
+    async fn tab_toggles_focus_and_keeps_the_dialog_open() {
+        let state = Arc::new(Mutex::new(blocked_state()));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+
+        press(&state, &mut conn, KeyCode::Tab).await;
+
+        let guard = state.lock().await;
+        assert!(
+            guard.plans_view.refine_blocked.is_some(),
+            "the dialog must stay open while the focus moves"
+        );
+        assert_eq!(guard.confirm_button, ConfirmDialogButton::Confirm);
+    }
+
+    #[tokio::test]
+    async fn enter_on_focused_confirm_initiates_replanning() {
+        let state = Arc::new(Mutex::new(blocked_state()));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+
+        // Focus the `Replan Horizon` button, then activate it.
+        press(&state, &mut conn, KeyCode::Tab).await;
+        press(&state, &mut conn, KeyCode::Enter).await;
+
+        let guard = state.lock().await;
+        assert!(guard.plans_view.refine_blocked.is_none());
+        assert!(guard.plans_view.refining);
+        assert_eq!(guard.plans_view.refining_plan_id.as_deref(), Some("plan-1"));
+        assert_eq!(guard.view_mode, ViewMode::Develop);
+    }
+
+    #[tokio::test]
+    async fn fast_select_accepts_and_dismisses() {
+        // `y` accepts even while the safe `Cancel` button holds focus.
+        let accept = Arc::new(Mutex::new(blocked_state()));
+        let mut conn_accept = RpcConnection::new(Vec::<u8>::new());
+        press(&accept, &mut conn_accept, KeyCode::Char('y')).await;
+        let guard = accept.lock().await;
+        assert!(guard.plans_view.refining);
+        assert!(guard.plans_view.refine_blocked.is_none());
+
+        // `n` dismisses without replanning.
+        let dismiss = Arc::new(Mutex::new(blocked_state()));
+        let mut conn_dismiss = RpcConnection::new(Vec::<u8>::new());
+        press(&dismiss, &mut conn_dismiss, KeyCode::Char('n')).await;
+        let guard = dismiss.lock().await;
+        assert!(!guard.plans_view.refining);
+        assert!(guard.plans_view.refine_blocked.is_none());
+    }
+
+    #[tokio::test]
+    async fn enter_on_default_cancel_dismisses_safely() {
+        let state = Arc::new(Mutex::new(blocked_state()));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+
+        // The default focus is the safe `Cancel`; Enter dismisses safely.
+        press(&state, &mut conn, KeyCode::Enter).await;
+
+        let guard = state.lock().await;
+        assert!(!guard.plans_view.refining);
+        assert!(guard.plans_view.refine_blocked.is_none());
+    }
+
+    #[tokio::test]
+    async fn blocked_dialog_confirm_when_busy_warns_and_keeps_dialog() {
+        let mut st = blocked_state();
+        st.plans_view.refining = true;
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+
+        press(&state, &mut conn, KeyCode::Char('y')).await;
+
+        let guard = state.lock().await;
+        assert!(guard.plans_view.refine_blocked.is_some());
+        assert_eq!(
+            guard.active_notification().map(|n| n.text.as_str()),
+            Some("Model is currently busy; wait for operation to finish")
+        );
     }
 }

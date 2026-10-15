@@ -26,7 +26,7 @@ pub use task::{
     DiscoveryStep, HealingStep, StagingStep, Task, TaskEnv, TaskStep, TurnCycle, VerificationStep,
 };
 
-use tauqe_protocol::ModelResult;
+use tauqe_protocol::{ModelResult, WorkflowKind};
 
 /// Result of a completed workflow turn.
 #[derive(Debug, Clone)]
@@ -42,16 +42,14 @@ pub struct WorkflowExecutionResult {
 pub struct WorkflowFactory;
 
 impl WorkflowFactory {
-    /// Returns the list of all supported workflow names.
-    pub fn available_workflows() -> Vec<String> {
-        vec!["git".to_string(), "naive".to_string()]
+    /// Returns the list of all supported workflow kinds.
+    pub fn available_workflows() -> Vec<WorkflowKind> {
+        vec![WorkflowKind::Git, WorkflowKind::Naive]
     }
 
     /// Validates whether a workflow name is supported.
     pub fn is_valid(name: &str) -> bool {
-        Self::available_workflows()
-            .iter()
-            .any(|w| w.eq_ignore_ascii_case(name.trim()))
+        name.parse::<WorkflowKind>().is_ok()
     }
 }
 
@@ -62,15 +60,16 @@ mod tests {
     #[test]
     fn test_workflow_factory_available() {
         let workflows = WorkflowFactory::available_workflows();
-        assert!(workflows.contains(&"git".to_string()));
-        assert!(workflows.contains(&"naive".to_string()));
-        assert!(!workflows.contains(&"toolchain".to_string()));
+        assert!(workflows.contains(&WorkflowKind::Git));
+        assert!(workflows.contains(&WorkflowKind::Naive));
     }
 
     #[test]
     fn test_workflow_factory_validation() {
         assert!(WorkflowFactory::is_valid("git"));
         assert!(WorkflowFactory::is_valid("naive"));
+        assert!(WorkflowFactory::is_valid("direct"));
+        assert!(WorkflowFactory::is_valid("single"));
         assert!(!WorkflowFactory::is_valid("toolchain"));
         assert!(!WorkflowFactory::is_valid("unknown_wf"));
     }

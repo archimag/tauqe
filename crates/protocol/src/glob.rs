@@ -5,40 +5,68 @@
 /// - `?` matches exactly one character.
 /// - `[abc]`, `[a-z]` and `[!a-z]` match a single character from a class.
 /// - `**` matches zero or more whole path segments.
-/// - A trailing `/` matches every path beneath a directory.
+/// - A trailing `/` matches every path beneath a directory (literal or wildcard,
+///   such as `crates/*/` or `src/**/`).
 /// - A non-wildcard pattern matches itself or acts as a directory prefix.
-/// - A wildcard pattern without `/` matches the basename at any depth.
+/// - A wildcard pattern without `/` matches the basename at any depth and does
+///   not act as a directory prefix (use a trailing slash such as `build*/` to
+///   match all paths beneath matching directories).
+///
+/// Leading, trailing and repeated slashes, as well as interior `.` segments,
+/// are normalized before matching, so `"/src//lib.rs"` and `"src/./lib.rs"`
+/// both match `"src/lib.rs"`.
 pub fn matches_glob_pattern(pattern: &str, path: &str) -> bool {
-    let clean_pat = pattern.trim().trim_start_matches("./");
-    let clean_path = path.trim().trim_start_matches("./");
+    let trimmed_pat = pattern.trim();
+    let clean_pat = normalize_path(trimmed_pat);
+    let clean_path = normalize_path(path);
 
-    if clean_pat.is_empty() {
+    if clean_pat.is_empty() || clean_path.is_empty() {
         return false;
+    }
+
+    // A trailing slash marks a directory prefix, matching every path beneath it.
+    if trimmed_pat.ends_with('/') {
+        if !contains_glob_meta(&clean_pat) {
+            return clean_path.starts_with(&format!("{clean_pat}/"));
+        }
+        let pat_str = format!("{clean_pat}/*/**");
+        let pat_parts = collapse_double_stars(pat_str.split('/').collect());
+        let path_parts: Vec<&str> = clean_path.split('/').collect();
+        return match_segments(&pat_parts, &path_parts);
     }
 
     if clean_path == clean_pat {
         return true;
     }
 
-    if clean_pat.ends_with('/') {
-        let dir = clean_pat.trim_end_matches('/');
-        return clean_path.starts_with(&format!("{}/", dir));
-    }
-
-    if !contains_glob_meta(clean_pat) {
-        return clean_path.starts_with(&format!("{}/", clean_pat));
+    if !contains_glob_meta(&clean_pat) {
+        return clean_path.starts_with(&format!("{clean_pat}/"));
     }
 
     // A wildcard pattern without a slash matches the basename at any depth.
     if !clean_pat.contains('/') {
-        let basename = clean_path.rsplit('/').next().unwrap_or(clean_path);
-        return match_wildcard_string(clean_pat, basename);
+        let basename = clean_path.rsplit('/').next().unwrap_or(clean_path.as_str());
+        return match_wildcard_string(&clean_pat, basename);
     }
 
     let pat_parts = collapse_double_stars(clean_pat.split('/').collect());
     let path_parts: Vec<&str> = clean_path.split('/').collect();
 
     match_segments(&pat_parts, &path_parts)
+}
+
+/// Normalizes a path or pattern into a canonical slash-separated form.
+///
+/// Surrounding whitespace is trimmed, and empty segments (from leading,
+/// trailing or repeated slashes) and `.` segments are dropped, so
+/// `"/src//lib.rs"` and `"src/./lib.rs"` both canonicalize to `"src/lib.rs"`.
+fn normalize_path(input: &str) -> String {
+    input
+        .trim()
+        .split('/')
+        .filter(|segment| !segment.is_empty() && *segment != ".")
+        .collect::<Vec<&str>>()
+        .join("/")
 }
 
 /// Returns `true` when the pattern contains any glob metacharacter.
@@ -63,26 +91,52 @@ fn collapse_double_stars(parts: Vec<&str>) -> Vec<&str> {
 }
 
 fn match_segments(pat: &[&str], path: &[&str]) -> bool {
-    if pat.is_empty() {
-        return path.is_empty();
+    let mut visited = vec![vec![false; path.len() + 1]; pat.len() + 1];
+    match_segments_at(pat, path, 0, 0, &mut visited)
+}
+
+/// Index-based segment matcher backed by a visited-state memo.
+///
+/// `**` may consume any number of segments, so a naive recursion splits at
+/// every boundary and degrades to `O(2^k)` in the number of `**` groups. Each
+/// `(pat_idx, path_idx)` state is a pure function of its indices, and any state
+/// that succeeds short-circuits the whole match, so states are only ever
+/// recomputed after a failure. Recording them collapses the search to
+/// `O(pat_len * path_len)`.
+fn match_segments_at(
+    pat: &[&str],
+    path: &[&str],
+    pat_idx: usize,
+    path_idx: usize,
+    visited: &mut [Vec<bool>],
+) -> bool {
+    if visited[pat_idx][path_idx] {
+        return false;
+    }
+    visited[pat_idx][path_idx] = true;
+
+    if pat_idx == pat.len() {
+        return path_idx == path.len();
     }
 
-    if pat[0] == "**" {
-        if match_segments(&pat[1..], path) {
+    if pat[pat_idx] == "**" {
+        if match_segments_at(pat, path, pat_idx + 1, path_idx, visited) {
             return true;
         }
-        if !path.is_empty() && match_segments(pat, &path[1..]) {
+        if path_idx < path.len()
+            && match_segments_at(pat, path, pat_idx, path_idx + 1, visited)
+        {
             return true;
         }
         return false;
     }
 
-    if path.is_empty() {
+    if path_idx == path.len() {
         return false;
     }
 
-    if match_wildcard_string(pat[0], path[0]) {
-        return match_segments(&pat[1..], &path[1..]);
+    if match_wildcard_string(pat[pat_idx], path[path_idx]) {
+        return match_segments_at(pat, path, pat_idx + 1, path_idx + 1, visited);
     }
 
     false
@@ -251,5 +305,58 @@ mod tests {
     fn test_empty_pattern() {
         assert!(!matches_glob_pattern("", "src/lib.rs"));
         assert!(!matches_glob_pattern("   ", "src/lib.rs"));
+    }
+
+    #[test]
+    fn test_leading_repeated_and_dot_slash_normalization() {
+        assert!(matches_glob_pattern("/src/lib.rs", "src/lib.rs"));
+        assert!(matches_glob_pattern("src/lib.rs", "/src/lib.rs"));
+        assert!(matches_glob_pattern("src//lib.rs", "src/lib.rs"));
+        assert!(matches_glob_pattern("src/./lib.rs", "src/lib.rs"));
+        assert!(matches_glob_pattern("././src/lib.rs", "src/lib.rs"));
+        assert!(matches_glob_pattern("src//*.rs", "src/lib.rs"));
+        assert!(matches_glob_pattern("src/*.rs", "src//lib.rs"));
+        assert!(matches_glob_pattern("src//", "src/lib.rs"));
+        assert!(!matches_glob_pattern("src/", "src"));
+    }
+
+    #[test]
+    fn test_non_adjacent_double_star_matching() {
+        assert!(matches_glob_pattern("**/a/**/b/**/c.rs", "x/a/y/b/z/c.rs"));
+        assert!(matches_glob_pattern("**/a/**/b/**/c.rs", "a/b/c.rs"));
+        assert!(!matches_glob_pattern("**/a/**/b/**/c.rs", "a/b/d.rs"));
+    }
+
+    #[test]
+    fn test_many_double_star_groups_terminate_promptly() {
+        // Naive recursion over multiple `**` groups backtracks exponentially;
+        // the memoized matcher must resolve this in polynomial time.
+        let pattern = format!("{}never", "**/x/".repeat(32));
+        let path = format!("{}y", "x/".repeat(32));
+        assert!(!matches_glob_pattern(&pattern, &path));
+    }
+
+    #[test]
+    fn test_trailing_slash_with_glob_meta() {
+        assert!(matches_glob_pattern("src/**/", "src/a/b.rs"));
+        assert!(matches_glob_pattern("src/**/", "src/lib.rs"));
+        assert!(!matches_glob_pattern("src/**/", "src"));
+        assert!(matches_glob_pattern("crates/*/", "crates/protocol/src/lib.rs"));
+        assert!(matches_glob_pattern("crates/*/", "crates/foo/Cargo.toml"));
+        assert!(!matches_glob_pattern("crates/*/", "crates/foo"));
+        assert!(!matches_glob_pattern("crates/*/", "crates"));
+        assert!(matches_glob_pattern("file[0-9]/", "file1/test.rs"));
+        assert!(!matches_glob_pattern("file[0-9]/", "file1"));
+        assert!(matches_glob_pattern("build*/", "build-out/x.o"));
+        assert!(!matches_glob_pattern("build*/", "build-out"));
+    }
+
+    #[test]
+    fn test_wildcard_without_slash_matches_basename_not_dir_prefix() {
+        assert!(matches_glob_pattern("build*", "src/build-helper.rs"));
+        assert!(matches_glob_pattern("build*", "build.rs"));
+        assert!(!matches_glob_pattern("build*", "build-out/x.o"));
+        assert!(matches_glob_pattern("build*/", "build-out/x.o"));
+        assert!(matches_glob_pattern("build", "build/x.o"));
     }
 }

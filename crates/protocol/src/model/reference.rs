@@ -1,8 +1,9 @@
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderKind {
+    #[default]
     #[serde(rename = "openrouter")]
     OpenRouter,
 }
@@ -16,7 +17,10 @@ impl std::fmt::Display for ProviderKind {
 }
 
 /// A model identified by its provider and the provider-native model name.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+///
+/// The default is an empty OpenRouter reference, serving as the neutral
+/// starting value for UI state that has not yet observed a running model.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 pub struct ModelRef {
     pub provider: ProviderKind,
     pub name: String,
@@ -106,6 +110,13 @@ mod tests {
         let json = serde_json::to_string(&model).unwrap();
         let de: ModelRef = serde_json::from_str(&json).unwrap();
         assert_eq!(de, model);
+    }
+
+    #[test]
+    fn test_model_ref_default() {
+        let default = ModelRef::default();
+        assert_eq!(default.provider, ProviderKind::OpenRouter);
+        assert!(default.name.is_empty());
     }
 
     #[test]

@@ -4,7 +4,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use tauqe_protocol::{ModelResult, ModelUsageEvent};
+use tauqe_protocol::{ModelRef, ModelResult, ModelUsageEvent};
 
 pub mod input;
 pub mod render;
@@ -88,41 +88,22 @@ pub enum FileEditStatus {
     Error,
 }
 
-impl FileEditStatus {
-    /// Decodes the wire status emitted on a completed file edit.
-    ///
-    /// Only `ok` counts as success; any unrecognized value degrades to `error`
-    /// so an unexpected status is never rendered as a successful edit.
-    pub fn from_wire(status: &str) -> Self {
+impl From<tauqe_protocol::EditFileStatus> for FileEditStatus {
+    /// Maps the strict wire status onto the view lifecycle status.
+    fn from(status: tauqe_protocol::EditFileStatus) -> Self {
         match status {
-            "ok" => Self::Ok,
-            _ => Self::Error,
+            tauqe_protocol::EditFileStatus::Ok => Self::Ok,
+            tauqe_protocol::EditFileStatus::Error => Self::Error,
         }
     }
 }
 
 /// Kind of file operation proposed by the model.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum EditOp {
-    Replace,
-    Create,
-    Delete,
-    Move,
-    Overwrite,
-}
-
-impl EditOp {
-    /// Decodes the wire op-type emitted when an edit starts.
-    pub fn from_wire(op_type: &str) -> Self {
-        match op_type {
-            "create" => Self::Create,
-            "delete" => Self::Delete,
-            "move" => Self::Move,
-            "overwrite" => Self::Overwrite,
-            _ => Self::Replace,
-        }
-    }
-}
+///
+/// Aliased to the protocol's strict [`tauqe_protocol::EditFileOp`] so the view
+/// and the wire contract share a single source of truth, and the compiler
+/// enforces exhaustive handling of every operation.
+pub type EditOp = tauqe_protocol::EditFileOp;
 
 #[derive(Debug, Clone)]
 pub struct ModelCodeBlock {
@@ -422,6 +403,7 @@ impl ReasoningState {
             return;
         }
         self.streaming = false;
+        self.show = false;
         self.update_markdown();
     }
 
@@ -571,7 +553,7 @@ pub enum DevelopFocus {
 
 pub struct DevelopView {
     pub operation_id: Option<String>,
-    pub model: Option<String>,
+    pub model: Option<ModelRef>,
     pub reasoning: ReasoningState,
     pub theme_mode: crate::config::ThemeMode,
     pub text: String,
@@ -609,6 +591,9 @@ pub struct DevelopView {
     pub code_blocks: Vec<ModelCodeBlock>,
     pub content_rect: (u16, u16, u16, u16),
     pub content_width: usize,
+    /// Vertical scroll offset of the prompt editor, retained across frames so
+    /// the cursor keeps its position instead of sticking to the bottom row.
+    pub input_scroll: u16,
     /// Timestamp of the first `Esc` that armed clearing a non-empty prompt.
     /// A second `Esc` within the confirmation window clears the draft; this
     /// guards long drafts from accidental `ESC`-prefixed Alt sequences.
@@ -658,6 +643,7 @@ impl Default for DevelopView {
             code_blocks: Vec::new(),
             content_rect: (0, 0, 0, 0),
             content_width: 0,
+            input_scroll: 0,
             esc_clear_armed: None,
             markdown_dirty: false,
             last_markdown_render: None,

@@ -561,11 +561,12 @@ fn test_plan_evaluate_scope_dependencies() {
         other => panic!("Expected Ready, got {:?}", other),
     }
 
-    // A step whose dependency is not DONE yet is blocked when targeted.
+    // A step whose dependency is not DONE yet is blocked when targeted, surfacing unmet prerequisites.
     match plan.evaluate_scope(Some("2")) {
         PlanScopeEvaluation::BlockedByDependencies(items) => {
             assert_eq!(items.len(), 1);
             assert!(items[0].contains("#2"));
+            assert!(items[0].contains("unmet dependencies: #1"));
         }
         other => panic!("Expected BlockedByDependencies, got {:?}", other),
     }
@@ -736,21 +737,181 @@ fn test_plan_to_markdown() {
 }
 
 #[test]
-fn test_plan_discussion_prompt_detection_and_extraction() {
+fn test_plan_validate_success() {
     let plan = Plan {
-        id: "auth-v2".to_string(),
-        title: "OAuth & JWT".to_string(),
-        description: Some("Tokens & Refresh".to_string()),
+        id: "valid-plan".to_string(),
+        title: "Valid".to_string(),
+        concept: vec![ConceptItem {
+            id: "c-1".to_string(),
+            title: "Arch Invariant".to_string(),
+            details: None,
+            children: vec![],
+        }],
+        items: vec![
+            item("1", "Step 1", PlanItemStatus::Done, vec![]),
+            PlanItem {
+                id: "2".to_string(),
+                title: "Step 2".to_string(),
+                status: PlanItemStatus::Todo,
+                depends_on: vec!["1".to_string()],
+                concept_refs: vec!["c-1".to_string()],
+                ..Default::default()
+            },
+        ],
         ..Default::default()
     };
-    let prompt = format_plan_discussion_prompt(&plan, &[], "Clarify signing");
-    assert!(is_plan_discussion_prompt(&prompt));
-    assert!(is_plan_discussion_prompt(&format!(" \n\t{}", prompt)));
-    assert_eq!(extract_plan_discussion_id(&prompt), Some("auth-v2".to_string()));
-    assert_eq!(
-        extract_plan_discussion_id(&format!("  \n{}", prompt)),
-        Some("auth-v2".to_string())
-    );
-    assert_eq!(extract_plan_discussion_id("regular message"), None);
-    assert!(prompt.contains("<active_plan id=\"auth-v2\" title=\"OAuth &amp; JWT\""));
+    assert!(plan.validate().is_ok());
 }
+
+#[test]
+fn test_plan_validate_item_errors() {
+    // 1. Empty item ID
+    let empty_id = Plan {
+        id: "p".to_string(),
+        title: "P".to_string(),
+        items: vec![item("  ", "Empty", PlanItemStatus::Todo, vec![])],
+        ..Default::default()
+    };
+    assert_eq!(empty_id.validate().unwrap_err(), vec![PlanValidationError::EmptyItemId]);
+
+    // 2. Duplicate item ID (case-insensitive)
+    let dup_id = Plan {
+        id: "p".to_string(),
+        title: "P".to_string(),
+        items: vec![
+            item("Step-1", "A", PlanItemStatus::Todo, vec![]),
+            item("step-1", "B", PlanItemStatus::Todo, vec![]),
+        ],
+        ..Default::default()
+    };
+    assert_eq!(
+        dup_id.validate().unwrap_err(),
+        vec![PlanValidationError::DuplicateItemId("step-1".to_string())]
+    );
+
+    // 3. Duplicate concept ID
+    let dup_concept = Plan {
+        id: "p".to_string(),
+        title: "P".to_string(),
+        concept: vec![
+            ConceptItem {
+                id: "c-1".to_string(),
+                title: "A".to_string(),
+                details: None,
+                children: vec![],
+            },
+            ConceptItem {
+                id: "C-1".to_string(),
+                title: "B".to_string(),
+                details: None,
+                children: vec![],
+            },
+        ],
+        ..Default::default()
+    };
+    assert_eq!(
+        dup_concept.validate().unwrap_err(),
+        vec![PlanValidationError::DuplicateConceptId("C-1".to_string())]
+    );
+
+    // 4. Missing concept ref
+    let missing_concept = Plan {
+        id: "p".to_string(),
+        title: "P".to_string(),
+        items: vec![PlanItem {
+            id: "1".to_string(),
+            title: "Step 1".to_string(),
+            concept_refs: vec!["c-missing".to_string()],
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    assert_eq!(
+        missing_concept.validate().unwrap_err(),
+        vec![PlanValidationError::MissingConceptRef {
+            item_id: "1".to_string(),
+            concept_ref: "c-missing".to_string(),
+        }]
+    );
+}
+
+#[test]
+fn test_plan_validate_dependency_errors() {
+    // 1. Missing dependency
+    let missing_dep = Plan {
+        id: "p".to_string(),
+        title: "P".to_string(),
+        items: vec![PlanItem {
+            id: "1".to_string(),
+            title: "Step 1".to_string(),
+            depends_on: vec!["ghost".to_string()],
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    assert_eq!(
+        missing_dep.validate().unwrap_err(),
+        vec![PlanValidationError::MissingDependency {
+            item_id: "1".to_string(),
+            depends_on: "ghost".to_string(),
+        }]
+    );
+
+    // 2. Self dependency
+    let self_dep = Plan {
+        id: "p".to_string(),
+        title: "P".to_string(),
+        items: vec![PlanItem {
+            id: "1".to_string(),
+            title: "Step 1".to_string(),
+            depends_on: vec!["1".to_string()],
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    assert_eq!(
+        self_dep.validate().unwrap_err(),
+        vec![PlanValidationError::SelfDependency("1".to_string())]
+    );
+
+    // 3. Cyclic dependency
+    let cyclic = Plan {
+        id: "p".to_string(),
+        title: "P".to_string(),
+        items: vec![
+            PlanItem {
+                id: "A".to_string(),
+                title: "Step A".to_string(),
+                depends_on: vec!["B".to_string()],
+                ..Default::default()
+            },
+            PlanItem {
+                id: "B".to_string(),
+                title: "Step B".to_string(),
+                depends_on: vec!["A".to_string()],
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+    let errs = cyclic.validate().unwrap_err();
+    assert_eq!(errs.len(), 1);
+    match &errs[0] {
+        PlanValidationError::CyclicDependency(cycle) => {
+            assert!(cycle.contains(&"A".to_string()));
+            assert!(cycle.contains(&"B".to_string()));
+        }
+        other => panic!("Expected CyclicDependency, got {:?}", other),
+    }
+
+    // Display implementation
+    assert_eq!(
+        PlanValidationError::EmptyItemId.to_string(),
+        "Step ID cannot be empty"
+    );
+    assert_eq!(
+        PlanValidationError::SelfDependency("1".to_string()).to_string(),
+        "Step '1' cannot depend on itself"
+    );
+}
+

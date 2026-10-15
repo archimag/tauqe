@@ -10,6 +10,7 @@ pub mod config;
 pub mod context;
 pub(crate) mod docs;
 pub mod edits;
+pub(crate) mod escape;
 pub mod git;
 pub mod history;
 pub mod plan;

@@ -70,6 +70,16 @@ All review sessions in TAUQE are first-class versioned engineering artifacts per
   - `target_files`: list of audited repository file paths;
   - `items`: collection of discrete structured review findings.
 
+Each finding within `items` stores:
+- `id`: unique numeric identifier within the session;
+- `title`: concise title of the finding;
+- `model`: optional model selection or role override (`Option<ModelSelection>`);
+- `severity`: audit severity level (`CRITICAL`, `WARN`, `SUGGESTION`, `INFO`);
+- `status`: finding lifecycle status;
+- `files`: list of repository-relative file paths affected (`Vec<String>`);
+- `resolution_notes`: optional resolution notes or skip rationale (`Option<String>`);
+- `body`: detailed finding description, code evidence, and remediation advice.
+
 ---
 
 ## 6.4 Finding Lifecycle and Status Progression
@@ -82,10 +92,11 @@ Each finding in a review session undergoes a formal lifecycle:
          ▼                                         ▼
    [ REJECTED ]                             [ IN_PROGRESS ]
    (won't fix /                             (under active execution)
-    false positive)                                │
-                                                   ▼
-                                              [ FIXED ]
-                                            (compiler verified)
+    false positive)                         ┌──────┴──────┐
+                                            ▼             ▼
+                                        [ FIXED ]     [ SKIPPED ]
+                                       (verified)   (already resolved /
+                                                     not reproducible)
 ```
 
 1. **DISCUSSION:**
@@ -96,10 +107,12 @@ Each finding in a review session undergoes a formal lifecycle:
    Actively being resolved by the model in an isolated turn.
 4. **FIXED:**
    Successfully resolved, staged in Git, and verified by deterministic toolchain gates (`cargo check`, linters, tests).
-5. **REJECTED:**
+5. **SKIPPED:**
+   Bypassed during execution because the finding was already addressed by earlier changes in the batch, rendered obsolete by prior refactorings, or verified as a non-reproducible false positive during active inspection. The model's or developer's justification is retained in `resolution_notes`.
+6. **REJECTED:**
    Dismissed as false positive, intentional design trade-off, or non-actionable.
 
-Press `t` or `s` on any finding to open the interactive status picker modal, supporting fast numeric selection (`1` Discussion, `2` Todo, `3` InProgress, `4` Fixed, `5` Rejected).
+Press `t` or `s` on any finding to open the interactive status picker modal, supporting fast numeric selection (`1` Discussion, `2` Todo, `3` InProgress, `4` Fixed, `5` Skipped, `6` Rejected).
 
 ---
 
@@ -113,29 +126,44 @@ When evaluating complex findings, the developer does not have to accept or rejec
 
 ---
 
-## 6.6 Isolated Execution & Server-Side Fail-Fast Batch Runner (`x` / `Enter`)
+## 6.6 Isolated Execution & Server-Side Fail-Fast Batch Runner (`x` / `Enter` / `X`)
 
-Findings approved as `TODO` can be executed directly from the Review workspace without conversational context pollution. The client sends one `review/execute` request with `review_id` and an optional `item_id`. The server owns the queue and every status transition.
+Findings approved as `TODO` can be executed directly from the Review workspace without conversational context pollution. The client sends one `review/execute` request with an optional `review_id` and optional `item_id`. When `review_id` is omitted, the server executes actionable findings across all review sessions sequentially. The server owns the queue and every status transition.
 
 **Why the server owns the batch.** Marking a finding `FIXED` and advancing to the next finding must be one atomic decision tied to the verified result of the turn. If the TUI drove the queue, a disconnect would lose the batch and clients could disagree about the review state. The TUI is a thin view: it starts the scope and renders `review/updated`, `review/listChanged`, `turn/phase`, and `model/*` events, then receives a single typed `review/batch_finished` event carrying the aggregate status, finding counters, and elapsed time once the supervisor terminates.
 
 **Mandatory Pre-Flight Verification.** Before executing any finding, a single one or a whole batch, the server runs the exact same toolchain pipeline (`VerifyTarget::All`) that the core runs after each fixing turn. If the repository does not build or its tests fail, execution is blocked synchronously before any LLM request and before any status change, at zero token cost. The server returns `PREFLIGHT_VERIFICATION_FAILED` with the full compiler or test output and leaves the finding statuses untouched. Repositories without a detected toolchain skip this gate transparently.
 
 ### 1. Single Finding Execution (`x` or `Enter` on a finding)
-- The server validates that the finding is in `TODO` or `IN_PROGRESS` status. Findings in `DISCUSSION`, `REJECTED`, or already `FIXED` are refused.
-- A confirmation popup shows the finding details and file location.
-- The server marks the finding `IN_PROGRESS`, pre-loads its file as editable, and formats an isolated prompt containing only the target finding, its location, and directives.
-- The model requests necessary context via `<context_request>`, edits are staged in memory, and toolchain gates validate them.
-- The finding becomes `FIXED` only if the turn is successful **and** actually applied verified code changes to disk. Explanatory text alone, even with a terminal success tag, does not close a finding: resolving a finding is a code-modifying contract, not a discussion.
+- The server validates that the finding is in `TODO` or `IN_PROGRESS` status. Findings in `DISCUSSION`, `REJECTED`, `SKIPPED`, or already `FIXED` are refused.
+- A confirmation popup displays finding details and associated target files.
+- The server marks the finding `IN_PROGRESS`, pre-loads all files in `item.files` as editable into the `auto` context layer, and formats an isolated execution prompt containing the finding body, target paths, and directives.
+- The model requests additional context via `<context_request>` if needed, edits are validated in staging, and toolchain gates verify the build.
+- **Completion Contract:** The finding transitions to `FIXED` only if the turn succeeds **and** actually applies verified code changes to disk.
+- **Managed Skip (`<skip>`):** If the model determines that the finding was already addressed by preceding edits or is non-reproducible, it emits a typed protocol outcome tag: `<skip reason="Concise reason">Detailed explanation</skip>` (or self-closing `<skip reason="..." />`). The server transitions the finding to `SKIPPED`, persists the explanation to `item.resolution_notes`, and concludes the turn cleanly without requiring code modifications.
 
 ### 2. Batch Execution (`x` on a session header)
 - The server evaluates the whole session: if any finding remains in `DISCUSSION`, the batch is refused to enforce human triage.
 - All findings in `TODO` or `IN_PROGRESS` form an ordered queue. A confirmation dialog shows the queue before it starts.
-- **Server-Side Fail-Fast Policy:** Findings execute sequentially. If a finding fails toolchain verification, hits compiler errors, ends with a terminal error tag, produces no applied code change, or is interrupted by the user (`Esc` / `Ctrl+C`):
-  - The server stops the batch immediately and reports the reason.
-  - The failed finding returns to `TODO`. File changes of the failed turn are undone by the Git workflow checkpoint.
-  - Findings fixed earlier in the batch stay `FIXED`; they are not rolled back.
-  - Subsequent findings are not started, which prevents compounding errors.
+- **Sequential Execution and Uninterrupted Skips:** When a finding emits `<skip>`, the server records its `resolution_notes`, transitions it to `SKIPPED`, and immediately proceeds to the next finding in the queue without interrupting the batch.
+- **Server-Side Fail-Fast Policy:** Findings execute sequentially. If a finding fails toolchain verification, hits compiler errors, ends with a terminal `<error>` tag, produces no applied code changes (without emitting `<skip>`), or is interrupted by the user (`Esc` / `Ctrl+C`):
+  - The server stops the batch immediately and reports the failure reason.
+  - The failed finding returns to `TODO`. File changes of the failed turn are rolled back cleanly by the Git workflow checkpoint.
+  - Findings fixed (`FIXED`) or skipped (`SKIPPED`) earlier in the batch remain recorded; they are not rolled back.
+  - Subsequent findings in the queue are not started, preventing compounding errors.
+
+### 3. Cross-Session Batch Execution (`X` / `Shift+X`)
+Pressing `X` (`Shift+X`) anywhere in the Review workspace initiates sequential batch execution across **all** review sessions:
+- **Human-in-the-Loop Precondition:** The server inspects all sessions for actionable items. If all findings across all sessions remain in `DISCUSSION`, execution is refused with an explicit guidance prompt to triage and approve items (`t`) first.
+- **Aggregated Confirmation:** When actionable findings exist, an aggregated confirmation dialog shows the total number of findings and participating sessions before starting.
+- **Ordered Sequential Execution:** Actionable findings across sessions are queued in `{session_id}:{item_id}` order. The server switches the active session pointer (`.active_review`) as it moves across sessions, pre-loads target files, runs toolchain gates, applies fail-fast isolation, and terminates with a single aggregated `review/batch_finished` event (`owner_id: "all"`).
+
+### 4. Multi-File Findings and Elimination of Line Number Drift
+Earlier review systems bound each finding to a single `file_path` and a fragile `line_range`. In practice, line numbers drift rapidly across consecutive edits in a batch, inducing model hallucinations and patch application failures. Moreover, architectural and interface bugs frequently span multiple files (for example, a trait definition, concrete implementations, and caller sites).
+
+TAUQE addresses this through two structural invariants:
+1. **Multi-File Path Association (`files: Vec<String>`):** Findings declare a clean list of related file paths without line coordinates, harmonizing with `PlanItem.files`. Legacy review files containing `file_path` are automatically migrated on read to `files`.
+2. **Batch Context Preloading:** Before invoking the coder model for a step, the server preloads **all** paths in `item.files` into the `auto` context layer as editable. The model receives all relevant files immediately on turn 0, eliminating discovery latency.
 
 ---
 
@@ -146,7 +174,7 @@ In accordance with TAUQE's dual-contour architecture, review findings are not du
 - **Dedicated Discussion Contour (`d`):** Whenever an architectural finding needs triage, feasibility inquiry, or refinement, pressing `d` launches a focused Structured Discussion targeting specifically the chosen finding or entire audit session.
 - **Direct Status Approval:** During discussion, findings can be approved (`TODO`) or dismissed (`REJECTED`) programmatically via structured `review_update` responses.
 - **Focused Execution (`x` / `Enter`):** Approved findings are executed in isolated turns with deterministic toolchain verification.
-- **View Filtering (`f`):** Press `f` in Review to filter out closed findings (`FIXED` and `REJECTED`), keeping the view focused strictly on outstanding engineering debt.
+- **View Filtering (`f`):** Press `f` in Review to filter out closed findings (`FIXED`, `SKIPPED`, and `REJECTED`), keeping the view focused strictly on outstanding engineering debt.
 
 ---
 

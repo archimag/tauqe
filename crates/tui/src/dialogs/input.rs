@@ -11,14 +11,12 @@ use crate::views::develop::{DevelopView, TurnStatus};
 use crate::views::history::HistoryViewState;
 
 mod confirm;
-mod discuss;
 mod prompt;
 mod refine;
 mod selection;
 mod status;
 
 use confirm::{resolve_confirm, ConfirmOutcome};
-pub(crate) use discuss::submit_discuss_plan;
 pub(crate) use refine::submit_refine_dialog;
 pub(crate) use selection::activate_selection_item;
 pub(crate) use status::apply_status_dialog;
@@ -207,16 +205,61 @@ pub(crate) async fn handle_dialog_event(
                 let is_cmd = !is_ctrl_alt
                     && (primary.matches(key.modifiers)
                         || key.modifiers.contains(KeyModifiers::CONTROL));
+                let has_shift = key.modifiers.contains(KeyModifiers::SHIFT);
+                let has_alt = key.modifiers.contains(KeyModifiers::ALT);
+
+                // C-Enter accelerator unconditionally launches review from any section.
+                if matches!(key.code, KeyCode::Enter) && is_cmd {
+                    let prompt = dialog.prompt_editor.get_text().trim().to_string();
+                    let selected_model = dialog.selected_entry().map(|e| e.model.clone());
+                    let params = ReviewStartParams {
+                        model: selected_model,
+                        user_prompt: if prompt.is_empty() {
+                            None
+                        } else {
+                            Some(prompt)
+                        },
+                    };
+                    start_turn(
+                        state,
+                        st,
+                        server_writer,
+                        methods::REVIEW_START,
+                        serde_json::to_value(params)?,
+                        |st| st.review.begin(),
+                    )
+                    .await;
+                    return Ok(Some(InputResult::Continue));
+                }
 
                 match key.code {
                     // Esc always dismisses the dialog (safe cancellation).
                     KeyCode::Esc => {}
+                    KeyCode::Char('q') if dialog.focus.is_actions() => {}
                     KeyCode::Tab => {
-                        dialog.focus.cycle_next();
+                        if dialog.focus.is_actions()
+                            && dialog.confirm_button == crate::app::ConfirmDialogButton::Cancel
+                        {
+                            dialog.confirm_button = crate::app::ConfirmDialogButton::Confirm;
+                        } else {
+                            if dialog.focus.is_actions() {
+                                dialog.confirm_button = crate::app::ConfirmDialogButton::Cancel;
+                            }
+                            dialog.focus.cycle_next(dialog.selector.len());
+                        }
                         st.review_dialog = Some(dialog);
                     }
                     KeyCode::BackTab => {
-                        dialog.focus.cycle_prev();
+                        if dialog.focus.is_actions()
+                            && dialog.confirm_button == crate::app::ConfirmDialogButton::Confirm
+                        {
+                            dialog.confirm_button = crate::app::ConfirmDialogButton::Cancel;
+                        } else {
+                            dialog.focus.cycle_prev(dialog.selector.len());
+                            if dialog.focus.is_actions() {
+                                dialog.confirm_button = crate::app::ConfirmDialogButton::Confirm;
+                            }
+                        }
                         st.review_dialog = Some(dialog);
                     }
                     // Horizontal stepping moves between the action buttons.
@@ -231,10 +274,8 @@ pub(crate) async fn handle_dialog_event(
                         };
                         st.review_dialog = Some(dialog);
                     }
-                    KeyCode::Enter
-                        if !key.modifiers.contains(KeyModifiers::SHIFT)
-                            && !key.modifiers.contains(KeyModifiers::ALT)
-                            && dialog.focus.is_actions() =>
+                    KeyCode::Enter | KeyCode::Char(' ')
+                        if !has_shift && !has_alt && dialog.focus.is_actions() =>
                     {
                         // Starting a review is a long-running operation: it
                         // begins only from the focused `Confirm` button. The safe
@@ -262,6 +303,7 @@ pub(crate) async fn handle_dialog_event(
                             .await;
                             return Ok(Some(InputResult::Continue));
                         }
+                        // Safe cancel dismisses without re-attaching the dialog.
                     }
                     _ => {
                         if dialog.focus.is_prompt_editor() {
@@ -462,14 +504,11 @@ pub(crate) async fn handle_dialog_event(
             }
             return Ok(Some(InputResult::Continue));
         }
-        Some(ActiveModal::DiscussPlan) => {
-            return discuss::handle_discuss_plan(key, st, server_writer).await;
-        }
         Some(ActiveModal::RefineDialog) => {
             return refine::handle_refine_dialog(key, st, server_writer).await;
         }
         Some(ActiveModal::RefineBlocked) => {
-            return refine::handle_refine_blocked(key, st);
+            return refine::handle_refine_blocked(key, st, server_writer).await;
         }
         Some(ActiveModal::Prompt) => {
             return prompt::handle_prompt_modal(key, st, server_writer).await;
@@ -589,8 +628,7 @@ mod tests {
             model: None,
             severity: ReviewSeverity::Warning,
             status: ReviewStatus::Todo,
-            file_path: None,
-            line_range: None,
+            files: Vec::new(),
             resolution_notes: None,
             body: String::new(),
         }
@@ -598,7 +636,7 @@ mod tests {
 
     fn execute_review_target() -> ConfirmExecuteReviewState {
         ConfirmExecuteReviewState {
-            review_id: "rev-1".to_string(),
+            review_id: Some("rev-1".to_string()),
             review_title: "Session rev-1".to_string(),
             scope_title: "All remaining TODO findings".to_string(),
             item_id: Some(1),

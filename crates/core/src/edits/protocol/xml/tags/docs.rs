@@ -1,5 +1,7 @@
 //! Parser for the `<doc_request>` control tag.
 
+use tauqe_protocol::DocTopic;
+
 use super::{next_simple_tag, strip_tags};
 use crate::edits::protocol::xml::extract_attribute;
 
@@ -13,17 +15,18 @@ pub fn strip_doc_request_tags(text: &str) -> String {
     strip_tags(text, next_doc_request_tag)
 }
 
-/// Returns the requested documentation topics (lowercase); a missing topic means `all`.
-pub(crate) fn parse_doc_request_tags(text: &str) -> Vec<String> {
+/// Returns the requested documentation topics; an unknown, empty, or missing
+/// topic resolves to [`DocTopic::All`] via [`DocTopic::parse_lossy`], honoring
+/// Postel's law at the model-output ingest gateway.
+pub(crate) fn parse_doc_request_tags(text: &str) -> Vec<DocTopic> {
     let mut topics = Vec::new();
     let mut pos = 0;
     while let Some((start, end)) = next_doc_request_tag(&text[pos..]) {
         let tag = &text[pos + start..pos + end];
         let header_end = tag.find('>').unwrap_or(tag.len());
         let topic = extract_attribute(&tag[..header_end], "topic")
-            .map(|t| t.trim().to_lowercase())
-            .filter(|t| !t.is_empty())
-            .unwrap_or_else(|| "all".to_string());
+            .map(|t| DocTopic::parse_lossy(&t))
+            .unwrap_or(DocTopic::All);
         topics.push(topic);
         pos += end;
     }
@@ -39,8 +42,14 @@ mod tests {
         let text = "Need docs.\n<doc_request topic=\"Interface\" />\n<doc_request_AB12 />";
         assert_eq!(
             parse_doc_request_tags(text),
-            vec!["interface".to_string(), "all".to_string()]
+            vec![DocTopic::Interface, DocTopic::All]
         );
+    }
+
+    #[test]
+    fn test_parse_doc_request_unknown_topic_falls_back_to_all() {
+        let text = "<doc_request topic=\"bogus\" />";
+        assert_eq!(parse_doc_request_tags(text), vec![DocTopic::All]);
     }
 
     #[test]
@@ -53,6 +62,6 @@ mod tests {
     fn test_parse_doc_request_ignores_code_fences_and_inline_backticks() {
         let doc_text = "See `<doc_request topic=\"git\" />`.\n<doc_request topic=\"interface\" />";
         let topics = parse_doc_request_tags(doc_text);
-        assert_eq!(topics, vec!["interface".to_string()]);
+        assert_eq!(topics, vec![DocTopic::Interface]);
     }
 }

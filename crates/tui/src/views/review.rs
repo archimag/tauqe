@@ -2,7 +2,7 @@ use std::collections::HashSet;
 
 use ratatui::style::{Color, Style, Stylize};
 use ratatui::text::{Line, Span};
-use tauqe_protocol::{ModelSelection, ReviewItem, ReviewSession, ReviewSeverity, ReviewStatus};
+use tauqe_protocol::{ModelRef, ModelSelection, ReviewItem, ReviewSession, ReviewSeverity, ReviewStatus};
 
 use crate::ui::wrap_lines;
 
@@ -19,12 +19,13 @@ pub enum VisibleReviewRow {
         title: String,
         description: Option<String>,
         created_at: u64,
-        model: String,
+        model: ModelRef,
         total: usize,
         fixed: usize,
         todo: usize,
         in_progress: usize,
         discussion: usize,
+        skipped: usize,
         rejected: usize,
         is_expanded: bool,
     },
@@ -41,8 +42,8 @@ pub enum VisibleReviewRow {
         severity: ReviewSeverity,
         status: ReviewStatus,
         model: Option<ModelSelection>,
-        file_path: Option<String>,
-        line_range: Option<(usize, usize)>,
+        files: Vec<String>,
+        resolution_notes: Option<String>,
         is_expanded: bool,
     },
 }
@@ -251,7 +252,7 @@ impl ReviewViewState {
         self.clamp_selection();
     }
 
-    fn effective_sessions(&self) -> Vec<ReviewSession> {
+    pub(crate) fn effective_sessions(&self) -> Vec<ReviewSession> {
         if self.sessions.is_empty() {
             if let Some(ref s) = self.session {
                 vec![s.clone()]
@@ -290,6 +291,11 @@ impl ReviewViewState {
                 .iter()
                 .filter(|i| i.status == ReviewStatus::Discussion)
                 .count();
+            let skipped = session
+                .items
+                .iter()
+                .filter(|i| i.status == ReviewStatus::Skipped)
+                .count();
             let rejected = session
                 .items
                 .iter()
@@ -311,6 +317,7 @@ impl ReviewViewState {
                 todo,
                 in_progress,
                 discussion,
+                skipped,
                 rejected,
                 is_expanded,
             });
@@ -329,6 +336,7 @@ impl ReviewViewState {
                 for item in &session.items {
                     if self.hide_closed
                         && (item.status == ReviewStatus::Fixed
+                            || item.status == ReviewStatus::Skipped
                             || item.status == ReviewStatus::Rejected)
                     {
                         continue;
@@ -342,8 +350,8 @@ impl ReviewViewState {
                         severity: item.severity,
                         status: item.status,
                         model: item.model.clone(),
-                        file_path: item.file_path.clone(),
-                        line_range: item.line_range,
+                        files: item.files.clone(),
+                        resolution_notes: item.resolution_notes.clone(),
                         is_expanded: item_expanded,
                     });
                 }
@@ -411,7 +419,9 @@ impl ReviewViewState {
             });
             for item in &session.items {
                 if self.hide_closed
-                    && (item.status == ReviewStatus::Fixed || item.status == ReviewStatus::Rejected)
+                    && (item.status == ReviewStatus::Fixed
+                        || item.status == ReviewStatus::Skipped
+                        || item.status == ReviewStatus::Rejected)
                 {
                     continue;
                 }
@@ -502,6 +512,7 @@ fn status_style(status: ReviewStatus) -> Style {
         ReviewStatus::Todo => Style::default().bg(Color::Yellow).fg(Color::Black).bold(),
         ReviewStatus::InProgress => Style::default().bg(Color::Cyan).fg(Color::Black).bold(),
         ReviewStatus::Fixed => Style::default().bg(Color::Green).fg(Color::Black).bold(),
+        ReviewStatus::Skipped => Style::default().bg(Color::DarkGray).fg(Color::White).bold(),
         ReviewStatus::Rejected => Style::default().bg(Color::DarkGray).fg(Color::White).bold(),
     }
 }
@@ -537,16 +548,17 @@ fn status_label(status: ReviewStatus) -> &'static str {
         ReviewStatus::Todo => "TODO",
         ReviewStatus::InProgress => "IN_PROGRESS",
         ReviewStatus::Fixed => "FIXED",
+        ReviewStatus::Skipped => "SKIP",
         ReviewStatus::Rejected => "REJECTED",
     }
 }
 
-fn location(file_path: Option<&str>, line_range: Option<(usize, usize)>) -> Option<String> {
-    file_path.map(|path| match line_range {
-        Some((a, b)) if a == b => format!("{}:{}", path, a),
-        Some((a, b)) => format!("{}:{}-{}", path, a, b),
-        None => path.to_string(),
-    })
+fn location(files: &[String]) -> Option<String> {
+    if files.is_empty() {
+        None
+    } else {
+        Some(files.join(", "))
+    }
 }
 
 fn split_title_and_file_path(title: &str) -> (&str, Option<&str>) {
@@ -605,6 +617,7 @@ fn compute_unified_review_lines(
                 todo,
                 in_progress,
                 discussion,
+                skipped,
                 rejected,
                 is_expanded,
                 ..
@@ -615,8 +628,8 @@ fn compute_unified_review_lines(
 
                 let fold_icon = if *is_expanded { "▼ " } else { "▶ " };
                 let stats_str = format!(
-                    "{}/{} fixed ({} todo, {} prog, {} disc, {} rej)",
-                    fixed, total, todo, in_progress, discussion, rejected
+                    "{}/{} fixed ({} todo, {} prog, {} disc, {} skip, {} rej)",
+                    fixed, total, todo, in_progress, discussion, skipped, rejected
                 );
 
                 let spans = vec![
@@ -689,8 +702,8 @@ fn compute_unified_review_lines(
                 severity,
                 status,
                 model,
-                file_path,
-                line_range,
+                files,
+                resolution_notes,
                 is_expanded,
                 ..
             } => {
@@ -699,7 +712,10 @@ fn compute_unified_review_lines(
 
                 let title_style = if is_selected {
                     Style::default().fg(Color::White).bold()
-                } else if *status == ReviewStatus::Fixed || *status == ReviewStatus::Rejected {
+                } else if *status == ReviewStatus::Fixed
+                    || *status == ReviewStatus::Skipped
+                    || *status == ReviewStatus::Rejected
+                {
                     Style::default().fg(Color::Gray)
                 } else {
                     Style::default().bold()
@@ -721,6 +737,16 @@ fn compute_unified_review_lines(
                 if let Some(selection) = model {
                     spans.push(model_badge(selection));
                 }
+                if !files.is_empty() {
+                    spans.push(Span::styled(
+                        format!(
+                            " [{} file{}]",
+                            files.len(),
+                            if files.len() == 1 { "" } else { "s" }
+                        ),
+                        Style::default().fg(Color::DarkGray),
+                    ));
+                }
 
                 let mut item_line = Line::from(spans).style(row_style);
                 if is_selected {
@@ -729,15 +755,39 @@ fn compute_unified_review_lines(
                 let mut row_lines = vec![item_line];
 
                 if *is_expanded {
-                    let loc_str = location(file_path.as_deref(), *line_range)
+                    let loc_str = location(files)
                         .or_else(|| extra_path.map(|s| s.to_string()));
                     if let Some(loc) = loc_str {
                         let clean_loc = loc.trim();
                         if !clean_loc.is_empty() {
                             row_lines.push(Line::from(vec![
-                                Span::styled("        File: ", Style::default().fg(Color::Cyan).bold()),
+                                Span::styled("        Files: ", Style::default().fg(Color::Cyan).bold()),
                                 Span::styled(clean_loc.to_string(), Style::default().fg(Color::White)),
                             ]));
+                        }
+                    }
+
+                    if let Some(notes) = resolution_notes.as_deref() {
+                        let clean_notes = notes.trim();
+                        if !clean_notes.is_empty() {
+                            let note_header = if *status == ReviewStatus::Skipped {
+                                "        Skip Reason: "
+                            } else {
+                                "        Note: "
+                            };
+                            let mut note_lines = clean_notes.lines();
+                            if let Some(first) = note_lines.next() {
+                                row_lines.push(Line::from(vec![
+                                    Span::styled(note_header, Style::default().fg(Color::Yellow).bold()),
+                                    Span::styled(first.to_string(), Style::default().fg(Color::White)),
+                                ]));
+                                for line in note_lines {
+                                    row_lines.push(Line::from(vec![
+                                        Span::styled("        │ ", Style::default().fg(Color::DarkGray)),
+                                        Span::styled(line.to_string(), Style::default().fg(Color::White)),
+                                    ]));
+                                }
+                            }
                         }
                     }
 
@@ -776,8 +826,7 @@ mod tests {
             model: None,
             severity: ReviewSeverity::Warning,
             status: ReviewStatus::Todo,
-            file_path: None,
-            line_range: None,
+            files: Vec::new(),
             resolution_notes: None,
             body: String::new(),
         }
@@ -788,7 +837,7 @@ mod tests {
             id: id.to_string(),
             title: format!("Session {}", id),
             created_at: 0,
-            model: "test-model".to_string(),
+            model: ModelRef::openrouter("test-model"),
             description: None,
             user_prompt: None,
             target_files: Vec::new(),
@@ -998,5 +1047,135 @@ mod tests {
         // Collapsing all hides the session and its summary again.
         view.toggle_fold_all();
         assert!(!view.is_all_expanded());
+    }
+
+    #[test]
+    fn test_review_item_multiple_files_badge_and_expanded_rendering() {
+        let mut session = make_session("rev-files", &[1]);
+        session.items[0].files = vec![
+            "crates/core/src/review.rs".to_string(),
+            "crates/protocol/src/review.rs".to_string(),
+        ];
+        let view = ReviewViewState {
+            sessions: vec![session],
+            ..Default::default()
+        };
+
+        // Collapsed item shows [2 files] badge
+        let rows = view.flatten_rows();
+        let (lines, _) =
+            compute_unified_review_lines(&rows, 1, 100, crate::config::ThemeMode::Dark);
+        let texts: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
+        assert!(
+            texts.iter().any(|t| t.contains("[2 files]")),
+            "collapsed finding should display file count badge, got: {texts:?}"
+        );
+
+        // Expanded item renders full files line
+        let mut view_expanded = view;
+        view_expanded.toggle_item_expanded("rev-files", 1);
+        let rows_exp = view_expanded.flatten_rows();
+        let (lines_exp, _) =
+            compute_unified_review_lines(&rows_exp, 1, 100, crate::config::ThemeMode::Dark);
+        let texts_exp: Vec<String> = lines_exp.iter().map(|l| l.to_string()).collect();
+        assert!(
+            texts_exp.iter().any(|t| t.contains("Files: ")
+                && t.contains("crates/core/src/review.rs, crates/protocol/src/review.rs")),
+            "expanded finding should render full file paths, got: {texts_exp:?}"
+        );
+    }
+
+    #[test]
+    fn test_review_item_skipped_badge_and_skip_reason_notes() {
+        let mut session = make_session("rev-skip", &[1, 2]);
+        session.items[0].status = ReviewStatus::Skipped;
+        session.items[0].resolution_notes = Some(
+            "Already addressed in previous turn\nVerified no code change needed".to_string(),
+        );
+        session.items[1].status = ReviewStatus::Fixed;
+        session.items[1].resolution_notes = Some("Fixed race condition".to_string());
+
+        let mut view = ReviewViewState {
+            sessions: vec![session],
+            ..Default::default()
+        };
+        view.toggle_item_expanded("rev-skip", 1);
+        view.toggle_item_expanded("rev-skip", 2);
+
+        let rows = view.flatten_rows();
+        let (lines, _) =
+            compute_unified_review_lines(&rows, 1, 100, crate::config::ThemeMode::Dark);
+        let texts: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
+
+        // 1. Badge displays compact SKIP
+        assert!(
+            texts.iter().any(|t| t.contains(" SKIP ")),
+            "expected compact SKIP status badge, got: {texts:?}"
+        );
+
+        // 2. Multiline Skip Reason renders with vertical prefix for subsequent lines
+        assert!(
+            texts.iter().any(|t| t.contains("Skip Reason: ")
+                && t.contains("Already addressed in previous turn")),
+            "expected Skip Reason header and first line, got: {texts:?}"
+        );
+        assert!(
+            texts.iter().any(|t| t.contains("│ Verified no code change needed")),
+            "expected indented subsequent line with vertical bar prefix, got: {texts:?}"
+        );
+
+        // 3. Regular non-skipped item renders Note: header
+        assert!(
+            texts.iter().any(|t| t.contains("Note: Fixed race condition")),
+            "expected regular Note: header for fixed item, got: {texts:?}"
+        );
+    }
+
+    #[test]
+    fn test_session_header_statistics_with_skipped() {
+        let mut session = make_session("rev-stats", &[1, 2, 3, 4, 5, 6, 7]);
+        session.items[0].status = ReviewStatus::Fixed;
+        session.items[1].status = ReviewStatus::Todo;
+        session.items[2].status = ReviewStatus::InProgress;
+        session.items[3].status = ReviewStatus::Discussion;
+        session.items[4].status = ReviewStatus::Skipped;
+        session.items[5].status = ReviewStatus::Skipped;
+        session.items[6].status = ReviewStatus::Rejected;
+
+        let view = ReviewViewState {
+            sessions: vec![session],
+            ..Default::default()
+        };
+        let rows = view.flatten_rows();
+
+        if let VisibleReviewRow::SessionHeader {
+            total,
+            fixed,
+            todo,
+            in_progress,
+            discussion,
+            skipped,
+            rejected,
+            ..
+        } = &rows[0]
+        {
+            assert_eq!(*total, 7);
+            assert_eq!(*fixed, 1);
+            assert_eq!(*todo, 1);
+            assert_eq!(*in_progress, 1);
+            assert_eq!(*discussion, 1);
+            assert_eq!(*skipped, 2);
+            assert_eq!(*rejected, 1);
+        } else {
+            panic!("expected SessionHeader row");
+        }
+
+        let (lines, _) =
+            compute_unified_review_lines(&rows, 0, 200, crate::config::ThemeMode::Dark);
+        let header_text = lines[0].to_string();
+        assert!(
+            header_text.contains("1/7 fixed (1 todo, 1 prog, 1 disc, 2 skip, 1 rej)"),
+            "expected session statistics formatted with skip count, got: {header_text}"
+        );
     }
 }

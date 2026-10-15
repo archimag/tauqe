@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 
+use crate::config::{EditProtocolKind, WorkflowKind};
 use crate::git::RepositoryState;
 use crate::model::ModelRef;
 
@@ -13,7 +14,7 @@ pub enum RequestId {
     Null,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Request {
     pub id: RequestId,
     pub method: String,
@@ -21,13 +22,100 @@ pub struct Request {
     pub params: Option<serde_json::Value>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+fn is_sensitive_method(method: &str) -> bool {
+    method == crate::methods::CREDENTIALS_SAVE || method.starts_with("credentials/")
+}
+
+fn is_sensitive_key(key: &str) -> bool {
+    let lower = key.to_ascii_lowercase();
+    lower == "api_key"
+        || lower == "apikey"
+        || lower == "key"
+        || lower == "token"
+        || lower == "secret"
+        || lower == "password"
+}
+
+fn redact_sensitive_json(value: &serde_json::Value, sensitive_context: bool) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(map) => {
+            let mut sanitized = serde_json::Map::with_capacity(map.len());
+            for (k, v) in map {
+                if sensitive_context || is_sensitive_key(k) {
+                    if v.is_object() || v.is_array() {
+                        sanitized.insert(k.clone(), redact_sensitive_json(v, sensitive_context));
+                    } else {
+                        sanitized.insert(
+                            k.clone(),
+                            serde_json::Value::String("<redacted>".to_string()),
+                        );
+                    }
+                } else if v.is_object() || v.is_array() {
+                    sanitized.insert(k.clone(), redact_sensitive_json(v, false));
+                } else {
+                    sanitized.insert(k.clone(), v.clone());
+                }
+            }
+            serde_json::Value::Object(sanitized)
+        }
+        serde_json::Value::Array(arr) => {
+            serde_json::Value::Array(
+                arr.iter()
+                    .map(|v| redact_sensitive_json(v, sensitive_context))
+                    .collect(),
+            )
+        }
+        serde_json::Value::String(_) if sensitive_context => {
+            serde_json::Value::String("<redacted>".to_string())
+        }
+        other => other.clone(),
+    }
+}
+
+impl std::fmt::Debug for Request {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut builder = f.debug_struct("Request");
+        builder.field("id", &self.id);
+        builder.field("method", &self.method);
+        let sensitive = is_sensitive_method(&self.method);
+        match &self.params {
+            Some(params) => {
+                let redacted = redact_sensitive_json(params, sensitive);
+                builder.field("params", &Some(redacted));
+            }
+            None => {
+                builder.field("params", &Option::<serde_json::Value>::None);
+            }
+        }
+        builder.finish()
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Response {
     pub id: RequestId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<ResponseError>,
+}
+
+impl std::fmt::Debug for Response {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut builder = f.debug_struct("Response");
+        builder.field("id", &self.id);
+        match &self.result {
+            Some(result) => {
+                let redacted = redact_sensitive_json(result, false);
+                builder.field("result", &Some(redacted));
+            }
+            None => {
+                builder.field("result", &Option::<serde_json::Value>::None);
+            }
+        }
+        builder.field("error", &self.error);
+        builder.finish()
+    }
 }
 
 impl Response {
@@ -62,12 +150,30 @@ impl Response {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct ResponseError {
     pub code: String,
     pub message: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub data: Option<serde_json::Value>,
+}
+
+impl std::fmt::Debug for ResponseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut builder = f.debug_struct("ResponseError");
+        builder.field("code", &self.code);
+        builder.field("message", &self.message);
+        match &self.data {
+            Some(data) => {
+                let redacted = redact_sensitive_json(data, false);
+                builder.field("data", &Some(redacted));
+            }
+            None => {
+                builder.field("data", &Option::<serde_json::Value>::None);
+            }
+        }
+        builder.finish()
+    }
 }
 
 impl ResponseError {
@@ -92,19 +198,47 @@ impl ResponseError {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Event {
     pub method: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub params: Option<serde_json::Value>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+impl std::fmt::Debug for Event {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut builder = f.debug_struct("Event");
+        builder.field("method", &self.method);
+        let sensitive = is_sensitive_method(&self.method);
+        match &self.params {
+            Some(params) => {
+                let redacted = redact_sensitive_json(params, sensitive);
+                builder.field("params", &Some(redacted));
+            }
+            None => {
+                builder.field("params", &Option::<serde_json::Value>::None);
+            }
+        }
+        builder.finish()
+    }
+}
+
+#[derive(Clone, Serialize)]
 #[serde(untagged)]
 pub enum Message {
     Request(Request),
     Response(Response),
     Event(Event),
+}
+
+impl std::fmt::Debug for Message {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Request(req) => f.debug_tuple("Request").field(req).finish(),
+            Self::Response(resp) => f.debug_tuple("Response").field(resp).finish(),
+            Self::Event(event) => f.debug_tuple("Event").field(event).finish(),
+        }
+    }
 }
 
 /// Permissive capture of every field a wire message may carry.
@@ -173,13 +307,13 @@ pub struct InitializeResult {
     pub repository: Option<RepositoryState>,
     pub model: ModelRef,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub workflow: Option<String>,
+    pub workflow: Option<WorkflowKind>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub edit_protocol: Option<String>,
+    pub edit_protocol: Option<EditProtocolKind>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub available_workflows: Vec<String>,
+    pub available_workflows: Vec<WorkflowKind>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub available_edit_protocols: Vec<String>,
+    pub available_edit_protocols: Vec<EditProtocolKind>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub available_models: Vec<ModelRef>,
 }
@@ -277,5 +411,97 @@ mod tests {
             Message::Response(response) => assert_eq!(response.id, RequestId::Null),
             other => panic!("Expected Response, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_request_debug_redacts_credentials_save() {
+        let req = Request {
+            id: RequestId::Number(1),
+            method: crate::methods::CREDENTIALS_SAVE.to_string(),
+            params: Some(serde_json::json!({
+                "api_key": "sk-secret-12345"
+            })),
+        };
+
+        let rendered = format!("{req:?}");
+        assert!(!rendered.contains("sk-secret-12345"));
+        assert!(rendered.contains("<redacted>"));
+    }
+
+    #[test]
+    fn test_message_debug_redacts_credentials_save() {
+        let msg = Message::Request(Request {
+            id: RequestId::Number(1),
+            method: crate::methods::CREDENTIALS_SAVE.to_string(),
+            params: Some(serde_json::json!({
+                "api_key": "sk-secret-67890"
+            })),
+        });
+
+        let rendered = format!("{msg:?}");
+        assert!(!rendered.contains("sk-secret-67890"));
+        assert!(rendered.contains("<redacted>"));
+    }
+
+    #[test]
+    fn test_request_debug_preserves_non_sensitive_params() {
+        let req = Request {
+            id: RequestId::Number(2),
+            method: crate::methods::CONTEXT_ADD.to_string(),
+            params: Some(serde_json::json!({
+                "path": "crates/protocol/src/lib.rs"
+            })),
+        };
+
+        let rendered = format!("{req:?}");
+        assert!(rendered.contains("crates/protocol/src/lib.rs"));
+    }
+
+    #[test]
+    fn test_request_debug_redacts_sensitive_keys_even_in_custom_methods() {
+        let req = Request {
+            id: RequestId::Number(3),
+            method: "custom/auth".to_string(),
+            params: Some(serde_json::json!({
+                "api_key": "sk-secret-custom",
+                "normal_field": "visible_value"
+            })),
+        };
+
+        let rendered = format!("{req:?}");
+        assert!(!rendered.contains("sk-secret-custom"));
+        assert!(rendered.contains("<redacted>"));
+        assert!(rendered.contains("visible_value"));
+    }
+
+    #[test]
+    fn test_response_debug_redacts_sensitive_keys() {
+        let resp = Response::ok(
+            RequestId::Number(4),
+            serde_json::json!({
+                "api_key": "sk-secret-response",
+                "status": "ok"
+            }),
+        );
+
+        let rendered = format!("{resp:?}");
+        assert!(!rendered.contains("sk-secret-response"));
+        assert!(rendered.contains("<redacted>"));
+        assert!(rendered.contains("ok"));
+    }
+
+    #[test]
+    fn test_response_error_debug_redacts_sensitive_keys() {
+        let err = ResponseError::with_data(
+            "AUTH_FAILED",
+            "invalid token",
+            serde_json::json!({
+                "token": "secret-token-failed"
+            }),
+        );
+
+        let rendered = format!("{err:?}");
+        assert!(!rendered.contains("secret-token-failed"));
+        assert!(rendered.contains("<redacted>"));
     }
 }

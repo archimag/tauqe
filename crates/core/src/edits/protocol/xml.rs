@@ -6,7 +6,7 @@
 //! syntax from conversational text, and [`marked`] binds the protocol to a
 //! per-turn marker. Control tags that are not code edits live in [`tags`].
 
-use tauqe_protocol::ModelResult;
+use tauqe_protocol::{DocTopic, ModelResult};
 
 use crate::edits::stream::{EditStreamFilter, XmlStreamFilter};
 
@@ -26,7 +26,7 @@ pub use clean::extract_conversational_text;
 pub use marker::generate_turn_marker;
 pub use marked::MarkedXmlEditProtocol;
 pub use parser::has_xml_edit_tags;
-pub(crate) use marker::{normalize_marked_xml, restore_xml_literals};
+pub(crate) use marker::{normalize_marked_xml_incremental, restore_xml_literals};
 pub(crate) use marked::is_valid_turn_marker;
 pub(crate) use parser::{extract_attribute, find_base_tag_start};
 pub use tags::{
@@ -62,7 +62,7 @@ impl EditProtocol for XmlEditProtocol {
         parse_context_request_tags(raw_text)
     }
 
-    fn parse_doc_requests(&self, raw_text: &str) -> Vec<String> {
+    fn parse_doc_requests(&self, raw_text: &str) -> Vec<DocTopic> {
         parse_doc_request_tags(raw_text)
     }
 

@@ -1,11 +1,123 @@
+use std::fmt;
+use std::str::FromStr;
+
 use serde::{Deserialize, Serialize};
 
 use crate::model::{ModelRef, ModelRolesSummary, ModelSelection};
 
+/// Discrete workflow engine that drives a development turn.
+///
+/// Replaces the former free-form workflow string. `Git` is the default
+/// transactional workflow: the working tree is checkpointed and every applied
+/// turn is committed. `Naive` applies edits directly to the working tree
+/// without commit safety and is also known as the single-turn or direct mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", try_from = "String")]
+pub enum WorkflowKind {
+    /// Transactional Git workflow (default).
+    #[default]
+    Git,
+    /// Direct working-tree edits without commit checkpoints.
+    Naive,
+}
+
+impl std::convert::TryFrom<String> for WorkflowKind {
+    type Error = String;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        value.parse()
+    }
+}
+
+impl WorkflowKind {
+    /// Canonical lower-case identifier used on the wire.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Git => "git",
+            Self::Naive => "naive",
+        }
+    }
+}
+
+impl fmt::Display for WorkflowKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for WorkflowKind {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "git" => Ok(Self::Git),
+            "naive" | "single" | "direct" => Ok(Self::Naive),
+            other => Err(format!(
+                "Unknown workflow '{}'. Expected 'git' or 'naive'",
+                other
+            )),
+        }
+    }
+}
+
+/// Discrete edit protocol used to decode model output for a turn.
+///
+/// Replaces the former free-form protocol string. `Xml` is the default
+/// marker-tag edit protocol. `Structured` drives JSON-schema structured output
+/// and is also known as the structured-output or JSON-schema mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", try_from = "String")]
+pub enum EditProtocolKind {
+    /// Marker-tag XML edit protocol (default).
+    #[default]
+    Xml,
+    /// JSON-schema structured output protocol.
+    Structured,
+}
+
+impl std::convert::TryFrom<String> for EditProtocolKind {
+    type Error = String;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        value.parse()
+    }
+}
+
+impl EditProtocolKind {
+    /// Canonical lower-case identifier used on the wire.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Xml => "xml",
+            Self::Structured => "structured",
+        }
+    }
+}
+
+impl fmt::Display for EditProtocolKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for EditProtocolKind {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "xml" => Ok(Self::Xml),
+            "structured" | "structured_output" | "json_schema" | "json" => Ok(Self::Structured),
+            other => Err(format!(
+                "Unknown edit protocol '{}'. Expected 'xml' or 'structured'",
+                other
+            )),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConfigState {
-    pub workflow: String,
-    pub edit_protocol: String,
+    pub workflow: WorkflowKind,
+    pub edit_protocol: EditProtocolKind,
     pub model: ModelRef,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selection: Option<ModelSelection>,
@@ -14,9 +126,9 @@ pub struct ConfigState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub history_model: Option<ModelRef>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub available_workflows: Vec<String>,
+    pub available_workflows: Vec<WorkflowKind>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub available_edit_protocols: Vec<String>,
+    pub available_edit_protocols: Vec<EditProtocolKind>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub available_models: Vec<ModelRef>,
 }
@@ -24,9 +136,9 @@ pub struct ConfigState {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ConfigSetParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub workflow: Option<String>,
+    pub workflow: Option<WorkflowKind>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub edit_protocol: Option<String>,
+    pub edit_protocol: Option<EditProtocolKind>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<ModelRef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -48,8 +160,10 @@ pub struct CredentialsSaveParams {
 
 /// Manual `Debug` that never prints the plaintext API key.
 ///
-/// A derived `Debug` would leak the secret into any `tracing` span or `{:?}`
-/// log of request params (or of an enclosing `Request`/`Message`). The key is
+/// A derived `Debug` on typed parameters would leak the secret into any
+/// `tracing` span or `{:?}` log. Transport-level [`crate::message::Request`]
+/// and [`crate::message::Message`] wrappers also provide dedicated `Debug`
+/// redaction for methods with secrets (such as `credentials/save`). The key is
 /// therefore replaced with a fixed placeholder.
 impl std::fmt::Debug for CredentialsSaveParams {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -93,8 +207,8 @@ mod tests {
     #[test]
     fn test_config_state_roles_serde() {
         let state = ConfigState {
-            workflow: "git".to_string(),
-            edit_protocol: "xml".to_string(),
+            workflow: WorkflowKind::Git,
+            edit_protocol: EditProtocolKind::Xml,
             model: ModelRef::openrouter("anthropic/claude-3.5-sonnet"),
             selection: Some(ModelSelection::Role(ModelRole::Coder)),
             roles: Some(ModelRolesSummary {
@@ -107,8 +221,8 @@ mod tests {
                 entries: None,
             }),
             history_model: Some(ModelRef::openrouter("scribe-model")),
-            available_workflows: vec!["git".to_string()],
-            available_edit_protocols: vec!["xml".to_string()],
+            available_workflows: vec![WorkflowKind::Git],
+            available_edit_protocols: vec![EditProtocolKind::Xml],
             available_models: vec![ModelRef::openrouter("coder-model")],
         };
 
@@ -117,6 +231,8 @@ mod tests {
         assert!(json.contains("\"coder\""));
         let de: ConfigState = serde_json::from_str(&json).unwrap();
         assert_eq!(de.roles.unwrap().coder, ModelRef::openrouter("coder-model"));
+        assert_eq!(de.workflow, WorkflowKind::Git);
+        assert_eq!(de.edit_protocol, EditProtocolKind::Xml);
     }
 
     #[test]
@@ -127,5 +243,104 @@ mod tests {
         let rendered = format!("{params:?}");
         assert!(!rendered.contains("sk-secret-value"));
         assert!(rendered.contains("<redacted>"));
+    }
+
+    #[test]
+    fn test_workflow_kind_serde_and_aliases() {
+        assert_eq!(serde_json::to_string(&WorkflowKind::Git).unwrap(), "\"git\"");
+        assert_eq!(
+            serde_json::to_string(&WorkflowKind::Naive).unwrap(),
+            "\"naive\""
+        );
+
+        assert_eq!(
+            serde_json::from_str::<WorkflowKind>("\"naive\"").unwrap(),
+            WorkflowKind::Naive
+        );
+        assert_eq!(
+            serde_json::from_str::<WorkflowKind>("\"single\"").unwrap(),
+            WorkflowKind::Naive
+        );
+        assert_eq!(
+            serde_json::from_str::<WorkflowKind>("\"direct\"").unwrap(),
+            WorkflowKind::Naive
+        );
+        assert_eq!(
+            serde_json::from_str::<WorkflowKind>("\" GIT \"").unwrap(),
+            WorkflowKind::Git
+        );
+        assert_eq!(
+            serde_json::from_str::<WorkflowKind>("\" DIRECT \"").unwrap(),
+            WorkflowKind::Naive
+        );
+        assert!(serde_json::from_str::<WorkflowKind>("\"legacy\"").is_err());
+    }
+
+    #[test]
+    fn test_workflow_kind_default_display_and_parsing() {
+        assert_eq!(WorkflowKind::default(), WorkflowKind::Git);
+        assert_eq!(WorkflowKind::Git.as_str(), "git");
+        assert_eq!(WorkflowKind::Naive.to_string(), "naive");
+        assert_eq!(" GIT ".parse::<WorkflowKind>().unwrap(), WorkflowKind::Git);
+        assert_eq!(
+            "direct".parse::<WorkflowKind>().unwrap(),
+            WorkflowKind::Naive
+        );
+        assert!("".parse::<WorkflowKind>().is_err());
+        assert!("bogus".parse::<WorkflowKind>().is_err());
+    }
+
+    #[test]
+    fn test_edit_protocol_kind_serde_and_aliases() {
+        assert_eq!(
+            serde_json::to_string(&EditProtocolKind::Xml).unwrap(),
+            "\"xml\""
+        );
+        assert_eq!(
+            serde_json::to_string(&EditProtocolKind::Structured).unwrap(),
+            "\"structured\""
+        );
+
+        assert_eq!(
+            serde_json::from_str::<EditProtocolKind>("\"xml\"").unwrap(),
+            EditProtocolKind::Xml
+        );
+        assert_eq!(
+            serde_json::from_str::<EditProtocolKind>("\"structured_output\"").unwrap(),
+            EditProtocolKind::Structured
+        );
+        assert_eq!(
+            serde_json::from_str::<EditProtocolKind>("\"json_schema\"").unwrap(),
+            EditProtocolKind::Structured
+        );
+        assert_eq!(
+            serde_json::from_str::<EditProtocolKind>("\"json\"").unwrap(),
+            EditProtocolKind::Structured
+        );
+        assert_eq!(
+            serde_json::from_str::<EditProtocolKind>("\" XML \"").unwrap(),
+            EditProtocolKind::Xml
+        );
+        assert_eq!(
+            serde_json::from_str::<EditProtocolKind>("\" JSON_SCHEMA \"").unwrap(),
+            EditProtocolKind::Structured
+        );
+        assert!(serde_json::from_str::<EditProtocolKind>("\"yaml\"").is_err());
+    }
+
+    #[test]
+    fn test_edit_protocol_kind_default_display_and_parsing() {
+        assert_eq!(EditProtocolKind::default(), EditProtocolKind::Xml);
+        assert_eq!(EditProtocolKind::Xml.as_str(), "xml");
+        assert_eq!(EditProtocolKind::Structured.to_string(), "structured");
+        assert_eq!(
+            "STRUCTURED".parse::<EditProtocolKind>().unwrap(),
+            EditProtocolKind::Structured
+        );
+        assert_eq!(
+            "json".parse::<EditProtocolKind>().unwrap(),
+            EditProtocolKind::Structured
+        );
+        assert!("".parse::<EditProtocolKind>().is_err());
     }
 }

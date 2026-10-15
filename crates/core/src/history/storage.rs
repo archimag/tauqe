@@ -47,6 +47,8 @@ impl SessionStorage {
             .with_context(|| format!("Failed to write history entry to: {:?}", file_path))?;
         file.flush()
             .with_context(|| format!("Failed to flush history file: {:?}", file_path))?;
+        file.sync_data()
+            .with_context(|| format!("Failed to sync history file: {:?}", file_path))?;
 
         Ok(())
     }
@@ -63,19 +65,33 @@ impl SessionStorage {
         let mut entries = Vec::new();
 
         for (line_idx, line_res) in reader.lines().enumerate() {
-            let line = line_res
-                .with_context(|| format!("Failed reading line {} from {:?}", line_idx + 1, file_path))?;
+            let line = match line_res {
+                Ok(l) => l,
+                Err(err) => {
+                    tracing::warn!(
+                        "Failed reading line {} from history file {:?}: {}",
+                        line_idx + 1,
+                        file_path,
+                        err
+                    );
+                    continue;
+                }
+            };
             let trimmed = line.trim();
             if trimmed.is_empty() {
                 continue;
             }
-            let entry = HistoryEntry::from_jsonl_line(trimmed).with_context(|| {
-                format!(
-                    "Invalid JSONL at line {} in history file {:?}",
-                    line_idx + 1, file_path
-                )
-            })?;
-            entries.push(entry);
+            match HistoryEntry::from_jsonl_line(trimmed) {
+                Ok(entry) => entries.push(entry),
+                Err(err) => {
+                    tracing::warn!(
+                        "Skipping invalid JSONL at line {} in history file {:?}: {}",
+                        line_idx + 1,
+                        file_path,
+                        err
+                    );
+                }
+            }
         }
 
         Ok(entries)
@@ -176,5 +192,39 @@ mod tests {
         // Test clear
         storage.clear().unwrap();
         assert!(storage.read_entries().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_storage_read_entries_skips_corrupted_lines() {
+        let dir = tempdir().unwrap();
+        let repo_root = dir.path().to_path_buf();
+        let storage = SessionStorage::new(repo_root);
+
+        let entry1 = HistoryEntry::Turn {
+            id: Some(1),
+            prompt: "First turn".to_string(),
+            context: vec![],
+        };
+        let entry2 = HistoryEntry::Turn {
+            id: Some(2),
+            prompt: "Second turn".to_string(),
+            context: vec![],
+        };
+
+        storage.append_entry(&entry1).unwrap();
+
+        // Inject corrupted lines directly into the file
+        let history_file = storage.history_path();
+        let mut file = OpenOptions::new().append(true).open(&history_file).unwrap();
+        writeln!(file, "{{corrupted json line").unwrap();
+        writeln!(file, "{{\"type\":\"unknown_variant\"}}").unwrap();
+        file.flush().unwrap();
+
+        storage.append_entry(&entry2).unwrap();
+
+        let entries = storage.read_entries().unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0], entry1);
+        assert_eq!(entries[1], entry2);
     }
 }

@@ -29,9 +29,9 @@ pub use paths::{
     write_default_config, write_default_conventions, DEFAULT_CONFIG_TEMPLATE,
 };
 pub use providers::{
-    find_credentials_file, has_openrouter_key, load_credentials, read_credentials_file,
-    write_credentials_file, write_credentials_stub, Credentials, OpenRouterConfig,
-    OpenRouterCredentials, ProvidersConfig,
+    credentials_candidates, find_credentials_file, has_openrouter_key, load_credentials,
+    read_credentials_file, write_credentials_file, write_credentials_stub, Credentials,
+    OpenRouterConfig, OpenRouterCredentials, ProvidersConfig,
 };
 pub use toolchain::{ToolchainConfig, DEFAULT_TOOLCHAIN_TIMEOUT_SECS};
 
@@ -182,7 +182,14 @@ pub fn load_config_with_options(opts: ConfigLoadOptions) -> AppConfig {
     if let Some(p) = config_path.as_deref().filter(|p| !p.as_os_str().is_empty()) {
         match std::fs::read_to_string(p) {
             Ok(content) => match toml::from_str::<AppConfig>(&content) {
-                Ok(parsed) => config = parsed,
+                Ok(parsed) => {
+                    config = parsed;
+                    if let Err(err) = config.validate() {
+                        tracing::warn!("Configuration validation failed for {}: {}", p.display(), err);
+                        config.config_error =
+                            Some(format!("Invalid configuration in {}: {}", p.display(), err));
+                    }
+                }
                 Err(err) => {
                     tracing::warn!("Failed to parse config file {}: {}", p.display(), err);
                     config.config_error =
@@ -222,60 +229,57 @@ pub fn load_config(repo_root: Option<&Path>) -> AppConfig {
     })
 }
 
-/// Resolves repository-local `[git]` integration settings for a repository root.
+/// Loads a specific configuration section from `tauqe.toml` without parsing the
+/// whole configuration file or loading credentials.
 ///
-/// Only the `[git]` table is parsed: commit-path helpers need a single
-/// deterministic flag and must not pay for credential resolution or unrelated
-/// configuration sections on every commit. A missing, unreadable, or malformed
-/// configuration resolves to the built-in defaults.
-pub fn load_git_config(repo_root: &Path) -> GitConfig {
+/// Returns the default value if the file does not exist, cannot be read, or the
+/// section cannot be parsed.
+pub fn load_section<T: for<'de> Deserialize<'de> + Default>(
+    repo_root: &Path,
+    section_key: &str,
+) -> T {
     let Some(path) = find_config_file(Some(repo_root), None) else {
-        return GitConfig::default();
+        return T::default();
     };
     let Ok(content) = std::fs::read_to_string(&path) else {
-        return GitConfig::default();
+        return T::default();
     };
-
-    #[derive(Deserialize)]
-    struct GitSection {
-        #[serde(default)]
-        git: GitConfig,
-    }
-
-    toml::from_str::<GitSection>(&content)
-        .map(|section| section.git)
+    let Ok(table) = toml::from_str::<toml::Table>(&content) else {
+        return T::default();
+    };
+    table
+        .get(section_key)
+        .cloned()
+        .and_then(|val| val.try_into::<T>().ok())
         .unwrap_or_default()
+}
+
+/// Resolves repository-local `[git]` integration settings for a repository root.
+///
+/// Only the `[git]` table is parsed without paying for credential resolution or
+/// unrelated configuration sections.
+pub fn load_git_config(repo_root: &Path) -> GitConfig {
+    load_section(repo_root, "git")
 }
 
 /// Resolves repository-local `[toolchain]` settings for a repository root.
 ///
-/// Mirrors [`load_git_config`]: only the `[toolchain]` table is parsed so the
-/// verification pipeline can honor a custom `check_command` and the configured
-/// per-command timeout without paying for the whole application configuration.
-/// A missing, unreadable, or malformed configuration resolves to the built-in
-/// defaults.
+/// Mirrors [`load_git_config`]: only the `[toolchain]` table is parsed.
 pub fn load_toolchain_config(repo_root: &Path) -> ToolchainConfig {
-    let Some(path) = find_config_file(Some(repo_root), None) else {
-        return ToolchainConfig::default();
-    };
-    let Ok(content) = std::fs::read_to_string(&path) else {
-        return ToolchainConfig::default();
-    };
+    load_section(repo_root, "toolchain")
+}
 
-    #[derive(Deserialize)]
-    struct ToolchainSection {
-        #[serde(default)]
-        toolchain: ToolchainConfig,
-    }
-
-    toml::from_str::<ToolchainSection>(&content)
-        .map(|section| section.toolchain)
-        .unwrap_or_default()
+/// Resolves repository-local `[context]` settings for a repository root.
+///
+/// Mirrors [`load_git_config`]: only the `[context]` table is parsed.
+pub fn load_context_config(repo_root: &Path) -> ContextConfig {
+    load_section(repo_root, "context")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tauqe_protocol::{EditProtocolKind, WorkflowKind};
 
     #[test]
     fn test_models_config_and_roles_resolution() {
@@ -536,8 +540,8 @@ models = ["deepseek/deepseek-chat", " ", "openai/gpt-4o"]
             config.active_model(),
             ModelRef::openrouter(BUILTIN_DEFAULT_PRIMARY_MODEL)
         );
-        assert_eq!(config.develop.workflow, "git");
-        assert_eq!(config.develop.protocol, "xml");
+        assert_eq!(config.develop.workflow, WorkflowKind::Git);
+        assert_eq!(config.develop.protocol, EditProtocolKind::Xml);
         assert_eq!(config.develop.max_retries, 3);
         assert!(config.providers.openrouter.is_none());
         assert!(config.toolchain.check_command.is_none());
@@ -645,5 +649,36 @@ models = ["deepseek/deepseek-chat", " ", "openai/gpt-4o"]
             config.config_error.is_some(),
             "a malformed config must record a diagnostic instead of silently defaulting"
         );
+    }
+
+    #[test]
+    fn test_invalid_models_config_surfaces_diagnostic() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            temp_dir.path().join("tauqe.toml"),
+            "[models]\nprimary = [\"openrouter:test/model\"]\ncoder = []\n",
+        )
+        .unwrap();
+
+        let config = load_config(Some(temp_dir.path()));
+        assert!(
+            config.config_error.is_some(),
+            "an invalid models config must record a diagnostic"
+        );
+        assert!(config.config_error.unwrap().contains("Invalid configuration"));
+    }
+
+    #[test]
+    fn test_load_context_config_reads_pinned() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            temp_dir.path().join("tauqe.toml"),
+            "[context]\npinned = [\"Conventions.md\", \"README.md\"]\nmax_discovery_rounds = 9\n",
+        )
+        .unwrap();
+
+        let cfg = load_context_config(temp_dir.path());
+        assert_eq!(cfg.pinned, vec!["Conventions.md".to_string(), "README.md".to_string()]);
+        assert_eq!(cfg.max_discovery_rounds, 9);
     }
 }

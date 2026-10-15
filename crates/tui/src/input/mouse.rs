@@ -658,21 +658,6 @@ pub async fn handle_mouse_event(
                         }
                     }
                 }
-                Some(ActiveModal::DiscussPlan) => {
-                    if let Some(dialog) = st.discuss_plan_dialog.clone() {
-                        let area = crate::dialogs::render::discuss_plan_dialog_area(term_rect);
-                        let (confirm_btn, cancel_btn) =
-                            crate::dialogs::render::discuss_plan_dialog_buttons(term_rect);
-
-                        if rect_contains(confirm_btn, mouse.column, mouse.row) {
-                            crate::dialogs::input::submit_discuss_plan(st, dialog, server_writer).await?;
-                        } else if rect_contains(cancel_btn, mouse.column, mouse.row)
-                            || !rect_contains(area, mouse.column, mouse.row)
-                        {
-                            st.discuss_plan_dialog = None;
-                        }
-                    }
-                }
                 Some(ActiveModal::RefineDialog) => {
                     if let Some(mut dialog) = st.plans_view.refine_dialog.take() {
                         let geo = crate::dialogs::render::refine_dialog_geometry(
@@ -756,16 +741,23 @@ pub async fn handle_mouse_event(
                         let options_count = dialog.target.options_count();
                         let area =
                             crate::dialogs::render::status_dialog_area(term_rect, options_count);
-                        if rect_contains(area, mouse.column, mouse.row) {
+                        let (apply_btn, cancel_btn) =
+                            crate::dialogs::render::status_dialog_buttons(term_rect, options_count);
+
+                        // The action bar carries two distinct buttons: Apply
+                        // commits the highlighted status, Cancel dismisses. Hit
+                        // each button by its rendered bounds so a click on
+                        // Apply can never fall through to the dismiss path.
+                        if rect_contains(apply_btn, mouse.column, mouse.row) {
+                            let chosen = dialog.selector.selected_index();
+                            crate::dialogs::input::apply_status_dialog(&mut st, chosen, server_writer).await?;
+                        } else if rect_contains(cancel_btn, mouse.column, mouse.row) {
+                            st.status_dialog = None;
+                        } else if rect_contains(area, mouse.column, mouse.row) {
                             let start_y = area.y + 4; // header border (1) + top margin (1) + target preview (2)
                             let clicked_row = mouse.row.saturating_sub(start_y) as usize;
                             if mouse.row >= start_y && clicked_row < options_count {
                                 crate::dialogs::input::apply_status_dialog(&mut st, clicked_row, server_writer).await?;
-                            } else {
-                                let footer_y = area.y + area.height.saturating_sub(3);
-                                if mouse.row >= footer_y {
-                                    st.status_dialog = None;
-                                }
                             }
                         } else {
                             st.status_dialog = None;
@@ -832,14 +824,14 @@ pub async fn handle_mouse_event(
                         if areas.develop_tab.1 > 0 && mouse.column >= areas.develop_tab.0 && mouse.column <= areas.develop_tab.1 {
                             crate::input::switch_view(&mut st, ViewMode::Develop, server_writer).await?;
                             return Ok(InputResult::Continue);
-                        } else if areas.context_tab.1 > 0 && mouse.column >= areas.context_tab.0 && mouse.column <= areas.context_tab.1 {
-                            crate::input::switch_view(&mut st, ViewMode::Context, server_writer).await?;
+                        } else if areas.plans_tab.1 > 0 && mouse.column >= areas.plans_tab.0 && mouse.column <= areas.plans_tab.1 {
+                            crate::input::switch_view(&mut st, ViewMode::Plans, server_writer).await?;
                             return Ok(InputResult::Continue);
                         } else if areas.review_tab.1 > 0 && mouse.column >= areas.review_tab.0 && mouse.column <= areas.review_tab.1 {
                             crate::input::switch_view(&mut st, ViewMode::Review, server_writer).await?;
                             return Ok(InputResult::Continue);
-                        } else if areas.plans_tab.1 > 0 && mouse.column >= areas.plans_tab.0 && mouse.column <= areas.plans_tab.1 {
-                            crate::input::switch_view(&mut st, ViewMode::Plans, server_writer).await?;
+                        } else if areas.context_tab.1 > 0 && mouse.column >= areas.context_tab.0 && mouse.column <= areas.context_tab.1 {
+                            crate::input::switch_view(&mut st, ViewMode::Context, server_writer).await?;
                             return Ok(InputResult::Continue);
                         } else if areas.history_tab.1 > 0 && mouse.column >= areas.history_tab.0 && mouse.column <= areas.history_tab.1 {
                             crate::input::switch_view(&mut st, ViewMode::History, server_writer).await?;
@@ -1014,5 +1006,107 @@ mod tests {
         // in a headless environment the paste source degrades to `None`.
         let res = handle_mouse_event(mouse, &state, &mut conn).await.unwrap();
         assert_eq!(res, InputResult::Continue);
+    }
+
+    /// A click on the status dialog's `[ Apply ]` button must commit the
+    /// highlighted status instead of dismissing the dialog without applying.
+    #[tokio::test]
+    async fn status_apply_button_click_applies_selected_status() {
+        let mut st = crate::app::test_state();
+        st.view_mode = ViewMode::Plans;
+        st.last_frame_area = Rect::new(0, 0, 100, 30);
+        st.plans_view.plans = vec![tauqe_protocol::Plan {
+            id: "plan-1".to_string(),
+            title: "Test Plan".to_string(),
+            description: None,
+            created_at: 0,
+            updated_at: 0,
+            concept: vec![],
+            items: vec![tauqe_protocol::PlanItem {
+                id: "1".to_string(),
+                title: "Step".to_string(),
+                details: None,
+                status: tauqe_protocol::PlanItemStatus::Todo,
+                files: vec![],
+                readonly_files: vec![],
+                concept_refs: vec![],
+                depends_on: vec![],
+                children: vec![],
+            }],
+        }];
+        st.status_dialog = Some(crate::app::StatusDialogState::new(
+            crate::app::StatusDialogTarget::PlanItem {
+                plan_id: "plan-1".to_string(),
+                item_id: "1".to_string(),
+                item_title: "Step".to_string(),
+                current_status: tauqe_protocol::PlanItemStatus::Todo,
+            },
+            3, // DONE
+        ));
+
+        let term = st.last_frame_area;
+        let (apply_btn, _cancel_btn) =
+            crate::dialogs::render::status_dialog_buttons(term, 6);
+        let mouse = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: apply_btn.x + 2,
+            row: apply_btn.y,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        };
+
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+        let res = handle_mouse_event(mouse, &state, &mut conn).await.unwrap();
+        assert_eq!(res, InputResult::Continue);
+
+        let st = state.lock().await;
+        assert!(st.status_dialog.is_none(), "the dialog must be consumed");
+        let item = st
+            .plans_view
+            .plans
+            .iter()
+            .find(|p| p.id == "plan-1")
+            .and_then(|p| p.find_item("1"))
+            .expect("plan item must exist");
+        assert_eq!(
+            item.status,
+            tauqe_protocol::PlanItemStatus::Done,
+            "Apply must commit the highlighted status"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_review_confirm_click_launches_turn() {
+        let mut st = crate::app::test_state();
+        st.view_mode = ViewMode::Review;
+        st.last_frame_area = Rect::new(0, 0, 100, 30);
+        st.confirm_execute_review = Some(crate::app::ConfirmExecuteReviewState {
+            review_id: Some("rev-1".to_string()),
+            review_title: "Session rev-1".to_string(),
+            scope_title: "All remaining TODO findings".to_string(),
+            item_id: Some(1),
+            items: vec![],
+        });
+
+        let term = st.last_frame_area;
+        let geom = crate::dialogs::render::execute_review_params(&st)
+            .map(|p| geometry_of(term, &p))
+            .unwrap();
+
+        let mouse = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: geom.confirm_button.x + 1,
+            row: geom.confirm_button.y,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        };
+
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+        let res = handle_mouse_event(mouse, &state, &mut conn).await.unwrap();
+        assert_eq!(res, InputResult::Continue);
+
+        let st = state.lock().await;
+        assert_eq!(st.view_mode, ViewMode::Develop);
+        assert!(st.confirm_execute_review.is_none());
     }
 }

@@ -1,14 +1,136 @@
 use crate::context::ContextFileContent;
+use crate::escape::{escape_xml_attr, escape_xml_text, single_line};
 use tauqe_protocol::review::ReviewSession;
 
-pub use tauqe_protocol::review::{
-    format_review_discussion_prompt, format_review_discussion_prompt_items,
-    REVIEW_DISCUSSION_PREFIX,
-};
+pub const REVIEW_DISCUSSION_PREFIX: &str = "# Review Discussion:";
 
 /// Returns true if the prompt represents an explicit review discussion turn.
 pub fn is_review_discussion_prompt(prompt: &str) -> bool {
     prompt.trim_start().starts_with(REVIEW_DISCUSSION_PREFIX)
+}
+
+/// Formats a targeted prompt for discussing and analyzing review findings in Structured Output mode.
+pub fn format_review_discussion_prompt(
+    session: &ReviewSession,
+    focused_item_id: Option<u32>,
+    user_comment: &str,
+) -> String {
+    let ids: Vec<u32> = focused_item_id.into_iter().collect();
+    format_review_discussion_prompt_items(session, &ids, user_comment)
+}
+
+/// Formats a targeted prompt for discussing multiple focused review findings in Structured Output mode.
+pub fn format_review_discussion_prompt_items(
+    session: &ReviewSession,
+    focused_item_ids: &[u32],
+    user_comment: &str,
+) -> String {
+    let mut out = String::new();
+    let clean_title = single_line(&session.title);
+    let title = if clean_title.is_empty() {
+        session.id.as_str()
+    } else {
+        clean_title.as_str()
+    };
+    out.push_str(&format!(
+        "{} [{}] {}\n\n",
+        REVIEW_DISCUSSION_PREFIX,
+        single_line(&session.id),
+        title
+    ));
+
+    if let Some(desc) = &session.description {
+        let trimmed = desc.trim();
+        if !trimmed.is_empty() {
+            out.push_str(&format!(
+                "## Review Scope & Description:\n{}\n\n",
+                escape_xml_text(trimmed)
+            ));
+        }
+    }
+
+    out.push_str("## Target Review Session Context:\n");
+    let (total, fixed) = session.stats();
+    out.push_str(&format!(
+        "<active_review id=\"{}\" title=\"{}\" progress=\"{}/{} fixed\">\n",
+        escape_xml_attr(&session.id),
+        escape_xml_attr(title),
+        fixed,
+        total
+    ));
+
+    for item in &session.items {
+        let is_focused = focused_item_ids.contains(&item.id);
+        let focus_mark = if is_focused { " [FOCUSED]" } else { "" };
+        let loc = if item.files.is_empty() {
+            String::new()
+        } else {
+            let joined = item
+                .files
+                .iter()
+                .map(|f| escape_xml_text(f))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(" ({})", joined)
+        };
+        out.push_str(&format!(
+            "  - #{}: [{}] {}{}{}\n",
+            item.id,
+            item.severity,
+            escape_xml_text(&item.title),
+            loc,
+            focus_mark
+        ));
+    }
+    out.push_str("</active_review>\n\n");
+
+    if !focused_item_ids.is_empty() {
+        out.push_str("### Items Focused by User for Discussion:\n");
+        for id in focused_item_ids {
+            if let Some(item) = session.find_item(*id) {
+                out.push_str(&format!(
+                    "- **#{} [{}] {}** (status: {})\n",
+                    item.id,
+                    item.severity,
+                    escape_xml_text(&item.title),
+                    item.status
+                ));
+                if !item.files.is_empty() {
+                    let joined = item
+                        .files
+                        .iter()
+                        .map(|f| format!("`{}`", escape_xml_text(f)))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    out.push_str(&format!("  Files: {}\n", joined));
+                }
+                if let Some(notes) = &item.resolution_notes {
+                    if !notes.trim().is_empty() {
+                        out.push_str(&format!(
+                            "  Resolution Strategy: {}\n",
+                            escape_xml_text(notes.trim())
+                        ));
+                    }
+                }
+                if !item.body.trim().is_empty() {
+                    out.push_str(&format!("  Details: {}\n", escape_xml_text(item.body.trim())));
+                }
+            }
+        }
+        out.push('\n');
+    }
+
+    out.push_str("## Developer Comment / Instructions:\n");
+    out.push_str(user_comment.trim());
+    out.push_str("\n\n");
+
+    out.push_str("## Instructions for Model:\n");
+    out.push_str("1. Address the developer's question or feedback regarding the code review findings.\n");
+    out.push_str("2. Discuss the problem, edge cases, and potential solutions conceptually. Do NOT emit file edits or code patches in this discussion turn.\n");
+    out.push_str("3. If the review findings or their statuses should be updated based on this discussion, explain the proposed modifications clearly in conversational text in `message`; the developer applies status changes through the review interface.\n");
+    out.push_str("4. If you need to inspect related files to verify your hypothesis, specify them in the `context_requests` array with `access: \"read_only\"`.\n");
+
+    out
 }
 
 /// Builds the system prompt for the isolated code review session.
@@ -39,8 +161,7 @@ pub fn build_review_system_prompt() -> String {
     prompt.push_str("  - `warning`: architecture violation, potential runtime issue, or poor error handling.\n");
     prompt.push_str("  - `suggestion`: code cleanup, optimization, or idiomatic improvement.\n");
     prompt.push_str("  - `info`: general observation or architectural insight.\n");
-    prompt.push_str("- `file_path`: repository-relative path of the affected file, or null when the finding is not file-specific.\n");
-    prompt.push_str("- `line_start` and `line_end`: 1-based start and end line of the affected range, or null when unknown.\n");
+    prompt.push_str("- `files`: array of repository-relative file paths affected by this finding (use `[]` when not file-specific).\n");
     prompt.push_str("- `body`: clear explanation of the problem, why it occurs, and concrete recommendations for how to resolve it.\n\n");
 
     prompt.push_str("If there are no issues, respond with an empty `findings` array.\n");
@@ -83,6 +204,8 @@ pub fn build_review_user_prompt(
     out
 }
 
+pub const REVIEW_STEP_RETRY_PREFIX: &str = "# Correction Required: Review Finding Turn Incomplete";
+
 /// Builds a corrective reprompt for a review finding turn that ended without
 /// valid code edits and without a terminal success tag.
 ///
@@ -92,7 +215,8 @@ pub fn build_review_user_prompt(
 /// next turn.
 pub fn format_review_step_retry_prompt(assistant_text: &str, error: Option<&str>) -> String {
     let mut out = String::new();
-    out.push_str("# Correction Required: Review Finding Turn Incomplete\n\n");
+    out.push_str(REVIEW_STEP_RETRY_PREFIX);
+    out.push_str("\n\n");
     out.push_str("Your previous turn ended without applying any verified code changes and without emitting the terminal success tag (`<success>`). This violates the execution protocol.\n\n");
 
     out.push_str("## Previous Assistant Response:\n");
@@ -133,9 +257,9 @@ pub struct ReviewStepTarget {
 
 /// Returns true if the prompt represents an isolated review step execution turn.
 pub fn is_review_step_execution_prompt(prompt: &str) -> bool {
-    prompt
-        .trim_start()
-        .starts_with(REVIEW_STEP_EXECUTION_PREFIX)
+    let trimmed = prompt.trim_start();
+    trimmed.starts_with(REVIEW_STEP_EXECUTION_PREFIX)
+        || trimmed.starts_with(REVIEW_STEP_RETRY_PREFIX)
 }
 
 /// Extracts the target review ID and item ID from an isolated review step execution prompt.
@@ -224,12 +348,14 @@ pub fn format_review_step_execution_prompt(
     out.push_str(&format!("- **ID**: `#{}`\n", item.id));
     out.push_str(&format!("- **Severity**: {}\n", item.severity));
     out.push_str(&format!("- **Title**: {}\n", item.title));
-    if let Some(path) = &item.file_path {
-        if let Some((start, end)) = item.line_range {
-            out.push_str(&format!("- **Location**: `{}:{}-{}`\n", path, start, end));
-        } else {
-            out.push_str(&format!("- **Location**: `{}`\n", path));
-        }
+    if !item.files.is_empty() {
+        let joined = item
+            .files
+            .iter()
+            .map(|f| format!("`{}`", f))
+            .collect::<Vec<_>>()
+            .join(", ");
+        out.push_str(&format!("- **Files**: {}\n", joined));
     }
     if !item.body.trim().is_empty() {
         out.push_str(&format!(
@@ -260,15 +386,95 @@ pub fn format_review_step_execution_prompt(
         marker_suffix
     ));
     out.push_str(&format!(
-        "5. Discovery Phase: If you need to inspect or edit files listed in <repo_map> that are not yet loaded in <context>, request them immediately using <context_request{0} path=\"...\" access=\"read_only|editable\" /> before writing code or explanations. Do NOT halt with conversational text if the necessary files can simply be requested.\n",
+        "5. If the finding is already resolved by earlier changes, is a false positive, or requires no code modifications, do NOT emit unnecessary edits; instead emit <skip{0} reason=\"...\">Detailed explanation</skip{0}>.\n",
         marker_suffix
     ));
     out.push_str(&format!(
-        "6. If you encounter an insurmountable technical blocker, contradictory requirements, or need developer decisions, emit the terminal error tag: <error{0} message=\"...\" /> explaining the exact blocker.\n",
+        "6. Discovery Phase: If you need to inspect or edit files listed in <repo_map> that are not yet loaded in <context>, request them immediately using <context_request{0} path=\"...\" access=\"read_only|editable\" /> before writing code or explanations. Do NOT halt with conversational text if the necessary files can simply be requested.\n",
+        marker_suffix
+    ));
+    out.push_str(&format!(
+        "7. If you encounter an insurmountable technical blocker, contradictory requirements, or need developer decisions, emit the terminal error tag: <error{0} message=\"...\" /> explaining the exact blocker.\n",
         marker_suffix
     ));
 
     Ok(out)
+}
+
+/// Extracts a `<skip>` reason and optional body from an assistant response.
+///
+/// Recognizes both turn-marker-bound tags (`<skip_MARKER ...>`) and unmarked
+/// `<skip ...>` tags, combining the `reason` attribute and inner text when both
+/// are present.
+pub fn extract_review_skip_reason(text: &str, marker: Option<&str>) -> Option<String> {
+    let mut candidates = Vec::new();
+    if let Some(m) = marker {
+        let trimmed = m.trim();
+        if !trimmed.is_empty() {
+            candidates.push(format!("skip_{}", trimmed));
+        }
+    }
+    candidates.push("skip".to_string());
+
+    for tag_name in &candidates {
+        let open_prefix = format!("<{}", tag_name);
+        let mut search_from = 0;
+        while let Some(rel) = text[search_from..].find(&open_prefix) {
+            let start = search_from + rel;
+            let after_name = start + open_prefix.len();
+            let next_ch = text[after_name..].chars().next();
+            if !matches!(next_ch, Some(' ') | Some('\t') | Some('\n') | Some('\r') | Some('>') | Some('/')) {
+                search_from = after_name;
+                continue;
+            }
+            let Some(gt_rel) = text[after_name..].find('>') else {
+                break;
+            };
+            let gt_pos = after_name + gt_rel;
+            let header = &text[after_name..gt_pos];
+            let self_closing = header.trim_end().ends_with('/');
+            let reason_attr = extract_reason_attr(header);
+
+            let body = if self_closing {
+                String::new()
+            } else {
+                let close_tag = format!("</{}>", tag_name);
+                if let Some(close_rel) = text[gt_pos + 1..].find(&close_tag) {
+                    text[gt_pos + 1..gt_pos + 1 + close_rel].trim().to_string()
+                } else {
+                    String::new()
+                }
+            };
+
+            let combined = match (reason_attr, body.is_empty()) {
+                (Some(r), true) => r,
+                (Some(r), false) if r == body => r,
+                (Some(r), false) => format!("{}: {}", r, body),
+                (None, false) => body,
+                (None, true) => "Skipped without additional details".to_string(),
+            };
+            return Some(combined);
+        }
+    }
+    None
+}
+
+fn extract_reason_attr(header: &str) -> Option<String> {
+    let idx = header.find("reason")?;
+    let rest = header[idx + "reason".len()..].trim_start();
+    let rest = rest.strip_prefix('=')?.trim_start();
+    let quote = rest.chars().next()?;
+    if quote != '"' && quote != '\'' {
+        return None;
+    }
+    let after_quote = &rest[quote.len_utf8()..];
+    let end = after_quote.find(quote)?;
+    let val = after_quote[..end].trim();
+    if val.is_empty() {
+        None
+    } else {
+        Some(val.to_string())
+    }
 }
 
 #[cfg(test)]
@@ -281,6 +487,7 @@ mod tests {
             "I inspected the file and it looks correct.",
             Some("No edits were applied"),
         );
+        assert!(is_review_step_execution_prompt(&prompt));
         assert!(prompt.contains("# Correction Required: Review Finding Turn Incomplete"));
         assert!(prompt.contains("<previous_response>"));
         assert!(prompt.contains("I inspected the file and it looks correct."));
@@ -303,7 +510,7 @@ mod tests {
             id: "rev-7".to_string(),
             title: "Performance Review".to_string(),
             created_at: 100,
-            model: "model-x".to_string(),
+            model: tauqe_protocol::ModelRef::openrouter("model-x"),
             description: Some("Optimize string copies".to_string()),
             user_prompt: None,
             target_files: vec!["crates/tui/src/view.rs".to_string()],
@@ -313,8 +520,7 @@ mod tests {
                 model: None,
                 severity: ReviewSeverity::Warning,
                 status: ReviewItemStatus::Todo,
-                file_path: Some("crates/tui/src/view.rs".to_string()),
-                line_range: Some((100, 110)),
+                files: vec!["crates/tui/src/view.rs".to_string()],
                 resolution_notes: None,
                 body: "Replace clone with reference borrowing".to_string(),
             }],
@@ -333,6 +539,41 @@ mod tests {
         assert_eq!(target.review_id.as_deref(), Some("rev-7"));
         assert_eq!(target.item_id, 3);
         assert_eq!(extract_review_step_execution_id(&prompt), Some(3));
+    }
+
+    #[test]
+    fn test_review_discussion_prompt_formatting() {
+        use tauqe_protocol::review::{ReviewItem, ReviewItemStatus, ReviewSeverity};
+        use tauqe_protocol::ModelRef;
+
+        let session = ReviewSession {
+            id: "rev-42".to_string(),
+            title: "Security Audit".to_string(),
+            created_at: 100,
+            model: ModelRef::openrouter("test-model"),
+            description: Some("Security review for core crate".to_string()),
+            user_prompt: None,
+            target_files: vec!["src/lib.rs".to_string()],
+            items: vec![ReviewItem {
+                id: 1,
+                title: "Race condition in cache".to_string(),
+                model: None,
+                severity: ReviewSeverity::Critical,
+                status: ReviewItemStatus::Discussion,
+                files: vec!["src/lib.rs".to_string()],
+                resolution_notes: Some("Extend scope of mutex guard".to_string()),
+                body: "Lock is dropped prematurely.".to_string(),
+            }],
+            raw_markdown: String::new(),
+        };
+
+        let prompt =
+            format_review_discussion_prompt(&session, Some(1), "Is this really possible?");
+        assert!(prompt.contains("# Review Discussion: [rev-42] Security Audit"));
+        assert!(prompt.contains("Race condition in cache"));
+        assert!(prompt.contains("Resolution Strategy: Extend scope of mutex guard"));
+        assert!(prompt.contains("Is this really possible?"));
+        assert!(prompt.contains("explain the proposed modifications clearly in conversational text"));
     }
 
     #[test]

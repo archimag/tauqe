@@ -32,7 +32,7 @@ impl std::str::FromStr for ModelRole {
     type Err = String;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.trim().to_lowercase().as_str() {
+        match s.trim().to_ascii_lowercase().as_str() {
             "scribe" => Ok(ModelRole::Scribe),
             "coder" => Ok(ModelRole::Coder),
             "architect" => Ok(ModelRole::Architect),

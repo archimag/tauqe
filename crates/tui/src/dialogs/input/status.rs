@@ -72,6 +72,7 @@ pub(crate) async fn apply_status_dialog(
                 tauqe_protocol::ReviewStatus::Todo,
                 tauqe_protocol::ReviewStatus::InProgress,
                 tauqe_protocol::ReviewStatus::Fixed,
+                tauqe_protocol::ReviewStatus::Skipped,
                 tauqe_protocol::ReviewStatus::Rejected,
             ];
             let new_status = match statuses.get(chosen_idx).copied() {

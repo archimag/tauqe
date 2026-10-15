@@ -437,13 +437,17 @@ pub(crate) const CANCEL_UNWIND_GRACE: std::time::Duration =
 /// task while a transaction is open.
 pub(crate) fn build_apply_policy(
     state: &Arc<AppState>,
-    workflow_name: &str,
+    workflow: tauqe_protocol::WorkflowKind,
 ) -> Box<dyn tauqe_core::workflow::policy::ApplyPolicy> {
-    match workflow_name {
-        "naive" => Box::new(tauqe_core::workflow::policy::DirectApplyPolicy::new()),
-        _ => Box::new(tauqe_core::workflow::git_policy::GitTransactionPolicy::with_guard(
-            Arc::clone(&state.git_transaction_active),
-        )),
+    match workflow {
+        tauqe_protocol::WorkflowKind::Naive => {
+            Box::new(tauqe_core::workflow::policy::DirectApplyPolicy::new())
+        }
+        tauqe_protocol::WorkflowKind::Git => {
+            Box::new(tauqe_core::workflow::git_policy::GitTransactionPolicy::with_guard(
+                Arc::clone(&state.git_transaction_active),
+            ))
+        }
     }
 }
 
@@ -511,7 +515,7 @@ async fn prepare_turn(
         method: events::MODEL_STARTED.to_string(),
         params: serde_json::to_value(ModelStartedEvent {
             operation_id: op_id.clone(),
-            model: model.to_string(),
+            model: model.clone(),
             role,
             alias,
             effort,
@@ -546,16 +550,17 @@ async fn prepare_turn(
 /// therefore declines the marker.
 fn resolve_turn_protocol(
     prompt: &str,
-    develop_protocol: &str,
+    develop_protocol: tauqe_protocol::EditProtocolKind,
     marker: Option<&str>,
 ) -> Box<dyn PromptProtocol> {
     let base_protocol: Box<dyn PromptProtocol> = if is_discussion_prompt(prompt) {
         Box::new(JsonPromptProtocol::discussion())
     } else {
-        let protocol_str = develop_protocol.trim().to_lowercase();
-        match protocol_str.as_str() {
-            "structured" | "json" => Box::new(JsonPromptProtocol::default()),
-            _ => Box::new(XmlPromptProtocol),
+        match develop_protocol {
+            tauqe_protocol::EditProtocolKind::Structured => {
+                Box::new(JsonPromptProtocol::default())
+            }
+            tauqe_protocol::EditProtocolKind::Xml => Box::new(XmlPromptProtocol),
         }
     };
     match marker {
@@ -588,7 +593,7 @@ async fn run_prepared_turn(
     let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamEvent>(100);
 
     let protocol =
-        resolve_turn_protocol(&prompt, &app_config.develop.protocol, marker.as_deref());
+        resolve_turn_protocol(&prompt, app_config.develop.protocol, marker.as_deref());
 
     let mut workflow_opts = tauqe_core::workflow::WorkflowOptions::from_app_config(&app_config);
     workflow_opts.reasoning_effort = reasoning_effort.or_else(|| match &selection {
@@ -1130,9 +1135,9 @@ pub async fn start_model_turn(
         prepare_turn(state, custom_selection, plan_context, None, false, marker, None).await?;
     let op_id = prepared.op_id.clone();
     let state_clone = Arc::clone(state);
-    let workflow_name = prepared.app_config.develop.workflow.trim().to_lowercase();
+    let workflow = prepared.app_config.develop.workflow;
     tokio::spawn(async move {
-        let policy = build_apply_policy(&state_clone, workflow_name.as_str());
+        let policy = build_apply_policy(&state_clone, workflow);
         let _ = run_prepared_turn(&state_clone, prompt, prepared, policy).await;
     });
     Ok(op_id)
@@ -1546,11 +1551,11 @@ mod tests {
         let plan_prompt = "# Plan Discussion: [p-1] Refine plan\n".to_string();
         let review_prompt = format!(
             "{} [rev-1] Fix issue\n",
-            tauqe_protocol::review::REVIEW_DISCUSSION_PREFIX
+            tauqe_core::review::REVIEW_DISCUSSION_PREFIX
         );
 
         for prompt in [plan_prompt, review_prompt] {
-            let protocol = resolve_turn_protocol(&prompt, "xml", None);
+            let protocol = resolve_turn_protocol(&prompt, tauqe_protocol::EditProtocolKind::Xml, None);
 
             // The discussion protocol carries plan capabilities while hiding
             // file editing and toolchain verification from the model.
@@ -1572,11 +1577,19 @@ mod tests {
     #[test]
     fn test_non_discussion_turn_respects_configured_protocol() {
         // A plain develop turn keeps the configured base protocol.
-        let xml_protocol = resolve_turn_protocol("Change compute to 42", "xml", None);
+        let xml_protocol = resolve_turn_protocol(
+            "Change compute to 42",
+            tauqe_protocol::EditProtocolKind::Xml,
+            None,
+        );
         assert!(xml_protocol.supports(tauqe_protocol::LlmCapability::FileEdits));
         assert!(xml_protocol.supports(tauqe_protocol::LlmCapability::ToolchainVerify));
 
-        let json_protocol = resolve_turn_protocol("Change compute to 42", "structured", None);
+        let json_protocol = resolve_turn_protocol(
+            "Change compute to 42",
+            tauqe_protocol::EditProtocolKind::Structured,
+            None,
+        );
         assert!(json_protocol.supports(tauqe_protocol::LlmCapability::FileEdits));
         assert!(json_protocol.supports(tauqe_protocol::LlmCapability::ToolchainVerify));
         // The structured edits protocol never advertises plan capabilities.

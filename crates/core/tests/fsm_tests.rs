@@ -436,6 +436,222 @@ async fn git_workflow_heals_compiler_failure() {
 }
 
 #[tokio::test]
+async fn git_workflow_verifies_and_heals_when_verify_tag_omitted_by_model() {
+    let (_dir, repo_root) = init_repo();
+    std::fs::write(repo_root.join("Cargo.toml"), HEAL_MANIFEST).expect("write manifest");
+    std::fs::create_dir_all(repo_root.join("src")).expect("create src directory");
+    std::fs::write(repo_root.join("src/lib.rs"), HEAL_LIB).expect("write broken library");
+    commit_fixture(&repo_root, &["Cargo.toml", "src/lib.rs"]);
+
+    let mut context = ContextManager::new(repo_root.clone());
+    context
+        .add_file("src/lib.rs", ContextAccess::Editable)
+        .expect("add library to context");
+    let mut history = HistoryManager::new(repo_root.clone());
+
+    // First attempt: repair alpha ONLY, and DO NOT emit <verify>.
+    // Without default verification, broken code would be committed! With auto-verify,
+    // cargo check fails because beta is still broken, triggering healing.
+    let fix_alpha_no_verify = edit_block(
+        "Repair alpha return type",
+        "src/lib.rs",
+        "pub fn alpha() -> i32 { \"alpha\" }",
+        "pub fn alpha() -> i32 { 1 }",
+    );
+    // Healing attempt: repair beta, also without <verify>.
+    let fix_beta_no_verify = edit_block(
+        "Repair beta return type",
+        "src/lib.rs",
+        "pub fn beta() -> i32 { \"beta\" }",
+        "pub fn beta() -> i32 { 2 }",
+    );
+    let provider = MockLlmProvider::scripted([
+        MockResponse::text(fix_alpha_no_verify),
+        MockResponse::text(fix_beta_no_verify),
+    ]);
+    let model = ModelRef::openrouter("mock/model");
+    let protocol = tauqe_core::prompt::xml::XmlPromptProtocol;
+    let protocol = protocol.with_turn_marker(MARKER).unwrap();
+    let (stream_tx, cancel_rx) = event_channel();
+
+    let mut policy = GitTransactionPolicy::new();
+    let exec = SingleExecution::new(WorkflowOptions::default());
+    let execution = exec
+        .execute(
+            &mut policy,
+            "Fix return types in src/lib.rs",
+            &provider,
+            &model,
+            &mut context,
+            &mut history,
+            protocol.as_ref(),
+            stream_tx,
+            cancel_rx,
+        )
+        .await
+        .expect("workflow execution succeeds");
+
+    match execution.result {
+        ModelResult::Edit { applied, error, .. } => {
+            assert!(error.is_none(), "unexpected error: {error:?}");
+            assert!(applied, "auto-verification should heal and apply edits");
+        }
+        other => panic!("expected applied edits, got {other:?}"),
+    }
+
+    let healed = std::fs::read_to_string(repo_root.join("src/lib.rs")).expect("read healed library");
+    assert!(healed.contains("pub fn alpha() -> i32 { 1 }"));
+    assert!(healed.contains("pub fn beta() -> i32 { 2 }"));
+    assert_eq!(
+        provider.requests().len(),
+        2,
+        "must trigger verification healing pass despite missing verify tag"
+    );
+}
+
+#[tokio::test]
+async fn git_workflow_skips_verification_when_auto_verify_disabled() {
+    let (_dir, repo_root) = init_repo();
+    std::fs::write(repo_root.join("Cargo.toml"), HEAL_MANIFEST).expect("write manifest");
+    std::fs::create_dir_all(repo_root.join("src")).expect("create src directory");
+    std::fs::write(repo_root.join("src/lib.rs"), HEAL_LIB).expect("write broken library");
+    std::fs::write(
+        repo_root.join("tauqe.toml"),
+        "[toolchain]\nauto_verify = false\n",
+    )
+    .expect("write config");
+    commit_fixture(&repo_root, &["Cargo.toml", "src/lib.rs", "tauqe.toml"]);
+
+    let mut context = ContextManager::new(repo_root.clone());
+    context
+        .add_file("src/lib.rs", ContextAccess::Editable)
+        .expect("add library to context");
+    let mut history = HistoryManager::new(repo_root.clone());
+
+    let fix_alpha_no_verify = edit_block(
+        "Repair alpha only",
+        "src/lib.rs",
+        "pub fn alpha() -> i32 { \"alpha\" }",
+        "pub fn alpha() -> i32 { 1 }",
+    );
+    let provider = MockLlmProvider::scripted([MockResponse::text(fix_alpha_no_verify)]);
+    let model = ModelRef::openrouter("mock/model");
+    let protocol = tauqe_core::prompt::xml::XmlPromptProtocol;
+    let protocol = protocol.with_turn_marker(MARKER).unwrap();
+    let (stream_tx, cancel_rx) = event_channel();
+
+    let mut policy = GitTransactionPolicy::new();
+    let exec = SingleExecution::new(WorkflowOptions::default());
+    let execution = exec
+        .execute(
+            &mut policy,
+            "Fix alpha in src/lib.rs",
+            &provider,
+            &model,
+            &mut context,
+            &mut history,
+            protocol.as_ref(),
+            stream_tx,
+            cancel_rx,
+        )
+        .await
+        .expect("workflow execution succeeds");
+
+    match execution.result {
+        ModelResult::Edit { applied, error, .. } => {
+            assert!(error.is_none());
+            assert!(applied, "edits should be applied directly when auto_verify is disabled");
+        }
+        other => panic!("expected applied edits, got {other:?}"),
+    }
+
+    assert_eq!(
+        provider.requests().len(),
+        1,
+        "must not trigger verification healing when auto_verify is disabled"
+    );
+}
+
+#[tokio::test]
+async fn git_workflow_heals_when_verification_response_has_text_only() {
+    let (_dir, repo_root) = init_repo();
+    std::fs::write(repo_root.join("Cargo.toml"), HEAL_MANIFEST).expect("write manifest");
+    std::fs::create_dir_all(repo_root.join("src")).expect("create src directory");
+    std::fs::write(repo_root.join("src/lib.rs"), HEAL_LIB).expect("write broken library");
+    commit_fixture(&repo_root, &["Cargo.toml", "src/lib.rs"]);
+
+    let mut context = ContextManager::new(repo_root.clone());
+    context
+        .add_file("src/lib.rs", ContextAccess::Editable)
+        .expect("add library to context");
+    let mut history = HistoryManager::new(repo_root.clone());
+
+    let fix_alpha = format!(
+        "{edits}\n<verify_{MARKER} target=\"check\" on_success=\"silent\" />",
+        edits = edit_block(
+            "Repair alpha return type",
+            "src/lib.rs",
+            "pub fn alpha() -> i32 { \"alpha\" }",
+            "pub fn alpha() -> i32 { 1 }",
+        ),
+    );
+    // The first verification retry response gives only text explanation without any edits.
+    let text_only_retry = "I see that beta also has a mismatched return type. Let me fix it.".to_string();
+    let fix_beta = format!(
+        "{edits}\n<verify_{MARKER} target=\"check\" on_success=\"silent\" />",
+        edits = edit_block(
+            "Repair beta return type",
+            "src/lib.rs",
+            "pub fn beta() -> i32 { \"beta\" }",
+            "pub fn beta() -> i32 { 2 }",
+        ),
+    );
+    let provider = MockLlmProvider::scripted([
+        MockResponse::text(fix_alpha),
+        MockResponse::text(text_only_retry),
+        MockResponse::text(fix_beta),
+    ]);
+    let model = ModelRef::openrouter("mock/model");
+    let protocol = tauqe_core::prompt::xml::XmlPromptProtocol;
+    let protocol = protocol.with_turn_marker(MARKER).unwrap();
+    let (stream_tx, cancel_rx) = event_channel();
+
+    let mut policy = GitTransactionPolicy::new();
+    let exec = SingleExecution::new(WorkflowOptions::default());
+    let execution = exec
+        .execute(
+            &mut policy,
+            "Fix the mismatched return types in src/lib.rs",
+            &provider,
+            &model,
+            &mut context,
+            &mut history,
+            protocol.as_ref(),
+            stream_tx,
+            cancel_rx,
+        )
+        .await
+        .expect("workflow execution succeeds");
+
+    match execution.result {
+        ModelResult::Edit { applied, error, .. } => {
+            assert!(error.is_none(), "unexpected error: {error:?}");
+            assert!(applied, "healing should survive text-only retry and apply the repaired edits");
+        }
+        other => panic!("expected applied edits, got {other:?}"),
+    }
+
+    let healed = std::fs::read_to_string(repo_root.join("src/lib.rs")).expect("read healed library");
+    assert!(healed.contains("pub fn alpha() -> i32 { 1 }"));
+    assert!(healed.contains("pub fn beta() -> i32 { 2 }"));
+    assert_eq!(provider.requests().len(), 3);
+    // The third request must contain the user prompt informing the model that edits were missing.
+    assert!(provider.requests()[2].messages[1]
+        .content
+        .contains("did not include any code edits"));
+}
+
+#[tokio::test]
 async fn scratchpad_from_discovery_reaches_verification_healing() {
     let (_dir, repo_root) = init_repo();
     std::fs::write(repo_root.join("Cargo.toml"), HEAL_MANIFEST).expect("write manifest");
@@ -973,7 +1189,7 @@ async fn plan_semantic_recovery_lifecycle_end_to_end() {
         PlanScopeEvaluation::StepBlocked
     );
 
-    // 4. Invariant #c-3: Sub-tree grafting replaces blocked step 2 and remaps dependents
+    // 4. Wave Horizon Planning replaces uncompleted horizon while preserving Done foundation
     let replacement = vec![
         PlanItem {
             id: "2.1".to_string(),
@@ -990,29 +1206,36 @@ async fn plan_semantic_recovery_lifecycle_end_to_end() {
             depends_on: vec!["2.1".to_string()],
             ..Default::default()
         },
+        PlanItem {
+            id: "3".to_string(),
+            title: "Integration Test".to_string(),
+            status: PlanItemStatus::Todo,
+            files: vec!["tests/integration.rs".to_string()],
+            depends_on: vec!["2.2".to_string()],
+            ..Default::default()
+        },
     ];
 
-    let grafted = tauqe_core::plan::storage::PlanStorage::graft_subtree(
+    let recovered = tauqe_core::plan::storage::PlanStorage::replace_uncompleted_horizon(
         &repo_root,
         "recovery-plan",
-        "2",
         replacement,
     )
-    .expect("graft subtree over blocked step");
+    .expect("replace uncompleted horizon over blocked step");
 
-    assert_eq!(grafted.items.len(), 4);
-    assert_eq!(grafted.items[0].id, "1");
-    assert_eq!(grafted.items[0].status, PlanItemStatus::Done);
-    assert_eq!(grafted.items[1].id, "2.1");
-    assert_eq!(grafted.items[2].id, "2.2");
-    assert_eq!(grafted.items[3].id, "3");
+    assert_eq!(recovered.items.len(), 4);
+    assert_eq!(recovered.items[0].id, "1");
+    assert_eq!(recovered.items[0].status, PlanItemStatus::Done);
+    assert_eq!(recovered.items[1].id, "2.1");
+    assert_eq!(recovered.items[2].id, "2.2");
+    assert_eq!(recovered.items[3].id, "3");
 
-    // Dependent tail step 3 is automatically remapped to exit step "2.2"
-    let remapped_dep = grafted.find_item("3").expect("find step 3");
+    // Dependent tail step 3 depends on step "2.2"
+    let remapped_dep = recovered.find_item("3").expect("find step 3");
     assert_eq!(remapped_dep.depends_on, vec!["2.2".to_string()]);
 
     // 5. Invariant #c-4 & #c-5: DAG readiness evaluation on the updated plan
-    match grafted.evaluate_scope(None) {
+    match recovered.evaluate_scope(None) {
         PlanScopeEvaluation::Ready(leaves) => {
             let ids: Vec<&str> = leaves.iter().map(|l| l.id.as_str()).collect();
             assert_eq!(ids, vec!["2.1", "2.2", "3"]);
@@ -1020,7 +1243,7 @@ async fn plan_semantic_recovery_lifecycle_end_to_end() {
         other => panic!("Expected Ready, got {:?}", other),
     }
 
-    match grafted.evaluate_scope(Some("3")) {
+    match recovered.evaluate_scope(Some("3")) {
         PlanScopeEvaluation::BlockedByDependencies(deps) => {
             assert_eq!(deps.len(), 1);
             assert!(deps[0].contains("#3"));
@@ -1029,7 +1252,7 @@ async fn plan_semantic_recovery_lifecycle_end_to_end() {
     }
 
     // Advance 2.1 to Done
-    let mut progressed = grafted.clone();
+    let mut progressed = recovered.clone();
     progressed.update_item_status("2.1", PlanItemStatus::Done);
     tauqe_core::plan::storage::PlanStorage::save_plan(&repo_root, &progressed)
         .expect("save progress");
@@ -1244,7 +1467,7 @@ fn discussion_prompt_selects_structured_discussion_protocol() {
     let plan_prompt = "# Plan Discussion: [p-1] Refine plan\n";
     let review_prompt = format!(
         "{} [rev-1] Fix issue\n",
-        tauqe_protocol::review::REVIEW_DISCUSSION_PREFIX
+        tauqe_core::review::REVIEW_DISCUSSION_PREFIX
     );
 
     for prompt in [plan_prompt, review_prompt.as_str()] {

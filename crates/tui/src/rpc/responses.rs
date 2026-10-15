@@ -149,7 +149,7 @@ pub async fn handle_response(
                 st.review.running = false;
                 st.review.error = Some(err.message.clone());
             }
-            Some(methods::PLAN_REFINE) => {
+            Some(methods::PLAN_REFINE) | Some(methods::PLAN_REPLAN) => {
                 st.plans_view.refining = false;
                 st.plans_view.refining_plan_id = None;
             }
@@ -470,7 +470,7 @@ pub async fn handle_response(
                 }
             }
             methods::PLAN_SET_ACTIVE => {}
-            methods::PLAN_REFINE => {
+            methods::PLAN_REFINE | methods::PLAN_REPLAN => {
                 st.plans_view.refining = false;
                 let refining_plan_id = st.plans_view.refining_plan_id.take();
                 if let Ok(refine_res) = serde_json::from_value::<tauqe_protocol::PlanRefineResult>(val) {
@@ -478,19 +478,21 @@ pub async fn handle_response(
                         tauqe_protocol::PlanRefineResult::Success { plan, explanation } => {
                             let plan_title = plan.title.clone();
                             let plan_id = plan.id.clone();
+                            let (total_items, completed_items) = plan.count_stats();
                             if let Some(pos) = st.plans_view.plans.iter().position(|p| p.id == plan.id) {
                                 st.plans_view.plans[pos] = plan;
                             } else {
                                 st.plans_view.plans.push(plan);
                             }
-                            st.plans_view.expanded_plans.insert(plan_id);
+                            st.plans_view.expanded_plans.insert(plan_id.clone());
+                            st.plans_view.collapsed_sections.remove(&format!("impl:{}", plan_id));
                             st.plans_view.clamp_selection();
                             st.plans_view.scroll_to_selected();
                             let msg = match explanation {
                                 Some(exp) if !exp.trim().is_empty() => {
-                                    format!("Plan '{}' refined: {}", plan_title, exp)
+                                    format!("Plan '{}' horizon updated ({}/{} done): {}", plan_title, completed_items, total_items, exp)
                                 }
-                                _ => format!("Plan '{}' refined successfully by architect", plan_title),
+                                _ => format!("Plan '{}' horizon updated successfully by architect ({}/{} done)", plan_title, completed_items, total_items),
                             };
                             st.notify_success(msg);
                         }
@@ -502,13 +504,14 @@ pub async fn handle_response(
                                 .find(|p| p.id == target_plan_id)
                                 .map(|p| p.title.clone())
                                 .unwrap_or_else(|| "Plan".to_string());
+                            st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
                             st.plans_view.refine_blocked = Some(crate::views::plans::PlanRefineBlockedState {
                                 plan_id: target_plan_id,
                                 plan_title,
                                 reason,
                             });
                             st.view_mode = ViewMode::Plans;
-                            st.notify_warning("Plan refinement blocked by architect: review required");
+                            st.notify_warning("Plan horizon synthesis blocked by architect: manual intervention or replanning required");
                         }
                     }
                 }
@@ -578,5 +581,105 @@ mod tests {
             .active_notification()
             .expect("pre-flight failure should raise a notification");
         assert_eq!(notif.level, NotificationLevel::Warning);
+    }
+
+    #[tokio::test]
+    async fn test_plan_refine_response_updates_horizon_and_notifies() {
+        let state = test_state();
+        {
+            let mut st = state.lock().await;
+            st.plans_view.refining = true;
+            st.plans_view.refining_plan_id = Some("p1".to_string());
+            st.plans_view.plans = vec![tauqe_protocol::Plan {
+                id: "p1".to_string(),
+                title: "Plan 1".to_string(),
+                ..Default::default()
+            }];
+        }
+
+        let plan = tauqe_protocol::Plan {
+            id: "p1".to_string(),
+            title: "Plan 1".to_string(),
+            items: vec![tauqe_protocol::PlanItem {
+                id: "s1".to_string(),
+                title: "Step 1".to_string(),
+                status: tauqe_protocol::PlanItemStatus::Todo,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let resp = Response {
+            id: RequestId::Number(1),
+            result: Some(
+                serde_json::to_value(tauqe_protocol::PlanRefineResult::Success {
+                    plan,
+                    explanation: Some("New horizon synthesized".to_string()),
+                })
+                .unwrap(),
+            ),
+            error: None,
+        };
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+        crate::rpc::transport::send_request_with_id(
+            &mut conn,
+            1,
+            methods::PLAN_REFINE,
+            serde_json::json!({}),
+        )
+        .await
+        .unwrap();
+
+        handle_response(resp, &state, &mut conn).await;
+
+        let st = state.lock().await;
+        assert!(!st.plans_view.refining);
+        assert!(st.plans_view.refining_plan_id.is_none());
+        assert_eq!(st.plans_view.plans[0].items.len(), 1);
+        let notif = st.active_notification().expect("notification expected");
+        assert!(notif.text.contains("Plan 'Plan 1' horizon updated"));
+    }
+
+    #[tokio::test]
+    async fn test_plan_refine_response_blocked_surfaces_dialog() {
+        let state = test_state();
+        {
+            let mut st = state.lock().await;
+            st.plans_view.refining = true;
+            st.plans_view.refining_plan_id = Some("p1".to_string());
+            st.plans_view.plans = vec![tauqe_protocol::Plan {
+                id: "p1".to_string(),
+                title: "Plan 1".to_string(),
+                ..Default::default()
+            }];
+        }
+
+        let resp = Response {
+            id: RequestId::Number(2),
+            result: Some(
+                serde_json::to_value(tauqe_protocol::PlanRefineResult::Blocked {
+                    reason: "Contradiction found".to_string(),
+                })
+                .unwrap(),
+            ),
+            error: None,
+        };
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+        crate::rpc::transport::send_request_with_id(
+            &mut conn,
+            2,
+            methods::PLAN_REFINE,
+            serde_json::json!({}),
+        )
+        .await
+        .unwrap();
+
+        handle_response(resp, &state, &mut conn).await;
+
+        let st = state.lock().await;
+        assert!(!st.plans_view.refining);
+        assert_eq!(st.view_mode, ViewMode::Plans);
+        let blocked = st.plans_view.refine_blocked.as_ref().expect("refine_blocked expected");
+        assert_eq!(blocked.plan_id, "p1");
+        assert_eq!(blocked.reason, "Contradiction found");
     }
 }

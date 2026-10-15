@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::path::Path;
+use tokio::sync::watch;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ToolchainKind {
@@ -13,6 +14,7 @@ pub enum ToolchainKind {
 #[derive(Debug, Clone)]
 pub struct ToolchainCheckResult {
     pub success: bool,
+    pub is_cancelled: bool,
     pub command: String,
     pub stdout: String,
     pub stderr: String,
@@ -107,6 +109,7 @@ pub fn resolve_verification_commands(
 pub async fn run_verification_pipeline(
     repo_root: &Path,
     target: &VerifyTarget,
+    cancel_rx: Option<&watch::Receiver<bool>>,
 ) -> (bool, Vec<ToolchainCheckResult>) {
     let config = crate::config::load_toolchain_config(repo_root);
     let (kind, _) = detect_toolchain(repo_root, config.check_command.as_deref());
@@ -115,7 +118,7 @@ pub async fn run_verification_pipeline(
     let mut results = Vec::new();
 
     for cmd in commands {
-        let res = run_toolchain_check_with_timeout(repo_root, &cmd, timeout_secs).await;
+        let res = run_toolchain_check_with_timeout(repo_root, &cmd, timeout_secs, cancel_rx).await;
         let success = res.success;
         results.push(res);
         if !success {
@@ -179,25 +182,57 @@ pub async fn run_toolchain_check(repo_root: &Path, command_str: &str) -> Toolcha
         repo_root,
         command_str,
         crate::config::DEFAULT_TOOLCHAIN_TIMEOUT_SECS,
+        None,
     )
     .await
 }
 
-/// Executes a toolchain verification command in repo root with a wall-clock timeout.
+#[cfg(unix)]
+fn kill_process_group(pid: u32) {
+    extern "C" {
+        fn kill(pid: i32, sig: i32) -> i32;
+    }
+    if let Ok(pid_i32) = i32::try_from(pid) {
+        if pid_i32 > 1 {
+            unsafe {
+                let _ = kill(-pid_i32, 9);
+            }
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn kill_process_group(_pid: u32) {}
+
+async fn wait_for_cancel(mut rx: watch::Receiver<bool>) {
+    if *rx.borrow() {
+        return;
+    }
+    while rx.changed().await.is_ok() {
+        if *rx.borrow() {
+            return;
+        }
+    }
+    std::future::pending::<()>().await;
+}
+
+/// Executes a toolchain verification command in repo root with a wall-clock timeout and cancellation.
 ///
 /// The command string is tokenized with shell-style quoting so arguments that
-/// contain spaces survive intact, and the child process is configured to be
-/// killed when the timeout drops its handle instead of lingering as background
-/// load after the turn moves on.
+/// contain spaces survive intact. On Unix platforms, the child process is launched
+/// in an isolated process group (`process_group(0)`) so that timeouts or client
+/// cancellations terminate the entire process hierarchy (e.g. `rustc` and test binaries).
 pub async fn run_toolchain_check_with_timeout(
     repo_root: &Path,
     command_str: &str,
     timeout_secs: u64,
+    cancel_rx: Option<&watch::Receiver<bool>>,
 ) -> ToolchainCheckResult {
     let tokens = tokenize_command(command_str);
     let Some((program, args)) = tokens.split_first() else {
         return ToolchainCheckResult {
             success: true,
+            is_cancelled: false,
             command: command_str.to_string(),
             stdout: String::new(),
             stderr: String::new(),
@@ -205,53 +240,117 @@ pub async fn run_toolchain_check_with_timeout(
         };
     };
 
+    if let Some(rx) = cancel_rx {
+        if *rx.borrow() {
+            return ToolchainCheckResult {
+                success: false,
+                is_cancelled: true,
+                command: command_str.to_string(),
+                stdout: String::new(),
+                stderr: "Execution cancelled".to_string(),
+                combined_output: format!("Command '{}' was cancelled", command_str),
+            };
+        }
+    }
+
     let mut cmd = tokio::process::Command::new(program);
     cmd.args(args);
     cmd.current_dir(repo_root);
-    // Terminate the child when the timeout drops its future; otherwise a long
-    // `cargo test` keeps running in the background after the turn gave up.
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
     cmd.kill_on_drop(true);
 
-    let output_res =
-        tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), cmd.output()).await;
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.as_std_mut().process_group(0);
+    }
 
-    match output_res {
-        Ok(Ok(output)) => {
-            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-            let mut combined = String::new();
-            if !stdout.is_empty() {
-                combined.push_str(&stdout);
-            }
-            if !stderr.is_empty() {
-                if !combined.is_empty() && !combined.ends_with('\n') {
-                    combined.push('\n');
-                }
-                combined.push_str(&stderr);
-            }
-
-            ToolchainCheckResult {
-                success: output.status.success(),
+    let child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(err) => {
+            return ToolchainCheckResult {
+                success: false,
+                is_cancelled: false,
                 command: command_str.to_string(),
-                stdout,
-                stderr,
-                combined_output: combined,
+                stdout: String::new(),
+                stderr: err.to_string(),
+                combined_output: format!("Failed to run command '{}': {}", command_str, err),
+            };
+        }
+    };
+
+    let child_pid = child.id();
+    let cancel_fut = async {
+        if let Some(rx) = cancel_rx {
+            wait_for_cancel(rx.clone()).await;
+        } else {
+            std::future::pending::<()>().await;
+        }
+    };
+
+    tokio::select! {
+        output_res = child.wait_with_output() => {
+            match output_res {
+                Ok(output) => {
+                    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+                    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+                    let mut combined = String::new();
+                    if !stdout.is_empty() {
+                        combined.push_str(&stdout);
+                    }
+                    if !stderr.is_empty() {
+                        if !combined.is_empty() && !combined.ends_with('\n') {
+                            combined.push('\n');
+                        }
+                        combined.push_str(&stderr);
+                    }
+
+                    ToolchainCheckResult {
+                        success: output.status.success(),
+                        is_cancelled: false,
+                        command: command_str.to_string(),
+                        stdout,
+                        stderr,
+                        combined_output: combined,
+                    }
+                }
+                Err(err) => ToolchainCheckResult {
+                    success: false,
+                    is_cancelled: false,
+                    command: command_str.to_string(),
+                    stdout: String::new(),
+                    stderr: err.to_string(),
+                    combined_output: format!("Failed to wait for command '{}': {}", command_str, err),
+                },
             }
         }
-        Ok(Err(err)) => ToolchainCheckResult {
-            success: false,
-            command: command_str.to_string(),
-            stdout: String::new(),
-            stderr: err.to_string(),
-            combined_output: format!("Failed to run command '{}': {}", command_str, err),
-        },
-        Err(_) => ToolchainCheckResult {
-            success: false,
-            command: command_str.to_string(),
-            stdout: String::new(),
-            stderr: format!("Execution timed out ({}s)", timeout_secs),
-            combined_output: format!("Command '{}' timed out after {}s", command_str, timeout_secs),
-        },
+        _ = tokio::time::sleep(std::time::Duration::from_secs(timeout_secs)) => {
+            if let Some(pid) = child_pid {
+                kill_process_group(pid);
+            }
+            ToolchainCheckResult {
+                success: false,
+                is_cancelled: false,
+                command: command_str.to_string(),
+                stdout: String::new(),
+                stderr: format!("Execution timed out ({}s)", timeout_secs),
+                combined_output: format!("Command '{}' timed out after {}s", command_str, timeout_secs),
+            }
+        }
+        _ = cancel_fut => {
+            if let Some(pid) = child_pid {
+                kill_process_group(pid);
+            }
+            ToolchainCheckResult {
+                success: false,
+                is_cancelled: true,
+                command: command_str.to_string(),
+                stdout: String::new(),
+                stderr: "Execution cancelled".to_string(),
+                combined_output: format!("Command '{}' was cancelled", command_str),
+            }
+        }
     }
 }
 
@@ -433,8 +532,34 @@ mod tests {
     #[tokio::test]
     async fn test_run_toolchain_check_with_timeout_preserves_quoted_arguments() {
         let dir = tempdir().unwrap();
-        let res = run_toolchain_check_with_timeout(dir.path(), "printf '%s' 'a b c'", 10).await;
+        let res = run_toolchain_check_with_timeout(dir.path(), "printf '%s' 'a b c'", 10, None).await;
         assert!(res.success, "command failed: {}", res.combined_output);
         assert_eq!(res.stdout, "a b c");
+    }
+
+    #[tokio::test]
+    async fn test_run_toolchain_check_with_timeout_pre_cancelled() {
+        let dir = tempdir().unwrap();
+        let (cancel_tx, cancel_rx) = watch::channel(true);
+        drop(cancel_tx);
+        let res = run_toolchain_check_with_timeout(dir.path(), "git --version", 10, Some(&cancel_rx)).await;
+        assert!(!res.success);
+        assert!(res.is_cancelled);
+        assert!(res.combined_output.contains("was cancelled"));
+    }
+
+    #[tokio::test]
+    async fn test_run_toolchain_check_cancellation_during_execution() {
+        let dir = tempdir().unwrap();
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+        let root = dir.path().to_path_buf();
+        let task = tokio::spawn(async move {
+            run_toolchain_check_with_timeout(&root, "sleep 10", 10, Some(&cancel_rx)).await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let _ = cancel_tx.send(true);
+        let res = task.await.unwrap();
+        assert!(!res.success);
+        assert!(res.is_cancelled);
     }
 }

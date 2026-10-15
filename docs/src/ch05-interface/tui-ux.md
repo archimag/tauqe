@@ -38,39 +38,26 @@ Reasoning output during an active turn is a progress indicator, not a document t
 - **Deferred deep rendering:** The tail uses lightweight per-line styling. The full Markdown parse and `syntect` code-block highlighting are not restarted against the still-open stream; they run exactly once, when the reasoning stage finalizes.
 - **Finalized transcript:** When reasoning completes, the sliding window is replaced by the complete reasoning transcript rendered through the standard Markdown pipeline, including syntax-highlighted code fences. The `Ctrl+R` fold/unfold toggle applies to both the live tail and the finalized transcript.
 
-- **`F2` / `Alt+2` / `Ctrl+2` (Context View):**
-  - Displays Pinned, User, and Auto context layers with token metrics.
-  - Quick keys: `e` (add file as editable), `r` / `a` (add file as read-only), `t` (toggle access Editable ↔ Read-Only), `u` (promote an Auto file to persistent User), `c` / `C` (clear all auto-requested files), `d` / `x` / `Del` (remove a file from context).
-  - Navigation and folding: `n` / `p` (or `j` / `k`, `↑` / `↓`) move the selection; `Space` / `Tab` or `Enter` fold or unfold a section; `Enter` also promotes an Auto file to User. `Esc` / `q` return to the REPL view.
-- **`F3` / `Alt+3` / `Ctrl+3` (Review View):**
-  - Dedicated code review workspace for static architectural and security audits.
-  - Unified navigation: `n` / `p` (or `↑` / `↓`), with `Ctrl+N` / `Ctrl+P` for accordion inspection of the next / previous finding.
-  - Interactive findings checklist: fold/unfold items (`Tab` / `Space`), execute the selected finding or every Todo finding in the session (`x`, with confirmation), and discuss the finding or the whole session in REPL (`d`).
-  - Intentional status assignment: Press `t` or `s` to open the status selection dialog (`1` Discussion, `2` Todo, `3` InProgress, `4` Fixed, `5` Rejected).
-  - Filtering and bulk folding: `f` toggles between all findings and hide-closed (FIXED / REJECTED); `a` folds or unfolds every session and finding.
-  - Run and refresh: `r` starts a new review of the current context; `Shift+R` refreshes the session list from the server.
-  - Clipboard and lifecycle: `c` / `y` copy the selected finding or session; `Delete` deletes a session (with confirmation); `Ctrl+R` folds or unfolds the thinking stream.
-- **`F4` / `Alt+4` / `Ctrl+4` (Plans View):**
+- **`F2` / `Alt+2` / `Ctrl+2` (Plans View):**
   - Workspace for managing tactical task hierarchies and execution roadmaps, split into an immutable Concept section (system invariants) and an Implementation section (executable steps).
   - Unified navigation: `n` / `p` (or `↑` / `↓`), with `Ctrl+N` / `Ctrl+P` for accordion inspection of the next / previous item.
   - Interactive tree of tasks with explicit statuses: Discussion, Todo, InProgress, Done, Blocked, and Cancelled.
   - Execution: `x` executes the target step, group, or entire plan (with confirmation); `Enter` executes a leaf step and folds/unfolds on groups and plan headers.
   - Discussion and refinement: `d` discusses the selected concept/step or the whole plan in REPL; `R` deep-refines plan architecture and steps with the Architect.
-    </replace>
-  </edit>
-
-  <edit path="docs/src/ch05-interface/tui-ux.md">
-    <search>
-## 5.2 Dual-Focus Architecture in Develop (Editor vs. Viewport)
-
-In the Develop view, TAUQE resolves the tension between text editing and inspection through a clean two-focus model without modal traps:
-    </search>
-    <replace>
-## 5.2 Dual-Focus Architecture in REPL (Editor vs. Viewport)
-
-In the REPL view, TAUQE resolves the tension between text editing and inspection through a clean two-focus model without modal traps:
   - Intentional status assignment: Press `t` or `s` to open the status dialog (`1` Discussion, `2` Todo, `3` InProgress, `4` Done, `5` Blocked, `6` Cancelled).
   - Bulk folding (`a`), plan refresh (`r`), deletion (`Delete`, with confirmation), and Markdown copy (`c` / `y`).
+- **`F3` / `Alt+3` / `Ctrl+3` (Review View):**
+  - Dedicated code review workspace for static architectural and security audits.
+  - Unified navigation: `n` / `p` (or `↑` / `↓`), with `Ctrl+N` / `Ctrl+P` for accordion inspection of the next / previous finding.
+  - Interactive findings checklist: fold/unfold items (`Tab` / `Space`), execute the selected finding or every Todo finding in the session (`x`, with confirmation), run cross-session execution across all review sessions (`X` / `Shift+X`, with confirmation), and discuss the finding or the whole session in REPL (`d`).
+  - Intentional status assignment: Press `t` or `s` to open the status selection dialog (`1` Discussion, `2` Todo, `3` InProgress, `4` Fixed, `5` Rejected).
+  - Filtering and bulk folding: `f` toggles between all findings and hide-closed (FIXED / REJECTED); `a` folds or unfolds every session and finding.
+  - Run and refresh: `r` starts a new review of the current context; `Shift+R` refreshes the session list from the server.
+  - Clipboard and lifecycle: `c` / `y` copy the selected finding or session; `Delete` deletes a session (with confirmation); `Ctrl+R` folds or unfolds the thinking stream.
+- **`F4` / `Alt+4` / `Ctrl+4` (Context View):**
+  - Displays Pinned, User, and Auto context layers with token metrics.
+  - Quick keys: `e` (add file as editable), `r` / `a` (add file as read-only), `t` (toggle access Editable ↔ Read-Only), `u` (promote an Auto file to persistent User), `c` / `C` (clear all auto-requested files), `d` / `x` / `Del` (remove a file from context).
+  - Navigation and folding: `n` / `p` (or `j` / `k`, `↑` / `↓`) move the selection; `Space` / `Tab` or `Enter` fold or unfold a section; `Enter` also promotes an Auto file to User. `Esc` / `q` return to the REPL view.
 - **`F5` / `Alt+5` / `Ctrl+5` (History View):**
   - Paginated audit log of semantic turns, code review runs, AI commit hashes, and file modifications.
   - Collapsible items: All entries are folded by default, displaying the role badge, commit summary, and preview lines.
@@ -247,7 +234,7 @@ auto_level_up = true                           # escalate the coder ladder on fa
 
 ## 5.8 Plan Stepper in REPL (Batch Step Progress)
 
-When a REPL turn belongs to a plan execution (a single step or a server-orchestrated batch), the REPL view renders a compact **Plan Stepper** above the model output. Its role is to keep the developer oriented during a multi-step scope without leaving REPL and without switching to the Plans view (`F4`).
+When a REPL turn belongs to a plan execution (a single step or a server-orchestrated batch), the REPL view renders a compact **Plan Stepper** above the model output. Its role is to keep the developer oriented during a multi-step scope without leaving REPL and without switching to the Plans view (`F2`).
 
 - **Title-only by design:** The stepper shows only step identifiers, a concise status (`Done`, `InProgress`, `Todo`), and short step titles, fitting in a 2–4 line header. It never renders expanded diffs, detail text, or concept nodes. Keeping the header terse preserves the reasoning and code output as the visual focus and avoids the noise of a full plan tree.
 - **Zero overhead for ad-hoc turns:** The stepper appears only when the turn carries plan-step metadata. A plain ad-hoc prompt renders exactly as before, with no extra header.

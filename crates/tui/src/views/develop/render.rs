@@ -306,21 +306,56 @@ fn render_model_pane(frame: &mut ratatui::Frame, state: &mut AppState, area: Rec
     frame.render_widget(model_paragraph, area);
 }
 
+/// Computes the prompt editor scroll offset so the cursor stays visible,
+/// moving the viewport only when the cursor leaves the visible window.
+///
+/// The offset is retained across frames: recomputing it from scratch pinned
+/// the cursor to the bottom row and made upward navigation jitter and stick
+/// at the lower edge. Scrolling now happens only at the window boundaries
+/// (visibility hysteresis), matching the Emacs-style `recenter` behavior
+/// users expect from a multiline prompt.
+fn ensure_visible_input_scroll(
+    current_scroll: usize,
+    cursor_visual_line: usize,
+    visible_input_lines: usize,
+    total_lines: usize,
+) -> usize {
+    if visible_input_lines == 0 || total_lines <= visible_input_lines {
+        return 0;
+    }
+
+    let max_scroll = total_lines - visible_input_lines;
+    let mut scroll = current_scroll.min(max_scroll);
+
+    if cursor_visual_line < scroll {
+        scroll = cursor_visual_line;
+    } else if cursor_visual_line >= scroll + visible_input_lines {
+        scroll = cursor_visual_line + 1 - visible_input_lines;
+    }
+
+    scroll.min(max_scroll)
+}
+
 fn render_prompt_input(
     frame: &mut ratatui::Frame,
-    state: &AppState,
+    state: &mut AppState,
     area: Rect,
     input_lines: Vec<Line<'static>>,
     cursor_visual_line: usize,
 ) {
     let is_busy = state.model.is_busy();
-    let visible_input_lines = area.height.saturating_sub(2);
-    let input_scroll =
-        if visible_input_lines > 0 && cursor_visual_line >= visible_input_lines as usize {
-            (cursor_visual_line + 1 - visible_input_lines as usize) as u16
-        } else {
-            0
-        };
+    let visible_input_lines = area.height.saturating_sub(2) as usize;
+
+    // Keep the prompt scroll stateful: the viewport moves only when the
+    // cursor leaves the visible window, instead of snapping to the bottom
+    // row on every frame (c-prompt-input-scroll-hysteresis).
+    let input_scroll = ensure_visible_input_scroll(
+        state.model.input_scroll as usize,
+        cursor_visual_line,
+        visible_input_lines,
+        input_lines.len(),
+    ) as u16;
+    state.model.input_scroll = input_scroll;
 
     let in_viewport = state.model.focus == DevelopFocus::Viewport;
     let border_style = if is_busy {
@@ -342,4 +377,66 @@ fn render_prompt_input(
         .block(input_block)
         .scroll((input_scroll, 0));
     frame.render_widget(input_paragraph, area);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ensure_visible_input_scroll;
+
+    #[test]
+    fn moving_within_the_window_keeps_the_scroll_stable() {
+        // Moving the cursor up inside the visible window must not shift the view.
+        assert_eq!(ensure_visible_input_scroll(10, 14, 5, 40), 10);
+        assert_eq!(ensure_visible_input_scroll(10, 10, 5, 40), 10);
+    }
+
+    #[test]
+    fn cursor_above_the_window_scrolls_up_to_reveal_it() {
+        assert_eq!(ensure_visible_input_scroll(10, 7, 5, 40), 7);
+        assert_eq!(ensure_visible_input_scroll(10, 0, 5, 40), 0);
+    }
+
+    #[test]
+    fn cursor_below_the_window_scrolls_down_just_enough() {
+        assert_eq!(ensure_visible_input_scroll(0, 5, 5, 40), 1);
+        assert_eq!(ensure_visible_input_scroll(3, 20, 5, 40), 16);
+    }
+
+    #[test]
+    fn short_content_or_empty_window_pins_scroll_to_zero() {
+        assert_eq!(ensure_visible_input_scroll(4, 2, 10, 6), 0);
+        assert_eq!(ensure_visible_input_scroll(4, 2, 0, 10), 0);
+        assert_eq!(ensure_visible_input_scroll(0, 0, 5, 5), 0);
+    }
+
+    #[test]
+    fn scroll_never_exceeds_maximum() {
+        // A stale offset larger than the content clamps to the last page.
+        assert_eq!(ensure_visible_input_scroll(100, 39, 5, 40), 35);
+    }
+
+    #[test]
+    fn upward_navigation_is_monotonic_without_jitter() {
+        let visible = 5usize;
+        let total = 20usize;
+        let mut scroll = 0usize;
+
+        for cursor in 0..total {
+            scroll = ensure_visible_input_scroll(scroll, cursor, visible, total);
+        }
+        assert_eq!(scroll, total - visible);
+
+        let mut observed = Vec::new();
+        for cursor in (0..total).rev() {
+            scroll = ensure_visible_input_scroll(scroll, cursor, visible, total);
+            observed.push(scroll);
+        }
+
+        // While the cursor stays inside the window the scroll must not move;
+        // it only follows once the cursor rises above the top row.
+        assert_eq!(observed[0], total - visible);
+        assert_eq!(observed[1], total - visible);
+        assert!(observed.iter().all(|&s| s <= total - visible));
+        assert_eq!(*observed.last().unwrap(), 0);
+    }
 }

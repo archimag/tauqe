@@ -39,6 +39,9 @@ fn selection_item_label(item: &SelectionItem, index: usize) -> String {
     match item {
         SelectionItem::Primary(entry) => numbered_entry_label(index, entry),
         SelectionItem::Model(model) => compact_model_name(model).to_string(),
+        SelectionItem::Catalog => {
+            format!("[{}] Others... (full model catalog)", index + 1)
+        }
     }
 }
 

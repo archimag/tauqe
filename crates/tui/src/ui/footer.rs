@@ -78,6 +78,78 @@ pub fn render_footer(frame: &mut ratatui::Frame, state: &AppState, area: Rect) {
             Style::default().fg(status_color).bold(),
         ));
 
+        // Turn telemetry (phase pipeline, round/detail, and the active file) is
+        // rendered unconditionally while a turn owns the interface, so a
+        // transient notification can never erase the phase pipeline or the file
+        // the model is working on. The notification follows as a compact badge
+        // on the same status line instead of replacing the telemetry.
+        if let Some(phase) = state.model.turn_phase {
+            let inner_width = area.width.saturating_sub(2) as usize;
+            if inner_width >= 80 {
+                footer_spans.push(Span::raw(" "));
+                footer_spans.extend(render_turn_phase_pipeline(phase));
+            }
+        }
+
+        if let Some(detail) = &state.model.turn_phase_detail {
+            footer_spans.push(Span::raw(" "));
+            footer_spans.push(Span::styled(
+                format!("[{}]", detail),
+                Style::default().fg(Color::Yellow).bold(),
+            ));
+        } else if let Some(round) = state.model.turn_round {
+            footer_spans.push(Span::raw(" "));
+            let round_str = if let Some(max) = state.model.turn_max_rounds {
+                format!("[Round {}/{}]", round, max)
+            } else {
+                format!("[Round {}]", round)
+            };
+            footer_spans.push(Span::styled(
+                round_str,
+                Style::default().fg(Color::Cyan).bold(),
+            ));
+        } else if let Some(round_str) = extract_current_round(&state.model.text) {
+            footer_spans.push(Span::raw(" "));
+            footer_spans.push(Span::styled(
+                format!("[{}]", round_str),
+                Style::default().fg(Color::Cyan).bold(),
+            ));
+        }
+
+        // Active retrying / modifying file
+        let active_file = state
+            .model
+            .files
+            .iter()
+            .rev()
+            .find(|f| matches!(f.status, FileEditStatus::Running | FileEditStatus::Retrying));
+
+        if let Some(f) = active_file {
+            if let Some(retry) = &f.retry_info {
+                footer_spans.push(Span::raw(" "));
+                footer_spans.push(Span::styled(
+                    format!("[{}]", retry),
+                    Style::default().fg(Color::Yellow).bold(),
+                ));
+            }
+            footer_spans.push(Span::raw(" "));
+            footer_spans.push(Span::styled(
+                format!("→ {}", f.path),
+                Style::default().fg(Color::White).bold(),
+            ));
+        } else if let Some(cmd) = state
+            .model
+            .toolchain
+            .as_ref()
+            .and_then(ToolchainState::running_command)
+        {
+            footer_spans.push(Span::raw(" "));
+            footer_spans.push(Span::styled(
+                format!("→ {}", cmd),
+                Style::default().fg(Color::Cyan).bold(),
+            ));
+        }
+
         if let Some(notif) = active_notif {
             footer_spans.push(Span::styled(" │ ", Style::default().fg(Color::DarkGray)));
             let (icon, color) = format_notification(notif);
@@ -85,73 +157,6 @@ pub fn render_footer(frame: &mut ratatui::Frame, state: &AppState, area: Rect) {
                 format!("{} {}", icon, notif.text),
                 Style::default().fg(color).bold(),
             ));
-        } else {
-            if let Some(phase) = state.model.turn_phase {
-                let inner_width = area.width.saturating_sub(2) as usize;
-                if inner_width >= 80 {
-                    footer_spans.push(Span::raw(" "));
-                    footer_spans.extend(render_turn_phase_pipeline(phase));
-                }
-            }
-
-            if let Some(detail) = &state.model.turn_phase_detail {
-                footer_spans.push(Span::raw(" "));
-                footer_spans.push(Span::styled(
-                    format!("[{}]", detail),
-                    Style::default().fg(Color::Yellow).bold(),
-                ));
-            } else if let Some(round) = state.model.turn_round {
-                footer_spans.push(Span::raw(" "));
-                let round_str = if let Some(max) = state.model.turn_max_rounds {
-                    format!("[Round {}/{}]", round, max)
-                } else {
-                    format!("[Round {}]", round)
-                };
-                footer_spans.push(Span::styled(
-                    round_str,
-                    Style::default().fg(Color::Cyan).bold(),
-                ));
-            } else if let Some(round_str) = extract_current_round(&state.model.text) {
-                footer_spans.push(Span::raw(" "));
-                footer_spans.push(Span::styled(
-                    format!("[{}]", round_str),
-                    Style::default().fg(Color::Cyan).bold(),
-                ));
-            }
-
-            // Active retrying / modifying file
-            let active_file = state
-                .model
-                .files
-                .iter()
-                .rev()
-                .find(|f| matches!(f.status, FileEditStatus::Running | FileEditStatus::Retrying));
-
-            if let Some(f) = active_file {
-                if let Some(retry) = &f.retry_info {
-                    footer_spans.push(Span::raw(" "));
-                    footer_spans.push(Span::styled(
-                        format!("[{}]", retry),
-                        Style::default().fg(Color::Yellow).bold(),
-                    ));
-                }
-                footer_spans.push(Span::raw(" "));
-                footer_spans.push(Span::styled(
-                    format!("→ {}", f.path),
-                    Style::default().fg(Color::White).bold(),
-                ));
-            } else if let Some(cmd) = state
-                .model
-                .toolchain
-                .as_ref()
-                .and_then(ToolchainState::running_command)
-            {
-                footer_spans.push(Span::raw(" "));
-                footer_spans.push(Span::styled(
-                    format!("→ {}", cmd),
-                    Style::default().fg(Color::Cyan).bold(),
-                ));
-            }
         }
     } else if let Some(notif) = active_notif {
         let (icon, color) = format_notification(notif);
@@ -380,6 +385,40 @@ mod tests {
         assert_eq!(
             format_footer_cost(0.0150, Some(0.0050), Some(0.0020), true),
             Some("Σ $0.0150 session · $0.0050 last · $0.0020 now".to_string())
+        );
+    }
+
+    #[test]
+    fn busy_footer_keeps_telemetry_alongside_notification() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let backend = TestBackend::new(120, 3);
+        let mut terminal = Terminal::new(backend).expect("terminal created");
+        let mut state = crate::app::test_state();
+        state.model.status = TurnStatus::Staging;
+        state.model.turn_phase = Some(tauqe_protocol::TurnPhase::Staging);
+        state.notify_warning("Patch applied");
+
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                render_footer(frame, &state, area);
+            })
+            .expect("draw succeeded");
+
+        let buffer = terminal.backend().buffer();
+        let content: String = buffer.content().iter().map(|cell| cell.symbol()).collect();
+
+        // The autonomous-turn telemetry survives the transient notification ...
+        assert!(
+            content.contains("Discovery"),
+            "phase pipeline must remain visible next to a notification: {content:?}"
+        );
+        // ... while the notification is still rendered on the same status line.
+        assert!(
+            content.contains("Patch applied"),
+            "notification must remain visible next to the telemetry: {content:?}"
         );
     }
 }

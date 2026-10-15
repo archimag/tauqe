@@ -107,10 +107,16 @@ impl PromptProtocol for JsonPromptProtocol {
                 }
 
                 // File edit operations decoded from the structured `changes` array.
-                if let ModelResult::Edit { edits, .. } = structured.parse_output(raw_text, &[]) {
-                    for operation in edits {
-                        commands.push(LlmCommand::Edit { operation });
+                match structured.parse_output(raw_text, &[]) {
+                    ModelResult::Edit { edits, error, .. } => {
+                        if let Some(message) = error {
+                            commands.push(LlmCommand::ProtocolError { message });
+                        }
+                        for operation in edits {
+                            commands.push(LlmCommand::Edit { operation });
+                        }
                     }
+                    ModelResult::Answer { .. } => {}
                 }
 
                 // Discovery: context requests.
@@ -272,6 +278,34 @@ mod tests {
             vec![LlmCommand::Text {
                 content: "Hello there! How can I help you?".to_string(),
             }]
+        );
+    }
+
+    #[test]
+    fn test_decode_invalid_structured_change_emits_protocol_error() {
+        let protocol = JsonPromptProtocol::edits();
+        let output = r#"{
+            "message": "Bad change",
+            "changes": [
+                {
+                    "op": "unknown_op",
+                    "path": "src/lib.rs",
+                    "to": "",
+                    "old_text": "",
+                    "new_text": "",
+                    "content": ""
+                }
+            ],
+            "context_requests": [],
+            "suggested_actions": []
+        }"#;
+        let commands = protocol.decode(output);
+        let has_error = commands
+            .iter()
+            .any(|cmd| matches!(cmd, LlmCommand::ProtocolError { .. }));
+        assert!(
+            has_error,
+            "Invalid structured change should produce ProtocolError command"
         );
     }
 

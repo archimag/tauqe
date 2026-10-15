@@ -34,7 +34,7 @@ impl std::str::FromStr for ReasoningEffort {
     type Err = String;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.trim().to_lowercase().as_str() {
+        match s.trim().to_ascii_lowercase().as_str() {
             "low" => Ok(ReasoningEffort::Low),
             "medium" => Ok(ReasoningEffort::Medium),
             "high" => Ok(ReasoningEffort::High),

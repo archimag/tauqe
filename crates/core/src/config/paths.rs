@@ -155,7 +155,12 @@ pub fn write_default_config(path: &Path) -> std::io::Result<()> {
         let _ = write_default_conventions(Path::new("Conventions.md"));
     }
 
-    std::fs::write(path, DEFAULT_CONFIG_TEMPLATE)
+    use std::io::Write;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+    file.write_all(DEFAULT_CONFIG_TEMPLATE.as_bytes())
 }
 
 pub fn write_default_conventions(path: &Path) -> std::io::Result<()> {
@@ -257,6 +262,16 @@ mod tests {
         assert_eq!(loaded.available_models(), template_cfg.available_models());
         assert_eq!(loaded.context.pinned, template_cfg.context.pinned);
         assert!(temp_dir.path().join("Conventions.md").is_file());
+    }
+
+    #[test]
+    fn test_write_default_config_fails_if_file_already_exists() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let cfg_path = default_config_path(Some(temp_dir.path()), None);
+        write_default_config(&cfg_path).unwrap();
+
+        let err = write_default_config(&cfg_path).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
     }
 
     #[test]

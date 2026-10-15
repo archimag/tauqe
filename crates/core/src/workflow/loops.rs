@@ -88,7 +88,7 @@ impl Task for EditLoop {
     async fn execute(&self, env: &mut TaskEnv<'_>) -> anyhow::Result<FsmTurnOutcome> {
         // Session bookkeeping runs once for the whole task so retried attempts
         // never duplicate the user prompt in history or re-run compaction.
-        let is_isolated_step = begin_session_turn(
+        let session_turn = begin_session_turn(
             &self.prompt,
             env.context,
             env.history,
@@ -98,36 +98,56 @@ impl Task for EditLoop {
         )
         .await;
 
-        let mut output = run_task_turn_body(&self.prompt, is_isolated_step, env).await?;
+        let res = async {
+            let mut output =
+                run_task_turn_body(&self.prompt, session_turn.is_isolated_step, env).await?;
 
-        let mut attempt = 0;
-        while !output.is_cancelled
-            && !has_valid_edits(&output.result)
-            && attempt < env.options.max_retries
-        {
-            attempt += 1;
-            let banner = format!(
-                "\n\n---\n**[Edit Retry {}/{}]** The task requires valid edits; requesting a corrected proposal...\n\n",
-                attempt, env.options.max_retries
-            );
-            let _ = env
-                .stream_tx
-                .send(StreamEvent::TextDelta(banner.clone()))
-                .await;
+            let mut attempt = 0;
+            while !output.is_cancelled
+                && !has_valid_edits(&output.result)
+                && attempt < env.options.max_retries
+            {
+                attempt += 1;
+                let banner = format!(
+                    "\n\n---\n**[Edit Retry {}/{}]** The task requires valid edits; requesting a corrected proposal...\n\n",
+                    attempt, env.options.max_retries
+                );
+                let _ = env
+                    .stream_tx
+                    .send(StreamEvent::TextDelta(banner.clone()))
+                    .await;
 
-            let retry_prompt = build_edit_retry_prompt(None);
-            let next = run_task_turn_body(&retry_prompt, is_isolated_step, env).await?;
-            let cancelled = next.is_cancelled;
-            merge_output(&mut output, next, &banner);
-            if cancelled {
-                break;
+                let retry_prompt = build_edit_retry_prompt(None);
+                let next =
+                    run_task_turn_body(&retry_prompt, session_turn.is_isolated_step, env).await?;
+                let cancelled = next.is_cancelled;
+                merge_output(&mut output, next, &banner);
+                if cancelled {
+                    break;
+                }
+            }
+            Ok(output)
+        }
+        .await;
+
+        match res {
+            Ok(output) => {
+                if output.is_cancelled {
+                    if let Some(id) = session_turn.turn_id {
+                        let _ = env.history.rollback_entry(id);
+                    }
+                } else {
+                    record_session_response(env.history, &output);
+                }
+                Ok(output)
+            }
+            Err(err) => {
+                if let Some(id) = session_turn.turn_id {
+                    let _ = env.history.rollback_entry(id);
+                }
+                Err(err)
             }
         }
-
-        if !output.is_cancelled {
-            record_session_response(env.history, &output);
-        }
-        Ok(output)
     }
 }
 

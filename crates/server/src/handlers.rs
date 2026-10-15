@@ -3,6 +3,9 @@ pub mod context;
 pub mod git;
 pub mod history;
 pub mod model;
+// The plan handlers still drive the legacy single-step `graft_subtree`; silence the
+// deprecation until the horizon-replanning migration replaces them.
+#[allow(deprecated)]
 pub mod plan;
 pub mod review;
 
@@ -112,7 +115,7 @@ where
 
 pub(crate) async fn run_preflight_verification(repo_root: &Path) -> Result<(), String> {
     let (ok, results) =
-        tauqe_core::toolchain::run_verification_pipeline(repo_root, &VerifyTarget::All).await;
+        tauqe_core::toolchain::run_verification_pipeline(repo_root, &VerifyTarget::All, None).await;
     if ok {
         return Ok(());
     }
@@ -161,8 +164,8 @@ async fn handle_client_initialize(req: Request, state: &Arc<AppState>) -> Respon
         let guard = state.config.lock().await;
         (
             guard.config.resolve_model(&guard.selection),
-            guard.config.develop.workflow.clone(),
-            guard.config.develop.protocol.clone(),
+            guard.config.develop.workflow,
+            guard.config.develop.protocol,
             guard.config.available_models(),
         )
     };

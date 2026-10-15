@@ -268,6 +268,7 @@ fn stage_file_edits(
     initial_staged: &StagedEditsState,
 ) -> Result<Option<String>, EditError> {
     let invalid_path = |err: anyhow::Error| EditError::InvalidPath(path.to_string(), err.to_string());
+    crate::context::verify_path_within_repo(repo_root, path).map_err(invalid_path)?;
     let in_context = context_manager.contains(path).map_err(invalid_path)?;
     let full_path = repo_root.join(path);
     let deleted = initial_staged.deleted_paths.contains(path);
@@ -659,7 +660,12 @@ fn apply_edit_proposal_inner(
         return Err(failed.error);
     }
 
-    // Update context layer for moved files
+    // Commit the validated change set to disk with all-or-nothing semantics.
+    // The context layer is only touched after every file is committed, so a
+    // disk failure never leaves context and disk out of sync.
+    commit_staged_edits(repo_root, &result.staged_state, &result.successful_paths)?;
+
+    // Update context layer for moved files strictly after disk commit succeeds
     for edit in &proposal.edits {
         if let EditOperation::Move { from, to } = edit {
             if let (Ok(clean_from), Ok(clean_to)) = (
@@ -671,11 +677,6 @@ fn apply_edit_proposal_inner(
             }
         }
     }
-
-    // Commit the validated change set to disk with all-or-nothing semantics.
-    // The context layer is only touched after every file is committed, so a
-    // disk failure never leaves context and disk out of sync.
-    commit_staged_edits(repo_root, &result.staged_state, &result.successful_paths)?;
 
     for path in &result.successful_paths {
         if result.staged_state.staged_files.contains_key(path) {
@@ -751,7 +752,46 @@ fn remove_backup_files(changes: &[PreparedChange]) {
 
 /// Creates the parent directories of a staged write, recording the ones this
 /// commit actually created so rollback can remove them again.
-fn create_parent_dirs(parent: &Path, created: &mut Vec<PathBuf>) -> std::io::Result<()> {
+fn create_parent_dirs(
+    repo_root: &Path,
+    parent: &Path,
+    created: &mut Vec<PathBuf>,
+) -> std::io::Result<()> {
+    if let Ok(canonical_root) = repo_root.canonicalize() {
+        let mut ancestor = parent;
+        while !ancestor.exists() && ancestor.symlink_metadata().is_err() {
+            match ancestor.parent() {
+                Some(p) if !p.as_os_str().is_empty() => ancestor = p,
+                _ => break,
+            }
+        }
+        if ancestor.exists() || ancestor.symlink_metadata().is_ok() {
+            match ancestor.canonicalize() {
+                Ok(canonical_anc) => {
+                    if !canonical_anc.starts_with(&canonical_root) {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::PermissionDenied,
+                            format!(
+                                "Parent directory '{}' escapes repository root via symlink",
+                                parent.display()
+                            ),
+                        ));
+                    }
+                }
+                Err(err) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        format!(
+                            "Parent directory '{}' ancestor cannot be resolved: {}",
+                            parent.display(),
+                            err
+                        ),
+                    ));
+                }
+            }
+        }
+    }
+
     // Walk upward and collect the ancestors that do not exist yet, deepest
     // first, so rollback removes exactly the directories this commit created.
     let mut missing = Vec::new();
@@ -833,11 +873,14 @@ fn commit_staged_edits(
     let mut created_dirs: Vec<PathBuf> = Vec::new();
 
     for path in paths {
+        crate::context::verify_path_within_repo(repo_root, path)
+            .map_err(|err| EditError::InvalidPath(path.clone(), err.to_string()))?;
+
         let final_path = repo_root.join(path);
         let backup_path = backup_sibling_path(&final_path);
         let temp_path = if let Some(content) = staged.staged_files.get(path) {
             if let Some(parent) = final_path.parent() {
-                if let Err(err) = create_parent_dirs(parent, &mut created_dirs) {
+                if let Err(err) = create_parent_dirs(repo_root, parent, &mut created_dirs) {
                     remove_temp_files(&prepared);
                     remove_created_dirs(&created_dirs);
                     return Err(EditError::Io(path.clone(), err));
@@ -1095,6 +1138,49 @@ mod staging_tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn test_move_failure_during_commit_leaves_context_intact() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("old.rs"), "fn hello() {}").unwrap();
+
+        let readonly_dir = root.join("readonly_dir");
+        std::fs::create_dir_all(&readonly_dir).unwrap();
+        std::fs::set_permissions(&readonly_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let mut cm = ContextManager::new(root.to_path_buf());
+        cm.add_file("old.rs", ContextAccess::Editable).unwrap();
+
+        let move_op = EditOperation::Move {
+            from: "old.rs".into(),
+            to: "new.rs".into(),
+        };
+        let failing_create = EditOperation::Create {
+            path: "readonly_dir/new_file.rs".into(),
+            content: "content".into(),
+        };
+
+        let proposal = EditProposal {
+            summary: "move and failing create".into(),
+            edits: vec![move_op, failing_create],
+        };
+
+        let res = apply_edit_proposal(root, &mut cm, &proposal);
+        assert!(res.is_err());
+
+        // Context must not have applied the rename since commit failed
+        assert!(cm.contains("old.rs").unwrap());
+        assert!(!cm.contains("new.rs").unwrap());
+        assert!(root.join("old.rs").exists());
+        assert!(!root.join("new.rs").exists());
+
+        // Reset permissions so tempdir cleanup succeeds
+        let _ = std::fs::set_permissions(&readonly_dir, std::fs::Permissions::from_mode(0o755));
+    }
+
+    #[test]
     fn fuzzy_replace_tolerates_trailing_whitespace_and_blank_line_spaces() {
         let dir = tempdir().unwrap();
         let root = dir.path();
@@ -1191,5 +1277,57 @@ mod staging_tests {
             .filter_map(|entry| entry.ok())
             .any(|entry| entry.file_name().to_string_lossy().contains(".tauqe-tmp"));
         assert!(!leftover, "commit must not leave temporary files behind");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_stage_and_commit_rejects_symlink_escaping_repo() {
+        let dir = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let repo_root = dir.path();
+        let outside_root = outside.path();
+
+        let secret = outside_root.join("target.txt");
+        std::fs::write(&secret, "initial").unwrap();
+
+        let sym_dir = repo_root.join("sym_dir");
+        std::os::unix::fs::symlink(outside_root, &sym_dir).unwrap();
+
+        let sym_file = repo_root.join("sym_file.txt");
+        std::os::unix::fs::symlink(&secret, &sym_file).unwrap();
+
+        let mut cm = ContextManager::new(repo_root.to_path_buf());
+
+        // Attempt to create a file inside an escaping symlink directory
+        let create_op = EditOperation::Create {
+            path: "sym_dir/hacked.txt".into(),
+            content: "payload".into(),
+        };
+        let result = stage_and_validate_edits(
+            repo_root,
+            &cm,
+            std::slice::from_ref(&create_op),
+            None,
+        );
+        assert!(!result.is_success());
+        assert!(matches!(&result.failed_files[0].error, EditError::InvalidPath(_, _)));
+        assert!(!outside_root.join("hacked.txt").exists());
+
+        let proposal = EditProposal {
+            summary: "create via escaping symlink".into(),
+            edits: vec![create_op],
+        };
+        assert!(apply_edit_proposal(repo_root, &mut cm, &proposal).is_err());
+        assert!(!outside_root.join("hacked.txt").exists());
+
+        // Attempt to overwrite or replace a file via an escaping symlink
+        let replace_op = EditOperation::Replace {
+            path: "sym_file.txt".into(),
+            old_text: "initial".into(),
+            new_text: "modified".into(),
+        };
+        let replace_res = stage_and_validate_edits(repo_root, &cm, &[replace_op], None);
+        assert!(!replace_res.is_success());
+        assert_eq!(std::fs::read_to_string(&secret).unwrap(), "initial");
     }
 }

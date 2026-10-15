@@ -27,7 +27,9 @@ pub use outcome::{
     extract_blocked, extract_error, extract_success, extract_terminal_outcome, strip_blocked_tags,
     strip_error_tags, strip_success_tags, strip_terminal_outcome_tags, TerminalOutcome,
 };
-pub use plan::{parse_plan_tags_with_diagnostics, strip_plan_tags, ParsedPlanTag};
+pub use plan::{
+    parse_plan_tags_with_diagnostics, strip_plan_tags, ParsedPlanItem, ParsedPlanTag,
+};
 pub use scratchpad::{extract_scratchpad, strip_scratchpad_tags};
 pub use verify::{
     extract_verify_request, strip_verify_tags, VerifyOnSuccess, VerifyRequest, VerifyTarget,

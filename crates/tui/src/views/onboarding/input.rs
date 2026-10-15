@@ -8,13 +8,6 @@ use crate::app::{AppState, OnboardingStep, ViewMode};
 use crate::input::InputResult;
 use crate::rpc::{send_request, RpcConnection};
 
-fn read_clipboard() -> Result<String, String> {
-    arboard::Clipboard::new()
-        .map_err(|e| e.to_string())?
-        .get_text()
-        .map_err(|e| e.to_string())
-}
-
 /// Persists the chosen workstation settings and reloads them, advancing to the
 /// Ready step only when both the write and the re-read succeed.
 fn save_workstation_config(st: &mut AppState, modifier: crate::config::PrimaryModifier) {
@@ -64,22 +57,34 @@ pub async fn handle_onboarding_key(
     let mut st = state.lock().await;
 
     if st.onboarding.input_active {
-        if key.modifiers.contains(KeyModifiers::CONTROL) {
+        // Clipboard and reveal commands follow the abstract primary command
+        // modifier (`C-V` paste, `C-R` reveal); Ctrl stays a universal fallback
+        // so the advertised `C-U` clear-buffer chord keeps working when the
+        // primary modifier is configured as Alt (Conventions §5.2).
+        let is_ctrl_alt = key.modifiers.contains(KeyModifiers::CONTROL)
+            && key.modifiers.contains(KeyModifiers::ALT);
+        let is_cmd = !is_ctrl_alt
+            && (st.tui_config.input.primary_modifier.matches(key.modifiers)
+                || key.modifiers.contains(KeyModifiers::CONTROL));
+
+        if is_cmd {
             match key.code {
-                KeyCode::Char('r') => {
+                KeyCode::Char('r') | KeyCode::Char('R') => {
                     st.onboarding.show_key = !st.onboarding.show_key;
                     return Ok(InputResult::Continue);
                 }
-                KeyCode::Char('v') | KeyCode::Char('y') => {
-                    match read_clipboard() {
-                        Ok(clip_text) => {
+                KeyCode::Char('v')
+                | KeyCode::Char('V')
+                | KeyCode::Char('y')
+                | KeyCode::Char('Y') => {
+                    match crate::clipboard::get_from_clipboard() {
+                        Some(clip_text) => {
                             st.onboarding.input_buffer.insert_str(clip_text.trim());
                         }
-                        Err(err) => {
-                            st.onboarding.set_error(format!(
-                                "Clipboard unavailable ({}). Use your terminal's paste instead.",
-                                err
-                            ));
+                        None => {
+                            st.onboarding.set_error(
+                                "Clipboard is empty or unavailable. Use your terminal's paste instead.",
+                            );
                         }
                     }
                     return Ok(InputResult::Continue);
@@ -139,7 +144,6 @@ pub async fn handle_onboarding_key(
                 }
             }
             _ => {
-                let is_cmd = st.tui_config.input.primary_modifier.matches(key.modifiers);
                 st.onboarding.input_buffer.handle_key(key, is_cmd);
             }
         }
@@ -236,13 +240,17 @@ pub async fn handle_onboarding_key(
                             st.onboarding.input_active = true;
                             st.onboarding.input_buffer.clear();
                             st.onboarding.show_key = false;
-                            let key_in_clipboard = read_clipboard()
-                                .map(|text| text.trim().starts_with("sk-or-"))
-                                .unwrap_or(false);
+                            let key_in_clipboard = crate::clipboard::get_from_clipboard()
+                                .is_some_and(|text| text.trim().starts_with("sk-or-"));
                             if key_in_clipboard {
-                                st.onboarding.set_status(
-                                    "API key detected in clipboard. Press Ctrl+V to paste it.",
+                                let paste_chord = format!(
+                                    "{}V",
+                                    st.tui_config.input.primary_modifier.prefix_str()
                                 );
+                                st.onboarding.set_status(format!(
+                                    "API key detected in clipboard. Press {} to paste it.",
+                                    paste_chord
+                                ));
                             }
                         }
                         1 => {

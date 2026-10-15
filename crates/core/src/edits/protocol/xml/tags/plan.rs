@@ -6,6 +6,7 @@ mod item;
 use super::{is_inside_markdown_code, strip_tags};
 use crate::edits::protocol::xml::{extract_attribute, find_base_tag_start};
 
+pub use item::ParsedPlanItem;
 use concept::parse_concept_items_with_diagnostics;
 use item::{next_item_tag_bounds, parse_plan_items_with_diagnostics};
 
@@ -65,7 +66,7 @@ pub struct ParsedPlanTag {
     pub title: Option<String>,
     pub description: Option<String>,
     pub concept: Vec<tauqe_protocol::ConceptItem>,
-    pub items: Vec<tauqe_protocol::PlanItem>,
+    pub items: Vec<ParsedPlanItem>,
 }
 
 fn find_closing_inner_tag(
@@ -319,7 +320,7 @@ Here is our plan:
         assert_eq!(p.concept[0].id, "c-1");
         assert_eq!(p.items.len(), 2);
         assert_eq!(p.items[0].id, "1");
-        assert_eq!(p.items[0].status, tauqe_protocol::PlanItemStatus::Done);
+        assert_eq!(p.items[0].status, Some(tauqe_protocol::PlanItemStatus::Done));
         assert_eq!(p.items[0].details.as_deref(), Some("Define User and Claims"));
         assert_eq!(p.items[1].children.len(), 1);
         assert_eq!(p.items[1].children[0].id, "2.1");
@@ -507,10 +508,10 @@ And outside markdown:
         assert_eq!(p.concept[0].id, "c-1");
         assert_eq!(p.items.len(), 2);
         assert_eq!(p.items[0].id, "1");
-        assert_eq!(p.items[0].status, tauqe_protocol::PlanItemStatus::Done);
+        assert_eq!(p.items[0].status, Some(tauqe_protocol::PlanItemStatus::Done));
         assert_eq!(p.items[0].title, "Protocol tags");
         assert_eq!(p.items[1].id, "2");
-        assert_eq!(p.items[1].status, tauqe_protocol::PlanItemStatus::Todo);
+        assert_eq!(p.items[1].status, Some(tauqe_protocol::PlanItemStatus::Todo));
     }
 
     #[test]

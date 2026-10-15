@@ -42,7 +42,7 @@ pub const DEVELOP_COMMANDS: &[KeyCommand] = &[
     KeyCommand { key: "Alt+C / Alt+Y", description: "Copy model response to clipboard" },
     // Auxiliary & Destructive
     KeyCommand { key: "C-G", description: "Detach the active discussion focus (with confirmation)" },
-    KeyCommand { key: "Esc", description: "Interrupt generation; press twice to clear the prompt (saved to kill ring); leave Viewport" },
+    KeyCommand { key: "Esc", description: "Interrupt generation; press twice to clear the prompt (saved to kill ring); detach discussion focus when empty; leave Viewport" },
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -426,6 +426,13 @@ pub async fn handle_develop_key(
                     st.model.esc_clear_armed = Some(std::time::Instant::now());
                     st.notify_info("Press Esc again to clear the prompt");
                 }
+            } else if st.discussion_focus.is_active() {
+                // With an empty prompt and an active discussion focus, `Esc`
+                // opens the same guarded detach confirmation as `C-G`, so both
+                // routes share one detach path and the `[Esc to detach]` banner
+                // reflects actual behavior.
+                st.confirm_detach_focus = true;
+                st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
             }
         }
         DevelopAction::SendPrompt => {
@@ -922,5 +929,37 @@ mod tests {
             DEVELOP_COMMANDS.len(),
             "duplicate key bindings in DEVELOP_COMMANDS"
         );
+    }
+
+    #[tokio::test]
+    async fn empty_prompt_esc_arms_detach_confirmation_for_active_focus() {
+        let mut st = crate::app::test_state();
+        st.discussion_focus =
+            tauqe_protocol::DiscussionFocus::plan("plan-1".to_string(), vec!["s-1".to_string()]);
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+
+        let key = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        handle_develop_key(key, &state, &mut conn).await.unwrap();
+
+        let st = state.lock().await;
+        assert!(
+            st.confirm_detach_focus,
+            "Esc on an empty prompt with an active focus must arm the detach confirmation"
+        );
+        assert_eq!(st.confirm_button, crate::app::ConfirmDialogButton::Cancel);
+    }
+
+    #[tokio::test]
+    async fn empty_prompt_esc_is_inert_without_active_focus() {
+        let state = Arc::new(Mutex::new(crate::app::test_state()));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+
+        let key = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        handle_develop_key(key, &state, &mut conn).await.unwrap();
+
+        let st = state.lock().await;
+        assert!(!st.confirm_detach_focus);
+        assert!(!st.confirm_cancel);
     }
 }

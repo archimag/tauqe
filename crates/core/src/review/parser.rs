@@ -32,33 +32,19 @@ pub fn review_findings_response_schema() -> serde_json::Value {
                             "enum": ["critical", "warning", "suggestion", "info"],
                             "description": "Finding severity: 'critical' (bug, panic, leak, or security flaw), 'warning' (architecture or runtime risk), 'suggestion' (cleanup or optimization), 'info' (general insight)"
                         },
-                        "file_path": {
-                            "anyOf": [
-                                { "type": "string" },
-                                { "type": "null" }
-                            ],
-                            "description": "Repository-relative path of the affected file, or null when the finding is not file-specific"
-                        },
-                        "line_start": {
-                            "anyOf": [
-                                { "type": "integer" },
-                                { "type": "null" }
-                            ],
-                            "description": "1-based start line of the affected range, or null when unknown"
-                        },
-                        "line_end": {
-                            "anyOf": [
-                                { "type": "integer" },
-                                { "type": "null" }
-                            ],
-                            "description": "1-based end line of the affected range, or null when unknown"
+                        "files": {
+                            "type": "array",
+                            "items": {
+                                "type": "string"
+                            },
+                            "description": "Repository-relative paths of the affected files (empty array when the finding is not file-specific)"
                         },
                         "body": {
                             "type": "string",
                             "description": "Clear explanation of the problem, why it occurs, and concrete remediation advice"
                         }
                     },
-                    "required": ["title", "severity", "file_path", "line_start", "line_end", "body"],
+                    "required": ["title", "severity", "files", "body"],
                     "additionalProperties": false
                 }
             }
@@ -103,11 +89,9 @@ pub struct ReviewFindingOutput {
     #[serde(default)]
     pub severity: ReviewSeverity,
     #[serde(default)]
+    pub files: Vec<String>,
+    #[serde(default)]
     pub file_path: Option<String>,
-    #[serde(default)]
-    pub line_start: Option<usize>,
-    #[serde(default)]
-    pub line_end: Option<usize>,
     #[serde(default)]
     pub body: String,
 }
@@ -128,16 +112,31 @@ pub fn parse_review_output(raw: &str) -> (Option<String>, Vec<ReviewItem>) {
             let items = findings
                 .into_iter()
                 .enumerate()
-                .map(|(index, finding)| ReviewItem {
-                    id: index as u32 + 1,
-                    title: normalize_title(finding.title, finding.severity),
-                    severity: finding.severity,
-                    status: ReviewItemStatus::Discussion,
-                    model: None,
-                    file_path: finding.file_path,
-                    line_range: combine_line_range(finding.line_start, finding.line_end),
-                    resolution_notes: None,
-                    body: finding.body.trim().to_string(),
+                .map(|(index, finding)| {
+                    let mut files: Vec<String> = finding
+                        .files
+                        .into_iter()
+                        .map(|f| f.trim().to_string())
+                        .filter(|f| !f.is_empty())
+                        .collect();
+                    if files.is_empty() {
+                        if let Some(fp) = finding.file_path {
+                            let trimmed = fp.trim();
+                            if !trimmed.is_empty() {
+                                files.push(trimmed.to_string());
+                            }
+                        }
+                    }
+                    ReviewItem {
+                        id: index as u32 + 1,
+                        title: normalize_title(finding.title, finding.severity),
+                        severity: finding.severity,
+                        status: ReviewItemStatus::Discussion,
+                        model: None,
+                        files,
+                        resolution_notes: None,
+                        body: finding.body.trim().to_string(),
+                    }
                 })
                 .collect();
             (normalize_summary(summary), items)
@@ -155,8 +154,7 @@ pub fn parse_review_output(raw: &str) -> (Option<String>, Vec<ReviewItem>) {
                         model: None,
                         severity: ReviewSeverity::Info,
                         status: ReviewItemStatus::Discussion,
-                        file_path: None,
-                        line_range: None,
+                        files: Vec::new(),
                         resolution_notes: None,
                         body: trimmed.to_string(),
                     }],
@@ -193,14 +191,6 @@ fn normalize_summary(summary: String) -> Option<String> {
     }
 }
 
-fn combine_line_range(start: Option<usize>, end: Option<usize>) -> Option<(usize, usize)> {
-    match (start, end) {
-        (Some(s), Some(e)) => Some((s, e.max(s))),
-        (Some(s), None) => Some((s, s)),
-        (None, Some(e)) => Some((e, e)),
-        (None, None) => None,
-    }
-}
 
 /// Deserializes a review payload, tolerating code fences and wrapper prose.
 fn parse_findings_output(raw: &str) -> Option<ReviewFindingsOutput> {
@@ -282,25 +272,19 @@ mod tests {
                 {
                     "title": "Race condition in state mutex",
                     "severity": "critical",
-                    "file_path": "crates/server/src/state.rs",
-                    "line_start": 42,
-                    "line_end": 50,
+                    "files": ["crates/server/src/state.rs", "crates/server/src/handlers/review.rs"],
                     "body": "Multiple background tasks acquire read locks concurrently while writing."
                 },
                 {
                     "title": "Inefficient string cloning",
                     "severity": "warning",
-                    "file_path": "crates/tui/src/ui/wrap.rs",
-                    "line_start": 115,
-                    "line_end": 115,
+                    "files": ["crates/tui/src/ui/wrap.rs"],
                     "body": "Cloning strings inside loop creates memory churn."
                 },
                 {
                     "title": "Use SmallVec for items",
                     "severity": "suggestion",
-                    "file_path": "crates/core/src/edits.rs",
-                    "line_start": null,
-                    "line_end": null,
+                    "files": ["crates/core/src/edits.rs"],
                     "body": "Can reduce heap allocations for small hunk counts."
                 }
             ]
@@ -313,33 +297,31 @@ mod tests {
         assert_eq!(items[0].severity, ReviewSeverity::Critical);
         assert_eq!(items[0].title, "Race condition in state mutex");
         assert_eq!(
-            items[0].file_path.as_deref(),
-            Some("crates/server/src/state.rs")
+            items[0].files,
+            vec![
+                "crates/server/src/state.rs",
+                "crates/server/src/handlers/review.rs"
+            ]
         );
-        assert_eq!(items[0].line_range, Some((42, 50)));
         assert_eq!(items[0].status, ReviewItemStatus::Discussion);
         assert!(items[0].body.contains("Multiple background tasks"));
 
         assert_eq!(items[1].severity, ReviewSeverity::Warning);
         assert_eq!(items[1].title, "Inefficient string cloning");
-        assert_eq!(items[1].line_range, Some((115, 115)));
+        assert_eq!(items[1].files, vec!["crates/tui/src/ui/wrap.rs"]);
 
         assert_eq!(items[2].severity, ReviewSeverity::Suggestion);
-        assert_eq!(
-            items[2].file_path.as_deref(),
-            Some("crates/core/src/edits.rs")
-        );
-        assert_eq!(items[2].line_range, None);
+        assert_eq!(items[2].files, vec!["crates/core/src/edits.rs"]);
     }
 
     #[test]
     fn test_parse_review_findings_tolerates_fences_and_wrapper_prose() {
-        let raw = "Here is the review:\n```json\n{\"findings\":[{\"title\":\"Bug\",\"severity\":\"warning\",\"file_path\":null,\"line_start\":null,\"line_end\":null,\"body\":\"details\"}]}\n```\nHope this helps!";
+        let raw = "Here is the review:\n```json\n{\"findings\":[{\"title\":\"Bug\",\"severity\":\"warning\",\"files\":[],\"body\":\"details\"}]}\n```\nHope this helps!";
         let items = parse_review_findings(raw);
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].title, "Bug");
         assert_eq!(items[0].severity, ReviewSeverity::Warning);
-        assert_eq!(items[0].file_path, None);
+        assert!(items[0].files.is_empty());
         assert_eq!(items[0].body, "details");
     }
 
@@ -372,7 +354,7 @@ mod tests {
         let required = schema["properties"]["findings"]["items"]["required"]
             .as_array()
             .unwrap();
-        assert_eq!(required.len(), 6);
+        assert_eq!(required.len(), 4);
     }
 
     #[test]
@@ -402,9 +384,7 @@ mod tests {
                 {
                     "title": "Race condition",
                     "severity": "critical",
-                    "file_path": "crates/server/src/state.rs",
-                    "line_start": 10,
-                    "line_end": 12,
+                    "files": ["crates/server/src/state.rs"],
                     "body": "Lock ordering is inconsistent."
                 }
             ]
@@ -418,7 +398,7 @@ mod tests {
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].title, "Race condition");
         assert_eq!(items[0].severity, ReviewSeverity::Critical);
-        assert_eq!(items[0].line_range, Some((10, 12)));
+        assert_eq!(items[0].files, vec!["crates/server/src/state.rs"]);
     }
 
     #[test]

@@ -44,6 +44,57 @@ pub fn has_openrouter_key(config: &AppConfig) -> bool {
         .unwrap_or(false)
 }
 
+pub fn credentials_candidates(
+    repo_root: Option<&Path>,
+    explicit_credentials: Option<&Path>,
+) -> Vec<PathBuf> {
+    credentials_candidates_internal(
+        repo_root,
+        dirs_home().as_deref(),
+        dirs_config().as_deref(),
+        explicit_credentials,
+    )
+}
+
+pub(crate) fn credentials_candidates_internal(
+    repo_root: Option<&Path>,
+    home: Option<&Path>,
+    config_dir: Option<&Path>,
+    cli_credentials: Option<&Path>,
+) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+
+    if let Some(explicit) = cli_credentials {
+        if !explicit.as_os_str().is_empty() {
+            candidates.push(explicit.to_path_buf());
+            return candidates;
+        }
+    }
+
+    let mut add_candidate = |p: PathBuf| {
+        if !candidates.contains(&p) {
+            candidates.push(p);
+        }
+    };
+
+    if let Some(root) = repo_root {
+        add_candidate(root.join(".tauqe").join("credentials.toml"));
+    } else if let Ok(cwd) = std::env::current_dir() {
+        add_candidate(cwd.join(".tauqe").join("credentials.toml"));
+    }
+
+    if let Some(cfg) = config_dir {
+        add_candidate(cfg.join("tauqe").join("credentials.toml"));
+    }
+
+    if let Some(h) = home {
+        add_candidate(h.join(".config").join("tauqe").join("credentials.toml"));
+        add_candidate(h.join(".tauqe").join("credentials.toml"));
+    }
+
+    candidates
+}
+
 pub fn find_credentials_file(
     repo_root: Option<&Path>,
     explicit_credentials: Option<&Path>,
@@ -62,37 +113,9 @@ pub(crate) fn find_credentials_file_internal(
     config_dir: Option<&Path>,
     cli_credentials: Option<&Path>,
 ) -> Option<PathBuf> {
-    if let Some(explicit) = cli_credentials {
-        if !explicit.as_os_str().is_empty() && explicit.is_file() {
-            return Some(explicit.to_path_buf());
-        }
-    }
-
-    let mut candidates = Vec::new();
-    let mut add_candidate = |p: PathBuf| {
-        if !candidates.contains(&p) {
-            candidates.push(p);
-        }
-    };
-
-    if let Some(root) = repo_root {
-        add_candidate(root.join(".tauqe").join("credentials.toml"));
-    }
-
-    if let Ok(cwd) = std::env::current_dir() {
-        add_candidate(cwd.join(".tauqe").join("credentials.toml"));
-    }
-
-    if let Some(cfg) = config_dir {
-        add_candidate(cfg.join("tauqe").join("credentials.toml"));
-    }
-
-    if let Some(h) = home {
-        add_candidate(h.join(".config").join("tauqe").join("credentials.toml"));
-        add_candidate(h.join(".tauqe").join("credentials.toml"));
-    }
-
-    candidates.into_iter().find(|p| p.is_file())
+    credentials_candidates_internal(repo_root, home, config_dir, cli_credentials)
+        .into_iter()
+        .find(|p| p.is_file())
 }
 
 pub fn load_credentials(
@@ -194,6 +217,20 @@ api_key = "sk-or-v1-YOUR-KEY-HERE"
 mod tests {
     use super::*;
     use crate::config::AppConfig;
+
+    #[test]
+    fn test_credentials_candidates_precedence() {
+        let explicit = Path::new("/custom/creds.toml");
+        let candidates = credentials_candidates(None, Some(explicit));
+        assert_eq!(candidates, vec![explicit.to_path_buf()]);
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let candidates = credentials_candidates_internal(Some(temp_dir.path()), None, None, None);
+        assert_eq!(
+            candidates,
+            vec![temp_dir.path().join(".tauqe").join("credentials.toml")]
+        );
+    }
 
     #[test]
     fn test_parse_credentials_toml() {

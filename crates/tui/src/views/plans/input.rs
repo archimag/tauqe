@@ -5,7 +5,6 @@ use tauqe_protocol::methods;
 use tokio::sync::Mutex;
 
 use crate::app::{AppState, KeyCommand, ViewMode};
-use crate::editor::InputEditor;
 use crate::input::InputResult;
 use crate::rpc::{send_request, RpcConnection};
 
@@ -16,7 +15,7 @@ pub const PLANS_COMMANDS: &[KeyCommand] = &[
     KeyCommand { key: "x", description: "Execute target step, group, or entire plan (with confirmation)" },
     KeyCommand { key: "Enter", description: "Execute leaf step; fold/unfold on groups and plan headers" },
     KeyCommand { key: "d", description: "Discuss selected concept/step or entire plan with AI in Develop" },
-    KeyCommand { key: "R", description: "Deep refine plan architecture & steps with AI (Architect)" },
+    KeyCommand { key: "R", description: "Deep refine / replan horizon with AI (Architect)" },
     KeyCommand { key: "t / s", description: "Change step status (Todo / InProgress / Done / Cancelled)" },
     // Navigation & Inspection
     KeyCommand { key: "n / p (or ↑/↓)", description: "Navigate plans, concept, and steps" },
@@ -66,7 +65,7 @@ fn execute_scope_action(st: &mut AppState, plan_id: &str, scope_id: Option<&str>
                 format!("{}, and {} more", items[..2].join(", "), items.len() - 2)
             };
             st.notify_warning(format!(
-                "Scope contains {} step(s) in BLOCKED status ({}). Resolve the reported blockers and replan before executing.",
+                "Scope contains {} step(s) in BLOCKED status ({}). Resolve blockers or press 'R' to replan horizon before executing.",
                 items.len(), preview
             ));
         }
@@ -85,7 +84,7 @@ fn execute_scope_action(st: &mut AppState, plan_id: &str, scope_id: Option<&str>
             ));
         }
         tauqe_protocol::PlanScopeEvaluation::StepBlocked => {
-            st.notify_warning("Step is BLOCKED; resolve the blocker or replan before executing.");
+            st.notify_warning("Step is BLOCKED; resolve the blocker or press 'R' to replan horizon before executing.");
         }
         tauqe_protocol::PlanScopeEvaluation::Cancelled => {
             st.notify_warning("Step is CANCELLED; change status to TODO before executing.");
@@ -302,12 +301,13 @@ pub async fn handle_plans_key(
                         _ => {}
                     }
 
-                    st.discuss_plan_dialog = Some(crate::app::DiscussPlanDialogState {
-                        plan_id: plan.id.clone(),
-                        plan_title: plan.title.clone(),
-                        focused_items: focused,
-                        prompt_editor: InputEditor::default(),
-                    });
+                    st.prompt_modal = Some(crate::app::PromptModalState::new(
+                        crate::app::PromptModalTarget::Plan {
+                            plan_id: plan.id.clone(),
+                            plan_title: plan.title.clone(),
+                            focused_items: focused,
+                        },
+                    ));
                 }
             }
         }
@@ -418,11 +418,17 @@ pub async fn handle_plans_key(
                         plan.title,
                         architect_entries,
                     );
+                    if let VisiblePlanRow::PlanItem { item_id, title, status: tauqe_protocol::PlanItemStatus::Blocked, .. } = &row {
+                        dialog.instructions_editor.insert_str(&format!(
+                            "Replan uncompleted horizon around blocked step #{}: {}",
+                            item_id, title
+                        ));
+                    }
                     // Open on the architect list when more than one model is
-                    // configured so it can be picked instantly with the digit
-                    // shortcuts; a single model leaves focus on the editor
-                    // (c-magit-key-navigation).
-                    if dialog.selector.len() > 1 {
+                    // configured and instructions are empty so it can be picked
+                    // instantly with the digit shortcuts; if pre-seeded with
+                    // instructions, keep focus on the editor.
+                    if dialog.selector.len() > 1 && dialog.instructions_editor.is_empty() {
                         dialog.focus = super::RefineDialogFocus::ModelList;
                     }
                     st.plans_view.refine_dialog = Some(dialog);
@@ -453,5 +459,43 @@ mod tests {
             PLANS_COMMANDS.len(),
             "duplicate key bindings in PLANS_COMMANDS"
         );
+    }
+
+    #[tokio::test]
+    async fn test_r_key_on_blocked_step_seeds_replan_instructions() {
+        let mut st = crate::app::test_state();
+        let plan = tauqe_protocol::Plan {
+            id: "plan-blocked".to_string(),
+            title: "Blocked Plan".to_string(),
+            items: vec![tauqe_protocol::PlanItem {
+                id: "1".to_string(),
+                title: "Failing step".to_string(),
+                status: tauqe_protocol::PlanItemStatus::Blocked,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        st.plans_view.plans = vec![plan];
+        st.plans_view.expand_all();
+        st.plans_view.selected_index = 1; // Step 1
+
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+        let res = handle_plans_key(
+            KeyEvent::new(KeyCode::Char('R'), crossterm::event::KeyModifiers::NONE),
+            &state,
+            &mut conn,
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(res, InputResult::Continue));
+        let guard = state.lock().await;
+        let dialog = guard.plans_view.refine_dialog.as_ref().expect("dialog opened");
+        assert!(dialog
+            .instructions_editor
+            .get_text()
+            .contains("Replan uncompleted horizon around blocked step #1: Failing step"));
+        assert!(dialog.focus.is_instructions_editor());
     }
 }

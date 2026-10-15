@@ -13,6 +13,7 @@ use super::VisibleReviewRow;
 pub const REVIEW_COMMANDS: &[KeyCommand] = &[
     // Core Actions
     KeyCommand { key: "x", description: "Execute target finding or all Todo findings in session (with confirmation)" },
+    KeyCommand { key: "X", description: "Execute all Todo findings across all sessions (with confirmation)" },
     KeyCommand { key: "Enter", description: "Execute finding; fold/unfold on session headers" },
     KeyCommand { key: "r", description: "Run code review on current context" },
     KeyCommand { key: "d", description: "Discuss selected finding or entire session in Develop" },
@@ -83,6 +84,12 @@ fn execute_review_scope_action(
             tauqe_protocol::ReviewStatus::Fixed => {
                 st.notify_info(format!("Finding #{} is already FIXED.", item.id));
             }
+            tauqe_protocol::ReviewStatus::Skipped => {
+                st.notify_info(format!(
+                    "Finding #{} is SKIPPED; change status to TODO (t) before executing.",
+                    item.id
+                ));
+            }
             tauqe_protocol::ReviewStatus::Rejected => {
                 st.notify_warning(format!(
                     "Finding #{} is REJECTED; change status to TODO (t) before executing.",
@@ -92,7 +99,7 @@ fn execute_review_scope_action(
             tauqe_protocol::ReviewStatus::Todo | tauqe_protocol::ReviewStatus::InProgress => {
                 st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
                 st.confirm_execute_review = Some(crate::app::ConfirmExecuteReviewState {
-                    review_id: session.id.clone(),
+                    review_id: Some(session.id.clone()),
                     review_title: if session.title.trim().is_empty() {
                         session.id.clone()
                     } else {
@@ -127,7 +134,7 @@ fn execute_review_scope_action(
 
         st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
         st.confirm_execute_review = Some(crate::app::ConfirmExecuteReviewState {
-            review_id: session.id.clone(),
+            review_id: Some(session.id.clone()),
             review_title: if session.title.trim().is_empty() {
                 session.id.clone()
             } else {
@@ -140,13 +147,80 @@ fn execute_review_scope_action(
     }
 }
 
+pub(crate) fn execute_all_reviews_action(st: &mut AppState) {
+    if st.model.is_busy() {
+        st.notify_warning("Model is currently busy; wait for turn to finish or press Esc to cancel");
+        return;
+    }
+
+    let sessions = st.review.effective_sessions();
+    if sessions.is_empty() {
+        st.notify_info("No review sessions available.");
+        return;
+    }
+
+    let mut todo_items = Vec::new();
+    let mut total_items = 0;
+    let mut discussion_count = 0;
+    let mut fixed_count = 0;
+
+    for session in &sessions {
+        for item in &session.items {
+            total_items += 1;
+            match item.status {
+                tauqe_protocol::ReviewStatus::Todo | tauqe_protocol::ReviewStatus::InProgress => {
+                    todo_items.push(item.clone());
+                }
+                tauqe_protocol::ReviewStatus::Discussion => {
+                    discussion_count += 1;
+                }
+                tauqe_protocol::ReviewStatus::Fixed => {
+                    fixed_count += 1;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    if todo_items.is_empty() {
+        if total_items == 0 {
+            st.notify_info("No findings in review sessions.");
+        } else if discussion_count > 0 {
+            st.notify_warning(
+                "All remaining findings are in DISCUSSION status; approve or change status to TODO (t) before executing.",
+            );
+        } else if fixed_count == total_items {
+            st.notify_info("All findings across all review sessions are already FIXED.");
+        } else {
+            st.notify_info("No TODO findings to execute across review sessions.");
+        }
+        return;
+    }
+
+    st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
+    st.confirm_execute_review = Some(crate::app::ConfirmExecuteReviewState {
+        review_id: None,
+        review_title: "All Review Sessions".to_string(),
+        scope_title: format!(
+            "All remaining TODO findings across all sessions ({} items)",
+            todo_items.len()
+        ),
+        item_id: None,
+        items: todo_items,
+    });
+}
+
 fn format_item_for_clipboard(item: &ReviewItem) -> String {
     let mut text = format!("[{}] {}", item.severity, item.title);
-    if let Some(path) = &item.file_path {
+    if !item.files.is_empty() {
         text.push('\n');
-        text.push_str(path);
-        if let Some((start, end)) = item.line_range {
-            text.push_str(&format!(":{}-{}", start, end));
+        text.push_str(&item.files.join(", "));
+    }
+    if let Some(notes) = &item.resolution_notes {
+        let trimmed = notes.trim();
+        if !trimmed.is_empty() {
+            text.push_str("\n\nResolution: ");
+            text.push_str(trimmed);
         }
     }
     if !item.body.trim().is_empty() {
@@ -272,23 +346,30 @@ pub async fn handle_review_key(
                 }
             }
         }
-        KeyCode::Char('x') | KeyCode::Char('X') => {
-            let sel_row = st.review.selected_row();
-            if let Some(row) = sel_row {
-                match row {
-                    VisibleReviewRow::SessionHeader { session_id, title, .. } => {
-                        execute_review_scope_action(&mut st, &session_id, None, &title);
-                    }
-                    VisibleReviewRow::SessionSummary { session_id, .. } => {
-                        execute_review_scope_action(&mut st, &session_id, None, &session_id);
-                    }
-                    VisibleReviewRow::ReviewItem {
-                        session_id,
-                        item_id,
-                        title,
-                        ..
-                    } => {
-                        execute_review_scope_action(&mut st, &session_id, Some(item_id), &title);
+        KeyCode::Char('X') => {
+            execute_all_reviews_action(&mut st);
+        }
+        KeyCode::Char('x') => {
+            if key.modifiers.contains(crossterm::event::KeyModifiers::SHIFT) {
+                execute_all_reviews_action(&mut st);
+            } else {
+                let sel_row = st.review.selected_row();
+                if let Some(row) = sel_row {
+                    match row {
+                        VisibleReviewRow::SessionHeader { session_id, title, .. } => {
+                            execute_review_scope_action(&mut st, &session_id, None, &title);
+                        }
+                        VisibleReviewRow::SessionSummary { session_id, .. } => {
+                            execute_review_scope_action(&mut st, &session_id, None, &session_id);
+                        }
+                        VisibleReviewRow::ReviewItem {
+                            session_id,
+                            item_id,
+                            title,
+                            ..
+                        } => {
+                            execute_review_scope_action(&mut st, &session_id, Some(item_id), &title);
+                        }
                     }
                 }
             }
@@ -346,7 +427,8 @@ pub async fn handle_review_key(
                     tauqe_protocol::ReviewStatus::Todo => 1,
                     tauqe_protocol::ReviewStatus::InProgress => 2,
                     tauqe_protocol::ReviewStatus::Fixed => 3,
-                    tauqe_protocol::ReviewStatus::Rejected => 4,
+                    tauqe_protocol::ReviewStatus::Skipped => 4,
+                    tauqe_protocol::ReviewStatus::Rejected => 5,
                 };
                 st.status_dialog = Some(crate::app::StatusDialogState::new(
                     crate::app::StatusDialogTarget::ReviewItem {
@@ -561,7 +643,7 @@ mod tests {
             id: "rev-1".to_string(),
             title: "Session rev-1".to_string(),
             created_at: 0,
-            model: "test-model".to_string(),
+            model: tauqe_protocol::ModelRef::openrouter("test-model"),
             description: None,
             user_prompt: None,
             target_files: Vec::new(),
@@ -571,8 +653,7 @@ mod tests {
                 model: None,
                 severity: ReviewSeverity::Warning,
                 status: ReviewStatus::Todo,
-                file_path: None,
-                line_range: None,
+                files: Vec::new(),
                 resolution_notes: None,
                 body: String::new(),
             }],
@@ -592,8 +673,223 @@ mod tests {
             .confirm_execute_review
             .as_ref()
             .expect("confirmation state should be armed");
-        assert_eq!(target.review_id, "rev-1");
+        assert_eq!(target.review_id, Some("rev-1".to_string()));
         assert_eq!(target.item_id, Some(1));
+        assert_eq!(target.items.len(), 1);
+    }
+
+    #[test]
+    fn test_execute_all_reviews_action_discussion_only_warns() {
+        use tauqe_protocol::{ReviewItem, ReviewSession, ReviewSeverity, ReviewStatus};
+
+        let mut st = crate::app::test_state();
+        let session = ReviewSession {
+            id: "rev-disc".to_string(),
+            title: "Discussion Only Session".to_string(),
+            created_at: 0,
+            model: tauqe_protocol::ModelRef::openrouter("test-model"),
+            description: None,
+            user_prompt: None,
+            target_files: Vec::new(),
+            items: vec![
+                ReviewItem {
+                    id: 1,
+                    title: "Finding 1".to_string(),
+                    model: None,
+                    severity: ReviewSeverity::Warning,
+                    status: ReviewStatus::Discussion,
+                    files: Vec::new(),
+                    resolution_notes: None,
+                    body: String::new(),
+                },
+                ReviewItem {
+                    id: 2,
+                    title: "Finding 2".to_string(),
+                    model: None,
+                    severity: ReviewSeverity::Suggestion,
+                    status: ReviewStatus::Discussion,
+                    files: Vec::new(),
+                    resolution_notes: None,
+                    body: String::new(),
+                },
+            ],
+            raw_markdown: String::new(),
+        };
+        st.review.sessions = vec![session];
+
+        execute_all_reviews_action(&mut st);
+
+        assert!(
+            st.confirm_execute_review.is_none(),
+            "dialog must not open when all findings are in DISCUSSION"
+        );
+        let notif = st
+            .active_notification()
+            .expect("notification should be surfaced");
+        assert!(
+            notif.text.contains("DISCUSSION"),
+            "expected notification warning about DISCUSSION status, got: {}",
+            notif.text
+        );
+    }
+
+    #[test]
+    fn test_execute_all_reviews_action_with_todo_opens_modal() {
+        use tauqe_protocol::{ReviewItem, ReviewSession, ReviewSeverity, ReviewStatus};
+
+        let mut st = crate::app::test_state();
+        let session1 = ReviewSession {
+            id: "rev-1".to_string(),
+            title: "Session 1".to_string(),
+            created_at: 0,
+            model: tauqe_protocol::ModelRef::openrouter("test-model"),
+            description: None,
+            user_prompt: None,
+            target_files: Vec::new(),
+            items: vec![
+                ReviewItem {
+                    id: 1,
+                    title: "Finding 1".to_string(),
+                    model: None,
+                    severity: ReviewSeverity::Warning,
+                    status: ReviewStatus::Todo,
+                    files: Vec::new(),
+                    resolution_notes: None,
+                    body: String::new(),
+                },
+                ReviewItem {
+                    id: 2,
+                    title: "Finding 2".to_string(),
+                    model: None,
+                    severity: ReviewSeverity::Info,
+                    status: ReviewStatus::Fixed,
+                    files: Vec::new(),
+                    resolution_notes: None,
+                    body: String::new(),
+                },
+            ],
+            raw_markdown: String::new(),
+        };
+        let session2 = ReviewSession {
+            id: "rev-2".to_string(),
+            title: "Session 2".to_string(),
+            created_at: 0,
+            model: tauqe_protocol::ModelRef::openrouter("test-model"),
+            description: None,
+            user_prompt: None,
+            target_files: Vec::new(),
+            items: vec![
+                ReviewItem {
+                    id: 1,
+                    title: "Finding 3".to_string(),
+                    model: None,
+                    severity: ReviewSeverity::Critical,
+                    status: ReviewStatus::InProgress,
+                    files: Vec::new(),
+                    resolution_notes: None,
+                    body: String::new(),
+                },
+                ReviewItem {
+                    id: 2,
+                    title: "Finding 4".to_string(),
+                    model: None,
+                    severity: ReviewSeverity::Suggestion,
+                    status: ReviewStatus::Discussion,
+                    files: Vec::new(),
+                    resolution_notes: None,
+                    body: String::new(),
+                },
+            ],
+            raw_markdown: String::new(),
+        };
+        st.review.sessions = vec![session1, session2];
+
+        execute_all_reviews_action(&mut st);
+
+        let target = st
+            .confirm_execute_review
+            .as_ref()
+            .expect("modal confirmation must be armed");
+        assert_eq!(target.review_id, None, "cross-session execution must have review_id: None");
+        assert_eq!(target.review_title, "All Review Sessions");
+        assert_eq!(st.confirm_button, crate::app::ConfirmDialogButton::Cancel);
+        assert_eq!(target.items.len(), 2, "must include exactly the Todo and InProgress items");
+        assert_eq!(target.items[0].title, "Finding 1");
+        assert_eq!(target.items[1].title, "Finding 3");
+    }
+
+    #[test]
+    fn test_execute_all_reviews_action_all_fixed_notifies() {
+        use tauqe_protocol::{ReviewItem, ReviewSession, ReviewSeverity, ReviewStatus};
+
+        let mut st = crate::app::test_state();
+        let session = ReviewSession {
+            id: "rev-fixed".to_string(),
+            title: "All Fixed Session".to_string(),
+            created_at: 0,
+            model: tauqe_protocol::ModelRef::openrouter("test-model"),
+            description: None,
+            user_prompt: None,
+            target_files: Vec::new(),
+            items: vec![ReviewItem {
+                id: 1,
+                title: "Finding 1".to_string(),
+                model: None,
+                severity: ReviewSeverity::Warning,
+                status: ReviewStatus::Fixed,
+                files: Vec::new(),
+                resolution_notes: None,
+                body: String::new(),
+            }],
+            raw_markdown: String::new(),
+        };
+        st.review.sessions = vec![session];
+
+        execute_all_reviews_action(&mut st);
+
+        assert!(st.confirm_execute_review.is_none());
+        let notif = st.active_notification().expect("notification should be set");
+        assert!(notif.text.contains("FIXED"));
+    }
+
+    #[tokio::test]
+    async fn test_handle_review_key_capital_x_triggers_batch_execute() {
+        use tauqe_protocol::{ReviewItem, ReviewSession, ReviewSeverity, ReviewStatus};
+
+        let mut st = crate::app::test_state();
+        st.view_mode = ViewMode::Review;
+        let session = ReviewSession {
+            id: "rev-1".to_string(),
+            title: "Session 1".to_string(),
+            created_at: 0,
+            model: tauqe_protocol::ModelRef::openrouter("test-model"),
+            description: None,
+            user_prompt: None,
+            target_files: Vec::new(),
+            items: vec![ReviewItem {
+                id: 1,
+                title: "Todo Finding".to_string(),
+                model: None,
+                severity: ReviewSeverity::Warning,
+                status: ReviewStatus::Todo,
+                files: Vec::new(),
+                resolution_notes: None,
+                body: String::new(),
+            }],
+            raw_markdown: String::new(),
+        };
+        st.review.sessions = vec![session];
+
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+
+        let key = KeyEvent::new(KeyCode::Char('X'), crossterm::event::KeyModifiers::NONE);
+        let res = handle_review_key(key, &state, &mut conn).await.unwrap();
+        assert_eq!(res, InputResult::Continue);
+
+        let st = state.lock().await;
+        let target = st.confirm_execute_review.as_ref().expect("modal must open");
+        assert_eq!(target.review_id, None);
         assert_eq!(target.items.len(), 1);
     }
 }

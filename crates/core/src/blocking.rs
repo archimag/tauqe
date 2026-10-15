@@ -67,13 +67,11 @@ where
     T: Send + 'static,
 {
     match Handle::try_current() {
-        Ok(handle) if handle.runtime_flavor() == RuntimeFlavor::CurrentThread => {
-            match handle.spawn_blocking(f).await {
-                Ok(value) => value,
-                Err(join_error) => resume_join_panic(join_error),
-            }
-        }
-        _ => run_blocking(f),
+        Ok(handle) => match handle.spawn_blocking(f).await {
+            Ok(value) => value,
+            Err(join_error) => resume_join_panic(join_error),
+        },
+        Err(_) => run_blocking(f),
     }
 }
 
@@ -147,6 +145,9 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn async_runs_on_a_multi_thread_runtime() {
+        let executor_thread = std::thread::current().id();
+        let worker_thread = run_blocking_async(|| std::thread::current().id()).await;
+        assert_ne!(executor_thread, worker_thread);
         assert_eq!(run_blocking_async(|| 23).await, 23);
     }
 }

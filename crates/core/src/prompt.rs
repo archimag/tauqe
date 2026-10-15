@@ -206,7 +206,7 @@ impl PromptAssembly {
         prompt.push_str(&format!(
             "10. Self-Knowledge: When the user asks about your identity, capabilities, concepts, workflows, keyboard shortcuts, or configuration, do NOT guess. Request the authoritative documentation using <doc_request{} topic=\"{}\" /> and output nothing else except a short note. You will be called again with <system_documentation> blocks; base your answer strictly on them and formulate it in the user's language.\n",
             marker_suffix,
-            crate::docs::TOPICS.join("|")
+            crate::docs::topic_hint()
         ));
         prompt.push_str(&format!(
             "10a. Turn Scratchpad (Working Memory): To retain working hypotheses, verified findings, or focus across multi-round discovery and verification healing cycles, you may emit <scratchpad{0}>...</scratchpad{0}>. Keep scratchpad notes concise (bullet points of what is verified, current hypothesis, and purpose of requested files). Notes are preserved within the current turn in <scratchpad> and isolated from persistent history.\n",
@@ -224,7 +224,7 @@ impl PromptAssembly {
                 ));
             }
         } else {
-            prompt.push('\n');
+            prompt.push_str("11. Step Execution Scope: You are executing a single isolated plan step. Plan creation, modification, status updates, or plan tags (<plan>) are strictly prohibited (step lifecycle and plan tracking are handled deterministically by the harness).\n\n");
         }
 
         if !self.is_discussion {
@@ -576,6 +576,7 @@ mod tests {
 
         let sys_prompt = assembly.build_system_prompt(&proto);
         assert!(!sys_prompt.contains("11. Local Engineering Plans"));
+        assert!(sys_prompt.contains("11. Step Execution Scope"));
 
         let messages = assembly.assemble_chat_messages("Execute step", &proto);
         assert!(!messages[0].content.contains("## Active Task Plan Context"));

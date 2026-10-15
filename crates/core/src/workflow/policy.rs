@@ -1,5 +1,6 @@
 use std::path::Path;
 
+use async_trait::async_trait;
 use tauqe_protocol::{EditOperation, EditProposal};
 
 use crate::context::ContextManager;
@@ -12,10 +13,11 @@ use crate::edits::{
 /// Keeping the transactional model of a turn out of the FSM loop lets the same
 /// pipeline run under different safety nets: direct writes for lightweight
 /// sessions and checkpointed Git transactions for verified ones.
+#[async_trait]
 pub trait ApplyPolicy: Send + Sync {
     /// Validates `edits` in memory, retaining any earlier staged state supplied
     /// by the caller. No bytes are written to disk at this stage.
-    fn staging(
+    async fn staging(
         &mut self,
         repo_root: &Path,
         context_manager: &ContextManager,
@@ -25,7 +27,7 @@ pub trait ApplyPolicy: Send + Sync {
 
     /// Writes the validated proposal to the working tree so it can be compiled
     /// and tested before being finalized.
-    fn apply_temporary(
+    async fn apply_temporary(
         &mut self,
         repo_root: &Path,
         context_manager: &mut ContextManager,
@@ -33,7 +35,7 @@ pub trait ApplyPolicy: Send + Sync {
     ) -> anyhow::Result<Vec<String>>;
 
     /// Makes a verified change set permanent, returning an optional commit hash.
-    fn apply_final(
+    async fn apply_final(
         &mut self,
         repo_root: &Path,
         changed_files: &[String],
@@ -42,7 +44,10 @@ pub trait ApplyPolicy: Send + Sync {
 
     /// Reverts the working tree to the state before `apply_temporary`.
     /// Returns `true` when changes were rolled back.
-    fn rollback(&mut self, repo_root: &Path) -> anyhow::Result<bool>;
+    async fn rollback(&mut self, repo_root: &Path) -> anyhow::Result<bool>;
+
+    /// Synchronous rollback fallback used during unwinding or drop.
+    fn rollback_sync(&mut self, repo_root: &Path) -> anyhow::Result<bool>;
 }
 
 /// Writes edits straight to disk, without checkpoints or commits.
@@ -58,8 +63,9 @@ impl DirectApplyPolicy {
     }
 }
 
+#[async_trait]
 impl ApplyPolicy for DirectApplyPolicy {
-    fn staging(
+    async fn staging(
         &mut self,
         repo_root: &Path,
         context_manager: &ContextManager,
@@ -69,7 +75,7 @@ impl ApplyPolicy for DirectApplyPolicy {
         stage_and_validate_edits(repo_root, context_manager, edits, staged_state)
     }
 
-    fn apply_temporary(
+    async fn apply_temporary(
         &mut self,
         repo_root: &Path,
         context_manager: &mut ContextManager,
@@ -79,7 +85,7 @@ impl ApplyPolicy for DirectApplyPolicy {
         Ok(changed_files)
     }
 
-    fn apply_final(
+    async fn apply_final(
         &mut self,
         _repo_root: &Path,
         _changed_files: &[String],
@@ -88,7 +94,11 @@ impl ApplyPolicy for DirectApplyPolicy {
         Ok(None)
     }
 
-    fn rollback(&mut self, _repo_root: &Path) -> anyhow::Result<bool> {
+    async fn rollback(&mut self, _repo_root: &Path) -> anyhow::Result<bool> {
+        Ok(false)
+    }
+
+    fn rollback_sync(&mut self, _repo_root: &Path) -> anyhow::Result<bool> {
         Ok(false)
     }
 }
@@ -99,8 +109,8 @@ mod tests {
     use crate::context::ContextManager;
     use tauqe_protocol::{ContextAccess, EditOperation, EditProposal};
 
-    #[test]
-    fn direct_policy_stages_applies_and_finalizes_without_commit() {
+    #[tokio::test]
+    async fn direct_policy_stages_applies_and_finalizes_without_commit() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         std::fs::write(root.join("a.rs"), "one\n").unwrap();
@@ -114,20 +124,20 @@ mod tests {
         }];
 
         let mut policy = DirectApplyPolicy::new();
-        let staged = policy.staging(root, &cm, &edits, None);
+        let staged = policy.staging(root, &cm, &edits, None).await;
         assert!(staged.is_success());
 
         let proposal = EditProposal {
             summary: "update a.rs".to_string(),
             edits: edits.clone(),
         };
-        let changed = policy.apply_temporary(root, &mut cm, &proposal).unwrap();
+        let changed = policy.apply_temporary(root, &mut cm, &proposal).await.unwrap();
         assert_eq!(changed, vec!["a.rs".to_string()]);
         assert_eq!(std::fs::read_to_string(root.join("a.rs")).unwrap(), "two\n");
 
-        let commit = policy.apply_final(root, &changed, "update a.rs").unwrap();
+        let commit = policy.apply_final(root, &changed, "update a.rs").await.unwrap();
         assert!(commit.is_none());
-        assert!(!policy.rollback(root).unwrap());
+        assert!(!policy.rollback(root).await.unwrap());
         assert_eq!(std::fs::read_to_string(root.join("a.rs")).unwrap(), "two\n");
     }
 }

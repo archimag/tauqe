@@ -9,7 +9,6 @@ use crate::editor::InputEditor;
 
 pub(crate) mod confirm;
 pub(crate) mod disconnected;
-pub(crate) mod discuss;
 pub(crate) mod help;
 pub(crate) mod prompt;
 pub(crate) mod refine;
@@ -29,9 +28,6 @@ pub(crate) use confirm::{
     render_confirm_execute_scope_popup, render_confirm_quit_popup, render_confirm_undo_popup,
 };
 pub(crate) use disconnected::render_disconnected_popup;
-pub(crate) use discuss::{
-    discuss_plan_dialog_area, discuss_plan_dialog_buttons, render_discuss_plan_dialog,
-};
 pub(crate) use help::render_help_popup;
 pub(crate) use prompt::render_prompt_modal;
 pub(crate) use refine::{
@@ -42,7 +38,7 @@ pub(crate) use selection::{
     render_selection_dialog, selection_dialog_area, selection_dialog_visible_height,
 };
 pub(crate) use squash::{render_squash_popup, squash_dialog_chunks};
-pub(crate) use status::{render_status_dialog, status_dialog_area};
+pub(crate) use status::{render_status_dialog, status_dialog_area, status_dialog_buttons};
 
 /// Renders editor text as lines, drawing the cursor (reversed char or a block at line end).
 pub(super) fn editor_lines(editor: &InputEditor, show_cursor: bool) -> Vec<Line<'static>> {

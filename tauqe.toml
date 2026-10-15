@@ -31,9 +31,8 @@ scribe = "~anthropic/claude-haiku-latest"    # history compaction, git squash co
 # saturating on the last one. Escalation stays strictly within the Coder role and
 # never switches to Architect, preserving the What vs How role isolation.
 coder = [
-  "~deepseek/deepseek-flash-latest",
+  #"~deepseek/deepseek-flash-latest",
   { model = "~google/gemini-flash-latest", effort = "medium" },
-  "google/gemini-4-argon"
 ]
 architect = [
   { model = "~google/gemini-flash-latest", effort = "high", alias = "Gemini Flash" },
@@ -58,6 +57,9 @@ auto_level_up = true
 # (corrective re-runs of a step turn that produced no verified edits and no terminal
 # success tag).
 max_retries = 5
+# Maximum automated replanning cycles triggered by a blocked coder step before
+# requiring manual developer intervention (default: 2).
+# max_replans = 2
 # workflow = "git"   # edit workflow: "toolchain", "git", "naive" (default: "git")
 # protocol = "xml"   # active edit protocol: "xml" (default: "xml")
 
@@ -66,6 +68,8 @@ max_retries = 5
 # max_retries = 5      # maximum retry attempts for compiler/linter self-healing
 # auto_heal = true     # automatically trigger the verification healing loop on check failures (default: true)
 # timeout_secs = 600   # wall-clock timeout in seconds for each verification command (default: 600)
+# auto_verify = true   # automatically run toolchain verification on turns with applied edits (default: true)
+# target = "all"       # default verification target when omitted: "all", "check", "clippy", "test" (default: "all")
 
 [git]
 # upstream = "origin/master"  # base upstream branch for calculating diffs (auto-detected by default)

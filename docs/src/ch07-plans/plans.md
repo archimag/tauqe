@@ -15,6 +15,7 @@ TAUQE provides a dedicated **Local Plans** subsystem designed around structured 
 - **Explicit DAG Dependencies (`depends_on: Vec<String>`):** Tasks form a Directed Acyclic Graph (DAG) rather than a rigid linear list. Steps declare dependencies on preceding items via their IDs. Topological scope validation (`Plan::evaluate_scope`) ensures tasks can only start once all direct prerequisites reach `PlanItemStatus::Done`. Parent task groups have container dependencies normalized so execution remains strictly leaf-scoped.
 - **Leaf-Only File Binding Invariant:** Parent items are conceptual milestones, phases, and task groups. They are never executed autonomously and must not carry file lists. Only leaf steps (`PlanItem::is_leaf() == true`) define the target context files and form the atomic execution units of a bounded turn. Any item with children has its `files` and its read-only reference files (`readonly_files`) cleared automatically during XML parsing, storage, and deserialization, so containers and leaves can never disagree. The TUI renders file badges only on leaf task rows and keeps section headers clean: a badge counts both roles (for example `[1 file + 2 ref]`), and an expanded leaf lists the target `files:`, the reference `ref:` paths, and the addressed `concept:` nodes on separate lines.
 - **"Done is Immutable" Persistence Invariant:** Completed tasks (`PlanItemStatus::Done`) represent verified, committed engineering progress. `PlanStorage::validate_done_immutability` semantically safeguards them: once a step is marked `Done`, subsequent plan saves, conversational updates, or replanning passes can neither delete it, alter its title, details, or target files, nor regress its status back to `Todo` or `InProgress`. Established architectural milestones cannot be rewritten or erased by generative drift.
+- **Wave Horizon Planning Model:** Tactical execution separates an immutable foundation from an adaptive, rolling task horizon. Completed steps (`Done`) are permanent, verified engineering milestones that the model is never asked to re-generate. Uncompleted work forms an open horizon that can be synthesized or revised in full without perturbing completed achievements. `PlanStorage::replace_uncompleted_horizon` atomically splices the verified Done foundation with the new horizon (`[...done_foundation, ...new_horizon_items]`), preventing status regressions, state inconsistencies, and ID collisions.
 - **Immune to History Compaction:** Unlike plain conversational chat where instructions fade after compaction rounds, local plans survive session restarts and compaction cycles intact.
 - **Typo-Tolerant Identifier Matching:** Plan identifiers (slugs like `jwt-auth` or `tui-refactor`) are resolved using Levenshtein distance and prefix matching. Minor typos made by the developer or model resolve seamlessly to the intended plan.
 
@@ -37,7 +38,7 @@ When running an assigned leaf task in an isolated turn:
 - **Concept Focus Retention:** The turn is supplied with the entire concept tree (`<plan_concept>`), completed milestones, and the single target task. The model retains full architectural awareness while chat history is suppressed to prevent hallucination.
 - **Streaming Edits:** Code edits are produced via the streaming XML protocol.
 - **Completion Marker:** When requirements are satisfied and verified, the step is marked complete by the terminal success tag (`<success summary="..." />`). The active protocol uses a dynamic per-turn marker suffix (for example `<success_<marker>>`); if the model omits the suffix, an unmarked `<success>` tag outside Markdown code fences is accepted as a fallback (§7.3.3).
-- **Semantic Blocker Protocol (`<blocked>`):** If an essential precondition fails, requirements contradict code invariants, or an unexpected architectural impediment arises, the model must **refuse to guess** or engage in blind trial-and-error. It emits `<blocked reason="..." details="..." />`. The harness instantly intercepts this command, aborts the turn, rolls back working tree modifications to the clean pre-turn checkpoint (`policy.rollback()`), and marks the step `BLOCKED` on disk without wasting cognitive tokens on futile patch-retry or healing loops (§7.3.4).
+- **Semantic Blocker Protocol (`<blocked>`):** If an essential precondition fails, requirements contradict code invariants, or an unexpected architectural impediment arises, the model must **refuse to guess** or engage in blind trial-and-error. It emits `<blocked reason="..." details="..." />`. The harness instantly intercepts this command, aborts the turn, rolls back working tree modifications to the clean pre-turn checkpoint (`policy.rollback()`), and marks the step `BLOCKED` on disk without wasting cognitive tokens on futile patch-retry or healing loops. In batch execution, this triggers the automated closed-loop replanning workflow (§7.3.4).
 - The engine marks the step `DONE` on disk and creates an atomic Git commit only after all project toolchain checks (`check`, `clippy`, `test`) pass cleanly.
 
 ---
@@ -49,15 +50,16 @@ TAUQE implements a disciplined, multi-stage planning pipeline:
 ### 7.3.0 The Duality: "What" vs "How" in Planning
 Software architecture thrives when the distinction between intent and implementation is strictly maintained:
 1. **The "What" Phase (Conversational Planning):** High-level architectural trade-offs, scope boundaries, and core design invariants are discussed with the developer in Develop (`Ctrl+1`) or targeted node discussions (`d`). The developer and AI collaborate to build the structured Concept Tree.
-2. **The "How" Phase (Deep Plan Refinement):** Once the concept is established, the developer triggers automated Deep Refine (`R`). An AI Architect analyzes the actual codebase AST contours and Tree-sitter symbols to produce the Implementation Blueprint.
+2. **The "How" Phase (Deep Plan Refinement & Horizon Synthesis):** Once the concept is established, the developer triggers automated Deep Refine (`R`). An AI Architect analyzes the actual codebase AST contours and Tree-sitter symbols to produce the Implementation Blueprint.
 
-### 7.3.1 Deep Plan Refinement (Architectural Decomposition)
+### 7.3.1 Deep Plan Refinement & Horizon Synthesis (Architectural Decomposition)
 Deep Plan Refinement (`R` in Plans view or RPC `plan/refine`) executes an isolated architectural pass with strict invariants:
 - **Concept Immutability Invariant:** The AI Architect receives the Concept Tree as an immutable architectural requirement. The architect is strictly prohibited from altering, rephrasing, or redesigning agreed concept items. Its sole mandate is to generate the implementation steps under `items`.
+- **Done Foundation Preservation:** When refining an existing plan that already has completed tasks, those tasks form an immutable foundation. The Architect synthesizes only the remaining horizon, and `PlanStorage::replace_uncompleted_horizon` atomically splices the new tasks into the plan.
 - **Target File Identification:** For every leaf step, the architect identifies the concrete repository files that must be touched (`files: [...]`) and links the step to corresponding concept nodes (`concept_refs: [...]`). Parent items stay file-free conceptual containers.
 - **Context Isolation:** To prevent generative hallucinations and prompt pollution, Deep Refine executes outside normal conversational history. The architect receives the Tree-sitter Repo Map, active context files, and the target plan structure.
 - **Deep Reasoning Depth:** The pass runs under the Architect role and therefore inherits the reasoning depth configured for that role in `[models.effort]` (for example `xhigh`). Deep planning thus receives maximum cognitive effort without binding that effort to a specific model name.
-- **Explicit Blocker Protocol (Refusal to Guess):** If requirements are contradictory, specifications incomplete, or codebase conventions violated, the architect must **refuse to guess**. It returns a structured `Blocked` status explaining the exact conflict. TAUQE presents this in a dedicated blocker modal with an option to immediately discuss the resolution with AI in Develop (`d`).
+- **Explicit Blocker Protocol (Refusal to Guess):** If requirements are contradictory, specifications incomplete, or codebase conventions violated, the architect must **refuse to guess**. It returns a structured `Blocked` status explaining the exact conflict. TAUQE presents this in a dedicated blocker modal with an option to immediately trigger replanning or discuss the resolution with AI in Develop (`d`).
 
 ### 7.3.2 Autonomous Scope Execution (Server-Orchestrated)
 A **scope** is one leaf step, a group of steps, or the whole plan. The client sends a single `plan/execute` request with `plan_id` and an optional `step_id`. The server owns the queue, the status transitions, and the advance from step to step.
@@ -72,7 +74,7 @@ A **scope** is one leaf step, a group of steps, or the whole plan. The client se
    - Otherwise, constructs the topologically ordered sequence of executable leaf steps (`TODO` or `IN_PROGRESS` only). Only one batch operation can execute concurrently.
 3. **Mandatory Pre-Flight Verification:** Before any step starts, the server runs the exact same toolchain pipeline (`VerifyTarget::All`) that the core runs after every autonomous step. If the repository does not build or its tests fail, execution is blocked synchronously, before any LLM request, before any step moves to `in_progress`, and at zero token cost. The server returns `PREFLIGHT_VERIFICATION_FAILED` with the full compiler or test output and leaves the scope statuses untouched. Repositories without a detected toolchain skip this gate transparently.
 4. **Per-Step Isolated Turn:** For each step, sequentially, the server marks it `in_progress`, pre-loads `step.files` into editable context and `step.readonly_files` into read-only reference context, injects the concept tree, suppresses conversational history, and runs a bounded turn. The interface switches to Develop (`Ctrl+1`) and shows the live turn together with a compact **Plan Stepper** (§5.8).
-5. **Atomic Completion & Semantic Blocking:** A step becomes `done` only when the turn is successful: the edits were applied and passed all toolchain checks, or the model emitted the terminal success tag. If the model emits `<blocked>`, the step transitions to `BLOCKED`, its working changes are rolled back, and the batch supervisor immediately halts with a diagnostic report. A text-only answer without code and without a terminal tag does not close the step.
+5. **Atomic Completion & Semantic Blocking:** A step becomes `done` only when the turn is successful: the edits were applied and passed all toolchain checks, or the model emitted the terminal success tag. If the model emits `<blocked>`, the step transitions to `BLOCKED`, its working changes are rolled back, and the batch supervisor initiates automated closed-loop replanning (§7.3.4). A text-only answer without code and without a terminal tag does not close the step.
 6. **Corrective Reprompt, then Fail-Fast:** If a step turn ends without verified code changes and without any terminal protocol tag (`<success>` or `<blocked>`), the server re-runs the step with a corrective prompt while the retry budget lasts (§7.3.3). Only once the budget is exhausted, the turn is cancelled, or a terminal error is reported does the server reset the step back to `todo`, report the reason, and stop the batch. Steps completed earlier stay `done`. Each failed turn's own file changes are undone by the Git workflow checkpoint.
 7. **Parent Status Recalculation:** When all child tasks under a parent node become `done`, the parent is automatically marked `done`.
 8. **Safe Cancellation:** `Esc` / `Ctrl+C` cancels the running turn. The cancelled step returns to `todo` and the rest of the batch does not start.
@@ -93,11 +95,13 @@ A bounded turn can fail the step contract in a purely conversational way: the mo
 
 Both settings that shape this loop are surfaced in project configuration and documented inline in `tauqe.toml`: `develop.max_retries` (the attempt budget) and `models.auto_level_up` (escalation on retry).
 
-### 7.3.4 Semantic Blocking, Sub-tree Grafting & Scoped Replanning (`plan/replan`)
+### 7.3.4 Semantic Blocking, Wave Horizon Planning & Automated Replanning (`plan/replan`)
 
-Real-world software development is hierarchical and non-linear. When an engineering task encounters an insurmountable roadblock, discarding the entire plan or manually editing JSON structures wastes effort and breaks architectural continuity.
+Real-world software development is iterative and non-linear. When an engineering task encounters an insurmountable roadblock—such as a contradictory requirement, an invalidated architectural assumption, or a broken third-party dependency—discarding the entire plan or manually editing JSON structures wastes effort and breaks architectural continuity.
 
-TAUQE implements **Hierarchical Task Network (HTN) Semantic Recovery**:
+Earlier designs attempted localized sub-tree grafting (`graft_subtree`), decomposing only the blocked task while preserving subsequent pending items. In practice, software engineering tasks are deeply interdependent: when an architectural assumption fails at step $N$, subsequent steps ($N+1 \dots M$) were designed around that flawed assumption. Retaining those downstream steps introduced subtle architectural drift, orphaned dependencies, and broken interface contracts.
+
+TAUQE deprecates single-step grafting in favor of **Wave Horizon Planning**:
 
 ```text
        Step N Execution (Coder)
@@ -109,35 +113,39 @@ TAUQE implements **Hierarchical Task Network (HTN) Semantic Recovery**:
         Git Rollback to Pre-Turn Checkpoint
         Step N status → BLOCKED
                   │
-       Escalation to Architect (RPC plan/replan)
+   Automated Replanning Loop (bounded by max_replans)
                   │
-       Diagnostic Replanning Packet
+       Architect Invocation (Wave Horizon Synthesis)
        ├── Immutable Concept Tree
        ├── Immutable Done Foundation (Steps 1..N-1)
        ├── Blocker Diagnostics (reason + details)
-       └── Remaining Task Horizon
+       └── Uncompleted Horizon Context
                   │
-       Architect Decomposes Step N into Sub-tree
+       PlanStorage::replace_uncompleted_horizon()
+       ├── Preserves Done Foundation (Steps 1..N-1)
+       └── Atomically Splices Newly Synthesized Horizon
                   │
-       PlanStorage::graft_subtree()
-       ├── Replaces Step N with Sub-tree Tasks (N.1, N.2...)
-       ├── Preserves Completed Steps (Done is Immutable)
-       └── Rewires Downstream Dependencies (depends_on)
+       Transactional History Recording
                   │
-       Developer Resumes Batch Execution (Enter / x)
+       Batch Execution Resumes on First New Leaf Step
 ```
 
-1. **Deterministic Rollback on Block:** When a Coder turn emits `<blocked reason="..." details="..." />`, the turn loop bypasses the patch-retry and verification healing stages. The Git policy immediately rolls back the working directory to the pre-turn checkpoint, transient auto-context files are flushed, and the step status is recorded as `BLOCKED`.
-2. **Targeted Diagnostic Packet:** Replanning invokes the Architect role through RPC `plan/replan`. The core constructs a focused diagnostic packet (`build_replan_diagnostic_packet`) containing:
-   - The immutable Concept Tree (architectural invariants);
-   - The verified foundation of all preceding completed tasks (`Done`);
-   - The explicit diagnostic report of why step $N$ failed;
-   - The remaining unfinished tasks and their dependencies.
-3. **Sub-tree Grafting (`PlanStorage::graft_subtree`):** Rather than re-generating the entire plan, the Architect returns a targeted decomposition of the blocked task into finer-grained sub-steps. The storage engine performs an atomic surgical graft:
-   - **Done Invariant Preserved:** Preceding completed milestones are untouched and cannot be modified.
-   - **Downstream Dependency Rewiring:** Any subsequent steps in the plan that depended on the blocked step ($N$) are automatically rewritten to depend on the terminal leaf tasks of the newly grafted sub-tree ($N.k$).
-   - **Parallel Branches Intact:** Independent tasks elsewhere in the plan maintain their original positions, statuses, and dependencies.
-4. **Seamless Execution Resumption:** Once the sub-tree is grafted, the developer presses `x` or `Enter` on the newly expanded tasks in Plans view (`Ctrl+4`). Scope execution resumes immediately from the first leaf step of the grafted sub-tree without manual intervention.
+1. **Deterministic Rollback on Block:** When a Coder turn emits `<blocked reason="..." details="..." />`, the turn loop immediately bypasses patch-retry and verification healing stages. The Git policy rolls back the working tree to the clean pre-turn checkpoint (`policy.rollback()`), transient auto-context files are flushed, and the step status is recorded as `BLOCKED`.
+2. **Unified Wave Horizon Synthesis:** Replanning and initial plan refinement are unified into a single pure synthesis function:
+   $$\text{Horizon} = \text{Architect}(\text{Concept}, \text{DoneFoundation}, \text{Context}, \text{Diagnostics})$$
+   The Architect is never asked to re-emit completed tasks (`Done`), completely eliminating the risk of status regression or violating `validate_done_immutability`. The Architect receives:
+   - The immutable Concept Tree (architectural intent and invariants);
+   - The immutable Done Foundation (verified milestones already in Git);
+   - The explicit diagnostic report of why step $N$ failed (reason, details, and compiler output);
+   - The repository context (Tree-sitter Repo Map and relevant files).
+   Based on this foundation, the Architect re-engineers the entire remaining task horizon to reach the goal under the newly discovered constraints.
+3. **Atomic Horizon Splicing (`PlanStorage::replace_uncompleted_horizon`):** Rather than performing fragile surgery on a single node, the storage engine atomically replaces all uncompleted items with the new horizon:
+   - **Done Foundation Preserved:** Completed steps are retained verbatim without risk of mutation or deletion.
+   - **ID Collision Avoidance:** Any items in the new horizon that collide with completed IDs are safely disambiguated or discarded.
+   - **Clean DAG State:** Uncompleted downstream dependencies are re-computed cleanly by the Architect rather than leaving orphaned prerequisite IDs.
+4. **Automated Closed-Loop Recovery & `max_replans`:** During autonomous batch execution (`plan/execute`), encountering a `<blocked>` outcome does not force the developer to manually intervene immediately. The batch supervisor automatically triggers replanning with the diagnostic packet, applies the new horizon, and resumes batch execution from the first executable leaf step. To prevent infinite cycles where models repeatedly block and replan, the loop is bounded by `develop.max_replans` (default: 2, configurable in `tauqe.toml`). If consecutive automated replans exceed this threshold, batch execution safely halts, keeping the step `BLOCKED` and requesting developer attention.
+5. **Session History Transactionality:** The Architect's replanning dialogue is recorded in session history **strictly after** the updated plan is successfully validated and persisted to disk. If validation fails or storage encounters an I/O error, the session history remains unpolluted by phantom replanning attempts.
+6. **Interactive TUI Integration:** If the developer wishes to inspect or guide replanning manually, pressing `R` on a blocked step in Plans view (`Ctrl+4`) opens the Refine/Replan dialog with the blocker reason and details automatically pre-seeded into the instructions editor. The developer can refine the instructions and trigger replanning directly without falling back into an unconstrained conversational REPL session. The Plan Stepper in Develop view and the Plans tree instantly update to reflect the new horizon.
 
 ---
 
@@ -148,7 +156,7 @@ TAUQE implements **Hierarchical Task Network (HTN) Semantic Recovery**:
 | `n` / `p` (or `↑` / `↓`) | Move selection through plans, concept items, and implementation items |
 | `Enter` / `x` | Execute leaf implementation step, group, or entire plan (with confirmation) |
 | `d` | Discuss selected concept item, implementation step, or plan architecture in Develop |
-| `R` | Deep refine implementation blueprint with AI Architect (preserves concept) |
+| `R` | Deep refine implementation blueprint or replan uncompleted horizon with AI Architect |
 | `t` / `s` | Open status selection dialog (`DISCUSSION`, `TODO`, `IN_PROGRESS`, `DONE`, `BLOCKED`, `CANCELLED`) |
 | `Tab` / `Space` | Fold or unfold section (Concept / Implementation) or hierarchical items |
 | `a` | Toggle fold / unfold all plans and sections |

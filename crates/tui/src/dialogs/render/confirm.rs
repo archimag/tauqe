@@ -177,17 +177,35 @@ pub fn render_confirm_detach_focus_popup(frame: &mut ratatui::Frame, state: &App
 pub fn execute_review_params(state: &AppState) -> Option<ConfirmModalParams<'_>> {
     let target = state.confirm_execute_review.as_ref()?;
 
-    let is_single = target.items.len() == 1;
-    let title = if is_single {
+    let is_all_sessions = target.review_id.is_none();
+    let is_single = target.items.len() == 1 && !is_all_sessions;
+    let title = if is_all_sessions {
+        "Execute All Review Sessions"
+    } else if is_single {
         "Execute Review Finding"
     } else {
         "Execute Review Session"
     };
 
-    let heading = if is_single {
+    let heading = if is_all_sessions {
+        "Resolve remaining findings sequentially across all sessions with automated verification?"
+    } else if is_single {
         "Resolve target review finding autonomously?"
     } else {
         "Resolve remaining findings sequentially with automated verification?"
+    };
+
+    let review_line = if let Some(ref rev_id) = target.review_id {
+        Line::from(vec![
+            Span::styled(" Review: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(&target.review_title, Style::default().bold().fg(Color::White)),
+            Span::styled(format!(" [{}]", rev_id), Style::default().fg(Color::DarkGray)),
+        ])
+    } else {
+        Line::from(vec![
+            Span::styled(" Review: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(&target.review_title, Style::default().bold().fg(Color::White)),
+        ])
     };
 
     let mut body_lines = vec![
@@ -197,11 +215,7 @@ pub fn execute_review_params(state: &AppState) -> Option<ConfirmModalParams<'_>>
             Style::default().bold().fg(Color::Cyan),
         )),
         Line::raw(""),
-        Line::from(vec![
-            Span::styled(" Review: ", Style::default().fg(Color::DarkGray)),
-            Span::styled(&target.review_title, Style::default().bold().fg(Color::White)),
-            Span::styled(format!(" [{}]", target.review_id), Style::default().fg(Color::DarkGray)),
-        ]),
+        review_line,
         Line::from(vec![
             Span::styled(" Scope: ", Style::default().fg(Color::DarkGray)),
             Span::styled(&target.scope_title, Style::default().bold().fg(Color::Yellow)),
@@ -211,14 +225,10 @@ pub fn execute_review_params(state: &AppState) -> Option<ConfirmModalParams<'_>>
 
     if is_single {
         let item = &target.items[0];
-        if let Some(path) = &item.file_path {
-            let loc = match item.line_range {
-                Some((s, e)) if s == e => format!("{}:{}", path, s),
-                Some((s, e)) => format!("{}:{}-{}", path, s, e),
-                None => path.clone(),
-            };
+        if !item.files.is_empty() {
+            let loc = item.files.join(", ");
             body_lines.push(Line::from(vec![
-                Span::styled(" Location: ", Style::default().fg(Color::DarkGray)),
+                Span::styled(" Files: ", Style::default().fg(Color::DarkGray)),
                 Span::styled(loc, Style::default().fg(Color::Cyan)),
             ]));
         }
@@ -263,9 +273,9 @@ pub fn execute_review_params(state: &AppState) -> Option<ConfirmModalParams<'_>>
     }
 
     let confirm_label = if is_single {
-        "Resolve (Enter)"
+        "Resolve (Enter / Y)"
     } else {
-        "Resolve Queue (Enter)"
+        "Resolve Queue (Enter / Y)"
     };
 
     Some(ConfirmModalParams {
@@ -367,9 +377,9 @@ pub fn execute_scope_params(state: &AppState) -> Option<ConfirmModalParams<'_>> 
     }
 
     let confirm_label = if is_single {
-        "Execute (Enter)"
+        "Execute (Enter / Y)"
     } else {
-        "Execute Scope (Enter)"
+        "Execute Scope (Enter / Y)"
     };
 
     Some(ConfirmModalParams {
@@ -660,5 +670,46 @@ mod tests {
             cancel_text.contains("Cancel"),
             "cancel row text: {cancel_text:?}"
         );
+    }
+
+    #[test]
+    fn test_execute_review_params_all_sessions() {
+        let mut st = crate::app::test_state();
+        st.confirm_execute_review = Some(crate::app::ConfirmExecuteReviewState {
+            review_id: None,
+            review_title: "All Review Sessions".to_string(),
+            scope_title: "All remaining TODO findings across all sessions (2 items)".to_string(),
+            item_id: None,
+            items: vec![
+                tauqe_protocol::ReviewItem {
+                    id: 1,
+                    title: "First".to_string(),
+                    model: None,
+                    severity: tauqe_protocol::ReviewSeverity::Warning,
+                    status: tauqe_protocol::ReviewStatus::Todo,
+                    files: vec![],
+                    resolution_notes: None,
+                    body: String::new(),
+                },
+                tauqe_protocol::ReviewItem {
+                    id: 2,
+                    title: "Second".to_string(),
+                    model: None,
+                    severity: tauqe_protocol::ReviewSeverity::Suggestion,
+                    status: tauqe_protocol::ReviewStatus::Todo,
+                    files: vec![],
+                    resolution_notes: None,
+                    body: String::new(),
+                },
+            ],
+        });
+
+        let params = execute_review_params(&st).expect("params should be generated");
+        assert_eq!(params.title, "Execute All Review Sessions");
+        assert_eq!(params.confirm_button, crate::app::ConfirmDialogButton::Cancel);
+        assert!(!params.destructive);
+        let texts: Vec<String> = params.body_lines.iter().map(|l| l.to_string()).collect();
+        assert!(texts.iter().any(|t| t.contains("Review: All Review Sessions")));
+        assert!(texts.iter().any(|t| t.contains("2 finding(s) to resolve")));
     }
 }

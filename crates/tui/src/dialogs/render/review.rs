@@ -12,7 +12,7 @@ pub const REVIEW_DIALOG_WIDTH: u16 = 64;
 /// Height of the review launch dialog, as a percentage of the terminal height.
 pub const REVIEW_DIALOG_HEIGHT: u16 = 54;
 /// Action-bar label for starting a review.
-pub const REVIEW_DIALOG_CONFIRM_LABEL: &str = "[ Start Review ]";
+pub const REVIEW_DIALOG_CONFIRM_LABEL: &str = "[ Start Review (C-Enter) ]";
 /// Action-bar label for cancelling the review dialog.
 pub const REVIEW_DIALOG_CANCEL_LABEL: &str = "[ Cancel ]";
 
@@ -193,9 +193,14 @@ pub fn render_review_dialog(
 
     // Instruction editor. The cursor is drawn only when the editor owns focus.
     let show_cursor = dialog.focus.is_prompt_editor();
+    let editor_title_style = if show_cursor {
+        Style::default().fg(Color::Cyan).bold()
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
     let mut editor_text = vec![Line::from(Span::styled(
         "  Additional review instructions (optional):",
-        Style::default().fg(Color::Cyan).bold(),
+        editor_title_style,
     ))];
     if dialog.prompt_editor.is_empty() {
         let mut spans = vec![Span::raw("  > ")];
@@ -220,22 +225,32 @@ pub fn render_review_dialog(
     );
 
     // Action bar with a focus-aware navigation hint.
+    let in_actions = dialog.focus.is_actions();
     let confirm_selected = dialog.confirm_button == crate::app::ConfirmDialogButton::Confirm;
-    let confirm_style = if confirm_selected {
-        Style::default().bg(Color::Green).fg(Color::Black).bold()
+    let (confirm_style, cancel_style) = if in_actions {
+        if confirm_selected {
+            (
+                Style::default().bg(Color::Green).fg(Color::Black).bold(),
+                Style::default().bg(Color::DarkGray).fg(Color::White),
+            )
+        } else {
+            (
+                Style::default().bg(Color::DarkGray).fg(Color::White),
+                Style::default().bg(Color::Cyan).fg(Color::Black).bold(),
+            )
+        }
     } else {
-        Style::default().fg(Color::Green)
-    };
-    let cancel_style = if confirm_selected {
-        Style::default().fg(Color::Cyan)
-    } else {
-        Style::default().bg(Color::Cyan).fg(Color::Black).bold()
+        (
+            Style::default().bg(Color::DarkGray).fg(Color::White),
+            Style::default().bg(Color::DarkGray).fg(Color::White),
+        )
     };
     let nav_hint = if dialog.focus.is_actions() {
         "Enter: confirm • ←/→: button • Esc: cancel".to_string()
     } else {
         format!(
-            "Tab: focus • {}: model • Esc: cancel",
+            "{}Enter: start • Tab: focus • {}: model • Esc: cancel",
+            primary.prefix_str(),
             crate::components::model_selector::model_select_hint(primary)
         )
     };
@@ -245,7 +260,7 @@ pub fn render_review_dialog(
             Span::raw("    "),
             Span::styled(format!(" {} ", REVIEW_DIALOG_CANCEL_LABEL), cancel_style),
         ]),
-        Line::from(Span::styled(nav_hint, Style::default().fg(Color::DarkGray))),
+        Line::from(Span::styled(nav_hint, Style::default().fg(Color::Gray))),
     ];
     let footer = Paragraph::new(actions).alignment(Alignment::Center);
     frame.render_widget(footer, footer_area);

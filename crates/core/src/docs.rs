@@ -1,6 +1,8 @@
 //! Documentation embedded into the binary. The same chapters serve human readers
 //! and the model, which requests them on demand via the `<doc_request>` tag.
 
+use tauqe_protocol::DocTopic;
+
 const INTRO: &str = include_str!("../../../docs/src/intro.md");
 const PHILOSOPHY: &str = include_str!("../../../docs/src/ch01-philosophy/semantic-harness.md");
 const CONTEXT: &str = include_str!("../../../docs/src/ch02-context/three-tier-model.md");
@@ -10,38 +12,28 @@ const INTERFACE: &str = include_str!("../../../docs/src/ch05-interface/tui-ux.md
 const REVIEW: &str = include_str!("../../../docs/src/ch06-review/review.md");
 const PLANS: &str = include_str!("../../../docs/src/ch07-plans/plans.md");
 
-/// Topics the model can request. The last one aggregates every chapter.
-pub(crate) const TOPICS: &[&str] = &[
-    "overview",
-    "context",
-    "workflow",
-    "git",
-    "interface",
-    "review",
-    "plan",
-    "plans",
-    "all",
-];
-
-/// Maps a requested topic to a known one; unknown topics resolve to `all`.
-pub(crate) fn resolve_topic(topic: &str) -> &'static str {
-    TOPICS
+/// Renders the authoritative documentation topics advertised in the system
+/// prompt, derived from [`DocTopic::ALL`] so the hint keeps a single source of
+/// truth.
+pub(crate) fn topic_hint() -> String {
+    DocTopic::ALL
         .iter()
-        .copied()
-        .find(|known| *known == topic)
-        .unwrap_or("all")
+        .map(DocTopic::as_str)
+        .collect::<Vec<_>>()
+        .join("|")
 }
 
-pub(crate) fn get_documentation(topic: &str) -> String {
-    let sections: &[&str] = match resolve_topic(topic) {
-        "overview" => &[INTRO, PHILOSOPHY],
-        "context" => &[CONTEXT],
-        "workflow" => &[LIFECYCLE],
-        "git" => &[GIT_SAFETY],
-        "interface" => &[INTERFACE],
-        "review" => &[REVIEW],
-        "plan" | "plans" => &[PLANS],
-        _ => &[
+/// Returns the concatenated documentation chapters for the requested topic.
+pub(crate) fn get_documentation(topic: DocTopic) -> String {
+    let sections: &[&str] = match topic {
+        DocTopic::Overview => &[INTRO, PHILOSOPHY],
+        DocTopic::Context => &[CONTEXT],
+        DocTopic::Workflow => &[LIFECYCLE],
+        DocTopic::Git => &[GIT_SAFETY],
+        DocTopic::Interface => &[INTERFACE],
+        DocTopic::Review => &[REVIEW],
+        DocTopic::Plan => &[PLANS],
+        DocTopic::All => &[
             INTRO, PHILOSOPHY, CONTEXT, LIFECYCLE, GIT_SAFETY, INTERFACE, REVIEW, PLANS,
         ],
     };
@@ -57,19 +49,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_resolve_topic_falls_back_to_all() {
-        assert_eq!(resolve_topic("interface"), "interface");
-        assert_eq!(resolve_topic("unknown"), "all");
-    }
-
-    #[test]
     fn test_get_documentation_topics() {
-        assert!(get_documentation("interface").contains("Ctrl+1"));
-        assert!(get_documentation("plan").contains("Local Plans"));
-        let all = get_documentation("all");
+        assert!(get_documentation(DocTopic::Interface).contains("Ctrl+1"));
+        assert!(get_documentation(DocTopic::Plan).contains("Local Plans"));
+        let all = get_documentation(DocTopic::All);
         assert!(all.contains("Semantic Harness"));
         assert!(all.contains("Ctrl+1"));
         assert!(all.contains("Local Plans"));
-        assert_eq!(get_documentation("bogus"), all);
+    }
+
+    #[test]
+    fn test_topic_hint_lists_every_topic() {
+        let hint = topic_hint();
+        for topic in DocTopic::ALL {
+            assert!(hint.contains(topic.as_str()));
+        }
     }
 }

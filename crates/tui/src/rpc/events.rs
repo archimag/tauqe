@@ -317,12 +317,12 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
                     if let Some(existing) = st.model.files.iter_mut().find(|f| f.path == data.path)
                     {
                         existing.status = FileEditStatus::Running;
-                        existing.op_type = EditOp::from_wire(&data.op_type);
+                        existing.op_type = data.op_type;
                         existing.retry_info = None;
                     } else {
                         st.model.files.push(StreamingFileEdit {
                             path: data.path,
-                            op_type: EditOp::from_wire(&data.op_type),
+                            op_type: data.op_type,
                             status: FileEditStatus::Running,
                             error: None,
                             hunks: Vec::new(),
@@ -352,7 +352,7 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
             if let Some(params) = ev.params {
                 if let Ok(data) = serde_json::from_value::<EditFileDoneEvent>(params) {
                     if let Some(f) = st.model.files.iter_mut().find(|f| f.path == data.path) {
-                        f.status = FileEditStatus::from_wire(&data.status);
+                        f.status = data.status.into();
                         f.error = data.error;
                         if f.status == FileEditStatus::Ok {
                             f.retry_info = None;
@@ -500,6 +500,7 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
         events::MODEL_FINISHED => {
             *is_reasoning = false;
             st.model.reasoning.finalize();
+            st.model.reasoning.show = false;
             st.confirm_cancel = false;
             st.running_model = None;
             if let Some(started) = st.turn_started_at.take() {
@@ -551,6 +552,12 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
                         if let Some(err) = st.model.edit_final_error.clone() {
                             st.notify_error(err);
                         }
+                    } else {
+                        let msg = format_turn_completion_message(
+                            st.model.last_commit_hash.as_deref(),
+                            st.model.last_commit_summary.as_deref(),
+                        );
+                        st.notify_success(msg);
                     }
                 }
             }
@@ -558,6 +565,7 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
         events::MODEL_CANCELLED => {
             *is_reasoning = false;
             st.model.reasoning.finalize();
+            st.model.reasoning.show = false;
             st.confirm_cancel = false;
             st.running_model = None;
             st.turn_started_at = None;
@@ -581,6 +589,7 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
         events::MODEL_ERROR => {
             *is_reasoning = false;
             st.model.reasoning.finalize();
+            st.model.reasoning.show = false;
             st.confirm_cancel = false;
             st.running_model = None;
             if let Some(started) = st.turn_started_at.take() {
@@ -831,6 +840,7 @@ fn finish_review_turn(model: &mut DevelopView) {
 /// Settles the REPL buffer into a terminal status and finalizes reasoning.
 fn end_review_turn(model: &mut DevelopView, status: TurnStatus, error: Option<String>) {
     model.reasoning.finalize();
+    model.reasoning.show = false;
     model.status = status;
     if let Some(message) = error {
         model.error = Some(message);
@@ -887,6 +897,21 @@ fn format_batch_summary(kind: &str, summary: &BatchFinishSummary) -> (String, St
     (title, body)
 }
 
+/// Formats the in-app completion message for a finished model turn, including
+/// the commit hash and summary when a commit was created.
+fn format_turn_completion_message(
+    commit_hash: Option<&str>,
+    commit_summary: Option<&str>,
+) -> String {
+    let summary = commit_summary.map(str::trim).filter(|s| !s.is_empty());
+    match (commit_hash, summary) {
+        (Some(hash), Some(summary)) => format!("Turn completed ({}): {}", hash, summary),
+        (Some(hash), None) => format!("Turn completed ({})", hash),
+        (None, Some(summary)) => format!("Turn completed: {}", summary),
+        (None, None) => "Turn completed".to_string(),
+    }
+}
+
 /// Formats an elapsed duration as `Ns` under a minute, otherwise `Nm Ss`.
 fn format_elapsed(seconds: u64) -> String {
     if seconds < 60 {
@@ -899,6 +924,7 @@ fn format_elapsed(seconds: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tauqe_protocol::ModelRef;
 
     fn batch_summary(
         status: BatchFinishStatus,
@@ -950,7 +976,7 @@ mod tests {
     fn review_started_event() -> ReviewStartedEvent {
         ReviewStartedEvent {
             operation_id: "rev-op-1".to_string(),
-            model: "reviewer".to_string(),
+            model: ModelRef::openrouter("reviewer"),
             files_count: 2,
             estimated_tokens: 128,
         }
@@ -977,7 +1003,7 @@ mod tests {
         begin_review_turn(&mut model, &review_started_event());
 
         assert_eq!(model.operation_id.as_deref(), Some("rev-op-1"));
-        assert_eq!(model.model.as_deref(), Some("reviewer"));
+        assert_eq!(model.model, Some(ModelRef::openrouter("reviewer")));
         assert_eq!(model.status, TurnStatus::Responding);
         assert!(model.text.is_empty());
         assert!(model.markdown_lines.is_empty());
@@ -1046,12 +1072,109 @@ mod tests {
     #[test]
     fn test_review_terminal_statuses_map_to_repl() {
         let mut cancelled = DevelopView::default();
+        cancelled.reasoning.show = true;
         end_review_turn(&mut cancelled, TurnStatus::Cancelled, None);
         assert_eq!(cancelled.status, TurnStatus::Cancelled);
+        assert!(!cancelled.reasoning.show);
 
         let mut failed = DevelopView::default();
+        failed.reasoning.show = true;
         end_review_turn(&mut failed, TurnStatus::Error, Some("boom".to_string()));
         assert_eq!(failed.status, TurnStatus::Error);
         assert_eq!(failed.error.as_deref(), Some("boom"));
+        assert!(!failed.reasoning.show);
+    }
+
+    #[tokio::test]
+    async fn test_model_error_folds_reasoning_block() {
+        let mut st = crate::app::test_state();
+        st.model.reasoning.append_delta("Deep thoughts...");
+        assert!(st.model.reasoning.show);
+
+        let state = Arc::new(Mutex::new(st));
+        let mut is_reasoning = true;
+        let ev = Event {
+            method: events::MODEL_ERROR.to_string(),
+            params: Some(
+                serde_json::to_value(ModelErrorEvent {
+                    operation_id: "op-err".to_string(),
+                    message: "Generation ended with finish_reason: error".to_string(),
+                })
+                .unwrap(),
+            ),
+        };
+
+        handle_event(ev, &state, &mut is_reasoning).await;
+
+        let guard = state.lock().await;
+        assert_eq!(guard.model.status, TurnStatus::Error);
+        assert!(!guard.model.reasoning.show);
+        assert!(!guard.model.reasoning.is_streaming());
+    }
+
+    #[tokio::test]
+    async fn test_model_finished_emits_in_app_success_notification_with_commit() {
+        let mut st = crate::app::test_state();
+        st.view_mode = crate::app::ViewMode::Plans;
+        st.model.status = TurnStatus::Editing;
+        st.model.edits_active = true;
+        st.model.edit_final_applied = Some(true);
+        st.model.last_commit_hash = Some("a1b2c3d".to_string());
+        st.model.last_commit_summary = Some("feat(tui): add notification".to_string());
+
+        let state = Arc::new(Mutex::new(st));
+        let mut is_reasoning = false;
+        let ev = Event {
+            method: events::MODEL_FINISHED.to_string(),
+            params: Some(
+                serde_json::to_value(ModelFinishedEvent {
+                    operation_id: "op-1".to_string(),
+                    full_text: String::new(),
+                })
+                .unwrap(),
+            ),
+        };
+
+        handle_event(ev, &state, &mut is_reasoning).await;
+
+        let guard = state.lock().await;
+        assert_eq!(guard.model.status, TurnStatus::Done);
+        let notif = guard
+            .active_notification()
+            .expect("completion notification must be set");
+        assert_eq!(notif.level, crate::app::NotificationLevel::Success);
+        assert_eq!(
+            notif.text,
+            "Turn completed (a1b2c3d): feat(tui): add notification"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_model_finished_without_edits_emits_completion_notification() {
+        let mut st = crate::app::test_state();
+        st.view_mode = crate::app::ViewMode::Review;
+        st.model.status = TurnStatus::Responding;
+
+        let state = Arc::new(Mutex::new(st));
+        let mut is_reasoning = false;
+        let ev = Event {
+            method: events::MODEL_FINISHED.to_string(),
+            params: Some(
+                serde_json::to_value(ModelFinishedEvent {
+                    operation_id: "op-2".to_string(),
+                    full_text: String::new(),
+                })
+                .unwrap(),
+            ),
+        };
+
+        handle_event(ev, &state, &mut is_reasoning).await;
+
+        let guard = state.lock().await;
+        let notif = guard
+            .active_notification()
+            .expect("completion notification must be set");
+        assert_eq!(notif.level, crate::app::NotificationLevel::Success);
+        assert_eq!(notif.text, "Turn completed");
     }
 }

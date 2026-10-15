@@ -81,25 +81,42 @@ fn marker_matches(candidate: &str, marker: &str) -> bool {
 /// parsing. An incomplete trailing token is withheld so the returned prefix is stable.
 /// Unsuffixed tags in source code are protected as literal content, never closing active blocks.
 pub(crate) fn normalize_marked_xml(text: &str, marker: &str, finished: bool) -> String {
+    let mut raw = text.to_string();
+    let mut stack = Vec::new();
+    normalize_marked_xml_incremental(&mut raw, marker, &mut stack, finished)
+}
+
+/// Incrementally normalizes raw XML input in place, draining fully processed bytes
+/// from `raw` and returning only newly produced normalized output. Retaining the tag
+/// `stack` across chunks avoids O(n^2) rescanning during streaming.
+pub(crate) fn normalize_marked_xml_incremental(
+    raw: &mut String,
+    marker: &str,
+    stack: &mut Vec<&'static str>,
+    finished: bool,
+) -> String {
     let mut output = String::new();
-    let mut stack: Vec<&str> = Vec::new();
     let protection = literal_prefix(marker);
     let mut pos = 0;
-    while pos < text.len() {
-        let Some(offset) = text[pos..].find('<') else {
-            output.push_str(&text[pos..]);
+    while pos < raw.len() {
+        let Some(offset) = raw[pos..].find('<') else {
+            output.push_str(&raw[pos..]);
+            pos = raw.len();
             break;
         };
         let start = pos + offset;
-        output.push_str(&text[pos..start]);
-        let closing = text[start..].starts_with("</");
+        output.push_str(&raw[pos..start]);
+        let closing = raw[start..].starts_with("</");
         let name_start = start + if closing { 2 } else { 1 };
-        let name_len = text[name_start..].bytes()
+        let name_len = raw[name_start..].bytes()
             .take_while(|b| b.is_ascii_alphanumeric() || *b == b'_' || *b == b'-')
             .count();
         let name_end = name_start + name_len;
-        if name_end == text.len() && !finished { break; }
-        let name = &text[name_start..name_end];
+        if name_end == raw.len() && !finished {
+            pos = start;
+            break;
+        }
+        let name = &raw[name_start..name_end];
         let mut active = XML_TAG_BASES.iter().copied().find(|base| {
             name.strip_prefix(base)
                 .and_then(|rest| rest.strip_prefix('_').or_else(|| rest.strip_prefix('-')))
@@ -115,14 +132,14 @@ pub(crate) fn normalize_marked_xml(text: &str, marker: &str, finished: bool) -> 
                 active = Some(base);
             }
         }
-        let boundary = text[name_end..].chars().next()
+        let boundary = raw[name_end..].chars().next()
             .map(|c| c.is_whitespace() || c == '>' || c == '/')
             .unwrap_or(false);
         if let (true, Some(base)) = (boundary, active) {
             // Find the end of the header without mistaking quoted '>' for its delimiter.
             let mut quote = None;
             let mut end = None;
-            for (idx, ch) in text[name_end..].char_indices() {
+            for (idx, ch) in raw[name_end..].char_indices() {
                 if let Some(q) = quote {
                     if ch == q { quote = None; }
                 } else if ch == '\'' || ch == '"' {
@@ -133,14 +150,17 @@ pub(crate) fn normalize_marked_xml(text: &str, marker: &str, finished: bool) -> 
                 }
             }
             let Some(end) = end else {
-                if !finished { break; }
+                if !finished {
+                    pos = start;
+                    break;
+                }
                 output.push_str(&protection);
                 pos = start + 1;
                 continue;
             };
             let accepted = if closing {
-                if let Some(pos) = stack.iter().rposition(|&s| s == base) {
-                    stack.truncate(pos);
+                if let Some(p) = stack.iter().rposition(|&s| s == base) {
+                    stack.truncate(p);
                     true
                 } else {
                     false
@@ -152,8 +172,8 @@ pub(crate) fn normalize_marked_xml(text: &str, marker: &str, finished: bool) -> 
                 output.push('<');
                 if closing { output.push('/'); }
                 output.push_str(base);
-                output.push_str(&text[name_end..end]);
-                if !closing && !text[name_end..end].trim_end().ends_with("/>") {
+                output.push_str(&raw[name_end..end]);
+                if !closing && !raw[name_end..end].trim_end().ends_with("/>") {
                     stack.push(base);
                 }
                 pos = end;
@@ -163,6 +183,7 @@ pub(crate) fn normalize_marked_xml(text: &str, marker: &str, finished: bool) -> 
         output.push_str(&protection);
         pos = start + 1;
     }
+    raw.drain(..pos);
     output
 }
 

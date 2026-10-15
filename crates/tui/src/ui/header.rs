@@ -139,7 +139,13 @@ fn tab_label(
     match tier {
         HeaderTier::Full => match mode {
             ViewMode::Develop => " 1: REPL ".to_string(),
-            ViewMode::Context => format!(" 2: Context ({}) ", ctx_count),
+            ViewMode::Plans => {
+                if plans_count > 0 {
+                    format!(" 2: Plans ({}) ", plans_count)
+                } else {
+                    " 2: Plans ".to_string()
+                }
+            }
             ViewMode::Review => {
                 if review_count > 0 {
                     format!(" 3: Review ({}) ", review_count)
@@ -147,19 +153,19 @@ fn tab_label(
                     " 3: Review ".to_string()
                 }
             }
-            ViewMode::Plans => {
-                if plans_count > 0 {
-                    format!(" 4: Plans ({}) ", plans_count)
-                } else {
-                    " 4: Plans ".to_string()
-                }
-            }
+            ViewMode::Context => format!(" 4: Context ({}) ", ctx_count),
             ViewMode::History => " 5: History ".to_string(),
             ViewMode::Onboarding => " ! Setup ".to_string(),
         },
         HeaderTier::Medium => match mode {
             ViewMode::Develop => " 1: REPL ".to_string(),
-            ViewMode::Context => format!(" 2: Ctx ({}) ", ctx_count),
+            ViewMode::Plans => {
+                if plans_count > 0 {
+                    format!(" 2: Plan ({}) ", plans_count)
+                } else {
+                    " 2: Plan ".to_string()
+                }
+            }
             ViewMode::Review => {
                 if review_count > 0 {
                     format!(" 3: Rev ({}) ", review_count)
@@ -167,13 +173,7 @@ fn tab_label(
                     " 3: Rev ".to_string()
                 }
             }
-            ViewMode::Plans => {
-                if plans_count > 0 {
-                    format!(" 4: Plan ({}) ", plans_count)
-                } else {
-                    " 4: Plan ".to_string()
-                }
-            }
+            ViewMode::Context => format!(" 4: Ctx ({}) ", ctx_count),
             ViewMode::History => " 5: Hist ".to_string(),
             ViewMode::Onboarding => " ! Setup ".to_string(),
         },
@@ -187,9 +187,13 @@ fn tab_label(
                         " 1 ".to_string()
                     }
                 }
-                ViewMode::Context => {
+                ViewMode::Plans => {
                     if is_active {
-                        format!(" 2: Ctx ({}) ", ctx_count)
+                        if plans_count > 0 {
+                            format!(" 2: Plan ({}) ", plans_count)
+                        } else {
+                            " 2: Plan ".to_string()
+                        }
                     } else {
                         " 2 ".to_string()
                     }
@@ -205,13 +209,9 @@ fn tab_label(
                         " 3 ".to_string()
                     }
                 }
-                ViewMode::Plans => {
+                ViewMode::Context => {
                     if is_active {
-                        if plans_count > 0 {
-                            format!(" 4: Plan ({}) ", plans_count)
-                        } else {
-                            " 4: Plan ".to_string()
-                        }
+                        format!(" 4: Ctx ({}) ", ctx_count)
                     } else {
                         " 4 ".to_string()
                     }
@@ -297,9 +297,9 @@ pub fn render_header(frame: &mut ratatui::Frame, state: &mut AppState, area: Rec
 
     let tabs = [
         (ViewMode::Develop, ClickTarget::DevelopTab),
-        (ViewMode::Context, ClickTarget::ContextTab),
-        (ViewMode::Review, ClickTarget::ReviewTab),
         (ViewMode::Plans, ClickTarget::PlansTab),
+        (ViewMode::Review, ClickTarget::ReviewTab),
+        (ViewMode::Context, ClickTarget::ContextTab),
         (ViewMode::History, ClickTarget::HistoryTab),
     ];
 
@@ -479,8 +479,8 @@ mod tests {
                 dirty: false,
             }),
             all_repo_files: Vec::new(),
-            workflow: "git".to_string(),
-            edit_protocol: "xml".to_string(),
+            workflow: tauqe_protocol::WorkflowKind::Git,
+            edit_protocol: tauqe_protocol::EditProtocolKind::Xml,
             active_model: ModelRef::openrouter("anthropic/claude-3-7-sonnet"),
             available_models: Vec::new(),
             available_workflows: Vec::new(),
@@ -511,7 +511,6 @@ mod tests {
             squash_dialog: None,
             review_dialog: None,
             prompt_modal: None,
-            discuss_plan_dialog: None,
             discuss_review_dialog: None,
             notification: None,
             turn_started_at: None,
@@ -545,6 +544,14 @@ mod tests {
         assert_eq!(
             tab_label(HeaderTier::Compact, ViewMode::Develop, ViewMode::Context, 0, 0, 0),
             " 1 "
+        );
+        assert_eq!(
+            tab_label(HeaderTier::Full, ViewMode::Plans, ViewMode::Develop, 0, 0, 0),
+            " 2: Plans "
+        );
+        assert_eq!(
+            tab_label(HeaderTier::Full, ViewMode::Plans, ViewMode::Develop, 0, 0, 3),
+            " 2: Plans (3) "
         );
         assert_eq!(
             tab_label(HeaderTier::Full, ViewMode::Review, ViewMode::Develop, 0, 0, 0),
@@ -633,7 +640,7 @@ mod tests {
             assert!(clicks.help_button.1 < max_col, "Help button exceeds width {} ({:?})", w, clicks.help_button);
             assert!(clicks.squash_button.1 < clicks.help_button.0, "Squash and help button overlap");
             assert!(clicks.model_select.1 < clicks.squash_button.0, "Model and squash button overlap");
-            assert!(clicks.develop_tab.1 < clicks.context_tab.0, "Develop and context tab overlap");
+            assert!(clicks.develop_tab.1 < clicks.plans_tab.0, "Develop and plans tab overlap");
         }
     }
 
@@ -700,7 +707,7 @@ mod tests {
 
         // The live model and its semantic role replace the idle selection.
         state.running_model = Some(crate::app::RunningModel {
-            model: "openrouter:anthropic/claude-3-7-sonnet".to_string(),
+            model: ModelRef::openrouter("anthropic/claude-3-7-sonnet"),
             role: Some(ModelRole::Coder),
             alias: None,
             effort: None,
@@ -712,7 +719,7 @@ mod tests {
 
         // A configured alias wins over the provider-qualified name.
         state.running_model = Some(crate::app::RunningModel {
-            model: "openrouter:anthropic/claude-3-7-sonnet".to_string(),
+            model: ModelRef::openrouter("anthropic/claude-3-7-sonnet"),
             role: Some(ModelRole::Architect),
             alias: Some("Sonnet".to_string()),
             effort: None,
@@ -721,7 +728,7 @@ mod tests {
 
         // The background Scribe role never replaces the visible model.
         state.running_model = Some(crate::app::RunningModel {
-            model: "openrouter:scribe".to_string(),
+            model: ModelRef::openrouter("scribe"),
             role: Some(ModelRole::Scribe),
             alias: None,
             effort: None,

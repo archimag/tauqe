@@ -4,6 +4,7 @@ use crate::discussion::DiscussionRequest;
 use crate::edit::{EditOperation, StructuredChangeProposal};
 
 use super::effort::ReasoningEffort;
+use super::reference::ModelRef;
 use super::role::ModelRole;
 use super::usage::ModelUsageInfo;
 
@@ -39,7 +40,7 @@ pub struct ModelTurnPlanContext {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelStartedEvent {
     pub operation_id: String,
-    pub model: String,
+    pub model: ModelRef,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub role: Option<ModelRole>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

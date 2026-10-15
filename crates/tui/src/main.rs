@@ -44,21 +44,23 @@ async fn main() -> anyhow::Result<()> {
     let protocol_version = handshake.protocol_version.clone();
     let workflow = handshake
         .workflow
-        .unwrap_or_else(|| "toolchain".to_string());
+        .unwrap_or_default();
     let edit_protocol = handshake
         .edit_protocol
-        .unwrap_or_else(|| "xml".to_string());
+        .unwrap_or_default();
     let available_workflows = if handshake.available_workflows.is_empty() {
         vec![
-            "toolchain".to_string(),
-            "git".to_string(),
-            "naive".to_string(),
+            tauqe_protocol::WorkflowKind::Git,
+            tauqe_protocol::WorkflowKind::Naive,
         ]
     } else {
         handshake.available_workflows
     };
     let available_edit_protocols = if handshake.available_edit_protocols.is_empty() {
-        vec!["xml".to_string(), "structured".to_string()]
+        vec![
+            tauqe_protocol::EditProtocolKind::Xml,
+            tauqe_protocol::EditProtocolKind::Structured,
+        ]
     } else {
         handshake.available_edit_protocols
     };

@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use crate::edits::protocol::xml::tags::ParsedPlanItem;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
@@ -6,6 +7,17 @@ use std::time::SystemTime;
 use tauqe_protocol::{
     DiscussionPlanAction, DiscussionPlanUpdate, Plan, PlanItem, PlanItemStatus, PlanSummary,
 };
+
+/// Execution mode governing plan mutation permissions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlanMutationMode {
+    /// Isolated step execution: any plan creation, modification, or deletion is forbidden.
+    IsolatedStep,
+    /// Develop mode: only proposing new plans (`save`) is permitted. Modification (`update`) and deletion (`delete`) are forbidden.
+    Develop,
+    /// Discussion mode: full plan creation, modification, and deletion are permitted.
+    Discussion,
+}
 
 pub struct PlanStorage;
 
@@ -114,9 +126,9 @@ impl PlanStorage {
         let file_path = dir.join(format!("{safe_id}.json"));
 
         if !file_path.is_file() {
-            // Check if any existing plan file matches the ID
+            // Check if any existing plan file matches the ID exactly or normalized
             if let Ok(plans) = Self::load_all(repo_root) {
-                if let Some(plan) = crate::plan::matcher::resolve_plan_id(id, &plans, None) {
+                if let Some(plan) = crate::plan::matcher::resolve_plan_id_exact(id, &plans) {
                     return Ok(Some(plan.clone()));
                 }
             }
@@ -529,11 +541,27 @@ impl PlanStorage {
         parsed: Vec<crate::edits::protocol::xml::tags::ParsedPlanTag>,
         errors: Vec<String>,
     ) -> PlanApplicationOutcome {
+        Self::apply_parsed_plans_with_mode(
+            repo_root,
+            parsed,
+            errors,
+            PlanMutationMode::Discussion,
+        )
+    }
+
+    /// Applies pre-parsed plan tags and diagnostics to local storage under a specific [`PlanMutationMode`].
+    pub fn apply_parsed_plans_with_mode(
+        repo_root: &Path,
+        parsed: Vec<crate::edits::protocol::xml::tags::ParsedPlanTag>,
+        errors: Vec<String>,
+        mode: PlanMutationMode,
+    ) -> PlanApplicationOutcome {
         Self::apply_parsed_plans_with_replacement(
             repo_root,
             parsed,
             errors,
             SaveItemsReplacement::Guarded,
+            mode,
         )
     }
 
@@ -546,9 +574,10 @@ impl PlanStorage {
         parsed: Vec<crate::edits::protocol::xml::tags::ParsedPlanTag>,
         errors: Vec<String>,
         replacement: SaveItemsReplacement,
+        mode: PlanMutationMode,
     ) -> PlanApplicationOutcome {
         let _guard = Self::lock();
-        Self::apply_parsed_plans_unlocked(repo_root, parsed, errors, replacement)
+        Self::apply_parsed_plans_unlocked(repo_root, parsed, errors, replacement, mode)
     }
 
     /// Lock-free core of [`Self::apply_parsed_plans`]; the caller must hold the storage lock.
@@ -557,6 +586,7 @@ impl PlanStorage {
         parsed: Vec<crate::edits::protocol::xml::tags::ParsedPlanTag>,
         mut errors: Vec<String>,
         replacement: SaveItemsReplacement,
+        mode: PlanMutationMode,
     ) -> PlanApplicationOutcome {
         if parsed.is_empty() && errors.is_empty() {
             return PlanApplicationOutcome::default();
@@ -572,7 +602,35 @@ impl PlanStorage {
 
         for tag in parsed {
             let action = tag.action.to_lowercase();
-            let matched_plan = crate::plan::matcher::resolve_plan_id(&tag.id, &all_plans, None).cloned();
+
+            match mode {
+                PlanMutationMode::IsolatedStep => {
+                    errors.push(format!(
+                        "Cannot perform plan action '{}' during isolated step execution: plan mutations are strictly prohibited during step execution",
+                        action
+                    ));
+                    continue;
+                }
+                PlanMutationMode::Develop => {
+                    if action != "save" {
+                        errors.push(format!(
+                            "Cannot perform plan action '{}' in Develop mode: only 'save' is permitted (plan modifications and deletions belong exclusively in Discussion mode)",
+                            action
+                        ));
+                        continue;
+                    }
+                    let already_exists = crate::plan::matcher::resolve_plan_id_exact(&tag.id, &all_plans).is_some()
+                        || applied.iter().any(|p: &Plan| p.id.eq_ignore_ascii_case(&tag.id));
+                    if already_exists {
+                        errors.push(format!(
+                            "Cannot modify existing plan '{}' in Develop mode: modifying existing plans belongs exclusively in Discussion mode",
+                            tag.id
+                        ));
+                        continue;
+                    }
+                }
+                PlanMutationMode::Discussion => {}
+            }
 
             match action.as_str() {
                 "save" => {
@@ -583,6 +641,7 @@ impl PlanStorage {
                         ));
                         continue;
                     }
+                    let matched_plan = crate::plan::matcher::resolve_plan_id_exact(&tag.id, &all_plans).cloned();
                     let mut plan = matched_plan.unwrap_or_else(|| Plan {
                         id: tag.id.clone(),
                         title: tag.title.clone().unwrap_or_else(|| tag.id.clone()),
@@ -601,16 +660,21 @@ impl PlanStorage {
                     if !tag.concept.is_empty() || plan.concept.is_empty() {
                         plan.concept = tag.concept;
                     }
+                    let items: Vec<PlanItem> = tag
+                        .items
+                        .into_iter()
+                        .map(ParsedPlanItem::into_plan_item)
+                        .collect();
                     match replacement {
                         // An explicit replacement always wins, even when it clears
                         // the stored steps.
-                        SaveItemsReplacement::Replace => plan.items = tag.items,
+                        SaveItemsReplacement::Replace => plan.items = items,
                         // A guarded save must never erase established work: the
                         // incoming items replace the plan only when they are
                         // non-empty.
                         SaveItemsReplacement::Guarded => {
-                            if !tag.items.is_empty() {
-                                plan.items = tag.items;
+                            if !items.is_empty() {
+                                plan.items = items;
                             }
                         }
                     }
@@ -629,7 +693,23 @@ impl PlanStorage {
                     }
                 }
                 "update" => {
-                    if let Some(mut plan) = matched_plan.or_else(|| Self::load_plan(repo_root, &tag.id).ok().flatten()) {
+                    let matched_plan = match crate::plan::matcher::resolve_plan(&tag.id, &all_plans, None) {
+                        crate::plan::matcher::PlanResolution::Found(p) => Some(p.clone()),
+                        crate::plan::matcher::PlanResolution::Ambiguous(candidates) => {
+                            let candidate_ids: Vec<String> = candidates.iter().map(|p| format!("'{}'", p.id)).collect();
+                            errors.push(format!(
+                                "Cannot update plan '{}': ambiguous match, candidates: {}",
+                                tag.id,
+                                candidate_ids.join(", ")
+                            ));
+                            continue;
+                        }
+                        crate::plan::matcher::PlanResolution::NotFound => {
+                            Self::load_plan(repo_root, &tag.id).ok().flatten()
+                        }
+                    };
+
+                    if let Some(mut plan) = matched_plan {
                         if let Some(t) = tag.title {
                             plan.title = t;
                         }
@@ -665,10 +745,12 @@ impl PlanStorage {
                             }
                         }
 
-                        fn update_single(items: &mut [PlanItem], update: &PlanItem) -> bool {
+                        fn update_single(items: &mut [PlanItem], update: &ParsedPlanItem) -> bool {
                             for item in items.iter_mut() {
                                 if item.id.eq_ignore_ascii_case(&update.id) {
-                                    item.status = update.status;
+                                    if let Some(s) = update.status {
+                                        item.status = s;
+                                    }
                                     if update.details.is_some() {
                                         item.details = update.details.clone();
                                     }
@@ -678,8 +760,14 @@ impl PlanStorage {
                                     if !update.files.is_empty() {
                                         item.files = update.files.clone();
                                     }
+                                    if !update.readonly_files.is_empty() {
+                                        item.readonly_files = update.readonly_files.clone();
+                                    }
                                     if !update.concept_refs.is_empty() {
                                         item.concept_refs = update.concept_refs.clone();
+                                    }
+                                    if !update.depends_on.is_empty() {
+                                        item.depends_on = update.depends_on.clone();
                                     }
                                     return true;
                                 }
@@ -728,7 +816,10 @@ impl PlanStorage {
                     }
                 }
                 "delete" => {
-                    match Self::delete_plan_unlocked(repo_root, &tag.id) {
+                    let target_id = crate::plan::matcher::resolve_plan_id_exact(&tag.id, &all_plans)
+                        .map(|p| p.id.as_str())
+                        .unwrap_or(&tag.id);
+                    match Self::delete_plan_unlocked(repo_root, target_id) {
                         Ok(true) => {}
                         Ok(false) => {
                             errors.push(format!("Cannot delete plan '{}': plan not found", tag.id));
@@ -751,6 +842,19 @@ PlanApplicationOutcome { applied, errors }
     pub fn apply_discussion_plan_update(
         repo_root: &Path,
         update: &DiscussionPlanUpdate,
+    ) -> PlanApplicationOutcome {
+        Self::apply_discussion_plan_update_with_mode(
+            repo_root,
+            update,
+            PlanMutationMode::Discussion,
+        )
+    }
+
+    /// Applies a structured `DiscussionPlanUpdate` directly to local plan storage under a specific [`PlanMutationMode`].
+    pub fn apply_discussion_plan_update_with_mode(
+        repo_root: &Path,
+        update: &DiscussionPlanUpdate,
+        mode: PlanMutationMode,
     ) -> PlanApplicationOutcome {
         let all_plans = Self::load_all(repo_root).unwrap_or_default();
         let active_id = Self::load_active_id(repo_root).ok().flatten();
@@ -792,7 +896,7 @@ PlanApplicationOutcome { applied, errors }
             title: update.title.clone(),
             description: update.description.clone(),
             concept: update.concept.clone(),
-            items: update.items.clone(),
+            items: update.items.clone().into_iter().map(Into::into).collect(),
         };
         // The structured discussion command is the explicit architect path: its
         // typed, deliberate item list (including an explicit empty list) fully
@@ -802,97 +906,77 @@ PlanApplicationOutcome { applied, errors }
             vec![parsed_tag],
             Vec::new(),
             SaveItemsReplacement::Replace,
+            mode,
         )
+    }
+
+    /// Applies plan tags (`<plan>...</plan>`) from model output to local storage under a specific [`PlanMutationMode`].
+    pub fn apply_plan_tags_with_mode(
+        repo_root: &Path,
+        text: &str,
+        mode: PlanMutationMode,
+    ) -> PlanApplicationOutcome {
+        let (parsed, errors) = crate::edits::protocol::xml::tags::parse_plan_tags_with_diagnostics(text);
+        Self::apply_parsed_plans_with_mode(repo_root, parsed, errors, mode)
     }
 
     /// Applies plan tags (`<plan>...</plan>`) from model output to local storage.
     pub fn apply_plan_tags(repo_root: &Path, text: &str) -> PlanApplicationOutcome {
-let (parsed, errors) = crate::edits::protocol::xml::tags::parse_plan_tags_with_diagnostics(text);
-Self::apply_parsed_plans(repo_root, parsed, errors)
+        Self::apply_plan_tags_with_mode(repo_root, text, PlanMutationMode::Discussion)
     }
 
-    /// Locally replaces a blocked leaf step with a structured sub-tree produced by the
-    /// Architect during semantic recovery (Rolling Wave Planning).
+    /// Replaces the entire uncompleted horizon of a plan with a freshly synthesized
+    /// step list while preserving the immutable `Done` foundation.
     ///
-    /// The graft is strictly local: the target step must be an executable leaf that is
-    /// not `Done` (completed steps are immutable). The sub-tree items are spliced into
-    /// the target's position, so the preceding tasks and the independent remainder of
-    /// the plan stay untouched. Every downstream task that depended on the replaced
-    /// step is re-pointed at the exit items of the grafted sub-tree, keeping the
-    /// dependent tail waiting on the decomposed work. Leaf-only file invariants are
+    /// This is the single synthesis primitive behind Wave Horizon Planning: the
+    /// Architect returns only the *new* steps for the remaining work, and the harness
+    /// guarantees the atomic concatenation `[...done_steps, ...new_horizon_steps]`.
+    /// Completed steps are therefore never regenerated by the model, so they can never
+    /// regress or be silently dropped; the stored `Done` statuses form an immutable
+    /// foundation that survives every replanning wave.
+    ///
+    /// The stored architectural `concept` is left untouched. A horizon that would close
+    /// a dependency cycle is rejected before anything reaches disk, leaving the stored
+    /// plan intact. Leaf-only file invariants and derived container statuses are
     /// normalized before the plan is persisted atomically.
-    pub fn graft_subtree(
+    pub fn replace_uncompleted_horizon(
         repo_root: &Path,
         plan_id: &str,
-        target_step_id: &str,
-        new_subtree: Vec<PlanItem>,
+        new_horizon_items: Vec<PlanItem>,
     ) -> Result<Plan> {
         let _guard = Self::lock();
-        Self::graft_subtree_unlocked(repo_root, plan_id, target_step_id, new_subtree)
+        Self::replace_uncompleted_horizon_unlocked(repo_root, plan_id, new_horizon_items)
     }
 
-    /// Lock-free core of [`Self::graft_subtree`]; the caller must hold the storage lock.
-    fn graft_subtree_unlocked(
+    /// Lock-free core of [`Self::replace_uncompleted_horizon`]; the caller must hold the
+    /// storage lock.
+    fn replace_uncompleted_horizon_unlocked(
         repo_root: &Path,
         plan_id: &str,
-        target_step_id: &str,
-        new_subtree: Vec<PlanItem>,
+        new_horizon_items: Vec<PlanItem>,
     ) -> Result<Plan> {
-        if new_subtree.is_empty() {
-            anyhow::bail!(
-                "Cannot graft an empty sub-tree over step '{}'",
-                target_step_id
-            );
-        }
-
         let mut plan = match Self::load_plan(repo_root, plan_id)? {
             Some(p) => p,
             None => anyhow::bail!("Plan '{}' not found", plan_id),
         };
 
-        let target = match plan.find_item(target_step_id) {
-            Some(item) => item.clone(),
-            None => anyhow::bail!(
-                "Step '{}' not found in plan '{}'",
-                target_step_id,
-                plan_id
-            ),
-        };
+        // Preserve the immutable Done foundation, then graft the synthesized horizon
+        // on top of it. Completed ids are protected from an incidental collision with a
+        // stale model id so a completed step can never be reintroduced as pending work.
+        let done_foundation = collect_done_foundation(&plan.items);
+        let done_ids: HashSet<String> = done_foundation
+            .iter()
+            .flat_map(collect_subtree_ids)
+            .map(|id| id.to_ascii_lowercase())
+            .collect();
 
-        if !target.is_leaf() {
-            anyhow::bail!(
-                "Step '{}' ({}) is not a leaf and cannot be grafted; graft only over executable leaf steps",
-                target.id,
-                target.title
-            );
-        }
-
-        if target.status == PlanItemStatus::Done {
-            anyhow::bail!(
-                "Step '{}' is DONE and immutable; completed steps cannot be replaced",
-                target.id
-            );
-        }
-
-        let exits = subtree_exit_ids(&new_subtree);
-
-        // Re-point the dependent tail before splicing so the grafted sub-tree itself is
-        // never rewritten.
-        if !exits.is_empty() {
-            remap_dependencies(&mut plan.items, &target.id, &exits);
-        }
-
-        if !splice_replacement(&mut plan.items, &target.id, &new_subtree) {
-            anyhow::bail!(
-                "Failed to locate step '{}' for grafting in plan '{}'",
-                target.id,
-                plan_id
-            );
-        }
+        let mut combined = done_foundation;
+        combined.extend(drop_done_collisions(new_horizon_items, &done_ids));
+        plan.items = combined;
 
         if let Some(cycle_step) = detect_dependency_cycle(&plan.items) {
             anyhow::bail!(
-                "Cycle detected in plan dependencies after grafting: step '{}' participates in a dependency loop",
+                "Dependency cycle detected in synthesized horizon: step '{}' participates in a dependency loop",
                 cycle_step
             );
         }
@@ -907,84 +991,6 @@ Self::apply_parsed_plans(repo_root, parsed, errors)
         Self::save_plan_unlocked(repo_root, &plan)?;
         Ok(plan)
     }
-}
-
-/// Splices `replacement` into the position of the item whose id matches `target_id`,
-/// preserving sibling order. Returns true when the target was found and replaced.
-fn splice_replacement(
-    items: &mut Vec<PlanItem>,
-    target_id: &str,
-    replacement: &[PlanItem],
-) -> bool {
-    if let Some(index) = items
-        .iter()
-        .position(|item| item.id.eq_ignore_ascii_case(target_id))
-    {
-        items.splice(index..=index, replacement.iter().cloned());
-        return true;
-    }
-    for item in items.iter_mut() {
-        if splice_replacement(&mut item.children, target_id, replacement) {
-            return true;
-        }
-    }
-    false
-}
-
-/// Rewrites every `depends_on` reference to `old_id` into references to `new_ids`,
-/// preserving unrelated dependencies and de-duplicating the result.
-fn remap_dependencies(items: &mut [PlanItem], old_id: &str, new_ids: &[String]) {
-    for item in items.iter_mut() {
-        if item
-            .depends_on
-            .iter()
-            .any(|dep| dep.eq_ignore_ascii_case(old_id))
-        {
-            let mut remapped: Vec<String> = Vec::with_capacity(item.depends_on.len());
-            for dep in &item.depends_on {
-                if dep.eq_ignore_ascii_case(old_id) {
-                    for new_id in new_ids {
-                        if !remapped.iter().any(|r| r.eq_ignore_ascii_case(new_id)) {
-                            remapped.push(new_id.clone());
-                        }
-                    }
-                } else if !remapped.iter().any(|r| r.eq_ignore_ascii_case(dep)) {
-                    remapped.push(dep.clone());
-                }
-            }
-            item.depends_on = remapped;
-        }
-        remap_dependencies(&mut item.children, old_id, new_ids);
-    }
-}
-
-/// Collects the exit item ids of a grafted sub-tree: the top-level items that no other
-/// item in the sub-tree depends on. When every top-level item is referenced (or the
-/// sub-tree holds a single item), the last item acts as the continuation point.
-fn subtree_exit_ids(subtree: &[PlanItem]) -> Vec<String> {
-    let mut referenced: HashSet<String> = HashSet::new();
-    fn collect(items: &[PlanItem], referenced: &mut HashSet<String>) {
-        for item in items {
-            for dep in &item.depends_on {
-                referenced.insert(dep.to_ascii_lowercase());
-            }
-            collect(&item.children, referenced);
-        }
-    }
-    collect(subtree, &mut referenced);
-
-    let mut exits: Vec<String> = subtree
-        .iter()
-        .filter(|item| !referenced.contains(&item.id.to_ascii_lowercase()))
-        .map(|item| item.id.clone())
-        .collect();
-
-    if exits.is_empty() {
-        if let Some(last) = subtree.last() {
-            exits.push(last.id.clone());
-        }
-    }
-    exits
 }
 
 /// Detects a dependency cycle in the plan's `depends_on` graph.
@@ -1047,6 +1053,52 @@ fn detect_dependency_cycle(items: &[PlanItem]) -> Option<String> {
         }
     }
     None
+}
+
+/// Collects the immutable `Done` foundation of a plan as a flat list.
+///
+/// A `Done` item is taken wholesale because its whole sub-tree is immutable. A
+/// completed leaf nested inside a partially-completed container is hoisted to the top
+/// level, so discarding the scaffold that merely grouped it never takes finished work
+/// down with it. This is the `Done_foundation` term of the Wave Horizon Planning
+/// synthesis `Horizon = Architect(concept, Done_foundation, context, diagnostics)`.
+fn collect_done_foundation(items: &[PlanItem]) -> Vec<PlanItem> {
+    let mut foundation = Vec::new();
+    for item in items {
+        if item.status == PlanItemStatus::Done {
+            foundation.push(item.clone());
+        } else {
+            foundation.extend(collect_done_foundation(&item.children));
+        }
+    }
+    foundation
+}
+
+/// Collects every id inside an item's sub-tree, including the item itself.
+fn collect_subtree_ids(item: &PlanItem) -> Vec<String> {
+    let mut ids = vec![item.id.clone()];
+    for child in &item.children {
+        ids.extend(collect_subtree_ids(child));
+    }
+    ids
+}
+
+/// Drops any synthesized horizon item whose id collides with a completed step,
+/// recursing into nested items.
+///
+/// The Architect returns only new steps, but a stale or hallucinated id that reuses a
+/// `Done` id would reintroduce a completed task and trip the immutability guard. The
+/// harness drops such collisions deterministically, so synthesis never depends on the
+/// model remembering which ids are already finished.
+fn drop_done_collisions(items: Vec<PlanItem>, done_ids: &HashSet<String>) -> Vec<PlanItem> {
+    items
+        .into_iter()
+        .filter(|item| !done_ids.contains(&item.id.to_ascii_lowercase()))
+        .map(|mut item| {
+            item.children = drop_done_collisions(item.children, done_ids);
+            item
+        })
+        .collect()
 }
 
 /// Result of applying plan operations from model output.
@@ -1586,183 +1638,94 @@ Step 1 is done:
         assert!(disc_res.errors[0].contains("Cannot remove completed step '1'"));
     }
 
+    
     #[test]
-    fn test_graft_subtree_replaces_blocked_leaf_and_remaps_dependents() {
+    fn test_save_plan_does_not_overwrite_differing_id_with_fuzzy_match() {
         let dir = tempdir().unwrap();
         let root = dir.path();
 
-        let plan = Plan {
-            id: "graft-plan".to_string(),
-            title: "Graft Plan".to_string(),
-            description: None,
-            created_at: 1,
-            updated_at: 1,
-            concept: vec![],
-            items: vec![
-                PlanItem {
-                    id: "1".to_string(),
-                    title: "Done foundation".to_string(),
-                    status: PlanItemStatus::Done,
-                    ..Default::default()
-                },
-                PlanItem {
-                    id: "2".to_string(),
-                    title: "Blocked endpoint".to_string(),
-                    details: Some("Implement handler".to_string()),
-                    status: PlanItemStatus::Blocked,
-                    files: vec!["src/endpoint.rs".to_string()],
-                    ..Default::default()
-                },
-                PlanItem {
-                    id: "3".to_string(),
-                    title: "Dependent integration".to_string(),
-                    status: PlanItemStatus::Todo,
-                    files: vec!["src/integration.rs".to_string()],
-                    depends_on: vec!["1".to_string(), "2".to_string()],
-                    ..Default::default()
-                },
-            ],
-        };
-        PlanStorage::save_plan(root, &plan).unwrap();
+        let plan1_text = r#"
+<plan action="save" id="plan-1" title="Plan One">
+  <concept>
+    <concept_item id="c-1" title="Invariant 1" />
+  </concept>
+  <item id="1" title="Step 1" status="done" />
+</plan>
+"#;
+        let outcome1 = PlanStorage::apply_plan_tags(root, plan1_text);
+        assert!(outcome1.errors.is_empty());
+        assert_eq!(outcome1.applied.len(), 1);
 
-        let replacement = vec![
-            PlanItem {
-                id: "2.1".to_string(),
-                title: "Split model".to_string(),
-                status: PlanItemStatus::Todo,
-                files: vec!["src/model.rs".to_string()],
-                readonly_files: vec!["src/contract.rs".to_string()],
-                ..Default::default()
-            },
-            PlanItem {
-                id: "2.2".to_string(),
-                title: "Split handler".to_string(),
-                status: PlanItemStatus::Todo,
-                files: vec!["src/handler.rs".to_string()],
-                depends_on: vec!["2.1".to_string()],
-                ..Default::default()
-            },
-        ];
+        // Saving "plan-2" (Levenshtein distance 1 from "plan-1") must NOT overwrite "plan-1"
+        let plan2_text = r#"
+<plan action="save" id="plan-2" title="Plan Two">
+  <concept>
+    <concept_item id="c-2" title="Invariant 2" />
+  </concept>
+  <item id="1" title="Step 1 in plan 2" status="todo" />
+</plan>
+"#;
+        let outcome2 = PlanStorage::apply_plan_tags(root, plan2_text);
+        assert!(outcome2.errors.is_empty(), "Errors: {:?}", outcome2.errors);
+        assert_eq!(outcome2.applied.len(), 1);
+        assert_eq!(outcome2.applied[0].id, "plan-2");
 
-        let grafted =
-            PlanStorage::graft_subtree(root, "graft-plan", "2", replacement).unwrap();
-
-        // The blocked leaf is replaced by the sub-tree in place.
-        assert_eq!(grafted.items.len(), 4);
-        assert_eq!(grafted.items[0].id, "1");
-        assert_eq!(grafted.items[1].id, "2.1");
-        assert_eq!(grafted.items[2].id, "2.2");
-        assert_eq!(grafted.items[3].id, "3");
-        assert!(grafted.find_item("2").is_none());
-
-        // The dependent tail is re-pointed at the sub-tree exit item.
-        let dependent = grafted.find_item("3").unwrap();
-        assert_eq!(dependent.depends_on, vec!["1".to_string(), "2.2".to_string()]);
+        let p1 = PlanStorage::load_plan(root, "plan-1").unwrap().unwrap();
+        let p2 = PlanStorage::load_plan(root, "plan-2").unwrap().unwrap();
+        assert_eq!(p1.id, "plan-1");
+        assert_eq!(p1.title, "Plan One");
+        assert_eq!(p2.id, "plan-2");
+        assert_eq!(p2.title, "Plan Two");
     }
 
     #[test]
-    fn test_graft_subtree_rejects_done_non_leaf_and_empty() {
+    fn test_update_plan_ambiguous_reports_error_without_mutating() {
         let dir = tempdir().unwrap();
         let root = dir.path();
 
-        let plan = Plan {
-            id: "graft-reject".to_string(),
-            title: "Graft Reject".to_string(),
-            description: None,
-            created_at: 1,
-            updated_at: 1,
-            concept: vec![],
-            items: vec![
-                PlanItem {
-                    id: "1".to_string(),
-                    title: "Done".to_string(),
-                    status: PlanItemStatus::Done,
-                    ..Default::default()
-                },
-                PlanItem {
-                    id: "2".to_string(),
-                    title: "Parent".to_string(),
-                    status: PlanItemStatus::Todo,
-                    children: vec![PlanItem {
-                        id: "2.1".to_string(),
-                        title: "Child".to_string(),
-                        status: PlanItemStatus::Todo,
-                        ..Default::default()
-                    }],
-                    ..Default::default()
-                },
-            ],
-        };
-        PlanStorage::save_plan(root, &plan).unwrap();
-
-        let replacement = vec![PlanItem {
-            id: "new".to_string(),
-            title: "New".to_string(),
-            status: PlanItemStatus::Todo,
+        let p1 = Plan {
+            id: "feature-alpha".to_string(),
+            title: "Feature Alpha".to_string(),
+            items: vec![PlanItem {
+                id: "1".to_string(),
+                title: "Step 1".to_string(),
+                status: PlanItemStatus::Todo,
+                ..Default::default()
+            }],
             ..Default::default()
-        }];
-
-        // DONE steps are immutable.
-        let err_done =
-            PlanStorage::graft_subtree(root, "graft-reject", "1", replacement.clone())
-                .unwrap_err();
-        assert!(err_done.to_string().contains("DONE and immutable"));
-
-        // Only leaves can be grafted.
-        let err_parent =
-            PlanStorage::graft_subtree(root, "graft-reject", "2", replacement.clone())
-                .unwrap_err();
-        assert!(err_parent.to_string().contains("not a leaf"));
-
-        // Empty sub-trees are rejected.
-        let err_empty =
-            PlanStorage::graft_subtree(root, "graft-reject", "2.1", Vec::new()).unwrap_err();
-        assert!(err_empty.to_string().contains("empty sub-tree"));
-    }
-
-    #[test]
-    fn test_graft_subtree_rejects_cyclic_dependencies() {
-        let dir = tempdir().unwrap();
-        let root = dir.path();
-
-        let plan = Plan {
-            id: "cycle-plan".to_string(),
-            title: "Cycle Plan".to_string(),
-            description: None,
-            created_at: 1,
-            updated_at: 1,
-            concept: vec![],
-            items: vec![
-                PlanItem {
-                    id: "1".to_string(),
-                    title: "Blocked step".to_string(),
-                    status: PlanItemStatus::Blocked,
-                    ..Default::default()
-                },
-                PlanItem {
-                    id: "2".to_string(),
-                    title: "Dependent".to_string(),
-                    status: PlanItemStatus::Todo,
-                    depends_on: vec!["1".to_string()],
-                    ..Default::default()
-                },
-            ],
         };
-        PlanStorage::save_plan(root, &plan).unwrap();
-
-        // The grafted exit node depends back on the dependent tail, closing a cycle.
-        let replacement = vec![PlanItem {
-            id: "1.1".to_string(),
-            title: "Split".to_string(),
-            status: PlanItemStatus::Todo,
-            depends_on: vec!["2".to_string()],
+        let p2 = Plan {
+            id: "feature-beta".to_string(),
+            title: "Feature Beta".to_string(),
+            items: vec![PlanItem {
+                id: "1".to_string(),
+                title: "Step 1".to_string(),
+                status: PlanItemStatus::Todo,
+                ..Default::default()
+            }],
             ..Default::default()
-        }];
+        };
+        PlanStorage::save_plan(root, &p1).unwrap();
+        PlanStorage::save_plan(root, &p2).unwrap();
 
-        let err = PlanStorage::graft_subtree(root, "cycle-plan", "1", replacement).unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("Cycle detected in plan dependencies after grafting"));
+        // "feature" matches both plans as a prefix
+        let update_text = r#"
+<plan action="update" id="feature">
+  <item id="1" status="done" />
+</plan>
+"#;
+        let outcome = PlanStorage::apply_plan_tags(root, update_text);
+        assert!(outcome.applied.is_empty());
+        assert_eq!(outcome.errors.len(), 1);
+        assert!(outcome.errors[0].contains("ambiguous match"));
+        assert!(outcome.errors[0].contains("'feature-alpha'"));
+        assert!(outcome.errors[0].contains("'feature-beta'"));
+
+        // Neither plan was modified
+        let p1_reloaded = PlanStorage::load_plan(root, "feature-alpha").unwrap().unwrap();
+        let p2_reloaded = PlanStorage::load_plan(root, "feature-beta").unwrap().unwrap();
+        assert_eq!(p1_reloaded.items[0].status, PlanItemStatus::Todo);
+        assert_eq!(p2_reloaded.items[0].status, PlanItemStatus::Todo);
     }
 
     #[test]
@@ -1939,5 +1902,381 @@ Step 1 is done:
         assert_eq!(applied.applied.len(), 1);
         assert_eq!(applied.applied[0].items.len(), 1);
         assert_eq!(applied.applied[0].items[0].status, PlanItemStatus::Done);
+    }
+
+    #[test]
+    fn test_replace_uncompleted_horizon_preserves_done_foundation() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+
+        let plan = Plan {
+            id: "horizon-plan".to_string(),
+            title: "Horizon Plan".to_string(),
+            items: vec![
+                PlanItem {
+                    id: "1".to_string(),
+                    title: "Foundation".to_string(),
+                    status: PlanItemStatus::Done,
+                    ..Default::default()
+                },
+                PlanItem {
+                    id: "2".to_string(),
+                    title: "Superseded work".to_string(),
+                    status: PlanItemStatus::Blocked,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        PlanStorage::save_plan(root, &plan).unwrap();
+
+        let new_horizon = vec![
+            PlanItem {
+                id: "3".to_string(),
+                title: "Synthesized step A".to_string(),
+                status: PlanItemStatus::Todo,
+                ..Default::default()
+            },
+            PlanItem {
+                id: "4".to_string(),
+                title: "Synthesized step B".to_string(),
+                status: PlanItemStatus::Todo,
+                depends_on: vec!["3".to_string()],
+                ..Default::default()
+            },
+        ];
+
+        let updated =
+            PlanStorage::replace_uncompleted_horizon(root, "horizon-plan", new_horizon).unwrap();
+
+        assert_eq!(updated.items.len(), 3);
+        assert_eq!(updated.items[0].id, "1");
+        assert_eq!(updated.items[0].status, PlanItemStatus::Done);
+        assert_eq!(updated.items[1].id, "3");
+        assert_eq!(updated.items[2].id, "4");
+        // The superseded non-Done step is replaced by the synthesized horizon.
+        assert!(updated.find_item("2").is_none());
+    }
+
+    #[test]
+    fn test_replace_uncompleted_horizon_from_empty_plan() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+
+        let plan = Plan {
+            id: "empty-plan".to_string(),
+            title: "Empty".to_string(),
+            ..Default::default()
+        };
+        PlanStorage::save_plan(root, &plan).unwrap();
+
+        let new_horizon = vec![PlanItem {
+            id: "1".to_string(),
+            title: "First".to_string(),
+            status: PlanItemStatus::Todo,
+            ..Default::default()
+        }];
+
+        let updated =
+            PlanStorage::replace_uncompleted_horizon(root, "empty-plan", new_horizon).unwrap();
+        assert_eq!(updated.items.len(), 1);
+        assert_eq!(updated.items[0].id, "1");
+        assert_eq!(updated.items[0].status, PlanItemStatus::Todo);
+    }
+
+    #[test]
+    fn test_replace_uncompleted_horizon_drops_done_id_collisions() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+
+        let plan = Plan {
+            id: "collision-plan".to_string(),
+            title: "Collision".to_string(),
+            items: vec![PlanItem {
+                id: "1".to_string(),
+                title: "Completed".to_string(),
+                status: PlanItemStatus::Done,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        PlanStorage::save_plan(root, &plan).unwrap();
+
+        // A stale model id reuses the completed step with a pending status.
+        let new_horizon = vec![
+            PlanItem {
+                id: "1".to_string(),
+                title: "Completed (stale)".to_string(),
+                status: PlanItemStatus::Todo,
+                ..Default::default()
+            },
+            PlanItem {
+                id: "2".to_string(),
+                title: "Next".to_string(),
+                status: PlanItemStatus::Todo,
+                ..Default::default()
+            },
+        ];
+
+        let updated =
+            PlanStorage::replace_uncompleted_horizon(root, "collision-plan", new_horizon).unwrap();
+
+        assert_eq!(updated.items.len(), 2);
+        // The completed step is preserved verbatim; the colliding horizon item is dropped.
+        assert_eq!(updated.items[0].id, "1");
+        assert_eq!(updated.items[0].status, PlanItemStatus::Done);
+        assert_eq!(updated.items[0].title, "Completed");
+        assert_eq!(updated.items[1].id, "2");
+    }
+
+    #[test]
+    fn test_replace_uncompleted_horizon_hoists_nested_done_leaves() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+
+        let plan = Plan {
+            id: "hoist-plan".to_string(),
+            title: "Hoist".to_string(),
+            items: vec![PlanItem {
+                id: "1".to_string(),
+                title: "Container".to_string(),
+                status: PlanItemStatus::Todo,
+                children: vec![
+                    PlanItem {
+                        id: "1.1".to_string(),
+                        title: "Done leaf".to_string(),
+                        status: PlanItemStatus::Done,
+                        ..Default::default()
+                    },
+                    PlanItem {
+                        id: "1.2".to_string(),
+                        title: "Todo leaf".to_string(),
+                        status: PlanItemStatus::Todo,
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        PlanStorage::save_plan(root, &plan).unwrap();
+
+        let new_horizon = vec![PlanItem {
+            id: "2".to_string(),
+            title: "Synthesized".to_string(),
+            status: PlanItemStatus::Todo,
+            ..Default::default()
+        }];
+
+        let updated =
+            PlanStorage::replace_uncompleted_horizon(root, "hoist-plan", new_horizon).unwrap();
+
+        // The completed leaf is hoisted out of the discarded container scaffold.
+        assert_eq!(updated.items.len(), 2);
+        assert_eq!(updated.items[0].id, "1.1");
+        assert_eq!(updated.items[0].status, PlanItemStatus::Done);
+        assert_eq!(updated.items[1].id, "2");
+        assert!(updated.find_item("1.2").is_none());
+    }
+
+    #[test]
+    fn test_replace_uncompleted_horizon_rejects_dependency_cycle() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+
+        let plan = Plan {
+            id: "cycle-plan".to_string(),
+            title: "Cycle".to_string(),
+            ..Default::default()
+        };
+        PlanStorage::save_plan(root, &plan).unwrap();
+
+        let new_horizon = vec![
+            PlanItem {
+                id: "a".to_string(),
+                title: "A".to_string(),
+                status: PlanItemStatus::Todo,
+                depends_on: vec!["b".to_string()],
+                ..Default::default()
+            },
+            PlanItem {
+                id: "b".to_string(),
+                title: "B".to_string(),
+                status: PlanItemStatus::Todo,
+                depends_on: vec!["a".to_string()],
+                ..Default::default()
+            },
+        ];
+
+        let err = PlanStorage::replace_uncompleted_horizon(root, "cycle-plan", new_horizon)
+            .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("Dependency cycle detected in synthesized horizon"));
+
+        // The rejected synthesis never touches the stored plan.
+        let stored = PlanStorage::load_plan(root, "cycle-plan").unwrap().unwrap();
+        assert!(stored.items.is_empty());
+    }
+
+    #[test]
+    fn test_replace_uncompleted_horizon_missing_plan_errors() {
+        let dir = tempdir().unwrap();
+        let err = PlanStorage::replace_uncompleted_horizon(dir.path(), "ghost", Vec::new())
+            .unwrap_err();
+        assert!(err.to_string().contains("not found"));
+    }
+
+    #[test]
+    fn test_plan_mutation_mode_enforcement() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+
+        let initial_plan = r#"
+<plan action="save" id="plan-mode-test" title="Initial">
+  <concept>
+    <concept_item id="c-1" title="Core Invariant" />
+  </concept>
+  <item id="1" title="Step 1" status="todo" />
+</plan>
+"#;
+
+        // 1. IsolatedStep mode forbids any plan actions (including save)
+        let res_isolated = PlanStorage::apply_plan_tags_with_mode(
+            root,
+            initial_plan,
+            PlanMutationMode::IsolatedStep,
+        );
+        assert!(res_isolated.applied.is_empty());
+        assert_eq!(res_isolated.errors.len(), 1);
+        assert!(res_isolated.errors[0].contains("isolated step execution"));
+
+        // 2. Develop mode permits saving a new plan
+        let res_develop_save = PlanStorage::apply_plan_tags_with_mode(
+            root,
+            initial_plan,
+            PlanMutationMode::Develop,
+        );
+        assert_eq!(res_develop_save.applied.len(), 1);
+        assert!(res_develop_save.errors.is_empty());
+
+        // 3. Develop mode forbids updating an existing plan
+        let update_text = r#"
+<plan action="update" id="plan-mode-test">
+  <item id="1" status="done" />
+</plan>
+"#;
+        let res_develop_update = PlanStorage::apply_plan_tags_with_mode(
+            root,
+            update_text,
+            PlanMutationMode::Develop,
+        );
+        assert!(res_develop_update.applied.is_empty());
+        assert_eq!(res_develop_update.errors.len(), 1);
+        assert!(res_develop_update.errors[0].contains("in Develop mode: only 'save' is permitted"));
+
+        // 4. Develop mode forbids deleting a plan
+        let delete_text = r#"<plan action="delete" id="plan-mode-test" />"#;
+        let res_develop_delete = PlanStorage::apply_plan_tags_with_mode(
+            root,
+            delete_text,
+            PlanMutationMode::Develop,
+        );
+        assert!(res_develop_delete.applied.is_empty());
+        assert_eq!(res_develop_delete.errors.len(), 1);
+        assert!(res_develop_delete.errors[0].contains("in Develop mode: only 'save' is permitted"));
+
+        // 5. Develop mode forbids modifying an existing plan even with action="save"
+        let overwrite_text = r#"
+<plan action="save" id="plan-mode-test" title="Overwritten">
+  <concept>
+    <concept_item id="c-2" title="New Invariant" />
+  </concept>
+</plan>
+"#;
+        let res_develop_overwrite = PlanStorage::apply_plan_tags_with_mode(
+            root,
+            overwrite_text,
+            PlanMutationMode::Develop,
+        );
+        assert!(res_develop_overwrite.applied.is_empty());
+        assert_eq!(res_develop_overwrite.errors.len(), 1);
+        assert!(res_develop_overwrite.errors[0].contains("Cannot modify existing plan 'plan-mode-test' in Develop mode"));
+
+        // 6. Discussion mode permits update
+        let res_disc_update = PlanStorage::apply_plan_tags_with_mode(
+            root,
+            update_text,
+            PlanMutationMode::Discussion,
+        );
+        assert_eq!(res_disc_update.applied.len(), 1);
+        assert!(res_disc_update.errors.is_empty());
+        assert_eq!(res_disc_update.applied[0].items[0].status, PlanItemStatus::Done);
+    }
+
+    #[test]
+    fn test_update_plan_item_without_status_preserves_existing_status() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+
+        let initial_plan = Plan {
+            id: "status-preserve".to_string(),
+            title: "Status Preserve".to_string(),
+            concept: vec![tauqe_protocol::ConceptItem {
+                id: "c-1".to_string(),
+                title: "Concept".to_string(),
+                details: None,
+                children: vec![],
+            }],
+            items: vec![
+                PlanItem {
+                    id: "1".to_string(),
+                    title: "Step 1".to_string(),
+                    status: PlanItemStatus::InProgress,
+                    readonly_files: vec!["crates/core/src/lib.rs".to_string()],
+                    depends_on: vec!["0".to_string()],
+                    ..Default::default()
+                },
+                PlanItem {
+                    id: "2".to_string(),
+                    title: "Step 2".to_string(),
+                    status: PlanItemStatus::Blocked,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        PlanStorage::save_plan(root, &initial_plan).unwrap();
+
+        // 1. Partial update without status attribute must NOT regress InProgress or Blocked to Todo
+        let partial_update = r#"
+<plan action="update" id="status-preserve">
+  <item id="1" title="Step 1 Updated" />
+</plan>
+"#;
+        let outcome = PlanStorage::apply_plan_tags(root, partial_update);
+        assert!(outcome.errors.is_empty(), "Errors: {:?}", outcome.errors);
+        assert_eq!(outcome.applied.len(), 1);
+
+        let plan = PlanStorage::load_plan(root, "status-preserve").unwrap().unwrap();
+        assert_eq!(plan.items[0].title, "Step 1 Updated");
+        assert_eq!(plan.items[0].status, PlanItemStatus::InProgress);
+        assert_eq!(plan.items[0].readonly_files, vec!["crates/core/src/lib.rs"]);
+        assert_eq!(plan.items[0].depends_on, vec!["0"]);
+        assert_eq!(plan.items[1].status, PlanItemStatus::Blocked);
+
+        // 2. Update with explicit readonly_files and depends_on
+        let update_with_deps = r#"
+<plan action="update" id="status-preserve">
+  <item id="1" readonly="crates/protocol/src/lib.rs" deps="2" />
+</plan>
+"#;
+        let outcome2 = PlanStorage::apply_plan_tags(root, update_with_deps);
+        assert!(outcome2.errors.is_empty(), "Errors: {:?}", outcome2.errors);
+
+        let plan2 = PlanStorage::load_plan(root, "status-preserve").unwrap().unwrap();
+        assert_eq!(plan2.items[0].status, PlanItemStatus::InProgress);
+        assert_eq!(plan2.items[0].readonly_files, vec!["crates/protocol/src/lib.rs"]);
+        assert_eq!(plan2.items[0].depends_on, vec!["2"]);
     }
 }

@@ -1,4 +1,4 @@
-use tauqe_protocol::{ContextAccess, ModelResult};
+use tauqe_protocol::{ContextAccess, DocTopic, EditProtocolKind, ModelResult};
 
 pub mod structured;
 pub mod utils;
@@ -35,8 +35,8 @@ pub trait EditProtocol: Send + Sync {
         Vec::new()
     }
 
-    /// Extracts requested documentation topics (lowercase; `all` when unspecified) from raw output.
-    fn parse_doc_requests(&self, _raw_text: &str) -> Vec<String> {
+    /// Extracts requested documentation topics (`All` when unspecified) from raw output.
+    fn parse_doc_requests(&self, _raw_text: &str) -> Vec<DocTopic> {
         Vec::new()
     }
 
@@ -108,9 +108,9 @@ pub trait EditProtocol: Send + Sync {
 pub struct EditProtocolFactory;
 
 impl EditProtocolFactory {
-    /// Returns the list of standard supported edit protocol names.
-    pub fn available_protocols() -> Vec<String> {
-        vec!["xml".to_string(), "structured".to_string()]
+    /// Returns the list of standard supported edit protocol kinds.
+    pub fn available_protocols() -> Vec<EditProtocolKind> {
+        vec![EditProtocolKind::Xml, EditProtocolKind::Structured]
     }
 
     /// Validates whether an edit protocol name is recognized.
@@ -118,36 +118,25 @@ impl EditProtocolFactory {
         Self::canonical_name(name).is_some()
     }
 
-    /// Resolves aliases to a canonical edit protocol name.
-    pub fn canonical_name(name: &str) -> Option<String> {
-        match name.trim().to_lowercase().as_str() {
-            "xml" => Some("xml".to_string()),
-            "structured" | "structured_output" | "json_schema" | "json" => {
-                Some("structured".to_string())
-            }
-            _ => None,
-        }
+    /// Resolves aliases to a canonical edit protocol kind.
+    pub fn canonical_name(name: &str) -> Option<EditProtocolKind> {
+        name.parse::<EditProtocolKind>().ok()
     }
 
-    /// Creates an EditProtocol instance by name or alias.
-    pub fn create_protocol(name: &str) -> Result<Box<dyn EditProtocol>, String> {
-        match name.trim().to_lowercase().as_str() {
-            "structured" | "structured_output" | "json_schema" | "json" => {
-                Ok(Box::new(StructuredEditProtocol))
-            }
-            "xml" => Ok(Box::new(XmlEditProtocol)),
-            other => Err(format!(
-                "Unknown edit protocol '{}'. Available protocols: {}",
-                other,
-                Self::available_protocols().join(", ")
-            )),
+    /// Creates an EditProtocol instance by protocol kind.
+    pub fn create_protocol(kind: EditProtocolKind) -> Box<dyn EditProtocol> {
+        match kind {
+            EditProtocolKind::Structured => Box::new(StructuredEditProtocol),
+            EditProtocolKind::Xml => Box::new(XmlEditProtocol),
         }
     }
 }
 
-/// Factory function to create an EditProtocol by identifier name.
+/// Factory function to create an EditProtocol by identifier name or alias.
 pub fn create_edit_protocol(name: &str) -> Box<dyn EditProtocol> {
-    EditProtocolFactory::create_protocol(name).unwrap_or_else(|_| Box::new(XmlEditProtocol))
+    name.parse::<EditProtocolKind>()
+        .map(EditProtocolFactory::create_protocol)
+        .unwrap_or_else(|_| Box::new(XmlEditProtocol))
 }
 
 #[cfg(test)]
@@ -171,7 +160,7 @@ mod tests {
 
         assert_eq!(
             EditProtocolFactory::available_protocols(),
-            vec!["xml".to_string(), "structured".to_string()]
+            vec![EditProtocolKind::Xml, EditProtocolKind::Structured]
         );
     }
 }

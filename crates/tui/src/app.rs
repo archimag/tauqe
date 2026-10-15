@@ -52,7 +52,6 @@ pub enum ActiveModal {
     DeleteReview,
     ExecuteReview,
     ExecuteScope,
-    DiscussPlan,
     RefineDialog,
     RefineBlocked,
     Prompt,
@@ -201,8 +200,8 @@ impl ModelChoice {
 /// header (an action surface) without duplicating server-side state.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RunningModel {
-    /// Wire model reference (`provider:name`).
-    pub model: String,
+    /// Wire model reference.
+    pub model: ModelRef,
     /// Semantic role that launched the turn, when it was role-driven.
     pub role: Option<ModelRole>,
     /// Configured human-readable alias, when one exists.
@@ -223,11 +222,7 @@ impl RunningModel {
                 return trimmed.to_string();
             }
         }
-        let short = self
-            .model
-            .split_once(':')
-            .map(|(_, name)| name)
-            .unwrap_or(self.model.as_str());
+        let short = compact_model_name(&self.model);
         match self.effort {
             Some(effort) => format!("{} [{}]", short, effort),
             None => short.to_string(),
@@ -327,6 +322,10 @@ pub enum SelectionDialogKind {
 pub enum SelectionItem {
     Primary(tauqe_protocol::ModelEntry),
     Model(ModelRef),
+    /// Pseudo-entry appended to the primary picker that opens the full model
+    /// catalog, so configured primary models never lock the developer out of
+    /// the complete provider list.
+    Catalog,
 }
 
 #[derive(Debug, Clone)]
@@ -368,7 +367,7 @@ impl StatusDialogTarget {
     pub fn options_count(&self) -> usize {
         match self {
             Self::PlanItem { .. } => 6,
-            Self::ReviewItem { .. } => 5,
+            Self::ReviewItem { .. } => 6,
         }
     }
 }
@@ -384,7 +383,7 @@ pub struct ConfirmExecuteScopeState {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConfirmExecuteReviewState {
-    pub review_id: String,
+    pub review_id: Option<String>,
     pub review_title: String,
     pub scope_title: String,
     pub item_id: Option<u32>,
@@ -425,14 +424,6 @@ impl PromptModalState {
 }
 
 #[derive(Debug, Clone)]
-pub struct DiscussPlanDialogState {
-    pub plan_id: String,
-    pub plan_title: String,
-    pub focused_items: Vec<(String, String)>,
-    pub prompt_editor: InputEditor,
-}
-
-#[derive(Debug, Clone)]
 pub struct DiscussReviewDialogState {
     pub review_id: String,
     pub review_title: String,
@@ -456,9 +447,9 @@ impl StatusDialogState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ViewMode {
     Develop,
-    Context,
-    Review,
     Plans,
+    Review,
+    Context,
     History,
     Onboarding,
 }
@@ -481,19 +472,34 @@ pub enum ReviewDialogFocus {
 
 impl ReviewDialogFocus {
     /// Advances focus to the next section in visual order.
-    pub fn cycle_next(&mut self) {
+    ///
+    /// When only one model is configured, `ModelList` is omitted from cycling so
+    /// navigation moves directly between the prompt editor and action buttons.
+    pub fn cycle_next(&mut self, entry_count: usize) {
         *self = match self {
             Self::ModelList => Self::PromptEditor,
             Self::PromptEditor => Self::Actions,
-            Self::Actions => Self::ModelList,
+            Self::Actions => {
+                if entry_count > 1 {
+                    Self::ModelList
+                } else {
+                    Self::PromptEditor
+                }
+            }
         };
     }
 
     /// Moves focus to the previous section in visual order.
-    pub fn cycle_prev(&mut self) {
+    pub fn cycle_prev(&mut self, entry_count: usize) {
         *self = match self {
             Self::ModelList => Self::Actions,
-            Self::PromptEditor => Self::ModelList,
+            Self::PromptEditor => {
+                if entry_count > 1 {
+                    Self::ModelList
+                } else {
+                    Self::Actions
+                }
+            }
             Self::Actions => Self::PromptEditor,
         };
     }
@@ -806,12 +812,12 @@ pub struct AppInit {
     pub protocol_version: String,
     pub repo_state: Option<RepositoryState>,
     pub all_repo_files: Vec<String>,
-    pub workflow: String,
-    pub edit_protocol: String,
+    pub workflow: tauqe_protocol::WorkflowKind,
+    pub edit_protocol: tauqe_protocol::EditProtocolKind,
     pub active_model: ModelRef,
     pub available_models: Vec<ModelRef>,
-    pub available_workflows: Vec<String>,
-    pub available_edit_protocols: Vec<String>,
+    pub available_workflows: Vec<tauqe_protocol::WorkflowKind>,
+    pub available_edit_protocols: Vec<tauqe_protocol::EditProtocolKind>,
     pub context: ContextState,
     pub onboarding: OnboardingState,
     pub input_editor: InputEditor,
@@ -824,12 +830,12 @@ pub struct AppState {
     pub protocol_version: String,
     pub repo_state: Option<RepositoryState>,
     pub all_repo_files: Vec<String>,
-    pub workflow: String,
-    pub edit_protocol: String,
+    pub workflow: tauqe_protocol::WorkflowKind,
+    pub edit_protocol: tauqe_protocol::EditProtocolKind,
     pub active_model: ModelRef,
     pub available_models: Vec<ModelRef>,
-    pub available_workflows: Vec<String>,
-    pub available_edit_protocols: Vec<String>,
+    pub available_workflows: Vec<tauqe_protocol::WorkflowKind>,
+    pub available_edit_protocols: Vec<tauqe_protocol::EditProtocolKind>,
     pub model: DevelopView,
     pub context: ContextState,
     pub context_view: ContextViewState,
@@ -856,7 +862,6 @@ pub struct AppState {
     pub squash_dialog: Option<SquashDialogState>,
     pub review_dialog: Option<ReviewDialogState>,
     pub prompt_modal: Option<PromptModalState>,
-    pub discuss_plan_dialog: Option<DiscussPlanDialogState>,
     pub discuss_review_dialog: Option<DiscussReviewDialogState>,
     pub notification: Option<AppNotification>,
     pub turn_started_at: Option<std::time::Instant>,
@@ -920,7 +925,6 @@ impl AppState {
             squash_dialog: None,
             review_dialog: None,
             prompt_modal: None,
-            discuss_plan_dialog: None,
             discuss_review_dialog: None,
             notification: None,
             turn_started_at: None,
@@ -992,7 +996,14 @@ impl AppState {
             _ => 0,
         };
 
-        let items: Vec<SelectionItem> = entries.into_iter().map(SelectionItem::Primary).collect();
+        let mut items: Vec<SelectionItem> =
+            entries.into_iter().map(SelectionItem::Primary).collect();
+        // The catalog escape hatch keeps every available provider model reachable
+        // even when primary models are configured. It is omitted only when the
+        // catalog is empty, which would otherwise produce an inert row.
+        if !self.available_models.is_empty() {
+            items.push(SelectionItem::Catalog);
+        }
         self.selection_dialog = Some(SelectionDialogState::new(
             SelectionDialogKind::PrimaryModels,
             items,
@@ -1067,9 +1078,6 @@ impl AppState {
         }
         if self.confirm_execute_scope.is_some() {
             return Some(ActiveModal::ExecuteScope);
-        }
-        if self.discuss_plan_dialog.is_some() {
-            return Some(ActiveModal::DiscussPlan);
         }
         if self.plans_view.refine_dialog.is_some() {
             return Some(ActiveModal::RefineDialog);
@@ -1187,8 +1195,8 @@ pub(crate) fn test_state() -> AppState {
         protocol_version: "1.0".to_string(),
         repo_state: None,
         all_repo_files: Vec::new(),
-        workflow: "git".to_string(),
-        edit_protocol: "xml".to_string(),
+        workflow: tauqe_protocol::WorkflowKind::Git,
+        edit_protocol: tauqe_protocol::EditProtocolKind::Xml,
         active_model: ModelRef::openrouter("test-model"),
         available_models: Vec::new(),
         available_workflows: Vec::new(),
@@ -1429,6 +1437,39 @@ mod tests {
         assert_eq!(dialog.items.len(), 1);
         assert_eq!(dialog.items[0], SelectionItem::Primary(primary_entry));
         assert_eq!(dialog.selector.selected_index(), 0);
+    }
+
+    #[test]
+    fn test_open_model_dialog_appends_catalog_escape_hatch() {
+        let mut state = test_state();
+        let primary_entry = tauqe_protocol::ModelEntry::new(
+            ModelRef::openrouter("primary-model"),
+            None,
+            None,
+        );
+        state.available_models = vec![ModelRef::openrouter("catalog-model")];
+        state.model_choice = ModelChoice {
+            selection: ModelSelection::Role(ModelRole::Primary),
+            roles: Some(ModelRolesSummary {
+                scribe: ModelRef::openrouter("scribe-model"),
+                coder: ModelRef::openrouter("coder-model"),
+                architect: ModelRef::openrouter("architect-model"),
+                primary: ModelRef::openrouter("primary-model"),
+                reviewer: ModelRef::openrouter("reviewer-model"),
+                efforts: None,
+                entries: Some(tauqe_protocol::ModelRolesEntries {
+                    primary: vec![primary_entry.clone()],
+                    ..Default::default()
+                }),
+            }),
+        };
+
+        assert!(state.open_model_dialog());
+        let dialog = state.selection_dialog.expect("dialog should be opened");
+        assert_eq!(dialog.kind, SelectionDialogKind::PrimaryModels);
+        assert_eq!(dialog.items.len(), 2);
+        assert_eq!(dialog.items[0], SelectionItem::Primary(primary_entry));
+        assert_eq!(dialog.items[1], SelectionItem::Catalog);
     }
 
     #[test]

@@ -5,11 +5,10 @@
 //! reasoning models that drop the marker suffix by retrying unmarked tags.
 
 use crate::edits::protocol::{ContextRequest, EditProtocol};
-use tauqe_protocol::{EditOperation, ModelResult};
+use tauqe_protocol::{DocTopic, EditOperation, ModelResult};
 
 use super::clean::extract_conversational_text;
 use super::marker::{normalize_marked_xml, restore_xml_literals};
-use super::parser::has_xml_edit_tags;
 use super::prompt;
 use super::tags::{self, TerminalOutcome, VerifyRequest};
 use super::XmlEditProtocol;
@@ -69,11 +68,15 @@ impl EditProtocol for MarkedXmlEditProtocol {
     fn turn_marker(&self) -> Option<&str> { Some(&self.marker) }
 
     fn parse_context_requests(&self, raw_text: &str) -> Vec<ContextRequest> {
-        self.tolerant_parse(raw_text, tags::parse_context_request_tags, Vec::is_empty)
+        // Strict marker requirement: discovery requests mutate context and must not
+        // be triggered by unmarked example tags in conversational text or source code.
+        let normalized = normalize_marked_xml(raw_text, &self.marker, true);
+        tags::parse_context_request_tags(&normalized)
     }
 
-    fn parse_doc_requests(&self, raw_text: &str) -> Vec<String> {
-        self.tolerant_parse(raw_text, tags::parse_doc_request_tags, Vec::is_empty)
+    fn parse_doc_requests(&self, raw_text: &str) -> Vec<DocTopic> {
+        let normalized = normalize_marked_xml(raw_text, &self.marker, true);
+        tags::parse_doc_request_tags(&normalized)
     }
 
     fn parse_verify_request(&self, raw_text: &str) -> Option<VerifyRequest> {
@@ -88,11 +91,10 @@ impl EditProtocol for MarkedXmlEditProtocol {
         &self,
         raw_text: &str,
     ) -> (Vec<tags::ParsedPlanTag>, Vec<String>) {
-        self.tolerant_parse(
-            raw_text,
-            tags::parse_plan_tags_with_diagnostics,
-            |parsed| parsed.0.is_empty(),
-        )
+        // Strict marker requirement: plan modifications must never be parsed
+        // from unsuffixed tags discussed in conversation or documentation.
+        let normalized = normalize_marked_xml(raw_text, &self.marker, true);
+        tags::parse_plan_tags_with_diagnostics(&normalized)
     }
 
     fn parse_scratchpad(&self, raw_text: &str) -> Option<String> {
@@ -105,10 +107,10 @@ impl EditProtocol for MarkedXmlEditProtocol {
     }
 
     fn parse_terminal_outcome(&self, raw_text: &str) -> Option<TerminalOutcome> {
-        // Prefer marker-suffixed tags; fall back to unmarked <success>/<error>
-        // tags when the model omitted the turn-marker suffix (deep-reasoning models).
-        let outcome =
-            self.tolerant_parse(raw_text, tags::extract_terminal_outcome, Option::is_none)?;
+        // Strict marker requirement: terminal outcomes determine control flow and must
+        // never fall back to unmarked tags quoted in source code or explanations.
+        let normalized = normalize_marked_xml(raw_text, &self.marker, true);
+        let outcome = tags::extract_terminal_outcome(&normalized)?;
         Some(match outcome {
             TerminalOutcome::Success { summary } => TerminalOutcome::Success {
                 summary: summary.map(|s| restore_xml_literals(&s, &self.marker)),
@@ -124,8 +126,8 @@ impl EditProtocol for MarkedXmlEditProtocol {
     }
 
     fn parse_error(&self, raw_text: &str) -> Option<String> {
-        self.tolerant_parse(raw_text, tags::extract_error, Option::is_none)
-            .map(|message| restore_xml_literals(&message, &self.marker))
+        let normalized = normalize_marked_xml(raw_text, &self.marker, true);
+        tags::extract_error(&normalized).map(|message| restore_xml_literals(&message, &self.marker))
     }
 
     fn clean_assistant_text(&self, raw_text: &str) -> String {
@@ -161,17 +163,11 @@ impl EditProtocol for MarkedXmlEditProtocol {
     }
 
     fn parse_output(&self, raw_text: &str, editable_paths: &[String]) -> ModelResult {
+        // Strict marker requirement: code edits must carry the active turn marker.
+        // Unmarked edit blocks in conversation or source code are treated as literals,
+        // preventing injection or unintentional patch application.
         let normalized = normalize_marked_xml(raw_text, &self.marker, true);
         let mut result = XmlEditProtocol.parse_output(&normalized, editable_paths);
-        // Tolerant fallback: when the model dropped the marker suffix on edit
-        // tags, normalization protects them as literals and the marked pass
-        // yields an answer; retry against the raw text so unmarked
-        // <tauqe_edits>/<edit> blocks still apply.
-        let used_raw =
-            matches!(&result, ModelResult::Answer { .. }) && has_xml_edit_tags(raw_text);
-        if used_raw {
-            result = XmlEditProtocol.parse_output(raw_text, editable_paths);
-        }
         match &mut result {
             ModelResult::Answer { text } => *text = restore_xml_literals(text, &self.marker),
             ModelResult::Edit { summary, edits, proposal, error, .. } => {
@@ -203,12 +199,8 @@ impl EditProtocol for MarkedXmlEditProtocol {
                         }
                     }
                 }
-                // Preserve the explanation for history without interpreting literal source tags.
-                let message = if used_raw {
-                    extract_conversational_text(raw_text)
-                } else {
-                    restore_xml_literals(&extract_conversational_text(&normalized), &self.marker)
-                };
+                let message =
+                    restore_xml_literals(&extract_conversational_text(&normalized), &self.marker);
                 *proposal = Some(tauqe_protocol::ModelResultProposal {
                     message,
                     ..Default::default()
@@ -236,7 +228,7 @@ impl EditProtocol for MarkedXmlEditProtocol {
 mod tests {
     use super::*;
     use super::tags::{VerifyOnSuccess, VerifyTarget};
-    use tauqe_protocol::{ContextAccess, EditOperation, ModelResult};
+    use tauqe_protocol::{EditOperation, ModelResult};
 
     #[test]
     fn test_marked_xml_ignores_unsuffixed_plan_tags() {
@@ -445,60 +437,19 @@ mod tests {
     }
 
     #[test]
-    fn test_marked_xml_terminal_outcome_falls_back_to_unmarked_tags() {
+    fn test_marked_xml_ignores_unmarked_terminal_outcomes() {
         let marker = "M246801";
         let proto = MarkedXmlEditProtocol::new(marker);
 
-        let success_output =
-            "Implemented the fix.\n<success summary=\"Fallback success\" />\nDone.";
-        assert_eq!(
-            proto.parse_terminal_outcome(success_output),
-            Some(TerminalOutcome::Success {
-                summary: Some("Fallback success".to_string()),
-            })
+        let output = concat!(
+            "Discussing outcomes:\n",
+            "<", "success summary=\"Example success\" />\n",
+            "<", "error message=\"Example blocker\" />\n",
+            "<", "blocked reason=\"Example reason\" />\n",
+            "Done.",
         );
-        assert_eq!(
-            proto.clean_assistant_text(success_output),
-            "Implemented the fix.\n\nDone."
-        );
-
-        let error_output = "Blocked.\n<error message=\"Fallback blocker\" />\nExiting.";
-        assert_eq!(
-            proto.parse_terminal_outcome(error_output),
-            Some(TerminalOutcome::Error {
-                message: "Fallback blocker".to_string(),
-            })
-        );
-        assert_eq!(
-            proto.clean_assistant_text(error_output),
-            "Blocked.\n\nExiting."
-        );
-    }
-
-    #[test]
-    fn test_marked_xml_terminal_outcome_prefers_marked_over_unmarked() {
-        let marker = "M246802";
-        let proto = MarkedXmlEditProtocol::new(marker);
-
-        let output = format!(
-            "Prefer the marked tag.\n<success summary=\"Unmarked\" />\n<success_{m} summary=\"Marked\" />\n",
-            m = marker
-        );
-        assert_eq!(
-            proto.parse_terminal_outcome(&output),
-            Some(TerminalOutcome::Success {
-                summary: Some("Marked".to_string()),
-            })
-        );
-    }
-
-    #[test]
-    fn test_marked_xml_terminal_outcome_fallback_ignores_markdown_code() {
-        let marker = "M246803";
-        let proto = MarkedXmlEditProtocol::new(marker);
-
-        let output = "Example only:\n```xml\n<success summary=\"Example\" />\n```\nInline `<error message=\"Example\" />`.";
         assert_eq!(proto.parse_terminal_outcome(output), None);
+        assert_eq!(proto.parse_error(output), None);
     }
 
     #[test]
@@ -553,15 +504,16 @@ let s = \"clean\";\n\
     }
 
     #[test]
-    fn test_marked_xml_context_request_falls_back_to_unmarked() {
+    fn test_marked_xml_ignores_unmarked_context_request() {
         let marker = "M246810";
         let proto = MarkedXmlEditProtocol::new(marker);
-        let output =
-            "Need context.\n<context_request path=\"src/a.rs\" access=\"editable\" />\nDone.";
+        let output = concat!(
+            "Need context example:\n",
+            "<", "context_request path=\"src/a.rs\" access=\"editable\" />\n",
+            "Done.",
+        );
         let requests = proto.parse_context_requests(output);
-        assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0].path, "src/a.rs");
-        assert_eq!(requests[0].access, ContextAccess::Editable);
+        assert!(requests.is_empty());
     }
 
     #[test]
@@ -575,32 +527,25 @@ let s = \"clean\";\n\
     }
 
     #[test]
-    fn test_marked_xml_edit_falls_back_to_unmarked() {
+    fn test_marked_xml_ignores_unmarked_edits() {
         let marker = "M357911";
         let proto = MarkedXmlEditProtocol::new(marker);
         let editable = vec!["src/lib.rs".to_string()];
         let output = concat!(
-            "Fixing.\n",
-            "<tauqe_edits summary=\"Fix\">\n",
-            "<edit path=\"src/lib.rs\">\n",
-            "<search>\nold();\n</search>\n",
-            "<replace>\nnew();\n<", "/replace>\n",
+            "Fixing example:\n",
+            "<", "tauqe_edits summary=\"Fix\">\n",
+            "<", "edit path=\"src/lib.rs\">\n",
+            "<", "search>\nold();\n</search>\n",
+            "<", "replace>\nnew();\n<", "/replace>\n",
             "<", "/edit>\n",
             "<", "/tauqe_edits>\n",
         );
         match proto.parse_output(output, &editable) {
-            ModelResult::Edit { edits, error: None, .. } => {
-                assert_eq!(edits.len(), 1);
-                match &edits[0] {
-                    EditOperation::Replace { path, old_text, new_text } => {
-                        assert_eq!(path, "src/lib.rs");
-                        assert!(old_text.contains("old();"));
-                        assert!(new_text.contains("new();"));
-                    }
-                    _ => panic!("Expected Replace"),
-                }
+            ModelResult::Answer { text } => {
+                assert!(text.contains("Fixing example:"));
+                assert!(text.contains("<tauqe_edits summary=\"Fix\">"));
             }
-            _ => panic!("Expected ModelResult::Edit"),
+            ModelResult::Edit { .. } => panic!("Expected ModelResult::Answer, got Edit"),
         }
     }
 

@@ -13,8 +13,8 @@ use std::path::Path;
 
 use tokio::sync::{mpsc, watch};
 use tauqe_protocol::{
-    ContextAccess, EditOperation, EditProposal, LlmCommand, LlmOutcome, ModelRef, ModelResult,
-    VerifyOnSuccess, VerifyTarget,
+    ContextAccess, DocTopic, EditOperation, EditProposal, LlmCommand, LlmOutcome, ModelRef,
+    ModelResult, VerifyOnSuccess, VerifyTarget,
 };
 
 use crate::context::{ContextFileContent, ContextManager};
@@ -36,8 +36,8 @@ use crate::workflow::retry::{
     retain_retried_failed_files,
 };
 use crate::workflow::verification::{
-    build_verification_retry_prompt, extract_error_paths, run_workflow_verification,
-    VerificationOutcome,
+    build_verification_missing_edits_prompt, build_verification_retry_prompt, extract_error_paths,
+    run_workflow_verification, VerificationOutcome,
 };
 use crate::workflow::WorkflowOptions;
 
@@ -105,11 +105,11 @@ impl ProposalStep {
     }
 
     /// Documentation topics requested by the model.
-    fn doc_requests(&self) -> Vec<String> {
+    fn doc_requests(&self) -> Vec<DocTopic> {
         self.commands
             .iter()
             .filter_map(|command| match command {
-                LlmCommand::DocRequest { topic } => Some(topic.clone()),
+                LlmCommand::DocRequest { topic } => Some(*topic),
                 _ => None,
             })
             .collect()
@@ -169,6 +169,17 @@ impl ProposalStep {
             .iter()
             .filter_map(|command| match command {
                 LlmCommand::Plan { update } => Some(update.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Protocol syntax or structure errors encountered during decoding.
+    fn protocol_errors(&self) -> Vec<String> {
+        self.commands
+            .iter()
+            .filter_map(|command| match command {
+                LlmCommand::ProtocolError { message } => Some(message.clone()),
                 _ => None,
             })
             .collect()
@@ -243,14 +254,18 @@ struct RepoMapCacheEntry {
 impl TurnInputCache {
     /// Returns the repository's tracked file list, re-reading it only when the
     /// repository HEAD has moved since the previous read.
-    fn tracked_files(&mut self, repo_root: &Path, head: &str) -> Vec<String> {
+    async fn tracked_files(&mut self, repo_root: &Path, head: &str) -> Vec<String> {
         let stale = self
             .files
             .as_ref()
             .map(|cached| cached.head != head)
             .unwrap_or(true);
         if stale {
-            let files = crate::git::list_repository_files(Some(repo_root)).unwrap_or_default();
+            let root = repo_root.to_path_buf();
+            let files = crate::blocking::run_blocking_async(move || {
+                crate::git::list_repository_files(Some(&root)).unwrap_or_default()
+            })
+            .await;
             self.files = Some(TrackedFiles {
                 head: head.to_string(),
                 files,
@@ -264,7 +279,7 @@ impl TurnInputCache {
 
     /// Returns the repo map for the given inputs, regenerating it only when the
     /// HEAD, the targetable path set, or the token budget has changed.
-    fn repo_map(
+    async fn repo_map(
         &mut self,
         repo_root: &Path,
         head: &str,
@@ -284,16 +299,22 @@ impl TurnInputCache {
             return self.repo_map.as_ref().and_then(|entry| entry.map.clone());
         }
 
-        let available_files = self.tracked_files(repo_root, head);
-        let map = crate::repomap::generate_repo_map_with_extractor(
-            repo_root,
-            &available_files,
-            targetable_paths,
-            token_budget,
-            &self.extractor,
-        )
-        .ok()
-        .filter(|map| !map.trim().is_empty());
+        let available_files = self.tracked_files(repo_root, head).await;
+        let root = repo_root.to_path_buf();
+        let targetable = targetable_paths.to_vec();
+        let extractor = self.extractor.clone();
+        let map = crate::blocking::run_blocking_async(move || {
+            crate::repomap::generate_repo_map_with_extractor(
+                &root,
+                &available_files,
+                &targetable,
+                token_budget,
+                &extractor,
+            )
+            .ok()
+            .filter(|map| !map.trim().is_empty())
+        })
+        .await;
 
         self.repo_map = Some(RepoMapCacheEntry {
             head: head.to_string(),
@@ -362,34 +383,35 @@ pub fn is_discussion_prompt(prompt: &str) -> bool {
         || crate::review::prompt::is_review_discussion_prompt(prompt)
 }
 
-fn apply_turn_plans(
+async fn apply_turn_plans(
     repo_root: &Path,
     plans: &[tauqe_protocol::DiscussionPlanUpdate],
-    assistant_text: &str,
+    mode: crate::plan::storage::PlanMutationMode,
 ) {
-    if !plans.is_empty() {
-        for plan_update in plans {
-            let outcome = crate::plan::storage::PlanStorage::apply_discussion_plan_update(
-                repo_root,
+    if plans.is_empty() {
+        return;
+    }
+    let root = repo_root.to_path_buf();
+    let plans_vec = plans.to_vec();
+    crate::blocking::run_blocking_async(move || {
+        for plan_update in &plans_vec {
+            let outcome = crate::plan::storage::PlanStorage::apply_discussion_plan_update_with_mode(
+                &root,
                 plan_update,
+                mode,
             );
+            for err in &outcome.errors {
+                tracing::warn!("Plan update rejected: {}", err);
+            }
             for plan in outcome.applied {
                 let _ = crate::plan::storage::PlanStorage::save_active_id(
-                    repo_root,
+                    &root,
                     Some(&plan.id),
                 );
             }
         }
-    } else {
-        let outcome =
-            crate::plan::storage::PlanStorage::apply_plan_tags(repo_root, assistant_text);
-        for plan in outcome.applied {
-            let _ = crate::plan::storage::PlanStorage::save_active_id(
-                repo_root,
-                Some(&plan.id),
-            );
-        }
-    }
+    })
+    .await;
 }
 
 /// Applies the turn's plan updates and packages the outcome.
@@ -397,13 +419,23 @@ fn apply_turn_plans(
 /// History recording is deliberately excluded here: it runs once per bounded
 /// turn in [`run_fsm_turn`], so repeated proposal rounds never duplicate
 /// history entries.
-fn finish_turn(
+///
+/// Invariant: Plan mutations are applied strictly when the turn succeeds without
+/// rollback or error (`applied == true` for edits, or `ModelResult::Answer`).
+async fn finish_turn(
     assistant_text: String,
     result: ModelResult,
     repo_root: &Path,
     plans: &[tauqe_protocol::DiscussionPlanUpdate],
+    mode: crate::plan::storage::PlanMutationMode,
 ) -> FsmTurnOutcome {
-    apply_turn_plans(repo_root, plans, &assistant_text);
+    let should_apply_plans = match &result {
+        ModelResult::Answer { .. } => true,
+        ModelResult::Edit { applied, .. } => *applied,
+    };
+    if should_apply_plans {
+        apply_turn_plans(repo_root, plans, mode).await;
+    }
     FsmTurnOutcome {
         assistant_text,
         result,
@@ -418,8 +450,8 @@ fn finish_turn(
 /// that the turn was reverted, so the discrepancy must stay visible rather than
 /// being silently dropped. Returns whether the working tree was actually
 /// restored.
-fn rollback_or_log(policy: &mut dyn ApplyPolicy, repo_root: &Path) -> bool {
-    match policy.rollback(repo_root) {
+async fn rollback_or_log(policy: &mut dyn ApplyPolicy, repo_root: &Path) -> bool {
+    match policy.rollback(repo_root).await {
         Ok(rolled_back) => rolled_back,
         Err(err) => {
             tracing::error!(
@@ -431,19 +463,88 @@ fn rollback_or_log(policy: &mut dyn ApplyPolicy, repo_root: &Path) -> bool {
     }
 }
 
+/// RAII guard that rolls back an open transaction and cleans auto context if
+/// dropped before being explicitly disarmed or finalized.
+///
+/// Ensures that early `?`-returns (e.g. LLM provider errors during verification
+/// healing), task cancellations, or panics do not leave dirty working trees,
+/// step commits, or transaction markers behind.
+struct TransactionRollbackGuard<'a> {
+    policy: &'a mut dyn ApplyPolicy,
+    context_manager: &'a mut ContextManager,
+    repo_root: &'a Path,
+    armed: bool,
+}
+
+impl<'a> TransactionRollbackGuard<'a> {
+    fn new(
+        policy: &'a mut dyn ApplyPolicy,
+        context_manager: &'a mut ContextManager,
+        repo_root: &'a Path,
+    ) -> Self {
+        Self {
+            policy,
+            context_manager,
+            repo_root,
+            armed: false,
+        }
+    }
+
+    fn arm(&mut self) {
+        self.armed = true;
+    }
+
+    async fn rollback(&mut self) -> bool {
+        self.armed = false;
+        let rolled_back = rollback_or_log(self.policy, self.repo_root).await;
+        self.context_manager.clear_auto();
+        self.context_manager.prune_missing_files();
+        rolled_back
+    }
+
+    async fn finalize(
+        &mut self,
+        changed_files: &[String],
+        summary: &str,
+    ) -> (Option<String>, Option<String>) {
+        self.armed = false;
+        self.context_manager.clear_auto();
+        finalize_applied(self.policy, self.repo_root, changed_files, summary).await
+    }
+
+    async fn apply_temporary(&mut self, proposal: &EditProposal) -> anyhow::Result<Vec<String>> {
+        self.policy
+            .apply_temporary(self.repo_root, self.context_manager, proposal)
+            .await
+    }
+}
+
+impl Drop for TransactionRollbackGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            tracing::warn!(
+                "TransactionRollbackGuard dropped while armed; rolling back open transaction"
+            );
+            let _ = self.policy.rollback_sync(self.repo_root);
+            self.context_manager.clear_auto();
+            self.context_manager.prune_missing_files();
+        }
+    }
+}
+
 /// Finalizes an applied turn and surfaces a commit failure as a diagnostic.
 ///
 /// The validated changes already sit in the working tree, so the turn stays
 /// `applied`, but a Git transaction that could not be finalized must not be
 /// hidden behind a silent `commit_hash: None`. The failure is logged and
 /// returned so the caller can attach it to `ModelResult::Edit.error`.
-fn finalize_applied(
+async fn finalize_applied(
     policy: &mut dyn ApplyPolicy,
     repo_root: &Path,
     changed_files: &[String],
     summary: &str,
 ) -> (Option<String>, Option<String>) {
-    match policy.apply_final(repo_root, changed_files, summary) {
+    match policy.apply_final(repo_root, changed_files, summary).await {
         Ok(commit_hash) => (commit_hash, None),
         Err(err) => {
             let message = format!(
@@ -471,8 +572,9 @@ async fn finalize_blocked_turn(
     reason: String,
     accumulated_text: String,
     plans: &[tauqe_protocol::DiscussionPlanUpdate],
+    mode: crate::plan::storage::PlanMutationMode,
 ) -> FsmTurnOutcome {
-    rollback_or_log(policy, repo_root);
+    rollback_or_log(policy, repo_root).await;
     context_manager.clear_auto();
     context_manager.prune_missing_files();
     let ctx_state = context_manager.get_state();
@@ -487,9 +589,15 @@ async fn finalize_blocked_turn(
         changed_files: Vec::new(),
         commit_hash: None,
     };
-    let mut outcome = finish_turn(accumulated_text, result, repo_root, plans);
+    let mut outcome = finish_turn(accumulated_text, result, repo_root, plans, mode).await;
     outcome.blocked = Some(reason);
     outcome
+}
+
+/// Bookkeeping metadata returned when beginning a session turn.
+pub(super) struct SessionTurn {
+    pub is_isolated_step: bool,
+    pub turn_id: Option<u64>,
 }
 
 /// Runs the orthogonal FSM turn: discovery, staging, verification, and healing.
@@ -516,10 +624,10 @@ pub async fn run_fsm_turn(
     cancel_rx: watch::Receiver<bool>,
     options: &WorkflowOptions,
 ) -> anyhow::Result<FsmTurnOutcome> {
-    let is_isolated_step =
+    let session_turn =
         begin_session_turn(prompt, context_manager, history_manager, provider, &cancel_rx, options)
             .await;
-    let outcome = run_fsm_turn_body(
+    let turn_res = run_fsm_turn_body(
         prompt,
         provider,
         model,
@@ -531,10 +639,26 @@ pub async fn run_fsm_turn(
         stream_tx,
         cancel_rx,
         options,
-        is_isolated_step,
+        session_turn.is_isolated_step,
     )
-    .await?;
-    if !outcome.is_cancelled {
+    .await;
+    let outcome = match turn_res {
+        Ok(outcome) => outcome,
+        Err(err) => {
+            rollback_or_log(policy, context_manager.repo_root()).await;
+            context_manager.clear_auto();
+            context_manager.prune_missing_files();
+            if let Some(id) = session_turn.turn_id {
+                let _ = history_manager.rollback_entry(id);
+            }
+            return Err(err);
+        }
+    };
+    if outcome.is_cancelled {
+        if let Some(id) = session_turn.turn_id {
+            let _ = history_manager.rollback_entry(id);
+        }
+    } else {
         record_session_response(history_manager, &outcome);
     }
     Ok(outcome)
@@ -553,10 +677,11 @@ pub(super) async fn begin_session_turn(
     provider: &dyn LlmProvider,
     cancel_rx: &watch::Receiver<bool>,
     options: &WorkflowOptions,
-) -> bool {
+) -> SessionTurn {
     let is_isolated_step = crate::plan::prompt::is_plan_step_execution_prompt(prompt)
         || crate::review::is_review_step_execution_prompt(prompt);
 
+    let mut turn_id = None;
     if !is_isolated_step {
         let _ = compact_history_if_needed_with_budget(
             history_manager,
@@ -573,15 +698,21 @@ pub(super) async fn begin_session_turn(
             .iter()
             .map(|item| item.path.clone())
             .collect();
-        if let Err(err) = history_manager.record_turn(prompt, context_paths) {
-            tracing::warn!(
-                "Failed to record the turn prompt in session history: {}",
-                err
-            );
+        match history_manager.record_turn(prompt, context_paths) {
+            Ok(entry) => turn_id = entry.id(),
+            Err(err) => {
+                tracing::warn!(
+                    "Failed to record the turn prompt in session history: {}",
+                    err
+                );
+            }
         }
     }
 
-    is_isolated_step
+    SessionTurn {
+        is_isolated_step,
+        turn_id,
+    }
 }
 
 /// Records the completed turn outcome in session history.
@@ -619,6 +750,14 @@ pub(super) async fn run_fsm_turn_body(
 ) -> anyhow::Result<FsmTurnOutcome> {
     let repo_root = context_manager.repo_root().to_path_buf();
 
+    let plan_mode = if is_isolated_step {
+        crate::plan::storage::PlanMutationMode::IsolatedStep
+    } else if is_discussion_prompt(prompt) {
+        crate::plan::storage::PlanMutationMode::Discussion
+    } else {
+        crate::plan::storage::PlanMutationMode::Develop
+    };
+
     let _ = stream_tx
         .send(StreamEvent::TurnPhase {
             phase: tauqe_protocol::TurnPhase::Proposal,
@@ -648,14 +787,11 @@ pub(super) async fn run_fsm_turn_body(
         is_isolated_step,
     )
     .await?;
-    state.absorb(&step);
-
-    let mut accumulated_text = step.text();
 
     if step.is_cancelled {
         let _ = stream_tx.send(StreamEvent::Done).await;
         return Ok(FsmTurnOutcome {
-            assistant_text: accumulated_text,
+            assistant_text: String::new(),
             result: ModelResult::Answer {
                 text: String::new(),
             },
@@ -663,6 +799,9 @@ pub(super) async fn run_fsm_turn_body(
             blocked: None,
         });
     }
+
+    state.absorb(&step);
+    let mut accumulated_text = step.text();
 
     if let Some(reason) = state.blocked.clone() {
         return Ok(finalize_blocked_turn(
@@ -673,6 +812,7 @@ pub(super) async fn run_fsm_turn_body(
             reason,
             accumulated_text,
             &state.plans,
+            plan_mode,
         )
         .await);
     }
@@ -680,7 +820,10 @@ pub(super) async fn run_fsm_turn_body(
     // Discovery loop: the model may request files before proposing edits.
     let mut discovery_round = 0;
     let mut round_prompt = prompt.to_string();
-    while discovery_round < options.max_discovery_rounds && step.edits().is_empty() {
+    while discovery_round < options.max_discovery_rounds
+        && step.edits().is_empty()
+        && step.protocol_errors().is_empty()
+    {
         let requests = step.context_requests();
         let doc_topics = step.doc_requests();
         if requests.is_empty() && doc_topics.is_empty() {
@@ -748,7 +891,7 @@ pub(super) async fn run_fsm_turn_body(
         if !doc_topics.is_empty() {
             let documentation = doc_topics
                 .iter()
-                .map(|topic| crate::docs::get_documentation(topic))
+                .map(|topic| crate::docs::get_documentation(*topic))
                 .collect::<Vec<_>>()
                 .join("\n\n");
             round_prompt.push_str(&format!(
@@ -795,8 +938,6 @@ pub(super) async fn run_fsm_turn_body(
             is_isolated_step,
         )
         .await?;
-        state.absorb(&step);
-        accumulated_text = merge_text(accumulated_text, &banner, &step.text());
 
         if step.is_cancelled {
             let _ = stream_tx.send(StreamEvent::Done).await;
@@ -810,6 +951,9 @@ pub(super) async fn run_fsm_turn_body(
             });
         }
 
+        state.absorb(&step);
+        accumulated_text = merge_text(accumulated_text, &banner, &step.text());
+
         if let Some(reason) = state.blocked.clone() {
             return Ok(finalize_blocked_turn(
                 policy,
@@ -819,6 +963,7 @@ pub(super) async fn run_fsm_turn_body(
                 reason,
                 accumulated_text,
                 &state.plans,
+                plan_mode,
             )
             .await);
         }
@@ -826,7 +971,7 @@ pub(super) async fn run_fsm_turn_body(
 
     // Terminal error short-circuits the turn before any staging.
     if let Some(message) = extract_error_message(state.terminal_outcome.as_ref()) {
-        rollback_or_log(policy, &repo_root);
+        rollback_or_log(policy, &repo_root).await;
         context_manager.clear_auto();
         context_manager.prune_missing_files();
         let ctx_state = context_manager.get_state();
@@ -841,16 +986,30 @@ pub(super) async fn run_fsm_turn_body(
             changed_files: Vec::new(),
             commit_hash: None,
         };
-        return Ok(finish_turn(accumulated_text, result, &repo_root, &state.plans));
+        return Ok(finish_turn(accumulated_text, result, &repo_root, &state.plans, plan_mode).await);
     }
 
     let mut current_edits = step.edits();
+    let mut current_protocol_errors = step.protocol_errors();
     let mut current_verify = state.verify_request.clone();
 
-    if current_edits.is_empty() {
+    if current_edits.is_empty() && current_protocol_errors.is_empty() {
         let mut answer_text = accumulated_text;
         if let Some(request) = current_verify.take() {
-            let outcome = run_workflow_verification(&repo_root, &request, &stream_tx, true).await;
+            let outcome =
+                run_workflow_verification(&repo_root, &request, &stream_tx, true, Some(&cancel_rx))
+                    .await;
+            if outcome.is_cancelled {
+                let _ = stream_tx.send(StreamEvent::Done).await;
+                return Ok(FsmTurnOutcome {
+                    assistant_text: answer_text,
+                    result: ModelResult::Answer {
+                        text: String::new(),
+                    },
+                    is_cancelled: true,
+                    blocked: None,
+                });
+            }
             if !outcome.report.trim().is_empty() {
                 if answer_text.trim().is_empty() {
                     answer_text = outcome.report;
@@ -863,7 +1022,7 @@ pub(super) async fn run_fsm_turn_body(
         let result = ModelResult::Answer {
             text: answer_text.clone(),
         };
-        return Ok(finish_turn(answer_text, result, &repo_root, &state.plans));
+        return Ok(finish_turn(answer_text, result, &repo_root, &state.plans, plan_mode).await);
     }
 
     // Staging loop: validate edits in memory, repairing failures.
@@ -883,20 +1042,22 @@ pub(super) async fn run_fsm_turn_body(
 
     let mut attempt = 0;
     loop {
-        let stage_res =
-            policy.staging(&repo_root, context_manager, &current_edits, staged_state.as_ref());
-        staged_state = Some(stage_res.staged_state);
-        succeeded_files.extend(stage_res.successful_paths);
-        cumulative_edits.extend(stage_res.successful_edits);
+        if !current_edits.is_empty() {
+            let stage_res =
+                policy.staging(&repo_root, context_manager, &current_edits, staged_state.as_ref()).await;
+            staged_state = Some(stage_res.staged_state);
+            succeeded_files.extend(stage_res.successful_paths);
+            cumulative_edits.extend(stage_res.successful_edits);
 
-        for path in &succeeded_files {
-            last_failed_errors.remove(path);
-        }
-        for failed in stage_res.failed_files {
-            last_failed_errors.insert(failed.path, failed.error);
+            for path in &succeeded_files {
+                last_failed_errors.remove(path);
+            }
+            for failed in stage_res.failed_files {
+                last_failed_errors.insert(failed.path, failed.error);
+            }
         }
 
-        if last_failed_errors.is_empty() || attempt >= options.max_retries {
+        if (last_failed_errors.is_empty() && current_protocol_errors.is_empty()) || attempt >= options.max_retries {
             break;
         }
         attempt += 1;
@@ -932,6 +1093,7 @@ pub(super) async fn run_fsm_turn_body(
         let repair_prompt = build_patch_retry_prompt(
             &succeeded_files,
             &last_failed_errors,
+            &current_protocol_errors,
             state.language.as_deref(),
         );
         let step_out = run_proposal_step(
@@ -976,26 +1138,30 @@ pub(super) async fn run_fsm_turn_body(
                 reason,
                 accumulated_text,
                 &state.plans,
+                plan_mode,
             )
             .await);
         }
 
         current_edits = step_out.edits();
+        current_protocol_errors = step_out.protocol_errors();
         current_verify = state.verify_request.clone();
-        retain_retried_failed_files(&mut last_failed_errors, context_manager, &current_edits);
-        if let Some(ref mut staged) = staged_state {
-            prepare_staged_for_retry(
-                staged,
-                &mut cumulative_edits,
-                &mut succeeded_files,
-                context_manager,
-                &current_edits,
-            );
+        if !current_edits.is_empty() {
+            retain_retried_failed_files(&mut last_failed_errors, context_manager, &current_edits);
+            if let Some(ref mut staged) = staged_state {
+                prepare_staged_for_retry(
+                    staged,
+                    &mut cumulative_edits,
+                    &mut succeeded_files,
+                    context_manager,
+                    &current_edits,
+                );
+            }
         }
     }
 
     if let Some(message) = extract_error_message(state.terminal_outcome.as_ref()) {
-        rollback_or_log(policy, &repo_root);
+        rollback_or_log(policy, &repo_root).await;
         context_manager.clear_auto();
         context_manager.prune_missing_files();
         let ctx_state = context_manager.get_state();
@@ -1010,11 +1176,14 @@ pub(super) async fn run_fsm_turn_body(
             changed_files: Vec::new(),
             commit_hash: None,
         };
-        return Ok(finish_turn(accumulated_text, result, &repo_root, &state.plans));
+        return Ok(finish_turn(accumulated_text, result, &repo_root, &state.plans, plan_mode).await);
     }
 
-    if !last_failed_errors.is_empty() {
+    if !last_failed_errors.is_empty() || !current_protocol_errors.is_empty() {
         let mut err_lines = Vec::new();
+        for err in &current_protocol_errors {
+            err_lines.push(format!("Protocol error: {}", err));
+        }
         let mut failed_sorted: Vec<(&String, &EditError)> = last_failed_errors.iter().collect();
         failed_sorted.sort_by_key(|(path, _)| *path);
         for (path, error) in failed_sorted {
@@ -1035,15 +1204,21 @@ pub(super) async fn run_fsm_turn_body(
             changed_files: Vec::new(),
             commit_hash: None,
         };
-        return Ok(finish_turn(accumulated_text, result, &repo_root, &state.plans));
+        return Ok(finish_turn(accumulated_text, result, &repo_root, &state.plans, plan_mode).await);
     }
 
     if cumulative_edits.is_empty() {
         let _ = stream_tx.send(StreamEvent::Done).await;
-        let result = ModelResult::Answer {
-            text: accumulated_text.clone(),
+        let result = ModelResult::Edit {
+            summary: "FSM edits failed".to_string(),
+            edits: Vec::new(),
+            proposal: None,
+            applied: false,
+            error: Some("No edits were successfully applied".to_string()),
+            changed_files: Vec::new(),
+            commit_hash: None,
         };
-        return Ok(finish_turn(accumulated_text, result, &repo_root, &state.plans));
+        return Ok(finish_turn(accumulated_text, result, &repo_root, &state.plans, plan_mode).await);
     }
 
     let mut summary = extract_success_summary(state.terminal_outcome.as_ref())
@@ -1054,27 +1229,44 @@ pub(super) async fn run_fsm_turn_body(
         edits: cumulative_edits.clone(),
     };
 
-    let mut total_changed_files =
-        match policy.apply_temporary(&repo_root, context_manager, &proposal) {
-            Ok(files) => files,
-            Err(error) => {
-                rollback_or_log(policy, &repo_root);
-                context_manager.prune_missing_files();
-                let ctx_state = context_manager.get_state();
-                let _ = stream_tx.send(StreamEvent::ContextChanged(ctx_state)).await;
-                let _ = stream_tx.send(StreamEvent::Done).await;
-                let result = ModelResult::Edit {
-                    summary,
-                    edits: cumulative_edits,
-                    proposal: None,
-                    applied: false,
-                    error: Some(error.to_string()),
-                    changed_files: Vec::new(),
-                    commit_hash: None,
-                };
-                return Ok(finish_turn(accumulated_text, result, &repo_root, &state.plans));
-            }
+    let mut guard = TransactionRollbackGuard::new(policy, context_manager, &repo_root);
+
+    let mut total_changed_files = match guard.apply_temporary(&proposal).await {
+        Ok(files) => {
+            guard.arm();
+            files
+        }
+        Err(error) => {
+            guard.rollback().await;
+            let ctx_state = guard.context_manager.get_state();
+            let _ = stream_tx.send(StreamEvent::ContextChanged(ctx_state)).await;
+            let _ = stream_tx.send(StreamEvent::Done).await;
+            let result = ModelResult::Edit {
+                summary,
+                edits: cumulative_edits,
+                proposal: None,
+                applied: false,
+                error: Some(error.to_string()),
+                changed_files: Vec::new(),
+                commit_hash: None,
+            };
+            return Ok(finish_turn(accumulated_text, result, &repo_root, &state.plans, plan_mode).await);
+        }
+    };
+
+    let toolchain_config = crate::config::load_toolchain_config(&repo_root);
+    if current_verify.is_none() && toolchain_config.effective_auto_verify() {
+        let target = match toolchain_config.effective_target() {
+            tauqe_protocol::VerifyTarget::All => EditVerifyTarget::All,
+            tauqe_protocol::VerifyTarget::Check => EditVerifyTarget::Check,
+            tauqe_protocol::VerifyTarget::Test => EditVerifyTarget::Test,
+            tauqe_protocol::VerifyTarget::Clippy => EditVerifyTarget::Clippy,
         };
+        current_verify = Some(EditVerifyRequest {
+            target,
+            on_success: EditVerifyOnSuccess::Silent,
+        });
+    }
 
     if let Some(mut verify_request) = current_verify {
         let _ = stream_tx
@@ -1086,10 +1278,25 @@ pub(super) async fn run_fsm_turn_body(
             })
             .await;
         let mut verify_outcome =
-            run_workflow_verification(&repo_root, &verify_request, &stream_tx, false).await;
+            run_workflow_verification(&repo_root, &verify_request, &stream_tx, false, Some(&cancel_rx)).await;
+        if verify_outcome.is_cancelled {
+            if guard.rollback().await {
+                let ctx_state = guard.context_manager.get_state();
+                let _ = stream_tx.send(StreamEvent::ContextChanged(ctx_state)).await;
+            }
+            let _ = stream_tx.send(StreamEvent::Done).await;
+            return Ok(FsmTurnOutcome {
+                assistant_text: accumulated_text,
+                result: ModelResult::Answer {
+                    text: String::new(),
+                },
+                is_cancelled: true,
+                blocked: None,
+            });
+        }
         if !verify_outcome.success {
             auto_register_error_files(
-                context_manager,
+                guard.context_manager,
                 &verify_outcome.report,
                 &repo_root,
                 &stream_tx,
@@ -1099,10 +1306,12 @@ pub(super) async fn run_fsm_turn_body(
 
         // The `[toolchain] auto_heal` flag gates the self-healing retry loop.
         // It defaults to on, preserving the standard bounded-turn behavior.
-        let auto_heal = crate::config::load_toolchain_config(&repo_root)
+        let auto_heal = toolchain_config
             .auto_heal
             .unwrap_or(true);
         let mut healing_attempt = 0;
+        let mut missing_edits = false;
+        let mut healing_protocol_errors = Vec::new();
         while !verify_outcome.success && auto_heal && healing_attempt < options.max_retries {
             healing_attempt += 1;
             let _ = stream_tx
@@ -1122,15 +1331,28 @@ pub(super) async fn run_fsm_turn_body(
                 .send(StreamEvent::TextDelta(retry_banner.clone()))
                 .await;
 
-            let retry_prompt = build_verification_retry_prompt(
-                &verify_outcome.report,
-                state.language.as_deref(),
-            );
+            let retry_prompt = if !healing_protocol_errors.is_empty() {
+                format!(
+                    "The proposed verification repair edits could not be parsed due to protocol syntax errors:\n{}\n\nPlease provide corrected edit blocks to fix the verification failure:\n{}",
+                    healing_protocol_errors.iter().map(|e| format!("- {}", e)).collect::<Vec<_>>().join("\n"),
+                    verify_outcome.report
+                )
+            } else if missing_edits {
+                build_verification_missing_edits_prompt(
+                    &verify_outcome.report,
+                    state.language.as_deref(),
+                )
+            } else {
+                build_verification_retry_prompt(
+                    &verify_outcome.report,
+                    state.language.as_deref(),
+                )
+            };
             let step_out = run_proposal_step(
                 &retry_prompt,
                 provider,
                 model,
-                context_manager,
+                guard.context_manager,
                 history_manager,
                 protocol,
                 workflow_name,
@@ -1146,10 +1368,8 @@ pub(super) async fn run_fsm_turn_body(
             .await?;
 
             if step_out.is_cancelled {
-                if rollback_or_log(policy, &repo_root) {
-                    context_manager.clear_auto();
-                    context_manager.prune_missing_files();
-                    let ctx_state = context_manager.get_state();
+                if guard.rollback().await {
+                    let ctx_state = guard.context_manager.get_state();
                     let _ = stream_tx.send(StreamEvent::ContextChanged(ctx_state)).await;
                 }
                 let _ = stream_tx.send(StreamEvent::Done).await;
@@ -1166,28 +1386,58 @@ pub(super) async fn run_fsm_turn_body(
             accumulated_text = merge_text(accumulated_text, &retry_banner, &step_out.text());
 
             if let Some(reason) = state.blocked.clone() {
-                return Ok(finalize_blocked_turn(
-                    policy,
-                    context_manager,
-                    &stream_tx,
-                    &repo_root,
-                    reason,
-                    accumulated_text,
-                    &state.plans,
-                )
-                .await);
+                guard.rollback().await;
+                let ctx_state = guard.context_manager.get_state();
+                let _ = stream_tx.send(StreamEvent::ContextChanged(ctx_state)).await;
+                let _ = stream_tx.send(StreamEvent::Done).await;
+                let result = ModelResult::Edit {
+                    summary: "Execution blocked".to_string(),
+                    edits: Vec::new(),
+                    proposal: None,
+                    applied: false,
+                    error: Some(reason.clone()),
+                    changed_files: Vec::new(),
+                    commit_hash: None,
+                };
+                let mut outcome = finish_turn(accumulated_text, result, &repo_root, &state.plans, plan_mode).await;
+                outcome.blocked = Some(reason);
+                return Ok(outcome);
+            }
+
+            let requests = step_out.context_requests();
+            if !requests.is_empty() {
+                let available_files = {
+                    let root = repo_root.clone();
+                    crate::blocking::run_blocking_async(move || {
+                        crate::git::list_repository_files(Some(&root)).unwrap_or_default()
+                    })
+                    .await
+                };
+                let outcome = reconcile_discovery_context(
+                    guard.context_manager,
+                    &requests,
+                    &available_files,
+                    options.files_token_budget,
+                );
+                if !outcome.added.is_empty() {
+                    let ctx_state = guard.context_manager.get_state();
+                    let _ = stream_tx.send(StreamEvent::ContextChanged(ctx_state)).await;
+                }
             }
 
             let retry_edits = step_out.edits();
+            healing_protocol_errors = step_out.protocol_errors();
             if retry_edits.is_empty() {
-                break;
+                missing_edits = true;
+                continue;
             }
+            missing_edits = false;
 
             let retry_proposal = EditProposal {
                 summary: summary.clone(),
                 edits: retry_edits,
             };
-            match policy.apply_temporary(&repo_root, context_manager, &retry_proposal) {
+            match guard.apply_temporary(&retry_proposal).await {
                 Ok(new_files) => {
                     for file in new_files {
                         if !total_changed_files.contains(&file) {
@@ -1198,11 +1448,26 @@ pub(super) async fn run_fsm_turn_body(
                         verify_request = new_request;
                     }
                     verify_outcome =
-                        run_workflow_verification(&repo_root, &verify_request, &stream_tx, false)
+                        run_workflow_verification(&repo_root, &verify_request, &stream_tx, false, Some(&cancel_rx))
                             .await;
+                    if verify_outcome.is_cancelled {
+                        if guard.rollback().await {
+                            let ctx_state = guard.context_manager.get_state();
+                            let _ = stream_tx.send(StreamEvent::ContextChanged(ctx_state)).await;
+                        }
+                        let _ = stream_tx.send(StreamEvent::Done).await;
+                        return Ok(FsmTurnOutcome {
+                            assistant_text: accumulated_text,
+                            result: ModelResult::Answer {
+                                text: String::new(),
+                            },
+                            is_cancelled: true,
+                            blocked: None,
+                        });
+                    }
                     if !verify_outcome.success {
                         auto_register_error_files(
-                            context_manager,
+                            guard.context_manager,
                             &verify_outcome.report,
                             &repo_root,
                             &stream_tx,
@@ -1213,6 +1478,7 @@ pub(super) async fn run_fsm_turn_body(
                 Err(error) => {
                     verify_outcome = VerificationOutcome {
                         success: false,
+                        is_cancelled: false,
                         report: format!("Failed to apply repair edits: {}", error),
                     };
                 }
@@ -1224,9 +1490,8 @@ pub(super) async fn run_fsm_turn_body(
                 summary = text;
             }
             let (commit_hash, commit_error) =
-                finalize_applied(policy, &repo_root, &total_changed_files, &summary);
-            context_manager.clear_auto();
-            let ctx_state = context_manager.get_state();
+                guard.finalize(&total_changed_files, &summary).await;
+            let ctx_state = guard.context_manager.get_state();
             let _ = stream_tx.send(StreamEvent::ContextChanged(ctx_state)).await;
             let _ = stream_tx.send(StreamEvent::Done).await;
             let result = ModelResult::Edit {
@@ -1238,13 +1503,11 @@ pub(super) async fn run_fsm_turn_body(
                 changed_files: total_changed_files,
                 commit_hash,
             };
-            return Ok(finish_turn(accumulated_text, result, &repo_root, &state.plans));
+            return Ok(finish_turn(accumulated_text, result, &repo_root, &state.plans, plan_mode).await);
         }
 
-        let changed_files = if rollback_or_log(policy, &repo_root) {
-            context_manager.clear_auto();
-            context_manager.prune_missing_files();
-            let ctx_state = context_manager.get_state();
+        let changed_files = if guard.rollback().await {
+            let ctx_state = guard.context_manager.get_state();
             let _ = stream_tx.send(StreamEvent::ContextChanged(ctx_state)).await;
             Vec::new()
         } else {
@@ -1260,7 +1523,7 @@ pub(super) async fn run_fsm_turn_body(
             changed_files,
             commit_hash: None,
         };
-        return Ok(finish_turn(accumulated_text, result, &repo_root, &state.plans));
+        return Ok(finish_turn(accumulated_text, result, &repo_root, &state.plans, plan_mode).await);
     }
 
     // No verification requested: finalize immediately.
@@ -1268,9 +1531,8 @@ pub(super) async fn run_fsm_turn_body(
         summary = text;
     }
     let (commit_hash, commit_error) =
-        finalize_applied(policy, &repo_root, &total_changed_files, &summary);
-    context_manager.clear_auto();
-    let ctx_state = context_manager.get_state();
+        guard.finalize(&total_changed_files, &summary).await;
+    let ctx_state = guard.context_manager.get_state();
     let _ = stream_tx.send(StreamEvent::ContextChanged(ctx_state)).await;
     let _ = stream_tx.send(StreamEvent::Done).await;
     let result = ModelResult::Edit {
@@ -1282,7 +1544,7 @@ pub(super) async fn run_fsm_turn_body(
         changed_files: total_changed_files,
         commit_hash,
     };
-    Ok(finish_turn(accumulated_text, result, &repo_root, &state.plans))
+    Ok(finish_turn(accumulated_text, result, &repo_root, &state.plans, plan_mode).await)
 }
 
 /// Runs a single atomic model interaction and decodes it into commands.
@@ -1311,7 +1573,23 @@ async fn run_proposal_step(
             .await
     };
     let ctx_state = context_manager.get_state();
-    let mut context_files = context_manager.read_context_files();
+    let root = repo_root.clone();
+    let items = ctx_state.items.clone();
+    let mut context_files = crate::blocking::run_blocking_async(move || {
+        let mut results = Vec::new();
+        for item in items {
+            let full_path = root.join(&item.path);
+            if let Ok(content) = std::fs::read_to_string(&full_path) {
+                results.push(ContextFileContent {
+                    path: item.path,
+                    access: item.access,
+                    content,
+                });
+            }
+        }
+        results
+    })
+    .await;
 
     if let Some(staged) = staged_state {
         for (path, content) in &staged.staged_files {
@@ -1334,12 +1612,14 @@ async fn run_proposal_step(
         .map(|file| file.path.clone())
         .collect();
 
-    let repo_map = cache.repo_map(
-        &repo_root,
-        &repo_state.head,
-        &targetable_paths,
-        options.repomap_token_budget,
-    );
+    let repo_map = cache
+        .repo_map(
+            &repo_root,
+            &repo_state.head,
+            &targetable_paths,
+            options.repomap_token_budget,
+        )
+        .await;
 
     let repomap_tokens = repo_map
         .as_deref()
@@ -1392,6 +1672,8 @@ async fn run_proposal_step(
     let forward_task = tokio::spawn(async move {
         let mut assistant_text = String::new();
         let mut cancelled = false;
+        let mut stream_error = None;
+        let mut completed = false;
         while let Some(event) = llm_rx.recv().await {
             match event {
                 StreamEvent::TextDelta(ref delta) => {
@@ -1406,7 +1688,13 @@ async fn run_proposal_step(
                     cancelled = true;
                     let _ = forward_stream_tx.send(StreamEvent::Cancelled).await;
                 }
-                StreamEvent::Done => {}
+                StreamEvent::Error(ref err) => {
+                    stream_error = Some(err.clone());
+                    let _ = forward_stream_tx.send(StreamEvent::Error(err.clone())).await;
+                }
+                StreamEvent::Done => {
+                    completed = true;
+                }
                 other => {
                     if forward_stream_tx.send(other).await.is_err() {
                         break;
@@ -1417,11 +1705,11 @@ async fn run_proposal_step(
         for forwarded in stream_filter.finish() {
             let _ = forward_stream_tx.send(forwarded).await;
         }
-        (assistant_text, cancelled)
+        (assistant_text, cancelled, stream_error, completed)
     });
 
     let client_result = client_call.await;
-    let (assistant_text, cancelled) = forward_task.await.map_err(|join_error| {
+    let (assistant_text, cancelled, stream_error, completed) = forward_task.await.map_err(|join_error| {
         tracing::error!(
             "Proposal streaming task terminated unexpectedly: {}",
             join_error
@@ -1433,11 +1721,26 @@ async fn run_proposal_step(
     })?;
     client_result?;
 
+    if let Some(err) = stream_error {
+        anyhow::bail!("LLM stream error: {}", err);
+    }
+
+    if cancelled {
+        return Ok(ProposalStep {
+            commands: Vec::new(),
+            is_cancelled: true,
+        });
+    }
+
+    if !completed {
+        anyhow::bail!("LLM stream closed unexpectedly without completion");
+    }
+
     let commands = protocol.decode(&assistant_text);
 
     Ok(ProposalStep {
         commands,
-        is_cancelled: cancelled,
+        is_cancelled: false,
     })
 }
 
@@ -1997,6 +2300,377 @@ mod tests {
         assert!(
             saw_repomap_tokens,
             "turn must emit StreamEvent::RepoMapTokens with estimated tokens"
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_error_during_proposal_aborts_and_rolls_back() {
+        let (_dir, root) = setup_repo(&[("a.rs", TARGET)]);
+        let mut context = context_with_target(&root);
+        let mut history = HistoryManager::new(root.clone());
+
+        let provider = MockLlmProvider::scripted([MockResponse::error("Connection terminated prematurely")]);
+        let model = ModelRef::openrouter("mock/model");
+        let protocol = XmlPromptProtocol;
+        let mut policy = DirectApplyPolicy::new();
+        let options = WorkflowOptions::default();
+        let (stream_tx, rx) = mpsc::channel(256);
+        drop(rx);
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+
+        let outcome_res = run_fsm_turn(
+            "Change compute to 42",
+            &provider,
+            &model,
+            &mut context,
+            &mut history,
+            &protocol,
+            &mut policy,
+            "git",
+            stream_tx,
+            cancel_rx,
+            &options,
+        )
+        .await;
+
+        assert!(outcome_res.is_err(), "turn must fail fast on stream error");
+        assert_eq!(std::fs::read_to_string(root.join("a.rs")).unwrap(), TARGET);
+        assert!(history.get_entries().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn retries_malformed_xml_edit_block_and_applies() {
+        let (_dir, root) = setup_repo(&[("a.rs", TARGET)]);
+        let mut context = context_with_target(&root);
+        let mut history = HistoryManager::new(root.clone());
+
+        let malformed_xml = "<tauqe_edits summary=\"Broken\"><edit path=\"a.rs\"><search>broken";
+        let valid_xml = edit_block(
+            "pub fn compute() -> i32 { 0 }",
+            "pub fn compute() -> i32 { 42 }",
+        );
+
+        let provider = MockLlmProvider::scripted([
+            MockResponse::text(malformed_xml),
+            MockResponse::text(valid_xml),
+        ]);
+        let model = ModelRef::openrouter("mock/model");
+        let protocol = XmlPromptProtocol;
+        let mut policy = DirectApplyPolicy::new();
+        let options = WorkflowOptions::default();
+        let (stream_tx, rx) = mpsc::channel(256);
+        drop(rx);
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+
+        let outcome = run_fsm_turn(
+            "Change compute to 42",
+            &provider,
+            &model,
+            &mut context,
+            &mut history,
+            &protocol,
+            &mut policy,
+            "git",
+            stream_tx,
+            cancel_rx,
+            &options,
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            outcome.result,
+            ModelResult::Edit { applied: true, .. }
+        ));
+        assert_eq!(
+            std::fs::read_to_string(root.join("a.rs")).unwrap(),
+            "pub fn compute() -> i32 { 42 }\n"
+        );
+        assert_eq!(provider.requests().len(), 2);
+        assert!(provider.requests()[1]
+            .messages
+            .iter()
+            .any(|m| m.content.contains("Protocol parsing errors")));
+    }
+
+    #[tokio::test]
+    async fn malformed_xml_edit_block_fails_as_edit_when_retries_exhausted() {
+        let (_dir, root) = setup_repo(&[("a.rs", TARGET)]);
+        let mut context = context_with_target(&root);
+        let mut history = HistoryManager::new(root.clone());
+
+        let malformed_xml = "<tauqe_edits summary=\"Broken\"><edit path=\"a.rs\"><search>broken";
+
+        let provider = MockLlmProvider::scripted([
+            MockResponse::text(malformed_xml),
+            MockResponse::text(malformed_xml),
+        ]);
+        let model = ModelRef::openrouter("mock/model");
+        let protocol = XmlPromptProtocol;
+        let mut policy = DirectApplyPolicy::new();
+        let options = WorkflowOptions {
+            max_retries: 1,
+            ..Default::default()
+        };
+        let (stream_tx, rx) = mpsc::channel(256);
+        drop(rx);
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+
+        let outcome = run_fsm_turn(
+            "Change compute to 42",
+            &provider,
+            &model,
+            &mut context,
+            &mut history,
+            &protocol,
+            &mut policy,
+            "git",
+            stream_tx,
+            cancel_rx,
+            &options,
+        )
+        .await
+        .unwrap();
+
+        match outcome.result {
+            ModelResult::Edit { applied, error, .. } => {
+                assert!(!applied);
+                assert!(error.unwrap().contains("Protocol error"));
+            }
+            other => panic!("expected failed Edit result, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn isolated_step_rejects_plan_mutations() {
+        let (_dir, root) = setup_repo(&[("a.rs", TARGET)]);
+        let mut context = context_with_target(&root);
+        let history = HistoryManager::new(root.clone());
+
+        let plan_xml = concat!(
+            "<tauqe_edits summary=\"Edit\">\n",
+            "<edit path=\"a.rs\">\n",
+            "<search>\npub fn compute() -> i32 { 0 }\n</search>\n",
+            "<replace>\npub fn compute() -> i32 { 42 }\n</replace>\n",
+            "</edit>\n",
+            "</tauqe_edits>\n",
+            "<plan action=\"save\" id=\"isolated-turn-plan\" title=\"Isolated\">\n",
+            "  <concept>\n",
+            "    <concept_item id=\"c-1\" title=\"Forbidden\" />\n",
+            "  </concept>\n",
+            "</plan>",
+        );
+        let provider = MockLlmProvider::scripted([MockResponse::text(plan_xml)]);
+        let model = ModelRef::openrouter("mock/model");
+        let protocol = XmlPromptProtocol;
+        let mut policy = DirectApplyPolicy::new();
+        let options = WorkflowOptions::default();
+        let (stream_tx, rx) = mpsc::channel(256);
+        drop(rx);
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+
+        // Run isolated step execution
+        let outcome = run_fsm_turn_body(
+            "Execute step: isolated",
+            &provider,
+            &model,
+            &mut context,
+            &history,
+            &protocol,
+            &mut policy,
+            "git",
+            stream_tx,
+            cancel_rx,
+            &options,
+            true, // is_isolated_step
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            outcome.result,
+            ModelResult::Edit { applied: true, .. }
+        ));
+        // The code edit was applied, but the plan must NOT have been saved
+        let loaded = crate::plan::storage::PlanStorage::load_plan(&root, "isolated-turn-plan").unwrap();
+        assert!(loaded.is_none(), "isolated step must not persist plan mutations");
+    }
+
+    #[tokio::test]
+    async fn develop_mode_rejects_plan_update() {
+        let (_dir, root) = setup_repo(&[("a.rs", TARGET)]);
+        let mut context = context_with_target(&root);
+        let mut history = HistoryManager::new(root.clone());
+
+        // First save a plan
+        let existing = tauqe_protocol::Plan {
+            id: "develop-plan".to_string(),
+            title: "Develop Plan".to_string(),
+            description: None,
+            created_at: 1,
+            updated_at: 1,
+            concept: vec![],
+            items: vec![tauqe_protocol::PlanItem {
+                id: "1".to_string(),
+                title: "Step 1".to_string(),
+                status: tauqe_protocol::PlanItemStatus::Todo,
+                ..Default::default()
+            }],
+        };
+        crate::plan::storage::PlanStorage::save_plan(&root, &existing).unwrap();
+
+        // Model in develop mode attempts to update the plan
+        let update_xml = concat!(
+            "Updating plan from develop:\n",
+            "<plan action=\"update\" id=\"develop-plan\">\n",
+            "  <item id=\"1\" status=\"done\" />\n",
+            "</plan>\n",
+        );
+        let provider = MockLlmProvider::scripted([MockResponse::text(update_xml)]);
+        let model = ModelRef::openrouter("mock/model");
+        let protocol = XmlPromptProtocol;
+        let mut policy = DirectApplyPolicy::new();
+        let options = WorkflowOptions::default();
+        let (stream_tx, rx) = mpsc::channel(256);
+        drop(rx);
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+
+        let outcome = run_fsm_turn(
+            "Update plan",
+            &provider,
+            &model,
+            &mut context,
+            &mut history,
+            &protocol,
+            &mut policy,
+            "git",
+            stream_tx,
+            cancel_rx,
+            &options,
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(outcome.result, ModelResult::Answer { .. }));
+        let loaded = crate::plan::storage::PlanStorage::load_plan(&root, "develop-plan")
+            .unwrap()
+            .unwrap();
+        // The item must remain Todo because update is rejected in Develop mode
+        assert_eq!(loaded.items[0].status, tauqe_protocol::PlanItemStatus::Todo);
+    }
+
+    #[tokio::test]
+    async fn rolled_back_turn_does_not_apply_plans() {
+        let (_dir, root) = setup_repo(&[("a.rs", TARGET)]);
+        let mut context = context_with_target(&root);
+        let mut history = HistoryManager::new(root.clone());
+
+        // Model emits a bad edit that fails staging and also emits a plan tag
+        let text = concat!(
+            "<tauqe_edits summary=\"Bad Edit\">\n",
+            "<edit path=\"a.rs\">\n",
+            "<search>\nNON_EXISTENT_CONTENT\n</search>\n",
+            "<replace>\nREPLACEMENT\n</replace>\n",
+            "</edit>\n",
+            "</tauqe_edits>\n",
+            "<plan action=\"save\" id=\"rollback-plan\" title=\"Should Not Save\">\n",
+            "  <concept>\n",
+            "    <concept_item id=\"c-1\" title=\"Concept\" />\n",
+            "  </concept>\n",
+            "</plan>",
+        );
+        let provider = MockLlmProvider::scripted([
+            MockResponse::text(text),
+            MockResponse::text("Still failing"),
+        ]);
+        let model = ModelRef::openrouter("mock/model");
+        let protocol = XmlPromptProtocol;
+        let mut policy = DirectApplyPolicy::new();
+        let options = WorkflowOptions {
+            max_retries: 1,
+            ..Default::default()
+        };
+        let (stream_tx, rx) = mpsc::channel(256);
+        drop(rx);
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+
+        let outcome = run_fsm_turn(
+            "Do bad edit",
+            &provider,
+            &model,
+            &mut context,
+            &mut history,
+            &protocol,
+            &mut policy,
+            "git",
+            stream_tx,
+            cancel_rx,
+            &options,
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            outcome.result,
+            ModelResult::Edit { applied: false, .. }
+        ));
+        let loaded = crate::plan::storage::PlanStorage::load_plan(&root, "rollback-plan").unwrap();
+        assert!(loaded.is_none(), "rolled back turn must not persist plan");
+    }
+
+    #[tokio::test]
+    async fn error_during_healing_triggers_automatic_rollback() {
+        let (_dir, root) = setup_repo(&[
+            ("a.rs", "pub fn compute() -> i32 { 0 }\n"),
+            ("Cargo.toml", "[package]\nname = \"fsm_heal_test\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[lib]\npath = \"a.rs\"\n"),
+        ]);
+        let mut context = context_with_target(&root);
+        let mut history = HistoryManager::new(root.clone());
+
+        // First attempt emits an edit with a syntax error and requests verification.
+        // Cargo check fails, triggering healing. During healing, the provider
+        // returns an error (e.g. network drop).
+        let bad_edit = concat!(
+            "<tauqe_edits summary=\"Edit\">\n",
+            "<edit path=\"a.rs\">\n",
+            "<search>\npub fn compute() -> i32 { 0 }\n</search>\n",
+            "<replace>\npub fn compute() -> i32 { SYNTAX_ERROR }\n</replace>\n",
+            "</edit>\n",
+            "</tauqe_edits>\n",
+            "<verify target=\"check\" on_success=\"silent\" />",
+        );
+        let provider = MockLlmProvider::scripted([
+            MockResponse::text(bad_edit),
+            MockResponse::error("OpenRouter connection reset"),
+        ]);
+        let model = ModelRef::openrouter("mock/model");
+        let protocol = XmlPromptProtocol;
+        let mut policy = crate::workflow::git_policy::GitTransactionPolicy::new();
+        let options = WorkflowOptions::default();
+        let (stream_tx, rx) = mpsc::channel(256);
+        drop(rx);
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+
+        let outcome_result = run_fsm_turn(
+            "Change compute",
+            &provider,
+            &model,
+            &mut context,
+            &mut history,
+            &protocol,
+            &mut policy,
+            "git",
+            stream_tx,
+            cancel_rx,
+            &options,
+        )
+        .await;
+
+        assert!(outcome_result.is_err(), "turn must propagate provider error");
+        // Verify working tree has been rolled back to pristine pre-turn state.
+        assert_eq!(
+            std::fs::read_to_string(root.join("a.rs")).unwrap(),
+            "pub fn compute() -> i32 { 0 }\n"
         );
     }
 }

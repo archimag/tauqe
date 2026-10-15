@@ -171,7 +171,7 @@ impl ExecutionMode for SingleExecution {
         // escalation replays the turn body on a stronger tier, so recording the
         // prompt and response here, rather than inside every attempt, keeps a
         // retried turn from leaving duplicate history entries behind.
-        let is_isolated_step = begin_session_turn(
+        let session_turn = begin_session_turn(
             prompt,
             context_manager,
             history_manager,
@@ -197,7 +197,7 @@ impl ExecutionMode for SingleExecution {
                 provider
             };
 
-            let turn = run_fsm_turn_body(
+            let turn_res = run_fsm_turn_body(
                 prompt,
                 active_provider,
                 &current_model,
@@ -209,9 +209,22 @@ impl ExecutionMode for SingleExecution {
                 stream_tx.clone(),
                 cancel_rx.clone(),
                 &turn_options,
-                is_isolated_step,
+                session_turn.is_isolated_step,
             )
-            .await?;
+            .await;
+
+            let turn = match turn_res {
+                Ok(turn) => turn,
+                Err(err) => {
+                    let _ = policy.rollback(context_manager.repo_root()).await;
+                    context_manager.clear_auto();
+                    context_manager.prune_missing_files();
+                    if let Some(id) = session_turn.turn_id {
+                        let _ = history_manager.rollback_entry(id);
+                    }
+                    return Err(err);
+                }
+            };
 
             let is_blocked = turn.blocked.is_some();
             let is_error = matches!(
@@ -267,7 +280,7 @@ impl ExecutionMode for SingleExecution {
                     let provider_ready =
                         next_m.provider == current_model.provider || new_provider.is_some();
                     if provider_ready {
-                        let _ = policy.rollback(context_manager.repo_root());
+                        let _ = policy.rollback(context_manager.repo_root()).await;
                         context_manager.prune_missing_files();
 
                         let reason = if is_error {
@@ -298,7 +311,11 @@ impl ExecutionMode for SingleExecution {
                 }
             }
 
-            if !turn.is_cancelled {
+            if turn.is_cancelled {
+                if let Some(id) = session_turn.turn_id {
+                    let _ = history_manager.rollback_entry(id);
+                }
+            } else {
                 record_session_response(history_manager, &turn);
             }
             return Ok(WorkflowExecutionResult {

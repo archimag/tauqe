@@ -11,7 +11,6 @@ pub mod context;
 pub mod discussion;
 pub mod edit;
 pub mod errors;
-pub(crate) mod escape;
 pub mod events;
 pub mod git;
 pub mod glob;
@@ -27,9 +26,12 @@ pub mod review;
 // turn an accidental name collision between two modules into a compile error
 // instead of a silently ambiguous glob re-export. Module paths remain public,
 // so both `tauqe_protocol::Item` and `tauqe_protocol::module::Item` resolve.
-pub use command::{LlmCapability, LlmCommand, LlmOutcome, VerifyOnSuccess, VerifyTarget};
+pub use command::{
+    DocTopic, LlmCapability, LlmCommand, LlmOutcome, VerifyOnSuccess, VerifyTarget,
+};
 pub use config::{
-    ConfigCreateParams, ConfigSetParams, ConfigState, CredentialsSaveParams, SystemStatusResult,
+    ConfigCreateParams, ConfigSetParams, ConfigState, CredentialsSaveParams, EditProtocolKind,
+    SystemStatusResult, WorkflowKind,
 };
 pub use context::{
     ContextAccess, ContextAddParams, ContextAddPatternParams, ContextAddPatternResult,
@@ -44,8 +46,9 @@ pub use discussion::{
     DiscussionSetFocusParams, DiscussionSetFocusResult, DiscussionTarget,
 };
 pub use edit::{
-    EditFileDoneEvent, EditFileRetryingEvent, EditFileStartedEvent, EditFinishedEvent,
-    EditHunkEvent, EditOperation, EditProposal, EditStartedEvent, StructuredChangeProposal,
+    EditFileDoneEvent, EditFileOp, EditFileRetryingEvent, EditFileStartedEvent, EditFileStatus,
+    EditFinishedEvent, EditHunkEvent, EditOperation, EditProposal, EditStartedEvent,
+    StructuredChangeProposal,
 };
 pub use errors::{
     ADD_FAILED, ADD_PATTERN_FAILED, CANCELLED, COMMITS_AHEAD_FAILED, CONFIG_CREATE_FAILED,
@@ -54,7 +57,7 @@ pub use errors::{
     INVALID_PLAN_TREE, INVALID_PROTOCOL, INVALID_REQUEST, INVALID_WORKFLOW, ITEM_IN_DISCUSSION,
     ITEM_REJECTED, LIST_FILES_FAILED, METHOD_NOT_FOUND, MODEL_ERROR, NEEDS_CONTEXT, NOT_FOUND,
     NOTHING_TO_EXECUTE, NOT_A_LEAF, NO_API_KEY, OPERATION_IN_PROGRESS,
-    PARSE_ERROR, PINNED_PROTECTED, PLAN_DELETE_FAILED, PLAN_GET_FAILED, PLAN_GRAFT_FAILED,
+    PARSE_ERROR, PINNED_PROTECTED, PLAN_DELETE_FAILED, PLAN_GET_FAILED,
     PLAN_LIST_FAILED, PLAN_LOAD_FAILED, PLAN_SAVE_FAILED, PLAN_SET_ACTIVE_FAILED,
     PLAN_UPDATE_FAILED, PREFLIGHT_VERIFICATION_FAILED, REMOVE_FAILED, REPOSITORY_STATE_FAILED,
     REVIEW_DELETE_FAILED, REVIEW_GET_FAILED, REVIEW_LIST_FAILED, REVIEW_LOAD_FAILED,
@@ -87,19 +90,17 @@ pub use model::{
     TurnPhaseEvent,
 };
 pub use plan::{
-    compute_items_status, extract_plan_discussion_id, format_plan_discussion_prompt,
-    is_plan_discussion_prompt, ConceptItem, Plan, PlanDeleteParams, PlanExecuteParams,
-    PlanGetParams, PlanGetResult, PlanItem, PlanItemStatus, PlanListChangedEvent, PlanListResult,
-    PlanRefineParams, PlanRefineResult, PlanSaveParams, PlanScopeEvaluation, PlanSetActiveParams,
-    PlanSetActiveResult, PlanStats, PlanSummary, PlanUpdateItemParams, PlanUpdateItemResult,
-    PlanUpdatedEvent, PLAN_DISCUSSION_PREFIX,
+    compute_items_status, ConceptItem, Plan, PlanDeleteParams, PlanExecuteParams, PlanGetParams,
+    PlanGetResult, PlanItem, PlanItemStatus, PlanListChangedEvent, PlanListResult,
+    PlanRefineParams, PlanRefineResult, PlanReplanParams, PlanSaveParams, PlanScopeEvaluation,
+    PlanSetActiveParams, PlanSetActiveResult, PlanStats, PlanSummary, PlanUpdateItemParams,
+    PlanUpdateItemResult, PlanUpdatedEvent,
 };
 pub use review::{
-    format_review_discussion_prompt, format_review_discussion_prompt_items,
     ReviewContentDeltaEvent, ReviewDeleteParams, ReviewDeleteResult, ReviewErrorEvent,
     ReviewExecuteParams, ReviewFinishedEvent, ReviewGetParams, ReviewGetResult, ReviewItem,
     ReviewItemStatus, ReviewListChangedEvent, ReviewListParams, ReviewListResult,
     ReviewReasoningDeltaEvent, ReviewSession, ReviewSeverity, ReviewStartParams,
     ReviewStartedEvent, ReviewStatus, ReviewSummary, ReviewUpdateItemParams,
-    ReviewUpdateItemResult, ReviewUpdatedEvent, REVIEW_DISCUSSION_PREFIX,
+    ReviewUpdateItemResult, ReviewUpdatedEvent,
 };

@@ -92,19 +92,34 @@ pub enum RefineDialogFocus {
 
 impl RefineDialogFocus {
     /// Advances focus to the next section in visual order.
-    pub fn cycle_next(&mut self) {
+    ///
+    /// When only one model is configured, `ModelList` is omitted from cycling so
+    /// navigation moves directly between instructions and action buttons.
+    pub fn cycle_next(&mut self, entry_count: usize) {
         *self = match self {
             Self::ModelList => Self::InstructionsEditor,
             Self::InstructionsEditor => Self::Actions,
-            Self::Actions => Self::ModelList,
+            Self::Actions => {
+                if entry_count > 1 {
+                    Self::ModelList
+                } else {
+                    Self::InstructionsEditor
+                }
+            }
         };
     }
 
     /// Moves focus to the previous section in visual order.
-    pub fn cycle_prev(&mut self) {
+    pub fn cycle_prev(&mut self, entry_count: usize) {
         *self = match self {
             Self::ModelList => Self::Actions,
-            Self::InstructionsEditor => Self::ModelList,
+            Self::InstructionsEditor => {
+                if entry_count > 1 {
+                    Self::ModelList
+                } else {
+                    Self::Actions
+                }
+            }
             Self::Actions => Self::InstructionsEditor,
         };
     }

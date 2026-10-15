@@ -16,7 +16,7 @@ use crate::dialogs::render::{
     render_confirm_delete_plan_popup, render_confirm_delete_review_popup,
     render_confirm_detach_focus_popup, render_confirm_execute_review_popup,
     render_confirm_execute_scope_popup, render_confirm_quit_popup, render_confirm_undo_popup,
-    render_disconnected_popup, render_discuss_plan_dialog, render_help_popup,
+    render_disconnected_popup, render_help_popup,
     render_plan_refine_blocked_dialog, render_plan_refine_dialog, render_prompt_modal,
     render_review_dialog, render_selection_dialog, render_squash_popup, render_status_dialog,
 };
@@ -165,11 +165,6 @@ pub fn render_ui(frame: &mut ratatui::Frame, state: &mut AppState) {
         }
         Some(ActiveModal::ExecuteReview) => render_confirm_execute_review_popup(frame, state),
         Some(ActiveModal::ExecuteScope) => render_confirm_execute_scope_popup(frame, state),
-        Some(ActiveModal::DiscussPlan) => {
-            if let Some(discuss) = &state.discuss_plan_dialog {
-                render_discuss_plan_dialog(frame, discuss);
-            }
-        }
         Some(ActiveModal::RefineDialog) => {
             if let Some(dialog) = &state.plans_view.refine_dialog {
                 render_plan_refine_dialog(frame, dialog, state.tui_config.input.primary_modifier);
@@ -177,7 +172,7 @@ pub fn render_ui(frame: &mut ratatui::Frame, state: &mut AppState) {
         }
         Some(ActiveModal::RefineBlocked) => {
             if let Some(blocked) = &state.plans_view.refine_blocked {
-                render_plan_refine_blocked_dialog(frame, blocked);
+                render_plan_refine_blocked_dialog(frame, blocked, state.confirm_button);
             }
         }
         Some(ActiveModal::Prompt) => {
