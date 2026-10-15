@@ -31,7 +31,7 @@ scribe = "~anthropic/claude-haiku-latest"    # history compaction, git squash co
 # saturating on the last one. Escalation stays strictly within the Coder role and
 # never switches to Architect, preserving the What vs How role isolation.
 coder = [
-  #"~deepseek/deepseek-flash-latest",
+  "~deepseek/deepseek-flash-latest",
   { model = "~google/gemini-flash-latest", effort = "medium" },
 ]
 architect = [

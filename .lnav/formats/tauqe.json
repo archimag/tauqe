@@ -1,0 +1,62 @@
+{
+  "$schema": "https://lnav.org/schemas/format-v1.json",
+  "tauqe_log": {
+    "title": "Tauqe Server Log",
+    "description": "Structured JSON log format for Tauqe server daemon",
+    "url": "https://github.com/tauqe/tauqe",
+    "json": true,
+    "timestamp-field": "timestamp",
+    "level-field": "level",
+    "body-field": "message",
+    "level": {
+      "error": "ERROR",
+      "warning": "WARN",
+      "info": "INFO",
+      "debug": "DEBUG",
+      "trace": "TRACE"
+    },
+    "line-format": [
+      { "field": "timestamp" },
+      " ",
+      { "field": "level", "min-width": 5 },
+      " ",
+      "[",
+      { "field": "target" },
+      "] ",
+      { "field": "message" }
+    ],
+    "value": {
+      "target": { "kind": "string", "identifier": true },
+      "operation_id": { "kind": "integer" },
+      "method": { "kind": "string", "identifier": true },
+      "duration_ms": { "kind": "integer" },
+      "error": { "kind": "string" },
+      "error_code": { "kind": "integer" },
+      "status_code": { "kind": "integer" },
+      "model": { "kind": "string", "identifier": true },
+      "effort": { "kind": "string" },
+      "phase": { "kind": "string", "identifier": true },
+      "plan_id": { "kind": "string", "identifier": true },
+      "step_id": { "kind": "string", "identifier": true },
+      "prompt_tokens": { "kind": "integer" },
+      "completion_tokens": { "kind": "integer" },
+      "total_tokens": { "kind": "integer" },
+      "cost": { "kind": "float" }
+    },
+    "highlights": {
+      "rpc_methods": {
+        "pattern": "\\b(model_ask|model_select|model_cancel|plan_list|plan_get|plan_save|plan_execute|plan_refine|plan_replan|review_start|review_execute|context_add|git_undo|git_diff)\\b",
+        "color": "#8be9fd",
+        "style": { "bold": true }
+      },
+      "durations": {
+        "pattern": "\\b\\d+ms\\b",
+        "color": "#f1fa8c"
+      },
+      "http_status": {
+        "pattern": "\\b(200|400|401|403|404|429|500|502|503|504)\\b",
+        "color": "#ff79c6"
+      }
+    }
+  }
+}

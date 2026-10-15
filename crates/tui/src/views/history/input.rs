@@ -45,12 +45,12 @@ pub const HISTORY_COMMANDS: &[KeyCommand] = &[
     KeyCommand { key: "↑/↓ or k/j", description: "Scroll history (fetches older turns)" },
     KeyCommand { key: "PgUp / PgDn", description: "Page scroll history view" },
     KeyCommand { key: "Home / End", description: "Jump to oldest / newest message" },
-    KeyCommand { key: "Esc / q", description: "Return to Develop view" },
+    KeyCommand { key: "Esc / q / C-G", description: "Return to Develop view (keyboard-quit)" },
     // Editing & Clipboard
     KeyCommand { key: "c", description: "Copy code block from active item" },
     KeyCommand { key: "y", description: "Copy selected item text to clipboard" },
     // Auxiliary & Destructive
-    KeyCommand { key: "C-G", description: "Clear conversation history (with confirmation)" },
+    KeyCommand { key: "Shift+C", description: "Clear conversation history (with confirmation)" },
 ];
 
 pub async fn handle_history_key(
@@ -64,17 +64,15 @@ pub async fn handle_history_key(
     let total_lines = st.history_view.rendered_lines_count as u16;
     let max_scroll = total_lines.saturating_sub(view_height);
 
-    // History clearing is isolated to this view: it requires the primary
-    // command modifier (C-g) and arms the existing confirmation dialog, so the
-    // destructive action can never fire from a bare key or a background view
-    // (c-history-clear-isolation). The global shortcut layer no longer owns it.
-    let primary_mod = st.tui_config.input.primary_modifier;
-    let is_ctrl_alt = key.modifiers.contains(KeyModifiers::CONTROL)
-        && key.modifiers.contains(KeyModifiers::ALT);
-    if !is_ctrl_alt
-        && primary_mod.matches(key.modifiers)
-        && matches!(key.code, KeyCode::Char('g') | KeyCode::Char('G'))
-    {
+    // Clearing the whole conversation history is destructive and isolated to
+    // this view: it requires Shift+C and arms the existing confirmation dialog,
+    // so the action can never fire from a bare key or a background view
+    // (c-history-clear-isolation). `C-g` is the canonical keyboard-quit chord:
+    // normalized to Esc globally, it simply leaves History for Develop exactly
+    // like the `Esc` arm below.
+    let is_clear_history = key.code == KeyCode::Char('C')
+        || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::SHIFT));
+    if is_clear_history {
         if st.model.is_busy() {
             st.notify_warning("Cannot clear history while model is generating");
         } else {
@@ -130,7 +128,7 @@ pub async fn handle_history_key(
                 st.history_view.scroll_to_selected_item(view_height, Some(content_width));
             }
         }
-        KeyCode::Char('c') | KeyCode::Char('C') => {
+        KeyCode::Char('c') => {
             let sel = st.history_view.selected_item_index;
             let item_info = st
                 .history_view
@@ -332,18 +330,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_primary_g_arms_history_clear_with_safe_cancel() {
-        let key = KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL);
+    async fn test_shift_c_arms_history_clear_with_safe_cancel() {
+        let key = KeyEvent::new(KeyCode::Char('C'), KeyModifiers::SHIFT);
         let (clear, _cancel, button) = dispatch(key).await;
-        assert!(clear, "C-g in History must arm the clear confirmation");
+        assert!(clear, "Shift+C in History must arm the clear confirmation");
         assert_eq!(button, crate::app::ConfirmDialogButton::Cancel);
     }
 
     #[tokio::test]
-    async fn test_bare_g_is_inert_in_history() {
-        let key = KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE);
+    async fn test_bare_c_does_not_arm_history_clear() {
+        let key = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE);
         let (clear, _cancel, _button) = dispatch(key).await;
-        assert!(!clear, "a bare g must never arm the destructive clear");
+        assert!(!clear, "a bare c must never arm the destructive clear");
     }
 
     #[tokio::test]

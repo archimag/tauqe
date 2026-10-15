@@ -7,7 +7,7 @@ use tauqe_protocol::{methods, ModelAskParams};
 
 use crate::app::{AppState, KeyCommand};
 use crate::config::PrimaryModifier;
-use crate::input::InputResult;
+use crate::input::{is_keyboard_quit, InputResult};
 use crate::rpc::{send_request, RpcConnection};
 use crate::views::develop::{DevelopFocus, DevelopView, TurnStatus};
 
@@ -41,8 +41,7 @@ pub const DEVELOP_COMMANDS: &[KeyCommand] = &[
     KeyCommand { key: "C-Y", description: "Yank (paste) text from the kill ring (falls back to the system clipboard when empty)" },
     KeyCommand { key: "Alt+C / Alt+Y", description: "Copy model response to clipboard" },
     // Auxiliary & Destructive
-    KeyCommand { key: "C-G", description: "Detach the active discussion focus (with confirmation)" },
-    KeyCommand { key: "Esc", description: "Interrupt generation; press twice to clear the prompt (saved to kill ring); detach discussion focus when empty; leave Viewport" },
+    KeyCommand { key: "Esc / C-G", description: "Interrupt generation (keyboard-quit); press twice to clear the prompt (saved to kill ring); detach discussion focus when empty; leave Viewport" },
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -75,7 +74,6 @@ pub enum DevelopAction {
     // Workflow actions
     SendPrompt,
     UndoCommit,
-    DetachFocus,
     OpenSquashDialog,
     CopyModelResponse,
     PrevModifiedFile,
@@ -165,6 +163,13 @@ pub fn resolve_develop_action(key: KeyEvent, primary_mod: PrimaryModifier) -> Op
     let has_shift = key.modifiers.contains(KeyModifiers::SHIFT);
     let is_primary = primary_mod.matches(key.modifiers);
 
+    // 0. C-g (keyboard-quit): the canonical abort chord is identical to Esc,
+    // returning Viewport focus to the prompt, clearing the prompt, or arming
+    // the detach confirmation on an empty prompt.
+    if is_keyboard_quit(&key) {
+        return Some(DevelopAction::ClearPromptSaving);
+    }
+
     // 1. Esc: interrupt generation or clear prompt
     if key.code == KeyCode::Esc {
         return Some(DevelopAction::ClearPromptSaving);
@@ -200,7 +205,6 @@ pub fn resolve_develop_action(key: KeyEvent, primary_mod: PrimaryModifier) -> Op
     if is_primary {
         match key.code {
             KeyCode::Enter => return Some(DevelopAction::SendPrompt),
-            KeyCode::Char('g') => return Some(DevelopAction::DetachFocus),
             KeyCode::Char('s') => return Some(DevelopAction::OpenSquashDialog),
             KeyCode::Char('z') => return Some(DevelopAction::UndoCommit),
             KeyCode::Char('j') => return Some(DevelopAction::InsertNewline),
@@ -460,14 +464,6 @@ pub async fn handle_develop_key(
             } else {
                 st.confirm_undo = true;
                 st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
-            }
-        }
-        DevelopAction::DetachFocus => {
-            if st.discussion_focus.is_active() {
-                st.confirm_detach_focus = true;
-                st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
-            } else {
-                st.notify_info("No active discussion focus to detach");
             }
         }
         DevelopAction::OpenSquashDialog => {

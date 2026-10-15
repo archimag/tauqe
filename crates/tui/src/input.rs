@@ -122,6 +122,14 @@ pub fn is_text_input_active(st: &AppState) -> bool {
 /// either no modifiers, Shift only, or AltGr (Ctrl+Alt / Ctrl+Alt+Shift) on Windows/X11.
 pub use crate::components::editor::is_char_typing;
 
+/// Returns whether the key event is the canonical keyboard-quit chord: `C-g`
+/// (Emacs `keyboard-quit`, ASCII BEL 0x07). The TUI treats it exactly like
+/// `Esc`, so one chord always aborts the running operation or closes the active
+/// surface without intercepting the system `SIGINT` signal.
+pub fn is_keyboard_quit(key: &KeyEvent) -> bool {
+    key.code == KeyCode::Char('g') && key.modifiers.contains(KeyModifiers::CONTROL)
+}
+
 /// Helper to remove the last word from a simple string buffer (equivalent to Ctrl+W).
 pub fn pop_word_backward(buf: &mut String) {
     while buf.ends_with(char::is_whitespace) {
@@ -267,6 +275,14 @@ pub async fn handle_terminal_event(
                         custom_langmap.as_deref(),
                     ));
                 }
+            }
+
+            // C-g (keyboard-quit) is the canonical abort chord: normalize it to
+            // `Esc` here so every view and modal reacts identically without a
+            // per-handler binding (Conventions §5). It runs after layout
+            // translation so a mapped key still resolves back to `C-g`.
+            if is_keyboard_quit(&key) {
+                key = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
             }
 
             if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('q') {
@@ -444,7 +460,14 @@ async fn handle_global_shortcuts(
         && (key.code == KeyCode::Char('c') || key.code == KeyCode::Char('C'));
 
     if is_cancel_shortcut {
-        if st.model.is_busy() || st.review.running {
+        if st.model.is_batch && st.model.is_busy() {
+            // A batch supervisor runs a bounded queue of isolated turns: offer
+            // the three-way choice between continuing, stopping after the
+            // current member, and aborting immediately instead of a plain
+            // interrupt (Conventions.md §7).
+            st.confirm_batch_cancel = true;
+            st.batch_cancel_button = crate::app::BatchCancelButton::Continue;
+        } else if st.model.is_busy() || st.review.running {
             st.confirm_cancel = true;
             st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
         } else {
@@ -501,6 +524,37 @@ mod tests {
             .unwrap();
         assert_eq!(res, InputResult::Continue);
         assert!(state.lock().await.terminal_focused);
+    }
+
+    #[test]
+    fn test_is_keyboard_quit_only_matches_ctrl_g() {
+        assert!(is_keyboard_quit(&KeyEvent::new(
+            KeyCode::Char('g'),
+            KeyModifiers::CONTROL
+        )));
+        assert!(!is_keyboard_quit(&KeyEvent::new(
+            KeyCode::Char('g'),
+            KeyModifiers::NONE
+        )));
+        assert!(!is_keyboard_quit(&KeyEvent::new(
+            KeyCode::Char('x'),
+            KeyModifiers::CONTROL
+        )));
+    }
+
+    #[tokio::test]
+    async fn test_ctrl_g_closes_active_modal_like_esc() {
+        let mut st = test_state();
+        st.show_help = true;
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+
+        let key = KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL);
+        let res = handle_terminal_event(crossterm::event::Event::Key(key), &state, &mut conn)
+            .await
+            .unwrap();
+        assert_eq!(res, InputResult::Continue);
+        assert!(!state.lock().await.show_help);
     }
 
     #[test]
@@ -831,6 +885,27 @@ mod tests {
         assert_eq!(res, Some(InputResult::Continue));
         assert!(state.lock().await.confirm_cancel);
         assert_eq!(state.lock().await.confirm_button, ConfirmDialogButton::Cancel);
+    }
+
+    #[tokio::test]
+    async fn test_cancel_shortcut_opens_batch_dialog_for_running_batch() {
+        let mut st = test_state();
+        st.model.status = crate::views::develop::TurnStatus::Responding;
+        st.model.is_batch = true;
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+
+        let key = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        let res = handle_global_shortcuts(key, &state, &mut conn, true)
+            .await
+            .unwrap();
+        assert_eq!(res, Some(InputResult::Continue));
+
+        let guard = state.lock().await;
+        assert!(guard.confirm_batch_cancel);
+        assert!(!guard.confirm_cancel);
+        assert_eq!(guard.batch_cancel_button, crate::app::BatchCancelButton::Continue);
+        assert!(!guard.batch_stopping);
     }
 
     #[tokio::test]

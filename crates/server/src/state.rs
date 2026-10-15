@@ -15,6 +15,8 @@ use crate::transport::OutChannel;
 pub struct ActiveOperation {
     pub id: u64,
     pub cancel_tx: watch::Sender<bool>,
+    /// Soft-stop signal observed by a running batch supervisor between members.
+    pub soft_stop_tx: watch::Sender<bool>,
     pub abort_handle: Option<tokio::task::AbortHandle>,
 }
 
@@ -29,12 +31,22 @@ pub struct OperationGuard {
     state: Arc<AppState>,
     id: u64,
     cancel_rx: watch::Receiver<bool>,
+    soft_stop_rx: watch::Receiver<bool>,
 }
 
 impl OperationGuard {
     /// Returns a receiver that observes this operation's cancellation signal.
     pub fn cancel_receiver(&self) -> watch::Receiver<bool> {
         self.cancel_rx.clone()
+    }
+
+    /// Returns a receiver that observes this operation's soft-stop signal.
+    ///
+    /// A batch supervisor checks it between members: the current member finishes
+    /// its bounded turn, compiler verification, and Git commit, and only then
+    /// does the queue stop before launching the next one.
+    pub fn soft_stop_receiver(&self) -> watch::Receiver<bool> {
+        self.soft_stop_rx.clone()
     }
 
     /// Installs the abort handle of the task currently driving this operation.
@@ -50,9 +62,17 @@ impl OperationGuard {
 
 impl Drop for OperationGuard {
     fn drop(&mut self) {
-        let mut slot = self.state.lock_active_operation();
-        if slot.as_ref().map(|op| op.id) == Some(self.id) {
-            *slot = None;
+        let released = {
+            let mut slot = self.state.lock_active_operation();
+            if slot.as_ref().map(|op| op.id) == Some(self.id) {
+                *slot = None;
+                true
+            } else {
+                false
+            }
+        };
+        if released {
+            tracing::info!(operation_slot_id = self.id, "Released active operation slot");
         }
     }
 }
@@ -115,7 +135,11 @@ impl AppState {
         if let Ok(Some(recovery_msg)) =
             tauqe_core::git::checkpoint::recover_interrupted_workflow(&repo_path)
         {
-            eprintln!("[tauqe-recovery] {}", recovery_msg);
+            tracing::warn!(
+                repo_root = %repo_path.display(),
+                "Recovered interrupted workflow: {}",
+                recovery_msg,
+            );
         }
 
         // Review legacy migration runs exactly once at startup, so listing or
@@ -167,20 +191,29 @@ impl AppState {
     pub fn try_begin_operation(self: &Arc<Self>) -> Result<OperationGuard, ()> {
         let mut slot = self.lock_active_operation();
         if slot.is_some() {
+            drop(slot);
+            tracing::warn!(
+                code = "OPERATION_IN_PROGRESS",
+                "Refused to register a new operation: a slot is already active",
+            );
             return Err(());
         }
         let id = next_operation_id();
         let (cancel_tx, cancel_rx) = watch::channel(false);
+        let (soft_stop_tx, soft_stop_rx) = watch::channel(false);
         *slot = Some(ActiveOperation {
             id,
             cancel_tx,
+            soft_stop_tx,
             abort_handle: None,
         });
         drop(slot);
+        tracing::info!(operation_slot_id = id, "Registered active operation slot");
         Ok(OperationGuard {
             state: Arc::clone(self),
             id,
             cancel_rx,
+            soft_stop_rx,
         })
     }
 
@@ -192,16 +225,48 @@ impl AppState {
     /// Removes and returns the registered operation so its cancel signal can be
     /// delivered while the slot is free for a later operation to register.
     pub fn take_active_operation(&self) -> Option<ActiveOperation> {
-        self.lock_active_operation().take()
+        let taken = self.lock_active_operation().take();
+        if let Some(op) = taken.as_ref() {
+            tracing::info!(operation_slot_id = op.id, "Removed active operation slot");
+        }
+        taken
     }
 
     /// Delivers a cancellation signal to the active operation without clearing
     /// its registration, so callers can still observe when the operation
     /// finishes and unwinds its transaction.
+    ///
+    /// The signal is raised at most once per operation: the shutdown drain
+    /// re-signals on every poll, and logging each repeat would flood the
+    /// journal.
     pub fn cancel_active_operation(&self) {
         let slot = self.lock_active_operation();
         if let Some(op) = slot.as_ref() {
-            let _ = op.cancel_tx.send(true);
+            if !op.cancel_tx.send_replace(true) {
+                tracing::info!(
+                    operation_slot_id = op.id,
+                    "Delivered hard-cancel signal to active operation",
+                );
+            }
+        }
+    }
+
+    /// Requests a graceful stop of the active operation without clearing its
+    /// registration.
+    ///
+    /// A batch supervisor observes this signal between members: the current
+    /// member finishes its bounded turn, compiler verification, and Git commit,
+    /// and only then does the queue stop before launching the next member.
+    /// Unlike [`AppState::cancel_active_operation`], the request is advisory and
+    /// never interrupts work that is already running.
+    pub fn soft_stop_active_operation(&self) {
+        let slot = self.lock_active_operation();
+        if let Some(op) = slot.as_ref() {
+            let _ = op.soft_stop_tx.send(true);
+            tracing::info!(
+                operation_slot_id = op.id,
+                "Requested soft stop of active operation",
+            );
         }
     }
 

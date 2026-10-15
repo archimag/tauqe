@@ -204,3 +204,23 @@ Subsystems may define local conventions that supplement these repository-wide ru
 - **Core Engine (`crates/core`):** `crates/core/Conventions.md` (dual-contour structured output and storage persistence invariants).
 
 Subsystem conventions are resolved and included in the Pinned context layer automatically by the harness whenever files within that subsystem are loaded into context.
+
+---
+
+## 11. Observability and Structured Logging
+
+1. **Library-versus-Daemon Logging Boundary (`core` vs `server`):**
+   - `crates/core` is a library and a pure generator of semantic observability events. It emits them exclusively through the lightweight `tracing` facade (`info!`, `warn!`, `error!`) and never depends on file sinks, on-disk formats, or rotation policy.
+   - `crates/server` owns the entire observability sink: subscriber initialization, the on-disk format, and the rotation policy. It installs `tracing-subscriber` (structured JSON records with millisecond RFC-3339 UTC timestamps) writing into `<repo_root>/.tauqe/server.log`, rotates that file by size (10 MiB by default), and retains only a bounded number of numbered archives (`server.log.1`).
+   - Rotating file output is confined to the daemon. `crates/tui` must never open a competing file descriptor on the rotating journal: it observes turn progress through RPC events only and never writes the server journal directly.
+2. **State Transitions Invariant:**
+   - Every significant state transition, operation lifecycle boundary, and failure point in the server runtime and the domain engine must emit a semantic log record through the `tracing` facade.
+   - This covers daemon startup and shutdown (stdin EOF, drain phase, forced-abort timeout), RPC transport events (incoming call, sanitized parameter summary, parse failure, per-request duration), operation-slot acquisition and cancellation signals, bounded-turn FSM phase changes, batch queue steps, Coder Ladder escalation, replanning activation, toolchain failures, and provider/network failures.
+   - **Rationale (Why):** a persistent daemon runs detached from the developer's terminal. Without structured transition records there is no deterministic way to reconstruct why a turn failed, whether an operation slot leaked, or which provider error aborted a run after the fact.
+3. **Anti-Bloat Logging Invariant:**
+   - Raw generation stream deltas (`TextDelta`, `ReasoningDelta`), full prompt bodies, context file contents, `RepoMap` dumps, and raw diffs must never be written to the journal in normal operation.
+   - The journal records exclusively interaction metadata, compact identifiers, and aggregated token and time metrics. This keeps the file analytically useful and bounds its size, so `grep`, `tail -f`, and `less` remain effective and rotation cannot be defeated by a single verbose turn.
+4. **Panic Observability:**
+   - The daemon installs a custom panic hook at startup that records the source location, the textual payload, and — when `RUST_BACKTRACE` enables it — the backtrace as a single `error`-level record with `target = "panic"` before the process unwinds.
+5. **Subsystem Instrumentation:**
+   - Domain-side instrumentation rules for the engine are specified in `crates/core/Conventions.md`.

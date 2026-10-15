@@ -404,6 +404,34 @@ pub async fn handle_mouse_event(
                         }
                     }
                 }
+                Some(ActiveModal::BatchCancel) => {
+                    let geom = crate::dialogs::render::batch_cancel_modal_geometry(term_rect);
+                    let choice = if rect_contains(geom.continue_button, mouse.column, mouse.row) {
+                        Some(crate::app::BatchCancelButton::Continue)
+                    } else if rect_contains(geom.soft_stop_button, mouse.column, mouse.row) {
+                        Some(crate::app::BatchCancelButton::SoftStop)
+                    } else if rect_contains(geom.hard_stop_button, mouse.column, mouse.row) {
+                        Some(crate::app::BatchCancelButton::HardStop)
+                    } else {
+                        None
+                    };
+
+                    match choice {
+                        Some(choice) => {
+                            crate::dialogs::input::apply_batch_cancel(
+                                &mut st,
+                                choice,
+                                server_writer,
+                            )
+                            .await?;
+                        }
+                        None => {
+                            st.confirm_batch_cancel = false;
+                            st.batch_cancel_button = crate::app::BatchCancelButton::Continue;
+                        }
+                    }
+                    return Ok(InputResult::Continue);
+                }
                 Some(ActiveModal::ClearAuto) => {
                     if st.context_view.confirm_clear_auto {
                         let geom = geometry_of(

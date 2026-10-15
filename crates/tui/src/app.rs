@@ -27,6 +27,43 @@ pub enum ConfirmDialogButton {
     Confirm,
 }
 
+/// Action selected in the batch-cancellation dialog.
+///
+/// A batch runs a bounded queue of isolated turns. Distinguishing "keep going"
+/// from a graceful stop (finish the current member, then halt) and an immediate
+/// abort lets the developer interrupt a long queue without discarding the work
+/// already committed (Conventions.md §7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BatchCancelButton {
+    /// Keep the batch running; the safe default.
+    #[default]
+    Continue,
+    /// Let the current member finish, then stop before the next one.
+    SoftStop,
+    /// Abort the current member and stop the batch immediately.
+    HardStop,
+}
+
+impl BatchCancelButton {
+    /// Advances focus to the next action button.
+    pub fn cycle_next(&mut self) {
+        *self = match self {
+            Self::Continue => Self::SoftStop,
+            Self::SoftStop => Self::HardStop,
+            Self::HardStop => Self::Continue,
+        };
+    }
+
+    /// Moves focus to the previous action button.
+    pub fn cycle_prev(&mut self) {
+        *self = match self {
+            Self::Continue => Self::HardStop,
+            Self::SoftStop => Self::Continue,
+            Self::HardStop => Self::SoftStop,
+        };
+    }
+}
+
 /// The single source of truth for modal stacking order.
 ///
 /// Every surface that must decide *which* modal is on top — keyboard dispatch,
@@ -44,6 +81,7 @@ pub enum ActiveModal {
     Review,
     ConfirmCancel,
     ConfirmQuit,
+    BatchCancel,
     ClearAuto,
     ClearUser,
     ConfirmUndo,
@@ -849,6 +887,12 @@ pub struct AppState {
     pub help_scroll: u16,
     pub confirm_cancel: bool,
     pub confirm_quit: bool,
+    /// Whether the batch-cancellation dialog is open.
+    pub confirm_batch_cancel: bool,
+    /// Action button currently focused in the batch-cancellation dialog.
+    pub batch_cancel_button: BatchCancelButton,
+    /// Whether a running batch has been asked to stop after its current member.
+    pub batch_stopping: bool,
     pub confirm_undo: bool,
     pub confirm_detach_focus: bool,
     pub confirm_clear_history: bool,
@@ -912,6 +956,9 @@ impl AppState {
             help_scroll: 0,
             confirm_cancel: false,
             confirm_quit: false,
+            confirm_batch_cancel: false,
+            batch_cancel_button: BatchCancelButton::Continue,
+            batch_stopping: false,
             confirm_undo: false,
             confirm_detach_focus: false,
             confirm_clear_history: false,
@@ -1054,6 +1101,9 @@ impl AppState {
         }
         if self.confirm_quit {
             return Some(ActiveModal::ConfirmQuit);
+        }
+        if self.confirm_batch_cancel {
+            return Some(ActiveModal::BatchCancel);
         }
         if self.context_view.confirm_clear_auto {
             return Some(ActiveModal::ClearAuto);
@@ -1525,5 +1575,36 @@ mod tests {
         // Help stays a lower-priority surface than the confirmation.
         st.show_help = true;
         assert_eq!(st.active_modal(), Some(ActiveModal::ClearUser));
+    }
+
+    #[test]
+    fn test_batch_cancel_dialog_priority_and_defaults() {
+        let mut st = test_state();
+        assert_eq!(st.batch_cancel_button, BatchCancelButton::Continue);
+
+        st.confirm_batch_cancel = true;
+        assert_eq!(st.active_modal(), Some(ActiveModal::BatchCancel));
+        assert!(st.has_active_modal());
+
+        // A later confirmation outranks it so the top-most surface always owns
+        // the keyboard.
+        st.confirm_quit = true;
+        assert_eq!(st.active_modal(), Some(ActiveModal::ConfirmQuit));
+    }
+
+    #[test]
+    fn test_batch_cancel_button_cycles_through_all_actions() {
+        let mut button = BatchCancelButton::Continue;
+        button.cycle_next();
+        assert_eq!(button, BatchCancelButton::SoftStop);
+        button.cycle_next();
+        assert_eq!(button, BatchCancelButton::HardStop);
+        button.cycle_next();
+        assert_eq!(button, BatchCancelButton::Continue);
+
+        button.cycle_prev();
+        assert_eq!(button, BatchCancelButton::HardStop);
+        button.cycle_prev();
+        assert_eq!(button, BatchCancelButton::SoftStop);
     }
 }

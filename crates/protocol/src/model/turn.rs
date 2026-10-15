@@ -24,6 +24,32 @@ pub struct ModelAskParams {
     pub discussion: Option<DiscussionRequest>,
 }
 
+/// How an in-flight cancellation should stop a running batch supervisor.
+///
+/// A soft stop lets the current member finish its bounded turn, verification,
+/// and Git commit before the queue halts; a hard stop aborts the current member
+/// immediately. Outside a batch the mode is irrelevant and cancellation is
+/// always immediate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CancelMode {
+    /// Finish the current member, then stop without starting the next one.
+    Soft,
+    /// Abort the current member immediately and stop the batch.
+    #[default]
+    Hard,
+}
+
+/// Parameters for `model/cancel`.
+///
+/// The `mode` field is optional so clients that predate two-mode cancellation
+/// keep sending an empty object and receive the default immediate abort.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelCancelParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<CancelMode>,
+}
+
 /// Execution context of a model turn driven by a plan step.
 ///
 /// Carries the owning plan identifier, the currently executing step, and the
@@ -188,5 +214,30 @@ mod tests {
 
         let de: ModelResult = serde_json::from_str(&json).unwrap();
         assert_eq!(de, answer);
+    }
+
+    #[test]
+    fn test_cancel_mode_and_model_cancel_params_serde() {
+        assert_eq!(CancelMode::default(), CancelMode::Hard);
+        assert_eq!(serde_json::to_string(&CancelMode::Soft).unwrap(), "\"soft\"");
+        assert_eq!(serde_json::to_string(&CancelMode::Hard).unwrap(), "\"hard\"");
+        assert_eq!(
+            serde_json::from_str::<CancelMode>("\"soft\"").unwrap(),
+            CancelMode::Soft
+        );
+
+        // Legacy clients send an empty object; the mode stays absent and the
+        // server falls back to an immediate abort.
+        let legacy: ModelCancelParams = serde_json::from_str("{}").unwrap();
+        assert_eq!(legacy.mode, None);
+        assert_eq!(serde_json::to_string(&legacy).unwrap(), "{}");
+
+        let soft = ModelCancelParams {
+            mode: Some(CancelMode::Soft),
+        };
+        let json = serde_json::to_string(&soft).unwrap();
+        assert_eq!(json, "{\"mode\":\"soft\"}");
+        let de: ModelCancelParams = serde_json::from_str(&json).unwrap();
+        assert_eq!(de.mode, Some(CancelMode::Soft));
     }
 }

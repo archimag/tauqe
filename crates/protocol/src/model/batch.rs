@@ -17,6 +17,9 @@ pub enum BatchFinishStatus {
     Blocked,
     /// The batch was cancelled by the user.
     Cancelled,
+    /// The user stopped the queue gracefully after the current member finished
+    /// its turn; already-completed members remain committed.
+    Stopped,
 }
 
 /// Compact summary of a completed batch run.
@@ -50,4 +53,25 @@ pub struct PlanBatchFinishedEvent {
 pub struct ReviewBatchFinishedEvent {
     pub operation_id: String,
     pub summary: BatchFinishSummary,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_batch_finish_status_serializes_every_variant() {
+        let cases = [
+            (BatchFinishStatus::Completed, "\"completed\""),
+            (BatchFinishStatus::Failed, "\"failed\""),
+            (BatchFinishStatus::Blocked, "\"blocked\""),
+            (BatchFinishStatus::Cancelled, "\"cancelled\""),
+            (BatchFinishStatus::Stopped, "\"stopped\""),
+        ];
+        for (status, wire) in cases {
+            assert_eq!(serde_json::to_string(&status).unwrap(), wire);
+            let de: BatchFinishStatus = serde_json::from_str(wire).unwrap();
+            assert_eq!(de, status);
+        }
+    }
 }

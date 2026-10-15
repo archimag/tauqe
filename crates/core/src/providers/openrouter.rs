@@ -14,6 +14,8 @@ const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 /// Maximum idle time between reads on an open stream. Bounds a stalled
 /// provider so a hung connection cannot block the turn indefinitely.
 const READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+/// Maximum characters of a raw provider response body captured in a log record.
+const RESPONSE_BODY_LOG_CHARS: usize = 500;
 
 pub struct OpenRouterProvider {
     api_key: String,
@@ -250,7 +252,21 @@ impl OpenRouterProvider {
         );
         headers.insert("X-Title", HeaderValue::from_static("Tauqe"));
 
+        if *cancel_rx.borrow() {
+            let _ = tx.send(StreamEvent::Cancelled).await;
+            return Ok(());
+        }
+
         let uses_json_schema = matches!(&response_format, Some(ResponseFormat::JsonSchema { .. }));
+
+        tracing::info!(
+            model = %model,
+            effort = ?reasoning_effort,
+            uses_json_schema,
+            messages_count = messages.len(),
+            "openrouter request dispatched"
+        );
+
         let payload = ChatCompletionRequest {
             model: model.to_string(),
             messages,
@@ -273,18 +289,40 @@ impl OpenRouterProvider {
         };
 
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
-        let response = self
-            .http_client
-            .post(&url)
-            .headers(headers)
-            .json(&payload)
-            .send()
-            .await
-            .context("Failed to connect to OpenRouter API")?;
+        let response = tokio::select! {
+            _ = cancel_rx.changed() => {
+                if *cancel_rx.borrow() {
+                    let _ = tx.send(StreamEvent::Cancelled).await;
+                    return Ok(());
+                }
+                bail!("OpenRouter request cancelled");
+            }
+            res = self
+                .http_client
+                .post(&url)
+                .headers(headers)
+                .json(&payload)
+                .send() => {
+                if let Err(err) = &res {
+                    tracing::warn!(
+                        is_timeout = err.is_timeout(),
+                        is_connect = err.is_connect(),
+                        error = %err,
+                        "openrouter request failed"
+                    );
+                }
+                res.context("Failed to connect to OpenRouter API")?
+            }
+        };
 
         if !response.status().is_success() {
             let status = response.status();
             let err_text = response.text().await.unwrap_or_default();
+            tracing::error!(
+                status_code = status.as_u16(),
+                response = %truncate_response_body(&err_text),
+                "openrouter http error"
+            );
             bail!("OpenRouter HTTP error {}: {}", status, err_text);
         }
 
@@ -332,7 +370,7 @@ impl OpenRouterProvider {
                                         let chunk_result =
                                             serde_json::from_str::<StreamingChunk>(payload_str);
                                         if let Err(err) = &chunk_result {
-                                            tracing::warn!("OpenRouter SSE parse error: {}", err);
+                                            tracing::warn!(error = %err, "openrouter sse parse error");
                                         }
                                         if let Ok(chunk) = chunk_result {
                                             if let Some(id) = chunk.id {
@@ -342,6 +380,7 @@ impl OpenRouterProvider {
                                             }
 
                                             if let Some(err) = chunk.error {
+                                                tracing::error!(error = %err.message, "openrouter stream error");
                                                 let _ = tx.send(StreamEvent::Error(err.message.clone())).await;
                                                 bail!("OpenRouter streaming error: {}", err.message);
                                             }
@@ -382,10 +421,15 @@ impl OpenRouterProvider {
 
                                             for choice in chunk.choices {
                                                 if let Some(err) = choice.error {
+                                                    tracing::error!(error = %err.message, "openrouter stream choice error");
                                                     let _ = tx.send(StreamEvent::Error(err.message.clone())).await;
                                                     bail!("OpenRouter streaming choice error: {}", err.message);
                                                 }
                                                 if choice.finish_reason.as_deref() == Some("error") {
+                                                    tracing::error!(
+                                                        finish_reason = "error",
+                                                        "openrouter generation error"
+                                                    );
                                                     let msg = "Generation ended with finish_reason: error".to_string();
                                                     let _ = tx
                                                         .send(StreamEvent::Error(msg.clone()))
@@ -412,6 +456,7 @@ impl OpenRouterProvider {
                             }
                         }
                         Some(Err(err)) => {
+                            tracing::warn!(error = %err, "openrouter stream read error");
                             let _ = tx.send(StreamEvent::Error(err.to_string())).await;
                             bail!("OpenRouter stream read error: {}", err);
                         }
@@ -428,6 +473,7 @@ impl OpenRouterProvider {
         }
 
         if !got_done_marker {
+            tracing::warn!("openrouter stream ended prematurely without [DONE] marker");
             let msg = "OpenRouter stream ended prematurely without [DONE] marker".to_string();
             let _ = tx.send(StreamEvent::Error(msg.clone())).await;
             bail!("{}", msg);
@@ -437,7 +483,7 @@ impl OpenRouterProvider {
             let needs_cost = latest_usage.as_ref().is_none_or(|u| u.cost.is_none());
             if needs_cost {
                 if let Ok(Some(stats)) = self.get_generation_stats(&gen_id).await {
-                    let mut usage = latest_usage.unwrap_or_default();
+                    let mut usage = latest_usage.clone().unwrap_or_default();
                     if usage.cost.is_none() {
                         usage.cost = stats.total_cost;
                     }
@@ -454,14 +500,42 @@ impl OpenRouterProvider {
                     if usage.total_tokens == 0 {
                         usage.total_tokens = usage.prompt_tokens + usage.completion_tokens;
                     }
+                    latest_usage = Some(usage.clone());
                     let _ = tx.send(StreamEvent::Usage(usage)).await;
                 }
             }
         }
 
+        log_stream_completion(model, &latest_usage);
+
         let _ = tx.send(StreamEvent::Done).await;
         Ok(())
     }
+}
+
+/// Truncates a provider response body on a Unicode scalar boundary for logging.
+fn truncate_response_body(body: &str) -> String {
+    let trimmed = body.trim();
+    let mut snippet: String = trimmed.chars().take(RESPONSE_BODY_LOG_CHARS).collect();
+    if trimmed.chars().count() > RESPONSE_BODY_LOG_CHARS {
+        snippet.push('…');
+    }
+    snippet
+}
+
+/// Records the aggregated token and cost metrics of a completed stream.
+fn log_stream_completion(model: &str, usage: &Option<ModelUsageInfo>) {
+    let usage = usage.clone().unwrap_or_default();
+    tracing::info!(
+        model = %model,
+        prompt_tokens = usage.prompt_tokens,
+        completion_tokens = usage.completion_tokens,
+        total_tokens = usage.total_tokens,
+        reasoning_tokens = ?usage.reasoning_tokens,
+        cached_tokens = ?usage.cached_tokens,
+        cost = ?usage.cost,
+        "openrouter stream completed"
+    );
 }
 
 fn find_sse_event_boundary(buf: &[u8]) -> Option<(usize, usize)> {
@@ -924,6 +998,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_stream_chat_cancels_pending_http_request() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(std::time::Duration::from_secs(60))
+                    .set_body_string("data: [DONE]\n\n"),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let provider =
+            OpenRouterProvider::new("test-api-key".to_string()).with_base_url(mock_server.uri());
+
+        let (tx, mut rx) = mpsc::channel(10);
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+
+        let provider_task = tokio::spawn(async move {
+            provider
+                .stream_text("test-model", vec![], tx, cancel_rx)
+                .await
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        cancel_tx.send(true).expect("failed to send cancel signal");
+
+        let res = tokio::time::timeout(std::time::Duration::from_secs(2), provider_task)
+            .await
+            .expect("cancellation should resolve promptly")
+            .expect("task join failed");
+
+        assert!(res.is_ok());
+
+        let event = rx.recv().await.expect("expected stream event");
+        assert!(matches!(event, StreamEvent::Cancelled));
+    }
+
+    #[tokio::test]
+    async fn test_stream_chat_pre_cancelled() {
+        let mock_server = MockServer::start().await;
+
+        let provider =
+            OpenRouterProvider::new("test-api-key".to_string()).with_base_url(mock_server.uri());
+
+        let (tx, mut rx) = mpsc::channel(10);
+        let (_cancel_tx, cancel_rx) = watch::channel(true);
+
+        let res = provider
+            .stream_text("test-model", vec![], tx, cancel_rx)
+            .await;
+
+        assert!(res.is_ok());
+
+        let event = rx.recv().await.expect("expected stream event");
+        assert!(matches!(event, StreamEvent::Cancelled));
+        assert_eq!(mock_server.received_requests().await.unwrap().len(), 0);
+    }
+
+    #[tokio::test]
     async fn test_stream_chat_http_error() {
         let mock_server = MockServer::start().await;
 
@@ -995,5 +1130,82 @@ mod tests {
                 .unwrap(),
             "json_object"
         );
+    }
+
+    #[tokio::test]
+    async fn test_stream_chat_finish_reason_error_returns_err() {
+        let mock_server = MockServer::start().await;
+
+        let sse_body = "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"error\"}]}\n\n";
+
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(sse_body, "text/event-stream"),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let provider =
+            OpenRouterProvider::new("test-api-key".to_string()).with_base_url(mock_server.uri());
+
+        let (tx, mut rx) = mpsc::channel(10);
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+
+        let res = provider
+            .stream_text("test-model", vec![], tx, cancel_rx)
+            .await;
+
+        assert!(res.is_err());
+        assert!(res
+            .unwrap_err()
+            .to_string()
+            .contains("finish_reason: error"));
+
+        let mut saw_error_event = false;
+        while let Some(event) = rx.recv().await {
+            if let StreamEvent::Error(msg) = event {
+                if msg.contains("finish_reason: error") {
+                    saw_error_event = true;
+                }
+            }
+        }
+        assert!(saw_error_event);
+    }
+
+    #[tokio::test]
+    async fn test_stream_chat_rate_limit_http_error() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(429).set_body_string("Too Many Requests"))
+            .mount(&mock_server)
+            .await;
+
+        let provider =
+            OpenRouterProvider::new("test-api-key".to_string()).with_base_url(mock_server.uri());
+
+        let (tx, _rx) = mpsc::channel(10);
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+
+        let res = provider
+            .stream_text("test-model", vec![], tx, cancel_rx)
+            .await;
+
+        assert!(res.is_err());
+        let err_msg = res.unwrap_err().to_string();
+        assert!(err_msg.contains("429"));
+        assert!(err_msg.contains("Too Many Requests"));
+    }
+
+    #[test]
+    fn test_truncate_response_body_is_utf8_safe() {
+        let body = "ошибка ".repeat(200);
+        let truncated = truncate_response_body(&body);
+        assert!(truncated.chars().count() <= RESPONSE_BODY_LOG_CHARS + 1);
+        assert!(truncated.ends_with('…'));
     }
 }

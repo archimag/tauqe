@@ -13,6 +13,7 @@ use tauqe_protocol::{
 };
 
 mod handlers;
+mod logging;
 mod state;
 mod transport;
 
@@ -29,6 +30,26 @@ async fn main() -> anyhow::Result<()> {
         tauqe_core::config::cli_arg_value_from(std::env::args(), "--credentials");
     let repo_state = tauqe_core::git::get_repository_state(None);
     let repo_path = PathBuf::from(&repo_state.root);
+
+    logging::install_panic_hook();
+    // The returned guard owns the non-blocking appender buffer; binding it to a
+    // live variable keeps it until `main` returns so no record is lost.
+    let _log_guard = logging::init_logging(&repo_path);
+    let log_path = logging::log_file_path(&repo_path);
+    tracing::info!(
+        pid = std::process::id(),
+        repo_root = %repo_path.display(),
+        explicit_config = %explicit_config
+            .as_deref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "<auto>".to_string()),
+        explicit_credentials = %explicit_credentials
+            .as_deref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "<auto>".to_string()),
+        log_path = %log_path.display(),
+        "Server daemon started",
+    );
     let config = tauqe_core::config::load_config_with_options(tauqe_core::config::ConfigLoadOptions {
         repo_root: Some(&repo_path),
         explicit_config: explicit_config.as_deref(),
@@ -82,7 +103,18 @@ async fn main() -> anyhow::Result<()> {
     // the client sent them and keeps responses ordered.
     let mut offloaded = tokio::task::JoinSet::new();
 
-    while let Ok(Some(line)) = reader.next_line().await {
+    loop {
+        let line = match reader.next_line().await {
+            Ok(Some(line)) => line,
+            Ok(None) => {
+                tracing::info!("stdin reached EOF; beginning graceful shutdown");
+                break;
+            }
+            Err(err) => {
+                tracing::warn!(error = %err, "stdin read failed; beginning graceful shutdown");
+                break;
+            }
+        };
         let line = line.trim();
         if line.is_empty() {
             continue;
@@ -94,6 +126,11 @@ async fn main() -> anyhow::Result<()> {
                 // A request that fails to parse has no correlatable id: answer
                 // with the explicit null id so it can never collide with a real
                 // request's id.
+                tracing::warn!(
+                    error = %err,
+                    code = errors::PARSE_ERROR,
+                    "Rejected unparsable RPC request",
+                );
                 let err_resp =
                     Response::err(RequestId::Null, errors::PARSE_ERROR, err.to_string());
                 state.out.send_response(&err_resp);
@@ -101,14 +138,27 @@ async fn main() -> anyhow::Result<()> {
             }
         };
 
+        let request_id = request.id.clone();
+        let method = request.method.clone();
+        tracing::info!(
+            request_id = ?request_id,
+            method = %method,
+            params = %request_param_keys(&request.params),
+            "RPC request received",
+        );
+
         if is_long_running(&request.method) {
             let state_for_req = Arc::clone(&state);
             offloaded.spawn(async move {
+                let started = std::time::Instant::now();
                 let response = handle_request(request, &state_for_req).await;
+                log_request_outcome(&request_id, &method, started.elapsed(), &response);
                 state_for_req.out.send_response(&response);
             });
         } else {
+            let started = std::time::Instant::now();
             let response = handle_request(request, &state).await;
+            log_request_outcome(&request_id, &method, started.elapsed(), &response);
             state.out.send_response(&response);
         }
     }
@@ -152,6 +202,7 @@ fn is_long_running(method: &str) -> bool {
 /// forever; anything still running when it expires is aborted, and startup
 /// crash recovery covers any residue.
 async fn drain_in_flight(state: &Arc<AppState>, offloaded: &mut tokio::task::JoinSet<()>) {
+    tracing::info!("Draining in-flight work before shutdown");
     let deadline = tokio::time::Instant::now() + SHUTDOWN_DRAIN_TIMEOUT;
     loop {
         // Re-signal on every pass so an operation that registers while we wait
@@ -159,9 +210,14 @@ async fn drain_in_flight(state: &Arc<AppState>, offloaded: &mut tokio::task::Joi
         state.cancel_active_operation();
 
         if !state.is_operation_active() && offloaded.is_empty() {
+            tracing::info!("In-flight work drained; shutdown complete");
             return;
         }
         if tokio::time::Instant::now() >= deadline {
+            tracing::warn!(
+                timeout_secs = SHUTDOWN_DRAIN_TIMEOUT.as_secs(),
+                "Shutdown drain timed out; aborting remaining work",
+            );
             break;
         }
 
@@ -175,6 +231,52 @@ async fn drain_in_flight(state: &Arc<AppState>, offloaded: &mut tokio::task::Joi
         }
     }
 
+    let remaining = offloaded.len();
     offloaded.abort_all();
+    tracing::warn!(remaining, "Force-aborting in-flight tasks at shutdown");
     while offloaded.join_next().await.is_some() {}
+}
+
+/// Renders a compact, secret-free summary of RPC parameters for the journal.
+///
+/// Only the top-level key set is recorded — never the values — so prompt
+/// bodies, file contents, and credentials can never leak into the log.
+fn request_param_keys(params: &Option<serde_json::Value>) -> String {
+    match params {
+        Some(serde_json::Value::Object(map)) => {
+            let mut keys: Vec<&str> = map.keys().map(String::as_str).collect();
+            keys.sort_unstable();
+            keys.join(",")
+        }
+        Some(_) => "<non-object>".to_string(),
+        None => "<none>".to_string(),
+    }
+}
+
+/// Records the terminal outcome of an RPC request together with its duration.
+///
+/// Only the status is logged — an `ok` marker or the error code — never the
+/// response payload, so results cannot leak into the journal.
+fn log_request_outcome(
+    request_id: &RequestId,
+    method: &str,
+    elapsed: std::time::Duration,
+    response: &Response,
+) {
+    let duration_ms = elapsed.as_millis() as u64;
+    match &response.error {
+        Some(err) => tracing::warn!(
+            request_id = ?request_id,
+            method = %method,
+            duration_ms,
+            error_code = %err.code,
+            "RPC request failed",
+        ),
+        None => tracing::info!(
+            request_id = ?request_id,
+            method = %method,
+            duration_ms,
+            "RPC request completed",
+        ),
+    }
 }

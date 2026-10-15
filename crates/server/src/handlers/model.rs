@@ -15,6 +15,7 @@ use tauqe_protocol::{
     ModelResultEvent, ModelStartedEvent, ModelUsageInfo, ReasoningEffort, Request, Response,
     ResponseError,
 };
+use tauqe_protocol::model::{CancelMode, ModelCancelParams};
 
 use crate::handlers::offload;
 use crate::state::{next_operation_id, AppState, OperationGuard};
@@ -404,6 +405,9 @@ struct PreparedTurn {
     selection: tauqe_protocol::ModelSelection,
     reasoning_effort: Option<ReasoningEffort>,
     op_id: String,
+    /// Whether the turn runs as a member of a batch supervisor. Recorded so the
+    /// turn's terminal log can distinguish batch steps from interactive turns.
+    is_batch: bool,
     /// Operation backing this turn. A turn that starts on its own owns the
     /// registration; a batch step shares the batch-level registration so the
     /// slot never lapses between steps.
@@ -511,6 +515,16 @@ async fn prepare_turn(
     let alias = entry.as_ref().and_then(|entry| entry.alias.clone());
     let effort = reasoning_effort.or_else(|| entry.as_ref().and_then(|entry| entry.effort));
 
+    tracing::info!(
+        operation_id = %op_id,
+        model = %model,
+        role = ?role,
+        alias = alias.as_deref().unwrap_or("none"),
+        effort = ?effort,
+        is_batch,
+        "Model turn started",
+    );
+
     state.out.send_event(&Event {
         method: events::MODEL_STARTED.to_string(),
         params: serde_json::to_value(ModelStartedEvent {
@@ -532,6 +546,7 @@ async fn prepare_turn(
         selection,
         reasoning_effort: effort,
         op_id,
+        is_batch,
         operation,
         marker,
     })
@@ -584,6 +599,7 @@ async fn run_prepared_turn(
         selection,
         reasoning_effort,
         op_id,
+        is_batch,
         operation,
         marker,
     } = prepared;
@@ -867,8 +883,21 @@ async fn run_prepared_turn(
         let stalled = tokio::time::timeout(CANCEL_UNWIND_GRACE, wf_task)
             .await
             .is_err();
-        if stalled && !state.git_transaction_active.load(Ordering::SeqCst) {
-            abort_handle.abort();
+        if stalled {
+            if state.git_transaction_active.load(Ordering::SeqCst) {
+                tracing::warn!(
+                    operation_id = %op_id,
+                    grace_secs = CANCEL_UNWIND_GRACE.as_secs(),
+                    "Turn did not unwind within the grace period; deferring abort while a git transaction is open",
+                );
+            } else {
+                tracing::warn!(
+                    operation_id = %op_id,
+                    grace_secs = CANCEL_UNWIND_GRACE.as_secs(),
+                    "Turn did not unwind within the grace period; aborting workflow task",
+                );
+                abort_handle.abort();
+            }
         }
 
         // Flush usage accumulated before the turn was cancelled or failed:
@@ -898,6 +927,16 @@ async fn run_prepared_turn(
             stream_error_msg
         };
 
+        let status = if is_cancelled { "cancelled" } else { "error" };
+        log_turn_finished(
+            &op_id,
+            &model,
+            is_batch,
+            status,
+            &usage_to_send,
+            error.as_deref(),
+        );
+
         return Ok(ModelTurnResult {
             operation_id: op_id,
             result: None,
@@ -909,9 +948,12 @@ async fn run_prepared_turn(
         });
     }
 
+    // Aggregated usage of the completed turn, captured for the terminal log.
+    let mut final_usage = ModelUsageInfo::default();
     let turn_result = match wf_task.await {
         Ok(Ok(wf_result)) => {
             let usage_to_send = usage_info.unwrap_or_default();
+            final_usage = usage_to_send.clone();
             let cost = usage_to_send.cost.unwrap_or(0.0);
             let total_cost = {
                 let mut total = state.total_cost.lock().await;
@@ -1118,6 +1160,15 @@ async fn run_prepared_turn(
         }
     };
 
+    log_turn_finished(
+        &turn_result.operation_id,
+        &model,
+        is_batch,
+        turn_status(&turn_result),
+        &final_usage,
+        turn_result.error.as_deref(),
+    );
+
     Ok(turn_result)
 }
 
@@ -1195,8 +1246,31 @@ pub async fn execute_model_turn(
 }
 
 pub async fn handle_model_cancel(req: Request, state: &Arc<AppState>) -> Response {
+    // The mode is optional so clients that predate two-mode cancellation keep
+    // sending an empty object and receive the default immediate abort.
+    let params: ModelCancelParams = req
+        .params
+        .and_then(|p| serde_json::from_value(p).ok())
+        .unwrap_or_default();
+
+    // A soft stop is advisory: the batch supervisor finishes the current member
+    // (its turn, compiler verification, and Git commit) and then stops before
+    // launching the next one. The operation stays registered so its cancel and
+    // soft-stop channels remain live until the batch unwinds on its own.
+    if params.mode == Some(CancelMode::Soft) {
+        state.soft_stop_active_operation();
+        return Response {
+            id: req.id,
+            result: Some(serde_json::json!({ "cancelled": true })),
+            error: None,
+        };
+    }
+
+    // A hard stop aborts as soon as possible: the operation is unregistered
+    // immediately and the cancel signal is delivered.
     let active_op = state.take_active_operation();
     if let Some(op) = active_op {
+        let slot_id = op.id;
         let _ = op.cancel_tx.send(true);
         if let Some(handle) = op.abort_handle {
             // Aborting is a last resort: the workflow unwinds cooperatively on
@@ -1207,6 +1281,11 @@ pub async fn handle_model_cancel(req: Request, state: &Arc<AppState>) -> Respons
             tokio::spawn(async move {
                 tokio::time::sleep(CANCEL_UNWIND_GRACE).await;
                 if !state.git_transaction_active.load(Ordering::SeqCst) {
+                    tracing::warn!(
+                        operation_slot_id = slot_id,
+                        grace_secs = CANCEL_UNWIND_GRACE.as_secs(),
+                        "Hard-cancel grace period elapsed; aborting workflow task",
+                    );
                     handle.abort();
                 }
             });
@@ -1257,6 +1336,63 @@ fn resolve_model_entry(
         .into_iter()
         .flat_map(|role| config.models.role_entries(role))
         .find(|entry| &entry.model == model),
+    }
+}
+
+/// Classifies a completed turn into a stable status label for the journal.
+fn turn_status(result: &ModelTurnResult) -> &'static str {
+    if result.is_cancelled {
+        "cancelled"
+    } else if result.error.is_some() {
+        "error"
+    } else {
+        match &result.result {
+            Some(tauqe_protocol::ModelResult::Edit { applied: true, .. }) => "applied",
+            Some(tauqe_protocol::ModelResult::Edit { .. }) => "edit_failed",
+            Some(tauqe_protocol::ModelResult::Answer { .. }) => "answer",
+            None => "empty",
+        }
+    }
+}
+
+/// Records the terminal outcome of a model turn with its aggregated usage.
+///
+/// Only metadata is logged — identifiers, the final status, and aggregated
+/// token and cost counters — never streamed deltas, hunks, or prompt bodies,
+/// upholding the Anti-Bloat logging invariant.
+fn log_turn_finished(
+    op_id: &str,
+    model: &tauqe_protocol::ModelRef,
+    is_batch: bool,
+    status: &'static str,
+    usage: &ModelUsageInfo,
+    error: Option<&str>,
+) {
+    if matches!(status, "cancelled" | "error" | "edit_failed") {
+        tracing::warn!(
+            operation_id = %op_id,
+            model = %model,
+            is_batch,
+            status,
+            prompt_tokens = usage.prompt_tokens,
+            completion_tokens = usage.completion_tokens,
+            total_tokens = usage.total_tokens,
+            cost = usage.cost.unwrap_or(0.0),
+            error = error.unwrap_or(""),
+            "Model turn finished",
+        );
+    } else {
+        tracing::info!(
+            operation_id = %op_id,
+            model = %model,
+            is_batch,
+            status,
+            prompt_tokens = usage.prompt_tokens,
+            completion_tokens = usage.completion_tokens,
+            total_tokens = usage.total_tokens,
+            cost = usage.cost.unwrap_or(0.0),
+            "Model turn finished",
+        );
     }
 }
 
@@ -1594,5 +1730,68 @@ mod tests {
         assert!(json_protocol.supports(tauqe_protocol::LlmCapability::ToolchainVerify));
         // The structured edits protocol never advertises plan capabilities.
         assert!(!json_protocol.supports(tauqe_protocol::LlmCapability::PlanUpdate));
+    }
+
+    #[tokio::test]
+    async fn test_handle_model_cancel_soft_keeps_operation_active() {
+        let (out, _rx) = crate::transport::OutChannel::new();
+        let (hist_tx, _hist_rx) = tokio::sync::mpsc::unbounded_channel();
+        let state = AppState::new(
+            tauqe_core::config::AppConfig::default(),
+            std::path::PathBuf::from("/nonexistent"),
+            hist_tx,
+            out,
+        );
+
+        let operation = state.try_begin_operation().expect("register operation");
+        let soft_rx = operation.soft_stop_receiver();
+        let cancel_rx = operation.cancel_receiver();
+        assert!(!*soft_rx.borrow());
+        assert!(!*cancel_rx.borrow());
+
+        let req = Request {
+            id: tauqe_protocol::RequestId::Number(1),
+            method: tauqe_protocol::methods::MODEL_CANCEL.to_string(),
+            params: Some(serde_json::json!({ "mode": "soft" })),
+        };
+        let res = handle_model_cancel(req, &state).await;
+        assert!(res.error.is_none());
+
+        // A soft stop raises the graceful signal but leaves the operation
+        // registered so the batch can finish its current member.
+        assert!(*soft_rx.borrow());
+        assert!(!*cancel_rx.borrow());
+        assert!(state.is_operation_active());
+    }
+
+    #[tokio::test]
+    async fn test_handle_model_cancel_hard_clears_operation() {
+        let (out, _rx) = crate::transport::OutChannel::new();
+        let (hist_tx, _hist_rx) = tokio::sync::mpsc::unbounded_channel();
+        let state = AppState::new(
+            tauqe_core::config::AppConfig::default(),
+            std::path::PathBuf::from("/nonexistent"),
+            hist_tx,
+            out,
+        );
+
+        let operation = state.try_begin_operation().expect("register operation");
+        let soft_rx = operation.soft_stop_receiver();
+        let cancel_rx = operation.cancel_receiver();
+
+        // Legacy clients omit the mode entirely; the default is an immediate
+        // abort.
+        let req = Request {
+            id: tauqe_protocol::RequestId::Number(1),
+            method: tauqe_protocol::methods::MODEL_CANCEL.to_string(),
+            params: None,
+        };
+        let res = handle_model_cancel(req, &state).await;
+        assert!(res.error.is_none());
+
+        // A hard stop delivers the cancel signal and clears the registration.
+        assert!(*cancel_rx.borrow());
+        assert!(!*soft_rx.borrow());
+        assert!(!state.is_operation_active());
     }
 }

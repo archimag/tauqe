@@ -78,6 +78,17 @@ pub fn render_footer(frame: &mut ratatui::Frame, state: &AppState, area: Rect) {
             Style::default().fg(status_color).bold(),
         ));
 
+        // A graceful batch stop is in flight: the current member finishes and
+        // the queue halts before the next one, so the developer sees exactly
+        // which stop is pending.
+        if state.batch_stopping {
+            footer_spans.push(Span::raw(" "));
+            footer_spans.push(Span::styled(
+                "[Stopping after current step]",
+                Style::default().fg(Color::Yellow).bold(),
+            ));
+        }
+
         // Turn telemetry (phase pipeline, round/detail, and the active file) is
         // rendered unconditionally while a turn owns the interface, so a
         // transient notification can never erase the phase pipeline or the file
@@ -419,6 +430,33 @@ mod tests {
         assert!(
             content.contains("Patch applied"),
             "notification must remain visible next to the telemetry: {content:?}"
+        );
+    }
+
+    #[test]
+    fn busy_footer_shows_soft_stop_indicator() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let backend = TestBackend::new(120, 3);
+        let mut terminal = Terminal::new(backend).expect("terminal created");
+        let mut state = crate::app::test_state();
+        state.model.status = TurnStatus::Responding;
+        state.model.is_batch = true;
+        state.batch_stopping = true;
+
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                render_footer(frame, &state, area);
+            })
+            .expect("draw succeeded");
+
+        let buffer = terminal.backend().buffer();
+        let content: String = buffer.content().iter().map(|cell| cell.symbol()).collect();
+        assert!(
+            content.contains("Stopping after current step"),
+            "the soft-stop indicator must be visible: {content:?}"
         );
     }
 }

@@ -136,11 +136,10 @@ pub fn find_server_binary() -> PathBuf {
 /// Resolves the repository root by walking up from the current working
 /// directory until a `.git` entry is found.
 ///
-/// The server keeps its session state in `.tauqe` at the repository root, so
-/// the client must place its own server log there as well; otherwise launching
-/// the TUI from a subdirectory would scatter `.tauqe` across the tree. When no
-/// repository is detected, the current directory is used so the TUI still runs
-/// outside version control.
+/// The server keeps its journal in `.tauqe` at the repository root. The client
+/// only derives that path to report where the log lives; it never opens the
+/// file, so the server stays the sole writer. When no repository is detected,
+/// the current directory is used so the TUI still runs outside version control.
 fn resolve_repo_root() -> PathBuf {
     let start = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let mut current = start.as_path();
@@ -157,21 +156,17 @@ fn resolve_repo_root() -> PathBuf {
 
 pub async fn start_server() -> anyhow::Result<(Child, ChildStdin, Lines<BufReader<ChildStdout>>, PathBuf)> {
     let server_path = find_server_binary();
-    let tauqe_dir = resolve_repo_root().join(".tauqe");
-    let log_path = match std::fs::create_dir_all(&tauqe_dir) {
-        Ok(_) => tauqe_dir.join("server.log"),
-        Err(_) => std::env::temp_dir().join("tauqe-server.log"),
-    };
-    let stderr_file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)
-        .with_context(|| format!("Failed to open server log file at '{}'", log_path.display()))?;
+    // The server owns its journal: it opens `.tauqe/server.log` through the
+    // rotating file appender in `logging`. The client only derives the same
+    // path to report where the log lives in disconnection notifications and
+    // never opens the file, so no second descriptor competes with the server's
+    // rotation.
+    let log_path = resolve_repo_root().join(".tauqe").join("server.log");
 
     let mut server_child = tokio::process::Command::new(&server_path)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::from(stderr_file))
+        .stderr(Stdio::null())
         .spawn()
         .with_context(|| {
             format!(

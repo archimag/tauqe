@@ -11,14 +11,15 @@ pub mod header;
 pub mod wrap;
 
 use crate::dialogs::render::{
-    render_confirm_cancel_popup, render_confirm_clear_auto_popup,
-    render_confirm_clear_history_popup, render_confirm_clear_user_popup,
-    render_confirm_delete_plan_popup, render_confirm_delete_review_popup,
-    render_confirm_detach_focus_popup, render_confirm_execute_review_popup,
-    render_confirm_execute_scope_popup, render_confirm_quit_popup, render_confirm_undo_popup,
-    render_disconnected_popup, render_help_popup,
-    render_plan_refine_blocked_dialog, render_plan_refine_dialog, render_prompt_modal,
-    render_review_dialog, render_selection_dialog, render_squash_popup, render_status_dialog,
+    render_confirm_batch_cancel_popup, render_confirm_cancel_popup,
+    render_confirm_clear_auto_popup, render_confirm_clear_history_popup,
+    render_confirm_clear_user_popup, render_confirm_delete_plan_popup,
+    render_confirm_delete_review_popup, render_confirm_detach_focus_popup,
+    render_confirm_execute_review_popup, render_confirm_execute_scope_popup,
+    render_confirm_quit_popup, render_confirm_undo_popup, render_disconnected_popup,
+    render_help_popup, render_plan_refine_blocked_dialog, render_plan_refine_dialog,
+    render_prompt_modal, render_review_dialog, render_selection_dialog, render_squash_popup,
+    render_status_dialog,
 };
 use crate::views::context::render_context_view;
 use crate::views::develop::render::render_develop_view;
@@ -147,6 +148,7 @@ pub fn render_ui(frame: &mut ratatui::Frame, state: &mut AppState) {
         }
         Some(ActiveModal::ConfirmCancel) => render_confirm_cancel_popup(frame, state),
         Some(ActiveModal::ConfirmQuit) => render_confirm_quit_popup(frame, state),
+        Some(ActiveModal::BatchCancel) => render_confirm_batch_cancel_popup(frame, state),
         Some(ActiveModal::ClearAuto) => render_confirm_clear_auto_popup(frame, state),
         Some(ActiveModal::ClearUser) => render_confirm_clear_user_popup(frame, state),
         Some(ActiveModal::ConfirmUndo) => render_confirm_undo_popup(frame, state),

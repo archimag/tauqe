@@ -1,4 +1,4 @@
-# Recipe по умолчанию: запускает dev-окружение
+# Запуск dev-окружения по умолчанию
 default: dev
 
 # Собрать сервер и запустить TUI для разработки
@@ -6,51 +6,20 @@ dev *args="":
     cargo build -p tauqe-server
     cargo run -p tauqe-tui -- {{args}}
 
-# Быстрая проверка всех пакетов воркспейса
-check:
-    cargo check --workspace --all-targets
-
-# Запуск тестов во всех пакетах
-test *args="":
-    cargo test --workspace {{args}}
-
-# Запуск clippy с подсветкой ошибок и предупреждений
-clippy:
-    cargo clippy --workspace --all-targets -- -D warnings
-
-# Автоматическое форматирование исходного кода
-fmt:
-    cargo fmt --all
-
-# Проверка форматирования без изменения файлов
-fmt-check:
-    cargo fmt --all -- --check
-
-# Сборка всех пакетов воркспейса в debug-режиме
-build:
-    cargo build --workspace
-
-# Сборка релизных бинарников tauqe-server и tauqe-tui
-release:
-    cargo build --release -p tauqe-server -p tauqe-tui
-
-# Установка tauqe-server и tauqe в систему (~/.cargo/bin)
+# Установка релизных версий tauqe-server и tauqe в систему (~/.cargo/bin)
+# (cargo install по умолчанию всегда собирает бинарники в --release режиме)
 install:
     cargo install --path crates/server --locked
     cargo install --path crates/tui --locked
-    @echo "Tauqe успешно установлен! Доступна команда 'tauqe'."
+    @echo "Tauqe успешно установлен в release-режиме! Доступна команда 'tauqe'."
 
-# Очистка артефактов сборки
-clean:
-    cargo clean
+# Интерактивный просмотр и анализ журнала сервера через lnav
+logs *args="":
+    lnav -I .lnav {{args}} .tauqe/server.log
 
-# Build mdBook documentation
-docs-build:
-    mdbook build docs
-
-# Serve mdBook documentation with live reload
-docs-serve *args="":
-    mdbook serve docs {{args}}
+# Живой просмотр журнала сервера в lnav (с автопереходом в конец файла и отслеживанием)
+logs-live:
+    lnav -I .lnav -c ':goto 100%' .tauqe/server.log
 
 # Подсчет строк кода проекта (включая тесты) с помощью tokei
 loc *args="crates":

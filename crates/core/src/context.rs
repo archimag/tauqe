@@ -282,33 +282,25 @@ impl ContextManager {
 
     pub fn get_state(&self) -> ContextState {
         let mut items = Vec::new();
-        for it in self.pinned.values() {
-            let mut it = it.clone();
-            if let Some(eff) = self.effective_access_for(&it.path) {
-                it.access = eff;
-            }
-            items.push(it);
-        }
-        for it in self.user.values() {
-            let mut it = it.clone();
-            if let Some(eff) = self.effective_access_for(&it.path) {
-                it.access = eff;
-            }
-            items.push(it);
-        }
-        for it in self.auto.values() {
-            let mut it = it.clone();
-            if let Some(eff) = self.effective_access_for(&it.path) {
-                it.access = eff;
-            }
-            items.push(it);
-        }
-
         let mut seen = std::collections::HashSet::new();
         let mut total_estimated_tokens = 0u64;
-        for it in &items {
-            if seen.insert(&it.path) {
-                total_estimated_tokens += it.estimated_tokens;
+
+        // Emit every context path exactly once, in pinned -> user -> auto order.
+        // A file present in the pinned layer must never be duplicated when it
+        // also lives in another layer (for example an editable override), so the
+        // first owning layer wins and the merged effective access is applied to
+        // the single emitted item.
+        for layer in [&self.pinned, &self.user, &self.auto] {
+            for it in layer.values() {
+                if !seen.insert(it.path.clone()) {
+                    continue;
+                }
+                let mut item = it.clone();
+                if let Some(eff) = self.effective_access_for(&item.path) {
+                    item.access = eff;
+                }
+                total_estimated_tokens += item.estimated_tokens;
+                items.push(item);
             }
         }
 
@@ -412,13 +404,24 @@ impl ContextManager {
             ContextLayer::Auto => {
                 if let Some(user_item) = self.user.get_mut(&clean_path) {
                     upgrade_access(user_item, access)
-                } else if self.pinned.contains_key(&clean_path) {
-                    // Pinned entries are owned by configuration and are rebuilt
-                    // on reload, so an editable override is tracked in the auto
-                    // layer instead of mutating the pinned entry in place. A
-                    // read-only request is a no-op because pinned is already
-                    // read-only.
-                    access == ContextAccess::Editable && store_item(&mut self.auto, item.clone())
+                } else if let Some(pinned_item) = self.pinned.get(&clean_path).cloned() {
+                    // A pinned entry is owned by configuration and is always
+                    // present in context, so it must never be duplicated into
+                    // the auto layer. An editable request is persisted as a
+                    // user-layer override (mirroring set_access); a read-only
+                    // request matches the pinned base access and is a no-op.
+                    if access == ContextAccess::Editable
+                        && pinned_item.access != ContextAccess::Editable
+                    {
+                        let override_item = ContextItem {
+                            access: ContextAccess::Editable,
+                            layer: ContextLayer::User,
+                            ..pinned_item
+                        };
+                        store_item(&mut self.user, override_item)
+                    } else {
+                        false
+                    }
                 } else {
                     store_item(&mut self.auto, item.clone())
                 }
@@ -1003,6 +1006,41 @@ mod tests {
 
         cm.add_auto_file("pinned.rs", ContextAccess::Editable).unwrap();
         assert!(cm.is_editable("pinned.rs").unwrap());
+    }
+
+    #[test]
+    fn test_auto_request_on_pinned_file_never_duplicates_into_auto_layer() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        std::fs::write(root.join("pinned.rs"), "fn pinned() {}").unwrap();
+
+        let mut cm = ContextManager::new(root);
+        cm.load_pinned(&["pinned.rs".to_string()]);
+        assert!(!cm.is_editable("pinned.rs").unwrap());
+
+        // The model requests the already-pinned file as editable.
+        cm.add_auto_file("pinned.rs", ContextAccess::Editable).unwrap();
+
+        // Access is upgraded without duplicating the pinned file into auto.
+        assert!(cm.is_editable("pinned.rs").unwrap());
+        assert!(cm.auto_files().is_empty());
+
+        // A read-only re-request stays a no-op for pinned files.
+        let rev_before = cm.get_state().revision;
+        cm.add_auto_file("pinned.rs", ContextAccess::ReadOnly).unwrap();
+        assert_eq!(cm.get_state().revision, rev_before);
+        assert!(cm.auto_files().is_empty());
+
+        // The emitted context state reports the path exactly once.
+        let state = cm.get_state();
+        let rows: Vec<_> = state
+            .items
+            .iter()
+            .filter(|i| i.path == "pinned.rs")
+            .collect();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].access, ContextAccess::Editable);
+        assert_eq!(rows[0].layer, ContextLayer::Pinned);
     }
 
     #[test]

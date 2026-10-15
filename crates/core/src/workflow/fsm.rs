@@ -371,6 +371,30 @@ fn merge_text(accumulated: String, banner: &str, new_text: &str) -> String {
     )
 }
 
+/// Logs an FSM phase transition with its bounded-turn metadata.
+///
+/// Only metadata is recorded: workflow name, model, phase label, round
+/// counters, and the isolation flag. Prompt text, file contents, diffs, and
+/// repo maps are never written, honoring the anti-bloat logging invariant.
+fn log_fsm_phase(
+    workflow: &str,
+    model: &ModelRef,
+    is_isolated_step: bool,
+    phase: tauqe_protocol::TurnPhase,
+    round: Option<usize>,
+    max_rounds: Option<usize>,
+) {
+    tracing::info!(
+        workflow = workflow,
+        model = %model,
+        isolated_step = is_isolated_step,
+        phase = %phase,
+        round = ?round,
+        max_rounds = ?max_rounds,
+        "turn phase"
+    );
+}
+
 /// Whether a prompt opens a discussion turn rather than a develop turn.
 ///
 /// Discussion turns are assembled by the server with a typed discussion heading,
@@ -574,6 +598,7 @@ async fn finalize_blocked_turn(
     plans: &[tauqe_protocol::DiscussionPlanUpdate],
     mode: crate::plan::storage::PlanMutationMode,
 ) -> FsmTurnOutcome {
+    tracing::warn!(reason = %reason, "bounded turn blocked");
     rollback_or_log(policy, repo_root).await;
     context_manager.clear_auto();
     context_manager.prune_missing_files();
@@ -758,6 +783,14 @@ pub(super) async fn run_fsm_turn_body(
         crate::plan::storage::PlanMutationMode::Develop
     };
 
+    log_fsm_phase(
+        workflow_name,
+        model,
+        is_isolated_step,
+        tauqe_protocol::TurnPhase::Proposal,
+        Some(1),
+        None,
+    );
     let _ = stream_tx
         .send(StreamEvent::TurnPhase {
             phase: tauqe_protocol::TurnPhase::Proposal,
@@ -872,6 +905,24 @@ pub(super) async fn run_fsm_turn_body(
         }
 
         discovery_round += 1;
+        log_fsm_phase(
+            workflow_name,
+            model,
+            is_isolated_step,
+            tauqe_protocol::TurnPhase::Discovery,
+            Some(discovery_round),
+            Some(options.max_discovery_rounds),
+        );
+        tracing::info!(
+            workflow = workflow_name,
+            model = %model,
+            round = discovery_round,
+            requested = requests.len(),
+            doc_topics = doc_topics.len(),
+            added = outcome.added.len(),
+            missing = outcome.missing.len(),
+            "context discovery round completed"
+        );
         let _ = stream_tx
             .send(StreamEvent::TurnPhase {
                 phase: tauqe_protocol::TurnPhase::Discovery,
@@ -911,6 +962,14 @@ pub(super) async fn run_fsm_turn_body(
         let _ = stream_tx
             .send(StreamEvent::TextDelta(banner.clone()))
             .await;
+        log_fsm_phase(
+            workflow_name,
+            model,
+            is_isolated_step,
+            tauqe_protocol::TurnPhase::Proposal,
+            Some(discovery_round + 1),
+            None,
+        );
         let _ = stream_tx
             .send(StreamEvent::TurnPhase {
                 phase: tauqe_protocol::TurnPhase::Proposal,
@@ -971,6 +1030,13 @@ pub(super) async fn run_fsm_turn_body(
 
     // Terminal error short-circuits the turn before any staging.
     if let Some(message) = extract_error_message(state.terminal_outcome.as_ref()) {
+        tracing::error!(
+            workflow = workflow_name,
+            model = %model,
+            isolated_step = is_isolated_step,
+            error = %message,
+            "bounded turn terminated by an error outcome"
+        );
         rollback_or_log(policy, &repo_root).await;
         context_manager.clear_auto();
         context_manager.prune_missing_files();
@@ -1018,6 +1084,12 @@ pub(super) async fn run_fsm_turn_body(
                 }
             }
         }
+        tracing::info!(
+            workflow = workflow_name,
+            model = %model,
+            isolated_step = is_isolated_step,
+            "bounded turn produced an answer without edits"
+        );
         let _ = stream_tx.send(StreamEvent::Done).await;
         let result = ModelResult::Answer {
             text: answer_text.clone(),
@@ -1031,6 +1103,14 @@ pub(super) async fn run_fsm_turn_body(
     let mut succeeded_files: HashSet<String> = HashSet::new();
     let mut last_failed_errors: HashMap<String, EditError> = HashMap::new();
 
+    log_fsm_phase(
+        workflow_name,
+        model,
+        is_isolated_step,
+        tauqe_protocol::TurnPhase::Staging,
+        Some(1),
+        Some(options.max_retries),
+    );
     let _ = stream_tx
         .send(StreamEvent::TurnPhase {
             phase: tauqe_protocol::TurnPhase::Staging,
@@ -1045,6 +1125,14 @@ pub(super) async fn run_fsm_turn_body(
         if !current_edits.is_empty() {
             let stage_res =
                 policy.staging(&repo_root, context_manager, &current_edits, staged_state.as_ref()).await;
+            tracing::info!(
+                workflow = workflow_name,
+                model = %model,
+                attempt = attempt,
+                succeeded_files = stage_res.successful_paths.len(),
+                failed_files = stage_res.failed_files.len(),
+                "staging round completed"
+            );
             staged_state = Some(stage_res.staged_state);
             succeeded_files.extend(stage_res.successful_paths);
             cumulative_edits.extend(stage_res.successful_edits);
@@ -1072,6 +1160,15 @@ pub(super) async fn run_fsm_turn_body(
             .await;
         for (path, error) in &last_failed_errors {
             let reason = format_patch_retry_reason(error);
+            tracing::warn!(
+                workflow = workflow_name,
+                model = %model,
+                attempt = attempt,
+                max_retries = options.max_retries,
+                path = path.as_str(),
+                reason = %reason,
+                "patch retry requested"
+            );
             let _ = stream_tx
                 .send(StreamEvent::EditFileRetrying {
                     path: path.clone(),
@@ -1161,6 +1258,13 @@ pub(super) async fn run_fsm_turn_body(
     }
 
     if let Some(message) = extract_error_message(state.terminal_outcome.as_ref()) {
+        tracing::error!(
+            workflow = workflow_name,
+            model = %model,
+            isolated_step = is_isolated_step,
+            error = %message,
+            "bounded turn terminated by an error outcome"
+        );
         rollback_or_log(policy, &repo_root).await;
         context_manager.clear_auto();
         context_manager.prune_missing_files();
@@ -1180,6 +1284,15 @@ pub(super) async fn run_fsm_turn_body(
     }
 
     if !last_failed_errors.is_empty() || !current_protocol_errors.is_empty() {
+        tracing::warn!(
+            workflow = workflow_name,
+            model = %model,
+            isolated_step = is_isolated_step,
+            max_retries = options.max_retries,
+            failed_files = last_failed_errors.len(),
+            protocol_errors = current_protocol_errors.len(),
+            "patch application attempts exhausted"
+        );
         let mut err_lines = Vec::new();
         for err in &current_protocol_errors {
             err_lines.push(format!("Protocol error: {}", err));
@@ -1208,6 +1321,12 @@ pub(super) async fn run_fsm_turn_body(
     }
 
     if cumulative_edits.is_empty() {
+        tracing::warn!(
+            workflow = workflow_name,
+            model = %model,
+            isolated_step = is_isolated_step,
+            "no edits were successfully staged"
+        );
         let _ = stream_tx.send(StreamEvent::Done).await;
         let result = ModelResult::Edit {
             summary: "FSM edits failed".to_string(),
@@ -1269,6 +1388,14 @@ pub(super) async fn run_fsm_turn_body(
     }
 
     if let Some(mut verify_request) = current_verify {
+        log_fsm_phase(
+            workflow_name,
+            model,
+            is_isolated_step,
+            tauqe_protocol::TurnPhase::Verification,
+            None,
+            None,
+        );
         let _ = stream_tx
             .send(StreamEvent::TurnPhase {
                 phase: tauqe_protocol::TurnPhase::Verification,
@@ -1314,6 +1441,14 @@ pub(super) async fn run_fsm_turn_body(
         let mut healing_protocol_errors = Vec::new();
         while !verify_outcome.success && auto_heal && healing_attempt < options.max_retries {
             healing_attempt += 1;
+            log_fsm_phase(
+                workflow_name,
+                model,
+                is_isolated_step,
+                tauqe_protocol::TurnPhase::Healing,
+                Some(healing_attempt),
+                Some(options.max_retries),
+            );
             let _ = stream_tx
                 .send(StreamEvent::TurnPhase {
                     phase: tauqe_protocol::TurnPhase::Healing,
@@ -1491,6 +1626,14 @@ pub(super) async fn run_fsm_turn_body(
             }
             let (commit_hash, commit_error) =
                 guard.finalize(&total_changed_files, &summary).await;
+            tracing::info!(
+                workflow = workflow_name,
+                model = %model,
+                isolated_step = is_isolated_step,
+                changed_files = total_changed_files.len(),
+                committed = commit_hash.is_some(),
+                "bounded turn applied and verified edits"
+            );
             let ctx_state = guard.context_manager.get_state();
             let _ = stream_tx.send(StreamEvent::ContextChanged(ctx_state)).await;
             let _ = stream_tx.send(StreamEvent::Done).await;
@@ -1513,6 +1656,12 @@ pub(super) async fn run_fsm_turn_body(
         } else {
             total_changed_files
         };
+        tracing::warn!(
+            workflow = workflow_name,
+            model = %model,
+            isolated_step = is_isolated_step,
+            "verification failed after healing attempts"
+        );
         let _ = stream_tx.send(StreamEvent::Done).await;
         let result = ModelResult::Edit {
             summary,
@@ -1532,6 +1681,14 @@ pub(super) async fn run_fsm_turn_body(
     }
     let (commit_hash, commit_error) =
         guard.finalize(&total_changed_files, &summary).await;
+    tracing::info!(
+        workflow = workflow_name,
+        model = %model,
+        isolated_step = is_isolated_step,
+        changed_files = total_changed_files.len(),
+        committed = commit_hash.is_some(),
+        "bounded turn finalized edits without verification"
+    );
     let ctx_state = guard.context_manager.get_state();
     let _ = stream_tx.send(StreamEvent::ContextChanged(ctx_state)).await;
     let _ = stream_tx.send(StreamEvent::Done).await;
@@ -1625,6 +1782,13 @@ async fn run_proposal_step(
         .as_deref()
         .map(crate::prompt::estimate_tokens)
         .unwrap_or(0);
+    tracing::info!(
+        workflow = workflow_name,
+        model = %model,
+        isolated_step = is_isolated_step,
+        repo_map_tokens = repomap_tokens,
+        "proposal round prepared"
+    );
     let _ = stream_tx
         .send(StreamEvent::RepoMapTokens(repomap_tokens))
         .await;

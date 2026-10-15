@@ -754,6 +754,10 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
         events::PLAN_BATCH_FINISHED => {
             if let Some(params) = ev.params {
                 if let Ok(data) = serde_json::from_value::<PlanBatchFinishedEvent>(params) {
+                    // The batch has terminated: clear the batch-scoped state so
+                    // a later interruption never targets a finished queue.
+                    st.batch_stopping = false;
+                    st.model.is_batch = false;
                     notify_batch_finished(&st, "Plan", &data.summary);
                 }
             }
@@ -761,6 +765,8 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
         events::REVIEW_BATCH_FINISHED => {
             if let Some(params) = ev.params {
                 if let Ok(data) = serde_json::from_value::<ReviewBatchFinishedEvent>(params) {
+                    st.batch_stopping = false;
+                    st.model.is_batch = false;
                     notify_batch_finished(&st, "Review", &data.summary);
                 }
             }
@@ -877,6 +883,7 @@ fn format_batch_summary(kind: &str, summary: &BatchFinishSummary) -> (String, St
         BatchFinishStatus::Failed => "failed",
         BatchFinishStatus::Blocked => "blocked",
         BatchFinishStatus::Cancelled => "cancelled",
+        BatchFinishStatus::Stopped => "stopped",
     };
     let title = format!("TAUQE {} batch {}", kind, status_word);
     let mut body = format!(

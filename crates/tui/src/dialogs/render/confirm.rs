@@ -5,10 +5,12 @@
 //! builders, so the action-button geometry derived from these parameters is
 //! identical for rendering and hit-testing and cannot drift (Conventions.md §7).
 
+use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Style, Stylize};
 use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 
-use crate::app::AppState;
+use crate::app::{AppState, BatchCancelButton};
 use crate::ui::header::truncate_to_width;
 
 use super::{render_modal_confirm, ConfirmModalParams};
@@ -617,6 +619,137 @@ pub fn render_confirm_clear_history_popup(frame: &mut ratatui::Frame, state: &Ap
     render_modal_confirm(frame, clear_history_params(state));
 }
 
+/// Action-button labels of the batch-cancellation dialog, in left-to-right
+/// order. The geometry and the renderer derive their layout from this single
+/// list so the drawn buttons are always the clickable ones.
+const BATCH_CANCEL_LABELS: [&str; 3] = [" Continue (C) ", " Soft Stop (S) ", " Hard Stop (H) "];
+const BATCH_CANCEL_WIDTH: u16 = 64;
+const BATCH_CANCEL_GAP: u16 = 2;
+
+/// Body content of the batch-cancellation dialog.
+///
+/// The three actions are described explicitly so the choice between keeping the
+/// queue, stopping after the current member, and aborting immediately is never
+/// ambiguous (Conventions.md §7).
+pub fn batch_cancel_body_lines() -> Vec<Line<'static>> {
+    vec![
+        Line::raw(""),
+        Line::from(Span::styled(
+            "Cancel batch execution?",
+            Style::default().bold().fg(Color::Yellow),
+        )),
+        Line::raw(""),
+        Line::from("Continue keeps the batch running."),
+        Line::from("Soft Stop finishes the current step, then stops the queue."),
+        Line::from(Span::styled(
+            "Hard Stop aborts the current step immediately.",
+            Style::default().fg(Color::DarkGray),
+        )),
+    ]
+}
+
+/// Exact geometry and action-button bounds of the batch-cancellation dialog.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BatchCancelModalGeometry {
+    pub area: Rect,
+    pub continue_button: Rect,
+    pub soft_stop_button: Rect,
+    pub hard_stop_button: Rect,
+}
+
+/// Computes the geometry and button bounds of the batch-cancellation dialog so
+/// that rendering and mouse hit-testing agree on the same layout.
+pub fn batch_cancel_modal_geometry(term: Rect) -> BatchCancelModalGeometry {
+    let body_lines_count = batch_cancel_body_lines().len();
+    let needed_height = (body_lines_count as u16).saturating_add(7).max(10);
+    let height_percent = (needed_height * 100 / term.height.max(1)).clamp(25, 90);
+    let area = crate::ui::centered_rect(BATCH_CANCEL_WIDTH, height_percent, term);
+
+    let inner_y = area.y + 1;
+    let inner_h = area.height.saturating_sub(2);
+    let inner_x = area.x + 1;
+    let inner_w = area.width.saturating_sub(2);
+    let btn_y = inner_y + inner_h.saturating_sub(3);
+
+    let widths: [u16; 3] = [
+        BATCH_CANCEL_LABELS[0].chars().count() as u16,
+        BATCH_CANCEL_LABELS[1].chars().count() as u16,
+        BATCH_CANCEL_LABELS[2].chars().count() as u16,
+    ];
+    let total = widths[0] + widths[1] + widths[2] + BATCH_CANCEL_GAP * 2;
+    let start = inner_x + inner_w.saturating_sub(total) / 2;
+
+    let continue_button = Rect::new(start, btn_y, widths[0], 1);
+    let soft_x = start + widths[0] + BATCH_CANCEL_GAP;
+    let soft_stop_button = Rect::new(soft_x, btn_y, widths[1], 1);
+    let hard_x = soft_x + widths[1] + BATCH_CANCEL_GAP;
+    let hard_stop_button = Rect::new(hard_x, btn_y, widths[2], 1);
+
+    BatchCancelModalGeometry {
+        area,
+        continue_button,
+        soft_stop_button,
+        hard_stop_button,
+    }
+}
+
+/// Renders the three-way batch-cancellation dialog.
+pub fn render_confirm_batch_cancel_popup(frame: &mut ratatui::Frame, state: &AppState) {
+    let geom = batch_cancel_modal_geometry(frame.area());
+
+    frame.render_widget(Clear, geom.area);
+    let outer_block = Block::default()
+        .title(" Cancel Batch Execution ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Yellow));
+    let inner_area = outer_block.inner(geom.area);
+    frame.render_widget(outer_block, geom.area);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(2), Constraint::Length(3)])
+        .split(inner_area);
+
+    let body = Paragraph::new(batch_cancel_body_lines())
+        .alignment(Alignment::Center)
+        .wrap(Wrap { trim: false });
+    frame.render_widget(body, chunks[0]);
+
+    let focused = state.batch_cancel_button;
+    let button_style = |button: BatchCancelButton| {
+        if button == focused {
+            Style::default().bg(Color::Cyan).fg(Color::Black).bold()
+        } else {
+            Style::default().bg(Color::DarkGray).fg(Color::White)
+        }
+    };
+
+    let actions_lines = vec![
+        Line::from(vec![
+            Span::styled(
+                BATCH_CANCEL_LABELS[0],
+                button_style(BatchCancelButton::Continue),
+            ),
+            Span::raw("  "),
+            Span::styled(
+                BATCH_CANCEL_LABELS[1],
+                button_style(BatchCancelButton::SoftStop),
+            ),
+            Span::raw("  "),
+            Span::styled(
+                BATCH_CANCEL_LABELS[2],
+                button_style(BatchCancelButton::HardStop),
+            ),
+        ]),
+        Line::from(Span::styled(
+            "Tab / ← / → focus • Enter/Space execute • s / h / c fast select • Esc cancel",
+            Style::default().fg(Color::Gray),
+        )),
+    ];
+    let actions_widget = Paragraph::new(actions_lines).alignment(Alignment::Center);
+    frame.render_widget(actions_widget, chunks[1]);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -711,5 +844,29 @@ mod tests {
         let texts: Vec<String> = params.body_lines.iter().map(|l| l.to_string()).collect();
         assert!(texts.iter().any(|t| t.contains("Review: All Review Sessions")));
         assert!(texts.iter().any(|t| t.contains("2 finding(s) to resolve")));
+    }
+
+    #[test]
+    fn batch_cancel_buttons_match_hit_geometry() {
+        let term = Rect::new(0, 0, 100, 30);
+        let mut terminal = Terminal::new(TestBackend::new(term.width, term.height)).unwrap();
+        let mut state = crate::app::test_state();
+        state.confirm_batch_cancel = true;
+
+        terminal
+            .draw(|f| render_confirm_batch_cancel_popup(f, &state))
+            .unwrap();
+
+        let geom = batch_cancel_modal_geometry(term);
+        let buffer = terminal.backend().buffer();
+        let read = |rect: Rect| -> String {
+            (rect.x..rect.x + rect.width)
+                .map(|x| buffer[(x, rect.y)].symbol())
+                .collect()
+        };
+
+        assert!(read(geom.continue_button).contains("Continue"));
+        assert!(read(geom.soft_stop_button).contains("Soft Stop"));
+        assert!(read(geom.hard_stop_button).contains("Hard Stop"));
     }
 }

@@ -91,6 +91,7 @@ In the Develop view, TAUQE resolves the tension between text editing and inspect
 ## 5.3 Input Safety and Onboarding Protection
 
 - **Commands require modifiers:** Destructive or state-changing actions use explicit modifiers (`Ctrl+Z` / `Alt+U` for Undo, `F6` / `Ctrl+S` for Squash, `Alt+C` for copying responses).
+- **Universal abort chord (`C-g`):** Pressing `Ctrl+G` (Emacs `keyboard-quit`) is normalized to `Esc` before any handler runs, so a single chord aborts the active generation, dismisses the top-most modal, returns from an auxiliary view, or detaches the active discussion focus exactly as `Esc` would. It is never wired to `SIGINT`, so the terminal's standard `Ctrl+C` behavior is preserved.
 - **Draft protection on exit:** Pressing `Ctrl+Q` prompts for confirmation whenever a prompt draft is non-empty, a model turn is active, or an unapplied squash diff exists, preventing accidental loss of uncommitted work.
 - **Onboarding isolation:** During initial configuration (`ViewMode::Onboarding`), view switching keys (`F1..F5`, `Ctrl+1..5`, `Alt+1..5`) and header mouse clicks are locked until setup is completed, preventing accidental bypass of credential verification.
 - **Deterministic onboarding sequence:** Initial setup advances through a fixed order — Git, Configuration, Credentials, Layout, Command Modifier, Ready — derived solely from completion flags. Optional phases the developer deliberately skips are recorded, so the flow never loops back and no step is silently dropped.
@@ -107,6 +108,7 @@ Modal dialogs follow a unified, three-tier layout standard designed for keyboard
 - **Fast Accelerators:** In confirmation dialogs, pressing `y` / `Y` confirms immediately, while `n` / `N`, `q`, or `Esc` cancels.
 - **Intentional Status Dialogs:** In Plans and Review, task and finding statuses are selected through explicit modal dialogs rather than accidental cycling. Plans offer Discussion, Todo, InProgress, Done, Blocked, and Cancelled (`1`..`6`); Review offers Discussion, Todo, InProgress, Fixed, and Rejected (`1`..`5`). Choose a target status using direct numeric keys, or navigate with `n` / `p` and confirm with `Enter` / `Space`.
 - **Git Squash Safety:** Within the squash dialog (`F6` / `Ctrl+S`), `Enter` or `Space` folds/unfolds changed files in the file list, and `Enter` in the message editor inserts a newline. Triggering the squash requires `Ctrl+Enter` or `Ctrl+S`, which opens an explicit confirmation dialog summarizing affected commits.
+- **Batch Cancellation Dialog (Three-Way Stop):** When a running plan or review batch receives a cancellation request (`Ctrl+C`), the dialog offers three explicit actions instead of a binary confirm: `Continue`, `Soft Stop`, and `Hard Stop`. `Soft Stop` lets the current step finish its bounded turn, compiler verification, and Git commit before the queue halts; `Hard Stop` aborts the current step immediately. `Continue` holds the safe default focus, so an accidental keypress never discards already-committed work. Direct accelerators `c` (Continue), `s` (Soft Stop), and `h` (Hard Stop) choose an action without moving focus, while `Tab`, `←` / `→`, `Enter` / `Space`, and `Esc` follow the standard dialog navigation rules above. While a soft stop is pending, the footer shows `[Stopping after current step]`, so a graceful drain is never confused with an immediate abort.
 
 ---
 
@@ -185,11 +187,12 @@ The natural unit of waiting differs between an interactive Develop turn and a ba
 
 ### 5.6.2 Aggregated Batch Notifications
 
-Batch supervisors emit a typed completion event (`plan/batch_finished`, `review/batch_finished`) once the internal `BatchExecution` loop ends. This event carries the final status (`Completed`, `Failed`, `Blocked`, `Cancelled`), the executed and scheduled step counts, and the elapsed time. The TUI marks batch turns, suppresses the usual per-turn signal on each step's `MODEL_FINISHED`, and fires exactly one aggregated notification from this final event:
+Batch supervisors emit a typed completion event (`plan/batch_finished`, `review/batch_finished`) once the internal `BatchExecution` loop ends. This event carries the final status (`Completed`, `Failed`, `Blocked`, `Cancelled`, `Stopped`), the executed and scheduled step counts, and the elapsed time. The TUI marks batch turns, suppresses the usual per-turn signal on each step's `MODEL_FINISHED`, and fires exactly one aggregated notification from this final event:
 
 - **Normal completion (`Completed`):** A single notification reports the finished status together with the step tally, so the developer learns the outcome of the entire operation at a glance instead of reconstructing it from dozens of individual signals.
 - **Failure or block stop (`Failed` / `Blocked`):** When the batch halts early on a failed or blocked step, the aggregated notification reports the halted status rather than a plain success. The offending step and any blocker reason remain inspectable in the REPL view; the notification only signals that the batch did not run to completion.
 - **Cancellation (`Cancelled`):** A cancelled batch reports the `Cancelled` status through the same single notification.
+- **Graceful stop (`Stopped`):** A soft stop lets the running member finish its turn, verification, and commit, then halts the queue, so the batch reports the `Stopped` status through the same single notification — distinguishing a graceful drain from an immediate abort.
 
 The aggregated notification is gated by the same `tui.toml` settings as single-turn signals (`sound`, `desktop`, `desktop_protocol`, `only_unfocused`, and `min_duration_seconds`), so batching changes only *when* the signal fires — never *how* it is delivered.
 

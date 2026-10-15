@@ -10,6 +10,33 @@ pub struct VerificationOutcome {
     pub report: String,
 }
 
+/// Records the outcome of a whole verification run as a single structured log record.
+fn log_verification_outcome(target: &str, duration_ms: u64, outcome: &VerificationOutcome) {
+    match (outcome.is_cancelled, outcome.success) {
+        (true, _) => tracing::warn!(
+            target = %target,
+            duration_ms,
+            success = false,
+            cancelled = true,
+            "verification cancelled"
+        ),
+        (false, true) => tracing::info!(
+            target = %target,
+            duration_ms,
+            success = true,
+            cancelled = false,
+            "verification finished"
+        ),
+        (false, false) => tracing::warn!(
+            target = %target,
+            duration_ms,
+            success = false,
+            cancelled = false,
+            "verification failed"
+        ),
+    }
+}
+
 /// Executes project verification pipeline according to model's `<verify .../>` request.
 pub async fn run_workflow_verification(
     repo_root: &Path,
@@ -24,6 +51,8 @@ pub async fn run_workflow_verification(
         VerifyTarget::Test => "test",
         VerifyTarget::All => "all",
     };
+    let started = std::time::Instant::now();
+    tracing::info!(target = %target_str, "verification started");
 
     let _ = stream_tx
         .send(StreamEvent::ToolchainStarted {
@@ -51,11 +80,13 @@ pub async fn run_workflow_verification(
         if stream_output || verify_req.on_success == VerifyOnSuccess::Report {
             let _ = stream_tx.send(StreamEvent::TextDelta(note.clone())).await;
         }
-        return VerificationOutcome {
+        let outcome = VerificationOutcome {
             success: true,
             is_cancelled: false,
             report: note,
         };
+        log_verification_outcome(target_str, started.elapsed().as_millis() as u64, &outcome);
+        return outcome;
     }
 
     let is_cancelled = results.iter().any(|r| r.is_cancelled);
@@ -73,11 +104,13 @@ pub async fn run_workflow_verification(
         if stream_output {
             let _ = stream_tx.send(StreamEvent::TextDelta(report.clone())).await;
         }
-        return VerificationOutcome {
+        let outcome = VerificationOutcome {
             success: false,
             is_cancelled: true,
             report,
         };
+        log_verification_outcome(target_str, started.elapsed().as_millis() as u64, &outcome);
+        return outcome;
     }
 
     let _ = stream_tx
@@ -121,11 +154,13 @@ pub async fn run_workflow_verification(
         }
     }
 
-    VerificationOutcome {
+    let outcome = VerificationOutcome {
         success: ok,
         is_cancelled: false,
         report,
-    }
+    };
+    log_verification_outcome(target_str, started.elapsed().as_millis() as u64, &outcome);
+    outcome
 }
 
 #[cfg(test)]

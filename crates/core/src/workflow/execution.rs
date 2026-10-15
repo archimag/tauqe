@@ -293,6 +293,15 @@ impl ExecutionMode for SingleExecution {
                             "No valid edits".to_string()
                         };
 
+                        tracing::warn!(
+                            from_tier = ladder_idx,
+                            to_tier = next_idx,
+                            from_model = %current_model,
+                            to_model = %next_m,
+                            effort = ?next_tier.effort,
+                            reason = %reason,
+                            "coder ladder escalation"
+                        );
                         let notice = format!(
                             "\n\n> ⚠️ **Level Up Escalation:** Turn failed on coder tier {} (`{}`, {}). Escalating to tier {} (`{}`)...\n\n",
                             ladder_idx, current_model, reason, next_idx, next_m

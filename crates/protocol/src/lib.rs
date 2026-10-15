@@ -97,10 +97,10 @@ pub use plan::{
     PlanUpdateItemResult, PlanUpdatedEvent,
 };
 pub use review::{
-    ReviewContentDeltaEvent, ReviewDeleteParams, ReviewDeleteResult, ReviewErrorEvent,
-    ReviewExecuteParams, ReviewFinishedEvent, ReviewGetParams, ReviewGetResult, ReviewItem,
-    ReviewItemStatus, ReviewListChangedEvent, ReviewListParams, ReviewListResult,
-    ReviewReasoningDeltaEvent, ReviewSession, ReviewSeverity, ReviewStartParams,
-    ReviewStartedEvent, ReviewStatus, ReviewSummary, ReviewUpdateItemParams,
-    ReviewUpdateItemResult, ReviewUpdatedEvent,
+    ReviewCancelParams, ReviewContentDeltaEvent, ReviewDeleteParams, ReviewDeleteResult,
+    ReviewErrorEvent, ReviewExecuteParams, ReviewFinishedEvent, ReviewGetParams,
+    ReviewGetResult, ReviewItem, ReviewItemStatus, ReviewListChangedEvent, ReviewListParams,
+    ReviewListResult, ReviewReasoningDeltaEvent, ReviewSession, ReviewSeverity,
+    ReviewStartParams, ReviewStartedEvent, ReviewStatus, ReviewSummary,
+    ReviewUpdateItemParams, ReviewUpdateItemResult, ReviewUpdatedEvent,
 };

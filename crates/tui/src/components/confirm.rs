@@ -15,6 +15,7 @@ use ratatui::widgets::{Paragraph, Wrap};
 use crate::app::{ConfirmDialogButton, ModalActionsState};
 use crate::components::editor::is_char_typing;
 use crate::components::modal::ModalFrame;
+use crate::input::is_keyboard_quit;
 use crate::ui::centered_rect;
 
 /// Outcome of resolving a key press inside a confirmation dialog.
@@ -99,6 +100,12 @@ impl ConfirmDialog {
                 ConfirmOutcome::Dismissed
             }
             KeyCode::Esc | KeyCode::Char('q') => {
+                self.reset_to_cancel();
+                ConfirmOutcome::Dismissed
+            }
+            // C-g (keyboard-quit) dismisses every confirmation safely, exactly
+            // like Esc, regardless of which button holds focus.
+            KeyCode::Char('g') if is_keyboard_quit(&key) => {
                 self.reset_to_cancel();
                 ConfirmOutcome::Dismissed
             }
@@ -254,5 +261,13 @@ mod tests {
             dialog.handle_key(key(KeyCode::Esc)),
             ConfirmOutcome::Dismissed
         );
+    }
+
+    #[test]
+    fn ctrl_g_dismisses_safely() {
+        let mut dialog = ConfirmDialog::new();
+        let ctrl_g = KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL);
+        assert_eq!(dialog.handle_key(ctrl_g), ConfirmOutcome::Dismissed);
+        assert!(dialog.is_cancel());
     }
 }

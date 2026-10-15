@@ -153,6 +153,7 @@ The bounded turn is deliberately not implemented as one monolithic routine. The 
 
 - **`SingleExecution`** drives one complete FSM cycle. It is responsible for Coder Ladder escalation — when `auto_level_up` is enabled and healing stalls, the turn is advanced to the next ladder rung within the `Coder` role (see §3.3) — and for cost accounting. The session cost observed before the turn is recorded as *previous*, while the cost accumulated during the turn is recorded as *current*, so the interface can attribute spend to a single turn rather than a blurred running total.
 - **`BatchExecution`** (`workflow/batch.rs`) is a supervisor over a queue of independent steps (implementation plan steps or code review findings). It synchronizes entity statuses (`InProgress`, `Done`, `Todo`), stops the queue on the first failure or cancellation to avoid cascading corruption, and accumulates token and cost usage across the whole chain via `BatchUsage`.
+- The supervisor stops the queue in two distinct ways. A **hard cancellation** aborts the current member immediately and terminates the run. A **soft stop** is observed strictly between members: the running member finishes its bounded turn, compiler verification, and Git commit, and only then does the queue halt before launching the next member. A soft stop never interrupts a step mid-turn, so the work already committed by the finished member is preserved. When both signals are pending before the same member, hard cancellation takes priority, so an explicit reset is never downgraded to a graceful drain. The two modes surface as distinct terminal statuses on the batch completion event (`Stopped` versus `Cancelled`).
 
 Both modes are parameterized by `WorkflowOptions`, which carries retry limits, discovery budgets, history budget, and model configuration. This keeps execution strategy independent of the concrete task being executed.
 
@@ -190,6 +191,8 @@ The `git` module remains a low-level facade over subprocess operations; `ApplyPo
 - **`OpenRouterProvider`** — real network transport.
 - **`MockLlmProvider`** — a scripted provider that replays predetermined responses. It enables deterministic multi-round scenarios (context request, compiler failure, successful healing patch, cancellation) to be exercised in the standard test runner in milliseconds and without any external network call.
 
+Cancellation is observed continuously, not only while the response body is streaming. The transport races the initial `send()` future against the cancellation watch channel with `tokio::select!`, so a turn aborts immediately even while the model is still reasoning and no body bytes have arrived. Without this race, the `Proposal` and `Awaiting` phases would stall until the provider finished generating, leaving cancellation effective only after the first token.
+
 ### Command Normalization: `LlmCapability` and `LlmCommand`
 
 The syntax of a protocol (XML tags or JSON Schema) is kept strictly separate from core business logic.
@@ -198,3 +201,35 @@ The syntax of a protocol (XML tags or JSON Schema) is kept strictly separate fro
 - Model output is decoded into a normalized **`Vec<LlmCommand>`**: `Text`, `Edit`, `ContextRequest`, `ContextDrop`, `DocRequest`, `Verify`, `Plan`, `Scratchpad`, `Outcome`, and `UserLanguage`.
 
 The streaming parser splits the data stream in two. Lightweight streaming events (`EditFileStarted`, `EditHunk`, `TurnPhase`, usage, toolchain status) are emitted to the UI as they arrive for immediate feedback, while the normalized commands are accumulated and handed to the core only once the stream finishes. This is why streaming remains responsive even though the commands themselves are processed deterministically.
+
+---
+
+## 3.8 Observability and Diagnostics
+
+A bounded turn runs detached from the developer's terminal: it streams, stages, and heals without a visible process. To make failures reconstructable after the fact and to keep the harness itself trustworthy, TAUQE records the turn into a structured, size-bounded server journal.
+
+### Structured Server Journal
+
+The `crates/server` daemon owns the observability sink and initializes `tracing-subscriber` at startup. Records are written as one-line JSON documents with millisecond RFC-3339 UTC timestamps into `<repo_root>/.tauqe/server.log`, so the journal stays readable both through plain console tools (`grep`, `tail -f`, `less`) and structured parsers (`jq`, `lnav`).
+
+### Size-Bounded Rotation
+
+The active journal is rotated by size: once it grows past a threshold (10 MiB by default), it is moved into a numbered archive (`server.log.1`) and a fresh active file is opened. Only a bounded number of archives is retained, so the `.tauqe/` directory can never grow without bound.
+
+### Panic Observability
+
+The daemon installs a custom panic hook at startup. Every uncaught panic is captured with its source location, textual payload, and — when `RUST_BACKTRACE` is set — its backtrace, then written as a single `error`-level record with `target = "panic"` before the process unwinds.
+
+### Semantic Traces of the Turn
+
+The turn lifecycle is traced at its significant boundaries rather than at its data plane:
+
+- daemon startup (PID, repository path) and graceful shutdown (stdin EOF, drain phase, forced-abort timeout);
+- RPC transport events (incoming call, sanitized parameter summary, parse failure, per-request duration);
+- operation-slot acquisition and the soft-stop / hard-cancel signals;
+- bounded-turn FSM phase transitions, batch queue steps, Coder Ladder escalation, and replanner activation;
+- toolchain failures and provider/network failures (HTTP status, timeout, stream interruption, `finish_reason: error`).
+
+### Anti-Bloat Guard
+
+The journal never carries raw generation stream deltas, full prompt bodies, context file contents, `RepoMap` dumps, or raw diffs in normal operation. It records interaction metadata, compact identifiers, and aggregated token and time metrics only. This keeps the file analytically useful and prevents a single verbose turn from defeating rotation.

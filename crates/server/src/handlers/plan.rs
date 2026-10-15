@@ -287,6 +287,9 @@ enum BatchOutcome {
     Cancelled {
         completed: usize,
     },
+    Stopped {
+        completed: usize,
+    },
 }
 
 fn publish_plan(state: &Arc<AppState>, repo_root: &Path, plan: Plan, active_id: &str) {
@@ -683,6 +686,7 @@ async fn run_plan_step(
 
     preload_step_files(state, repo_root, &item).await;
     set_step_status(state, repo_root, plan_id, step_id, PlanItemStatus::InProgress);
+    tracing::info!(plan_id = plan_id, step_id = step_id, "plan step started");
 
     // Generate the active turn marker before assembling prompts so the target
     // step prompt and the model turn share the same marker-bound protocol.
@@ -799,8 +803,19 @@ async fn run_plan_step(
         preload_step_files(state, repo_root, &item).await;
 
         if auto_level_up {
+            let from_tier = ladder_idx;
             ladder_idx += 1;
             let tier = models_config.coder_tier(ladder_idx);
+            tracing::warn!(
+                plan_id = plan_id,
+                step_id = step_id,
+                from_tier = from_tier,
+                to_tier = ladder_idx,
+                to_model = %tier.model,
+                effort = ?tier.effort,
+                reason = %reason,
+                "plan step coder escalation"
+            );
             selection = ModelSelection::Specific(tier.model);
             reasoning_effort = tier.effort;
         }
@@ -862,6 +877,12 @@ async fn run_plan_batch(
     let repo_root = state.context.read().await.repo_root().to_path_buf();
     let _ = PlanStorage::save_active_id(&repo_root, Some(plan_id));
 
+    tracing::info!(
+        plan_id = plan_id,
+        scheduled = current_step_ids.len(),
+        "plan batch started"
+    );
+
     let started_at = std::time::Instant::now();
 
     let (stream_tx, _stream_rx) = mpsc::channel::<StreamEvent>(1);
@@ -869,6 +890,11 @@ async fn run_plan_batch(
     // delivered between steps is honored instead of being lost, and the slot
     // stays registered for the batch's entire lifetime.
     let cancel_rx = operation.cancel_receiver();
+    // Soft stop ends the queue gracefully after the current step: the operation
+    // owns the signal, and a `model/cancel` request with `mode: "soft"` raises it
+    // so the current step finishes its turn, verification, and commit before the
+    // queue stops.
+    let soft_stop_rx = operation.soft_stop_receiver();
 
     let max_replans = state.config.lock().await.config.develop.max_replans;
     let mut replans_count = 0usize;
@@ -904,7 +930,7 @@ async fn run_plan_batch(
         };
 
         let report = BatchExecution::new()
-            .run(&steps, &mut executor, &stream_tx, &cancel_rx)
+            .run(&steps, &mut executor, &stream_tx, &cancel_rx, &soft_stop_rx)
             .await;
 
         let run_executed = report.executed.len();
@@ -925,6 +951,15 @@ async fn run_plan_batch(
                 final_stop = BatchStop::Cancelled;
                 break;
             }
+            BatchStop::Stopped => {
+                total_completed += report
+                    .executed
+                    .iter()
+                    .filter(|r| r.outcome.is_success())
+                    .count();
+                final_stop = BatchStop::Stopped;
+                break;
+            }
             BatchStop::Failed { step_id } => {
                 total_completed += run_executed.saturating_sub(1);
                 last_error = report.executed.last().and_then(|r| r.outcome.error.clone());
@@ -936,6 +971,15 @@ async fn run_plan_batch(
 
                 if replans_count < max_replans {
                     replans_count += 1;
+
+                    tracing::warn!(
+                        plan_id = plan_id,
+                        blocked_step_id = step_id.as_str(),
+                        replan_round = replans_count,
+                        max_replans = max_replans,
+                        reason = %reason,
+                        "automated replanning started"
+                    );
 
                     emit(
                         &state.out,
@@ -1020,6 +1064,12 @@ async fn run_plan_batch(
                                     current_step_ids =
                                         new_steps.into_iter().map(|s| s.id).collect();
                                     total_scheduled = total_completed + current_step_ids.len();
+                                    tracing::info!(
+                                        plan_id = plan_id,
+                                        new_horizon_steps = current_step_ids.len(),
+                                        replan_round = replans_count,
+                                        "automated replanning produced a new horizon"
+                                    );
                                     continue;
                                 }
                                 PlanScopeEvaluation::AllCompleted => {
@@ -1099,6 +1149,14 @@ async fn run_plan_batch(
         }
     }
 
+    tracing::info!(
+        plan_id = plan_id,
+        executed = total_executed_count,
+        scheduled = total_scheduled,
+        stop = ?final_stop,
+        "plan batch supervisor finished"
+    );
+
     let (status, error) = match &final_stop {
         BatchStop::Completed => (BatchFinishStatus::Completed, None),
         BatchStop::Failed { .. } => (
@@ -1107,6 +1165,7 @@ async fn run_plan_batch(
         ),
         BatchStop::Blocked { reason, .. } => (BatchFinishStatus::Blocked, Some(reason.clone())),
         BatchStop::Cancelled => (BatchFinishStatus::Cancelled, None),
+        BatchStop::Stopped => (BatchFinishStatus::Stopped, None),
     };
 
     let outcome = match final_stop {
@@ -1114,6 +1173,9 @@ async fn run_plan_batch(
             steps: total_completed,
         },
         BatchStop::Cancelled => BatchOutcome::Cancelled {
+            completed: total_completed,
+        },
+        BatchStop::Stopped => BatchOutcome::Stopped {
             completed: total_completed,
         },
         BatchStop::Failed { step_id } => {
@@ -1290,6 +1352,13 @@ pub async fn handle_plan_execute(req: Request, state: &Arc<AppState>) -> Respons
                     completed
                 );
             }
+            BatchOutcome::Stopped { completed } => {
+                tracing::info!(
+                    "Plan '{}' batch stopped gracefully after {} completed step(s)",
+                    plan_id,
+                    completed
+                );
+            }
         }
     });
 
@@ -1324,6 +1393,14 @@ async fn execute_plan_horizon_synthesis(
     operation: &OperationGuard,
 ) -> Response {
     let repo_root = state.context.read().await.repo_root().to_path_buf();
+
+    tracing::info!(
+        plan_id = %plan.id,
+        operation = operation_title,
+        replanning = diagnostics.is_some(),
+        blocked_step = ?diagnostics.as_ref().map(|d| d.blocked_step_id.as_str()),
+        "plan horizon synthesis started"
+    );
 
     let (
         provider,
@@ -1646,6 +1723,13 @@ async fn execute_plan_horizon_synthesis(
             }
 
             discovery_round += 1;
+            tracing::info!(
+                plan_id = %plan.id,
+                round = discovery_round,
+                added = outcome.added.len(),
+                missing = outcome.missing.len(),
+                "architect discovery round"
+            );
             state.out.send_event(&Event {
                 method: events::TURN_PHASE.to_string(),
                 params: serde_json::to_value(TurnPhaseEvent {
@@ -1726,6 +1810,11 @@ async fn execute_plan_horizon_synthesis(
 
     if output.status.eq_ignore_ascii_case("blocked") {
         let reason = output.reason.unwrap_or(output.explanation);
+        tracing::warn!(
+            plan_id = %plan.id,
+            reason = %reason,
+            "architect reported blockers"
+        );
         let blocked_msg =
             format!("Architect reported blockers for plan [{}]:\n\n{}", plan.id, reason);
         let _ = state.history.lock().await.record_response(
@@ -1782,6 +1871,7 @@ async fn execute_plan_horizon_synthesis(
     }
 
     // Replace the uncompleted horizon while preserving the immutable Done foundation.
+    let new_steps = output.items.len();
     let updated_plan =
         match PlanStorage::replace_uncompleted_horizon(&repo_root, &plan.id, output.items) {
             Ok(p) => p,
@@ -1793,6 +1883,13 @@ async fn execute_plan_horizon_synthesis(
     // Strict history transactionality: record the assistant response ONLY after
     // the synthesized horizon has been atomically written to disk.
     let (total_items, completed_items) = updated_plan.count_stats();
+    tracing::info!(
+        plan_id = %updated_plan.id,
+        total_items = total_items,
+        completed_items = completed_items,
+        new_steps = new_steps,
+        "plan horizon synthesized"
+    );
     let history_response = format!(
         "Plan [{}] horizon synthesized successfully ({} total, {} completed).\n\n{}",
         updated_plan.id, total_items, completed_items, output.explanation
@@ -1908,6 +2005,8 @@ pub async fn handle_plan_refine(req: Request, state: &Arc<AppState>) -> Response
             );
         }
     };
+
+    tracing::info!(plan_id = %plan.id, "plan refine requested");
 
     execute_plan_horizon_synthesis(
         req.id,
@@ -2063,6 +2162,12 @@ pub async fn handle_plan_replan(req: Request, state: &Arc<AppState>) -> Response
         blocked_reason,
         toolchain_status: None,
     };
+
+    tracing::info!(
+        plan_id = %plan.id,
+        step_id = step.id.as_str(),
+        "plan replan requested"
+    );
 
     execute_plan_horizon_synthesis(
         req.id,
@@ -3050,5 +3155,63 @@ mod tests {
 
         let reloaded = PlanStorage::load_plan(dir.path(), "limit-replan").unwrap().unwrap();
         assert_eq!(reloaded.find_item("1.1").unwrap().status, PlanItemStatus::Blocked);
+    }
+
+    #[tokio::test]
+    async fn test_plan_batch_stops_gracefully_on_soft_stop() {
+        let dir = TestDir::new();
+        let plan = Plan {
+            id: "soft-stop".to_string(),
+            title: "Soft Stop".to_string(),
+            created_at: 1,
+            updated_at: 1,
+            items: vec![
+                test_item("1", PlanItemStatus::Todo),
+                test_item("2", PlanItemStatus::Todo),
+            ],
+            ..Default::default()
+        };
+        PlanStorage::save_plan(dir.path(), &plan).unwrap();
+
+        let (out, mut rx) = OutChannel::new();
+        let (hist_tx, _hist_rx) = tokio::sync::mpsc::unbounded_channel();
+        let state = AppState::new(
+            tauqe_core::config::AppConfig::default(),
+            dir.path().to_path_buf(),
+            hist_tx,
+            out,
+        );
+
+        let operation = Arc::new(state.try_begin_operation().expect("register batch operation"));
+        // A soft stop requested before the batch starts stops the queue before
+        // the first step runs.
+        state.soft_stop_active_operation();
+
+        let outcome = run_plan_batch(
+            &state,
+            "soft-stop",
+            vec!["1".to_string(), "2".to_string()],
+            operation,
+        )
+        .await;
+
+        assert_eq!(outcome, BatchOutcome::Stopped { completed: 0 });
+
+        // No step was started: every status stays TODO.
+        let reloaded = PlanStorage::load_plan(dir.path(), "soft-stop").unwrap().unwrap();
+        assert!(reloaded.items.iter().all(|i| i.status == PlanItemStatus::Todo));
+
+        // The supervisor publishes a single typed completion event carrying the
+        // graceful "stopped" status.
+        let mut raw_events = Vec::new();
+        while let Ok(raw) = rx.try_recv() {
+            raw_events.push(raw);
+        }
+        let finished = raw_events
+            .iter()
+            .find(|e| e.contains(events::PLAN_BATCH_FINISHED))
+            .expect("plan/batch_finished must be emitted");
+        assert!(finished.contains("\"soft-stop\""));
+        assert!(finished.contains("\"stopped\""));
     }
 }

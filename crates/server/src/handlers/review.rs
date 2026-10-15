@@ -540,6 +540,9 @@ enum BatchOutcome {
     Cancelled {
         completed: usize,
     },
+    Stopped {
+        completed: usize,
+    },
 }
 
 fn publish_review(state: &Arc<AppState>, repo_root: &Path, review_id: &str) {
@@ -919,6 +922,11 @@ async fn run_review_batch(
     // delivered between findings is honored instead of being lost, and the slot
     // stays registered for the batch's entire lifetime.
     let cancel_rx = operation.cancel_receiver();
+    // Soft stop ends the queue gracefully after the current finding: the
+    // operation owns the signal, and a `model/cancel` request with `mode: "soft"`
+    // raises it so the current finding finishes its turn, verification, and
+    // commit before the queue stops.
+    let soft_stop_rx = operation.soft_stop_receiver();
 
     let mut executor = ReviewItemExecutor {
         state,
@@ -927,7 +935,7 @@ async fn run_review_batch(
     };
 
     let report = BatchExecution::new()
-        .run(&steps, &mut executor, &stream_tx, &cancel_rx)
+        .run(&steps, &mut executor, &stream_tx, &cancel_rx, &soft_stop_rx)
         .await;
 
     let executed_count = report.executed.len();
@@ -940,6 +948,7 @@ async fn run_review_batch(
         ),
         BatchStop::Blocked { reason, .. } => (BatchFinishStatus::Blocked, Some(reason.clone())),
         BatchStop::Cancelled => (BatchFinishStatus::Cancelled, None),
+        BatchStop::Stopped => (BatchFinishStatus::Stopped, None),
     };
 
     let parse_step_item_id = |step_id: &str| -> u32 {
@@ -955,6 +964,9 @@ async fn run_review_batch(
             items: executed_count,
         },
         BatchStop::Cancelled => BatchOutcome::Cancelled {
+            completed: executed_count,
+        },
+        BatchStop::Stopped => BatchOutcome::Stopped {
             completed: executed_count,
         },
         BatchStop::Failed { step_id } => {
@@ -1163,6 +1175,13 @@ pub async fn handle_review_execute(req: Request, state: &Arc<AppState>) -> Respo
             BatchOutcome::Cancelled { completed } => {
                 tracing::warn!(
                     "Review batch '{}' cancelled after {} fixed finding(s)",
+                    owner_id,
+                    completed
+                );
+            }
+            BatchOutcome::Stopped { completed } => {
+                tracing::info!(
+                    "Review batch '{}' stopped gracefully after {} fixed finding(s)",
                     owner_id,
                     completed
                 );
@@ -2230,5 +2249,61 @@ mod tests {
             assert!(ctx.is_editable("src/first.rs").unwrap());
             assert!(ctx.is_editable("src/second.rs").unwrap());
         }
+    }
+
+    #[tokio::test]
+    async fn test_review_batch_stops_gracefully_on_soft_stop() {
+        let dir = TestDir::new();
+        let session = test_session(
+            "rev-soft-stop",
+            vec![
+                test_item(1, ReviewItemStatus::Todo, "foo.rs"),
+                test_item(2, ReviewItemStatus::Todo, "foo.rs"),
+            ],
+        );
+        ReviewStorage::save_session(dir.path(), &session).unwrap();
+
+        let (out, mut rx) = OutChannel::new();
+        let (hist_tx, _hist_rx) = tokio::sync::mpsc::unbounded_channel();
+        let state = AppState::new(
+            tauqe_core::config::AppConfig::default(),
+            dir.path().to_path_buf(),
+            hist_tx,
+            out,
+        );
+
+        let operation = Arc::new(state.try_begin_operation().expect("register batch operation"));
+        // A soft stop requested before the batch starts stops the queue before
+        // the first finding runs.
+        state.soft_stop_active_operation();
+
+        let outcome = run_review_batch(
+            &state,
+            "rev-soft-stop",
+            make_tasks("rev-soft-stop", &[1, 2]),
+            operation,
+        )
+        .await;
+
+        assert_eq!(outcome, BatchOutcome::Stopped { completed: 0 });
+
+        // No finding was touched: every status stays TODO.
+        let reloaded = ReviewStorage::load_review(dir.path(), "rev-soft-stop")
+            .unwrap()
+            .unwrap();
+        assert!(reloaded.items.iter().all(|i| i.status == ReviewItemStatus::Todo));
+
+        // The supervisor publishes a single typed completion event carrying the
+        // graceful "stopped" status.
+        let mut raw_events = Vec::new();
+        while let Ok(raw) = rx.try_recv() {
+            raw_events.push(raw);
+        }
+        let finished = raw_events
+            .iter()
+            .find(|e| e.contains(events::REVIEW_BATCH_FINISHED))
+            .expect("review/batch_finished must be emitted");
+        assert!(finished.contains("\"rev-soft-stop\""));
+        assert!(finished.contains("\"stopped\""));
     }
 }

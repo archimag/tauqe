@@ -4,7 +4,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use tauqe_protocol::{methods, DiscussionFocus, ReviewStartParams};
 use tokio::sync::{Mutex, MutexGuard};
 
-use crate::app::{ActiveModal, AppState, ViewMode};
+use crate::app::{ActiveModal, AppState, BatchCancelButton, ViewMode};
 use crate::input::{squash, InputResult};
 use crate::rpc::{send_request, RpcConnection};
 use crate::views::develop::{DevelopView, TurnStatus};
@@ -16,7 +16,7 @@ mod refine;
 mod selection;
 mod status;
 
-use confirm::{resolve_confirm, ConfirmOutcome};
+use confirm::{resolve_batch_cancel, resolve_confirm, BatchCancelOutcome, ConfirmOutcome};
 pub(crate) use refine::submit_refine_dialog;
 pub(crate) use selection::activate_selection_item;
 pub(crate) use status::apply_status_dialog;
@@ -26,6 +26,8 @@ pub(crate) use status::apply_status_dialog;
 /// review execution) so the state transition stays consistent.
 fn begin_develop_turn(st: &mut AppState) {
     st.view_mode = ViewMode::Develop;
+    // A freshly launched turn starts from a clean batch-cancellation state.
+    st.batch_stopping = false;
     // Executing code hands control to the Coder role: detach the discussion
     // focus locally so no anchor survives into the new turn.
     st.discussion_focus = DiscussionFocus::None;
@@ -133,6 +135,67 @@ pub(crate) async fn delete_review(server_writer: &mut RpcConnection, review_id: 
     )
     .await?;
     send_request(server_writer, methods::REVIEW_LIST, serde_json::json!({})).await?;
+    Ok(())
+}
+
+/// Applies the action chosen in the batch-cancellation dialog.
+///
+/// `Continue` keeps the batch running. `Soft Stop` asks the supervisor to
+/// finish the current member and stop before the next one. `Hard Stop` aborts
+/// the running operation immediately. The dialog always closes and returns to
+/// its safe default, so the next interruption starts from `Continue`.
+pub(crate) async fn apply_batch_cancel(
+    st: &mut AppState,
+    choice: BatchCancelButton,
+    server_writer: &mut RpcConnection,
+) -> anyhow::Result<()> {
+    st.confirm_batch_cancel = false;
+    st.batch_cancel_button = BatchCancelButton::Continue;
+
+    match choice {
+        BatchCancelButton::Continue => {}
+        BatchCancelButton::SoftStop => {
+            st.batch_stopping = true;
+            // A soft stop is advisory: the operation stays registered so the
+            // supervisor can finish the current member and unwind on its own.
+            let params = tauqe_protocol::model::ModelCancelParams {
+                mode: Some(tauqe_protocol::model::CancelMode::Soft),
+            };
+            send_request(
+                server_writer,
+                methods::MODEL_CANCEL,
+                serde_json::to_value(params)?,
+            )
+            .await?;
+        }
+        BatchCancelButton::HardStop => {
+            st.batch_stopping = false;
+            let cancel_review = st.review.running;
+            let cancel_model = st.model.is_busy();
+            if cancel_review {
+                let params = tauqe_protocol::ReviewCancelParams {
+                    mode: Some(tauqe_protocol::model::CancelMode::Hard),
+                };
+                send_request(
+                    server_writer,
+                    methods::REVIEW_CANCEL,
+                    serde_json::to_value(params)?,
+                )
+                .await?;
+            }
+            if cancel_model || !cancel_review {
+                let params = tauqe_protocol::model::ModelCancelParams {
+                    mode: Some(tauqe_protocol::model::CancelMode::Hard),
+                };
+                send_request(
+                    server_writer,
+                    methods::MODEL_CANCEL,
+                    serde_json::to_value(params)?,
+                )
+                .await?;
+            }
+        }
+    }
     Ok(())
 }
 
@@ -356,6 +419,19 @@ pub(crate) async fn handle_dialog_event(
                 ConfirmOutcome::Accepted => {
                     st.confirm_quit = false;
                     return Ok(Some(InputResult::Exit));
+                }
+            }
+            return Ok(Some(InputResult::Continue));
+        }
+        Some(ActiveModal::BatchCancel) => {
+            match resolve_batch_cancel(&mut st, key) {
+                BatchCancelOutcome::Toggled => {}
+                BatchCancelOutcome::Dismissed => {
+                    st.confirm_batch_cancel = false;
+                    st.batch_cancel_button = BatchCancelButton::Continue;
+                }
+                BatchCancelOutcome::Chosen(choice) => {
+                    apply_batch_cancel(&mut st, choice, server_writer).await?;
                 }
             }
             return Ok(Some(InputResult::Continue));

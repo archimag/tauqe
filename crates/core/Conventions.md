@@ -65,3 +65,47 @@ The interaction protocol between Tauqe and large language models is strictly div
    - If an artifact can be resolved from Git, Tree-sitter, project manifests, or compiler output, resolve it through deterministic Rust routines, never LLM generation.
 2. **Fail-Fast on Verification Failure:**
    - Autonomous execution pipelines must abort immediately upon encountering compiler errors or test failures, rolling back dirty working trees to the pre-turn Git checkpoint.
+
+---
+
+## 5. Instant Provider Cancellation
+
+1. **Cancellation Before Response Headers:**
+   - A provider network request (`http_client.send().await`) must race the turn cancellation signal (`cancel_rx`) through `tokio::select!` while awaiting the HTTP response headers, not only while consuming the streamed body.
+2. **Rationale (Why):**
+   - While a model is reasoning during the `Proposal` and `Awaiting` phases, no body bytes have arrived yet. A request that observes cancellation only once the body starts streaming forces the developer to wait for the provider to finish before the turn can abort. Racing the initial send against `cancel_rx` makes interruption immediate in every phase.
+3. **Uniform Reporting:**
+   - When cancellation wins the race before headers arrive, the provider emits the same `StreamEvent::Cancelled` used everywhere else and returns cleanly, so callers never branch on a provider-specific cancellation path.
+
+---
+
+## 6. Batch Queue Stop Semantics
+
+1. **Two Stop Modes:**
+   - A running batch supervisor (plan step queue or review finding queue) supports two stop modes besides normal completion and failure: a **soft stop** that lets the current member finish, and a **hard stop** that aborts it immediately. Outside a batch, cancellation is always immediate.
+2. **Soft Stop Boundary:**
+   - A soft stop is observed strictly between members. The member already running completes its bounded turn, compiler verification, and Git commit; the queue then halts before launching the next member. Its committed result is preserved, never discarded.
+   - A soft stop never interrupts a step mid-turn: interrupting an in-flight step is the exclusive province of hard cancellation.
+3. **Hard Cancellation Priority:**
+   - When both a soft-stop and a hard-cancel signal are pending before the same member, hard cancellation wins. An explicit reset is never silently downgraded to a graceful stop.
+4. **Distinct Terminal Status:**
+   - The two stop modes surface as distinct terminal statuses (`Stopped` and `Cancelled`) on the batch completion event, so clients can distinguish a graceful drain from an immediate abort without inspecting internal signals.
+
+---
+
+## 7. Semantic Instrumentation (Observability)
+
+1. **Structured Events via the `tracing` Facade:**
+   - The core engine is a library: it emits semantic observability events exclusively through the lightweight `tracing` facade (`info!`, `warn!`, `error!`) and carries no dependency on file sinks, on-disk formats, or rotation. Subscriber initialization, the journal format, and the rotation policy belong entirely to `crates/server`.
+2. **State Transitions Invariant:**
+   - Key state transitions, operation lifecycles, and failure points in the domain engine must emit a semantic log record. This covers:
+     - bounded-turn FSM phase transitions (`workflow/fsm.rs`);
+     - batch queue steps and their terminal statuses (`workflow/batch.rs`);
+     - Coder Ladder (`CoderTier`) escalation along the coder role ladder (`workflow/execution.rs`);
+     - replanner activation in both manual and automatic modes (`plan`);
+     - toolchain failure diagnostics derived from `ToolchainCheckResult`;
+     - network and provider failures in `OpenRouterProvider` (HTTP status classes such as 401/429/502/504, connection timeouts, stream interruption, and `finish_reason: error`).
+   - **Rationale (Why):** turns run detached from the developer's terminal, so a structured transition record is the only way to reconstruct a failure — which compile error aborted a step, which rung of the ladder was consumed, or which provider error terminated a stream.
+3. **Anti-Bloat Logging Invariant:**
+   - The engine must never log raw generation deltas (`TextDelta`, `ReasoningDelta`), full prompt bodies, context file contents, `RepoMap` dumps, or raw diffs during normal operation. Only interaction metadata, compact identifiers, and aggregated token and time metrics are recorded.
+   - Toolchain failures are recorded as a compact, UTF-8-safe summary, never as a dumped compiler report.

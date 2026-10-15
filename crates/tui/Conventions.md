@@ -90,7 +90,7 @@ This document specifies mandatory architectural and UX invariants for the Tauqe 
      - `C-1` … `C-5` — switch tabs;
      - `C-M` / `Alt+M` — model selection picker;
      - `C-C` — cancel generation;
-     - `C-G` — detach the active discussion focus (Develop) or clear conversation history (History);
+     - `C-G` — keyboard-quit (Emacs `keyboard-quit`): the canonical abort chord, normalized globally to `Esc` before any handler runs, so it aborts the active operation, dismisses the top-most modal, returns from an auxiliary view, or detaches the active discussion focus exactly as `Esc` would;
      - `C-L` — recenter the active item or viewport (Emacs `recenter-top-bottom`);
      - `C-R` — toggle reasoning block;
      - `C-O` — reload configuration;
@@ -105,6 +105,11 @@ This document specifies mandatory architectural and UX invariants for the Tauqe 
    - Pressing `Enter` or `Esc` defaults to safe cancellation.
    - Quick confirmation is permitted via direct `y` or `Y` keypress.
    - Actions like `git undo` must verify that an undoable entity exists before prompting the user, emitting an informative notification otherwise.
+
+5. **Canonical Keyboard-Quit (`C-g`):**
+   - `C-g` (ASCII BEL, `0x07`) is the universal abort chord inherited from Emacs. It is normalized once, before any view or modal handler runs, to `Esc`, so every surface reacts identically without a per-handler binding.
+   - The chord must never be implemented by installing a `SIGINT` handler. Normalizing the key event keeps the process free of signal handling and preserves the terminal's standard `Ctrl+C` behavior.
+   - Because `C-g` resolves to `Esc`, its effect is always `Esc`'s effect in the active context: interrupt a running generation, dismiss the top-most modal, return from an auxiliary view, or detach the active discussion focus. It never clears history; history clearing is the dedicated `Shift+C` binding inside the History view.
 
 ---
 
@@ -123,6 +128,12 @@ This document specifies mandatory architectural and UX invariants for the Tauqe 
    - **Fast Accelerators in Confirmation Modals:** Direct `y` / `Y` confirms immediately; `n` / `N` or `Esc` cancels and closes immediately, regardless of button focus.
    - **Dismissal:** `Esc` or `q` unconditionally cancels and dismisses dialogs (except where a text input editor is actively capturing keystrokes).
    - **List Navigation in Selection Dialogs:** When the body contains a selectable list (e.g., model picker), items are navigated using standard keys (`n`/`p`, `j`/`k`, `↑`/`↓`, `PgUp`/`PgDn`, `Home`/`End`), preserving current item selection when focus shifts to action buttons.
+
+3. **Batch Cancellation Dialog (Three-Way Stop):**
+   - When a running batch (plan or review execution) receives a cancellation request, the modal presents three explicit actions instead of a binary confirm: `Continue`, `Soft Stop`, and `Hard Stop`. A stop is thereby a deliberate choice rather than an accidental dismissal.
+   - `Soft Stop` lets the current member finish its bounded turn, compiler verification, and Git commit before the queue halts; `Hard Stop` aborts the current member immediately. `Continue` keeps the queue running and holds the safe default focus, so an accidental keypress never discards committed work.
+   - Direct accelerators `c` (Continue), `s` (Soft Stop), and `h` (Hard Stop) select an action without moving focus; `Tab`, `←`/`→`, `Enter`/`Space`, and `Esc` follow the standard dialog navigation rules above.
+   - While a soft stop is pending, the footer indicates it (e.g. `[Stopping after current step]`), so the developer can distinguish a graceful drain still in progress from an immediate abort (see §1).
 
 ---
 

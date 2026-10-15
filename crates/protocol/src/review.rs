@@ -1,6 +1,6 @@
 use serde::{Deserialize, Deserializer, Serialize};
 
-use crate::model::{ModelRef, ModelSelection, ModelUsageInfo};
+use crate::model::{CancelMode, ModelRef, ModelSelection, ModelUsageInfo};
 
 /// Leniently deserializes a [`ModelRef`] from either a structured JSON object
 /// (`{"provider":"openrouter","name":"..."}`) or a legacy string representation
@@ -288,6 +288,16 @@ pub struct ReviewDeleteResult {
     pub success: bool,
 }
 
+/// Parameters for `review/cancel`.
+///
+/// The `mode` field is optional so clients that predate two-mode cancellation
+/// keep sending an empty object and receive the default immediate abort.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewCancelParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<CancelMode>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct ReviewExecuteParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -385,6 +395,23 @@ mod tests {
             serde_json::from_str(r#"{"review_id":"rev-2"}"#).unwrap();
         assert_eq!(single_session_only.review_id.as_deref(), Some("rev-2"));
         assert_eq!(single_session_only.item_id, None);
+    }
+
+    #[test]
+    fn test_review_cancel_params_serde() {
+        // Legacy clients send an empty object; the mode stays absent and the
+        // server falls back to an immediate abort.
+        let legacy: ReviewCancelParams = serde_json::from_str("{}").unwrap();
+        assert_eq!(legacy.mode, None);
+        assert_eq!(serde_json::to_string(&legacy).unwrap(), "{}");
+
+        let soft = ReviewCancelParams {
+            mode: Some(CancelMode::Soft),
+        };
+        let json = serde_json::to_string(&soft).unwrap();
+        assert_eq!(json, "{\"mode\":\"soft\"}");
+        let de: ReviewCancelParams = serde_json::from_str(&json).unwrap();
+        assert_eq!(de.mode, Some(CancelMode::Soft));
     }
 
     #[test]
