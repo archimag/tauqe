@@ -3,7 +3,14 @@
     warn(clippy::unwrap_used, clippy::expect_used, clippy::panic)
 )]
 
-pub const PROTOCOL_VERSION: &str = "0.1.0";
+/// Version of the wire contract defined by this crate.
+///
+/// The `protocol` crate *is* the wire contract: every request, response,
+/// event, and shared domain DTO lives here. Its version therefore defines the
+/// wire version, so the constant is derived from `CARGO_PKG_VERSION` rather
+/// than maintained by hand. This keeps a single source of truth and makes the
+/// handshake report a value that cannot drift from the definitions it names.
+pub const PROTOCOL_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub mod command;
 pub mod config;
@@ -47,7 +54,7 @@ pub use discussion::{
 };
 pub use edit::{
     EditFileDoneEvent, EditFileOp, EditFileRetryingEvent, EditFileStartedEvent, EditFileStatus,
-    EditFinishedEvent, EditHunkEvent, EditOperation, EditProposal, EditStartedEvent,
+    EditFinishedEvent, EditHunkEvent, EditOperation, EditOutcome, EditProposal, EditStartedEvent,
     StructuredChangeProposal,
 };
 pub use errors::{
@@ -71,7 +78,7 @@ pub use git::{
     GitSquashGenerateMessageResult, GitSquashPreviewParams, GitSquashPreviewResult, GitUndoResult,
     RepositoryInitParams, RepositoryInitResult, RepositoryListFilesResult, RepositoryState,
 };
-pub use glob::matches_glob_pattern;
+pub use glob::{matches_glob_pattern, GlobPattern};
 pub use history::{
     HistoryEntryAddedEvent, HistoryGetParams, HistoryGetResult, UiHistoryItem, UiHistoryKind,
 };
@@ -80,8 +87,10 @@ pub use message::{
     ResponseError,
 };
 pub use model::{
-    BatchFinishStatus, BatchFinishSummary, CoderTier, ModelAskParams,
-    ModelChangedEvent, ModelCurrentResult, ModelDeltaEvent, ModelEntry, ModelErrorEvent,
+    BatchFinishStatus, BatchFinishSummary, CancelMode, CoderTier, deserialize_model_ref_lenient,
+    ModelAskParams, ModelCancelParams, ModelChangedEvent, ModelCurrentResult, ModelDeltaEvent,
+    ModelEntry,
+    ModelErrorEvent,
     ModelFinishedEvent, ModelRef, ModelResult, ModelResultEvent, ModelResultProposal, ModelRole,
     ModelRolesEffort, ModelRolesEntries, ModelRolesSummary, ModelSelectParams, ModelSelectResult,
     ModelSelection, ModelStartedEvent, ModelTurnPlanContext, ModelUsageEvent, ModelUsageInfo,
@@ -94,13 +103,57 @@ pub use plan::{
     PlanGetResult, PlanItem, PlanItemStatus, PlanListChangedEvent, PlanListResult,
     PlanRefineParams, PlanRefineResult, PlanReplanParams, PlanSaveParams, PlanScopeEvaluation,
     PlanSetActiveParams, PlanSetActiveResult, PlanStats, PlanSummary, PlanUpdateItemParams,
-    PlanUpdateItemResult, PlanUpdatedEvent,
+    PlanUpdateItemResult, PlanUpdatedEvent, PlanValidationError,
 };
 pub use review::{
     ReviewCancelParams, ReviewContentDeltaEvent, ReviewDeleteParams, ReviewDeleteResult,
     ReviewErrorEvent, ReviewExecuteParams, ReviewFinishedEvent, ReviewGetParams,
     ReviewGetResult, ReviewItem, ReviewItemStatus, ReviewListChangedEvent, ReviewListParams,
-    ReviewListResult, ReviewReasoningDeltaEvent, ReviewSession, ReviewSeverity,
-    ReviewStartParams, ReviewStartedEvent, ReviewStatus, ReviewSummary,
-    ReviewUpdateItemParams, ReviewUpdateItemResult, ReviewUpdatedEvent,
+    ReviewListResult, ReviewReasoningDeltaEvent, ReviewRefineItemParams,
+    ReviewRefineItemResult, ReviewSession, ReviewSeverity, ReviewStartParams,
+    ReviewStartedEvent, ReviewSummary, ReviewUpdateItemParams, ReviewUpdateItemResult,
+    ReviewUpdatedEvent,
 };
+
+#[cfg(test)]
+mod wire_contract_tracking {
+    use super::PROTOCOL_VERSION;
+
+    /// The reported wire version must never drift from the crate version it
+    /// mirrors. Deriving the constant makes this hold by construction; the
+    /// assertion pins the intent against a future hand-written regression.
+    #[test]
+    fn protocol_version_tracks_crate_version() {
+        assert_eq!(PROTOCOL_VERSION, env!("CARGO_PKG_VERSION"));
+    }
+
+    /// Forcing function for the removal of the legacy compatibility aliases.
+    ///
+    /// A set of backward-compatibility aliases is retained only so older
+    /// clients keep working and is annotated "scheduled for removal in 0.2.0".
+    /// A comment alone never forces that cleanup, so this gate turns the intent
+    /// into an enforceable check: it passes while the crate is on the 0.1 line
+    /// and fails the moment the version reaches 0.2.0, forcing the aliases to
+    /// be deleted together with this test.
+    ///
+    /// Tracked aliases:
+    /// - `DocTopic`: `plans`
+    /// - `WorkflowKind`: `single`, `direct`
+    /// - `EditProtocolKind`: `structured_output`, `json_schema`, `json`
+    /// - `ReviewItemStatus`: `done`
+    /// - `PlanReplanParams`: `id`, `item_id`
+    #[test]
+    fn legacy_aliases_must_be_removed_by_0_2_0() {
+        let mut parts = env!("CARGO_PKG_VERSION").split('.');
+        let major: u32 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+        let minor: u32 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+        assert!(
+            (major, minor) < (0, 2),
+            "Crate version {}. The legacy aliases (DocTopic `plans`; WorkflowKind \
+             `single`/`direct`; EditProtocolKind `structured_output`/`json_schema`/\
+             `json`; ReviewItemStatus `done`; PlanReplanParams `id`/`item_id`) were \
+             scheduled for removal in 0.2.0. Remove them and delete this test.",
+            PROTOCOL_VERSION
+        );
+    }
+}

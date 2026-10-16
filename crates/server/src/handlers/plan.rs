@@ -37,7 +37,7 @@ fn emit(out: &OutChannel, method: &str, params: Option<serde_json::Value>) {
 /// Architect and client payloads are not trusted: a repeated ID would make
 /// `Plan::find_item` ambiguous and let one step silently shadow another, while an
 /// empty ID cannot be addressed at all. Such a tree is rejected before persistence.
-fn find_duplicate_item_ids(items: &[PlanItem]) -> Option<String> {
+pub(crate) fn find_duplicate_item_ids(items: &[PlanItem]) -> Option<String> {
     fn walk(items: &[PlanItem], seen: &mut HashSet<String>) -> Option<String> {
         for item in items {
             let key = item.id.trim().to_ascii_lowercase();
@@ -339,7 +339,7 @@ fn report_step_failure(state: &Arc<AppState>, operation_id: &str, message: &str)
 /// layer before the turn starts. Target files are registered as editable, while
 /// reference files are registered as read-only. Declared step files are never
 /// capped by an artificial quota.
-async fn preload_step_files(state: &Arc<AppState>, repo_root: &Path, item: &PlanItem) {
+pub(crate) async fn preload_step_files(state: &Arc<AppState>, repo_root: &Path, item: &PlanItem) {
     if item.files.is_empty() && item.readonly_files.is_empty() {
         return;
     }
@@ -375,7 +375,7 @@ async fn preload_step_files(state: &Arc<AppState>, repo_root: &Path, item: &Plan
 /// Resolves the LLM provider for architect plan operations (refine and replan),
 /// consulting the test override in test configurations before falling back to
 /// network provider construction.
-async fn resolve_architect_provider(
+pub(crate) async fn resolve_architect_provider(
     _state: &Arc<AppState>,
     cfg: &tauqe_core::config::AppConfig,
     provider_kind: tauqe_protocol::ProviderKind,
@@ -391,12 +391,12 @@ async fn resolve_architect_provider(
         .map_err(|err| err.to_string())
 }
 
-struct ArchitectStreamOutcome {
-    raw_text: String,
-    streamed_explanation_bytes: usize,
+pub(crate) struct ArchitectStreamOutcome {
+    pub(crate) raw_text: String,
+    pub(crate) streamed_explanation_bytes: usize,
 }
 
-enum ArchitectStreamError {
+pub(crate) enum ArchitectStreamError {
     Cancelled,
     ModelError(String),
 }
@@ -405,7 +405,7 @@ enum ArchitectStreamError {
 /// reasoning deltas and explanation text deltas to the client, handling cancellation
 /// and errors, and committing token usage to session state.
 #[allow(clippy::too_many_arguments)]
-async fn run_architect_stream(
+pub(crate) async fn run_architect_stream(
     state: &Arc<AppState>,
     provider: Arc<dyn LlmProvider>,
     model_name: String,
@@ -594,8 +594,8 @@ async fn clear_auto_context(state: &Arc<AppState>) {
 /// accompanied by a terminal success tag, must not satisfy the step contract.
 fn turn_applied_edits(turn: &crate::handlers::model::ModelTurnResult) -> bool {
     match &turn.result {
-        Some(tauqe_protocol::ModelResult::Edit { applied, error, .. }) => {
-            *applied && error.is_none()
+        Some(tauqe_protocol::ModelResult::Edit { outcome, .. }) => {
+            outcome.applied && outcome.error.is_none()
         }
         _ => false,
     }
@@ -2639,10 +2639,12 @@ mod tests {
                 summary: "fix".to_string(),
                 edits: vec![],
                 proposal: None,
-                applied: true,
-                error: None,
-                changed_files: vec!["src/lib.rs".to_string()],
-                commit_hash: Some("abc".to_string()),
+                outcome: tauqe_protocol::EditOutcome {
+                    applied: true,
+                    error: None,
+                    changed_files: vec!["src/lib.rs".to_string()],
+                    commit_hash: Some("abc".to_string()),
+                },
             }),
             assistant_text: "done".to_string(),
             is_cancelled: false,
@@ -2675,10 +2677,12 @@ mod tests {
                 summary: "fix".to_string(),
                 edits: vec![],
                 proposal: None,
-                applied: false,
-                error: Some("compiler error".to_string()),
-                changed_files: vec![],
-                commit_hash: None,
+                outcome: tauqe_protocol::EditOutcome {
+                    applied: false,
+                    error: Some("compiler error".to_string()),
+                    changed_files: vec![],
+                    commit_hash: None,
+                },
             }),
             assistant_text: String::new(),
             is_cancelled: false,

@@ -5,7 +5,7 @@ pub mod xml;
 
 use crate::context::ContextFileContent;
 use crate::prompt::protocol::PromptProtocol;
-use crate::providers::ChatMessage;
+use crate::providers::{ChatMessage, JsonSchemaDefinition, ResponseFormat};
 use tauqe_protocol::{ContextAccess, ModelRole, Plan, RepositoryState};
 
 /// Default model role used for squash commit message synthesis.
@@ -65,9 +65,152 @@ pub fn build_squash_commit_prompt(
 
     prompt.push_str("## Instructions\n");
     prompt.push_str("1. Write a concise commit message summarizing the squashed commits and cumulative changes according to project guidelines.\n");
-    prompt.push_str("2. Output ONLY the commit message text itself. Do NOT include markdown code block fences (no ```), explanations, tags, or conversational fluff.\n");
+    prompt.push_str("2. Respond with a single JSON object matching the enforced schema, placing the commit message in the `commit_message` field. Do NOT include markdown code block fences, explanations, tags, or conversational fluff.\n");
 
     prompt
+}
+
+/// JSON Schema for the history compaction summary output.
+///
+/// History compaction never produces code changes, so it is a Structured Output
+/// operation (see `crates/core/Conventions.md`, section 1.2). The Scribe returns
+/// a machine-readable summary object instead of free-form prose recovered by
+/// heuristics.
+pub fn history_compaction_response_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "summary": {
+                "type": "string",
+                "description": "Concise, structured summary capturing completed tasks, key code changes, and the context preserved from the compacted history"
+            }
+        },
+        "required": ["summary"],
+        "additionalProperties": false
+    })
+}
+
+/// Builds the provider [`ResponseFormat`] that enforces the history compaction schema.
+pub fn history_compaction_response_format() -> ResponseFormat {
+    ResponseFormat::JsonSchema {
+        json_schema: JsonSchemaDefinition {
+            name: "history_compaction".to_string(),
+            description: Some(
+                "Concise structured summary of compacted session history".to_string(),
+            ),
+            schema: history_compaction_response_schema(),
+            strict: Some(true),
+        },
+    }
+}
+
+/// Extracts the summary text from the Scribe's structured compaction output.
+pub fn parse_compaction_summary(raw: &str) -> Option<String> {
+    extract_json_string_field(raw, "summary")
+}
+
+/// JSON Schema for the squashed commit message output.
+///
+/// Squash commit synthesis never produces code changes, so it is a Structured
+/// Output operation (see `crates/core/Conventions.md`, section 1.2). The Scribe
+/// returns the message as a machine-readable field instead of text recovered by
+/// stripping code fences.
+pub fn squash_commit_response_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "commit_message": {
+                "type": "string",
+                "description": "Final squashed commit message text, following project commit-message conventions, without markdown code fences or surrounding prose"
+            }
+        },
+        "required": ["commit_message"],
+        "additionalProperties": false
+    })
+}
+
+/// Builds the provider [`ResponseFormat`] that enforces the squash commit schema.
+pub fn squash_commit_response_format() -> ResponseFormat {
+    ResponseFormat::JsonSchema {
+        json_schema: JsonSchemaDefinition {
+            name: "squash_commit".to_string(),
+            description: Some("Squashed commit message synthesis".to_string()),
+            schema: squash_commit_response_schema(),
+            strict: Some(true),
+        },
+    }
+}
+
+/// Extracts the commit message from the Scribe's structured squash output.
+pub fn parse_squash_commit_message(raw: &str) -> Option<String> {
+    extract_json_string_field(raw, "commit_message")
+}
+
+/// Extracts a single non-empty string field from a model's structured JSON
+/// output, tolerating surrounding markdown code fences or wrapper prose.
+///
+/// The byte scan only inspects ASCII delimiters, so multi-byte UTF-8 content is
+/// never sliced across a scalar boundary.
+fn extract_json_string_field(raw: &str, field: &str) -> Option<String> {
+    let value = parse_first_json_object(raw)?;
+    let text = value.get(field)?.as_str()?;
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+/// Parses the first JSON object found in a model response.
+fn parse_first_json_object(raw: &str) -> Option<serde_json::Value> {
+    let trimmed = raw.trim();
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) {
+        if value.is_object() {
+            return Some(value);
+        }
+    }
+    let bytes = raw.as_bytes();
+    let start = bytes.iter().position(|&b| b == b'{')?;
+    let end = balanced_object_end(raw, start)?;
+    let value = serde_json::from_str::<serde_json::Value>(&raw[start..end]).ok()?;
+    if value.is_object() {
+        Some(value)
+    } else {
+        None
+    }
+}
+
+/// Returns the exclusive end offset of the JSON value starting at `start`.
+fn balanced_object_end(raw: &str, start: usize) -> Option<usize> {
+    let bytes = raw.as_bytes();
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut i = start;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if in_string {
+            match b {
+                b'\\' => i += 1,
+                b'"' => in_string = false,
+                _ => {}
+            }
+        } else {
+            match b {
+                b'"' => in_string = true,
+                b'{' | b'[' => depth += 1,
+                b'}' | b']' => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        return Some(i + 1);
+                    }
+                }
+                _ => {}
+            }
+        }
+        i += 1;
+    }
+    None
 }
 
 /// Estimates a token count from a raw byte length.
@@ -160,7 +303,11 @@ impl PromptAssembly {
         prompt.push_str("You are Tauqe AI, an expert programming assistant operating inside TAUQE (The Answer to the Ultimate Question of Engineering), an AI-native engineering control environment built on the literal harness paradigm.\n\n");
         prompt.push_str("## Core System Contract\n");
         prompt.push_str("1. Authoritative Source: The files provided in <context> represent the authoritative current state of the project. Do not invent missing code.\n");
-        prompt.push_str("1a. Operational Protocol Tags: All operational protocol tags (<context_request>, <doc_request>, <verify>, <user_language>, <plan>, <scratchpad>, <success>, <error>) must be emitted strictly at the end of your response outside markdown code blocks. If you mention, quote, or discuss tags in conversational text, you MUST enclose them in backticks (e.g. `<context_request ...>`) so they are treated as literal text and not operational commands.\n");
+        if self.is_isolated_step {
+            prompt.push_str("1a. Operational Protocol Tags: All operational protocol tags (<context_request>, <doc_request>, <user_language>, <scratchpad>, <success>, <error>, <blocked>) must be emitted strictly at the end of your response outside markdown code blocks. If you mention, quote, or discuss tags in conversational text, you MUST enclose them in backticks (e.g. `<context_request ...>`) so they are treated as literal text and not operational commands.\n");
+        } else {
+            prompt.push_str("1a. Operational Protocol Tags: All operational protocol tags (<context_request>, <doc_request>, <verify>, <user_language>, <plan>, <scratchpad>, <success>, <error>, <blocked>) must be emitted strictly at the end of your response outside markdown code blocks. If you mention, quote, or discuss tags in conversational text, you MUST enclose them in backticks (e.g. `<context_request ...>`) so they are treated as literal text and not operational commands.\n");
+        }
         let marker_suffix = protocol
             .turn_marker()
             .map(|m| format!("_{}", m))
@@ -199,10 +346,16 @@ impl PromptAssembly {
                 marker_suffix, marker_suffix, marker_suffix, marker_suffix
             ));
         }
-        prompt.push_str(&format!(
-            "9. Code Verification: You can trigger deterministic code verification (check, clippy, test) using <verify{} target=\"all|check|test|clippy\" on_success=\"silent|report\" />. Always use on_success=\"silent\" unless the user explicitly requested to see raw command logs or test output. Verification is primarily for self-checking; never dump or quote full test/build logs if verification succeeds. A concise confirmation that the code is verified is sufficient.\n",
-            marker_suffix
-        ));
+        if self.is_isolated_step {
+            prompt.push_str(
+                "9. Code Verification: Verification on code modifications is handled automatically and deterministically by the harness at the end of each step. Do NOT emit <verify> tags (the harness runs toolchain verification and gating automatically).\n"
+            );
+        } else {
+            prompt.push_str(&format!(
+                "9. Code Verification: Verification on code modifications is performed automatically and deterministically by the harness. Emit <verify{0} target=\"all|check|test|clippy\" on_success=\"silent|report\" /> ONLY when the user explicitly requests running verification, compiler checks, or tests to inspect codebase status. Always use on_success=\"silent\" unless the user explicitly asked to see raw command logs or test output. Do NOT emit <verify> on normal code edits, as the harness verifies them automatically.\n",
+                marker_suffix
+            ));
+        }
         prompt.push_str(&format!(
             "10. Self-Knowledge: When the user asks about your identity, capabilities, concepts, workflows, keyboard shortcuts, or configuration, do NOT guess. Request the authoritative documentation using <doc_request{} topic=\"{}\" /> and output nothing else except a short note. You will be called again with <system_documentation> blocks; base your answer strictly on them and formulate it in the user's language.\n",
             marker_suffix,
@@ -692,5 +845,39 @@ mod tests {
 
         let messages = assembly.assemble_chat_messages("Go", &*marked);
         assert!(messages[0].content.contains("<scratchpad_M12345>"));
+    }
+
+    #[test]
+    fn test_parse_structured_scribe_output_tolerates_fences_and_prose() {
+        assert_eq!(
+            parse_compaction_summary("{\"summary\":\"Done A and B\"}").as_deref(),
+            Some("Done A and B")
+        );
+        assert_eq!(
+            parse_squash_commit_message("```json\n{\"commit_message\":\"feat: add x\"}\n```")
+                .as_deref(),
+            Some("feat: add x")
+        );
+        assert_eq!(
+            parse_squash_commit_message("Here: {\"commit_message\":\"fix: y\"} done").as_deref(),
+            Some("fix: y")
+        );
+        assert_eq!(parse_compaction_summary(""), None);
+        assert_eq!(parse_compaction_summary("{\"summary\":\"   \"}"), None);
+        assert_eq!(parse_squash_commit_message("not json"), None);
+    }
+
+    #[test]
+    fn test_parse_structured_scribe_output_is_utf8_safe() {
+        let raw = "{\"summary\":\"Задача выполнена — контекст сохранён\"}";
+        assert_eq!(
+            parse_compaction_summary(raw).as_deref(),
+            Some("Задача выполнена — контекст сохранён")
+        );
+        let fenced = "```json\n{\"commit_message\":\"feat: добавить функцию\"}\n```";
+        assert_eq!(
+            parse_squash_commit_message(fenced).as_deref(),
+            Some("feat: добавить функцию")
+        );
     }
 }

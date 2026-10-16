@@ -91,7 +91,7 @@ impl ApplyPolicy for GitTransactionPolicy {
         // tree to its true pre-turn state.
         if self.checkpoint.is_none() {
             let root = repo_root.to_path_buf();
-            let checkpoint = crate::blocking::run_blocking_async(move || create_checkpoint(&root)).await?;
+            let checkpoint = crate::blocking::run_blocking_async(move || create_checkpoint(&root)).await??;
             self.checkpoint = Some(checkpoint);
         }
         self.publish_transaction_state();
@@ -104,7 +104,7 @@ impl ApplyPolicy for GitTransactionPolicy {
             crate::blocking::run_blocking_async(move || {
                 create_step_commit(&root, &files, "initial attempt")
             })
-            .await?;
+            .await??;
         }
 
         Ok(changed_files)
@@ -131,7 +131,7 @@ impl ApplyPolicy for GitTransactionPolicy {
         .await;
 
         self.clear_transaction_state();
-        match res {
+        match res? {
             Ok(hash) => Ok(hash),
             Err(err) => {
                 tracing::warn!("Failed to finalize squashed AI commit: {}", err);
@@ -144,17 +144,7 @@ impl ApplyPolicy for GitTransactionPolicy {
         self.clear_transaction_state();
         if let Some(checkpoint) = self.checkpoint.take() {
             let root = repo_root.to_path_buf();
-            crate::blocking::run_blocking_async(move || restore_checkpoint(&root, &checkpoint)).await?;
-            Ok(true)
-        } else {
-            Ok(false)
-        }
-    }
-
-    fn rollback_sync(&mut self, repo_root: &Path) -> anyhow::Result<bool> {
-        self.clear_transaction_state();
-        if let Some(checkpoint) = self.checkpoint.take() {
-            restore_checkpoint(repo_root, &checkpoint)?;
+            crate::blocking::run_blocking_async(move || restore_checkpoint(&root, &checkpoint)).await??;
             Ok(true)
         } else {
             Ok(false)

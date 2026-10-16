@@ -1,7 +1,6 @@
-//! Concrete typed FSM tasks assembled from the base turn steps.
+//! Concrete typed FSM tasks.
 //!
-//! This module composes the reusable step building blocks declared in
-//! [`super::task`] into the concrete [`Task`] implementations used by the
+//! This module declares the concrete [`Task`] implementations used by the
 //! workflow execution modes:
 //!
 //! - [`AnswerEditLoop`] runs the full discovery/edit/healing cycle while
@@ -9,18 +8,11 @@
 //!   definitions.
 //! - [`EditLoop`] runs the same cycle but requires at least one valid edit,
 //!   issuing a corrective retry whenever the model answers without edits.
-//! - [`StructuredTask`] runs a lightweight discovery/staging cycle for
-//!   schema-driven exchanges whose complete result is consumed after
-//!   generation.
-//! - [`StructuredStreamingTask`] runs the same lightweight cycle for
-//!   schema-driven exchanges whose content streams to the interface as it is
-//!   produced.
 //!
 //! Every task delegates the low-level cycling to the shared edit pipeline, so
-//! the tasks differ only in their acceptance contract and declared cycle, never
-//! in control flow. Keeping the phases inside one pipeline preserves a single
-//! source of truth for discovery, staging, and healing while the tasks stay
-//! declarative.
+//! the tasks differ only in their acceptance contract, never in control flow.
+//! Keeping the phases inside one pipeline preserves a single source of truth
+//! for discovery, staging, and healing while the tasks stay declarative.
 
 use async_trait::async_trait;
 
@@ -29,7 +21,7 @@ use crate::providers::StreamEvent;
 use super::fsm::{
     begin_session_turn, record_session_response, run_fsm_turn, run_fsm_turn_body, FsmTurnOutcome,
 };
-use super::task::{DiscoveryStep, StagingStep, Task, TaskEnv, TurnCycle};
+use super::task::{Task, TaskEnv};
 
 /// FSM task that runs a discovery/edit/healing cycle while allowing the model
 /// to answer without edits and to define new plans.
@@ -50,10 +42,6 @@ impl AnswerEditLoop {
 impl Task for AnswerEditLoop {
     fn name(&self) -> &'static str {
         "answer_edit_loop"
-    }
-
-    fn cycle(&self) -> TurnCycle {
-        TurnCycle::standard()
     }
 
     async fn execute(&self, env: &mut TaskEnv<'_>) -> anyhow::Result<FsmTurnOutcome> {
@@ -79,10 +67,6 @@ impl EditLoop {
 impl Task for EditLoop {
     fn name(&self) -> &'static str {
         "edit_loop"
-    }
-
-    fn cycle(&self) -> TurnCycle {
-        TurnCycle::standard()
     }
 
     async fn execute(&self, env: &mut TaskEnv<'_>) -> anyhow::Result<FsmTurnOutcome> {
@@ -148,81 +132,6 @@ impl Task for EditLoop {
                 Err(err)
             }
         }
-    }
-}
-
-/// Lightweight FSM cycle shared by the structured tasks.
-///
-/// Structured exchanges gather context and generate or stage their payload
-/// without entering the compiler verification and healing phases, which belong
-/// to code-modifying turns.
-fn structured_turn_cycle() -> TurnCycle {
-    TurnCycle::new().with(DiscoveryStep).with(StagingStep)
-}
-
-/// FSM task producing a schema-driven structured payload that is consumed once
-/// generation completes.
-///
-/// Suited to structured artifacts such as plan definitions, where the caller
-/// needs the fully assembled object rather than incremental output.
-pub struct StructuredTask {
-    prompt: String,
-}
-
-impl StructuredTask {
-    /// Creates a structured task bound to the turn prompt.
-    pub fn new(prompt: impl Into<String>) -> Self {
-        Self {
-            prompt: prompt.into(),
-        }
-    }
-}
-
-#[async_trait]
-impl Task for StructuredTask {
-    fn name(&self) -> &'static str {
-        "structured_task"
-    }
-
-    fn cycle(&self) -> TurnCycle {
-        structured_turn_cycle()
-    }
-
-    async fn execute(&self, env: &mut TaskEnv<'_>) -> anyhow::Result<FsmTurnOutcome> {
-        run_task_turn(&self.prompt, env).await
-    }
-}
-
-/// FSM task producing a schema-driven structured payload whose content is
-/// streamed to the interface as it is generated.
-///
-/// Suited to structured artifacts such as review findings, where the caller
-/// renders the result incrementally while the final object is assembled.
-pub struct StructuredStreamingTask {
-    prompt: String,
-}
-
-impl StructuredStreamingTask {
-    /// Creates a streaming structured task bound to the turn prompt.
-    pub fn new(prompt: impl Into<String>) -> Self {
-        Self {
-            prompt: prompt.into(),
-        }
-    }
-}
-
-#[async_trait]
-impl Task for StructuredStreamingTask {
-    fn name(&self) -> &'static str {
-        "structured_streaming_task"
-    }
-
-    fn cycle(&self) -> TurnCycle {
-        structured_turn_cycle()
-    }
-
-    async fn execute(&self, env: &mut TaskEnv<'_>) -> anyhow::Result<FsmTurnOutcome> {
-        run_task_turn(&self.prompt, env).await
     }
 }
 
@@ -323,9 +232,7 @@ mod tests {
     use crate::workflow::policy::DirectApplyPolicy;
     use crate::workflow::WorkflowOptions;
 
-    use super::{
-        AnswerEditLoop, EditLoop, StructuredStreamingTask, StructuredTask, Task, TaskEnv,
-    };
+    use super::{AnswerEditLoop, EditLoop, Task, TaskEnv};
 
     struct MockScriptProvider {
         responses: Mutex<VecDeque<String>>,
@@ -399,14 +306,12 @@ mod tests {
     }
 
     #[test]
-    fn test_loop_names_and_standard_cycles() {
+    fn test_loop_names() {
         let answer_loop = AnswerEditLoop::new("prompt");
         assert_eq!(answer_loop.name(), "answer_edit_loop");
-        assert_eq!(answer_loop.cycle().len(), 4);
 
         let edit_loop = EditLoop::new("prompt");
         assert_eq!(edit_loop.name(), "edit_loop");
-        assert_eq!(edit_loop.cycle().len(), 4);
     }
 
     #[tokio::test]
@@ -576,98 +481,5 @@ mod tests {
 
         assert!(matches!(out.result, ModelResult::Edit { ref edits, .. } if !edits.is_empty()));
         assert!(!out.assistant_text.contains("Edit Retry"));
-    }
-
-    #[test]
-    fn test_structured_tasks_report_names_and_lightweight_cycles() {
-        let structured = StructuredTask::new("prompt");
-        assert_eq!(structured.name(), "structured_task");
-        assert_eq!(structured.cycle().len(), 2);
-        let phases = structured.cycle().phases();
-        assert!(matches!(phases[0], tauqe_protocol::TurnPhase::Discovery));
-        assert!(matches!(phases[1], tauqe_protocol::TurnPhase::Staging));
-
-        let streaming = StructuredStreamingTask::new("prompt");
-        assert_eq!(streaming.name(), "structured_streaming_task");
-        assert_eq!(streaming.cycle().len(), 2);
-        let phases = streaming.cycle().phases();
-        assert!(matches!(phases[0], tauqe_protocol::TurnPhase::Discovery));
-        assert!(matches!(phases[1], tauqe_protocol::TurnPhase::Staging));
-    }
-
-    #[tokio::test]
-    async fn test_structured_task_returns_answer_without_edits() {
-        let (_dir, repo_root) = init_repo_with_target();
-        let mut context = ContextManager::new(repo_root.clone());
-        context.add_file("target.rs", ContextAccess::Editable).unwrap();
-        let mut history = HistoryManager::new(repo_root.clone());
-        let protocol = crate::prompt::xml::XmlPromptProtocol;
-        let protocol = protocol.with_turn_marker("MOCK").unwrap();
-
-        let provider = MockScriptProvider::new(vec![
-            "Here is the structured plan summary without any code edits.".to_string(),
-        ]);
-        let model = ModelRef::openrouter("test/model");
-        let (tx, _rx) = mpsc::channel(100);
-        let (_cancel_tx, cancel_rx) = watch::channel(false);
-        let options = WorkflowOptions::default();
-        let mut policy = DirectApplyPolicy::new();
-
-        let mut env = TaskEnv {
-            provider: &provider,
-            model: &model,
-            context: &mut context,
-            history: &mut history,
-            protocol: protocol.as_ref(),
-            policy: &mut policy,
-            workflow_name: "git",
-            stream_tx: tx,
-            cancel_rx,
-            options: &options,
-        };
-
-        let task = StructuredTask::new("Draft the plan outline");
-        let out = task.execute(&mut env).await.unwrap();
-
-        assert!(!out.is_cancelled);
-        assert!(matches!(out.result, ModelResult::Answer { .. }));
-    }
-
-    #[tokio::test]
-    async fn test_structured_streaming_task_returns_answer_without_edits() {
-        let (_dir, repo_root) = init_repo_with_target();
-        let mut context = ContextManager::new(repo_root.clone());
-        context.add_file("target.rs", ContextAccess::Editable).unwrap();
-        let mut history = HistoryManager::new(repo_root.clone());
-        let protocol = crate::prompt::xml::XmlPromptProtocol;
-        let protocol = protocol.with_turn_marker("MOCK").unwrap();
-
-        let provider = MockScriptProvider::new(vec![
-            "Streaming the review summary as structured content.".to_string(),
-        ]);
-        let model = ModelRef::openrouter("test/model");
-        let (tx, _rx) = mpsc::channel(100);
-        let (_cancel_tx, cancel_rx) = watch::channel(false);
-        let options = WorkflowOptions::default();
-        let mut policy = DirectApplyPolicy::new();
-
-        let mut env = TaskEnv {
-            provider: &provider,
-            model: &model,
-            context: &mut context,
-            history: &mut history,
-            protocol: protocol.as_ref(),
-            policy: &mut policy,
-            workflow_name: "git",
-            stream_tx: tx,
-            cancel_rx,
-            options: &options,
-        };
-
-        let task = StructuredStreamingTask::new("Summarize the review findings");
-        let out = task.execute(&mut env).await.unwrap();
-
-        assert!(!out.is_cancelled);
-        assert!(matches!(out.result, ModelResult::Answer { .. }));
     }
 }

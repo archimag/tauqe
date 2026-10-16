@@ -23,7 +23,10 @@ impl std::fmt::Display for ModelSelection {
 
 impl Default for ModelSelection {
     fn default() -> Self {
-        ModelSelection::Role(ModelRole::Coder)
+        // `Primary` is the mandatory base role and the deterministic default
+        // for every specialized role that omits its own list, so it is the
+        // only safe implicit selection.
+        ModelSelection::Role(ModelRole::Primary)
     }
 }
 
@@ -100,5 +103,13 @@ mod tests {
         let roles_json = serde_json::to_string(&roles_summary).unwrap();
         let de_roles: ModelRolesSummary = serde_json::from_str(&roles_json).unwrap();
         assert_eq!(de_roles, roles_summary);
+    }
+
+    #[test]
+    fn test_model_selection_default_is_primary_role() {
+        assert_eq!(
+            ModelSelection::default(),
+            ModelSelection::Role(ModelRole::Primary)
+        );
     }
 }

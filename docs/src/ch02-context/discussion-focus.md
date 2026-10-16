@@ -82,7 +82,9 @@ receives every change through a typed focus-changed event. The lifecycle is:
 
 1. **Set.** An explicit discussion target replaces the anchor. This does not
    reset the REPL session history, so the developer keeps the running dialogue
-   while switching the entity under discussion.
+   while switching the entity under discussion. Plans and Review also expose a
+   direct `f` command that sets the anchor in one keystroke without leaving the
+   view (see 2.8.7).
 2. **Continue.** A plain ask does not clear the anchor. While a focus is active,
    the current state of the focused plan or review is injected into the prompt on
    every such turn, so follow-up questions stay grounded in the live
@@ -123,3 +125,21 @@ the focus reset no longer competes with the most-used key on the keyboard. The
 same `C-g` chord is reused in the History view for a different, similarly
 destructive action (clearing the conversation history), each gated by its own
 confirmation; the two never fire together because each is scoped to its own view.
+
+## 2.8.7. Quick Focus from Plans and Review
+
+The focus is most often set by opening a discussion, but setting it must not
+cost a screen switch. Both the **Plans** and **Review** views bind `f` to a
+direct **quick focus** command on the selected row:
+
+- On a plan header, `f` anchors the discussion to the whole plan; on a specific
+  plan step or review finding, it anchors to that item.
+- The command dispatches `discussion/set_focus` immediately, with no prompt text
+  required, so the developer binds the discussion to an entity in one keystroke.
+- The view **does not change**: the developer stays exactly where they are. A
+  status notification confirms the new anchor, and the focused row gains a
+  `[FOCUS]` badge so the binding is visible without leaving the screen.
+
+This is the interactive counterpart to the typed target of 2.8.2: the same
+anchor, set without a round-trip through the REPL. It only *sets* the focus;
+releasing it stays the separate, guarded action described in 2.8.6.

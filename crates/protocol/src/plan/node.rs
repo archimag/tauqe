@@ -41,6 +41,17 @@ impl fmt::Display for PlanValidationError {
 
 impl std::error::Error for PlanValidationError {}
 
+/// Canonical, shared comparison key for every plan and concept identifier.
+///
+/// Validation, lookup, and scheduling must agree on identifier identity,
+/// otherwise a plan can pass [`Plan::validate`] yet stay blocked forever on a
+/// dependency it was supposed to satisfy. Trimming and ASCII-lowercasing here
+/// collapses cosmetic spelling differences such as `"1"`, `"1 "`, and `" 1"`
+/// into one key used everywhere.
+pub(super) fn id_key(id: &str) -> String {
+    id.trim().to_ascii_lowercase()
+}
+
 /// Two-section engineering plan: Concept Tree ("What") and Implementation Blueprint ("How").
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct Plan {
@@ -125,6 +136,38 @@ pub fn compute_items_status(items: &[PlanItem]) -> PlanItemStatus {
     PlanItemStatus::InProgress
 }
 
+/// Counts executable, non-cancelled leaf items and how many of them are `Done`.
+///
+/// This is the single authoritative leaf-progress metric shared by a full plan
+/// ([`Plan::count_stats`]) and a review finding's embedded subplan
+/// ([`crate::review::ReviewItem::subplan_stats`]). Only leaves carry an explicit,
+/// authoritative status; a container's status is derived from its children and
+/// may be stale in memory. Counting leaves never double-counts a container
+/// alongside the children it aggregates, and `Cancelled` leaves are excluded
+/// from `total` so a completed plan never reports a `completed/total` ratio
+/// below one.
+pub fn count_leaf_stats(items: &[PlanItem]) -> (usize, usize) {
+    fn walk(items: &[PlanItem], total: &mut usize, completed: &mut usize) {
+        for item in items {
+            if item.is_leaf() {
+                if item.status == PlanItemStatus::Cancelled {
+                    continue;
+                }
+                *total += 1;
+                if item.status == PlanItemStatus::Done {
+                    *completed += 1;
+                }
+            } else {
+                walk(&item.children, total, completed);
+            }
+        }
+    }
+    let mut total = 0;
+    let mut completed = 0;
+    walk(items, &mut total, &mut completed);
+    (total, completed)
+}
+
 impl Plan {
     /// Computes the overall plan status deterministically based on its items.
     pub fn status(&self) -> PlanItemStatus {
@@ -150,36 +193,21 @@ impl Plan {
         PlanStats { total, completed }
     }
 
-    /// Counts executable leaf items and how many of them are `Done`.
+    /// Counts executable, non-cancelled leaf items and how many of them are
+    /// `Done`.
     ///
-    /// Only leaves carry an explicit, authoritative status; a container's status
-    /// is derived from its children and may be stale in memory. Counting leaves
-    /// keeps the progress metric consistent with [`Self::status`], which also
-    /// derives from the leaves, and never double-counts a container alongside the
-    /// children it aggregates.
+    /// Delegates to [`count_leaf_stats`], the single authoritative leaf-progress
+    /// metric also used for a review finding's embedded subplan, so a plan and a
+    /// subplan can never drift apart. See that function for the precise
+    /// semantics.
     pub fn count_stats(&self) -> (usize, usize) {
-        fn walk(items: &[PlanItem], total: &mut usize, completed: &mut usize) {
-            for item in items {
-                if item.is_leaf() {
-                    *total += 1;
-                    if item.status == PlanItemStatus::Done {
-                        *completed += 1;
-                    }
-                } else {
-                    walk(&item.children, total, completed);
-                }
-            }
-        }
-        let mut total = 0;
-        let mut completed = 0;
-        walk(&self.items, &mut total, &mut completed);
-        (total, completed)
+        count_leaf_stats(&self.items)
     }
 
     pub fn find_concept_item(&self, item_id: &str) -> Option<&ConceptItem> {
         fn walk<'a>(items: &'a [ConceptItem], target: &str) -> Option<&'a ConceptItem> {
             for item in items {
-                if item.id.eq_ignore_ascii_case(target) {
+                if id_key(&item.id) == target {
                     return Some(item);
                 }
                 if let Some(found) = walk(&item.children, target) {
@@ -188,13 +216,13 @@ impl Plan {
             }
             None
         }
-        walk(&self.concept, item_id)
+        walk(&self.concept, &id_key(item_id))
     }
 
     pub fn find_concept_item_mut(&mut self, item_id: &str) -> Option<&mut ConceptItem> {
         fn walk<'a>(items: &'a mut [ConceptItem], target: &str) -> Option<&'a mut ConceptItem> {
             for item in items {
-                if item.id.eq_ignore_ascii_case(target) {
+                if id_key(&item.id) == target {
                     return Some(item);
                 }
                 if let Some(found) = walk(&mut item.children, target) {
@@ -203,13 +231,13 @@ impl Plan {
             }
             None
         }
-        walk(&mut self.concept, item_id)
+        walk(&mut self.concept, &id_key(item_id))
     }
 
     pub fn find_item(&self, item_id: &str) -> Option<&PlanItem> {
         fn walk<'a>(items: &'a [PlanItem], target: &str) -> Option<&'a PlanItem> {
             for item in items {
-                if item.id.eq_ignore_ascii_case(target) {
+                if id_key(&item.id) == target {
                     return Some(item);
                 }
                 if let Some(found) = walk(&item.children, target) {
@@ -218,13 +246,21 @@ impl Plan {
             }
             None
         }
-        walk(&self.items, item_id)
+        walk(&self.items, &id_key(item_id))
     }
 
     pub fn is_leaf_item(&self, item_id: &str) -> Option<bool> {
         self.find_item(item_id).map(|item| item.is_leaf())
     }
 
+    /// Recomputes the derived status of every container item from its children.
+    ///
+    /// Only leaves carry an authoritative status; a container's status is a pure
+    /// function of its descendants (see [`compute_items_status`]). This normalizer
+    /// is the single place that materializes that derived value onto containers,
+    /// so a caller that mutates a leaf refreshes the tree through it instead of
+    /// hand-rolling aggregation. It performs no I/O and is allocation-only, which
+    /// is why it legitimately lives in `protocol` (see `Conventions.md` §2).
     pub fn refresh_parent_statuses(&mut self) {
         fn walk(items: &mut [PlanItem]) {
             for item in items.iter_mut() {
@@ -272,26 +308,30 @@ impl Plan {
     /// and its status was durably changed; it returns `false` both for an unknown
     /// identifier and for a container target, so a caller never mistakes a
     /// discarded assignment for a successful update.
+    ///
+    /// The `tui` crate uses this helper for optimistic status updates and their
+    /// rollback, so it is part of the sanctioned, I/O-free `protocol` surface
+    /// documented in `Conventions.md` §2.
     pub fn update_item_status(&mut self, item_id: &str, status: PlanItemStatus) -> bool {
         // Locates the target and classifies it: `Some(true)` for an assignable
         // leaf, `Some(false)` for a non-assignable container, `None` when absent.
-        fn walk(items: &mut [PlanItem], item_id: &str, status: PlanItemStatus) -> Option<bool> {
+        fn walk(items: &mut [PlanItem], target: &str, status: PlanItemStatus) -> Option<bool> {
             for item in items {
-                if item.id.eq_ignore_ascii_case(item_id) {
+                if id_key(&item.id) == target {
                     if item.is_leaf() {
                         item.status = status;
                         return Some(true);
                     }
                     return Some(false);
                 }
-                if let Some(updated) = walk(&mut item.children, item_id, status) {
+                if let Some(updated) = walk(&mut item.children, target, status) {
                     return Some(updated);
                 }
             }
             None
         }
 
-        if walk(&mut self.items, item_id, status) == Some(true) {
+        if walk(&mut self.items, &id_key(item_id), status) == Some(true) {
             self.refresh_parent_statuses();
             true
         } else {
@@ -319,12 +359,9 @@ impl Plan {
             errors: &mut Vec<PlanValidationError>,
         ) {
             for c in concepts {
-                let trimmed = c.id.trim();
-                if !trimmed.is_empty() {
-                    let key = trimmed.to_ascii_lowercase();
-                    if !seen.insert(key) {
-                        errors.push(PlanValidationError::DuplicateConceptId(c.id.clone()));
-                    }
+                let key = id_key(&c.id);
+                if !key.is_empty() && !seen.insert(key) {
+                    errors.push(PlanValidationError::DuplicateConceptId(c.id.clone()));
                 }
                 walk_concepts(&c.children, seen, errors);
             }
@@ -341,16 +378,13 @@ impl Plan {
             errors: &mut Vec<PlanValidationError>,
         ) {
             for item in items {
-                let trimmed = item.id.trim();
-                if trimmed.is_empty() {
+                let key = id_key(&item.id);
+                if key.is_empty() {
                     errors.push(PlanValidationError::EmptyItemId);
+                } else if !seen.insert(key.clone()) {
+                    errors.push(PlanValidationError::DuplicateItemId(item.id.clone()));
                 } else {
-                    let key = trimmed.to_ascii_lowercase();
-                    if !seen.insert(key.clone()) {
-                        errors.push(PlanValidationError::DuplicateItemId(item.id.clone()));
-                    } else {
-                        id_display.insert(key, item.id.clone());
-                    }
+                    id_display.insert(key, item.id.clone());
                 }
                 walk_items(&item.children, seen, id_display, errors);
             }
@@ -367,11 +401,11 @@ impl Plan {
             errors: &mut Vec<PlanValidationError>,
         ) {
             for item in items {
-                let item_key = item.id.trim().to_ascii_lowercase();
+                let item_key = id_key(&item.id);
 
                 // Validate concept_refs
                 for c_ref in &item.concept_refs {
-                    let c_key = c_ref.trim().to_ascii_lowercase();
+                    let c_key = id_key(c_ref);
                     if !seen_concepts.contains(&c_key) {
                         errors.push(PlanValidationError::MissingConceptRef {
                             item_id: item.id.clone(),
@@ -383,11 +417,10 @@ impl Plan {
                 // Validate depends_on
                 let mut deps_for_item = Vec::new();
                 for dep in &item.depends_on {
-                    let dep_trimmed = dep.trim();
-                    if dep_trimmed.is_empty() {
+                    let dep_key = id_key(dep);
+                    if dep_key.is_empty() {
                         continue;
                     }
-                    let dep_key = dep_trimmed.to_ascii_lowercase();
                     if dep_key == item_key {
                         errors.push(PlanValidationError::SelfDependency(item.id.clone()));
                     } else if !seen_items.contains(&dep_key) {
@@ -401,6 +434,17 @@ impl Plan {
                 }
 
                 if !item_key.is_empty() {
+                    // A container becomes `Done` exactly when all of its
+                    // descendant leaves are `Done`, so it implicitly depends on
+                    // them. Recording those edges lets the cycle detector expose
+                    // a leaf that depends on its own ancestor: the ancestor can
+                    // never finish without the leaf, and the leaf can never start
+                    // without the ancestor. Only the derived status of a
+                    // container is meaningful, so the implicit edges are added
+                    // for non-leaf items only.
+                    if !item.is_leaf() {
+                        collect_descendant_leaf_keys(item, &mut deps_for_item);
+                    }
                     dep_graph.insert(item_key, deps_for_item);
                 }
 
@@ -422,7 +466,30 @@ impl Plan {
     }
 }
 
+/// Collects the normalized keys of every leaf reachable beneath `item`.
+///
+/// A container's completion is defined by its descendant leaves, so these keys
+/// are the implicit dependencies that connect a container to the leaves whose
+/// `depends_on` may point back at it.
+fn collect_descendant_leaf_keys(item: &PlanItem, out: &mut Vec<String>) {
+    for child in &item.children {
+        if child.is_leaf() {
+            let key = id_key(&child.id);
+            if !key.is_empty() {
+                out.push(key);
+            }
+        } else {
+            collect_descendant_leaf_keys(child, out);
+        }
+    }
+}
+
 /// Detects a dependency cycle in a directed adjacency graph.
+///
+/// Uses an explicit work stack instead of recursion so that a flat list with a
+/// very long `depends_on` chain cannot overflow the call stack. The traversal
+/// order, node marks, and reported cycle path are identical to a recursive
+/// depth-first search.
 fn detect_dependency_cycle(
     graph: &HashMap<String, Vec<String>>,
     id_display: &HashMap<String, String>,
@@ -433,51 +500,57 @@ fn detect_dependency_cycle(
         Visited,
     }
 
-    fn dfs(
-        node: &str,
-        graph: &HashMap<String, Vec<String>>,
-        marks: &mut HashMap<String, Mark>,
-        path: &mut Vec<String>,
-        id_display: &HashMap<String, String>,
-    ) -> Option<Vec<String>> {
-        marks.insert(node.to_string(), Mark::Visiting);
-        path.push(node.to_string());
+    let mut marks: HashMap<String, Mark> = HashMap::new();
+    // The active DFS chain from the root to the node currently being explored.
+    let mut path: Vec<String> = Vec::new();
 
-        if let Some(neighbors) = graph.get(node) {
-            for neighbor in neighbors {
-                match marks.get(neighbor) {
+    let mut keys: Vec<&String> = graph.keys().collect();
+    keys.sort();
+    for key in keys {
+        if marks.contains_key(key) {
+            continue;
+        }
+        marks.insert(key.clone(), Mark::Visiting);
+        path.push(key.clone());
+        // Each frame records a node and the index of its next unvisited
+        // neighbor, mirroring the same position a recursive call would resume
+        // from after returning.
+        let mut stack: Vec<(String, usize)> = vec![(key.clone(), 0)];
+
+        while let Some((node, index)) = stack.pop() {
+            let next_neighbor = graph
+                .get(&node)
+                .and_then(|neighbors| neighbors.get(index))
+                .cloned();
+            if let Some(neighbor) = next_neighbor {
+                // Requeue this node to resume at the following neighbor.
+                stack.push((node.clone(), index + 1));
+                match marks.get(&neighbor) {
                     Some(Mark::Visiting) => {
-                        let cycle_start = path.iter().position(|n| n == neighbor).unwrap_or(0);
+                        let cycle_start =
+                            path.iter().position(|n| n == &neighbor).unwrap_or(0);
                         let mut cycle: Vec<String> = path[cycle_start..]
                             .iter()
                             .map(|k| id_display.get(k).cloned().unwrap_or_else(|| k.clone()))
                             .collect();
-                        cycle.push(id_display.get(neighbor).cloned().unwrap_or_else(|| neighbor.clone()));
+                        cycle.push(
+                            id_display
+                                .get(&neighbor)
+                                .cloned()
+                                .unwrap_or_else(|| neighbor.clone()),
+                        );
                         return Some(cycle);
                     }
                     Some(Mark::Visited) => {}
                     None => {
-                        if let Some(cycle) = dfs(neighbor, graph, marks, path, id_display) {
-                            return Some(cycle);
-                        }
+                        marks.insert(neighbor.clone(), Mark::Visiting);
+                        path.push(neighbor.clone());
+                        stack.push((neighbor, 0));
                     }
                 }
-            }
-        }
-
-        path.pop();
-        marks.insert(node.to_string(), Mark::Visited);
-        None
-    }
-
-    let mut marks = HashMap::new();
-    let mut path = Vec::new();
-    let mut keys: Vec<&String> = graph.keys().collect();
-    keys.sort();
-    for key in keys {
-        if !marks.contains_key(key) {
-            if let Some(cycle) = dfs(key, graph, &mut marks, &mut path, id_display) {
-                return Some(cycle);
+            } else {
+                marks.insert(node, Mark::Visited);
+                path.pop();
             }
         }
     }

@@ -1,10 +1,12 @@
-use ratatui::style::{Color, Style, Stylize};
+use ratatui::style::{Style, Stylize};
 use ratatui::text::{Line, Span};
-use std::cell::RefCell;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use tauqe_protocol::{ModelRef, ModelResult, ModelUsageEvent};
+
+use crate::theme::color::RgbColor;
+use crate::theme::engine::{current_engine, ThemeEngine};
 
 pub mod input;
 pub mod render;
@@ -142,7 +144,7 @@ pub struct StreamingFileEdit {
 /// of the file's hunks, so a changed hunk always re-renders.
 #[derive(Default)]
 pub struct DiffRenderCache {
-    entries: RefCell<HashMap<String, DiffCacheEntry>>,
+    entries: HashMap<String, DiffCacheEntry>,
 }
 
 struct DiffCacheEntry {
@@ -153,13 +155,13 @@ struct DiffCacheEntry {
 impl DiffRenderCache {
     /// Returns the rendered diff body for `file`, recomputing it only when the
     /// cached fingerprint no longer matches the file's hunks.
-    fn lines_for(&self, file: &StreamingFileEdit) -> Vec<Line<'static>> {
+    fn lines_for(&mut self, file: &StreamingFileEdit) -> Vec<Line<'static>> {
         let fingerprint = diff_fingerprint(file);
         if let Some(lines) = self.cached_lines(&file.path, fingerprint) {
             return lines;
         }
         let lines = render_expanded_diff_lines(file);
-        self.entries.borrow_mut().insert(
+        self.entries.insert(
             file.path.clone(),
             DiffCacheEntry {
                 fingerprint,
@@ -170,8 +172,7 @@ impl DiffRenderCache {
     }
 
     fn cached_lines(&self, path: &str, fingerprint: u64) -> Option<Vec<Line<'static>>> {
-        let entries = self.entries.borrow();
-        let entry = entries.get(path)?;
+        let entry = self.entries.get(path)?;
         if entry.fingerprint == fingerprint {
             Some(entry.lines.clone())
         } else {
@@ -197,49 +198,47 @@ fn diff_fingerprint(file: &StreamingFileEdit) -> u64 {
     hasher.finish()
 }
 
+/// Filled indicator style: a semantic background role with inverse text.
+///
+/// Toolchain, commit, and turn-status badges resolve both their surface and
+/// their label from the active palette, so a badge never disappears on a
+/// terminal with a non-standard palette (c-1).
+fn indicator_style(engine: &ThemeEngine, bg: RgbColor) -> Style {
+    engine
+        .bg(bg)
+        .fg(engine.color(engine.palette().text_inverse))
+        .bold()
+}
+
 /// Renders the expanded diff body for a single file edit.
 ///
 /// Extracted from the model-line builder so the result can be cached and its
 /// length reused for scroll accounting without recomputing the diff.
 fn render_expanded_diff_lines(file: &StreamingFileEdit) -> Vec<Line<'static>> {
+    let engine = current_engine();
+    let palette = engine.palette();
     let mut lines: Vec<Line<'static>> = Vec::new();
     for hunk in &file.hunks {
         if file.op_type == EditOp::Create {
             lines.push(Line::from(vec![Span::styled(
                 "  @@ new file @@",
-                Style::default().fg(Color::Green).bold(),
+                engine.fg(palette.diff_added).bold(),
             )]));
             for line in hunk.new_text.lines() {
                 lines.push(Line::from(vec![
-                    Span::styled(
-                        "  + ",
-                        Style::default()
-                            .fg(crate::markdown::safe_rgb(120, 240, 120))
-                            .bold(),
-                    ),
-                    Span::styled(
-                        line.to_string(),
-                        Style::default().fg(crate::markdown::safe_rgb(140, 240, 140)),
-                    ),
+                    Span::styled("  + ", engine.fg(palette.diff_added).bold()),
+                    Span::styled(line.to_string(), engine.fg(palette.diff_added)),
                 ]));
             }
         } else if file.op_type == EditOp::Delete {
             lines.push(Line::from(vec![Span::styled(
                 "  @@ deleted file @@",
-                Style::default().fg(Color::Red).bold(),
+                engine.fg(palette.diff_removed).bold(),
             )]));
             for line in hunk.old_text.lines() {
                 lines.push(Line::from(vec![
-                    Span::styled(
-                        "  - ",
-                        Style::default()
-                            .fg(crate::markdown::safe_rgb(255, 120, 120))
-                            .bold(),
-                    ),
-                    Span::styled(
-                        line.to_string(),
-                        Style::default().fg(crate::markdown::safe_rgb(255, 140, 140)),
-                    ),
+                    Span::styled("  - ", engine.fg(palette.diff_removed).bold()),
+                    Span::styled(line.to_string(), engine.fg(palette.diff_removed)),
                 ]));
             }
         } else {
@@ -251,7 +250,7 @@ fn render_expanded_diff_lines(file: &StreamingFileEdit) -> Vec<Line<'static>> {
             };
             lines.push(Line::from(vec![Span::styled(
                 header_text,
-                Style::default().fg(Color::Cyan).bold(),
+                engine.fg(palette.status_info).bold(),
             )]));
 
             for op in diff.ops() {
@@ -260,41 +259,28 @@ fn render_expanded_diff_lines(file: &StreamingFileEdit) -> Vec<Line<'static>> {
                     match change.tag() {
                         similar::ChangeTag::Delete => {
                             lines.push(Line::from(vec![
-                                Span::styled(
-                                    "  - ",
-                                    Style::default()
-                                        .fg(crate::markdown::safe_rgb(255, 120, 120))
-                                        .bold(),
-                                ),
+                                Span::styled("  - ", engine.fg(palette.diff_removed).bold()),
                                 Span::styled(
                                     line_str.to_string(),
-                                    Style::default()
-                                        .fg(crate::markdown::safe_rgb(255, 140, 140)),
+                                    engine.fg(palette.diff_removed),
                                 ),
                             ]));
                         }
                         similar::ChangeTag::Insert => {
                             lines.push(Line::from(vec![
-                                Span::styled(
-                                    "  + ",
-                                    Style::default()
-                                        .fg(crate::markdown::safe_rgb(120, 240, 120))
-                                        .bold(),
-                                ),
+                                Span::styled("  + ", engine.fg(palette.diff_added).bold()),
                                 Span::styled(
                                     line_str.to_string(),
-                                    Style::default()
-                                        .fg(crate::markdown::safe_rgb(140, 240, 140)),
+                                    engine.fg(palette.diff_added),
                                 ),
                             ]));
                         }
                         similar::ChangeTag::Equal => {
                             lines.push(Line::from(vec![
-                                Span::styled("    ", Style::default().fg(Color::DarkGray)),
+                                Span::styled("    ", engine.fg(palette.diff_context)),
                                 Span::styled(
                                     line_str.to_string(),
-                                    Style::default()
-                                        .fg(crate::markdown::safe_rgb(170, 175, 185)),
+                                    engine.fg(palette.diff_context),
                                 ),
                             ]));
                         }
@@ -448,9 +434,10 @@ impl ReasoningState {
     }
 
     fn tail_line(line: &str) -> Line<'static> {
+        let engine = current_engine();
         Line::from(Span::styled(
             line.to_string(),
-            Style::default().fg(crate::markdown::safe_rgb(140, 180, 230)),
+            engine.fg(engine.palette().text_secondary),
         ))
     }
 
@@ -479,13 +466,13 @@ impl ReasoningState {
             return Vec::new();
         }
 
+        let engine = current_engine();
+        let palette = engine.palette();
+
         let mut lines = Vec::new();
         let reasoning_badge = Span::styled(
             " [REASONING] ",
-            Style::default()
-                .bg(crate::markdown::safe_rgb(60, 90, 140))
-                .fg(Color::White)
-                .bold(),
+            indicator_style(&engine, palette.button_active_bg),
         );
 
         if !self.show {
@@ -494,7 +481,7 @@ impl ReasoningState {
                 Span::raw(" "),
                 Span::styled(
                     "▶ Thinking hidden",
-                    Style::default().fg(Color::DarkGray).bold(),
+                    engine.fg(palette.text_muted).bold(),
                 ),
             ]));
             return lines;
@@ -506,9 +493,7 @@ impl ReasoningState {
                 Span::raw(" "),
                 Span::styled(
                     format!("Thinking… ({} lines)", self.total_lines()),
-                    Style::default()
-                        .fg(crate::markdown::safe_rgb(130, 170, 220))
-                        .bold(),
+                    engine.fg(palette.status_info).bold(),
                 ),
             ]));
 
@@ -520,19 +505,13 @@ impl ReasoningState {
             lines.push(Line::from(vec![
                 reasoning_badge,
                 Span::raw(" "),
-                Span::styled(
-                    "Thinking",
-                    Style::default()
-                        .fg(crate::markdown::safe_rgb(130, 170, 220))
-                        .bold(),
-                ),
+                Span::styled("Thinking", engine.fg(palette.status_info).bold()),
             ]));
 
             if !self.lines.is_empty() {
                 lines.extend(self.lines.iter().cloned());
             } else {
-                let text_style = Style::default()
-                    .fg(crate::markdown::safe_rgb(140, 180, 230));
+                let text_style = engine.fg(palette.text_secondary);
                 for line in self.text.lines() {
                     lines.push(Line::from(Span::styled(line.to_string(), text_style)));
                 }
@@ -677,6 +656,18 @@ impl DevelopView {
         }
     }
 
+    /// Re-renders the answer and reasoning Markdown under the currently active
+    /// theme, forcing a repaint even when the light/dark mode is unchanged.
+    ///
+    /// A hot theme reload (configuration reload or the interactive preset
+    /// selector) swaps the global palette without changing the light/dark mode,
+    /// so the throttled [`Self::set_theme_mode`] path would otherwise leave the
+    /// cached Markdown painted in the previous colors.
+    pub fn refresh_theme(&mut self) {
+        self.render_markdown_now();
+        self.reasoning.update_markdown();
+    }
+
     fn render_markdown_now(&mut self) {
         let flashing_id = self.copy_flash.as_ref().map(|(id, _)| *id);
         let mut theme = crate::markdown::MarkdownTheme::answer_themed(self.theme_mode);
@@ -730,7 +721,7 @@ impl DevelopView {
             || (self.edits_active && self.edit_final_applied.is_none())
     }
 
-    pub fn max_scroll(&self, view_height: u16) -> u16 {
+    pub fn max_scroll(&mut self, view_height: u16) -> u16 {
         let count = if self.rendered_lines_count > 0 {
             self.rendered_lines_count
         } else {
@@ -748,11 +739,7 @@ impl DevelopView {
         }
     }
 
-    pub fn expanded_file_lines_count(&self, file: &StreamingFileEdit) -> usize {
-        self.diff_cache.lines_for(file).len()
-    }
-
-    pub fn file_line_offset(&self, target_idx: usize) -> usize {
+    pub fn file_line_offset(&mut self, target_idx: usize) -> usize {
         let mut line_idx = 0;
         if self.error.is_some() {
             line_idx += 1;
@@ -797,7 +784,7 @@ impl DevelopView {
                     line_idx += 1;
                 }
                 if file.expanded {
-                    line_idx += self.expanded_file_lines_count(file);
+                    line_idx += self.diff_cache.lines_for(file).len();
                 }
             }
         }
@@ -836,13 +823,16 @@ impl DevelopView {
     }
 }
 
-pub fn compute_model_lines(model: &DevelopView) -> Vec<Line<'static>> {
+pub fn compute_model_lines(model: &mut DevelopView) -> Vec<Line<'static>> {
+    let engine = current_engine();
+    let palette = engine.palette();
+
     let mut model_lines: Vec<Line<'static>> = Vec::new();
 
     if let Some(err) = &model.error {
         model_lines.push(Line::from(vec![
             Span::raw("Error: "),
-            Span::styled(err.clone(), Style::default().fg(Color::Red)),
+            Span::styled(err.clone(), engine.fg(palette.status_error)),
         ]));
     }
 
@@ -853,7 +843,7 @@ pub fn compute_model_lines(model: &DevelopView) -> Vec<Line<'static>> {
                 (
                     Span::styled(
                         format!(" [{}] TOOLCHAIN ", spin),
-                        Style::default().bg(Color::Cyan).fg(Color::Black).bold(),
+                        indicator_style(&engine, palette.status_info),
                     ),
                     format!("Running `{}`...", command),
                 )
@@ -861,14 +851,14 @@ pub fn compute_model_lines(model: &DevelopView) -> Vec<Line<'static>> {
             ToolchainState::Passed { command } => (
                 Span::styled(
                     " [TOOLCHAIN: OK] ",
-                    Style::default().bg(Color::Green).fg(Color::Black).bold(),
+                    indicator_style(&engine, palette.status_success),
                 ),
                 format!("`{}` passed", command),
             ),
             ToolchainState::Failed { command, message } => (
                 Span::styled(
                     " [TOOLCHAIN: FAILED] ",
-                    Style::default().bg(Color::Red).fg(Color::White).bold(),
+                    indicator_style(&engine, palette.status_error),
                 ),
                 message
                     .clone()
@@ -915,24 +905,24 @@ pub fn compute_model_lines(model: &DevelopView) -> Vec<Line<'static>> {
                 if let Some(hash) = &model.last_commit_hash {
                     Span::styled(
                         format!(" [COMMITTED: {}] ", hash),
-                        Style::default().bg(Color::Green).fg(Color::Black).bold(),
+                        indicator_style(&engine, palette.status_success),
                     )
                 } else {
                     Span::styled(
                         " [APPLIED] ",
-                        Style::default().bg(Color::Green).fg(Color::Black).bold(),
+                        indicator_style(&engine, palette.status_success),
                     )
                 }
             }
             Some(false) => Span::styled(
                 " [REJECTED] ",
-                Style::default().bg(Color::Red).fg(Color::White).bold(),
+                indicator_style(&engine, palette.status_error),
             ),
             None => {
                 let spin = SPINNER_FRAMES[model.spinner_frame % SPINNER_FRAMES.len()];
                 Span::styled(
                     format!(" [{}] Modifying ", spin),
-                    Style::default().bg(Color::Yellow).fg(Color::Black).bold(),
+                    indicator_style(&engine, palette.status_warning),
                 )
             }
         };
@@ -942,7 +932,7 @@ pub fn compute_model_lines(model: &DevelopView) -> Vec<Line<'static>> {
             Span::raw(" "),
             Span::styled(
                 format!("Proposed Edits ({}/{} files)", ok_files, total_files),
-                Style::default().bold().fg(Color::Cyan),
+                engine.fg(palette.status_info).bold(),
             ),
         ];
 
@@ -961,20 +951,22 @@ pub fn compute_model_lines(model: &DevelopView) -> Vec<Line<'static>> {
             let cursor_prefix = if is_selected { "> " } else { "  " };
 
             let (status_icon, status_style) = match file.status {
-                FileEditStatus::Ok => ("✓", Style::default().fg(Color::Green).bold()),
-                FileEditStatus::Error => ("✗", Style::default().fg(Color::Red).bold()),
+                FileEditStatus::Ok => ("✓", engine.fg(palette.status_success).bold()),
+                FileEditStatus::Error => ("✗", engine.fg(palette.status_error).bold()),
                 FileEditStatus::Running | FileEditStatus::Retrying => (
                     SPINNER_FRAMES[model.spinner_frame % SPINNER_FRAMES.len()],
-                    Style::default().fg(Color::Yellow).bold(),
+                    engine.fg(palette.status_warning).bold(),
                 ),
             };
 
             let (op_label, op_style) = match file.op_type {
-                EditOp::Create => ("[NEW] ", Style::default().fg(Color::Green).bold()),
-                EditOp::Delete => ("[DEL] ", Style::default().fg(Color::Red).bold()),
-                EditOp::Move => ("[MOVE] ", Style::default().fg(Color::Cyan).bold()),
-                EditOp::Overwrite => ("[OVERWRITE] ", Style::default().fg(Color::Yellow).bold()),
-                EditOp::Replace => ("[EDIT] ", Style::default().fg(Color::Magenta).bold()),
+                EditOp::Create => ("[NEW] ", engine.fg(palette.status_success).bold()),
+                EditOp::Delete => ("[DEL] ", engine.fg(palette.status_error).bold()),
+                EditOp::Move => ("[MOVE] ", engine.fg(palette.status_info).bold()),
+                EditOp::Overwrite => {
+                    ("[OVERWRITE] ", engine.fg(palette.status_warning).bold())
+                }
+                EditOp::Replace => ("[EDIT] ", engine.fg(palette.button_active_bg).bold()),
             };
 
             let hunk_count = file.hunks.len();
@@ -1004,21 +996,21 @@ pub fn compute_model_lines(model: &DevelopView) -> Vec<Line<'static>> {
             };
 
             let file_line_style = if is_selected {
-                Style::default().bg(Color::DarkGray).bold()
+                engine.bg(palette.overlay).bold()
             } else {
                 Style::default()
             };
 
             let mut file_spans = vec![
                 Span::raw("  "),
-                Span::styled(cursor_prefix, Style::default().fg(Color::Cyan)),
-                Span::styled(fold_icon, Style::default().fg(Color::DarkGray)),
+                Span::styled(cursor_prefix, engine.fg(palette.status_info)),
+                Span::styled(fold_icon, engine.fg(palette.text_muted)),
                 Span::styled(op_label, op_style),
                 Span::styled(file.path.clone(), Style::default().bold()),
                 Span::raw(" "),
                 Span::styled(
                     format!("({})", hunk_label),
-                    Style::default().fg(Color::DarkGray),
+                    engine.fg(palette.text_muted),
                 ),
                 Span::raw(" "),
                 Span::styled(status_icon, status_style),
@@ -1029,7 +1021,7 @@ pub fn compute_model_lines(model: &DevelopView) -> Vec<Line<'static>> {
                     file_spans.push(Span::raw(" "));
                     file_spans.push(Span::styled(
                         format!("(Retrying {})", retry),
-                        Style::default().fg(Color::Yellow).bold(),
+                        engine.fg(palette.status_warning).bold(),
                     ));
                 }
             }
@@ -1040,8 +1032,11 @@ pub fn compute_model_lines(model: &DevelopView) -> Vec<Line<'static>> {
                 if let Some(err_msg) = &file.error {
                     model_lines.push(Line::from(vec![
                         Span::raw("      "),
-                        Span::styled("Validation Error: ", Style::default().fg(Color::Red).bold()),
-                        Span::styled(err_msg.clone(), Style::default().fg(Color::Yellow)),
+                        Span::styled(
+                            "Validation Error: ",
+                            engine.fg(palette.status_error).bold(),
+                        ),
+                        Span::styled(err_msg.clone(), engine.fg(palette.status_warning)),
                     ]));
                 }
             }
@@ -1055,13 +1050,13 @@ pub fn compute_model_lines(model: &DevelopView) -> Vec<Line<'static>> {
     if let Some(usage) = &model.usage {
         model_lines.push(Line::raw(""));
         let mut usage_spans = vec![
-            Span::styled("Tokens: ", Style::default().fg(Color::DarkGray).bold()),
+            Span::styled("Tokens: ", engine.fg(palette.text_muted).bold()),
             Span::styled(
                 format!(
                     "{} prompt, {} completion",
                     usage.usage.prompt_tokens, usage.usage.completion_tokens,
                 ),
-                Style::default().fg(Color::DarkGray),
+                engine.fg(palette.text_muted),
             ),
         ];
 
@@ -1069,7 +1064,7 @@ pub fn compute_model_lines(model: &DevelopView) -> Vec<Line<'static>> {
             if reason_tokens > 0 {
                 usage_spans.push(Span::styled(
                     format!(", {} reasoning", reason_tokens),
-                    Style::default().fg(Color::Magenta),
+                    engine.fg(palette.text_secondary),
                 ));
             }
         }
@@ -1078,7 +1073,7 @@ pub fn compute_model_lines(model: &DevelopView) -> Vec<Line<'static>> {
             if cached_tokens > 0 {
                 usage_spans.push(Span::styled(
                     format!(", {} cached", cached_tokens),
-                    Style::default().fg(Color::Cyan),
+                    engine.fg(palette.status_info),
                 ));
             }
         }

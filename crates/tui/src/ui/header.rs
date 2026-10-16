@@ -1,11 +1,12 @@
 use std::path::Path;
 
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Style, Stylize};
+use ratatui::style::Stylize;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 
 use crate::app::{role_badge, role_title, AppState, HeaderClickAreas, ViewMode};
+use crate::theme::engine::{current_engine, ThemeEngine};
 
 /// Helper to truncate a string to a max visual display width, appending `…` if needed.
 pub(crate) fn truncate_to_width(s: &str, max_width: usize) -> String {
@@ -231,6 +232,16 @@ fn tab_label(
 
 /// Top header: project name -> tabs -> model selector & tools (Squash, Help).
 pub fn render_header(frame: &mut ratatui::Frame, state: &mut AppState, area: Rect) {
+    let engine = current_engine();
+    render_header_with_engine(frame, state, area, &engine);
+}
+
+fn render_header_with_engine(
+    frame: &mut ratatui::Frame,
+    state: &mut AppState,
+    area: Rect,
+    engine: &ThemeEngine,
+) {
     state.header_clicks = HeaderClickAreas::default();
     if area.height < 3 || area.width < 10 {
         return;
@@ -257,21 +268,29 @@ pub fn render_header(frame: &mut ratatui::Frame, state: &mut AppState, area: Rec
             (6, " [F6] ", format!(" [{}] ", help_hint))
         };
 
+    let palette = engine.palette();
+
     let model_label = model_selector_label(state, max_model_len);
     let model_text = format!(" 🧠 {} ", model_label);
-    let model_span = Span::styled(model_text, Style::default().fg(Color::Green).bold());
+    let model_span = Span::styled(model_text, engine.fg(palette.status_success).bold());
 
     let squash_span = Span::styled(
         squash_text,
-        Style::default().bg(Color::Cyan).fg(Color::Black).bold(),
+        engine
+            .bg(palette.button_active_bg)
+            .fg(engine.color(palette.text_inverse))
+            .bold(),
     );
 
     let help_span = Span::styled(
         help_text,
-        Style::default().bg(Color::DarkGray).fg(Color::White).bold(),
+        engine
+            .bg(palette.button_bg)
+            .fg(engine.color(palette.button_fg))
+            .bold(),
     );
 
-    let div_style = Style::default().fg(Color::DarkGray);
+    let div_style = engine.fg(palette.text_muted);
     let div_span = Span::styled(" │ ", div_style);
 
     let right_items: Vec<(Span, Option<ClickTarget>)> = vec![
@@ -345,8 +364,13 @@ pub fn render_header(frame: &mut ratatui::Frame, state: &mut AppState, area: Rec
         (HeaderTier::Compact, calc_tabs_width(HeaderTier::Compact))
     };
 
-    let active_style = Style::default().bg(Color::Blue).fg(Color::White).bold();
-    let inactive_style = Style::default().bg(Color::DarkGray).fg(Color::White);
+    let active_style = engine
+        .bg(palette.button_active_bg)
+        .fg(engine.color(palette.text_inverse))
+        .bold();
+    let inactive_style = engine
+        .bg(palette.button_bg)
+        .fg(engine.color(palette.button_fg));
 
     let raw_project_name = match &state.repo_state {
         Some(repo) => Path::new(&repo.root)
@@ -364,14 +388,14 @@ pub fn render_header(frame: &mut ratatui::Frame, state: &mut AppState, area: Rec
     if avail_proj_w >= 8 {
         let max_name = avail_proj_w.saturating_sub(7).clamp(1, 20);
         let proj_name = truncate_to_width(&raw_project_name, max_name);
-        left_items.push((Span::styled(" 📁 ", Style::default().fg(Color::Yellow)), None));
+        left_items.push((Span::styled(" 📁 ", engine.fg(palette.text_secondary)), None));
         left_items.push((
-            Span::styled(proj_name, Style::default().fg(Color::Cyan).bold()),
+            Span::styled(proj_name, engine.fg(palette.status_info).bold()),
             None,
         ));
-        left_items.push((Span::styled(" │ ", Style::default().fg(Color::DarkGray)), None));
+        left_items.push((Span::styled(" │ ", engine.fg(palette.text_muted)), None));
     } else if avail_proj_w >= 4 {
-        left_items.push((Span::styled(" 📁 ", Style::default().fg(Color::Yellow)), None));
+        left_items.push((Span::styled(" 📁 ", engine.fg(palette.text_secondary)), None));
     }
 
     // Add tabs
@@ -408,7 +432,10 @@ pub fn render_header(frame: &mut ratatui::Frame, state: &mut AppState, area: Rec
         left_items.push((
             Span::styled(
                 ob_label,
-                Style::default().bg(Color::Yellow).fg(Color::Black).bold(),
+                engine
+                    .bg(palette.status_warning)
+                    .fg(engine.color(palette.text_inverse))
+                    .bold(),
             ),
             None,
         ));
@@ -457,7 +484,14 @@ pub fn render_header(frame: &mut ratatui::Frame, state: &mut AppState, area: Rec
     }
 
     let header_line = Line::from(header_spans);
-    let header = Paragraph::new(header_line).block(Block::default().borders(Borders::ALL));
+    let header = Paragraph::new(header_line)
+        .style(ratatui::style::Style::default().bg(engine.color(palette.canvas)))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(engine.fg(palette.border))
+                .style(ratatui::style::Style::default().bg(engine.color(palette.canvas))),
+        );
     frame.render_widget(header, area);
 }
 
@@ -467,6 +501,10 @@ mod tests {
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
     use tauqe_protocol::{ModelRef, ModelRole, ModelSelection};
+
+    use crate::theme::color::ColorDepth;
+    use crate::theme::engine::ThemeEngine;
+    use crate::theme::presets::ThemePreset;
 
     fn test_app_state() -> AppState {
         AppState {
@@ -514,7 +552,6 @@ mod tests {
             squash_dialog: None,
             review_dialog: None,
             prompt_modal: None,
-            discuss_review_dialog: None,
             notification: None,
             turn_started_at: None,
             server_disconnected: None,
@@ -527,6 +564,8 @@ mod tests {
             model_choice: crate::app::ModelChoice::default(),
             running_model: None,
             discussion_focus: tauqe_protocol::DiscussionFocus::None,
+            active_theme_preset: crate::theme::presets::ThemePreset::TauqeDark,
+            theme_selector: None,
         }
     }
 
@@ -761,5 +800,36 @@ mod tests {
 
         assert_ne!(state.header_clicks.help_button, (0, 0));
         assert_ne!(state.header_clicks.squash_button, (0, 0));
+    }
+
+    #[test]
+    fn header_chrome_styles_track_theme_tokens() {
+        for preset in [ThemePreset::TauqeDark, ThemePreset::TauqeLight] {
+            let engine = ThemeEngine::new(preset, ColorDepth::Truecolor);
+            let palette = engine.palette();
+
+            let backend = TestBackend::new(120, 3);
+            let mut terminal = Terminal::new(backend).expect("terminal created");
+            let mut state = test_app_state();
+            state.view_mode = ViewMode::Develop;
+
+            terminal
+                .draw(|frame| {
+                    render_header_with_engine(frame, &mut state, frame.area(), &engine);
+                })
+                .expect("draw succeeded");
+
+            let row = state.header_clicks.row;
+            let (start, end) = state.header_clicks.develop_tab;
+            assert!(end >= start);
+            let cell = &terminal.backend().buffer()[(start, row)];
+            assert_eq!(cell.bg, engine.color(palette.button_active_bg));
+            assert_eq!(cell.fg, engine.color(palette.text_inverse));
+
+            let (help_start, _) = state.header_clicks.help_button;
+            let help_cell = &terminal.backend().buffer()[(help_start, row)];
+            assert_eq!(help_cell.bg, engine.color(palette.button_bg));
+            assert_eq!(help_cell.fg, engine.color(palette.button_fg));
+        }
     }
 }

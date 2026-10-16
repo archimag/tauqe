@@ -89,3 +89,20 @@ pinned = [
     "Vision.md",
     "docs/src/SUMMARY.md"
 ]
+
+# ---------------------------------------------------------------------------
+# Terminal appearance (themes) is a personal workstation preference and lives
+# in the user configuration, never in this project file (see Conventions.md,
+# section 7.2). Built-in presets are selected in $XDG_CONFIG_HOME/tauqe/tui.toml:
+#
+#   [theme]
+#   # Named preset; it takes precedence over `mode` when set:
+#   #   "tauqe-dark" (default) | "tauqe-light" | "catppuccin" |
+#   #   "gruvbox" | "solarized-dark"
+#   # name = "tauqe-dark"
+#   # Legacy light/dark fallback, used when `name` is unset:
+#   # mode = "auto"
+#   # Color depth: "auto" (detected) | "truecolor" | "ansi256" | "ansi16"
+#   # color_depth = "auto"
+#
+# See docs/src/ch05-interface/tui-ux.md (section 5.10) for the design system.

@@ -6,35 +6,38 @@
 //! identical for rendering and hit-testing and cannot drift (Conventions.md §7).
 
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
-use ratatui::style::{Color, Style, Stylize};
+use ratatui::style::Stylize;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
+use ratatui::widgets::{Paragraph, Wrap};
 
 use crate::app::{AppState, BatchCancelButton};
+use crate::theme::engine::current_engine;
 use crate::ui::header::truncate_to_width;
 
-use super::{render_modal_confirm, ConfirmModalParams};
+use super::{render_modal_confirm, ConfirmModalParams, ModalTone};
 
 /// Presentation parameters for the interruption confirmation, shared by the
 /// renderer and mouse hit-testing.
 pub fn confirm_cancel_params(state: &AppState) -> ConfirmModalParams<'_> {
+    let engine = current_engine();
+    let palette = engine.palette();
     let body_lines = vec![
         Line::raw(""),
         Line::from(Span::styled(
             "Interrupt active model operation?",
-            Style::default().bold().fg(Color::Yellow),
+            engine.fg(palette.status_warning).bold(),
         )),
         Line::raw(""),
         Line::from("Generation will be stopped immediately."),
         Line::from(Span::styled(
             "All in-progress edits and uncommitted diffs will be discarded.",
-            Style::default().fg(Color::DarkGray),
+            engine.fg(palette.text_muted),
         )),
     ];
 
     ConfirmModalParams {
         title: "Confirm Interruption",
-        border_color: Color::Yellow,
+        tone: ModalTone::Warning,
         body_lines,
         confirm_label: "Interrupt (Y)",
         cancel_label: "Cancel (Esc)",
@@ -50,6 +53,8 @@ pub fn render_confirm_cancel_popup(frame: &mut ratatui::Frame, state: &AppState)
 
 /// Presentation parameters for the quit confirmation.
 pub fn confirm_quit_params(state: &AppState) -> ConfirmModalParams<'_> {
+    let engine = current_engine();
+    let palette = engine.palette();
     let activity = if state.review.running {
         "Code review is currently in progress."
     } else if state.model.is_busy() {
@@ -68,19 +73,19 @@ pub fn confirm_quit_params(state: &AppState) -> ConfirmModalParams<'_> {
         Line::raw(""),
         Line::from(Span::styled(
             "Quit TAUQE?",
-            Style::default().bold().fg(Color::Red),
+            engine.fg(palette.status_error).bold(),
         )),
         Line::raw(""),
         Line::from(activity),
         Line::from(Span::styled(
             "Exiting now will terminate the session and discard active work.",
-            Style::default().fg(Color::DarkGray),
+            engine.fg(palette.text_muted),
         )),
     ];
 
     ConfirmModalParams {
         title: "Confirm Quit",
-        border_color: Color::Red,
+        tone: ModalTone::Dangerous,
         body_lines,
         confirm_label: "Quit TAUQE (Y)",
         cancel_label: "Cancel (Esc)",
@@ -96,11 +101,13 @@ pub fn render_confirm_quit_popup(frame: &mut ratatui::Frame, state: &AppState) {
 
 /// Presentation parameters for the undo confirmation.
 pub fn confirm_undo_params(state: &AppState) -> ConfirmModalParams<'_> {
+    let engine = current_engine();
+    let palette = engine.palette();
     let mut body_lines = vec![
         Line::raw(""),
         Line::from(Span::styled(
             "Are you sure you want to undo the last AI commit?",
-            Style::default().bold().fg(Color::Yellow),
+            engine.fg(palette.status_warning).bold(),
         )),
         Line::raw(""),
     ];
@@ -108,24 +115,24 @@ pub fn confirm_undo_params(state: &AppState) -> ConfirmModalParams<'_> {
     if let Some(hash) = &state.model.last_commit_hash {
         body_lines.push(Line::from(vec![
             Span::raw("Commit: "),
-            Span::styled(hash.clone(), Style::default().bold().fg(Color::Cyan)),
+            Span::styled(hash.clone(), engine.fg(palette.status_info).bold()),
         ]));
     }
     if let Some(summary) = &state.model.last_commit_summary {
         body_lines.push(Line::from(vec![
             Span::raw("Summary: "),
-            Span::styled(summary.clone(), Style::default().fg(Color::White)),
+            Span::styled(summary.clone(), engine.fg(palette.text_primary)),
         ]));
     }
     body_lines.push(Line::raw(""));
     body_lines.push(Line::from(Span::styled(
         "Any uncommitted changes from the pre-edit checkpoint will be restored.",
-        Style::default().fg(Color::DarkGray),
+        engine.fg(palette.text_muted),
     )));
 
     ConfirmModalParams {
         title: "Confirm Undo",
-        border_color: Color::Red,
+        tone: ModalTone::Dangerous,
         body_lines,
         confirm_label: "Confirm Undo (Y)",
         cancel_label: "Cancel (Esc)",
@@ -145,23 +152,25 @@ pub fn render_confirm_undo_popup(frame: &mut ratatui::Frame, state: &AppState) {
 /// guards against accidental loss of conversational context rather than data:
 /// the safe `Cancel` default keeps the active plan or review anchor in place.
 pub fn confirm_detach_focus_params(state: &AppState) -> ConfirmModalParams<'_> {
+    let engine = current_engine();
+    let palette = engine.palette();
     let body_lines = vec![
         Line::raw(""),
         Line::from(Span::styled(
             "Detach the active discussion focus?",
-            Style::default().bold().fg(Color::Yellow),
+            engine.fg(palette.status_warning).bold(),
         )),
         Line::raw(""),
         Line::from("The REPL will return to the free codebase context."),
         Line::from(Span::styled(
             "The plan or review anchor is released until you focus on it again.",
-            Style::default().fg(Color::DarkGray),
+            engine.fg(palette.text_muted),
         )),
     ];
 
     ConfirmModalParams {
         title: "Confirm Detach Focus",
-        border_color: Color::Yellow,
+        tone: ModalTone::Warning,
         body_lines,
         confirm_label: "Detach (Y)",
         cancel_label: "Cancel (Esc)",
@@ -178,6 +187,8 @@ pub fn render_confirm_detach_focus_popup(frame: &mut ratatui::Frame, state: &App
 /// Presentation parameters for the review-execution confirmation.
 pub fn execute_review_params(state: &AppState) -> Option<ConfirmModalParams<'_>> {
     let target = state.confirm_execute_review.as_ref()?;
+    let engine = current_engine();
+    let palette = engine.palette();
 
     let is_all_sessions = target.review_id.is_none();
     let is_single = target.items.len() == 1 && !is_all_sessions;
@@ -199,14 +210,14 @@ pub fn execute_review_params(state: &AppState) -> Option<ConfirmModalParams<'_>>
 
     let review_line = if let Some(ref rev_id) = target.review_id {
         Line::from(vec![
-            Span::styled(" Review: ", Style::default().fg(Color::DarkGray)),
-            Span::styled(&target.review_title, Style::default().bold().fg(Color::White)),
-            Span::styled(format!(" [{}]", rev_id), Style::default().fg(Color::DarkGray)),
+            Span::styled(" Review: ", engine.fg(palette.text_muted)),
+            Span::styled(&target.review_title, engine.fg(palette.text_primary).bold()),
+            Span::styled(format!(" [{}]", rev_id), engine.fg(palette.text_muted)),
         ])
     } else {
         Line::from(vec![
-            Span::styled(" Review: ", Style::default().fg(Color::DarkGray)),
-            Span::styled(&target.review_title, Style::default().bold().fg(Color::White)),
+            Span::styled(" Review: ", engine.fg(palette.text_muted)),
+            Span::styled(&target.review_title, engine.fg(palette.text_primary).bold()),
         ])
     };
 
@@ -214,14 +225,14 @@ pub fn execute_review_params(state: &AppState) -> Option<ConfirmModalParams<'_>>
         Line::raw(""),
         Line::from(Span::styled(
             heading,
-            Style::default().bold().fg(Color::Cyan),
+            engine.fg(palette.status_info).bold(),
         )),
         Line::raw(""),
         review_line,
         Line::from(vec![
-            Span::styled(" Scope: ", Style::default().fg(Color::DarkGray)),
-            Span::styled(&target.scope_title, Style::default().bold().fg(Color::Yellow)),
-            Span::styled(format!(" ({} finding(s) to resolve)", target.items.len()), Style::default().fg(Color::White)),
+            Span::styled(" Scope: ", engine.fg(palette.text_muted)),
+            Span::styled(&target.scope_title, engine.fg(palette.status_warning).bold()),
+            Span::styled(format!(" ({} finding(s) to resolve)", target.items.len()), engine.fg(palette.text_primary)),
         ]),
     ];
 
@@ -230,34 +241,34 @@ pub fn execute_review_params(state: &AppState) -> Option<ConfirmModalParams<'_>>
         if !item.files.is_empty() {
             let loc = item.files.join(", ");
             body_lines.push(Line::from(vec![
-                Span::styled(" Files: ", Style::default().fg(Color::DarkGray)),
-                Span::styled(loc, Style::default().fg(Color::Cyan)),
+                Span::styled(" Files: ", engine.fg(palette.text_muted)),
+                Span::styled(loc, engine.fg(palette.status_info)),
             ]));
         }
         let trimmed = item.body.trim();
         if !trimmed.is_empty() {
             let first_line = trimmed.lines().next().unwrap_or("");
             body_lines.push(Line::from(vec![
-                Span::styled(" Recommendation: ", Style::default().fg(Color::DarkGray)),
+                Span::styled(" Recommendation: ", engine.fg(palette.text_muted)),
                 Span::styled(
                     truncate_to_width(first_line, 45),
-                    Style::default().fg(Color::Gray),
+                    engine.fg(palette.text_secondary),
                 ),
             ]));
         }
     } else {
         body_lines.push(Line::raw(""));
-        body_lines.push(Line::from(Span::styled(" Findings in execution queue:", Style::default().fg(Color::DarkGray))));
+        body_lines.push(Line::from(Span::styled(" Findings in execution queue:", engine.fg(palette.text_muted))));
         for (i, item) in target.items.iter().take(4).enumerate() {
             body_lines.push(Line::from(vec![
-                Span::styled(format!("   {}. ", i + 1), Style::default().fg(Color::Cyan)),
-                Span::styled(format!("[{}] #{} {}", item.severity, item.id, truncate_to_width(&item.title, 36)), Style::default().fg(Color::White)),
+                Span::styled(format!("   {}. ", i + 1), engine.fg(palette.status_info)),
+                Span::styled(format!("[{}] #{} {}", item.severity, item.id, truncate_to_width(&item.title, 36)), engine.fg(palette.text_primary)),
             ]));
         }
         if target.items.len() > 4 {
             body_lines.push(Line::from(Span::styled(
                 format!("   ... and {} more finding(s)", target.items.len() - 4),
-                Style::default().fg(Color::DarkGray).italic(),
+                engine.fg(palette.text_muted).italic(),
             )));
         }
     }
@@ -265,12 +276,12 @@ pub fn execute_review_params(state: &AppState) -> Option<ConfirmModalParams<'_>>
     body_lines.push(Line::raw(""));
     body_lines.push(Line::from(Span::styled(
         "TAUQE will resolve each finding in an isolated turn with compiler verification gates.",
-        Style::default().fg(Color::DarkGray),
+        engine.fg(palette.text_muted),
     )));
     if !is_single {
         body_lines.push(Line::from(Span::styled(
             "Fail-Fast Policy: execution stops and rolls back immediately if any finding fails verification.",
-            Style::default().fg(Color::DarkGray),
+            engine.fg(palette.text_muted),
         )));
     }
 
@@ -282,7 +293,7 @@ pub fn execute_review_params(state: &AppState) -> Option<ConfirmModalParams<'_>>
 
     Some(ConfirmModalParams {
         title,
-        border_color: Color::Cyan,
+        tone: ModalTone::Info,
         body_lines,
         confirm_label,
         cancel_label: "Cancel (Esc)",
@@ -301,6 +312,8 @@ pub fn render_confirm_execute_review_popup(frame: &mut ratatui::Frame, state: &A
 /// Presentation parameters for the plan-step execution confirmation.
 pub fn execute_scope_params(state: &AppState) -> Option<ConfirmModalParams<'_>> {
     let target = state.confirm_execute_scope.as_ref()?;
+    let engine = current_engine();
+    let palette = engine.palette();
 
     let is_single = target.steps.len() == 1;
     let title = if is_single {
@@ -319,18 +332,18 @@ pub fn execute_scope_params(state: &AppState) -> Option<ConfirmModalParams<'_>> 
         Line::raw(""),
         Line::from(Span::styled(
             heading,
-            Style::default().bold().fg(Color::Cyan),
+            engine.fg(palette.status_info).bold(),
         )),
         Line::raw(""),
         Line::from(vec![
-            Span::styled(" Plan: ", Style::default().fg(Color::DarkGray)),
-            Span::styled(&target.plan_title, Style::default().bold().fg(Color::White)),
-            Span::styled(format!(" [{}]", target.plan_id), Style::default().fg(Color::DarkGray)),
+            Span::styled(" Plan: ", engine.fg(palette.text_muted)),
+            Span::styled(&target.plan_title, engine.fg(palette.text_primary).bold()),
+            Span::styled(format!(" [{}]", target.plan_id), engine.fg(palette.text_muted)),
         ]),
         Line::from(vec![
-            Span::styled(" Scope: ", Style::default().fg(Color::DarkGray)),
-            Span::styled(&target.scope_title, Style::default().bold().fg(Color::Yellow)),
-            Span::styled(format!(" ({} step(s) to execute)", target.steps.len()), Style::default().fg(Color::White)),
+            Span::styled(" Scope: ", engine.fg(palette.text_muted)),
+            Span::styled(&target.scope_title, engine.fg(palette.status_warning).bold()),
+            Span::styled(format!(" ({} step(s) to execute)", target.steps.len()), engine.fg(palette.text_primary)),
         ]),
     ];
 
@@ -341,27 +354,27 @@ pub fn execute_scope_params(state: &AppState) -> Option<ConfirmModalParams<'_>> 
             if !trimmed.is_empty() {
                 let first_line = trimmed.lines().next().unwrap_or("");
                 body_lines.push(Line::from(vec![
-                    Span::styled(" Details: ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(" Details: ", engine.fg(palette.text_muted)),
                     Span::styled(
                         truncate_to_width(first_line, 45),
-                        Style::default().fg(Color::Gray),
+                        engine.fg(palette.text_secondary),
                     ),
                 ]));
             }
         }
     } else {
         body_lines.push(Line::raw(""));
-        body_lines.push(Line::from(Span::styled(" Steps in execution queue:", Style::default().fg(Color::DarkGray))));
+        body_lines.push(Line::from(Span::styled(" Steps in execution queue:", engine.fg(palette.text_muted))));
         for (i, step) in target.steps.iter().take(4).enumerate() {
             body_lines.push(Line::from(vec![
-                Span::styled(format!("   {}. ", i + 1), Style::default().fg(Color::Cyan)),
-                Span::styled(format!("#{} {}", step.id, truncate_to_width(&step.title, 40)), Style::default().fg(Color::White)),
+                Span::styled(format!("   {}. ", i + 1), engine.fg(palette.status_info)),
+                Span::styled(format!("#{} {}", step.id, truncate_to_width(&step.title, 40)), engine.fg(palette.text_primary)),
             ]));
         }
         if target.steps.len() > 4 {
             body_lines.push(Line::from(Span::styled(
                 format!("   ... and {} more step(s)", target.steps.len() - 4),
-                Style::default().fg(Color::DarkGray).italic(),
+                engine.fg(palette.text_muted).italic(),
             )));
         }
     }
@@ -369,12 +382,12 @@ pub fn execute_scope_params(state: &AppState) -> Option<ConfirmModalParams<'_>> 
     body_lines.push(Line::raw(""));
     body_lines.push(Line::from(Span::styled(
         "TAUQE will execute each step in an isolated turn with compiler verification gates.",
-        Style::default().fg(Color::DarkGray),
+        engine.fg(palette.text_muted),
     )));
     if !is_single {
         body_lines.push(Line::from(Span::styled(
             "Execution stops immediately if any step fails or is interrupted.",
-            Style::default().fg(Color::DarkGray),
+            engine.fg(palette.text_muted),
         )));
     }
 
@@ -386,7 +399,7 @@ pub fn execute_scope_params(state: &AppState) -> Option<ConfirmModalParams<'_>> 
 
     Some(ConfirmModalParams {
         title,
-        border_color: Color::Cyan,
+        tone: ModalTone::Info,
         body_lines,
         confirm_label,
         cancel_label: "Cancel (Esc)",
@@ -404,6 +417,8 @@ pub fn render_confirm_execute_scope_popup(frame: &mut ratatui::Frame, state: &Ap
 
 /// Presentation parameters for the plan-deletion confirmation.
 pub fn delete_plan_params<'a>(state: &'a AppState, plan_id: &str) -> ConfirmModalParams<'a> {
+    let engine = current_engine();
+    let palette = engine.palette();
     let plan_title = state
         .plans_view
         .plans
@@ -416,22 +431,22 @@ pub fn delete_plan_params<'a>(state: &'a AppState, plan_id: &str) -> ConfirmModa
         Line::raw(""),
         Line::from(Span::styled(
             "Are you sure you want to delete this plan?",
-            Style::default().bold().fg(Color::Yellow),
+            engine.fg(palette.status_warning).bold(),
         )),
         Line::raw(""),
         Line::from(vec![
             Span::raw("Plan: "),
-            Span::styled(format!("{} ({})", plan_title, plan_id), Style::default().bold().fg(Color::Cyan)),
+            Span::styled(format!("{} ({})", plan_title, plan_id), engine.fg(palette.status_info).bold()),
         ]),
         Line::from(Span::styled(
             "The plan file in .tauqe/plans/ will be permanently removed.",
-            Style::default().fg(Color::Gray),
+            engine.fg(palette.text_secondary),
         )),
     ];
 
     ConfirmModalParams {
         title: "Confirm Delete Plan",
-        border_color: Color::Red,
+        tone: ModalTone::Dangerous,
         body_lines,
         confirm_label: "Confirm Delete (Y)",
         cancel_label: "Cancel (Esc)",
@@ -447,6 +462,8 @@ pub fn render_confirm_delete_plan_popup(frame: &mut ratatui::Frame, plan_id: &st
 
 /// Presentation parameters for the review-deletion confirmation.
 pub fn delete_review_params<'a>(state: &'a AppState, session_id: &str) -> ConfirmModalParams<'a> {
+    let engine = current_engine();
+    let palette = engine.palette();
     let review_title = state
         .review
         .sessions
@@ -460,22 +477,22 @@ pub fn delete_review_params<'a>(state: &'a AppState, session_id: &str) -> Confir
         Line::raw(""),
         Line::from(Span::styled(
             "Are you sure you want to delete this review session?",
-            Style::default().bold().fg(Color::Yellow),
+            engine.fg(palette.status_warning).bold(),
         )),
         Line::raw(""),
         Line::from(vec![
             Span::raw("Review: "),
-            Span::styled(format!("{} ({})", review_title, session_id), Style::default().bold().fg(Color::Cyan)),
+            Span::styled(format!("{} ({})", review_title, session_id), engine.fg(palette.status_info).bold()),
         ]),
         Line::from(Span::styled(
             "The review file in .tauqe/reviews/ will be permanently removed.",
-            Style::default().fg(Color::Gray),
+            engine.fg(palette.text_secondary),
         )),
     ];
 
     ConfirmModalParams {
         title: "Confirm Delete Review",
-        border_color: Color::Red,
+        tone: ModalTone::Dangerous,
         body_lines,
         confirm_label: "Confirm Delete (Y)",
         cancel_label: "Cancel (Esc)",
@@ -491,6 +508,8 @@ pub fn render_confirm_delete_review_popup(frame: &mut ratatui::Frame, session_id
 
 /// Presentation parameters for the "clear Auto context" confirmation.
 pub fn clear_auto_params(state: &AppState) -> ConfirmModalParams<'_> {
+    let engine = current_engine();
+    let palette = engine.palette();
     let auto_count = state
         .context
         .items
@@ -502,26 +521,26 @@ pub fn clear_auto_params(state: &AppState) -> ConfirmModalParams<'_> {
         Line::raw(""),
         Line::from(Span::styled(
             "Clear all Auto-context files?",
-            Style::default().bold().fg(Color::Yellow),
+            engine.fg(palette.status_warning).bold(),
         )),
         Line::raw(""),
         Line::from(vec![
             Span::raw("Are you sure you want to remove all "),
             Span::styled(
                 format!("{} file(s)", auto_count),
-                Style::default().bold().fg(Color::Magenta),
+                engine.fg(palette.button_active_bg).bold(),
             ),
             Span::raw(" from the Auto layer?"),
         ]),
         Line::from(Span::styled(
             "Persistent User files and Pinned files will not be affected.",
-            Style::default().fg(Color::DarkGray),
+            engine.fg(palette.text_muted),
         )),
     ];
 
     ConfirmModalParams {
         title: "Confirm Clear Auto Context",
-        border_color: Color::Yellow,
+        tone: ModalTone::Warning,
         body_lines,
         confirm_label: "Confirm Clear (Y)",
         cancel_label: "Cancel (Esc)",
@@ -539,6 +558,8 @@ pub fn render_confirm_clear_auto_popup(frame: &mut ratatui::Frame, state: &AppSt
 /// Auto-layer reset: a guarded confirmation whose safe default is `Cancel`, while
 /// the protected Pinned and regenerable Auto layers stay untouched.
 pub fn clear_user_params(state: &AppState) -> ConfirmModalParams<'_> {
+    let engine = current_engine();
+    let palette = engine.palette();
     let user_count = state
         .context
         .items
@@ -550,26 +571,26 @@ pub fn clear_user_params(state: &AppState) -> ConfirmModalParams<'_> {
         Line::raw(""),
         Line::from(Span::styled(
             "Clear all User-context files?",
-            Style::default().bold().fg(Color::Yellow),
+            engine.fg(palette.status_warning).bold(),
         )),
         Line::raw(""),
         Line::from(vec![
             Span::raw("Are you sure you want to remove all "),
             Span::styled(
                 format!("{} file(s)", user_count),
-                Style::default().bold().fg(Color::Magenta),
+                engine.fg(palette.button_active_bg).bold(),
             ),
             Span::raw(" from the User layer?"),
         ]),
         Line::from(Span::styled(
             "Protected Pinned files and Auto-requested files will not be affected.",
-            Style::default().fg(Color::DarkGray),
+            engine.fg(palette.text_muted),
         )),
     ];
 
     ConfirmModalParams {
         title: "Confirm Clear User Context",
-        border_color: Color::Yellow,
+        tone: ModalTone::Warning,
         body_lines,
         confirm_label: "Confirm Clear (Y)",
         cancel_label: "Cancel (Esc)",
@@ -585,27 +606,29 @@ pub fn render_confirm_clear_user_popup(frame: &mut ratatui::Frame, state: &AppSt
 
 /// Presentation parameters for the "clear history" confirmation.
 pub fn clear_history_params(state: &AppState) -> ConfirmModalParams<'_> {
+    let engine = current_engine();
+    let palette = engine.palette();
     let body_lines = vec![
         Line::raw(""),
         Line::from(Span::styled(
             "Are you sure you want to clear conversation history?",
-            Style::default().bold().fg(Color::Yellow),
+            engine.fg(palette.status_warning).bold(),
         )),
         Line::raw(""),
         Line::from("This will permanently erase session history:"),
         Line::from(Span::styled(
             "  .tauqe/history.jsonl",
-            Style::default().fg(Color::DarkGray).italic(),
+            engine.fg(palette.text_muted).italic(),
         )),
         Line::from(Span::styled(
             "and clear the current model view output.",
-            Style::default().fg(Color::DarkGray),
+            engine.fg(palette.text_muted),
         )),
     ];
 
     ConfirmModalParams {
         title: "Confirm Clear History",
-        border_color: Color::Red,
+        tone: ModalTone::Dangerous,
         body_lines,
         confirm_label: "Confirm Clear (Y)",
         cancel_label: "Cancel (Esc)",
@@ -632,18 +655,20 @@ const BATCH_CANCEL_GAP: u16 = 2;
 /// queue, stopping after the current member, and aborting immediately is never
 /// ambiguous (Conventions.md §7).
 pub fn batch_cancel_body_lines() -> Vec<Line<'static>> {
+    let engine = current_engine();
+    let palette = engine.palette();
     vec![
         Line::raw(""),
         Line::from(Span::styled(
             "Cancel batch execution?",
-            Style::default().bold().fg(Color::Yellow),
+            engine.fg(palette.status_warning).bold(),
         )),
         Line::raw(""),
         Line::from("Continue keeps the batch running."),
         Line::from("Soft Stop finishes the current step, then stops the queue."),
         Line::from(Span::styled(
             "Hard Stop aborts the current step immediately.",
-            Style::default().fg(Color::DarkGray),
+            engine.fg(palette.text_muted),
         )),
     ]
 }
@@ -695,15 +720,16 @@ pub fn batch_cancel_modal_geometry(term: Rect) -> BatchCancelModalGeometry {
 
 /// Renders the three-way batch-cancellation dialog.
 pub fn render_confirm_batch_cancel_popup(frame: &mut ratatui::Frame, state: &AppState) {
+    let engine = current_engine();
+    let palette = engine.palette();
     let geom = batch_cancel_modal_geometry(frame.area());
 
-    frame.render_widget(Clear, geom.area);
-    let outer_block = Block::default()
-        .title(" Cancel Batch Execution ")
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Yellow));
-    let inner_area = outer_block.inner(geom.area);
-    frame.render_widget(outer_block, geom.area);
+    let inner_area = crate::components::modal::render_modal_container(
+        frame,
+        geom.area,
+        "Cancel Batch Execution",
+        ModalTone::Warning,
+    );
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -718,9 +744,9 @@ pub fn render_confirm_batch_cancel_popup(frame: &mut ratatui::Frame, state: &App
     let focused = state.batch_cancel_button;
     let button_style = |button: BatchCancelButton| {
         if button == focused {
-            Style::default().bg(Color::Cyan).fg(Color::Black).bold()
+            engine.bg(palette.button_active_bg).fg(engine.color(palette.text_inverse)).bold()
         } else {
-            Style::default().bg(Color::DarkGray).fg(Color::White)
+            engine.bg(palette.button_bg).fg(engine.color(palette.button_fg))
         }
     };
 
@@ -743,7 +769,7 @@ pub fn render_confirm_batch_cancel_popup(frame: &mut ratatui::Frame, state: &App
         ]),
         Line::from(Span::styled(
             "Tab / ← / → focus • Enter/Space execute • s / h / c fast select • Esc cancel",
-            Style::default().fg(Color::Gray),
+            engine.fg(palette.text_secondary),
         )),
     ];
     let actions_widget = Paragraph::new(actions_lines).alignment(Alignment::Center);
@@ -764,7 +790,7 @@ mod tests {
         let term = Rect::new(0, 0, 100, 30);
         let params = ConfirmModalParams {
             title: "Confirm Test",
-            border_color: Color::Red,
+            tone: ModalTone::Dangerous,
             body_lines: vec![Line::raw(""), Line::from("Body"), Line::raw("")],
             confirm_label: "Resolve (Enter)",
             cancel_label: "Cancel (Esc)",
@@ -819,8 +845,9 @@ mod tests {
                     title: "First".to_string(),
                     model: None,
                     severity: tauqe_protocol::ReviewSeverity::Warning,
-                    status: tauqe_protocol::ReviewStatus::Todo,
+                    status: tauqe_protocol::ReviewItemStatus::Todo,
                     files: vec![],
+                    subplan: Vec::new(),
                     resolution_notes: None,
                     body: String::new(),
                 },
@@ -829,8 +856,9 @@ mod tests {
                     title: "Second".to_string(),
                     model: None,
                     severity: tauqe_protocol::ReviewSeverity::Suggestion,
-                    status: tauqe_protocol::ReviewStatus::Todo,
+                    status: tauqe_protocol::ReviewItemStatus::Todo,
                     files: vec![],
+                    subplan: Vec::new(),
                     resolution_notes: None,
                     body: String::new(),
                 },

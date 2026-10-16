@@ -1906,6 +1906,7 @@ dependencies = [
  "serde",
  "serde_json",
  "struson",
+ "tauqe-core",
  "tauqe-protocol",
  "tempfile",
  "thiserror 1.0.69",

@@ -7,8 +7,8 @@
 //! schema keeps a single source of truth.
 
 use crate::edits::protocol::structured::StructuredEditProtocol;
-use crate::edits::protocol::EditProtocol;
 use crate::edits::stream::discussion::DiscussionStreamFilter;
+use crate::edits::stream::JsonStreamFilter;
 use tauqe_protocol::{LlmCapability, LlmCommand, ModelResult};
 
 use super::protocol::PromptProtocol;
@@ -108,8 +108,8 @@ impl PromptProtocol for JsonPromptProtocol {
 
                 // File edit operations decoded from the structured `changes` array.
                 match structured.parse_output(raw_text, &[]) {
-                    ModelResult::Edit { edits, error, .. } => {
-                        if let Some(message) = error {
+                    ModelResult::Edit { edits, outcome, .. } => {
+                        if let Some(message) = outcome.error {
                             commands.push(LlmCommand::ProtocolError { message });
                         }
                         for operation in edits {
@@ -196,10 +196,7 @@ impl PromptProtocol for JsonPromptProtocol {
     }
 
     fn turn_marker(&self) -> Option<&str> {
-        match &self.mode {
-            JsonPromptMode::Edits => StructuredEditProtocol.turn_marker(),
-            JsonPromptMode::Discussion { .. } => None,
-        }
+        None
     }
 
     fn with_turn_marker(&self, _marker: &str) -> Option<Box<dyn PromptProtocol>> {
@@ -236,9 +233,10 @@ impl PromptProtocol for JsonPromptProtocol {
         staged_contents: std::collections::HashMap<String, String>,
     ) -> Box<dyn crate::edits::stream::EditStreamFilter> {
         match &self.mode {
-            JsonPromptMode::Edits => {
-                StructuredEditProtocol.create_stream_filter(editable_paths, repo_root, staged_contents)
-            }
+            JsonPromptMode::Edits => Box::new(
+                JsonStreamFilter::new(editable_paths, repo_root)
+                    .with_staged_contents(staged_contents),
+            ),
             JsonPromptMode::Discussion { stream_field } => {
                 Box::new(DiscussionStreamFilter::with_target_field(stream_field.clone()))
             }
@@ -382,6 +380,23 @@ mod tests {
         assert!(commands.contains(&LlmCommand::UserLanguage {
             language: "Russian".to_string(),
         }));
+    }
+
+    #[test]
+    fn test_decode_verify_control_tag() {
+        let protocol = JsonPromptProtocol::default();
+        let output = concat!(
+            "{\"message\":\"Done.\",\"changes\":[],\"context_requests\":[],\"suggested_actions\":[]}\n",
+            "<verify target=\"test\" on_success=\"silent\" />\n",
+        );
+        let commands = protocol.decode(output);
+        assert!(commands.iter().any(|cmd| matches!(
+            cmd,
+            LlmCommand::Verify {
+                target: tauqe_protocol::VerifyTarget::Test,
+                on_success: tauqe_protocol::VerifyOnSuccess::Silent,
+            }
+        )));
     }
 
     #[test]

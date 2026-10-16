@@ -6,11 +6,9 @@
 //! syntax from conversational text, and [`marked`] binds the protocol to a
 //! per-turn marker. Control tags that are not code edits live in [`tags`].
 
-use tauqe_protocol::{DocTopic, ModelResult};
+use tauqe_protocol::{DocTopic, EditOutcome, ModelResult};
 
-use crate::edits::stream::{EditStreamFilter, XmlStreamFilter};
-
-use super::{ContextRequest, EditProtocol};
+use super::ContextRequest;
 
 mod clean;
 mod marker;
@@ -45,66 +43,59 @@ pub(crate) use tags::{
 #[derive(Debug, Default, Clone)]
 pub struct XmlEditProtocol;
 
-impl EditProtocol for XmlEditProtocol {
-    fn name(&self) -> &'static str {
-        "xml"
-    }
-
-    fn with_turn_marker(&self, marker: &str) -> Option<Box<dyn EditProtocol>> {
-        if !is_valid_turn_marker(marker) {
-            tracing::warn!(marker = %marker, "ignoring malformed turn marker");
-            return None;
-        }
-        Some(Box::new(MarkedXmlEditProtocol::new(marker)))
-    }
-
-    fn parse_context_requests(&self, raw_text: &str) -> Vec<ContextRequest> {
+impl XmlEditProtocol {
+    /// Extracts context requests (files the model wants added to context).
+    pub fn parse_context_requests(&self, raw_text: &str) -> Vec<ContextRequest> {
         parse_context_request_tags(raw_text)
     }
 
-    fn parse_doc_requests(&self, raw_text: &str) -> Vec<DocTopic> {
+    /// Extracts requested documentation topics (`All` when unspecified).
+    pub fn parse_doc_requests(&self, raw_text: &str) -> Vec<DocTopic> {
         parse_doc_request_tags(raw_text)
     }
 
-    fn parse_verify_request(&self, raw_text: &str) -> Option<VerifyRequest> {
+    /// Extracts a code verification request (check/clippy/test) when present.
+    pub fn parse_verify_request(&self, raw_text: &str) -> Option<VerifyRequest> {
         tags::extract_verify_request(raw_text)
     }
 
-    fn parse_user_language(&self, raw_text: &str) -> Option<String> {
+    /// Extracts the detected user language when present.
+    pub fn parse_user_language(&self, raw_text: &str) -> Option<String> {
         tags::extract_user_language(raw_text)
     }
 
-    fn parse_plan_tags(
-        &self,
-        raw_text: &str,
-    ) -> (Vec<tags::ParsedPlanTag>, Vec<String>) {
+    /// Extracts plan tags and validation diagnostics from raw output.
+    pub fn parse_plan_tags(&self, raw_text: &str) -> (Vec<tags::ParsedPlanTag>, Vec<String>) {
         tags::parse_plan_tags_with_diagnostics(raw_text)
     }
 
-    fn parse_scratchpad(&self, raw_text: &str) -> Option<String> {
+    /// Extracts ephemeral scratchpad notes (`<scratchpad>`) when present.
+    pub fn parse_scratchpad(&self, raw_text: &str) -> Option<String> {
         tags::extract_scratchpad(raw_text)
     }
 
-    fn parse_terminal_outcome(&self, raw_text: &str) -> Option<TerminalOutcome> {
+    /// Extracts the terminal outcome (`<success>`, `<error>`, `<blocked>`) when present.
+    pub fn parse_terminal_outcome(&self, raw_text: &str) -> Option<TerminalOutcome> {
         tags::extract_terminal_outcome(raw_text)
     }
 
-    fn parse_error(&self, raw_text: &str) -> Option<String> {
+    /// Extracts a blocker or error message (`<error>`) when present.
+    pub fn parse_error(&self, raw_text: &str) -> Option<String> {
         tags::extract_error(raw_text)
     }
 
-    fn clean_assistant_text(&self, raw_text: &str) -> String {
+    /// Cleans model output for presentation and history by stripping protocol control tags.
+    pub fn clean_assistant_text(&self, raw_text: &str) -> String {
         extract_conversational_text(raw_text)
     }
 
-    fn system_instructions(
-        &self,
-        editable_paths: &[String],
-    ) -> String {
+    /// Returns system prompt instructions tailored for this edit protocol.
+    pub fn system_instructions(&self, editable_paths: &[String]) -> String {
         prompt::base_system_instructions(editable_paths)
     }
 
-    fn parse_output(&self, raw_text: &str, editable_paths: &[String]) -> ModelResult {
+    /// Parses raw model text into a `ModelResult`.
+    pub fn parse_output(&self, raw_text: &str, editable_paths: &[String]) -> ModelResult {
         if !has_xml_edit_tags(raw_text) {
             return ModelResult::Answer {
                 text: strip_terminal_outcome_tags(&strip_scratchpad_tags(&strip_plan_tags(&strip_verify_tags(&strip_user_language_tags(
@@ -131,10 +122,12 @@ impl EditProtocol for XmlEditProtocol {
                             message: extract_conversational_text(raw_text),
                             ..Default::default()
                         }),
-                        applied: false,
-                        error: None,
-                        changed_files: Vec::new(),
-                        commit_hash: None,
+                        outcome: EditOutcome {
+                            applied: false,
+                            error: None,
+                            changed_files: Vec::new(),
+                            commit_hash: None,
+                        },
                     }
                 }
             }
@@ -142,24 +135,14 @@ impl EditProtocol for XmlEditProtocol {
                 summary: "Malformed XML edit block".to_string(),
                 edits: Vec::new(),
                 proposal: None,
-                applied: false,
-                error: Some(err_msg),
-                changed_files: Vec::new(),
-                commit_hash: None,
+                outcome: EditOutcome {
+                    applied: false,
+                    error: Some(err_msg),
+                    changed_files: Vec::new(),
+                    commit_hash: None,
+                },
             },
         }
-    }
-
-    fn create_stream_filter(
-        &self,
-        editable_paths: Vec<String>,
-        repo_root: std::path::PathBuf,
-        staged_contents: std::collections::HashMap<String, String>,
-    ) -> Box<dyn EditStreamFilter> {
-        Box::new(
-            XmlStreamFilter::new(editable_paths, repo_root)
-                .with_staged_contents(staged_contents),
-        )
     }
 }
 
@@ -235,7 +218,7 @@ pub fn new_fn() {}
         let editable = vec!["src/lib.rs".to_string()];
         let output = "Rewriting.\n<tauqe_edits summary=\"Rewrite lib\">\n<overwrite path=\"src/lib.rs\">\npub fn all_new() {}\n</overwrite>\n</tauqe_edits>";
         match XmlEditProtocol.parse_output(output, &editable) {
-            ModelResult::Edit { edits, error: None, .. } => {
+            ModelResult::Edit { edits, outcome, .. } if outcome.error.is_none() => {
                 assert_eq!(edits.len(), 1);
                 match &edits[0] {
                     EditOperation::Overwrite { path, content } => {
@@ -247,19 +230,6 @@ pub fn new_fn() {}
             }
             _ => panic!("Expected valid edit"),
         }
-    }
-
-    #[test]
-    fn test_with_turn_marker_rejects_malformed_marker_without_panicking() {
-        let proto = XmlEditProtocol;
-        assert!(proto.with_turn_marker("").is_none());
-        assert!(proto.with_turn_marker("bad marker").is_none());
-        assert!(proto.with_turn_marker("has-dash").is_none());
-        assert!(proto.with_turn_marker("Valid123").is_some());
-
-        let marked = MarkedXmlEditProtocol::new("Valid123");
-        assert!(marked.with_turn_marker("").is_none());
-        assert!(marked.with_turn_marker("Valid123").is_some());
     }
 
     #[test]

@@ -414,7 +414,10 @@ pub async fn handle_develop_key(
             st.input_editor.yank();
         }
         DevelopAction::ClearPromptSaving => {
-            if st.model.is_busy() {
+            if st.model.is_batch && st.model.is_busy() {
+                st.confirm_batch_cancel = true;
+                st.batch_cancel_button = crate::app::BatchCancelButton::Continue;
+            } else if st.model.is_busy() {
                 st.confirm_cancel = true;
                 st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
             } else if !st.input_editor.is_empty() {
@@ -443,9 +446,8 @@ pub async fn handle_develop_key(
             st.model.focus = DevelopFocus::Editor;
             if let Some(prompt) = st.take_prompt() {
                 drop(st);
-                let params = ModelAskParams {
-                    prompt: prompt.clone(),
-                    discussion: None,
+                let params = ModelAskParams::Prompt {
+                    text: prompt.clone(),
                 };
                 if let Err(err) = send_request(server_writer, methods::MODEL_ASK, serde_json::to_value(params)?).await {
                     let mut st = state.lock().await;
@@ -944,6 +946,40 @@ mod tests {
             "Esc on an empty prompt with an active focus must arm the detach confirmation"
         );
         assert_eq!(st.confirm_button, crate::app::ConfirmDialogButton::Cancel);
+    }
+
+    #[tokio::test]
+    async fn test_esc_during_batch_execution_opens_batch_cancel_dialog() {
+        let mut st = crate::app::test_state();
+        st.model.status = TurnStatus::Responding;
+        st.model.is_batch = true;
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+
+        let key = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        handle_develop_key(key, &state, &mut conn).await.unwrap();
+
+        let guard = state.lock().await;
+        assert!(guard.confirm_batch_cancel, "Esc during batch must open three-way batch cancel dialog");
+        assert!(!guard.confirm_cancel, "Esc during batch must not open binary hard cancel dialog");
+        assert_eq!(guard.batch_cancel_button, crate::app::BatchCancelButton::Continue);
+    }
+
+    #[tokio::test]
+    async fn test_esc_during_single_turn_opens_hard_cancel_dialog() {
+        let mut st = crate::app::test_state();
+        st.model.status = TurnStatus::Responding;
+        st.model.is_batch = false;
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+
+        let key = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        handle_develop_key(key, &state, &mut conn).await.unwrap();
+
+        let guard = state.lock().await;
+        assert!(!guard.confirm_batch_cancel);
+        assert!(guard.confirm_cancel);
+        assert_eq!(guard.confirm_button, crate::app::ConfirmDialogButton::Cancel);
     }
 
     #[tokio::test]

@@ -45,9 +45,6 @@ pub trait ApplyPolicy: Send + Sync {
     /// Reverts the working tree to the state before `apply_temporary`.
     /// Returns `true` when changes were rolled back.
     async fn rollback(&mut self, repo_root: &Path) -> anyhow::Result<bool>;
-
-    /// Synchronous rollback fallback used during unwinding or drop.
-    fn rollback_sync(&mut self, repo_root: &Path) -> anyhow::Result<bool>;
 }
 
 /// Writes edits straight to disk, without checkpoints or commits.
@@ -95,10 +92,6 @@ impl ApplyPolicy for DirectApplyPolicy {
     }
 
     async fn rollback(&mut self, _repo_root: &Path) -> anyhow::Result<bool> {
-        Ok(false)
-    }
-
-    fn rollback_sync(&mut self, _repo_root: &Path) -> anyhow::Result<bool> {
         Ok(false)
     }
 }

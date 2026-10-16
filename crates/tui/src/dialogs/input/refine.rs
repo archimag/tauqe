@@ -211,37 +211,53 @@ pub(super) async fn handle_refine_blocked(
         }
         super::ConfirmOutcome::Dismissed => {}
         super::ConfirmOutcome::Accepted => {
-            if st.model.is_busy() || st.review.running || st.plans_view.refining {
-                st.notify_warning("Model is currently busy; wait for operation to finish");
-                st.plans_view.refine_blocked = Some(blocked);
-                return Ok(Some(InputResult::Continue));
-            }
-
-            let instructions = Some(format!(
-                "Replan uncompleted horizon addressing blockers:\n{}",
-                blocked.reason
-            ));
-            let params = tauqe_protocol::PlanRefineParams {
-                plan_id: blocked.plan_id.clone(),
-                model: None,
-                instructions,
-            };
-
-            st.plans_view.refining = true;
-            st.plans_view.refining_plan_id = Some(blocked.plan_id);
-            super::begin_develop_turn(&mut st);
-
-            drop(st);
-            send_request(
-                server_writer,
-                methods::PLAN_REFINE,
-                serde_json::to_value(params)?,
-            )
-            .await?;
+            submit_refine_blocked(st, blocked, server_writer).await?;
         }
     }
 
     Ok(Some(InputResult::Continue))
+}
+
+/// Initiates horizon replanning from the "refinement blocked" modal.
+///
+/// Shared by the keyboard and mouse confirmation paths so a click starts the
+/// exact same replanning turn as `Enter`: the blocker reason is folded into the
+/// refine instructions, the plan is flagged as refining, and the turn hands off
+/// to the Develop view. When the model is already busy the dialog is restored so
+/// the developer can retry.
+pub(crate) async fn submit_refine_blocked(
+    mut st: MutexGuard<'_, AppState>,
+    blocked: crate::views::plans::PlanRefineBlockedState,
+    server_writer: &mut RpcConnection,
+) -> anyhow::Result<()> {
+    if st.model.is_busy() || st.review.running || st.plans_view.refining {
+        st.notify_warning("Model is currently busy; wait for operation to finish");
+        st.plans_view.refine_blocked = Some(blocked);
+        return Ok(());
+    }
+
+    let instructions = Some(format!(
+        "Replan uncompleted horizon addressing blockers:\n{}",
+        blocked.reason
+    ));
+    let params = tauqe_protocol::PlanRefineParams {
+        plan_id: blocked.plan_id.clone(),
+        model: None,
+        instructions,
+    };
+
+    st.plans_view.refining = true;
+    st.plans_view.refining_plan_id = Some(blocked.plan_id);
+    super::begin_develop_turn(&mut st);
+
+    drop(st);
+    send_request(
+        server_writer,
+        methods::PLAN_REFINE,
+        serde_json::to_value(params)?,
+    )
+    .await?;
+    Ok(())
 }
 
 #[cfg(test)]

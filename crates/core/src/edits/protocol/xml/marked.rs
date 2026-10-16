@@ -4,7 +4,7 @@
 //! structural tags stay unambiguous across concatenated turns. It also tolerates
 //! reasoning models that drop the marker suffix by retrying unmarked tags.
 
-use crate::edits::protocol::{ContextRequest, EditProtocol};
+use crate::edits::protocol::ContextRequest;
 use tauqe_protocol::{DocTopic, EditOperation, ModelResult};
 
 use super::clean::extract_conversational_text;
@@ -60,55 +60,62 @@ impl MarkedXmlEditProtocol {
             parsed
         }
     }
-}
 
-impl EditProtocol for MarkedXmlEditProtocol {
-    fn name(&self) -> &'static str { "xml" }
+    /// Returns the turn marker this protocol is bound to.
+    pub fn turn_marker(&self) -> Option<&str> {
+        Some(&self.marker)
+    }
 
-    fn turn_marker(&self) -> Option<&str> { Some(&self.marker) }
-
-    fn parse_context_requests(&self, raw_text: &str) -> Vec<ContextRequest> {
-        // Strict marker requirement: discovery requests mutate context and must not
-        // be triggered by unmarked example tags in conversational text or source code.
+    /// Extracts context requests strictly bound to the active turn marker.
+    ///
+    /// Discovery requests mutate context and must not be triggered by unmarked
+    /// example tags in conversational text or source code.
+    pub fn parse_context_requests(&self, raw_text: &str) -> Vec<ContextRequest> {
         let normalized = normalize_marked_xml(raw_text, &self.marker, true);
         tags::parse_context_request_tags(&normalized)
     }
 
-    fn parse_doc_requests(&self, raw_text: &str) -> Vec<DocTopic> {
+    /// Extracts documentation topics strictly bound to the active turn marker.
+    pub fn parse_doc_requests(&self, raw_text: &str) -> Vec<DocTopic> {
         let normalized = normalize_marked_xml(raw_text, &self.marker, true);
         tags::parse_doc_request_tags(&normalized)
     }
 
-    fn parse_verify_request(&self, raw_text: &str) -> Option<VerifyRequest> {
+    /// Extracts a verification request, tolerating an unmarked fallback.
+    pub fn parse_verify_request(&self, raw_text: &str) -> Option<VerifyRequest> {
         self.tolerant_parse(raw_text, tags::extract_verify_request, Option::is_none)
     }
 
-    fn parse_user_language(&self, raw_text: &str) -> Option<String> {
+    /// Extracts the detected user language, tolerating an unmarked fallback.
+    pub fn parse_user_language(&self, raw_text: &str) -> Option<String> {
         self.tolerant_parse(raw_text, tags::extract_user_language, Option::is_none)
     }
 
-    fn parse_plan_tags(
-        &self,
-        raw_text: &str,
-    ) -> (Vec<tags::ParsedPlanTag>, Vec<String>) {
-        // Strict marker requirement: plan modifications must never be parsed
-        // from unsuffixed tags discussed in conversation or documentation.
+    /// Extracts plan tags strictly bound to the active turn marker.
+    ///
+    /// Plan modifications must never be parsed from unsuffixed tags discussed
+    /// in conversation or documentation.
+    pub fn parse_plan_tags(&self, raw_text: &str) -> (Vec<tags::ParsedPlanTag>, Vec<String>) {
         let normalized = normalize_marked_xml(raw_text, &self.marker, true);
         tags::parse_plan_tags_with_diagnostics(&normalized)
     }
 
-    fn parse_scratchpad(&self, raw_text: &str) -> Option<String> {
-        // Marker-normalized notes first, then unmarked <scratchpad> notes so a
-        // reasoning model that dropped the suffix still keeps its working memory.
+    /// Extracts scratchpad notes, preferring marker-bound notes over unmarked ones.
+    ///
+    /// Marker-normalized notes come first, then unmarked `<scratchpad>` notes so
+    /// a reasoning model that dropped the suffix still keeps its working memory.
+    pub fn parse_scratchpad(&self, raw_text: &str) -> Option<String> {
         let normalized = normalize_marked_xml(raw_text, &self.marker, true);
         tags::extract_scratchpad(&normalized)
             .map(|notes| restore_xml_literals(&notes, &self.marker))
             .or_else(|| tags::extract_scratchpad(raw_text))
     }
 
-    fn parse_terminal_outcome(&self, raw_text: &str) -> Option<TerminalOutcome> {
-        // Strict marker requirement: terminal outcomes determine control flow and must
-        // never fall back to unmarked tags quoted in source code or explanations.
+    /// Extracts the terminal outcome strictly bound to the active turn marker.
+    ///
+    /// Terminal outcomes determine control flow and must never fall back to
+    /// unmarked tags quoted in source code or explanations.
+    pub fn parse_terminal_outcome(&self, raw_text: &str) -> Option<TerminalOutcome> {
         let normalized = normalize_marked_xml(raw_text, &self.marker, true);
         let outcome = tags::extract_terminal_outcome(&normalized)?;
         Some(match outcome {
@@ -125,14 +132,17 @@ impl EditProtocol for MarkedXmlEditProtocol {
         })
     }
 
-    fn parse_error(&self, raw_text: &str) -> Option<String> {
+    /// Extracts a blocker or error message bound to the active turn marker.
+    pub fn parse_error(&self, raw_text: &str) -> Option<String> {
         let normalized = normalize_marked_xml(raw_text, &self.marker, true);
         tags::extract_error(&normalized).map(|message| restore_xml_literals(&message, &self.marker))
     }
 
-    fn clean_assistant_text(&self, raw_text: &str) -> String {
-        // Strip terminal outcome and scratchpad tags (both marker-suffixed and unmarked, while
-        // respecting markdown code) so they never leak into conversational text.
+    /// Cleans model output, stripping terminal outcome and scratchpad tags.
+    ///
+    /// Both marker-suffixed and unmarked tags are removed (while respecting
+    /// markdown code) so they never leak into conversational text.
+    pub fn clean_assistant_text(&self, raw_text: &str) -> String {
         let without_terminal = tags::strip_terminal_outcome_tags(raw_text);
         let without_scratchpad = tags::strip_scratchpad_tags(&without_terminal);
         if !without_scratchpad.contains(&self.marker) {
@@ -144,35 +154,27 @@ impl EditProtocol for MarkedXmlEditProtocol {
         restore_xml_literals(&extract_conversational_text(&normalized), &self.marker)
     }
 
-    fn with_turn_marker(&self, marker: &str) -> Option<Box<dyn EditProtocol>> {
-        if !is_valid_turn_marker(marker) {
-            tracing::warn!(marker = %marker, "ignoring malformed turn marker");
-            return None;
-        }
-        Some(Box::new(Self::new(marker)))
-    }
-
-    fn system_instructions(
-        &self,
-        editable_paths: &[String],
-    ) -> String {
+    /// Returns system prompt instructions with the turn marker applied.
+    pub fn system_instructions(&self, editable_paths: &[String]) -> String {
         prompt::apply_turn_marker(
             &prompt::base_system_instructions(editable_paths),
             &self.marker,
         )
     }
 
-    fn parse_output(&self, raw_text: &str, editable_paths: &[String]) -> ModelResult {
-        // Strict marker requirement: code edits must carry the active turn marker.
-        // Unmarked edit blocks in conversation or source code are treated as literals,
-        // preventing injection or unintentional patch application.
+    /// Parses raw model text into a `ModelResult`, enforcing the turn marker.
+    ///
+    /// Code edits must carry the active turn marker. Unmarked edit blocks in
+    /// conversation or source code are treated as literals, preventing injection
+    /// or unintentional patch application.
+    pub fn parse_output(&self, raw_text: &str, editable_paths: &[String]) -> ModelResult {
         let normalized = normalize_marked_xml(raw_text, &self.marker, true);
         let mut result = XmlEditProtocol.parse_output(&normalized, editable_paths);
         match &mut result {
             ModelResult::Answer { text } => *text = restore_xml_literals(text, &self.marker),
-            ModelResult::Edit { summary, edits, proposal, error, .. } => {
+            ModelResult::Edit { summary, edits, proposal, outcome, .. } => {
                 *summary = restore_xml_literals(summary, &self.marker);
-                if let Some(message) = error {
+                if let Some(message) = &mut outcome.error {
                     *message = restore_xml_literals(message, &self.marker);
                 }
                 for edit in edits {
@@ -208,19 +210,6 @@ impl EditProtocol for MarkedXmlEditProtocol {
             }
         }
         result
-    }
-
-    fn create_stream_filter(
-        &self,
-        editable_paths: Vec<String>,
-        repo_root: std::path::PathBuf,
-        staged_contents: std::collections::HashMap<String, String>,
-    ) -> Box<dyn crate::edits::stream::EditStreamFilter> {
-        Box::new(
-            crate::edits::stream::XmlStreamFilter::new(editable_paths, repo_root)
-                .with_marker(Some(self.marker.clone()))
-                .with_staged_contents(staged_contents),
-        )
     }
 }
 

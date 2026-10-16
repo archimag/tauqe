@@ -1,4 +1,3 @@
-use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::LazyLock;
 
 use pulldown_cmark::{Alignment, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
@@ -8,6 +7,8 @@ use syntect::easy::HighlightLines;
 use syntect::highlighting::{Style as SynStyle, ThemeSet};
 use syntect::parsing::SyntaxSet;
 
+use crate::theme::color::RgbColor;
+
 mod latex;
 pub use latex::convert_latex_to_unicode;
 use latex::render_text_spans;
@@ -15,73 +16,37 @@ use latex::render_text_spans;
 static SYNTAX_SET: LazyLock<SyntaxSet> = LazyLock::new(SyntaxSet::load_defaults_newlines);
 static THEME_SET: LazyLock<ThemeSet> = LazyLock::new(ThemeSet::load_defaults);
 
-/// Process-wide color-depth override: `0` = auto, `1` = truecolor, `2` = 256.
-///
-/// `Auto` keeps environment-based detection. An explicit value from `tui.toml`
-/// forces the palette, so a terminal that supports 24-bit color without
-/// advertising it through `COLORTERM`/`TERM` can be enabled by hand.
-static COLOR_DEPTH_OVERRIDE: AtomicU8 = AtomicU8::new(0);
-
 /// Applies the configured color-depth override; `Auto` restores detection.
+///
+/// The authoritative depth state lives in the theme engine; this keeps the
+/// historical markdown-side entry point delegating to it.
 pub fn set_color_depth_override(depth: crate::config::ColorDepth) {
-    let value = match depth {
-        crate::config::ColorDepth::Auto => 0,
-        crate::config::ColorDepth::Truecolor => 1,
-        crate::config::ColorDepth::Ansi256 => 2,
-    };
-    COLOR_DEPTH_OVERRIDE.store(value, Ordering::Relaxed);
+    crate::theme::engine::set_color_depth(depth);
 }
 
+/// Whether the active color depth is 24-bit truecolor.
 pub fn supports_truecolor() -> bool {
-    match COLOR_DEPTH_OVERRIDE.load(Ordering::Relaxed) {
-        1 => true,
-        2 => false,
-        _ => detect_truecolor_from_env(),
-    }
+    matches!(
+        crate::theme::engine::current_depth(),
+        crate::theme::color::ColorDepth::Truecolor
+    )
 }
 
-/// Environment-based truecolor detection, evaluated once per process.
-fn detect_truecolor_from_env() -> bool {
-    static TRUECOLOR: LazyLock<bool> = LazyLock::new(|| {
-        if let Ok(val) = std::env::var("COLORTERM") {
-            let v = val.to_lowercase();
-            if v == "truecolor" || v == "24bit" {
-                return true;
-            }
-        }
-        if let Ok(term) = std::env::var("TERM") {
-            let t = term.to_lowercase();
-            if t.contains("kitty") || t.contains("alacritty") || t.contains("wezterm") {
-                return true;
-            }
-        }
-        false
-    });
-    *TRUECOLOR
-}
-
+/// Projects an 8-bit-per-channel color onto the xterm 256-color cube.
 pub fn rgb_to_ansi256(r: u8, g: u8, b: u8) -> u8 {
-    let max = r.max(g).max(b);
-    let min = r.min(g).min(b);
-    if max - min <= 8 {
-        let avg = (r as u16 + g as u16 + b as u16) / 3;
-        if avg < 8 {
-            return 16;
-        }
-        if avg > 248 {
-            return 231;
-        }
-        return (232 + ((avg - 8) * 24 / 240)).min(255) as u8;
-    }
-    let r_idx = (r as u16 * 5 / 255) as u8;
-    let g_idx = (g as u16 * 5 / 255) as u8;
-    let b_idx = (b as u16 * 5 / 255) as u8;
-    16 + 36 * r_idx + 6 * g_idx + b_idx
+    RgbColor::new(r, g, b).to_ansi256()
 }
 
+/// Projects a raw RGB color onto the active terminal color depth.
+///
+/// Truecolor terminals receive the exact RGB value, 256-color terminals the
+/// nearest protected-cube index, and the 16-color fallback degrades to the
+/// default foreground so text stays legible.
 pub fn safe_rgb(r: u8, g: u8, b: u8) -> Color {
     if supports_truecolor() {
         Color::Rgb(r, g, b)
+    } else if crate::theme::engine::current_depth() == crate::theme::color::ColorDepth::Ansi16 {
+        Color::Reset
     } else {
         Color::Indexed(rgb_to_ansi256(r, g, b))
     }
@@ -153,114 +118,105 @@ impl Default for MarkdownTheme {
 }
 
 impl MarkdownTheme {
+    /// Builds the answer-rendering Markdown theme from the active semantic
+    /// palette, projecting every role through the theme engine so headings,
+    /// quotes, lists, tables, and code blocks stay legible at each color depth.
     pub fn answer_themed(mode: crate::config::ThemeMode) -> Self {
-        match mode {
-            crate::config::ThemeMode::Light => Self {
-                text_style: Style::default(),
-                bold_style: Style::default().add_modifier(Modifier::BOLD),
-                italic_style: Style::default().add_modifier(Modifier::ITALIC),
-                h1: Style::default()
-                    .fg(Color::Blue)
-                    .add_modifier(Modifier::BOLD),
-                h2: Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-                h3: Style::default()
-                    .fg(Color::Magenta)
-                    .add_modifier(Modifier::BOLD),
-                h4: Style::default()
-                    .fg(safe_rgb(160, 100, 20))
-                    .add_modifier(Modifier::BOLD),
-                h5: Style::default().add_modifier(Modifier::BOLD),
-                h6: Style::default()
-                    .fg(Color::DarkGray)
-                    .add_modifier(Modifier::BOLD),
-                inline_code: Style::default()
-                    .bg(safe_rgb(235, 238, 245))
-                    .fg(safe_rgb(180, 80, 20))
-                    .add_modifier(Modifier::BOLD),
-                code_border: Style::default().fg(safe_rgb(180, 190, 205)),
-                code_lang: Style::default()
-                    .fg(safe_rgb(160, 90, 10))
-                    .add_modifier(Modifier::BOLD),
-                code_text: Style::default().fg(safe_rgb(30, 35, 45)),
-                code_bg: safe_rgb(240, 243, 250),
-                blockquote_bar: Style::default().fg(Color::Blue),
-                blockquote_text: Style::default().fg(Color::DarkGray),
-                list_bullet: Style::default()
-                    .fg(Color::Blue)
-                    .add_modifier(Modifier::BOLD),
-                link: Style::default()
-                    .fg(Color::Blue)
-                    .add_modifier(Modifier::UNDERLINED),
-                hr: Style::default().fg(Color::Gray),
-                table_border: Style::default().fg(safe_rgb(180, 190, 205)),
-                table_head: Style::default()
-                    .fg(Color::Blue)
-                    .add_modifier(Modifier::BOLD),
-                table_cell: Style::default(),
-                math_style: Style::default()
-                    .fg(Color::Blue)
-                    .add_modifier(Modifier::ITALIC),
-                compact: false,
-                hard_breaks: false,
-                line_prefix: None,
-                max_width: None,
-                is_light: true,
-            },
-            _ => Self {
-                text_style: Style::default(),
-                bold_style: Style::default().add_modifier(Modifier::BOLD),
-                italic_style: Style::default().add_modifier(Modifier::ITALIC),
-                h1: Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-                h2: Style::default()
-                    .fg(Color::LightBlue)
-                    .add_modifier(Modifier::BOLD),
-                h3: Style::default()
-                    .fg(Color::Magenta)
-                    .add_modifier(Modifier::BOLD),
-                h4: Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-                h5: Style::default().add_modifier(Modifier::BOLD),
-                h6: Style::default()
-                    .fg(Color::DarkGray)
-                    .add_modifier(Modifier::BOLD),
-                inline_code: Style::default()
-                    .bg(safe_rgb(36, 40, 52))
-                    .fg(safe_rgb(240, 205, 120))
-                    .add_modifier(Modifier::BOLD),
-                code_border: Style::default().fg(safe_rgb(75, 90, 115)),
-                code_lang: Style::default()
-                    .fg(safe_rgb(245, 205, 100))
-                    .add_modifier(Modifier::BOLD),
-                code_text: Style::default().fg(safe_rgb(220, 225, 235)),
-                code_bg: safe_rgb(24, 27, 36),
-                blockquote_bar: Style::default().fg(Color::Cyan),
-                blockquote_text: Style::default().fg(Color::Gray),
-                list_bullet: Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-                link: Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::UNDERLINED),
-                hr: Style::default().fg(Color::DarkGray),
-                table_border: Style::default().fg(safe_rgb(75, 90, 115)),
-                table_head: Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-                table_cell: Style::default(),
-                math_style: Style::default()
-                    .fg(Color::LightCyan)
-                    .add_modifier(Modifier::ITALIC),
-                compact: false,
-                hard_breaks: false,
-                line_prefix: None,
-                max_width: None,
-                is_light: false,
-            },
+        Self::from_semantic(&crate::theme::engine::active_engine(mode), false)
+    }
+
+    fn from_semantic(engine: &crate::theme::engine::ThemeEngine, reasoning: bool) -> Self {
+        if reasoning {
+            Self::from_palette_reasoning(engine)
+        } else {
+            Self::from_palette_answer(engine)
+        }
+    }
+
+    fn from_palette_answer(engine: &crate::theme::engine::ThemeEngine) -> Self {
+        let palette = engine.palette();
+        let body = engine.fg(palette.text_primary);
+        let accent = engine.fg(palette.status_info);
+        Self {
+            text_style: body,
+            bold_style: body.add_modifier(Modifier::BOLD),
+            italic_style: body.add_modifier(Modifier::ITALIC),
+            h1: engine
+                .fg(palette.button_active_bg)
+                .add_modifier(Modifier::BOLD),
+            h2: accent.add_modifier(Modifier::BOLD),
+            h3: engine
+                .fg(palette.status_success)
+                .add_modifier(Modifier::BOLD),
+            h4: engine
+                .fg(palette.status_warning)
+                .add_modifier(Modifier::BOLD),
+            h5: body.add_modifier(Modifier::BOLD),
+            h6: engine.fg(palette.text_muted).add_modifier(Modifier::BOLD),
+            inline_code: engine
+                .fg(palette.status_warning)
+                .bg(engine.color(palette.surface))
+                .add_modifier(Modifier::BOLD),
+            code_border: engine.fg(palette.border),
+            code_lang: engine
+                .fg(palette.status_warning)
+                .add_modifier(Modifier::BOLD),
+            code_text: body,
+            code_bg: engine.color(palette.code_bg),
+            blockquote_bar: accent,
+            blockquote_text: engine.fg(palette.text_secondary),
+            list_bullet: accent.add_modifier(Modifier::BOLD),
+            link: accent.add_modifier(Modifier::UNDERLINED),
+            hr: engine.fg(palette.text_muted),
+            table_border: engine.fg(palette.border),
+            table_head: accent.add_modifier(Modifier::BOLD),
+            table_cell: body,
+            math_style: accent.add_modifier(Modifier::ITALIC),
+            compact: false,
+            hard_breaks: false,
+            line_prefix: None,
+            max_width: None,
+            is_light: engine.is_light(),
+        }
+    }
+
+    fn from_palette_reasoning(engine: &crate::theme::engine::ThemeEngine) -> Self {
+        let palette = engine.palette();
+        let body = engine.fg(palette.text_secondary);
+        let accent = engine.fg(palette.status_info);
+        Self {
+            text_style: body,
+            bold_style: engine
+                .fg(palette.text_primary)
+                .add_modifier(Modifier::BOLD),
+            italic_style: body.add_modifier(Modifier::ITALIC),
+            h1: accent.add_modifier(Modifier::BOLD),
+            h2: accent.add_modifier(Modifier::BOLD),
+            h3: accent.add_modifier(Modifier::BOLD),
+            h4: accent.add_modifier(Modifier::BOLD),
+            h5: accent.add_modifier(Modifier::BOLD),
+            h6: accent.add_modifier(Modifier::BOLD),
+            inline_code: engine
+                .fg(palette.text_primary)
+                .bg(engine.color(palette.code_bg)),
+            code_border: engine.fg(palette.border),
+            code_lang: accent,
+            code_text: body,
+            code_bg: engine.color(palette.code_bg),
+            blockquote_bar: engine.fg(palette.border),
+            blockquote_text: body,
+            list_bullet: accent,
+            link: accent.add_modifier(Modifier::UNDERLINED),
+            hr: engine.fg(palette.border),
+            table_border: engine.fg(palette.border),
+            table_head: accent,
+            table_cell: body,
+            math_style: body.add_modifier(Modifier::ITALIC),
+            compact: true,
+            hard_breaks: false,
+            line_prefix: None,
+            max_width: None,
+            is_light: engine.is_light(),
         }
     }
 
@@ -268,111 +224,11 @@ impl MarkdownTheme {
         Self::answer_themed(crate::config::ThemeMode::Auto)
     }
 
+    /// Builds the subdued reasoning-rendering Markdown theme from the active
+    /// semantic palette, keeping the thinking transcript legible while visually
+    /// distinct from the answer body.
     pub fn reasoning_themed(mode: crate::config::ThemeMode) -> Self {
-        match mode {
-            crate::config::ThemeMode::Light => {
-                let base_blue = Style::default().fg(safe_rgb(45, 85, 140));
-                Self {
-                    text_style: base_blue,
-                    bold_style: Style::default()
-                        .fg(safe_rgb(30, 65, 120))
-                        .add_modifier(Modifier::BOLD),
-                    italic_style: Style::default().add_modifier(Modifier::ITALIC),
-                    h1: Style::default()
-                        .fg(safe_rgb(25, 60, 115))
-                        .add_modifier(Modifier::BOLD),
-                    h2: Style::default()
-                        .fg(safe_rgb(35, 75, 130))
-                        .add_modifier(Modifier::BOLD),
-                    h3: Style::default()
-                        .fg(safe_rgb(45, 85, 140))
-                        .add_modifier(Modifier::BOLD),
-                    h4: Style::default()
-                        .fg(safe_rgb(55, 95, 150))
-                        .add_modifier(Modifier::BOLD),
-                    h5: Style::default()
-                        .fg(safe_rgb(65, 105, 160))
-                        .add_modifier(Modifier::BOLD),
-                    h6: Style::default()
-                        .fg(safe_rgb(75, 115, 170))
-                        .add_modifier(Modifier::BOLD),
-                    inline_code: Style::default()
-                        .fg(safe_rgb(35, 75, 130))
-                        .bg(safe_rgb(225, 235, 248)),
-                    code_border: Style::default().fg(safe_rgb(180, 195, 220)),
-                    code_lang: Style::default().fg(safe_rgb(70, 100, 145)),
-                    code_text: base_blue,
-                    code_bg: safe_rgb(238, 244, 252),
-                    blockquote_bar: Style::default().fg(safe_rgb(100, 130, 180)),
-                    blockquote_text: base_blue,
-                    list_bullet: Style::default().fg(safe_rgb(60, 100, 160)),
-                    link: Style::default()
-                        .fg(safe_rgb(35, 75, 130))
-                        .add_modifier(Modifier::UNDERLINED),
-                    hr: Style::default().fg(safe_rgb(180, 195, 220)),
-                    table_border: Style::default().fg(safe_rgb(180, 195, 220)),
-                    table_head: Style::default().fg(safe_rgb(35, 75, 130)),
-                    table_cell: base_blue,
-                    math_style: base_blue.add_modifier(Modifier::ITALIC),
-                    compact: true,
-                    hard_breaks: false,
-                    line_prefix: None,
-                    max_width: None,
-                    is_light: true,
-                }
-            }
-            _ => {
-                let base_blue = Style::default().fg(safe_rgb(140, 180, 225));
-                Self {
-                    text_style: base_blue,
-                    bold_style: Style::default()
-                        .fg(safe_rgb(165, 200, 240))
-                        .add_modifier(Modifier::BOLD),
-                    italic_style: Style::default().add_modifier(Modifier::ITALIC),
-                    h1: Style::default()
-                        .fg(safe_rgb(155, 195, 240))
-                        .add_modifier(Modifier::BOLD),
-                    h2: Style::default()
-                        .fg(safe_rgb(140, 180, 225))
-                        .add_modifier(Modifier::BOLD),
-                    h3: Style::default()
-                        .fg(safe_rgb(130, 170, 215))
-                        .add_modifier(Modifier::BOLD),
-                    h4: Style::default()
-                        .fg(safe_rgb(120, 160, 205))
-                        .add_modifier(Modifier::BOLD),
-                    h5: Style::default()
-                        .fg(safe_rgb(110, 150, 195))
-                        .add_modifier(Modifier::BOLD),
-                    h6: Style::default()
-                        .fg(safe_rgb(95, 130, 175))
-                        .add_modifier(Modifier::BOLD),
-                    inline_code: Style::default()
-                        .fg(safe_rgb(165, 200, 240))
-                        .bg(safe_rgb(30, 42, 60)),
-                    code_border: Style::default().fg(safe_rgb(60, 85, 120)),
-                    code_lang: Style::default().fg(safe_rgb(130, 170, 220)),
-                    code_text: base_blue,
-                    code_bg: safe_rgb(18, 25, 38),
-                    blockquote_bar: Style::default().fg(safe_rgb(70, 95, 130)),
-                    blockquote_text: base_blue,
-                    list_bullet: Style::default().fg(safe_rgb(100, 145, 195)),
-                    link: Style::default()
-                        .fg(safe_rgb(130, 170, 225))
-                        .add_modifier(Modifier::UNDERLINED),
-                    hr: Style::default().fg(safe_rgb(60, 85, 120)),
-                    table_border: Style::default().fg(safe_rgb(60, 85, 120)),
-                    table_head: Style::default().fg(safe_rgb(145, 185, 230)),
-                    table_cell: base_blue,
-                    math_style: base_blue.add_modifier(Modifier::ITALIC),
-                    compact: true,
-                    hard_breaks: false,
-                    line_prefix: None,
-                    max_width: None,
-                    is_light: false,
-                }
-            }
-        }
+        Self::from_semantic(&crate::theme::engine::active_engine(mode), true)
     }
 
     pub fn reasoning() -> Self {
@@ -1570,7 +1426,8 @@ mod tests {
     #[test]
     fn test_code_block_empty_lines_and_typescript_highlighting() {
         let ts_code = "```typescript\nconst x: number = 42;\n\nfunction test(): void {}\n```";
-        let lines = render_markdown(ts_code, &MarkdownTheme::answer());
+        let theme = MarkdownTheme::answer();
+        let lines = render_markdown(ts_code, &theme);
         let default_code_fg = safe_rgb(220, 225, 235);
         let has_highlighting = lines.iter().any(|l| {
             l.spans.iter().any(|s| {
@@ -1579,7 +1436,7 @@ mod tests {
         });
         assert!(has_highlighting, "TypeScript code must have syntax highlighting");
 
-        let code_bg = MarkdownTheme::answer().code_bg;
+        let code_bg = theme.code_bg;
         // lines[0] is lang header ("typescript")
         // lines[1] is top padding
         assert_eq!(lines[1].spans[0].style.bg, Some(code_bg), "Top padding must have code_bg");
@@ -1596,7 +1453,8 @@ mod tests {
     #[test]
     fn code_block_renders_borderless_with_padding_and_background() {
         let md = "```rust\nfn main() {}\n```";
-        let lines = render_markdown(md, &MarkdownTheme::answer());
+        let theme = MarkdownTheme::answer();
+        let lines = render_markdown(md, &theme);
         assert!(lines.len() >= 4);
 
         let lang_line = &lines[0];
@@ -1622,10 +1480,10 @@ mod tests {
         assert_eq!(top_text.chars().count(), code_text.chars().count());
 
         // Background should be applied across the entire block
-        assert_eq!(top_pad.spans[0].style.bg, Some(MarkdownTheme::answer().code_bg));
-        assert_eq!(code_line.spans[0].style.bg, Some(MarkdownTheme::answer().code_bg));
-        assert_eq!(code_line.spans.last().unwrap().style.bg, Some(MarkdownTheme::answer().code_bg));
-        assert_eq!(bot_pad.spans[0].style.bg, Some(MarkdownTheme::answer().code_bg));
+        assert_eq!(top_pad.spans[0].style.bg, Some(theme.code_bg));
+        assert_eq!(code_line.spans[0].style.bg, Some(theme.code_bg));
+        assert_eq!(code_line.spans.last().unwrap().style.bg, Some(theme.code_bg));
+        assert_eq!(bot_pad.spans[0].style.bg, Some(theme.code_bg));
     }
 
     #[test]

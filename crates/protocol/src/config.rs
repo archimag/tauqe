@@ -51,6 +51,9 @@ impl FromStr for WorkflowKind {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.trim().to_ascii_lowercase().as_str() {
             "git" => Ok(Self::Git),
+            // `single` and `direct` are legacy aliases for the naive (direct)
+            // workflow; scheduled for removal in 0.2.0 and tracked by the
+            // wire-contract test in `lib.rs`.
             "naive" | "single" | "direct" => Ok(Self::Naive),
             other => Err(format!(
                 "Unknown workflow '{}'. Expected 'git' or 'naive'",
@@ -105,6 +108,9 @@ impl FromStr for EditProtocolKind {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.trim().to_ascii_lowercase().as_str() {
             "xml" => Ok(Self::Xml),
+            // `structured_output`, `json_schema`, and `json` are legacy aliases
+            // for the structured protocol; scheduled for removal in 0.2.0 and
+            // tracked by the wire-contract test in `lib.rs`.
             "structured" | "structured_output" | "json_schema" | "json" => Ok(Self::Structured),
             other => Err(format!(
                 "Unknown edit protocol '{}'. Expected 'xml' or 'structured'",

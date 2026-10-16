@@ -13,6 +13,7 @@ pub mod input;
 pub mod markdown;
 pub mod rpc;
 pub mod terminal;
+pub mod theme;
 pub mod ui;
 pub mod views;
 
@@ -146,6 +147,7 @@ async fn main() -> anyhow::Result<()> {
 
     let mut msg_rx = rpc::spawn_message_reader(server_reader);
     let (mut terminal, _guard) = terminal::init_terminal()?;
+    terminal.clear()?;
     let mut event_rx = terminal::spawn_event_reader();
     let mut last_spinner_tick = Instant::now();
     let mut last_draw: Option<Instant> = None;

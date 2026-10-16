@@ -1,10 +1,11 @@
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Color, Style, Stylize};
+use ratatui::style::{Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Padding, Paragraph};
-use tauqe_protocol::DiscussionFocus;
+use tauqe_protocol::{DiscussionFocus, DiscussionTarget};
 
 use crate::app::AppState;
+use crate::theme::engine::current_engine;
 use crate::ui::wrap_line;
 
 use super::{compute_model_lines, DevelopFocus, SPINNER_FRAMES};
@@ -69,59 +70,63 @@ pub fn render_develop_view(
 /// carries no command of its own. The server owns the authoritative focus; this
 /// only mirrors it for display.
 fn render_discussion_focus_banner(frame: &mut ratatui::Frame, state: &AppState, area: Rect) {
+    let engine = current_engine();
+    let palette = engine.palette();
     let (badge, badge_bg, id, title, focused_count) = match &state.discussion_focus {
-        DiscussionFocus::Plan {
-            plan_id,
+        DiscussionFocus::Focused {
+            target,
             focused_items,
-        } => {
-            let title = state
-                .plans_view
-                .plans
-                .iter()
-                .find(|plan| &plan.id == plan_id)
-                .map(|plan| plan.title.clone())
-                .unwrap_or_else(|| plan_id.clone());
-            (
-                "[PLAN]",
-                Color::Cyan,
-                plan_id.clone(),
-                title,
-                focused_items.len(),
-            )
-        }
-        DiscussionFocus::Review {
-            review_id,
-            focused_items,
-        } => {
-            let title = state
-                .review
-                .sessions
-                .iter()
-                .find(|session| &session.id == review_id)
-                .map(|session| session.title.clone())
-                .unwrap_or_else(|| review_id.clone());
-            (
-                "[REVIEW]",
-                Color::Magenta,
-                review_id.clone(),
-                title,
-                focused_items.len(),
-            )
-        }
+        } => match target {
+            DiscussionTarget::Plan { id } => {
+                let title = state
+                    .plans_view
+                    .plans
+                    .iter()
+                    .find(|plan| &plan.id == id)
+                    .map(|plan| plan.title.clone())
+                    .unwrap_or_else(|| id.clone());
+                (
+                    "[PLAN]",
+                    palette.status_info,
+                    id.clone(),
+                    title,
+                    focused_items.len(),
+                )
+            }
+            DiscussionTarget::Review { id } => {
+                let title = state
+                    .review
+                    .sessions
+                    .iter()
+                    .find(|session| &session.id == id)
+                    .map(|session| session.title.clone())
+                    .unwrap_or_else(|| id.clone());
+                (
+                    "[REVIEW]",
+                    palette.button_active_bg,
+                    id.clone(),
+                    title,
+                    focused_items.len(),
+                )
+            }
+        },
         DiscussionFocus::None => return,
     };
 
     let mut spans = vec![
         Span::styled(
             format!(" {} ", badge),
-            Style::default().bg(badge_bg).fg(Color::Black).bold(),
+            engine
+                .bg(badge_bg)
+                .fg(engine.color(palette.text_inverse))
+                .bold(),
         ),
         Span::raw(" "),
-        Span::styled(id, Style::default().fg(Color::Cyan).bold()),
+        Span::styled(id, engine.fg(palette.status_info).bold()),
         Span::raw(" \u{2014} "),
         Span::styled(
             title.replace(['\r', '\n'], " "),
-            Style::default().fg(Color::White),
+            engine.fg(palette.text_primary),
         ),
     ];
 
@@ -129,14 +134,14 @@ fn render_discussion_focus_banner(frame: &mut ratatui::Frame, state: &AppState, 
         spans.push(Span::raw(" "));
         spans.push(Span::styled(
             format!("({} focused)", focused_count),
-            Style::default().fg(Color::DarkGray),
+            engine.fg(palette.text_muted),
         ));
     }
 
     spans.push(Span::raw("  "));
     spans.push(Span::styled(
         "[Esc to detach]",
-        Style::default().fg(Color::DarkGray).bold(),
+        engine.fg(palette.text_muted).bold(),
     ));
 
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
@@ -154,10 +159,13 @@ fn plan_stepper_lines(state: &AppState) -> Option<Vec<Line<'static>>> {
         .iter()
         .find(|plan| plan.id == plan_ctx.plan_id)?;
 
+    let engine = current_engine();
+    let palette = engine.palette();
+
     let mut lines: Vec<Line<'static>> = Vec::new();
     lines.push(Line::from(vec![
-        Span::styled("Plan: ", Style::default().fg(Color::DarkGray).bold()),
-        Span::styled(plan.title.clone(), Style::default().fg(Color::Cyan).bold()),
+        Span::styled("Plan: ", engine.fg(palette.text_muted).bold()),
+        Span::styled(plan.title.clone(), engine.fg(palette.status_info).bold()),
     ]));
 
     let step_ids: Vec<&str> = if plan_ctx.batch_step_ids.is_empty() {
@@ -175,28 +183,28 @@ fn plan_stepper_lines(state: &AppState) -> Option<Vec<Line<'static>>> {
         let (badge, badge_style) = if is_active {
             (
                 SPINNER_FRAMES[state.model.spinner_frame % SPINNER_FRAMES.len()],
-                Style::default().fg(Color::Yellow).bold(),
+                engine.fg(palette.status_warning).bold(),
             )
         } else {
             plan_status_badge(item.status)
         };
 
         let title_style = if is_active {
-            Style::default().fg(Color::White).bold()
+            engine.fg(palette.text_primary).bold()
         } else {
-            Style::default().fg(Color::Gray)
+            engine.fg(palette.text_secondary)
         };
 
         lines.push(Line::from(vec![
             Span::styled(
                 if is_active { "> " } else { "  " },
-                Style::default().fg(Color::Cyan),
+                engine.fg(palette.status_info),
             ),
             Span::styled(badge.to_string(), badge_style),
             Span::raw(" "),
             Span::styled(
                 format!("#{} ", item.id),
-                Style::default().fg(Color::DarkGray),
+                engine.fg(palette.text_muted),
             ),
             Span::styled(item.title.clone(), title_style),
         ]));
@@ -206,24 +214,31 @@ fn plan_stepper_lines(state: &AppState) -> Option<Vec<Line<'static>>> {
 }
 
 fn plan_status_badge(status: tauqe_protocol::PlanItemStatus) -> (&'static str, Style) {
+    let engine = current_engine();
+    let palette = engine.palette();
     match status {
-        tauqe_protocol::PlanItemStatus::Done => ("✓", Style::default().fg(Color::Green).bold()),
-        tauqe_protocol::PlanItemStatus::InProgress => {
-            ("▶", Style::default().fg(Color::Yellow).bold())
+        tauqe_protocol::PlanItemStatus::Done => {
+            ("✓", engine.fg(palette.status_success).bold())
         }
-        tauqe_protocol::PlanItemStatus::Todo => ("○", Style::default().fg(Color::DarkGray)),
-        tauqe_protocol::PlanItemStatus::Blocked => ("!", Style::default().fg(Color::Red).bold()),
-        tauqe_protocol::PlanItemStatus::Cancelled => ("✗", Style::default().fg(Color::Red)),
+        tauqe_protocol::PlanItemStatus::InProgress => {
+            ("▶", engine.fg(palette.status_warning).bold())
+        }
+        tauqe_protocol::PlanItemStatus::Todo => ("○", engine.fg(palette.text_muted)),
+        tauqe_protocol::PlanItemStatus::Blocked => {
+            ("!", engine.fg(palette.status_error).bold())
+        }
+        tauqe_protocol::PlanItemStatus::Cancelled => ("✗", engine.fg(palette.status_error)),
         tauqe_protocol::PlanItemStatus::Discussion => {
-            ("?", Style::default().fg(Color::Magenta).bold())
+            ("?", engine.fg(palette.button_active_bg).bold())
         }
     }
 }
 
 fn render_plan_stepper(frame: &mut ratatui::Frame, lines: Vec<Line<'static>>, area: Rect) {
+    let engine = current_engine();
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::DarkGray))
+        .border_style(engine.fg(engine.palette().border))
         .padding(Padding::horizontal(1));
     let paragraph = Paragraph::new(lines).block(block);
     frame.render_widget(paragraph, area);
@@ -259,7 +274,7 @@ fn render_model_pane(frame: &mut ratatui::Frame, state: &mut AppState, area: Rec
         }
     }
 
-    let raw_lines = compute_model_lines(&state.model);
+    let raw_lines = compute_model_lines(&mut state.model);
 
     let prefix_count = (state.model.error.is_some() as usize)
         + (state.model.toolchain.is_some() as usize);
@@ -357,11 +372,13 @@ fn render_prompt_input(
     ) as u16;
     state.model.input_scroll = input_scroll;
 
+    let engine = current_engine();
+    let palette = engine.palette();
     let in_viewport = state.model.focus == DevelopFocus::Viewport;
     let border_style = if is_busy {
-        Style::default().fg(Color::Yellow)
+        engine.fg(palette.status_warning)
     } else if in_viewport {
-        Style::default().fg(Color::DarkGray)
+        engine.fg(palette.text_muted)
     } else {
         Style::default()
     };

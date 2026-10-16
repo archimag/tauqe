@@ -14,8 +14,9 @@ static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(10);
 #[derive(Debug, Clone)]
 pub enum OptimisticRollback {
     ReviewItemStatus {
+        review_id: Option<String>,
         item_id: u32,
-        prev_status: tauqe_protocol::ReviewStatus,
+        prev_status: tauqe_protocol::ReviewItemStatus,
     },
     PlanItemStatus {
         plan_id: String,

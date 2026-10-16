@@ -1,8 +1,10 @@
 use std::path::{Path, PathBuf};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use ratatui::style::{Color, Style, Stylize};
+use ratatui::style::{Style, Stylize};
 use ratatui::text::{Line, Span};
+
+use crate::theme::engine::current_engine;
 
 /// Walks up from the current directory to the nearest ancestor that looks like
 /// a Tauqe state root (contains `.tauqe` or `.git`). This keeps the prompt
@@ -737,16 +739,19 @@ impl TextEditor {
         is_busy: bool,
     ) -> (Vec<Line<'static>>, usize) {
         let content_width = content_width.max(10);
+        let engine = current_engine();
+        let palette = engine.palette();
         let prefix_style = if is_busy {
-            Style::default().fg(Color::DarkGray).bold()
+            engine.fg(palette.text_muted).bold()
         } else {
-            Style::default().fg(Color::Cyan).bold()
+            engine.fg(palette.status_info).bold()
         };
+        let cursor_style = engine.fg(palette.status_warning);
 
         if self.is_empty() {
             let line = Line::from(vec![
                 Span::styled(" > ", prefix_style),
-                Span::styled("█", Style::default().fg(Color::Yellow)),
+                Span::styled("█", cursor_style),
             ]);
             return (vec![line], 0);
         }
@@ -781,7 +786,7 @@ impl TextEditor {
 
             if raw_line.is_empty() {
                 if cursor_offset == Some(0) {
-                    current_spans.push(Span::styled("█", Style::default().fg(Color::Yellow)));
+                    current_spans.push(Span::styled("█", cursor_style));
                     cursor_visual_line = visual_lines.len();
                 }
                 visual_lines.push(Line::from(current_spans));
@@ -808,7 +813,10 @@ impl TextEditor {
                             }
                             s.push(Span::styled(
                                 ch.to_string(),
-                                Style::default().bg(Color::White).fg(Color::Black).bold(),
+                                engine
+                                    .bg(palette.text_primary)
+                                    .fg(engine.color(palette.text_inverse))
+                                    .bold(),
                             ));
                             if !after.is_empty() {
                                 s.push(Span::raw(after.to_string()));
@@ -841,10 +849,7 @@ impl TextEditor {
                             current_width = 3;
                         }
                         if has_cursor {
-                            current_spans.push(Span::styled(
-                                "█",
-                                Style::default().fg(Color::Yellow),
-                            ));
+                            current_spans.push(Span::styled("█", cursor_style));
                             current_width += 1;
                             cursor_visual_line = visual_lines.len();
                         }
@@ -891,7 +896,7 @@ impl TextEditor {
             }
 
             if cursor_offset == Some(line_len) {
-                let cursor_span = Span::styled("█", Style::default().fg(Color::Yellow));
+                let cursor_span = Span::styled("█", cursor_style);
                 let cursor_w = cursor_span.width();
                 if current_width + cursor_w > content_width && current_width > 3 {
                     visual_lines.push(Line::from(std::mem::take(&mut current_spans)));
@@ -909,7 +914,7 @@ impl TextEditor {
         if visual_lines.is_empty() {
             visual_lines.push(Line::from(vec![
                 Span::styled(" > ", prefix_style),
-                Span::styled("█", Style::default().fg(Color::Yellow)),
+                Span::styled("█", cursor_style),
             ]));
         }
 

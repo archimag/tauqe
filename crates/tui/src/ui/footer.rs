@@ -1,21 +1,38 @@
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Style, Stylize};
+use ratatui::style::Stylize;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 
 use crate::app::{AppState, ViewMode};
+use crate::theme::color::RgbColor;
+use crate::theme::engine::{current_engine, ThemeEngine};
+use crate::theme::palette::ThemePalette;
 use crate::views::develop::{FileEditStatus, ToolchainState, TurnStatus, SPINNER_FRAMES};
 
 pub fn render_footer(frame: &mut ratatui::Frame, state: &AppState, area: Rect) {
+    let engine = current_engine();
+    render_footer_with_engine(frame, state, area, &engine);
+}
+
+fn render_footer_with_engine(
+    frame: &mut ratatui::Frame,
+    state: &AppState,
+    area: Rect,
+    engine: &ThemeEngine,
+) {
+    let palette = engine.palette();
     let mut footer_spans = Vec::new();
 
     // 1. TAUQE badge
     let badge_text = " TAUQE ";
     footer_spans.push(Span::styled(
         badge_text,
-        Style::default().bg(Color::Cyan).fg(Color::Black).bold(),
+        engine
+            .bg(palette.button_active_bg)
+            .fg(engine.color(palette.text_inverse))
+            .bold(),
     ));
-    footer_spans.push(Span::styled(" │ ", Style::default().fg(Color::DarkGray)));
+    footer_spans.push(Span::styled(" │ ", engine.fg(palette.text_muted)));
 
     // 2. Financial indicator (Σ session · last · now)
     if let Some(cost_str) = format_footer_cost(
@@ -26,9 +43,9 @@ pub fn render_footer(frame: &mut ratatui::Frame, state: &AppState, area: Rect) {
     ) {
         footer_spans.push(Span::styled(
             cost_str,
-            Style::default().fg(Color::Yellow).bold(),
+            engine.fg(palette.status_warning).bold(),
         ));
-        footer_spans.push(Span::styled(" │ ", Style::default().fg(Color::DarkGray)));
+        footer_spans.push(Span::styled(" │ ", engine.fg(palette.text_muted)));
     }
 
     // 3. Status, Round, Retry, Current file indicators AND Notifications
@@ -38,44 +55,44 @@ pub fn render_footer(frame: &mut ratatui::Frame, state: &AppState, area: Rect) {
         let spin = SPINNER_FRAMES[state.model.spinner_frame % SPINNER_FRAMES.len()];
         footer_spans.push(Span::styled(
             format!("{} Reviewing", spin),
-            Style::default().fg(Color::Magenta).bold(),
+            engine.fg(palette.button_active_bg).bold(),
         ));
         if let Some(notif) = active_notif {
-            footer_spans.push(Span::styled(" │ ", Style::default().fg(Color::DarkGray)));
-            let (icon, color) = format_notification(notif);
+            footer_spans.push(Span::styled(" │ ", engine.fg(palette.text_muted)));
+            let (icon, color) = format_notification(notif, &palette);
             footer_spans.push(Span::styled(
                 format!("{} {}", icon, notif.text),
-                Style::default().fg(color).bold(),
+                engine.fg(color).bold(),
             ));
         }
     } else if state.model.is_busy() {
         let spin = SPINNER_FRAMES[state.model.spinner_frame % SPINNER_FRAMES.len()];
 
         let (status_name, status_color) = match state.model.turn_phase {
-            Some(tauqe_protocol::TurnPhase::Discovery) => ("Discovery", Color::Cyan),
+            Some(tauqe_protocol::TurnPhase::Discovery) => ("Discovery", palette.status_info),
             Some(tauqe_protocol::TurnPhase::Proposal) => {
                 if state.model.status == TurnStatus::Thinking {
-                    ("Thinking", Color::Rgb(130, 170, 220))
+                    ("Thinking", palette.text_secondary)
                 } else {
-                    ("Proposal", Color::Yellow)
+                    ("Proposal", palette.status_warning)
                 }
             }
-            Some(tauqe_protocol::TurnPhase::Staging) => ("Staging", Color::Magenta),
-            Some(tauqe_protocol::TurnPhase::Verification) => ("Verifying", Color::Cyan),
-            Some(tauqe_protocol::TurnPhase::Healing) => ("Healing", Color::LightRed),
+            Some(tauqe_protocol::TurnPhase::Staging) => ("Staging", palette.button_active_bg),
+            Some(tauqe_protocol::TurnPhase::Verification) => ("Verifying", palette.status_info),
+            Some(tauqe_protocol::TurnPhase::Healing) => ("Healing", palette.status_error),
             None => match state.model.status {
-                TurnStatus::Thinking => ("Thinking", Color::Rgb(130, 170, 220)),
-                TurnStatus::Editing => ("Editing", Color::Magenta),
-                TurnStatus::Verifying => ("Verifying", Color::Cyan),
-                TurnStatus::Responding => ("Responding", Color::Yellow),
-                TurnStatus::Awaiting => ("Awaiting", Color::Yellow),
-                other => (other.label(), Color::Yellow),
+                TurnStatus::Thinking => ("Thinking", palette.text_secondary),
+                TurnStatus::Editing => ("Editing", palette.button_active_bg),
+                TurnStatus::Verifying => ("Verifying", palette.status_info),
+                TurnStatus::Responding => ("Responding", palette.status_warning),
+                TurnStatus::Awaiting => ("Awaiting", palette.status_warning),
+                other => (other.label(), palette.status_warning),
             },
         };
 
         footer_spans.push(Span::styled(
             format!("{} {}", spin, status_name),
-            Style::default().fg(status_color).bold(),
+            engine.fg(status_color).bold(),
         ));
 
         // A graceful batch stop is in flight: the current member finishes and
@@ -85,7 +102,7 @@ pub fn render_footer(frame: &mut ratatui::Frame, state: &AppState, area: Rect) {
             footer_spans.push(Span::raw(" "));
             footer_spans.push(Span::styled(
                 "[Stopping after current step]",
-                Style::default().fg(Color::Yellow).bold(),
+                engine.fg(palette.status_warning).bold(),
             ));
         }
 
@@ -98,7 +115,7 @@ pub fn render_footer(frame: &mut ratatui::Frame, state: &AppState, area: Rect) {
             let inner_width = area.width.saturating_sub(2) as usize;
             if inner_width >= 80 {
                 footer_spans.push(Span::raw(" "));
-                footer_spans.extend(render_turn_phase_pipeline(phase));
+                footer_spans.extend(render_turn_phase_pipeline(engine, phase));
             }
         }
 
@@ -106,7 +123,7 @@ pub fn render_footer(frame: &mut ratatui::Frame, state: &AppState, area: Rect) {
             footer_spans.push(Span::raw(" "));
             footer_spans.push(Span::styled(
                 format!("[{}]", detail),
-                Style::default().fg(Color::Yellow).bold(),
+                engine.fg(palette.status_warning).bold(),
             ));
         } else if let Some(round) = state.model.turn_round {
             footer_spans.push(Span::raw(" "));
@@ -117,13 +134,13 @@ pub fn render_footer(frame: &mut ratatui::Frame, state: &AppState, area: Rect) {
             };
             footer_spans.push(Span::styled(
                 round_str,
-                Style::default().fg(Color::Cyan).bold(),
+                engine.fg(palette.status_info).bold(),
             ));
         } else if let Some(round_str) = extract_current_round(&state.model.text) {
             footer_spans.push(Span::raw(" "));
             footer_spans.push(Span::styled(
                 format!("[{}]", round_str),
-                Style::default().fg(Color::Cyan).bold(),
+                engine.fg(palette.status_info).bold(),
             ));
         }
 
@@ -140,13 +157,13 @@ pub fn render_footer(frame: &mut ratatui::Frame, state: &AppState, area: Rect) {
                 footer_spans.push(Span::raw(" "));
                 footer_spans.push(Span::styled(
                     format!("[{}]", retry),
-                    Style::default().fg(Color::Yellow).bold(),
+                    engine.fg(palette.status_warning).bold(),
                 ));
             }
             footer_spans.push(Span::raw(" "));
             footer_spans.push(Span::styled(
                 format!("→ {}", f.path),
-                Style::default().fg(Color::White).bold(),
+                engine.fg(palette.text_primary).bold(),
             ));
         } else if let Some(cmd) = state
             .model
@@ -157,30 +174,30 @@ pub fn render_footer(frame: &mut ratatui::Frame, state: &AppState, area: Rect) {
             footer_spans.push(Span::raw(" "));
             footer_spans.push(Span::styled(
                 format!("→ {}", cmd),
-                Style::default().fg(Color::Cyan).bold(),
+                engine.fg(palette.status_info).bold(),
             ));
         }
 
         if let Some(notif) = active_notif {
-            footer_spans.push(Span::styled(" │ ", Style::default().fg(Color::DarkGray)));
-            let (icon, color) = format_notification(notif);
+            footer_spans.push(Span::styled(" │ ", engine.fg(palette.text_muted)));
+            let (icon, color) = format_notification(notif, &palette);
             footer_spans.push(Span::styled(
                 format!("{} {}", icon, notif.text),
-                Style::default().fg(color).bold(),
+                engine.fg(color).bold(),
             ));
         }
     } else if let Some(notif) = active_notif {
-        let (icon, color) = format_notification(notif);
+        let (icon, color) = format_notification(notif, &palette);
         footer_spans.push(Span::styled(
             format!("{} {}", icon, notif.text),
-            Style::default().fg(color).bold(),
+            engine.fg(color).bold(),
         ));
     } else {
         let (status_lbl, status_style) = match state.model.status {
-            TurnStatus::Done => ("Done", Style::default().fg(Color::Green).bold()),
-            TurnStatus::Cancelled => ("Cancelled", Style::default().fg(Color::Red).bold()),
-            TurnStatus::Error => ("Error", Style::default().fg(Color::Red).bold()),
-            _ => ("Ready", Style::default().fg(Color::Green)),
+            TurnStatus::Done => ("Done", engine.fg(palette.status_success).bold()),
+            TurnStatus::Cancelled => ("Cancelled", engine.fg(palette.status_error).bold()),
+            TurnStatus::Error => ("Error", engine.fg(palette.status_error).bold()),
+            _ => ("Ready", engine.fg(palette.status_success)),
         };
         footer_spans.push(Span::styled(status_lbl, status_style));
     }
@@ -192,11 +209,11 @@ pub fn render_footer(frame: &mut ratatui::Frame, state: &AppState, area: Rect) {
     if let Some(tokens) = state.model.repomap_tokens {
         if tokens > 0 {
             let (color, bold) = if state.model.is_busy() {
-                (Color::Cyan, true)
+                (palette.status_info, true)
             } else {
-                (Color::DarkGray, false)
+                (palette.text_muted, false)
             };
-            let mut style = Style::default().fg(color);
+            let mut style = engine.fg(color);
             if bold {
                 style = style.bold();
             }
@@ -206,14 +223,14 @@ pub fn render_footer(frame: &mut ratatui::Frame, state: &AppState, area: Rect) {
 
     if state.view_mode == ViewMode::History {
         if !right_spans.is_empty() {
-            right_spans.push(Span::styled(" │ ", Style::default().fg(Color::DarkGray)));
+            right_spans.push(Span::styled(" │ ", engine.fg(palette.text_muted)));
         }
         let tokens = state.history_view.get_estimated_tokens();
         let total = state.history_view.total_count;
         let hist_stats = format!("{} entries (~{} tokens)", total, tokens);
         right_spans.push(Span::styled(
             hist_stats,
-            Style::default().fg(Color::Cyan).bold(),
+            engine.fg(palette.status_info).bold(),
         ));
     }
 
@@ -231,26 +248,40 @@ pub fn render_footer(frame: &mut ratatui::Frame, state: &AppState, area: Rect) {
             footer_spans.push(Span::raw(" ".repeat(padding)));
             footer_spans.extend(right_spans);
         } else {
-            footer_spans.push(Span::styled(" │ ", Style::default().fg(Color::DarkGray)));
+            footer_spans.push(Span::styled(" │ ", engine.fg(palette.text_muted)));
             footer_spans.extend(right_spans);
         }
     }
 
     let footer_line = Line::from(footer_spans);
-    let footer = Paragraph::new(footer_line).block(Block::default().borders(Borders::ALL));
+    let footer = Paragraph::new(footer_line)
+        .style(ratatui::style::Style::default().bg(engine.color(palette.canvas)))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(engine.fg(palette.border))
+                .style(ratatui::style::Style::default().bg(engine.color(palette.canvas))),
+        );
     frame.render_widget(footer, area);
 }
 
-pub fn format_notification(notif: &crate::app::AppNotification) -> (&'static str, Color) {
+pub fn format_notification(
+    notif: &crate::app::AppNotification,
+    palette: &ThemePalette,
+) -> (&'static str, RgbColor) {
     match notif.level {
-        crate::app::NotificationLevel::Info => ("ℹ", Color::Cyan),
-        crate::app::NotificationLevel::Success => ("✓", Color::Green),
-        crate::app::NotificationLevel::Warning => ("⚠", Color::Yellow),
-        crate::app::NotificationLevel::Error => ("✗", Color::Red),
+        crate::app::NotificationLevel::Info => ("ℹ", palette.status_info),
+        crate::app::NotificationLevel::Success => ("✓", palette.status_success),
+        crate::app::NotificationLevel::Warning => ("⚠", palette.status_warning),
+        crate::app::NotificationLevel::Error => ("✗", palette.status_error),
     }
 }
 
-pub fn render_turn_phase_pipeline(current: tauqe_protocol::TurnPhase) -> Vec<Span<'static>> {
+pub fn render_turn_phase_pipeline(
+    engine: &ThemeEngine,
+    current: tauqe_protocol::TurnPhase,
+) -> Vec<Span<'static>> {
+    let palette = engine.palette();
     let phases = [
         (tauqe_protocol::TurnPhase::Discovery, "Discovery"),
         (tauqe_protocol::TurnPhase::Proposal, "Proposal"),
@@ -260,24 +291,18 @@ pub fn render_turn_phase_pipeline(current: tauqe_protocol::TurnPhase) -> Vec<Spa
     ];
 
     let mut spans = Vec::new();
-    spans.push(Span::styled("[", Style::default().fg(Color::DarkGray)));
+    spans.push(Span::styled("[", engine.fg(palette.text_muted)));
     for (idx, (phase, label)) in phases.iter().enumerate() {
         if idx > 0 {
-            spans.push(Span::styled("→", Style::default().fg(Color::DarkGray)));
+            spans.push(Span::styled("→", engine.fg(palette.text_muted)));
         }
         if *phase == current {
-            spans.push(Span::styled(
-                *label,
-                Style::default().fg(Color::Cyan).bold(),
-            ));
+            spans.push(Span::styled(*label, engine.fg(palette.status_info).bold()));
         } else {
-            spans.push(Span::styled(
-                *label,
-                Style::default().fg(Color::DarkGray),
-            ));
+            spans.push(Span::styled(*label, engine.fg(palette.text_muted)));
         }
     }
-    spans.push(Span::styled("]", Style::default().fg(Color::DarkGray)));
+    spans.push(Span::styled("]", engine.fg(palette.text_muted)));
     spans
 }
 
@@ -332,13 +357,21 @@ pub fn format_footer_cost(
 mod tests {
     use super::*;
 
+    use crate::theme::color::ColorDepth;
+    use crate::theme::engine::ThemeEngine;
+    use crate::theme::presets::ThemePreset;
+
     #[test]
     fn test_render_turn_phase_pipeline() {
-        let spans = render_turn_phase_pipeline(tauqe_protocol::TurnPhase::Staging);
+        let engine = ThemeEngine::new(ThemePreset::TauqeDark, ColorDepth::Truecolor);
+        let spans = render_turn_phase_pipeline(&engine, tauqe_protocol::TurnPhase::Staging);
         let combined: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(combined, "[Discovery→Proposal→Staging→Verify→Heal]");
         let staging_span = spans.iter().find(|s| s.content == "Staging").unwrap();
-        assert_eq!(staging_span.style.fg, Some(Color::Cyan));
+        assert_eq!(
+            staging_span.style.fg,
+            Some(engine.color(engine.palette().status_info))
+        );
     }
 
     #[test]
@@ -360,13 +393,17 @@ mod tests {
 
     #[test]
     fn test_format_notification() {
+        let palette = ThemePreset::TauqeDark.palette();
         let notif_info = crate::app::AppNotification {
             level: crate::app::NotificationLevel::Info,
             text: "info text".to_string(),
             created_at: std::time::Instant::now(),
             ttl: std::time::Duration::from_secs(3),
         };
-        assert_eq!(format_notification(&notif_info), ("ℹ", Color::Cyan));
+        assert_eq!(
+            format_notification(&notif_info, &palette),
+            ("ℹ", palette.status_info)
+        );
 
         let notif_err = crate::app::AppNotification {
             level: crate::app::NotificationLevel::Error,
@@ -374,7 +411,10 @@ mod tests {
             created_at: std::time::Instant::now(),
             ttl: std::time::Duration::from_secs(6),
         };
-        assert_eq!(format_notification(&notif_err), ("✗", Color::Red));
+        assert_eq!(
+            format_notification(&notif_err, &palette),
+            ("✗", palette.status_error)
+        );
     }
 
     #[test]
@@ -458,5 +498,37 @@ mod tests {
             content.contains("Stopping after current step"),
             "the soft-stop indicator must be visible: {content:?}"
         );
+    }
+
+    #[test]
+    fn footer_chrome_styles_track_theme_tokens() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        for preset in [ThemePreset::TauqeDark, ThemePreset::TauqeLight] {
+            let engine = ThemeEngine::new(preset, ColorDepth::Truecolor);
+            let palette = engine.palette();
+
+            let backend = TestBackend::new(120, 3);
+            let mut terminal = Terminal::new(backend).expect("terminal created");
+            let mut state = crate::app::test_state();
+            state.model.status = TurnStatus::Done;
+
+            terminal
+                .draw(|frame| {
+                    let area = frame.area();
+                    render_footer_with_engine(frame, &state, area, &engine);
+                })
+                .expect("draw succeeded");
+
+            let buffer = terminal.backend().buffer();
+            // The TAUQE badge is filled with the accent surface token.
+            assert_eq!(buffer[(1, 1)].bg, engine.color(palette.button_active_bg));
+            assert_eq!(buffer[(1, 1)].fg, engine.color(palette.text_inverse));
+            // The divider next to the badge uses the muted chrome token.
+            assert_eq!(buffer[(8, 1)].fg, engine.color(palette.text_muted));
+            // The idle Ready/Done indicator uses the success status token.
+            assert_eq!(buffer[(11, 1)].fg, engine.color(palette.status_success));
+        }
     }
 }

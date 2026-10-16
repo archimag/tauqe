@@ -144,8 +144,8 @@ async fn answer_edit_loop_stages_matching_edits() {
         .expect("answer/edit loop executes");
 
     match &output.result {
-        ModelResult::Edit { edits, error, .. } => {
-            assert!(error.is_none(), "unexpected error: {error:?}");
+        ModelResult::Edit { edits, outcome, .. } => {
+            assert!(outcome.error.is_none(), "unexpected error: {:?}", outcome.error);
             assert_eq!(edits.len(), 1);
         }
         other => panic!("expected staged edits, got {other:?}"),
@@ -422,9 +422,9 @@ async fn git_workflow_heals_compiler_failure() {
         .expect("workflow execution succeeds");
 
     match execution.result {
-        ModelResult::Edit { applied, error, .. } => {
-            assert!(error.is_none(), "unexpected error: {error:?}");
-            assert!(applied, "healing should apply and commit the repaired edits");
+        ModelResult::Edit { outcome, .. } => {
+            assert!(outcome.error.is_none(), "unexpected error: {:?}", outcome.error);
+            assert!(outcome.applied, "healing should apply and commit the repaired edits");
         }
         other => panic!("expected applied edits, got {other:?}"),
     }
@@ -492,9 +492,9 @@ async fn git_workflow_verifies_and_heals_when_verify_tag_omitted_by_model() {
         .expect("workflow execution succeeds");
 
     match execution.result {
-        ModelResult::Edit { applied, error, .. } => {
-            assert!(error.is_none(), "unexpected error: {error:?}");
-            assert!(applied, "auto-verification should heal and apply edits");
+        ModelResult::Edit { outcome, .. } => {
+            assert!(outcome.error.is_none(), "unexpected error: {:?}", outcome.error);
+            assert!(outcome.applied, "auto-verification should heal and apply edits");
         }
         other => panic!("expected applied edits, got {other:?}"),
     }
@@ -558,9 +558,12 @@ async fn git_workflow_skips_verification_when_auto_verify_disabled() {
         .expect("workflow execution succeeds");
 
     match execution.result {
-        ModelResult::Edit { applied, error, .. } => {
-            assert!(error.is_none());
-            assert!(applied, "edits should be applied directly when auto_verify is disabled");
+        ModelResult::Edit { outcome, .. } => {
+            assert!(outcome.error.is_none());
+            assert!(
+                outcome.applied,
+                "edits should be applied directly when auto_verify is disabled"
+            );
         }
         other => panic!("expected applied edits, got {other:?}"),
     }
@@ -634,9 +637,12 @@ async fn git_workflow_heals_when_verification_response_has_text_only() {
         .expect("workflow execution succeeds");
 
     match execution.result {
-        ModelResult::Edit { applied, error, .. } => {
-            assert!(error.is_none(), "unexpected error: {error:?}");
-            assert!(applied, "healing should survive text-only retry and apply the repaired edits");
+        ModelResult::Edit { outcome, .. } => {
+            assert!(outcome.error.is_none(), "unexpected error: {:?}", outcome.error);
+            assert!(
+                outcome.applied,
+                "healing should survive text-only retry and apply the repaired edits"
+            );
         }
         other => panic!("expected applied edits, got {other:?}"),
     }
@@ -717,7 +723,7 @@ async fn scratchpad_from_discovery_reaches_verification_healing() {
 
     assert!(matches!(
         execution.result,
-        ModelResult::Edit { applied: true, .. }
+        ModelResult::Edit { outcome, .. } if outcome.applied
     ));
     assert_eq!(provider.requests().len(), 3);
     let healing_request = &provider.requests()[2];
@@ -1007,9 +1013,9 @@ async fn terminal_error_outcome_blocks_without_applying_edits() {
         .expect("answer/edit loop executes");
 
     match output.result {
-        ModelResult::Edit { applied, error, .. } => {
-            assert!(!applied);
-            assert_eq!(error, Some("Missing dependencies".to_string()));
+        ModelResult::Edit { outcome, .. } => {
+            assert!(!outcome.applied);
+            assert_eq!(outcome.error, Some("Missing dependencies".to_string()));
         }
         _ => panic!("Expected unapplied Edit result with error"),
     }
@@ -1060,9 +1066,9 @@ async fn terminal_success_outcome_labels_applied_edits() {
         .expect("answer/edit loop executes");
 
     match output.result {
-        ModelResult::Edit { applied, error, .. } => {
-            assert!(applied);
-            assert!(error.is_none());
+        ModelResult::Edit { outcome, .. } => {
+            assert!(outcome.applied);
+            assert!(outcome.error.is_none());
         }
         _ => panic!("Expected applied Edit result"),
     }

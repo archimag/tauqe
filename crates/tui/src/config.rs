@@ -116,10 +116,10 @@ pub enum ThemeMode {
 
 /// Terminal color depth for RGB styles.
 ///
-/// `Auto` (default) detects the capability from `COLORTERM`/`TERM`. `Truecolor`
-/// and `Ansi256` force the palette, letting a user correct detection on
-/// terminals that support 24-bit color without advertising it (for example
-/// Windows Terminal or tmux).
+/// `Auto` (default) detects the capability from `COLORTERM`/`TERM`. `Truecolor`,
+/// `Ansi256`, and `Ansi16` force a specific depth, letting a user correct
+/// detection or opt into the attribute-based fallback on terminals that support
+/// 24-bit color without advertising it (for example Windows Terminal or tmux).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ColorDepth {
@@ -127,6 +127,7 @@ pub enum ColorDepth {
     Auto,
     Truecolor,
     Ansi256,
+    Ansi16,
 }
 
 impl ThemeMode {
@@ -166,6 +167,11 @@ static LIGHT_BACKGROUND: std::sync::LazyLock<bool> = std::sync::LazyLock::new(||
 
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct ThemeConfig {
+    /// Explicit built-in preset name (for example `"catppuccin"`). When set and
+    /// recognized, it overrides `mode`.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// Legacy light/dark mode, used as the fallback when `name` is unset.
     #[serde(default)]
     pub mode: ThemeMode,
     #[serde(default)]
@@ -278,10 +284,16 @@ min_duration_seconds = 5
 # command = "paplay /usr/share/sounds/freedesktop/stereo/complete.oga"
 
 [theme]
-# Color theme mode: "auto" (default), "dark", or "light":
+# Named color preset, overriding `mode` when set:
+#   "tauqe-dark" (default) | "tauqe-light" | "catppuccin" |
+#   "gruvbox" | "solarized-dark"
+# name = "tauqe-dark"
+# Legacy light/dark mode, used as the fallback when `name` is unset:
+#   "auto" (default, probes the terminal background), "dark", or "light"
 # mode = "auto"
 # Terminal color depth for RGB styles: "auto" (default, detected from
-# COLORTERM/TERM), "truecolor" (force 24-bit), or "ansi256" (force fallback):
+# COLORTERM/TERM), "truecolor" (force 24-bit), "ansi256" (force the xterm
+# 256-color cube), or "ansi16" (force the attribute-based fallback):
 # color_depth = "auto"
 "#;
 
@@ -307,6 +319,36 @@ pub fn save_tui_config_full(
     let merged = merge_workstation_settings(&source, layout, langmap.as_deref(), primary_modifier);
     fs::write(&path, merged)?;
     Ok(path)
+}
+
+/// Persists the selected theme preset into `tui.toml` under `[theme] name`,
+/// preserving every unrelated key and comment. A missing file is seeded from
+/// [`DEFAULT_TUI_TEMPLATE`].
+pub fn save_theme_preset(name: &str) -> std::io::Result<PathBuf> {
+    let path = default_tui_config_path();
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)?;
+        }
+    }
+    let source = fs::read_to_string(&path).unwrap_or_else(|_| DEFAULT_TUI_TEMPLATE.to_string());
+    let merged = merge_theme_name(&source, name);
+    fs::write(&path, merged)?;
+    Ok(path)
+}
+
+/// Merges a theme preset name into an existing document while preserving every
+/// unrelated key, section, and comment. Malformed input degrades to an empty
+/// document instead of failing.
+fn merge_theme_name(source: &str, name: &str) -> String {
+    let mut doc: DocumentMut = source.parse().unwrap_or_else(|_| DocumentMut::new());
+    if !doc.contains_key("theme") {
+        doc.insert("theme", Item::Table(Table::new()));
+    }
+    if let Some(theme) = doc.get_mut("theme").and_then(|item| item.as_table_mut()) {
+        set_input_value(theme, "name", name);
+    }
+    doc.to_string()
 }
 
 /// Merges the workstation settings into an existing document while preserving
@@ -415,6 +457,23 @@ mod tests {
     }
 
     #[test]
+    fn test_theme_config_deserializes_named_preset_and_ansi16() {
+        let cfg: TuiConfig =
+            toml::from_str("[theme]\nname = \"catppuccin\"\ncolor_depth = \"ansi16\"\n")
+                .expect("valid tui config");
+        assert_eq!(cfg.theme.name.as_deref(), Some("catppuccin"));
+        assert_eq!(cfg.theme.color_depth, ColorDepth::Ansi16);
+    }
+
+    #[test]
+    fn test_theme_config_name_defaults_to_none_and_legacy_mode_still_parses() {
+        let cfg: TuiConfig = toml::from_str("[theme]\nmode = \"dark\"\n").expect("valid");
+        assert_eq!(cfg.theme.name, None);
+        assert_eq!(cfg.theme.mode, ThemeMode::Dark);
+        assert_eq!(cfg.theme.color_depth, ColorDepth::Auto);
+    }
+
+    #[test]
     fn test_merge_workstation_settings_preserves_unrelated_keys_and_comments() {
         let source = r#"# Personal TUI settings
 [input]
@@ -468,5 +527,23 @@ mode = "light"
         assert!(merged.contains("\"none\""));
         assert!(merged.contains("primary_modifier"));
         assert!(merged.contains("\"alt\""));
+    }
+
+    #[test]
+    fn test_merge_theme_name_preserves_unrelated_keys() {
+        let source =
+            "# Personal\n[theme]\nmode = \"dark\"\n\n[input]\nlayout = \"none\"\n";
+        let merged = merge_theme_name(source, "gruvbox");
+        assert!(merged.contains("name = \"gruvbox\""));
+        assert!(merged.contains("# Personal"));
+        assert!(merged.contains("mode = \"dark\""));
+        assert!(merged.contains("layout = \"none\""));
+    }
+
+    #[test]
+    fn test_merge_theme_name_seeds_missing_theme_table() {
+        let merged = merge_theme_name("", "tauqe-light");
+        assert!(merged.contains("[theme]"));
+        assert!(merged.contains("name = \"tauqe-light\""));
     }
 }

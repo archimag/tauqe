@@ -1,5 +1,5 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use tauqe_protocol::{methods, DiscussionFocus};
+use tauqe_protocol::{methods, DiscussionFocus, DiscussionRequest, DiscussionTarget, ModelAskParams};
 use tokio::sync::MutexGuard;
 
 use crate::app::{AppState, ModalFocus, PromptModalState, PromptModalTarget};
@@ -94,7 +94,7 @@ pub(super) async fn handle_prompt_modal(
 /// Resolves the modal target, formats the discussion prompt and dispatches the
 /// model request. The modal is restored when the comment is empty or the target
 /// cannot be found so the user can correct the input.
-async fn submit_prompt_modal(
+pub(crate) async fn submit_prompt_modal(
     mut st: MutexGuard<'_, AppState>,
     dialog: PromptModalState,
     server_writer: &mut RpcConnection,
@@ -117,7 +117,9 @@ async fn submit_prompt_modal(
                 .map(|(id, _)| id.to_string())
                 .collect::<Vec<String>>();
             (
-                serde_json::json!({ "kind": "review", "id": review_id }),
+                DiscussionTarget::Review {
+                    id: review_id.clone(),
+                },
                 ids.clone(),
                 DiscussionFocus::review(review_id.clone(), ids),
             )
@@ -132,7 +134,9 @@ async fn submit_prompt_modal(
                 .map(|(id, _)| id.clone())
                 .collect::<Vec<String>>();
             (
-                serde_json::json!({ "kind": "plan", "id": plan_id }),
+                DiscussionTarget::Plan {
+                    id: plan_id.clone(),
+                },
                 ids.clone(),
                 DiscussionFocus::plan(plan_id.clone(), ids),
             )
@@ -142,16 +146,15 @@ async fn submit_prompt_modal(
     super::begin_develop_turn(&mut st);
     st.discussion_focus = focus;
     drop(st);
+    let params = ModelAskParams::Discussion(DiscussionRequest {
+        target,
+        focused_items,
+        comment: user_comment,
+    });
     send_request(
         server_writer,
         methods::MODEL_ASK,
-        serde_json::json!({
-            "discussion": {
-                "target": target,
-                "focused_items": focused_items,
-                "comment": user_comment,
-            }
-        }),
+        serde_json::to_value(params)?,
     )
     .await?;
     Ok(Some(InputResult::Continue))

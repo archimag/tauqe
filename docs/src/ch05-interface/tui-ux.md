@@ -8,7 +8,7 @@ TAUQE's terminal UI combines the design philosophies of **Magit** (structured, l
 
 To guarantee universal compatibility across modern and legacy terminal emulators alike, all primary view modes and key actions support dual bindings (both modifier chords and standard function keys):
 
-Throughout this chapter, `Ctrl+<key>` denotes the abstract **Primary Command Modifier** (`C-<key>`). It defaults to `Ctrl` and can be remapped to `Alt` in `tui.toml` (see section 5.5). Function keys (`F1`..`F6`) and arrow keys are universal fallbacks that stay active on every terminal.
+Throughout this chapter, `Ctrl+<key>` denotes the abstract **Primary Command Modifier** (`C-<key>`). It defaults to `Ctrl` and can be remapped to `Alt` in `tui.toml` (see section 5.5). Function keys (`F1`..`F7`) and arrow keys are universal fallbacks that stay active on every terminal.
 
 - **`F1` / `Alt+1` / `Ctrl+1` (REPL View):**
   - The central engineering cockpit and execution canvas where coding turns take place.
@@ -22,6 +22,7 @@ Throughout this chapter, `Ctrl+<key>` denotes the abstract **Primary Command Mod
   - Active LLM selection: Press `Alt+M` or `Ctrl+M` from any screen (or click the model in the header) to open the model picker. See section 5.7 for the role model.
   - Contextual help: Press `Ctrl+H` / `Alt+H` from any view or `?` in navigation views to open the interactive help dialog.
   - Configuration reload: Press `Ctrl+O` to reload `tui.toml` settings without restarting TAUQE.
+  - Theme selector: Press `F7` to open the interactive theme picker and preview built-in presets live (see section 5.10).
 
 ### What Happens in REPL When You Submit a Prompt
 When you submit an engineering intent, TAUQE does not simply invoke a single-shot completion. Instead, it guides the model through an **autonomous, multi-round bounded turn**:
@@ -141,10 +142,19 @@ primary_modifier = "ctrl"
 # langmap = "йцукенгшщзхъ;qwertyuiop[]"
 
 [theme]
-# Color theme mode: "dark", "light", or "auto" (default: "auto").
-# When "auto" is set, TAUQE checks COLORFGBG or terminal environment hints.
-# Automatically detects 24-bit truecolor support and quantizes to ANSI-256 where required.
-mode = "auto"
+# Named built-in preset; it takes precedence over `mode` when set:
+#   "tauqe-dark" (default) | "tauqe-light" | "catppuccin" |
+#   "gruvbox" | "solarized-dark"
+name = "tauqe-dark"
+
+# Legacy light/dark mode, used as the fallback when `name` is unset.
+# "auto" (default) probes the terminal background via COLORFGBG:
+# mode = "auto"
+
+# Terminal color depth for RGB styles. "auto" (default) detects it from
+# COLORTERM/TERM; "truecolor" forces 24-bit, "ansi256" forces the xterm
+# 256-color cube, and "ansi16" forces the attribute-based fallback:
+# color_depth = "auto"
 
 [notifications]
 # Terminal audio bell (\x07 / BEL). In Kitty, WezTerm, Alacritty, and modern desktop
@@ -253,3 +263,56 @@ Assistant responses, reasoning transcripts, plan details, and history entries ar
 - **Column alignment:** Markdown column alignment (`:---`, `:---:`, `---:`) is honored, so left-, center-, and right-aligned cells line up as authored.
 - **Block highlighting:** Fenced code blocks render borderless with a background band, a language label, and a `[📋 Copy]` button in the header line. Syntax highlighting is applied per language through `syntect`, and the active color theme is matched so the code band stays legible in both dark and light modes.
 - **Theme and color depth:** The renderer detects 24-bit truecolor support from the environment and quantizes to ANSI-256 where truecolor is unavailable, so highlighting degrades gracefully on legacy terminals. Reasoning output uses a distinct, dimmed blue palette to keep it visually separate from the final answer.
+
+---
+
+## 5.10 Semantic Theme System and Color Depth
+
+TAUQE owns its color space instead of borrowing the terminal's. The interface renders through a small semantic design system, so one declarative choice restyles every view without touching component code.
+
+### 5.10.1 Semantic Roles Instead of Raw ANSI Colors
+
+A view that paints itself with literal ANSI names (`Color::DarkGray`, `Color::White`) inherits the terminal's *remappable* palette. Under schemes such as Solarized the host reassigns the low color slots, so a gray border can collapse into its background and an element simply disappears.
+
+TAUQE therefore never names raw colors in its views. Every surface resolves its foreground, background, and border from a **semantic role** in `ThemePalette` — for example `border`, `surface`, `canvas`, `text_primary`, `button_active_bg`, `status_error`, or `diff_added`. A view asks for the role; the design system decides the color. Because a role never depends on the host palette, the interface stays legible and internally consistent on any terminal.
+
+### 5.10.2 Three-Tier Adaptive Color Degradation
+
+Presets are authored once in 24-bit sRGB. The rendering engine projects each role onto the depth the terminal actually supports, so one palette serves modern and legacy terminals without per-view branching:
+
+- **Truecolor:** roles are emitted as exact 24-bit RGB.
+- **ANSI 256:** each role is quantized to the nearest entry of the xterm 256-color cube. The projection is confined to indices `16..=255` (the fixed color cube plus the grayscale ramp); the low slots `0..=15` are deliberately never emitted, because terminals remap them to host-configured colors — precisely the Solarized failure mode this design system exists to avoid.
+- **ANSI 16:** color is dropped entirely, and surfaces are conveyed by attributes instead. Filled controls and panels use a reversed band (`REVERSED`), so buttons and overlays stay distinguishable even where no color can be trusted.
+
+The active depth is detected from `COLORTERM`/`TERM` on startup and can be forced when detection is wrong (see section 5.10.4). Degradation is monotonic: each tier steps down to a coarser rendering, never to a broken one.
+
+### 5.10.3 Built-in Calibrated Presets
+
+TAUQE ships five complete, hand-calibrated presets. Each defines every semantic role, so text, borders, buttons, statuses, and diffs stay legible *together*; they are not partial palettes layered over a guess.
+
+| Preset (`name`) | Character |
+| --- | --- |
+| `tauqe-dark` (default) | Signature graphite-blue, a restrained Tokyo Night accent set. |
+| `tauqe-light` | Clean paper canvas with muted pastels. |
+| `catppuccin` | Catppuccin Mocha. |
+| `gruvbox` | Warm, retro-inspired dark scheme. |
+| `solarized-dark` | Solarized Dark, recalibrated in true color so borders and buttons keep reliable contrast. |
+
+Every preset is covered by automated WCAG contrast tests in both the truecolor and the ANSI-256 projections. A palette whose text or buttons fall below the required contrast ratio fails the build, so calibration is enforced by tests rather than by eye.
+
+### 5.10.4 Configuration and Hot Reload
+
+Theme selection is a personal workstation preference, so it lives in the user configuration and never in the project `tauqe.toml`. In `$XDG_CONFIG_HOME/tauqe/tui.toml`:
+
+```toml
+[theme]
+name = "tauqe-dark"
+# mode = "auto"
+# color_depth = "auto"
+```
+
+- `name` names a built-in preset and takes precedence whenever it is set.
+- `mode` (`"auto"`, `"dark"`, or `"light"`) is the legacy fallback used only when `name` is unset; `"auto"` probes the terminal background.
+- `color_depth` (`"auto"`, `"truecolor"`, `"ansi256"`, or `"ansi16"`) forces a color depth when detection is wrong.
+
+Switching is seamless. Press `F7` to open the interactive theme selector, where moving the cursor previews each preset live; `Enter` saves the choice and `Esc` restores the previous one. Alternatively, edit the file and press `Ctrl+O` to reload. Both paths apply the new theme immediately, without restarting TAUQE and without interrupting an active turn.

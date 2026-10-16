@@ -1,10 +1,9 @@
-use tauqe_protocol::{EditOperation, ModelResult, ModelResultProposal};
+use tauqe_protocol::{EditFileOp, EditOperation, EditOutcome, ModelResult, ModelResultProposal};
 
 use crate::providers::{JsonSchemaDefinition, ResponseFormat};
 
-use super::utils::{normalize_content, parse_context_request_spec, resolve_target_path_for_op};
-use super::{ContextRequest, EditProtocol, VerifyRequest};
-use crate::edits::stream::{EditStreamFilter, JsonStreamFilter};
+use super::utils::{normalize_content, resolve_target_path_for_op};
+use super::{ContextRequest, VerifyRequest};
 
 /// Structured Output JSON-schema edit protocol
 #[derive(Debug, Default, Clone)]
@@ -89,7 +88,7 @@ impl StructuredEditProtocol {
         let mut edits = Vec::new();
 
         for change in &proposal.changes {
-            let is_create = change.op.trim().eq_ignore_ascii_case("create");
+            let is_create = change.op == EditFileOp::Create;
             let target_path = match resolve_target_path_for_op(&change.path, editable_paths, is_create) {
                 Ok(p) => p,
                 Err(ambiguity_err) => {
@@ -97,10 +96,12 @@ impl StructuredEditProtocol {
                         summary: "Ambiguous file path".to_string(),
                         edits: Vec::new(),
                         proposal: Some(proposal),
-                        applied: false,
-                        error: Some(ambiguity_err),
-                        changed_files: Vec::new(),
-                        commit_hash: None,
+                        outcome: EditOutcome {
+                            applied: false,
+                            error: Some(ambiguity_err),
+                            changed_files: Vec::new(),
+                            commit_hash: None,
+                        },
                     };
                 }
             };
@@ -113,14 +114,16 @@ impl StructuredEditProtocol {
                     summary: format!("File '{}' is not in context", target_path),
                     edits: Vec::new(),
                     proposal: Some(proposal),
-                    applied: false,
-                    error: Some(format!(
-                        "File '{}' is not present in context. To edit it, request it first via context_requests. Permitted files in context: {}",
-                        target_path,
-                        editable_paths.join(", ")
-                    )),
-                    changed_files: Vec::new(),
-                    commit_hash: None,
+                    outcome: EditOutcome {
+                        applied: false,
+                        error: Some(format!(
+                            "File '{}' is not present in context. To edit it, request it first via context_requests. Permitted files in context: {}",
+                            target_path,
+                            editable_paths.join(", ")
+                        )),
+                        changed_files: Vec::new(),
+                        commit_hash: None,
+                    },
                 };
             }
 
@@ -133,7 +136,7 @@ impl StructuredEditProtocol {
             resolved.new_text = change.new_text.as_deref().map(normalize_content);
             resolved.content = change.content.as_deref().map(normalize_content);
 
-            if resolved.op.trim().eq_ignore_ascii_case("move") {
+            if resolved.op == EditFileOp::Move {
                 let dest_raw = change.to.as_deref().unwrap_or_default();
                 let target_to = match resolve_target_path_for_op(dest_raw, editable_paths, true) {
                     Ok(p) => p,
@@ -142,10 +145,12 @@ impl StructuredEditProtocol {
                             summary: "Ambiguous destination file path".to_string(),
                             edits: Vec::new(),
                             proposal: Some(proposal),
-                            applied: false,
-                            error: Some(ambiguity_err),
-                            changed_files: Vec::new(),
-                            commit_hash: None,
+                            outcome: EditOutcome {
+                                applied: false,
+                                error: Some(ambiguity_err),
+                                changed_files: Vec::new(),
+                                commit_hash: None,
+                            },
                         };
                     }
                 };
@@ -159,10 +164,12 @@ impl StructuredEditProtocol {
                         summary: format!("Invalid change: {}", message),
                         edits: Vec::new(),
                         proposal: Some(proposal),
-                        applied: false,
-                        error: Some(message),
-                        changed_files: Vec::new(),
-                        commit_hash: None,
+                        outcome: EditOutcome {
+                            applied: false,
+                            error: Some(message),
+                            changed_files: Vec::new(),
+                            commit_hash: None,
+                        },
                     };
                 }
             }
@@ -197,23 +204,17 @@ impl StructuredEditProtocol {
             summary,
             edits,
             proposal: Some(proposal),
-            applied: false,
-            error: None,
-            changed_files: Vec::new(),
-            commit_hash: None,
+            outcome: EditOutcome {
+                applied: false,
+                error: None,
+                changed_files: Vec::new(),
+                commit_hash: None,
+            },
         }
     }
-}
 
-impl EditProtocol for StructuredEditProtocol {
-    fn name(&self) -> &'static str {
-        "structured"
-    }
-
-    fn system_instructions(
-        &self,
-        editable_paths: &[String],
-    ) -> String {
+    /// Returns system prompt instructions for the structured-output protocol.
+    pub fn system_instructions(&self, editable_paths: &[String]) -> String {
         let mut prompt = String::new();
         prompt.push_str("## Code Modification Protocol (Structured Output JSON)\n");
         prompt.push_str("You must respond with a JSON object conforming to the structured output schema with the following fields:\n");
@@ -249,7 +250,8 @@ impl EditProtocol for StructuredEditProtocol {
         prompt
     }
 
-    fn response_format(&self, editable_paths: &[String]) -> Option<ResponseFormat> {
+    /// Returns the JSON-schema response format used to constrain generation.
+    pub fn response_format(&self, editable_paths: &[String]) -> Option<ResponseFormat> {
         Some(ResponseFormat::JsonSchema {
             json_schema: JsonSchemaDefinition {
                 name: "tauqe_edit_proposal".to_string(),
@@ -260,33 +262,38 @@ impl EditProtocol for StructuredEditProtocol {
         })
     }
 
-    fn parse_context_requests(&self, raw_text: &str) -> Vec<ContextRequest> {
+    /// Extracts context requests from a structured proposal.
+    pub fn parse_context_requests(&self, raw_text: &str) -> Vec<ContextRequest> {
         parse_proposal(raw_text)
             .map(|p| {
                 p.context_requests
-                    .iter()
-                    .filter_map(|spec| parse_context_request_spec(spec))
+                    .into_iter()
+                    .map(|request| ContextRequest {
+                        path: request.path,
+                        access: request.access,
+                    })
                     .collect()
             })
             .unwrap_or_default()
     }
 
-    fn parse_verify_request(&self, raw_text: &str) -> Option<VerifyRequest> {
-        if super::xml::has_xml_edit_tags(raw_text) {
-            return super::xml::tags::extract_verify_request(raw_text);
-        }
-        None
+    /// Extracts a verification request from XML control tags when present.
+    pub fn parse_verify_request(&self, raw_text: &str) -> Option<VerifyRequest> {
+        super::xml::tags::extract_verify_request(raw_text)
     }
 
-    fn parse_user_language(&self, raw_text: &str) -> Option<String> {
+    /// Extracts the detected user language when present.
+    pub fn parse_user_language(&self, raw_text: &str) -> Option<String> {
         super::xml::tags::extract_user_language(raw_text)
     }
 
-    fn clean_assistant_text(&self, raw_text: &str) -> String {
+    /// Cleans model output for presentation and history.
+    pub fn clean_assistant_text(&self, raw_text: &str) -> String {
         clean_raw_json_or_text(raw_text)
     }
 
-    fn parse_output(&self, raw_text: &str, editable_paths: &[String]) -> ModelResult {
+    /// Parses raw model text into a `ModelResult`.
+    pub fn parse_output(&self, raw_text: &str, editable_paths: &[String]) -> ModelResult {
         if let Some(proposal) = parse_proposal(raw_text) {
             return self.proposal_to_model_result(proposal, editable_paths);
         }
@@ -298,18 +305,6 @@ impl EditProtocol for StructuredEditProtocol {
         ModelResult::Answer {
             text: raw_text.to_string(),
         }
-    }
-
-    fn create_stream_filter(
-        &self,
-        editable_paths: Vec<String>,
-        repo_root: std::path::PathBuf,
-        staged_contents: std::collections::HashMap<String, String>,
-    ) -> Box<dyn EditStreamFilter> {
-        Box::new(
-            JsonStreamFilter::new(editable_paths, repo_root)
-                .with_staged_contents(staged_contents),
-        )
     }
 }
 
@@ -456,6 +451,7 @@ pub fn extract_json_messages(raw: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::edits::protocol::xml::tags::{VerifyOnSuccess, VerifyTarget};
     use tauqe_protocol::ContextAccess;
 
     #[test]
@@ -661,5 +657,16 @@ mod tests {
             messages[0],
             "Сообщение с кириллицей и экранированием \"кавычек\""
         );
+    }
+
+    #[test]
+    fn test_structured_protocol_extract_verify_request_without_xml_edits() {
+        let proto = StructuredEditProtocol;
+        let raw = "{\"message\":\"Done\",\"changes\":[],\"context_requests\":[],\"suggested_actions\":[]}\n<verify target=\"test\" on_success=\"report\" />";
+        let req = proto.parse_verify_request(raw);
+        assert!(req.is_some());
+        let req = req.unwrap();
+        assert_eq!(req.target, VerifyTarget::Test);
+        assert_eq!(req.on_success, VerifyOnSuccess::Report);
     }
 }

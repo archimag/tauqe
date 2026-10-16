@@ -8,13 +8,12 @@
 
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::layout::{Alignment, Rect};
-use ratatui::style::Color;
 use ratatui::text::Line;
 use ratatui::widgets::{Paragraph, Wrap};
 
 use crate::app::{ConfirmDialogButton, ModalActionsState};
 use crate::components::editor::is_char_typing;
-use crate::components::modal::ModalFrame;
+use crate::components::modal::{ModalFrame, ModalTone};
 use crate::input::is_keyboard_quit;
 use crate::ui::centered_rect;
 
@@ -161,7 +160,8 @@ pub fn confirm_modal_geometry(
 /// Presentation parameters for a confirmation modal.
 pub struct ConfirmModalParams<'a> {
     pub title: &'a str,
-    pub border_color: Color,
+    /// Semantic border accent of the modal frame.
+    pub tone: ModalTone,
     pub body_lines: Vec<Line<'a>>,
     pub confirm_label: &'a str,
     pub cancel_label: &'a str,
@@ -184,7 +184,7 @@ pub fn render_modal_confirm(frame: &mut ratatui::Frame, params: ConfirmModalPara
 
     let modal = ModalFrame {
         title: params.title,
-        border_color: params.border_color,
+        tone: params.tone,
         area: geom.area,
         confirm_label: params.confirm_label,
         cancel_label: params.cancel_label,

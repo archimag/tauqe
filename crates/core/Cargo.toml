@@ -7,6 +7,11 @@ license.workspace = true
 [lints]
 workspace = true
 
+[features]
+# Exposes the scripted `MockLlmProvider` test double to downstream crates
+# that need it in their own integration and unit tests.
+test-support = []
+
 [dependencies]
 tauqe-protocol.workspace = true
 serde.workspace = true
@@ -25,5 +30,8 @@ tree-sitter = "0.22"
 tree-sitter-rust = "0.21"
 
 [dev-dependencies]
+# Depend on this crate's own feature so integration tests under `tests/`
+# (compiled as separate crates) can still reach `MockLlmProvider`.
+tauqe-core = { path = ".", features = ["test-support"] }
 tempfile = "3"
 wiremock = "0.6"

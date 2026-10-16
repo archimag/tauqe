@@ -22,9 +22,7 @@ pub use fsm::{run_fsm_turn, FsmTurnOutcome};
 pub use git_policy::GitTransactionPolicy;
 pub use loops::{AnswerEditLoop, EditLoop};
 pub use policy::{ApplyPolicy, DirectApplyPolicy};
-pub use task::{
-    DiscoveryStep, HealingStep, StagingStep, Task, TaskEnv, TaskStep, TurnCycle, VerificationStep,
-};
+pub use task::{Task, TaskEnv};
 
 use tauqe_protocol::{ModelResult, WorkflowKind};
 

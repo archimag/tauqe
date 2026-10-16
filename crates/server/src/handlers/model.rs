@@ -11,7 +11,7 @@ use tauqe_protocol::{
     events, DiscussionClearFocusResult, DiscussionFocus, DiscussionGetFocusResult,
     DiscussionRequest, DiscussionSetFocusParams, DiscussionSetFocusResult, DiscussionTarget,
     EditFileDoneEvent, EditFileRetryingEvent, EditFileStartedEvent, EditFinishedEvent,
-    EditHunkEvent, EditStartedEvent, Event, GitCommitCreatedEvent, ModelAskParams,
+    EditHunkEvent, EditOutcome, EditStartedEvent, Event, GitCommitCreatedEvent, ModelAskParams,
     ModelResultEvent, ModelStartedEvent, ModelUsageInfo, ReasoningEffort, Request, Response,
     ResponseError,
 };
@@ -75,8 +75,8 @@ async fn build_model_ask_prompt(
     state: &Arc<AppState>,
     params: ModelAskParams,
 ) -> Result<String, ResponseError> {
-    match params.discussion {
-        Some(discussion) => {
+    match params {
+        ModelAskParams::Discussion(discussion) => {
             let prompt = build_discussion_prompt(
                 state,
                 &discussion.target,
@@ -91,8 +91,8 @@ async fn build_model_ask_prompt(
                 .await;
             Ok(prompt)
         }
-        None => {
-            if params.prompt.trim().is_empty() {
+        ModelAskParams::Prompt { text } => {
+            if text.trim().is_empty() {
                 return Err(ResponseError {
                     code: tauqe_protocol::errors::INVALID_PARAMS.to_string(),
                     message: "Model ask requires a non-empty prompt or a discussion target"
@@ -102,9 +102,7 @@ async fn build_model_ask_prompt(
             }
             match focus_to_target(&state.discussion_focus().await) {
                 Some((target, focused_items)) => {
-                    match build_discussion_prompt(state, &target, &focused_items, &params.prompt)
-                        .await
-                    {
+                    match build_discussion_prompt(state, &target, &focused_items, &text).await {
                         Ok(prompt) => Ok(prompt),
                         Err(err) => {
                             // The focused entity is gone (for example the plan
@@ -115,11 +113,11 @@ async fn build_model_ask_prompt(
                                 err.message
                             );
                             state.clear_discussion_focus().await;
-                            Ok(params.prompt)
+                            Ok(text)
                         }
                     }
                 }
-                None => Ok(params.prompt),
+                None => Ok(text),
             }
         }
     }
@@ -127,41 +125,16 @@ async fn build_model_ask_prompt(
 
 /// Maps an explicit discussion target onto the focus anchor it establishes.
 fn focus_from_target(discussion: &DiscussionRequest) -> DiscussionFocus {
-    match &discussion.target {
-        DiscussionTarget::Plan { id } => {
-            DiscussionFocus::plan(id.clone(), discussion.focused_items.clone())
-        }
-        DiscussionTarget::Review { id } => {
-            DiscussionFocus::review(id.clone(), discussion.focused_items.clone())
-        }
-    }
+    DiscussionFocus::from_target(discussion.target.clone(), discussion.focused_items.clone())
 }
 
 /// Maps an active focus anchor onto the discussion target it addresses.
 ///
 /// Returns `None` for the free (unfocused) mode, so a plain prompt stays as-is.
 fn focus_to_target(focus: &DiscussionFocus) -> Option<(DiscussionTarget, Vec<String>)> {
-    match focus {
-        DiscussionFocus::None => None,
-        DiscussionFocus::Plan {
-            plan_id,
-            focused_items,
-        } => Some((
-            DiscussionTarget::Plan {
-                id: plan_id.clone(),
-            },
-            focused_items.clone(),
-        )),
-        DiscussionFocus::Review {
-            review_id,
-            focused_items,
-        } => Some((
-            DiscussionTarget::Review {
-                id: review_id.clone(),
-            },
-            focused_items.clone(),
-        )),
-    }
+    focus
+        .target()
+        .map(|target| (target.clone(), focus.focused_items().to_vec()))
 }
 
 /// Builds the discussion prompt for a typed target, loading the referenced plan
@@ -387,11 +360,11 @@ impl ModelTurnResult {
             return false;
         }
         match &self.result {
-            Some(tauqe_protocol::ModelResult::Edit {
-                applied: true,
-                error: None,
-                ..
-            }) => true,
+            Some(tauqe_protocol::ModelResult::Edit { outcome, .. })
+                if outcome.applied && outcome.error.is_none() =>
+            {
+                true
+            }
             Some(tauqe_protocol::ModelResult::Answer { .. }) => self.has_terminal_success,
             _ => false,
         }
@@ -973,11 +946,8 @@ async fn run_prepared_turn(
             });
 
             if let tauqe_protocol::ModelResult::Edit {
-                applied,
-                ref error,
-                ref changed_files,
-                ref commit_hash,
                 ref summary,
+                ref outcome,
                 ..
             } = wf_result.result
             {
@@ -985,22 +955,19 @@ async fn run_prepared_turn(
                     method: events::EDIT_FINISHED.to_string(),
                     params: serde_json::to_value(EditFinishedEvent {
                         operation_id: op_id.clone(),
-                        applied,
-                        error: error.clone(),
-                        changed_files: changed_files.clone(),
-                        commit_hash: commit_hash.clone(),
+                        outcome: outcome.clone(),
                     })
                     .ok(),
                 });
                 edit_finished_sent = true;
 
-                if let Some(hash) = commit_hash {
+                if let Some(hash) = &outcome.commit_hash {
                     state.out.send_event(&Event {
                         method: events::GIT_COMMIT_CREATED.to_string(),
                         params: serde_json::to_value(GitCommitCreatedEvent {
                             commit_hash: hash.clone(),
                             summary: summary.clone(),
-                            changed_files: changed_files.clone(),
+                            changed_files: outcome.changed_files.clone(),
                         })
                         .ok(),
                     });
@@ -1088,11 +1055,9 @@ async fn run_prepared_turn(
                     .is_some();
 
             let turn_error = match &wf_result.result {
-                tauqe_protocol::ModelResult::Edit {
-                    error,
-                    applied: false,
-                    ..
-                } => error.clone(),
+                tauqe_protocol::ModelResult::Edit { outcome, .. } if !outcome.applied => {
+                    outcome.error.clone()
+                }
                 _ => None,
             };
 
@@ -1347,7 +1312,7 @@ fn turn_status(result: &ModelTurnResult) -> &'static str {
         "error"
     } else {
         match &result.result {
-            Some(tauqe_protocol::ModelResult::Edit { applied: true, .. }) => "applied",
+            Some(tauqe_protocol::ModelResult::Edit { outcome, .. }) if outcome.applied => "applied",
             Some(tauqe_protocol::ModelResult::Edit { .. }) => "edit_failed",
             Some(tauqe_protocol::ModelResult::Answer { .. }) => "answer",
             None => "empty",
@@ -1439,10 +1404,12 @@ fn send_edit_aborted(out: &OutChannel, op_id: &str, error: String) {
         method: events::EDIT_FINISHED.to_string(),
         params: serde_json::to_value(EditFinishedEvent {
             operation_id: op_id.to_string(),
-            applied: false,
-            error: Some(error),
-            changed_files: Vec::new(),
-            commit_hash: None,
+            outcome: EditOutcome {
+                applied: false,
+                error: Some(error),
+                changed_files: Vec::new(),
+                commit_hash: None,
+            },
         })
         .ok(),
     });
@@ -1461,10 +1428,12 @@ mod tests {
                 summary: "Fixed bug".to_string(),
                 edits: vec![],
                 proposal: None,
-                applied: true,
-                error: None,
-                changed_files: vec!["src/lib.rs".to_string()],
-                commit_hash: Some("abc".to_string()),
+                outcome: tauqe_protocol::EditOutcome {
+                    applied: true,
+                    error: None,
+                    changed_files: vec!["src/lib.rs".to_string()],
+                    commit_hash: Some("abc".to_string()),
+                },
             }),
             assistant_text: "Done.".to_string(),
             is_cancelled: false,
@@ -1481,10 +1450,12 @@ mod tests {
                 summary: "Failed".to_string(),
                 edits: vec![],
                 proposal: None,
-                applied: false,
-                error: Some("compiler error".to_string()),
-                changed_files: vec![],
-                commit_hash: None,
+                outcome: tauqe_protocol::EditOutcome {
+                    applied: false,
+                    error: Some("compiler error".to_string()),
+                    changed_files: vec![],
+                    commit_hash: None,
+                },
             }),
             assistant_text: "Failed.".to_string(),
             is_cancelled: false,
@@ -1541,10 +1512,12 @@ mod tests {
                 summary: "Execution blocked".to_string(),
                 edits: vec![],
                 proposal: None,
-                applied: false,
-                error: Some("precondition missing".to_string()),
-                changed_files: vec![],
-                commit_hash: None,
+                outcome: tauqe_protocol::EditOutcome {
+                    applied: false,
+                    error: Some("precondition missing".to_string()),
+                    changed_files: vec![],
+                    commit_hash: None,
+                },
             }),
             assistant_text: "Blocked.".to_string(),
             is_cancelled: false,
@@ -1562,10 +1535,12 @@ mod tests {
             summary: "sum".to_string(),
             edits: vec![],
             proposal: None,
-            applied: false,
-            error: None,
-            changed_files: vec![],
-            commit_hash: None,
+            outcome: tauqe_protocol::EditOutcome {
+                applied: false,
+                error: None,
+                changed_files: vec![],
+                commit_hash: None,
+            },
         };
         
         // Never report if no edit events were sent

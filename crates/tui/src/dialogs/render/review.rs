@@ -1,9 +1,10 @@
 use ratatui::layout::{Alignment, Rect};
-use ratatui::style::{Color, Style, Stylize};
+use ratatui::style::{Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 
 use crate::config::PrimaryModifier;
+use crate::theme::engine::current_engine;
 use crate::ui::centered_rect;
 use super::editor_lines;
 
@@ -24,6 +25,8 @@ const REVIEW_FOOTER_HEIGHT: u16 = 3;
 const REVIEW_EDITOR_MIN_HEIGHT: u16 = 3;
 /// Maximum reviewer rows drawn before the list scrolls.
 const REVIEW_MODEL_LIST_MAX_ROWS: u16 = 6;
+/// Height of the target-paths field: a single-line input inside a border.
+const REVIEW_PATH_HEIGHT: u16 = 3;
 
 /// Number of reviewer rows drawn for `entry_count` entries, before borders.
 fn review_model_list_rows(entry_count: usize) -> u16 {
@@ -55,29 +58,36 @@ fn inset(area: Rect) -> Rect {
     )
 }
 
-/// Splits the dialog interior into `[header, reviewer list, editor, footer]`.
+/// Splits the dialog interior into
+/// `[header, reviewer list, path field, editor, footer]`.
 ///
-/// The action bar, list, and header are sized first so the dialog stays usable
-/// on short terminals; the instruction editor absorbs whatever height remains.
-fn review_dialog_chunks(area: Rect, entry_count: usize) -> [Rect; 4] {
+/// The action bar, list, path field, and header are sized first so the dialog
+/// stays usable on short terminals; the instruction editor absorbs whatever
+/// height remains. The path field keeps its reserved single-line height and the
+/// header yields before it, so the target directory or glob stays visible.
+fn review_dialog_chunks(area: Rect, entry_count: usize) -> [Rect; 5] {
     let inner = inset(area);
 
     let footer_h = REVIEW_FOOTER_HEIGHT.min(inner.height);
     let after_footer = inner.height - footer_h;
 
     // The list never takes more than half of the room left after the footer, so
-    // the header and editor always keep space on short terminals.
+    // the header and editors always keep space on short terminals.
     let list_h = (review_model_list_rows(entry_count) + 2).min(after_footer / 2);
     let after_list = after_footer - list_h;
 
-    let header_h = REVIEW_HEADER_HEIGHT.min(after_list.saturating_sub(REVIEW_EDITOR_MIN_HEIGHT));
-    let editor_h = after_list - header_h;
+    let path_h = REVIEW_PATH_HEIGHT.min(after_list.saturating_sub(REVIEW_EDITOR_MIN_HEIGHT));
+    let after_path = after_list - path_h;
+
+    let header_h = REVIEW_HEADER_HEIGHT.min(after_path.saturating_sub(REVIEW_EDITOR_MIN_HEIGHT));
+    let editor_h = after_path - header_h;
 
     let header = Rect::new(inner.x, inner.y, inner.width, header_h);
     let list = Rect::new(inner.x, inner.y + header_h, inner.width, list_h);
-    let editor = Rect::new(inner.x, list.y + list_h, inner.width, editor_h);
+    let path = Rect::new(inner.x, list.y + list_h, inner.width, path_h);
+    let editor = Rect::new(inner.x, path.y + path_h, inner.width, editor_h);
     let footer = Rect::new(inner.x, editor.y + editor_h, inner.width, footer_h);
-    [header, list, editor, footer]
+    [header, list, path, editor, footer]
 }
 
 /// Computes the dialog frame, the reviewer-row area, and the action buttons
@@ -87,7 +97,7 @@ pub fn review_dialog_geometry(term: Rect, entry_count: usize) -> ReviewDialogGeo
     let chunks = review_dialog_chunks(area, entry_count);
     let model_rows = inset(chunks[1]);
 
-    let footer = chunks[3];
+    let footer = chunks[4];
     let confirm_w = REVIEW_DIALOG_CONFIRM_LABEL.len() as u16 + 2;
     let cancel_w = REVIEW_DIALOG_CANCEL_LABEL.len() as u16 + 2;
     let gap = 4u16;
@@ -109,6 +119,8 @@ pub fn render_review_dialog(
     dialog: &crate::app::ReviewDialogState,
     primary: PrimaryModifier,
 ) {
+    let engine = current_engine();
+    let palette = engine.palette();
     let entry_count = dialog.selector.len();
     let area = centered_rect(REVIEW_DIALOG_WIDTH, REVIEW_DIALOG_HEIGHT, frame.area());
     frame.render_widget(Clear, area);
@@ -116,32 +128,33 @@ pub fn render_review_dialog(
     let outer_block = Block::default()
         .title(" Launch Code Review ")
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Magenta));
+        .border_style(engine.fg(palette.button_active_bg))
+        .style(Style::default().bg(engine.color(palette.surface)));
     frame.render_widget(outer_block, area);
 
-    let [header_area, list_area, editor_area, footer_area] =
+    let [header_area, list_area, path_area, editor_area, footer_area] =
         review_dialog_chunks(area, entry_count);
 
-    let dim = Style::default().fg(Color::DarkGray);
+    let dim = engine.fg(palette.text_muted);
 
     // Header: what is about to be reviewed.
     let header_lines = vec![
         Line::raw(""),
         Line::from(Span::styled(
             "Run automated code review on active context files?",
-            Style::default().bold().fg(Color::Yellow),
+            engine.fg(palette.status_warning).bold(),
         )),
         Line::raw(""),
         Line::from(vec![
             Span::styled("  Files: ", dim),
             Span::styled(
                 dialog.files_count.to_string(),
-                Style::default().fg(Color::White).bold(),
+                engine.fg(palette.text_primary).bold(),
             ),
             Span::styled("    Estimated tokens: ", dim),
             Span::styled(
                 format!("~{}", dialog.estimated_tokens),
-                Style::default().fg(Color::White).bold(),
+                engine.fg(palette.text_primary).bold(),
             ),
         ]),
         Line::from(Span::styled(
@@ -168,14 +181,15 @@ pub fn render_review_dialog(
         " Reviewer Model ".to_string()
     };
     let list_border = if dialog.focus.is_model_list() {
-        Style::default().fg(Color::Magenta).bold()
+        engine.fg(palette.button_active_bg).bold()
     } else {
-        Style::default().fg(Color::DarkGray)
+        engine.fg(palette.border)
     };
     let list_block = Block::default()
         .title(list_title)
         .borders(Borders::ALL)
-        .border_style(list_border);
+        .border_style(list_border)
+        .style(Style::default().bg(engine.color(palette.surface)));
     let list_inner = list_block.inner(list_area);
     frame.render_widget(list_block, list_area);
     if entry_count == 0 {
@@ -191,12 +205,53 @@ pub fn render_review_dialog(
         frame.render_widget(Paragraph::new(rows), list_inner);
     }
 
+    // Target paths field. A single-line input that narrows the review to a
+    // directory or glob without touching the User Context layer: the value rides
+    // along in `ReviewStartParams::path_pattern` and the server merges the
+    // matched files with the developer's layer (c-review-context-input). The
+    // cursor is drawn only when the field owns focus.
+    let show_path_cursor = dialog.focus.is_path_editor();
+    let path_border = if show_path_cursor {
+        engine.fg(palette.status_info).bold()
+    } else {
+        engine.fg(palette.border)
+    };
+    let mut path_content = Vec::new();
+    if dialog.path_editor.is_empty() {
+        let mut spans = vec![Span::raw("  > ")];
+        if show_path_cursor {
+            spans.push(Span::styled("█", engine.fg(palette.status_warning)));
+        }
+        spans.push(Span::styled(
+            " target directory or glob, e.g. src/**/*.rs (optional)",
+            dim,
+        ));
+        path_content.push(Line::from(spans));
+    } else {
+        for line in editor_lines(&dialog.path_editor, show_path_cursor) {
+            let mut spans = vec![Span::raw("  > ")];
+            spans.extend(line.spans);
+            path_content.push(Line::from(spans));
+        }
+    }
+    let path_block = Block::default()
+        .title(" Target Paths (optional) ")
+        .borders(Borders::ALL)
+        .border_style(path_border)
+        .style(Style::default().bg(engine.color(palette.surface)));
+    frame.render_widget(
+        Paragraph::new(path_content)
+            .block(path_block)
+            .wrap(Wrap { trim: false }),
+        path_area,
+    );
+
     // Instruction editor. The cursor is drawn only when the editor owns focus.
     let show_cursor = dialog.focus.is_prompt_editor();
     let editor_title_style = if show_cursor {
-        Style::default().fg(Color::Cyan).bold()
+        engine.fg(palette.status_info).bold()
     } else {
-        Style::default().fg(Color::DarkGray)
+        engine.fg(palette.border)
     };
     let mut editor_text = vec![Line::from(Span::styled(
         "  Additional review instructions (optional):",
@@ -205,7 +260,7 @@ pub fn render_review_dialog(
     if dialog.prompt_editor.is_empty() {
         let mut spans = vec![Span::raw("  > ")];
         if show_cursor {
-            spans.push(Span::styled("█", Style::default().fg(Color::Yellow)));
+            spans.push(Span::styled("█", engine.fg(palette.status_warning)));
         }
         spans.push(Span::styled(
             " (type additional review focus or leave empty)...",
@@ -230,19 +285,19 @@ pub fn render_review_dialog(
     let (confirm_style, cancel_style) = if in_actions {
         if confirm_selected {
             (
-                Style::default().bg(Color::Green).fg(Color::Black).bold(),
-                Style::default().bg(Color::DarkGray).fg(Color::White),
+                engine.bg(palette.status_success).fg(engine.color(palette.text_inverse)).bold(),
+                engine.bg(palette.button_bg).fg(engine.color(palette.button_fg)),
             )
         } else {
             (
-                Style::default().bg(Color::DarkGray).fg(Color::White),
-                Style::default().bg(Color::Cyan).fg(Color::Black).bold(),
+                engine.bg(palette.button_bg).fg(engine.color(palette.button_fg)),
+                engine.bg(palette.button_active_bg).fg(engine.color(palette.text_inverse)).bold(),
             )
         }
     } else {
         (
-            Style::default().bg(Color::DarkGray).fg(Color::White),
-            Style::default().bg(Color::DarkGray).fg(Color::White),
+            engine.bg(palette.button_bg).fg(engine.color(palette.button_fg)),
+            engine.bg(palette.button_bg).fg(engine.color(palette.button_fg)),
         )
     };
     let nav_hint = if dialog.focus.is_actions() {
@@ -260,7 +315,7 @@ pub fn render_review_dialog(
             Span::raw("    "),
             Span::styled(format!(" {} ", REVIEW_DIALOG_CANCEL_LABEL), cancel_style),
         ]),
-        Line::from(Span::styled(nav_hint, Style::default().fg(Color::Gray))),
+        Line::from(Span::styled(nav_hint, engine.fg(palette.text_secondary))),
     ];
     let footer = Paragraph::new(actions).alignment(Alignment::Center);
     frame.render_widget(footer, footer_area);
@@ -284,5 +339,24 @@ mod tests {
         assert!(geo.model_rows.y >= geo.area.y);
         assert!(geo.model_rows.y + geo.model_rows.height <= geo.area.bottom());
         assert_eq!(geo.model_rows.height, 3, "one row per reviewer entry");
+    }
+
+    #[test]
+    fn test_review_dialog_chunks_reserve_path_field_between_list_and_editor() {
+        let term = Rect::new(0, 0, 120, 40);
+        let area = centered_rect(REVIEW_DIALOG_WIDTH, REVIEW_DIALOG_HEIGHT, term);
+        let [header, list, path, editor, footer] = review_dialog_chunks(area, 3);
+
+        // The reserved single-line path field is fully visible on a normal terminal.
+        assert_eq!(path.height, REVIEW_PATH_HEIGHT);
+
+        // The interior stacks top-to-bottom without gaps or overlap.
+        assert_eq!(header.y, area.y + 1);
+        assert_eq!(list.y, header.y + header.height);
+        assert_eq!(path.y, list.y + list.height);
+        assert_eq!(editor.y, path.y + path.height);
+        assert_eq!(footer.y, editor.y + editor.height);
+        assert!(footer.y + footer.height <= area.bottom());
+        assert!(path.width > 0 && editor.height > 0);
     }
 }

@@ -1,7 +1,9 @@
+#[cfg(any(test, feature = "test-support"))]
 pub mod mock;
 pub mod openrouter;
 pub mod types;
 
+#[cfg(any(test, feature = "test-support"))]
 pub use mock::MockLlmProvider;
 pub use openrouter::OpenRouterProvider;
 pub use types::*;

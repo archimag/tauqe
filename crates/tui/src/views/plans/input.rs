@@ -15,6 +15,7 @@ pub const PLANS_COMMANDS: &[KeyCommand] = &[
     KeyCommand { key: "x", description: "Execute target step, group, or entire plan (with confirmation)" },
     KeyCommand { key: "Enter", description: "Execute leaf step; fold/unfold on groups and plan headers" },
     KeyCommand { key: "d", description: "Discuss selected concept/step or entire plan with AI in Develop" },
+    KeyCommand { key: "f", description: "Set discussion focus to selected plan or step without leaving the view" },
     KeyCommand { key: "R", description: "Deep refine / replan horizon with AI (Architect)" },
     KeyCommand { key: "t / s", description: "Change step status (Todo / InProgress / Done / Cancelled)" },
     // Navigation & Inspection
@@ -309,6 +310,46 @@ pub async fn handle_plans_key(
                         },
                     ));
                 }
+            }
+        }
+        KeyCode::Char('f') if !is_ctrl && !is_primary => {
+            let sel_row = st.plans_view.selected_row();
+            if let Some(row) = sel_row {
+                let plan_id = row.plan_id().to_string();
+                let plan_title = st
+                    .plans_view
+                    .plans
+                    .iter()
+                    .find(|p| p.id == plan_id)
+                    .map(|p| p.title.clone())
+                    .unwrap_or_else(|| plan_id.clone());
+                let (focused, target_label) = match &row {
+                    VisiblePlanRow::ConceptItem { item_id, title, .. } => {
+                        (vec![item_id.clone()], Some(format!("concept {} '{}'", item_id, title)))
+                    }
+                    VisiblePlanRow::PlanItem { item_id, title, .. } => {
+                        (vec![item_id.clone()], Some(format!("step {} '{}'", item_id, title)))
+                    }
+                    _ => (Vec::new(), None),
+                };
+                let focus = tauqe_protocol::DiscussionFocus::plan(plan_id, focused);
+                st.discussion_focus = focus.clone();
+                let params = tauqe_protocol::DiscussionSetFocusParams { focus };
+                let message = match target_label {
+                    Some(label) => {
+                        format!("Discussion focus set to {} in plan '{}'", label, plan_title)
+                    }
+                    None => format!("Discussion focus set to plan '{}'", plan_title),
+                };
+                drop(st);
+                send_request(
+                    server_writer,
+                    methods::DISCUSSION_SET_FOCUS,
+                    serde_json::to_value(&params)?,
+                )
+                .await?;
+                let mut st = state.lock().await;
+                st.notify_info(message);
             }
         }
         KeyCode::Char('a') | KeyCode::Char('A') => {

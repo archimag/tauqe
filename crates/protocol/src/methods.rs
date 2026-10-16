@@ -40,7 +40,7 @@ pub const REVIEW_GET: &str = "review/get";
 pub const REVIEW_UPDATE_ITEM: &str = "review/updateItem";
 pub const REVIEW_DELETE: &str = "review/delete";
 pub const REVIEW_EXECUTE: &str = "review/execute";
-pub const REVIEW_CLEAR: &str = "review/clear";
+pub const REVIEW_REFINE_ITEM: &str = "review/refineItem";
 
 pub const PLAN_LIST: &str = "plan/list";
 pub const PLAN_GET: &str = "plan/get";
@@ -101,7 +101,7 @@ mod tests {
             REVIEW_UPDATE_ITEM,
             REVIEW_DELETE,
             REVIEW_EXECUTE,
-            REVIEW_CLEAR,
+            REVIEW_REFINE_ITEM,
             PLAN_LIST,
             PLAN_GET,
             PLAN_SAVE,

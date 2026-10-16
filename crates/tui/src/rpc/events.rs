@@ -389,12 +389,12 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
         events::EDIT_FINISHED => {
             if let Some(params) = ev.params {
                 if let Ok(data) = serde_json::from_value::<EditFinishedEvent>(params) {
-                    st.model.edit_final_applied = Some(data.applied);
-                    st.model.edit_final_error = data.error;
-                    if let Some(hash) = data.commit_hash {
+                    st.model.edit_final_applied = Some(data.outcome.applied);
+                    st.model.edit_final_error = data.outcome.error;
+                    if let Some(hash) = data.outcome.commit_hash {
                         st.model.last_commit_hash = Some(hash);
                     }
-                    if data.applied {
+                    if data.outcome.applied {
                         for f in st.model.files.iter_mut() {
                             f.status = FileEditStatus::Ok;
                             f.error = None;
@@ -433,14 +433,9 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
             if let Some(params) = ev.params {
                 if let Ok(data) = serde_json::from_value::<ModelResultEvent>(params) {
                     match &data.result {
-                        ModelResult::Edit {
-                            applied: true,
-                            commit_hash,
-                            summary,
-                            ..
-                        } => {
+                        ModelResult::Edit { outcome, summary, .. } if outcome.applied => {
                             st.model.edit_final_applied = Some(true);
-                            if let Some(hash) = commit_hash {
+                            if let Some(hash) = &outcome.commit_hash {
                                 st.model.last_commit_hash = Some(hash.clone());
                             }
                             st.model.last_commit_summary = Some(summary.clone());
@@ -450,14 +445,9 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
                                 f.retry_info = None;
                             }
                         }
-                        ModelResult::Edit {
-                            applied: false,
-                            error,
-                            summary,
-                            ..
-                        } => {
+                        ModelResult::Edit { outcome, summary, .. } if !outcome.applied => {
                             st.model.edit_final_applied = Some(false);
-                            st.model.edit_final_error = error.clone();
+                            st.model.edit_final_error = outcome.error.clone();
                             st.model.last_commit_summary = Some(summary.clone());
                             for f in st.model.files.iter_mut() {
                                 if matches!(f.status, FileEditStatus::Running | FileEditStatus::Retrying)
@@ -465,7 +455,7 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
                                     f.status = FileEditStatus::Error;
                                     f.retry_info = None;
                                     if f.error.is_none() {
-                                        f.error = error.clone().or_else(|| {
+                                        f.error = outcome.error.clone().or_else(|| {
                                             Some(messages::EDIT_FAILED_FALLBACK.to_string())
                                         });
                                     }

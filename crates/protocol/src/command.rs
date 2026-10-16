@@ -132,6 +132,9 @@ impl FromStr for DocTopic {
             "git" => Ok(Self::Git),
             "interface" => Ok(Self::Interface),
             "review" => Ok(Self::Review),
+            // `plans` is a legacy plural alias kept only for tolerant model
+            // output parsing; scheduled for removal in 0.2.0 and tracked by the
+            // wire-contract test in `lib.rs`.
             "plan" | "plans" => Ok(Self::Plan),
             "all" => Ok(Self::All),
             other => Err(format!(

@@ -828,7 +828,7 @@ pub fn format_plan_step_execution_prompt(
         step.id
     ));
     out.push_str("2. Do NOT implement any upcoming or subsequent steps from the plan.\n");
-    out.push_str("3. Keep changes minimal, coherent, and verified with toolchain checks.\n");
+    out.push_str("3. Keep changes minimal and coherent. Toolchain verification is handled automatically and deterministically by the harness; do NOT emit <verify> tags.\n");
     out.push_str(&format!(
         "4. When implementation and verification are complete, emit the completion tag: <success{0} summary=\"...\" />.\n",
         marker_suffix

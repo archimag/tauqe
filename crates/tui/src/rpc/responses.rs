@@ -115,8 +115,9 @@ pub async fn handle_response(
         if let RequestId::Number(id) = resp.id {
             if let Some(rollback) = conn.take_optimistic_rollback(id) {
                 match rollback {
-                    OptimisticRollback::ReviewItemStatus { item_id, prev_status } => {
-                        st.review.set_item_status(None, item_id, prev_status);
+                    OptimisticRollback::ReviewItemStatus { review_id, item_id, prev_status } => {
+                        st.review
+                            .set_item_status(review_id.as_deref(), item_id, prev_status);
                     }
                     OptimisticRollback::PlanItemStatus { plan_id, item_id, prev_status } => {
                         if let Some(plan) = st.plans_view.plans.iter_mut().find(|p| p.id == plan_id) {
@@ -153,6 +154,9 @@ pub async fn handle_response(
                 st.plans_view.refining = false;
                 st.plans_view.refining_plan_id = None;
             }
+            Some(methods::REVIEW_REFINE_ITEM) => {
+                st.review.refining = None;
+            }
             Some(methods::GIT_SQUASH_PREVIEW)
             | Some(methods::GIT_SQUASH_GENERATE_MESSAGE)
             | Some(methods::GIT_SQUASH_APPLY) => {
@@ -185,9 +189,18 @@ pub async fn handle_response(
         return;
     }
 
-    if let RequestId::Number(id) = resp.id {
-        conn.take_optimistic_rollback(id);
-    }
+    // On success the optimistic rollback never applies, but a review status
+    // update still needs its target scope so the server's authoritative item
+    // replaces the finding in the correct session rather than in whichever
+    // session happens to share the numeric finding id.
+    let updated_review_id = if let RequestId::Number(id) = resp.id {
+        match conn.take_optimistic_rollback(id) {
+            Some(OptimisticRollback::ReviewItemStatus { review_id, .. }) => review_id,
+            _ => None,
+        }
+    } else {
+        None
+    };
 
     if method.as_deref() == Some(methods::PLAN_DELETE) {
         st.notify_success("Plan deleted");
@@ -437,7 +450,7 @@ pub async fn handle_response(
             }
             methods::REVIEW_UPDATE_ITEM => {
                 if let Ok(res) = serde_json::from_value::<ReviewUpdateItemResult>(val) {
-                    st.review.apply_item(None, res.item);
+                    st.review.apply_item(updated_review_id.as_deref(), res.item);
                 }
             }
             methods::REVIEW_LIST => {
@@ -446,6 +459,28 @@ pub async fn handle_response(
                 }
             }
             methods::REVIEW_START | methods::REVIEW_CANCEL | methods::REVIEW_DELETE => {}
+            methods::REVIEW_REFINE_ITEM => {
+                let review_id = st.review.refining.take();
+                if let Ok(res) =
+                    serde_json::from_value::<tauqe_protocol::ReviewRefineItemResult>(val)
+                {
+                    match res {
+                        tauqe_protocol::ReviewRefineItemResult::Success { item, explanation } => {
+                            st.review.apply_item(review_id.as_deref(), item);
+                            let msg = match explanation {
+                                Some(exp) if !exp.trim().is_empty() => {
+                                    format!("Finding decomposed into steps: {}", exp)
+                                }
+                                _ => "Finding decomposed into steps by the Architect".to_string(),
+                            };
+                            st.notify_success(msg);
+                        }
+                        tauqe_protocol::ReviewRefineItemResult::Blocked { reason } => {
+                            st.notify_warning(format!("Decomposition blocked: {}", reason));
+                        }
+                    }
+                }
+            }
             methods::PLAN_LIST => {
                 if let Ok(res) = serde_json::from_value::<tauqe_protocol::PlanListResult>(val) {
                     st.plans_view.plans = res.plans;
@@ -541,7 +576,9 @@ pub async fn handle_response(
 mod tests {
     use super::*;
     use crate::app::NotificationLevel;
-    use tauqe_protocol::ResponseError;
+    use tauqe_protocol::{
+        ResponseError, ReviewItem, ReviewItemStatus, ReviewSession, ReviewSeverity,
+    };
 
     fn test_state() -> Arc<Mutex<AppState>> {
         Arc::new(Mutex::new(crate::app::test_state()))
@@ -681,5 +718,141 @@ mod tests {
         let blocked = st.plans_view.refine_blocked.as_ref().expect("refine_blocked expected");
         assert_eq!(blocked.plan_id, "p1");
         assert_eq!(blocked.reason, "Contradiction found");
+    }
+
+    fn review_item(id: u32, status: ReviewItemStatus) -> ReviewItem {
+        ReviewItem {
+            id,
+            title: format!("Finding {id}"),
+            model: None,
+            severity: ReviewSeverity::Info,
+            status,
+            files: Vec::new(),
+            subplan: Vec::new(),
+            resolution_notes: None,
+            body: String::new(),
+        }
+    }
+
+    fn review_session(id: &str, status: ReviewItemStatus) -> ReviewSession {
+        ReviewSession {
+            id: id.to_string(),
+            title: format!("Session {id}"),
+            created_at: 0,
+            model: tauqe_protocol::ModelRef::openrouter("test-model"),
+            description: None,
+            user_prompt: None,
+            target_files: Vec::new(),
+            items: vec![review_item(1, status)],
+            raw_markdown: String::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_review_status_rollback_is_scoped_by_review_id() {
+        let state = test_state();
+        {
+            let mut st = state.lock().await;
+            st.review = crate::views::review::ReviewViewState {
+                sessions: vec![
+                    review_session("rev-1", ReviewItemStatus::InProgress),
+                    review_session("rev-2", ReviewItemStatus::InProgress),
+                ],
+                session: Some(review_session("rev-1", ReviewItemStatus::InProgress)),
+                ..Default::default()
+            };
+        }
+
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+        crate::rpc::transport::send_request_with_id(
+            &mut conn,
+            42,
+            methods::REVIEW_UPDATE_ITEM,
+            serde_json::json!({}),
+        )
+        .await
+        .unwrap();
+        conn.record_optimistic_rollback(
+            42,
+            OptimisticRollback::ReviewItemStatus {
+                review_id: Some("rev-2".to_string()),
+                item_id: 1,
+                prev_status: ReviewItemStatus::Todo,
+            },
+        );
+
+        let resp = Response {
+            id: RequestId::Number(42),
+            result: None,
+            error: Some(ResponseError::new("REVIEW_UPDATE_FAILED", "boom")),
+        };
+        handle_response(resp, &state, &mut conn).await;
+
+        let st = state.lock().await;
+        // Only rev-2 rolls back; rev-1 keeps its optimistic value.
+        assert_eq!(
+            st.review.sessions[0].items[0].status,
+            ReviewItemStatus::InProgress
+        );
+        assert_eq!(st.review.sessions[1].items[0].status, ReviewItemStatus::Todo);
+        assert_eq!(
+            st.review.session.as_ref().map(|s| s.items[0].status),
+            Some(ReviewItemStatus::InProgress)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_review_update_item_response_is_scoped_by_review_id() {
+        let state = test_state();
+        {
+            let mut st = state.lock().await;
+            st.review = crate::views::review::ReviewViewState {
+                sessions: vec![
+                    review_session("rev-1", ReviewItemStatus::Todo),
+                    review_session("rev-2", ReviewItemStatus::InProgress),
+                ],
+                session: Some(review_session("rev-1", ReviewItemStatus::Todo)),
+                ..Default::default()
+            };
+        }
+
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+        crate::rpc::transport::send_request_with_id(
+            &mut conn,
+            43,
+            methods::REVIEW_UPDATE_ITEM,
+            serde_json::json!({}),
+        )
+        .await
+        .unwrap();
+        conn.record_optimistic_rollback(
+            43,
+            OptimisticRollback::ReviewItemStatus {
+                review_id: Some("rev-2".to_string()),
+                item_id: 1,
+                prev_status: ReviewItemStatus::Todo,
+            },
+        );
+
+        let resp = Response {
+            id: RequestId::Number(43),
+            result: Some(
+                serde_json::to_value(ReviewUpdateItemResult {
+                    item: review_item(1, ReviewItemStatus::Fixed),
+                })
+                .unwrap(),
+            ),
+            error: None,
+        };
+        handle_response(resp, &state, &mut conn).await;
+
+        let st = state.lock().await;
+        // The server's authoritative item lands in rev-2 only.
+        assert_eq!(st.review.sessions[0].items[0].status, ReviewItemStatus::Todo);
+        assert_eq!(st.review.sessions[1].items[0].status, ReviewItemStatus::Fixed);
+        assert_eq!(
+            st.review.session.as_ref().map(|s| s.items[0].status),
+            Some(ReviewItemStatus::Todo)
+        );
     }
 }

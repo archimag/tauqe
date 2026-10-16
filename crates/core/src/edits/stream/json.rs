@@ -64,7 +64,7 @@ impl JsonStreamFilter {
             self.has_emitted_edit_started = true;
         }
 
-        let op = change.op.parse::<EditFileOp>().unwrap_or(EditFileOp::Replace);
+        let op = change.op;
         let is_create = op == EditFileOp::Create;
         let resolved_path = resolve_path(&change.path, &self.editable_paths, is_create);
 

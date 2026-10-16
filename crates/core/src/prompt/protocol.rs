@@ -7,7 +7,6 @@
 //! pipeline therefore operates purely on normalized semantics and stays
 //! independent of any single protocol format.
 
-use crate::edits::protocol::create_edit_protocol;
 use tauqe_protocol::{LlmCapability, LlmCommand};
 
 /// Decodes raw model output into normalized core commands.
@@ -73,21 +72,14 @@ pub trait PromptProtocol: Send + Sync {
 
     /// Creates a streaming filter that intercepts code edits in real time.
     ///
-    /// The default reuses the reference edit protocol resolved from
-    /// [`PromptProtocol::name`], so protocols without custom streaming reuse the
-    /// shared edit-parsing machinery.
+    /// Each protocol constructs its own filter, so no protocol is ever
+    /// reconstructed from its [`PromptProtocol::name`] string.
     fn create_stream_filter(
         &self,
         editable_paths: Vec<String>,
         repo_root: std::path::PathBuf,
         staged_contents: std::collections::HashMap<String, String>,
-    ) -> Box<dyn crate::edits::stream::EditStreamFilter> {
-        create_edit_protocol(self.name()).create_stream_filter(
-            editable_paths,
-            repo_root,
-            staged_contents,
-        )
-    }
+    ) -> Box<dyn crate::edits::stream::EditStreamFilter>;
 }
 
 #[cfg(test)]
@@ -114,6 +106,18 @@ mod tests {
 
         fn system_instructions(&self, _editable_paths: &[String]) -> String {
             String::new()
+        }
+
+        fn create_stream_filter(
+            &self,
+            editable_paths: Vec<String>,
+            repo_root: std::path::PathBuf,
+            staged_contents: std::collections::HashMap<String, String>,
+        ) -> Box<dyn crate::edits::stream::EditStreamFilter> {
+            Box::new(
+                crate::edits::stream::XmlStreamFilter::new(editable_paths, repo_root)
+                    .with_staged_contents(staged_contents),
+            )
         }
     }
 

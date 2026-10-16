@@ -318,10 +318,12 @@ pub async fn handle_git_squash_generate_message(req: Request, state: &Arc<AppSta
         let (tx, mut rx) = tokio::sync::mpsc::channel(50);
         let msgs = vec![ChatMessage::user(&prompt)];
         let model_name = model.name.clone();
-        let stream_task =
-            tokio::spawn(
-                async move { provider.stream_text(&model_name, msgs, tx, cancel_rx).await },
-            );
+        let response_format = tauqe_core::prompt::squash_commit_response_format();
+        let stream_task = tokio::spawn(async move {
+            provider
+                .stream_chat(&model_name, msgs, Some(response_format), tx, cancel_rx)
+                .await
+        });
         let mut full_text = String::new();
         let mut usage: Option<tauqe_protocol::ModelUsageInfo> = None;
         let mut stream_error: Option<String> = None;
@@ -358,21 +360,12 @@ pub async fn handle_git_squash_generate_message(req: Request, state: &Arc<AppSta
                 );
             }
         }
-        let trimmed = full_text.trim();
-        let cleaned = trimmed
-            .strip_prefix("```")
-            .and_then(|s| s.strip_suffix("```"))
-            .unwrap_or(trimmed)
-            .trim()
-            .to_string();
-        let msg = if cleaned.is_empty() {
+        let msg = tauqe_core::prompt::parse_squash_commit_message(&full_text).unwrap_or_else(|| {
             commits_ahead
                 .first()
                 .map(|c| c.subject.clone())
                 .unwrap_or_else(|| "Squashed commits".to_string())
-        } else {
-            cleaned
-        };
+        });
         (msg, usage)
     } else {
         (

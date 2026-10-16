@@ -33,24 +33,31 @@ impl SessionStorage {
     pub fn append_entry(&self, entry: &HistoryEntry) -> Result<()> {
         let line = entry.to_jsonl_line()?;
         let dir = self.tauqe_dir();
-        create_dir_all(&dir)
-            .with_context(|| format!("Failed to create .tauqe directory: {:?}", dir))?;
-
         let file_path = self.history_path();
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&file_path)
-            .with_context(|| format!("Failed to open history file for appending: {:?}", file_path))?;
 
-        writeln!(file, "{line}")
-            .with_context(|| format!("Failed to write history entry to: {:?}", file_path))?;
-        file.flush()
-            .with_context(|| format!("Failed to flush history file: {:?}", file_path))?;
-        file.sync_data()
-            .with_context(|| format!("Failed to sync history file: {:?}", file_path))?;
+        // The write, flush, and `fsync` barrier run off the async executor
+        // thread so a slow disk never stalls the bounded turn or the UI.
+        crate::blocking::run_blocking(move || -> Result<()> {
+            create_dir_all(&dir)
+                .with_context(|| format!("Failed to create .tauqe directory: {:?}", dir))?;
 
-        Ok(())
+            let mut file = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&file_path)
+                .with_context(|| {
+                    format!("Failed to open history file for appending: {:?}", file_path)
+                })?;
+
+            writeln!(file, "{line}")
+                .with_context(|| format!("Failed to write history entry to: {:?}", file_path))?;
+            file.flush()
+                .with_context(|| format!("Failed to flush history file: {:?}", file_path))?;
+            file.sync_data()
+                .with_context(|| format!("Failed to sync history file: {:?}", file_path))?;
+
+            Ok(())
+        })
     }
 
     pub fn read_entries(&self) -> Result<Vec<HistoryEntry>> {
@@ -99,10 +106,14 @@ impl SessionStorage {
 
     /// Atomically rewrites the history file with the provided entries.
     pub fn rewrite_entries(&self, entries: &[HistoryEntry]) -> Result<()> {
-        let dir = self.tauqe_dir();
-        create_dir_all(&dir)
-            .with_context(|| format!("Failed to create .tauqe directory: {:?}", dir))?;
+        let mut payload = String::new();
+        for entry in entries {
+            let line = entry.to_jsonl_line()?;
+            payload.push_str(&line);
+            payload.push('\n');
+        }
 
+        let dir = self.tauqe_dir();
         let target_path = self.history_path();
         let temp_filename = format!(
             "{}.tmp.{}",
@@ -111,29 +122,37 @@ impl SessionStorage {
         );
         let temp_path = dir.join(temp_filename);
 
-        {
-            let mut temp_file = File::create(&temp_path)
-                .with_context(|| format!("Failed to create temp history file: {:?}", temp_path))?;
+        // The write, flush, and `fsync` barrier, plus the atomic rename, run
+        // off the async executor thread so a slow disk never stalls the turn.
+        crate::blocking::run_blocking(move || -> Result<()> {
+            create_dir_all(&dir)
+                .with_context(|| format!("Failed to create .tauqe directory: {:?}", dir))?;
 
-            for entry in entries {
-                let line = entry.to_jsonl_line()?;
-                writeln!(temp_file, "{line}")
-                    .with_context(|| format!("Failed to write to temp history file: {:?}", temp_path))?;
+            {
+                let mut temp_file = File::create(&temp_path).with_context(|| {
+                    format!("Failed to create temp history file: {:?}", temp_path)
+                })?;
+
+                temp_file.write_all(payload.as_bytes()).with_context(|| {
+                    format!("Failed to write to temp history file: {:?}", temp_path)
+                })?;
+                temp_file.flush().with_context(|| {
+                    format!("Failed to flush temp history file: {:?}", temp_path)
+                })?;
+                temp_file.sync_all().with_context(|| {
+                    format!("Failed to sync temp history file: {:?}", temp_path)
+                })?;
             }
-            temp_file.flush()
-                .with_context(|| format!("Failed to flush temp history file: {:?}", temp_path))?;
-            temp_file.sync_all()
-                .with_context(|| format!("Failed to sync temp history file: {:?}", temp_path))?;
-        }
 
-        std::fs::rename(&temp_path, &target_path).with_context(|| {
-            format!(
-                "Failed to atomically replace history file from {:?} to {:?}",
-                temp_path, target_path
-            )
-        })?;
+            std::fs::rename(&temp_path, &target_path).with_context(|| {
+                format!(
+                    "Failed to atomically replace history file from {:?} to {:?}",
+                    temp_path, target_path
+                )
+            })?;
 
-        Ok(())
+            Ok(())
+        })
     }
 
     pub fn clear(&self) -> Result<()> {

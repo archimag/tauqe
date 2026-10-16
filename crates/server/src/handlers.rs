@@ -61,6 +61,7 @@ pub async fn handle_request(req: Request, state: &Arc<AppState>) -> Response {
         methods::REVIEW_UPDATE_ITEM => review::handle_review_update_item(req, state).await,
         methods::REVIEW_DELETE => review::handle_review_delete(req, state).await,
         methods::REVIEW_EXECUTE => review::handle_review_execute(req, state).await,
+        methods::REVIEW_REFINE_ITEM => review::handle_review_refine_item(req, state).await,
 
         methods::PLAN_LIST => plan::handle_plan_list(req, state).await,
         methods::PLAN_GET => plan::handle_plan_get(req, state).await,

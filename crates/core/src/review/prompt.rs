@@ -1,6 +1,7 @@
 use crate::context::ContextFileContent;
 use crate::escape::{escape_xml_attr, escape_xml_text, single_line};
-use tauqe_protocol::review::ReviewSession;
+use tauqe_protocol::review::{ReviewItem, ReviewSession};
+use tauqe_protocol::PlanItem;
 
 pub const REVIEW_DISCUSSION_PREFIX: &str = "# Review Discussion:";
 
@@ -114,6 +115,29 @@ pub fn format_review_discussion_prompt_items(
                 }
                 if !item.body.trim().is_empty() {
                     out.push_str(&format!("  Details: {}\n", escape_xml_text(item.body.trim())));
+                }
+                if item.has_subplan() {
+                    out.push_str("  Subplan:\n");
+                    fn render_subplan_discussion(
+                        out: &mut String,
+                        items: &[PlanItem],
+                        depth: usize,
+                    ) {
+                        let indent = "  ".repeat(depth + 2);
+                        for sub in items {
+                            out.push_str(&format!(
+                                "{}- #{}: {} ({})\n",
+                                indent,
+                                sub.id,
+                                escape_xml_text(&sub.title),
+                                sub.status
+                            ));
+                            if !sub.children.is_empty() {
+                                render_subplan_discussion(out, &sub.children, depth + 1);
+                            }
+                        }
+                    }
+                    render_subplan_discussion(&mut out, &item.subplan, 0);
                 }
             }
         }
@@ -372,6 +396,38 @@ pub fn format_review_step_execution_prompt(
             ));
         }
     }
+    if item.has_subplan() {
+        out.push_str("### Decomposed Subplan Steps:\n");
+        fn render_subplan_exec(out: &mut String, items: &[PlanItem], depth: usize) {
+            let indent = "  ".repeat(depth);
+            for sub in items {
+                out.push_str(&format!(
+                    "{}- [{}] #{} {}",
+                    indent,
+                    sub.status,
+                    sub.id,
+                    sub.title
+                ));
+                if !sub.files.is_empty() {
+                    out.push_str(&format!(" (files: {})", sub.files.join(", ")));
+                }
+                if !sub.readonly_files.is_empty() {
+                    out.push_str(&format!(" (readonly: {})", sub.readonly_files.join(", ")));
+                }
+                if let Some(details) = &sub.details {
+                    let trimmed = details.trim();
+                    if !trimmed.is_empty() {
+                        out.push_str(&format!(": {}", trimmed));
+                    }
+                }
+                out.push('\n');
+                if !sub.children.is_empty() {
+                    render_subplan_exec(out, &sub.children, depth + 1);
+                }
+            }
+        }
+        render_subplan_exec(&mut out, &item.subplan, 0);
+    }
     out.push('\n');
 
     out.push_str("## Execution Directives:\n");
@@ -380,7 +436,7 @@ pub fn format_review_step_execution_prompt(
         item.id
     ));
     out.push_str("2. Do NOT touch unrelated code or address other findings outside of this scope.\n");
-    out.push_str("3. Keep changes minimal, coherent, and verified with toolchain checks.\n");
+    out.push_str("3. Keep changes minimal and coherent. Toolchain verification is handled automatically and deterministically by the harness; do NOT emit <verify> tags.\n");
     out.push_str(&format!(
         "4. When implementation and verification are complete, emit the completion tag: <success{0} summary=\"...\" />.\n",
         marker_suffix
@@ -477,6 +533,168 @@ fn extract_reason_attr(header: &str) -> Option<String> {
     }
 }
 
+/// Target size range (in changed lines) for one cohesive leaf implementation step.
+const LEAF_STEP_TARGET_LINES: (usize, usize) = (150, 400);
+
+/// Maximum supported hierarchy nesting depth for structured plan refinement output.
+pub const MAX_REVIEW_SUBPLAN_DEPTH: usize = 5;
+
+/// Builds the system prompt for refining a review finding into an actionable subplan.
+///
+/// Dispatched to the Architect role to decompose an audit finding into concrete,
+/// compilable leaf steps conforming to the plan engine's execution invariants.
+pub fn build_review_finding_refine_system_prompt() -> String {
+    let mut out = String::new();
+    out.push_str("You are a Principal Software Architect in TAUQE (The Answer to the Ultimate Question of Engineering).\n\n");
+    out.push_str("Your mission is Review Finding Decomposition: analyzing an analytical code review finding and synthesizing an actionable, verifiable step plan (subplan) that completely resolves the identified architectural, safety, or correctness issue.\n\n");
+
+    out.push_str("## Core Invariants & Rules:\n\n");
+    out.push_str("1. Finding Remediation Mandate (\"What\" vs \"How\"):\n");
+    out.push_str("   - The review finding describes the deficiency, safety hazard, or architectural problem to fix.\n");
+    out.push_str("   - Your exclusive responsibility is engineering decomposition (\"How\"): the exact modules, interfaces, contracts, types, and sequence of implementation required to resolve it.\n\n");
+
+    out.push_str("2. Subplan Synthesis Contract:\n");
+    out.push_str("   - Return the hierarchical list of executable implementation steps with `status: \"todo\"`.\n");
+    out.push_str("   - Synthesize a coherent roadmap that completely resolves the finding without breaking existing subsystem invariants.\n\n");
+
+    out.push_str("3. Strict Blocker Protocol (Refusal to Plan):\n");
+    out.push_str("   - If you discover that the finding is a false positive, contradicts architectural invariants, or cannot be resolved without developer guidance:\n");
+    out.push_str("   - You MUST set `status: \"blocked\"`, provide empty `items: []`, and document a comprehensive technical explanation in `reason`.\n\n");
+
+    out.push_str("4. Step Granularity and Compilability Invariants:\n");
+    out.push_str("   - Every leaf step is executed in an isolated turn with its own toolchain verification gates.\n");
+    out.push_str("   - Leaf-Only Files Invariant: For every executable leaf step, you MUST populate `files: [\"path/to/file\"]` with exact repository-relative file paths. Conceptual container items MUST have empty `files: []`.\n");
+    out.push_str("   - Reference Files Contract: Populate `readonly_files: [\"path/to/reference\"]` with contracts, conventions, or types needed as read-only context during step execution.\n");
+    out.push_str("   - Avoid Micro-Fragmentation: Group cohesive changes across 1-4 related files under a single leaf step if they form a logical unit of work.\n");
+    out.push_str(&format!(
+        "   - Target leaf step size: calibrated to {}-{} lines of change.\n",
+        LEAF_STEP_TARGET_LINES.0, LEAF_STEP_TARGET_LINES.1
+    ));
+    out.push_str("   - Compilability Invariant: The codebase MUST remain in a compiling, fully verified state at the end of EVERY leaf step.\n");
+    out.push_str("   - Order steps strictly by prerequisite dependencies (`depends_on`).\n\n");
+
+    out.push_str("5. Strict Language Consistency Invariant:\n");
+    out.push_str("   - Detect the primary natural language used in the review finding's title and description.\n");
+    out.push_str("   - You MUST formulate all titles, step details, explanations, and reasons strictly in that SAME natural language.\n\n");
+
+    out.push_str("6. Codebase Exploration & Discovery Contract:\n");
+    out.push_str("   - You have access to symbol contours in `<repo_map>` and already loaded files in `Active Context Files`.\n");
+    out.push_str("   - If you need to inspect exact implementations before synthesizing the subplan, set `status: \"needs_context\"`, specify repository-relative file paths in `context_requests: [...]`, and leave `items: []`.\n\n");
+
+    out.push_str("7. Output Format:\n");
+    out.push_str("   - Output strictly according to the specified JSON schema.\n");
+    out
+}
+
+/// Alias for `build_review_finding_refine_system_prompt`.
+pub fn build_review_refine_system_prompt() -> String {
+    build_review_finding_refine_system_prompt()
+}
+
+/// Builds the user prompt for refining a single review finding into a subplan.
+pub fn build_review_finding_refine_user_prompt(
+    session: &ReviewSession,
+    item: &ReviewItem,
+    context_files: &[ContextFileContent],
+    repo_map: Option<&str>,
+    instructions: Option<&str>,
+) -> String {
+    let mut out = String::new();
+    out.push_str(&format!(
+        "# Review Finding Refinement: [{}#{}] {}\n\n",
+        session.id, item.id, item.title
+    ));
+
+    out.push_str("## Target Review Session:\n");
+    let clean_title = single_line(&session.title);
+    let title = if clean_title.is_empty() {
+        &session.id
+    } else {
+        &clean_title
+    };
+    out.push_str(&format!("- **Session**: {} ({})\n", title, session.id));
+    if let Some(desc) = &session.description {
+        let trimmed = desc.trim();
+        if !trimmed.is_empty() {
+            out.push_str(&format!("- **Scope / Summary**: {}\n", trimmed));
+        }
+    }
+    out.push('\n');
+
+    out.push_str("## Target Finding to Decompose:\n");
+    out.push_str(&format!("- **ID**: `#{}`\n", item.id));
+    out.push_str(&format!("- **Severity**: {}\n", item.severity));
+    out.push_str(&format!("- **Title**: {}\n", item.title));
+    if !item.files.is_empty() {
+        out.push_str(&format!(
+            "- **Target Files**: {}\n",
+            item.files.join(", ")
+        ));
+    }
+    if !item.body.trim().is_empty() {
+        out.push_str(&format!("- **Details / Recommendation**:\n{}\n", item.body.trim()));
+    }
+    if let Some(notes) = &item.resolution_notes {
+        let trimmed = notes.trim();
+        if !trimmed.is_empty() {
+            out.push_str(&format!("- **Resolution Notes**:\n{}\n", trimmed));
+        }
+    }
+    if item.has_subplan() {
+        out.push_str("- **Existing Subplan Steps**:\n");
+        for sub in &item.subplan {
+            out.push_str(&format!("  - [{}] #{} {}\n", sub.status, sub.id, sub.title));
+        }
+    }
+    out.push('\n');
+
+    if let Some(rm) = repo_map {
+        let trimmed = rm.trim();
+        if !trimmed.is_empty() {
+            out.push_str("## Codebase Symbol Contours (<repo_map>):\n");
+            out.push_str(trimmed);
+            out.push_str("\n\n");
+        }
+    }
+
+    if !context_files.is_empty() {
+        out.push_str("## Active Context Files:\n");
+        for file in context_files {
+            out.push_str(&format!("### File: `{}`\n```\n{}\n```\n\n", file.path, file.content));
+        }
+    }
+
+    if let Some(ins) = instructions {
+        let trimmed = ins.trim();
+        if !trimmed.is_empty() {
+            out.push_str("## Developer Directives:\n");
+            out.push_str(trimmed);
+            out.push_str("\n\n");
+        }
+    }
+
+    out.push_str("## Architect Instructions:\n");
+    out.push_str("1. Analyze the review finding and determine the necessary refactorings and code changes.\n");
+    out.push_str("2. Synthesize a decomposed, dependency-ordered subplan of leaf steps with `status: \"todo\"`.\n");
+    out.push_str("3. For each leaf step, declare `files`, `readonly_files`, and `depends_on`. Ensure each step leaves the codebase in a compiling state.\n");
+    out.push_str("4. If the finding is blocked or cannot be implemented, report `status: \"blocked\"` with `reason`.\n");
+    out.push_str("5. If you need more source files to verify interfaces, report `status: \"needs_context\"` with `context_requests`.\n");
+    out.push_str("6. Language Directive: Formulate all titles, details, explanations, and reasons strictly in the same natural language as the finding.\n");
+
+    out
+}
+
+/// Alias for `build_review_finding_refine_user_prompt`.
+pub fn build_review_refine_user_prompt(
+    session: &ReviewSession,
+    item: &ReviewItem,
+    context_files: &[ContextFileContent],
+    repo_map: Option<&str>,
+    instructions: Option<&str>,
+) -> String {
+    build_review_finding_refine_user_prompt(session, item, context_files, repo_map, instructions)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -503,6 +721,91 @@ mod tests {
     }
 
     #[test]
+    fn test_format_review_step_execution_prompt_with_subplan() {
+        use tauqe_protocol::review::{ReviewItem, ReviewItemStatus, ReviewSeverity};
+        use tauqe_protocol::PlanItemStatus;
+
+        let session = ReviewSession {
+            id: "rev-sub".to_string(),
+            title: "Subplan Review".to_string(),
+            created_at: 100,
+            model: tauqe_protocol::ModelRef::openrouter("model-x"),
+            description: None,
+            user_prompt: None,
+            target_files: vec!["crates/core/src/lib.rs".to_string()],
+            items: vec![ReviewItem {
+                id: 1,
+                title: "Refactor architecture".to_string(),
+                model: None,
+                severity: ReviewSeverity::Warning,
+                status: ReviewItemStatus::Todo,
+                files: vec!["crates/core/src/lib.rs".to_string()],
+                subplan: vec![PlanItem {
+                    id: "1.1".to_string(),
+                    title: "Split module".to_string(),
+                    details: Some("Create submodules".to_string()),
+                    status: PlanItemStatus::Done,
+                    concept_refs: vec![],
+                    files: vec!["crates/core/src/sub.rs".to_string()],
+                    readonly_files: vec![],
+                    depends_on: vec![],
+                    children: vec![],
+                }],
+                resolution_notes: None,
+                body: "Break down large file".to_string(),
+            }],
+            raw_markdown: String::new(),
+        };
+
+        let prompt = format_review_step_execution_prompt(&session, 1, "_TAG").unwrap();
+        assert!(prompt.contains("Decomposed Subplan Steps:"));
+        assert!(prompt.contains("- [DONE] #1.1 Split module (files: crates/core/src/sub.rs): Create submodules"));
+    }
+
+    #[test]
+    fn test_build_review_finding_refine_prompts() {
+        use tauqe_protocol::review::{ReviewItem, ReviewItemStatus, ReviewSeverity};
+
+        let session = ReviewSession {
+            id: "rev-ref".to_string(),
+            title: "Refinement Session".to_string(),
+            created_at: 100,
+            model: tauqe_protocol::ModelRef::openrouter("model-x"),
+            description: Some("Audit findings to refine".to_string()),
+            user_prompt: None,
+            target_files: vec!["crates/core/src/lib.rs".to_string()],
+            items: vec![ReviewItem {
+                id: 42,
+                title: "Decompose this issue".to_string(),
+                model: None,
+                severity: ReviewSeverity::Critical,
+                status: ReviewItemStatus::Discussion,
+                files: vec!["crates/core/src/lib.rs".to_string()],
+                subplan: vec![],
+                resolution_notes: Some("Break into sub-steps".to_string()),
+                body: "Needs structural division".to_string(),
+            }],
+            raw_markdown: String::new(),
+        };
+
+        let sys = build_review_finding_refine_system_prompt();
+        assert!(sys.contains("Review Finding Decomposition"));
+        assert!(sys.contains("Compilability Invariants"));
+
+        let user = build_review_finding_refine_user_prompt(
+            &session,
+            &session.items[0],
+            &[],
+            Some("fn outline()"),
+            Some("Focus on safety"),
+        );
+        assert!(user.contains("# Review Finding Refinement: [rev-ref#42] Decompose this issue"));
+        assert!(user.contains("Focus on safety"));
+        assert!(user.contains("fn outline()"));
+        assert!(user.contains("Break into sub-steps"));
+    }
+
+    #[test]
     fn test_format_review_step_execution_prompt() {
         use tauqe_protocol::review::{ReviewItem, ReviewItemStatus, ReviewSeverity};
 
@@ -521,6 +824,7 @@ mod tests {
                 severity: ReviewSeverity::Warning,
                 status: ReviewItemStatus::Todo,
                 files: vec!["crates/tui/src/view.rs".to_string()],
+                subplan: Vec::new(),
                 resolution_notes: None,
                 body: "Replace clone with reference borrowing".to_string(),
             }],
@@ -561,6 +865,7 @@ mod tests {
                 severity: ReviewSeverity::Critical,
                 status: ReviewItemStatus::Discussion,
                 files: vec!["src/lib.rs".to_string()],
+                subplan: Vec::new(),
                 resolution_notes: Some("Extend scope of mutex guard".to_string()),
                 body: "Lock is dropped prematurely.".to_string(),
             }],

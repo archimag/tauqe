@@ -71,6 +71,9 @@ pub struct PlanRefineParams {
     pub instructions: Option<String>,
 }
 
+// The `id` and `item_id` aliases on this RPC parameter type are legacy wire
+// names retained so older clients keep working; scheduled for removal in 0.2.0
+// and tracked by the wire-contract test in `lib.rs`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct PlanReplanParams {
     #[serde(alias = "id")]

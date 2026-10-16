@@ -46,6 +46,13 @@ impl Default for ContextConfig {
     }
 }
 
+/// Deserializes `[context].pinned`.
+///
+/// Accepts a list of paths (`pinned = ["a.md", "b.md"]`), a single path
+/// string, or a table carrying a `files` key (`[context.pinned]` with
+/// `files = ["a.md"]`). Any other table is rejected with a descriptive error
+/// rather than being silently reinterpreted, so a mistyped table cannot pin
+/// arbitrary keys as paths.
 fn deserialize_pinned<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -56,7 +63,7 @@ where
         List(Vec<String>),
         Single(String),
         TableWithFiles { files: Vec<String> },
-        TableKeys(std::collections::BTreeMap<String, toml::Value>),
+        OtherTable(toml::Value),
     }
 
     let raw = PinnedRaw::deserialize(deserializer)?;
@@ -84,16 +91,12 @@ where
                 }
             }
         }
-        PinnedRaw::TableKeys(map) => {
-            for (k, v) in map {
-                let path = match v {
-                    toml::Value::String(s) if !s.trim().is_empty() => s.trim().to_string(),
-                    _ => k.trim().to_string(),
-                };
-                if !path.is_empty() && !files.contains(&path) {
-                    files.push(path);
-                }
-            }
+        PinnedRaw::OtherTable(value) => {
+            return Err(serde::de::Error::custom(format!(
+                "invalid `[context].pinned` value: expected a list of paths, a single path, \
+                 or a table with a `files` key, found {}",
+                value.type_str()
+            )));
         }
     }
     Ok(files)

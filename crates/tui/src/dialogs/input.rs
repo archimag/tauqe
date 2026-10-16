@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use tauqe_protocol::{methods, DiscussionFocus, ReviewStartParams};
+use tauqe_protocol::{methods, DiscussionFocus};
 use tokio::sync::{Mutex, MutexGuard};
 
 use crate::app::{ActiveModal, AppState, BatchCancelButton, ViewMode};
@@ -17,7 +17,8 @@ mod selection;
 mod status;
 
 use confirm::{resolve_batch_cancel, resolve_confirm, BatchCancelOutcome, ConfirmOutcome};
-pub(crate) use refine::submit_refine_dialog;
+pub(crate) use prompt::submit_prompt_modal;
+pub(crate) use refine::{submit_refine_blocked, submit_refine_dialog};
 pub(crate) use selection::activate_selection_item;
 pub(crate) use status::apply_status_dialog;
 
@@ -61,6 +62,7 @@ fn begin_develop_turn(st: &mut AppState) {
 /// keeps that batch fixing fully transparent.
 fn begin_review_execution_turn(st: &mut AppState) {
     begin_develop_turn(st);
+    st.model.is_batch = true;
     st.notify_info("Executing review finding(s): switched to REPL for coder execution");
 }
 
@@ -111,6 +113,123 @@ async fn start_turn(
         snapshot.restore(&mut st);
         st.notify_error(format!("Failed to start turn: {}", err));
     }
+}
+
+/// Applies the shared start transition for a plan-step batch execution.
+///
+/// It is the plan-step peer of [`begin_review_execution_turn`]: the Coder role
+/// takes over the REPL and `is_batch` marks the turn as part of a batch, so the
+/// three-way batch-cancel dialog and per-step notification suppression stay
+/// active.
+fn begin_scope_execution_turn(st: &mut AppState) {
+    begin_develop_turn(st);
+    st.model.is_batch = true;
+}
+
+/// Launches a review-finding batch execution from a developer confirmation.
+///
+/// Shared by the keyboard and mouse confirmation paths so a mouse click starts
+/// the exact same batch turn as `Enter`: the Coder role takes over, `is_batch`
+/// enables the three-way batch-cancel dialog, the discussion focus detaches, and
+/// a rollback snapshot protects the launch.
+pub(crate) async fn confirm_execute_review(
+    state: &Arc<Mutex<AppState>>,
+    st: MutexGuard<'_, AppState>,
+    server_writer: &mut RpcConnection,
+    target: crate::app::ConfirmExecuteReviewState,
+) -> anyhow::Result<()> {
+    let params = tauqe_protocol::ReviewExecuteParams {
+        review_id: target.review_id,
+        item_id: target.item_id,
+    };
+    let params = serde_json::to_value(params)?;
+    start_turn(
+        state,
+        st,
+        server_writer,
+        methods::REVIEW_EXECUTE,
+        params,
+        begin_review_execution_turn,
+    )
+    .await;
+    Ok(())
+}
+
+/// Launches a plan-step batch execution from a developer confirmation.
+///
+/// The plan-step peer of [`confirm_execute_review`], shared by the keyboard and
+/// mouse confirmation paths.
+pub(crate) async fn confirm_execute_scope(
+    state: &Arc<Mutex<AppState>>,
+    st: MutexGuard<'_, AppState>,
+    server_writer: &mut RpcConnection,
+    target: crate::app::ConfirmExecuteScopeState,
+) -> anyhow::Result<()> {
+    let params = tauqe_protocol::PlanExecuteParams {
+        plan_id: target.plan_id,
+        step_id: target.step_id,
+    };
+    let params = serde_json::to_value(params)?;
+    start_turn(
+        state,
+        st,
+        server_writer,
+        methods::PLAN_EXECUTE,
+        params,
+        begin_scope_execution_turn,
+    )
+    .await;
+    Ok(())
+}
+
+/// Starts a review session from the review dialog.
+///
+/// Shared by the keyboard and mouse paths so a failed request rolls the
+/// optimistic UI state back identically on both.
+pub(crate) async fn confirm_start_review(
+    state: &Arc<Mutex<AppState>>,
+    st: MutexGuard<'_, AppState>,
+    server_writer: &mut RpcConnection,
+    params: serde_json::Value,
+) -> anyhow::Result<()> {
+    start_turn(
+        state,
+        st,
+        server_writer,
+        methods::REVIEW_START,
+        params,
+        |st| st.review.begin(),
+    )
+    .await;
+    Ok(())
+}
+
+/// Clears the conversation history.
+///
+/// Preserves the running session cost and re-syncs the theme so the reset model
+/// and history views keep the active theme mode. Shared by the keyboard and
+/// mouse confirmation paths.
+pub(crate) async fn confirm_clear_history(
+    mut st: MutexGuard<'_, AppState>,
+    server_writer: &mut RpcConnection,
+) -> anyhow::Result<()> {
+    let cost = st.model.session_total_cost;
+    let prev_cost = st.model.prev_cost;
+    st.model = DevelopView {
+        session_total_cost: cost,
+        prev_cost,
+        ..Default::default()
+    };
+    st.history_view = HistoryViewState::default();
+    st.sync_theme_mode();
+    drop(st);
+    send_request(
+        server_writer,
+        methods::MODEL_CLEAR_HISTORY,
+        serde_json::json!({}),
+    )
+    .await?;
+    Ok(())
 }
 
 /// The plan view is refreshed from server responses, so nothing is cleared locally
@@ -273,25 +392,8 @@ pub(crate) async fn handle_dialog_event(
 
                 // C-Enter accelerator unconditionally launches review from any section.
                 if matches!(key.code, KeyCode::Enter) && is_cmd {
-                    let prompt = dialog.prompt_editor.get_text().trim().to_string();
-                    let selected_model = dialog.selected_entry().map(|e| e.model.clone());
-                    let params = ReviewStartParams {
-                        model: selected_model,
-                        user_prompt: if prompt.is_empty() {
-                            None
-                        } else {
-                            Some(prompt)
-                        },
-                    };
-                    start_turn(
-                        state,
-                        st,
-                        server_writer,
-                        methods::REVIEW_START,
-                        serde_json::to_value(params)?,
-                        |st| st.review.begin(),
-                    )
-                    .await;
+                    let params = serde_json::to_value(dialog.start_params())?;
+                    confirm_start_review(state, st, server_writer, params).await?;
                     return Ok(Some(InputResult::Continue));
                 }
 
@@ -344,26 +446,8 @@ pub(crate) async fn handle_dialog_event(
                         // begins only from the focused `Confirm` button. The safe
                         // `Cancel` default dismisses the dialog (Conventions §7).
                         if dialog.confirm_button == crate::app::ConfirmDialogButton::Confirm {
-                            let prompt = dialog.prompt_editor.get_text().trim().to_string();
-                            let selected_model =
-                                dialog.selected_entry().map(|e| e.model.clone());
-                            let params = ReviewStartParams {
-                                model: selected_model,
-                                user_prompt: if prompt.is_empty() {
-                                    None
-                                } else {
-                                    Some(prompt)
-                                },
-                            };
-                            start_turn(
-                                state,
-                                st,
-                                server_writer,
-                                methods::REVIEW_START,
-                                serde_json::to_value(params)?,
-                                |st| st.review.begin(),
-                            )
-                            .await;
+                            let params = serde_json::to_value(dialog.start_params())?;
+                            confirm_start_review(state, st, server_writer, params).await?;
                             return Ok(Some(InputResult::Continue));
                         }
                         // Safe cancel dismisses without re-attaching the dialog.
@@ -375,6 +459,15 @@ pub(crate) async fn handle_dialog_event(
                                 key,
                                 is_cmd,
                                 true,
+                            );
+                        } else if dialog.focus.is_path_editor() {
+                            // The target path is a single-line field: newline
+                            // insertion and vertical movement stay disabled.
+                            crate::input::handle_editor_key(
+                                &mut dialog.path_editor,
+                                key,
+                                is_cmd,
+                                false,
                             );
                         }
                         st.review_dialog = Some(dialog);
@@ -538,19 +631,7 @@ pub(crate) async fn handle_dialog_event(
                     ConfirmOutcome::Toggled => st.confirm_execute_review = Some(target),
                     ConfirmOutcome::Dismissed => {}
                     ConfirmOutcome::Accepted => {
-                        let params = tauqe_protocol::ReviewExecuteParams {
-                            review_id: target.review_id,
-                            item_id: target.item_id,
-                        };
-                        start_turn(
-                            state,
-                            st,
-                            server_writer,
-                            methods::REVIEW_EXECUTE,
-                            serde_json::to_value(params)?,
-                            begin_review_execution_turn,
-                        )
-                        .await;
+                        confirm_execute_review(state, st, server_writer, target).await?;
                     }
                 }
             }
@@ -562,19 +643,7 @@ pub(crate) async fn handle_dialog_event(
                     ConfirmOutcome::Toggled => st.confirm_execute_scope = Some(target),
                     ConfirmOutcome::Dismissed => {}
                     ConfirmOutcome::Accepted => {
-                        let params = tauqe_protocol::PlanExecuteParams {
-                            plan_id: target.plan_id,
-                            step_id: target.step_id,
-                        };
-                        start_turn(
-                            state,
-                            st,
-                            server_writer,
-                            methods::PLAN_EXECUTE,
-                            serde_json::to_value(params)?,
-                            begin_develop_turn,
-                        )
-                        .await;
+                        confirm_execute_scope(state, st, server_writer, target).await?;
                     }
                 }
             }
@@ -595,22 +664,7 @@ pub(crate) async fn handle_dialog_event(
                 ConfirmOutcome::Dismissed => st.confirm_clear_history = false,
                 ConfirmOutcome::Accepted => {
                     st.confirm_clear_history = false;
-                    let cost = st.model.session_total_cost;
-                    let prev_cost = st.model.prev_cost;
-                    st.model = DevelopView {
-                        session_total_cost: cost,
-                        prev_cost,
-                        ..Default::default()
-                    };
-                    st.history_view = HistoryViewState::default();
-                    st.sync_theme_mode();
-                    drop(st);
-                    send_request(
-                        server_writer,
-                        methods::MODEL_CLEAR_HISTORY,
-                        serde_json::json!({}),
-                    )
-                    .await?;
+                    confirm_clear_history(st, server_writer).await?;
                 }
             }
             return Ok(Some(InputResult::Continue));
@@ -647,6 +701,12 @@ pub(crate) async fn handle_dialog_event(
         }
         Some(ActiveModal::Selection) => {
             return selection::handle_selection_dialog_key(key, st, server_writer).await;
+        }
+        Some(ActiveModal::ThemeSelector) => {
+            let visible =
+                crate::theme::selector::theme_selector_visible_height(st.last_frame_area);
+            crate::theme::selector::handle_theme_selector_key(key, &mut st, visible);
+            return Ok(Some(InputResult::Continue));
         }
         Some(ActiveModal::Help) => {
             match key.code {
@@ -692,7 +752,7 @@ pub(crate) async fn handle_dialog_event(
 mod tests {
     use std::sync::Arc;
 
-    use tauqe_protocol::{ReviewItem, ReviewSeverity, ReviewStatus};
+    use tauqe_protocol::{ReviewItem, ReviewItemStatus, ReviewSeverity};
 
     use super::*;
     use crate::app::{ConfirmDialogButton, ConfirmExecuteReviewState};
@@ -703,8 +763,9 @@ mod tests {
             title: format!("Finding {}", id),
             model: None,
             severity: ReviewSeverity::Warning,
-            status: ReviewStatus::Todo,
+            status: ReviewItemStatus::Todo,
             files: Vec::new(),
+            subplan: Vec::new(),
             resolution_notes: None,
             body: String::new(),
         }
@@ -768,5 +829,32 @@ mod tests {
             Some("Executing review finding(s): switched to REPL for coder execution")
         );
         assert!(!pending, "confirmation state must be consumed");
+    }
+
+    #[tokio::test]
+    async fn review_dialog_path_editor_captures_typed_text() {
+        use crate::app::{ReviewDialogFocus, ReviewDialogState};
+
+        let mut st = crate::app::test_state();
+        st.view_mode = ViewMode::Review;
+        let mut dialog = ReviewDialogState::new(1, 10, Vec::new());
+        dialog.focus = ReviewDialogFocus::PathEditor;
+        st.review_dialog = Some(dialog);
+
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+
+        handle_dialog_event(
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+            &state,
+            &mut conn,
+        )
+        .await
+        .expect("in-memory dispatch never fails");
+
+        let guard = state.lock().await;
+        let dialog = guard.review_dialog.as_ref().expect("dialog stays open");
+        assert_eq!(dialog.path_editor.get_text(), "x");
+        assert!(dialog.prompt_editor.is_empty());
     }
 }

@@ -22,6 +22,7 @@ pub struct TerminalGuard {
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
+        reset_terminal_background();
         let _ = execute!(
             stdout(),
             DisableFocusChange,
@@ -104,6 +105,50 @@ pub fn sanitize_notification_text(raw: &str, max_len: usize) -> String {
         }
     }
     cleaned.trim().to_string()
+}
+
+pub fn wrap_osc_payload(payload: &str) -> Vec<u8> {
+    if std::env::var_os("TMUX").is_some() {
+        let escaped = payload.replace('\x1b', "\x1b\x1b");
+        format!("\x1bPtmux;{}\x1b\\", escaped).into_bytes()
+    } else {
+        payload.as_bytes().to_vec()
+    }
+}
+
+pub fn format_osc11_background(color: crate::theme::color::RgbColor) -> Vec<u8> {
+    let payload = format!(
+        "\x1b]11;#{:02x}{:02x}{:02x}\x07\x1b]11;#{:02x}{:02x}{:02x}\x1b\\",
+        color.r, color.g, color.b, color.r, color.g, color.b
+    );
+    wrap_osc_payload(&payload)
+}
+
+pub fn format_osc111_reset() -> Vec<u8> {
+    let payload = "\x1b]111\x07\x1b]111\x1b\\";
+    wrap_osc_payload(payload)
+}
+
+/// Updates the host terminal's default window background color via OSC 11 to match
+/// the active canvas palette, coloring any external window margins/padding.
+pub fn update_terminal_background(color: crate::theme::color::RgbColor) {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static CURRENT_COLOR: AtomicU32 = AtomicU32::new(u32::MAX);
+    let packed = ((color.r as u32) << 16) | ((color.g as u32) << 8) | (color.b as u32);
+    if CURRENT_COLOR.swap(packed, Ordering::Relaxed) != packed {
+        let payload = format_osc11_background(color);
+        let mut out = stdout();
+        let _ = out.write_all(&payload);
+        let _ = out.flush();
+    }
+}
+
+/// Resets the host terminal's window background color via OSC 111.
+pub fn reset_terminal_background() {
+    let payload = format_osc111_reset();
+    let mut out = stdout();
+    let _ = out.write_all(&payload);
+    let _ = out.flush();
 }
 
 pub fn format_desktop_notification(
@@ -213,6 +258,18 @@ mod tests {
         let cleaned = sanitize_notification_text(input, 15);
         assert_eq!(cleaned.chars().count(), 15);
         assert_eq!(cleaned, "Проверка длинно");
+    }
+
+    #[test]
+    fn test_format_osc11_background_and_reset() {
+        let color = crate::theme::color::RgbColor::new(26, 27, 38);
+        let osc11 = format_osc11_background(color);
+        let s = String::from_utf8(osc11).unwrap();
+        assert!(s.contains("]11;#1a1b26"));
+
+        let osc111 = format_osc111_reset();
+        let s111 = String::from_utf8(osc111).unwrap();
+        assert!(s111.contains("]111"));
     }
 
     #[test]

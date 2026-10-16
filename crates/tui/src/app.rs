@@ -1,13 +1,15 @@
 use ratatui::layout::Rect;
 use tauqe_protocol::{
     ContextState, DiscussionFocus, ModelRef, ModelRole, ModelRolesSummary, ModelSelection,
-    ReasoningEffort, RepositoryState, SystemStatusResult,
+    ReasoningEffort, RepositoryState, ReviewStartParams, SystemStatusResult,
 };
 
 use crate::components::model_selector::ModelSelector;
 use crate::components::ListSelector;
 use crate::config::TuiConfig;
 use crate::editor::InputEditor;
+use crate::theme::presets::ThemePreset;
+use crate::theme::selector::ThemeSelectorState;
 use crate::views::context::ContextViewState;
 use crate::views::develop::{DevelopView, TurnStatus};
 use crate::views::history::HistoryViewState;
@@ -96,6 +98,7 @@ pub enum ActiveModal {
     ClearHistory,
     Status,
     Selection,
+    ThemeSelector,
     Help,
 }
 
@@ -396,7 +399,7 @@ pub enum StatusDialogTarget {
         review_id: Option<String>,
         item_id: u32,
         item_title: String,
-        current_status: tauqe_protocol::ReviewStatus,
+        current_status: tauqe_protocol::ReviewItemStatus,
     },
 }
 
@@ -461,14 +464,6 @@ impl PromptModalState {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct DiscussReviewDialogState {
-    pub review_id: String,
-    pub review_title: String,
-    pub focused_items: Vec<(u32, String)>,
-    pub prompt_editor: InputEditor,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StatusDialogState {
     pub target: StatusDialogTarget,
@@ -503,6 +498,8 @@ pub enum ViewMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ReviewDialogFocus {
     ModelList,
+    /// Single-line field for the target directory or glob pattern.
+    PathEditor,
     #[default]
     PromptEditor,
     Actions,
@@ -512,16 +509,18 @@ impl ReviewDialogFocus {
     /// Advances focus to the next section in visual order.
     ///
     /// When only one model is configured, `ModelList` is omitted from cycling so
-    /// navigation moves directly between the prompt editor and action buttons.
+    /// navigation moves directly between the path field, the prompt editor, and
+    /// the action buttons.
     pub fn cycle_next(&mut self, entry_count: usize) {
         *self = match self {
-            Self::ModelList => Self::PromptEditor,
+            Self::ModelList => Self::PathEditor,
+            Self::PathEditor => Self::PromptEditor,
             Self::PromptEditor => Self::Actions,
             Self::Actions => {
                 if entry_count > 1 {
                     Self::ModelList
                 } else {
-                    Self::PromptEditor
+                    Self::PathEditor
                 }
             }
         };
@@ -531,19 +530,24 @@ impl ReviewDialogFocus {
     pub fn cycle_prev(&mut self, entry_count: usize) {
         *self = match self {
             Self::ModelList => Self::Actions,
-            Self::PromptEditor => {
+            Self::PathEditor => {
                 if entry_count > 1 {
                     Self::ModelList
                 } else {
                     Self::Actions
                 }
             }
+            Self::PromptEditor => Self::PathEditor,
             Self::Actions => Self::PromptEditor,
         };
     }
 
     pub fn is_model_list(&self) -> bool {
         matches!(self, Self::ModelList)
+    }
+
+    pub fn is_path_editor(&self) -> bool {
+        matches!(self, Self::PathEditor)
     }
 
     pub fn is_prompt_editor(&self) -> bool {
@@ -562,6 +566,13 @@ pub struct ReviewDialogState {
     /// Reviewer-role model selector: configured entries, cyclic navigation,
     /// embedded-list rendering, and the shared scroll arithmetic (c-1, c-2).
     pub selector: ModelSelector,
+    /// Single-line target directory or glob pattern narrowing the reviewed set.
+    ///
+    /// The value is sent as `ReviewStartParams::path_pattern`, so the matched
+    /// files are merged alongside the User Context on the server instead of
+    /// replacing it: the developer keeps exclusive ownership of that layer
+    /// (c-review-context-input).
+    pub path_editor: InputEditor,
     pub prompt_editor: InputEditor,
     /// Section that currently owns the keyboard.
     pub focus: ReviewDialogFocus,
@@ -581,6 +592,7 @@ impl ReviewDialogState {
             files_count,
             estimated_tokens,
             selector: ModelSelector::new(ModelRole::Reviewer, reviewer_entries, 0),
+            path_editor: InputEditor::default(),
             prompt_editor: InputEditor::default(),
             focus: ReviewDialogFocus::default(),
             confirm_button: ConfirmDialogButton::Cancel,
@@ -590,6 +602,23 @@ impl ReviewDialogState {
     /// Currently selected reviewer entry, if any.
     pub fn selected_entry(&self) -> Option<&tauqe_protocol::ModelEntry> {
         self.selector.selected_entry()
+    }
+
+    /// Builds the RPC parameters that launch this review.
+    ///
+    /// Both text fields are trimmed and collapse to `None` when blank, so an
+    /// empty prompt or path never reaches the server as a meaningless value.
+    /// The optional directory or glob becomes `path_pattern`, which the server
+    /// applies by merging the matched files with the current User Context
+    /// without mutating the developer's layer (c-review-context-input).
+    pub fn start_params(&self) -> ReviewStartParams {
+        let prompt = self.prompt_editor.get_text().trim().to_string();
+        let pattern = self.path_editor.get_text().trim().to_string();
+        ReviewStartParams {
+            model: self.selected_entry().map(|entry| entry.model.clone()),
+            user_prompt: if prompt.is_empty() { None } else { Some(prompt) },
+            path_pattern: if pattern.is_empty() { None } else { Some(pattern) },
+        }
     }
 }
 
@@ -906,7 +935,6 @@ pub struct AppState {
     pub squash_dialog: Option<SquashDialogState>,
     pub review_dialog: Option<ReviewDialogState>,
     pub prompt_modal: Option<PromptModalState>,
-    pub discuss_review_dialog: Option<DiscussReviewDialogState>,
     pub notification: Option<AppNotification>,
     pub turn_started_at: Option<std::time::Instant>,
     pub server_disconnected: Option<String>,
@@ -925,6 +953,10 @@ pub struct AppState {
     /// The server owns the authoritative value and broadcasts every change via
     /// `discussion/focusChanged`; the client only mirrors it for rendering.
     pub discussion_focus: DiscussionFocus,
+    /// Active theme preset currently painted across the interface.
+    pub active_theme_preset: ThemePreset,
+    /// Interactive theme preset selector, when open.
+    pub theme_selector: Option<ThemeSelectorState>,
 }
 
 impl AppState {
@@ -932,6 +964,10 @@ impl AppState {
     /// every transient field with a default. Shared by production startup and
     /// tests so the field set is defined in exactly one place.
     pub fn new(init: AppInit) -> Self {
+        let active_theme_preset = ThemePreset::resolve(
+            init.tui_config.theme.name.as_deref(),
+            init.tui_config.theme.mode.resolve(),
+        );
         Self {
             view_mode: init.view_mode,
             protocol_version: init.protocol_version,
@@ -972,7 +1008,6 @@ impl AppState {
             squash_dialog: None,
             review_dialog: None,
             prompt_modal: None,
-            discuss_review_dialog: None,
             notification: None,
             turn_started_at: None,
             server_disconnected: None,
@@ -985,6 +1020,8 @@ impl AppState {
             model_choice: ModelChoice::default(),
             running_model: None,
             discussion_focus: DiscussionFocus::None,
+            active_theme_preset,
+            theme_selector: None,
         }
     }
 
@@ -1147,6 +1184,9 @@ impl AppState {
         if self.selection_dialog.is_some() {
             return Some(ActiveModal::Selection);
         }
+        if self.theme_selector.is_some() {
+            return Some(ActiveModal::ThemeSelector);
+        }
         if self.show_help {
             return Some(ActiveModal::Help);
         }
@@ -1156,12 +1196,9 @@ impl AppState {
     /// Whether any modal surface (or the inline Context-view file input)
     /// currently suppresses background interaction.
     pub fn has_active_modal(&self) -> bool {
-        // `discuss_review_dialog` is retained for compatibility and `adding_file`
-        // is an inline Context-view input; neither participates in the modal
-        // stack, yet both still block background interaction.
-        self.active_modal().is_some()
-            || self.discuss_review_dialog.is_some()
-            || self.context_view.adding_file
+        // `adding_file` is an inline Context-view input; it does not participate
+        // in the modal stack, yet it still blocks background interaction.
+        self.active_modal().is_some() || self.context_view.adding_file
     }
 
     pub fn active_notification(&self) -> Option<&AppNotification> {
@@ -1224,15 +1261,39 @@ impl AppState {
     }
 
     /// Propagates the configured theme to every view that renders Markdown,
-    /// resolving `Auto` against the terminal background. Called on startup, on
-    /// configuration reload, and whenever a view is rebuilt from defaults.
+    /// resolving `Auto` against the terminal background and applying the
+    /// configured preset. Called on startup, on configuration reload, and
+    /// whenever a view is rebuilt from defaults.
     pub fn sync_theme_mode(&mut self) {
         crate::markdown::set_color_depth_override(self.tui_config.theme.color_depth);
+        let preset = ThemePreset::resolve(
+            self.tui_config.theme.name.as_deref(),
+            self.tui_config.theme.mode.resolve(),
+        );
+        self.apply_theme_preset(preset);
+    }
+
+    /// Applies a theme preset to the live interface (hot reload).
+    ///
+    /// The global projection engine and every Markdown-bearing surface are
+    /// refreshed in place, so a preset swap — from a configuration reload or
+    /// the interactive selector — takes effect immediately without a restart
+    /// and without disturbing the prompt draft or any in-flight turn (`#c-4`).
+    pub fn apply_theme_preset(&mut self, preset: ThemePreset) {
+        self.active_theme_preset = preset;
+        crate::theme::engine::set_active_preset(Some(preset));
         let mode = self.tui_config.theme.mode.resolve();
         self.model.set_theme_mode(mode);
+        self.model.refresh_theme();
         self.history_view.theme_mode = mode;
+        self.history_view.refresh_theme();
         self.plans_view.theme_mode = mode;
         self.review.theme_mode = mode;
+    }
+
+    /// Opens the interactive theme preset selector, seeded on the active preset.
+    pub fn open_theme_selector(&mut self) {
+        self.theme_selector = Some(ThemeSelectorState::new(self.active_theme_preset));
     }
 }
 
@@ -1262,6 +1323,25 @@ pub(crate) fn test_state() -> AppState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_apply_theme_preset_hot_swaps_without_touching_draft() {
+        let mut st = test_state();
+        st.input_editor.insert_str("unsubmitted draft");
+
+        st.apply_theme_preset(ThemePreset::Gruvbox);
+        assert_eq!(st.active_theme_preset, ThemePreset::Gruvbox);
+        // A hot theme swap never disturbs the developer's unsubmitted prompt.
+        assert_eq!(st.input_editor.get_text(), "unsubmitted draft");
+    }
+
+    #[test]
+    fn test_sync_theme_mode_reads_preset_from_configuration() {
+        let mut st = test_state();
+        st.tui_config.theme.name = Some("catppuccin".to_string());
+        st.sync_theme_mode();
+        assert_eq!(st.active_theme_preset, ThemePreset::Catppuccin);
+    }
 
     #[test]
     fn test_onboarding_next_step_deterministic_order() {
@@ -1606,5 +1686,67 @@ mod tests {
         assert_eq!(button, BatchCancelButton::HardStop);
         button.cycle_prev();
         assert_eq!(button, BatchCancelButton::SoftStop);
+    }
+
+    #[test]
+    fn test_review_dialog_focus_cycles_through_path_editor() {
+        // More than one reviewer configured: the model list participates.
+        let mut focus = ReviewDialogFocus::PromptEditor;
+        focus.cycle_next(3);
+        assert_eq!(focus, ReviewDialogFocus::Actions);
+        focus.cycle_next(3);
+        assert_eq!(focus, ReviewDialogFocus::ModelList);
+        focus.cycle_next(3);
+        assert_eq!(focus, ReviewDialogFocus::PathEditor);
+        focus.cycle_next(3);
+        assert_eq!(focus, ReviewDialogFocus::PromptEditor);
+
+        // Backward order mirrors the forward order exactly.
+        focus.cycle_prev(3);
+        assert_eq!(focus, ReviewDialogFocus::PathEditor);
+        focus.cycle_prev(3);
+        assert_eq!(focus, ReviewDialogFocus::ModelList);
+        focus.cycle_prev(3);
+        assert_eq!(focus, ReviewDialogFocus::Actions);
+        focus.cycle_prev(3);
+        assert_eq!(focus, ReviewDialogFocus::PromptEditor);
+    }
+
+    #[test]
+    fn test_review_dialog_focus_skips_model_list_when_single_reviewer() {
+        let mut focus = ReviewDialogFocus::PromptEditor;
+        focus.cycle_next(1);
+        assert_eq!(focus, ReviewDialogFocus::Actions);
+        focus.cycle_next(1);
+        assert_eq!(focus, ReviewDialogFocus::PathEditor);
+        focus.cycle_next(1);
+        assert_eq!(focus, ReviewDialogFocus::PromptEditor);
+
+        focus.cycle_prev(1);
+        assert_eq!(focus, ReviewDialogFocus::PathEditor);
+        focus.cycle_prev(1);
+        assert_eq!(focus, ReviewDialogFocus::Actions);
+        focus.cycle_prev(1);
+        assert_eq!(focus, ReviewDialogFocus::PromptEditor);
+    }
+
+    #[test]
+    fn test_review_dialog_start_params_folds_path_and_prompt() {
+        let mut dialog = ReviewDialogState::new(0, 0, Vec::new());
+
+        // Both fields start blank: neither reaches the wire.
+        let params = dialog.start_params();
+        assert!(params.user_prompt.is_none());
+        assert!(params.path_pattern.is_none());
+        assert_eq!(serde_json::to_string(&params).unwrap(), "{}");
+
+        dialog.prompt_editor.insert_str("  focus on error handling  ");
+        dialog.path_editor.insert_str(" crates/core/src/**/*.rs ");
+        let params = dialog.start_params();
+        assert_eq!(params.user_prompt.as_deref(), Some("focus on error handling"));
+        assert_eq!(
+            params.path_pattern.as_deref(),
+            Some("crates/core/src/**/*.rs")
+        );
     }
 }

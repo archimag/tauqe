@@ -229,11 +229,12 @@ impl ExecutionMode for SingleExecution {
             let is_blocked = turn.blocked.is_some();
             let is_error = matches!(
                 &turn.result,
-                ModelResult::Edit { error: Some(_), applied: false, .. }
+                ModelResult::Edit { outcome, .. } if outcome.error.is_some() && !outcome.applied
             );
             let is_empty_edit = matches!(
                 &turn.result,
-                ModelResult::Edit { edits, error: None, .. } if edits.is_empty()
+                ModelResult::Edit { edits, outcome, .. }
+                    if edits.is_empty() && outcome.error.is_none()
             );
 
             if (is_error || is_empty_edit)
@@ -284,10 +285,14 @@ impl ExecutionMode for SingleExecution {
                         context_manager.prune_missing_files();
 
                         let reason = if is_error {
-                            if let ModelResult::Edit { error: Some(ref err_msg), .. } = turn.result {
-                                err_msg.clone()
-                            } else {
-                                "Unknown error".to_string()
+                            match &turn.result {
+                                ModelResult::Edit { outcome, .. } if outcome.error.is_some() => {
+                                    outcome
+                                        .error
+                                        .clone()
+                                        .unwrap_or_else(|| "Unknown error".to_string())
+                                }
+                                _ => "Unknown error".to_string(),
                             }
                         } else {
                             "No valid edits".to_string()
@@ -467,9 +472,13 @@ coder = [
             .expect("single execution runs to completion");
 
         match execution.result {
-            ModelResult::Edit { applied, error, .. } => {
-                assert!(error.is_none(), "unexpected error: {error:?}");
-                assert!(applied, "verified turn should be applied");
+            ModelResult::Edit { outcome, .. } => {
+                assert!(
+                    outcome.error.is_none(),
+                    "unexpected error: {:?}",
+                    outcome.error
+                );
+                assert!(outcome.applied, "verified turn should be applied");
             }
             other => panic!("expected applied edits, got {other:?}"),
         }

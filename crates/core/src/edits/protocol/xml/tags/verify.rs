@@ -8,7 +8,7 @@ pub(crate) fn next_verify_tag(text: &str) -> Option<(usize, usize)> {
     next_simple_tag(text, "<verify")
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VerifyTarget {
     All,
     Check,
@@ -16,7 +16,7 @@ pub enum VerifyTarget {
     Clippy,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VerifyOnSuccess {
     Silent,
     Report,

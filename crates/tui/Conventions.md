@@ -156,3 +156,34 @@ This document specifies mandatory architectural and UX invariants for the Tauqe 
 
 4. **Focus Indicator:**
   - While the Viewport has focus, the prompt border is dimmed and titled `[VIEWPORT]`.
+
+---
+
+## 8. Semantic Design System and Absolute Prohibition of Raw Colors
+
+1. **Single Source of Truth for Visual Styling (`ThemeEngine` & `ThemePalette`):**
+   - All presentation rendering across primary views, modal dialogs, popup overlays, text editors, and global chrome must resolve colors and styles exclusively through `crate::theme::engine::current_engine()` (or a passed `&ThemeEngine`) and the semantic `ThemePalette` tokens.
+   - UI components must never hardcode concrete terminal colors, construct ad-hoc ANSI styles, or invent local color constants.
+
+2. **Absolute Prohibition of Raw Colors:**
+   - Direct usage of raw `ratatui::style::Color` variants (e.g. `Color::Black`, `Color::White`, `Color::Red`, `Color::Green`, `Color::Yellow`, `Color::Blue`, `Color::Magenta`, `Color::Cyan`, `Color::Gray`, `Color::DarkGray`, `Color::Light*`, `Color::Rgb(...)`, `Color::Indexed(...)`) or unstyled/default-filled blocks in presentation code is **strictly forbidden**.
+   - The sole allowed color constructor in UI code is projection through `engine.color(role)`, `engine.fg(role)`, and `engine.bg(role)`.
+
+3. **Mandatory Surface and Background Layering:**
+   - Visual hierarchy must be maintained strictly through palette layer roles:
+     - `canvas` — root workspace/window background;
+     - `surface` — modal dialog cards, popups, and bordered containers;
+     - `overlay` — floating dropdowns, selection rows, and contextual menus;
+     - `code_bg` — inline and block code surfaces.
+   - Leaving modal dialogs, popups, or confirmation overlays with transparent, unstyled, or default terminal backgrounds (`Color::Reset` or unstyled blocks) is strictly prohibited. Every modal container MUST explicitly fill its background using `palette.surface` (or `palette.overlay`) so underlying content is visually occluded across all color depths.
+
+4. **Semantic Role Mapping:**
+   - **Text:** `text_primary` for headings and high-priority content, `text_secondary` for descriptive labels and secondary values, `text_muted` for subtle hints, borders, and inactive separators, `text_inverse` for text rendered over accented backgrounds (active buttons, badges).
+   - **Borders & Chrome:** `border` for standard container dividers; `ModalTone` (`Info`, `Warning`, `Dangerous`, `Accent`) for semantic dialog border accents.
+   - **Action Controls:** `button_bg` and `button_fg` for resting buttons, `button_active_bg` and `text_inverse` for focused/active buttons, `status_error` and `text_inverse` for dangerous/destructive action buttons.
+   - **Status & Indicators:** `status_info`, `status_success`, `status_warning`, `status_error` for notifications, telemetry, and lifecycle badges.
+   - **Diffs & Patches:** `diff_added`, `diff_removed`, `diff_context` for unified diffs and file reviews.
+
+5. **Projection Transparency:**
+   - View code must never attempt manual ANSI downsampling, 16-color degradation branching, or separate light/dark logic branches.
+   - The `ThemeEngine` automatically projects semantic tokens through the active `ColorProjector` (`Truecolor` → `ANSI 256` → `ANSI 16` fallback with attributes), guaranteeing legibility and WCAG contrast in all terminal environments.

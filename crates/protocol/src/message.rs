@@ -26,14 +26,29 @@ fn is_sensitive_method(method: &str) -> bool {
     method == crate::methods::CREDENTIALS_SAVE || method.starts_with("credentials/")
 }
 
+/// Reports whether a JSON object key names a secret and must be redacted.
+///
+/// Matching is tolerant of case and separator differences — `api_key`,
+/// `api-key`, `apiKey`, and `openrouter_api_key` all collapse to the same
+/// normalized form — and recognizes credential key *families* rather than a
+/// fixed whitelist of exact names, so variants such as `access_token`,
+/// `refresh_token`, `client_secret`, `authorization`, and `bearer` cannot slip
+/// through in plaintext.
 fn is_sensitive_key(key: &str) -> bool {
-    let lower = key.to_ascii_lowercase();
-    lower == "api_key"
-        || lower == "apikey"
-        || lower == "key"
-        || lower == "token"
-        || lower == "secret"
-        || lower == "password"
+    // Strip non-alphanumerics so `api_key`, `api-key`, and `apikey` normalize
+    // identically before the suffix and substring tests below.
+    let normalized: String = key
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .map(|c| c.to_ascii_lowercase())
+        .collect();
+
+    normalized.ends_with("key")
+        || normalized.contains("token")
+        || normalized.contains("secret")
+        || normalized.contains("password")
+        || normalized.contains("authorization")
+        || normalized.contains("bearer")
 }
 
 fn redact_sensitive_json(value: &serde_json::Value, sensitive_context: bool) -> serde_json::Value {
@@ -58,13 +73,11 @@ fn redact_sensitive_json(value: &serde_json::Value, sensitive_context: bool) -> 
             }
             serde_json::Value::Object(sanitized)
         }
-        serde_json::Value::Array(arr) => {
-            serde_json::Value::Array(
-                arr.iter()
-                    .map(|v| redact_sensitive_json(v, sensitive_context))
-                    .collect(),
-            )
-        }
+        serde_json::Value::Array(arr) => serde_json::Value::Array(
+            arr.iter()
+                .map(|v| redact_sensitive_json(v, sensitive_context))
+                .collect(),
+        ),
         serde_json::Value::String(_) if sensitive_context => {
             serde_json::Value::String("<redacted>".to_string())
         }
@@ -241,6 +254,20 @@ impl std::fmt::Debug for Message {
     }
 }
 
+/// Deserializes an `id` field that is present in the wire payload.
+///
+/// Serde invokes this only when the `id` key exists, so a JSON `null` maps to
+/// `RequestId::Null` and yields `Some(RequestId::Null)`. An absent key instead
+/// falls back to `None` through `#[serde(default)]`, letting the classifier
+/// tell a request that carries a null id apart from an event that carries no
+/// id at all.
+fn deserialize_present_id<'de, D>(deserializer: D) -> Result<Option<RequestId>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    RequestId::deserialize(deserializer).map(Some)
+}
+
 /// Permissive capture of every field a wire message may carry.
 ///
 /// A message is classified by field presence rather than by untagged
@@ -250,7 +277,7 @@ impl std::fmt::Debug for Message {
 /// [`Response`] shape.
 #[derive(Deserialize)]
 struct RawMessage {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_present_id")]
     id: Option<RequestId>,
     #[serde(default)]
     method: Option<String>,
@@ -269,8 +296,11 @@ impl<'de> Deserialize<'de> for Message {
     {
         let raw = RawMessage::deserialize(deserializer)?;
 
-        // A message carrying `method` is a client request (when it has an id)
-        // or a server event (when it does not). Any other object is a response.
+        // A message carrying `method` is a client request when the `id` key is
+        // present — including an explicit `null`, which classifies as
+        // `RequestId::Null` so the server can reject it deterministically — and
+        // a server event when the `id` key is entirely absent. Any other object
+        // is a response.
         match raw.method {
             Some(method) => match raw.id {
                 Some(id) => Ok(Message::Request(Request {
@@ -397,10 +427,20 @@ mod tests {
         // error rather than being silently absorbed by the response shape.
         assert!(serde_json::from_str::<Message>(r#"{"id":1,"method":123}"#).is_err());
 
-        // A request carrying a null id is not a valid request; it is routed to a
-        // server event, so no reply is ever produced on a null correlation id.
+        // A request carrying an explicitly null id is still a request: the
+        // server then rejects it deterministically instead of silently dropping
+        // it, so a malformed client is never left waiting.
         match serde_json::from_str::<Message>(r#"{"id":null,"method":"ping"}"#).unwrap() {
-            Message::Event(event) => assert_eq!(event.method, "ping"),
+            Message::Request(request) => {
+                assert_eq!(request.id, RequestId::Null);
+                assert_eq!(request.method, "ping");
+            }
+            other => panic!("Expected Request with null id, got {other:?}"),
+        }
+
+        // A message that omits the `id` key entirely is a server event.
+        match serde_json::from_str::<Message>(r#"{"method":"model/delta"}"#).unwrap() {
+            Message::Event(event) => assert_eq!(event.method, "model/delta"),
             other => panic!("Expected Event, got {other:?}"),
         }
 
@@ -502,6 +542,69 @@ mod tests {
 
         let rendered = format!("{err:?}");
         assert!(!rendered.contains("secret-token-failed"));
+        assert!(rendered.contains("<redacted>"));
+    }
+
+    #[test]
+    fn test_is_sensitive_key_matches_credential_variants() {
+        for key in [
+            "api_key",
+            "api-key",
+            "apiKey",
+            "apikey",
+            "key",
+            "openrouter_api_key",
+            "access_token",
+            "refresh_token",
+            "id_token",
+            "secret",
+            "client_secret",
+            "password",
+            "new_password",
+            "authorization",
+            "bearer",
+        ] {
+            assert!(is_sensitive_key(key), "{key} must be treated as sensitive");
+        }
+
+        for key in ["path", "method", "model", "name", "keyword", "count"] {
+            assert!(
+                !is_sensitive_key(key),
+                "{key} must not be treated as sensitive"
+            );
+        }
+    }
+
+    #[test]
+    fn test_request_debug_redacts_common_credential_key_variants() {
+        let req = Request {
+            id: RequestId::Number(5),
+            method: "custom/echo".to_string(),
+            params: Some(serde_json::json!({
+                "openrouter_api_key": "sk-or-secret-value",
+                "access_token": "access-secret-value",
+                "refresh_token": "refresh-secret-value",
+                "authorization": "auth-secret-value",
+                "client_secret": "client-secret-value",
+                "bearer": "bearer-secret-value",
+                "api-key": "dashed-secret-value",
+                "safe_field": "visible_value"
+            })),
+        };
+
+        let rendered = format!("{req:?}");
+        for secret in [
+            "sk-or-secret-value",
+            "access-secret-value",
+            "refresh-secret-value",
+            "auth-secret-value",
+            "client-secret-value",
+            "bearer-secret-value",
+            "dashed-secret-value",
+        ] {
+            assert!(!rendered.contains(secret), "{secret} leaked into Debug");
+        }
+        assert!(rendered.contains("visible_value"));
         assert!(rendered.contains("<redacted>"));
     }
 }

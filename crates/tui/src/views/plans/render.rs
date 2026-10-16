@@ -19,6 +19,10 @@ pub fn render_plans_view(
     let width = (inner.width as usize).max(10);
     state.plans_view.view_height = height;
     state.plans_view.content_width = width;
+    // Mirror the authoritative discussion focus so the row builder can mark the
+    // anchored element without re-reading global application state.
+    let focus = state.discussion_focus.clone();
+    state.plans_view.discussion_focus = focus;
 
     let rows = state.plans_view.flatten_rows();
     state.plans_view.clamp_selection();

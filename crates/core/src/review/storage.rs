@@ -469,6 +469,7 @@ mod tests {
                 severity: ReviewSeverity::Critical,
                 status: ReviewItemStatus::Discussion,
                 files: vec!["crates/core/src/lib.rs".to_string()],
+                subplan: Vec::new(),
                 resolution_notes: None,
                 body: "Check input validation".to_string(),
             }],
@@ -553,6 +554,7 @@ mod tests {
                 severity: tauqe_protocol::ReviewSeverity::Suggestion,
                 status: ReviewItemStatus::Todo,
                 files: vec![],
+                subplan: Vec::new(),
                 resolution_notes: None,
                 body: "Check".to_string(),
             })

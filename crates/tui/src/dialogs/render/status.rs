@@ -1,8 +1,10 @@
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Color, Style, Stylize};
+use ratatui::style::{Style, Stylize};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+use ratatui::widgets::Paragraph;
 
+use crate::components::modal::{render_modal_container, ModalTone};
+use crate::theme::engine::current_engine;
 use crate::ui::centered_rect;
 use crate::ui::header::truncate_to_width;
 
@@ -83,9 +85,10 @@ pub fn render_status_dialog(
     frame: &mut ratatui::Frame,
     dialog: &crate::app::StatusDialogState,
 ) {
+    let engine = current_engine();
+    let palette = engine.palette();
     let options_count = dialog.target.options_count();
     let area = status_dialog_area(frame.area(), options_count);
-    frame.render_widget(Clear, area);
 
     let (title, raw_target_title, current_idx, options) = match &dialog.target {
         crate::app::StatusDialogTarget::PlanItem { item_title, current_status, .. } => {
@@ -98,49 +101,45 @@ pub fn render_status_dialog(
                 tauqe_protocol::PlanItemStatus::Cancelled => 5,
             };
             let opts = vec![
-                ("DISCUSSION", Color::Magenta, Color::Black, "Under review / requires discussion"),
-                ("TODO", Color::Yellow, Color::Black, "Approved / ready for execution"),
-                ("IN_PROGRESS", Color::Cyan, Color::Black, "Currently in active development"),
-                ("DONE", Color::Green, Color::Black, "Completed and verified"),
-                ("BLOCKED", Color::Red, Color::White, "Blocked by unmet prerequisites / needs replanning"),
-                ("CANCELLED", Color::DarkGray, Color::White, "Superseded or cancelled"),
+                ("DISCUSSION", palette.button_active_bg, palette.text_inverse, "Under review / requires discussion"),
+                ("TODO", palette.status_warning, palette.text_inverse, "Approved / ready for execution"),
+                ("IN_PROGRESS", palette.status_info, palette.text_inverse, "Currently in active development"),
+                ("DONE", palette.status_success, palette.text_inverse, "Completed and verified"),
+                ("BLOCKED", palette.status_error, palette.text_inverse, "Blocked by unmet prerequisites / needs replanning"),
+                ("CANCELLED", palette.button_bg, palette.text_muted, "Superseded or cancelled"),
             ];
             (" Change Task Status ", item_title.as_str(), cur, opts)
         }
         crate::app::StatusDialogTarget::ReviewItem { item_title, current_status, .. } => {
             let cur = match current_status {
-                tauqe_protocol::ReviewStatus::Discussion => 0,
-                tauqe_protocol::ReviewStatus::Todo => 1,
-                tauqe_protocol::ReviewStatus::InProgress => 2,
-                tauqe_protocol::ReviewStatus::Fixed => 3,
-                tauqe_protocol::ReviewStatus::Skipped => 4,
-                tauqe_protocol::ReviewStatus::Rejected => 5,
+                tauqe_protocol::ReviewItemStatus::Discussion => 0,
+                tauqe_protocol::ReviewItemStatus::Todo => 1,
+                tauqe_protocol::ReviewItemStatus::InProgress => 2,
+                tauqe_protocol::ReviewItemStatus::Fixed => 3,
+                tauqe_protocol::ReviewItemStatus::Skipped => 4,
+                tauqe_protocol::ReviewItemStatus::Rejected => 5,
             };
             let opts = vec![
-                ("DISCUSSION", Color::Magenta, Color::Black, "Under review / requires discussion"),
-                ("TODO", Color::Yellow, Color::Black, "Approved / ready for implementation"),
-                ("IN_PROGRESS", Color::Cyan, Color::Black, "Currently being fixed"),
-                ("FIXED", Color::Green, Color::Black, "Resolved and addressed in code"),
-                ("SKIPPED", Color::DarkGray, Color::White, "Skipped / no code changes needed"),
-                ("REJECTED", Color::DarkGray, Color::White, "False positive / won't fix"),
+                ("DISCUSSION", palette.button_active_bg, palette.text_inverse, "Under review / requires discussion"),
+                ("TODO", palette.status_warning, palette.text_inverse, "Approved / ready for implementation"),
+                ("IN_PROGRESS", palette.status_info, palette.text_inverse, "Currently being fixed"),
+                ("FIXED", palette.status_success, palette.text_inverse, "Resolved and addressed in code"),
+                ("SKIPPED", palette.button_bg, palette.text_muted, "Skipped / no code changes needed"),
+                ("REJECTED", palette.button_bg, palette.text_muted, "False positive / won't fix"),
             ];
             (" Change Finding Status ", item_title.as_str(), cur, opts)
         }
     };
 
-    let outer_block = Block::default()
-        .title(title)
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan));
-    frame.render_widget(outer_block, area);
+    render_modal_container(frame, area, title, ModalTone::Info);
 
     let chunks = status_dialog_chunks(area, options_count);
 
     let max_title_w = chunks[0].width.saturating_sub(10) as usize;
     let target_preview = truncate_to_width(raw_target_title.trim(), max_title_w);
     let target_line = Line::from(vec![
-        Span::styled(" Item: ", Style::default().fg(Color::DarkGray)),
-        Span::styled(target_preview, Style::default().bold().fg(Color::White)),
+        Span::styled(" Item: ", engine.fg(palette.text_muted)),
+        Span::styled(target_preview, engine.fg(palette.text_primary).bold()),
     ]);
     frame.render_widget(Paragraph::new(vec![Line::raw(""), target_line, Line::raw("")]), chunks[0]);
 
@@ -154,27 +153,27 @@ pub fn render_status_dialog(
         let key_shortcut = format!("[{}] ", idx + 1);
 
         let row_style = if is_cursor {
-            Style::default().bg(Color::DarkGray).fg(Color::White).bold()
+            engine.bg(palette.overlay)
         } else {
             Style::default()
         };
 
-        let badge_style = Style::default().bg(*bg).fg(*fg).bold();
+        let badge_style = engine.bg(*bg).fg(engine.color(*fg)).bold();
 
         body_lines.push(Line::from(vec![
-            Span::styled(cursor_prefix, Style::default().fg(Color::Cyan).bold()),
+            Span::styled(cursor_prefix, engine.fg(palette.status_info).bold()),
             Span::styled(
                 current_marker,
                 if is_current {
-                    Style::default().fg(Color::Green).bold()
+                    engine.fg(palette.status_success).bold()
                 } else {
-                    Style::default().fg(Color::DarkGray)
+                    engine.fg(palette.text_muted)
                 },
             ),
-            Span::styled(key_shortcut, Style::default().fg(Color::Yellow).bold()),
+            Span::styled(key_shortcut, engine.fg(palette.status_warning).bold()),
             Span::styled(format!(" {:<11} ", label), badge_style),
             Span::raw(" "),
-            Span::styled(*desc, if is_cursor { Style::default().fg(Color::White) } else { Style::default().fg(Color::Gray) }),
+            Span::styled(*desc, if is_cursor { engine.fg(palette.text_primary) } else { engine.fg(palette.text_secondary) }),
         ]).style(row_style));
     }
     frame.render_widget(Paragraph::new(body_lines), chunks[1]);
@@ -184,17 +183,17 @@ pub fn render_status_dialog(
         Line::from(vec![
             Span::styled(
                 status_apply_label(options_count),
-                Style::default().bg(Color::Green).fg(Color::Black).bold(),
+                engine.bg(palette.button_active_bg).fg(engine.color(palette.text_inverse)).bold(),
             ),
             Span::raw(STATUS_BUTTON_GAP),
             Span::styled(
                 STATUS_CANCEL_LABEL,
-                Style::default().bg(Color::DarkGray).fg(Color::White),
+                engine.bg(palette.button_bg).fg(engine.color(palette.button_fg)),
             ),
         ]),
         Line::from(Span::styled(
             format!("{} fast select • n/p or j/k navigate • Enter apply • Esc cancel", fast_select_label),
-            Style::default().fg(Color::DarkGray),
+            engine.fg(palette.text_muted),
         )),
     ];
     let actions_widget = Paragraph::new(actions).alignment(ratatui::layout::Alignment::Center);

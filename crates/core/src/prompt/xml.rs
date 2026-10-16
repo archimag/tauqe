@@ -7,10 +7,15 @@
 //! parsing is delegated to the edit protocol so the XML grammar keeps a single
 //! source of truth.
 
+use crate::edits::protocol::xml::is_valid_turn_marker;
 use crate::edits::protocol::xml::tags::{ParsedPlanItem, ParsedPlanTag};
-use crate::edits::protocol::{EditProtocol, MarkedXmlEditProtocol, XmlEditProtocol};
+use crate::edits::protocol::{
+    ContextRequest, MarkedXmlEditProtocol, TerminalOutcome, VerifyRequest, XmlEditProtocol,
+};
+use crate::edits::stream::XmlStreamFilter;
 use tauqe_protocol::{
-    DiscussionPlanAction, DiscussionPlanUpdate, LlmCapability, LlmCommand, LlmOutcome, ModelResult,
+    DiscussionPlanAction, DiscussionPlanUpdate, DocTopic, LlmCapability, LlmCommand, LlmOutcome,
+    ModelResult,
 };
 
 use super::protocol::PromptProtocol;
@@ -52,20 +57,18 @@ impl PromptProtocol for XmlPromptProtocol {
     }
 
     fn turn_marker(&self) -> Option<&str> {
-        XmlEditProtocol.turn_marker()
+        None
     }
 
     fn with_turn_marker(&self, marker: &str) -> Option<Box<dyn PromptProtocol>> {
-        XmlEditProtocol
-            .with_turn_marker(marker)
-            .map(|_| Box::new(MarkedXmlPromptProtocol::new(marker)) as Box<dyn PromptProtocol>)
+        bind_turn_marker(marker)
     }
 
     fn response_format(
         &self,
-        editable_paths: &[String],
+        _editable_paths: &[String],
     ) -> Option<crate::providers::ResponseFormat> {
-        XmlEditProtocol.response_format(editable_paths)
+        None
     }
 
     fn create_stream_filter(
@@ -74,7 +77,9 @@ impl PromptProtocol for XmlPromptProtocol {
         repo_root: std::path::PathBuf,
         staged_contents: std::collections::HashMap<String, String>,
     ) -> Box<dyn crate::edits::stream::EditStreamFilter> {
-        XmlEditProtocol.create_stream_filter(editable_paths, repo_root, staged_contents)
+        Box::new(
+            XmlStreamFilter::new(editable_paths, repo_root).with_staged_contents(staged_contents),
+        )
     }
 }
 
@@ -94,6 +99,18 @@ impl MarkedXmlPromptProtocol {
             inner: MarkedXmlEditProtocol::new(marker),
         }
     }
+}
+
+/// Binds the active turn marker to a marker-bound XML prompt protocol.
+///
+/// A malformed marker is rejected without panicking, so a bad marker can never
+/// crash the long-lived daemon.
+fn bind_turn_marker(marker: &str) -> Option<Box<dyn PromptProtocol>> {
+    if !is_valid_turn_marker(marker) {
+        tracing::warn!(marker = %marker, "ignoring malformed turn marker");
+        return None;
+    }
+    Some(Box::new(MarkedXmlPromptProtocol::new(marker)))
 }
 
 impl PromptProtocol for MarkedXmlPromptProtocol {
@@ -118,16 +135,14 @@ impl PromptProtocol for MarkedXmlPromptProtocol {
     }
 
     fn with_turn_marker(&self, marker: &str) -> Option<Box<dyn PromptProtocol>> {
-        self.inner
-            .with_turn_marker(marker)
-            .map(|_| Box::new(MarkedXmlPromptProtocol::new(marker)) as Box<dyn PromptProtocol>)
+        bind_turn_marker(marker)
     }
 
     fn response_format(
         &self,
-        editable_paths: &[String],
+        _editable_paths: &[String],
     ) -> Option<crate::providers::ResponseFormat> {
-        self.inner.response_format(editable_paths)
+        None
     }
 
     fn create_stream_filter(
@@ -136,8 +151,90 @@ impl PromptProtocol for MarkedXmlPromptProtocol {
         repo_root: std::path::PathBuf,
         staged_contents: std::collections::HashMap<String, String>,
     ) -> Box<dyn crate::edits::stream::EditStreamFilter> {
-        self.inner
-            .create_stream_filter(editable_paths, repo_root, staged_contents)
+        Box::new(
+            XmlStreamFilter::new(editable_paths, repo_root)
+                .with_marker(self.inner.turn_marker().map(str::to_string))
+                .with_staged_contents(staged_contents),
+        )
+    }
+}
+
+/// Private extraction surface shared by the unbound and marker-bound XML parsers.
+///
+/// Both parsers decode the same XML tag grammar; the marker-bound variant only
+/// normalizes the active turn marker before parsing and restores marker-mangled
+/// literals afterwards. This trait lets the single [`decode_xml_commands`]
+/// routine serve both parsers while callers keep interacting exclusively through
+/// [`PromptProtocol`].
+trait XmlExtraction {
+    fn clean_assistant_text(&self, raw_text: &str) -> String;
+    fn parse_output(&self, raw_text: &str, editable_paths: &[String]) -> ModelResult;
+    fn parse_context_requests(&self, raw_text: &str) -> Vec<ContextRequest>;
+    fn parse_doc_requests(&self, raw_text: &str) -> Vec<DocTopic>;
+    fn parse_plan_tags(&self, raw_text: &str) -> (Vec<ParsedPlanTag>, Vec<String>);
+    fn parse_verify_request(&self, raw_text: &str) -> Option<VerifyRequest>;
+    fn parse_scratchpad(&self, raw_text: &str) -> Option<String>;
+    fn parse_terminal_outcome(&self, raw_text: &str) -> Option<TerminalOutcome>;
+    fn parse_user_language(&self, raw_text: &str) -> Option<String>;
+}
+
+impl XmlExtraction for XmlEditProtocol {
+    fn clean_assistant_text(&self, raw_text: &str) -> String {
+        XmlEditProtocol::clean_assistant_text(self, raw_text)
+    }
+    fn parse_output(&self, raw_text: &str, editable_paths: &[String]) -> ModelResult {
+        XmlEditProtocol::parse_output(self, raw_text, editable_paths)
+    }
+    fn parse_context_requests(&self, raw_text: &str) -> Vec<ContextRequest> {
+        XmlEditProtocol::parse_context_requests(self, raw_text)
+    }
+    fn parse_doc_requests(&self, raw_text: &str) -> Vec<DocTopic> {
+        XmlEditProtocol::parse_doc_requests(self, raw_text)
+    }
+    fn parse_plan_tags(&self, raw_text: &str) -> (Vec<ParsedPlanTag>, Vec<String>) {
+        XmlEditProtocol::parse_plan_tags(self, raw_text)
+    }
+    fn parse_verify_request(&self, raw_text: &str) -> Option<VerifyRequest> {
+        XmlEditProtocol::parse_verify_request(self, raw_text)
+    }
+    fn parse_scratchpad(&self, raw_text: &str) -> Option<String> {
+        XmlEditProtocol::parse_scratchpad(self, raw_text)
+    }
+    fn parse_terminal_outcome(&self, raw_text: &str) -> Option<TerminalOutcome> {
+        XmlEditProtocol::parse_terminal_outcome(self, raw_text)
+    }
+    fn parse_user_language(&self, raw_text: &str) -> Option<String> {
+        XmlEditProtocol::parse_user_language(self, raw_text)
+    }
+}
+
+impl XmlExtraction for MarkedXmlEditProtocol {
+    fn clean_assistant_text(&self, raw_text: &str) -> String {
+        MarkedXmlEditProtocol::clean_assistant_text(self, raw_text)
+    }
+    fn parse_output(&self, raw_text: &str, editable_paths: &[String]) -> ModelResult {
+        MarkedXmlEditProtocol::parse_output(self, raw_text, editable_paths)
+    }
+    fn parse_context_requests(&self, raw_text: &str) -> Vec<ContextRequest> {
+        MarkedXmlEditProtocol::parse_context_requests(self, raw_text)
+    }
+    fn parse_doc_requests(&self, raw_text: &str) -> Vec<DocTopic> {
+        MarkedXmlEditProtocol::parse_doc_requests(self, raw_text)
+    }
+    fn parse_plan_tags(&self, raw_text: &str) -> (Vec<ParsedPlanTag>, Vec<String>) {
+        MarkedXmlEditProtocol::parse_plan_tags(self, raw_text)
+    }
+    fn parse_verify_request(&self, raw_text: &str) -> Option<VerifyRequest> {
+        MarkedXmlEditProtocol::parse_verify_request(self, raw_text)
+    }
+    fn parse_scratchpad(&self, raw_text: &str) -> Option<String> {
+        MarkedXmlEditProtocol::parse_scratchpad(self, raw_text)
+    }
+    fn parse_terminal_outcome(&self, raw_text: &str) -> Option<TerminalOutcome> {
+        MarkedXmlEditProtocol::parse_terminal_outcome(self, raw_text)
+    }
+    fn parse_user_language(&self, raw_text: &str) -> Option<String> {
+        MarkedXmlEditProtocol::parse_user_language(self, raw_text)
     }
 }
 
@@ -145,7 +242,7 @@ impl PromptProtocol for MarkedXmlPromptProtocol {
 ///
 /// Shared by the unbound and marker-bound XML protocols so tag extraction keeps
 /// a single source of truth.
-fn decode_xml_commands(xml: &dyn EditProtocol, raw_text: &str) -> Vec<LlmCommand> {
+fn decode_xml_commands(xml: &impl XmlExtraction, raw_text: &str) -> Vec<LlmCommand> {
     let mut commands = Vec::new();
 
     // Conversational text with edit blocks and control tags removed.
@@ -156,8 +253,8 @@ fn decode_xml_commands(xml: &dyn EditProtocol, raw_text: &str) -> Vec<LlmCommand
 
     // File edit operations decoded from XML edit blocks.
     match xml.parse_output(raw_text, &[]) {
-        ModelResult::Edit { edits, error, .. } => {
-            if let Some(message) = error {
+        ModelResult::Edit { edits, outcome, .. } => {
+            if let Some(message) = outcome.error {
                 commands.push(LlmCommand::ProtocolError { message });
             }
             for operation in edits {
@@ -302,6 +399,19 @@ mod tests {
         ] {
             assert!(protocol.supports(capability));
         }
+    }
+
+    #[test]
+    fn test_with_turn_marker_rejects_malformed_marker_without_panicking() {
+        let proto = XmlPromptProtocol;
+        assert!(proto.with_turn_marker("").is_none());
+        assert!(proto.with_turn_marker("bad marker").is_none());
+        assert!(proto.with_turn_marker("has-dash").is_none());
+        assert!(proto.with_turn_marker("Valid123").is_some());
+
+        let marked = MarkedXmlPromptProtocol::new("Valid123");
+        assert!(marked.with_turn_marker("").is_none());
+        assert!(marked.with_turn_marker("Valid123").is_some());
     }
 
     #[test]

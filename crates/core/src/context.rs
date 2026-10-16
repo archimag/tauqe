@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::collections::BTreeSet;
 pub use tauqe_protocol::matches_glob_pattern;
-use tauqe_protocol::{ContextAccess, ContextItem, ContextLayer, ContextState};
+use tauqe_protocol::{ContextAccess, ContextItem, ContextLayer, ContextState, GlobPattern};
 
 #[derive(Debug, Clone)]
 pub struct ContextFileContent {
@@ -514,9 +514,14 @@ impl ContextManager {
             bail!("Empty pattern is not allowed");
         }
 
+        // Compile the pattern once and match every candidate against it: the
+        // repository file list can be large, and re-normalizing the pattern per
+        // path is pure overhead.
+        let compiled = GlobPattern::new(trimmed_pat);
+
         let mut matched_files: Vec<String> = available_files
             .iter()
-            .filter(|path| matches_glob_pattern(trimmed_pat, path))
+            .filter(|path| compiled.matches(path))
             .filter(|path| !self.user.contains_key(*path))
             .cloned()
             .collect();

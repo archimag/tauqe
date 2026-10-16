@@ -160,6 +160,13 @@ impl HistoryViewState {
         }
     }
 
+    /// Invalidates the cached item bodies so the next render re-parses every
+    /// visible entry under the newly active theme. Called on hot theme reloads,
+    /// where the light/dark mode is unchanged but the palette is not.
+    pub fn refresh_theme(&mut self) {
+        self.body_cache = HistoryBodyCache::default();
+    }
+
     pub fn get_estimated_tokens(&self) -> u64 {
         if self.estimated_tokens > 0 {
             self.estimated_tokens

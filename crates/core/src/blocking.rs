@@ -26,6 +26,7 @@
 use std::cell::Cell;
 
 use tokio::runtime::{Handle, RuntimeFlavor};
+use tokio::task::JoinError;
 
 thread_local! {
     /// Whether the current thread is already running inside [`run_blocking`].
@@ -61,33 +62,18 @@ pub(crate) fn run_blocking<T>(f: impl FnOnce() -> T) -> T {
 /// returns. On a multi-threaded runtime, or when no runtime is present, it
 /// delegates to [`run_blocking`] so the `block_in_place` fast path and the
 /// panic-free synchronous fallback are preserved.
-pub(crate) async fn run_blocking_async<T, F>(f: F) -> T
+///
+/// Returns `Ok(T)` on successful completion, or `Err(JoinError)` if the offloaded
+/// task panicked or was cancelled during runtime shutdown.
+pub(crate) async fn run_blocking_async<T, F>(f: F) -> Result<T, JoinError>
 where
     F: FnOnce() -> T + Send + 'static,
     T: Send + 'static,
 {
     match Handle::try_current() {
-        Ok(handle) => match handle.spawn_blocking(f).await {
-            Ok(value) => value,
-            Err(join_error) => resume_join_panic(join_error),
-        },
-        Err(_) => run_blocking(f),
+        Ok(handle) => handle.spawn_blocking(f).await,
+        Err(_) => Ok(run_blocking(f)),
     }
-}
-
-/// Propagates the failure of an offloaded blocking task.
-///
-/// `spawn_blocking` only reports an error when the closure panicked or the
-/// runtime shut down before it finished. There is no value to hand back in
-/// either case, so the panic is resumed (or synthesized for a shutdown
-/// cancellation) to keep the failure visible instead of fabricating a value.
-fn resume_join_panic(join_error: tokio::task::JoinError) -> ! {
-    if join_error.is_panic() {
-        std::panic::resume_unwind(join_error.into_panic());
-    }
-    std::panic::resume_unwind(Box::new(
-        "blocking task was cancelled before completing",
-    ));
 }
 
 /// Clears the thread-local blocking flag when the guarded scope ends, including
@@ -131,7 +117,7 @@ mod tests {
 
     #[tokio::test]
     async fn async_runs_on_a_current_thread_runtime() {
-        assert_eq!(run_blocking_async(|| 19).await, 19);
+        assert_eq!(run_blocking_async(|| 19).await.unwrap(), 19);
     }
 
     #[tokio::test]
@@ -139,15 +125,29 @@ mod tests {
         // On a current-thread runtime the closure must leave the single
         // executor thread, otherwise a blocking call would stall it.
         let executor_thread = std::thread::current().id();
-        let worker_thread = run_blocking_async(|| std::thread::current().id()).await;
+        let worker_thread = run_blocking_async(|| std::thread::current().id())
+            .await
+            .unwrap();
         assert_ne!(executor_thread, worker_thread);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn async_runs_on_a_multi_thread_runtime() {
         let executor_thread = std::thread::current().id();
-        let worker_thread = run_blocking_async(|| std::thread::current().id()).await;
+        let worker_thread = run_blocking_async(|| std::thread::current().id())
+            .await
+            .unwrap();
         assert_ne!(executor_thread, worker_thread);
-        assert_eq!(run_blocking_async(|| 23).await, 23);
+        assert_eq!(run_blocking_async(|| 23).await.unwrap(), 23);
+    }
+
+    #[tokio::test]
+    async fn async_captures_panic_as_join_error() {
+        let result = run_blocking_async(|| {
+            panic!("intentional panic for test");
+        })
+        .await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().is_panic());
     }
 }

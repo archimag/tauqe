@@ -2,7 +2,7 @@ use ratatui::layout::Rect;
 use ratatui::style::{Color, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Padding, Paragraph};
-use tauqe_protocol::ReviewStatus;
+use tauqe_protocol::ReviewItemStatus;
 
 use crate::app::AppState;
 
@@ -23,6 +23,10 @@ pub fn render_review_view(
     let width = (inner.width as usize).max(10);
     state.review.view_height = height;
     state.review.content_width = width;
+    // Mirror the authoritative discussion focus so the row builder can mark the
+    // anchored element without re-reading global application state.
+    let focus = state.discussion_focus.clone();
+    state.review.discussion_focus = focus;
 
     let rows = state.review.flatten_rows();
     state.review.clamp_selection();
@@ -96,11 +100,11 @@ pub fn render_review_view(
     let total_items: usize = effective.iter().map(|s| s.items.len()).sum();
     let fixed_items: usize = effective
         .iter()
-        .map(|s| s.items.iter().filter(|i| i.status == ReviewStatus::Fixed).count())
+        .map(|s| s.items.iter().filter(|i| i.status == ReviewItemStatus::Fixed).count())
         .sum();
     let skipped_items: usize = effective
         .iter()
-        .map(|s| s.items.iter().filter(|i| i.status == ReviewStatus::Skipped).count())
+        .map(|s| s.items.iter().filter(|i| i.status == ReviewItemStatus::Skipped).count())
         .sum();
 
     let mut status_spans = Vec::new();
@@ -125,6 +129,12 @@ pub fn render_review_view(
         ));
         if state.review.hide_closed {
             status_spans.push(Span::styled(" | Filter: Open only", Style::default().fg(Color::Yellow)));
+        }
+        if state.review.refining.is_some() {
+            status_spans.push(Span::styled(
+                " | [Refining: Architect is decomposing the finding...]",
+                Style::default().fg(Color::Yellow).bold(),
+            ));
         }
         if !rows.is_empty() {
             status_spans.push(Span::styled(
@@ -268,6 +278,7 @@ mod tests {
             skipped: 0,
             rejected: 0,
             is_expanded: true,
+            focused: false,
         };
 
         let text: String = describe_review_row(&row)
@@ -283,7 +294,7 @@ mod tests {
 
     #[test]
     fn executive_summary_remains_visible_after_session_set() {
-        use tauqe_protocol::{ReviewItem, ReviewSeverity, ReviewSession, ReviewStatus};
+        use tauqe_protocol::{ReviewItem, ReviewItemStatus, ReviewSeverity, ReviewSession};
 
         let mut review = ReviewViewState::default();
 
@@ -300,8 +311,9 @@ mod tests {
                 title: "Finding".to_string(),
                 model: None,
                 severity: ReviewSeverity::Warning,
-                status: ReviewStatus::Todo,
+                status: ReviewItemStatus::Todo,
                 files: Vec::new(),
+                subplan: Vec::new(),
                 resolution_notes: None,
                 body: String::new(),
             }],

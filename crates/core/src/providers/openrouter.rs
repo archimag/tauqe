@@ -290,12 +290,15 @@ impl OpenRouterProvider {
 
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
         let response = tokio::select! {
-            _ = cancel_rx.changed() => {
-                if *cancel_rx.borrow() {
-                    let _ = tx.send(StreamEvent::Cancelled).await;
-                    return Ok(());
-                }
-                bail!("OpenRouter request cancelled");
+            // The `wait_for` future yields a `watch::Ref` guard, which is not
+            // `Send`. Scope it inside an async block that drops the guard
+            // before the branch body awaits, so the whole turn future stays
+            // `Send`.
+            _ = async {
+                let _ = cancel_rx.wait_for(|cancelled| *cancelled).await;
+            } => {
+                let _ = tx.send(StreamEvent::Cancelled).await;
+                return Ok(());
             }
             res = self
                 .http_client

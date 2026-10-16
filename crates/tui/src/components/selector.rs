@@ -73,6 +73,15 @@ impl ListSelector {
         }
     }
 
+    /// Moves the selection directly to `index`, clamping it into range.
+    pub fn select_index(&mut self, index: usize, visible_height: usize) {
+        if self.item_count == 0 {
+            return;
+        }
+        self.selected_index = index.min(self.item_count - 1);
+        self.ensure_visible(visible_height);
+    }
+
     /// Moves the selection to the first row.
     pub fn select_first(&mut self, visible_height: usize) {
         self.selected_index = 0;

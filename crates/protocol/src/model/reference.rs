@@ -1,4 +1,4 @@
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -33,12 +33,58 @@ impl ModelRef {
             name: name.into(),
         }
     }
+
+    /// Leniently parses a model reference from a previously persisted string.
+    ///
+    /// Unlike the strict [`FromStr`] implementation — which deliberately
+    /// rejects a mistyped provider prefix so a configuration typo surfaces
+    /// immediately — this parser reads values that were already stored (review
+    /// sessions, saved plans). A persisted record must never become unreadable
+    /// because an old value predates a stricter rule, so this parser never
+    /// fails:
+    ///
+    /// - an empty or whitespace-only string yields the neutral
+    ///   [`ModelRef::default`];
+    /// - a well-formed `provider:name` or bare provider-native name parses
+    ///   exactly as the strict parser does;
+    /// - any other string keeps its raw text as an OpenRouter model name, so
+    ///   the original value survives a read/write round-trip instead of being
+    ///   silently lost.
+    pub fn parse_lenient(s: &str) -> Self {
+        let trimmed = s.trim();
+        if trimmed.is_empty() {
+            return ModelRef::default();
+        }
+        match trimmed.parse::<ModelRef>() {
+            Ok(model) => model,
+            Err(_) => ModelRef::openrouter(trimmed),
+        }
+    }
+
+    /// Returns the canonical `provider:name` specification for persistence and
+    /// wire transport.
+    ///
+    /// This is the authoritative text form of a [`ModelRef`]: it is exactly the
+    /// string serialization writes and the strict [`FromStr`] implementation
+    /// reads back, so `ModelRef::from_str(&model.to_spec()) == Ok(model)` holds
+    /// for every value the strict parser can produce. [`std::fmt::Display`]
+    /// renders the same text for humans; this method names the round-trip
+    /// contract explicitly so persisted and wire values never depend on a
+    /// presentation-oriented formatter.
+    pub fn to_spec(&self) -> String {
+        format!("{}:{}", self.provider, self.name)
+    }
 }
 
-/// Presentation form only (`provider:name`); never parse it back.
+/// Renders the canonical `provider:name` specification for display.
+///
+/// The rendered text is identical to [`ModelRef::to_spec`], which is the
+/// authoritative form for persistence and wire transport. Use `to_spec` when
+/// building persisted or wire values; use `Display` when producing human-facing
+/// labels.
 impl std::fmt::Display for ModelRef {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}:{}", self.provider, self.name)
+        f.write_str(&self.to_spec())
     }
 }
 
@@ -96,6 +142,65 @@ fn is_openrouter_variant_suffix(suffix: &str) -> bool {
         suffix.trim().to_ascii_lowercase().as_str(),
         "free" | "extended" | "nitro" | "floor" | "online" | "thinking"
     )
+}
+
+/// Leniently deserializes a [`ModelRef`] from either a structured JSON object
+/// (`{"provider":"openrouter","name":"..."}`) or a legacy string representation
+/// (`"openrouter:..."` or a bare provider-native name).
+///
+/// This runs while reading values that were already persisted, so it obeys
+/// Postel's law. A legacy string the strict parser now rejects (for example a
+/// mistyped provider prefix) never fails the whole record: it is preserved
+/// through [`ModelRef::parse_lenient`]. An explicit `null` degrades to the
+/// neutral default, matching an absent field. A dispatched visitor keeps the
+/// precise structured-field diagnostic, such as an unknown provider, instead of
+/// the opaque "data did not match any variant" that an untagged enum produces.
+pub fn deserialize_model_ref_lenient<'de, D>(deserializer: D) -> Result<ModelRef, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct ModelRefVisitor;
+
+    impl<'de> serde::de::Visitor<'de> for ModelRefVisitor {
+        type Value = ModelRef;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("a { provider, name } table or a legacy model string")
+        }
+
+        fn visit_str<E>(self, value: &str) -> Result<ModelRef, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(ModelRef::parse_lenient(value))
+        }
+
+        fn visit_unit<E>(self) -> Result<ModelRef, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(ModelRef::default())
+        }
+
+        fn visit_none<E>(self) -> Result<ModelRef, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(ModelRef::default())
+        }
+
+        fn visit_map<A>(self, map: A) -> Result<ModelRef, A::Error>
+        where
+            A: serde::de::MapAccess<'de>,
+        {
+            // Delegating the structured form to `ModelRef`'s own `Deserialize`
+            // keeps its provider validation identical to the strict path while
+            // preserving the precise field diagnostic.
+            ModelRef::deserialize(serde::de::value::MapAccessDeserializer::new(map))
+        }
+    }
+
+    deserializer.deserialize_any(ModelRefVisitor)
 }
 
 #[cfg(test)]
@@ -159,5 +264,48 @@ mod tests {
                 .unwrap(),
             ModelRef::openrouter("meta-llama/llama-3.3-70b-instruct:nitro")
         );
+    }
+
+    #[test]
+    fn test_model_ref_parse_lenient_never_fails() {
+        // A well-formed specification parses exactly as the strict parser does.
+        assert_eq!(
+            ModelRef::parse_lenient("openrouter:anthropic/claude-3.7-sonnet"),
+            ModelRef::openrouter("anthropic/claude-3.7-sonnet")
+        );
+        assert_eq!(
+            ModelRef::parse_lenient("  meta-llama/llama-3.3-70b-instruct:free  "),
+            ModelRef::openrouter("meta-llama/llama-3.3-70b-instruct:free")
+        );
+
+        // An empty or whitespace-only string yields the neutral default.
+        assert_eq!(ModelRef::parse_lenient(""), ModelRef::default());
+        assert_eq!(ModelRef::parse_lenient("   "), ModelRef::default());
+
+        // A string the strict parser rejects keeps its raw text instead of
+        // being lost or turning the whole persisted record unreadable.
+        assert_eq!(
+            ModelRef::parse_lenient("anthropc:claude"),
+            ModelRef::openrouter("anthropc:claude")
+        );
+    }
+
+    #[test]
+    fn test_model_ref_to_spec_round_trips_through_from_str() {
+        // The canonical spec string is exactly what the strict parser reads
+        // back, so persistence never depends on a presentation formatter.
+        for spec in [
+            "openrouter:anthropic/claude-3.7-sonnet",
+            "openrouter:meta-llama/llama-3.3-70b-instruct:free",
+            "openrouter:meta-llama/llama-3.3-70b-instruct:nitro",
+        ] {
+            let model: ModelRef = spec.parse().unwrap();
+            assert_eq!(model.to_spec(), spec);
+            assert_eq!(model.to_spec().parse::<ModelRef>().unwrap(), model);
+        }
+
+        // `Display` renders the same canonical spec as `to_spec`.
+        let model = ModelRef::openrouter("anthropic/claude-3.7-sonnet");
+        assert_eq!(model.to_string(), model.to_spec());
     }
 }

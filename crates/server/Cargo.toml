@@ -17,3 +17,8 @@ tracing-subscriber.workspace = true
 tracing-appender.workspace = true
 anyhow.workspace = true
 async-trait = "0.1"
+
+[dev-dependencies]
+# Enables `MockLlmProvider` for handler unit tests without leaking the test
+# double into the release daemon binary.
+tauqe-core = { workspace = true, features = ["test-support"] }

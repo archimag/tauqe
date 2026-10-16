@@ -245,6 +245,78 @@ fn test_count_stats_reports_only_leaves() {
 }
 
 #[test]
+fn test_count_stats_excludes_cancelled_leaves_and_agrees_with_done_status() {
+    let plan = Plan {
+        id: "done-with-cancelled".to_string(),
+        title: "Done With Cancelled".to_string(),
+        description: None,
+        created_at: 1,
+        updated_at: 1,
+        concept: vec![],
+        items: vec![
+            item("1", "Done step", PlanItemStatus::Done, vec![]),
+            item("2", "Cancelled step", PlanItemStatus::Cancelled, vec![]),
+        ],
+    };
+
+    // `compute_items_status` treats the plan as Done because every active
+    // (non-cancelled) leaf is Done. The progress metric must agree: the cancelled
+    // leaf is excluded from `total`, so the ratio stays `1/1`, never `1/2`.
+    assert_eq!(plan.status(), PlanItemStatus::Done);
+    assert_eq!(plan.count_stats(), (1, 1));
+
+    let summary = plan.summary();
+    assert_eq!(summary.status, PlanItemStatus::Done);
+    assert_eq!(summary.total_items, 1);
+    assert_eq!(summary.completed_items, 1);
+}
+
+#[test]
+fn test_count_stats_excludes_cancelled_leaves_in_mixed_plan() {
+    let plan = Plan {
+        id: "mixed-cancelled".to_string(),
+        title: "Mixed Cancelled".to_string(),
+        description: None,
+        created_at: 1,
+        updated_at: 1,
+        concept: vec![],
+        items: vec![
+            item("1", "Done step", PlanItemStatus::Done, vec![]),
+            item("2", "Todo step", PlanItemStatus::Todo, vec![]),
+            item("3", "Cancelled step", PlanItemStatus::Cancelled, vec![]),
+        ],
+    };
+
+    // A mix of Done and Todo leaves keeps the plan InProgress; the cancelled leaf
+    // is excluded from the denominator, so the ratio reflects only executable
+    // remaining work.
+    assert_eq!(plan.status(), PlanItemStatus::InProgress);
+    assert_eq!(plan.count_stats(), (2, 1));
+}
+
+#[test]
+fn test_count_stats_all_cancelled_reports_zero_and_cancelled_status() {
+    let plan = Plan {
+        id: "all-cancelled".to_string(),
+        title: "All Cancelled".to_string(),
+        description: None,
+        created_at: 1,
+        updated_at: 1,
+        concept: vec![],
+        items: vec![
+            item("1", "Cancelled A", PlanItemStatus::Cancelled, vec![]),
+            item("2", "Cancelled B", PlanItemStatus::Cancelled, vec![]),
+        ],
+    };
+
+    // With every leaf cancelled there is no executable work left, so the metric
+    // is `0/0` and the aggregated status is Cancelled rather than a misleading
+    // `0/2` against a cancelled plan.
+    assert_eq!(plan.status(), PlanItemStatus::Cancelled);
+    assert_eq!(plan.count_stats(), (0, 0));
+}
+
+#[test]
 fn test_evaluate_scope_reports_only_leaves_for_discussion() {
     let mut plan = Plan {
         id: "leaf-only-scope".to_string(),
@@ -915,3 +987,96 @@ fn test_plan_validate_dependency_errors() {
     );
 }
 
+#[test]
+fn test_identifier_normalization_is_consistent_across_validation_lookup_and_readiness() {
+    let mut dependent = item("2", "Dependent", PlanItemStatus::Todo, vec![]);
+    // The dependency spelling differs from the stored id only by surrounding
+    // whitespace; validation trims it, so readiness must resolve it too.
+    dependent.depends_on = vec!["1 ".to_string()];
+
+    let plan = Plan {
+        id: "normalized-ids".to_string(),
+        title: "Normalized Ids".to_string(),
+        description: None,
+        created_at: 1,
+        updated_at: 1,
+        concept: vec![],
+        items: vec![
+            item(" 1 ", "Producer", PlanItemStatus::Done, vec![]),
+            dependent,
+        ],
+    };
+
+    // Validation accepts the plan: the dependency key collapses onto the item key.
+    assert!(plan.validate().is_ok());
+
+    // Lookup by any spelling of the id resolves to the same step.
+    assert!(plan.find_item("1").is_some());
+    assert!(plan.find_item(" 1 ").is_some());
+
+    // The dependency `"1 "` is satisfied by the Done producer `" 1 "`, so the
+    // dependent step is scheduled instead of staying blocked forever.
+    match plan.evaluate_scope(None) {
+        PlanScopeEvaluation::Ready(leaves) => {
+            let ids: Vec<&str> = leaves.iter().map(|i| i.id.as_str()).collect();
+            assert_eq!(ids, vec!["2"]);
+        }
+        other => panic!("Expected Ready, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_plan_validate_detects_leaf_depending_on_its_own_ancestor() {
+    // A leaf that lists its own container in `depends_on` can never be ready: the
+    // container is `Done` only when all of its descendant leaves are `Done`.
+    // `normalize_leaf_files` leaves no explicit `depends_on` on the container, so
+    // the deadlock is implicit and only validation can surface it.
+    let mut leaf = item("1.1", "Child", PlanItemStatus::Todo, vec![]);
+    leaf.depends_on = vec!["1".to_string()];
+
+    let plan = Plan {
+        id: "ancestor-dep".to_string(),
+        title: "Ancestor Dep".to_string(),
+        items: vec![item("1", "Group", PlanItemStatus::Todo, vec![leaf])],
+        ..Default::default()
+    };
+
+    let errs = plan.validate().unwrap_err();
+    assert_eq!(errs.len(), 1);
+    match &errs[0] {
+        PlanValidationError::CyclicDependency(cycle) => {
+            assert!(cycle.contains(&"1".to_string()));
+            assert!(cycle.contains(&"1.1".to_string()));
+        }
+        other => panic!("Expected CyclicDependency, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_plan_validate_detects_transitive_ancestor_deadlock() {
+    // A leaf nested two levels deep that depends on the top container closes the
+    // same implicit cycle across nesting levels: the top container cannot finish
+    // without the deep leaf, and the deep leaf cannot start without the container.
+    let mut deep = item("1.a.1", "Deep leaf", PlanItemStatus::Todo, vec![]);
+    deep.depends_on = vec!["1".to_string()];
+
+    let plan = Plan {
+        id: "deep-ancestor-dep".to_string(),
+        title: "Deep Ancestor Dep".to_string(),
+        items: vec![item(
+            "1",
+            "Top",
+            PlanItemStatus::Todo,
+            vec![item("1.a", "Mid", PlanItemStatus::Todo, vec![deep])],
+        )],
+        ..Default::default()
+    };
+
+    match plan.validate().unwrap_err().as_slice() {
+        [PlanValidationError::CyclicDependency(cycle)] => {
+            assert!(cycle.contains(&"1".to_string()));
+            assert!(cycle.contains(&"1.a.1".to_string()));
+        }
+        other => panic!("Expected a single CyclicDependency, got {:?}", other),
+    }
+}

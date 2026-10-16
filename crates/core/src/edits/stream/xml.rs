@@ -816,9 +816,11 @@ mod tests {
         let input = "Hi\n<tauqe_edits_K7Q2ZX summary=\"Update\">\n<edit_K7Q2ZX path=\"xml.rs\">\n<search_K7Q2ZX>\nlet s = \"</search>\";\n</search_K7Q2ZX>\n<replace_K7Q2ZX>\nlet s = \"<create>\";\n</replace_K7Q2ZX>\n</edit_K7Q2ZX>\n</tauqe_edits_K7Q2ZX>\nBye";
         let paths = vec!["xml.rs".to_string()];
         let proto = crate::edits::protocol::MarkedXmlEditProtocol::new(marker);
-        let parsed = crate::edits::EditProtocol::parse_output(&proto, input, &paths);
+        let parsed = proto.parse_output(input, &paths);
         let (expected_old, expected_new) = match parsed {
-            tauqe_protocol::ModelResult::Edit { edits, error: None, .. } => {
+            tauqe_protocol::ModelResult::Edit { edits, outcome, .. }
+                if outcome.error.is_none() =>
+            {
                 match edits.into_iter().next().unwrap() {
                     tauqe_protocol::EditOperation::Replace { old_text, new_text, .. } => {
                         (old_text, new_text)

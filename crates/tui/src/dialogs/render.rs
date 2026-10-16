@@ -1,10 +1,12 @@
-use ratatui::style::{Color, Style, Stylize};
+use ratatui::style::{Style, Stylize};
 use ratatui::text::{Line, Span};
+
+use crate::theme::engine::current_engine;
 
 pub(crate) use crate::components::confirm::{
     confirm_modal_geometry, render_modal_confirm, ConfirmModalGeometry, ConfirmModalParams,
 };
-pub(crate) use crate::components::modal::{render_modal_frame, ModalFrameParams};
+pub(crate) use crate::components::modal::{render_modal_frame, ModalFrameParams, ModalTone};
 use crate::editor::InputEditor;
 
 pub(crate) mod confirm;
@@ -30,9 +32,10 @@ pub(crate) use confirm::{
 };
 pub(crate) use disconnected::render_disconnected_popup;
 pub(crate) use help::render_help_popup;
-pub(crate) use prompt::render_prompt_modal;
+pub(crate) use prompt::{prompt_modal_area, prompt_modal_buttons, render_prompt_modal};
 pub(crate) use refine::{
-    refine_dialog_geometry, render_plan_refine_blocked_dialog, render_plan_refine_dialog,
+    refine_blocked_params, refine_dialog_geometry, render_plan_refine_blocked_dialog,
+    render_plan_refine_dialog,
 };
 pub(crate) use review::{render_review_dialog, review_dialog_geometry};
 pub(crate) use selection::{
@@ -43,6 +46,8 @@ pub(crate) use status::{render_status_dialog, status_dialog_area, status_dialog_
 
 /// Renders editor text as lines, drawing the cursor (reversed char or a block at line end).
 pub(super) fn editor_lines(editor: &InputEditor, show_cursor: bool) -> Vec<Line<'static>> {
+    let engine = current_engine();
+    let palette = engine.palette();
     let mut lines = Vec::new();
     let mut start = 0usize;
     for raw in editor.get_text().split('\n') {
@@ -56,7 +61,7 @@ pub(super) fn editor_lines(editor: &InputEditor, show_cursor: bool) -> Vec<Line<
                     spans.push(Span::styled(c.to_string(), Style::default().reversed()));
                     spans.push(Span::raw(chars.as_str().to_string()));
                 }
-                None => spans.push(Span::styled("█", Style::default().fg(Color::Yellow))),
+                None => spans.push(Span::styled("█", engine.fg(palette.status_warning))),
             }
             lines.push(Line::from(spans));
         } else {

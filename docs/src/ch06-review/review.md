@@ -54,6 +54,12 @@ When you trigger a review in TAUQE, the review model does **not** receive the on
 3. **Model Heterogeneity:**
    The audit runs in the dedicated **Reviewer** role, a read-only analytical mandate. TAUQE resolves it to the configured `reviewer` model unless a specific model is chosen for the run, so an analytical reasoning model can audit while a fast coding model drives Develop.
 
+### Selecting the Audited Files: Target Paths without Context Mutation
+
+By default a review audits the files already in context. The launch dialog also accepts an optional **target directory or glob pattern** (for example `src/**/*.rs`), carried on the request as `ReviewStartParams::path_pattern`.
+
+The server resolves the pattern against the repository's tracked files and **merges** the matched paths with the files already in context, de-duplicated, for that run only. This deliberately leaves the **User Context untouched**: the system never clears or rewrites the developer's layer, so the audited file set can widen for a single review while the developer keeps exclusive control of what stays loaded. Because matched files are read directly from the working tree, a scoped review can cover code the developer never explicitly added.
+
 ---
 
 ## 6.3 Multi-Session Storage & Review Formats
@@ -77,6 +83,7 @@ Each finding within `items` stores:
 - `severity`: audit severity level (`CRITICAL`, `WARN`, `SUGGESTION`, `INFO`);
 - `status`: finding lifecycle status;
 - `files`: list of repository-relative file paths affected (`Vec<String>`);
+- `subplan`: optional embedded step plan that decomposes the finding into traceable sub-steps (`Vec<PlanItem>`);
 - `resolution_notes`: optional resolution notes or skip rationale (`Option<String>`);
 - `body`: detailed finding description, code evidence, and remediation advice.
 
@@ -106,11 +113,15 @@ Each finding in a review session undergoes a formal lifecycle:
 3. **IN_PROGRESS:**
    Actively being resolved by the model in an isolated turn.
 4. **FIXED:**
-   Successfully resolved, staged in Git, and verified by deterministic toolchain gates (`cargo check`, linters, tests).
+   Successfully resolved, staged in Git, and verified by deterministic toolchain gates (`cargo check`, linters, tests). A concise summary of the applied change is captured automatically in `resolution_notes`, so the essence of the fix stays readable in the view without opening the Git diff.
 5. **SKIPPED:**
    Bypassed during execution because the finding was already addressed by earlier changes in the batch, rendered obsolete by prior refactorings, or verified as a non-reproducible false positive during active inspection. The model's or developer's justification is retained in `resolution_notes`.
 6. **REJECTED:**
    Dismissed as false positive, intentional design trade-off, or non-actionable.
+
+### Progress Counting
+
+Session progress is `fixed / total`, and `total` counts only **actionable** findings. `SKIPPED` and `REJECTED` are terminal, non-actionable outcomes, so both are excluded from the denominator. This mirrors how a plan excludes `CANCELLED` leaves from its progress metric (`Plan::count_stats`). A session whose remaining findings are all resolved therefore reports `fixed == total` (a full progress bar) instead of a fraction that can never reach one; a session with no actionable findings reports `0/0`.
 
 Press `t` or `s` on any finding to open the interactive status picker modal, supporting fast numeric selection (`1` Discussion, `2` Todo, `3` InProgress, `4` Fixed, `5` Skipped, `6` Rejected).
 
@@ -123,6 +134,7 @@ When evaluating complex findings, the developer does not have to accept or rejec
 - **Focused Scope:** Discussions target either a specific finding (`[rev-xxx] #id`) or the entire session scope.
 - **Structured Output Protocol:** Discussions run in Develop using a dedicated structured prompt. The model discusses trade-offs conceptually without generating unstructured code edits.
 - **Automatic Status Synchronization:** If the developer approves or rejects items during discussion, the model emits structured `review_update` objects that update finding statuses directly in `.tauqe/reviews/` without manual editing.
+- **Quick Focus (`f`):** Pressing `f` on a finding or session binds the active discussion focus to it directly (`discussion/set_focus`) without leaving the Review view or typing a prompt; the focused row then shows a `[FOCUS]` badge (see 2.8.7).
 
 ---
 
@@ -139,7 +151,7 @@ Findings approved as `TODO` can be executed directly from the Review workspace w
 - A confirmation popup displays finding details and associated target files.
 - The server marks the finding `IN_PROGRESS`, pre-loads all files in `item.files` as editable into the `auto` context layer, and formats an isolated execution prompt containing the finding body, target paths, and directives.
 - The model requests additional context via `<context_request>` if needed, edits are validated in staging, and toolchain gates verify the build.
-- **Completion Contract:** The finding transitions to `FIXED` only if the turn succeeds **and** actually applies verified code changes to disk.
+- **Completion Contract:** The finding transitions to `FIXED` only if the turn succeeds **and** actually applies verified code changes to disk. The turn's edit summary is written to `resolution_notes` when the finding has none, so the essence of the fix is preserved alongside the status.
 - **Managed Skip (`<skip>`):** If the model determines that the finding was already addressed by preceding edits or is non-reproducible, it emits a typed protocol outcome tag: `<skip reason="Concise reason">Detailed explanation</skip>` (or self-closing `<skip reason="..." />`). The server transitions the finding to `SKIPPED`, persists the explanation to `item.resolution_notes`, and concludes the turn cleanly without requiring code modifications.
 
 ### 2. Batch Execution (`x` on a session header)
@@ -174,7 +186,8 @@ In accordance with TAUQE's dual-contour architecture, review findings are not du
 - **Dedicated Discussion Contour (`d`):** Whenever an architectural finding needs triage, feasibility inquiry, or refinement, pressing `d` launches a focused Structured Discussion targeting specifically the chosen finding or entire audit session.
 - **Direct Status Approval:** During discussion, findings can be approved (`TODO`) or dismissed (`REJECTED`) programmatically via structured `review_update` responses.
 - **Focused Execution (`x` / `Enter`):** Approved findings are executed in isolated turns with deterministic toolchain verification.
-- **View Filtering (`f`):** Press `f` in Review to filter out closed findings (`FIXED`, `SKIPPED`, and `REJECTED`), keeping the view focused strictly on outstanding engineering debt.
+- **Architect Decomposition (`R`):** A finding broader than one bounded turn can be decomposed into an embedded subplan via the Architect role (see section 6.9).
+- **View Filtering (`F`):** Press `F` (Shift+F) in Review to filter out closed findings (`FIXED`, `SKIPPED`, and `REJECTED`), keeping the view focused strictly on outstanding engineering debt.
 
 ---
 
@@ -185,3 +198,32 @@ A finding can carry a model assignment: a semantic role (`scribe`, `coder`, `arc
 Fixing a finding is intra-role escalation only. When `auto_level_up = true` in the `[models]` section of `tauqe.toml`, a finding that fails verification does not stop the queue immediately. TAUQE first rolls the working tree back to the pre-step checkpoint, then restarts the finding on the next rung of the coder ladder (`CoderTier`, each rung pairing a model with a reasoning effort). Files already found during discovery stay in context. Only when the ladder is exhausted does the Fail-Fast policy from section 6.6 apply: the tree stays rolled back, the finding returns to `TODO`, and the batch stops.
 
 Escalation never crosses the role boundary: a coder failure is answered by a stronger coder, never by promoting the turn into the Architect role. The audit model is chosen per run in the launch dialog; escalation affects only fix execution, never the audit itself.
+
+---
+
+## 6.9 Embedded Subplans: Architect Decomposition and Safe Partial Execution
+
+A finding can be broader than one bounded turn can resolve cleanly. Pressing `R` on a selected finding dispatches it to the **Architect** role (`review/refineItem`), which decomposes it into an **embedded subplan** stored directly on `ReviewItem::subplan`.
+
+### Why Reuse the Plan Engine
+
+The subplan reuses the plan domain verbatim: each sub-step is a `PlanItem` with the same status vocabulary, dependency evaluation, and leaf-file normalization as a full implementation plan. Finding decomposition and plan refinement are conceptually the same operation — both call the Architect — so they share the horizon-synthesis logic. Reusing the engine keeps a finding's sub-step progress consistent with a plan's progress and avoids a parallel scheduling implementation.
+
+### Architect Decomposition (`R`)
+
+- The Architect inspects the finding, its body, and its target files, and may request additional context across bounded discovery rounds, exactly as other Architect operations do.
+- A schema-enforced structured response either yields a decomposed subplan or reports a semantic `<blocked>` outcome.
+- The synthesized horizon is merged with the finding's existing **Done foundation**: every sub-step already marked `Done` is preserved verbatim, colliding identifiers are dropped deterministically, and the merged tree is validated before it reaches disk. A subplan that would introduce a dependency cycle is rejected.
+- Decomposition alone does not change the finding status; the finding stays `TODO` until its sub-steps are executed.
+
+### Execution and Safe Partial Progress
+
+When a finding carries a subplan, its execution expands each **leaf** sub-step into its own bounded turn — files preloaded as editable, with the same completion contract and coder-ladder escalation as a single finding. A sub-step that applies cleanly is persisted as `Done` immediately, so finished work survives any later interruption.
+
+If a sub-step fails, blocks, or the turn is cancelled:
+
+- Completed sub-steps **stay `Done`**; the working tree keeps every verified change, so the codebase remains functional.
+- The stop reason is recorded in `resolution_notes`.
+- The finding transitions to `SKIPPED`, letting the developer inspect the cause and decide how to proceed without discarding the finished sub-steps.
+
+This mirrors the safety principle the plan runner applies to a completed horizon: finished work is immutable, and a partial advance is recorded rather than thrown away.

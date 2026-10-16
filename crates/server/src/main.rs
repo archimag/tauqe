@@ -1,6 +1,6 @@
 #![cfg_attr(
     not(test),
-    warn(clippy::unwrap_used, clippy::expect_used, clippy::panic)
+    deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)
 )]
 
 use std::path::PathBuf;
@@ -34,7 +34,16 @@ async fn main() -> anyhow::Result<()> {
     logging::install_panic_hook();
     // The returned guard owns the non-blocking appender buffer; binding it to a
     // live variable keeps it until `main` returns so no record is lost.
-    let _log_guard = logging::init_logging(&repo_path);
+    // A failure here must not be silent: without a subscriber the daemon would
+    // run normally yet drop every tracing event for its whole lifetime. stderr
+    // is the only diagnostic channel still available at this point.
+    let _log_guard = match logging::init_logging(&repo_path) {
+        Ok(guard) => Some(guard),
+        Err(err) => {
+            eprintln!("[WARN] Failed to initialise file logging: {err}");
+            None
+        }
+    };
     let log_path = logging::log_file_path(&repo_path);
     tracing::info!(
         pid = std::process::id(),
@@ -137,6 +146,24 @@ async fn main() -> anyhow::Result<()> {
                 continue;
             }
         };
+
+        // A request whose correlation id is explicitly null cannot be answered
+        // unambiguously. Rejecting it before dispatch keeps a malformed client
+        // from silently triggering a turn it can never correlate.
+        if request.id == RequestId::Null {
+            tracing::warn!(
+                method = %request.method,
+                code = errors::INVALID_REQUEST,
+                "Rejected RPC request with a null id",
+            );
+            let err_resp = Response::err(
+                RequestId::Null,
+                errors::INVALID_REQUEST,
+                "Request id must not be null",
+            );
+            state.out.send_response(&err_resp);
+            continue;
+        }
 
         let request_id = request.id.clone();
         let method = request.method.clone();

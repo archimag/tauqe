@@ -1,11 +1,13 @@
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Color, Style, Stylize};
+use ratatui::style::Stylize;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+use ratatui::widgets::Paragraph;
 
 use crate::app::{
     compact_model_name, numbered_entry_label, SelectionDialogKind, SelectionItem,
 };
+use crate::components::modal::render_modal_container_styled;
+use crate::theme::engine::current_engine;
 
 /// Select button label as drawn by [`render_selection_dialog`], including its
 /// surrounding `[ ]` decoration.
@@ -88,23 +90,25 @@ pub fn render_selection_dialog(
     dialog: &crate::app::SelectionDialogState,
 ) {
     let area = selection_dialog_area(frame.area(), dialog.items.len());
-    frame.render_widget(Clear, area);
 
     let title = match dialog.kind {
-        SelectionDialogKind::PrimaryModels => " Select Primary Model ".to_string(),
+        SelectionDialogKind::PrimaryModels => "Select Primary Model".to_string(),
         SelectionDialogKind::ModelCatalog => format!(
-            " Select Model ({}/{}) ",
+            "Select Model ({}/{})",
             dialog.selector.selected_index() + 1,
             dialog.items.len()
         ),
     };
 
-    let outer_block = Block::default()
-        .title(title)
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Green));
-    let inner_area = outer_block.inner(area);
-    frame.render_widget(outer_block, area);
+    let engine = current_engine();
+    let palette = engine.palette();
+
+    let inner_area = render_modal_container_styled(
+        frame,
+        area,
+        &title,
+        engine.fg(palette.status_success),
+    );
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -120,7 +124,7 @@ pub fn render_selection_dialog(
         SelectionDialogKind::ModelCatalog => " All available models",
     };
     frame.render_widget(
-        Paragraph::new(Span::styled(intro, Style::default().fg(Color::DarkGray))),
+        Paragraph::new(Span::styled(intro, engine.fg(palette.text_muted))),
         chunks[0],
     );
 
@@ -141,14 +145,14 @@ pub fn render_selection_dialog(
         // `▶` selection indicator reads identically across all three dialogs.
         let marker = if is_selected { " ▶ " } else { "   " };
         let marker_style = if is_selected {
-            Style::default().fg(Color::Green).bold()
+            engine.fg(palette.status_success).bold()
         } else {
-            Style::default().fg(Color::DarkGray)
+            engine.fg(palette.text_muted)
         };
         let line_style = if is_selected {
-            Style::default().bg(Color::DarkGray).fg(Color::White).bold()
+            engine.bg(palette.overlay).fg(engine.color(palette.text_primary)).bold()
         } else {
-            Style::default().fg(Color::Gray)
+            engine.fg(palette.text_secondary)
         };
 
         lines.push(Line::from(vec![
@@ -162,16 +166,16 @@ pub fn render_selection_dialog(
 
     let actions = vec![
         Line::from(vec![
-            Span::styled(SELECT_BUTTON_LABEL, Style::default().bg(Color::Green).fg(Color::Black).bold()),
+            Span::styled(SELECT_BUTTON_LABEL, engine.bg(palette.button_active_bg).fg(engine.color(palette.text_inverse)).bold()),
             Span::raw(BUTTON_GAP),
-            Span::styled(CANCEL_BUTTON_LABEL, Style::default().bg(Color::DarkGray).fg(Color::White)),
+            Span::styled(CANCEL_BUTTON_LABEL, engine.bg(palette.button_bg).fg(engine.color(palette.button_fg))),
         ]),
         Line::from(Span::styled(
             match dialog.kind {
                 SelectionDialogKind::PrimaryModels => "1-9 quick select • n/p navigate • Enter select • Esc close",
                 SelectionDialogKind::ModelCatalog => "n/p navigate • Enter select • Esc/q dismiss",
             },
-            Style::default().fg(Color::DarkGray),
+            engine.fg(palette.text_muted),
         )),
     ];
     let actions_widget = Paragraph::new(actions).alignment(ratatui::layout::Alignment::Center);

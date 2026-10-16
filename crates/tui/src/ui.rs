@@ -1,9 +1,10 @@
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
-use ratatui::style::{Color, Style, Stylize};
+use ratatui::style::Stylize;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
 use crate::app::{ActiveModal, AppState, ViewMode};
+use crate::theme::engine::current_engine;
 
 pub mod footer;
 pub mod geometry;
@@ -39,12 +40,29 @@ const MIN_TERM_HEIGHT: u16 = 12;
 /// are dropped so the main area keeps enough rows to stay usable.
 const COMPACT_TERM_HEIGHT: u16 = 20;
 
+/// Solid background filler that unconditionally sets symbol and background color
+/// for every grid cell, preventing unstyled gaps and terminal default background leakage.
+struct CanvasBackground(ratatui::style::Color);
+
+impl ratatui::widgets::Widget for CanvasBackground {
+    fn render(self, area: Rect, buf: &mut ratatui::buffer::Buffer) {
+        for y in area.top()..area.bottom() {
+            for x in area.left()..area.right() {
+                let cell = &mut buf[(x, y)];
+                cell.set_symbol(" ");
+                cell.set_bg(self.0);
+            }
+        }
+    }
+}
+
 fn render_terminal_too_small(frame: &mut ratatui::Frame) {
+    let engine = current_engine();
     let area = frame.area();
     let lines = vec![
         Line::from(Span::styled(
             "Terminal too small",
-            Style::default().fg(Color::Yellow).bold(),
+            engine.fg(engine.palette().status_warning).bold(),
         )),
         Line::from(format!("Current: {}x{}", area.width, area.height)),
         Line::from(format!("Required: {}x{} (Ctrl+Q to exit)", MIN_TERM_WIDTH, MIN_TERM_HEIGHT)),
@@ -61,6 +79,16 @@ pub fn render_ui(frame: &mut ratatui::Frame, state: &mut AppState) {
         render_terminal_too_small(frame);
         return;
     }
+    let engine = current_engine();
+    let palette = engine.palette();
+
+    // Synchronize host terminal window margins with the theme canvas.
+    crate::terminal::update_terminal_background(palette.canvas);
+
+    // Paint the theme canvas across the entire grid buffer so every cell is initialized
+    // with the active palette background, eliminating terminal color bars.
+    frame.render_widget(CanvasBackground(engine.color(palette.canvas)), area);
+
     let term_height = area.height;
     let term_width = area.width;
     let compact = term_height < COMPACT_TERM_HEIGHT;
@@ -191,6 +219,11 @@ pub fn render_ui(frame: &mut ratatui::Frame, state: &mut AppState) {
         Some(ActiveModal::Selection) => {
             if let Some(dialog) = &state.selection_dialog {
                 render_selection_dialog(frame, dialog);
+            }
+        }
+        Some(ActiveModal::ThemeSelector) => {
+            if let Some(dialog) = &state.theme_selector {
+                crate::theme::selector::render_theme_selector(frame, dialog);
             }
         }
         Some(ActiveModal::Help) => {

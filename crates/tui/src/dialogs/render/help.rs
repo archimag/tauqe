@@ -1,10 +1,12 @@
 use ratatui::layout::{Constraint, Direction, Layout};
-use ratatui::style::{Color, Style, Stylize};
+use ratatui::style::Stylize;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+use ratatui::widgets::Paragraph;
 
 use crate::app::ViewMode;
-
+use crate::components::modal::{render_modal_container, ModalTone};
+use crate::theme::engine::{current_engine, ThemeEngine};
+use crate::theme::palette::ThemePalette;
 use crate::ui::centered_rect;
 
 pub const GLOBAL_COMMANDS: &[crate::app::KeyCommand] = &[
@@ -18,6 +20,7 @@ pub const GLOBAL_COMMANDS: &[crate::app::KeyCommand] = &[
     // Auxiliary & Destructive.
     crate::app::KeyCommand { key: "C-M / Alt+M", description: "Select active model" },
     crate::app::KeyCommand { key: "C-O", description: "Reload configuration from disk" },
+    crate::app::KeyCommand { key: "F7", description: "Select color theme (live preview)" },
     crate::app::KeyCommand { key: "Ctrl+Q", description: "Quit TAUQE" },
 ];
 
@@ -80,19 +83,21 @@ fn push_command_lines(
     col_w: usize,
     desc_w: usize,
     primary_modifier: crate::config::PrimaryModifier,
+    engine: &ThemeEngine,
+    palette: &ThemePalette,
 ) {
     for cmd in commands {
         let display_key = format_command_key(cmd.key, primary_modifier);
         let mut wrapped = wrap_words(cmd.description, desc_w).into_iter();
         let first = wrapped.next().unwrap_or_default();
         lines.push(Line::from(vec![
-            Span::styled(format!("  {:<col_w$}", display_key), Style::default().fg(Color::White).bold()),
-            Span::styled(first, Style::default().fg(Color::Gray)),
+            Span::styled(format!("  {:<col_w$}", display_key), engine.fg(palette.text_primary).bold()),
+            Span::styled(first, engine.fg(palette.text_secondary)),
         ]));
         for rest in wrapped {
             lines.push(Line::from(vec![
                 Span::raw(" ".repeat(2 + col_w)),
-                Span::styled(rest, Style::default().fg(Color::Gray)),
+                Span::styled(rest, engine.fg(palette.text_secondary)),
             ]));
         }
     }
@@ -106,7 +111,6 @@ pub fn render_help_popup(
 ) {
     let (title, mode_commands) = get_mode_key_commands(mode);
     let area = centered_rect(76, 75, frame.area());
-    frame.render_widget(Clear, area);
 
     let key_w = GLOBAL_COMMANDS
         .iter()
@@ -118,28 +122,26 @@ pub fn render_help_popup(
     let inner_w = area.width.saturating_sub(2) as usize;
     let desc_w = inner_w.saturating_sub(2 + col_w).max(10);
 
+    let engine = current_engine();
+    let palette = engine.palette();
+
     let mut help_lines: Vec<Line<'static>> = vec![
         Line::raw(""),
         Line::from(Span::styled(
             "Global Navigation",
-            Style::default().fg(Color::Cyan).bold(),
+            engine.fg(palette.status_info).bold(),
         )),
     ];
-    push_command_lines(&mut help_lines, GLOBAL_COMMANDS, col_w, desc_w, primary_modifier);
+    push_command_lines(&mut help_lines, GLOBAL_COMMANDS, col_w, desc_w, primary_modifier, &engine, &palette);
 
     help_lines.push(Line::raw(""));
     help_lines.push(Line::from(Span::styled(
         "Active Mode Shortcuts",
-        Style::default().fg(Color::Yellow).bold(),
+        engine.fg(palette.status_warning).bold(),
     )));
-    push_command_lines(&mut help_lines, mode_commands, col_w, desc_w, primary_modifier);
+    push_command_lines(&mut help_lines, mode_commands, col_w, desc_w, primary_modifier, &engine, &palette);
 
-    let outer_block = Block::default()
-        .title(title)
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Yellow));
-    let inner_area = outer_block.inner(area);
-    frame.render_widget(outer_block, area);
+    let inner_area = render_modal_container(frame, area, title, ModalTone::Warning);
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -159,11 +161,11 @@ pub fn render_help_popup(
     let actions = vec![
         Line::from(Span::styled(
             " [ Close Help (Esc / q / ?) ] ",
-            Style::default().bg(Color::DarkGray).fg(Color::White).bold(),
+            engine.bg(palette.button_bg).fg(engine.color(palette.button_fg)).bold(),
         )),
         Line::from(Span::styled(
             "n/p or j/k scroll • PgUp/PgDn page scroll • Home top • Esc/q close",
-            Style::default().fg(Color::DarkGray),
+            engine.fg(palette.text_muted),
         )),
     ];
     let footer = Paragraph::new(actions).alignment(ratatui::layout::Alignment::Center);

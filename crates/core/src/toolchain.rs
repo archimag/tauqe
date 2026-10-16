@@ -23,11 +23,36 @@ pub struct ToolchainCheckResult {
 
 use crate::edits::protocol::xml::VerifyTarget;
 
+/// Reads the `scripts` table from `package.json` once so toolchain detection and
+/// verification command resolution share a single manifest read.
+fn read_package_scripts(repo_root: &Path) -> Option<serde_json::Map<String, serde_json::Value>> {
+    let content = std::fs::read_to_string(repo_root.join("package.json")).ok()?;
+    let json: serde_json::Value = serde_json::from_str(&content).ok()?;
+    json.get("scripts")
+        .and_then(|scripts| scripts.as_object())
+        .cloned()
+}
+
 /// Returns the sequence of command strings to execute for the given verification target and toolchain.
+///
+/// Reads `package.json` once and delegates to `resolve_verification_commands_with_scripts`.
 pub fn resolve_verification_commands(
     repo_root: &Path,
     kind: &ToolchainKind,
     target: &VerifyTarget,
+) -> Vec<String> {
+    let scripts = read_package_scripts(repo_root);
+    resolve_verification_commands_with_scripts(repo_root, kind, target, scripts.as_ref())
+}
+
+/// Resolves verification commands from a `package.json` `scripts` table already
+/// read by the caller, so toolchain detection and command resolution share a
+/// single disk read.
+fn resolve_verification_commands_with_scripts(
+    repo_root: &Path,
+    kind: &ToolchainKind,
+    target: &VerifyTarget,
+    scripts: Option<&serde_json::Map<String, serde_json::Value>>,
 ) -> Vec<String> {
     match kind {
         ToolchainKind::Cargo => match target {
@@ -43,44 +68,39 @@ pub fn resolve_verification_commands(
         ToolchainKind::Npm => {
             let mut cmds = Vec::new();
             if repo_root.join("package.json").is_file() {
-                if let Ok(content) = std::fs::read_to_string(repo_root.join("package.json")) {
-                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
-                        let scripts = json.get("scripts").and_then(|s| s.as_object());
-                        let has_check = scripts.is_some_and(|s| s.contains_key("check"));
-                        let has_lint = scripts.is_some_and(|s| s.contains_key("lint"));
-                        let has_test = scripts.is_some_and(|s| s.contains_key("test"));
+                let has_check = scripts.is_some_and(|s| s.contains_key("check"));
+                let has_lint = scripts.is_some_and(|s| s.contains_key("lint"));
+                let has_test = scripts.is_some_and(|s| s.contains_key("test"));
 
-                        match target {
-                            VerifyTarget::Check => {
-                                if has_check {
-                                    cmds.push("npm run check".to_string());
-                                } else if repo_root.join("tsconfig.json").is_file() {
-                                    cmds.push("npx tsc --noEmit".to_string());
-                                }
-                            }
-                            VerifyTarget::Clippy => {
-                                if has_lint {
-                                    cmds.push("npm run lint".to_string());
-                                }
-                            }
-                            VerifyTarget::Test => {
-                                if has_test {
-                                    cmds.push("npm test".to_string());
-                                }
-                            }
-                            VerifyTarget::All => {
-                                if has_check {
-                                    cmds.push("npm run check".to_string());
-                                } else if repo_root.join("tsconfig.json").is_file() {
-                                    cmds.push("npx tsc --noEmit".to_string());
-                                }
-                                if has_lint {
-                                    cmds.push("npm run lint".to_string());
-                                }
-                                if has_test {
-                                    cmds.push("npm test".to_string());
-                                }
-                            }
+                match target {
+                    VerifyTarget::Check => {
+                        if has_check {
+                            cmds.push("npm run check".to_string());
+                        } else if repo_root.join("tsconfig.json").is_file() {
+                            cmds.push("npx tsc --noEmit".to_string());
+                        }
+                    }
+                    VerifyTarget::Clippy => {
+                        if has_lint {
+                            cmds.push("npm run lint".to_string());
+                        }
+                    }
+                    VerifyTarget::Test => {
+                        if has_test {
+                            cmds.push("npm test".to_string());
+                        }
+                    }
+                    VerifyTarget::All => {
+                        if has_check {
+                            cmds.push("npm run check".to_string());
+                        } else if repo_root.join("tsconfig.json").is_file() {
+                            cmds.push("npx tsc --noEmit".to_string());
+                        }
+                        if has_lint {
+                            cmds.push("npm run lint".to_string());
+                        }
+                        if has_test {
+                            cmds.push("npm test".to_string());
                         }
                     }
                 }
@@ -111,10 +131,17 @@ pub async fn run_verification_pipeline(
     target: &VerifyTarget,
     cancel_rx: Option<&watch::Receiver<bool>>,
 ) -> (bool, Vec<ToolchainCheckResult>) {
-    let config = crate::config::load_toolchain_config(repo_root);
-    let (kind, _) = detect_toolchain(repo_root, config.check_command.as_deref());
-    let commands = resolve_verification_commands(repo_root, &kind, target);
-    let timeout_secs = config.effective_timeout_secs();
+    // Configuration loading and toolchain detection read `tauqe.toml` and
+    // `package.json` from disk, so they run off the async executor thread.
+    let (commands, timeout_secs) = crate::blocking::run_blocking(|| {
+        let config = crate::config::load_toolchain_config(repo_root);
+        let scripts = read_package_scripts(repo_root);
+        let (kind, _) =
+            detect_toolchain_with_scripts(repo_root, config.check_command.as_deref(), scripts.as_ref());
+        let commands =
+            resolve_verification_commands_with_scripts(repo_root, &kind, target, scripts.as_ref());
+        (commands, config.effective_timeout_secs())
+    });
     let mut results = Vec::new();
 
     for cmd in commands {
@@ -130,9 +157,22 @@ pub async fn run_verification_pipeline(
 }
 
 /// Deterministically detects the build/validation toolchain from project files in repo root.
+///
+/// Reads `package.json` once and delegates to `detect_toolchain_with_scripts`.
 pub fn detect_toolchain(
     repo_root: &Path,
     custom_command: Option<&str>,
+) -> (ToolchainKind, Option<String>) {
+    let scripts = read_package_scripts(repo_root);
+    detect_toolchain_with_scripts(repo_root, custom_command, scripts.as_ref())
+}
+
+/// Detects the toolchain using a `package.json` `scripts` table already read by
+/// the caller, so detection and command resolution share one disk read.
+fn detect_toolchain_with_scripts(
+    repo_root: &Path,
+    custom_command: Option<&str>,
+    scripts: Option<&serde_json::Map<String, serde_json::Value>>,
 ) -> (ToolchainKind, Option<String>) {
     if let Some(cmd) = custom_command {
         if !cmd.trim().is_empty() {
@@ -148,19 +188,15 @@ pub fn detect_toolchain(
     }
 
     if repo_root.join("package.json").is_file() {
-        if let Ok(content) = std::fs::read_to_string(repo_root.join("package.json")) {
-            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
-                if let Some(scripts) = json.get("scripts").and_then(|s| s.as_object()) {
-                    if scripts.contains_key("check") {
-                        return (ToolchainKind::Npm, Some("npm run check".to_string()));
-                    }
-                    if scripts.contains_key("typecheck") {
-                        return (ToolchainKind::Npm, Some("npm run typecheck".to_string()));
-                    }
-                    if scripts.contains_key("test") {
-                        return (ToolchainKind::Npm, Some("npm test".to_string()));
-                    }
-                }
+        if let Some(scripts) = scripts {
+            if scripts.contains_key("check") {
+                return (ToolchainKind::Npm, Some("npm run check".to_string()));
+            }
+            if scripts.contains_key("typecheck") {
+                return (ToolchainKind::Npm, Some("npm run typecheck".to_string()));
+            }
+            if scripts.contains_key("test") {
+                return (ToolchainKind::Npm, Some("npm test".to_string()));
             }
         }
         if repo_root.join("tsconfig.json").is_file() {

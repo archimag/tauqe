@@ -102,9 +102,10 @@ pub fn is_text_input_active(st: &AppState) -> bool {
         Some(ActiveModal::Prompt) => {
             st.prompt_modal.as_ref().is_some_and(|modal| modal.focus.is_editor())
         }
-        Some(ActiveModal::Review) => {
-            st.review_dialog.as_ref().is_some_and(|d| d.focus.is_prompt_editor())
-        }
+        Some(ActiveModal::Review) => st
+            .review_dialog
+            .as_ref()
+            .is_some_and(|d| d.focus.is_prompt_editor() || d.focus.is_path_editor()),
         Some(ActiveModal::RefineDialog) => {
             st.plans_view.refine_dialog.as_ref().is_some_and(|d| d.focus.is_instructions_editor())
         }
@@ -176,7 +177,13 @@ pub fn handle_paste(st: &mut AppState, text: &str) {
         }
         Some(ActiveModal::Review) => {
             if let Some(dialog) = st.review_dialog.as_mut() {
-                dialog.prompt_editor.insert_paste(text);
+                // Paste targets the field that owns the keyboard, so a pasted
+                // path never lands in the prompt editor and vice versa.
+                if dialog.focus.is_path_editor() {
+                    dialog.path_editor.insert_paste_single_line(text);
+                } else {
+                    dialog.prompt_editor.insert_paste(text);
+                }
             }
         }
         Some(ActiveModal::Prompt) => {
@@ -494,6 +501,14 @@ async fn handle_global_shortcuts(
 
     if key.code == KeyCode::F(6) {
         open_squash_dialog(&mut st, server_writer).await?;
+        return Ok(Some(InputResult::Continue));
+    }
+
+    // F7 opens the interactive theme selector (universal hardware fallback).
+    // The dialog is purely presentational and previews presets live, so it is
+    // available even mid-turn without disturbing the running operation.
+    if key.code == KeyCode::F(7) {
+        st.open_theme_selector();
         return Ok(Some(InputResult::Continue));
     }
 
@@ -967,6 +982,19 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(res, Some(InputResult::Continue));
+    }
+
+    #[tokio::test]
+    async fn test_f7_opens_the_theme_selector() {
+        let state = Arc::new(Mutex::new(test_state()));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+
+        let key = KeyEvent::new(KeyCode::F(7), KeyModifiers::NONE);
+        let res = handle_global_shortcuts(key, &state, &mut conn, false)
+            .await
+            .unwrap();
+        assert_eq!(res, Some(InputResult::Continue));
+        assert!(state.lock().await.theme_selector.is_some());
     }
 
     #[tokio::test]

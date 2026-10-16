@@ -56,6 +56,7 @@ The interaction protocol between Tauqe and large language models is strictly div
    - Disk state of plans and review items cannot be altered without explicit user authorization or programmatic verification completion (e.g., status moves to `Fixed` strictly after compiler verification and atomic git commit).
 4. **Computed Aggregate State (Single Source of Truth):**
    - The status of an entire plan or review session is strictly a computed property derived deterministically from the statuses of its constituent items (`compute_items_status`), never stored as an independent mutable field on disk. This prevents state desynchronization and ensures strict adherence to the underlying task hierarchy.
+   - Progress counting obeys the same single-source rule. A `resolved / total` metric counts only actionable items: terminal, non-actionable outcomes are excluded from the denominator so an entity whose remaining work is finished reports `resolved == total` rather than a fraction that can never reach one. `Plan::count_stats` drops `Cancelled` leaves; `ReviewSession::stats` drops `Skipped` and `Rejected` findings.
 
 ---
 
@@ -109,3 +110,25 @@ The interaction protocol between Tauqe and large language models is strictly div
 3. **Anti-Bloat Logging Invariant:**
    - The engine must never log raw generation deltas (`TextDelta`, `ReasoningDelta`), full prompt bodies, context file contents, `RepoMap` dumps, or raw diffs during normal operation. Only interaction metadata, compact identifiers, and aggregated token and time metrics are recorded.
    - Toolchain failures are recorded as a compact, UTF-8-safe summary, never as a dumped compiler report.
+
+---
+
+## 8. Async Executor and Blocking I/O
+
+1. **No Blocking I/O on Async Task Threads:**
+   - The engine drives synchronous filesystem, Git, and toolchain work from
+     inside async tasks. Blocking calls — an `fsync`-bounded history write
+     (`SessionStorage::append_entry`, `rewrite_entries`), a context metadata
+     check (`prune_missing_files`, `add_auto_file`), a toolchain configuration
+     read (`tauqe.toml`, `package.json`), or a `git` subprocess — must never run
+     directly on a Tokio worker thread.
+   - Route such work through `crate::blocking::run_blocking` from synchronous
+     code, or `crate::blocking::run_blocking_async` (returning `Result<T, JoinError>`)
+     from async code when the closure is `Send + 'static`. Both helpers are
+     reentrant and degrade to a direct call outside a multi-threaded runtime, so
+     synchronous callers and tests stay panic-free.
+2. **Rationale (Why):**
+   - An `fsync` barrier or a cold metadata read can block for tens of
+     milliseconds. Running it inline on the executor thread freezes the bounded
+     turn, provider streaming, and RPC handling. Offloading the call keeps the
+     runtime responsive without introducing background state.

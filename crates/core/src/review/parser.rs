@@ -134,6 +134,7 @@ pub fn parse_review_output(raw: &str) -> (Option<String>, Vec<ReviewItem>) {
                         status: ReviewItemStatus::Discussion,
                         model: None,
                         files,
+                        subplan: Vec::new(),
                         resolution_notes: None,
                         body: finding.body.trim().to_string(),
                     }
@@ -155,6 +156,7 @@ pub fn parse_review_output(raw: &str) -> (Option<String>, Vec<ReviewItem>) {
                         severity: ReviewSeverity::Info,
                         status: ReviewItemStatus::Discussion,
                         files: Vec::new(),
+                        subplan: Vec::new(),
                         resolution_notes: None,
                         body: trimmed.to_string(),
                     }],

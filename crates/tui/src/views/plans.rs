@@ -1,10 +1,14 @@
 use std::collections::HashSet;
 
-use ratatui::style::{Color, Style, Stylize};
+use ratatui::style::{Style, Stylize};
 use ratatui::text::{Line, Span};
-use tauqe_protocol::{ConceptItem, ModelEntry, ModelRole, Plan, PlanItem, PlanItemStatus};
+use tauqe_protocol::{
+    ConceptItem, DiscussionFocus, DiscussionTarget, ModelEntry, ModelRole, Plan, PlanItem,
+    PlanItemStatus,
+};
 
 use crate::components::model_selector::ModelSelector;
+use crate::theme::engine::current_engine;
 use crate::ui::wrap_lines;
 
 pub mod input;
@@ -23,6 +27,8 @@ pub enum VisiblePlanRow {
         completed: usize,
         status: PlanItemStatus,
         is_expanded: bool,
+        /// Whether the active discussion focus anchors on the whole plan.
+        focused: bool,
     },
     ConceptHeader {
         plan_id: String,
@@ -39,6 +45,8 @@ pub enum VisiblePlanRow {
         has_details: bool,
         is_expandable: bool,
         is_expanded: bool,
+        /// Whether the active discussion focus anchors on this concept item.
+        focused: bool,
     },
     ImplementationHeader {
         plan_id: String,
@@ -60,6 +68,8 @@ pub enum VisiblePlanRow {
         has_details: bool,
         is_expandable: bool,
         is_expanded: bool,
+        /// Whether the active discussion focus anchors on this step.
+        focused: bool,
     },
 }
 
@@ -196,6 +206,9 @@ pub struct PlansViewState {
     pub refine_dialog: Option<PlanRefineDialogState>,
     pub refine_blocked: Option<PlanRefineBlockedState>,
     pub theme_mode: crate::config::ThemeMode,
+    /// Active discussion focus mirrored from the server, used to render the
+    /// `[FOCUS]` indicator. Synced from `AppState::discussion_focus` on render.
+    pub discussion_focus: DiscussionFocus,
 }
 
 impl PlansViewState {
@@ -300,6 +313,31 @@ impl PlansViewState {
         }
     }
 
+    /// Whether the active discussion focus anchors on a whole plan.
+    fn is_plan_focused(&self, plan_id: &str) -> bool {
+        matches!(
+            &self.discussion_focus,
+            DiscussionFocus::Focused {
+                target: DiscussionTarget::Plan { id },
+                focused_items,
+            } if id.as_str() == plan_id && focused_items.is_empty()
+        )
+    }
+
+    /// Whether the active discussion focus anchors on a specific plan or
+    /// concept item.
+    fn is_item_focused(&self, plan_id: &str, item_id: &str) -> bool {
+        match &self.discussion_focus {
+            DiscussionFocus::Focused {
+                target: DiscussionTarget::Plan { id },
+                focused_items,
+            } if id.as_str() == plan_id => {
+                focused_items.iter().any(|fid| fid.as_str() == item_id)
+            }
+            _ => false,
+        }
+    }
+
     pub fn flatten_rows(&self) -> Vec<VisiblePlanRow> {
         let mut rows = Vec::new();
         for plan in &self.plans {
@@ -315,6 +353,7 @@ impl PlansViewState {
                 completed,
                 status,
                 is_expanded,
+                focused: self.is_plan_focused(&plan.id),
             });
 
             if is_expanded {
@@ -375,6 +414,7 @@ impl PlansViewState {
             has_details,
             is_expandable,
             is_expanded,
+            focused: self.is_item_focused(plan_id, &item.id),
         });
 
         if has_children && is_expanded {
@@ -413,6 +453,7 @@ impl PlansViewState {
             has_details,
             is_expandable,
             is_expanded,
+            focused: self.is_item_focused(plan_id, &item.id),
         });
 
         if has_children && is_expanded {
@@ -703,14 +744,30 @@ impl PlansViewState {
 }
 
 fn status_style(status: PlanItemStatus) -> Style {
+    let engine = current_engine();
+    let palette = engine.palette();
+    let inverse = engine.color(palette.text_inverse);
     match status {
-        PlanItemStatus::Discussion => Style::default().bg(Color::Magenta).fg(Color::Black).bold(),
-        PlanItemStatus::Todo => Style::default().bg(Color::Yellow).fg(Color::Black).bold(),
-        PlanItemStatus::InProgress => Style::default().bg(Color::Cyan).fg(Color::Black).bold(),
-        PlanItemStatus::Done => Style::default().bg(Color::Green).fg(Color::Black).bold(),
-        PlanItemStatus::Blocked => Style::default().bg(Color::Red).fg(Color::White).bold(),
-        PlanItemStatus::Cancelled => Style::default().bg(Color::DarkGray).fg(Color::White).bold(),
+        PlanItemStatus::Discussion => engine.bg(palette.button_active_bg).fg(inverse).bold(),
+        PlanItemStatus::Todo => engine.bg(palette.status_warning).fg(inverse).bold(),
+        PlanItemStatus::InProgress => engine.bg(palette.status_info).fg(inverse).bold(),
+        PlanItemStatus::Done => engine.bg(palette.status_success).fg(inverse).bold(),
+        PlanItemStatus::Blocked => engine.bg(palette.status_error).fg(inverse).bold(),
+        PlanItemStatus::Cancelled => engine.bg(palette.text_muted).fg(inverse).bold(),
     }
+}
+
+/// Compact indicator marking the row anchored by the active discussion focus.
+fn focus_badge() -> Span<'static> {
+    let engine = current_engine();
+    let palette = engine.palette();
+    Span::styled(
+        " [FOCUS]",
+        engine
+            .bg(palette.status_success)
+            .fg(engine.color(palette.text_inverse))
+            .bold(),
+    )
 }
 
 fn pad_line_to_width(mut line: Line<'static>, width: usize, fill_style: Style) -> Line<'static> {
@@ -768,6 +825,8 @@ fn compute_unified_plan_lines(
     width: usize,
     theme_mode: crate::config::ThemeMode,
 ) -> (Vec<Line<'static>>, Vec<usize>) {
+    let engine = current_engine();
+    let palette = engine.palette();
     let mut all_lines = Vec::new();
     let mut offsets = Vec::with_capacity(rows.len());
 
@@ -776,13 +835,13 @@ fn compute_unified_plan_lines(
         offsets.push(all_lines.len());
 
         let row_style = if is_selected {
-            Style::default().bg(Color::DarkGray)
+            engine.bg(palette.overlay)
         } else {
             Style::default()
         };
 
         let gutter = if is_selected {
-            Span::styled("▌", Style::default().fg(Color::Cyan).bold())
+            Span::styled("▌", engine.fg(palette.status_info).bold())
         } else {
             Span::raw(" ")
         };
@@ -796,6 +855,7 @@ fn compute_unified_plan_lines(
                 completed,
                 status,
                 is_expanded,
+                focused,
             } => {
                 if idx > 0 {
                     all_lines.push(Line::raw(""));
@@ -804,16 +864,29 @@ fn compute_unified_plan_lines(
                 let fold_icon = if *is_expanded { "▼ " } else { "▶ " };
                 let stats_str = format!("{}/{} done", completed, total);
 
-                let spans = vec![
+                let mut spans = vec![
                     gutter,
                     Span::raw(" "),
-                    Span::styled(fold_icon, Style::default().fg(Color::Yellow).bold()),
+                    Span::styled(fold_icon, engine.fg(palette.status_warning).bold()),
                     Span::styled(format!(" {} ", status), status_style(*status)),
                     Span::raw(" "),
-                    Span::styled(format!("[{}] ", plan_id), Style::default().bold().fg(Color::Cyan)),
-                    Span::styled(title.clone(), Style::default().bold().fg(Color::White)),
-                    Span::styled(format!(" ({})", stats_str), Style::default().fg(if is_selected { Color::White } else { Color::DarkGray })),
+                    Span::styled(
+                        format!("[{}] ", plan_id),
+                        engine.fg(palette.status_info).bold(),
+                    ),
+                    Span::styled(title.clone(), engine.fg(palette.text_primary).bold()),
+                    Span::styled(
+                        format!(" ({})", stats_str),
+                        if is_selected {
+                            engine.fg(palette.text_primary)
+                        } else {
+                            engine.fg(palette.text_muted)
+                        },
+                    ),
                 ];
+                if *focused {
+                    spans.push(focus_badge());
+                }
 
                 let mut header_line = Line::from(spans).style(row_style);
                 if is_selected {
@@ -828,18 +901,27 @@ fn compute_unified_plan_lines(
                             let mut desc_lines = Vec::new();
                             let mut theme =
                                 crate::markdown::MarkdownTheme::answer_themed(theme_mode);
-                            theme.text_style = Style::default().fg(Color::Gray);
+                            theme.text_style = engine.fg(palette.text_secondary);
                             theme.hard_breaks = true;
                             theme.compact = true;
-                            theme.line_prefix = Some(Span::styled("    │ ", Style::default().fg(Color::DarkGray)));
+                            theme.line_prefix = Some(Span::styled(
+                                "    │ ",
+                                engine.fg(palette.text_muted),
+                            ));
                             let md = crate::markdown::render_markdown(&prepared, &theme);
                             if !md.is_empty() {
                                 desc_lines.extend(md);
                             } else {
                                 for line in prepared.lines() {
                                     desc_lines.push(Line::from(vec![
-                                        Span::styled("    │ ", Style::default().fg(Color::DarkGray)),
-                                        Span::styled(line.to_string(), Style::default().fg(Color::Gray)),
+                                        Span::styled(
+                                            "    │ ",
+                                            engine.fg(palette.text_muted),
+                                        ),
+                                        Span::styled(
+                                            line.to_string(),
+                                            engine.fg(palette.text_secondary),
+                                        ),
                                     ]));
                                 }
                             }
@@ -857,11 +939,27 @@ fn compute_unified_plan_lines(
                 let spans = vec![
                     gutter,
                     Span::raw("  "),
-                    Span::styled(fold_icon, Style::default().fg(Color::Magenta).bold()),
-                    Span::styled(" CONCEPT ", Style::default().bg(Color::Magenta).fg(Color::Black).bold()),
+                    Span::styled(fold_icon, engine.fg(palette.button_active_bg).bold()),
+                    Span::styled(
+                        " CONCEPT ",
+                        engine
+                            .bg(palette.button_active_bg)
+                            .fg(engine.color(palette.text_inverse))
+                            .bold(),
+                    ),
                     Span::raw(" "),
-                    Span::styled("Architectural Intent & Invariants", Style::default().bold().fg(Color::White)),
-                    Span::styled(format!(" ({} item{})", count, if *count == 1 { "" } else { "s" }), Style::default().fg(if is_selected { Color::White } else { Color::DarkGray })),
+                    Span::styled(
+                        "Architectural Intent & Invariants",
+                        engine.fg(palette.text_primary).bold(),
+                    ),
+                    Span::styled(
+                        format!(" ({} item{})", count, if *count == 1 { "" } else { "s" }),
+                        if is_selected {
+                            engine.fg(palette.text_primary)
+                        } else {
+                            engine.fg(palette.text_muted)
+                        },
+                    ),
                 ];
                 let mut line = Line::from(spans).style(row_style);
                 if is_selected {
@@ -876,6 +974,7 @@ fn compute_unified_plan_lines(
                 depth,
                 is_expandable,
                 is_expanded,
+                focused,
                 ..
             } => {
                 let indent = "  ".repeat(*depth);
@@ -887,25 +986,28 @@ fn compute_unified_plan_lines(
                     "◆ "
                 };
                 let fold_style = if *is_expandable {
-                    Style::default().fg(Color::Magenta).bold()
+                    engine.fg(palette.button_active_bg).bold()
                 } else if is_selected {
-                    Style::default().fg(Color::Cyan).bold()
+                    engine.fg(palette.status_info).bold()
                 } else {
-                    Style::default().fg(Color::DarkGray)
+                    engine.fg(palette.text_muted)
                 };
                 let title_style = if is_selected {
-                    Style::default().fg(Color::White).bold()
+                    engine.fg(palette.text_primary).bold()
                 } else {
-                    Style::default().fg(Color::LightMagenta)
+                    engine.fg(palette.button_active_bg)
                 };
                 let clean_title = title.replace(['\r', '\n'], " ").trim().to_string();
 
-                let spans = vec![
+                let mut spans = vec![
                     gutter,
                     Span::raw(indent.clone()),
                     Span::styled(fold_icon, fold_style),
                     Span::styled(format!("#{} {}", item_id, clean_title), title_style),
                 ];
+                if *focused {
+                    spans.push(focus_badge());
+                }
                 let mut row_line = Line::from(spans).style(row_style);
                 if is_selected {
                     row_line = pad_line_to_width(row_line, width, row_style);
@@ -918,12 +1020,12 @@ fn compute_unified_plan_lines(
                         if !prepared.is_empty() {
                             let mut theme =
                                 crate::markdown::MarkdownTheme::answer_themed(theme_mode);
-                            theme.text_style = Style::default().fg(Color::Gray);
+                            theme.text_style = engine.fg(palette.text_secondary);
                             theme.hard_breaks = true;
                             theme.compact = true;
                             theme.line_prefix = Some(Span::styled(
                                 format!("{}    │ ", indent),
-                                Style::default().fg(Color::DarkGray),
+                                engine.fg(palette.text_muted),
                             ));
                             let md = crate::markdown::render_markdown(&prepared, &theme);
                             if !md.is_empty() {
@@ -945,11 +1047,27 @@ fn compute_unified_plan_lines(
                 let spans = vec![
                     gutter,
                     Span::raw("  "),
-                    Span::styled(fold_icon, Style::default().fg(Color::Cyan).bold()),
-                    Span::styled(" IMPLEMENTATION ", Style::default().bg(Color::Cyan).fg(Color::Black).bold()),
+                    Span::styled(fold_icon, engine.fg(palette.status_info).bold()),
+                    Span::styled(
+                        " IMPLEMENTATION ",
+                        engine
+                            .bg(palette.status_info)
+                            .fg(engine.color(palette.text_inverse))
+                            .bold(),
+                    ),
                     Span::raw(" "),
-                    Span::styled("Execution Blueprint", Style::default().bold().fg(Color::White)),
-                    Span::styled(format!(" ({})", stats_str), Style::default().fg(if is_selected { Color::White } else { Color::DarkGray })),
+                    Span::styled(
+                        "Execution Blueprint",
+                        engine.fg(palette.text_primary).bold(),
+                    ),
+                    Span::styled(
+                        format!(" ({})", stats_str),
+                        if is_selected {
+                            engine.fg(palette.text_primary)
+                        } else {
+                            engine.fg(palette.text_muted)
+                        },
+                    ),
                 ];
                 let mut line = Line::from(spans).style(row_style);
                 if is_selected {
@@ -970,6 +1088,7 @@ fn compute_unified_plan_lines(
                 has_details: _,
                 is_expandable,
                 is_expanded,
+                focused,
                 ..
             } => {
                 let indent = "  ".repeat(*depth);
@@ -987,17 +1106,17 @@ fn compute_unified_plan_lines(
                 };
 
                 let fold_style = if *is_expandable {
-                    Style::default().fg(Color::Yellow).bold()
+                    engine.fg(palette.status_warning).bold()
                 } else if is_selected {
-                    Style::default().fg(Color::Cyan).bold()
+                    engine.fg(palette.status_info).bold()
                 } else {
-                    Style::default().fg(Color::DarkGray)
+                    engine.fg(palette.text_muted)
                 };
 
                 let title_style = if is_selected {
-                    Style::default().fg(Color::White).bold()
+                    engine.fg(palette.text_primary).bold()
                 } else if *status == PlanItemStatus::Done || *status == PlanItemStatus::Cancelled {
-                    Style::default().fg(Color::Gray)
+                    engine.fg(palette.text_secondary)
                 } else {
                     Style::default().bold()
                 };
@@ -1027,8 +1146,11 @@ fn compute_unified_plan_lines(
                     }
                     spans.push(Span::styled(
                         format!(" [{}]", badge_parts.join(" + ")),
-                        Style::default().fg(Color::DarkGray),
+                        engine.fg(palette.text_muted),
                     ));
+                }
+                if *focused {
+                    spans.push(focus_badge());
                 }
 
                 let mut row_line = Line::from(spans).style(row_style);
@@ -1040,23 +1162,38 @@ fn compute_unified_plan_lines(
                 if *is_expanded {
                     if !*has_children && !files.is_empty() {
                         row_lines.push(Line::from(vec![
-                            Span::styled(format!("{}    │ ", indent), Style::default().fg(Color::DarkGray)),
-                            Span::styled("files: ", Style::default().fg(Color::DarkGray)),
-                            Span::styled(files.join(", "), Style::default().fg(Color::Cyan)),
+                            Span::styled(
+                                format!("{}    │ ", indent),
+                                engine.fg(palette.text_muted),
+                            ),
+                            Span::styled("files: ", engine.fg(palette.text_muted)),
+                            Span::styled(files.join(", "), engine.fg(palette.status_info)),
                         ]));
                     }
                     if !*has_children && !readonly_files.is_empty() {
                         row_lines.push(Line::from(vec![
-                            Span::styled(format!("{}    │ ", indent), Style::default().fg(Color::DarkGray)),
-                            Span::styled("ref: ", Style::default().fg(Color::DarkGray)),
-                            Span::styled(readonly_files.join(", "), Style::default().fg(Color::LightCyan)),
+                            Span::styled(
+                                format!("{}    │ ", indent),
+                                engine.fg(palette.text_muted),
+                            ),
+                            Span::styled("ref: ", engine.fg(palette.text_muted)),
+                            Span::styled(
+                                readonly_files.join(", "),
+                                engine.fg(palette.status_info),
+                            ),
                         ]));
                     }
                     if !concept_refs.is_empty() {
                         row_lines.push(Line::from(vec![
-                            Span::styled(format!("{}    │ ", indent), Style::default().fg(Color::DarkGray)),
-                            Span::styled("concept: ", Style::default().fg(Color::DarkGray)),
-                            Span::styled(concept_refs.join(", "), Style::default().fg(Color::Magenta)),
+                            Span::styled(
+                                format!("{}    │ ", indent),
+                                engine.fg(palette.text_muted),
+                            ),
+                            Span::styled("concept: ", engine.fg(palette.text_muted)),
+                            Span::styled(
+                                concept_refs.join(", "),
+                                engine.fg(palette.button_active_bg),
+                            ),
                         ]));
                     }
                     if let Some(det) = details {
@@ -1064,12 +1201,12 @@ fn compute_unified_plan_lines(
                         if !prepared.is_empty() {
                             let mut theme =
                                 crate::markdown::MarkdownTheme::answer_themed(theme_mode);
-                            theme.text_style = Style::default().fg(Color::Gray);
+                            theme.text_style = engine.fg(palette.text_secondary);
                             theme.hard_breaks = true;
                             theme.compact = true;
                             theme.line_prefix = Some(Span::styled(
                                 format!("{}    │ ", indent),
-                                Style::default().fg(Color::DarkGray),
+                                engine.fg(palette.text_muted),
                             ));
                             let md = crate::markdown::render_markdown(&prepared, &theme);
                             if !md.is_empty() {
@@ -1449,6 +1586,76 @@ mod tests {
         assert!(matches!(
             view.selected_row(),
             Some(VisiblePlanRow::ConceptItem { ref item_id, .. }) if item_id == "c-1.2"
+        ));
+    }
+
+    #[test]
+    fn test_focus_badge_marks_the_anchored_plan_item() {
+        let mut view = PlansViewState::default();
+        let plan = Plan {
+            id: "focus-plan".to_string(),
+            title: "Focus Plan".to_string(),
+            description: None,
+            created_at: 0,
+            updated_at: 0,
+            concept: vec![],
+            items: vec![PlanItem {
+                id: "1".to_string(),
+                title: "Step".to_string(),
+                details: None,
+                status: PlanItemStatus::Todo,
+                files: vec![],
+                readonly_files: vec![],
+                concept_refs: vec![],
+                depends_on: vec![],
+                children: vec![],
+            }],
+        };
+        view.plans = vec![plan];
+        view.expand_all();
+        view.discussion_focus =
+            tauqe_protocol::DiscussionFocus::plan("focus-plan", vec!["1".to_string()]);
+
+        let rows = view.flatten_rows();
+        assert!(matches!(
+            &rows[0],
+            VisiblePlanRow::PlanHeader { focused: false, .. }
+        ));
+        assert!(rows.iter().any(|r| matches!(
+            r,
+            VisiblePlanRow::PlanItem { item_id, focused: true, .. } if item_id == "1"
+        )));
+
+        let (lines, _) =
+            compute_unified_plan_lines(&rows, usize::MAX, 200, crate::config::ThemeMode::Auto);
+        let mut text = String::new();
+        for line in &lines {
+            for span in &line.spans {
+                text.push_str(&span.content);
+            }
+        }
+        assert!(text.contains("[FOCUS]"), "focus badge should render: {}", text);
+    }
+
+    #[test]
+    fn test_focus_badge_marks_the_anchored_whole_plan() {
+        let mut view = PlansViewState::default();
+        let plan = Plan {
+            id: "focus-plan".to_string(),
+            title: "Focus Plan".to_string(),
+            description: None,
+            created_at: 0,
+            updated_at: 0,
+            concept: vec![],
+            items: vec![],
+        };
+        view.plans = vec![plan];
+        view.discussion_focus = tauqe_protocol::DiscussionFocus::plan("focus-plan", vec![]);
+
+        let rows = view.flatten_rows();
+        assert!(matches!(
+            &rows[0],
+            VisiblePlanRow::PlanHeader { focused: true, .. }
         ));
     }
 }

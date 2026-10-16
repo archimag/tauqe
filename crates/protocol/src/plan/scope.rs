@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 
 use super::item::{PlanItem, PlanItemStatus};
-use super::node::{compute_items_status, Plan};
+use super::node::{compute_items_status, id_key, Plan};
 
 /// Evaluation result of a targeted plan execution scope.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -148,7 +148,7 @@ impl Plan {
                     compute_items_status(&item.children) == PlanItemStatus::Done
                 };
                 if is_done {
-                    satisfied.insert(item.id.to_ascii_lowercase());
+                    satisfied.insert(id_key(&item.id));
                 }
                 collect_done(&item.children, satisfied);
             }
@@ -164,9 +164,9 @@ impl Plan {
                 let deps_met = leaf
                     .depends_on
                     .iter()
-                    .all(|dep| satisfied.contains(&dep.to_ascii_lowercase()));
+                    .all(|dep| satisfied.contains(&id_key(dep)));
                 if deps_met {
-                    satisfied.insert(leaf.id.to_ascii_lowercase());
+                    satisfied.insert(id_key(&leaf.id));
                     ready.push(leaf);
                     progressed = true;
                 } else {
@@ -185,7 +185,7 @@ impl Plan {
                 let unmet: Vec<String> = leaf
                     .depends_on
                     .iter()
-                    .filter(|dep| !satisfied.contains(&dep.to_ascii_lowercase()))
+                    .filter(|dep| !satisfied.contains(&id_key(dep.as_str())))
                     .map(|dep| format!("#{dep}"))
                     .collect();
                 if unmet.is_empty() {

@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
-use crate::ModelUsageInfo;
+
+use crate::model::ModelUsageInfo;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RepositoryState {

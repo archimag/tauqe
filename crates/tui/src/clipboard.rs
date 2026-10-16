@@ -1,11 +1,23 @@
 use std::io::Write;
+use std::sync::mpsc;
 use std::sync::Mutex;
+use std::time::Duration;
 
-static CLIPBOARD: Mutex<Option<arboard::Clipboard>> = Mutex::new(None);
+/// Upper bound (250 ms) for a single native clipboard operation.
+///
+/// `arboard` talks to an external X11/Wayland/OS clipboard process that can
+/// stall for seconds when its owner is hung or slow. The TUI drives clipboard
+/// access from its async event loop, so an unbounded call would freeze terminal
+/// rendering. Native work runs on a short-lived worker thread and is awaited
+/// for at most this long; on expiry the operation degrades safely — a copy
+/// reports the native path as unavailable, a paste returns no text.
+pub const NATIVE_CLIPBOARD_TIMEOUT: Duration = Duration::from_millis(250);
 
 /// Maximum payload size (100 KB) for terminal OSC 52 clipboard sequences
 /// to avoid terminal multiplexer buffer overflows.
 pub const MAX_OSC52_BYTES: usize = 100 * 1024;
+
+static CLIPBOARD: Mutex<Option<arboard::Clipboard>> = Mutex::new(None);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CopyResult {
@@ -29,17 +41,65 @@ pub fn is_ssh_session() -> bool {
         || std::env::var_os("SSH_CLIENT").is_some()
 }
 
+/// Runs a blocking clipboard operation on a short-lived worker thread and
+/// returns its result, or `fallback` if the worker does not finish within
+/// [`NATIVE_CLIPBOARD_TIMEOUT`].
+///
+/// The external clipboard process can stall indefinitely; offloading the call
+/// keeps that stall off the TUI event loop. A worker that outlives the timeout
+/// is detached and its eventual result is discarded. A worker panic (which
+/// drops its sender) is indistinguishable from a timeout and yields `fallback`.
+fn run_bounded<T, F>(work: F, fallback: T) -> T
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    let (tx, rx) = mpsc::channel();
+    let spawned = std::thread::Builder::new()
+        .name("tauqe-clipboard".to_string())
+        .spawn(move || {
+            let _ = tx.send(work());
+        });
+    if spawned.is_ok() {
+        rx.recv_timeout(NATIVE_CLIPBOARD_TIMEOUT)
+            .unwrap_or(fallback)
+    } else {
+        fallback
+    }
+}
+
 /// Reads plain text for a standard paste, re-initializing the shared handle if
 /// necessary. When the standard clipboard holds no text, the X11/Wayland
 /// Primary Selection is consulted as a fallback so that a recent mouse
 /// selection remains pasteable.
 pub fn get_from_clipboard() -> Option<String> {
-    read_standard_clipboard().or_else(get_from_primary_selection)
+    run_bounded(
+        || read_standard_clipboard_now().or_else(read_primary_selection_now),
+        None,
+    )
 }
 
-/// Reads plain text from the standard OS clipboard only, re-initializing the
-/// shared handle once if it has gone stale.
-fn read_standard_clipboard() -> Option<String> {
+/// Reads text from the X11/Wayland Primary Selection buffer.
+///
+/// The Primary Selection is the ephemeral buffer that the most recent mouse
+/// selection populates and that terminals paste on a middle-click. It has no
+/// equivalent on macOS, Windows, or Android, where this always returns `None`.
+pub fn get_from_primary_selection() -> Option<String> {
+    run_bounded(read_primary_selection_now, None)
+}
+
+/// Reads the best available paste buffer for a middle-click, preferring the
+/// Primary Selection and falling back to the standard clipboard.
+pub fn get_primary_or_clipboard() -> Option<String> {
+    run_bounded(
+        || read_primary_selection_now().or_else(read_standard_clipboard_now),
+        None,
+    )
+}
+
+/// Reads text from the standard OS clipboard only, re-initializing the shared
+/// handle once if it has gone stale.
+fn read_standard_clipboard_now() -> Option<String> {
     if let Ok(mut guard) = CLIPBOARD.lock() {
         if guard.is_none() {
             *guard = arboard::Clipboard::new().ok();
@@ -66,12 +126,9 @@ fn read_standard_clipboard() -> Option<String> {
     None
 }
 
-/// Reads text from the X11/Wayland Primary Selection buffer.
-///
-/// The Primary Selection is the ephemeral buffer that the most recent mouse
-/// selection populates and that terminals paste on a middle-click. It has no
-/// equivalent on macOS, Windows, or Android, where this always returns `None`.
-pub fn get_from_primary_selection() -> Option<String> {
+/// Reads text from the X11/Wayland Primary Selection buffer on platforms that
+/// expose one, returning `None` everywhere else.
+fn read_primary_selection_now() -> Option<String> {
     #[cfg(all(unix, not(target_os = "macos"), not(target_os = "android"), not(target_os = "emscripten")))]
     {
         use arboard::GetExtLinux;
@@ -82,74 +139,34 @@ pub fn get_from_primary_selection() -> Option<String> {
             }
 
             if let Some(clipboard) = guard.as_mut() {
-                let primary = clipboard
+                return clipboard
                     .get()
                     .clipboard(arboard::LinuxClipboardKind::Primary)
                     .text()
                     .ok()
                     .filter(|text| !text.is_empty());
-                if let Some(text) = primary {
-                    return Some(text);
-                }
             }
         }
     }
     None
 }
 
-/// Reads the best available paste buffer for a middle-click, preferring the
-/// Primary Selection and falling back to the standard clipboard.
-pub fn get_primary_or_clipboard() -> Option<String> {
-    get_from_primary_selection().or_else(read_standard_clipboard)
-}
-
 pub fn copy_to_clipboard(text: &str) -> CopyResult {
     let clean_text = text.trim_end_matches(['\r', '\n']);
-    let mut native_ok = false;
 
-    if let Ok(mut guard) = CLIPBOARD.lock() {
-        if guard.is_none() {
-            *guard = arboard::Clipboard::new().ok();
-        }
-
-        let mut needs_reinit = false;
-        if let Some(clipboard) = guard.as_mut() {
-            if clipboard.set_text(clean_text.to_string()).is_ok() {
-                native_ok = true;
-                #[cfg(all(unix, not(target_os = "macos"), not(target_os = "android"), not(target_os = "emscripten")))]
-                {
-                    use arboard::SetExtLinux;
-                    let _ = clipboard
-                        .set()
-                        .clipboard(arboard::LinuxClipboardKind::Primary)
-                        .text(clean_text.to_string());
-                }
-            } else {
-                needs_reinit = true;
-            }
-        } else {
-            needs_reinit = true;
-        }
-
-        if needs_reinit {
-            if let Ok(mut new_cb) = arboard::Clipboard::new() {
-                if new_cb.set_text(clean_text.to_string()).is_ok() {
-                    native_ok = true;
-                    #[cfg(all(unix, not(target_os = "macos"), not(target_os = "android"), not(target_os = "emscripten")))]
-                    {
-                        use arboard::SetExtLinux;
-                        let _ = new_cb
-                            .set()
-                            .clipboard(arboard::LinuxClipboardKind::Primary)
-                            .text(clean_text.to_string());
-                    }
-                }
-                *guard = Some(new_cb);
-            }
-        }
-    }
-
+    // In an SSH session the native clipboard belongs to the remote host and is
+    // unreachable from the user's terminal, so only the OSC 52 sequence is
+    // meaningful. Skip `arboard` entirely: with X11 forwarding a native write
+    // can stall over the network even though its result is discarded below.
     let in_ssh = is_ssh_session();
+
+    let native_ok = if in_ssh {
+        false
+    } else {
+        let owned = clean_text.to_string();
+        run_bounded(move || write_native_clipboard(&owned), false)
+    };
+
     let should_send_osc52 = !native_ok || in_ssh;
     let mut osc52_ok = false;
     if should_send_osc52 && clean_text.len() <= MAX_OSC52_BYTES {
@@ -178,6 +195,57 @@ pub fn copy_to_clipboard(text: &str) -> CopyResult {
     } else {
         CopyResult::Failed
     }
+}
+
+/// Writes `text` to the native OS clipboard, re-initializing the shared handle
+/// once when it has gone stale, and mirrors it into the X11/Wayland Primary
+/// Selection on Linux. Returns whether the standard clipboard was updated.
+fn write_native_clipboard(text: &str) -> bool {
+    let mut native_ok = false;
+
+    if let Ok(mut guard) = CLIPBOARD.lock() {
+        if guard.is_none() {
+            *guard = arboard::Clipboard::new().ok();
+        }
+
+        let mut needs_reinit = false;
+        if let Some(clipboard) = guard.as_mut() {
+            if clipboard.set_text(text.to_string()).is_ok() {
+                native_ok = true;
+                #[cfg(all(unix, not(target_os = "macos"), not(target_os = "android"), not(target_os = "emscripten")))]
+                {
+                    use arboard::SetExtLinux;
+                    let _ = clipboard
+                        .set()
+                        .clipboard(arboard::LinuxClipboardKind::Primary)
+                        .text(text.to_string());
+                }
+            } else {
+                needs_reinit = true;
+            }
+        } else {
+            needs_reinit = true;
+        }
+
+        if needs_reinit {
+            if let Ok(mut new_cb) = arboard::Clipboard::new() {
+                if new_cb.set_text(text.to_string()).is_ok() {
+                    native_ok = true;
+                    #[cfg(all(unix, not(target_os = "macos"), not(target_os = "android"), not(target_os = "emscripten")))]
+                    {
+                        use arboard::SetExtLinux;
+                        let _ = new_cb
+                            .set()
+                            .clipboard(arboard::LinuxClipboardKind::Primary)
+                            .text(text.to_string());
+                    }
+                }
+                *guard = Some(new_cb);
+            }
+        }
+    }
+
+    native_ok
 }
 
 fn base64_encode(data: &[u8]) -> String {
@@ -211,10 +279,46 @@ mod tests {
     fn test_selection_accessors_degrade_gracefully() {
         // A headless environment has no display server, so the accessors must
         // return `None` instead of panicking. Where a display exists they read
-        // whatever the developer currently has selected.
+        // whatever the developer currently has selected. The bounded worker
+        // guarantees the call returns even if the selection owner is hung.
         let _ = get_from_clipboard();
         let _ = get_from_primary_selection();
         let _ = get_primary_or_clipboard();
+    }
+
+    #[test]
+    fn test_run_bounded_returns_worker_value_when_prompt() {
+        assert_eq!(run_bounded(|| 42, 0), 42);
+    }
+
+    #[test]
+    fn test_run_bounded_falls_back_on_timeout() {
+        let start = std::time::Instant::now();
+        let got = run_bounded(
+            || {
+                std::thread::sleep(NATIVE_CLIPBOARD_TIMEOUT + Duration::from_millis(200));
+                1
+            },
+            0,
+        );
+        assert_eq!(got, 0, "a slow worker must yield the fallback value");
+        assert!(
+            start.elapsed() >= NATIVE_CLIPBOARD_TIMEOUT,
+            "the call must wait at least the timeout before falling back"
+        );
+    }
+
+    #[test]
+    fn test_run_bounded_falls_back_on_worker_panic() {
+        // A panicking worker drops its sender, which surfaces as a disconnect
+        // and must degrade to the fallback instead of propagating the panic.
+        let got = run_bounded(
+            || -> i32 {
+                panic!("worker failure");
+            },
+            7,
+        );
+        assert_eq!(got, 7);
     }
 
     #[test]

@@ -1,9 +1,13 @@
 use std::collections::HashSet;
 
-use ratatui::style::{Color, Style, Stylize};
+use ratatui::style::{Style, Stylize};
 use ratatui::text::{Line, Span};
-use tauqe_protocol::{ModelRef, ModelSelection, ReviewItem, ReviewSession, ReviewSeverity, ReviewStatus};
+use tauqe_protocol::{
+    DiscussionFocus, DiscussionTarget, ModelRef, ModelSelection, PlanItem, PlanItemStatus,
+    ReviewItem, ReviewItemStatus, ReviewSession, ReviewSeverity,
+};
 
+use crate::theme::engine::current_engine;
 use crate::ui::wrap_lines;
 
 pub mod input;
@@ -28,6 +32,8 @@ pub enum VisibleReviewRow {
         skipped: usize,
         rejected: usize,
         is_expanded: bool,
+        /// Whether the active discussion focus anchors on this session.
+        focused: bool,
     },
     SessionSummary {
         session_id: String,
@@ -40,11 +46,15 @@ pub enum VisibleReviewRow {
         title: String,
         body: String,
         severity: ReviewSeverity,
-        status: ReviewStatus,
+        status: ReviewItemStatus,
         model: Option<ModelSelection>,
         files: Vec<String>,
         resolution_notes: Option<String>,
+        /// Embedded step plan decomposed by the Architect, rendered on expansion.
+        subplan: Vec<PlanItem>,
         is_expanded: bool,
+        /// Whether the active discussion focus anchors on this finding.
+        focused: bool,
     },
 }
 
@@ -61,6 +71,9 @@ impl VisibleReviewRow {
 #[derive(Debug, Clone, Default)]
 pub struct ReviewViewState {
     pub running: bool,
+    /// Review id currently under Architect decomposition (`review/refineItem`),
+    /// if any. Drives the in-flight footer indicator and blocks re-entry.
+    pub refining: Option<String>,
     pub sessions: Vec<ReviewSession>,
     pub session: Option<ReviewSession>,
     pub selected_index: usize,
@@ -74,6 +87,9 @@ pub struct ReviewViewState {
     pub content_width: usize,
     pub rendered_lines: usize,
     pub theme_mode: crate::config::ThemeMode,
+    /// Active discussion focus mirrored from the server, used to render the
+    /// `[FOCUS]` indicator. Synced from `AppState::discussion_focus` on render.
+    pub discussion_focus: DiscussionFocus,
 }
 
 impl ReviewViewState {
@@ -145,7 +161,7 @@ impl ReviewViewState {
     /// Single path for changing a finding status (optimistic update and
     /// rollback). Updates both the session list used for rendering and the
     /// active session copy, scoped by `review_id` when provided.
-    pub fn set_item_status(&mut self, review_id: Option<&str>, item_id: u32, status: ReviewStatus) {
+    pub fn set_item_status(&mut self, review_id: Option<&str>, item_id: u32, status: ReviewItemStatus) {
         let in_scope = |session_id: &str| review_id.is_none_or(|id| id == session_id);
         if let Some(session) = self.session.as_mut() {
             if in_scope(&session.id) {
@@ -264,6 +280,31 @@ impl ReviewViewState {
         }
     }
 
+    /// Whether the active discussion focus anchors on a whole review session.
+    fn is_session_focused(&self, session_id: &str) -> bool {
+        matches!(
+            &self.discussion_focus,
+            DiscussionFocus::Focused {
+                target: DiscussionTarget::Review { id },
+                focused_items,
+            } if id.as_str() == session_id && focused_items.is_empty()
+        )
+    }
+
+    /// Whether the active discussion focus anchors on a specific finding.
+    fn is_item_focused(&self, session_id: &str, item_id: u32) -> bool {
+        match &self.discussion_focus {
+            DiscussionFocus::Focused {
+                target: DiscussionTarget::Review { id },
+                focused_items,
+            } if id.as_str() == session_id => {
+                let key = item_id.to_string();
+                focused_items.iter().any(|fid| fid == &key)
+            }
+            _ => false,
+        }
+    }
+
     pub fn flatten_rows(&self) -> Vec<VisibleReviewRow> {
         let mut rows = Vec::new();
         let effective = self.effective_sessions();
@@ -274,32 +315,32 @@ impl ReviewViewState {
             let fixed = session
                 .items
                 .iter()
-                .filter(|i| i.status == ReviewStatus::Fixed)
+                .filter(|i| i.status == ReviewItemStatus::Fixed)
                 .count();
             let todo = session
                 .items
                 .iter()
-                .filter(|i| i.status == ReviewStatus::Todo)
+                .filter(|i| i.status == ReviewItemStatus::Todo)
                 .count();
             let in_progress = session
                 .items
                 .iter()
-                .filter(|i| i.status == ReviewStatus::InProgress)
+                .filter(|i| i.status == ReviewItemStatus::InProgress)
                 .count();
             let discussion = session
                 .items
                 .iter()
-                .filter(|i| i.status == ReviewStatus::Discussion)
+                .filter(|i| i.status == ReviewItemStatus::Discussion)
                 .count();
             let skipped = session
                 .items
                 .iter()
-                .filter(|i| i.status == ReviewStatus::Skipped)
+                .filter(|i| i.status == ReviewItemStatus::Skipped)
                 .count();
             let rejected = session
                 .items
                 .iter()
-                .filter(|i| i.status == ReviewStatus::Rejected)
+                .filter(|i| i.status == ReviewItemStatus::Rejected)
                 .count();
 
             rows.push(VisibleReviewRow::SessionHeader {
@@ -320,6 +361,7 @@ impl ReviewViewState {
                 skipped,
                 rejected,
                 is_expanded,
+                focused: self.is_session_focused(&session.id),
             });
 
             if is_expanded {
@@ -335,9 +377,9 @@ impl ReviewViewState {
                 }
                 for item in &session.items {
                     if self.hide_closed
-                        && (item.status == ReviewStatus::Fixed
-                            || item.status == ReviewStatus::Skipped
-                            || item.status == ReviewStatus::Rejected)
+                        && (item.status == ReviewItemStatus::Fixed
+                            || item.status == ReviewItemStatus::Skipped
+                            || item.status == ReviewItemStatus::Rejected)
                     {
                         continue;
                     }
@@ -352,7 +394,9 @@ impl ReviewViewState {
                         model: item.model.clone(),
                         files: item.files.clone(),
                         resolution_notes: item.resolution_notes.clone(),
+                        subplan: item.subplan.clone(),
                         is_expanded: item_expanded,
+                        focused: self.is_item_focused(&session.id, item.id),
                     });
                 }
             }
@@ -419,9 +463,9 @@ impl ReviewViewState {
             });
             for item in &session.items {
                 if self.hide_closed
-                    && (item.status == ReviewStatus::Fixed
-                        || item.status == ReviewStatus::Skipped
-                        || item.status == ReviewStatus::Rejected)
+                    && (item.status == ReviewItemStatus::Fixed
+                        || item.status == ReviewItemStatus::Skipped
+                        || item.status == ReviewItemStatus::Rejected)
                 {
                     continue;
                 }
@@ -498,58 +542,147 @@ impl ReviewViewState {
 }
 
 fn severity_style(severity: ReviewSeverity) -> Style {
+    let engine = current_engine();
+    let palette = engine.palette();
     match severity {
-        ReviewSeverity::Critical => Style::default().fg(Color::Red).bold(),
-        ReviewSeverity::Warning => Style::default().fg(Color::Yellow).bold(),
-        ReviewSeverity::Suggestion => Style::default().fg(Color::Cyan).bold(),
-        ReviewSeverity::Info => Style::default().fg(Color::Gray).bold(),
+        ReviewSeverity::Critical => engine.fg(palette.status_error).bold(),
+        ReviewSeverity::Warning => engine.fg(palette.status_warning).bold(),
+        ReviewSeverity::Suggestion => engine.fg(palette.status_info).bold(),
+        ReviewSeverity::Info => engine.fg(palette.text_secondary).bold(),
     }
 }
 
-fn status_style(status: ReviewStatus) -> Style {
+fn status_style(status: ReviewItemStatus) -> Style {
+    let engine = current_engine();
+    let palette = engine.palette();
+    let inverse = engine.color(palette.text_inverse);
     match status {
-        ReviewStatus::Discussion => Style::default().bg(Color::Magenta).fg(Color::Black).bold(),
-        ReviewStatus::Todo => Style::default().bg(Color::Yellow).fg(Color::Black).bold(),
-        ReviewStatus::InProgress => Style::default().bg(Color::Cyan).fg(Color::Black).bold(),
-        ReviewStatus::Fixed => Style::default().bg(Color::Green).fg(Color::Black).bold(),
-        ReviewStatus::Skipped => Style::default().bg(Color::DarkGray).fg(Color::White).bold(),
-        ReviewStatus::Rejected => Style::default().bg(Color::DarkGray).fg(Color::White).bold(),
+        ReviewItemStatus::Discussion => engine.bg(palette.button_active_bg).fg(inverse).bold(),
+        ReviewItemStatus::Todo => engine.bg(palette.status_warning).fg(inverse).bold(),
+        ReviewItemStatus::InProgress => engine.bg(palette.status_info).fg(inverse).bold(),
+        ReviewItemStatus::Fixed => engine.bg(palette.status_success).fg(inverse).bold(),
+        ReviewItemStatus::Skipped => engine.bg(palette.text_muted).fg(inverse).bold(),
+        ReviewItemStatus::Rejected => engine.bg(palette.text_muted).fg(inverse).bold(),
     }
+}
+
+/// Compact indicator marking the row anchored by the active discussion focus.
+fn focus_badge() -> Span<'static> {
+    let engine = current_engine();
+    let palette = engine.palette();
+    Span::styled(
+        " [FOCUS]",
+        engine
+            .bg(palette.status_success)
+            .fg(engine.color(palette.text_inverse))
+            .bold(),
+    )
+}
+
+/// Status badge style for a subplan step, mirroring the Plans view vocabulary so
+/// a decomposed finding reads exactly like an implementation step.
+fn plan_status_style(status: PlanItemStatus) -> Style {
+    let engine = current_engine();
+    let palette = engine.palette();
+    let inverse = engine.color(palette.text_inverse);
+    match status {
+        PlanItemStatus::Discussion => engine.bg(palette.button_active_bg).fg(inverse).bold(),
+        PlanItemStatus::Todo => engine.bg(palette.status_warning).fg(inverse).bold(),
+        PlanItemStatus::InProgress => engine.bg(palette.status_info).fg(inverse).bold(),
+        PlanItemStatus::Done => engine.bg(palette.status_success).fg(inverse).bold(),
+        PlanItemStatus::Blocked => engine.bg(palette.status_error).fg(inverse).bold(),
+        PlanItemStatus::Cancelled => engine.bg(palette.text_muted).fg(inverse).bold(),
+    }
+}
+
+/// Counts executable leaves in an embedded subplan as `(completed, total)`.
+///
+/// Mirrors `ReviewItem::subplan_stats`: only leaves carry an explicit status,
+/// cancelled leaves are excluded from the total, and `completed` counts the
+/// done leaves.
+fn subplan_progress(items: &[PlanItem]) -> (usize, usize) {
+    fn walk(items: &[PlanItem], total: &mut usize, completed: &mut usize) {
+        for item in items {
+            if item.is_leaf() {
+                if item.status == PlanItemStatus::Cancelled {
+                    continue;
+                }
+                *total += 1;
+                if item.status == PlanItemStatus::Done {
+                    *completed += 1;
+                }
+            } else {
+                walk(&item.children, total, completed);
+            }
+        }
+    }
+    let mut total = 0;
+    let mut completed = 0;
+    walk(items, &mut total, &mut completed);
+    (completed, total)
+}
+
+/// Renders the embedded subplan tree as indented, status-badged rows shown when
+/// a finding is expanded.
+fn subplan_lines(items: &[PlanItem], depth: usize) -> Vec<Line<'static>> {
+    let engine = current_engine();
+    let palette = engine.palette();
+    let mut out = Vec::new();
+    for item in items {
+        let mut prefix = String::from("        │ ");
+        prefix.push_str(&"  ".repeat(depth));
+        out.push(Line::from(vec![
+            Span::styled(prefix, engine.fg(palette.text_muted)),
+            Span::styled(format!(" {} ", item.status), plan_status_style(item.status)),
+            Span::raw(" "),
+            Span::styled(
+                format!("#{} {}", item.id, item.title),
+                engine.fg(palette.text_primary),
+            ),
+        ]));
+        if !item.children.is_empty() {
+            out.extend(subplan_lines(&item.children, depth + 1));
+        }
+    }
+    out
 }
 
 fn model_badge(selection: &ModelSelection) -> Span<'static> {
+    let engine = current_engine();
+    let palette = engine.palette();
     match selection {
         ModelSelection::Role(role) => match role {
             tauqe_protocol::ModelRole::Scribe => {
-                Span::styled(" [Scr]", Style::default().fg(Color::Green))
+                Span::styled(" [Scr]", engine.fg(palette.status_success))
             }
             tauqe_protocol::ModelRole::Coder => {
-                Span::styled(" [Cod]", Style::default().fg(Color::Yellow))
+                Span::styled(" [Cod]", engine.fg(palette.status_warning))
             }
             tauqe_protocol::ModelRole::Architect => {
-                Span::styled(" [Arc]", Style::default().fg(Color::Red))
+                Span::styled(" [Arc]", engine.fg(palette.status_error))
             }
             tauqe_protocol::ModelRole::Primary => {
-                Span::styled(" [Pri]", Style::default().fg(Color::Cyan))
+                Span::styled(" [Pri]", engine.fg(palette.status_info))
             }
             tauqe_protocol::ModelRole::Reviewer => {
-                Span::styled(" [Rev]", Style::default().fg(Color::Magenta))
+                Span::styled(" [Rev]", engine.fg(palette.button_active_bg))
             }
         },
-        ModelSelection::Specific(model_ref) => {
-            Span::styled(format!(" [{}]", model_ref.name), Style::default().fg(Color::Cyan))
-        }
+        ModelSelection::Specific(model_ref) => Span::styled(
+            format!(" [{}]", model_ref.name),
+            engine.fg(palette.status_info),
+        ),
     }
 }
 
-fn status_label(status: ReviewStatus) -> &'static str {
+fn status_label(status: ReviewItemStatus) -> &'static str {
     match status {
-        ReviewStatus::Discussion => "DISCUSSION",
-        ReviewStatus::Todo => "TODO",
-        ReviewStatus::InProgress => "IN_PROGRESS",
-        ReviewStatus::Fixed => "FIXED",
-        ReviewStatus::Skipped => "SKIP",
-        ReviewStatus::Rejected => "REJECTED",
+        ReviewItemStatus::Discussion => "DISCUSSION",
+        ReviewItemStatus::Todo => "TODO",
+        ReviewItemStatus::InProgress => "IN_PROGRESS",
+        ReviewItemStatus::Fixed => "FIXED",
+        ReviewItemStatus::Skipped => "SKIP",
+        ReviewItemStatus::Rejected => "REJECTED",
     }
 }
 
@@ -588,6 +721,8 @@ fn compute_unified_review_lines(
     width: usize,
     theme_mode: crate::config::ThemeMode,
 ) -> (Vec<Line<'static>>, Vec<usize>) {
+    let engine = current_engine();
+    let palette = engine.palette();
     let mut all_lines = Vec::new();
     let mut offsets = Vec::with_capacity(rows.len());
 
@@ -596,13 +731,13 @@ fn compute_unified_review_lines(
         offsets.push(all_lines.len());
 
         let row_style = if is_selected {
-            Style::default().bg(Color::DarkGray)
+            engine.bg(palette.overlay)
         } else {
             Style::default()
         };
 
         let gutter = if is_selected {
-            Span::styled("▌", Style::default().fg(Color::Cyan).bold())
+            Span::styled("▌", engine.fg(palette.status_info).bold())
         } else {
             Span::raw(" ")
         };
@@ -620,6 +755,7 @@ fn compute_unified_review_lines(
                 skipped,
                 rejected,
                 is_expanded,
+                focused,
                 ..
             } => {
                 if idx > 0 {
@@ -632,15 +768,31 @@ fn compute_unified_review_lines(
                     fixed, total, todo, in_progress, discussion, skipped, rejected
                 );
 
-                let spans = vec![
+                let mut spans = vec![
                     gutter,
                     Span::raw(" "),
-                    Span::styled(fold_icon, Style::default().fg(Color::Yellow).bold()),
-                    Span::styled(format!("[{}] ", session_id), Style::default().bold().fg(Color::Cyan)),
-                    Span::styled(title.clone(), Style::default().bold().fg(Color::White)),
-                    Span::styled(format!(" ({}) ", model), Style::default().fg(Color::DarkGray)),
-                    Span::styled(format!("({})", stats_str), Style::default().fg(if is_selected { Color::White } else { Color::DarkGray })),
+                    Span::styled(fold_icon, engine.fg(palette.status_warning).bold()),
+                    Span::styled(
+                        format!("[{}] ", session_id),
+                        engine.fg(palette.status_info).bold(),
+                    ),
+                    Span::styled(title.clone(), engine.fg(palette.text_primary).bold()),
+                    Span::styled(
+                        format!(" ({}) ", model),
+                        engine.fg(palette.text_muted),
+                    ),
+                    Span::styled(
+                        format!("({})", stats_str),
+                        if is_selected {
+                            engine.fg(palette.text_primary)
+                        } else {
+                            engine.fg(palette.text_muted)
+                        },
+                    ),
                 ];
+                if *focused {
+                    spans.push(focus_badge());
+                }
 
                 let mut header_line = Line::from(spans).style(row_style);
                 if is_selected {
@@ -657,10 +809,10 @@ fn compute_unified_review_lines(
                 let spans = vec![
                     gutter,
                     Span::raw("  "),
-                    Span::styled(fold_icon, Style::default().fg(Color::Yellow).bold()),
+                    Span::styled(fold_icon, engine.fg(palette.status_warning).bold()),
                     Span::styled(
                         "Executive Summary:",
-                        Style::default().fg(Color::Green).bold(),
+                        engine.fg(palette.status_success).bold(),
                     ),
                 ];
 
@@ -675,18 +827,27 @@ fn compute_unified_review_lines(
                     if !trimmed.is_empty() {
                         let mut theme =
                             crate::markdown::MarkdownTheme::answer_themed(theme_mode);
-                        theme.text_style = Style::default().fg(Color::Gray);
+                        theme.text_style = engine.fg(palette.text_secondary);
                         theme.hard_breaks = true;
                         theme.compact = true;
-                        theme.line_prefix = Some(Span::styled("    │ ", Style::default().fg(Color::DarkGray)));
+                        theme.line_prefix = Some(Span::styled(
+                            "    │ ",
+                            engine.fg(palette.text_muted),
+                        ));
                         let md = crate::markdown::render_markdown(trimmed, &theme);
                         if !md.is_empty() {
                             row_lines.extend(md);
                         } else {
                             for line in trimmed.lines() {
                                 row_lines.push(Line::from(vec![
-                                    Span::styled("    │ ", Style::default().fg(Color::DarkGray)),
-                                    Span::styled(line.to_string(), Style::default().fg(Color::Gray)),
+                                    Span::styled(
+                                        "    │ ",
+                                        engine.fg(palette.text_muted),
+                                    ),
+                                    Span::styled(
+                                        line.to_string(),
+                                        engine.fg(palette.text_secondary),
+                                    ),
                                 ]));
                             }
                         }
@@ -704,19 +865,21 @@ fn compute_unified_review_lines(
                 model,
                 files,
                 resolution_notes,
+                subplan,
                 is_expanded,
+                focused,
                 ..
             } => {
                 let fold_icon = if *is_expanded { "▼ " } else { "▶ " };
                 let label = status_label(*status);
 
                 let title_style = if is_selected {
-                    Style::default().fg(Color::White).bold()
-                } else if *status == ReviewStatus::Fixed
-                    || *status == ReviewStatus::Skipped
-                    || *status == ReviewStatus::Rejected
+                    engine.fg(palette.text_primary).bold()
+                } else if *status == ReviewItemStatus::Fixed
+                    || *status == ReviewItemStatus::Skipped
+                    || *status == ReviewItemStatus::Rejected
                 {
-                    Style::default().fg(Color::Gray)
+                    engine.fg(palette.text_secondary)
                 } else {
                     Style::default().bold()
                 };
@@ -727,7 +890,7 @@ fn compute_unified_review_lines(
                 let mut spans = vec![
                     gutter,
                     Span::raw("    "),
-                    Span::styled(fold_icon, Style::default().fg(Color::Yellow).bold()),
+                    Span::styled(fold_icon, engine.fg(palette.status_warning).bold()),
                     Span::styled(format!(" {} ", label), status_style(*status)),
                     Span::raw(" "),
                     Span::styled(format!("[{}]", severity), severity_style(*severity)),
@@ -744,8 +907,20 @@ fn compute_unified_review_lines(
                             files.len(),
                             if files.len() == 1 { "" } else { "s" }
                         ),
-                        Style::default().fg(Color::DarkGray),
+                        engine.fg(palette.text_muted),
                     ));
+                }
+                if !subplan.is_empty() {
+                    let (done, total) = subplan_progress(subplan.as_slice());
+                    if total > 0 {
+                        spans.push(Span::styled(
+                            format!(" [{}/{} steps]", done, total),
+                            engine.fg(palette.status_info),
+                        ));
+                    }
+                }
+                if *focused {
+                    spans.push(focus_badge());
                 }
 
                 let mut item_line = Line::from(spans).style(row_style);
@@ -761,8 +936,14 @@ fn compute_unified_review_lines(
                         let clean_loc = loc.trim();
                         if !clean_loc.is_empty() {
                             row_lines.push(Line::from(vec![
-                                Span::styled("        Files: ", Style::default().fg(Color::Cyan).bold()),
-                                Span::styled(clean_loc.to_string(), Style::default().fg(Color::White)),
+                                Span::styled(
+                                    "        Files: ",
+                                    engine.fg(palette.status_info).bold(),
+                                ),
+                                Span::styled(
+                                    clean_loc.to_string(),
+                                    engine.fg(palette.text_primary),
+                                ),
                             ]));
                         }
                     }
@@ -770,7 +951,7 @@ fn compute_unified_review_lines(
                     if let Some(notes) = resolution_notes.as_deref() {
                         let clean_notes = notes.trim();
                         if !clean_notes.is_empty() {
-                            let note_header = if *status == ReviewStatus::Skipped {
+                            let note_header = if *status == ReviewItemStatus::Skipped {
                                 "        Skip Reason: "
                             } else {
                                 "        Note: "
@@ -778,13 +959,25 @@ fn compute_unified_review_lines(
                             let mut note_lines = clean_notes.lines();
                             if let Some(first) = note_lines.next() {
                                 row_lines.push(Line::from(vec![
-                                    Span::styled(note_header, Style::default().fg(Color::Yellow).bold()),
-                                    Span::styled(first.to_string(), Style::default().fg(Color::White)),
+                                    Span::styled(
+                                        note_header,
+                                        engine.fg(palette.status_warning).bold(),
+                                    ),
+                                    Span::styled(
+                                        first.to_string(),
+                                        engine.fg(palette.text_primary),
+                                    ),
                                 ]));
                                 for line in note_lines {
                                     row_lines.push(Line::from(vec![
-                                        Span::styled("        │ ", Style::default().fg(Color::DarkGray)),
-                                        Span::styled(line.to_string(), Style::default().fg(Color::White)),
+                                        Span::styled(
+                                            "        │ ",
+                                            engine.fg(palette.text_muted),
+                                        ),
+                                        Span::styled(
+                                            line.to_string(),
+                                            engine.fg(palette.text_primary),
+                                        ),
                                     ]));
                                 }
                             }
@@ -795,14 +988,25 @@ fn compute_unified_review_lines(
                     if !clean_body.is_empty() {
                         let mut theme =
                             crate::markdown::MarkdownTheme::answer_themed(theme_mode);
-                        theme.text_style = Style::default().fg(Color::Gray);
+                        theme.text_style = engine.fg(palette.text_secondary);
                         theme.hard_breaks = true;
                         theme.compact = true;
-                        theme.line_prefix = Some(Span::styled("        │ ", Style::default().fg(Color::DarkGray)));
+                        theme.line_prefix = Some(Span::styled(
+                            "        │ ",
+                            engine.fg(palette.text_muted),
+                        ));
                         let md = crate::markdown::render_markdown(clean_body, &theme);
                         if !md.is_empty() {
                             row_lines.extend(md);
                         }
+                    }
+
+                    if !subplan.is_empty() {
+                        row_lines.push(Line::from(Span::styled(
+                            "        Subtasks:",
+                            engine.fg(palette.status_info).bold(),
+                        )));
+                        row_lines.extend(subplan_lines(subplan.as_slice(), 0));
                     }
                 }
 
@@ -817,7 +1021,7 @@ fn compute_unified_review_lines(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tauqe_protocol::{ReviewItem, ReviewSeverity, ReviewSession, ReviewStatus};
+    use tauqe_protocol::{ReviewItem, ReviewItemStatus, ReviewSeverity, ReviewSession};
 
     fn make_item(id: u32) -> ReviewItem {
         ReviewItem {
@@ -825,8 +1029,9 @@ mod tests {
             title: format!("Finding {}", id),
             model: None,
             severity: ReviewSeverity::Warning,
-            status: ReviewStatus::Todo,
+            status: ReviewItemStatus::Todo,
             files: Vec::new(),
+            subplan: vec![],
             resolution_notes: None,
             body: String::new(),
         }
@@ -855,29 +1060,29 @@ mod tests {
         view.session = view.sessions.first().cloned();
 
         // Updating rev-2 must not touch the same-numbered finding in rev-1.
-        view.set_item_status(Some("rev-2"), 1, ReviewStatus::Fixed);
-        assert_eq!(view.sessions[0].items[0].status, ReviewStatus::Todo);
-        assert_eq!(view.sessions[1].items[0].status, ReviewStatus::Fixed);
+        view.set_item_status(Some("rev-2"), 1, ReviewItemStatus::Fixed);
+        assert_eq!(view.sessions[0].items[0].status, ReviewItemStatus::Todo);
+        assert_eq!(view.sessions[1].items[0].status, ReviewItemStatus::Fixed);
         assert_eq!(
             view.session.as_ref().map(|s| s.items[0].status),
-            Some(ReviewStatus::Todo)
+            Some(ReviewItemStatus::Todo)
         );
 
         // Updating the active session keeps both copies in sync.
-        view.set_item_status(Some("rev-1"), 1, ReviewStatus::InProgress);
-        assert_eq!(view.sessions[0].items[0].status, ReviewStatus::InProgress);
+        view.set_item_status(Some("rev-1"), 1, ReviewItemStatus::InProgress);
+        assert_eq!(view.sessions[0].items[0].status, ReviewItemStatus::InProgress);
         assert_eq!(
             view.session.as_ref().map(|s| s.items[0].status),
-            Some(ReviewStatus::InProgress)
+            Some(ReviewItemStatus::InProgress)
         );
-        assert_eq!(view.sessions[1].items[0].status, ReviewStatus::Fixed);
+        assert_eq!(view.sessions[1].items[0].status, ReviewItemStatus::Fixed);
 
         // apply_item is scoped the same way.
         let mut replacement = make_item(1);
-        replacement.status = ReviewStatus::Rejected;
+        replacement.status = ReviewItemStatus::Rejected;
         view.apply_item(Some("rev-2"), replacement);
-        assert_eq!(view.sessions[0].items[0].status, ReviewStatus::InProgress);
-        assert_eq!(view.sessions[1].items[0].status, ReviewStatus::Rejected);
+        assert_eq!(view.sessions[0].items[0].status, ReviewItemStatus::InProgress);
+        assert_eq!(view.sessions[1].items[0].status, ReviewItemStatus::Rejected);
     }
 
     #[test]
@@ -1088,11 +1293,11 @@ mod tests {
     #[test]
     fn test_review_item_skipped_badge_and_skip_reason_notes() {
         let mut session = make_session("rev-skip", &[1, 2]);
-        session.items[0].status = ReviewStatus::Skipped;
+        session.items[0].status = ReviewItemStatus::Skipped;
         session.items[0].resolution_notes = Some(
             "Already addressed in previous turn\nVerified no code change needed".to_string(),
         );
-        session.items[1].status = ReviewStatus::Fixed;
+        session.items[1].status = ReviewItemStatus::Fixed;
         session.items[1].resolution_notes = Some("Fixed race condition".to_string());
 
         let mut view = ReviewViewState {
@@ -1134,13 +1339,13 @@ mod tests {
     #[test]
     fn test_session_header_statistics_with_skipped() {
         let mut session = make_session("rev-stats", &[1, 2, 3, 4, 5, 6, 7]);
-        session.items[0].status = ReviewStatus::Fixed;
-        session.items[1].status = ReviewStatus::Todo;
-        session.items[2].status = ReviewStatus::InProgress;
-        session.items[3].status = ReviewStatus::Discussion;
-        session.items[4].status = ReviewStatus::Skipped;
-        session.items[5].status = ReviewStatus::Skipped;
-        session.items[6].status = ReviewStatus::Rejected;
+        session.items[0].status = ReviewItemStatus::Fixed;
+        session.items[1].status = ReviewItemStatus::Todo;
+        session.items[2].status = ReviewItemStatus::InProgress;
+        session.items[3].status = ReviewItemStatus::Discussion;
+        session.items[4].status = ReviewItemStatus::Skipped;
+        session.items[5].status = ReviewItemStatus::Skipped;
+        session.items[6].status = ReviewItemStatus::Rejected;
 
         let view = ReviewViewState {
             sessions: vec![session],
@@ -1177,5 +1382,59 @@ mod tests {
             header_text.contains("1/7 fixed (1 todo, 1 prog, 1 disc, 2 skip, 1 rej)"),
             "expected session statistics formatted with skip count, got: {header_text}"
         );
+    }
+
+    #[test]
+    fn test_review_focus_badge_and_subplan_rendering() {
+        let mut session = make_session("rev-focus", &[1]);
+        session.items[0].subplan = vec![
+            PlanItem {
+                id: "1.1".to_string(),
+                title: "First subtask".to_string(),
+                status: PlanItemStatus::Done,
+                ..Default::default()
+            },
+            PlanItem {
+                id: "1.2".to_string(),
+                title: "Second subtask".to_string(),
+                status: PlanItemStatus::InProgress,
+                ..Default::default()
+            },
+        ];
+        let mut view = ReviewViewState {
+            sessions: vec![session],
+            ..Default::default()
+        };
+        view.discussion_focus =
+            tauqe_protocol::DiscussionFocus::review("rev-focus", vec!["1".to_string()]);
+        view.toggle_item_expanded("rev-focus", 1);
+
+        let rows = view.flatten_rows();
+        assert!(matches!(
+            &rows[0],
+            VisibleReviewRow::SessionHeader { focused: false, .. }
+        ));
+        assert!(rows.iter().any(|r| matches!(
+            r,
+            VisibleReviewRow::ReviewItem {
+                item_id: 1,
+                focused: true,
+                ..
+            }
+        )));
+
+        let (lines, _) =
+            compute_unified_review_lines(&rows, 1, 120, crate::config::ThemeMode::Dark);
+        let mut text = String::new();
+        for line in &lines {
+            for span in &line.spans {
+                text.push_str(&span.content);
+            }
+        }
+        assert!(text.contains("[FOCUS]"), "focus badge expected: {text}");
+        assert!(text.contains("[1/2 steps]"), "subplan badge expected: {text}");
+        assert!(text.contains("Subtasks:"), "subtask header expected: {text}");
+        assert!(text.contains("#1.1 First subtask"), "subtask expected: {text}");
+        assert!(text.contains("#1.2 Second subtask"), "subtask expected: {text}");
     }
 }

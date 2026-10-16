@@ -39,6 +39,12 @@ fn transaction_marker_path(dir: &Path) -> PathBuf {
     dir.join(TRANSACTION_MARKER_FILE)
 }
 
+/// Reports whether the recorded transaction base is still part of the history of
+/// the commit currently checked out.
+fn is_ancestor_of_head(dir: &Path, ancestor: &str) -> bool {
+    run_git(Some(dir), &["merge-base", "--is-ancestor", ancestor, "HEAD"]).is_ok()
+}
+
 /// Persists the checkpoint of an open transaction so crash recovery can tell a
 /// genuine interrupted Tauqe transaction apart from an unrelated commit that
 /// merely shares the step-commit subject prefix.
@@ -151,11 +157,12 @@ pub fn cleanup_orphaned_staging_files(root: &Path) -> usize {
 /// a hand-written commit or a step commit from another branch after a checkout —
 /// is never mistaken for a dangling transaction.
 ///
-/// When the marker is present, every commit between the recorded base and HEAD
-/// must carry the Tauqe co-author trailer; otherwise recovery refuses and
-/// reports the reason instead of rewriting history. A successful recovery resets
-/// to the recorded base via `previous_head` and unwinds a temporary checkpoint
-/// commit so uncommitted developer changes are restored safely.
+/// When the marker is present, the recorded base must still be an ancestor of
+/// HEAD, and every commit between that base and HEAD must carry the Tauqe
+/// co-author trailer; otherwise recovery refuses and reports the reason instead
+/// of rewriting history. A successful recovery resets to the recorded base via
+/// `previous_head` and unwinds a temporary checkpoint commit so uncommitted
+/// developer changes are restored safely.
 pub fn recover_interrupted_workflow(dir: &Path) -> Result<Option<String>> {
     if !crate::git::state::is_git_repository(Some(dir)) {
         return Ok(None);
@@ -175,6 +182,17 @@ pub fn recover_interrupted_workflow(dir: &Path) -> Result<Option<String>> {
             return Ok(None);
         }
     };
+
+    // The recorded base must still be part of the history of the commit that is
+    // currently checked out. After a manual branch switch the base can belong to
+    // another branch entirely, and resetting to it would discard commits that
+    // were never part of the transaction.
+    if !is_ancestor_of_head(dir, &checkpoint.previous_head) {
+        return Ok(Some(format!(
+            "Skipped crash recovery: recorded transaction base {} is not an ancestor of HEAD; repository left untouched.",
+            checkpoint.previous_head
+        )));
+    }
 
     // Collect the commits recorded on top of the transaction base. They must all
     // be Tauqe-created; anything else means this is not a dangling Tauqe
@@ -880,5 +898,55 @@ mod tests {
             .trim()
             .to_string();
         assert_eq!(head_before, head_after);
+    }
+
+    #[test]
+    fn test_recover_refuses_when_recorded_base_is_not_an_ancestor() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+        crate::git::state::init_repository(Some(path), true).unwrap();
+
+        let current_branch =
+            crate::git::cmd::run_git(Some(path), &["rev-parse", "--abbrev-ref", "HEAD"])
+                .unwrap()
+                .trim()
+                .to_string();
+
+        // A commit that lives only on a side branch, recorded as the base of a
+        // transaction opened on the branch currently checked out.
+        crate::git::cmd::run_git(Some(path), &["checkout", "-b", "side"]).unwrap();
+        fs::write(path.join("side.txt"), "side work").unwrap();
+        crate::git::cmd::run_git(Some(path), &["add", "side.txt"]).unwrap();
+        crate::git::cmd::commit_with_developer_author(path, "chore: side work", false).unwrap();
+        let foreign_base = crate::git::cmd::run_git(Some(path), &["rev-parse", "HEAD"])
+            .unwrap()
+            .trim()
+            .to_string();
+
+        crate::git::cmd::run_git(Some(path), &["checkout", current_branch.as_str()]).unwrap();
+        let head_before = crate::git::cmd::run_git(Some(path), &["rev-parse", "HEAD"])
+            .unwrap()
+            .trim()
+            .to_string();
+
+        let checkpoint = CheckpointInfo {
+            created_checkpoint_commit: false,
+            previous_head: foreign_base,
+        };
+        write_transaction_marker(path, &checkpoint).unwrap();
+
+        let recovery = recover_interrupted_workflow(path).unwrap();
+        let msg = recovery.unwrap_or_default();
+        assert!(msg.contains("not an ancestor of HEAD"));
+
+        // Resetting to a base outside the current history would discard commits
+        // that were never part of the transaction, so HEAD must stay put and the
+        // marker must survive for a later attempt on the matching branch.
+        let head_after = crate::git::cmd::run_git(Some(path), &["rev-parse", "HEAD"])
+            .unwrap()
+            .trim()
+            .to_string();
+        assert_eq!(head_before, head_after);
+        assert!(read_transaction_marker(path).is_some());
     }
 }

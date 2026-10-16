@@ -409,30 +409,12 @@ pub fn render_onboarding_view(
         .block(Block::default().title(" Information ").borders(Borders::ALL));
     frame.render_widget(info_block, info_area);
 
-    let footer_line = Line::from(vec![
-        Span::styled(
-            " ↑ / ↓ (k / j) ",
-            Style::default().bg(Color::DarkGray).fg(Color::White).bold(),
-        ),
-        Span::raw(" Select Item  "),
-        Span::styled(
-            " Enter ",
-            Style::default().bg(Color::DarkGray).fg(Color::White).bold(),
-        ),
-        Span::raw(" Confirm  "),
-        Span::styled(
-            " Esc / q ",
-            Style::default().bg(Color::DarkGray).fg(Color::White).bold(),
-        ),
-        Span::raw(" Back / Exit  "),
-        Span::styled(
-            " Ctrl+O ",
-            Style::default().bg(Color::DarkGray).fg(Color::White).bold(),
-        ),
-        Span::raw(" Reload Config"),
-    ]);
-    let footer = Paragraph::new(footer_line).block(Block::default().borders(Borders::ALL));
-    frame.render_widget(footer, footer_area);
+    // The footer is reserved for operational telemetry (Conventions §1.2, §3.2):
+    // onboarding keybindings are documented by the Help modal (`ONBOARDING_COMMANDS`),
+    // never by a persistent hint bar. Reuse the shared telemetry footer so the
+    // onboarding chrome stays theme-correct and the reload chord follows the
+    // configured primary modifier instead of a hardcoded `Ctrl+O` (Conventions §5.2).
+    crate::ui::render_footer(frame, state, footer_area);
 }
 
 #[cfg(test)]
@@ -458,5 +440,47 @@ mod tests {
         let badge_gatekeeper = render_onboarding_step_badge(crate::app::OnboardingStep::Gatekeeper);
         let text_gatekeeper = badge_gatekeeper.to_string();
         assert!(text_gatekeeper.contains("Warning: API Key Missing"));
+    }
+
+    #[test]
+    fn onboarding_footer_shows_telemetry_not_keyboard_hints() {
+        use ratatui::backend::TestBackend;
+        use ratatui::layout::{Constraint, Direction, Layout};
+        use ratatui::Terminal;
+
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).expect("terminal created");
+        let mut state = crate::app::test_state();
+        state.view_mode = crate::app::ViewMode::Onboarding;
+
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                let chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([
+                        Constraint::Length(3),
+                        Constraint::Min(5),
+                        Constraint::Length(3),
+                        Constraint::Length(3),
+                    ])
+                    .split(area);
+                render_onboarding_view(frame, &state, chunks[1], chunks[2], chunks[3]);
+            })
+            .expect("draw succeeded");
+
+        let buffer = terminal.backend().buffer();
+        let content: String = buffer.content().iter().map(|cell| cell.symbol()).collect();
+
+        // §3.2: a primary view never renders a persistent shortcut hint bar.
+        assert!(
+            !content.contains("Reload Config") && !content.contains("Select Item"),
+            "onboarding footer must not render shortcut hints: {content:?}"
+        );
+        // The shared telemetry footer identifies the environment instead.
+        assert!(
+            content.contains("TAUQE"),
+            "onboarding footer must render the shared telemetry footer: {content:?}"
+        );
     }
 }

@@ -52,7 +52,7 @@ pub async fn compact_history_if_needed_with_budget(
     }
 
     let summarization_prompt = format!(
-        "Summarize the following interaction history into a concise, structured summary capturing the completed tasks, key code changes, and context:\n\n```jsonl\n{}\n```\nProvide only the summary text without any JSON or XML wrapper.",
+        "Summarize the following interaction history into a concise, structured summary capturing the completed tasks, key code changes, and context:\n\n```jsonl\n{}\n```\nRespond with a single JSON object matching the enforced schema, placing the summary text in the `summary` field. Do not wrap the JSON in markdown code fences.",
         head_text.trim()
     );
 
@@ -65,7 +65,7 @@ pub async fn compact_history_if_needed_with_budget(
     let client_call = provider.stream_chat(
         &model.name,
         messages,
-        None,
+        Some(crate::prompt::history_compaction_response_format()),
         tx,
         cancel_rx,
     );
@@ -107,9 +107,13 @@ pub async fn compact_history_if_needed_with_budget(
                 )
             })?;
             if let Some(summary_text) = maybe_summary {
-                let trimmed = summary_text.trim();
-                if !trimmed.is_empty() {
-                    history_manager.apply_compaction(trimmed, tail)?;
+                match crate::prompt::parse_compaction_summary(&summary_text) {
+                    Some(summary) => history_manager.apply_compaction(&summary, tail)?,
+                    None => {
+                        tracing::warn!(
+                            "History compaction produced no recoverable summary; skipping compaction to preserve history"
+                        );
+                    }
                 }
             } else {
                 tracing::warn!(
@@ -163,8 +167,7 @@ pub fn record_workflow_response(
             summary,
             edits,
             proposal,
-            applied,
-            commit_hash,
+            outcome,
             ..
         } => {
             let msg = if let Some(m) = proposal
@@ -200,8 +203,8 @@ pub fn record_workflow_response(
                 }
             }
 
-            let commit = if *applied {
-                commit_hash.clone()
+            let commit = if outcome.applied {
+                outcome.commit_hash.clone()
             } else {
                 None
             };
@@ -224,7 +227,6 @@ pub fn record_workflow_response(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::edits::protocol::EditProtocol;
     use crate::prompt::PromptAssembly;
 
     #[tokio::test]
@@ -300,10 +302,12 @@ mod tests {
                 new_text: "fn new() {}".to_string(),
             }],
             proposal: None,
-            applied: true,
-            error: None,
-            changed_files: vec!["src/a.rs".to_string()],
-            commit_hash: Some("1234567".to_string()),
+            outcome: tauqe_protocol::EditOutcome {
+                applied: true,
+                error: None,
+                changed_files: vec!["src/a.rs".to_string()],
+                commit_hash: Some("1234567".to_string()),
+            },
         };
 
         record_workflow_response(&mut hm, &edit_res, raw_json, vec![]);
@@ -341,10 +345,12 @@ mod tests {
                 new_text: "new".to_string(),
             }],
             proposal: None,
-            applied: true,
-            error: None,
-            changed_files: vec!["a.rs".to_string()],
-            commit_hash: Some("abcdef1".to_string()),
+            outcome: tauqe_protocol::EditOutcome {
+                applied: true,
+                error: None,
+                changed_files: vec!["a.rs".to_string()],
+                commit_hash: Some("abcdef1".to_string()),
+            },
         };
 
         record_workflow_response(&mut hm, &edit_res, raw_discovery, vec![]);
@@ -396,10 +402,12 @@ mod tests {
                 message: "I found the issue and fixed it.".to_string(),
                 ..Default::default()
             }),
-            applied: true,
-            error: None,
-            changed_files: vec!["src/parser.rs".to_string()],
-            commit_hash: Some("1122334".to_string()),
+            outcome: tauqe_protocol::EditOutcome {
+                applied: true,
+                error: None,
+                changed_files: vec!["src/parser.rs".to_string()],
+                commit_hash: Some("1122334".to_string()),
+            },
         };
 
         record_workflow_response(&mut hm, &edit_res, raw_assistant, vec![]);

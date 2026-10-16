@@ -1,27 +1,31 @@
 use serde::{Deserialize, Serialize};
 
-use crate::discussion::DiscussionRequest;
-use crate::edit::{EditOperation, StructuredChangeProposal};
+use crate::discussion::{DiscussionContextRequest, DiscussionRequest};
+use crate::edit::{EditOperation, EditOutcome, StructuredChangeProposal};
 
 use super::effort::ReasoningEffort;
 use super::reference::ModelRef;
 use super::role::ModelRole;
 use super::usage::ModelUsageInfo;
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct ModelAskParams {
-    /// Free-form prompt for a plain interactive turn.
+/// Input of a `model/ask` request.
+///
+/// The two mutually exclusive turn kinds are modeled by a tagged enum instead
+/// of a struct with a free-form `prompt` and an optional `discussion`. A
+/// request therefore always carries exactly one target: it can never smuggle
+/// both a prompt and a discussion target, nor arrive with neither, so the
+/// illegal combinations the struct admitted are no longer representable.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ModelAskParams {
+    /// Free-form interactive turn.
     ///
-    /// Empty when the request carries a structured discussion target instead.
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub prompt: String,
-    /// Explicit discussion target.
-    ///
-    /// When present, the server generates the discussion prompt from these typed
-    /// fields instead of relying on an in-band marker inside user-controlled
-    /// prompt text.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub discussion: Option<DiscussionRequest>,
+    /// An empty prompt continues the anchored discussion (when one is active)
+    /// or is rejected with `INVALID_PARAMS` by the server.
+    Prompt { text: String },
+    /// Discussion turn addressed at a plan or review session, carrying the
+    /// typed target, the focused items, and the developer comment.
+    Discussion(DiscussionRequest),
 }
 
 /// How an in-flight cancellation should stop a running batch supervisor.
@@ -91,12 +95,44 @@ pub struct ModelResultProposal {
     pub message: String,
     #[serde(default)]
     pub changes: Vec<StructuredChangeProposal>,
-    #[serde(default)]
-    pub context_requests: Vec<String>,
+    #[serde(default, deserialize_with = "deserialize_context_request_specs")]
+    pub context_requests: Vec<DiscussionContextRequest>,
     #[serde(default)]
     pub context_drops: Vec<String>,
     #[serde(default)]
     pub suggested_actions: Vec<String>,
+}
+
+/// Normalizes the `context_requests` field of [`ModelResultProposal`] into
+/// typed, access-aware requests.
+///
+/// The edit-protocol schema encodes the requested access level in a compact
+/// string (`"path"`, `"read_only:path"`, or `"editable:path"`), while a
+/// round-tripped proposal carries explicit `{ "path", "access" }` objects. Both
+/// forms are accepted so the model's requested access level is preserved in a
+/// single [`DiscussionContextRequest`] representation instead of being dropped
+/// into an ambiguous bare string.
+fn deserialize_context_request_specs<'de, D>(
+    deserializer: D,
+) -> Result<Vec<DiscussionContextRequest>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum ContextRequestSpec {
+        Path(String),
+        Detailed(DiscussionContextRequest),
+    }
+
+    let specs = Vec::<ContextRequestSpec>::deserialize(deserializer)?;
+    Ok(specs
+        .into_iter()
+        .filter_map(|spec| match spec {
+            ContextRequestSpec::Path(path) => DiscussionContextRequest::parse_spec(&path),
+            ContextRequestSpec::Detailed(request) => request.normalized(),
+        })
+        .collect())
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -111,13 +147,8 @@ pub enum ModelResult {
         edits: Vec<EditOperation>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         proposal: Option<ModelResultProposal>,
-        applied: bool,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        error: Option<String>,
-        #[serde(default)]
-        changed_files: Vec<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        commit_hash: Option<String>,
+        #[serde(flatten)]
+        outcome: EditOutcome,
     },
 }
 
@@ -214,6 +245,72 @@ mod tests {
 
         let de: ModelResult = serde_json::from_str(&json).unwrap();
         assert_eq!(de, answer);
+    }
+
+    #[test]
+    fn test_model_ask_params_is_a_tagged_enum() {
+        let prompt = ModelAskParams::Prompt {
+            text: "hello".to_string(),
+        };
+        let json = serde_json::to_string(&prompt).unwrap();
+        assert_eq!(json, "{\"kind\":\"prompt\",\"text\":\"hello\"}");
+        let de: ModelAskParams = serde_json::from_str(&json).unwrap();
+        assert_eq!(de, prompt);
+
+        let discussion = ModelAskParams::Discussion(DiscussionRequest {
+            target: crate::discussion::DiscussionTarget::Plan {
+                id: "p-1".to_string(),
+            },
+            focused_items: vec!["1".to_string()],
+            comment: "refine".to_string(),
+        });
+        let json = serde_json::to_string(&discussion).unwrap();
+        assert!(json.contains("\"kind\":\"discussion\""));
+        assert!(json.contains("\"comment\":\"refine\""));
+        let de: ModelAskParams = serde_json::from_str(&json).unwrap();
+        assert_eq!(de, discussion);
+    }
+
+    #[test]
+    fn test_model_result_edit_flattens_the_shared_outcome() {
+        let result = ModelResult::Edit {
+            summary: "Change compute".to_string(),
+            edits: Vec::new(),
+            proposal: None,
+            outcome: EditOutcome {
+                applied: true,
+                error: None,
+                changed_files: vec!["src/lib.rs".to_string()],
+                commit_hash: Some("abc1234".to_string()),
+            },
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        assert!(json.contains("\"kind\":\"edit\""));
+        assert!(json.contains("\"applied\":true"));
+        assert!(json.contains("\"commit_hash\":\"abc1234\""));
+        assert!(
+            !json.contains("outcome"),
+            "the shared outcome must serialize inline, not nested: {json}"
+        );
+        let de: ModelResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(de, result);
+    }
+
+    #[test]
+    fn test_model_result_proposal_preserves_context_request_access() {
+        let raw = r#"{"message":"Need files","changes":[],"context_requests":["src/a.rs","editable:src/b.rs"],"context_drops":[],"suggested_actions":[]}"#;
+        let proposal: ModelResultProposal = serde_json::from_str(raw).unwrap();
+        assert_eq!(proposal.context_requests.len(), 2);
+        assert_eq!(proposal.context_requests[0].path, "src/a.rs");
+        assert_eq!(
+            proposal.context_requests[0].access,
+            crate::context::ContextAccess::ReadOnly
+        );
+        assert_eq!(proposal.context_requests[1].path, "src/b.rs");
+        assert_eq!(
+            proposal.context_requests[1].access,
+            crate::context::ContextAccess::Editable
+        );
     }
 
     #[test]

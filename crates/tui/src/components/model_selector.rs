@@ -16,12 +16,13 @@
 #![allow(dead_code)] // Introced ahead of its dialog integrations; drop once consumed.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use ratatui::style::{Color, Style, Stylize};
+use ratatui::style::Stylize;
 use ratatui::text::{Line, Span};
 use tauqe_protocol::{ModelEntry, ModelRole};
 
 use crate::app::{numbered_entry_label, role_badge};
 use crate::config::PrimaryModifier;
+use crate::theme::engine::current_engine;
 
 /// Stateful selector over the models configured for one semantic role.
 ///
@@ -203,16 +204,18 @@ impl ModelSelector {
     /// own field label (for example `Reviewer:`) while the selector remains the
     /// single source of truth for the model presentation.
     pub fn render_stepper_spans(&self, primary: PrimaryModifier) -> Vec<Span<'static>> {
+        let engine = current_engine();
+        let palette = engine.palette();
         let mut spans = vec![Span::styled(
             format!("{} ", role_badge(self.role)),
-            Style::default().fg(Color::Magenta).bold(),
+            engine.fg(palette.button_active_bg).bold(),
         )];
 
         match self.selected_entry() {
             Some(entry) => {
                 spans.push(Span::styled(
                     entry.display_label(),
-                    Style::default().fg(Color::Green).bold(),
+                    engine.fg(palette.status_success).bold(),
                 ));
                 // `display_label` already folds the effort into the label when
                 // the entry has no alias, so the separate indicator only fills
@@ -221,14 +224,14 @@ impl ModelSelector {
                     if let Some(effort) = entry.effort {
                         spans.push(Span::styled(
                             format!(" [{}]", effort),
-                            Style::default().fg(Color::Yellow).bold(),
+                            engine.fg(palette.status_warning).bold(),
                         ));
                     }
                 }
             }
             None => spans.push(Span::styled(
                 "None".to_string(),
-                Style::default().fg(Color::DarkGray),
+                engine.fg(palette.text_muted),
             )),
         }
 
@@ -240,7 +243,7 @@ impl ModelSelector {
                     self.entries.len(),
                     model_select_hint(primary)
                 ),
-                Style::default().fg(Color::Cyan),
+                engine.fg(palette.status_info),
             ));
         }
 
@@ -254,6 +257,8 @@ impl ModelSelector {
     /// `visible_height` rows are produced, so the caller can paste the result
     /// into a dialog body of any size without further clipping.
     pub fn render_list_lines(&self, visible_height: usize) -> Vec<Line<'static>> {
+        let engine = current_engine();
+        let palette = engine.palette();
         let (start, end) = self.visible_range(visible_height);
         let mut lines = Vec::with_capacity(end.saturating_sub(start));
 
@@ -261,14 +266,17 @@ impl ModelSelector {
             let is_selected = index == self.selected_index;
             let marker = if is_selected { " ▶ " } else { "   " };
             let marker_style = if is_selected {
-                Style::default().fg(Color::Green).bold()
+                engine.fg(palette.status_success).bold()
             } else {
-                Style::default().fg(Color::DarkGray)
+                engine.fg(palette.text_muted)
             };
             let row_style = if is_selected {
-                Style::default().bg(Color::DarkGray).fg(Color::White).bold()
+                engine
+                    .bg(palette.overlay)
+                    .fg(engine.color(palette.text_primary))
+                    .bold()
             } else {
-                Style::default().fg(Color::Gray)
+                engine.fg(palette.text_secondary)
             };
 
             lines.push(Line::from(vec![
