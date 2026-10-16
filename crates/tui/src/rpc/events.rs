@@ -3,9 +3,9 @@ use tokio::sync::Mutex;
 use tauqe_protocol::{
     events, BatchFinishStatus, BatchFinishSummary, ConfigState, ContextState, EditFileDoneEvent,
     EditFileRetryingEvent, EditFileStartedEvent, EditFinishedEvent, EditHunkEvent, Event,
-    GitCommitCreatedEvent, GitSquashApplyResult, GitUndoResult, HistoryEntryAddedEvent,
-    ModelDeltaEvent, ModelErrorEvent, ModelFinishedEvent, ModelResult, ModelResultEvent,
-    ModelStartedEvent, ModelUsageEvent, PlanBatchFinishedEvent, RepositoryState,
+    GitCommitCreatedEvent, GitSquashApplyResult, GitUndoResult, HistoryCompactedEvent,
+    HistoryEntryAddedEvent, ModelDeltaEvent, ModelErrorEvent, ModelFinishedEvent, ModelResult,
+    ModelResultEvent, ModelStartedEvent, ModelUsageEvent, PlanBatchFinishedEvent, RepositoryState,
     ReviewBatchFinishedEvent, ReviewContentDeltaEvent, ReviewErrorEvent, ReviewFinishedEvent,
     ReviewReasoningDeltaEvent, ReviewStartedEvent,
 };
@@ -100,6 +100,22 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
                         st.history_view.selected_item_index =
                             st.history_view.items.len().saturating_sub(1);
                     }
+                }
+            }
+        }
+        events::HISTORY_COMPACTED => {
+            if let Some(params) = ev.params {
+                if let Ok(data) = serde_json::from_value::<HistoryCompactedEvent>(params) {
+                    // Compaction is a structural replacement of the summarized
+                    // head with a single leading summary, never an append.
+                    let view_height = st.last_model_height;
+                    st.history_view.apply_compaction(
+                        data.summary,
+                        &data.tail_ids,
+                        data.total_count,
+                        data.estimated_tokens,
+                        view_height,
+                    );
                 }
             }
         }
@@ -921,7 +937,7 @@ fn format_elapsed(seconds: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tauqe_protocol::ModelRef;
+    use tauqe_protocol::{ModelRef, UiHistoryItem, UiHistoryKind};
 
     fn batch_summary(
         status: BatchFinishStatus,
@@ -1173,5 +1189,126 @@ mod tests {
             .expect("completion notification must be set");
         assert_eq!(notif.level, crate::app::NotificationLevel::Success);
         assert_eq!(notif.text, "Turn completed");
+    }
+
+    fn ui_history_item(id: u64, kind: UiHistoryKind, text: &str) -> UiHistoryItem {
+        UiHistoryItem {
+            id,
+            kind,
+            text: text.to_string(),
+            summary: None,
+            commit_hash: None,
+            files: Vec::new(),
+        }
+    }
+
+    fn compacted_event(
+        summary: UiHistoryItem,
+        tail_ids: Vec<u64>,
+        total_count: usize,
+        estimated_tokens: u64,
+    ) -> Event {
+        Event {
+            method: events::HISTORY_COMPACTED.to_string(),
+            params: Some(
+                serde_json::to_value(HistoryCompactedEvent {
+                    summary,
+                    tail_ids,
+                    total_count,
+                    estimated_tokens,
+                })
+                .unwrap(),
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_history_compacted_removes_head_and_places_summary_first() {
+        let mut st = crate::app::test_state();
+        st.last_model_height = 2;
+        st.history_view.auto_scroll = true;
+        st.history_view.total_count = 5;
+        st.history_view.estimated_tokens = 40;
+        st.history_view.items = vec![
+            ui_history_item(1, UiHistoryKind::User, "q1"),
+            ui_history_item(2, UiHistoryKind::Assistant, "a1"),
+            ui_history_item(3, UiHistoryKind::User, "q2"),
+            ui_history_item(4, UiHistoryKind::Assistant, "a2"),
+            ui_history_item(5, UiHistoryKind::User, "q3"),
+        ];
+        st.history_view.expanded_items.insert(2);
+
+        let state = Arc::new(Mutex::new(st));
+        let mut is_reasoning = false;
+        let ev = compacted_event(
+            ui_history_item(3, UiHistoryKind::System, "Session compacted"),
+            vec![4, 5],
+            3,
+            256,
+        );
+
+        handle_event(ev, &state, &mut is_reasoning).await;
+
+        let guard = state.lock().await;
+        let ids: Vec<u64> = guard.history_view.items.iter().map(|it| it.id).collect();
+        assert_eq!(
+            ids,
+            vec![3, 4, 5],
+            "the compacted head is dropped and the tail follows"
+        );
+        assert_eq!(guard.history_view.items[0].id, 3, "summary leads at index zero");
+        assert_eq!(guard.history_view.items[0].kind, UiHistoryKind::System);
+        assert_eq!(guard.history_view.total_count, 3);
+        assert_eq!(guard.history_view.estimated_tokens, 256);
+        assert!(
+            !guard.history_view.expanded_items.contains(&2),
+            "head fold state is discarded"
+        );
+
+        let rendered = guard.history_view.rendered_lines_count;
+        let expected_scroll = u16::try_from(rendered)
+            .unwrap_or(u16::MAX)
+            .saturating_sub(2);
+        assert_eq!(guard.history_view.scroll, expected_scroll);
+        assert_eq!(
+            guard.history_view.selected_item_index,
+            guard.history_view.items.len() - 1
+        );
+    }
+
+    #[tokio::test]
+    async fn test_history_compacted_without_auto_scroll_clamps_position() {
+        let mut st = crate::app::test_state();
+        st.last_model_height = 5;
+        st.history_view.auto_scroll = false;
+        st.history_view.scroll = u16::MAX;
+        st.history_view.selected_item_index = 99;
+        st.history_view.items = (1u64..=6)
+            .map(|i| ui_history_item(i, UiHistoryKind::User, "line"))
+            .collect();
+
+        let state = Arc::new(Mutex::new(st));
+        let mut is_reasoning = false;
+        let ev = compacted_event(
+            ui_history_item(3, UiHistoryKind::System, "Compacted"),
+            vec![4, 5, 6],
+            4,
+            96,
+        );
+
+        handle_event(ev, &state, &mut is_reasoning).await;
+
+        let guard = state.lock().await;
+        let ids: Vec<u64> = guard.history_view.items.iter().map(|it| it.id).collect();
+        assert_eq!(ids, vec![3, 4, 5, 6]);
+        assert_eq!(
+            guard.history_view.selected_item_index,
+            guard.history_view.items.len() - 1
+        );
+        let rendered = guard.history_view.rendered_lines_count;
+        let expected_scroll = u16::try_from(rendered)
+            .unwrap_or(u16::MAX)
+            .saturating_sub(5);
+        assert_eq!(guard.history_view.scroll, expected_scroll);
     }
 }

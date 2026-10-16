@@ -306,11 +306,7 @@ pub const HELP_OPEN_CHORD: &str = "C-H";
 /// Compact rendering of [`HELP_OPEN_CHORD`] for the header button
 /// (`C-H` for the Ctrl primary modifier, `M-H` for Alt).
 pub fn help_open_hint(primary: crate::config::PrimaryModifier) -> String {
-    let prefix = match primary {
-        crate::config::PrimaryModifier::Ctrl => "C-",
-        crate::config::PrimaryModifier::Alt => "M-",
-    };
-    HELP_OPEN_CHORD.replace("C-", prefix)
+    HELP_OPEN_CHORD.replace("C-", primary.emacs_prefix())
 }
 
 /// Compact label for a model entry, preferring its alias when configured
@@ -336,7 +332,6 @@ pub fn compact_entry_label(entry: &tauqe_protocol::ModelEntry) -> String {
 /// The reusable [`crate::components::model_selector::ModelSelector`] list and
 /// the primary model picker share this one numbering rule so their rows cannot
 /// drift apart.
-#[allow(dead_code)] // Consumed by the embedded model lists as they are integrated.
 pub fn numbered_entry_label(index: usize, entry: &tauqe_protocol::ModelEntry) -> String {
     let mut label = format!("[{}] {}", index + 1, entry.display_label());
     let aliased = entry
@@ -485,6 +480,53 @@ pub enum ViewMode {
     Context,
     History,
     Onboarding,
+}
+
+/// Tab currently shown by the Help modal.
+///
+/// The Help dialog exposes three independent command surfaces: global shortcuts
+/// reachable from any view (`Global`), the commands of the active view mode
+/// (`CurrentMode`), and the shared [`crate::editor::InputEditor`] Emacs/Readline
+/// bindings (`TextEditor`). Keeping them on separate tabs prevents mode help
+/// and global shortcuts from colliding or overflowing the screen (Conventions.md §3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum HelpTab {
+    /// Application-wide shortcuts reachable from every view; the default tab.
+    #[default]
+    Global,
+    /// Commands specific to the active view mode.
+    CurrentMode,
+    /// Shared text-editor (Emacs/Readline) commands.
+    TextEditor,
+}
+
+impl HelpTab {
+    /// Advances to the next tab, wrapping around.
+    pub fn next(self) -> Self {
+        match self {
+            Self::Global => Self::CurrentMode,
+            Self::CurrentMode => Self::TextEditor,
+            Self::TextEditor => Self::Global,
+        }
+    }
+
+    /// Moves to the previous tab, wrapping around.
+    pub fn prev(self) -> Self {
+        match self {
+            Self::Global => Self::TextEditor,
+            Self::CurrentMode => Self::Global,
+            Self::TextEditor => Self::CurrentMode,
+        }
+    }
+
+    /// Human-readable tab label shown in the popup's tab bar.
+    pub fn title(self) -> &'static str {
+        match self {
+            Self::Global => "Global",
+            Self::CurrentMode => "Current Mode",
+            Self::TextEditor => "Text Editor",
+        }
+    }
 }
 
 /// Focus section of the review launch dialog.
@@ -914,6 +956,8 @@ pub struct AppState {
     pub tui_config: TuiConfig,
     pub show_help: bool,
     pub help_scroll: u16,
+    /// Tab currently shown by the Help modal (`Mode Shortcuts` vs `Text Editor`).
+    pub help_tab: HelpTab,
     pub confirm_cancel: bool,
     pub confirm_quit: bool,
     /// Whether the batch-cancellation dialog is open.
@@ -990,6 +1034,7 @@ impl AppState {
             tui_config: init.tui_config,
             show_help: false,
             help_scroll: 0,
+            help_tab: HelpTab::default(),
             confirm_cancel: false,
             confirm_quit: false,
             confirm_batch_cancel: false,

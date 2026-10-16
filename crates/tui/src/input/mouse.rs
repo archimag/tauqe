@@ -212,17 +212,12 @@ pub async fn handle_mouse_event(
             // is always the surface that receives the click (single source of truth).
             match st.active_modal() {
                 Some(ActiveModal::ServerDisconnected) => {
-                    let area = crate::ui::centered_rect(64, 30, term_rect);
-                    let inner_y = area.y + 1;
-                    let inner_h = area.height.saturating_sub(2);
-                    let inner_x = area.x + 1;
-                    let inner_w = area.width.saturating_sub(2);
-                    let btn_y = inner_y + inner_h.saturating_sub(3);
-                    let btn_len = " [ Quit TAUQE (q / Ctrl+Q) ] ".len() as u16;
-                    let start_x = inner_x + (inner_w.saturating_sub(btn_len)) / 2;
-                    let quit_btn = Rect::new(start_x, btn_y, btn_len, 1);
-                    if rect_contains(quit_btn, mouse.column, mouse.row)
-                        || !rect_contains(area, mouse.column, mouse.row)
+                    // Single source of truth: the renderer derives the quit
+                    // button from the same geometry, so clicks and the drawn
+                    // button can never drift (Conventions §6, §7).
+                    let geom = crate::dialogs::render::disconnected_button_geometry(term_rect);
+                    if rect_contains(geom.quit_button, mouse.column, mouse.row)
+                        || !rect_contains(geom.area, mouse.column, mouse.row)
                     {
                         return Ok(InputResult::Exit);
                     }

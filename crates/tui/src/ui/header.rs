@@ -257,15 +257,18 @@ fn render_header_with_engine(
     // button advertises the real binding (primary-modifier chord) rather than `?`,
     // which would be typed literally into the Develop prompt.
     let help_hint = crate::app::help_open_hint(state.tui_config.input.primary_modifier);
-    let (max_model_len, squash_text, help_text): (usize, &str, String) =
+    // The squash button advertises the portable C-S / M-S chord, following the
+    // configured primary modifier instead of the former F6 hardware key.
+    let squash_hint = format!("{}S", state.tui_config.input.primary_modifier.emacs_prefix());
+    let (max_model_len, squash_text, help_text): (usize, String, String) =
         if inner_header_width >= 125 {
-            (20, " [F6 Squash] ", format!(" [{}] Help ", help_hint))
+            (20, format!(" [{} Squash] ", squash_hint), format!(" [{}] Help ", help_hint))
         } else if inner_header_width >= 95 {
-            (12, " [F6 Squash] ", format!(" [{}] Help ", help_hint))
+            (12, format!(" [{} Squash] ", squash_hint), format!(" [{}] Help ", help_hint))
         } else if inner_header_width >= 75 {
-            (8, " [F6] ", format!(" [{}] Help ", help_hint))
+            (8, format!(" [{}] ", squash_hint), format!(" [{}] Help ", help_hint))
         } else {
-            (6, " [F6] ", format!(" [{}] ", help_hint))
+            (6, format!(" [{}] ", squash_hint), format!(" [{}] ", help_hint))
         };
 
     let palette = engine.palette();
@@ -534,6 +537,7 @@ mod tests {
             tui_config: crate::config::TuiConfig::default(),
             show_help: false,
             help_scroll: 0,
+            help_tab: crate::app::HelpTab::default(),
             confirm_cancel: false,
             confirm_quit: false,
             confirm_batch_cancel: false,
@@ -567,6 +571,17 @@ mod tests {
             active_theme_preset: crate::theme::presets::ThemePreset::TauqeDark,
             theme_selector: None,
         }
+    }
+
+    /// Extracts the rendered header row as a string so tests can assert on the
+    /// dynamic labels (for example the squash chord).
+    fn header_row_text(terminal: &Terminal<TestBackend>, row: u16) -> String {
+        let buffer = terminal.backend().buffer();
+        let mut text = String::new();
+        for x in 0..buffer.area().width {
+            text.push_str(buffer[(x, row)].symbol());
+        }
+        text
     }
 
     #[test]
@@ -683,6 +698,12 @@ mod tests {
             assert!(clicks.squash_button.1 < clicks.help_button.0, "Squash and help button overlap");
             assert!(clicks.model_select.1 < clicks.squash_button.0, "Model and squash button overlap");
             assert!(clicks.develop_tab.1 < clicks.plans_tab.0, "Develop and plans tab overlap");
+
+            assert!(
+                header_row_text(&terminal, clicks.row).contains("C-S"),
+                "the squash button must advertise the C-S chord at width {}",
+                w
+            );
         }
     }
 
@@ -800,6 +821,10 @@ mod tests {
 
         assert_ne!(state.header_clicks.help_button, (0, 0));
         assert_ne!(state.header_clicks.squash_button, (0, 0));
+        assert!(
+            header_row_text(&terminal, state.header_clicks.row).contains("M-S"),
+            "the squash button must follow the Alt primary modifier"
+        );
     }
 
     #[test]

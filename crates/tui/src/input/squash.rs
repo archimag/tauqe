@@ -210,10 +210,6 @@ fn handle_browse(dialog: &mut SquashDialogState, key: KeyEvent, is_cmd: bool) ->
             request_apply_confirm(dialog);
             SquashAction::None
         }
-        KeyCode::F(6) => {
-            request_apply_confirm(dialog);
-            SquashAction::None
-        }
         KeyCode::Char(' ') | KeyCode::Enter => {
             if let Some(file) = dialog.files.get_mut(dialog.selected_file_index) {
                 file.expanded = !file.expanded;
@@ -343,6 +339,7 @@ mod tests {
     fn ready_dialog() -> SquashDialogState {
         SquashDialogState {
             loading: false,
+            status_message: None,
             ..Default::default()
         }
     }
@@ -406,6 +403,18 @@ mod tests {
 
         // Input is ignored until the server responds.
         assert!(matches!(press(&mut dialog, KeyCode::Esc), SquashAction::None));
+        assert_eq!(dialog.confirm, None);
+    }
+
+    #[test]
+    fn function_key_does_not_trigger_apply_in_browse() {
+        let mut dialog = ready_dialog();
+        assert!(dialog.status_message.is_none());
+
+        // F6 is inert: the squash apply is reachable only through the C-S / M-S
+        // chords, never through a hardware function key.
+        assert!(matches!(press(&mut dialog, KeyCode::F(6)), SquashAction::None));
+        assert!(dialog.status_message.is_none());
         assert_eq!(dialog.confirm, None);
     }
 }

@@ -1,48 +1,434 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent};
 use tokio::sync::Mutex;
 use tauqe_protocol::{methods, ModelAskParams};
 
-use crate::app::{AppState, KeyCommand};
-use crate::config::PrimaryModifier;
-use crate::input::{is_keyboard_quit, InputResult};
+use crate::app::AppState;
+use crate::command::CommandCategory::{Essential, Helpers, Interface};
+use crate::command::{CommandMap, CommandSpec, KeyChord};
+use crate::config::{InputConfig, MetaModifier, PrimaryModifier};
+use crate::input::InputResult;
 use crate::rpc::{send_request, RpcConnection};
 use crate::views::develop::{DevelopFocus, DevelopView, TurnStatus};
 
 /// Time window within which a second `Esc` confirms clearing a non-empty prompt.
 const ESC_CLEAR_WINDOW: Duration = Duration::from_secs(2);
 
-pub const DEVELOP_COMMANDS: &[KeyCommand] = &[
-    // Core Actions
-    KeyCommand { key: "Enter / C-Enter", description: "Send prompt" },
-    KeyCommand { key: "C-Z / Alt+U", description: "Undo last AI commit" },
-    KeyCommand { key: "F6 / C-S", description: "Squash commits dialog" },
-    // Navigation & Inspection
-    KeyCommand { key: "C-Space / Shift+Tab", description: "Switch focus between prompt and Viewport (typing returns focus to prompt)" },
-    KeyCommand { key: "C-T / Enter (Viewport)", description: "Fold / unfold selected file diff" },
-    KeyCommand { key: "C-[ / C-] / Alt+[/]", description: "Select previous / next modified file" },
-    KeyCommand { key: "C-P / C-N", description: "Move cursor line up / down (Viewport: select previous / next file)" },
-    KeyCommand { key: "↑ / ↓", description: "Move cursor between prompt lines; navigate history at the first / last line (Viewport: select previous / next file or scroll)" },
-    KeyCommand { key: "PgUp / PgDn", description: "Page scroll response view" },
-    KeyCommand { key: "Alt+↑ / Alt+↓", description: "Scroll model response up / down" },
-    // Editing & Clipboard
-    KeyCommand { key: "Alt+P / Alt+N", description: "Navigate prompt history backward / forward" },
-    KeyCommand { key: "Shift+Enter / Alt+Enter / C-J", description: "Insert newline into prompt" },
-    KeyCommand { key: "Tab", description: "Insert two spaces into the prompt (Viewport: fold / unfold selected file diff)" },
-    KeyCommand { key: "C-Left / C-Right / Alt+B / Alt+F", description: "Move cursor word backward / forward" },
-    KeyCommand { key: "C-B / C-F / Left / Right", description: "Move cursor character backward / forward" },
-    KeyCommand { key: "C-A / C-E / Home / End", description: "Move cursor to beginning / end of line (Viewport: scroll to top / bottom)" },
-    KeyCommand { key: "C-K / C-U", description: "Kill line to end / beginning into kill ring" },
-    KeyCommand { key: "C-W / Alt+Backspace", description: "Kill word backward into kill ring" },
-    KeyCommand { key: "Alt+D", description: "Kill word forward into kill ring" },
-    KeyCommand { key: "C-D / Delete", description: "Delete character forward" },
-    KeyCommand { key: "C-Y", description: "Yank (paste) text from the kill ring (falls back to the system clipboard when empty)" },
-    KeyCommand { key: "Alt+C / Alt+Y", description: "Copy model response to clipboard" },
-    // Auxiliary & Destructive
-    KeyCommand { key: "Esc / C-G", description: "Interrupt generation (keyboard-quit); press twice to clear the prompt (saved to kill ring); detach discussion focus when empty; leave Viewport" },
-];
+pub static DEVELOP_COMMAND_MAP: CommandMap<DevelopAction> = CommandMap::new(&[
+    // Essential: the costly work cycle.
+    CommandSpec::new(
+        KeyChord::Primary(KeyCode::Enter),
+        DevelopAction::SendPrompt,
+        Essential,
+        "Send the prompt",
+    ),
+    CommandSpec::new(
+        KeyChord::Ctrl(KeyCode::Enter),
+        DevelopAction::SendPrompt,
+        Essential,
+        "Send the prompt",
+    ),
+    CommandSpec::new(
+        KeyChord::Bare(KeyCode::Enter),
+        DevelopAction::SendPrompt,
+        Essential,
+        "Send the prompt",
+    ),
+    CommandSpec::new(
+        KeyChord::Alt(KeyCode::Char('u')),
+        DevelopAction::UndoCommit,
+        Essential,
+        "Undo the last AI commit",
+    ),
+    CommandSpec::new(
+        KeyChord::Primary(KeyCode::Char('z')),
+        DevelopAction::UndoCommit,
+        Essential,
+        "Undo the last AI commit",
+    ),
+    CommandSpec::new(
+        KeyChord::Ctrl(KeyCode::Char('z')),
+        DevelopAction::UndoCommit,
+        Essential,
+        "Undo the last AI commit",
+    ),
+    CommandSpec::new(
+        KeyChord::PrimaryOrMeta(KeyCode::Char('s')),
+        DevelopAction::OpenSquashDialog,
+        Essential,
+        "Open the squash AI commits dialog",
+    ),
+    // Interface: focus, folding, file navigation, scrolling, and editor navigation.
+    CommandSpec::new(
+        KeyChord::Shift(KeyCode::Tab),
+        DevelopAction::ToggleFocus,
+        Interface,
+        "Switch focus between the prompt and the Viewport",
+    ),
+    CommandSpec::new(
+        KeyChord::Shift(KeyCode::BackTab),
+        DevelopAction::ToggleFocus,
+        Interface,
+        "Switch focus between the prompt and the Viewport",
+    ),
+    CommandSpec::new(
+        KeyChord::Bare(KeyCode::BackTab),
+        DevelopAction::ToggleFocus,
+        Interface,
+        "Switch focus between the prompt and the Viewport",
+    ),
+    CommandSpec::new(
+        KeyChord::Primary(KeyCode::Char(' ')),
+        DevelopAction::ToggleFocus,
+        Interface,
+        "Switch focus between the prompt and the Viewport",
+    ),
+    CommandSpec::new(
+        KeyChord::Ctrl(KeyCode::Char(' ')),
+        DevelopAction::ToggleFocus,
+        Interface,
+        "Switch focus between the prompt and the Viewport",
+    ),
+    CommandSpec::new(
+        KeyChord::Alt(KeyCode::Char(' ')),
+        DevelopAction::ToggleSelectedFileFold,
+        Interface,
+        "Fold or unfold the selected file diff",
+    ),
+    CommandSpec::new(
+        KeyChord::Primary(KeyCode::Char('t')),
+        DevelopAction::ToggleSelectedFileFold,
+        Interface,
+        "Fold or unfold the selected file diff",
+    ),
+    CommandSpec::new(
+        KeyChord::Ctrl(KeyCode::Char('t')),
+        DevelopAction::ToggleSelectedFileFold,
+        Interface,
+        "Fold or unfold the selected file diff",
+    ),
+    CommandSpec::new(
+        KeyChord::Alt(KeyCode::Char('t')),
+        DevelopAction::ToggleSelectedFileFold,
+        Interface,
+        "Fold or unfold the selected file diff",
+    ),
+    CommandSpec::new(
+        KeyChord::Ctrl(KeyCode::Char('[')),
+        DevelopAction::PrevModifiedFile,
+        Interface,
+        "Select the previous modified file",
+    ),
+    CommandSpec::new(
+        KeyChord::Ctrl(KeyCode::Char(']')),
+        DevelopAction::NextModifiedFile,
+        Interface,
+        "Select the next modified file",
+    ),
+    CommandSpec::new(
+        KeyChord::Alt(KeyCode::Char('[')),
+        DevelopAction::PrevModifiedFile,
+        Interface,
+        "Select the previous modified file",
+    ),
+    CommandSpec::new(
+        KeyChord::Alt(KeyCode::Char(']')),
+        DevelopAction::NextModifiedFile,
+        Interface,
+        "Select the next modified file",
+    ),
+    CommandSpec::new(
+        KeyChord::Alt(KeyCode::Up),
+        DevelopAction::ScrollResponseUp,
+        Interface,
+        "Scroll the response up",
+    ),
+    CommandSpec::new(
+        KeyChord::Alt(KeyCode::Down),
+        DevelopAction::ScrollResponseDown,
+        Interface,
+        "Scroll the response down",
+    ),
+    CommandSpec::new(
+        KeyChord::Shift(KeyCode::Up),
+        DevelopAction::ScrollResponseUp,
+        Interface,
+        "Scroll the response up",
+    ),
+    CommandSpec::new(
+        KeyChord::Shift(KeyCode::Down),
+        DevelopAction::ScrollResponseDown,
+        Interface,
+        "Scroll the response down",
+    ),
+    CommandSpec::new(
+        KeyChord::Bare(KeyCode::PageUp),
+        DevelopAction::ScrollResponsePageUp,
+        Interface,
+        "Scroll the response up one page",
+    ),
+    CommandSpec::new(
+        KeyChord::Bare(KeyCode::PageDown),
+        DevelopAction::ScrollResponsePageDown,
+        Interface,
+        "Scroll the response down one page",
+    ),
+    CommandSpec::new(
+        KeyChord::Bare(KeyCode::Up),
+        DevelopAction::LineUpOrHistoryPrev,
+        Interface,
+        "Move the cursor up one line; navigate history at the first line",
+    ),
+    CommandSpec::new(
+        KeyChord::Bare(KeyCode::Down),
+        DevelopAction::LineDownOrHistoryNext,
+        Interface,
+        "Move the cursor down one line; navigate history at the last line",
+    ),
+    CommandSpec::new(
+        KeyChord::Ctrl(KeyCode::Char('p')),
+        DevelopAction::MoveLineUp,
+        Interface,
+        "Move the cursor up one line",
+    ),
+    CommandSpec::new(
+        KeyChord::Ctrl(KeyCode::Char('n')),
+        DevelopAction::MoveLineDown,
+        Interface,
+        "Move the cursor down one line",
+    ),
+    CommandSpec::new(
+        KeyChord::Alt(KeyCode::Char('p')),
+        DevelopAction::HistoryPrev,
+        Interface,
+        "Navigate the prompt history backward",
+    ),
+    CommandSpec::new(
+        KeyChord::Alt(KeyCode::Char('n')),
+        DevelopAction::HistoryNext,
+        Interface,
+        "Navigate the prompt history forward",
+    ),
+    CommandSpec::new(
+        KeyChord::Primary(KeyCode::Char('a')),
+        DevelopAction::MoveBeginningOfLine,
+        Interface,
+        "Move the cursor to the beginning of the line",
+    ),
+    CommandSpec::new(
+        KeyChord::Ctrl(KeyCode::Char('a')),
+        DevelopAction::MoveBeginningOfLine,
+        Interface,
+        "Move the cursor to the beginning of the line",
+    ),
+    CommandSpec::new(
+        KeyChord::Primary(KeyCode::Char('e')),
+        DevelopAction::MoveEndOfLine,
+        Interface,
+        "Move the cursor to the end of the line",
+    ),
+    CommandSpec::new(
+        KeyChord::Ctrl(KeyCode::Char('e')),
+        DevelopAction::MoveEndOfLine,
+        Interface,
+        "Move the cursor to the end of the line",
+    ),
+    CommandSpec::new(
+        KeyChord::Ctrl(KeyCode::Char('b')),
+        DevelopAction::MoveCharBackward,
+        Interface,
+        "Move the cursor one character backward",
+    ),
+    CommandSpec::new(
+        KeyChord::Ctrl(KeyCode::Char('f')),
+        DevelopAction::MoveCharForward,
+        Interface,
+        "Move the cursor one character forward",
+    ),
+    CommandSpec::new(
+        KeyChord::Alt(KeyCode::Char('b')),
+        DevelopAction::MoveWordBackward,
+        Interface,
+        "Move the cursor one word backward",
+    ),
+    CommandSpec::new(
+        KeyChord::Alt(KeyCode::Char('f')),
+        DevelopAction::MoveWordForward,
+        Interface,
+        "Move the cursor one word forward",
+    ),
+    CommandSpec::new(
+        KeyChord::Ctrl(KeyCode::Left),
+        DevelopAction::MoveWordBackward,
+        Interface,
+        "Move the cursor one word backward",
+    ),
+    CommandSpec::new(
+        KeyChord::Ctrl(KeyCode::Right),
+        DevelopAction::MoveWordForward,
+        Interface,
+        "Move the cursor one word forward",
+    ),
+    CommandSpec::new(
+        KeyChord::Alt(KeyCode::Left),
+        DevelopAction::MoveWordBackward,
+        Interface,
+        "Move the cursor one word backward",
+    ),
+    CommandSpec::new(
+        KeyChord::Alt(KeyCode::Right),
+        DevelopAction::MoveWordForward,
+        Interface,
+        "Move the cursor one word forward",
+    ),
+    CommandSpec::new(
+        KeyChord::Bare(KeyCode::Left),
+        DevelopAction::MoveCharBackward,
+        Interface,
+        "Move the cursor one character backward",
+    ),
+    CommandSpec::new(
+        KeyChord::Bare(KeyCode::Right),
+        DevelopAction::MoveCharForward,
+        Interface,
+        "Move the cursor one character forward",
+    ),
+    CommandSpec::new(
+        KeyChord::Bare(KeyCode::Home),
+        DevelopAction::MoveBeginningOfLine,
+        Interface,
+        "Move the cursor to the beginning of the line",
+    ),
+    CommandSpec::new(
+        KeyChord::Bare(KeyCode::End),
+        DevelopAction::MoveEndOfLine,
+        Interface,
+        "Move the cursor to the end of the line",
+    ),
+    // Helpers: editing and clipboard operations.
+    CommandSpec::new(
+        KeyChord::Bare(KeyCode::Tab),
+        DevelopAction::InsertSpaces,
+        Helpers,
+        "Insert two spaces",
+    ),
+    CommandSpec::new(
+        KeyChord::Shift(KeyCode::Enter),
+        DevelopAction::InsertNewline,
+        Helpers,
+        "Insert a newline",
+    ),
+    CommandSpec::new(
+        KeyChord::Alt(KeyCode::Enter),
+        DevelopAction::InsertNewline,
+        Helpers,
+        "Insert a newline",
+    ),
+    CommandSpec::new(
+        KeyChord::Ctrl(KeyCode::Char('j')),
+        DevelopAction::InsertNewline,
+        Helpers,
+        "Insert a newline",
+    ),
+    CommandSpec::new(
+        KeyChord::Bare(KeyCode::Backspace),
+        DevelopAction::DeleteBackward,
+        Helpers,
+        "Delete the character backward",
+    ),
+    CommandSpec::new(
+        KeyChord::Alt(KeyCode::Backspace),
+        DevelopAction::KillWordBackward,
+        Helpers,
+        "Kill the word before the cursor",
+    ),
+    CommandSpec::new(
+        KeyChord::Ctrl(KeyCode::Char('d')),
+        DevelopAction::DeleteForward,
+        Helpers,
+        "Delete the character forward",
+    ),
+    CommandSpec::new(
+        KeyChord::Bare(KeyCode::Delete),
+        DevelopAction::DeleteForward,
+        Helpers,
+        "Delete the character forward",
+    ),
+    CommandSpec::new(
+        KeyChord::Primary(KeyCode::Char('k')),
+        DevelopAction::KillLine,
+        Helpers,
+        "Kill to the end of the line",
+    ),
+    CommandSpec::new(
+        KeyChord::Ctrl(KeyCode::Char('k')),
+        DevelopAction::KillLine,
+        Helpers,
+        "Kill to the end of the line",
+    ),
+    CommandSpec::new(
+        KeyChord::Ctrl(KeyCode::Char('u')),
+        DevelopAction::KillToBeginningOfLine,
+        Helpers,
+        "Kill to the beginning of the line",
+    ),
+    CommandSpec::new(
+        KeyChord::Primary(KeyCode::Char('w')),
+        DevelopAction::KillWordBackward,
+        Helpers,
+        "Kill the word before the cursor",
+    ),
+    CommandSpec::new(
+        KeyChord::Ctrl(KeyCode::Char('w')),
+        DevelopAction::KillWordBackward,
+        Helpers,
+        "Kill the word before the cursor",
+    ),
+    CommandSpec::new(
+        KeyChord::Alt(KeyCode::Char('d')),
+        DevelopAction::KillWordForward,
+        Helpers,
+        "Kill the word after the cursor",
+    ),
+    CommandSpec::new(
+        KeyChord::Primary(KeyCode::Char('y')),
+        DevelopAction::Yank,
+        Helpers,
+        "Yank from the kill ring or the clipboard",
+    ),
+    CommandSpec::new(
+        KeyChord::Ctrl(KeyCode::Char('y')),
+        DevelopAction::Yank,
+        Helpers,
+        "Yank from the kill ring or the clipboard",
+    ),
+    CommandSpec::new(
+        KeyChord::Alt(KeyCode::Char('y')),
+        DevelopAction::CopyModelResponse,
+        Helpers,
+        "Copy the model response to the clipboard",
+    ),
+    CommandSpec::new(
+        KeyChord::Alt(KeyCode::Char('c')),
+        DevelopAction::CopyModelResponse,
+        Helpers,
+        "Copy the model response to the clipboard",
+    ),
+    CommandSpec::new(
+        KeyChord::Ctrl(KeyCode::Char('g')),
+        DevelopAction::ClearPromptSaving,
+        Helpers,
+        "Interrupt, or clear the prompt (saving it to the kill ring)",
+    ),
+    CommandSpec::new(
+        KeyChord::Bare(KeyCode::Esc),
+        DevelopAction::ClearPromptSaving,
+        Helpers,
+        "Interrupt, or clear the prompt (saving it to the kill ring)",
+    ),
+]);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DevelopAction {
@@ -95,8 +481,10 @@ pub enum DevelopAction {
 }
 
 /// True for actions that edit or move the prompt cursor. When the Viewport has focus,
-/// these actions return focus to the prompt before they are applied.
-fn is_editor_action(action: DevelopAction) -> bool {
+/// these actions return focus to the prompt before they are applied. The Help
+/// surface reuses this predicate so the shared editor vocabulary stays on the
+/// TextEditor tab instead of being duplicated in the active mode's tab.
+pub fn is_editor_action(action: DevelopAction) -> bool {
     matches!(
         action,
         DevelopAction::InsertChar(_)
@@ -127,8 +515,12 @@ fn is_editor_action(action: DevelopAction) -> bool {
 /// The base editor bindings are buffer-content independent, so the Viewport is the
 /// sole place that maps `Tab`, `Home`, `End` and the arrow keys to response
 /// navigation (Conventions §8).
-pub fn resolve_viewport_action(key: KeyEvent, primary_mod: PrimaryModifier) -> Option<DevelopAction> {
-    let action = resolve_develop_action(key, primary_mod)?;
+pub fn resolve_viewport_action(
+    key: KeyEvent,
+    primary_mod: PrimaryModifier,
+    meta_mod: MetaModifier,
+) -> Option<DevelopAction> {
+    let action = resolve_develop_action(key, primary_mod, meta_mod)?;
     Some(match action {
         DevelopAction::ClearPromptSaving => DevelopAction::ToggleFocus,
         DevelopAction::SendPrompt
@@ -157,176 +549,30 @@ pub fn resolve_viewport_action(key: KeyEvent, primary_mod: PrimaryModifier) -> O
 /// Editor bindings never depend on buffer content: `Tab`, `Home`, `End` and the arrow
 /// keys keep a single meaning whether the prompt is empty or not. Navigation over the
 /// response and file diffs is the exclusive responsibility of the Viewport (§8).
-pub fn resolve_develop_action(key: KeyEvent, primary_mod: PrimaryModifier) -> Option<DevelopAction> {
-    let has_ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-    let has_alt = key.modifiers.contains(KeyModifiers::ALT);
-    let has_shift = key.modifiers.contains(KeyModifiers::SHIFT);
-    let is_primary = primary_mod.matches(key.modifiers);
+pub fn resolve_develop_action(
+    key: KeyEvent,
+    primary_mod: PrimaryModifier,
+    meta_mod: MetaModifier,
+) -> Option<DevelopAction> {
+    let input = InputConfig {
+        primary_modifier: primary_mod,
+        meta_modifier: meta_mod,
+        ..InputConfig::default()
+    };
 
-    // 0. C-g (keyboard-quit): the canonical abort chord is identical to Esc,
-    // returning Viewport focus to the prompt, clearing the prompt, or arming
-    // the detach confirmation on an empty prompt.
-    if is_keyboard_quit(&key) {
-        return Some(DevelopAction::ClearPromptSaving);
+    if let Some(spec) = DEVELOP_COMMAND_MAP.resolve(key, &input, false) {
+        return Some(spec.action);
     }
 
-    // 1. Esc: interrupt generation or clear prompt
-    if key.code == KeyCode::Esc {
-        return Some(DevelopAction::ClearPromptSaving);
-    }
-
-    // 2. Universal hardware function keys
-    if key.code == KeyCode::F(6) {
-        return Some(DevelopAction::OpenSquashDialog);
-    }
-
-    // Shift+Tab switches focus between the prompt and the Viewport
-    if key.code == KeyCode::BackTab || (key.code == KeyCode::Tab && has_shift) {
-        return Some(DevelopAction::ToggleFocus);
-    }
-
-    // 3. Alt+C and Alt+Y: Copy model response (Alt+C always; Alt+Y when not primary modifier)
-    if has_alt && !has_ctrl {
-        match key.code {
-            KeyCode::Char('c') | KeyCode::Char('C') => {
-                return Some(DevelopAction::CopyModelResponse);
-            }
-            KeyCode::Char('y') | KeyCode::Char('Y') if primary_mod != PrimaryModifier::Alt => {
-                return Some(DevelopAction::CopyModelResponse);
-            }
-            KeyCode::Char('u') | KeyCode::Char('U') => {
-                return Some(DevelopAction::UndoCommit);
-            }
-            _ => {}
+    // Printable characters typed without a command modifier are inserted
+    // unconditionally into the prompt buffer.
+    if let KeyCode::Char(c) = key.code {
+        if crate::input::is_char_typing(key.modifiers) {
+            return Some(DevelopAction::InsertChar(c));
         }
     }
 
-    // 4. Primary Command Modifier (C-x) chords
-    if is_primary {
-        match key.code {
-            KeyCode::Enter => return Some(DevelopAction::SendPrompt),
-            KeyCode::Char('s') => return Some(DevelopAction::OpenSquashDialog),
-            KeyCode::Char('z') => return Some(DevelopAction::UndoCommit),
-            KeyCode::Char('j') => return Some(DevelopAction::InsertNewline),
-            KeyCode::Char('t') | KeyCode::Char('T') => return Some(DevelopAction::ToggleSelectedFileFold),
-            KeyCode::Char('[') => return Some(DevelopAction::PrevModifiedFile),
-            KeyCode::Char(']') => return Some(DevelopAction::NextModifiedFile),
-            KeyCode::Char(' ') => return Some(DevelopAction::ToggleFocus),
-            KeyCode::Char('a') => return Some(DevelopAction::MoveBeginningOfLine),
-            KeyCode::Char('e') => return Some(DevelopAction::MoveEndOfLine),
-            KeyCode::Char('k') => return Some(DevelopAction::KillLine),
-            KeyCode::Char('w') => return Some(DevelopAction::KillWordBackward),
-            KeyCode::Char('y') => return Some(DevelopAction::Yank),
-            KeyCode::Left => return Some(DevelopAction::MoveWordBackward),
-            KeyCode::Right => return Some(DevelopAction::MoveWordForward),
-            // Mode-specific character actions
-            KeyCode::Char('p') | KeyCode::Char('P') if primary_mod == PrimaryModifier::Ctrl => {
-                return Some(DevelopAction::MoveLineUp);
-            }
-            KeyCode::Char('n') | KeyCode::Char('N') if primary_mod == PrimaryModifier::Ctrl => {
-                return Some(DevelopAction::MoveLineDown);
-            }
-            KeyCode::Char('p') | KeyCode::Char('P') if primary_mod == PrimaryModifier::Alt => {
-                return Some(DevelopAction::HistoryPrev);
-            }
-            KeyCode::Char('n') | KeyCode::Char('N') if primary_mod == PrimaryModifier::Alt => {
-                return Some(DevelopAction::HistoryNext);
-            }
-            KeyCode::Char('u') if primary_mod == PrimaryModifier::Ctrl => {
-                return Some(DevelopAction::KillToBeginningOfLine);
-            }
-            KeyCode::Char('b') if primary_mod == PrimaryModifier::Ctrl => {
-                return Some(DevelopAction::MoveCharBackward);
-            }
-            KeyCode::Char('f') if primary_mod == PrimaryModifier::Ctrl => {
-                return Some(DevelopAction::MoveCharForward);
-            }
-            KeyCode::Char('d') if primary_mod == PrimaryModifier::Ctrl => {
-                return Some(DevelopAction::DeleteForward);
-            }
-            // When primary is Alt, keep Readline word semantics
-            KeyCode::Char('b') if primary_mod == PrimaryModifier::Alt => {
-                return Some(DevelopAction::MoveWordBackward);
-            }
-            KeyCode::Char('f') if primary_mod == PrimaryModifier::Alt => {
-                return Some(DevelopAction::MoveWordForward);
-            }
-            KeyCode::Char('d') if primary_mod == PrimaryModifier::Alt => {
-                return Some(DevelopAction::KillWordForward);
-            }
-            _ => {}
-        }
-    }
-
-    // 5. Readline Ctrl chords (always active even if primary_modifier is Alt)
-    if has_ctrl && !has_alt {
-        match key.code {
-            KeyCode::Char('a') => return Some(DevelopAction::MoveBeginningOfLine),
-            KeyCode::Char('e') => return Some(DevelopAction::MoveEndOfLine),
-            KeyCode::Char('k') => return Some(DevelopAction::KillLine),
-            KeyCode::Char('u') => return Some(DevelopAction::KillToBeginningOfLine),
-            KeyCode::Char('w') => return Some(DevelopAction::KillWordBackward),
-            KeyCode::Char('y') => return Some(DevelopAction::Yank),
-            KeyCode::Char('d') => return Some(DevelopAction::DeleteForward),
-            KeyCode::Char('b') => return Some(DevelopAction::MoveCharBackward),
-            KeyCode::Char('f') => return Some(DevelopAction::MoveCharForward),
-            KeyCode::Char('j') => return Some(DevelopAction::InsertNewline),
-            KeyCode::Char('p') | KeyCode::Char('P') => return Some(DevelopAction::MoveLineUp),
-            KeyCode::Char('n') | KeyCode::Char('N') => return Some(DevelopAction::MoveLineDown),
-            KeyCode::Char('t') | KeyCode::Char('T') => return Some(DevelopAction::ToggleSelectedFileFold),
-            KeyCode::Left => return Some(DevelopAction::MoveWordBackward),
-            KeyCode::Right => return Some(DevelopAction::MoveWordForward),
-            KeyCode::Char('[') => return Some(DevelopAction::PrevModifiedFile),
-            KeyCode::Char(']') => return Some(DevelopAction::NextModifiedFile),
-            KeyCode::Char(' ') => return Some(DevelopAction::ToggleFocus),
-            KeyCode::Char('s') => return Some(DevelopAction::OpenSquashDialog),
-            KeyCode::Char('z') => return Some(DevelopAction::UndoCommit),
-            _ => {}
-        }
-    }
-
-    // 6. Readline Alt chords and response scrolling
-    if has_alt && !has_ctrl {
-        match key.code {
-            KeyCode::Char('b') | KeyCode::Left => return Some(DevelopAction::MoveWordBackward),
-            KeyCode::Char('f') | KeyCode::Right => return Some(DevelopAction::MoveWordForward),
-            KeyCode::Char('d') => return Some(DevelopAction::KillWordForward),
-            KeyCode::Char('p') | KeyCode::Char('P') => return Some(DevelopAction::HistoryPrev),
-            KeyCode::Char('n') | KeyCode::Char('N') => return Some(DevelopAction::HistoryNext),
-            KeyCode::Char('t') | KeyCode::Char('T') => return Some(DevelopAction::ToggleSelectedFileFold),
-            KeyCode::Backspace => return Some(DevelopAction::KillWordBackward),
-            KeyCode::Enter => return Some(DevelopAction::InsertNewline),
-            KeyCode::Char('[') => return Some(DevelopAction::PrevModifiedFile),
-            KeyCode::Char(']') => return Some(DevelopAction::NextModifiedFile),
-            KeyCode::Char(' ') => return Some(DevelopAction::ToggleSelectedFileFold),
-            KeyCode::Up => return Some(DevelopAction::ScrollResponseUp),
-            KeyCode::Down => return Some(DevelopAction::ScrollResponseDown),
-            _ => {}
-        }
-    }
-
-    // 7. Plain navigation & editing keys (independent of buffer content)
-    match key.code {
-        KeyCode::Enter if has_shift => Some(DevelopAction::InsertNewline),
-        KeyCode::Enter => Some(DevelopAction::SendPrompt),
-        KeyCode::Tab => Some(DevelopAction::InsertSpaces),
-        KeyCode::Backspace => Some(DevelopAction::DeleteBackward),
-        KeyCode::Delete => Some(DevelopAction::DeleteForward),
-        KeyCode::Left => Some(DevelopAction::MoveCharBackward),
-        KeyCode::Right => Some(DevelopAction::MoveCharForward),
-        KeyCode::Home => Some(DevelopAction::MoveBeginningOfLine),
-        KeyCode::End => Some(DevelopAction::MoveEndOfLine),
-        KeyCode::PageUp => Some(DevelopAction::ScrollResponsePageUp),
-        KeyCode::PageDown => Some(DevelopAction::ScrollResponsePageDown),
-        KeyCode::Up if has_shift => Some(DevelopAction::ScrollResponseUp),
-        KeyCode::Down if has_shift => Some(DevelopAction::ScrollResponseDown),
-        KeyCode::Up => Some(DevelopAction::LineUpOrHistoryPrev),
-        KeyCode::Down => Some(DevelopAction::LineDownOrHistoryNext),
-        KeyCode::Char(c) if crate::input::is_char_typing(key.modifiers) => {
-            Some(DevelopAction::InsertChar(c))
-        }
-        _ => None,
-    }
+    None
 }
 
 pub async fn handle_develop_key(
@@ -334,18 +580,19 @@ pub async fn handle_develop_key(
     state: &Arc<Mutex<AppState>>,
     server_writer: &mut RpcConnection,
 ) -> anyhow::Result<InputResult> {
-    let (primary_mod, in_viewport) = {
+    let (primary_mod, meta_mod, in_viewport) = {
         let st = state.lock().await;
         (
             st.tui_config.input.primary_modifier,
+            st.tui_config.input.meta_modifier,
             st.model.focus == DevelopFocus::Viewport,
         )
     };
 
     let resolved = if in_viewport {
-        resolve_viewport_action(key, primary_mod)
+        resolve_viewport_action(key, primary_mod, meta_mod)
     } else {
-        resolve_develop_action(key, primary_mod)
+        resolve_develop_action(key, primary_mod, meta_mod)
     };
     let action = match resolved {
         Some(act) => act,
@@ -614,9 +861,23 @@ fn step_viewport_down(model: &mut DevelopView, view_height: u16) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crossterm::event::KeyModifiers;
 
     fn key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
         KeyEvent::new(code, modifiers)
+    }
+
+    /// Resolves a Develop action under the default Ctrl primary / Alt meta pair.
+    ///
+    /// The two-argument shim keeps the key-mapping assertions focused; the
+    /// production resolver additionally takes the configured meta modifier.
+    fn resolve_develop_action(key: KeyEvent, primary_mod: PrimaryModifier) -> Option<DevelopAction> {
+        super::resolve_develop_action(key, primary_mod, MetaModifier::Alt)
+    }
+
+    /// Resolves a Viewport action under the default Ctrl primary / Alt meta pair.
+    fn resolve_viewport_action(key: KeyEvent, primary_mod: PrimaryModifier) -> Option<DevelopAction> {
+        super::resolve_viewport_action(key, primary_mod, MetaModifier::Alt)
     }
 
     #[test]
@@ -918,15 +1179,18 @@ mod tests {
     }
 
     #[test]
-    fn test_command_bindings_are_unique() {
-        use std::collections::HashSet;
-        let keys: HashSet<&str> = DEVELOP_COMMANDS.iter().map(|c| c.key).collect();
-        assert!(!DEVELOP_COMMANDS.is_empty());
-        assert_eq!(
-            keys.len(),
-            DEVELOP_COMMANDS.len(),
-            "duplicate key bindings in DEVELOP_COMMANDS"
-        );
+    fn test_command_map_chords_are_unique() {
+        let chords: Vec<KeyChord> = DEVELOP_COMMAND_MAP
+            .specs()
+            .iter()
+            .map(|spec| spec.chord)
+            .collect();
+        assert!(!chords.is_empty());
+        for (index, chord) in chords.iter().enumerate() {
+            for other in chords.iter().skip(index + 1) {
+                assert_ne!(chord, other, "duplicate key chord in DEVELOP_COMMAND_MAP");
+            }
+        }
     }
 
     #[tokio::test]

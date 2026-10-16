@@ -70,8 +70,12 @@ impl<'a> TransactionRollbackGuard<'a> {
     pub(super) async fn rollback(&mut self) -> bool {
         self.armed = false;
         let rolled_back = rollback_or_log(self.policy, self.repo_root).await;
-        self.context_manager.clear_auto();
-        self.context_manager.prune_missing_files();
+        // Clearing auto context recomputes hierarchical pinned files through
+        // disk checks, so the sweep runs off the async executor thread.
+        crate::blocking::run_blocking(|| {
+            self.context_manager.clear_auto();
+            self.context_manager.prune_missing_files();
+        });
         rolled_back
     }
 
@@ -81,7 +85,9 @@ impl<'a> TransactionRollbackGuard<'a> {
         summary: &str,
     ) -> (Option<String>, Option<String>) {
         self.armed = false;
-        self.context_manager.clear_auto();
+        // Clearing auto context recomputes hierarchical pinned files through
+        // disk checks, so the sweep runs off the async executor thread.
+        crate::blocking::run_blocking(|| self.context_manager.clear_auto());
         finalize_applied(self.policy, self.repo_root, changed_files, summary).await
     }
 
@@ -220,8 +226,12 @@ pub(super) async fn finalize_blocked_turn(
 ) -> FsmTurnOutcome {
     tracing::warn!(reason = %reason, "bounded turn blocked");
     rollback_or_log(policy, repo_root).await;
-    context_manager.clear_auto();
-    context_manager.prune_missing_files();
+    // Auto-layer cleanup performs filesystem metadata checks, so the sweep
+    // runs off the async executor thread.
+    crate::blocking::run_blocking(|| {
+        context_manager.clear_auto();
+        context_manager.prune_missing_files();
+    });
     let ctx_state = context_manager.get_state();
     let _ = stream_tx.send(StreamEvent::ContextChanged(ctx_state)).await;
     let _ = stream_tx.send(StreamEvent::Done).await;

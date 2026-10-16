@@ -4,7 +4,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use tauqe_protocol::{methods, DiscussionFocus};
 use tokio::sync::{Mutex, MutexGuard};
 
-use crate::app::{ActiveModal, AppState, BatchCancelButton, ViewMode};
+use crate::app::{ActiveModal, AppState, BatchCancelButton, HelpTab, ViewMode};
 use crate::input::{squash, InputResult};
 use crate::rpc::{send_request, RpcConnection};
 use crate::views::develop::{DevelopView, TurnStatus};
@@ -336,6 +336,7 @@ pub(crate) async fn handle_dialog_event(
         Some(ActiveModal::Review) => {
             if let Some(mut dialog) = st.review_dialog.take() {
                 let primary = st.tui_config.input.primary_modifier;
+                let meta = st.tui_config.input.meta_modifier;
                 let visible_rows = crate::dialogs::render::review_dialog_geometry(
                     st.last_frame_area,
                     dialog.selector.len(),
@@ -343,13 +344,13 @@ pub(crate) async fn handle_dialog_event(
                 .model_rows
                 .height as usize;
 
-                // The C-M / Alt+M chord always switches the reviewer; the arrows
+                // The C-M / M-M chord always switches the reviewer; the arrows
                 // browse the list only while the list owns focus, so list
                 // navigation and text editing never fight over the same keys
                 // (c-magit-key-navigation).
                 if dialog
                     .selector
-                    .handle_key(key, primary, !dialog.focus.is_model_list())
+                    .handle_key(key, primary, meta, !dialog.focus.is_model_list())
                 {
                     st.review_dialog = Some(dialog);
                     return Ok(Some(InputResult::Continue));
@@ -709,9 +710,34 @@ pub(crate) async fn handle_dialog_event(
             return Ok(Some(InputResult::Continue));
         }
         Some(ActiveModal::Help) => {
+            let command_modifier = key.modifiers.contains(KeyModifiers::CONTROL)
+                || key.modifiers.contains(KeyModifiers::ALT);
             match key.code {
-                KeyCode::F(1) | KeyCode::Char('?') | KeyCode::Esc | KeyCode::Char('q') => {
+                KeyCode::Char('?') | KeyCode::Esc | KeyCode::Char('q') => {
                     st.show_help = false;
+                    st.help_scroll = 0;
+                }
+                // Tab / Shift+Tab cycle the help tabs; bare 1 / 2 / 3 jump directly
+                // to a tab. Switching resets the scroll so each tab opens at
+                // its top (Conventions §3, concept #c-3).
+                KeyCode::Tab => {
+                    st.help_tab = st.help_tab.next();
+                    st.help_scroll = 0;
+                }
+                KeyCode::BackTab => {
+                    st.help_tab = st.help_tab.prev();
+                    st.help_scroll = 0;
+                }
+                KeyCode::Char('1') if !command_modifier => {
+                    st.help_tab = HelpTab::Global;
+                    st.help_scroll = 0;
+                }
+                KeyCode::Char('2') if !command_modifier => {
+                    st.help_tab = HelpTab::CurrentMode;
+                    st.help_scroll = 0;
+                }
+                KeyCode::Char('3') if !command_modifier => {
+                    st.help_tab = HelpTab::TextEditor;
                     st.help_scroll = 0;
                 }
                 KeyCode::Char('h') | KeyCode::Char('H')
@@ -803,6 +829,94 @@ mod tests {
             notification,
             guard.confirm_execute_review.is_some(),
         )
+    }
+
+    #[tokio::test]
+    async fn help_modal_tab_shortcuts_switch_between_tabs() {
+        let mut st = crate::app::test_state();
+        st.show_help = true;
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+
+        // Tab cycles to the Current Mode tab.
+        handle_dialog_event(
+            KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
+            &state,
+            &mut conn,
+        )
+        .await
+        .unwrap();
+        assert_eq!(state.lock().await.help_tab, HelpTab::CurrentMode);
+
+        // Tab again cycles to the Text Editor tab.
+        handle_dialog_event(
+            KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
+            &state,
+            &mut conn,
+        )
+        .await
+        .unwrap();
+        assert_eq!(state.lock().await.help_tab, HelpTab::TextEditor);
+
+        // Shift+Tab walks back to the Current Mode tab.
+        handle_dialog_event(
+            KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT),
+            &state,
+            &mut conn,
+        )
+        .await
+        .unwrap();
+        assert_eq!(state.lock().await.help_tab, HelpTab::CurrentMode);
+
+        // Bare digits select a tab directly.
+        handle_dialog_event(
+            KeyEvent::new(KeyCode::Char('3'), KeyModifiers::NONE),
+            &state,
+            &mut conn,
+        )
+        .await
+        .unwrap();
+        assert_eq!(state.lock().await.help_tab, HelpTab::TextEditor);
+
+        handle_dialog_event(
+            KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE),
+            &state,
+            &mut conn,
+        )
+        .await
+        .unwrap();
+        assert_eq!(state.lock().await.help_tab, HelpTab::Global);
+
+        handle_dialog_event(
+            KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE),
+            &state,
+            &mut conn,
+        )
+        .await
+        .unwrap();
+        assert_eq!(state.lock().await.help_tab, HelpTab::CurrentMode);
+
+        // The dialog stays open across every tab switch.
+        assert!(state.lock().await.show_help);
+    }
+
+    #[tokio::test]
+    async fn help_modal_command_chords_do_not_switch_tabs() {
+        let mut st = crate::app::test_state();
+        st.show_help = true;
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+
+        // C-2 belongs to the global view-switch chord, not to the help tabs, so
+        // the digit accelerators must ignore command modifiers.
+        handle_dialog_event(
+            KeyEvent::new(KeyCode::Char('2'), KeyModifiers::CONTROL),
+            &state,
+            &mut conn,
+        )
+        .await
+        .unwrap();
+        assert_eq!(state.lock().await.help_tab, HelpTab::Global);
     }
 
     #[tokio::test]

@@ -1,5 +1,5 @@
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Style, Stylize};
+use ratatui::style::Stylize;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
@@ -8,11 +8,25 @@ use crate::app::AppState;
 use super::{format_masked_key, ONBOARDING_STEPS};
 
 pub fn render_onboarding_step_badge(current_step: crate::app::OnboardingStep) -> Line<'static> {
+    let engine = crate::theme::engine::current_engine();
+    let palette = engine.palette();
     if current_step == crate::app::OnboardingStep::Gatekeeper {
         return Line::from(vec![
-            Span::styled(" 0. Git [OK] ─── 1. Configuration [OK] ─── ", Style::default().fg(Color::Green)),
-            Span::styled("[Warning: API Key Missing]", Style::default().bg(Color::Red).fg(Color::White).bold()),
-            Span::styled(" ─── 3. Layout ─── 4. Modifier ─── 5. Ready", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                " 0. Git [OK] ─── 1. Configuration [OK] ─── ",
+                engine.fg(palette.status_success),
+            ),
+            Span::styled(
+                "[Warning: API Key Missing]",
+                engine
+                    .bg(palette.status_error)
+                    .fg(engine.color(palette.text_inverse))
+                    .bold(),
+            ),
+            Span::styled(
+                " ─── 3. Layout ─── 4. Modifier ─── 5. Ready",
+                engine.fg(palette.text_muted),
+            ),
         ]);
     }
 
@@ -24,23 +38,20 @@ pub fn render_onboarding_step_badge(current_step: crate::app::OnboardingStep) ->
     let mut spans = Vec::new();
     for (idx, meta) in ONBOARDING_STEPS.iter().enumerate() {
         if idx > 0 {
-            spans.push(Span::styled(" ─── ", Style::default().fg(Color::DarkGray)));
+            spans.push(Span::styled(" ─── ", engine.fg(palette.text_muted)));
         }
         if idx < current_idx {
             spans.push(Span::styled(
                 format!("{}{} [OK]", if idx == 0 { " " } else { "" }, meta.name),
-                Style::default().fg(Color::Green),
+                engine.fg(palette.status_success),
             ));
         } else if idx == current_idx {
             spans.push(Span::styled(
                 format!(" [{}] ", meta.name),
-                Style::default().bg(meta.active_bg).fg(meta.active_fg).bold(),
+                meta.accent.badge_style(&engine).bold(),
             ));
         } else {
-            spans.push(Span::styled(
-                meta.name,
-                Style::default().fg(Color::DarkGray),
-            ));
+            spans.push(Span::styled(meta.name, engine.fg(palette.text_muted)));
         }
     }
     Line::from(spans)
@@ -54,6 +65,8 @@ pub fn render_onboarding_view(
     footer_area: Rect,
 ) {
     let ob = &state.onboarding;
+    let engine = crate::theme::engine::current_engine();
+    let palette = engine.palette();
 
     let step_badge = render_onboarding_step_badge(ob.step);
 
@@ -66,7 +79,7 @@ pub fn render_onboarding_view(
         crate::app::OnboardingStep::Git => {
             lines.push(Line::from(Span::styled(
                 "Step 0: Initialize Git Repository",
-                Style::default().bold().fg(Color::Red),
+                engine.fg(palette.status_error).bold(),
             )));
             lines.push(Line::from("The current working directory is not a Git repository."));
             lines.push(Line::from("Tauqe strictly requires Git: isolated pre-edit checkpoints, atomic turn commits,"));
@@ -74,7 +87,7 @@ pub fn render_onboarding_view(
             lines.push(Line::raw(""));
             lines.push(Line::from(Span::styled(
                 "Select an action (arrows ↑/↓, then Enter):",
-                Style::default().bold().fg(Color::White),
+                engine.fg(palette.text_primary).bold(),
             )));
             lines.push(Line::raw(""));
 
@@ -88,12 +101,15 @@ pub fn render_onboarding_view(
                 let is_sel = idx == ob.selected_index;
                 let prefix = if is_sel { "  ▶ [●] " } else { "    [ ] " };
                 let style = if is_sel {
-                    Style::default().bg(Color::DarkGray).fg(Color::White).bold()
+                    engine
+                        .bg(palette.overlay)
+                        .fg(engine.color(palette.text_primary))
+                        .bold()
                 } else {
-                    Style::default().fg(Color::Gray)
+                    engine.fg(palette.text_secondary)
                 };
                 lines.push(Line::from(vec![
-                    Span::styled(prefix, Style::default().fg(Color::Cyan).bold()),
+                    Span::styled(prefix, engine.fg(palette.status_error).bold()),
                     Span::styled(opt.clone(), style),
                 ]));
             }
@@ -101,7 +117,7 @@ pub fn render_onboarding_view(
         crate::app::OnboardingStep::Config => {
             lines.push(Line::from(Span::styled(
                 "Step 1: Project Configuration (tauqe.toml)",
-                Style::default().bold().fg(Color::Cyan),
+                engine.fg(palette.status_info).bold(),
             )));
             lines.push(Line::from("Configuration file not found in project root."));
             lines.push(Line::from(format!(
@@ -111,7 +127,7 @@ pub fn render_onboarding_view(
             lines.push(Line::raw(""));
             lines.push(Line::from(Span::styled(
                 "Select configuration option (arrows ↑/↓, then Enter):",
-                Style::default().bold().fg(Color::White),
+                engine.fg(palette.text_primary).bold(),
             )));
             lines.push(Line::raw(""));
 
@@ -124,12 +140,15 @@ pub fn render_onboarding_view(
                 let is_sel = idx == ob.selected_index;
                 let prefix = if is_sel { "  ▶ [●] " } else { "    [ ] " };
                 let style = if is_sel {
-                    Style::default().bg(Color::DarkGray).fg(Color::White).bold()
+                    engine
+                        .bg(palette.overlay)
+                        .fg(engine.color(palette.text_primary))
+                        .bold()
                 } else {
-                    Style::default().fg(Color::Gray)
+                    engine.fg(palette.text_secondary)
                 };
                 lines.push(Line::from(vec![
-                    Span::styled(prefix, Style::default().fg(Color::Cyan).bold()),
+                    Span::styled(prefix, engine.fg(palette.status_info).bold()),
                     Span::styled(opt.clone(), style),
                 ]));
             }
@@ -137,7 +156,7 @@ pub fn render_onboarding_view(
         crate::app::OnboardingStep::Credentials => {
             lines.push(Line::from(Span::styled(
                 "Step 2: Credentials and OpenRouter API Key",
-                Style::default().bold().fg(Color::Yellow),
+                engine.fg(palette.status_warning).bold(),
             )));
             lines.push(Line::from("OpenRouter API key was not detected in environment (OPENROUTER_API_KEY) or credentials files."));
             lines.push(Line::from("An API key is required to query models (obtain at https://openrouter.ai/keys)."));
@@ -148,7 +167,7 @@ pub fn render_onboarding_view(
             lines.push(Line::raw(""));
             lines.push(Line::from(Span::styled(
                 "Select key setup method (arrows ↑/↓, then Enter):",
-                Style::default().bold().fg(Color::White),
+                engine.fg(palette.text_primary).bold(),
             )));
             lines.push(Line::raw(""));
 
@@ -163,12 +182,15 @@ pub fn render_onboarding_view(
                 let is_sel = idx == ob.selected_index;
                 let prefix = if is_sel { "  ▶ [●] " } else { "    [ ] " };
                 let style = if is_sel {
-                    Style::default().bg(Color::DarkGray).fg(Color::White).bold()
+                    engine
+                        .bg(palette.overlay)
+                        .fg(engine.color(palette.text_primary))
+                        .bold()
                 } else {
-                    Style::default().fg(Color::Gray)
+                    engine.fg(palette.text_secondary)
                 };
                 lines.push(Line::from(vec![
-                    Span::styled(prefix, Style::default().fg(Color::Yellow).bold()),
+                    Span::styled(prefix, engine.fg(palette.status_warning).bold()),
                     Span::styled(opt.clone(), style),
                 ]));
             }
@@ -176,7 +198,7 @@ pub fn render_onboarding_view(
         crate::app::OnboardingStep::Workstation => {
             lines.push(Line::from(Span::styled(
                 "Step 3: Workstation Keyboard Layout and Mapping (tui.toml)",
-                Style::default().bold().fg(Color::Magenta),
+                engine.fg(palette.button_active_bg).bold(),
             )));
             lines.push(Line::from("Configure shortcut key translation and navigation keys for your system layout."));
             lines.push(Line::from(format!(
@@ -186,7 +208,7 @@ pub fn render_onboarding_view(
             lines.push(Line::raw(""));
             lines.push(Line::from(Span::styled(
                 "Select keyboard layout option (arrows ↑/↓, then Enter):",
-                Style::default().bold().fg(Color::White),
+                engine.fg(palette.text_primary).bold(),
             )));
             lines.push(Line::raw(""));
 
@@ -201,12 +223,15 @@ pub fn render_onboarding_view(
                 let is_sel = idx == ob.selected_index;
                 let prefix = if is_sel { "  ▶ [●] " } else { "    [ ] " };
                 let style = if is_sel {
-                    Style::default().bg(Color::DarkGray).fg(Color::White).bold()
+                    engine
+                        .bg(palette.overlay)
+                        .fg(engine.color(palette.text_primary))
+                        .bold()
                 } else {
-                    Style::default().fg(Color::Gray)
+                    engine.fg(palette.text_secondary)
                 };
                 lines.push(Line::from(vec![
-                    Span::styled(prefix, Style::default().fg(Color::Magenta).bold()),
+                    Span::styled(prefix, engine.fg(palette.button_active_bg).bold()),
                     Span::styled(opt.clone(), style),
                 ]));
             }
@@ -214,14 +239,14 @@ pub fn render_onboarding_view(
         crate::app::OnboardingStep::Modifier => {
             lines.push(Line::from(Span::styled(
                 "Step 4: Primary Command Modifier (C-)",
-                Style::default().bold().fg(Color::Blue),
+                engine.fg(palette.overlay).bold(),
             )));
             lines.push(Line::from("In text input mode (prompt buffer, commit message editor), every regular key types text."));
             lines.push(Line::from("Functional commands (send prompt, undo, squash, model picker, tabs) use the primary modifier."));
             lines.push(Line::raw(""));
             lines.push(Line::from(Span::styled(
                 "Select primary command modifier (arrows ↑/↓, then Enter):",
-                Style::default().bold().fg(Color::White),
+                engine.fg(palette.text_primary).bold(),
             )));
             lines.push(Line::raw(""));
 
@@ -234,12 +259,15 @@ pub fn render_onboarding_view(
                 let is_sel = idx == ob.selected_index;
                 let prefix = if is_sel { "  ▶ [●] " } else { "    [ ] " };
                 let style = if is_sel {
-                    Style::default().bg(Color::DarkGray).fg(Color::White).bold()
+                    engine
+                        .bg(palette.overlay)
+                        .fg(engine.color(palette.text_primary))
+                        .bold()
                 } else {
-                    Style::default().fg(Color::Gray)
+                    engine.fg(palette.text_secondary)
                 };
                 lines.push(Line::from(vec![
-                    Span::styled(prefix, Style::default().fg(Color::Blue).bold()),
+                    Span::styled(prefix, engine.fg(palette.overlay).bold()),
                     Span::styled(opt.clone(), style),
                 ]));
             }
@@ -247,11 +275,11 @@ pub fn render_onboarding_view(
         crate::app::OnboardingStep::Gatekeeper => {
             lines.push(Line::from(Span::styled(
                 "Warning: System Not Ready",
-                Style::default().bold().fg(Color::Red),
+                engine.fg(palette.status_error).bold(),
             )));
             lines.push(Line::from("Language model calls cannot proceed without an OpenRouter API key."));
             lines.push(Line::from("You can input the key now, create credentials.toml, or export:"));
-            lines.push(Line::from(Span::styled("  export OPENROUTER_API_KEY=\"sk-or-v1-...\"", Style::default().fg(Color::Cyan).bold())));
+            lines.push(Line::from(Span::styled("  export OPENROUTER_API_KEY=\"sk-or-v1-...\"", engine.fg(palette.status_info).bold())));
             lines.push(Line::raw(""));
 
             let options = [
@@ -264,12 +292,15 @@ pub fn render_onboarding_view(
                 let is_sel = idx == ob.selected_index;
                 let prefix = if is_sel { "  ▶ [●] " } else { "    [ ] " };
                 let style = if is_sel {
-                    Style::default().bg(Color::DarkGray).fg(Color::White).bold()
+                    engine
+                        .bg(palette.overlay)
+                        .fg(engine.color(palette.text_primary))
+                        .bold()
                 } else {
-                    Style::default().fg(Color::Gray)
+                    engine.fg(palette.text_secondary)
                 };
                 lines.push(Line::from(vec![
-                    Span::styled(prefix, Style::default().fg(Color::Red).bold()),
+                    Span::styled(prefix, engine.fg(palette.status_error).bold()),
                     Span::styled(opt.clone(), style),
                 ]));
             }
@@ -277,46 +308,49 @@ pub fn render_onboarding_view(
         crate::app::OnboardingStep::Ready => {
             lines.push(Line::from(Span::styled(
                 "Step 5: System is successfully configured and ready to use!",
-                Style::default().bold().fg(Color::Green),
+                engine.fg(palette.status_success).bold(),
             )));
             lines.push(Line::raw(""));
             lines.push(Line::from(vec![
-                Span::styled("• Model: ", Style::default().bold()),
-                Span::styled(state.active_model.to_string(), Style::default().fg(Color::Cyan)),
+                Span::styled("• Model: ", engine.fg(palette.text_primary).bold()),
+                Span::styled(state.active_model.to_string(), engine.fg(palette.status_info)),
             ]));
             lines.push(Line::from(vec![
-                Span::styled("• Configuration: ", Style::default().bold()),
+                Span::styled("• Configuration: ", engine.fg(palette.text_primary).bold()),
                 Span::styled(
                     ob.config_path.as_deref().unwrap_or("Built-in defaults"),
-                    Style::default().fg(Color::White),
+                    engine.fg(palette.text_primary),
                 ),
             ]));
             lines.push(Line::from(vec![
-                Span::styled("• OpenRouter Key: ", Style::default().bold()),
-                Span::styled("[OK] Configured", Style::default().fg(Color::Green).bold()),
+                Span::styled("• OpenRouter Key: ", engine.fg(palette.text_primary).bold()),
+                Span::styled("[OK] Configured", engine.fg(palette.status_success).bold()),
             ]));
             lines.push(Line::from(vec![
-                Span::styled("• Command Modifier: ", Style::default().bold()),
+                Span::styled("• Command Modifier: ", engine.fg(palette.text_primary).bold()),
                 Span::styled(
                     match state.tui_config.input.primary_modifier {
                         crate::config::PrimaryModifier::Ctrl => "Ctrl (Default)",
                         crate::config::PrimaryModifier::Alt => "Alt",
                     },
-                    Style::default().fg(Color::Blue).bold(),
+                    engine.fg(palette.status_info).bold(),
                 ),
             ]));
             lines.push(Line::raw(""));
             lines.push(Line::from("Press Enter to open the development workspace."));
             lines.push(Line::from(Span::styled(
                 "Press '?' at any time to view the hotkey reference.",
-                Style::default().fg(Color::DarkGray),
+                engine.fg(palette.text_muted),
             )));
             lines.push(Line::raw(""));
 
             let prefix = "  ▶ [●] ";
-            let style = Style::default().bg(Color::Green).fg(Color::Black).bold();
+            let style = engine
+                .bg(palette.status_success)
+                .fg(engine.color(palette.text_inverse))
+                .bold();
             lines.push(Line::from(vec![
-                Span::styled(prefix, Style::default().fg(Color::Green).bold()),
+                Span::styled(prefix, engine.fg(palette.status_success).bold()),
                 Span::styled(" Start Session (Open Terminal) ", style),
             ]));
         }
@@ -327,10 +361,10 @@ pub fn render_onboarding_view(
         if ob.input_langmap {
             let prompt = "Enter Custom Langmap (e.g. 'йцукен;qwerty' or 'йq,цw'): ";
             lines.push(Line::from(vec![
-                Span::styled(prompt, Style::default().fg(Color::Magenta).bold()),
-                Span::styled(ob.input_buffer.get_text(), Style::default().fg(Color::White).bold()),
-                Span::styled("█", Style::default().fg(Color::Magenta)),
-                Span::styled("  (Enter: Save, Esc: Cancel)", Style::default().fg(Color::DarkGray)),
+                Span::styled(prompt, engine.fg(palette.button_active_bg).bold()),
+                Span::styled(ob.input_buffer.get_text(), engine.fg(palette.text_primary).bold()),
+                Span::styled("█", engine.fg(palette.button_active_bg)),
+                Span::styled("  (Enter: Save, Esc: Cancel)", engine.fg(palette.text_muted)),
             ]));
         } else {
             let prompt = "Enter OpenRouter API Key: ";
@@ -363,10 +397,10 @@ pub fn render_onboarding_view(
             };
 
             lines.push(Line::from(vec![
-                Span::styled(prompt, Style::default().fg(Color::Yellow).bold()),
-                Span::styled(displayed, Style::default().fg(Color::White).bold()),
-                Span::styled("█", Style::default().fg(Color::Yellow)),
-                Span::styled(hint, Style::default().fg(Color::DarkGray)),
+                Span::styled(prompt, engine.fg(palette.status_warning).bold()),
+                Span::styled(displayed, engine.fg(palette.text_primary).bold()),
+                Span::styled("█", engine.fg(palette.status_warning)),
+                Span::styled(hint, engine.fg(palette.text_muted)),
             ]));
         }
     }
@@ -375,14 +409,14 @@ pub fn render_onboarding_view(
         lines.push(Line::raw(""));
         lines.push(Line::from(Span::styled(
             format!("Error: {}", err),
-            Style::default().fg(Color::Red).bold(),
+            engine.fg(palette.status_error).bold(),
         )));
     }
     if let Some(msg) = &ob.status_message {
         lines.push(Line::raw(""));
         lines.push(Line::from(Span::styled(
             format!("✓ {}", msg),
-            Style::default().fg(Color::Green).bold(),
+            engine.fg(palette.status_success).bold(),
         )));
     }
 
@@ -391,7 +425,7 @@ pub fn render_onboarding_view(
             Block::default()
                 .title(" Tauqe Initial Setup (Onboarding) ")
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Cyan)),
+                .border_style(engine.fg(palette.status_info)),
         )
         .wrap(Wrap { trim: false });
     frame.render_widget(main_block, main_area);
@@ -405,7 +439,7 @@ pub fn render_onboarding_view(
         crate::app::OnboardingStep::Gatekeeper => "OpenRouter API key is required for LLM calls. Select an action.",
         crate::app::OnboardingStep::Ready => "All parameters verified. Press Enter to start.",
     };
-    let info_block = Paragraph::new(Line::from(Span::styled(info_text, Style::default().fg(Color::DarkGray))))
+    let info_block = Paragraph::new(Line::from(Span::styled(info_text, engine.fg(palette.text_muted))))
         .block(Block::default().title(" Information ").borders(Borders::ALL));
     frame.render_widget(info_block, info_area);
 

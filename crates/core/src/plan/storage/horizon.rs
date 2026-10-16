@@ -37,7 +37,7 @@ impl PlanStorage {
         plan_id: &str,
         new_horizon_items: Vec<PlanItem>,
     ) -> Result<Plan> {
-        let mut plan = match Self::load_plan(repo_root, plan_id)? {
+        let mut plan = match Self::load_plan_unlocked(repo_root, plan_id)? {
             Some(p) => p,
             None => anyhow::bail!("Plan '{}' not found", plan_id),
         };

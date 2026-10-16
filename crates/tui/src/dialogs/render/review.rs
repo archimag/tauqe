@@ -3,6 +3,7 @@ use ratatui::style::{Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 
+use crate::components::modal::render_dialog_footer;
 use crate::config::PrimaryModifier;
 use crate::theme::engine::current_engine;
 use crate::ui::centered_rect;
@@ -19,7 +20,8 @@ pub const REVIEW_DIALOG_CANCEL_LABEL: &str = "[ Cancel ]";
 
 /// Height of the header block (summary and target metadata).
 const REVIEW_HEADER_HEIGHT: u16 = 6;
-/// Height of the action-bar block (buttons and navigation hint).
+/// Height of the footer block: the action bar (2 rows) plus the docked hint
+/// strip (1 row).
 const REVIEW_FOOTER_HEIGHT: u16 = 3;
 /// Minimum height kept for the instruction editor on short terminals.
 const REVIEW_EDITOR_MIN_HEIGHT: u16 = 3;
@@ -59,13 +61,15 @@ fn inset(area: Rect) -> Rect {
 }
 
 /// Splits the dialog interior into
-/// `[header, reviewer list, path field, editor, footer]`.
+/// `[header, reviewer list, path field, editor, buttons, footer]`.
 ///
 /// The action bar, list, path field, and header are sized first so the dialog
 /// stays usable on short terminals; the instruction editor absorbs whatever
 /// height remains. The path field keeps its reserved single-line height and the
-/// header yields before it, so the target directory or glob stays visible.
-fn review_dialog_chunks(area: Rect, entry_count: usize) -> [Rect; 5] {
+/// header yields before it, so the target directory or glob stays visible. The
+/// footer block splits into the interactive action bar and a one-row docked
+/// hint strip pinned to the card's bottom edge.
+fn review_dialog_chunks(area: Rect, entry_count: usize) -> [Rect; 6] {
     let inner = inset(area);
 
     let footer_h = REVIEW_FOOTER_HEIGHT.min(inner.height);
@@ -86,8 +90,14 @@ fn review_dialog_chunks(area: Rect, entry_count: usize) -> [Rect; 5] {
     let list = Rect::new(inner.x, inner.y + header_h, inner.width, list_h);
     let path = Rect::new(inner.x, list.y + list_h, inner.width, path_h);
     let editor = Rect::new(inner.x, path.y + path_h, inner.width, editor_h);
-    let footer = Rect::new(inner.x, editor.y + editor_h, inner.width, footer_h);
-    [header, list, path, editor, footer]
+
+    // Split the footer into the action buttons and the docked hint strip so the
+    // hint reads as persistent chrome rather than a second row of buttons (c-1).
+    let docked_h = 1.min(footer_h);
+    let buttons_h = footer_h - docked_h;
+    let buttons = Rect::new(inner.x, editor.y + editor_h, inner.width, buttons_h);
+    let footer = Rect::new(inner.x, buttons.y + buttons_h, inner.width, docked_h);
+    [header, list, path, editor, buttons, footer]
 }
 
 /// Computes the dialog frame, the reviewer-row area, and the action buttons
@@ -97,14 +107,14 @@ pub fn review_dialog_geometry(term: Rect, entry_count: usize) -> ReviewDialogGeo
     let chunks = review_dialog_chunks(area, entry_count);
     let model_rows = inset(chunks[1]);
 
-    let footer = chunks[4];
+    let buttons = chunks[4];
     let confirm_w = REVIEW_DIALOG_CONFIRM_LABEL.len() as u16 + 2;
     let cancel_w = REVIEW_DIALOG_CANCEL_LABEL.len() as u16 + 2;
     let gap = 4u16;
     let total = confirm_w + gap + cancel_w;
-    let start_x = footer.x + (footer.width.saturating_sub(total)) / 2;
-    let confirm_button = Rect::new(start_x, footer.y, confirm_w, 1);
-    let cancel_button = Rect::new(start_x + confirm_w + gap, footer.y, cancel_w, 1);
+    let start_x = buttons.x + (buttons.width.saturating_sub(total)) / 2;
+    let confirm_button = Rect::new(start_x, buttons.y, confirm_w, 1);
+    let cancel_button = Rect::new(start_x + confirm_w + gap, buttons.y, cancel_w, 1);
 
     ReviewDialogGeometry {
         area,
@@ -132,7 +142,7 @@ pub fn render_review_dialog(
         .style(Style::default().bg(engine.color(palette.surface)));
     frame.render_widget(outer_block, area);
 
-    let [header_area, list_area, path_area, editor_area, footer_area] =
+    let [header_area, list_area, path_area, editor_area, buttons_area, footer_area] =
         review_dialog_chunks(area, entry_count);
 
     let dim = engine.fg(palette.text_muted);
@@ -301,24 +311,28 @@ pub fn render_review_dialog(
         )
     };
     let nav_hint = if dialog.focus.is_actions() {
-        "Enter: confirm • ←/→: button • Esc: cancel".to_string()
+        "Enter confirm • ← / → button • Esc cancel".to_string()
     } else {
         format!(
-            "{}Enter: start • Tab: focus • {}: model • Esc: cancel",
+            "{}Enter start • Tab focus • {} model • Esc cancel",
             primary.prefix_str(),
             crate::components::model_selector::model_select_hint(primary)
         )
     };
-    let actions = vec![
-        Line::from(vec![
-            Span::styled(format!(" {} ", REVIEW_DIALOG_CONFIRM_LABEL), confirm_style),
-            Span::raw("    "),
-            Span::styled(format!(" {} ", REVIEW_DIALOG_CANCEL_LABEL), cancel_style),
-        ]),
-        Line::from(Span::styled(nav_hint, engine.fg(palette.text_secondary))),
-    ];
-    let footer = Paragraph::new(actions).alignment(Alignment::Center);
-    frame.render_widget(footer, footer_area);
+    let actions = Line::from(vec![
+        Span::styled(format!(" {} ", REVIEW_DIALOG_CONFIRM_LABEL), confirm_style),
+        Span::raw("    "),
+        Span::styled(format!(" {} ", REVIEW_DIALOG_CANCEL_LABEL), cancel_style),
+    ]);
+    frame.render_widget(
+        Paragraph::new(actions).alignment(Alignment::Center),
+        buttons_area,
+    );
+
+    // The navigation hint is docked to the card's bottom edge as its own strip
+    // filled with `palette.overlay`, so it reads as persistent chrome instead
+    // of a second line of buttons (c-1, c-2).
+    render_dialog_footer(frame, footer_area, &nav_hint);
 }
 
 #[cfg(test)]
@@ -345,18 +359,21 @@ mod tests {
     fn test_review_dialog_chunks_reserve_path_field_between_list_and_editor() {
         let term = Rect::new(0, 0, 120, 40);
         let area = centered_rect(REVIEW_DIALOG_WIDTH, REVIEW_DIALOG_HEIGHT, term);
-        let [header, list, path, editor, footer] = review_dialog_chunks(area, 3);
+        let [header, list, path, editor, buttons, footer] = review_dialog_chunks(area, 3);
 
         // The reserved single-line path field is fully visible on a normal terminal.
         assert_eq!(path.height, REVIEW_PATH_HEIGHT);
 
-        // The interior stacks top-to-bottom without gaps or overlap.
+        // The interior stacks top-to-bottom without gaps or overlap, and the
+        // footer block ends in a one-row docked hint strip.
         assert_eq!(header.y, area.y + 1);
         assert_eq!(list.y, header.y + header.height);
         assert_eq!(path.y, list.y + list.height);
         assert_eq!(editor.y, path.y + path.height);
-        assert_eq!(footer.y, editor.y + editor.height);
+        assert_eq!(buttons.y, editor.y + editor.height);
+        assert_eq!(footer.y, buttons.y + buttons.height);
         assert!(footer.y + footer.height <= area.bottom());
         assert!(path.width > 0 && editor.height > 0);
+        assert_eq!(footer.height, 1, "docked hint strip is one row");
     }
 }

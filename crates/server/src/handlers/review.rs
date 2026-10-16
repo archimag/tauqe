@@ -1,6 +1,5 @@
 use std::collections::HashSet;
 use std::path::Path;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -39,6 +38,22 @@ use crate::handlers::plan::{
 };
 use crate::state::{next_operation_id, AppState, OperationGuard};
 use crate::transport::OutChannel;
+
+/// Runs a blocking review-storage operation on the Tokio blocking pool.
+///
+/// The storage engine holds a synchronous process-wide mutex and performs disk
+/// I/O, both of which must stay off the async worker threads.
+async fn offload_review<T, F>(f: F) -> Result<T, String>
+where
+    F: FnOnce() -> anyhow::Result<T> + Send + 'static,
+    T: Send + 'static,
+{
+    match super::offload(f).await {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(err)) => Err(format!("{:#}", err)),
+        Err(err) => Err(err),
+    }
+}
 
 fn emit(out: &OutChannel, method: &str, params: Option<serde_json::Value>) {
     out.send_event(&Event {
@@ -124,31 +139,46 @@ pub async fn handle_review_start(req: Request, state: &Arc<AppState>) -> Respons
     };
 
     if let Some(pattern) = params.path_pattern.as_deref().map(str::trim).filter(|p| !p.is_empty()) {
-        let available_files = tauqe_core::git::list_repository_files(Some(&repo_root)).unwrap_or_default();
-        let existing_paths: std::collections::HashSet<String> = files.iter().map(|f| f.path.clone()).collect();
-        // Compile once and match every repository file against the compiled
-        // pattern instead of re-normalizing it per path.
-        let compiled = tauqe_protocol::GlobPattern::new(pattern);
-        let mut matched: Vec<String> = available_files
-            .into_iter()
-            .filter(|path| !existing_paths.contains(path) && compiled.matches(path))
-            .collect();
-        matched.sort();
+        let existing_paths: std::collections::HashSet<String> =
+            files.iter().map(|f| f.path.clone()).collect();
+        let pattern = pattern.to_string();
+        let root = repo_root.clone();
+        // Listing the repository and reading every matched file is blocking git
+        // and filesystem work, so it is offloaded off the async worker thread.
+        let matched_files = super::offload(move || {
+            let available_files =
+                tauqe_core::git::list_repository_files(Some(&root)).unwrap_or_default();
+            let compiled = tauqe_protocol::GlobPattern::new(&pattern);
+            let mut matched: Vec<String> = available_files
+                .into_iter()
+                .filter(|path| !existing_paths.contains(path) && compiled.matches(path))
+                .collect();
+            matched.sort();
 
-        for path in matched {
-            if tauqe_core::context::verify_path_within_repo(&repo_root, &path).is_err() {
-                continue;
+            let mut read = Vec::new();
+            for path in matched {
+                if tauqe_core::context::verify_path_within_repo(&root, &path).is_err() {
+                    continue;
+                }
+                let full_path = root.join(&path);
+                if let Ok(content) = std::fs::read_to_string(&full_path) {
+                    read.push((path, content));
+                }
             }
-            let full_path = repo_root.join(&path);
-            if let Ok(content) = std::fs::read_to_string(&full_path) {
-                let tokens = tauqe_core::prompt::estimate_tokens_from_bytes(content.len() as u64) as usize;
-                estimated_tokens += tokens;
-                files.push(tauqe_core::context::ContextFileContent {
-                    path,
-                    access: ContextAccess::ReadOnly,
-                    content,
-                });
-            }
+            read
+        })
+        .await
+        .unwrap_or_default();
+
+        for (path, content) in matched_files {
+            let tokens =
+                tauqe_core::prompt::estimate_tokens_from_bytes(content.len() as u64) as usize;
+            estimated_tokens += tokens;
+            files.push(tauqe_core::context::ContextFileContent {
+                path,
+                access: ContextAccess::ReadOnly,
+                content,
+            });
         }
     }
 
@@ -333,8 +363,12 @@ pub async fn handle_review_start(req: Request, state: &Arc<AppState>) -> Respons
             items,
             raw_markdown: raw_buffer,
         };
-        if let Err(err) = ReviewStorage::save_session(&repo_root, &session) {
-            emit_error(&state.out, &op_id, format!("{:#}", err));
+        let save_root = repo_root.clone();
+        let session_clone = session.clone();
+        if let Err(err) =
+            offload_review(move || ReviewStorage::save_session(&save_root, &session_clone)).await
+        {
+            emit_error(&state.out, &op_id, err);
             return;
         }
 
@@ -347,8 +381,12 @@ pub async fn handle_review_start(req: Request, state: &Arc<AppState>) -> Respons
             .ok(),
         );
 
-        if let Ok(reviews) = ReviewStorage::load_all(&repo_root) {
-            let active_id = ReviewStorage::load_active_id(&repo_root).ok().flatten();
+        let list_root = repo_root.clone();
+        if let Ok(reviews) = offload_review(move || ReviewStorage::load_all(&list_root)).await {
+            let active_root = repo_root.clone();
+            let active_id = offload_review(move || ReviewStorage::load_active_id(&active_root))
+                .await
+                .unwrap_or(None);
             emit(
                 &state.out,
                 events::REVIEW_LIST_CHANGED,
@@ -414,34 +452,28 @@ pub async fn handle_review_cancel(req: Request, state: &Arc<AppState>) -> Respon
         return Response::ok(req.id, serde_json::json!({ "cancelled": true }));
     }
 
-    let active_op = state.take_active_operation();
-    if let Some(op) = active_op {
-        let _ = op.cancel_tx.send(true);
-        if let Some(handle) = op.abort_handle {
-            // Aborting is a last resort: the streaming task unwinds
-            // cooperatively on the cancel signal, and a hard abort is deferred
-            // while a git transaction is still open so a half-finished
-            // checkpoint or step commit is never abandoned mid-transaction.
-            let state = Arc::clone(state);
-            tokio::spawn(async move {
-                tokio::time::sleep(crate::handlers::model::CANCEL_UNWIND_GRACE).await;
-                if !state.git_transaction_active.load(Ordering::SeqCst) {
-                    handle.abort();
-                }
-            });
-        }
-    }
+    // A hard stop signals cancellation but keeps the operation slot registered:
+    // the cancelled workflow keeps mutating state (rolling back its git
+    // transaction, releasing the session lock) until it unwinds and drops its
+    // guard. Clearing the slot immediately would let a client start
+    // `git/undo`, `config/set`, or a new turn against a half-unwound turn. A
+    // watchdog force-aborts a stalled task after the grace period.
+    state.hard_cancel_active_operation();
     Response::ok(req.id, serde_json::json!({ "cancelled": true }))
 }
 
 pub async fn handle_review_list(req: Request, state: &Arc<AppState>) -> Response {
     let repo_root = state.context.read().await.repo_root().to_path_buf();
-    match ReviewStorage::load_all(&repo_root) {
+    let load_root = repo_root.clone();
+    match offload_review(move || ReviewStorage::load_all(&load_root)).await {
         Ok(reviews) => {
-            let active_id = ReviewStorage::load_active_id(&repo_root).ok().flatten();
+            let active_root = repo_root.clone();
+            let active_id = offload_review(move || ReviewStorage::load_active_id(&active_root))
+                .await
+                .unwrap_or(None);
             Response::ok_typed(req.id, &ReviewListResult { reviews, active_id })
         }
-        Err(err) => Response::err(req.id, errors::REVIEW_LIST_FAILED, format!("{:#}", err)),
+        Err(err) => Response::err(req.id, errors::REVIEW_LIST_FAILED, err),
     }
 }
 
@@ -465,31 +497,48 @@ pub async fn handle_review_get(req: Request, state: &Arc<AppState>) -> Response 
     });
 
     let repo_root = state.context.read().await.repo_root().to_path_buf();
+
+    let active_id = {
+        let root = repo_root.clone();
+        offload_review(move || ReviewStorage::load_active_id(&root))
+            .await
+            .unwrap_or(None)
+    };
+    let active_missing = active_id.is_none();
+
     let review_id = match &target_id {
         Some(id) => Some(id.clone()),
-        None => ReviewStorage::load_active_id(&repo_root)
-            .ok()
-            .flatten()
-            .or_else(|| {
-                ReviewStorage::list_reviews(&repo_root)
-                    .ok()
-                    .and_then(|reviews| reviews.into_iter().next().map(|r| r.id))
-            }),
+        None => match active_id {
+            Some(id) => Some(id),
+            None => {
+                let root = repo_root.clone();
+                offload_review(move || {
+                    ReviewStorage::list_reviews(&root)
+                        .map(|reviews| reviews.into_iter().next().map(|r| r.id))
+                })
+                .await
+                .unwrap_or(None)
+            }
+        },
     };
 
-    if target_id.is_none() {
-        if let Ok(None) = ReviewStorage::load_active_id(&repo_root) {
-            if let Some(ref id) = review_id {
-                let _ = ReviewStorage::save_active_id(&repo_root, Some(id.as_str()));
-            }
+    if target_id.is_none() && active_missing {
+        if let Some(id) = review_id.clone() {
+            let root = repo_root.clone();
+            let _ =
+                offload_review(move || ReviewStorage::save_active_id(&root, Some(id.as_str())))
+                    .await;
         }
     }
 
     match review_id {
-        Some(id) => match ReviewStorage::load_review(&repo_root, &id) {
-            Ok(session) => Response::ok_typed(req.id, &ReviewGetResult { session }),
-            Err(err) => Response::err(req.id, errors::REVIEW_GET_FAILED, format!("{:#}", err)),
-        },
+        Some(id) => {
+            let root = repo_root.clone();
+            match offload_review(move || ReviewStorage::load_review(&root, &id)).await {
+                Ok(session) => Response::ok_typed(req.id, &ReviewGetResult { session }),
+                Err(err) => Response::err(req.id, errors::REVIEW_GET_FAILED, err),
+            }
+        }
         None => Response::ok_typed(req.id, &ReviewGetResult { session: None }),
     }
 }
@@ -501,11 +550,20 @@ pub async fn handle_review_delete(req: Request, state: &Arc<AppState>) -> Respon
     };
 
     let repo_root = state.context.read().await.repo_root().to_path_buf();
-    match ReviewStorage::delete_review(&repo_root, &params.id) {
+    let delete_root = repo_root.clone();
+    let review_id = params.id.clone();
+    match offload_review(move || ReviewStorage::delete_review(&delete_root, &review_id)).await {
         Ok(deleted) => {
             if deleted {
-                if let Ok(reviews) = ReviewStorage::load_all(&repo_root) {
-                    let active_id = ReviewStorage::load_active_id(&repo_root).ok().flatten();
+                let list_root = repo_root.clone();
+                if let Ok(reviews) =
+                    offload_review(move || ReviewStorage::load_all(&list_root)).await
+                {
+                    let active_root = repo_root.clone();
+                    let active_id =
+                        offload_review(move || ReviewStorage::load_active_id(&active_root))
+                            .await
+                            .unwrap_or(None);
                     emit(
                         &state.out,
                         events::REVIEW_LIST_CHANGED,
@@ -515,7 +573,7 @@ pub async fn handle_review_delete(req: Request, state: &Arc<AppState>) -> Respon
             }
             Response::ok_typed(req.id, &ReviewDeleteResult { success: deleted })
         }
-        Err(err) => Response::err(req.id, errors::REVIEW_DELETE_FAILED, format!("{:#}", err)),
+        Err(err) => Response::err(req.id, errors::REVIEW_DELETE_FAILED, err),
     }
 }
 
@@ -529,31 +587,46 @@ pub async fn handle_review_update_item(req: Request, state: &Arc<AppState>) -> R
     };
 
     let repo_root = state.context.read().await.repo_root().to_path_buf();
-    let result = ReviewStorage::update_session_item(
-        &repo_root,
-        params.review_id.as_deref(),
-        params.item_id,
-        |item| {
-            if let Some(status) = params.status {
-                item.status = status;
-            }
-            if let Some(notes) = params.resolution_notes.clone() {
-                let trimmed = notes.trim();
-                item.resolution_notes = if trimmed.is_empty() {
-                    None
-                } else {
-                    Some(trimmed.to_string())
-                };
-            }
-        },
-    );
+    let update_root = repo_root.clone();
+    let review_id = params.review_id.clone();
+    let item_id = params.item_id;
+    let status = params.status;
+    let resolution_notes = params.resolution_notes.clone();
+
+    let result = offload_review(move || {
+        ReviewStorage::update_session_item(
+            &update_root,
+            review_id.as_deref(),
+            item_id,
+            |item| {
+                if let Some(status) = status {
+                    item.status = status;
+                }
+                if let Some(notes) = resolution_notes {
+                    let trimmed = notes.trim();
+                    item.resolution_notes = if trimmed.is_empty() {
+                        None
+                    } else {
+                        Some(trimmed.to_string())
+                    };
+                }
+            },
+        )
+    })
+    .await;
 
     match result {
         Ok(Some(item)) => {
-            let session = match params.review_id.as_deref() {
-                Some(id) => ReviewStorage::load_review(&repo_root, id).ok().flatten(),
-                None => ReviewStorage::load_latest(&repo_root).ok().flatten(),
-            };
+            let load_root = repo_root.clone();
+            let load_id = params.review_id.clone();
+            let session = offload_review(move || match load_id.as_deref() {
+                Some(id) => ReviewStorage::load_review(&load_root, id),
+                None => ReviewStorage::load_latest(&load_root),
+            })
+            .await
+            .ok()
+            .flatten();
+
             if let Some(session) = session {
                 emit(
                     &state.out,
@@ -561,8 +634,12 @@ pub async fn handle_review_update_item(req: Request, state: &Arc<AppState>) -> R
                     serde_json::to_value(ReviewUpdatedEvent { session }).ok(),
                 );
             }
-            if let Ok(reviews) = ReviewStorage::load_all(&repo_root) {
-                let active_id = ReviewStorage::load_active_id(&repo_root).ok().flatten();
+            let list_root = repo_root.clone();
+            if let Ok(reviews) = offload_review(move || ReviewStorage::load_all(&list_root)).await {
+                let active_root = repo_root.clone();
+                let active_id = offload_review(move || ReviewStorage::load_active_id(&active_root))
+                    .await
+                    .unwrap_or(None);
                 emit(
                     &state.out,
                     events::REVIEW_LIST_CHANGED,
@@ -576,7 +653,7 @@ pub async fn handle_review_update_item(req: Request, state: &Arc<AppState>) -> R
             errors::NOT_FOUND,
             format!("Review item #{} not found", params.item_id),
         ),
-        Err(err) => Response::err(req.id, errors::REVIEW_UPDATE_FAILED, format!("{:#}", err)),
+        Err(err) => Response::err(req.id, errors::REVIEW_UPDATE_FAILED, err),
     }
 }
 
@@ -600,30 +677,24 @@ pub async fn handle_review_refine_item(req: Request, state: &Arc<AppState>) -> R
     };
 
     let repo_root = state.context.read().await.repo_root().to_path_buf();
+    let load_root = repo_root.clone();
+    let load_id = params.review_id.clone();
 
-    let session = match params.review_id.as_deref() {
-        Some(id) => match ReviewStorage::load_review(&repo_root, id) {
-            Ok(Some(s)) => s,
-            Ok(None) => {
-                return Response::err(
-                    req.id,
-                    errors::NOT_FOUND,
-                    format!("Review session '{}' not found", id),
-                );
-            }
-            Err(err) => return Response::err(req.id, errors::REVIEW_LOAD_FAILED, format!("{:#}", err)),
-        },
-        None => match ReviewStorage::load_latest(&repo_root) {
-            Ok(Some(s)) => s,
-            Ok(None) => {
-                return Response::err(
-                    req.id,
-                    errors::NOT_FOUND,
-                    "No review session is available to refine",
-                );
-            }
-            Err(err) => return Response::err(req.id, errors::REVIEW_LOAD_FAILED, format!("{:#}", err)),
-        },
+    let session = match offload_review(move || match load_id.as_deref() {
+        Some(id) => ReviewStorage::load_review(&load_root, id),
+        None => ReviewStorage::load_latest(&load_root),
+    })
+    .await
+    {
+        Ok(Some(s)) => s,
+        Ok(None) => {
+            let msg = match params.review_id.as_deref() {
+                Some(id) => format!("Review session '{}' not found", id),
+                None => "No review session is available to refine".to_string(),
+            };
+            return Response::err(req.id, errors::NOT_FOUND, msg);
+        }
+        Err(err) => return Response::err(req.id, errors::REVIEW_LOAD_FAILED, err),
     };
 
     let item = match session.find_item(params.item_id) {
@@ -785,20 +856,30 @@ async fn execute_review_finding_refine(
             .ok(),
         );
 
-        let (context_files, repo_map) = {
+        // Read the context file contents under a short-lived read guard, then
+        // release the guard before the blocking git and Tree-sitter work. That
+        // work is offloaded so it never stalls an async worker thread.
+        let context_files = {
             let ctx = state.context.read().await;
-            let files = ctx.read_context_files();
-            let context_paths: Vec<String> = files.iter().map(|f| f.path.clone()).collect();
-            let all_files =
-                tauqe_core::git::list_repository_files(Some(repo_root)).unwrap_or_default();
-            let rmap = tauqe_core::repomap::generate_repo_map(
-                repo_root,
-                &all_files,
-                &context_paths,
-                repomap_budget,
-            )
-            .ok();
-            (files, rmap)
+            ctx.read_context_files()
+        };
+        let context_paths: Vec<String> =
+            context_files.iter().map(|f| f.path.clone()).collect();
+        let repo_map = {
+            let root = repo_root.to_path_buf();
+            super::offload(move || {
+                let all_files =
+                    tauqe_core::git::list_repository_files(Some(&root)).unwrap_or_default();
+                tauqe_core::repomap::generate_repo_map(
+                    &root,
+                    &all_files,
+                    &context_paths,
+                    repomap_budget,
+                )
+                .ok()
+            })
+            .await
+            .unwrap_or(None)
         };
 
         let sys_prompt = tauqe_core::review::prompt::build_review_finding_refine_system_prompt();
@@ -913,10 +994,17 @@ async fn execute_review_finding_refine(
                 })
                 .collect();
 
+            let available_files = {
+                let root = repo_root.to_path_buf();
+                super::offload(move || tauqe_core::git::list_repository_files(Some(&root)))
+                    .await
+                    .ok()
+                    .and_then(|files| files.ok())
+                    .unwrap_or_default()
+            };
+
             let (outcome, new_ctx_state) = {
                 let mut ctx = state.context.write().await;
-                let available_files =
-                    tauqe_core::git::list_repository_files(Some(repo_root)).unwrap_or_default();
                 let oc = apply_context_requests_detailed(
                     &mut ctx,
                     &requests,
@@ -1090,9 +1178,21 @@ async fn execute_review_finding_refine(
 
     let review_id = session.id.clone();
     let item_id = item.id;
-    let updated = match ReviewStorage::update_session_item(repo_root, Some(&review_id), item_id, |it| {
-        it.subplan = merged.clone();
-    }) {
+    let save_root = repo_root.to_path_buf();
+    let save_review_id = review_id.clone();
+    let save_merged = merged.clone();
+    let updated = match offload_review(move || {
+        ReviewStorage::update_session_item(
+            &save_root,
+            Some(&save_review_id),
+            item_id,
+            |it| {
+                it.subplan = save_merged;
+            },
+        )
+    })
+    .await
+    {
         Ok(Some(it)) => it,
         Ok(None) => {
             return Response::err(
@@ -1102,7 +1202,7 @@ async fn execute_review_finding_refine(
             );
         }
         Err(err) => {
-            return Response::err(req_id, errors::REVIEW_UPDATE_FAILED, format!("{:#}", err));
+            return Response::err(req_id, errors::REVIEW_UPDATE_FAILED, err);
         }
     };
 
@@ -1125,15 +1225,23 @@ async fn execute_review_finding_refine(
         Vec::new(),
     );
 
-    if let Ok(Some(session)) = ReviewStorage::load_review(repo_root, &review_id) {
+    let load_root = repo_root.to_path_buf();
+    let load_id = review_id.clone();
+    if let Ok(Some(session)) =
+        offload_review(move || ReviewStorage::load_review(&load_root, &load_id)).await
+    {
         emit(
             &state.out,
             events::REVIEW_UPDATED,
             serde_json::to_value(ReviewUpdatedEvent { session }).ok(),
         );
     }
-    if let Ok(reviews) = ReviewStorage::load_all(repo_root) {
-        let active_id = ReviewStorage::load_active_id(repo_root).ok().flatten();
+    let list_root = repo_root.to_path_buf();
+    if let Ok(reviews) = offload_review(move || ReviewStorage::load_all(&list_root)).await {
+        let active_root = repo_root.to_path_buf();
+        let active_id = offload_review(move || ReviewStorage::load_active_id(&active_root))
+            .await
+            .unwrap_or(None);
         emit(
             &state.out,
             events::REVIEW_LIST_CHANGED,
@@ -1317,8 +1425,14 @@ async fn preload_item_files(state: &Arc<AppState>, repo_root: &Path, files: &[St
         return;
     }
     let files_token_budget = state.config.lock().await.config.context.files_token_budget;
-    let available_files =
-        tauqe_core::git::list_repository_files(Some(repo_root)).unwrap_or_default();
+    let available_files = {
+        let repo_root = repo_root.to_path_buf();
+        super::offload(move || tauqe_core::git::list_repository_files(Some(&repo_root)))
+            .await
+            .ok()
+            .and_then(|files| files.ok())
+            .unwrap_or_default()
+    };
 
     let (outcome, new_ctx_state) = {
         let mut ctx = state.context.write().await;
@@ -1372,6 +1486,18 @@ fn turn_applied_edits(turn: &crate::handlers::model::ModelTurnResult) -> bool {
 /// Executes one finding in an isolated turn. The finding becomes FIXED only when the
 /// turn satisfies the success contract; on any failure it returns to TODO.
 async fn run_review_step(
+    state: &Arc<AppState>,
+    repo_root: &Path,
+    review_id: &str,
+    item_id: u32,
+    operation: Arc<OperationGuard>,
+) -> Result<(), String> {
+    let res = run_review_step_inner(state, repo_root, review_id, item_id, operation).await;
+    clear_auto_context(state).await;
+    res
+}
+
+async fn run_review_step_inner(
     state: &Arc<AppState>,
     repo_root: &Path,
     review_id: &str,
@@ -1798,6 +1924,8 @@ async fn run_review_subplan(
             attempt += 1;
         };
 
+        clear_auto_context(state).await;
+
         match step_result {
             Ok(()) => {
                 mark_substep_status(&mut subplan, step_id, PlanItemStatus::Done);
@@ -1812,6 +1940,7 @@ async fn run_review_subplan(
             }
         }
     }
+    clear_auto_context(state).await;
 
     let notes = format!(
         "Subplan completed: all {} sub-step(s) applied successfully",
@@ -1897,6 +2026,7 @@ async fn run_review_batch(
     if owner_id != "all" {
         let _ = ReviewStorage::save_active_id(&repo_root, Some(owner_id));
     }
+    clear_auto_context(state).await;
 
     let started_at = std::time::Instant::now();
 
@@ -1987,6 +2117,8 @@ async fn run_review_batch(
         }
     };
 
+    clear_auto_context(state).await;
+
     emit(
         &state.out,
         events::REVIEW_BATCH_FINISHED,
@@ -2017,10 +2149,12 @@ pub async fn handle_review_execute(req: Request, state: &Arc<AppState>) -> Respo
 
     let (owner_id, tasks) = match params.review_id.as_deref() {
         Some(review_id) => {
-            let session = match ReviewStorage::load_review(&repo_root, review_id) {
+            let load_root = repo_root.clone();
+            let load_id = review_id.to_string();
+            let session = match offload_review(move || ReviewStorage::load_review(&load_root, &load_id)).await {
                 Ok(Some(s)) => s,
                 Ok(None) => return Response::err(req.id, errors::NOT_FOUND, format!("Review session '{}' not found", review_id)),
-                Err(err) => return Response::err(req.id, errors::REVIEW_LOAD_FAILED, format!("{:#}", err)),
+                Err(err) => return Response::err(req.id, errors::REVIEW_LOAD_FAILED, err),
             };
 
             let item_ids: Vec<u32> = match params.item_id {
@@ -2091,9 +2225,10 @@ pub async fn handle_review_execute(req: Request, state: &Arc<AppState>) -> Respo
                     "item_id cannot be specified when review_id is omitted",
                 );
             }
-            let sessions = match ReviewStorage::load_all(&repo_root) {
+            let list_root = repo_root.clone();
+            let sessions = match offload_review(move || ReviewStorage::load_all(&list_root)).await {
                 Ok(s) => s,
-                Err(err) => return Response::err(req.id, errors::REVIEW_LOAD_FAILED, format!("{:#}", err)),
+                Err(err) => return Response::err(req.id, errors::REVIEW_LOAD_FAILED, err),
             };
             let mut tasks: Vec<(String, u32)> = Vec::new();
             for session in sessions {

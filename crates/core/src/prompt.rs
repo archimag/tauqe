@@ -4,6 +4,7 @@ pub mod stream;
 pub mod xml;
 
 use crate::context::ContextFileContent;
+use crate::edits::stream::json::decode::first_json_object_str;
 use crate::prompt::protocol::PromptProtocol;
 use crate::providers::{ChatMessage, JsonSchemaDefinition, ResponseFormat};
 use tauqe_protocol::{ContextAccess, ModelRole, Plan, RepositoryState};
@@ -170,47 +171,9 @@ fn parse_first_json_object(raw: &str) -> Option<serde_json::Value> {
             return Some(value);
         }
     }
-    let bytes = raw.as_bytes();
-    let start = bytes.iter().position(|&b| b == b'{')?;
-    let end = balanced_object_end(raw, start)?;
-    let value = serde_json::from_str::<serde_json::Value>(&raw[start..end]).ok()?;
-    if value.is_object() {
-        Some(value)
-    } else {
-        None
-    }
-}
-
-/// Returns the exclusive end offset of the JSON value starting at `start`.
-fn balanced_object_end(raw: &str, start: usize) -> Option<usize> {
-    let bytes = raw.as_bytes();
-    let mut depth = 0usize;
-    let mut in_string = false;
-    let mut i = start;
-    while i < bytes.len() {
-        let b = bytes[i];
-        if in_string {
-            match b {
-                b'\\' => i += 1,
-                b'"' => in_string = false,
-                _ => {}
-            }
-        } else {
-            match b {
-                b'"' => in_string = true,
-                b'{' | b'[' => depth += 1,
-                b'}' | b']' => {
-                    depth = depth.saturating_sub(1);
-                    if depth == 0 {
-                        return Some(i + 1);
-                    }
-                }
-                _ => {}
-            }
-        }
-        i += 1;
-    }
-    None
+    let candidate = first_json_object_str(raw)?;
+    let value = serde_json::from_str::<serde_json::Value>(candidate).ok()?;
+    value.is_object().then_some(value)
 }
 
 /// Estimates a token count from a raw byte length.

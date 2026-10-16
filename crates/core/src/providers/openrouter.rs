@@ -2,152 +2,33 @@ use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
-use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, watch};
 use tauqe_protocol::{ModelUsageInfo, ProviderKind};
 
 use super::types::{ChatMessage, ReasoningEffort, ResponseFormat, StreamEvent};
 use super::LlmProvider;
 
+use self::sse::{find_sse_event_boundary, log_stream_completion, truncate_response_body};
+use self::types::{
+    ChatCompletionRequest, GenerationResponse, ProviderPreferences, ReasoningOption, StreamOptions,
+    StreamingChunk,
+};
+
+mod sse;
+pub mod types;
+
+pub use self::types::GenerationStats;
+
 /// Maximum time to establish a connection to OpenRouter.
 const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 /// Maximum idle time between reads on an open stream. Bounds a stalled
 /// provider so a hung connection cannot block the turn indefinitely.
 const READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
-/// Maximum characters of a raw provider response body captured in a log record.
-const RESPONSE_BODY_LOG_CHARS: usize = 500;
 
 pub struct OpenRouterProvider {
     api_key: String,
     base_url: String,
     http_client: reqwest::Client,
-}
-
-#[derive(Debug, Serialize)]
-struct ChatCompletionRequest {
-    model: String,
-    messages: Vec<ChatMessage>,
-    stream: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    stream_options: Option<StreamOptions>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    reasoning: Option<ReasoningOption>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    response_format: Option<ResponseFormat>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    provider: Option<ProviderPreferences>,
-}
-
-#[derive(Debug, Serialize)]
-struct ProviderPreferences {
-    require_parameters: bool,
-}
-
-#[derive(Debug, Serialize)]
-struct StreamOptions {
-    include_usage: bool,
-}
-
-#[derive(Debug, Serialize)]
-struct ReasoningOption {
-    enabled: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    effort: Option<ReasoningEffort>,
-}
-
-#[derive(Debug, Deserialize)]
-struct StreamingChunk {
-    #[serde(default)]
-    id: Option<String>,
-    #[serde(default)]
-    choices: Vec<StreamingChoice>,
-    #[serde(default)]
-    usage: Option<OpenRouterUsage>,
-    #[serde(default)]
-    cost: Option<f64>,
-    #[serde(default)]
-    total_cost: Option<f64>,
-    #[serde(default)]
-    error: Option<OpenRouterError>,
-}
-
-#[derive(Debug, Deserialize)]
-struct GenerationResponse {
-    data: Option<GenerationData>,
-}
-
-#[derive(Debug, Deserialize)]
-struct GenerationData {
-    #[serde(default)]
-    total_cost: Option<f64>,
-    #[serde(default)]
-    tokens_prompt: Option<u32>,
-    #[serde(default)]
-    tokens_completion: Option<u32>,
-    #[serde(default)]
-    native_tokens_prompt: Option<u32>,
-    #[serde(default)]
-    native_tokens_completion: Option<u32>,
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct GenerationStats {
-    pub total_cost: Option<f64>,
-    pub prompt_tokens: Option<u32>,
-    pub completion_tokens: Option<u32>,
-}
-
-#[derive(Debug, Deserialize)]
-struct StreamingChoice {
-    #[serde(default)]
-    delta: Option<StreamingDelta>,
-    #[serde(default)]
-    finish_reason: Option<String>,
-    #[serde(default)]
-    error: Option<OpenRouterError>,
-}
-
-#[derive(Debug, Deserialize)]
-struct StreamingDelta {
-    #[serde(default)]
-    content: Option<String>,
-    #[serde(default)]
-    reasoning: Option<String>,
-}
-
-#[derive(Debug, Deserialize, Default)]
-struct OpenRouterUsage {
-    #[serde(default)]
-    prompt_tokens: u32,
-    #[serde(default)]
-    completion_tokens: u32,
-    #[serde(default)]
-    total_tokens: u32,
-    #[serde(default)]
-    cost: Option<f64>,
-    #[serde(default)]
-    total_cost: Option<f64>,
-    #[serde(default)]
-    prompt_tokens_details: Option<PromptTokensDetails>,
-    #[serde(default)]
-    completion_tokens_details: Option<CompletionTokensDetails>,
-}
-
-#[derive(Debug, Deserialize, Default)]
-struct PromptTokensDetails {
-    #[serde(default)]
-    cached_tokens: Option<u32>,
-}
-
-#[derive(Debug, Deserialize, Default)]
-struct CompletionTokensDetails {
-    #[serde(default)]
-    reasoning_tokens: Option<u32>,
-}
-
-#[derive(Debug, Deserialize)]
-struct OpenRouterError {
-    message: String,
 }
 
 impl OpenRouterProvider {
@@ -516,56 +397,6 @@ impl OpenRouterProvider {
     }
 }
 
-/// Truncates a provider response body on a Unicode scalar boundary for logging.
-fn truncate_response_body(body: &str) -> String {
-    let trimmed = body.trim();
-    let mut snippet: String = trimmed.chars().take(RESPONSE_BODY_LOG_CHARS).collect();
-    if trimmed.chars().count() > RESPONSE_BODY_LOG_CHARS {
-        snippet.push('…');
-    }
-    snippet
-}
-
-/// Records the aggregated token and cost metrics of a completed stream.
-fn log_stream_completion(model: &str, usage: &Option<ModelUsageInfo>) {
-    let usage = usage.clone().unwrap_or_default();
-    tracing::info!(
-        model = %model,
-        prompt_tokens = usage.prompt_tokens,
-        completion_tokens = usage.completion_tokens,
-        total_tokens = usage.total_tokens,
-        reasoning_tokens = ?usage.reasoning_tokens,
-        cached_tokens = ?usage.cached_tokens,
-        cost = ?usage.cost,
-        "openrouter stream completed"
-    );
-}
-
-fn find_sse_event_boundary(buf: &[u8]) -> Option<(usize, usize)> {
-    let pos_lf = find_subslice(buf, b"\n\n").map(|p| (p, 2));
-    let pos_crlf = find_subslice(buf, b"\r\n\r\n").map(|p| (p, 4));
-
-    match (pos_lf, pos_crlf) {
-        (Some((p1, l1)), Some((p2, l2))) => {
-            if p1 <= p2 {
-                Some((p1, l1))
-            } else {
-                Some((p2, l2))
-            }
-        }
-        (Some(res), None) => Some(res),
-        (None, Some(res)) => Some(res),
-        (None, None) => None,
-    }
-}
-
-fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    if needle.is_empty() || haystack.len() < needle.len() {
-        return None;
-    }
-    haystack.windows(needle.len()).position(|w| w == needle)
-}
-
 #[async_trait]
 impl LlmProvider for OpenRouterProvider {
     fn kind(&self) -> ProviderKind {
@@ -608,6 +439,9 @@ impl LlmProvider for OpenRouterProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::sse::{
+        find_sse_event_boundary, truncate_response_body, RESPONSE_BODY_LOG_CHARS,
+    };
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 

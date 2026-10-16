@@ -480,6 +480,14 @@ async fn test_review_batch_fail_fast_resets_status_and_preloads_file() {
     ReviewStorage::save_session(dir.path(), &session).unwrap();
     let state = test_state(&dir);
 
+    // Verify preload_item_files directly
+    preload_item_files(&state, dir.path(), &["./src/target.rs".to_string()]).await;
+    {
+        let ctx = state.context.read().await;
+        assert!(ctx.is_editable("src/target.rs").unwrap());
+    }
+    clear_auto_context(&state).await;
+
     // Without an API key the first turn cannot start: the batch must stop at finding 1.
     let operation = Arc::new(state.try_begin_operation().expect("register batch operation"));
     let outcome = run_review_batch(&state, "rev-exec-1", make_tasks("rev-exec-1", &[1, 2]), operation).await;
@@ -493,10 +501,10 @@ async fn test_review_batch_fail_fast_resets_status_and_preloads_file() {
         other => panic!("Expected Failed, got {:?}", other),
     }
 
-    // The finding file was preloaded as editable before the turn.
+    // Auto context is cleared after batch execution finishes so files do not leak.
     {
         let ctx = state.context.read().await;
-        assert!(ctx.is_editable("src/target.rs").unwrap());
+        assert!(!ctx.contains("src/target.rs").unwrap());
     }
 
     // Fail-Fast: statuses are back to TODO and nothing is marked FIXED.
@@ -1049,15 +1057,29 @@ async fn test_review_batch_preloads_multiple_files() {
         assert!(!ctx.contains("src/second.rs").unwrap());
     }
 
-    let operation = Arc::new(state.try_begin_operation().expect("register batch operation"));
-    let outcome = run_review_batch(&state, "rev-preload-multi", make_tasks("rev-preload-multi", &[1]), operation).await;
-    assert!(matches!(outcome, BatchOutcome::Completed { items: 1 }));
-
-    // Both files must have been preloaded into context as editable
+    // Verify preload_item_files directly
+    preload_item_files(
+        &state,
+        dir.path(),
+        &["src/first.rs".to_string(), "src/second.rs".to_string()],
+    )
+    .await;
     {
         let ctx = state.context.read().await;
         assert!(ctx.is_editable("src/first.rs").unwrap());
         assert!(ctx.is_editable("src/second.rs").unwrap());
+    }
+    clear_auto_context(&state).await;
+
+    let operation = Arc::new(state.try_begin_operation().expect("register batch operation"));
+    let outcome = run_review_batch(&state, "rev-preload-multi", make_tasks("rev-preload-multi", &[1]), operation).await;
+    assert!(matches!(outcome, BatchOutcome::Completed { items: 1 }));
+
+    // After batch execution, auto context is cleaned up so preloaded files do not leak
+    {
+        let ctx = state.context.read().await;
+        assert!(!ctx.contains("src/first.rs").unwrap());
+        assert!(!ctx.contains("src/second.rs").unwrap());
     }
 }
 

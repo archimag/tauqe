@@ -7,28 +7,177 @@ use tauqe_protocol::{
     ContextRemoveParams, ContextSetAccessParams,
 };
 
-use crate::app::{AppState, KeyCommand, ViewMode};
+use crate::app::{AppState, ViewMode};
+use crate::command::CommandCategory::{Essential, Helpers, Interface};
+use crate::command::{CommandMap, CommandSpec, KeyChord};
 use crate::input::InputResult;
 use crate::rpc::{send_request, RpcConnection};
 
 use super::ContextRow;
 
-pub const CONTEXT_COMMANDS: &[KeyCommand] = &[
-    // Core Actions
-    KeyCommand { key: "e", description: "Add file to context as editable" },
-    KeyCommand { key: "r / a", description: "Add file to context as read-only" },
-    KeyCommand { key: "t", description: "Toggle access (Editable ↔ Read-Only)" },
-    KeyCommand { key: "u", description: "Promote Auto file to persistent User file" },
-    KeyCommand { key: "Enter", description: "Promote Auto file or toggle section" },
-    // Navigation & Inspection
-    KeyCommand { key: "n / p (or j/k, ↑/↓)", description: "Move selection down / up" },
-    KeyCommand { key: "Space / Tab", description: "Fold / unfold section" },
-    KeyCommand { key: "Esc / q", description: "Return to Develop view" },
-    // Auxiliary & Destructive
-    KeyCommand { key: "d / x / Del", description: "Remove file from context" },
-    KeyCommand { key: "c", description: "Clear all Auto-requested files (Auto)" },
-    KeyCommand { key: "C / Shift+C", description: "Clear all persistent User files (User)" },
-];
+/// Keyboard actions available in the Context view.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContextAction {
+    AddEditable,
+    AddReadOnly,
+    ToggleAccess,
+    PromoteToUser,
+    Activate,
+    NavPrev,
+    NavNext,
+    FoldToggle,
+    Return,
+    Remove,
+    ClearAuto,
+    ClearUser,
+}
+
+/// Single source of truth for the Context view keybindings.
+///
+/// Essential commands mutate the three context layers; Interface commands
+/// navigate and fold the section tree; Helpers remove a file or clear a whole
+/// layer. The map drives the generated Help dialog. The destructive
+/// layer-clearing chords are declared first so a shifted `C` always resolves to
+/// clearing the persistent User layer instead of the Auto layer.
+pub static CONTEXT_COMMAND_MAP: CommandMap<ContextAction> = CommandMap::new(&[
+    // Destructive layer clearing, declared before the bare `c` binding so the
+    // shifted chords never fall through to the Auto-layer action.
+    CommandSpec::new(
+        KeyChord::Bare(KeyCode::Char('C')),
+        ContextAction::ClearUser,
+        Helpers,
+        "Clear all persistent User files",
+    ),
+    CommandSpec::new(
+        KeyChord::Shift(KeyCode::Char('c')),
+        ContextAction::ClearUser,
+        Helpers,
+        "Clear all persistent User files",
+    ),
+    CommandSpec::new(
+        KeyChord::Bare(KeyCode::Char('c')),
+        ContextAction::ClearAuto,
+        Helpers,
+        "Clear all Auto-requested files",
+    ),
+    // Essential: context layer mutations.
+    CommandSpec::new(
+        KeyChord::Bare(KeyCode::Char('e')),
+        ContextAction::AddEditable,
+        Essential,
+        "Add a file to context as editable",
+    ),
+    CommandSpec::new(
+        KeyChord::Bare(KeyCode::Char('r')),
+        ContextAction::AddReadOnly,
+        Essential,
+        "Add a file to context as read-only",
+    ),
+    CommandSpec::new(
+        KeyChord::Bare(KeyCode::Char('a')),
+        ContextAction::AddReadOnly,
+        Essential,
+        "Add a file to context as read-only",
+    ),
+    CommandSpec::new(
+        KeyChord::Bare(KeyCode::Char('t')),
+        ContextAction::ToggleAccess,
+        Essential,
+        "Toggle access between Editable and Read-Only",
+    ),
+    CommandSpec::new(
+        KeyChord::Bare(KeyCode::Char('u')),
+        ContextAction::PromoteToUser,
+        Essential,
+        "Promote an Auto file to the persistent User layer",
+    ),
+    CommandSpec::new(
+        KeyChord::Bare(KeyCode::Enter),
+        ContextAction::Activate,
+        Essential,
+        "Promote an Auto file or fold / unfold the selected section",
+    ),
+    // Interface: navigation and folding.
+    CommandSpec::new(
+        KeyChord::Bare(KeyCode::Esc),
+        ContextAction::Return,
+        Interface,
+        "Return to the REPL",
+    ),
+    CommandSpec::new(
+        KeyChord::Bare(KeyCode::Char('q')),
+        ContextAction::Return,
+        Interface,
+        "Return to the REPL",
+    ),
+    CommandSpec::new(
+        KeyChord::Bare(KeyCode::Up),
+        ContextAction::NavPrev,
+        Interface,
+        "Select the previous row",
+    ),
+    CommandSpec::new(
+        KeyChord::Bare(KeyCode::Char('k')),
+        ContextAction::NavPrev,
+        Interface,
+        "Select the previous row",
+    ),
+    CommandSpec::new(
+        KeyChord::Bare(KeyCode::Char('p')),
+        ContextAction::NavPrev,
+        Interface,
+        "Select the previous row",
+    ),
+    CommandSpec::new(
+        KeyChord::Bare(KeyCode::Down),
+        ContextAction::NavNext,
+        Interface,
+        "Select the next row",
+    ),
+    CommandSpec::new(
+        KeyChord::Bare(KeyCode::Char('j')),
+        ContextAction::NavNext,
+        Interface,
+        "Select the next row",
+    ),
+    CommandSpec::new(
+        KeyChord::Bare(KeyCode::Char('n')),
+        ContextAction::NavNext,
+        Interface,
+        "Select the next row",
+    ),
+    CommandSpec::new(
+        KeyChord::Bare(KeyCode::Tab),
+        ContextAction::FoldToggle,
+        Interface,
+        "Fold or unfold the selected section",
+    ),
+    CommandSpec::new(
+        KeyChord::Bare(KeyCode::Char(' ')),
+        ContextAction::FoldToggle,
+        Interface,
+        "Fold or unfold the selected section",
+    ),
+    // Helpers: removal.
+    CommandSpec::new(
+        KeyChord::Bare(KeyCode::Char('d')),
+        ContextAction::Remove,
+        Helpers,
+        "Remove the selected file from context",
+    ),
+    CommandSpec::new(
+        KeyChord::Bare(KeyCode::Char('x')),
+        ContextAction::Remove,
+        Helpers,
+        "Remove the selected file from context",
+    ),
+    CommandSpec::new(
+        KeyChord::Bare(KeyCode::Delete),
+        ContextAction::Remove,
+        Helpers,
+        "Remove the selected file from context",
+    ),
+]);
 
 pub async fn handle_context_key(
     key: KeyEvent,
@@ -411,14 +560,17 @@ mod tests {
     }
 
     #[test]
-    fn test_command_bindings_are_unique() {
-        use std::collections::HashSet;
-        let keys: HashSet<&str> = CONTEXT_COMMANDS.iter().map(|c| c.key).collect();
-        assert!(!CONTEXT_COMMANDS.is_empty());
-        assert_eq!(
-            keys.len(),
-            CONTEXT_COMMANDS.len(),
-            "duplicate key bindings in CONTEXT_COMMANDS"
-        );
+    fn test_command_map_chords_are_unique() {
+        let chords: Vec<KeyChord> = CONTEXT_COMMAND_MAP
+            .specs()
+            .iter()
+            .map(|spec| spec.chord)
+            .collect();
+        assert!(!chords.is_empty());
+        for (index, chord) in chords.iter().enumerate() {
+            for other in chords.iter().skip(index + 1) {
+                assert_ne!(chord, other, "duplicate key chord in CONTEXT_COMMAND_MAP");
+            }
+        }
     }
 }

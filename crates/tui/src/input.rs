@@ -383,18 +383,16 @@ async fn handle_global_shortcuts(
     }
 
     let mut st = state.lock().await;
-    let primary_mod = st.tui_config.input.primary_modifier;
+    let is_primary = st.tui_config.input.is_primary(key.modifiers);
+    let is_meta = st.tui_config.input.is_meta(key.modifiers);
+    let is_command = is_primary || is_meta;
     let is_ctrl_alt = key.modifiers.contains(KeyModifiers::CONTROL)
         && key.modifiers.contains(KeyModifiers::ALT);
-    let is_primary = !is_ctrl_alt && primary_mod.matches(key.modifiers);
-    let is_alt_only = key.modifiers.contains(KeyModifiers::ALT)
-        && !key.modifiers.contains(KeyModifiers::CONTROL);
-    let is_alt_tab = key.modifiers == KeyModifiers::ALT;
 
     // Help trigger (available in every view, including onboarding):
-    // - In text input mode: C-h (or Alt+h / Ctrl+h) or C-?
+    // - In text input mode: C-h (or M-h / Ctrl+h) or C-?
     // - In non-text navigation mode: bare '?', C-h, or C-?
-    let is_c_h = (is_primary || is_alt_only || key.modifiers.contains(KeyModifiers::CONTROL))
+    let is_c_h = (is_primary || is_meta || key.modifiers.contains(KeyModifiers::CONTROL))
         && (key.code == KeyCode::Char('h') || key.code == KeyCode::Char('H'));
 
     let is_help_shortcut = if text_input_active {
@@ -426,18 +424,14 @@ async fn handle_global_shortcuts(
         return Ok(None);
     }
 
-    // Tab switching via F1..F5 (universal hardware fallback) or C-1..5 (Primary Command Modifier) or Alt+1..5
+    // Tab switching uses portable command chords only: C-1..5 (Primary) and
+    // M-1..5 (Meta). No hardware function keys (Conventions §5).
     let switch_tab = match key.code {
-        KeyCode::F(1) => Some(ViewMode::Develop),
-        KeyCode::F(2) => Some(ViewMode::Plans),
-        KeyCode::F(3) => Some(ViewMode::Review),
-        KeyCode::F(4) => Some(ViewMode::Context),
-        KeyCode::F(5) => Some(ViewMode::History),
-        KeyCode::Char('1') if is_primary || is_alt_tab => Some(ViewMode::Develop),
-        KeyCode::Char('2') if is_primary || is_alt_tab => Some(ViewMode::Plans),
-        KeyCode::Char('3') if is_primary || is_alt_tab => Some(ViewMode::Review),
-        KeyCode::Char('4') if is_primary || is_alt_tab => Some(ViewMode::Context),
-        KeyCode::Char('5') if is_primary || is_alt_tab => Some(ViewMode::History),
+        KeyCode::Char('1') if is_command => Some(ViewMode::Develop),
+        KeyCode::Char('2') if is_command => Some(ViewMode::Plans),
+        KeyCode::Char('3') if is_command => Some(ViewMode::Review),
+        KeyCode::Char('4') if is_command => Some(ViewMode::Context),
+        KeyCode::Char('5') if is_command => Some(ViewMode::History),
         _ => None,
     };
 
@@ -446,11 +440,23 @@ async fn handle_global_shortcuts(
         return Ok(Some(InputResult::Continue));
     }
 
-    // Model selection dialog via C-M (Primary Command Modifier) or Alt+M (universal terminal fallback)
-    let is_model_shortcut = (is_primary
-        && (key.code == KeyCode::Char('m') || key.code == KeyCode::Char('M')))
-        || (is_alt_only
-            && (key.code == KeyCode::Char('m') || key.code == KeyCode::Char('M')));
+    // Squash dialog via C-S / M-S (portable chords replace the former F6).
+    if is_command && (key.code == KeyCode::Char('s') || key.code == KeyCode::Char('S')) {
+        open_squash_dialog(&mut st, server_writer).await?;
+        return Ok(Some(InputResult::Continue));
+    }
+
+    // Theme selector via M-T (portable chord replaces the former F7). The
+    // dialog is purely presentational and previews presets live, so it is
+    // available even mid-turn without disturbing the running operation.
+    if is_meta && (key.code == KeyCode::Char('t') || key.code == KeyCode::Char('T')) {
+        st.open_theme_selector();
+        return Ok(Some(InputResult::Continue));
+    }
+
+    // Model selection dialog via C-M / M-M.
+    let is_model_shortcut = is_command
+        && (key.code == KeyCode::Char('m') || key.code == KeyCode::Char('M'));
 
     if is_model_shortcut {
         if st.model.is_busy() {
@@ -497,19 +503,6 @@ async fn handle_global_shortcuts(
             }
             _ => {}
         }
-    }
-
-    if key.code == KeyCode::F(6) {
-        open_squash_dialog(&mut st, server_writer).await?;
-        return Ok(Some(InputResult::Continue));
-    }
-
-    // F7 opens the interactive theme selector (universal hardware fallback).
-    // The dialog is purely presentational and previews presets live, so it is
-    // available even mid-turn without disturbing the running operation.
-    if key.code == KeyCode::F(7) {
-        st.open_theme_selector();
-        return Ok(Some(InputResult::Continue));
     }
 
     Ok(None)
@@ -814,15 +807,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_f1_in_develop_does_not_open_help() {
+    async fn test_function_keys_are_ignored_by_global_shortcuts() {
         let state = Arc::new(Mutex::new(test_state()));
         let mut conn = RpcConnection::new(Vec::<u8>::new());
 
-        let key = KeyEvent::new(KeyCode::F(1), KeyModifiers::NONE);
-        let res = handle_global_shortcuts(key, &state, &mut conn, true).await.unwrap();
-        assert_eq!(res, Some(InputResult::Continue));
-        assert!(!state.lock().await.show_help);
-        assert_eq!(state.lock().await.view_mode, ViewMode::Develop);
+        for f in 1..=7 {
+            let res = handle_global_shortcuts(
+                KeyEvent::new(KeyCode::F(f), KeyModifiers::NONE),
+                &state,
+                &mut conn,
+                true,
+            )
+            .await
+            .unwrap();
+            assert_eq!(res, None, "function key F{} must be ignored", f);
+        }
+
+        let st = state.lock().await;
+        assert!(!st.show_help);
+        assert_eq!(st.view_mode, ViewMode::Develop);
+        assert!(st.squash_dialog.is_none());
+        assert!(st.theme_selector.is_none());
     }
 
     #[tokio::test]
@@ -944,9 +949,9 @@ mod tests {
         let state = Arc::new(Mutex::new(st));
         let mut conn = RpcConnection::new(Vec::<u8>::new());
 
-        // F6 (squash) must not fire before a workspace exists.
-        let key_f6 = KeyEvent::new(KeyCode::F(6), KeyModifiers::NONE);
-        let res = handle_global_shortcuts(key_f6, &state, &mut conn, false)
+        // The squash chord must not fire before a workspace exists.
+        let key_cs = KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL);
+        let res = handle_global_shortcuts(key_cs, &state, &mut conn, false)
             .await
             .unwrap();
         assert_eq!(res, None);
@@ -962,8 +967,8 @@ mod tests {
         assert!(!state.lock().await.confirm_clear_history);
 
         // Tab switching is blocked too.
-        let key_f2 = KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE);
-        let res = handle_global_shortcuts(key_f2, &state, &mut conn, false)
+        let key_c2 = KeyEvent::new(KeyCode::Char('2'), KeyModifiers::CONTROL);
+        let res = handle_global_shortcuts(key_c2, &state, &mut conn, false)
             .await
             .unwrap();
         assert_eq!(res, None);
@@ -985,11 +990,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_f7_opens_the_theme_selector() {
+    async fn test_meta_t_opens_the_theme_selector() {
         let state = Arc::new(Mutex::new(test_state()));
         let mut conn = RpcConnection::new(Vec::<u8>::new());
 
-        let key = KeyEvent::new(KeyCode::F(7), KeyModifiers::NONE);
+        let key = KeyEvent::new(KeyCode::Char('t'), KeyModifiers::ALT);
         let res = handle_global_shortcuts(key, &state, &mut conn, false)
             .await
             .unwrap();
@@ -1010,5 +1015,71 @@ mod tests {
             .unwrap();
         assert_eq!(res, Some(InputResult::Continue));
         assert!(state.lock().await.show_help);
+    }
+
+    #[tokio::test]
+    async fn test_command_digits_switch_tabs() {
+        let state = Arc::new(Mutex::new(test_state()));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+
+        // C-2 (Primary) switches to Plans.
+        let res = handle_global_shortcuts(
+            KeyEvent::new(KeyCode::Char('2'), KeyModifiers::CONTROL),
+            &state,
+            &mut conn,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(res, Some(InputResult::Continue));
+        assert_eq!(state.lock().await.view_mode, ViewMode::Plans);
+
+        // M-4 (Meta) switches to Context.
+        let res = handle_global_shortcuts(
+            KeyEvent::new(KeyCode::Char('4'), KeyModifiers::ALT),
+            &state,
+            &mut conn,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(res, Some(InputResult::Continue));
+        assert_eq!(state.lock().await.view_mode, ViewMode::Context);
+    }
+
+    #[tokio::test]
+    async fn test_command_chords_open_squash_dialog() {
+        let state = Arc::new(Mutex::new(test_state()));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+
+        // C-S (Primary).
+        let res = handle_global_shortcuts(
+            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
+            &state,
+            &mut conn,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(res, Some(InputResult::Continue));
+        assert!(state.lock().await.squash_dialog.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_meta_s_opens_squash_dialog() {
+        let state = Arc::new(Mutex::new(test_state()));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+
+        // M-S (Meta).
+        let res = handle_global_shortcuts(
+            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::ALT),
+            &state,
+            &mut conn,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(res, Some(InputResult::Continue));
+        assert!(state.lock().await.squash_dialog.is_some());
     }
 }

@@ -5,7 +5,7 @@ use crate::editor::InputEditor;
 pub mod input;
 pub mod render;
 
-pub use self::input::{handle_context_key, CONTEXT_COMMANDS};
+pub use self::input::{handle_context_key, CONTEXT_COMMAND_MAP};
 pub use self::render::render_context_view;
 
 #[derive(Debug, Clone, PartialEq, Eq)]

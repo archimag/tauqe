@@ -563,6 +563,8 @@ async fn finish_patch_failure(
         ctx.options.max_retries,
         err_lines.join("\n")
     );
+    ctx.context_manager.clear_auto();
+    crate::blocking::run_blocking(|| ctx.context_manager.prune_missing_files());
     let _ = ctx.stream_tx.send(StreamEvent::Done).await;
     let result = ModelResult::Edit {
         summary: "FSM edits failed".to_string(),
@@ -593,6 +595,8 @@ async fn finish_no_edits(ctx: &mut PhaseContext<'_>) -> FsmTurnOutcome {
         isolated_step = ctx.is_isolated_step,
         "no edits were successfully staged"
     );
+    ctx.context_manager.clear_auto();
+    crate::blocking::run_blocking(|| ctx.context_manager.prune_missing_files());
     let _ = ctx.stream_tx.send(StreamEvent::Done).await;
     let result = ModelResult::Edit {
         summary: "FSM edits failed".to_string(),

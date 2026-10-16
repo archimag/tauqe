@@ -26,24 +26,44 @@ This document specifies mandatory architectural and UX invariants for the Tauqe 
 
 ## 3. Single Source of Truth for Keyboard Commands and Clean Views
 
-1. **Automatic Help Generation:**
-   - Every view mode must define its keyboard commands via a structured command registry.
-   - The interactive Help system (`?`) must automatically derive its contents directly from these command definitions without manual duplication of keybindings in modal dialogs or popups.
+1. **Typed Command Specifications (`CommandSpec`):**
+   - Every keyboard binding is declared exactly once, as an executable command specification in `crates/tui/src/command.rs`: an abstract [`KeyChord`], a typed action, a [`CommandCategory`], and a help description.
+   - The input dispatcher that intercepts keys and the Help generator that documents them read the same structures, so the keys the developer sees in Help can never drift from the keys the application actually intercepts.
+   - Scattered string descriptions and hardcoded key checks in handlers are forbidden. A view owns a static [`CommandMap`] of its specifications and derives both input resolution and Help rendering from it.
+   - Maps are grouped by scope: `GLOBAL_COMMAND_MAP` (application-wide), `EDITOR_COMMAND_MAP` (the shared text editor), per-view maps, and the shared `DIALOG_COMMAND_MAP` for modal dialogs.
 
-2. **Prohibition of Action Hint Bars in Primary Views:**
+2. **Semantic Key Chords (`KeyChord`):**
+   - An abstract chord names intent independently of the physical keyboard, so one specification describes the developer's actual modifiers.
+   - `Primary` (`C-`) and `Meta` (`M-`) are the two symmetric command modifiers, resolved dynamically through `InputConfig::is_primary(...)` / `InputConfig::is_meta(...)`. Hardcoding `KeyModifiers::CONTROL` or `KeyModifiers::ALT` in a view is forbidden.
+   - `PrimaryOrMeta` binds a chord reachable on either command modifier, so a terminal without a dedicated Meta key still reaches the action.
+   - `Bare` names a single alphanumeric or navigation key without command modifiers. Bare chords are active only in structural navigation and are unconditionally blocked while a text editor is capturing keystrokes, so the unconditional character insertion invariant (§5) always holds.
+   - `Shift` names an explicit `Shift` combination (`Shift+Tab`, `Shift+C`, `Shift+X`) used for reverse motion, destructive actions, and batch operations, deliberately separated from typed characters and command modifiers.
+   - `Ctrl` and `Alt` name raw physical chords whose key must never be remapped (the `C-g` keyboard-quit and the `Ctrl+C` cancel chord).
+   - Chord display is projected through the configured modifiers, so Help and dialog footers always name the real keys instead of the abstract notation.
+   - The zero F-keys invariant (§5) holds across every map: `KeyCode::F(...)` is never bound.
+
+3. **Prohibition of Action Hint Bars in Primary Views:**
    - Primary view modes (Develop, Context, Review, Plans, History) must **never** render persistent keyboard command toolbars, shortcut hint banners ("Actions: Tab Fold, x Check..."), or bottom action bars.
-   - The standardized Help modal (`?`) is the single authoritative mechanism for discovering view commands.
+   - The standardized Help modal (`Ctrl+H` / `Alt+H`, or `?` in navigation views) is the single authoritative mechanism for discovering view commands.
    - Bottom status areas are reserved strictly for operational telemetry, entity metadata, and progress indicators.
    - Keybinding hints are permissible only inside temporary, contextual modal dialogs (confirmations, selection popups) where immediate contextual guidance is required.
 
-3. **Four-Level Cognitive Ordering of Help Commands:**
-   - Command lists in the Help modal (both global and per-mode) must be ranked strictly by cognitive importance, from the primary work cycle down to rare or destructive actions:
-     1. **Core Actions** — the primary work cycle the user repeats constantly (sending and cancelling turns, squashing, executing).
-     2. **Navigation & Inspection** — switching views, scrolling, folding, and inspecting state.
-     3. **Editing & Clipboard** — text editing, prompt history, copy, and paste.
-     4. **Auxiliary & Destructive** — model selection, context or history resets, configuration reload, and quitting.
-   - Arbitrary or chronological insertion is forbidden: each command belongs to the level matching its daily cognitive weight, not the order in which it was implemented.
-   - Levels without applicable commands are omitted; the remaining levels keep their relative order.
+4. **Three-Tier Cognitive Classification of Help Commands:**
+   - The Help modal derives its contents strictly from the command maps without manual duplication, and ranks commands by cognitive importance through the [`CommandCategory`] model:
+     1. **Essential** — costly operations that spend tokens or touch Git (sending and cancelling turns, executing a step or batch, squashing commits).
+     2. **Interface** — presentation, navigation, and view state (switching views, tree navigation, folding, focus toggling).
+     3. **Helpers** — auxiliary operations that do not mutate interface state (copying to the clipboard, filtering, recentering).
+   - Categories keep their canonical order (Essential → Interface → Helpers) and any empty category is omitted. Arbitrary or chronological insertion is forbidden: each command belongs to the tier matching its daily cognitive weight, not the order in which it was implemented.
+
+5. **Decoupled Three-Tab Help Subsystem (Global, Current Mode, Text Editor):**
+   - The Help modal presents three dedicated tabs — Global Shortcuts, Current Mode Shortcuts, and Text Editor Help — completely separating application-wide navigation from view-specific workflows and the shared text editor vocabulary.
+   - Global shortcuts are derived from `GLOBAL_COMMAND_MAP`; active view shortcuts are derived from the mode's typed `CommandMap` (categorized into Essential, Interface, Helpers); and Readline/Emacs text editor bindings are derived from `EDITOR_COMMAND_MAP`.
+   - Separating Global and Current Mode ensures neither surface overflows the screen or buries mode-specific commands under application-wide shortcuts.
+
+6. **Unified Dialog Footers from the Local Command Map:**
+   - Modal footer hints are not hand-laid per dialog. They are generated by the reusable modal component from the shared `DIALOG_COMMAND_MAP`, with the configured `C-` / `M-` labels applied automatically.
+   - The footer therefore advertises exactly the chords the dialogs intercept, deduplicated and grouped (focus / activate / fast select / dismiss), and stays consistent across every modal.
+   - The hint is rendered as a docked, `palette.overlay`-filled help panel below the action bar (see §6.4), with its chords, verbs, and separators styled through semantic text roles.
 
 ---
 
@@ -72,32 +92,38 @@ This document specifies mandatory architectural and UX invariants for the Tauqe 
      - **Unconditional Character Insertion:** Every printable character typed without a command modifier MUST be unconditionally inserted into the text buffer. Intercepting bare alphanumeric keys (such as `u`, `s`, `c`, `y`, `[`, `]`, or `Space`) when the prompt buffer is empty is strictly forbidden.
      - All functional commands and actions within text input contexts MUST require an explicit command modifier.
 
-2. **The Abstract Primary Command Modifier (`C-`):**
-   - Commands in text input contexts are formulated conceptually as `C-<key>` (in Emacs tradition).
-   - `C-` represents the abstract Primary Command Modifier, configured by the user in `$XDG_CONFIG_HOME/tauqe/tui.toml` under `[input] primary_modifier = "ctrl"` (default) or `"alt"`.
-   - The codebase must never hardcode raw `KeyModifiers::CONTROL` checks for input-level actions without checking `primary_modifier.matches(...)`.
-   - Standard `C-` bindings:
+2. **Symmetric Abstract Command Modifiers (`C-` and `M-`):**
+   - Commands in text input contexts are formulated conceptually with two independent Emacs-style chords: the primary modifier `C-<key>` and the meta modifier `M-<key>`.
+   - `C-` is the abstract Primary Command Modifier, configured in `$XDG_CONFIG_HOME/tauqe/tui.toml` under `[input] primary_modifier = "ctrl"` (default) or `"alt"`. `M-` is the abstract Meta Command Modifier, configured under `[input] meta_modifier = "alt"` (default) or `"ctrl"`.
+   - The two modifiers are independent and symmetric, so either chord can be remapped and a terminal that lacks a dedicated Meta key still reaches every action.
+   - The codebase must never hardcode raw `KeyModifiers::CONTROL` or `KeyModifiers::ALT` checks for input-level actions; it must resolve them through `InputConfig::is_primary(...)` and `InputConfig::is_meta(...)`.
+   - The AltGr / compose chord (`Ctrl+Alt`) belongs to neither modifier, so typing composed characters or `AltGr` digits never triggers an application command.
+   - Standard bindings:
      - `C-Enter` — send prompt / confirm message editor;
      - `C-Z` — undo last AI commit;
-     - `C-S` — open squash commits dialog;
+     - `C-S` / `M-S` — open squash commits dialog;
      - `C-W` — kill word backward;
+     - `M-B`, `M-F` — move word backward / forward;
      - `C-A`, `C-E`, `C-K`, `C-U`, `C-Y`, `C-D`, `C-B`, `C-F` — standard line editing and yank;
      - `C-P`, `C-N` — move cursor line up / down;
-     - `Alt+P`, `Alt+N` — navigate prompt history backward / forward;
+     - `M-P`, `M-N` — navigate prompt history backward / forward;
      - `C-T` — toggle file diff folding;
      - `C-Space` / `Shift+Tab` — switch Develop focus between the prompt and the Viewport;
      - `C-J` — insert newline;
-     - `C-1` … `C-5` — switch tabs;
-     - `C-M` / `Alt+M` — model selection picker;
+     - `C-1` … `C-5` / `M-1` … `M-5` — switch tabs;
+     - `C-M` / `M-M` — model selection picker;
      - `C-C` — cancel generation;
      - `C-G` — keyboard-quit (Emacs `keyboard-quit`): the canonical abort chord, normalized globally to `Esc` before any handler runs, so it aborts the active operation, dismisses the top-most modal, returns from an auxiliary view, or detaches the active discussion focus exactly as `Esc` would;
      - `C-L` — recenter the active item or viewport (Emacs `recenter-top-bottom`);
      - `C-R` — toggle reasoning block;
      - `C-O` — reload configuration;
+     - `C-H` / `M-H` — open the contextual Help dialog;
+     - `M-T` — open the color theme selector;
      - `C-[` / `C-]` — navigate response file diffs;
 
-3. **Universal Hardware / Terminal Fallbacks:**
-   - Universal function keys (`F1`..`F5` for tabs, `F6` for squash, dedicated arrows, `Home`/`End`, `PgUp`/`PgDn`) remain active across all terminal types, regardless of keyboard protocol capabilities.
+3. **Zero F-Keys Invariant and Universal Fallbacks:**
+   - The TUI must never bind `KeyCode::F(...)` (`F1`..`F12`). Function keys are intercepted unpredictably by window managers, terminal multiplexers, and laptop firmware, some are reserved by the terminal itself, and 60% and compact keyboards omit the row entirely. Every action must be reachable through a bare key, `C-`, `M-`, or a dedicated navigation key.
+   - Universal navigation keys (dedicated arrows, `Home`/`End`, `PgUp`/`PgDn`) remain active across all terminal types, regardless of keyboard protocol capabilities.
    - `Alt+Enter` and `Ctrl+J` serve as universal fallbacks for newline insertion in legacy terminals lacking `Shift+Enter`.
 
 4. **Explicit Confirmation for Destructive and Long-Running Actions:**
@@ -120,6 +146,7 @@ This document specifies mandatory architectural and UX invariants for the Tauqe 
      - **Header / Title:** Border title (`Block::bordered().title(...)`) indicating operation context and status (e.g. ` Confirm Cancellation `, ` Select Model `, ` Squash AI Commits (Applying...) `).
      - **Body:** Central functional area (formatted text/alert for confirmations, virtual scrollable list for selectors, or structured input/diff pane).
      - **Actions Footer:** Dedicated bottom action bar separated by visual hierarchy or divider, presenting explicit action buttons (`[ Confirm ]`, `[ Cancel ]`, etc.).
+     - **Docked Help Panel:** Immediately below the action bar, a non-interactive hint strip docked to the bottom border and rendered as a `palette.overlay`-filled row (see §6.4). It is chrome, not a fourth content tier.
 
 2. **Standardized Command Navigation:**
    - **Focus Cycling:** `Tab` and `Shift+Tab` cycle focus between actionable controls (buttons or fields).
@@ -134,6 +161,22 @@ This document specifies mandatory architectural and UX invariants for the Tauqe 
    - `Soft Stop` lets the current member finish its bounded turn, compiler verification, and Git commit before the queue halts; `Hard Stop` aborts the current member immediately. `Continue` keeps the queue running and holds the safe default focus, so an accidental keypress never discards committed work.
    - Direct accelerators `c` (Continue), `s` (Soft Stop), and `h` (Hard Stop) select an action without moving focus; `Tab`, `←`/`→`, `Enter`/`Space`, and `Esc` follow the standard dialog navigation rules above.
    - While a soft stop is pending, the footer indicates it (e.g. `[Stopping after current step]`), so the developer can distinguish a graceful drain still in progress from an immediate abort (see §1).
+
+4. **Docked Help Panel and Layering Invariant:**
+   - The hint text of a modal dialog is never a loose caption hanging in the gap between the buttons and the border. It forms a **docked help panel**: a full-width strip filled with `palette.overlay` and docked to the bottom inner row of the dialog, immediately above the bottom border.
+   - Docking the hint to its own filled row separates persistent chrome from the interactive action bar and visually closes the dialog card, so the eye reads the buttons as controls and the strip as guidance. A transparent or unstyled hint row is forbidden (see §8).
+   - The panel is non-interactive: it never receives focus, is never hit-tested for activation, and exposes no selectable controls. Its text is generated from the shared `DIALOG_COMMAND_MAP` (§3.6), never hand-authored per dialog.
+
+5. **Semantic Typography for Hint Chords:**
+   - Hint text is not a flat string; it is assembled from structured `Span`s so every token carries its own semantic role:
+     - key chords render in `palette.text_primary` (emphasized);
+     - action verbs render in `palette.text_secondary`;
+     - separator glyphs (`/` and `•`) recede into `palette.text_muted`.
+   - This semantic contrast keeps the keys scannable and legible on any terminal or color profile and honors the absolute prohibition of raw colors (§8). Hints are projected through the configured `C-` / `M-` modifiers before styling, so the styled tokens always name the real keys.
+
+6. **Mouse Hit-Testing Synchronization Invariant:**
+   - Every geometry helper that reports clickable button rectangles (for example `modal_action_buttons`) must compute its coordinates from the exact same `Layout` formula the render path uses. Shifting the action bar, or inserting the docked help panel below it, must therefore never desynchronize the click targets from the drawn buttons.
+   - Rendering and hit-testing share a single geometry source of truth, so the confirm/cancel buttons that are drawn are always the buttons that are clickable.
 
 ---
 

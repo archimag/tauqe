@@ -6,7 +6,7 @@ use ratatui::widgets::Paragraph;
 use crate::app::{
     compact_model_name, numbered_entry_label, SelectionDialogKind, SelectionItem,
 };
-use crate::components::modal::render_modal_container_styled;
+use crate::components::modal::{render_dialog_footer, render_modal_container_styled};
 use crate::theme::engine::current_engine;
 
 /// Select button label as drawn by [`render_selection_dialog`], including its
@@ -68,7 +68,8 @@ pub fn selection_dialog_buttons(term: Rect, item_count: usize) -> (Rect, Rect) {
         .constraints([
             Constraint::Length(1),
             Constraint::Min(2),
-            Constraint::Length(3),
+            Constraint::Length(2),
+            Constraint::Length(1),
         ])
         .split(inner);
     let bar = chunks[2];
@@ -115,7 +116,8 @@ pub fn render_selection_dialog(
         .constraints([
             Constraint::Length(1),
             Constraint::Min(2),
-            Constraint::Length(3),
+            Constraint::Length(2),
+            Constraint::Length(1),
         ])
         .split(inner_area);
 
@@ -164,22 +166,24 @@ pub fn render_selection_dialog(
     let list_widget = Paragraph::new(lines);
     frame.render_widget(list_widget, chunks[1]);
 
-    let actions = vec![
-        Line::from(vec![
-            Span::styled(SELECT_BUTTON_LABEL, engine.bg(palette.button_active_bg).fg(engine.color(palette.text_inverse)).bold()),
-            Span::raw(BUTTON_GAP),
-            Span::styled(CANCEL_BUTTON_LABEL, engine.bg(palette.button_bg).fg(engine.color(palette.button_fg))),
-        ]),
-        Line::from(Span::styled(
-            match dialog.kind {
-                SelectionDialogKind::PrimaryModels => "1-9 quick select • n/p navigate • Enter select • Esc close",
-                SelectionDialogKind::ModelCatalog => "n/p navigate • Enter select • Esc/q dismiss",
-            },
-            engine.fg(palette.text_muted),
-        )),
-    ];
+    let actions = Line::from(vec![
+        Span::styled(SELECT_BUTTON_LABEL, engine.bg(palette.button_active_bg).fg(engine.color(palette.text_inverse)).bold()),
+        Span::raw(BUTTON_GAP),
+        Span::styled(CANCEL_BUTTON_LABEL, engine.bg(palette.button_bg).fg(engine.color(palette.button_fg))),
+    ]);
     let actions_widget = Paragraph::new(actions).alignment(ratatui::layout::Alignment::Center);
     frame.render_widget(actions_widget, chunks[2]);
+
+    // The navigation hint is docked to the card's bottom edge as its own strip
+    // filled with `palette.overlay`, so it reads as persistent chrome instead
+    // of a second line of buttons (c-1, c-2).
+    let footer_hint = match dialog.kind {
+        SelectionDialogKind::PrimaryModels => {
+            "1-9 quick select • n / p navigate • Enter select • Esc dismiss"
+        }
+        SelectionDialogKind::ModelCatalog => "n / p navigate • Enter select • Esc dismiss",
+    };
+    render_dialog_footer(frame, chunks[3], footer_hint);
 }
 
 #[cfg(test)]

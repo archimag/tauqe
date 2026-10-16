@@ -972,11 +972,29 @@ async fn run_prepared_turn(
                         .ok(),
                     });
 
-                    let repo_state = tauqe_core::git::get_repository_state(None);
-                    state.out.send_event(&Event {
-                        method: events::GIT_STATE_CHANGED.to_string(),
-                        params: Some(serde_json::json!({ "repository": repo_state })),
-                    });
+                    // Reading the repository state shells out to git; offload
+                    // it and resolve the repository from the authoritative
+                    // shared root instead of the process CWD.
+                    let repo_root = state.repo_root().await;
+                    match offload(move || {
+                        let root = repo_root.as_path();
+                        tauqe_core::git::get_repository_state(Some(root))
+                    })
+                    .await
+                    {
+                        Ok(repo_state) => {
+                            state.out.send_event(&Event {
+                                method: events::GIT_STATE_CHANGED.to_string(),
+                                params: Some(serde_json::json!({ "repository": repo_state })),
+                            });
+                        }
+                        Err(err) => {
+                            tracing::warn!(
+                                error = %err,
+                                "Failed to read repository state after commit"
+                            );
+                        }
+                    }
                 }
             }
 
@@ -1231,31 +1249,13 @@ pub async fn handle_model_cancel(req: Request, state: &Arc<AppState>) -> Respons
         };
     }
 
-    // A hard stop aborts as soon as possible: the operation is unregistered
-    // immediately and the cancel signal is delivered.
-    let active_op = state.take_active_operation();
-    if let Some(op) = active_op {
-        let slot_id = op.id;
-        let _ = op.cancel_tx.send(true);
-        if let Some(handle) = op.abort_handle {
-            // Aborting is a last resort: the workflow unwinds cooperatively on
-            // the cancel signal, and a hard abort is deferred while a git
-            // transaction is still open so a half-finished checkpoint or step
-            // commit is never abandoned mid-transaction.
-            let state = Arc::clone(state);
-            tokio::spawn(async move {
-                tokio::time::sleep(CANCEL_UNWIND_GRACE).await;
-                if !state.git_transaction_active.load(Ordering::SeqCst) {
-                    tracing::warn!(
-                        operation_slot_id = slot_id,
-                        grace_secs = CANCEL_UNWIND_GRACE.as_secs(),
-                        "Hard-cancel grace period elapsed; aborting workflow task",
-                    );
-                    handle.abort();
-                }
-            });
-        }
-    }
+    // A hard stop signals cancellation but keeps the operation slot registered:
+    // the cancelled workflow keeps mutating state (rolling back its git
+    // transaction, releasing the session lock) until it observes the cancel
+    // signal and drops its guard. Clearing the slot immediately would let a
+    // client start `git/undo`, `config/set`, or a new turn against a half-unwound
+    // turn. A watchdog force-aborts a stalled task after the grace period.
+    state.hard_cancel_active_operation();
     Response {
         id: req.id,
         result: Some(serde_json::json!({ "cancelled": true })),
@@ -1740,7 +1740,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_handle_model_cancel_hard_clears_operation() {
+    async fn test_handle_model_cancel_hard_signals_and_keeps_operation_active() {
         let (out, _rx) = crate::transport::OutChannel::new();
         let (hist_tx, _hist_rx) = tokio::sync::mpsc::unbounded_channel();
         let state = AppState::new(
@@ -1764,9 +1764,11 @@ mod tests {
         let res = handle_model_cancel(req, &state).await;
         assert!(res.error.is_none());
 
-        // A hard stop delivers the cancel signal and clears the registration.
+        // A hard stop delivers the cancel signal but keeps the operation slot
+        // registered until the workflow unwinds and drops its guard, so a
+        // concurrent request cannot race a half-unwound turn.
         assert!(*cancel_rx.borrow());
         assert!(!*soft_rx.borrow());
-        assert!(!state.is_operation_active());
+        assert!(state.is_operation_active());
     }
 }

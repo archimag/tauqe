@@ -1,6 +1,7 @@
 use serde::Deserialize;
 use tauqe_protocol::{ReviewItem, ReviewItemStatus, ReviewSeverity};
 
+use crate::edits::stream::json::decode::{balanced_object_end, strip_code_fence};
 use crate::providers::{JsonSchemaDefinition, ResponseFormat};
 
 /// Strict JSON Schema for the review synthesis output.
@@ -210,55 +211,6 @@ fn parse_findings_output(raw: &str) -> Option<ReviewFindingsOutput> {
             }
         }
         from = start + 1;
-    }
-    None
-}
-
-/// Returns the trimmed contents of the first markdown code fence, if present.
-fn strip_code_fence(raw: &str) -> &str {
-    let trimmed = raw.trim();
-    if let Some(idx) = trimmed.find("```json") {
-        let after = &trimmed[idx + 7..];
-        if let Some(end) = after.find("```") {
-            return after[..end].trim();
-        }
-    } else if let Some(idx) = trimmed.find("```") {
-        let after = &trimmed[idx + 3..];
-        if let Some(end) = after.find("```") {
-            return after[..end].trim();
-        }
-    }
-    trimmed
-}
-
-/// Returns the exclusive end offset of the JSON object starting at `start`, if complete.
-fn balanced_object_end(raw: &str, start: usize) -> Option<usize> {
-    let bytes = raw.as_bytes();
-    let mut depth = 0usize;
-    let mut in_string = false;
-    let mut i = start;
-    while i < bytes.len() {
-        let b = bytes[i];
-        if in_string {
-            match b {
-                b'\\' => i += 1,
-                b'"' => in_string = false,
-                _ => {}
-            }
-        } else {
-            match b {
-                b'"' => in_string = true,
-                b'{' | b'[' => depth += 1,
-                b'}' | b']' => {
-                    depth = depth.saturating_sub(1);
-                    if depth == 0 {
-                        return Some(i + 1);
-                    }
-                }
-                _ => {}
-            }
-        }
-        i += 1;
     }
     None
 }

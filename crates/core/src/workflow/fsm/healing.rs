@@ -329,12 +329,17 @@ pub(super) async fn run_apply_and_verify_phase(
                     .await
                     .unwrap_or_default()
                 };
-                let outcome = reconcile_discovery_context(
-                    guard.context_manager,
-                    requests,
-                    &available_files,
-                    ctx.options.files_token_budget,
-                );
+                // Discovery reconciliation canonicalizes paths and reads file
+                // metadata, so it runs off the async executor thread.
+                let files_token_budget = ctx.options.files_token_budget;
+                let outcome = crate::blocking::run_blocking(|| {
+                    reconcile_discovery_context(
+                        guard.context_manager,
+                        requests,
+                        &available_files,
+                        files_token_budget,
+                    )
+                });
                 if !outcome.added.is_empty() {
                     let ctx_state = guard.context_manager.get_state();
                     let _ = ctx.stream_tx.send(StreamEvent::ContextChanged(ctx_state)).await;

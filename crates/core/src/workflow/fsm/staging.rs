@@ -68,12 +68,17 @@ pub(super) async fn run_discovery_phase(
             .await
             .unwrap_or_default()
         };
-        let outcome = reconcile_discovery_context(
-            ctx.context_manager,
-            requests,
-            &available_files,
-            ctx.options.files_token_budget,
-        );
+        // Discovery reconciliation canonicalizes paths and reads file metadata,
+        // so it runs off the async executor thread.
+        let files_token_budget = ctx.options.files_token_budget;
+        let outcome = crate::blocking::run_blocking(|| {
+            reconcile_discovery_context(
+                ctx.context_manager,
+                requests,
+                &available_files,
+                files_token_budget,
+            )
+        });
 
         if let Some(limit) = outcome.limit_exceeded {
             let warn = format!(

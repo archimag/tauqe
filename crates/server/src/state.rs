@@ -5,12 +5,24 @@ use std::sync::Arc;
 use tokio::sync::{watch, Mutex};
 use tauqe_core::config::AppConfig;
 use tauqe_core::context::ContextManager;
-use tauqe_core::history::HistoryManager;
+use tauqe_core::history::{HistoryManager, HistoryMutation};
 use tauqe_protocol::{
-    events, DiscussionFocus, DiscussionFocusChangedEvent, Event, ModelSelection, UiHistoryItem,
+    events, DiscussionFocus, DiscussionFocusChangedEvent, Event, ModelSelection,
 };
 
 use crate::transport::OutChannel;
+
+/// Poll cadence while the last-resort hard-cancel abort waits for an in-flight
+/// git transaction to close.
+const HARD_CANCEL_POLL_INTERVAL: std::time::Duration =
+    std::time::Duration::from_millis(100);
+
+/// Maximum time the last-resort hard-cancel abort is deferred while a git
+/// transaction stays open before the stalled workflow task is force-aborted
+/// anyway. A transaction open this long means the turn is wedged; core startup
+/// crash recovery unwinds any residue on the next launch.
+const HARD_CANCEL_TRANSACTION_DEFER_LIMIT: std::time::Duration =
+    std::time::Duration::from_secs(60);
 
 pub struct ActiveOperation {
     pub id: u64,
@@ -107,7 +119,7 @@ pub struct AppState {
     /// current state of the focused plan or review session, turning one-shot
     /// comments into a continuous multi-turn dialogue.
     pub discussion_focus: Mutex<DiscussionFocus>,
-    pub history_sender: tokio::sync::mpsc::UnboundedSender<UiHistoryItem>,
+    pub history_sender: tokio::sync::mpsc::UnboundedSender<HistoryMutation>,
     pub out: OutChannel,
     /// Shared flag set while a git-backed apply policy holds an open
     /// transaction. Turn supervisors consult it before force-aborting a
@@ -128,7 +140,7 @@ impl AppState {
     pub fn new(
         config: AppConfig,
         repo_path: PathBuf,
-        history_sender: tokio::sync::mpsc::UnboundedSender<UiHistoryItem>,
+        history_sender: tokio::sync::mpsc::UnboundedSender<HistoryMutation>,
         out: OutChannel,
     ) -> Arc<Self> {
         // Crash recovery: check and recover any dangling checkpoint or step commits from an interrupted workflow
@@ -150,8 +162,11 @@ impl AppState {
         let default_selection = config.default_selection();
         let history_sender_init = history_sender.clone();
         let mut initial_history_manager = HistoryManager::new(repo_path.clone());
-        initial_history_manager.set_listener(move |item| {
-            let _ = history_sender_init.send(item);
+        // Forward every history mutation — appends and structural compactions —
+        // so the client rebuilds its session view from the authoritative
+        // result instead of inferring it from append events alone.
+        initial_history_manager.set_listener(move |mutation| {
+            let _ = history_sender_init.send(mutation);
         });
 
         Arc::new(Self {
@@ -222,14 +237,59 @@ impl AppState {
         self.lock_active_operation().is_some()
     }
 
-    /// Removes and returns the registered operation so its cancel signal can be
-    /// delivered while the slot is free for a later operation to register.
-    pub fn take_active_operation(&self) -> Option<ActiveOperation> {
-        let taken = self.lock_active_operation().take();
-        if let Some(op) = taken.as_ref() {
-            tracing::info!(operation_slot_id = op.id, "Removed active operation slot");
+    /// Delivers the hard-cancel signal to the active operation and schedules the
+    /// last-resort force-abort watchdog.
+    ///
+    /// The operation slot is intentionally left registered: the cancelled
+    /// workflow keeps mutating state (rolling back its git transaction,
+    /// releasing the session lock) until it observes the cancel signal and drops
+    /// its [`OperationGuard`]. Clearing the slot immediately would let a client
+    /// start `git/undo`, `config/set`, or a new turn against a half-unwound turn
+    /// and would let the batch supervisor abort a later step.
+    pub fn hard_cancel_active_operation(self: &Arc<Self>) {
+        let Some(op_id) = self.signal_hard_cancel() else {
+            return;
+        };
+        let state = Arc::clone(self);
+        tokio::spawn(async move {
+            tokio::time::sleep(crate::handlers::model::CANCEL_UNWIND_GRACE).await;
+            state.abort_stalled_operation(op_id).await;
+        });
+    }
+
+    /// Force-aborts the operation identified by `op_id` after the hard-cancel
+    /// grace period has elapsed, once no git transaction is open.
+    ///
+    /// Cooperative cancellation is the primary path; this is the last resort for
+    /// a workflow that ignored the cancel signal. The abort is deferred — never
+    /// dropped — while a git transaction is still open, so a half-finished
+    /// checkpoint or step commit is never abandoned mid-transaction, and the
+    /// wait is bounded so a wedged turn cannot leak its task for the daemon's
+    /// lifetime. The handle is read fresh from the slot, so the abort targets
+    /// the currently running inner task and a superseded watchdog can never
+    /// abort a newer operation.
+    pub async fn abort_stalled_operation(&self, op_id: u64) {
+        let deadline = tokio::time::Instant::now() + HARD_CANCEL_TRANSACTION_DEFER_LIMIT;
+        while self.git_transaction_active.load(Ordering::SeqCst)
+            && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(HARD_CANCEL_POLL_INTERVAL).await;
         }
-        taken
+
+        let handle = {
+            let slot = self.lock_active_operation();
+            match slot.as_ref() {
+                Some(op) if op.id == op_id => op.abort_handle.clone(),
+                _ => None,
+            }
+        };
+        if let Some(handle) = handle {
+            tracing::warn!(
+                operation_slot_id = op_id,
+                "Hard-cancel grace period elapsed; aborting stalled workflow task",
+            );
+            handle.abort();
+        }
     }
 
     /// Delivers a cancellation signal to the active operation without clearing
@@ -240,15 +300,22 @@ impl AppState {
     /// re-signals on every poll, and logging each repeat would flood the
     /// journal.
     pub fn cancel_active_operation(&self) {
+        let _ = self.signal_hard_cancel();
+    }
+
+    /// Raises the hard-cancel signal on the registered operation and returns its
+    /// id, or `None` when no operation is registered. Shared by the shutdown
+    /// drain and the interactive hard-cancel path.
+    fn signal_hard_cancel(&self) -> Option<u64> {
         let slot = self.lock_active_operation();
-        if let Some(op) = slot.as_ref() {
-            if !op.cancel_tx.send_replace(true) {
-                tracing::info!(
-                    operation_slot_id = op.id,
-                    "Delivered hard-cancel signal to active operation",
-                );
-            }
+        let op = slot.as_ref()?;
+        if !op.cancel_tx.send_replace(true) {
+            tracing::info!(
+                operation_slot_id = op.id,
+                "Delivered hard-cancel signal to active operation",
+            );
         }
+        Some(op.id)
     }
 
     /// Requests a graceful stop of the active operation without clearing its

@@ -16,6 +16,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
 use crate::app::{ConfirmDialogButton, ModalActionsState};
+use crate::command::dialog::{DialogCommand, DIALOG_COMMAND_MAP};
+use crate::config::{active_meta_modifier, active_primary_modifier};
 use crate::theme::color::RgbColor;
 use crate::theme::engine::{current_engine, ThemeEngine};
 
@@ -61,6 +63,137 @@ pub fn button_style(engine: &ThemeEngine, bg: RgbColor, fg: RgbColor, emphasized
         style = style.add_modifier(Modifier::BOLD);
     }
     style
+}
+
+/// Projects one cognitive group of the shared dialog vocabulary.
+///
+/// Chords are listed in `actions` order and deduplicated, so a group reads
+/// `Tab / Shift+Tab` instead of mirroring the registry declaration order. Every
+/// chord is rendered through the configured `C-` / `M-` modifiers, so a footer
+/// never hardcodes a modifier string (Conventions §4, §6).
+fn dialog_hint_group(actions: &[DialogCommand], verb: &str) -> Option<String> {
+    let primary = active_primary_modifier();
+    let meta = active_meta_modifier();
+    let mut keys: Vec<String> = Vec::new();
+    for action in actions {
+        for spec in DIALOG_COMMAND_MAP.specs() {
+            if spec.action == *action {
+                let key = spec.chord.display(primary, meta);
+                if !keys.contains(&key) {
+                    keys.push(key);
+                }
+            }
+        }
+    }
+    (!keys.is_empty()).then(|| format!("{} {}", keys.join(" / "), verb))
+}
+
+/// Navigation and activation hint: focus cycling and control activation.
+///
+/// Derived from the shared dialog command map, so the modal footers advertise
+/// exactly the chords the dialogs intercept.
+pub fn dialog_navigation_hint() -> String {
+    let focus = dialog_hint_group(
+        &[DialogCommand::FocusNext, DialogCommand::FocusPrev],
+        "focus",
+    );
+    let activate = dialog_hint_group(&[DialogCommand::Activate], "activate");
+    [focus, activate]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(" • ")
+}
+
+/// The standard `y` / `n` fast-select hint.
+pub fn dialog_fast_select_hint() -> String {
+    dialog_hint_group(
+        &[DialogCommand::ConfirmFast, DialogCommand::CancelFast],
+        "fast select",
+    )
+    .unwrap_or_default()
+}
+
+/// The dismissal hint (`Esc` / `q`).
+pub fn dialog_dismiss_hint() -> String {
+    dialog_hint_group(&[DialogCommand::Dismiss], "dismiss").unwrap_or_default()
+}
+
+/// The full universal dialog footer hint, used when a dialog supplies no text
+/// of its own.
+pub fn dialog_footer_hint() -> String {
+    [
+        dialog_navigation_hint(),
+        dialog_fast_select_hint(),
+        dialog_dismiss_hint(),
+    ]
+    .into_iter()
+    .filter(|group| !group.is_empty())
+    .collect::<Vec<_>>()
+    .join(" • ")
+}
+
+/// Splits a dialog hint into styled spans: each chord reads as an interactive
+/// key, each group's verb as its description, and the `/` and `•` separators
+/// recede into the muted role.
+///
+/// The input is the footer vocabulary produced by [`dialog_footer_hint`] and the
+/// batch dialog: `•`-separated groups whose keys are ` / `-separated and which
+/// end in a verb (for example `Tab / Shift+Tab focus`).
+fn hint_spans(engine: &ThemeEngine, hint: &str) -> Vec<Span<'static>> {
+    if hint.is_empty() {
+        return Vec::new();
+    }
+
+    let palette = engine.palette();
+    let key_style = engine.fg(palette.text_primary).add_modifier(Modifier::BOLD);
+    let verb_style = engine.fg(palette.text_secondary);
+    let sep_style = engine.fg(palette.text_muted);
+
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    for (group_index, group) in hint.split(" • ").enumerate() {
+        if group_index > 0 {
+            spans.push(Span::styled(" • ", sep_style));
+        }
+        // A group reads `CHORD1 / CHORD2 / ... / CHORDn VERB`: the chords are
+        // single tokens joined by `" / "` and the trailing verb is a phrase, so
+        // only the final `" / "` segment splits into its chord and the verb.
+        let parts: Vec<&str> = group.split(" / ").collect();
+        let last = parts.last().copied().unwrap_or("");
+        let (last_chord, verb) = match last.split_once(' ') {
+            Some((chord, verb)) => (chord, verb),
+            None => (last, ""),
+        };
+        let mut chords: Vec<&str> = parts[..parts.len().saturating_sub(1)].to_vec();
+        chords.push(last_chord);
+        chords.retain(|chord| !chord.is_empty());
+        for (key_index, key) in chords.iter().enumerate() {
+            if key_index > 0 {
+                spans.push(Span::styled(" / ", sep_style));
+            }
+            spans.push(Span::styled((*key).to_string(), key_style));
+        }
+        if !verb.is_empty() {
+            spans.push(Span::styled(format!(" {}", verb), verb_style));
+        }
+    }
+    spans
+}
+
+/// Renders the docked dialog footer strip.
+///
+/// The strip is a full-width row filled with `palette.overlay` that carries the
+/// semantic hint vocabulary: chords read as interactive keys, their verbs as
+/// descriptions, and the separators recede into the muted role. Docking the
+/// hint to its own row separates it from the interactive controls and closes
+/// the dialog card visually (`#c-1`, `#c-2`).
+pub fn render_dialog_footer(frame: &mut ratatui::Frame, area: Rect, hint: &str) {
+    let engine = current_engine();
+    let palette = engine.palette();
+    let footer = Paragraph::new(Line::from(hint_spans(&engine, hint)))
+        .alignment(Alignment::Center)
+        .style(Style::default().bg(engine.color(palette.overlay)));
+    frame.render_widget(footer, area);
 }
 
 /// Renders a cleared, surface-filled, bordered modal container with an explicit border style.
@@ -133,7 +266,11 @@ impl ModalFrame<'_> {
 
         let chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Min(2), Constraint::Length(3)])
+            .constraints([
+                Constraint::Min(2),
+                Constraint::Length(2),
+                Constraint::Length(1),
+            ])
             .split(inner_area);
 
         render_body(frame, chunks[0]);
@@ -157,20 +294,22 @@ impl ModalFrame<'_> {
             (resting, resting)
         };
 
-        let hint = self
-            .hint_text
-            .unwrap_or("Tab / ← / → focus • Enter/Space execute • y / n fast select • Esc cancel");
-
-        let actions_lines = vec![
-            Line::from(vec![
-                Span::styled(format!(" [ {} ] ", self.confirm_label), confirm_style),
-                Span::raw("    "),
-                Span::styled(format!(" [ {} ] ", self.cancel_label), cancel_style),
-            ]),
-            Line::from(Span::styled(hint, engine.fg(palette.text_secondary))),
-        ];
-        let actions_widget = Paragraph::new(actions_lines).alignment(Alignment::Center);
+        let actions_line = Line::from(vec![
+            Span::styled(format!(" [ {} ] ", self.confirm_label), confirm_style),
+            Span::raw("    "),
+            Span::styled(format!(" [ {} ] ", self.cancel_label), cancel_style),
+        ]);
+        let actions_widget = Paragraph::new(actions_line).alignment(Alignment::Center);
         frame.render_widget(actions_widget, chunks[1]);
+
+        // The navigation vocabulary is docked to the very bottom row as its own
+        // strip, separated from the action buttons, so it reads as persistent
+        // chrome rather than a second line of buttons.
+        let hint = match self.hint_text {
+            Some(text) => text.to_string(),
+            None => dialog_footer_hint(),
+        };
+        render_dialog_footer(frame, chunks[2], &hint);
     }
 }
 
@@ -195,18 +334,67 @@ pub fn modal_action_buttons(area: Rect, confirm_label: &str, cancel_label: &str)
         area.width.saturating_sub(2),
         area.height.saturating_sub(2),
     );
-    // The frame splits its interior into a flexible body and a fixed three-row
-    // action bar; the first of those rows carries the buttons.
-    let action_y = inner.y + inner.height.saturating_sub(3);
+    // Mirror the frame's own split (flexible body, two-row button zone, one-row
+    // docked hint strip) so hit-testing lands on the row the buttons are drawn
+    // in and can never drift from the rendered layout (Conventions §6, §7).
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(2),
+            Constraint::Length(2),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+    let action_bar = chunks[1];
 
     let confirm_w = (confirm_label.chars().count() as u16).saturating_add(6);
     let cancel_w = (cancel_label.chars().count() as u16).saturating_add(6);
     let gap = 4u16;
     let total = confirm_w + gap + cancel_w;
-    let start_x = inner.x + inner.width.saturating_sub(total) / 2;
+    let start_x = action_bar.x + action_bar.width.saturating_sub(total) / 2;
 
     (
-        Rect::new(start_x, action_y, confirm_w, 1),
-        Rect::new(start_x + confirm_w + gap, action_y, cancel_w, 1),
+        Rect::new(start_x, action_bar.y, confirm_w, 1),
+        Rect::new(start_x + confirm_w + gap, action_bar.y, cancel_w, 1),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::hint_spans;
+    use crate::theme::engine::current_engine;
+
+    fn contents(hint: &str) -> Vec<String> {
+        let engine = current_engine();
+        hint_spans(&engine, hint)
+            .into_iter()
+            .map(|span| span.content.to_string())
+            .collect()
+    }
+
+    /// A multi-word verb must stay with its group instead of leaking into the
+    /// chord list, so the fast-select hint keeps exactly its two keys.
+    #[test]
+    fn hint_spans_keeps_a_multi_word_verb_with_its_group() {
+        assert_eq!(
+            contents("y / n fast select"),
+            vec!["y", " / ", "n", " fast select"],
+        );
+    }
+
+    #[test]
+    fn hint_spans_keeps_single_word_verbs_and_separators() {
+        assert_eq!(
+            contents("Tab / Shift+Tab focus • Enter activate"),
+            vec![
+                "Tab",
+                " / ",
+                "Shift+Tab",
+                " focus",
+                " • ",
+                "Enter",
+                " activate",
+            ],
+        );
+    }
 }

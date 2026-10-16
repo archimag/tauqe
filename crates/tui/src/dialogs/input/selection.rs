@@ -1,5 +1,4 @@
 use crossterm::event::{KeyCode, KeyEvent};
-use ratatui::layout::Rect;
 use tokio::sync::MutexGuard;
 
 use crate::app::{AppState, SelectionDialogKind, SelectionItem};
@@ -76,9 +75,12 @@ pub(super) async fn handle_selection_dialog_key(
         None => return Ok(None),
     };
 
-    let (term_w, term_h) = crossterm::terminal::size().unwrap_or((80, 24));
+    // Reuse the geometry of the last rendered frame instead of querying the OS
+    // terminal size mid-event: it avoids an unnecessary syscall and keeps the
+    // scroll viewport aligned with what is actually on screen (and with the
+    // frame area customized by tests).
     let area = crate::dialogs::render::selection_dialog_area(
-        Rect::new(0, 0, term_w, term_h),
+        st.last_frame_area,
         dialog.items.len(),
     );
     let visible_height = crate::dialogs::render::selection_dialog_visible_height(area);

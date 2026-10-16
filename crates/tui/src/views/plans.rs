@@ -14,7 +14,7 @@ use crate::ui::wrap_lines;
 pub mod input;
 pub mod render;
 
-pub use self::input::{handle_plans_key, PLANS_COMMANDS};
+pub use self::input::{handle_plans_key, PLANS_COMMAND_MAP};
 pub use self::render::render_plans_view;
 
 #[derive(Debug, Clone, PartialEq, Eq)]

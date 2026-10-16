@@ -4,7 +4,9 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use tokio::sync::Mutex;
 use tauqe_protocol::{methods, HistoryGetParams};
 
-use crate::app::{AppState, KeyCommand, ViewMode};
+use crate::app::{AppState, ViewMode};
+use crate::command::CommandCategory::{Essential, Helpers, Interface};
+use crate::command::{CommandMap, CommandSpec, KeyChord};
 use crate::input::InputResult;
 use crate::rpc::{send_request, RpcConnection};
 
@@ -36,22 +38,204 @@ pub async fn request_older_history(
     Ok(())
 }
 
-pub const HISTORY_COMMANDS: &[KeyCommand] = &[
-    // Core Actions
-    KeyCommand { key: "Enter / Tab / Space", description: "Fold / unfold active history item" },
-    // Navigation & Inspection
-    KeyCommand { key: "n / p (or [ / ])", description: "Navigate between history items" },
-    KeyCommand { key: "l / C-l", description: "Recenter active history item (Emacs C-l style)" },
-    KeyCommand { key: "↑/↓ or k/j", description: "Scroll history (fetches older turns)" },
-    KeyCommand { key: "PgUp / PgDn", description: "Page scroll history view" },
-    KeyCommand { key: "Home / End", description: "Jump to oldest / newest message" },
-    KeyCommand { key: "Esc / q / C-G", description: "Return to Develop view (keyboard-quit)" },
-    // Editing & Clipboard
-    KeyCommand { key: "c", description: "Copy code block from active item" },
-    KeyCommand { key: "y", description: "Copy selected item text to clipboard" },
-    // Auxiliary & Destructive
-    KeyCommand { key: "Shift+C", description: "Clear conversation history (with confirmation)" },
-];
+/// Keyboard actions available in the History view.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HistoryAction {
+    Return,
+    FoldToggle,
+    NavPrev,
+    NavNext,
+    Recenter,
+    ScrollUp,
+    ScrollDown,
+    PageUp,
+    PageDown,
+    SelectFirst,
+    SelectLast,
+    CopyBlock,
+    CopyItem,
+    ClearHistory,
+}
+
+/// Single source of truth for the History view keybindings.
+///
+/// Essential commands fold and copy an entry; Interface commands navigate and
+/// scroll; Helpers clear the whole conversation. The map drives the generated
+/// Help dialog. The destructive clear chords are declared first so a shifted `C`
+/// never resolves to the plain copy binding.
+pub static HISTORY_COMMAND_MAP: CommandMap<HistoryAction> = CommandMap::new(&[
+    // Destructive clearing, declared before the bare `c` binding.
+    CommandSpec::new(
+        KeyChord::Bare(KeyCode::Char('C')),
+        HistoryAction::ClearHistory,
+        Helpers,
+        "Clear the conversation history (with confirmation)",
+    ),
+    CommandSpec::new(
+        KeyChord::Shift(KeyCode::Char('c')),
+        HistoryAction::ClearHistory,
+        Helpers,
+        "Clear the conversation history (with confirmation)",
+    ),
+    // Essential: folding and copying the active entry.
+    CommandSpec::new(
+        KeyChord::Bare(KeyCode::Enter),
+        HistoryAction::FoldToggle,
+        Essential,
+        "Fold or unfold the active history item",
+    ),
+    CommandSpec::new(
+        KeyChord::Bare(KeyCode::Tab),
+        HistoryAction::FoldToggle,
+        Essential,
+        "Fold or unfold the active history item",
+    ),
+    CommandSpec::new(
+        KeyChord::Bare(KeyCode::Char(' ')),
+        HistoryAction::FoldToggle,
+        Essential,
+        "Fold or unfold the active history item",
+    ),
+    CommandSpec::new(
+        KeyChord::Bare(KeyCode::Char('c')),
+        HistoryAction::CopyBlock,
+        Essential,
+        "Copy the code block of the active item",
+    ),
+    CommandSpec::new(
+        KeyChord::Bare(KeyCode::Char('y')),
+        HistoryAction::CopyItem,
+        Essential,
+        "Copy the selected item text to the clipboard",
+    ),
+    CommandSpec::new(
+        KeyChord::Bare(KeyCode::Char('Y')),
+        HistoryAction::CopyItem,
+        Essential,
+        "Copy the selected item text to the clipboard",
+    ),
+    // Interface: navigation and scrolling.
+    CommandSpec::new(
+        KeyChord::Bare(KeyCode::Esc),
+        HistoryAction::Return,
+        Interface,
+        "Return to the REPL",
+    ),
+    CommandSpec::new(
+        KeyChord::Bare(KeyCode::Char('q')),
+        HistoryAction::Return,
+        Interface,
+        "Return to the REPL",
+    ),
+    CommandSpec::new(
+        KeyChord::Bare(KeyCode::Char('p')),
+        HistoryAction::NavPrev,
+        Interface,
+        "Select the previous item, fetching older turns at the top",
+    ),
+    CommandSpec::new(
+        KeyChord::Bare(KeyCode::Char('P')),
+        HistoryAction::NavPrev,
+        Interface,
+        "Select the previous item, fetching older turns at the top",
+    ),
+    CommandSpec::new(
+        KeyChord::Bare(KeyCode::Char('[')),
+        HistoryAction::NavPrev,
+        Interface,
+        "Select the previous item, fetching older turns at the top",
+    ),
+    CommandSpec::new(
+        KeyChord::Shift(KeyCode::BackTab),
+        HistoryAction::NavPrev,
+        Interface,
+        "Select the previous item, fetching older turns at the top",
+    ),
+    CommandSpec::new(
+        KeyChord::Bare(KeyCode::BackTab),
+        HistoryAction::NavPrev,
+        Interface,
+        "Select the previous item, fetching older turns at the top",
+    ),
+    CommandSpec::new(
+        KeyChord::Bare(KeyCode::Char('n')),
+        HistoryAction::NavNext,
+        Interface,
+        "Select the next history item",
+    ),
+    CommandSpec::new(
+        KeyChord::Bare(KeyCode::Char('N')),
+        HistoryAction::NavNext,
+        Interface,
+        "Select the next history item",
+    ),
+    CommandSpec::new(
+        KeyChord::Bare(KeyCode::Char(']')),
+        HistoryAction::NavNext,
+        Interface,
+        "Select the next history item",
+    ),
+    CommandSpec::new(
+        KeyChord::Bare(KeyCode::Char('l')),
+        HistoryAction::Recenter,
+        Interface,
+        "Recenter the active history item",
+    ),
+    CommandSpec::new(
+        KeyChord::Bare(KeyCode::Char('L')),
+        HistoryAction::Recenter,
+        Interface,
+        "Recenter the active history item",
+    ),
+    CommandSpec::new(
+        KeyChord::Bare(KeyCode::Up),
+        HistoryAction::ScrollUp,
+        Interface,
+        "Scroll the history up one line",
+    ),
+    CommandSpec::new(
+        KeyChord::Bare(KeyCode::Char('k')),
+        HistoryAction::ScrollUp,
+        Interface,
+        "Scroll the history up one line",
+    ),
+    CommandSpec::new(
+        KeyChord::Bare(KeyCode::Down),
+        HistoryAction::ScrollDown,
+        Interface,
+        "Scroll the history down one line",
+    ),
+    CommandSpec::new(
+        KeyChord::Bare(KeyCode::Char('j')),
+        HistoryAction::ScrollDown,
+        Interface,
+        "Scroll the history down one line",
+    ),
+    CommandSpec::new(
+        KeyChord::Bare(KeyCode::PageUp),
+        HistoryAction::PageUp,
+        Interface,
+        "Scroll the history up one page",
+    ),
+    CommandSpec::new(
+        KeyChord::Bare(KeyCode::PageDown),
+        HistoryAction::PageDown,
+        Interface,
+        "Scroll the history down one page",
+    ),
+    CommandSpec::new(
+        KeyChord::Bare(KeyCode::Home),
+        HistoryAction::SelectFirst,
+        Interface,
+        "Jump to the oldest message",
+    ),
+    CommandSpec::new(
+        KeyChord::Bare(KeyCode::End),
+        HistoryAction::SelectLast,
+        Interface,
+        "Jump to the newest message",
+    ),
+]);
 
 pub async fn handle_history_key(
     key: KeyEvent,
@@ -294,17 +478,20 @@ pub async fn handle_history_key(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashSet;
 
     #[test]
-    fn test_command_bindings_are_unique() {
-        let keys: HashSet<&str> = HISTORY_COMMANDS.iter().map(|c| c.key).collect();
-        assert!(!HISTORY_COMMANDS.is_empty());
-        assert_eq!(
-            keys.len(),
-            HISTORY_COMMANDS.len(),
-            "duplicate key bindings in HISTORY_COMMANDS"
-        );
+    fn test_command_map_chords_are_unique() {
+        let chords: Vec<KeyChord> = HISTORY_COMMAND_MAP
+            .specs()
+            .iter()
+            .map(|spec| spec.chord)
+            .collect();
+        assert!(!chords.is_empty());
+        for (index, chord) in chords.iter().enumerate() {
+            for other in chords.iter().skip(index + 1) {
+                assert_ne!(chord, other, "duplicate key chord in HISTORY_COMMAND_MAP");
+            }
+        }
     }
 
     /// Dispatches one key into the History handler with a deliberately unsafe

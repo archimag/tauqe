@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent};
 use tokio::sync::Mutex;
 use tauqe_protocol::methods;
 
@@ -11,14 +11,18 @@ use crate::rpc::{send_request, RpcConnection};
 /// Persists the chosen workstation settings and reloads them, advancing to the
 /// Ready step only when both the write and the re-read succeed.
 fn save_workstation_config(st: &mut AppState, modifier: crate::config::PrimaryModifier) {
-    let label = match modifier {
-        crate::config::PrimaryModifier::Ctrl => "Ctrl",
-        crate::config::PrimaryModifier::Alt => "Alt",
+    // The two command chords are paired: whichever key becomes the primary
+    // modifier flips the meta modifier to the other key, so `C-x` and `M-x`
+    // never collide on one physical key (Conventions §5.2).
+    let meta = match modifier {
+        crate::config::PrimaryModifier::Ctrl => crate::config::MetaModifier::Alt,
+        crate::config::PrimaryModifier::Alt => crate::config::MetaModifier::Ctrl,
     };
     let saved = crate::config::save_tui_config_full(
         st.onboarding.chosen_layout,
         st.onboarding.chosen_langmap.clone(),
         modifier,
+        meta,
     );
     match saved {
         Ok(path) => match crate::config::TuiConfig::load_checked() {
@@ -26,9 +30,10 @@ fn save_workstation_config(st: &mut AppState, modifier: crate::config::PrimaryMo
                 st.tui_config = cfg;
                 st.onboarding.has_tui_config = true;
                 st.onboarding.set_status(format!(
-                    "Workstation configuration saved to {} (Primary modifier: {})",
+                    "Workstation configuration saved to {} (Primary: {}, Meta: {})",
                     path.display(),
-                    label
+                    modifier.emacs_prefix(),
+                    meta.emacs_prefix()
                 ));
                 st.onboarding.step = st.onboarding.next_step();
                 st.onboarding.selected_index = 0;
@@ -57,15 +62,13 @@ pub async fn handle_onboarding_key(
     let mut st = state.lock().await;
 
     if st.onboarding.input_active {
-        // Clipboard and reveal commands follow the abstract primary command
-        // modifier (`C-V` paste, `C-R` reveal); Ctrl stays a universal fallback
-        // so the advertised `C-U` clear-buffer chord keeps working when the
+        // Clipboard and reveal commands follow the abstract command modifiers:
+        // either the primary chord (`C-`) or the meta chord (`M-`) drives them.
+        // The AltGr / compose chord is excluded inside the abstract checks, and
+        // the paired meta modifier keeps a Ctrl fallback working when the
         // primary modifier is configured as Alt (Conventions §5.2).
-        let is_ctrl_alt = key.modifiers.contains(KeyModifiers::CONTROL)
-            && key.modifiers.contains(KeyModifiers::ALT);
-        let is_cmd = !is_ctrl_alt
-            && (st.tui_config.input.primary_modifier.matches(key.modifiers)
-                || key.modifiers.contains(KeyModifiers::CONTROL));
+        let is_cmd = st.tui_config.input.is_primary(key.modifiers)
+            || st.tui_config.input.is_meta(key.modifiers);
 
         if is_cmd {
             match key.code {
@@ -243,13 +246,17 @@ pub async fn handle_onboarding_key(
                             let key_in_clipboard = crate::clipboard::get_from_clipboard()
                                 .is_some_and(|text| text.trim().starts_with("sk-or-"));
                             if key_in_clipboard {
-                                let paste_chord = format!(
+                                let primary_chord = format!(
                                     "{}V",
                                     st.tui_config.input.primary_modifier.prefix_str()
                                 );
+                                let meta_chord = format!(
+                                    "{}V",
+                                    st.tui_config.input.meta_modifier.prefix_str()
+                                );
                                 st.onboarding.set_status(format!(
-                                    "API key detected in clipboard. Press {} to paste it.",
-                                    paste_chord
+                                    "API key detected in clipboard. Press {} or {} to paste it.",
+                                    primary_chord, meta_chord
                                 ));
                             }
                         }

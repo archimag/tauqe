@@ -1,5 +1,5 @@
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Style, Stylize};
+use ratatui::style::Stylize;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Padding, Paragraph};
 
@@ -70,10 +70,12 @@ pub fn render_history_view(
     };
     let total_shown = state.history_view.items.len();
 
+    let engine = crate::theme::engine::current_engine();
+    let palette = engine.palette();
     let info_line = Line::from(vec![
         Span::styled(
             format!(" History | Item {}/{} ", sel_idx, total_shown),
-            Style::default().fg(Color::White).bold(),
+            engine.fg(palette.text_primary).bold(),
         ),
         Span::raw(" | "),
         Span::styled(
@@ -83,15 +85,15 @@ pub fn render_history_view(
                 "[Auto-scroll: OFF]"
             },
             if state.history_view.auto_scroll {
-                Style::default().fg(Color::Green).bold()
+                engine.fg(palette.status_success).bold()
             } else {
-                Style::default().fg(Color::DarkGray)
+                engine.fg(palette.text_muted)
             },
         ),
         Span::raw(" | "),
         Span::styled(
             format!("~{} tokens", state.history_view.get_estimated_tokens()),
-            Style::default().fg(Color::Cyan),
+            engine.fg(palette.status_info),
         ),
     ]);
     let prompt_widget = Paragraph::new(info_line)

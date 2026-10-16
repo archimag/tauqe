@@ -67,67 +67,73 @@ impl PlanStorage {
     }
 
     /// Lists all stored plans from `.tauqe/plans`, ordered by `updated_at` descending.
+    ///
+    /// Acquires the process-global storage lock so a listing never observes a plan
+    /// file mid-rename while another task is persisting it.
     pub fn list_plans(repo_root: &Path) -> Result<Vec<PlanSummary>> {
-        let dir = Self::plans_dir(repo_root);
-        if !dir.is_dir() {
-            return Ok(Vec::new());
-        }
+        let _guard = Self::lock();
+        Self::list_plans_unlocked(repo_root)
+    }
 
-        let mut summaries = Vec::new();
-        let entries = std::fs::read_dir(&dir)
-            .with_context(|| format!("Failed to read plans directory at {}", dir.display()))?;
-
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_file() && path.extension().and_then(|s| s.to_str()) == Some("json") {
-                match std::fs::read_to_string(&path) {
-                    Ok(content) => match serde_json::from_str::<Plan>(&content) {
-                        Ok(plan) => summaries.push(plan.summary()),
-                        Err(err) => tracing::warn!(
-                            path = %path.display(),
-                            error = %err,
-                            "Skipping corrupted plan file"
-                        ),
-                    },
-                    Err(err) => tracing::warn!(
-                        path = %path.display(),
-                        error = %err,
-                        "Failed to read plan file"
-                    ),
-                }
-            }
-        }
-
-        summaries.sort_by_key(|s| std::cmp::Reverse(s.updated_at));
-        Ok(summaries)
+    /// Lock-free core of [`Self::list_plans`]; the caller must hold the storage lock.
+    fn list_plans_unlocked(repo_root: &Path) -> Result<Vec<PlanSummary>> {
+        Ok(Self::load_all_unlocked(repo_root)?
+            .into_iter()
+            .map(|plan| plan.summary())
+            .collect())
     }
 
     /// Loads a specific plan by its exact ID or file name.
+    ///
+    /// Acquires the process-global storage lock, so a read never races a concurrent
+    /// atomic rename in a write path.
     pub fn load_plan(repo_root: &Path, id: &str) -> Result<Option<Plan>> {
+        let _guard = Self::lock();
+        Self::load_plan_unlocked(repo_root, id)
+    }
+
+    /// Lock-free core of [`Self::load_plan`]; the caller must hold the storage lock.
+    fn load_plan_unlocked(repo_root: &Path, id: &str) -> Result<Option<Plan>> {
         let dir = Self::plans_dir(repo_root);
         let safe_id = Self::sanitize_id(id);
         let file_path = dir.join(format!("{safe_id}.json"));
 
-        if !file_path.is_file() {
-            // Check if any existing plan file matches the ID exactly or normalized
-            if let Ok(plans) = Self::load_all(repo_root) {
-                if let Some(plan) = crate::plan::matcher::resolve_plan_id_exact(id, &plans) {
-                    return Ok(Some(plan.clone()));
-                }
+        if file_path.is_file() {
+            let content = std::fs::read_to_string(&file_path)
+                .with_context(|| format!("Failed to read plan file at {}", file_path.display()))?;
+            let plan: Plan = serde_json::from_str(&content)
+                .with_context(|| format!("Failed to parse plan JSON at {}", file_path.display()))?;
+
+            // A sanitized-name collision (for example "team/auth" and "team-auth")
+            // can surface a file that stores a different plan. Return it only when it
+            // actually carries the requested id; otherwise fall through to exact
+            // resolution so a lookup never leaks an unrelated plan.
+            if plan.id.eq_ignore_ascii_case(id) {
+                return Ok(Some(plan));
             }
-            return Ok(None);
         }
 
-        let content = std::fs::read_to_string(&file_path)
-            .with_context(|| format!("Failed to read plan file at {}", file_path.display()))?;
-        let plan: Plan = serde_json::from_str(&content)
-            .with_context(|| format!("Failed to parse plan JSON at {}", file_path.display()))?;
-
-        Ok(Some(plan))
+        // Resolve the id against every stored plan. This covers a plan stored under
+        // an alternatively sanitized file name and exact/normalized id matching.
+        if let Ok(plans) = Self::load_all_unlocked(repo_root) {
+            if let Some(plan) = crate::plan::matcher::resolve_plan_id_exact(id, &plans) {
+                return Ok(Some(plan.clone()));
+            }
+        }
+        Ok(None)
     }
 
     /// Loads all full plans from disk.
+    ///
+    /// Acquires the process-global storage lock, so a read never races a concurrent
+    /// atomic rename in a write path.
     pub fn load_all(repo_root: &Path) -> Result<Vec<Plan>> {
+        let _guard = Self::lock();
+        Self::load_all_unlocked(repo_root)
+    }
+
+    /// Lock-free core of [`Self::load_all`]; the caller must hold the storage lock.
+    fn load_all_unlocked(repo_root: &Path) -> Result<Vec<Plan>> {
         let dir = Self::plans_dir(repo_root);
         if !dir.is_dir() {
             return Ok(Vec::new());
@@ -162,6 +168,39 @@ impl PlanStorage {
         Ok(plans)
     }
 
+    /// Resolves the on-disk file that currently stores the plan identified by `id`,
+    /// or `None` when no stored plan matches.
+    ///
+    /// The storage file name is normally `sanitize_id(id)`, but an id change (for
+    /// example a casing change) leaves the plan under a differently sanitized name.
+    /// Resolving the real file lets [`Self::save_plan_unlocked`] update and
+    /// [`Self::delete_plan_unlocked`] remove the existing artifact instead of
+    /// creating or leaving behind a duplicate plan file with the same id.
+    ///
+    /// Lock-free; the caller must hold the storage lock.
+    fn find_plan_file_unlocked(repo_root: &Path, id: &str) -> Option<PathBuf> {
+        let dir = Self::plans_dir(repo_root);
+        let entries = std::fs::read_dir(&dir).ok()?;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_file() || path.extension().and_then(|s| s.to_str()) != Some("json") {
+                continue;
+            }
+            let content = match std::fs::read_to_string(&path) {
+                Ok(content) => content,
+                Err(_) => continue,
+            };
+            let plan = match serde_json::from_str::<Plan>(&content) {
+                Ok(plan) => plan,
+                Err(_) => continue,
+            };
+            if plan.id.eq_ignore_ascii_case(id) {
+                return Some(path);
+            }
+        }
+        None
+    }
+
     /// Saves a plan into `.tauqe/plans/<id>.json` atomically.
     ///
     /// Serializes against concurrent storage mutations through the process-global
@@ -185,20 +224,28 @@ impl PlanStorage {
         })?;
 
         let safe_id = Self::sanitize_id(&plan.id);
-        let target_file = dir.join(format!("{safe_id}.json"));
-        let temp_file = dir.join(format!("{safe_id}.json.tmp"));
+        let default_target = dir.join(format!("{safe_id}.json"));
 
         let mut normalized = plan.clone();
         normalized.normalize_leaf_files();
         normalized.refresh_parent_statuses();
+
+        // Reuse the file that already stores this plan even when its name differs
+        // from the sanitized id (for example after an id casing change). Writing to
+        // the resolved file keeps a single plan per id on disk instead of spawning a
+        // duplicate `{safe_id}.json` beside the original.
+        let target_file = if default_target.is_file() {
+            default_target
+        } else {
+            Self::find_plan_file_unlocked(repo_root, &plan.id).unwrap_or(default_target)
+        };
+        let temp_file = target_file.with_extension("json.tmp");
 
         let existing = if target_file.is_file() {
             let content = std::fs::read_to_string(&target_file)
                 .with_context(|| format!("Failed to read existing plan file at {}", target_file.display()))?;
             Some(serde_json::from_str::<Plan>(&content)
                 .with_context(|| format!("Failed to parse existing plan JSON at {}", target_file.display()))?)
-        } else if let Ok(all) = Self::load_all(repo_root) {
-            all.into_iter().find(|p| p.id.eq_ignore_ascii_case(&plan.id))
         } else {
             None
         };
@@ -225,6 +272,12 @@ impl PlanStorage {
             format!("Failed to atomically rename plan file to {}", target_file.display())
         })?;
 
+        // If no active plan is set, make this plan active so clients always have
+        // a persisted active-plan marker to render.
+        if let Ok(None) = Self::load_active_id_unlocked(repo_root) {
+            let _ = Self::save_active_id_unlocked(repo_root, Some(&plan.id));
+        }
+
         Ok(())
     }
 
@@ -238,28 +291,37 @@ impl PlanStorage {
 
     /// Lock-free core of [`Self::delete_plan`]; the caller must hold the storage lock.
     fn delete_plan_unlocked(repo_root: &Path, id: &str) -> Result<bool> {
-        let dir = Self::plans_dir(repo_root);
         let safe_id = Self::sanitize_id(id);
-        let target_file = dir.join(format!("{safe_id}.json"));
 
-        if target_file.is_file() {
-            std::fs::remove_file(&target_file)
-                .with_context(|| format!("Failed to remove plan file at {}", target_file.display()))?;
+        // Delete the file that actually stores this plan. Resolving by id (rather
+        // than by the default sanitized name) finds a plan living under an
+        // alternatively sanitized name and never removes a colliding file that
+        // stores a different plan.
+        let target_file = match Self::find_plan_file_unlocked(repo_root, id) {
+            Some(existing) => existing,
+            None => return Ok(false),
+        };
 
-            // If the deleted plan was active, clear active marker
-            if let Ok(Some(act)) = Self::load_active_id(repo_root) {
-                if act == id || act == safe_id {
-                    let _ = Self::save_active_id_unlocked(repo_root, None);
-                }
+        std::fs::remove_file(&target_file)
+            .with_context(|| format!("Failed to remove plan file at {}", target_file.display()))?;
+
+        // If the deleted plan was active, clear active marker
+        if let Ok(Some(act)) = Self::load_active_id_unlocked(repo_root) {
+            if act == id || act == safe_id {
+                let _ = Self::save_active_id_unlocked(repo_root, None);
             }
-            Ok(true)
-        } else {
-            Ok(false)
         }
+        Ok(true)
     }
 
     /// Loads the active plan ID from `.tauqe/plans/active`.
     pub fn load_active_id(repo_root: &Path) -> Result<Option<String>> {
+        let _guard = Self::lock();
+        Self::load_active_id_unlocked(repo_root)
+    }
+
+    /// Lock-free core of [`Self::load_active_id`]; the caller must hold the storage lock.
+    fn load_active_id_unlocked(repo_root: &Path) -> Result<Option<String>> {
         let active_file = Self::plans_dir(repo_root).join("active");
         if !active_file.is_file() {
             return Ok(None);
@@ -325,7 +387,7 @@ impl PlanStorage {
         title: Option<&str>,
         details: Option<&str>,
     ) -> Result<Option<Plan>> {
-        let mut plan = match Self::load_plan(repo_root, plan_id)? {
+        let mut plan = match Self::load_plan_unlocked(repo_root, plan_id)? {
             Some(p) => p,
             None => return Ok(None),
         };
@@ -384,7 +446,7 @@ impl PlanStorage {
         item_id: &str,
         status: Option<PlanItemStatus>,
     ) -> Result<Option<Plan>> {
-        let mut plan = match Self::load_plan(repo_root, plan_id)? {
+        let mut plan = match Self::load_plan_unlocked(repo_root, plan_id)? {
             Some(p) => p,
             None => return Ok(None),
         };
@@ -733,5 +795,88 @@ mod tests {
             .filter(|item| item.status == PlanItemStatus::Done)
             .count();
         assert_eq!(done, 16);
+    }
+
+    #[test]
+    fn test_save_plan_reuses_differing_filename_instead_of_duplicating() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+
+        let first = Plan {
+            id: "Tauqe-Server".to_string(),
+            title: "First".to_string(),
+            ..Default::default()
+        };
+        PlanStorage::save_plan(root, &first).unwrap();
+        assert!(PlanStorage::plans_dir(root).join("Tauqe-Server.json").is_file());
+
+        // A casing change yields a different sanitized file name; the existing file
+        // must be reused instead of writing a second `tauqe-server.json`.
+        let second = Plan {
+            id: "tauqe-server".to_string(),
+            title: "Second".to_string(),
+            ..Default::default()
+        };
+        PlanStorage::save_plan(root, &second).unwrap();
+
+        let json_files: Vec<_> = std::fs::read_dir(PlanStorage::plans_dir(root))
+            .unwrap()
+            .flatten()
+            .filter(|entry| entry.path().extension().and_then(|s| s.to_str()) == Some("json"))
+            .collect();
+        assert_eq!(
+            json_files.len(),
+            1,
+            "expected a single plan file, found {json_files:?}"
+        );
+
+        let loaded = PlanStorage::load_plan(root, "tauqe-server").unwrap().unwrap();
+        assert_eq!(loaded.title, "Second");
+    }
+
+    #[test]
+    fn test_delete_plan_resolves_differing_filename() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+
+        let plan = Plan {
+            id: "Legacy Name".to_string(),
+            title: "Legacy".to_string(),
+            ..Default::default()
+        };
+        PlanStorage::save_plan(root, &plan).unwrap();
+        let stored = PlanStorage::plans_dir(root).join("Legacy-Name.json");
+        assert!(stored.is_file());
+
+        // Deleting with a different casing resolves the real artifact rather than
+        // the absent default target.
+        let deleted = PlanStorage::delete_plan(root, "legacy name").unwrap();
+        assert!(deleted);
+        assert!(!stored.is_file());
+    }
+
+    #[test]
+    fn test_load_and_delete_respect_sanitized_id_collision() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+
+        let plan = Plan {
+            id: "team/auth".to_string(),
+            title: "Team Auth".to_string(),
+            ..Default::default()
+        };
+        PlanStorage::save_plan(root, &plan).unwrap();
+
+        // Loading a non-existent colliding ID must return None rather than the
+        // colliding plan stored under the same sanitized file name.
+        let result = PlanStorage::load_plan(root, "team-auth").unwrap();
+        assert!(result.is_none());
+
+        // Deleting a non-existent colliding ID must return false and keep the plan.
+        let deleted = PlanStorage::delete_plan(root, "team-auth").unwrap();
+        assert!(!deleted);
+
+        let still_exists = PlanStorage::load_plan(root, "team/auth").unwrap();
+        assert!(still_exists.is_some());
     }
 }

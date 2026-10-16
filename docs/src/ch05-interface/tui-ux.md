@@ -6,11 +6,11 @@ TAUQE's terminal UI combines the design philosophies of **Magit** (structured, l
 
 ## 5.1 Primary Views and Universal Navigation
 
-To guarantee universal compatibility across modern and legacy terminal emulators alike, all primary view modes and key actions support dual bindings (both modifier chords and standard function keys):
+To guarantee universal compatibility across modern and legacy terminal emulators alike, all primary view modes and key actions are bound to portable Emacs/Readline chords instead of function keys:
 
-Throughout this chapter, `Ctrl+<key>` denotes the abstract **Primary Command Modifier** (`C-<key>`). It defaults to `Ctrl` and can be remapped to `Alt` in `tui.toml` (see section 5.5). Function keys (`F1`..`F7`) and arrow keys are universal fallbacks that stay active on every terminal.
+Throughout this chapter, `Ctrl+<key>` denotes the abstract **Primary Command Modifier** (`C-<key>`) and `Alt+<key>` the abstract **Meta Command Modifier** (`M-<key>`). Both are independent personal workstation settings that can be swapped in `tui.toml` (see section 5.5). Function keys (`F1`..`F12`) are never bound: window managers, terminal multiplexers, and laptop firmware intercept them unpredictably, and 60% and compact keyboards omit them entirely, so every action lives in the main alphanumeric block or on a dedicated navigation key.
 
-- **`F1` / `Alt+1` / `Ctrl+1` (REPL View):**
+- **`Ctrl+1` / `Alt+1` (REPL View):**
   - The central engineering cockpit and execution canvas where coding turns take place.
   - Displays turn progression as a structured, live document: collapsible reasoning blocks (`Ctrl+R`), streaming markdown explanations, and interactive proposed file diffs.
   - **Dual-Focus Architecture:** Switch focus seamlessly between the prompt editor and the response/diffs viewport using `Ctrl+Space` or `Shift+Tab`.
@@ -22,7 +22,7 @@ Throughout this chapter, `Ctrl+<key>` denotes the abstract **Primary Command Mod
   - Active LLM selection: Press `Alt+M` or `Ctrl+M` from any screen (or click the model in the header) to open the model picker. See section 5.7 for the role model.
   - Contextual help: Press `Ctrl+H` / `Alt+H` from any view or `?` in navigation views to open the interactive help dialog.
   - Configuration reload: Press `Ctrl+O` to reload `tui.toml` settings without restarting TAUQE.
-  - Theme selector: Press `F7` to open the interactive theme picker and preview built-in presets live (see section 5.10).
+  - Theme selector: Press `Alt+T` (`M-T`) to open the interactive theme picker and preview built-in presets live (see section 5.10).
 
 ### What Happens in REPL When You Submit a Prompt
 When you submit an engineering intent, TAUQE does not simply invoke a single-shot completion. Instead, it guides the model through an **autonomous, multi-round bounded turn**:
@@ -39,7 +39,7 @@ Reasoning output during an active turn is a progress indicator, not a document t
 - **Deferred deep rendering:** The tail uses lightweight per-line styling. The full Markdown parse and `syntect` code-block highlighting are not restarted against the still-open stream; they run exactly once, when the reasoning stage finalizes.
 - **Finalized transcript:** When reasoning completes, the sliding window is replaced by the complete reasoning transcript rendered through the standard Markdown pipeline, including syntax-highlighted code fences. The `Ctrl+R` fold/unfold toggle applies to both the live tail and the finalized transcript.
 
-- **`F2` / `Alt+2` / `Ctrl+2` (Plans View):**
+- **`Ctrl+2` / `Alt+2` (Plans View):**
   - Workspace for managing tactical task hierarchies and execution roadmaps, split into an immutable Concept section (system invariants) and an Implementation section (executable steps).
   - Unified navigation: `n` / `p` (or `↑` / `↓`), with `Ctrl+N` / `Ctrl+P` for accordion inspection of the next / previous item.
   - Interactive tree of tasks with explicit statuses: Discussion, Todo, InProgress, Done, Blocked, and Cancelled.
@@ -47,7 +47,7 @@ Reasoning output during an active turn is a progress indicator, not a document t
   - Discussion and refinement: `d` discusses the selected concept/step or the whole plan in REPL; `R` deep-refines plan architecture and steps with the Architect.
   - Intentional status assignment: Press `t` or `s` to open the status dialog (`1` Discussion, `2` Todo, `3` InProgress, `4` Done, `5` Blocked, `6` Cancelled).
   - Bulk folding (`a`), plan refresh (`r`), deletion (`Delete`, with confirmation), and Markdown copy (`c` / `y`).
-- **`F3` / `Alt+3` / `Ctrl+3` (Review View):**
+- **`Ctrl+3` / `Alt+3` (Review View):**
   - Dedicated code review workspace for static architectural and security audits.
   - Unified navigation: `n` / `p` (or `↑` / `↓`), with `Ctrl+N` / `Ctrl+P` for accordion inspection of the next / previous finding.
   - Interactive findings checklist: fold/unfold items (`Tab` / `Space`), execute the selected finding or every Todo finding in the session (`x`, with confirmation), run cross-session execution across all review sessions (`X` / `Shift+X`, with confirmation), and discuss the finding or the whole session in REPL (`d`).
@@ -55,11 +55,11 @@ Reasoning output during an active turn is a progress indicator, not a document t
   - Filtering and bulk folding: `f` toggles between all findings and hide-closed (FIXED / REJECTED); `a` folds or unfolds every session and finding.
   - Run and refresh: `r` starts a new review of the current context; `Shift+R` refreshes the session list from the server.
   - Clipboard and lifecycle: `c` / `y` copy the selected finding or session; `Delete` deletes a session (with confirmation); `Ctrl+R` folds or unfolds the thinking stream.
-- **`F4` / `Alt+4` / `Ctrl+4` (Context View):**
+- **`Ctrl+4` / `Alt+4` (Context View):**
   - Displays Pinned, User, and Auto context layers with token metrics.
   - Quick keys: `e` (add file as editable), `r` / `a` (add file as read-only), `t` (toggle access Editable ↔ Read-Only), `u` (promote an Auto file to persistent User), `c` / `C` (clear all auto-requested files), `d` / `x` / `Del` (remove a file from context).
   - Navigation and folding: `n` / `p` (or `j` / `k`, `↑` / `↓`) move the selection; `Space` / `Tab` or `Enter` fold or unfold a section; `Enter` also promotes an Auto file to User. `Esc` / `q` return to the REPL view.
-- **`F5` / `Alt+5` / `Ctrl+5` (History View):**
+- **`Ctrl+5` / `Alt+5` (History View):**
   - Paginated audit log of semantic turns, code review runs, AI commit hashes, and file modifications.
   - Collapsible items: All entries are folded by default, displaying the role badge, commit summary, and preview lines.
   - Press `Tab`, `Space`, or `Enter` to fold/unfold the active entry and inspect the full response and modified files.
@@ -91,10 +91,10 @@ In the Develop view, TAUQE resolves the tension between text editing and inspect
 
 ## 5.3 Input Safety and Onboarding Protection
 
-- **Commands require modifiers:** Destructive or state-changing actions use explicit modifiers (`Ctrl+Z` / `Alt+U` for Undo, `F6` / `Ctrl+S` for Squash, `Alt+C` for copying responses).
+- **Commands require modifiers:** Destructive or state-changing actions use explicit modifiers (`Ctrl+Z` / `Alt+U` for Undo, `Ctrl+S` / `Alt+S` for Squash, `Alt+C` for copying responses).
 - **Universal abort chord (`C-g`):** Pressing `Ctrl+G` (Emacs `keyboard-quit`) is normalized to `Esc` before any handler runs, so a single chord aborts the active generation, dismisses the top-most modal, returns from an auxiliary view, or detaches the active discussion focus exactly as `Esc` would. It is never wired to `SIGINT`, so the terminal's standard `Ctrl+C` behavior is preserved.
 - **Draft protection on exit:** Pressing `Ctrl+Q` prompts for confirmation whenever a prompt draft is non-empty, a model turn is active, or an unapplied squash diff exists, preventing accidental loss of uncommitted work.
-- **Onboarding isolation:** During initial configuration (`ViewMode::Onboarding`), view switching keys (`F1..F5`, `Ctrl+1..5`, `Alt+1..5`) and header mouse clicks are locked until setup is completed, preventing accidental bypass of credential verification.
+- **Onboarding isolation:** During initial configuration (`ViewMode::Onboarding`), view switching keys (`Ctrl+1..5`, `Alt+1..5`) and header mouse clicks are locked until setup is completed, preventing accidental bypass of credential verification.
 - **Deterministic onboarding sequence:** Initial setup advances through a fixed order — Git, Configuration, Credentials, Layout, Command Modifier, Ready — derived solely from completion flags. Optional phases the developer deliberately skips are recorded, so the flow never loops back and no step is silently dropped.
 - **Contextual help:** Press `Ctrl+H` / `Alt+H` from any view or `?` in navigation views to open the contextual help dialog.
 
@@ -103,12 +103,15 @@ In the Develop view, TAUQE resolves the tension between text editing and inspect
 ## 5.4 Modal Dialog Architecture & Interaction Standard
 
 Modal dialogs follow a unified, three-tier layout standard designed for keyboard reliability, safety, and layout neutrality:
-- **Structure:** Every dialog consists of a distinct **Header** (title and context), a central **Body** (content, form, or options), and an **Actions / Keybindings Footer**.
+- **Structure:** Every dialog consists of a distinct **Header** (title and context), a central **Body** (content, form, or options), and an **Actions / Keybindings Footer**. The footer has two bands: an interactive action bar carrying the buttons, and a non-interactive **docked help panel** directly below it.
+- **Docked Help Panel:** The hint line does not float in the gap between the buttons and the border. It forms a full-width, `overlay`-filled strip docked to the bottom inner row of the card, immediately above the bottom border. Docking the hint to its own filled row separates persistent guidance from the interactive controls and visually closes the dialog card. The strip is non-interactive: it takes no focus and exposes no selectable controls.
+- **Semantic Hint Typography:** Hints are assembled from structured spans rather than a flat string: chords render in `text_primary` (emphasized), action verbs in `text_secondary`, and separators (`/`, `•`) in `text_muted`. This keeps keys scannable and legible at any color depth and follows the semantic design system of section 5.10.
+- **Hit-Testing Synchronization:** The geometry helpers that report clickable button rectangles derive their coordinates from the same `Layout` formula the render path uses, so shifting the action bar (or adding the docked panel below it) never desynchronizes mouse clicks from the drawn buttons: the buttons you see are always the buttons you can click.
 - **Destructive Action Safety:** Confirmation dialogs (Quit with draft, Undo AI commit, Git squash, Cancel generation, Delete plan, Clear history) default focus securely to `[ Cancel ]`.
 - **Button Navigation:** Switch focus between buttons using `Tab`, `Shift+Tab`, or arrow keys (`←`, `→`). Press `Enter` or `Space` to activate the focused button.
 - **Fast Accelerators:** In confirmation dialogs, pressing `y` / `Y` confirms immediately, while `n` / `N`, `q`, or `Esc` cancels.
 - **Intentional Status Dialogs:** In Plans and Review, task and finding statuses are selected through explicit modal dialogs rather than accidental cycling. Plans offer Discussion, Todo, InProgress, Done, Blocked, and Cancelled (`1`..`6`); Review offers Discussion, Todo, InProgress, Fixed, and Rejected (`1`..`5`). Choose a target status using direct numeric keys, or navigate with `n` / `p` and confirm with `Enter` / `Space`.
-- **Git Squash Safety:** Within the squash dialog (`F6` / `Ctrl+S`), `Enter` or `Space` folds/unfolds changed files in the file list, and `Enter` in the message editor inserts a newline. Triggering the squash requires `Ctrl+Enter` or `Ctrl+S`, which opens an explicit confirmation dialog summarizing affected commits.
+- **Git Squash Safety:** Within the squash dialog (`Ctrl+S` / `Alt+S`), `Enter` or `Space` folds/unfolds changed files in the file list, and `Enter` in the message editor inserts a newline. Triggering the squash requires `Ctrl+Enter` or `Ctrl+S`, which opens an explicit confirmation dialog summarizing affected commits.
 - **Batch Cancellation Dialog (Three-Way Stop):** When a running plan or review batch receives a cancellation request (`Ctrl+C`), the dialog offers three explicit actions instead of a binary confirm: `Continue`, `Soft Stop`, and `Hard Stop`. `Soft Stop` lets the current step finish its bounded turn, compiler verification, and Git commit before the queue halts; `Hard Stop` aborts the current step immediately. `Continue` holds the safe default focus, so an accidental keypress never discards already-committed work. Direct accelerators `c` (Continue), `s` (Soft Stop), and `h` (Hard Stop) choose an action without moving focus, while `Tab`, `←` / `→`, `Enter` / `Space`, and `Esc` follow the standard dialog navigation rules above. While a soft stop is pending, the footer shows `[Stopping after current step]`, so a graceful drain is never confused with an immediate abort.
 
 ---
@@ -130,10 +133,15 @@ layout = "none"
 # Abstract Primary Command Modifier for text-input contexts:
 #   "ctrl" - Commands are formulated as C-<key> (default).
 #   "alt"  - Commands are formulated as Alt-<key> (M-<key>).
-# This only changes the modifier used for input-level actions. Alt-based
-# Readline word navigation (Alt+B, Alt+F) and universal function keys
-# remain available regardless of the chosen modifier.
+# This only changes the modifier used for input-level actions.
 primary_modifier = "ctrl"
+
+# Abstract Meta Command Modifier for text-input and navigation chords:
+#   "alt"  - Commands are formulated as Alt-<key> (M-<key>, default).
+#   "ctrl" - Commands are formulated as Ctrl-<key> (C-<key>).
+# The primary and meta modifiers are independent and symmetric, so a
+# terminal without a dedicated Meta key can freely swap the two chords.
+meta_modifier = "alt"
 
 # Optional universal character mapping (langmap) for any non-Latin layout:
 # Supports two formats:
@@ -177,6 +185,12 @@ min_duration_seconds = 5
 # Optional shell command hook executed on long turn completion:
 # command = "paplay /usr/share/sounds/freedesktop/stereo/complete.oga"
 ```
+
+### Why C- and M- chords instead of function keys
+
+The two modifier parameters express one symmetric idea. `primary_modifier` selects the abstract `C-<key>` chord; `meta_modifier` selects the abstract `M-<key>` chord. They exist because a terminal has no dedicated Meta key: modern terminals send `M-` as `Alt`, legacy setups send it as `Ctrl`, and a developer whose `Alt` is consumed by the window manager can swap the two chords freely. No view hardcodes `KeyModifiers::CONTROL` or `KeyModifiers::ALT`; every chord is matched through `InputConfig::is_primary(...)` and `InputConfig::is_meta(...)`.
+
+TAUQE deliberately binds no function keys (`F1`..`F12`). Function keys are the least portable part of a keyboard: window managers, terminal multiplexers, and laptop firmware intercept them, some are reserved by the terminal itself, and 60% and compact keyboards omit the row entirely. Anchoring the interface on Emacs/Readline chords (`C-` / `M-`) and dedicated navigation keys (arrows, `Home`/`End`, `PgUp`/`PgDn`) keeps every action reachable on any keyboard and lets a cramped or non-standard layout be remapped without relearning the interface.
 
 ---
 
@@ -315,4 +329,44 @@ name = "tauqe-dark"
 - `mode` (`"auto"`, `"dark"`, or `"light"`) is the legacy fallback used only when `name` is unset; `"auto"` probes the terminal background.
 - `color_depth` (`"auto"`, `"truecolor"`, `"ansi256"`, or `"ansi16"`) forces a color depth when detection is wrong.
 
-Switching is seamless. Press `F7` to open the interactive theme selector, where moving the cursor previews each preset live; `Enter` saves the choice and `Esc` restores the previous one. Alternatively, edit the file and press `Ctrl+O` to reload. Both paths apply the new theme immediately, without restarting TAUQE and without interrupting an active turn.
+Switching is seamless. Press `Alt+T` (`M-T`) to open the interactive theme selector, where moving the cursor previews each preset live; `Enter` saves the choice and `Esc` restores the previous one. Alternatively, edit the file and press `Ctrl+O` to reload. Both paths apply the new theme immediately, without restarting TAUQE and without interrupting an active turn.
+
+---
+
+## 5.11 Command Map and Categorized Help
+
+Every keyboard binding is declared exactly once, and both the input dispatcher and the Help window are generated from those same declarations, so the keys documented in Help cannot drift from the keys the application actually intercepts.
+
+### 5.11.1 Command Specifications as a Single Source of Truth
+
+A command is an executable specification: an abstract chord, a typed action, a cognitive category, and a help description. Handling code never carries a scattered string description or a hardcoded key check; each view owns a static command map and derives both key resolution and Help rendering from it. The maps are grouped by scope:
+
+- the global map — application-wide shortcuts reachable from any view;
+- the editor map — the shared text editor's Emacs/Readline bindings;
+- per-view maps — the commands of Plans, Review, Context, History, and the REPL;
+- the dialog map — the universal modal-dialog vocabulary.
+
+### 5.11.2 Semantic Key Chords
+
+A chord names intent independently of the physical keyboard, so one specification describes the developer's actual modifiers:
+
+- `C-` (**Primary**) and `M-` (**Meta**) are the two symmetric command modifiers, resolved from the configured `primary_modifier` and `meta_modifier` (section 5.5). No view hardcodes a physical modifier.
+- A chord reachable on either command modifier stays reachable on a terminal without a dedicated Meta key.
+- **Bare** keys are active only in structural navigation and are unconditionally blocked while a text editor is capturing keystrokes. This is what guarantees the unconditional character insertion rule of section 5.2.
+- **Shift** combinations (`Shift+Tab`, `Shift+C`, `Shift+X`) carry reverse motion, destructive actions, and batch operations, kept separate from typed characters.
+- Raw `Ctrl` and `Alt` chords are used only where the physical key must never be remapped — the `Ctrl+G` keyboard-quit and the `Ctrl+C` cancel chord.
+- No function key (`F1`..`F12`) is ever bound.
+
+### 5.11.3 Categorized Help
+
+The Help window (`Ctrl+H` / `Alt+H`, or `?` in navigation views) derives its contents from the command maps and ranks them by cognitive weight through three tiers:
+
+1. **Essential** — costly operations that spend tokens or touch Git: sending and cancelling turns, executing a step or batch, squashing commits.
+2. **Interface** — presentation, navigation, and view state: switching views, tree navigation, folding, focus toggling.
+3. **Helpers** — auxiliary operations that do not change interface state: copying to the clipboard, filtering, recentering.
+
+Tiers keep their canonical order and any empty tier is omitted. Each command belongs to the tier that matches its daily cognitive weight, never to the order in which it was implemented.
+
+### 5.11.4 Text Editor and Dialog Help
+
+The shared text editor backs the REPL prompt, the squash message field, the review prompt, the file picker, and the onboarding fields. Its Emacs/Readline bindings are documented once on a dedicated Text Editor Help tab, next to the active mode's own shortcut tab, so the editor vocabulary is never duplicated into every mode's list. Modal dialogs follow the same principle: their footer hints are generated from the shared dialog command map with the configured `C-` / `M-` labels, so a footer advertises exactly the chords the dialog intercepts. That hint is rendered as the docked help panel described in section 5.4, with its chords, verbs, and separators styled through the semantic text roles.

@@ -89,11 +89,35 @@ pub(crate) async fn reload_config_with_overrides(
     repo_root: Option<&Path>,
 ) -> AppConfig {
     let (explicit_config, explicit_credentials) = explicit_cli_paths(state).await;
-    load_config_with_options(ConfigLoadOptions {
-        repo_root,
-        explicit_config: explicit_config.as_deref(),
-        explicit_credentials: explicit_credentials.as_deref(),
+    let repo_root = repo_root.map(Path::to_path_buf);
+    // Loading configuration reads files from disk; offload it so the async
+    // worker thread is never blocked.
+    match super::offload(move || {
+        load_config_with_options(ConfigLoadOptions {
+            repo_root: repo_root.as_deref(),
+            explicit_config: explicit_config.as_deref(),
+            explicit_credentials: explicit_credentials.as_deref(),
+        })
     })
+    .await
+    {
+        Ok(cfg) => cfg,
+        Err(err) => {
+            tracing::warn!(error = %err, "Failed to reload configuration; keeping defaults");
+            AppConfig::default()
+        }
+    }
+}
+
+/// Probes whether the repository is a Git working tree, off the async worker.
+///
+/// The probe shells out to git, so it runs on the blocking pool and resolves
+/// the repository from the authoritative shared root instead of the process CWD.
+async fn repo_has_git(repo_opt: Option<&Path>) -> bool {
+    let root = repo_opt.map(Path::to_path_buf);
+    super::offload(move || tauqe_core::git::is_git_repository(root.as_deref()))
+        .await
+        .unwrap_or(false)
 }
 
 /// Assembles the authoritative [`SystemStatusResult`] from a single source so
@@ -106,10 +130,10 @@ fn build_system_status(
     cfg: &AppConfig,
     selection: &ModelSelection,
     repo_opt: Option<&Path>,
+    has_git: bool,
     config_path: Option<String>,
     credentials_path: Option<String>,
 ) -> SystemStatusResult {
-    let has_git = tauqe_core::git::is_git_repository(None);
     let has_api_key = tauqe_core::config::has_openrouter_key(cfg);
 
     let explicit_config = cfg.explicit_config_path.as_deref();
@@ -295,8 +319,10 @@ pub async fn handle_system_status(req: Request, state: &Arc<AppState>) -> Respon
     let repo_root = resolved_repo_root(state).await;
     let repo_opt = repo_root.as_deref();
 
+    let has_git = repo_has_git(repo_opt).await;
     let guard = state.config.lock().await;
-    let status = build_system_status(&guard.config, &guard.selection, repo_opt, None, None);
+    let status =
+        build_system_status(&guard.config, &guard.selection, repo_opt, has_git, None, None);
 
     Response::ok_typed(req.id, &status)
 }
@@ -332,8 +358,10 @@ pub async fn handle_config_reload(req: Request, state: &Arc<AppState>) -> Respon
         params: serde_json::to_value(&updated_state).ok(),
     });
 
+    let has_git = repo_has_git(repo_opt).await;
     let guard = state.config.lock().await;
-    let status = build_system_status(&guard.config, &cur_sel_val, repo_opt, None, None);
+    let status =
+        build_system_status(&guard.config, &cur_sel_val, repo_opt, has_git, None, None);
 
     Response::ok_typed(req.id, &status)
 }
@@ -358,7 +386,26 @@ pub async fn handle_config_create(req: Request, state: &Arc<AppState>) -> Respon
     let (explicit_config, _) = explicit_cli_paths(state).await;
     let target_path =
         tauqe_core::config::default_config_path(repo_opt, explicit_config.as_deref());
-    if let Err(err) = tauqe_core::config::write_default_config(&target_path) {
+    let write_path = target_path.clone();
+    let write_outcome = match super::offload(move || {
+        tauqe_core::config::write_default_config(&write_path)
+    })
+    .await
+    {
+        Ok(outcome) => outcome,
+        Err(err) => {
+            return Response {
+                id: req.id,
+                result: None,
+                error: Some(ResponseError {
+                    code: "CONFIG_CREATE_FAILED".to_string(),
+                    message: err,
+                    data: None,
+                }),
+            };
+        }
+    };
+    if let Err(err) = write_outcome {
         return Response {
             id: req.id,
             result: None,
@@ -384,9 +431,11 @@ pub async fn handle_config_create(req: Request, state: &Arc<AppState>) -> Respon
         params: serde_json::to_value(&updated_state).ok(),
     });
 
+    let has_git = repo_has_git(repo_opt).await;
     let guard = state.config.lock().await;
     let config_path = Some(target_path.to_string_lossy().to_string());
-    let status = build_system_status(&guard.config, &cur_sel_val, repo_opt, config_path, None);
+    let status =
+        build_system_status(&guard.config, &cur_sel_val, repo_opt, has_git, config_path, None);
 
     Response::ok_typed(req.id, &status)
 }
@@ -428,7 +477,27 @@ pub async fn handle_credentials_save(req: Request, state: &Arc<AppState>) -> Res
     let (_, explicit_credentials) = explicit_cli_paths(state).await;
     let target_path =
         tauqe_core::config::default_credentials_path(repo_opt, explicit_credentials.as_deref());
-    if let Err(err) = tauqe_core::config::write_credentials_file(&target_path, api_key) {
+    let write_path = target_path.clone();
+    let api_key_owned = api_key.to_string();
+    let write_outcome = match super::offload(move || {
+        tauqe_core::config::write_credentials_file(&write_path, &api_key_owned)
+    })
+    .await
+    {
+        Ok(outcome) => outcome,
+        Err(err) => {
+            return Response {
+                id: req.id,
+                result: None,
+                error: Some(ResponseError {
+                    code: "CREDENTIALS_SAVE_FAILED".to_string(),
+                    message: err,
+                    data: None,
+                }),
+            };
+        }
+    };
+    if let Err(err) = write_outcome {
         return Response {
             id: req.id,
             result: None,
@@ -456,9 +525,17 @@ pub async fn handle_credentials_save(req: Request, state: &Arc<AppState>) -> Res
         params: serde_json::to_value(&updated_state).ok(),
     });
 
+    let has_git = repo_has_git(repo_opt).await;
     let guard = state.config.lock().await;
     let credentials_path = Some(target_path.to_string_lossy().to_string());
-    let status = build_system_status(&guard.config, &cur_sel_val, repo_opt, None, credentials_path);
+    let status = build_system_status(
+        &guard.config,
+        &cur_sel_val,
+        repo_opt,
+        has_git,
+        None,
+        credentials_path,
+    );
 
     Response::ok_typed(req.id, &status)
 }
@@ -470,7 +547,26 @@ pub async fn handle_credentials_create_stub(req: Request, state: &Arc<AppState>)
     let (_, explicit_credentials) = explicit_cli_paths(state).await;
     let target_path =
         tauqe_core::config::default_credentials_path(repo_opt, explicit_credentials.as_deref());
-    if let Err(err) = tauqe_core::config::write_credentials_stub(&target_path) {
+    let write_path = target_path.clone();
+    let write_outcome = match super::offload(move || {
+        tauqe_core::config::write_credentials_stub(&write_path)
+    })
+    .await
+    {
+        Ok(outcome) => outcome,
+        Err(err) => {
+            return Response {
+                id: req.id,
+                result: None,
+                error: Some(ResponseError {
+                    code: "CREDENTIALS_STUB_FAILED".to_string(),
+                    message: err,
+                    data: None,
+                }),
+            };
+        }
+    };
+    if let Err(err) = write_outcome {
         return Response {
             id: req.id,
             result: None,
@@ -485,10 +581,17 @@ pub async fn handle_credentials_create_stub(req: Request, state: &Arc<AppState>)
         };
     }
 
+    let has_git = repo_has_git(repo_opt).await;
     let guard = state.config.lock().await;
     let credentials_path = Some(target_path.to_string_lossy().to_string());
-    let status =
-        build_system_status(&guard.config, &guard.selection, repo_opt, None, credentials_path);
+    let status = build_system_status(
+        &guard.config,
+        &guard.selection,
+        repo_opt,
+        has_git,
+        None,
+        credentials_path,
+    );
 
     Response::ok_typed(req.id, &status)
 }

@@ -24,6 +24,8 @@ pub struct ThemePalette {
     pub text_secondary: RgbColor,
     /// De-emphasized text such as hints and disabled entries.
     pub text_muted: RgbColor,
+    /// Reasoning and thought process transcript text.
+    pub text_reasoning: RgbColor,
     /// Text drawn over a filled, high-contrast surface.
     pub text_inverse: RgbColor,
     /// Resting button background.
@@ -65,6 +67,7 @@ mod tests {
             text_primary: RgbColor::new(220, 225, 235),
             text_secondary: RgbColor::new(170, 178, 192),
             text_muted: RgbColor::new(120, 128, 145),
+            text_reasoning: RgbColor::new(170, 160, 210),
             text_inverse: RgbColor::new(16, 18, 24),
             button_bg: RgbColor::new(48, 54, 72),
             button_fg: RgbColor::new(225, 230, 240),

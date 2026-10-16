@@ -1,29 +1,18 @@
-use ratatui::layout::{Constraint, Direction, Layout};
+use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::Stylize;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
-use crate::app::ViewMode;
-use crate::components::modal::{render_modal_container, ModalTone};
+use crate::app::{HelpTab, ViewMode};
+use crate::command::editor::EDITOR_COMMAND_MAP;
+use crate::command::global::GLOBAL_COMMAND_MAP;
+use crate::command::{CommandCategory, CommandMap};
+use crate::components::modal::{button_style, render_modal_container, ModalTone};
+use crate::config::{MetaModifier, PrimaryModifier};
 use crate::theme::engine::{current_engine, ThemeEngine};
-use crate::theme::palette::ThemePalette;
 use crate::ui::centered_rect;
 
-pub const GLOBAL_COMMANDS: &[crate::app::KeyCommand] = &[
-    // Core Actions: the primary work cycle.
-    crate::app::KeyCommand { key: "F6 / C-S", description: "Squash commits dialog" },
-    crate::app::KeyCommand { key: "Ctrl+C", description: "Cancel active generation" },
-    // Navigation & Inspection.
-    crate::app::KeyCommand { key: "C-1..5 / F1..F5", description: "Switch views: REPL │ Plans │ Review │ Context │ History" },
-    crate::app::KeyCommand { key: "C-R", description: "Fold / unfold thinking (reasoning) stream" },
-    crate::app::KeyCommand { key: crate::app::HELP_OPEN_CHORD, description: "Open this help dialog (? also opens it outside text input); Esc / q close it" },
-    // Auxiliary & Destructive.
-    crate::app::KeyCommand { key: "C-M / Alt+M", description: "Select active model" },
-    crate::app::KeyCommand { key: "C-O", description: "Reload configuration from disk" },
-    crate::app::KeyCommand { key: "F7", description: "Select color theme (live preview)" },
-    crate::app::KeyCommand { key: "Ctrl+Q", description: "Quit TAUQE" },
-];
-
+/// Commands shown on the Setup (onboarding) tab.
 pub const ONBOARDING_COMMANDS: &[crate::app::KeyCommand] = &[
     // Core Actions: the primary work cycle.
     crate::app::KeyCommand { key: "Enter", description: "Execute selected onboarding action" },
@@ -37,15 +26,29 @@ pub const ONBOARDING_COMMANDS: &[crate::app::KeyCommand] = &[
     crate::app::KeyCommand { key: "C-O", description: "Reload configuration from disk" },
 ];
 
-pub fn get_mode_key_commands(mode: ViewMode) -> (&'static str, &'static [crate::app::KeyCommand]) {
-    match mode {
-        ViewMode::Develop => (" Help: REPL ", crate::views::develop::DEVELOP_COMMANDS),
-        ViewMode::Context => (" Help: Context ", crate::views::context::CONTEXT_COMMANDS),
-        ViewMode::History => (" Help: History ", crate::views::history::HISTORY_COMMANDS),
-        ViewMode::Review => (" Help: Review ", crate::views::review::REVIEW_COMMANDS),
-        ViewMode::Plans => (" Help: Plans ", crate::views::plans::PLANS_COMMANDS),
-        ViewMode::Onboarding => (" Help: Setup ", ONBOARDING_COMMANDS),
-    }
+/// One rendered help command: the projected chord label and its description.
+pub struct HelpCommand {
+    pub key: String,
+    pub description: &'static str,
+}
+
+/// One titled block of help commands: a cognitive tier or a single mode's list.
+struct HelpSection {
+    heading: &'static str,
+    commands: Vec<HelpCommand>,
+}
+
+/// Renders an abstract command chord for display: every `C-` (primary) and `M-`
+/// (meta) prefix is projected through the developer's configured modifiers, so
+/// the Help dialog always advertises the real keys (concept #c-1).
+fn format_command_key(
+    raw_key: &str,
+    primary_modifier: PrimaryModifier,
+    meta_modifier: MetaModifier,
+) -> String {
+    raw_key
+        .replace("C-", primary_modifier.prefix_str())
+        .replace("M-", meta_modifier.prefix_str())
 }
 
 fn wrap_words(text: &str, width: usize) -> Vec<String> {
@@ -69,86 +72,271 @@ fn wrap_words(text: &str, width: usize) -> Vec<String> {
     lines
 }
 
-fn format_command_key(raw_key: &str, primary_modifier: crate::config::PrimaryModifier) -> String {
-    let mod_prefix = match primary_modifier {
-        crate::config::PrimaryModifier::Ctrl => "Ctrl+",
-        crate::config::PrimaryModifier::Alt => "Alt+",
-    };
-    raw_key.replace("C-", mod_prefix)
+/// Projects one categorized [`CommandMap`] into the three cognitive tiers.
+///
+/// Tiers keep their canonical order (Essential → Interface → Helpers) and any
+/// empty tier is omitted, so a map without costly operations simply starts at
+/// Interface (Conventions §3, concept #c-2).
+fn command_map_sections<A: 'static>(
+    map: &CommandMap<A>,
+    primary: PrimaryModifier,
+    meta: MetaModifier,
+) -> Vec<HelpSection> {
+    command_map_filtered_sections(map, primary, meta, |_| true)
 }
 
-fn push_command_lines(
+/// Projects a categorized [`CommandMap`] into cognitive tiers, filtering specs
+/// via `keep` to exclude commands belonging to other surfaces (e.g. text editor).
+fn command_map_filtered_sections<A: 'static>(
+    map: &CommandMap<A>,
+    primary: PrimaryModifier,
+    meta: MetaModifier,
+    keep: impl Fn(&A) -> bool,
+) -> Vec<HelpSection> {
+    CommandCategory::ALL
+        .iter()
+        .filter_map(|category| {
+            let mut seen = std::collections::HashSet::new();
+            let mut commands = Vec::new();
+            for spec in map.by_category(*category) {
+                if !keep(&spec.action) {
+                    continue;
+                }
+                let key = spec.chord.display(primary, meta);
+                if seen.insert(key.clone()) {
+                    commands.push(HelpCommand {
+                        key,
+                        description: spec.description,
+                    });
+                }
+            }
+            if commands.is_empty() {
+                None
+            } else {
+                Some(HelpSection {
+                    heading: category.title(),
+                    commands,
+                })
+            }
+        })
+        .collect()
+}
+
+/// Builds the cognitive-ordered sections for the active view mode.
+fn mode_help_sections(
+    mode: ViewMode,
+    primary: PrimaryModifier,
+    meta: MetaModifier,
+) -> Vec<HelpSection> {
+    match mode {
+        ViewMode::Develop => command_map_filtered_sections(
+            &crate::views::develop::DEVELOP_COMMAND_MAP,
+            primary,
+            meta,
+            |action| !crate::views::develop::input::is_editor_action(*action),
+        ),
+        ViewMode::Plans => command_map_filtered_sections(
+            &crate::views::plans::PLANS_COMMAND_MAP,
+            primary,
+            meta,
+            |_| true,
+        ),
+        ViewMode::Context => command_map_filtered_sections(
+            &crate::views::context::CONTEXT_COMMAND_MAP,
+            primary,
+            meta,
+            |_| true,
+        ),
+        ViewMode::History => command_map_filtered_sections(
+            &crate::views::history::HISTORY_COMMAND_MAP,
+            primary,
+            meta,
+            |_| true,
+        ),
+        ViewMode::Review => command_map_filtered_sections(
+            &crate::views::review::REVIEW_COMMAND_MAP,
+            primary,
+            meta,
+            |_| true,
+        ),
+        ViewMode::Onboarding => vec![HelpSection {
+            heading: "Setup",
+            commands: list_help_commands(ONBOARDING_COMMANDS, primary, meta),
+        }],
+    }
+}
+
+/// Builds the sections rendered on the active Help tab.
+///
+/// - `Global`: application-wide shortcuts in three cognitive tiers.
+/// - `CurrentMode`: view-specific commands in three cognitive tiers.
+/// - `TextEditor`: shared Emacs/Readline editor bindings.
+fn build_sections(
+    tab: HelpTab,
+    mode: ViewMode,
+    primary: PrimaryModifier,
+    meta: MetaModifier,
+) -> Vec<HelpSection> {
+    match tab {
+        HelpTab::Global => command_map_sections(&GLOBAL_COMMAND_MAP, primary, meta),
+        HelpTab::CurrentMode => mode_help_sections(mode, primary, meta),
+        HelpTab::TextEditor => command_map_sections(&EDITOR_COMMAND_MAP, primary, meta),
+    }
+}
+
+/// Appends one command row (and any wrapped description continuations).
+fn push_command(
     lines: &mut Vec<Line<'static>>,
-    commands: &[crate::app::KeyCommand],
+    command: &HelpCommand,
     col_w: usize,
     desc_w: usize,
-    primary_modifier: crate::config::PrimaryModifier,
     engine: &ThemeEngine,
-    palette: &ThemePalette,
 ) {
-    for cmd in commands {
-        let display_key = format_command_key(cmd.key, primary_modifier);
-        let mut wrapped = wrap_words(cmd.description, desc_w).into_iter();
-        let first = wrapped.next().unwrap_or_default();
+    let palette = engine.palette();
+    let mut wrapped = wrap_words(command.description, desc_w).into_iter();
+    let first = wrapped.next().unwrap_or_default();
+    lines.push(Line::from(vec![
+        Span::styled(
+            format!("  {:<col_w$}", command.key),
+            engine.fg(palette.text_primary).bold(),
+        ),
+        Span::styled(first, engine.fg(palette.text_secondary)),
+    ]));
+    for rest in wrapped {
         lines.push(Line::from(vec![
-            Span::styled(format!("  {:<col_w$}", display_key), engine.fg(palette.text_primary).bold()),
-            Span::styled(first, engine.fg(palette.text_secondary)),
+            Span::raw(" ".repeat(2 + col_w)),
+            Span::styled(rest, engine.fg(palette.text_secondary)),
         ]));
-        for rest in wrapped {
-            lines.push(Line::from(vec![
-                Span::raw(" ".repeat(2 + col_w)),
-                Span::styled(rest, engine.fg(palette.text_secondary)),
-            ]));
+    }
+}
+
+/// Builds the complete scrollable body for one Help tab at the given width.
+fn build_help_body(
+    tab: HelpTab,
+    mode: ViewMode,
+    primary: PrimaryModifier,
+    meta: MetaModifier,
+    inner_w: usize,
+) -> Vec<Line<'static>> {
+    let engine = current_engine();
+    let palette = engine.palette();
+    let sections = build_sections(tab, mode, primary, meta);
+
+    let key_w = sections
+        .iter()
+        .flat_map(|section| section.commands.iter())
+        .map(|command| command.key.chars().count())
+        .max()
+        .unwrap_or(0);
+    let col_w = key_w + 2;
+    let desc_w = inner_w.saturating_sub(2 + col_w).max(10);
+
+    let mut lines: Vec<Line<'static>> = vec![Line::raw("")];
+    for (index, section) in sections.iter().enumerate() {
+        if index > 0 {
+            lines.push(Line::raw(""));
+        }
+        lines.push(Line::from(Span::styled(
+            section.heading.to_string(),
+            engine.fg(palette.status_info).bold(),
+        )));
+        for command in &section.commands {
+            push_command(&mut lines, command, col_w, desc_w, &engine);
         }
     }
+    lines
+}
+
+/// Renders the tab bar, highlighting the active tab with the accent button style.
+fn render_help_tab_bar(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    active: HelpTab,
+    engine: &ThemeEngine,
+) {
+    let palette = engine.palette();
+    let mut spans: Vec<Span> = Vec::new();
+    for (index, tab) in [HelpTab::Global, HelpTab::CurrentMode, HelpTab::TextEditor].iter().enumerate() {
+        if index > 0 {
+            spans.push(Span::raw("    "));
+        }
+        let style = if *tab == active {
+            button_style(engine, palette.button_active_bg, palette.text_inverse, true)
+        } else {
+            button_style(engine, palette.button_bg, palette.button_fg, false)
+        };
+        spans.push(Span::styled(format!(" {} ", tab.title()), style));
+    }
+    let line = Line::from(spans).alignment(Alignment::Center);
+    frame.render_widget(Paragraph::new(line), area);
+}
+
+/// Converts a legacy key-command list into help rows, projecting `C-` / `M-`.
+fn list_help_commands(
+    commands: &'static [crate::app::KeyCommand],
+    primary: PrimaryModifier,
+    meta: MetaModifier,
+) -> Vec<HelpCommand> {
+    commands
+        .iter()
+        .map(|command| HelpCommand {
+            key: format_command_key(command.key, primary, meta),
+            description: command.description,
+        })
+        .collect()
+}
+
+/// Returns the heading and cognitive-ordered rows for the active mode.
+///
+/// Modes backed by a typed [`CommandMap`] derive their rows from that single
+/// source of truth; modes still using a legacy list are projected from it.
+#[cfg(test)]
+pub fn get_mode_key_commands(
+    mode: ViewMode,
+    primary: PrimaryModifier,
+    meta: MetaModifier,
+) -> (&'static str, Vec<HelpCommand>) {
+    let title = match mode {
+        ViewMode::Develop => "REPL",
+        ViewMode::Plans => "Plans",
+        ViewMode::Context => "Context",
+        ViewMode::History => "History",
+        ViewMode::Review => "Review",
+        ViewMode::Onboarding => "Setup",
+    };
+    let sections = mode_help_sections(mode, primary, meta);
+    let commands = sections.into_iter().flat_map(|s| s.commands).collect();
+    (title, commands)
 }
 
 pub fn render_help_popup(
     frame: &mut ratatui::Frame,
     mode: ViewMode,
+    tab: HelpTab,
     scroll: &mut u16,
-    primary_modifier: crate::config::PrimaryModifier,
+    primary_modifier: PrimaryModifier,
+    meta_modifier: MetaModifier,
 ) {
-    let (title, mode_commands) = get_mode_key_commands(mode);
     let area = centered_rect(76, 75, frame.area());
-
-    let key_w = GLOBAL_COMMANDS
-        .iter()
-        .chain(mode_commands.iter())
-        .map(|c| format_command_key(c.key, primary_modifier).chars().count())
-        .max()
-        .unwrap_or(0);
-    let col_w = key_w + 2;
-    let inner_w = area.width.saturating_sub(2) as usize;
-    let desc_w = inner_w.saturating_sub(2 + col_w).max(10);
-
     let engine = current_engine();
     let palette = engine.palette();
 
-    let mut help_lines: Vec<Line<'static>> = vec![
-        Line::raw(""),
-        Line::from(Span::styled(
-            "Global Navigation",
-            engine.fg(palette.status_info).bold(),
-        )),
-    ];
-    push_command_lines(&mut help_lines, GLOBAL_COMMANDS, col_w, desc_w, primary_modifier, &engine, &palette);
-
-    help_lines.push(Line::raw(""));
-    help_lines.push(Line::from(Span::styled(
-        "Active Mode Shortcuts",
-        engine.fg(palette.status_warning).bold(),
-    )));
-    push_command_lines(&mut help_lines, mode_commands, col_w, desc_w, primary_modifier, &engine, &palette);
-
-    let inner_area = render_modal_container(frame, area, title, ModalTone::Warning);
+    let inner_area = render_modal_container(frame, area, "Help", ModalTone::Warning);
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(4), Constraint::Length(3)])
+        .constraints([
+            Constraint::Length(2),
+            Constraint::Min(4),
+            Constraint::Length(3),
+        ])
         .split(inner_area);
 
-    let inner_h = chunks[0].height as usize;
+    render_help_tab_bar(frame, chunks[0], tab, &engine);
+
+    let body_w = chunks[1].width.max(1) as usize;
+    let help_lines = build_help_body(tab, mode, primary_modifier, meta_modifier, body_w);
+    let inner_h = chunks[1].height as usize;
     let max_scroll = help_lines
         .len()
         .saturating_sub(inner_h)
@@ -156,35 +344,151 @@ pub fn render_help_popup(
     *scroll = (*scroll).min(max_scroll);
 
     let help_widget = Paragraph::new(help_lines).scroll((*scroll, 0));
-    frame.render_widget(help_widget, chunks[0]);
+    frame.render_widget(help_widget, chunks[1]);
 
     let actions = vec![
         Line::from(Span::styled(
             " [ Close Help (Esc / q / ?) ] ",
-            engine.bg(palette.button_bg).fg(engine.color(palette.button_fg)).bold(),
+            button_style(&engine, palette.button_bg, palette.button_fg, true),
         )),
         Line::from(Span::styled(
-            "n/p or j/k scroll • PgUp/PgDn page scroll • Home top • Esc/q close",
+            "Tab / Shift+Tab · 1 / 2 / 3 switch tabs • n/p or j/k scroll • PgUp/PgDn page • Home top",
             engine.fg(palette.text_muted),
         )),
     ];
-    let footer = Paragraph::new(actions).alignment(ratatui::layout::Alignment::Center);
-    frame.render_widget(footer, chunks[1]);
+    let footer = Paragraph::new(actions).alignment(Alignment::Center);
+    frame.render_widget(footer, chunks[2]);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_global_help_command_advertises_real_binding() {
-        let entry = GLOBAL_COMMANDS
+    fn line_text(line: &Line<'_>) -> String {
+        let mut text = String::new();
+        for span in &line.spans {
+            text.push_str(&span.content);
+        }
+        text
+    }
+
+    fn rendered_text(tab: HelpTab, mode: ViewMode) -> String {
+        build_help_body(tab, mode, PrimaryModifier::Ctrl, MetaModifier::Alt, 100)
             .iter()
-            .find(|c| c.description.contains("help dialog"))
-            .expect("the Help dialog command must be documented");
-        // Help opens with the primary-modifier chord, never with F1 (which switches
-        // to the Develop tab) and never with a bare `?` inside a text input.
-        assert_eq!(entry.key, crate::app::HELP_OPEN_CHORD);
-        assert!(!entry.key.contains("F1"));
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn help_tab_defaults_to_global_and_cycles_across_three_tabs() {
+        assert_eq!(HelpTab::default(), HelpTab::Global);
+        assert_eq!(HelpTab::Global.next(), HelpTab::CurrentMode);
+        assert_eq!(HelpTab::CurrentMode.next(), HelpTab::TextEditor);
+        assert_eq!(HelpTab::TextEditor.next(), HelpTab::Global);
+        assert_eq!(HelpTab::Global.prev(), HelpTab::TextEditor);
+        assert_eq!(HelpTab::CurrentMode.prev(), HelpTab::Global);
+        assert_eq!(HelpTab::TextEditor.prev(), HelpTab::CurrentMode);
+    }
+
+    #[test]
+    fn global_tab_renders_the_three_cognitive_tiers() {
+        let text = rendered_text(HelpTab::Global, ViewMode::Plans);
+        assert!(text.contains("Essential"));
+        assert!(text.contains("Interface"));
+        assert!(text.contains("Helpers"));
+        // Global commands are advertised with their projected chords.
+        assert!(text.contains("Cancel the active generation"));
+        assert!(text.contains("Ctrl+C"));
+        // Mode-specific commands must not be mixed into Global.
+        assert!(!text.contains("Execute the selected step"));
+    }
+
+    #[test]
+    fn current_mode_tab_renders_mode_commands_without_global_leakage() {
+        let text = rendered_text(HelpTab::CurrentMode, ViewMode::Plans);
+        assert!(text.contains("Essential"));
+        assert!(text.contains("Interface"));
+        assert!(text.contains("Execute the selected step"));
+        // Global commands must not be mixed into CurrentMode.
+        assert!(!text.contains("Cancel the active generation"));
+    }
+
+    #[test]
+    fn text_editor_tab_renders_editor_commands() {
+        let text = rendered_text(HelpTab::TextEditor, ViewMode::Plans);
+        assert!(text.contains("Kill the word before the cursor"));
+        assert!(text.contains("Yank from the kill ring or the clipboard"));
+        assert!(!text.contains("Cancel the active generation"));
+        assert!(!text.contains("Execute the selected step"));
+    }
+
+    #[test]
+    fn help_tabs_do_not_leak_commands_into_each_other() {
+        let global = rendered_text(HelpTab::Global, ViewMode::Develop);
+        assert!(global.contains("Cancel the active generation"));
+        assert!(!global.contains("Send the prompt"));
+        assert!(!global.contains("Yank from the kill ring or the clipboard"));
+
+        let mode = rendered_text(HelpTab::CurrentMode, ViewMode::Develop);
+        assert!(!mode.contains("Cancel the active generation"));
+        assert!(mode.contains("Send the prompt"));
+        assert!(!mode.contains("Yank from the kill ring or the clipboard"));
+
+        let editor = rendered_text(HelpTab::TextEditor, ViewMode::Develop);
+        assert!(!editor.contains("Cancel the active generation"));
+        assert!(!editor.contains("Send the prompt"));
+        assert!(editor.contains("Yank from the kill ring or the clipboard"));
+    }
+
+    #[test]
+    fn global_map_binds_the_help_dialog_to_a_command_chord() {
+        use crate::command::global::GlobalCommand;
+
+        let spec = GLOBAL_COMMAND_MAP
+            .specs()
+            .iter()
+            .find(|spec| spec.action == GlobalCommand::OpenHelp)
+            .expect("the Help dialog must be reachable from the command map");
+        let chord = spec.chord.display(PrimaryModifier::Ctrl, MetaModifier::Alt);
+        assert!(!chord.contains('F'));
+    }
+
+    #[test]
+    fn no_command_advertises_a_function_key() {
+        let (primary, meta) = (PrimaryModifier::Ctrl, MetaModifier::Alt);
+        let mut keys: Vec<String> = GLOBAL_COMMAND_MAP
+            .specs()
+            .iter()
+            .map(|spec| spec.chord.display(primary, meta))
+            .collect();
+        keys.extend(
+            EDITOR_COMMAND_MAP
+                .specs()
+                .iter()
+                .map(|spec| spec.chord.display(primary, meta)),
+        );
+        for mode in [
+            ViewMode::Develop,
+            ViewMode::Context,
+            ViewMode::History,
+            ViewMode::Review,
+            ViewMode::Plans,
+            ViewMode::Onboarding,
+        ] {
+            let (_, commands) = get_mode_key_commands(mode, primary, meta);
+            keys.extend(commands.iter().map(|command| command.key.clone()));
+        }
+        for key in keys {
+            for index in 1..=10 {
+                let fkey = format!("F{}", index);
+                assert!(
+                    !key.contains(fkey.as_str()),
+                    "function key {} must never be bound (found in {:?})",
+                    fkey,
+                    key,
+                );
+            }
+        }
     }
 }

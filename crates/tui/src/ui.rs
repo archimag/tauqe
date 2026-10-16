@@ -230,8 +230,10 @@ pub fn render_ui(frame: &mut ratatui::Frame, state: &mut AppState) {
             render_help_popup(
                 frame,
                 state.view_mode,
+                state.help_tab,
                 &mut state.help_scroll,
                 state.tui_config.input.primary_modifier,
+                state.tui_config.input.meta_modifier,
             );
         }
         None => {}

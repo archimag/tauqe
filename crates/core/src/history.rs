@@ -14,8 +14,24 @@ pub use compaction::{
 pub use entry::HistoryEntry;
 pub use storage::SessionStorage;
 
+/// A typed notification of a mutation to the session history.
+///
+/// Appending a record and compacting the session are structurally different
+/// operations: an append extends the dialogue, whereas compaction replaces the
+/// summarized prefix with a single summary entry and preserves a tail.
+/// Reporting both through one append-shaped notification forces a compaction
+/// to masquerade as a trailing message, so subscribers receive the mutation
+/// kind explicitly instead.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HistoryMutation {
+    /// A new interaction record was appended to the end of the session.
+    Appended { item: UiHistoryItem },
+    /// The summarized prefix was replaced by `summary`, preserving `tail_ids`.
+    Compacted { summary: UiHistoryItem, tail_ids: Vec<u64> },
+}
+
 #[derive(Clone)]
-pub struct HistoryEntryListener(pub Arc<dyn Fn(UiHistoryItem) + Send + Sync>);
+pub struct HistoryEntryListener(pub Arc<dyn Fn(HistoryMutation) + Send + Sync>);
 
 impl std::fmt::Debug for HistoryEntryListener {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -55,7 +71,7 @@ impl HistoryManager {
 
     pub fn set_listener<F>(&mut self, listener: F)
     where
-        F: Fn(UiHistoryItem) + Send + Sync + 'static,
+        F: Fn(HistoryMutation) + Send + Sync + 'static,
     {
         self.listener = Some(HistoryEntryListener(Arc::new(listener)));
     }
@@ -151,7 +167,7 @@ impl HistoryManager {
         if let Some(listener) = &self.listener {
             let id = entry.id().unwrap_or(self.current_max_id);
             let item = Self::entry_to_ui_item(id, entry);
-            (listener.0)(item);
+            (listener.0)(HistoryMutation::Appended { item });
         }
     }
 
@@ -313,13 +329,14 @@ impl HistoryManager {
         tail: Vec<HistoryEntry>,
     ) -> Result<()> {
         let summary_id = tail.first().and_then(|e| e.id()).map(|id| id.saturating_sub(1));
+        let tail_ids: Vec<u64> = tail.iter().filter_map(|entry| entry.id()).collect();
         let compacted = build_compacted_history(summary_id, summary_text.into(), tail);
         self.storage.rewrite_entries(&compacted)?;
-        if let Some(summary_entry) = compacted.first() {
-            if let Some(listener) = &self.listener {
+        if let Some(listener) = &self.listener {
+            if let Some(summary_entry) = compacted.first() {
                 let id = summary_entry.id().unwrap_or(1);
-                let item = Self::entry_to_ui_item(id, summary_entry);
-                (listener.0)(item);
+                let summary = Self::entry_to_ui_item(id, summary_entry);
+                (listener.0)(HistoryMutation::Compacted { summary, tail_ids });
             }
         }
         Ok(())
@@ -563,5 +580,47 @@ mod tests {
 
         let next_entry = hm.record_turn("Prompt 21", vec![]).unwrap();
         assert_eq!(next_entry.id(), Some(21));
+    }
+
+    #[test]
+    fn test_listener_receives_typed_mutations() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let mut hm = HistoryManager::new(root);
+
+        let received: Arc<std::sync::Mutex<Vec<HistoryMutation>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = Arc::clone(&received);
+        hm.set_listener(move |mutation| {
+            let mut guard = sink.lock().unwrap();
+            guard.push(mutation);
+        });
+
+        for i in 1..=4 {
+            hm.record_turn(format!("Task {}", i), vec![]).unwrap();
+            hm.record_response(format!("Done {}", i), None, None, vec![]).unwrap();
+        }
+
+        // Compaction must be reported as a structural mutation carrying the
+        // summary and the ids of the preserved tail, not as another append.
+        let (_, tail) = hm.prepare_compaction(2).unwrap().unwrap();
+        let expected_tail_ids: Vec<u64> = tail.iter().filter_map(|entry| entry.id()).collect();
+        assert_eq!(expected_tail_ids, vec![5, 6, 7, 8]);
+        hm.apply_compaction("Earlier tasks summarized.", tail).unwrap();
+
+        let mutations = received.lock().unwrap();
+        // Eight appends (four turns, four responses), then one compaction.
+        assert_eq!(mutations.len(), 9);
+        for mutation in &mutations[..8] {
+            assert!(matches!(mutation, HistoryMutation::Appended { .. }));
+        }
+        match &mutations[8] {
+            HistoryMutation::Compacted { summary, tail_ids } => {
+                assert_eq!(summary.kind, UiHistoryKind::System);
+                assert_eq!(summary.text, "Earlier tasks summarized.");
+                assert_eq!(tail_ids, &expected_tail_ids);
+            }
+            other => panic!("expected a compaction mutation, got {:?}", other),
+        }
     }
 }

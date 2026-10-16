@@ -7,9 +7,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tauqe_core::history::HistoryMutation;
 use tauqe_protocol::{
-    errors, events, methods, Event, HistoryEntryAddedEvent, Request, RequestId, Response,
-    UiHistoryItem,
+    errors, events, methods, Event, HistoryCompactedEvent, HistoryEntryAddedEvent, Request,
+    RequestId, Response,
 };
 
 mod handlers;
@@ -65,27 +66,51 @@ async fn main() -> anyhow::Result<()> {
         explicit_credentials: explicit_credentials.as_deref(),
     });
 
-    let (history_tx, mut history_rx) = tokio::sync::mpsc::unbounded_channel::<UiHistoryItem>();
+    let (history_tx, mut history_rx) =
+        tokio::sync::mpsc::unbounded_channel::<HistoryMutation>();
     let (out, mut out_rx) = OutChannel::new();
 
     let state = AppState::new(config, repo_path, history_tx, out);
 
-    // Forward UI history items to out channel as events
+    // Forward every history mutation to the client as an event: an append
+    // becomes a `history/entryAdded` record, while a compaction becomes a
+    // structural `history/compacted` record carrying the summary and the
+    // preserved tail. Reporting compaction as its own event lets the client
+    // rebuild its session view from the authoritative result instead of
+    // reconstructing it from append events alone.
     let out_for_history = state.out.clone();
     let state_for_history = Arc::clone(&state);
     tokio::spawn(async move {
-        while let Some(item) = history_rx.recv().await {
+        while let Some(mutation) = history_rx.recv().await {
             let estimated_tokens = {
                 let h = state_for_history.history.lock().await;
                 h.estimated_tokens().ok()
             };
-            let ev = Event {
-                method: events::HISTORY_ENTRY_ADDED.to_string(),
-                params: serde_json::to_value(HistoryEntryAddedEvent {
-                    item,
-                    estimated_tokens,
-                })
-                .ok(),
+            let ev = match mutation {
+                HistoryMutation::Appended { item } => Event {
+                    method: events::HISTORY_ENTRY_ADDED.to_string(),
+                    params: serde_json::to_value(HistoryEntryAddedEvent {
+                        item,
+                        estimated_tokens,
+                    })
+                    .ok(),
+                },
+                HistoryMutation::Compacted { summary, tail_ids } => {
+                    // The compacted session is the summary followed by the
+                    // preserved tail, so its entry count derives from the tail
+                    // size and needs no additional disk read.
+                    let total_count = tail_ids.len().saturating_add(1);
+                    Event {
+                        method: events::HISTORY_COMPACTED.to_string(),
+                        params: serde_json::to_value(HistoryCompactedEvent {
+                            summary,
+                            tail_ids,
+                            total_count,
+                            estimated_tokens: estimated_tokens.unwrap_or(0),
+                        })
+                        .ok(),
+                    }
+                }
             };
             out_for_history.send_event(&ev);
         }
@@ -203,7 +228,8 @@ const SHUTDOWN_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_se
 /// Poll cadence while waiting for in-flight work to unwind during shutdown.
 const SHUTDOWN_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
 
-/// Methods whose handlers block on long-running work — an LLM turn or the
+/// Methods whose handlers block on long-running work — an LLM turn, a turn
+/// entry point that performs synchronous setup or disk I/O, or the
 /// deterministic pre-flight toolchain verification — and must therefore be
 /// offloaded from the read loop. Offloading keeps the loop free to accept
 /// cancels and to observe stdin EOF. Every other method is short and runs
@@ -211,9 +237,11 @@ const SHUTDOWN_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_mi
 fn is_long_running(method: &str) -> bool {
     matches!(
         method,
-        methods::PLAN_REFINE
+        methods::MODEL_ASK
+            | methods::PLAN_REFINE
             | methods::PLAN_REPLAN
             | methods::PLAN_EXECUTE
+            | methods::REVIEW_START
             | methods::REVIEW_EXECUTE
             | methods::GIT_SQUASH_GENERATE_MESSAGE
     )

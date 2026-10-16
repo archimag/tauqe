@@ -13,7 +13,7 @@ use crate::ui::wrap_lines;
 pub mod input;
 pub mod render;
 
-pub use self::input::{handle_review_key, REVIEW_COMMANDS};
+pub use self::input::{handle_review_key, REVIEW_COMMAND_MAP};
 pub use self::render::render_review_view;
 
 #[derive(Debug, Clone, PartialEq, Eq)]

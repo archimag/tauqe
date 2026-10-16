@@ -11,7 +11,7 @@ use crate::theme::engine::{current_engine, ThemeEngine};
 pub mod input;
 pub mod render;
 
-pub use self::input::{handle_develop_key, DEVELOP_COMMANDS};
+pub use self::input::{handle_develop_key, DEVELOP_COMMAND_MAP};
 
 /// Minimum interval between full markdown re-parses while a response is streaming.
 const MARKDOWN_THROTTLE: Duration = Duration::from_millis(80);
@@ -437,7 +437,7 @@ impl ReasoningState {
         let engine = current_engine();
         Line::from(Span::styled(
             line.to_string(),
-            engine.fg(engine.palette().text_secondary),
+            engine.fg(engine.palette().text_reasoning),
         ))
     }
 
@@ -511,7 +511,7 @@ impl ReasoningState {
             if !self.lines.is_empty() {
                 lines.extend(self.lines.iter().cloned());
             } else {
-                let text_style = engine.fg(palette.text_secondary);
+                let text_style = engine.fg(palette.text_reasoning);
                 for line in self.text.lines() {
                     lines.push(Line::from(Span::styled(line.to_string(), text_style)));
                 }

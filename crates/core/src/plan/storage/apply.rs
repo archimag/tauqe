@@ -92,7 +92,7 @@ impl PlanStorage {
             .unwrap_or_default()
             .as_secs();
 
-        let all_plans = Self::load_all(repo_root).unwrap_or_default();
+        let all_plans = Self::load_all_unlocked(repo_root).unwrap_or_default();
 
         for tag in parsed {
             let action = tag.action.to_lowercase();
@@ -176,7 +176,7 @@ impl PlanStorage {
                     plan.updated_at = now;
                     match Self::save_plan_unlocked(repo_root, &plan) {
                         Ok(()) => {
-                            if let Ok(None) = Self::load_active_id(repo_root) {
+                            if let Ok(None) = Self::load_active_id_unlocked(repo_root) {
                                 let _ = Self::save_active_id_unlocked(repo_root, Some(&plan.id));
                             }
                             applied.push(plan);
@@ -199,7 +199,7 @@ impl PlanStorage {
                             continue;
                         }
                         crate::plan::matcher::PlanResolution::NotFound => {
-                            Self::load_plan(repo_root, &tag.id).ok().flatten()
+                            Self::load_plan_unlocked(repo_root, &tag.id).ok().flatten()
                         }
                     };
 
@@ -350,8 +350,13 @@ impl PlanStorage {
         update: &DiscussionPlanUpdate,
         mode: PlanMutationMode,
     ) -> PlanApplicationOutcome {
-        let all_plans = Self::load_all(repo_root).unwrap_or_default();
-        let active_id = Self::load_active_id(repo_root).ok().flatten();
+        // Resolve the target plan and the effective action under the same lock
+        // that guards the follow-up mutation, so a concurrent task cannot create
+        // or swap the active plan between resolution and application.
+        let _guard = Self::lock();
+
+        let all_plans = Self::load_all_unlocked(repo_root).unwrap_or_default();
+        let active_id = Self::load_active_id_unlocked(repo_root).ok().flatten();
         let plan_id = update
             .id
             .as_deref()
@@ -367,7 +372,7 @@ impl PlanStorage {
 
         let action = if update.action == DiscussionPlanAction::Update
             && all_plans.is_empty()
-            && Self::load_plan(repo_root, &plan_id).ok().flatten().is_none()
+            && Self::load_plan_unlocked(repo_root, &plan_id).ok().flatten().is_none()
         {
             "save".to_string()
         } else {
@@ -395,7 +400,7 @@ impl PlanStorage {
         // The structured discussion command is the explicit architect path: its
         // typed, deliberate item list (including an explicit empty list) fully
         // replaces the stored plan.
-        Self::apply_parsed_plans_with_replacement(
+        Self::apply_parsed_plans_unlocked(
             repo_root,
             vec![parsed_tag],
             Vec::new(),

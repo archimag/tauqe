@@ -3,7 +3,7 @@ use ratatui::style::{Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
-use crate::components::modal::{render_modal_container, ModalTone};
+use crate::components::modal::{render_dialog_footer, render_modal_container, ModalTone};
 use crate::theme::engine::current_engine;
 use crate::ui::centered_rect;
 use crate::ui::header::truncate_to_width;
@@ -40,11 +40,13 @@ const STATUS_CANCEL_LABEL: &str = " [ Cancel (Esc) ] ";
 /// Spacing drawn between the two action buttons.
 const STATUS_BUTTON_GAP: &str = "    ";
 
-/// Splits the dialog interior into `[header, options, footer]`.
+/// Splits the dialog interior into `[header, options, buttons, footer]`.
 ///
 /// Shared by the renderer and mouse hit-testing so the option rows and the
 /// action buttons stay in lockstep and can never drift apart (Conventions §2).
-fn status_dialog_chunks(area: Rect, options_count: usize) -> [Rect; 3] {
+/// The footer block holds the interactive buttons and the one-row docked hint
+/// strip.
+fn status_dialog_chunks(area: Rect, options_count: usize) -> [Rect; 4] {
     let inner = Rect::new(
         area.x + 1,
         area.y + 1,
@@ -56,10 +58,11 @@ fn status_dialog_chunks(area: Rect, options_count: usize) -> [Rect; 3] {
         .constraints([
             Constraint::Length(3),
             Constraint::Min(options_count as u16),
-            Constraint::Length(3),
+            Constraint::Length(2),
+            Constraint::Length(1),
         ])
         .split(inner);
-    [chunks[0], chunks[1], chunks[2]]
+    [chunks[0], chunks[1], chunks[2], chunks[3]]
 }
 
 /// Returns the apply and cancel button rectangles of the status dialog,
@@ -67,17 +70,17 @@ fn status_dialog_chunks(area: Rect, options_count: usize) -> [Rect; 3] {
 /// mouse hit-testing cannot drift from the rendered buttons (Conventions §6).
 pub fn status_dialog_buttons(term: Rect, options_count: usize) -> (Rect, Rect) {
     let area = status_dialog_area(term, options_count);
-    let footer = status_dialog_chunks(area, options_count)[2];
+    let bar = status_dialog_chunks(area, options_count)[2];
 
     let apply_w = status_apply_label(options_count).chars().count() as u16;
     let cancel_w = STATUS_CANCEL_LABEL.chars().count() as u16;
     let gap_w = STATUS_BUTTON_GAP.chars().count() as u16;
     let total = apply_w + gap_w + cancel_w;
-    let start_x = footer.x + footer.width.saturating_sub(total) / 2;
+    let start_x = bar.x + bar.width.saturating_sub(total) / 2;
 
     (
-        Rect::new(start_x, footer.y, apply_w, 1),
-        Rect::new(start_x + apply_w + gap_w, footer.y, cancel_w, 1),
+        Rect::new(start_x, bar.y, apply_w, 1),
+        Rect::new(start_x + apply_w + gap_w, bar.y, cancel_w, 1),
     )
 }
 
@@ -178,26 +181,29 @@ pub fn render_status_dialog(
     }
     frame.render_widget(Paragraph::new(body_lines), chunks[1]);
 
-    let fast_select_label = status_fast_select_label(options_count);
-    let actions = vec![
-        Line::from(vec![
-            Span::styled(
-                status_apply_label(options_count),
-                engine.bg(palette.button_active_bg).fg(engine.color(palette.text_inverse)).bold(),
-            ),
-            Span::raw(STATUS_BUTTON_GAP),
-            Span::styled(
-                STATUS_CANCEL_LABEL,
-                engine.bg(palette.button_bg).fg(engine.color(palette.button_fg)),
-            ),
-        ]),
-        Line::from(Span::styled(
-            format!("{} fast select • n/p or j/k navigate • Enter apply • Esc cancel", fast_select_label),
-            engine.fg(palette.text_muted),
-        )),
-    ];
+    let actions = Line::from(vec![
+        Span::styled(
+            status_apply_label(options_count),
+            engine.bg(palette.button_active_bg).fg(engine.color(palette.text_inverse)).bold(),
+        ),
+        Span::raw(STATUS_BUTTON_GAP),
+        Span::styled(
+            STATUS_CANCEL_LABEL,
+            engine.bg(palette.button_bg).fg(engine.color(palette.button_fg)),
+        ),
+    ]);
     let actions_widget = Paragraph::new(actions).alignment(ratatui::layout::Alignment::Center);
     frame.render_widget(actions_widget, chunks[2]);
+
+    // The navigation hint is docked to the card's bottom edge as its own strip
+    // filled with `palette.overlay`, so it reads as persistent chrome instead
+    // of a second line of buttons (c-1, c-2).
+    let fast_select_label = status_fast_select_label(options_count);
+    let footer_hint = format!(
+        "{} fast select • n / p or j / k navigate • Enter apply • Esc cancel",
+        fast_select_label
+    );
+    render_dialog_footer(frame, chunks[3], &footer_hint);
 }
 
 #[cfg(test)]

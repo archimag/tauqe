@@ -217,8 +217,12 @@ impl ExecutionMode for SingleExecution {
                 Ok(turn) => turn,
                 Err(err) => {
                     let _ = policy.rollback(context_manager.repo_root()).await;
-                    context_manager.clear_auto();
-                    context_manager.prune_missing_files();
+                    // Auto-layer cleanup performs filesystem metadata checks, so
+                    // the sweep runs off the async executor thread.
+                    crate::blocking::run_blocking(|| {
+                        context_manager.clear_auto();
+                        context_manager.prune_missing_files();
+                    });
                     if let Some(id) = session_turn.turn_id {
                         let _ = history_manager.rollback_entry(id);
                     }
@@ -282,7 +286,9 @@ impl ExecutionMode for SingleExecution {
                         next_m.provider == current_model.provider || new_provider.is_some();
                     if provider_ready {
                         let _ = policy.rollback(context_manager.repo_root()).await;
-                        context_manager.prune_missing_files();
+                        // Pruning missing files performs filesystem metadata
+                        // checks, so it runs off the async executor thread.
+                        crate::blocking::run_blocking(|| context_manager.prune_missing_files());
 
                         let reason = if is_error {
                             match &turn.result {

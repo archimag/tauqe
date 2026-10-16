@@ -1,6 +1,7 @@
 use tauqe_protocol::{DiscussionContextRequest, DiscussionPlanUpdate, DiscussionResponse};
 use tracing::{info, warn};
 
+use super::json::decode::{balanced_object_end, strip_code_fence, StringFieldCursor};
 use super::json::extract_streamed_string_field;
 use super::EditStreamFilter;
 use crate::providers::StreamEvent;
@@ -15,6 +16,7 @@ pub struct DiscussionStreamFilter {
     target_field: String,
     passthrough: Option<bool>,
     buffer: String,
+    message_cursor: StringFieldCursor,
     message_streamed_bytes: usize,
     message_finished: bool,
     response: Option<DiscussionResponse>,
@@ -37,10 +39,29 @@ impl DiscussionStreamFilter {
             target_field: target_field.into(),
             passthrough: None,
             buffer: String::new(),
+            message_cursor: StringFieldCursor::new(),
             message_streamed_bytes: 0,
             message_finished: false,
             response: None,
         }
+    }
+
+    /// Advances the on-the-fly `TextDelta` stream of the target field by one
+    /// incremental step, resuming from the cursor's saved scan offsets.
+    fn stream_message_delta(&mut self, events: &mut Vec<StreamEvent>) {
+        if self.message_finished {
+            return;
+        }
+        let (delta, finished) = extract_streamed_string_field(
+            &self.buffer,
+            &self.target_field,
+            &mut self.message_cursor,
+        );
+        if let Some(d) = delta {
+            self.message_streamed_bytes += d.len();
+            events.push(StreamEvent::TextDelta(d));
+        }
+        self.message_finished = finished;
     }
 
     /// Pushes a delta chunk and yields any unescaped `TextDelta` stream events.
@@ -79,17 +100,7 @@ impl DiscussionStreamFilter {
         }
 
         // 1. Stream target field deltas on the fly
-        if !self.message_finished {
-            let (delta, new_streamed, finished) =
-                extract_streamed_string_field(&self.buffer, &self.target_field, self.message_streamed_bytes);
-            if let Some(d) = delta {
-                if !d.is_empty() {
-                    events.push(StreamEvent::TextDelta(d));
-                }
-            }
-            self.message_streamed_bytes = new_streamed;
-            self.message_finished = finished;
-        }
+        self.stream_message_delta(&mut events);
 
         events
     }
@@ -102,17 +113,7 @@ impl DiscussionStreamFilter {
             return events;
         }
 
-        if !self.message_finished {
-            let (delta, new_streamed, finished) =
-                extract_streamed_string_field(&self.buffer, &self.target_field, self.message_streamed_bytes);
-            if let Some(d) = delta {
-                if !d.is_empty() {
-                    events.push(StreamEvent::TextDelta(d));
-                }
-            }
-            self.message_streamed_bytes = new_streamed;
-            self.message_finished = finished;
-        }
+        self.stream_message_delta(&mut events);
 
         let parsed = Self::parse_response(&self.buffer);
 
@@ -127,7 +128,7 @@ impl DiscussionStreamFilter {
                     None
                 }
             } else {
-                serde_json::from_str::<serde_json::Value>(extract_json_str(&self.buffer))
+                serde_json::from_str::<serde_json::Value>(strip_code_fence(&self.buffer))
                     .ok()
                     .and_then(|v| {
                         v.get(&self.target_field)
@@ -164,7 +165,7 @@ impl DiscussionStreamFilter {
 
     /// Robustly parses a raw model output into `DiscussionResponse` with resilient fallbacks.
     pub fn parse_response(raw: &str) -> DiscussionResponse {
-        let clean = extract_json_str(raw);
+        let clean = strip_code_fence(raw);
         if let Ok(mut resp) = serde_json::from_str::<DiscussionResponse>(clean) {
             Self::sanitize_plan_update(&mut resp);
             return resp;
@@ -172,13 +173,11 @@ impl DiscussionStreamFilter {
 
         // Try finding JSON object in raw if markdown wrappers or text surrounds it
         if let Some(start) = raw.find('{') {
-            if let Some(end) = raw.rfind('}') {
-                if end > start {
-                    let candidate = &raw[start..=end];
-                    if let Ok(mut resp) = serde_json::from_str::<DiscussionResponse>(candidate) {
-                        Self::sanitize_plan_update(&mut resp);
-                        return resp;
-                    }
+            if let Some(end) = balanced_object_end(raw, start) {
+                let candidate = &raw[start..end];
+                if let Ok(mut resp) = serde_json::from_str::<DiscussionResponse>(candidate) {
+                    Self::sanitize_plan_update(&mut resp);
+                    return resp;
                 }
             }
         }
@@ -196,7 +195,12 @@ impl DiscussionStreamFilter {
                 .get("plan_update")
                 .filter(|v| !v.is_null())
                 .and_then(|v| serde_json::from_value::<DiscussionPlanUpdate>(v.clone()).ok())
-                .filter(|u| u.id.is_some() || !u.items.is_empty() || !u.concept.is_empty() || u.title.is_some());
+                .filter(|u| {
+                    u.id.is_some()
+                        || !u.items.is_empty()
+                        || !u.concept.is_empty()
+                        || u.title.is_some()
+                });
 
             let context_requests = val
                 .get("context_requests")
@@ -226,7 +230,11 @@ impl DiscussionStreamFilter {
 
     fn sanitize_plan_update(resp: &mut DiscussionResponse) {
         if let Some(ref update) = resp.plan_update {
-            if update.id.is_none() && update.items.is_empty() && update.concept.is_empty() && update.title.is_none() {
+            if update.id.is_none()
+                && update.items.is_empty()
+                && update.concept.is_empty()
+                && update.title.is_none()
+            {
                 resp.plan_update = None;
             }
         }
@@ -241,22 +249,6 @@ impl EditStreamFilter for DiscussionStreamFilter {
     fn finish(mut self: Box<Self>) -> Vec<StreamEvent> {
         self.finish_internal()
     }
-}
-
-fn extract_json_str(raw: &str) -> &str {
-    let trimmed = raw.trim();
-    if let Some(idx) = trimmed.find("```json") {
-        let after = &trimmed[idx + 7..];
-        if let Some(end) = after.find("```") {
-            return after[..end].trim();
-        }
-    } else if let Some(idx) = trimmed.find("```") {
-        let after = &trimmed[idx + 3..];
-        if let Some(end) = after.find("```") {
-            return after[..end].trim();
-        }
-    }
-    trimmed
 }
 
 #[cfg(test)]

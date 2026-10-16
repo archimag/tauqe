@@ -1,5 +1,5 @@
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Style, Stylize};
+use ratatui::style::Stylize;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Padding, Paragraph};
 
@@ -13,6 +13,8 @@ pub fn render_plans_view(
     main_area: Rect,
     info_area: Rect,
 ) {
+    let engine = crate::theme::engine::current_engine();
+    let palette = engine.palette();
     let block = Block::default().padding(Padding::horizontal(1));
     let inner = block.inner(main_area);
     let height = inner.height;
@@ -33,11 +35,11 @@ pub fn render_plans_view(
                 Line::raw(""),
                 Line::from(Span::styled(
                     "  No local engineering plans yet.",
-                    Style::default().fg(Color::DarkGray).bold(),
+                    engine.fg(palette.text_muted).bold(),
                 )),
                 Line::from(Span::styled(
                     "  Ask Tauqe AI in Develop (Ctrl+1) to formulate a multi-step task plan, or press 'r' to refresh.",
-                    Style::default().fg(Color::DarkGray),
+                    engine.fg(palette.text_muted),
                 )),
             ],
             Vec::new(),
@@ -83,10 +85,10 @@ pub fn render_plans_view(
 
     let mut status_spans = Vec::new();
     if let Some(msg) = &state.plans_view.status_message {
-        status_spans.push(Span::styled(msg.clone(), Style::default().fg(Color::Gray)));
+        status_spans.push(Span::styled(msg.clone(), engine.fg(palette.text_secondary)));
     } else {
         if let Some(row) = state.plans_view.selected_row() {
-            status_spans.extend(describe_plan_row(&row));
+            status_spans.extend(describe_plan_row(&row, &engine));
         }
         let plans_count = state.plans_view.plans.len();
         let total_items: usize = state.plans_view.plans.iter().map(|p| p.count_stats().0).sum();
@@ -96,18 +98,18 @@ pub fn render_plans_view(
                 "  |  {} plan(s), {} item(s) ({} done)",
                 plans_count, total_items, total_completed
             ),
-            Style::default().fg(Color::DarkGray),
+            engine.fg(palette.text_muted),
         ));
         if !rows.is_empty() {
             status_spans.push(Span::styled(
                 format!(" | [Row {}/{}]", state.plans_view.selected_index + 1, rows.len()),
-                Style::default().fg(Color::DarkGray),
+                engine.fg(palette.text_muted),
             ));
         }
         if state.plans_view.refining {
             status_spans.push(Span::styled(
                 " | [REFINING: AI Architect is analyzing codebase...]",
-                Style::default().fg(Color::Yellow).bold(),
+                engine.fg(palette.status_warning).bold(),
             ));
         }
     }
@@ -127,7 +129,11 @@ fn first_content_line(raw: Option<&str>) -> Option<String> {
     })
 }
 
-fn describe_plan_row(row: &VisiblePlanRow) -> Vec<Span<'static>> {
+fn describe_plan_row(
+    row: &VisiblePlanRow,
+    engine: &crate::theme::engine::ThemeEngine,
+) -> Vec<Span<'static>> {
+    let palette = engine.palette();
     match row {
         VisiblePlanRow::PlanHeader {
             title,
@@ -140,25 +146,25 @@ fn describe_plan_row(row: &VisiblePlanRow) -> Vec<Span<'static>> {
             let mut spans = vec![
                 Span::styled(
                     format!(" Plan: {}", title),
-                    Style::default().fg(Color::White).bold(),
+                    engine.fg(palette.text_primary).bold(),
                 ),
                 Span::styled(format!(" [{}]", status), status_style(*status)),
                 Span::styled(
                     format!("  {}/{} done", completed, total),
-                    Style::default().fg(Color::Gray),
+                    engine.fg(palette.text_secondary),
                 ),
             ];
             if let Some(desc) = first_content_line(description.as_deref()) {
                 spans.push(Span::styled(
                     format!("  —  {}", desc),
-                    Style::default().fg(Color::DarkGray),
+                    engine.fg(palette.text_muted),
                 ));
             }
             spans
         }
         VisiblePlanRow::ConceptHeader { count, .. } => vec![Span::styled(
             format!(" Concept: {} item(s) of architectural intent", count),
-            Style::default().fg(Color::Magenta),
+            engine.fg(palette.button_active_bg),
         )],
         VisiblePlanRow::ConceptItem {
             item_id,
@@ -168,12 +174,12 @@ fn describe_plan_row(row: &VisiblePlanRow) -> Vec<Span<'static>> {
         } => {
             let mut spans = vec![Span::styled(
                 format!(" #{} {}", item_id, title),
-                Style::default().fg(Color::LightMagenta).bold(),
+                engine.fg(palette.button_active_bg).bold(),
             )];
             if let Some(desc) = first_content_line(details.as_deref()) {
                 spans.push(Span::styled(
                     format!("  —  {}", desc),
-                    Style::default().fg(Color::DarkGray),
+                    engine.fg(palette.text_muted),
                 ));
             }
             spans
@@ -184,7 +190,7 @@ fn describe_plan_row(row: &VisiblePlanRow) -> Vec<Span<'static>> {
             ..
         } => vec![Span::styled(
             format!(" Execution blueprint: {}/{} done", completed, total),
-            Style::default().fg(Color::Cyan),
+            engine.fg(palette.status_info),
         )],
         VisiblePlanRow::PlanItem {
             item_id,
@@ -198,26 +204,26 @@ fn describe_plan_row(row: &VisiblePlanRow) -> Vec<Span<'static>> {
             let mut spans = vec![
                 Span::styled(
                     format!(" #{} {}", item_id, title),
-                    Style::default().fg(Color::White).bold(),
+                    engine.fg(palette.text_primary).bold(),
                 ),
                 Span::styled(format!(" [{}]", status), status_style(*status)),
             ];
             if let Some(desc) = first_content_line(details.as_deref()) {
                 spans.push(Span::styled(
                     format!("  —  {}", desc),
-                    Style::default().fg(Color::DarkGray),
+                    engine.fg(palette.text_muted),
                 ));
             }
             if !files.is_empty() {
                 spans.push(Span::styled(
                     format!("  files: {}", files.join(", ")),
-                    Style::default().fg(Color::Cyan),
+                    engine.fg(palette.status_info),
                 ));
             }
             if !readonly_files.is_empty() {
                 spans.push(Span::styled(
                     format!("  ref: {}", readonly_files.join(", ")),
-                    Style::default().fg(Color::LightCyan),
+                    engine.fg(palette.text_secondary),
                 ));
             }
             spans

@@ -80,7 +80,8 @@ pub use git::{
 };
 pub use glob::{matches_glob_pattern, GlobPattern};
 pub use history::{
-    HistoryEntryAddedEvent, HistoryGetParams, HistoryGetResult, UiHistoryItem, UiHistoryKind,
+    HistoryCompactedEvent, HistoryEntryAddedEvent, HistoryGetParams, HistoryGetResult,
+    UiHistoryItem, UiHistoryKind,
 };
 pub use message::{
     Event, InitializeParams, InitializeResult, Message, Request, RequestId, Response,

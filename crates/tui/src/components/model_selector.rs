@@ -13,15 +13,13 @@
 //! returns composable spans so each dialog can prepend its own field label while
 //! still sharing one model-presentation rule.
 
-#![allow(dead_code)] // Introced ahead of its dialog integrations; drop once consumed.
-
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::style::Stylize;
 use ratatui::text::{Line, Span};
 use tauqe_protocol::{ModelEntry, ModelRole};
 
 use crate::app::{numbered_entry_label, role_badge};
-use crate::config::PrimaryModifier;
+use crate::config::{MetaModifier, PrimaryModifier};
 use crate::theme::engine::current_engine;
 
 /// Stateful selector over the models configured for one semantic role.
@@ -103,7 +101,7 @@ impl ModelSelector {
     /// Resolves a key event against the model-switch chord and the navigation
     /// arrows.
     ///
-    /// The chord (`C-M` / `Alt+M`) always switches, even while the instruction
+    /// The chord (`C-M` / `M-M`) always switches, even while the instruction
     /// editor owns the keyboard; the arrows switch only when the editor does
     /// not own them, so cursor movement and model browsing never fight over the
     /// same keys (Conventions.md §6, §8). Returns `true` when the selector
@@ -112,13 +110,14 @@ impl ModelSelector {
         &mut self,
         key: KeyEvent,
         primary: PrimaryModifier,
+        meta: MetaModifier,
         editor_focused: bool,
     ) -> bool {
         if self.entries.is_empty() {
             return false;
         }
 
-        if is_model_switch_chord(&key, primary) {
+        if is_model_switch_chord(&key, primary, meta) {
             self.select_next();
             return true;
         }
@@ -334,21 +333,24 @@ fn has_alias(entry: &ModelEntry) -> bool {
 
 /// Renders the model-switch hint for the active primary modifier.
 ///
-/// With the Ctrl modifier the chord is `C-M` and the `Alt+M` hardware fallback
-/// is advertised alongside it; with the Alt modifier both spellings collapse to
-/// `Alt+M`.
+/// The chord is advertised in the abstract `C-` / `M-` vocabulary: with the
+/// Ctrl primary the `C-M` chord and the `M-M` meta fallback are shown together;
+/// with the Alt primary both collapse to `M-M`.
 pub fn model_select_hint(primary: PrimaryModifier) -> String {
     match primary {
-        PrimaryModifier::Ctrl => "C-M / Alt+M".to_string(),
-        PrimaryModifier::Alt => "Alt+M".to_string(),
+        PrimaryModifier::Ctrl => "C-M / M-M".to_string(),
+        PrimaryModifier::Alt => "M-M".to_string(),
     }
 }
 
-/// Whether the key is the `C-M` / `Alt+M` model-switch chord.
+/// Whether the key is the model-switch chord (`C-M` / `M-M`).
 ///
-/// `Ctrl+Alt` (`AltGr` / compose) is deliberately excluded so that
-/// keyboard-layout characters are never mistaken for the chord.
-fn is_model_switch_chord(key: &KeyEvent, primary: PrimaryModifier) -> bool {
+/// Both the configured primary modifier (`C-`) and the configured meta
+/// modifier (`M-`) switch the model, so the chord follows the user's mapping
+/// instead of a hardcoded `Alt`. `Ctrl+Alt` (`AltGr` / compose) is deliberately
+/// excluded so that keyboard-layout characters are never mistaken for the
+/// chord.
+fn is_model_switch_chord(key: &KeyEvent, primary: PrimaryModifier, meta: MetaModifier) -> bool {
     if !matches!(key.code, KeyCode::Char('m') | KeyCode::Char('M')) {
         return false;
     }
@@ -357,7 +359,7 @@ fn is_model_switch_chord(key: &KeyEvent, primary: PrimaryModifier) -> bool {
     if ctrl && alt {
         return false;
     }
-    primary.matches(key.modifiers) || alt
+    primary.matches(key.modifiers) || meta.matches(key.modifiers)
 }
 
 #[cfg(test)]
@@ -437,10 +439,11 @@ mod tests {
         assert_eq!(selector.selected_index(), 0);
 
         let chord = key(KeyCode::Char('m'), KeyModifiers::CONTROL);
-        assert!(!selector.handle_key(chord, PrimaryModifier::Ctrl, true));
+        assert!(!selector.handle_key(chord, PrimaryModifier::Ctrl, MetaModifier::Alt, true));
         assert!(!selector.handle_key(
             key(KeyCode::Down, KeyModifiers::NONE),
             PrimaryModifier::Ctrl,
+            MetaModifier::Alt,
             false,
         ));
 
@@ -457,6 +460,7 @@ mod tests {
         assert!(selector.handle_key(
             key(KeyCode::Char('m'), KeyModifiers::CONTROL),
             PrimaryModifier::Ctrl,
+            MetaModifier::Alt,
             true,
         ));
         assert_eq!(selector.selected_index(), 1);
@@ -464,6 +468,7 @@ mod tests {
         assert!(selector.handle_key(
             key(KeyCode::Char('M'), KeyModifiers::ALT),
             PrimaryModifier::Ctrl,
+            MetaModifier::Alt,
             true,
         ));
         assert_eq!(selector.selected_index(), 2);
@@ -476,6 +481,7 @@ mod tests {
         assert!(!selector.handle_key(
             key(KeyCode::Char('m'), KeyModifiers::CONTROL),
             PrimaryModifier::Alt,
+            MetaModifier::Alt,
             true,
         ));
         assert_eq!(selector.selected_index(), 0);
@@ -483,6 +489,7 @@ mod tests {
         assert!(selector.handle_key(
             key(KeyCode::Char('m'), KeyModifiers::ALT),
             PrimaryModifier::Alt,
+            MetaModifier::Alt,
             true,
         ));
         assert_eq!(selector.selected_index(), 1);
@@ -493,7 +500,7 @@ mod tests {
         let mut selector = ModelSelector::new(ModelRole::Reviewer, three_entries(), 0);
 
         let compose = key(KeyCode::Char('m'), KeyModifiers::CONTROL | KeyModifiers::ALT);
-        assert!(!selector.handle_key(compose, PrimaryModifier::Ctrl, true));
+        assert!(!selector.handle_key(compose, PrimaryModifier::Ctrl, MetaModifier::Alt, true));
         assert_eq!(selector.selected_index(), 0);
     }
 
@@ -504,6 +511,7 @@ mod tests {
         assert!(!selector.handle_key(
             key(KeyCode::Down, KeyModifiers::NONE),
             PrimaryModifier::Ctrl,
+            MetaModifier::Alt,
             true,
         ));
         assert_eq!(selector.selected_index(), 0, "editor keeps the arrows");
@@ -511,6 +519,7 @@ mod tests {
         assert!(selector.handle_key(
             key(KeyCode::Down, KeyModifiers::NONE),
             PrimaryModifier::Ctrl,
+            MetaModifier::Alt,
             false,
         ));
         assert_eq!(selector.selected_index(), 1);
@@ -518,6 +527,7 @@ mod tests {
         assert!(selector.handle_key(
             key(KeyCode::Up, KeyModifiers::NONE),
             PrimaryModifier::Ctrl,
+            MetaModifier::Alt,
             false,
         ));
         assert_eq!(selector.selected_index(), 0);
@@ -525,6 +535,7 @@ mod tests {
         assert!(!selector.handle_key(
             key(KeyCode::Enter, KeyModifiers::NONE),
             PrimaryModifier::Ctrl,
+            MetaModifier::Alt,
             false,
         ));
     }
@@ -542,7 +553,7 @@ mod tests {
 
         assert_eq!(
             text_of(&selector.render_stepper_spans(PrimaryModifier::Ctrl)),
-            "[Rev] Claude Auditor [high]  [1 of 2 • C-M / Alt+M]"
+            "[Rev] Claude Auditor [high]  [1 of 2 • C-M / M-M]"
         );
     }
 
@@ -566,7 +577,7 @@ mod tests {
 
         assert_eq!(
             text_of(&selector.render_stepper_spans(PrimaryModifier::Alt)),
-            "[Arc] openrouter:c  [3 of 3 • Alt+M]"
+            "[Arc] openrouter:c  [3 of 3 • M-M]"
         );
     }
 

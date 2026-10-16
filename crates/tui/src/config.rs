@@ -35,6 +35,63 @@ impl PrimaryModifier {
             PrimaryModifier::Alt => "Alt+",
         }
     }
+
+    /// Emacs-style chord prefix (`C-` for Ctrl, `M-` for Alt).
+    pub fn emacs_prefix(&self) -> &'static str {
+        match self {
+            PrimaryModifier::Ctrl => "C-",
+            PrimaryModifier::Alt => "M-",
+        }
+    }
+}
+
+/// Abstract meta command modifier (`M-`), the Readline/Emacs counterpart of the
+/// primary command modifier.
+///
+/// A keyboard carries two independent command chords: the primary modifier
+/// (`C-`, [`PrimaryModifier`]) and the meta modifier (`M-`). A terminal without
+/// a dedicated Meta key sends `M-` as either `Alt` (most modern terminals) or
+/// `Ctrl` (legacy setups), so the chord is expressed abstractly and resolved
+/// here instead of hardcoding `KeyModifiers::ALT` at every call site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MetaModifier {
+    #[default]
+    Alt,
+    Ctrl,
+}
+
+impl MetaModifier {
+    pub fn matches(&self, modifiers: KeyModifiers) -> bool {
+        match self {
+            MetaModifier::Alt => modifiers.contains(KeyModifiers::ALT),
+            MetaModifier::Ctrl => modifiers.contains(KeyModifiers::CONTROL),
+        }
+    }
+
+    pub fn prefix_str(&self) -> &'static str {
+        match self {
+            MetaModifier::Alt => "Alt+",
+            MetaModifier::Ctrl => "Ctrl+",
+        }
+    }
+
+    /// Emacs-style chord prefix (`M-` for Alt, `C-` for Ctrl).
+    pub fn emacs_prefix(&self) -> &'static str {
+        match self {
+            MetaModifier::Alt => "M-",
+            MetaModifier::Ctrl => "C-",
+        }
+    }
+}
+
+/// Whether the modifiers form the AltGr / compose chord (`Ctrl+Alt`).
+///
+/// On Windows and X11 AltGr arrives as `CONTROL | ALT`, so neither the primary
+/// nor the meta modifier may claim it; otherwise typing composed characters or
+/// AltGr digits would trigger application commands.
+fn is_compose_chord(modifiers: KeyModifiers) -> bool {
+    modifiers.contains(KeyModifiers::CONTROL) && modifiers.contains(KeyModifiers::ALT)
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -45,6 +102,66 @@ pub struct InputConfig {
     pub langmap: Option<String>,
     #[serde(default)]
     pub primary_modifier: PrimaryModifier,
+    #[serde(default)]
+    pub meta_modifier: MetaModifier,
+}
+
+impl InputConfig {
+    /// Whether the modifiers encode the abstract primary command modifier
+    /// (`C-`), excluding the AltGr / compose chord.
+    pub fn is_primary(&self, modifiers: KeyModifiers) -> bool {
+        !is_compose_chord(modifiers) && self.primary_modifier.matches(modifiers)
+    }
+
+    /// Whether the modifiers encode the abstract meta command modifier (`M-`),
+    /// excluding the AltGr / compose chord.
+    pub fn is_meta(&self, modifiers: KeyModifiers) -> bool {
+        !is_compose_chord(modifiers) && self.meta_modifier.matches(modifiers)
+    }
+}
+
+/// Process-wide snapshot of the configured input modifiers.
+///
+/// Rendering surfaces that build key hints without a reference to the
+/// application state read the `C-` / `M-` labels from here. The configuration
+/// load path installs them once, so drawing a dialog never touches the file
+/// system and never hardcodes a modifier string (Conventions §4).
+static ACTIVE_PRIMARY_MODIFIER: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+static ACTIVE_META_MODIFIER: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Installs the configured command modifiers for global key projection.
+pub fn set_active_input_modifiers(primary: PrimaryModifier, meta: MetaModifier) {
+    use std::sync::atomic::Ordering;
+    ACTIVE_PRIMARY_MODIFIER.store(
+        match primary {
+            PrimaryModifier::Ctrl => 0,
+            PrimaryModifier::Alt => 1,
+        },
+        Ordering::Relaxed,
+    );
+    ACTIVE_META_MODIFIER.store(
+        match meta {
+            MetaModifier::Alt => 0,
+            MetaModifier::Ctrl => 1,
+        },
+        Ordering::Relaxed,
+    );
+}
+
+/// The active primary command modifier (`C-`).
+pub fn active_primary_modifier() -> PrimaryModifier {
+    match ACTIVE_PRIMARY_MODIFIER.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => PrimaryModifier::Alt,
+        _ => PrimaryModifier::Ctrl,
+    }
+}
+
+/// The active meta command modifier (`M-`).
+pub fn active_meta_modifier() -> MetaModifier {
+    match ACTIVE_META_MODIFIER.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => MetaModifier::Ctrl,
+        _ => MetaModifier::Alt,
+    }
 }
 
 fn default_true() -> bool {
@@ -193,17 +310,31 @@ impl TuiConfig {
     /// invalid file is reported as an error so the caller can surface it.
     pub fn load_checked() -> Result<Self, String> {
         let Some(path) = find_tui_config_path() else {
-            return Ok(TuiConfig::default());
+            let config = TuiConfig::default();
+            config.install_input_modifiers();
+            return Ok(config);
         };
         let content = fs::read_to_string(&path)
             .map_err(|e| format!("Cannot read {}: {}", path.display(), e))?;
-        toml::from_str::<TuiConfig>(&content).map_err(|e| {
+        let config = toml::from_str::<TuiConfig>(&content).map_err(|e| {
             format!(
                 "Invalid {}: {}",
                 path.display(),
                 e.to_string().lines().next().unwrap_or("parse error")
             )
-        })
+        })?;
+        config.install_input_modifiers();
+        Ok(config)
+    }
+
+    /// Publishes the configured command modifiers for global key projection.
+    ///
+    /// Surfaces that build keybinding hints without a reference to the
+    /// application state read them back through [`active_primary_modifier`] and
+    /// [`active_meta_modifier`], so `C-` / `M-` labels always track the
+    /// developer's configuration.
+    fn install_input_modifiers(&self) {
+        set_active_input_modifiers(self.input.primary_modifier, self.input.meta_modifier);
     }
 
     pub fn load() -> Self {
@@ -253,7 +384,7 @@ pub fn default_tui_config_path() -> PathBuf {
 }
 
 pub fn save_tui_config(layout: LayoutPreset, langmap: Option<String>) -> std::io::Result<PathBuf> {
-    save_tui_config_full(layout, langmap, PrimaryModifier::Ctrl)
+    save_tui_config_full(layout, langmap, PrimaryModifier::Ctrl, MetaModifier::Alt)
 }
 
 /// Template seeded into a fresh `tui.toml`. It documents the default values and
@@ -268,6 +399,10 @@ layout = "none"
 # Primary command modifier for text input commands (Emacs-style C-x):
 #   "ctrl" (default) or "alt"
 primary_modifier = "ctrl"
+
+# Meta command modifier for text input commands (Emacs-style M-x):
+#   "alt" (default) or "ctrl"
+meta_modifier = "alt"
 
 [notifications]
 # Sound bell (\x07 / BEL) on long turn completion (triggers window alert/urgency in Kitty/WezTerm):
@@ -307,6 +442,7 @@ pub fn save_tui_config_full(
     layout: LayoutPreset,
     langmap: Option<String>,
     primary_modifier: PrimaryModifier,
+    meta_modifier: MetaModifier,
 ) -> std::io::Result<PathBuf> {
     let path = default_tui_config_path();
     if let Some(parent) = path.parent() {
@@ -316,7 +452,13 @@ pub fn save_tui_config_full(
     }
 
     let source = fs::read_to_string(&path).unwrap_or_else(|_| DEFAULT_TUI_TEMPLATE.to_string());
-    let merged = merge_workstation_settings(&source, layout, langmap.as_deref(), primary_modifier);
+    let merged = merge_workstation_settings(
+        &source,
+        layout,
+        langmap.as_deref(),
+        primary_modifier,
+        meta_modifier,
+    );
     fs::write(&path, merged)?;
     Ok(path)
 }
@@ -359,6 +501,7 @@ fn merge_workstation_settings(
     layout: LayoutPreset,
     langmap: Option<&str>,
     primary_modifier: PrimaryModifier,
+    meta_modifier: MetaModifier,
 ) -> String {
     let mut doc: DocumentMut = source.parse().unwrap_or_else(|_| DocumentMut::new());
 
@@ -369,6 +512,7 @@ fn merge_workstation_settings(
     if let Some(input) = doc.get_mut("input").and_then(|item| item.as_table_mut()) {
         set_input_value(input, "layout", layout_str(layout));
         set_input_value(input, "primary_modifier", primary_modifier_str(primary_modifier));
+        set_input_value(input, "meta_modifier", meta_modifier_str(meta_modifier));
         match langmap.map(str::trim).filter(|s| !s.is_empty()) {
             Some(lm) => set_input_value(input, "langmap", lm),
             None => {
@@ -391,6 +535,13 @@ fn primary_modifier_str(modifier: PrimaryModifier) -> &'static str {
     match modifier {
         PrimaryModifier::Ctrl => "ctrl",
         PrimaryModifier::Alt => "alt",
+    }
+}
+
+fn meta_modifier_str(modifier: MetaModifier) -> &'static str {
+    match modifier {
+        MetaModifier::Alt => "alt",
+        MetaModifier::Ctrl => "ctrl",
     }
 }
 
@@ -493,10 +644,13 @@ mode = "light"
             LayoutPreset::None,
             Some("йцукен"),
             PrimaryModifier::Ctrl,
+            MetaModifier::Alt,
         );
         assert!(merged.contains("\"none\""));
         assert!(!merged.contains("ru_jcuken"));
         assert!(merged.contains("\"ctrl\""));
+        assert!(merged.contains("meta_modifier"));
+        assert!(merged.contains("\"alt\""));
         assert!(merged.contains("langmap"));
         assert!(merged.contains("йцукен"));
         assert!(merged.contains("# Personal TUI settings"));
@@ -514,6 +668,7 @@ mode = "light"
             LayoutPreset::RuJcuken,
             None,
             PrimaryModifier::Ctrl,
+            MetaModifier::Alt,
         );
         assert!(merged.contains("ru_jcuken"));
         assert!(!merged.contains("langmap"));
@@ -521,12 +676,82 @@ mode = "light"
 
     #[test]
     fn test_merge_workstation_settings_seeds_missing_input_table() {
-        let merged =
-            merge_workstation_settings("", LayoutPreset::None, None, PrimaryModifier::Alt);
+        let merged = merge_workstation_settings(
+            "",
+            LayoutPreset::None,
+            None,
+            PrimaryModifier::Alt,
+            MetaModifier::Ctrl,
+        );
         assert!(merged.contains("layout"));
         assert!(merged.contains("\"none\""));
         assert!(merged.contains("primary_modifier"));
         assert!(merged.contains("\"alt\""));
+        assert!(merged.contains("meta_modifier"));
+        assert!(merged.contains("\"ctrl\""));
+    }
+
+    #[test]
+    fn test_meta_modifier_defaults_parse_and_prefixes() {
+        // A missing key resolves to the Alt default (the most common Meta key),
+        // while the primary modifier keeps its Ctrl default.
+        let default: TuiConfig = toml::from_str("").expect("empty config");
+        assert_eq!(default.input.meta_modifier, MetaModifier::Alt);
+        assert_eq!(default.input.primary_modifier, PrimaryModifier::Ctrl);
+
+        let cfg: TuiConfig =
+            toml::from_str("[input]\nmeta_modifier = \"ctrl\"\n").expect("valid tui config");
+        assert_eq!(cfg.input.meta_modifier, MetaModifier::Ctrl);
+
+        assert_eq!(MetaModifier::Alt.prefix_str(), "Alt+");
+        assert_eq!(MetaModifier::Alt.emacs_prefix(), "M-");
+        assert_eq!(MetaModifier::Ctrl.prefix_str(), "Ctrl+");
+        assert_eq!(MetaModifier::Ctrl.emacs_prefix(), "C-");
+
+        assert_eq!(PrimaryModifier::Ctrl.emacs_prefix(), "C-");
+        assert_eq!(PrimaryModifier::Alt.emacs_prefix(), "M-");
+    }
+
+    #[test]
+    fn test_input_config_is_primary_and_is_meta_exclude_altgr() {
+        let ctrl_primary = InputConfig {
+            primary_modifier: PrimaryModifier::Ctrl,
+            meta_modifier: MetaModifier::Alt,
+            ..InputConfig::default()
+        };
+        assert!(ctrl_primary.is_primary(KeyModifiers::CONTROL));
+        assert!(ctrl_primary.is_meta(KeyModifiers::ALT));
+        assert!(!ctrl_primary.is_primary(KeyModifiers::ALT));
+        assert!(!ctrl_primary.is_meta(KeyModifiers::CONTROL));
+
+        // The AltGr / compose chord belongs to neither modifier.
+        let altgr = KeyModifiers::CONTROL | KeyModifiers::ALT;
+        assert!(!ctrl_primary.is_primary(altgr));
+        assert!(!ctrl_primary.is_meta(altgr));
+
+        // Swapping the chords keeps the same AltGr exclusion.
+        let alt_primary = InputConfig {
+            primary_modifier: PrimaryModifier::Alt,
+            meta_modifier: MetaModifier::Ctrl,
+            ..InputConfig::default()
+        };
+        assert!(alt_primary.is_primary(KeyModifiers::ALT));
+        assert!(alt_primary.is_meta(KeyModifiers::CONTROL));
+        assert!(!alt_primary.is_primary(altgr));
+        assert!(!alt_primary.is_meta(altgr));
+    }
+
+    #[test]
+    fn test_merge_workstation_settings_persists_paired_meta_modifier() {
+        let merged = merge_workstation_settings(
+            "",
+            LayoutPreset::None,
+            None,
+            PrimaryModifier::Alt,
+            MetaModifier::Ctrl,
+        );
+        assert!(merged.contains("primary_modifier = \"alt\""));
+        assert!(merged.contains("meta_modifier = \"ctrl\""));
     }
 
     #[test]

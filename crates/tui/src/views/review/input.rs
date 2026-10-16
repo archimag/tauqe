@@ -4,37 +4,315 @@ use crossterm::event::{KeyCode, KeyEvent};
 use tauqe_protocol::{methods, ModelRole, ModelSelection, ReviewItem, ReviewRefineItemParams};
 use tokio::sync::Mutex;
 
-use crate::app::{AppState, KeyCommand, ReviewDialogState, ViewMode};
+use crate::app::{AppState, ReviewDialogState, ViewMode};
+use crate::command::CommandCategory::{Essential, Helpers, Interface};
+use crate::command::{CommandMap, CommandSpec, KeyChord};
 use crate::input::InputResult;
 use crate::rpc::{send_request, RpcConnection};
 
 use super::VisibleReviewRow;
 
-pub const REVIEW_COMMANDS: &[KeyCommand] = &[
-    // Core Actions
-    KeyCommand { key: "x", description: "Execute target finding or all Todo findings in session (with confirmation)" },
-    KeyCommand { key: "X", description: "Execute all Todo findings across all sessions (with confirmation)" },
-    KeyCommand { key: "Enter", description: "Execute finding; fold/unfold on session headers" },
-    KeyCommand { key: "r", description: "Run code review on current context" },
-    KeyCommand { key: "d", description: "Discuss selected finding or entire session in Develop" },
-    KeyCommand { key: "R", description: "Decompose selected finding into steps with AI (Architect)" },
-    KeyCommand { key: "f", description: "Set discussion focus to selected session or finding without leaving the view" },
-    KeyCommand { key: "t / s", description: "Change finding status (Discussion / Todo / InProgress...)" },
-    // Navigation & Inspection
-    KeyCommand { key: "n / p (or ↑/↓)", description: "Navigate review sessions and findings" },
-    KeyCommand { key: "C-n / C-p", description: "Inspect next / previous finding (accordion walk)" },
-    KeyCommand { key: "Tab / Space", description: "Fold / unfold session, summary, or finding details" },
-    KeyCommand { key: "a", description: "Toggle fold / unfold all sessions and findings" },
-    KeyCommand { key: "F", description: "Toggle filter: show all / hide closed (FIXED/REJECTED)" },
-    KeyCommand { key: "PgUp / PgDn", description: "Page scroll review view" },
-    KeyCommand { key: "Home / End", description: "Select first / last row" },
-    KeyCommand { key: "Esc / q", description: "Return to Develop view" },
-    // Editing & Clipboard
-    KeyCommand { key: "c / y", description: "Copy selected finding or session to clipboard" },
-    // Auxiliary & Destructive
-    KeyCommand { key: "g", description: "Refresh review sessions from server" },
-    KeyCommand { key: "Delete", description: "Delete review session (with confirmation)" },
-];
+/// Keyboard actions available in the Review view.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviewAction {
+    Return,
+    Activate,
+    Execute,
+    ExecuteAll,
+    RunReview,
+    Discuss,
+    Refine,
+    ChangeStatus,
+    SetFocus,
+    ToggleHideClosed,
+    NavPrev,
+    NavNext,
+    AccordionPrev,
+    AccordionNext,
+    SelectFirst,
+    SelectLast,
+    PageUp,
+    PageDown,
+    FoldToggle,
+    FoldAll,
+    Copy,
+    Refresh,
+    DeleteReview,
+}
+
+/// Single source of truth for the Review view keybindings.
+///
+/// Essential commands drive finding execution and the review cycle; Interface
+/// commands navigate, fold, and filter the tree; Helpers copy, refresh, and
+/// delete. The map drives the generated Help dialog. Case-differentiated chords
+/// are declared first so a shifted lowercase key always resolves to its explicit
+/// uppercase binding before the bare binding of the same letter.
+pub static REVIEW_COMMAND_MAP: CommandMap<ReviewAction> = CommandMap::new(&[
+    // Case-differentiated execution chords, declared before the bare `x`.
+    CommandSpec::new(
+        KeyChord::Bare(KeyCode::Char('X')),
+        ReviewAction::ExecuteAll,
+        Essential,
+        "Execute all Todo findings across all sessions (with confirmation)",
+    ),
+    CommandSpec::new(
+        KeyChord::Shift(KeyCode::Char('x')),
+        ReviewAction::ExecuteAll,
+        Essential,
+        "Execute all Todo findings across all sessions (with confirmation)",
+    ),
+    CommandSpec::new(
+        KeyChord::Bare(KeyCode::Char('x')),
+        ReviewAction::Execute,
+        Essential,
+        "Execute the selected finding or all Todo findings in the session",
+    ),
+    // Case-differentiated decomposition chords, declared before the bare `r`.
+    CommandSpec::new(
+        KeyChord::Bare(KeyCode::Char('R')),
+        ReviewAction::Refine,
+        Essential,
+        "Decompose the selected finding into steps with the Architect",
+    ),
+    CommandSpec::new(
+        KeyChord::Shift(KeyCode::Char('r')),
+        ReviewAction::Refine,
+        Essential,
+        "Decompose the selected finding into steps with the Architect",
+    ),
+    CommandSpec::new(
+        KeyChord::Bare(KeyCode::Char('r')),
+        ReviewAction::RunReview,
+        Essential,
+        "Run a code review on the current context",
+    ),
+    // Case-differentiated filter chords, declared before the bare `f`.
+    CommandSpec::new(
+        KeyChord::Bare(KeyCode::Char('F')),
+        ReviewAction::ToggleHideClosed,
+        Interface,
+        "Toggle the filter between all findings and open findings only",
+    ),
+    CommandSpec::new(
+        KeyChord::Shift(KeyCode::Char('f')),
+        ReviewAction::ToggleHideClosed,
+        Interface,
+        "Toggle the filter between all findings and open findings only",
+    ),
+    CommandSpec::new(
+        KeyChord::Bare(KeyCode::Char('f')),
+        ReviewAction::SetFocus,
+        Interface,
+        "Set the discussion focus to the selection without leaving the view",
+    ),
+    // Essential: review execution and the workflow cycle.
+    CommandSpec::new(
+        KeyChord::Bare(KeyCode::Enter),
+        ReviewAction::Activate,
+        Essential,
+        "Execute the selected finding; fold or unfold on session headers",
+    ),
+    CommandSpec::new(
+        KeyChord::Bare(KeyCode::Char('d')),
+        ReviewAction::Discuss,
+        Essential,
+        "Discuss the selected finding or the entire session in the REPL",
+    ),
+    CommandSpec::new(
+        KeyChord::Bare(KeyCode::Char('D')),
+        ReviewAction::Discuss,
+        Essential,
+        "Discuss the selected finding or the entire session in the REPL",
+    ),
+    CommandSpec::new(
+        KeyChord::Bare(KeyCode::Char('t')),
+        ReviewAction::ChangeStatus,
+        Essential,
+        "Change the finding status",
+    ),
+    CommandSpec::new(
+        KeyChord::Bare(KeyCode::Char('T')),
+        ReviewAction::ChangeStatus,
+        Essential,
+        "Change the finding status",
+    ),
+    CommandSpec::new(
+        KeyChord::Bare(KeyCode::Char('s')),
+        ReviewAction::ChangeStatus,
+        Essential,
+        "Change the finding status",
+    ),
+    CommandSpec::new(
+        KeyChord::Bare(KeyCode::Char('S')),
+        ReviewAction::ChangeStatus,
+        Essential,
+        "Change the finding status",
+    ),
+    // Interface: navigation, accordion walk, folding, and scrolling.
+    CommandSpec::new(
+        KeyChord::Bare(KeyCode::Esc),
+        ReviewAction::Return,
+        Interface,
+        "Return to the REPL",
+    ),
+    CommandSpec::new(
+        KeyChord::Bare(KeyCode::Char('q')),
+        ReviewAction::Return,
+        Interface,
+        "Return to the REPL",
+    ),
+    CommandSpec::new(
+        KeyChord::Bare(KeyCode::Up),
+        ReviewAction::NavPrev,
+        Interface,
+        "Select the previous row",
+    ),
+    CommandSpec::new(
+        KeyChord::Bare(KeyCode::Char('p')),
+        ReviewAction::NavPrev,
+        Interface,
+        "Select the previous row",
+    ),
+    CommandSpec::new(
+        KeyChord::Bare(KeyCode::Char('P')),
+        ReviewAction::NavPrev,
+        Interface,
+        "Select the previous row",
+    ),
+    CommandSpec::new(
+        KeyChord::Bare(KeyCode::Down),
+        ReviewAction::NavNext,
+        Interface,
+        "Select the next row",
+    ),
+    CommandSpec::new(
+        KeyChord::Bare(KeyCode::Char('n')),
+        ReviewAction::NavNext,
+        Interface,
+        "Select the next row",
+    ),
+    CommandSpec::new(
+        KeyChord::Bare(KeyCode::Char('N')),
+        ReviewAction::NavNext,
+        Interface,
+        "Select the next row",
+    ),
+    CommandSpec::new(
+        KeyChord::Ctrl(KeyCode::Char('n')),
+        ReviewAction::AccordionNext,
+        Interface,
+        "Inspect the next finding (accordion walk)",
+    ),
+    CommandSpec::new(
+        KeyChord::Primary(KeyCode::Char('n')),
+        ReviewAction::AccordionNext,
+        Interface,
+        "Inspect the next finding (accordion walk)",
+    ),
+    CommandSpec::new(
+        KeyChord::Ctrl(KeyCode::Char('p')),
+        ReviewAction::AccordionPrev,
+        Interface,
+        "Inspect the previous finding (accordion walk)",
+    ),
+    CommandSpec::new(
+        KeyChord::Primary(KeyCode::Char('p')),
+        ReviewAction::AccordionPrev,
+        Interface,
+        "Inspect the previous finding (accordion walk)",
+    ),
+    CommandSpec::new(
+        KeyChord::Bare(KeyCode::Home),
+        ReviewAction::SelectFirst,
+        Interface,
+        "Select the first row",
+    ),
+    CommandSpec::new(
+        KeyChord::Bare(KeyCode::End),
+        ReviewAction::SelectLast,
+        Interface,
+        "Select the last row",
+    ),
+    CommandSpec::new(
+        KeyChord::Bare(KeyCode::PageUp),
+        ReviewAction::PageUp,
+        Interface,
+        "Scroll the review view up one page",
+    ),
+    CommandSpec::new(
+        KeyChord::Bare(KeyCode::PageDown),
+        ReviewAction::PageDown,
+        Interface,
+        "Scroll the review view down one page",
+    ),
+    CommandSpec::new(
+        KeyChord::Bare(KeyCode::Tab),
+        ReviewAction::FoldToggle,
+        Interface,
+        "Fold or unfold the session, summary, or finding details",
+    ),
+    CommandSpec::new(
+        KeyChord::Bare(KeyCode::Char(' ')),
+        ReviewAction::FoldToggle,
+        Interface,
+        "Fold or unfold the session, summary, or finding details",
+    ),
+    CommandSpec::new(
+        KeyChord::Bare(KeyCode::Char('a')),
+        ReviewAction::FoldAll,
+        Interface,
+        "Toggle fold or unfold for all sessions and findings",
+    ),
+    CommandSpec::new(
+        KeyChord::Bare(KeyCode::Char('A')),
+        ReviewAction::FoldAll,
+        Interface,
+        "Toggle fold or unfold for all sessions and findings",
+    ),
+    // Helpers: clipboard, refresh, and destructive operations.
+    CommandSpec::new(
+        KeyChord::Bare(KeyCode::Char('c')),
+        ReviewAction::Copy,
+        Helpers,
+        "Copy the selected finding or session to the clipboard",
+    ),
+    CommandSpec::new(
+        KeyChord::Bare(KeyCode::Char('C')),
+        ReviewAction::Copy,
+        Helpers,
+        "Copy the selected finding or session to the clipboard",
+    ),
+    CommandSpec::new(
+        KeyChord::Bare(KeyCode::Char('y')),
+        ReviewAction::Copy,
+        Helpers,
+        "Copy the selected finding or session to the clipboard",
+    ),
+    CommandSpec::new(
+        KeyChord::Bare(KeyCode::Char('Y')),
+        ReviewAction::Copy,
+        Helpers,
+        "Copy the selected finding or session to the clipboard",
+    ),
+    CommandSpec::new(
+        KeyChord::Bare(KeyCode::Delete),
+        ReviewAction::DeleteReview,
+        Helpers,
+        "Delete the review session (with confirmation)",
+    ),
+    CommandSpec::new(
+        KeyChord::Bare(KeyCode::Char('g')),
+        ReviewAction::Refresh,
+        Helpers,
+        "Refresh review sessions from the server",
+    ),
+    CommandSpec::new(
+        KeyChord::Bare(KeyCode::Char('G')),
+        ReviewAction::Refresh,
+        Helpers,
+        "Refresh review sessions from the server",
+    ),
+]);
 
 fn execute_review_scope_action(
     st: &mut AppState,
@@ -341,7 +619,8 @@ pub async fn handle_review_key(
             st.review.scroll = st.review.scroll.saturating_sub(page);
         }
         KeyCode::PageDown => {
-            let max = (st.review.rendered_lines as u16).saturating_sub(page);
+            let max = (st.review.rendered_lines as u16)
+                .saturating_sub(st.review.view_height);
             st.review.scroll = st.review.scroll.saturating_add(page).min(max);
         }
         KeyCode::Tab | KeyCode::Char(' ') => {
@@ -673,17 +952,20 @@ pub async fn handle_review_key(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashSet;
 
     #[test]
-    fn test_command_bindings_are_unique() {
-        let keys: HashSet<&str> = REVIEW_COMMANDS.iter().map(|c| c.key).collect();
-        assert!(!REVIEW_COMMANDS.is_empty());
-        assert_eq!(
-            keys.len(),
-            REVIEW_COMMANDS.len(),
-            "duplicate key bindings in REVIEW_COMMANDS"
-        );
+    fn test_command_map_chords_are_unique() {
+        let chords: Vec<KeyChord> = REVIEW_COMMAND_MAP
+            .specs()
+            .iter()
+            .map(|spec| spec.chord)
+            .collect();
+        assert!(!chords.is_empty());
+        for (index, chord) in chords.iter().enumerate() {
+            for other in chords.iter().skip(index + 1) {
+                assert_ne!(chord, other, "duplicate key chord in REVIEW_COMMAND_MAP");
+            }
+        }
     }
 
     #[tokio::test]

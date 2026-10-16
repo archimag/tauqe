@@ -5,6 +5,7 @@
 
 pub mod app;
 pub mod clipboard;
+pub mod command;
 pub mod components;
 pub mod config;
 pub mod dialogs;

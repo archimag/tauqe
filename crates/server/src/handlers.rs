@@ -136,7 +136,21 @@ pub(crate) async fn run_preflight_verification(repo_root: &Path) -> Result<(), S
 }
 
 async fn handle_client_initialize(req: Request, state: &Arc<AppState>) -> Response {
-    let repo_state = tauqe_core::git::get_repository_state(None);
+    // Reading the repository state shells out to git, so it is offloaded and
+    // resolved from the authoritative shared root instead of the process CWD.
+    let repo_root = state.repo_root().await;
+    let repo_state = match offload(move || {
+        let root = repo_root.as_path();
+        tauqe_core::git::get_repository_state(Some(root))
+    })
+    .await
+    {
+        Ok(repo_state) => repo_state,
+        Err(err) => {
+            tracing::warn!(error = %err, "Failed to read repository state during initialize");
+            return Response::err(req.id, tauqe_protocol::errors::REPOSITORY_STATE_FAILED, err);
+        }
+    };
     let repo_path = Path::new(&repo_state.root);
 
     // Update configuration and the repo-bound managers under separate, short-lived
@@ -154,8 +168,10 @@ async fn handle_client_initialize(req: Request, state: &Arc<AppState>) -> Respon
         }
         let mut hm = HistoryManager::new(repo_path.to_path_buf());
         let sender = state.history_sender.clone();
-        hm.set_listener(move |item| {
-            let _ = sender.send(item);
+        // Forward every history mutation so a compaction reaches the client as
+        // a structural rewrite rather than a trailing append.
+        hm.set_listener(move |mutation| {
+            let _ = sender.send(mutation);
         });
         let mut history = state.history.lock().await;
         *history = hm;

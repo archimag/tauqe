@@ -1,5 +1,6 @@
 use tauqe_protocol::{EditFileOp, EditOperation, EditOutcome, ModelResult, ModelResultProposal};
 
+use crate::edits::stream::json::decode::{balanced_object_end, strip_code_fence};
 use crate::providers::{JsonSchemaDefinition, ResponseFormat};
 
 use super::utils::{normalize_content, resolve_target_path_for_op};
@@ -26,8 +27,8 @@ impl StructuredEditProtocol {
                         "properties": {
                             "op": {
                                 "type": "string",
-                                "enum": ["replace", "create", "delete", "move"],
-                                "description": "Operation type: 'replace' for modifying existing files, 'create' for new files, 'delete' for deleting files, 'move' for moving or renaming files"
+                                "enum": ["replace", "create", "delete", "move", "overwrite"],
+                                "description": "Operation type: 'replace' for modifying existing files, 'create' for new files, 'delete' for deleting files, 'move' for moving or renaming files, 'overwrite' for replacing the entire content of an existing file"
                             },
                             "path": {
                                 "type": "string",
@@ -47,7 +48,7 @@ impl StructuredEditProtocol {
                             },
                             "content": {
                                 "type": "string",
-                                "description": "Complete file content (required for 'create', empty string otherwise)"
+                                "description": "Complete file content (required for 'create' and 'overwrite', empty string otherwise)"
                             }
                         },
                         "required": ["op", "path", "to", "old_text", "new_text", "content"],
@@ -219,7 +220,7 @@ impl StructuredEditProtocol {
         prompt.push_str("## Code Modification Protocol (Structured Output JSON)\n");
         prompt.push_str("You must respond with a JSON object conforming to the structured output schema with the following fields:\n");
         prompt.push_str("- `message`: Your conversational explanation or answer to the user.\n");
-        prompt.push_str("- `changes`: Array of code edit operations (`op`: 'replace'|'create'|'delete'|'move', `path`, `to`, `old_text`, `new_text`, `content`).\n");
+        prompt.push_str("- `changes`: Array of code edit operations (`op`: 'replace'|'create'|'delete'|'move'|'overwrite', `path`, `to`, `old_text`, `new_text`, `content`).\n");
         prompt.push_str("- `context_requests`: Files to add to context. Each entry is a repository-relative path (read-only) or `editable:<path>` for files you need to modify.\n");
         prompt.push_str(
             "- `suggested_actions`: Optional list of suggested follow-up options for the user.\n",
@@ -242,7 +243,7 @@ impl StructuredEditProtocol {
             "2. For 'replace', `path` MUST match one of the permitted files in <editable_files>.\n",
         );
         prompt.push_str("3. For 'replace', `old_text` must match EXACTLY ONE location in the target file, including indentation and whitespace.\n");
-        prompt.push_str("4. For 'create', `content` must contain the complete file content from first to last line.\n");
+        prompt.push_str("4. For 'create' and 'overwrite', `content` must contain the complete file content from first to last line.\n");
         prompt.push_str("5. If no code changes are needed, set `changes: []` and provide your answer in `message`.\n");
 
         prompt.push_str("6. Context Discovery: If the task requires files listed in <repo_map> that are not present in the editable or read-only files, request them FIRST: set `changes: []` and list them in `context_requests`. You will be called again with the full file contents added to context. Never request files that are already in context.\n\n");
@@ -317,7 +318,7 @@ impl StructuredEditProtocol {
 ///
 /// Thus `&raw[start..end]` and `raw[from..]` never split multi-byte characters.
 fn parse_proposal(raw: &str) -> Option<ModelResultProposal> {
-    let clean = extract_json_str(raw);
+    let clean = strip_code_fence(raw);
     if let Ok(p) = serde_json::from_str::<ModelResultProposal>(clean) {
         return Some(p);
     }
@@ -333,58 +334,6 @@ fn parse_proposal(raw: &str) -> Option<ModelResultProposal> {
         from = start + 1;
     }
     None
-}
-
-/// Returns the exclusive end offset of the JSON object starting at `start`, if complete.
-///
-/// UTF-8 Slicing Invariant:
-/// When returning `Some(i + 1)`, byte `bytes[i]` is guaranteed to be an ASCII closing delimiter
-/// (`b'}'` or `b']'`), which is single-byte ASCII. Therefore `i + 1` is always a valid UTF-8 char boundary.
-fn balanced_object_end(raw: &str, start: usize) -> Option<usize> {
-    let bytes = raw.as_bytes();
-    let mut depth = 0usize;
-    let mut in_string = false;
-    let mut i = start;
-    while i < bytes.len() {
-        let b = bytes[i];
-        if in_string {
-            match b {
-                b'\\' => i += 1,
-                b'"' => in_string = false,
-                _ => {}
-            }
-        } else {
-            match b {
-                b'"' => in_string = true,
-                b'{' | b'[' => depth += 1,
-                b'}' | b']' => {
-                    depth = depth.saturating_sub(1);
-                    if depth == 0 {
-                        return Some(i + 1);
-                    }
-                }
-                _ => {}
-            }
-        }
-        i += 1;
-    }
-    None
-}
-
-fn extract_json_str(raw: &str) -> &str {
-    let trimmed = raw.trim();
-    if let Some(idx) = trimmed.find("```json") {
-        let after = &trimmed[idx + 7..];
-        if let Some(end) = after.find("```") {
-            return after[..end].trim();
-        }
-    } else if let Some(idx) = trimmed.find("```") {
-        let after = &trimmed[idx + 3..];
-        if let Some(end) = after.find("```") {
-            return after[..end].trim();
-        }
-    }
-    trimmed
 }
 
 /// Cleans raw text or JSON into conversational text without raw schema markup.
@@ -552,6 +501,18 @@ mod tests {
             .as_array()
             .unwrap();
         assert_eq!(required.len(), 6);
+    }
+
+    #[test]
+    fn test_structured_schema_and_instructions_include_overwrite() {
+        let schema = StructuredEditProtocol::schema(&[]);
+        let ops = schema["properties"]["changes"]["items"]["properties"]["op"]["enum"]
+            .as_array()
+            .unwrap();
+        assert!(ops.iter().any(|op| op == "overwrite"));
+
+        let instr = StructuredEditProtocol.system_instructions(&[]);
+        assert!(instr.contains("overwrite"));
     }
 
     #[test]

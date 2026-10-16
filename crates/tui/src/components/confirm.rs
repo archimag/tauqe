@@ -138,22 +138,16 @@ pub fn confirm_modal_geometry(
     let height_percent = (needed_height * 100 / term.height.max(1)).clamp(25, 90);
     let area = centered_rect(width, height_percent, term);
 
-    let inner_y = area.y + 1;
-    let inner_h = area.height.saturating_sub(2);
-    let inner_x = area.x + 1;
-    let inner_w = area.width.saturating_sub(2);
-
-    let btn_y = inner_y + inner_h.saturating_sub(3);
-
-    let l1 = confirm_label.chars().count() + 6;
-    let l2 = cancel_label.chars().count() + 6;
-    let total_len = l1 + 4 + l2;
-    let start_x = inner_x + (inner_w.saturating_sub(total_len as u16)) / 2;
+    // Delegate to the shared modal geometry so the confirmation buttons and the
+    // reusable modal frame derive their bounds from a single source of truth and
+    // cannot drift (Conventions §6, §7).
+    let (confirm_button, cancel_button) =
+        crate::components::modal::modal_action_buttons(area, confirm_label, cancel_label);
 
     ConfirmModalGeometry {
         area,
-        confirm_button: Rect::new(start_x, btn_y, l1 as u16, 1),
-        cancel_button: Rect::new(start_x + l1 as u16 + 4, btn_y, l2 as u16, 1),
+        confirm_button,
+        cancel_button,
     }
 }
 
@@ -191,9 +185,9 @@ pub fn render_modal_confirm(frame: &mut ratatui::Frame, params: ConfirmModalPara
         actions_state: dialog.actions(),
         is_actions_focused: true,
         destructive: params.destructive,
-        hint_text: Some(
-            "Tab / ← / → focus • Enter/Space execute • y / n fast select • Esc cancel",
-        ),
+        // `None` lets the frame render the shared dialog vocabulary projected
+        // through the configured `C-` / `M-` modifiers.
+        hint_text: None,
     };
 
     modal.render(frame, |f, body_area| {

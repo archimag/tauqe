@@ -104,10 +104,13 @@ pub fn render_prompt_modal(
         actions_state: modal.actions,
         is_actions_focused,
         destructive: false,
+        // The footer vocabulary is projected through the shared semantic span
+        // renderer: every group reads `CHORD / CHORD verb`, so chords are
+        // emphasized, verbs read as descriptions, and separators recede.
         hint_text: if is_actions_focused {
-            Some("← / → switch button • Enter/Space execute • Tab to Editor • y / n fast select • Esc cancel")
+            Some("← / → switch • Tab focus • Enter send • y / n select • Esc dismiss")
         } else {
-            Some("Type message • Enter send • Shift+Enter / Alt+Enter / C-J newline • Tab to Buttons • Esc cancel")
+            Some("Enter send • Shift+Enter / Alt+Enter / C-J newline • Tab controls • Esc dismiss")
         },
     };
 

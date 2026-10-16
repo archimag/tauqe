@@ -104,6 +104,7 @@ const TAUQE_DARK: ThemePalette = ThemePalette {
     text_primary: RgbColor::new(192, 202, 245),
     text_secondary: RgbColor::new(169, 177, 214),
     text_muted: RgbColor::new(86, 95, 137),
+    text_reasoning: RgbColor::new(177, 162, 202),
     text_inverse: RgbColor::new(26, 27, 38),
     button_bg: RgbColor::new(59, 66, 97),
     button_fg: RgbColor::new(192, 202, 245),
@@ -127,6 +128,7 @@ const TAUQE_LIGHT: ThemePalette = ThemePalette {
     text_primary: RgbColor::new(58, 58, 56),
     text_secondary: RgbColor::new(92, 92, 88),
     text_muted: RgbColor::new(138, 138, 132),
+    text_reasoning: RgbColor::new(108, 92, 132),
     text_inverse: RgbColor::new(250, 249, 245),
     button_bg: RgbColor::new(227, 224, 214),
     button_fg: RgbColor::new(58, 58, 56),
@@ -150,6 +152,7 @@ const CATPPUCCIN_MOCHA: ThemePalette = ThemePalette {
     text_primary: RgbColor::new(205, 214, 244),
     text_secondary: RgbColor::new(186, 194, 222),
     text_muted: RgbColor::new(127, 132, 156),
+    text_reasoning: RgbColor::new(203, 166, 247),
     text_inverse: RgbColor::new(17, 17, 27),
     button_bg: RgbColor::new(69, 71, 90),
     button_fg: RgbColor::new(205, 214, 244),
@@ -173,6 +176,7 @@ const GRUVBOX_DARK: ThemePalette = ThemePalette {
     text_primary: RgbColor::new(235, 219, 178),
     text_secondary: RgbColor::new(213, 196, 161),
     text_muted: RgbColor::new(146, 131, 116),
+    text_reasoning: RgbColor::new(211, 134, 155),
     text_inverse: RgbColor::new(40, 40, 40),
     button_bg: RgbColor::new(80, 73, 69),
     button_fg: RgbColor::new(235, 219, 178),
@@ -197,6 +201,7 @@ const SOLARIZED_DARK: ThemePalette = ThemePalette {
     text_primary: RgbColor::new(147, 161, 161),
     text_secondary: RgbColor::new(131, 148, 150),
     text_muted: RgbColor::new(101, 123, 131),
+    text_reasoning: RgbColor::new(178, 150, 205),
     text_inverse: RgbColor::new(0, 43, 54),
     button_bg: RgbColor::new(7, 54, 66),
     button_fg: RgbColor::new(147, 161, 161),
@@ -286,6 +291,10 @@ mod tests {
         assert!(
             pair(palette.text_muted, palette.canvas) >= 2.0,
             "{preset:?}/{depth:?}: muted text is illegible on the canvas"
+        );
+        assert!(
+            pair(palette.text_reasoning, palette.canvas) >= 3.0,
+            "{preset:?}/{depth:?}: reasoning text lacks contrast on the canvas"
         );
         assert!(
             pair(palette.button_fg, palette.button_bg) >= 3.0,

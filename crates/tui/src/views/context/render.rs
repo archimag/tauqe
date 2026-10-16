@@ -1,5 +1,5 @@
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style, Stylize};
+use ratatui::style::{Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Padding, Paragraph, Wrap};
 use tauqe_protocol::{ContextAccess, ContextLayer};
@@ -15,6 +15,8 @@ pub fn render_context_view(
     main_area: Rect,
     info_area: Rect,
 ) {
+    let engine = crate::theme::engine::current_engine();
+    let palette = engine.palette();
     let mut context_lines: Vec<Line> = Vec::new();
 
     let pinned_count = state.context.items.iter().filter(|i| i.layer == ContextLayer::Pinned).count();
@@ -25,7 +27,7 @@ pub fn render_context_view(
         Span::raw("Total size: "),
         Span::styled(
             format!("~{} tokens", state.context.total_estimated_tokens),
-            Style::default().fg(Color::Cyan).bold(),
+            engine.fg(palette.status_info).bold(),
         ),
         Span::raw(format!(
             " | Files: {} (Pinned: {}, User: {}, Auto: {})",
@@ -45,14 +47,14 @@ pub fn render_context_view(
         let is_selected = idx == state.context_view.cursor_index;
         match row {
             ContextRow::Header(layer) => {
-                let (arrow, name, count, tokens, style_color, hint) = match layer {
+                let (arrow, name, count, tokens, role, hint) = match layer {
                     ContextLayer::Pinned => {
                         let arrow = if state.context_view.pinned_expanded { "▼" } else { "▶" };
                         let tokens: u64 = state.context.items.iter()
                             .filter(|i| i.layer == ContextLayer::Pinned)
                             .map(|i| i.estimated_tokens)
                             .sum();
-                        (arrow, "Pinned Files", pinned_count, tokens, Color::Cyan, " [Protected / Config]")
+                        (arrow, "Pinned Files", pinned_count, tokens, palette.status_info, " [Protected / Config]")
                     }
                     ContextLayer::User => {
                         let arrow = if state.context_view.user_expanded { "▼" } else { "▶" };
@@ -60,7 +62,7 @@ pub fn render_context_view(
                             .filter(|i| i.layer == ContextLayer::User)
                             .map(|i| i.estimated_tokens)
                             .sum();
-                        (arrow, "User Files", user_count, tokens, Color::Yellow, " [Editable / Read-Only]")
+                        (arrow, "User Files", user_count, tokens, palette.status_warning, " [Editable / Read-Only]")
                     }
                     ContextLayer::Auto => {
                         let arrow = if state.context_view.auto_expanded { "▼" } else { "▶" };
@@ -68,25 +70,25 @@ pub fn render_context_view(
                             .filter(|i| i.layer == ContextLayer::Auto)
                             .map(|i| i.estimated_tokens)
                             .sum();
-                        (arrow, "Auto Files", auto_count, tokens, Color::Magenta, " [Model Requested]")
+                        (arrow, "Auto Files", auto_count, tokens, palette.button_active_bg, " [Model Requested]")
                     }
                 };
 
                 let prefix = if is_selected { "● " } else { "  " };
                 let line_style = if is_selected {
-                    Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD)
+                    engine.bg(palette.overlay).add_modifier(Modifier::BOLD)
                 } else {
                     Style::default()
                 };
 
                 let header_line = Line::from(vec![
-                    Span::styled(prefix, Style::default().fg(style_color).bold()),
-                    Span::styled(format!("{} {} ", arrow, name), Style::default().fg(style_color).bold()),
+                    Span::styled(prefix, engine.fg(role).bold()),
+                    Span::styled(format!("{} {} ", arrow, name), engine.fg(role).bold()),
                     Span::styled(
                         format!("({} files, ~{} tokens)", count, tokens),
-                        Style::default().fg(Color::White).bold(),
+                        engine.fg(palette.text_primary).bold(),
                     ),
-                    Span::styled(hint, Style::default().fg(Color::DarkGray)),
+                    Span::styled(hint, engine.fg(palette.text_muted)),
                 ]).style(line_style);
 
                 context_lines.push(header_line);
@@ -96,23 +98,21 @@ pub fn render_context_view(
 
                 let (access_badge, access_style) = match item.access {
                     ContextAccess::Editable => {
-                        ("[EDITABLE] ", Style::default().fg(Color::Yellow).bold())
+                        ("[EDITABLE] ", engine.fg(palette.status_warning).bold())
                     }
                     ContextAccess::ReadOnly => {
-                        ("[READ-ONLY]", Style::default().fg(Color::Green))
+                        ("[READ-ONLY]", engine.fg(palette.status_success))
                     }
                 };
 
                 let line_style = if is_selected {
-                    Style::default()
-                        .bg(Color::DarkGray)
-                        .add_modifier(Modifier::BOLD)
+                    engine.bg(palette.overlay).add_modifier(Modifier::BOLD)
                 } else {
                     Style::default()
                 };
 
                 let item_line = Line::from(vec![
-                    Span::styled(cursor_prefix, Style::default().fg(Color::Cyan)).bold(),
+                    Span::styled(cursor_prefix, engine.fg(palette.status_info)).bold(),
                     Span::styled(access_badge, access_style),
                     Span::raw(" "),
                     Span::styled(&item.path, Style::default().bold()),
@@ -121,7 +121,7 @@ pub fn render_context_view(
                             "  (~{} tokens, {} B)",
                             item.estimated_tokens, item.size_bytes
                         ),
-                        Style::default().fg(Color::DarkGray),
+                        engine.fg(palette.text_muted),
                     ),
                 ])
                 .style(line_style);
@@ -152,33 +152,33 @@ pub fn render_context_view(
     let info_line = match active_row {
         Some(ContextRow::Header(ContextLayer::Pinned)) => Line::from(Span::styled(
             "Pinned layer: Architecture & reference documents specified in tauqe.toml",
-            Style::default().fg(Color::Cyan),
+            engine.fg(palette.status_info),
         )),
         Some(ContextRow::Header(ContextLayer::User)) => Line::from(Span::styled(
             "User layer: Persistent files curated by the developer (Editable or Read-Only)",
-            Style::default().fg(Color::Yellow),
+            engine.fg(palette.status_warning),
         )),
         Some(ContextRow::Header(ContextLayer::Auto)) => Line::from(Span::styled(
             "Auto layer: Files autonomously requested by the model during discovery rounds",
-            Style::default().fg(Color::Magenta),
+            engine.fg(palette.button_active_bg),
         )),
         Some(ContextRow::Item(ref it)) => match it.layer {
             ContextLayer::Pinned => Line::from(Span::styled(
                 format!("Pinned document: {} (protected, ~{} tokens)", it.path, it.estimated_tokens),
-                Style::default().fg(Color::Cyan),
+                engine.fg(palette.status_info),
             )),
             ContextLayer::User => Line::from(Span::styled(
                 format!("User file: {} [{:?}], ~{} tokens", it.path, it.access, it.estimated_tokens),
-                Style::default().fg(Color::White),
+                engine.fg(palette.text_primary),
             )),
             ContextLayer::Auto => Line::from(Span::styled(
                 format!("Auto-discovered file: {} [{:?}], ~{} tokens", it.path, it.access, it.estimated_tokens),
-                Style::default().fg(Color::Magenta),
+                engine.fg(palette.button_active_bg),
             )),
         },
         None => Line::from(Span::styled(
             "Context state: 3 layers (Pinned, User, Auto) | Press '?' for commands",
-            Style::default().fg(Color::DarkGray),
+            engine.fg(palette.text_muted),
         )),
     };
     let prompt_widget = Paragraph::new(info_line)
@@ -191,6 +191,8 @@ pub fn render_context_view(
 }
 
 fn render_add_file_picker(frame: &mut ratatui::Frame, state: &AppState) {
+    let engine = crate::theme::engine::current_engine();
+    let palette = engine.palette();
     let area = centered_rect(70, 50, frame.area());
     frame.render_widget(Clear, area);
 
@@ -200,25 +202,26 @@ fn render_add_file_picker(frame: &mut ratatui::Frame, state: &AppState) {
         .split(area);
 
     let input_line = Line::from(vec![
-        Span::styled(" File / Pattern: ", Style::default().fg(Color::Cyan).bold()),
+        Span::styled(" File / Pattern: ", engine.fg(palette.status_info).bold()),
         Span::raw(state.context_view.add_input.get_text()),
-        Span::styled("█", Style::default().fg(Color::Yellow)),
+        Span::styled("█", engine.fg(palette.status_warning)),
     ]);
-    let (access_title, border_color) = match state.context_view.add_access {
+    let (access_title, border_style) = match state.context_view.add_access {
         ContextAccess::Editable => (
             " Add EDITABLE to Context (Path, directory or glob like *.rs) ",
-            Color::Yellow,
+            engine.fg(palette.status_warning),
         ),
         ContextAccess::ReadOnly => (
             " Add READ-ONLY to Context (Path, directory or glob like *.rs) ",
-            Color::Cyan,
+            engine.fg(palette.status_info),
         ),
     };
     let input_block = Paragraph::new(input_line).block(
         Block::default()
             .title(access_title)
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(border_color)),
+            .border_style(border_style)
+            .style(Style::default().bg(engine.color(palette.surface))),
     );
     frame.render_widget(input_block, chunks[0]);
 
@@ -230,12 +233,12 @@ fn render_add_file_picker(frame: &mut ratatui::Frame, state: &AppState) {
     if state.all_repo_files.is_empty() {
         candidate_lines.push(Line::from(Span::styled(
             "  Loading repository files from server...",
-            Style::default().fg(Color::Yellow).italic(),
+            engine.fg(palette.status_warning).italic(),
         )));
     } else if total_candidates == 0 {
         candidate_lines.push(Line::from(Span::styled(
             "  No matching files found.",
-            Style::default().fg(Color::DarkGray),
+            engine.fg(palette.text_muted),
         )));
     } else {
         let max_visible = visible_rows.max(1);
@@ -252,29 +255,35 @@ fn render_add_file_picker(frame: &mut ratatui::Frame, state: &AppState) {
             let (prefix, style) = if is_sel {
                 (
                     " ▶ ",
-                    Style::default().bg(Color::DarkGray).fg(Color::White).bold(),
+                    engine
+                        .bg(palette.overlay)
+                        .fg(engine.color(palette.text_primary))
+                        .bold(),
                 )
             } else {
-                ("   ", Style::default().fg(Color::Gray))
+                ("   ", engine.fg(palette.text_secondary))
             };
 
             let is_pattern_entry = candidate.starts_with("[+] Add all matching '");
 
             let line = if is_pattern_entry {
                 Line::from(vec![
-                    Span::styled(prefix, Style::default().fg(Color::Green).bold()),
+                    Span::styled(prefix, engine.fg(palette.status_success).bold()),
                     Span::styled(
                         candidate,
                         if is_sel {
-                            Style::default().bg(Color::Green).fg(Color::Black).bold()
+                            engine
+                                .bg(palette.status_success)
+                                .fg(engine.color(palette.text_inverse))
+                                .bold()
                         } else {
-                            Style::default().fg(Color::Green).bold()
+                            engine.fg(palette.status_success).bold()
                         },
                     ),
                 ])
             } else {
                 Line::from(vec![
-                    Span::styled(prefix, Style::default().fg(Color::Cyan)).bold(),
+                    Span::styled(prefix, engine.fg(palette.status_info)).bold(),
                     Span::styled(candidate, style),
                 ])
             };
@@ -308,7 +317,8 @@ fn render_add_file_picker(frame: &mut ratatui::Frame, state: &AppState) {
         Block::default()
             .title(list_title)
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::DarkGray)),
+            .border_style(engine.fg(palette.text_muted))
+            .style(Style::default().bg(engine.color(palette.surface))),
     );
     frame.render_widget(list_block, chunks[1]);
 }

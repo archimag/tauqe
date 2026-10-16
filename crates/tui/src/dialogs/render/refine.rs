@@ -6,6 +6,7 @@ use ratatui::style::{Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 
+use crate::components::modal::render_dialog_footer;
 use crate::config::PrimaryModifier;
 use crate::theme::engine::current_engine;
 use crate::ui::centered_rect;
@@ -22,7 +23,8 @@ pub const REFINE_DIALOG_CANCEL_LABEL: &str = "[ Cancel ]";
 
 /// Height of the header block (plan label and description).
 const REFINE_HEADER_HEIGHT: u16 = 4;
-/// Height of the action-bar block (buttons and navigation hint).
+/// Height of the footer block: the action bar (2 rows) plus the docked hint
+/// strip (1 row).
 const REFINE_FOOTER_HEIGHT: u16 = 3;
 /// Minimum height kept for the instructions editor on short terminals.
 const REFINE_EDITOR_MIN_HEIGHT: u16 = 3;
@@ -59,11 +61,14 @@ fn inset(area: Rect) -> Rect {
     )
 }
 
-/// Splits the dialog interior into `[header, architect list, editor, footer]`.
+/// Splits the dialog interior into
+/// `[header, architect list, editor, buttons, footer]`.
 ///
 /// The action bar, list, and header are sized first so the dialog stays usable
 /// on short terminals; the instructions editor absorbs whatever height remains.
-fn refine_dialog_chunks(area: Rect, entry_count: usize) -> [Rect; 4] {
+/// The footer block splits into the interactive action bar and a one-row docked
+/// hint strip pinned to the card's bottom edge.
+fn refine_dialog_chunks(area: Rect, entry_count: usize) -> [Rect; 5] {
     let inner = inset(area);
 
     let footer_h = REFINE_FOOTER_HEIGHT.min(inner.height);
@@ -80,8 +85,14 @@ fn refine_dialog_chunks(area: Rect, entry_count: usize) -> [Rect; 4] {
     let header = Rect::new(inner.x, inner.y, inner.width, header_h);
     let list = Rect::new(inner.x, inner.y + header_h, inner.width, list_h);
     let editor = Rect::new(inner.x, list.y + list_h, inner.width, editor_h);
-    let footer = Rect::new(inner.x, editor.y + editor_h, inner.width, footer_h);
-    [header, list, editor, footer]
+
+    // Split the footer into the action buttons and the docked hint strip so the
+    // hint reads as persistent chrome rather than a second row of buttons (c-1).
+    let docked_h = 1.min(footer_h);
+    let buttons_h = footer_h - docked_h;
+    let buttons = Rect::new(inner.x, editor.y + editor_h, inner.width, buttons_h);
+    let footer = Rect::new(inner.x, buttons.y + buttons_h, inner.width, docked_h);
+    [header, list, editor, buttons, footer]
 }
 
 /// Computes the dialog frame, the architect-row area, and the action buttons
@@ -91,14 +102,14 @@ pub fn refine_dialog_geometry(term: Rect, entry_count: usize) -> RefineDialogGeo
     let chunks = refine_dialog_chunks(area, entry_count);
     let model_rows = inset(chunks[1]);
 
-    let footer = chunks[3];
+    let buttons = chunks[3];
     let confirm_w = REFINE_DIALOG_CONFIRM_LABEL.len() as u16 + 2;
     let cancel_w = REFINE_DIALOG_CANCEL_LABEL.len() as u16 + 2;
     let gap = 4u16;
     let total = confirm_w + gap + cancel_w;
-    let start_x = footer.x + (footer.width.saturating_sub(total)) / 2;
-    let confirm_button = Rect::new(start_x, footer.y, confirm_w, 1);
-    let cancel_button = Rect::new(start_x + confirm_w + gap, footer.y, cancel_w, 1);
+    let start_x = buttons.x + (buttons.width.saturating_sub(total)) / 2;
+    let confirm_button = Rect::new(start_x, buttons.y, confirm_w, 1);
+    let cancel_button = Rect::new(start_x + confirm_w + gap, buttons.y, cancel_w, 1);
 
     RefineDialogGeometry {
         area,
@@ -126,7 +137,7 @@ pub fn render_plan_refine_dialog(
         .style(Style::default().bg(engine.color(palette.surface)));
     frame.render_widget(outer_block, area);
 
-    let [header_area, list_area, editor_area, footer_area] =
+    let [header_area, list_area, editor_area, buttons_area, footer_area] =
         refine_dialog_chunks(area, entry_count);
 
     let dim = engine.fg(palette.text_muted);
@@ -242,24 +253,28 @@ pub fn render_plan_refine_dialog(
         )
     };
     let nav_hint = if dialog.focus.is_actions() {
-        "Enter: confirm • ←/→: button • Esc: cancel".to_string()
+        "Enter confirm • ← / → button • Esc cancel".to_string()
     } else {
         format!(
-            "{}Enter: start • Tab: focus • {}: model • Esc: cancel",
+            "{}Enter start • Tab focus • {} model • Esc cancel",
             primary.prefix_str(),
             crate::components::model_selector::model_select_hint(primary)
         )
     };
-    let actions = vec![
-        Line::from(vec![
-            Span::styled(format!(" {} ", REFINE_DIALOG_CONFIRM_LABEL), confirm_style),
-            Span::raw("    "),
-            Span::styled(format!(" {} ", REFINE_DIALOG_CANCEL_LABEL), cancel_style),
-        ]),
-        Line::from(Span::styled(nav_hint, engine.fg(palette.text_secondary))),
-    ];
-    let footer = Paragraph::new(actions).alignment(Alignment::Center);
-    frame.render_widget(footer, footer_area);
+    let actions = Line::from(vec![
+        Span::styled(format!(" {} ", REFINE_DIALOG_CONFIRM_LABEL), confirm_style),
+        Span::raw("    "),
+        Span::styled(format!(" {} ", REFINE_DIALOG_CANCEL_LABEL), cancel_style),
+    ]);
+    frame.render_widget(
+        Paragraph::new(actions).alignment(Alignment::Center),
+        buttons_area,
+    );
+
+    // The navigation hint is docked to the card's bottom edge as its own strip
+    // filled with `palette.overlay`, so it reads as persistent chrome instead
+    // of a second line of buttons (c-1, c-2).
+    render_dialog_footer(frame, footer_area, &nav_hint);
 }
 
 /// Presentation parameters for the "refinement blocked" modal, shared by the

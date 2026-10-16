@@ -690,11 +690,25 @@ pub fn batch_cancel_modal_geometry(term: Rect) -> BatchCancelModalGeometry {
     let height_percent = (needed_height * 100 / term.height.max(1)).clamp(25, 90);
     let area = crate::ui::centered_rect(BATCH_CANCEL_WIDTH, height_percent, term);
 
-    let inner_y = area.y + 1;
-    let inner_h = area.height.saturating_sub(2);
-    let inner_x = area.x + 1;
-    let inner_w = area.width.saturating_sub(2);
-    let btn_y = inner_y + inner_h.saturating_sub(3);
+    // Mirror the renderer's own split (flexible body, two-row action zone,
+    // one-row docked hint strip) so hit-testing lands on the row the buttons
+    // are drawn in and can never drift from the rendered layout (Conventions §6, §7).
+    let inner = Rect::new(
+        area.x + 1,
+        area.y + 1,
+        area.width.saturating_sub(2),
+        area.height.saturating_sub(2),
+    );
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(2),
+            Constraint::Length(2),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+    let action_bar = chunks[1];
+    let btn_y = action_bar.y;
 
     let widths: [u16; 3] = [
         BATCH_CANCEL_LABELS[0].chars().count() as u16,
@@ -702,7 +716,7 @@ pub fn batch_cancel_modal_geometry(term: Rect) -> BatchCancelModalGeometry {
         BATCH_CANCEL_LABELS[2].chars().count() as u16,
     ];
     let total = widths[0] + widths[1] + widths[2] + BATCH_CANCEL_GAP * 2;
-    let start = inner_x + inner_w.saturating_sub(total) / 2;
+    let start = action_bar.x + action_bar.width.saturating_sub(total) / 2;
 
     let continue_button = Rect::new(start, btn_y, widths[0], 1);
     let soft_x = start + widths[0] + BATCH_CANCEL_GAP;
@@ -716,6 +730,20 @@ pub fn batch_cancel_modal_geometry(term: Rect) -> BatchCancelModalGeometry {
         soft_stop_button,
         hard_stop_button,
     }
+}
+
+/// Footer hint of the batch-cancellation dialog.
+///
+/// Navigation and dismissal are the shared dialog vocabulary, projected through
+/// the configured modifiers; the fast-select verbs are the batch's own
+/// `Continue` / `Soft Stop` / `Hard Stop` accelerators, so they are named here
+/// rather than in the universal dialog map.
+fn batch_cancel_hint() -> String {
+    format!(
+        "{} • s / h / c fast select • {}",
+        crate::components::modal::dialog_navigation_hint(),
+        crate::components::modal::dialog_dismiss_hint(),
+    )
 }
 
 /// Renders the three-way batch-cancellation dialog.
@@ -733,7 +761,11 @@ pub fn render_confirm_batch_cancel_popup(frame: &mut ratatui::Frame, state: &App
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(2), Constraint::Length(3)])
+        .constraints([
+            Constraint::Min(2),
+            Constraint::Length(2),
+            Constraint::Length(1),
+        ])
         .split(inner_area);
 
     let body = Paragraph::new(batch_cancel_body_lines())
@@ -750,30 +782,26 @@ pub fn render_confirm_batch_cancel_popup(frame: &mut ratatui::Frame, state: &App
         }
     };
 
-    let actions_lines = vec![
-        Line::from(vec![
-            Span::styled(
-                BATCH_CANCEL_LABELS[0],
-                button_style(BatchCancelButton::Continue),
-            ),
-            Span::raw("  "),
-            Span::styled(
-                BATCH_CANCEL_LABELS[1],
-                button_style(BatchCancelButton::SoftStop),
-            ),
-            Span::raw("  "),
-            Span::styled(
-                BATCH_CANCEL_LABELS[2],
-                button_style(BatchCancelButton::HardStop),
-            ),
-        ]),
-        Line::from(Span::styled(
-            "Tab / ← / → focus • Enter/Space execute • s / h / c fast select • Esc cancel",
-            engine.fg(palette.text_secondary),
-        )),
-    ];
-    let actions_widget = Paragraph::new(actions_lines).alignment(Alignment::Center);
+    let actions_line = Line::from(vec![
+        Span::styled(
+            BATCH_CANCEL_LABELS[0],
+            button_style(BatchCancelButton::Continue),
+        ),
+        Span::raw("  "),
+        Span::styled(
+            BATCH_CANCEL_LABELS[1],
+            button_style(BatchCancelButton::SoftStop),
+        ),
+        Span::raw("  "),
+        Span::styled(
+            BATCH_CANCEL_LABELS[2],
+            button_style(BatchCancelButton::HardStop),
+        ),
+    ]);
+    let actions_widget = Paragraph::new(actions_line).alignment(Alignment::Center);
     frame.render_widget(actions_widget, chunks[1]);
+
+    crate::components::modal::render_dialog_footer(frame, chunks[2], &batch_cancel_hint());
 }
 
 #[cfg(test)]

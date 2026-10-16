@@ -46,8 +46,8 @@ pub async fn handle_repository_init(req: Request, state: &Arc<AppState>) -> Resp
                 }
                 let mut hm = tauqe_core::history::HistoryManager::new(repo_path.to_path_buf());
                 let sender = state.history_sender.clone();
-                hm.set_listener(move |item| {
-                    let _ = sender.send(item);
+                hm.set_listener(move |mutation| {
+                    let _ = sender.send(mutation);
                 });
                 let mut history = state.history.lock().await;
                 *history = hm;

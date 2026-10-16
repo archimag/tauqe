@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use ratatui::style::{Color, Style, Stylize};
+use ratatui::style::{Style, Stylize};
 use ratatui::text::{Line, Span};
 use tauqe_protocol::{UiHistoryItem, UiHistoryKind};
 
@@ -9,7 +9,7 @@ use crate::ui::wrap_lines;
 pub mod input;
 pub mod render;
 
-pub use self::input::{handle_history_key, request_older_history, HISTORY_COMMANDS};
+pub use self::input::{handle_history_key, request_older_history, HISTORY_COMMAND_MAP};
 pub use self::render::render_history_view;
 
 const COLLAPSED_PREVIEW_LINES: usize = 3;
@@ -173,6 +173,56 @@ impl HistoryViewState {
         } else {
             let total_chars: usize = self.items.iter().map(|it| it.text.chars().count()).sum();
             total_chars.div_ceil(4) as u64
+        }
+    }
+
+    /// Applies a server-side session compaction event to the in-memory view.
+    ///
+    /// Compaction is a structural replacement, not an append: the summarized
+    /// head entries are dropped, the authoritative `summary` becomes the first
+    /// item (index zero), and the preserved `tail_ids` follow in their original
+    /// monotonic order. Stale fold state and cached bodies of the removed head
+    /// are discarded, and the viewport is re-anchored against the new geometry.
+    pub fn apply_compaction(
+        &mut self,
+        summary: UiHistoryItem,
+        tail_ids: &[u64],
+        total_count: usize,
+        estimated_tokens: u64,
+        view_height: u16,
+    ) {
+        let tail: HashSet<u64> = tail_ids.iter().copied().collect();
+
+        // Drop every entry folded into the summary; whatever the server kept in
+        // the tail survives in its original, monotonically increasing order.
+        self.items.retain(|it| tail.contains(&it.id));
+        // The summary always occupies index zero.
+        self.items.insert(0, summary);
+
+        self.total_count = total_count;
+        self.estimated_tokens = estimated_tokens;
+
+        // Fold state and cached bodies of the removed head entries are stale.
+        let live: HashSet<u64> = self.items.iter().map(|it| it.id).collect();
+        self.expanded_items.retain(|id| live.contains(id));
+        self.body_cache.entries.retain(|(id, _), _| live.contains(id));
+
+        // Recompute geometry against the new item set and re-anchor the viewport.
+        let max_width = Some(self.content_width);
+        if self.auto_scroll {
+            self.selected_item_index = self.items.len().saturating_sub(1);
+        } else {
+            self.selected_item_index = self
+                .selected_item_index
+                .min(self.items.len().saturating_sub(1));
+        }
+        let (total_lines, _) = self.layout_offsets(max_width, Some(self.selected_item_index));
+        self.rendered_lines_count = total_lines;
+        let max_scroll = clamp_u16(total_lines).saturating_sub(view_height);
+        if self.auto_scroll {
+            self.scroll = max_scroll;
+        } else {
+            self.scroll = self.scroll.min(max_scroll);
         }
     }
 
@@ -349,40 +399,59 @@ fn wrap_one(line: Line<'static>, max_width: Option<usize>) -> Vec<Line<'static>>
     }
 }
 
-fn build_item_header(item: &UiHistoryItem, is_selected: bool, is_expanded: bool) -> Line<'static> {
+fn build_item_header(
+    item: &UiHistoryItem,
+    is_selected: bool,
+    is_expanded: bool,
+    theme_mode: crate::config::ThemeMode,
+) -> Line<'static> {
+    let engine = crate::theme::engine::active_engine(theme_mode);
+    let palette = engine.palette();
     let cursor_prefix = if is_selected { "● " } else { "  " };
     let prefix_style = if is_selected {
-        Style::default().fg(Color::Cyan).bold()
+        engine.fg(palette.status_info).bold()
     } else {
-        Style::default().fg(Color::DarkGray)
+        engine.fg(palette.text_muted)
     };
 
     let fold_icon = if is_expanded { "▼ " } else { "▶ " };
     let fold_style = if is_expanded {
-        Style::default().fg(Color::Yellow).bold()
+        engine.fg(palette.status_warning).bold()
     } else {
-        Style::default().fg(Color::DarkGray).bold()
+        engine.fg(palette.text_muted).bold()
     };
 
     let badge = match item.kind {
         UiHistoryKind::User => Span::styled(
             " [USER] ",
-            Style::default().bg(Color::Blue).fg(Color::White).bold(),
+            engine
+                .bg(palette.status_info)
+                .fg(engine.color(palette.text_inverse))
+                .bold(),
         ),
         UiHistoryKind::Assistant => Span::styled(
             " [ASSISTANT] ",
-            Style::default().bg(Color::Green).fg(Color::Black).bold(),
+            engine
+                .bg(palette.status_success)
+                .fg(engine.color(palette.text_inverse))
+                .bold(),
         ),
         UiHistoryKind::System => {
             if item.commit_hash.is_some() && item.text.to_lowercase().contains("undid") {
                 Span::styled(
                     " [UNDO] ",
-                    Style::default().bg(Color::Yellow).fg(Color::Black).bold(),
+                    engine
+                        .bg(palette.status_warning)
+                        .fg(engine.color(palette.text_inverse))
+                        .bold(),
                 )
             } else {
                 Span::styled(
                     " [SYSTEM] ",
-                    Style::default().bg(Color::DarkGray).fg(Color::White).bold(),
+                    engine
+                        .bg(palette.text_muted)
+                        .fg(engine.color(palette.text_inverse))
+                        .bold(),
                 )
             }
         }
@@ -390,7 +459,7 @@ fn build_item_header(item: &UiHistoryItem, is_selected: bool, is_expanded: bool)
 
     let id_span = Span::styled(
         format!(" #{}", item.id),
-        Style::default().fg(Color::DarkGray).bold(),
+        engine.fg(palette.text_muted).bold(),
     );
 
     let mut header_spans = vec![
@@ -403,7 +472,7 @@ fn build_item_header(item: &UiHistoryItem, is_selected: bool, is_expanded: bool)
         header_spans.push(Span::raw(" "));
         header_spans.push(Span::styled(
             format!("[COMMIT: {}]", hash),
-            Style::default().fg(Color::Cyan).bold(),
+            engine.fg(palette.status_info).bold(),
         ));
     }
     if let Some(summary) = &item.summary {
@@ -421,10 +490,12 @@ fn build_item_body(
     theme_mode: crate::config::ThemeMode,
     flash_id: Option<usize>,
 ) -> CachedBody {
+    let engine = crate::theme::engine::active_engine(theme_mode);
+    let palette = engine.palette();
     let text_style = match item.kind {
-        UiHistoryKind::User => Style::default().fg(Color::Cyan),
-        UiHistoryKind::Assistant => Style::default().fg(Color::White),
-        UiHistoryKind::System => Style::default().fg(Color::Yellow),
+        UiHistoryKind::User => engine.fg(palette.status_info),
+        UiHistoryKind::Assistant => engine.fg(palette.text_primary),
+        UiHistoryKind::System => engine.fg(palette.status_warning),
     };
 
     let mut raw_lines: Vec<Line<'static>> = Vec::new();
@@ -461,37 +532,37 @@ fn build_item_body(
                     Span::raw("  "),
                     Span::styled(
                         format!("Modified files ({}):", item.files.len()),
-                        Style::default().fg(Color::Cyan).bold(),
+                        engine.fg(palette.status_info).bold(),
                     ),
                 ]));
                 for file_entry in &item.files {
                     let (op_label, op_style, path) = if let Some(p) = file_entry.strip_prefix("[NEW] ") {
-                        ("[NEW] ", Style::default().fg(Color::Green).bold(), p)
+                        ("[NEW] ", engine.fg(palette.status_success).bold(), p)
                     } else if let Some(p) = file_entry.strip_prefix("[DEL] ") {
-                        ("[DEL] ", Style::default().fg(Color::Red).bold(), p)
+                        ("[DEL] ", engine.fg(palette.status_error).bold(), p)
                     } else if let Some(p) = file_entry.strip_prefix("[OVERWRITE] ") {
-                        ("[OVERWRITE] ", Style::default().fg(Color::Yellow).bold(), p)
+                        ("[OVERWRITE] ", engine.fg(palette.status_warning).bold(), p)
                     } else if let Some(p) = file_entry.strip_prefix("[MOVE] ") {
-                        ("[MOVE] ", Style::default().fg(Color::Cyan).bold(), p)
+                        ("[MOVE] ", engine.fg(palette.status_info).bold(), p)
                     } else if let Some(p) = file_entry.strip_prefix("[EDIT] ") {
-                        ("[EDIT] ", Style::default().fg(Color::Magenta).bold(), p)
+                        ("[EDIT] ", engine.fg(palette.button_active_bg).bold(), p)
                     } else {
-                        ("• ", Style::default().fg(Color::Yellow).bold(), file_entry.as_str())
+                        ("• ", engine.fg(palette.status_warning).bold(), file_entry.as_str())
                     };
 
                     raw_lines.push(Line::from(vec![
                         Span::raw("    "),
                         Span::styled(op_label, op_style),
-                        Span::styled(path.to_string(), Style::default().fg(Color::White)),
+                        Span::styled(path.to_string(), engine.fg(palette.text_primary)),
                     ]));
                 }
             } else {
                 let mut file_spans = vec![
                     Span::raw("  "),
-                    Span::styled("Context: ", Style::default().fg(Color::DarkGray).bold()),
+                    Span::styled("Context: ", engine.fg(palette.text_muted).bold()),
                 ];
                 let files_joined = item.files.join(", ");
-                file_spans.push(Span::styled(files_joined, Style::default().fg(Color::DarkGray)));
+                file_spans.push(Span::styled(files_joined, engine.fg(palette.text_muted)));
                 raw_lines.push(Line::from(file_spans));
             }
         }
@@ -520,7 +591,7 @@ fn build_item_body(
             let note_str = format!("    ... [{}]", notes.join(", "));
             raw_lines.push(Line::from(Span::styled(
                 note_str,
-                Style::default().fg(Color::DarkGray).italic(),
+                engine.fg(palette.text_muted).italic(),
             )));
         }
     }
@@ -565,6 +636,8 @@ fn layout_history(
     theme_mode: crate::config::ThemeMode,
     cache: &mut HistoryBodyCache,
 ) -> (Vec<Line<'static>>, Vec<usize>, Vec<HistoryCodeBlock>) {
+    let engine = crate::theme::engine::active_engine(theme_mode);
+    let palette = engine.palette();
     let mut all_lines = Vec::new();
     let mut offsets = Vec::with_capacity(items.len());
     let mut code_blocks = Vec::new();
@@ -576,7 +649,7 @@ fn layout_history(
         if idx > 0 {
             let divider = Line::from(Span::styled(
                 "─".repeat(div_width),
-                Style::default().fg(crate::markdown::safe_rgb(60, 60, 60)),
+                engine.fg(palette.border),
             ));
             all_lines.extend(wrap_one(divider, max_width));
         }
@@ -586,7 +659,7 @@ fn layout_history(
         let is_selected = selected_index == Some(idx);
         let is_expanded = expanded_items.map(|set| set.contains(&item.id)).unwrap_or(false);
         all_lines.extend(wrap_one(
-            build_item_header(item, is_selected, is_expanded),
+            build_item_header(item, is_selected, is_expanded, theme_mode),
             max_width,
         ));
 
@@ -819,5 +892,171 @@ mod tests {
     fn test_clamp_u16_saturates() {
         assert_eq!(clamp_u16(10), 10);
         assert_eq!(clamp_u16(70_000), u16::MAX);
+    }
+
+    fn history_item(id: u64, kind: UiHistoryKind, text: &str) -> UiHistoryItem {
+        UiHistoryItem {
+            id,
+            kind,
+            text: text.to_string(),
+            summary: None,
+            commit_hash: None,
+            files: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn test_apply_compaction_removes_head_and_anchors_auto_scroll() {
+        let mut st = HistoryViewState {
+            content_width: 40,
+            auto_scroll: true,
+            scroll: 0,
+            items: vec![
+                history_item(1, UiHistoryKind::User, "q1"),
+                history_item(2, UiHistoryKind::Assistant, "a1"),
+                history_item(3, UiHistoryKind::User, "q2"),
+                history_item(4, UiHistoryKind::Assistant, "a2"),
+                history_item(5, UiHistoryKind::User, "q3"),
+            ],
+            total_count: 5,
+            has_more: true,
+            ..Default::default()
+        };
+        st.expanded_items.insert(2);
+        st.expanded_items.insert(4);
+
+        // Populate the body cache so head invalidation is observable.
+        let width = st.content_width;
+        st.layout_offsets(Some(width), None);
+        assert!(st.body_cache.entries.keys().any(|(id, _)| *id == 2));
+        assert!(st.body_cache.entries.keys().any(|(id, _)| *id == 4));
+
+        st.apply_compaction(
+            history_item(3, UiHistoryKind::System, "Session compacted"),
+            &[4, 5],
+            3,
+            256,
+            5,
+        );
+
+        let ids: Vec<u64> = st.items.iter().map(|it| it.id).collect();
+        assert_eq!(ids, vec![3, 4, 5], "summary leads the monotonic tail");
+        assert_eq!(st.items[0].kind, UiHistoryKind::System);
+        assert_eq!(st.total_count, 3);
+        assert_eq!(st.estimated_tokens, 256);
+        assert!(!st.expanded_items.contains(&2), "head fold state is dropped");
+        assert!(st.expanded_items.contains(&4), "tail fold state survives");
+        assert!(
+            !st.body_cache.entries.keys().any(|(id, _)| *id == 2),
+            "head body cache is invalidated"
+        );
+        assert_eq!(st.selected_item_index, st.items.len() - 1);
+
+        let expected_lines = compute_history_lines(
+            &st.items,
+            Some(st.content_width),
+            Some(st.selected_item_index),
+            Some(&st.expanded_items),
+        )
+        .len();
+        assert_eq!(st.rendered_lines_count, expected_lines);
+        assert_eq!(st.scroll, clamp_u16(expected_lines).saturating_sub(5));
+    }
+
+    #[test]
+    fn test_apply_compaction_without_auto_scroll_preserves_position() {
+        let mut st = HistoryViewState {
+            content_width: 40,
+            auto_scroll: false,
+            scroll: 0,
+            selected_item_index: 1,
+            items: (1u64..=6)
+                .map(|i| history_item(i, UiHistoryKind::User, "line"))
+                .collect(),
+            total_count: 6,
+            ..Default::default()
+        };
+
+        st.apply_compaction(
+            history_item(3, UiHistoryKind::System, "Compacted"),
+            &[4, 5, 6],
+            4,
+            96,
+            5,
+        );
+
+        let ids: Vec<u64> = st.items.iter().map(|it| it.id).collect();
+        assert_eq!(ids, vec![3, 4, 5, 6]);
+        assert_eq!(st.selected_item_index, 1, "in-range selection is preserved");
+        assert_eq!(st.scroll, 0, "in-range scroll is preserved");
+    }
+
+    #[test]
+    fn test_apply_compaction_without_auto_scroll_clamps_out_of_range() {
+        let mut st = HistoryViewState {
+            content_width: 40,
+            auto_scroll: false,
+            scroll: u16::MAX,
+            selected_item_index: 99,
+            items: (1u64..=6)
+                .map(|i| history_item(i, UiHistoryKind::User, "line"))
+                .collect(),
+            total_count: 6,
+            ..Default::default()
+        };
+
+        st.apply_compaction(
+            history_item(3, UiHistoryKind::System, "Compacted"),
+            &[4, 5, 6],
+            4,
+            96,
+            5,
+        );
+
+        assert_eq!(st.selected_item_index, st.items.len() - 1);
+        assert_eq!(
+            st.scroll,
+            clamp_u16(st.rendered_lines_count).saturating_sub(5)
+        );
+    }
+
+    #[test]
+    fn test_apply_compaction_is_repeatable() {
+        let mut st = HistoryViewState {
+            content_width: 40,
+            auto_scroll: true,
+            items: (1u64..=6)
+                .map(|i| history_item(i, UiHistoryKind::User, "line"))
+                .collect(),
+            total_count: 6,
+            ..Default::default()
+        };
+
+        st.apply_compaction(
+            history_item(3, UiHistoryKind::System, "first compaction"),
+            &[4, 5, 6],
+            4,
+            128,
+            5,
+        );
+        assert_eq!(
+            st.items.iter().map(|it| it.id).collect::<Vec<_>>(),
+            vec![3, 4, 5, 6]
+        );
+
+        st.apply_compaction(
+            history_item(5, UiHistoryKind::System, "second compaction"),
+            &[6],
+            2,
+            64,
+            5,
+        );
+        assert_eq!(
+            st.items.iter().map(|it| it.id).collect::<Vec<_>>(),
+            vec![5, 6]
+        );
+        assert_eq!(st.total_count, 2);
+        assert_eq!(st.estimated_tokens, 64);
+        assert_eq!(st.selected_item_index, 1);
     }
 }

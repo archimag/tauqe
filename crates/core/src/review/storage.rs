@@ -160,12 +160,30 @@ impl ReviewStorage {
             }
         }
 
-        if let Err(err) = std::fs::remove_file(legacy_file) {
-            tracing::warn!(
-                "Migrated legacy review file {} but failed to remove it: {}",
-                legacy_file.display(),
-                err
-            );
+        // `save_session_unlocked` reuses whichever file already stores this id, so
+        // when the legacy file still embeds the session id the save lands on that
+        // legacy path instead of the canonical one. Rename the artifact onto its
+        // canonical id-based name so the cleanup below never deletes the only copy.
+        if legacy_file != target_file && !target_file.is_file() && legacy_file.is_file() {
+            if let Err(err) = std::fs::rename(legacy_file, &target_file) {
+                tracing::warn!(
+                    "Failed to rename migrated review file {} to {}: {}",
+                    legacy_file.display(),
+                    target_file.display(),
+                    err
+                );
+            }
+        }
+
+        // Discard the legacy source only once the canonical file is safely in place.
+        if legacy_file != target_file && target_file.is_file() && legacy_file.is_file() {
+            if let Err(err) = std::fs::remove_file(legacy_file) {
+                tracing::warn!(
+                    "Migrated legacy review file {} but failed to remove it: {}",
+                    legacy_file.display(),
+                    err
+                );
+            }
         }
         true
     }
@@ -182,7 +200,16 @@ impl ReviewStorage {
     }
 
     /// Loads all review sessions from disk.
+    ///
+    /// Acquires the process-global review storage lock, so a read never races a
+    /// concurrent atomic rename in a write path.
     pub fn load_all(repo_root: &Path) -> Result<Vec<ReviewSession>> {
+        let _guard = Self::lock();
+        Self::load_all_unlocked(repo_root)
+    }
+
+    /// Lock-free core of [`Self::load_all`]; the caller must hold the storage lock.
+    fn load_all_unlocked(repo_root: &Path) -> Result<Vec<ReviewSession>> {
         let dir = Self::reviews_dir(repo_root);
         if !dir.is_dir() {
             return Ok(Vec::new());
@@ -217,22 +244,68 @@ impl ReviewStorage {
         Ok(reviews)
     }
 
-    /// Loads a specific review session by ID.
-    pub fn load_review(repo_root: &Path, id: &str) -> Result<Option<ReviewSession>> {
+    /// Resolves the on-disk file that currently stores the review session identified
+    /// by `id`, or `None` when no stored session matches.
+    ///
+    /// The storage file name is normally `sanitize_id(id)`, but an id change (for
+    /// example a casing change) leaves the session under a differently sanitized
+    /// name. Resolving the real file keeps save and delete operating on the existing
+    /// artifact instead of creating or leaving behind a duplicate session file.
+    ///
+    /// Lock-free; the caller must hold the storage lock.
+    fn find_session_file_unlocked(repo_root: &Path, id: &str) -> Option<PathBuf> {
         let dir = Self::reviews_dir(repo_root);
         let safe_id = Self::sanitize_id(id);
-        let file_path = dir.join(format!("{safe_id}.json"));
-
-        if !file_path.is_file() {
-            // Check if any existing review matches the id case-insensitively
-            let all = Self::load_all(repo_root)?;
-            for rev in all {
-                if rev.id.eq_ignore_ascii_case(id) {
-                    return Ok(Some(rev));
+        let default_target = dir.join(format!("{safe_id}.json"));
+        if default_target.is_file() {
+            if let Ok(content) = std::fs::read_to_string(&default_target) {
+                if let Ok(session) = serde_json::from_str::<ReviewSession>(&content) {
+                    if session.id.eq_ignore_ascii_case(id) {
+                        return Some(default_target);
+                    }
                 }
             }
-            return Ok(None);
         }
+
+        let entries = std::fs::read_dir(&dir).ok()?;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path == default_target
+                || !path.is_file()
+                || path.extension().and_then(|s| s.to_str()) != Some("json")
+            {
+                continue;
+            }
+            let content = match std::fs::read_to_string(&path) {
+                Ok(content) => content,
+                Err(_) => continue,
+            };
+            let session = match serde_json::from_str::<ReviewSession>(&content) {
+                Ok(session) => session,
+                Err(_) => continue,
+            };
+            if session.id.eq_ignore_ascii_case(id) {
+                return Some(path);
+            }
+        }
+        None
+    }
+
+    /// Loads a specific review session by ID.
+    ///
+    /// Acquires the process-global review storage lock, so a read never races a
+    /// concurrent atomic rename in a write path.
+    pub fn load_review(repo_root: &Path, id: &str) -> Result<Option<ReviewSession>> {
+        let _guard = Self::lock();
+        Self::load_review_unlocked(repo_root, id)
+    }
+
+    /// Lock-free core of [`Self::load_review`]; the caller must hold the storage lock.
+    fn load_review_unlocked(repo_root: &Path, id: &str) -> Result<Option<ReviewSession>> {
+        let file_path = match Self::find_session_file_unlocked(repo_root, id) {
+            Some(path) => path,
+            None => return Ok(None),
+        };
 
         let content = std::fs::read_to_string(&file_path)
             .with_context(|| format!("Failed to read review file at {}", file_path.display()))?;
@@ -243,15 +316,21 @@ impl ReviewStorage {
 
     /// Loads the active or latest review session.
     pub fn load_latest(repo_root: &Path) -> Result<Option<ReviewSession>> {
+        let _guard = Self::lock();
+        Self::load_latest_unlocked(repo_root)
+    }
+
+    /// Lock-free core of [`Self::load_latest`]; the caller must hold the storage lock.
+    fn load_latest_unlocked(repo_root: &Path) -> Result<Option<ReviewSession>> {
         // 1. Try active review marker
-        if let Ok(Some(active_id)) = Self::load_active_id(repo_root) {
-            if let Ok(Some(session)) = Self::load_review(repo_root, &active_id) {
+        if let Ok(Some(active_id)) = Self::load_active_id_unlocked(repo_root) {
+            if let Ok(Some(session)) = Self::load_review_unlocked(repo_root, &active_id) {
                 return Ok(Some(session));
             }
         }
 
         // 2. Fall back to most recent review
-        let all = Self::load_all(repo_root)?;
+        let all = Self::load_all_unlocked(repo_root)?;
         Ok(all.into_iter().next())
     }
 
@@ -269,8 +348,34 @@ impl ReviewStorage {
         })?;
 
         let safe_id = Self::sanitize_id(&session.id);
-        let target_file = dir.join(format!("{safe_id}.json"));
-        let temp_file = dir.join(format!("{safe_id}.json.tmp"));
+        let default_target = dir.join(format!("{safe_id}.json"));
+
+        // Reuse the file that already stores this session even when its name differs
+        // from the sanitized id, so saving never spawns a duplicate session file.
+        let target_file = Self::find_session_file_unlocked(repo_root, &session.id)
+            .unwrap_or(default_target);
+        let temp_file = target_file.with_extension("json.tmp");
+
+        // Refuse to overwrite a file that already stores a different review session
+        // whose sanitized storage name collides with this one (for example
+        // "team/auth" and "team-auth" both sanitize to "team-auth.json"), so a save
+        // never silently replaces an unrelated session.
+        if target_file.is_file() {
+            let content = std::fs::read_to_string(&target_file).with_context(|| {
+                format!("Failed to read existing review file at {}", target_file.display())
+            })?;
+            let existing: ReviewSession = serde_json::from_str(&content).with_context(|| {
+                format!("Failed to parse existing review JSON at {}", target_file.display())
+            })?;
+            if !existing.id.eq_ignore_ascii_case(&session.id) {
+                anyhow::bail!(
+                    "Cannot save review session '{}': storage name '{}.json' is already used by review session '{}'; choose a distinct review id",
+                    session.id,
+                    safe_id,
+                    existing.id
+                );
+            }
+        }
 
         let json = serde_json::to_string_pretty(session)
             .context("Failed to serialize review session to JSON")?;
@@ -283,7 +388,7 @@ impl ReviewStorage {
         })?;
 
         // If no active review is set, make this session active
-        if let Ok(None) = Self::load_active_id(repo_root) {
+        if let Ok(None) = Self::load_active_id_unlocked(repo_root) {
             let _ = Self::save_active_id_unlocked(repo_root, Some(&session.id));
         }
 
@@ -300,25 +405,49 @@ impl ReviewStorage {
     fn delete_review_unlocked(repo_root: &Path, id: &str) -> Result<bool> {
         let dir = Self::reviews_dir(repo_root);
         let safe_id = Self::sanitize_id(id);
-        let target_file = dir.join(format!("{safe_id}.json"));
 
-        if target_file.is_file() {
-            std::fs::remove_file(&target_file)
-                .with_context(|| format!("Failed to remove review file at {}", target_file.display()))?;
-
-            if let Ok(Some(active)) = Self::load_active_id(repo_root) {
-                if active == id || active == safe_id {
-                    let _ = Self::save_active_id_unlocked(repo_root, None);
+        // Delete the file that actually stores this session. When the session lives
+        // under a differently sanitized name, removing only the default target would
+        // leave the real artifact behind. If default target exists but stores a different
+        // session (collision), ensure we never delete the unrelated file.
+        let target_file = match Self::find_session_file_unlocked(repo_root, id) {
+            Some(existing) => existing,
+            None => {
+                let default_target = dir.join(format!("{safe_id}.json"));
+                if default_target.is_file() {
+                    if let Ok(content) = std::fs::read_to_string(&default_target) {
+                        if let Ok(session) = serde_json::from_str::<ReviewSession>(&content) {
+                            if !session.id.eq_ignore_ascii_case(id) {
+                                return Ok(false);
+                            }
+                        }
+                    }
+                    default_target
+                } else {
+                    return Ok(false);
                 }
             }
-            Ok(true)
-        } else {
-            Ok(false)
+        };
+
+        std::fs::remove_file(&target_file)
+            .with_context(|| format!("Failed to remove review file at {}", target_file.display()))?;
+
+        if let Ok(Some(active)) = Self::load_active_id_unlocked(repo_root) {
+            if active.eq_ignore_ascii_case(id) || active.eq_ignore_ascii_case(&safe_id) {
+                let _ = Self::save_active_id_unlocked(repo_root, None);
+            }
         }
+        Ok(true)
     }
 
     /// Loads the active review ID from `.tauqe/reviews/active`.
     pub fn load_active_id(repo_root: &Path) -> Result<Option<String>> {
+        let _guard = Self::lock();
+        Self::load_active_id_unlocked(repo_root)
+    }
+
+    /// Lock-free core of [`Self::load_active_id`]; the caller must hold the storage lock.
+    fn load_active_id_unlocked(repo_root: &Path) -> Result<Option<String>> {
         let active_file = Self::reviews_dir(repo_root).join("active");
         if !active_file.is_file() {
             return Ok(None);
@@ -370,7 +499,7 @@ impl ReviewStorage {
         updater: F,
     ) -> Result<Option<ReviewItem>>
     where
-        F: FnMut(&mut ReviewItem),
+        F: FnOnce(&mut ReviewItem),
     {
         let _guard = Self::lock();
         Self::update_session_item_unlocked(repo_root, review_id, item_id, updater)
@@ -381,30 +510,28 @@ impl ReviewStorage {
         repo_root: &Path,
         review_id: Option<&str>,
         item_id: u32,
-        mut updater: F,
+        updater: F,
     ) -> Result<Option<ReviewItem>>
     where
-        F: FnMut(&mut ReviewItem),
+        F: FnOnce(&mut ReviewItem),
     {
         let mut session = match review_id {
-            Some(id) => match Self::load_review(repo_root, id)? {
+            Some(id) => match Self::load_review_unlocked(repo_root, id)? {
                 Some(s) => s,
                 None => return Ok(None),
             },
-            None => match Self::load_latest(repo_root)? {
+            None => match Self::load_latest_unlocked(repo_root)? {
                 Some(s) => s,
                 None => return Ok(None),
             },
         };
 
-        let mut updated_item = None;
-        for item in &mut session.items {
-            if item.id == item_id {
-                updater(item);
-                updated_item = Some(item.clone());
-                break;
-            }
-        }
+        let updated_item = if let Some(item) = session.items.iter_mut().find(|it| it.id == item_id) {
+            updater(item);
+            Some(item.clone())
+        } else {
+            None
+        };
 
         if updated_item.is_some() {
             Self::save_session_unlocked(repo_root, &session)?;
@@ -428,7 +555,7 @@ impl ReviewStorage {
     /// Convenience helper for latest session item update.
     pub fn update_item<F>(repo_root: &Path, item_id: u32, updater: F) -> Result<Option<ReviewItem>>
     where
-        F: FnMut(&mut ReviewItem),
+        F: FnOnce(&mut ReviewItem),
     {
         Self::update_session_item(repo_root, None, item_id, updater)
     }
@@ -626,5 +753,150 @@ mod tests {
         let all = ReviewStorage::load_all(root).unwrap();
         assert_eq!(all.len(), 1);
         assert_eq!(all[0].id, "valid-review");
+    }
+
+    #[test]
+    fn test_save_session_reuses_differing_filename_instead_of_duplicating() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+
+        let first = ReviewSession {
+            id: "Review One".to_string(),
+            title: "First".to_string(),
+            created_at: 1,
+            model: tauqe_protocol::ModelRef::openrouter("test-model"),
+            description: None,
+            user_prompt: None,
+            target_files: vec![],
+            items: vec![],
+            raw_markdown: String::new(),
+        };
+        ReviewStorage::save_session(root, &first).unwrap();
+        assert!(ReviewStorage::reviews_dir(root).join("Review-One.json").is_file());
+
+        // A casing change yields a different sanitized file name; the existing file
+        // must be reused instead of writing a second `review-one.json`.
+        let second = ReviewSession {
+            id: "review one".to_string(),
+            title: "Second".to_string(),
+            created_at: 2,
+            model: tauqe_protocol::ModelRef::openrouter("test-model"),
+            description: None,
+            user_prompt: None,
+            target_files: vec![],
+            items: vec![],
+            raw_markdown: String::new(),
+        };
+        ReviewStorage::save_session(root, &second).unwrap();
+
+        let json_files: Vec<_> = std::fs::read_dir(ReviewStorage::reviews_dir(root))
+            .unwrap()
+            .flatten()
+            .filter(|entry| entry.path().extension().and_then(|s| s.to_str()) == Some("json"))
+            .collect();
+        assert_eq!(
+            json_files.len(),
+            1,
+            "expected a single review file, found {json_files:?}"
+        );
+
+        let loaded = ReviewStorage::load_review(root, "review one").unwrap().unwrap();
+        assert_eq!(loaded.created_at, 2);
+    }
+
+    #[test]
+    fn test_delete_review_resolves_differing_filename() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+
+        let session = ReviewSession {
+            id: "Legacy Review".to_string(),
+            title: "Legacy".to_string(),
+            created_at: 1,
+            model: tauqe_protocol::ModelRef::openrouter("test-model"),
+            description: None,
+            user_prompt: None,
+            target_files: vec![],
+            items: vec![],
+            raw_markdown: String::new(),
+        };
+        ReviewStorage::save_session(root, &session).unwrap();
+        let stored = ReviewStorage::reviews_dir(root).join("Legacy-Review.json");
+        assert!(stored.is_file());
+
+        let deleted = ReviewStorage::delete_review(root, "legacy review").unwrap();
+        assert!(deleted);
+        assert!(!stored.is_file());
+    }
+
+    #[test]
+    fn test_save_session_detects_sanitized_id_collision() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+
+        let first = ReviewSession {
+            id: "team/auth".to_string(),
+            title: "Team Auth".to_string(),
+            created_at: 1,
+            model: tauqe_protocol::ModelRef::openrouter("test-model"),
+            description: None,
+            user_prompt: None,
+            target_files: vec![],
+            items: vec![],
+            raw_markdown: String::new(),
+        };
+        ReviewStorage::save_session(root, &first).unwrap();
+
+        // "team-auth" sanitizes to the same storage name as "team/auth".
+        let colliding = ReviewSession {
+            id: "team-auth".to_string(),
+            title: "Team Auth Alternate".to_string(),
+            created_at: 2,
+            model: tauqe_protocol::ModelRef::openrouter("test-model"),
+            description: None,
+            user_prompt: None,
+            target_files: vec![],
+            items: vec![],
+            raw_markdown: String::new(),
+        };
+        let err = ReviewStorage::save_session(root, &colliding).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("already used by review session 'team/auth'"));
+
+        // The original session is preserved unchanged.
+        let loaded = ReviewStorage::load_review(root, "team/auth").unwrap().unwrap();
+        assert_eq!(loaded.id, "team/auth");
+        assert_eq!(loaded.title, "Team Auth");
+    }
+
+    #[test]
+    fn test_load_and_delete_respect_sanitized_id_collision() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+
+        let session = ReviewSession {
+            id: "team/auth".to_string(),
+            title: "Team Auth".to_string(),
+            created_at: 1,
+            model: tauqe_protocol::ModelRef::openrouter("test-model"),
+            description: None,
+            user_prompt: None,
+            target_files: vec![],
+            items: vec![],
+            raw_markdown: String::new(),
+        };
+        ReviewStorage::save_session(root, &session).unwrap();
+
+        // Loading a non-existent colliding ID must return None rather than the colliding session.
+        let result = ReviewStorage::load_review(root, "team-auth").unwrap();
+        assert!(result.is_none());
+
+        // Deleting a non-existent colliding ID must return false and not delete the existing session.
+        let deleted = ReviewStorage::delete_review(root, "team-auth").unwrap();
+        assert!(!deleted);
+
+        let still_exists = ReviewStorage::load_review(root, "team/auth").unwrap();
+        assert!(still_exists.is_some());
     }
 }

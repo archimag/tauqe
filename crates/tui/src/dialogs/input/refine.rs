@@ -23,6 +23,7 @@ pub(super) async fn handle_refine_dialog(
     };
 
     let primary = st.tui_config.input.primary_modifier;
+    let meta = st.tui_config.input.meta_modifier;
     let visible_rows = crate::dialogs::render::refine_dialog_geometry(
         st.last_frame_area,
         dialog.selector.len(),
@@ -30,12 +31,12 @@ pub(super) async fn handle_refine_dialog(
     .model_rows
     .height as usize;
 
-    // The C-M / Alt+M chord always switches the architect; the arrows browse the
+    // The C-M / M-M chord always switches the architect; the arrows browse the
     // list only while the list owns focus, so list navigation and text editing
     // never fight over the same keys (c-magit-key-navigation).
     if dialog
         .selector
-        .handle_key(key, primary, !dialog.focus.is_model_list())
+        .handle_key(key, primary, meta, !dialog.focus.is_model_list())
     {
         st.plans_view.refine_dialog = Some(dialog);
         return Ok(Some(InputResult::Continue));

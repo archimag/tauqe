@@ -1,5 +1,5 @@
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Style, Stylize};
+use ratatui::style::Stylize;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Padding, Paragraph};
 use tauqe_protocol::ReviewItemStatus;
@@ -17,6 +17,8 @@ pub fn render_review_view(
     main_area: Rect,
     info_area: Rect,
 ) {
+    let engine = crate::theme::engine::current_engine();
+    let palette = engine.palette();
     let block = Block::default().padding(Padding::horizontal(1));
     let inner = block.inner(main_area);
     let height = inner.height;
@@ -32,16 +34,16 @@ pub fn render_review_view(
     state.review.clamp_selection();
 
     let (lines, offsets) = if rows.is_empty() {
-        let empty_lines = if state.model.is_busy() {
+        let empty_lines = if state.review.running {
             vec![
                 Line::raw(""),
                 Line::from(Span::styled(
                     "  Review in progress...",
-                    Style::default().fg(Color::Yellow).bold(),
+                    engine.fg(palette.status_warning).bold(),
                 )),
                 Line::from(Span::styled(
                     "  Streaming findings and summary in Develop view (Ctrl+1).",
-                    Style::default().fg(Color::DarkGray),
+                    engine.fg(palette.text_muted),
                 )),
             ]
         } else {
@@ -49,11 +51,11 @@ pub fn render_review_view(
                 Line::raw(""),
                 Line::from(Span::styled(
                     "  No code reviews yet.",
-                    Style::default().fg(Color::DarkGray).bold(),
+                    engine.fg(palette.text_muted).bold(),
                 )),
                 Line::from(Span::styled(
                     "  Add files to Context (Ctrl+2), then press 'r' to run a code review.",
-                    Style::default().fg(Color::DarkGray),
+                    engine.fg(palette.text_muted),
                 )),
             ]
         };
@@ -109,37 +111,37 @@ pub fn render_review_view(
 
     let mut status_spans = Vec::new();
     if let Some(err) = &state.review.error {
-        status_spans.push(Span::styled(format!(" {}", err), Style::default().fg(Color::Red).bold()));
+        status_spans.push(Span::styled(format!(" {}", err), engine.fg(palette.status_error).bold()));
     } else {
-        if state.model.is_busy() {
+        if state.review.running {
             status_spans.push(Span::styled(
                 " Review in progress... ",
-                Style::default().fg(Color::Yellow).bold(),
+                engine.fg(palette.status_warning).bold(),
             ));
         }
         if let Some(row) = state.review.selected_row() {
-            status_spans.extend(describe_review_row(&row));
+            status_spans.extend(describe_review_row(&row, &engine));
         }
         status_spans.push(Span::styled(
             format!(
                 "  |  {} session(s), {} finding(s) ({} fixed, {} skipped)",
                 total_sessions, total_items, fixed_items, skipped_items
             ),
-            Style::default().fg(Color::DarkGray),
+            engine.fg(palette.text_muted),
         ));
         if state.review.hide_closed {
-            status_spans.push(Span::styled(" | Filter: Open only", Style::default().fg(Color::Yellow)));
+            status_spans.push(Span::styled(" | Filter: Open only", engine.fg(palette.status_warning)));
         }
         if state.review.refining.is_some() {
             status_spans.push(Span::styled(
                 " | [Refining: Architect is decomposing the finding...]",
-                Style::default().fg(Color::Yellow).bold(),
+                engine.fg(palette.status_warning).bold(),
             ));
         }
         if !rows.is_empty() {
             status_spans.push(Span::styled(
                 format!(" | [Row {}/{}]", state.review.selected_index + 1, rows.len()),
-                Style::default().fg(Color::Gray),
+                engine.fg(palette.text_secondary),
             ));
         }
     }
@@ -158,7 +160,11 @@ fn first_content_line(raw: Option<&str>) -> Option<String> {
     })
 }
 
-fn describe_review_row(row: &VisibleReviewRow) -> Vec<Span<'static>> {
+fn describe_review_row(
+    row: &VisibleReviewRow,
+    engine: &crate::theme::engine::ThemeEngine,
+) -> Vec<Span<'static>> {
+    let palette = engine.palette();
     match row {
         VisibleReviewRow::SessionHeader {
             title,
@@ -176,21 +182,24 @@ fn describe_review_row(row: &VisibleReviewRow) -> Vec<Span<'static>> {
             let mut spans = vec![
                 Span::styled(
                     format!(" Review: {}", title),
-                    Style::default().fg(Color::White).bold(),
+                    engine.fg(palette.text_primary).bold(),
                 ),
-                Span::styled(format!(" ({})", model), Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    format!(" ({})", model),
+                    engine.fg(palette.text_muted),
+                ),
                 Span::styled(
                     format!(
                         "  {}/{} fixed ({} todo, {} prog, {} disc, {} skip, {} rej)",
                         fixed, total, todo, in_progress, discussion, skipped, rejected
                     ),
-                    Style::default().fg(Color::Gray),
+                    engine.fg(palette.text_secondary),
                 ),
             ];
             if let Some(desc) = first_content_line(description.as_deref()) {
                 spans.push(Span::styled(
                     format!("  —  {}", desc),
-                    Style::default().fg(Color::DarkGray),
+                    engine.fg(palette.text_muted),
                 ));
             }
             spans
@@ -205,12 +214,12 @@ fn describe_review_row(row: &VisibleReviewRow) -> Vec<Span<'static>> {
                     " Executive Summary{}",
                     if *is_expanded { "" } else { " (folded)" }
                 ),
-                Style::default().fg(Color::Green).bold(),
+                engine.fg(palette.status_success).bold(),
             )];
             if let Some(desc) = first_content_line(Some(description.as_str())) {
                 spans.push(Span::styled(
                     format!("  —  {}", desc),
-                    Style::default().fg(Color::DarkGray),
+                    engine.fg(palette.text_muted),
                 ));
             }
             spans
@@ -226,14 +235,17 @@ fn describe_review_row(row: &VisibleReviewRow) -> Vec<Span<'static>> {
             ..
         } => {
             let mut spans = vec![
-                Span::styled(format!(" #{} ", item_id), Style::default().fg(Color::Gray)),
+                Span::styled(
+                    format!(" #{} ", item_id),
+                    engine.fg(palette.text_secondary),
+                ),
                 Span::styled(format!("[{}]", severity), severity_style(*severity)),
                 Span::raw(" "),
                 Span::styled(
                     format!(" {} ", status_label(*status)),
                     status_style(*status),
                 ),
-                Span::styled(title.clone(), Style::default().fg(Color::White).bold()),
+                Span::styled(title.clone(), engine.fg(palette.text_primary).bold()),
             ];
             if let Some(selection) = model {
                 spans.push(model_badge(selection));
@@ -241,13 +253,13 @@ fn describe_review_row(row: &VisibleReviewRow) -> Vec<Span<'static>> {
             if let Some(loc) = location(files) {
                 spans.push(Span::styled(
                     format!("  {}", loc),
-                    Style::default().fg(Color::Cyan),
+                    engine.fg(palette.status_info),
                 ));
             }
             if let Some(desc) = first_content_line(Some(body.as_str())) {
                 spans.push(Span::styled(
                     format!("  —  {}", desc),
-                    Style::default().fg(Color::DarkGray),
+                    engine.fg(palette.text_muted),
                 ));
             }
             spans
@@ -281,7 +293,8 @@ mod tests {
             focused: false,
         };
 
-        let text: String = describe_review_row(&row)
+        let engine = crate::theme::engine::current_engine();
+        let text: String = describe_review_row(&row, &engine)
             .iter()
             .map(|span| span.content.to_string())
             .collect();
@@ -337,11 +350,11 @@ mod tests {
     }
 
     #[test]
-    fn render_review_view_shows_in_progress_indicator_when_model_busy() {
+    fn render_review_view_shows_in_progress_indicator_when_review_running() {
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         let mut state = crate::app::test_state();
-        state.model.status = crate::views::develop::TurnStatus::Responding;
+        state.review.running = true;
 
         terminal
             .draw(|f| {
@@ -357,6 +370,31 @@ mod tests {
         assert!(
             content.contains("Review in progress..."),
             "expected 'Review in progress...' indicator in buffer"
+        );
+    }
+
+    #[test]
+    fn render_review_view_does_not_show_in_progress_when_unrelated_model_busy() {
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut state = crate::app::test_state();
+        state.model.status = crate::views::develop::TurnStatus::Responding;
+        state.review.running = false;
+
+        terminal
+            .draw(|f| {
+                let area = f.area();
+                let main_area = Rect::new(0, 0, area.width, area.height.saturating_sub(1));
+                let info_area = Rect::new(0, area.height.saturating_sub(1), area.width, 1);
+                render_review_view(f, &mut state, main_area, info_area);
+            })
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let content: String = buffer.content().iter().map(|c| c.symbol()).collect();
+        assert!(
+            !content.contains("Review in progress..."),
+            "did not expect 'Review in progress...' when review is not running"
         );
     }
 }

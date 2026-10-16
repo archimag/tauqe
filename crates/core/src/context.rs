@@ -1,10 +1,15 @@
 use anyhow::{bail, Result};
 use crate::prompt::estimate_tokens_from_bytes;
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
 use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
 pub use tauqe_protocol::matches_glob_pattern;
 use tauqe_protocol::{ContextAccess, ContextItem, ContextLayer, ContextState, GlobPattern};
+
+pub mod path;
+pub mod pinned;
+
+pub use path::verify_path_within_repo;
 
 #[derive(Debug, Clone)]
 pub struct ContextFileContent {
@@ -59,78 +64,6 @@ fn upgrade_access(item: &mut ContextItem, access: ContextAccess) -> bool {
     }
 }
 
-/// Verifies that `relative_path` does not traverse or resolve to a symlink
-/// outside `repo_root`.
-///
-/// If `relative_path` (or its deepest existing ancestor) points outside the
-/// canonical repository root, returns an error.
-pub fn verify_path_within_repo(repo_root: &Path, relative_path: &str) -> Result<()> {
-    let Ok(canonical_root) = repo_root.canonicalize() else {
-        // If repo_root cannot be canonicalized (e.g. does not exist in a synthetic test),
-        // we cannot inspect symlinks on disk.
-        return Ok(());
-    };
-
-    let full_path = repo_root.join(relative_path);
-
-    // 1. If full_path exists (or is a symlink on disk):
-    // symlink_metadata().is_ok() detects broken symlinks as well as existing files/dirs.
-    if full_path.symlink_metadata().is_ok() {
-        match full_path.canonicalize() {
-            Ok(canonical_target) => {
-                if !canonical_target.starts_with(&canonical_root) {
-                    bail!(
-                        "Path '{}' escapes repository root via symlink pointing to '{}'",
-                        relative_path,
-                        canonical_target.display()
-                    );
-                }
-            }
-            Err(err) => {
-                bail!(
-                    "Path '{}' cannot be canonicalized (broken symlink or inaccessible): {}",
-                    relative_path,
-                    err
-                );
-            }
-        }
-    } else {
-        // 2. If full_path does not exist yet (e.g. a new file to create):
-        // Walk up to find the deepest existing ancestor directory.
-        let mut ancestor = full_path.as_path();
-        while !ancestor.exists() && ancestor.symlink_metadata().is_err() {
-            match ancestor.parent() {
-                Some(p) if !p.as_os_str().is_empty() => ancestor = p,
-                _ => break,
-            }
-        }
-
-        if ancestor.exists() || ancestor.symlink_metadata().is_ok() {
-            match ancestor.canonicalize() {
-                Ok(canonical_ancestor) => {
-                    if !canonical_ancestor.starts_with(&canonical_root) {
-                        bail!(
-                            "Path '{}' parent directory escapes repository root via symlink pointing to '{}'",
-                            relative_path,
-                            canonical_ancestor.display()
-                        );
-                    }
-                }
-                Err(err) => {
-                    bail!(
-                        "Path '{}' ancestor directory '{}' cannot be canonicalized: {}",
-                        relative_path,
-                        ancestor.display(),
-                        err
-                    );
-                }
-            }
-        }
-    }
-
-    Ok(())
-}
-
 impl ContextManager {
     pub fn new(repo_root: PathBuf) -> Self {
         let mut cm = Self {
@@ -169,96 +102,6 @@ impl ContextManager {
     pub fn set_repo_root(&mut self, repo_root: PathBuf) {
         self.repo_root = repo_root;
         self.load_pinned_from_repo();
-    }
-
-    pub fn load_pinned_from_repo(&mut self) {
-        let config = crate::config::load_context_config(&self.repo_root);
-        self.load_pinned(&config.pinned);
-    }
-
-    pub fn load_pinned(&mut self, pinned_paths: &[String]) {
-        self.pinned_patterns = pinned_paths.to_vec();
-        self.recompute_pinned();
-    }
-
-    /// Recomputes the pinned context layer with hierarchical resolution.
-    ///
-    /// Root-level pinned files matching `pinned_patterns` from `repo_root` are always
-    /// included. Additionally, for every file present in the `user` or `auto` context
-    /// layers, all parent directories up to the project root are traversed: at each level,
-    /// every pinned pattern is resolved as a relative path and any existing file is added
-    /// to the pinned layer (read-only, deduplicated, never escaping repo root).
-    fn recompute_pinned(&mut self) -> bool {
-        let mut new_pinned = BTreeMap::new();
-
-        // 1. Root-level pinned files
-        for pattern in &self.pinned_patterns {
-            if let Ok(clean_path) = self.normalize_path(pattern) {
-                self.insert_pinned_candidate(&mut new_pinned, clean_path);
-            }
-        }
-
-        // 2. Hierarchical pinned files for all items in user and auto layers
-        let mut checked_dirs = BTreeSet::new();
-        for file_path in self.user.keys().chain(self.auto.keys()) {
-            let mut curr = Path::new(file_path).parent();
-            while let Some(parent) = curr {
-                if parent.as_os_str().is_empty() {
-                    break;
-                }
-                if !checked_dirs.insert(parent.to_path_buf()) {
-                    // This directory and all its parent ancestors were already checked
-                    break;
-                }
-                for pattern in &self.pinned_patterns {
-                    let candidate = parent.join(pattern);
-                    let candidate_str = candidate.to_string_lossy().to_string();
-                    if let Ok(clean_candidate) = self.normalize_path(&candidate_str) {
-                        self.insert_pinned_candidate(&mut new_pinned, clean_candidate);
-                    }
-                }
-                curr = parent.parent();
-            }
-        }
-
-        if self.pinned != new_pinned {
-            self.pinned = new_pinned;
-            true
-        } else {
-            false
-        }
-    }
-
-    fn insert_pinned_candidate(
-        &self,
-        target_map: &mut BTreeMap<String, ContextItem>,
-        clean_path: String,
-    ) {
-        if target_map.contains_key(&clean_path) {
-            return;
-        }
-        if verify_path_within_repo(&self.repo_root, &clean_path).is_err() {
-            return;
-        }
-        let full_path = self.repo_root.join(&clean_path);
-        if full_path.is_file() {
-            if let Some(existing) = self.pinned.get(&clean_path) {
-                target_map.insert(clean_path, existing.clone());
-            } else if let Ok(meta) = std::fs::metadata(&full_path) {
-                let size = meta.len();
-                let tokens = estimate_tokens_from_bytes(size);
-                target_map.insert(
-                    clean_path.clone(),
-                    ContextItem {
-                        path: clean_path,
-                        access: ContextAccess::ReadOnly,
-                        size_bytes: size,
-                        estimated_tokens: tokens,
-                        layer: ContextLayer::Pinned,
-                    },
-                );
-            }
-        }
     }
 
     /// Resolves access across all layers.
@@ -668,24 +511,8 @@ impl ContextManager {
             return Ok(true);
         }
 
-        // Pinned entries are owned by project configuration and are rebuilt
-        // from `tauqe.toml` on reload, so writing the override into the pinned
-        // layer would be silently discarded. Persist a user-layer override
-        // instead; a read-only request matches the pinned base access and is
-        // reported as no change.
-        if let Some(pinned_item) = self.pinned.get(&clean_path).cloned() {
-            if pinned_item.access == access {
-                return Ok(false);
-            }
-            let user_item = ContextItem {
-                access,
-                layer: ContextLayer::User,
-                ..pinned_item
-            };
-            if store_item(&mut self.user, user_item) {
-                self.revision += 1;
-                return Ok(true);
-            }
+        if self.pinned.contains_key(&clean_path) {
+            bail!("Pinned file '{}' access cannot be changed", clean_path);
         }
 
         Ok(false)
@@ -790,56 +617,12 @@ impl ContextManager {
             self.revision += 1;
         }
     }
-
-    pub fn normalize_path(&self, p: &str) -> Result<String> {
-        let path = Path::new(p);
-        let mut components = Vec::new();
-
-        for component in path.components() {
-            match component {
-                std::path::Component::Normal(c) => components.push(c.to_string_lossy().to_string()),
-                std::path::Component::CurDir => {}
-                std::path::Component::ParentDir => {
-                    if components.pop().is_none() {
-                        bail!("Path escapes repository root: {}", p);
-                    }
-                }
-                std::path::Component::RootDir | std::path::Component::Prefix(_) => {
-                    bail!("Absolute paths are not allowed: {}", p);
-                }
-            }
-        }
-
-        if components.is_empty() {
-            bail!("Empty path is not allowed");
-        }
-
-        let clean = components.join("/");
-        verify_path_within_repo(&self.repo_root, &clean)?;
-        Ok(clean)
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use tempfile::tempdir;
-
-    #[test]
-    fn test_normalize_path() {
-        let cm = ContextManager::new(PathBuf::from("/tmp"));
-        assert_eq!(
-            cm.normalize_path("crates/core/src/lib.rs").unwrap(),
-            "crates/core/src/lib.rs"
-        );
-        assert_eq!(
-            cm.normalize_path("./crates/core/../core/src/lib.rs")
-                .unwrap(),
-            "crates/core/src/lib.rs"
-        );
-        assert!(cm.normalize_path("../outside.rs").is_err());
-        assert!(cm.normalize_path("/abs/path.rs").is_err());
-    }
 
     #[test]
     fn test_add_files_by_pattern() {
@@ -889,6 +672,21 @@ mod tests {
 
         assert_eq!(outcome.added_items.len(), 1);
         assert!(outcome.truncated);
+    }
+
+    #[test]
+    fn test_set_access_on_pinned_file_is_rejected() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        std::fs::write(root.join("pinned.rs"), "pub fn pinned() {}").unwrap();
+
+        let mut cm = ContextManager::new(root);
+        cm.load_pinned(&["pinned.rs".to_string()]);
+        assert!(!cm.is_editable("pinned.rs").unwrap());
+
+        let res = cm.set_access("pinned.rs", ContextAccess::Editable);
+        assert!(res.is_err());
+        assert!(!cm.is_editable("pinned.rs").unwrap());
     }
 
     #[test]
@@ -997,73 +795,6 @@ mod tests {
 
         primary.merge_turn_context(&turn_snapshot);
         assert!(primary.is_editable("file.rs").unwrap());
-    }
-
-    #[test]
-    fn test_add_auto_file_upgrades_pinned_layer_to_editable() {
-        let dir = tempdir().unwrap();
-        let root = dir.path().to_path_buf();
-        std::fs::write(root.join("pinned.rs"), "fn pinned() {}").unwrap();
-
-        let mut cm = ContextManager::new(root);
-        cm.load_pinned(&["pinned.rs".to_string()]);
-        assert!(!cm.is_editable("pinned.rs").unwrap());
-
-        cm.add_auto_file("pinned.rs", ContextAccess::Editable).unwrap();
-        assert!(cm.is_editable("pinned.rs").unwrap());
-    }
-
-    #[test]
-    fn test_auto_request_on_pinned_file_never_duplicates_into_auto_layer() {
-        let dir = tempdir().unwrap();
-        let root = dir.path().to_path_buf();
-        std::fs::write(root.join("pinned.rs"), "fn pinned() {}").unwrap();
-
-        let mut cm = ContextManager::new(root);
-        cm.load_pinned(&["pinned.rs".to_string()]);
-        assert!(!cm.is_editable("pinned.rs").unwrap());
-
-        // The model requests the already-pinned file as editable.
-        cm.add_auto_file("pinned.rs", ContextAccess::Editable).unwrap();
-
-        // Access is upgraded without duplicating the pinned file into auto.
-        assert!(cm.is_editable("pinned.rs").unwrap());
-        assert!(cm.auto_files().is_empty());
-
-        // A read-only re-request stays a no-op for pinned files.
-        let rev_before = cm.get_state().revision;
-        cm.add_auto_file("pinned.rs", ContextAccess::ReadOnly).unwrap();
-        assert_eq!(cm.get_state().revision, rev_before);
-        assert!(cm.auto_files().is_empty());
-
-        // The emitted context state reports the path exactly once.
-        let state = cm.get_state();
-        let rows: Vec<_> = state
-            .items
-            .iter()
-            .filter(|i| i.path == "pinned.rs")
-            .collect();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].access, ContextAccess::Editable);
-        assert_eq!(rows[0].layer, ContextLayer::Pinned);
-    }
-
-    #[test]
-    fn test_merge_turn_context_syncs_upgraded_pinned_access() {
-        let dir = tempdir().unwrap();
-        let root = dir.path().to_path_buf();
-        std::fs::write(root.join("pinned.rs"), "fn pinned() {}").unwrap();
-
-        let mut primary = ContextManager::new(root);
-        primary.load_pinned(&["pinned.rs".to_string()]);
-        assert!(!primary.is_editable("pinned.rs").unwrap());
-
-        let mut turn_snapshot = primary.clone();
-        turn_snapshot.add_auto_file("pinned.rs", ContextAccess::Editable).unwrap();
-        assert!(turn_snapshot.is_editable("pinned.rs").unwrap());
-
-        primary.merge_turn_context(&turn_snapshot);
-        assert!(primary.is_editable("pinned.rs").unwrap());
     }
 
     #[test]
@@ -1180,116 +911,5 @@ mod tests {
 
         assert_eq!(cm.get_state().revision, rev_before);
         assert!(cm.contains("auto.rs").unwrap());
-    }
-
-    #[test]
-    fn test_hierarchical_pinned_resolution() {
-        let dir = tempdir().unwrap();
-        let root = dir.path().to_path_buf();
-
-        std::fs::write(root.join("Conventions.md"), "# Root Conventions").unwrap();
-        std::fs::create_dir_all(root.join("crates/tui/src/views")).unwrap();
-        std::fs::write(root.join("crates/tui/Conventions.md"), "# TUI Conventions").unwrap();
-        std::fs::write(root.join("crates/tui/src/views/develop.rs"), "pub fn view() {}").unwrap();
-        std::fs::create_dir_all(root.join("crates/core/src")).unwrap();
-        std::fs::write(root.join("crates/core/Conventions.md"), "# Core Conventions").unwrap();
-        std::fs::write(root.join("crates/core/src/lib.rs"), "pub fn core() {}").unwrap();
-
-        let mut cm = ContextManager::new(root);
-        cm.load_pinned(&["Conventions.md".to_string()]);
-
-        // Initially only root Conventions.md is pinned
-        assert!(cm.contains("Conventions.md").unwrap());
-        assert!(!cm.contains("crates/tui/Conventions.md").unwrap());
-        assert!(!cm.contains("crates/core/Conventions.md").unwrap());
-
-        // Adding a file in crates/tui automatically includes crates/tui/Conventions.md in pinned
-        cm.add_file("crates/tui/src/views/develop.rs", ContextAccess::Editable).unwrap();
-        assert!(cm.contains("crates/tui/Conventions.md").unwrap());
-        assert!(!cm.is_editable("crates/tui/Conventions.md").unwrap());
-        assert!(!cm.contains("crates/core/Conventions.md").unwrap());
-
-        // Adding a file in crates/core to auto layer automatically includes crates/core/Conventions.md
-        cm.add_auto_file("crates/core/src/lib.rs", ContextAccess::ReadOnly).unwrap();
-        assert!(cm.contains("crates/core/Conventions.md").unwrap());
-
-        // Clearing auto removes crates/core/Conventions.md, but retains crates/tui/Conventions.md
-        cm.clear_auto();
-        assert!(!cm.contains("crates/core/Conventions.md").unwrap());
-        assert!(cm.contains("crates/tui/Conventions.md").unwrap());
-
-        // Removing the user file removes crates/tui/Conventions.md
-        cm.remove_file("crates/tui/src/views/develop.rs").unwrap();
-        assert!(!cm.contains("crates/tui/Conventions.md").unwrap());
-        assert!(cm.contains("Conventions.md").unwrap());
-    }
-
-    #[test]
-    #[cfg(unix)]
-    fn test_symlink_escaping_repo_is_rejected() {
-        let dir = tempdir().unwrap();
-        let outside = tempdir().unwrap();
-        let repo_root = dir.path().to_path_buf();
-        let outside_root = outside.path().to_path_buf();
-
-        let secret_file = outside_root.join("secret.txt");
-        std::fs::write(&secret_file, "super secret").unwrap();
-
-        // Symlink pointing to a file outside repo
-        let sym_file = repo_root.join("sym_file.txt");
-        std::os::unix::fs::symlink(&secret_file, &sym_file).unwrap();
-
-        // Symlink pointing to a directory outside repo
-        let sym_dir = repo_root.join("sym_dir");
-        std::os::unix::fs::symlink(&outside_root, &sym_dir).unwrap();
-
-        let mut cm = ContextManager::new(repo_root.clone());
-
-        // File symlink escapes repo
-        assert!(cm.normalize_path("sym_file.txt").is_err());
-        assert!(cm.add_file("sym_file.txt", ContextAccess::ReadOnly).is_err());
-
-        // Directory symlink escapes repo (both existing and non-existing files under it)
-        assert!(cm.normalize_path("sym_dir/secret.txt").is_err());
-        assert!(cm.normalize_path("sym_dir/new_file.txt").is_err());
-        assert!(cm.add_file("sym_dir/secret.txt", ContextAccess::ReadOnly).is_err());
-
-        // Symlink pointing inside repo is allowed
-        let internal_dir = repo_root.join("src");
-        std::fs::create_dir_all(&internal_dir).unwrap();
-        let internal_file = internal_dir.join("lib.rs");
-        std::fs::write(&internal_file, "pub fn ok() {}").unwrap();
-
-        let internal_sym = repo_root.join("sym_lib.rs");
-        std::os::unix::fs::symlink(&internal_file, &internal_sym).unwrap();
-
-        assert!(cm.normalize_path("sym_lib.rs").is_ok());
-        assert!(cm.add_file("sym_lib.rs", ContextAccess::ReadOnly).is_ok());
-
-        // Reading context files ignores any file that escapes repo
-        let files = cm.read_context_files();
-        assert!(files.iter().any(|f| f.path == "sym_lib.rs"));
-        assert!(!files.iter().any(|f| f.path == "sym_file.txt"));
-    }
-
-    #[test]
-    fn test_context_manager_with_pinned_and_scoped_config_loader() {
-        let dir = tempdir().unwrap();
-        let root = dir.path().to_path_buf();
-        std::fs::write(root.join("pinned.md"), "# Pinned").unwrap();
-        std::fs::write(
-            root.join("tauqe.toml"),
-            "[context]\npinned = [\"pinned.md\"]\n",
-        )
-        .unwrap();
-
-        // ContextManager::new reads exclusively [context] via load_context_config
-        let cm_auto = ContextManager::new(root.clone());
-        assert_eq!(cm_auto.pinned_patterns(), &["pinned.md".to_string()]);
-        assert!(cm_auto.contains("pinned.md").unwrap());
-
-        // ContextManager::with_pinned sets patterns explicitly without disk config lookup
-        let cm_explicit = ContextManager::with_pinned(root, &["other.md".to_string()]);
-        assert_eq!(cm_explicit.pinned_patterns(), &["other.md".to_string()]);
     }
 }

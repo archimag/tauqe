@@ -30,7 +30,7 @@ pub(crate) use confirm::{
     render_confirm_execute_review_popup, render_confirm_execute_scope_popup,
     render_confirm_quit_popup, render_confirm_undo_popup,
 };
-pub(crate) use disconnected::render_disconnected_popup;
+pub(crate) use disconnected::{disconnected_button_geometry, render_disconnected_popup};
 pub(crate) use help::render_help_popup;
 pub(crate) use prompt::{prompt_modal_area, prompt_modal_buttons, render_prompt_modal};
 pub(crate) use refine::{
