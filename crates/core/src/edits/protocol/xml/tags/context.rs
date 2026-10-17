@@ -2,48 +2,51 @@
 
 use tauqe_protocol::ContextAccess;
 
-use super::{next_simple_tag, strip_tags};
-use crate::edits::protocol::xml::extract_attribute;
+use crate::edits::protocol::xml::engine::{self, XmlTagSpec};
 use crate::edits::protocol::ContextRequest;
 
-/// Locates the next complete `<context_request .../>` tag (unsuffixed dialect).
-pub(crate) fn next_context_request_tag(text: &str) -> Option<(usize, usize)> {
-    next_simple_tag(text, "<context_request")
+/// Specification of the `<context_request>` control tag from the XML tag registry.
+pub(crate) fn tag_spec() -> Option<&'static XmlTagSpec> {
+    engine::tag_spec("context_request")
 }
 
 /// Removes all context request tags from text.
 pub fn strip_context_request_tags(text: &str) -> String {
-    strip_tags(text, next_context_request_tag)
+    match tag_spec() {
+        Some(spec) => engine::strip_tag_by_spec(text, spec),
+        None => text.to_string(),
+    }
 }
 
 /// Parses all `<context_request>` tags into typed access requests.
 pub(crate) fn parse_context_request_tags(text: &str) -> Vec<ContextRequest> {
+    let Some(spec) = tag_spec() else {
+        return Vec::new();
+    };
     let mut requests = Vec::new();
-    let mut pos = 0;
-    while let Some((start, end)) = next_context_request_tag(&text[pos..]) {
-        let tag = &text[pos + start..pos + end];
-        let header_end = tag.find('>').unwrap_or(tag.len());
-        let header = &tag[..header_end];
-        if let Some(path) = extract_attribute(header, "path") {
-            let path = path
-                .trim()
-                .trim_start_matches("./")
-                .trim_start_matches('/')
-                .to_string();
-            if !path.is_empty() {
-                let editable = extract_attribute(header, "access")
-                    .is_some_and(|a| a.trim().eq_ignore_ascii_case("editable"));
-                requests.push(ContextRequest {
-                    path,
-                    access: if editable {
-                        ContextAccess::Editable
-                    } else {
-                        ContextAccess::ReadOnly
-                    },
-                });
-            }
+    for found in engine::iter_tags(text, spec) {
+        let Some(raw_path) = found.attr("path") else {
+            continue;
+        };
+        let path = raw_path
+            .trim()
+            .trim_start_matches("./")
+            .trim_start_matches('/')
+            .to_string();
+        if path.is_empty() {
+            continue;
         }
-        pos += end;
+        let editable = found
+            .attr("access")
+            .is_some_and(|access| access.trim().eq_ignore_ascii_case("editable"));
+        requests.push(ContextRequest {
+            path,
+            access: if editable {
+                ContextAccess::Editable
+            } else {
+                ContextAccess::ReadOnly
+            },
+        });
     }
     requests
 }

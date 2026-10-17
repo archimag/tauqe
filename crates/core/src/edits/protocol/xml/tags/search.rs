@@ -2,17 +2,27 @@
 
 use tauqe_protocol::RepoSearchRequest;
 
-use super::{next_simple_tag, strip_tags};
-use crate::edits::protocol::xml::extract_attribute;
+use crate::edits::protocol::xml::engine::{self, XmlTagSpec};
 
-/// Locates the next complete `<repo_search .../>` tag.
-pub(crate) fn next_repo_search_tag(text: &str) -> Option<(usize, usize)> {
-    next_simple_tag(text, "<repo_search")
+/// Specification of the `<repo_search>` control tag from the XML tag registry.
+pub(crate) fn tag_spec() -> Option<&'static XmlTagSpec> {
+    engine::tag_spec("repo_search")
 }
 
 /// Removes all repo search tags from text.
 pub fn strip_repo_search_tags(text: &str) -> String {
-    strip_tags(text, next_repo_search_tag)
+    match tag_spec() {
+        Some(spec) => engine::strip_tag_by_spec(text, spec),
+        None => text.to_string(),
+    }
+}
+
+fn normalized_path(raw: Option<String>) -> String {
+    raw.unwrap_or_default()
+        .trim()
+        .trim_start_matches("./")
+        .trim_start_matches('/')
+        .to_string()
 }
 
 /// Parses all `<repo_search>` tags into typed search requests.
@@ -21,32 +31,20 @@ pub fn strip_repo_search_tags(text: &str) -> String {
 /// - `path`: `path`, `dir` (defaults to empty string for repository root)
 /// - `regex`: `regex`, `pattern`, `query`
 pub(crate) fn parse_repo_search_tags(text: &str) -> Vec<RepoSearchRequest> {
+    let Some(spec) = tag_spec() else {
+        return Vec::new();
+    };
     let mut requests = Vec::new();
-    let mut pos = 0;
-    while let Some((start, end)) = next_repo_search_tag(&text[pos..]) {
-        let tag = &text[pos + start..pos + end];
-        let header_end = tag.find('>').unwrap_or(tag.len());
-        let header = &tag[..header_end];
-
-        let path = extract_attribute(header, "path")
-            .or_else(|| extract_attribute(header, "dir"))
-            .unwrap_or_default()
-            .trim()
-            .trim_start_matches("./")
-            .trim_start_matches('/')
-            .to_string();
-
-        let regex = extract_attribute(header, "regex")
-            .or_else(|| extract_attribute(header, "pattern"))
-            .or_else(|| extract_attribute(header, "query"))
+    for found in engine::iter_tags(text, spec) {
+        let path = normalized_path(found.attr_any(&["path", "dir"]));
+        let regex = found
+            .attr_any(&["regex", "pattern", "query"])
             .unwrap_or_default()
             .trim()
             .to_string();
-
         if !regex.is_empty() {
             requests.push(RepoSearchRequest { path, regex });
         }
-        pos += end;
     }
     requests
 }

@@ -60,7 +60,7 @@ max_retries = 5
 # Maximum automated replanning cycles triggered by a blocked coder step before
 # requiring manual developer intervention (default: 2).
 # max_replans = 2
-# workflow = "git"   # edit workflow: "toolchain", "git", "naive" (default: "git")
+# workflow = "git"   # edit workflow: "git", "naive" (default: "git")
 # protocol = "xml"   # active edit protocol: "xml" (default: "xml")
 
 [toolchain]

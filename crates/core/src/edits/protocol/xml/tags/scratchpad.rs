@@ -1,53 +1,21 @@
 //! Parser for the `<scratchpad>` control tag.
 
-use super::{next_control_tag, strip_tags};
-use crate::edits::protocol::xml::extract_attribute;
+use super::{next_tag_bounds, strip_tags};
+use crate::edits::protocol::xml::engine;
 
 /// Locates the next complete `<scratchpad ...>...</scratchpad>` or `<scratchpad .../>` tag.
 pub(crate) fn next_scratchpad_tag(text: &str) -> Option<(usize, usize)> {
-    next_control_tag(text, "<scratchpad")
+    next_tag_bounds(text, "<scratchpad")
 }
 
 /// Extracts ephemeral scratchpad content from model output if present.
 pub fn extract_scratchpad(text: &str) -> Option<String> {
-    let mut notes = Vec::new();
-    let mut pos = 0;
-    while let Some((start, end)) = next_scratchpad_tag(&text[pos..]) {
-        let abs_start = pos + start;
-        let abs_end = pos + end;
-        let tag = &text[abs_start..abs_end];
-        let header_end = tag.find('>').unwrap_or(tag.len());
-        let header = &tag[..header_end];
-        let is_self_closing = header.trim_end().ends_with('/');
-
-        let tag_name = header
-            .strip_prefix('<')
-            .unwrap_or_default()
-            .chars()
-            .take_while(|c| !c.is_whitespace() && *c != '>' && *c != '/')
-            .collect::<String>();
-        let close_tag = format!("</{}>", tag_name);
-
-        let mut note = None;
-        if !is_self_closing && tag.ends_with(&close_tag) {
-            let body = tag[header_end + 1..tag.len() - close_tag.len()].trim();
-            if !body.is_empty() {
-                note = Some(body.to_string());
-            }
-        }
-        if note.is_none() {
-            if let Some(attr_note) = extract_attribute(header, "note") {
-                let trimmed = attr_note.trim();
-                if !trimmed.is_empty() {
-                    note = Some(trimmed.to_string());
-                }
-            }
-        }
-        if let Some(n) = note {
-            notes.push(n);
-        }
-        pos = abs_end;
-    }
+    let spec = engine::tag_spec("scratchpad")?;
+    let notes: Vec<String> = engine::iter_tags(text, spec)
+        .filter_map(|tag| tag.attr_or_body(&["note"]))
+        .map(|note| note.trim().to_string())
+        .filter(|note| !note.is_empty())
+        .collect();
     if notes.is_empty() {
         None
     } else {

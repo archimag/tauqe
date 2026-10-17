@@ -87,7 +87,6 @@ pub enum ActiveModal {
     BatchCancel,
     ClearAuto,
     ClearUser,
-    ConfirmUndo,
     ConfirmDetachFocus,
     DeletePlan,
     DeleteReview,
@@ -1038,7 +1037,6 @@ pub struct AppState {
     pub batch_cancel_button: BatchCancelButton,
     /// Whether a running batch has been asked to stop after its current member.
     pub batch_stopping: bool,
-    pub confirm_undo: bool,
     pub confirm_detach_focus: bool,
     pub confirm_clear_history: bool,
     pub confirm_delete_plan: Option<String>,
@@ -1116,7 +1114,6 @@ impl AppState {
             confirm_batch_cancel: false,
             batch_cancel_button: BatchCancelButton::Continue,
             batch_stopping: false,
-            confirm_undo: false,
             confirm_detach_focus: false,
             confirm_clear_history: false,
             confirm_delete_plan: None,
@@ -1275,9 +1272,6 @@ impl AppState {
         }
         if self.context_view.confirm_clear_user {
             return Some(ActiveModal::ClearUser);
-        }
-        if self.confirm_undo {
-            return Some(ActiveModal::ConfirmUndo);
         }
         if self.confirm_detach_focus {
             return Some(ActiveModal::ConfirmDetachFocus);

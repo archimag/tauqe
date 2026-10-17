@@ -232,10 +232,12 @@ pub async fn run_fsm_turn(
         Ok(outcome) => outcome,
         Err(err) => {
             rollback_or_log(policy, context_manager.repo_root()).await;
-            context_manager.clear_auto();
-            // Metadata pruning walks every context path, so it runs off the
-            // async executor thread.
-            crate::blocking::run_blocking(|| context_manager.prune_missing_files());
+            // Auto-layer cleanup recomputes pinned ancestors and walks every
+            // context path, so the sweep runs off the async executor thread.
+            crate::blocking::run_blocking(|| {
+                context_manager.clear_auto();
+                context_manager.prune_missing_files();
+            });
             if let Some(id) = session_turn.turn_id {
                 let _ = history_manager.rollback_entry(id);
             }
@@ -344,6 +346,22 @@ pub(super) async fn run_fsm_turn_body(
         PlanMutationMode::Discussion
     } else {
         PlanMutationMode::Develop
+    };
+
+    let isolated_protocol;
+    let protocol: &dyn PromptProtocol = if is_isolated_step
+        && (protocol.supports(tauqe_protocol::LlmCapability::PlanCreation)
+            || protocol.supports(tauqe_protocol::LlmCapability::PlanUpdate))
+    {
+        let narrowed_caps = if protocol.name() == "structured" {
+            tauqe_protocol::CapabilitySet::isolated_step_structured()
+        } else {
+            tauqe_protocol::CapabilitySet::isolated_step_xml()
+        };
+        isolated_protocol = protocol.with_capability_set(narrowed_caps);
+        isolated_protocol.as_ref()
+    } else {
+        protocol
     };
 
     log_fsm_phase(
@@ -494,8 +512,12 @@ async fn finish_on_error_outcome(ctx: &mut PhaseContext<'_>) -> Option<FsmTurnOu
         "bounded turn terminated by an error outcome"
     );
     rollback_or_log(ctx.policy, ctx.repo_root).await;
-    ctx.context_manager.clear_auto();
-    crate::blocking::run_blocking(|| ctx.context_manager.prune_missing_files());
+    // Auto-layer cleanup recomputes pinned ancestors and walks every context
+    // path, so the sweep runs off the async executor thread.
+    crate::blocking::run_blocking(|| {
+        ctx.context_manager.clear_auto();
+        ctx.context_manager.prune_missing_files();
+    });
     let ctx_state = ctx.context_manager.get_state();
     let _ = ctx.stream_tx.send(StreamEvent::ContextChanged(ctx_state)).await;
     let _ = ctx.stream_tx.send(StreamEvent::Done).await;
@@ -616,8 +638,10 @@ async fn finish_patch_failure(
         ctx.options.max_retries,
         err_lines.join("\n")
     );
-    ctx.context_manager.clear_auto();
-    crate::blocking::run_blocking(|| ctx.context_manager.prune_missing_files());
+    crate::blocking::run_blocking(|| {
+        ctx.context_manager.clear_auto();
+        ctx.context_manager.prune_missing_files();
+    });
     let _ = ctx.stream_tx.send(StreamEvent::Done).await;
     let result = ModelResult::Edit {
         summary: "FSM edits failed".to_string(),
@@ -648,8 +672,10 @@ async fn finish_no_edits(ctx: &mut PhaseContext<'_>) -> FsmTurnOutcome {
         isolated_step = ctx.is_isolated_step,
         "no edits were successfully staged"
     );
-    ctx.context_manager.clear_auto();
-    crate::blocking::run_blocking(|| ctx.context_manager.prune_missing_files());
+    crate::blocking::run_blocking(|| {
+        ctx.context_manager.clear_auto();
+        ctx.context_manager.prune_missing_files();
+    });
     let _ = ctx.stream_tx.send(StreamEvent::Done).await;
     let result = ModelResult::Edit {
         summary: "FSM edits failed".to_string(),

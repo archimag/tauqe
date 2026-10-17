@@ -2,7 +2,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tauqe_protocol::{
     methods, ConfigState, ContextState, GitSquashApplyResult, GitSquashGenerateMessageResult,
-    GitSquashPreviewResult, GitUndoResult, HistoryGetResult, RepositoryListFilesResult, RequestId,
+    GitSquashPreviewResult, HistoryGetResult, RepositoryListFilesResult, RequestId,
     Response, ReviewGetResult, ReviewUpdateItemResult, SystemStatusResult,
 };
 
@@ -283,15 +283,6 @@ pub async fn handle_response(
                         dialog.focus = crate::app::SquashDialogFocus::MessageEditor;
                         dialog.status_message = Some(messages::SQUASH_MSG_GENERATED.to_string());
                     }
-                }
-            }
-            methods::GIT_UNDO => {
-                if let Ok(undo_res) = serde_json::from_value::<GitUndoResult>(val) {
-                    st.notify_success(undo_res.message);
-                    st.model.last_commit_hash = None;
-                    st.model.last_commit_summary = None;
-                    st.model.edit_final_applied = None;
-                    st.model.files.clear();
                 }
             }
             methods::HISTORY_GET => {

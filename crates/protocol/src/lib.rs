@@ -35,7 +35,8 @@ pub mod review;
 // instead of a silently ambiguous glob re-export. Module paths remain public,
 // so both `tauqe_protocol::Item` and `tauqe_protocol::module::Item` resolve.
 pub use command::{
-    DocTopic, LlmCapability, LlmCommand, LlmOutcome, VerifyOnSuccess, VerifyTarget,
+    CapabilityPhase, CapabilitySet, DocTopic, LlmCapability, LlmCommand, LlmOutcome,
+    VerifyOnSuccess, VerifyTarget,
 };
 pub use config::{
     ConfigCreateParams, ConfigSetParams, ConfigState, CredentialsSaveParams, EditProtocolKind,

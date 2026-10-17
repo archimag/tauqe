@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 
+use crate::command::DocTopic;
 use crate::discussion::{
     deserialize_null_as_default, DiscussionContextRequest, DiscussionRequest, RepoSearchRequest,
 };
@@ -91,6 +92,38 @@ pub struct ModelDeltaEvent {
     pub delta: String,
 }
 
+/// Terminal outcome declared through a structured proposal.
+///
+/// Structured output carries the terminal outcome as an explicit object field
+/// instead of a `<success>` / `<error>` control tag. `status` is kept as the raw
+/// model-declared string so the decoding layer owns tolerant normalization,
+/// while `summary` and `message` carry the optional success summary or error
+/// text.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StructuredOutcomeProposal {
+    #[serde(default)]
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+/// Semantic blocker declared through a structured proposal.
+///
+/// Mirrors the `<blocked>` protocol tag: `is_blocked` is the explicit flag the
+/// model sets when a precondition or assumption fails, `reason` names the
+/// violated precondition, and `details` optionally expands it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StructuredBlockedProposal {
+    #[serde(default)]
+    pub is_blocked: bool,
+    #[serde(default)]
+    pub reason: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub details: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct ModelResultProposal {
     #[serde(default)]
@@ -106,6 +139,18 @@ pub struct ModelResultProposal {
         skip_serializing_if = "Vec::is_empty"
     )]
     pub repo_searches: Vec<RepoSearchRequest>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_null_as_default",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub doc_requests: Vec<DocTopic>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scratchpad: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<StructuredOutcomeProposal>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocked: Option<StructuredBlockedProposal>,
     #[serde(default)]
     pub context_drops: Vec<String>,
     #[serde(default)]
@@ -379,5 +424,78 @@ mod tests {
         assert_eq!(json, "{\"mode\":\"soft\"}");
         let de: ModelCancelParams = serde_json::from_str(&json).unwrap();
         assert_eq!(de.mode, Some(CancelMode::Soft));
+    }
+
+    #[test]
+    fn test_model_result_proposal_structured_control_fields() {
+        let raw = r#"{
+            "message": "Gathering context",
+            "changes": [],
+            "context_requests": [],
+            "repo_searches": [],
+            "doc_requests": ["workflow", "git"],
+            "scratchpad": "Verified: parser fixed.",
+            "outcome": {"status": "success", "summary": "All checks passed", "message": null},
+            "blocked": null,
+            "context_drops": [],
+            "suggested_actions": []
+        }"#;
+        let proposal: ModelResultProposal = serde_json::from_str(raw).unwrap();
+        assert_eq!(
+            proposal.doc_requests,
+            vec![DocTopic::Workflow, DocTopic::Git]
+        );
+        assert_eq!(
+            proposal.scratchpad.as_deref(),
+            Some("Verified: parser fixed.")
+        );
+        let outcome = proposal.outcome.as_ref().expect("outcome proposal");
+        assert_eq!(outcome.status, "success");
+        assert_eq!(outcome.summary.as_deref(), Some("All checks passed"));
+        assert!(outcome.message.is_none());
+        assert!(proposal.blocked.is_none());
+
+        let json = serde_json::to_string(&proposal).unwrap();
+        assert!(json.contains("\"doc_requests\":[\"workflow\",\"git\"]"));
+        assert!(json.contains("\"scratchpad\":\"Verified: parser fixed.\""));
+        assert!(json.contains("\"status\":\"success\""));
+        assert!(!json.contains("\"blocked\""));
+        assert_eq!(
+            serde_json::from_str::<ModelResultProposal>(&json).unwrap(),
+            proposal
+        );
+    }
+
+    #[test]
+    fn test_model_result_proposal_blocked_and_null_tolerance() {
+        let raw = r#"{
+            "message": "Cannot proceed",
+            "changes": [],
+            "doc_requests": null,
+            "scratchpad": null,
+            "outcome": null,
+            "blocked": {
+                "is_blocked": true,
+                "reason": "Missing table",
+                "details": "users table absent"
+            }
+        }"#;
+        let proposal: ModelResultProposal = serde_json::from_str(raw).unwrap();
+        assert!(proposal.doc_requests.is_empty());
+        assert!(proposal.scratchpad.is_none());
+        assert!(proposal.outcome.is_none());
+        let blocked = proposal.blocked.expect("blocked proposal");
+        assert!(blocked.is_blocked);
+        assert_eq!(blocked.reason, "Missing table");
+        assert_eq!(blocked.details.as_deref(), Some("users table absent"));
+
+        // A minimal payload leaves every extended field at its default, so the
+        // schema extension never breaks an existing proposal document.
+        let minimal: ModelResultProposal =
+            serde_json::from_str(r#"{"message":"ok","changes":[]}"#).unwrap();
+        assert!(minimal.doc_requests.is_empty());
+        assert!(minimal.scratchpad.is_none());
+        assert!(minimal.outcome.is_none());
+        assert!(minimal.blocked.is_none());
     }
 }

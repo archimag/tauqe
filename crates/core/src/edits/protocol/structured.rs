@@ -1,10 +1,15 @@
-use tauqe_protocol::{EditFileOp, EditOperation, EditOutcome, ModelResult, ModelResultProposal};
+use tauqe_protocol::{
+    CapabilitySet, DocTopic, EditFileOp, EditOperation, EditOutcome, LlmCapability, ModelResult,
+    ModelResultProposal,
+};
 
+use crate::capabilities::{CapabilityRegistry, PromptRenderContext};
+use crate::edits::protocol::xml::engine::strip_all_control_tags;
 use crate::edits::stream::json::decode::{balanced_object_end, strip_code_fence};
 use crate::providers::{JsonSchemaDefinition, ResponseFormat};
 
 use super::utils::{normalize_content, resolve_target_path_for_op};
-use super::{ContextRequest, VerifyRequest};
+use super::{ContextRequest, TerminalOutcome, VerifyOnSuccess, VerifyRequest, VerifyTarget};
 
 /// Structured Output JSON-schema edit protocol
 #[derive(Debug, Default, Clone)]
@@ -81,6 +86,81 @@ impl StructuredEditProtocol {
                         "additionalProperties": false
                     }
                 },
+                "doc_requests": {
+                    "type": "array",
+                    "description": "System documentation topics to request before answering questions about identity, capabilities, concepts, or workflows",
+                    "items": {
+                        "type": "string",
+                        "enum": ["overview", "context", "workflow", "git", "interface", "review", "plan", "all"]
+                    }
+                },
+                "scratchpad": {
+                    "type": "string",
+                    "description": "Turn-local working memory notes holding hypotheses, verified findings, and the purpose of context still needed; empty string when there is nothing to record"
+                },
+                "outcome": {
+                    "type": "object",
+                    "description": "Terminal outcome of the turn; status 'none' while the turn continues",
+                    "properties": {
+                        "status": {
+                            "type": "string",
+                            "enum": ["none", "success", "error"],
+                            "description": "'none' while the turn continues, 'success' when it succeeds, 'error' when it fails"
+                        },
+                        "summary": {
+                            "type": "string",
+                            "description": "Success summary (empty string otherwise)"
+                        },
+                        "message": {
+                            "type": "string",
+                            "description": "Error message (empty string otherwise)"
+                        }
+                    },
+                    "required": ["status", "summary", "message"],
+                    "additionalProperties": false
+                },
+                "blocked": {
+                    "type": "object",
+                    "description": "Semantic blocker reported when a precondition or assumption fails",
+                    "properties": {
+                        "is_blocked": {
+                            "type": "boolean",
+                            "description": "True only when a precondition or assumption fails"
+                        },
+                        "reason": {
+                            "type": "string",
+                            "description": "Violated precondition or assumption (empty string when not blocked)"
+                        },
+                        "details": {
+                            "type": "string",
+                            "description": "Optional expansion of the blocker (empty string otherwise)"
+                        }
+                    },
+                    "required": ["is_blocked", "reason", "details"],
+                    "additionalProperties": false
+                },
+                "verify": {
+                    "type": "object",
+                    "description": "Deterministic toolchain verification request",
+                    "properties": {
+                        "target": {
+                            "type": "string",
+                            "enum": ["none", "all", "check", "test", "clippy"],
+                            "description": "'none' when no verification is requested, otherwise the verification scope"
+                        },
+                        "on_success": {
+                            "type": "string",
+                            "enum": ["silent", "report"],
+                            "description": "'silent' reports only a concise confirmation, 'report' surfaces the full command output"
+                        }
+                    },
+                    "required": ["target", "on_success"],
+                    "additionalProperties": false
+                },
+                "user_language": {
+                    "type": "string",
+                    "description": "Detected primary natural language of the user prompt; empty string when unknown"
+                },
                 "suggested_actions": {
                     "type": "array",
                     "description": "Optional list of suggested follow-up options for the user",
@@ -89,7 +169,11 @@ impl StructuredEditProtocol {
                     }
                 }
             },
-            "required": ["message", "changes", "context_requests", "repo_searches", "suggested_actions"],
+            "required": [
+                "message", "changes", "context_requests", "repo_searches",
+                "doc_requests", "scratchpad", "outcome", "blocked",
+                "verify", "user_language", "suggested_actions"
+            ],
             "additionalProperties": false
         })
     }
@@ -235,16 +319,36 @@ impl StructuredEditProtocol {
 
     /// Returns system prompt instructions for the structured-output protocol.
     pub fn system_instructions(&self, editable_paths: &[String]) -> String {
+        self.system_instructions_for(&CapabilitySet::develop_structured(), editable_paths)
+    }
+
+    /// Returns system prompt instructions for an explicit capability set.
+    ///
+    /// The field reference is composed from the capability registry, so a
+    /// narrowed set never advertises a field for a disabled capability.
+    pub fn system_instructions_for(
+        &self,
+        capabilities: &CapabilitySet,
+        editable_paths: &[String],
+    ) -> String {
+        let ctx = PromptRenderContext::new(editable_paths, None);
         let mut prompt = String::new();
         prompt.push_str("## Code Modification Protocol (Structured Output JSON)\n");
-        prompt.push_str("You must respond with a JSON object conforming to the structured output schema with the following fields:\n");
-        prompt.push_str("- `message`: Your conversational explanation or answer to the user.\n");
-        prompt.push_str("- `changes`: Array of code edit operations (`op`: 'replace'|'create'|'delete'|'move'|'overwrite', `path`, `to`, `old_text`, `new_text`, `content`).\n");
-        prompt.push_str("- `context_requests`: Files to add to context. Each entry is a repository-relative path (read-only) or `editable:<path>` for files you need to modify.\n");
-        prompt.push_str("- `repo_searches`: Repository search requests ({ `path`: string, `regex`: string }) to locate symbols or text patterns across files.\n");
         prompt.push_str(
-            "- `suggested_actions`: Optional list of suggested follow-up options for the user.\n",
+            "Respond with a single JSON object conforming to the structured output schema:\n",
         );
+        prompt.push_str(
+            &CapabilityRegistry::global()
+                .compose_structured_protocol_instructions(capabilities, &ctx),
+        );
+        prompt.push_str(
+            "\n- `suggested_actions`: optional list of suggested follow-up options for the user.\n\n",
+        );
+
+        if !capabilities.contains(LlmCapability::FileEdits) {
+            return prompt;
+        }
+
         prompt.push_str("Every field of a change is required: use an empty string \"\" for fields that do not apply to the operation (e.g. `old_text`/`new_text` for 'create'/'delete', `content` for 'replace').\n\n");
 
         if editable_paths.is_empty() {
@@ -265,9 +369,6 @@ impl StructuredEditProtocol {
         prompt.push_str("3. For 'replace', `old_text` must match EXACTLY ONE location in the target file, including indentation and whitespace.\n");
         prompt.push_str("4. For 'create' and 'overwrite', `content` must contain the complete file content from first to last line.\n");
         prompt.push_str("5. If no code changes are needed, set `changes: []` and provide your answer in `message`.\n");
-
-        prompt.push_str("6. Context Discovery: If the task requires files listed in <repo_map> that are not present in the editable or read-only files, request them FIRST: set `changes: []` and list them in `context_requests`. You will be called again with the full file contents added to context. Never request files that are already in context.\n");
-        prompt.push_str("7. Repository Search: To locate symbols or patterns across repository files during discovery, specify queries in `repo_searches` with `path` (relative directory/file or \"\" for repository root) and `regex` (Rust / ripgrep regex syntax). Supports `\\b`, `\\w`, `\\d`, non-capturing groups `(?:...)`, case-insensitive flag `(?i)`. Lookaround assertions (`(?=...)`, `(?!...)`, `(?<=...)`, `(?<!...)`) and backreferences (`\\1`) are strictly forbidden.\n\n");
 
         prompt
     }
@@ -309,14 +410,160 @@ impl StructuredEditProtocol {
         super::xml::tags::parse_repo_search_tags(raw_text)
     }
 
-    /// Extracts a verification request from XML control tags when present.
+    /// Extracts requested documentation topics from a structured proposal,
+    /// falling back to XML control tags when the JSON field is absent.
+    pub fn parse_doc_requests(&self, raw_text: &str) -> Vec<DocTopic> {
+        if let Some(proposal) = parse_proposal(raw_text) {
+            if !proposal.doc_requests.is_empty() {
+                return proposal.doc_requests;
+            }
+        }
+        super::xml::tags::parse_doc_request_tags(raw_text)
+    }
+
+    /// Extracts ephemeral scratchpad notes from a structured proposal,
+    /// falling back to XML control tags when the JSON field is absent.
+    pub fn parse_scratchpad(&self, raw_text: &str) -> Option<String> {
+        if let Some(proposal) = parse_proposal(raw_text) {
+            if let Some(notes) = proposal.scratchpad.as_deref() {
+                let trimmed = notes.trim();
+                if !trimmed.is_empty() {
+                    return Some(trimmed.to_string());
+                }
+            }
+        }
+        super::xml::tags::extract_scratchpad(raw_text)
+    }
+
+    /// Extracts the terminal outcome from a structured proposal, falling back
+    /// to XML control tags when the JSON field is absent or reports `none`.
+    ///
+    /// A `<blocked>` tag is itself a terminal outcome: a broken precondition
+    /// ends the turn exactly like success or error, so the fallback surfaces it
+    /// as [`TerminalOutcome::Blocked`].
+    pub fn parse_terminal_outcome(&self, raw_text: &str) -> Option<TerminalOutcome> {
+        if let Some(proposal) = parse_proposal(raw_text) {
+            if let Some(outcome) = proposal.outcome {
+                let status = outcome.status.trim().to_ascii_lowercase();
+                match status.as_str() {
+                    "success" => {
+                        let summary = outcome
+                            .summary
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|summary| !summary.is_empty())
+                            .map(str::to_string);
+                        return Some(TerminalOutcome::Success { summary });
+                    }
+                    "error" => {
+                        let message = outcome
+                            .message
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|message| !message.is_empty())
+                            .unwrap_or("Execution error")
+                            .to_string();
+                        return Some(TerminalOutcome::Error { message });
+                    }
+                    _ => {}
+                }
+            }
+        }
+        super::xml::tags::extract_terminal_outcome(raw_text)
+    }
+
+    /// Extracts a semantic blocker from a structured proposal, falling back to
+    /// XML control tags when the JSON field is absent or reports no blocker.
+    pub fn parse_blocked(&self, raw_text: &str) -> Option<(String, Option<String>)> {
+        if let Some(proposal) = parse_proposal(raw_text) {
+            if let Some(blocked) = proposal.blocked {
+                if blocked.is_blocked {
+                    let reason = blocked.reason.trim();
+                    let reason = if reason.is_empty() {
+                        "Execution blocked".to_string()
+                    } else {
+                        reason.to_string()
+                    };
+                    let details = blocked
+                        .details
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|details| !details.is_empty())
+                        .map(str::to_string);
+                    return Some((reason, details));
+                }
+            }
+        }
+        super::xml::tags::extract_blocked(raw_text)
+    }
+
+    /// Extracts a verification request from the structured `verify` field,
+    /// falling back to XML control tags when the JSON field is absent or
+    /// reports `none`.
     pub fn parse_verify_request(&self, raw_text: &str) -> Option<VerifyRequest> {
+        if let Some(value) = parse_proposal_value(raw_text) {
+            if let Some(verify) = value.get("verify").and_then(|field| field.as_object()) {
+                let target = verify
+                    .get("target")
+                    .and_then(|field| field.as_str())
+                    .unwrap_or_default()
+                    .trim()
+                    .to_ascii_lowercase();
+                if !target.is_empty() && target != "none" {
+                    let target = match target.as_str() {
+                        "check" => VerifyTarget::Check,
+                        "test" => VerifyTarget::Test,
+                        "clippy" => VerifyTarget::Clippy,
+                        _ => VerifyTarget::All,
+                    };
+                    let on_success = match verify
+                        .get("on_success")
+                        .and_then(|field| field.as_str())
+                        .unwrap_or_default()
+                        .trim()
+                        .to_ascii_lowercase()
+                        .as_str()
+                    {
+                        "silent" => VerifyOnSuccess::Silent,
+                        _ => VerifyOnSuccess::Report,
+                    };
+                    return Some(VerifyRequest { target, on_success });
+                }
+            }
+        }
         super::xml::tags::extract_verify_request(raw_text)
     }
 
-    /// Extracts the detected user language when present.
+    /// Extracts the detected user language from the structured `user_language`
+    /// field, falling back to XML control tags when the field is absent or
+    /// blank.
     pub fn parse_user_language(&self, raw_text: &str) -> Option<String> {
+        if let Some(value) = parse_proposal_value(raw_text) {
+            if let Some(language) = value.get("user_language").and_then(|field| field.as_str()) {
+                let trimmed = language.trim();
+                if !trimmed.is_empty() {
+                    return Some(trimmed.to_string());
+                }
+            }
+        }
         super::xml::tags::extract_user_language(raw_text)
+    }
+
+    /// Extracts plan creation or modification payloads from the structured
+    /// `plan_update` field, falling back to `<plan>` control tags when the field
+    /// is absent.
+    pub fn parse_plan_updates(&self, raw_text: &str) -> Vec<tauqe_protocol::DiscussionPlanUpdate> {
+        if let Some(value) = parse_proposal_value(raw_text) {
+            if let Some(plan_update) = value.get("plan_update") {
+                if let Ok(update) =
+                    serde_json::from_value::<tauqe_protocol::DiscussionPlanUpdate>(plan_update.clone())
+                {
+                    return vec![update];
+                }
+            }
+        }
+        let (tags, _diagnostics) = super::xml::tags::parse_plan_tags_with_diagnostics(raw_text);
+        tags.into_iter().map(plan_tag_to_update).collect()
     }
 
     /// Cleans model output for presentation and history.
@@ -367,29 +614,68 @@ fn parse_proposal(raw: &str) -> Option<ModelResultProposal> {
     None
 }
 
+/// Parses raw model text into a generic JSON object, tolerating fences and
+/// wrapper prose.
+///
+/// The structured proposal DTO does not model every control field (verification,
+/// detected language, and plan updates travel through dedicated decoders), so
+/// these fields are read straight from the parsed object. Offsets are derived
+/// strictly from ASCII byte matches, keeping the slicing UTF-8 safe.
+fn parse_proposal_value(raw: &str) -> Option<serde_json::Value> {
+    let clean = strip_code_fence(raw);
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(clean) {
+        return Some(value);
+    }
+
+    let mut from = 0;
+    while let Some(rel) = raw[from..].find('{') {
+        let start = from + rel;
+        if let Some(end) = balanced_object_end(raw, start) {
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw[start..end]) {
+                return Some(value);
+            }
+        }
+        from = start + 1;
+    }
+    None
+}
+
+/// Converts a parsed `<plan>` tag into a normalized plan update.
+fn plan_tag_to_update(
+    tag: crate::edits::protocol::xml::tags::ParsedPlanTag,
+) -> tauqe_protocol::DiscussionPlanUpdate {
+    let action = match tag.action.as_str() {
+        "save" => tauqe_protocol::DiscussionPlanAction::Save,
+        "delete" => tauqe_protocol::DiscussionPlanAction::Delete,
+        _ => tauqe_protocol::DiscussionPlanAction::Update,
+    };
+    tauqe_protocol::DiscussionPlanUpdate {
+        action,
+        id: Some(tag.id),
+        title: tag.title,
+        description: tag.description,
+        concept: tag.concept,
+        items: tag
+            .items
+            .into_iter()
+            .map(crate::edits::protocol::xml::tags::ParsedPlanItem::into_plan_item)
+            .collect(),
+    }
+}
+
 /// Cleans raw text or JSON into conversational text without raw schema markup.
+///
+/// Every control tag is removed by the single parametric sanitizer, so JSON
+/// scaffolding and XML control tags can never leak into conversational text.
 pub fn clean_raw_json_or_text(raw: &str) -> String {
     let msgs = extract_json_messages(raw);
     if !msgs.is_empty() {
-        let joined = msgs.join("\n\n");
-        return super::xml::tags::strip_verify_tags(
-            &super::xml::tags::strip_user_language_tags(
-                &super::xml::tags::strip_repo_search_tags(
-                    &super::xml::tags::strip_context_request_tags(&joined),
-                ),
-            ),
-        );
+        return strip_all_control_tags(&msgs.join("\n\n"));
     }
 
     if let Some(proposal) = parse_proposal(raw) {
         if !proposal.message.trim().is_empty() {
-            return super::xml::tags::strip_verify_tags(
-                &super::xml::tags::strip_user_language_tags(
-                    &super::xml::tags::strip_repo_search_tags(
-                        &super::xml::tags::strip_context_request_tags(&proposal.message),
-                    ),
-                ),
-            );
+            return strip_all_control_tags(&proposal.message);
         }
     }
 
@@ -397,13 +683,7 @@ pub fn clean_raw_json_or_text(raw: &str) -> String {
         return super::xml::extract_conversational_text(raw);
     }
 
-    super::xml::tags::strip_verify_tags(
-        &super::xml::tags::strip_user_language_tags(
-            &super::xml::tags::strip_repo_search_tags(
-                &super::xml::tags::strip_context_request_tags(raw),
-            ),
-        ),
-    )
+    strip_all_control_tags(raw)
 }
 
 /// Extracts conversational "message" strings from structured JSON output blocks.
@@ -421,6 +701,13 @@ pub fn extract_json_messages(raw: &str) -> Vec<String> {
                         && (val.get("changes").is_some()
                             || val.get("context_requests").is_some()
                             || val.get("repo_searches").is_some()
+                            || val.get("doc_requests").is_some()
+                            || val.get("scratchpad").is_some()
+                            || val.get("outcome").is_some()
+                            || val.get("blocked").is_some()
+                            || val.get("verify").is_some()
+                            || val.get("user_language").is_some()
+                            || val.get("plan_update").is_some()
                             || val.get("suggested_actions").is_some())
                     {
                         messages.push(trimmed.to_string());
@@ -628,6 +915,21 @@ mod tests {
     }
 
     #[test]
+    fn test_structured_system_instructions_respect_the_capability_set() {
+        let full = StructuredEditProtocol.system_instructions(&[]);
+        assert!(full.contains("context_requests"));
+        assert!(full.contains("overwrite"));
+
+        let narrowed = StructuredEditProtocol.system_instructions_for(
+            &CapabilitySet::from_slice(&[LlmCapability::TextMessage, LlmCapability::FileEdits]),
+            &[],
+        );
+        assert!(narrowed.contains("changes"));
+        assert!(!narrowed.contains("context_requests"));
+        assert!(!narrowed.contains("repo_searches"));
+    }
+
+    #[test]
     fn test_structured_protocol_system_instructions() {
         let proto = StructuredEditProtocol;
         let paths = vec!["src/lib.rs".to_string()];
@@ -675,6 +977,178 @@ mod tests {
     }
 
     #[test]
+    fn test_structured_schema_declares_control_fields() {
+        let schema = StructuredEditProtocol::schema(&[]);
+        let required: Vec<&str> = schema["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|field| field.as_str())
+            .collect();
+        for field in ["doc_requests", "scratchpad", "outcome", "blocked"] {
+            assert!(
+                required.contains(&field),
+                "field '{field}' must be required in the schema"
+            );
+            assert!(
+                schema["properties"].get(field).is_some(),
+                "field '{field}' must be declared in properties"
+            );
+        }
+
+        let statuses = schema["properties"]["outcome"]["properties"]["status"]["enum"]
+            .as_array()
+            .unwrap();
+        for status in ["none", "success", "error"] {
+            assert!(statuses.iter().any(|value| value == status));
+        }
+        assert_eq!(
+            schema["properties"]["blocked"]["properties"]["is_blocked"]["type"],
+            "boolean"
+        );
+        assert_eq!(
+            schema["properties"]["doc_requests"]["items"]["type"],
+            "string"
+        );
+        assert!(!schema.to_string().contains("\"null\""));
+    }
+
+    #[test]
+    fn test_structured_system_instructions_include_control_fields() {
+        let capabilities = CapabilitySet::from_slice(&[
+            LlmCapability::TextMessage,
+            LlmCapability::FileEdits,
+            LlmCapability::Discovery,
+            LlmCapability::DocRequest,
+            LlmCapability::Scratchpad,
+            LlmCapability::Outcome,
+            LlmCapability::Blocked,
+        ]);
+        let instructions = StructuredEditProtocol.system_instructions_for(&capabilities, &[]);
+        for field in ["doc_requests", "scratchpad", "outcome", "blocked"] {
+            assert!(
+                instructions.contains(field),
+                "instructions must mention '{field}'"
+            );
+        }
+    }
+
+    #[test]
+    fn test_structured_protocol_parse_doc_requests_and_scratchpad() {
+        let proto = StructuredEditProtocol;
+        let json = r#"{
+            "message": "Need docs",
+            "changes": [],
+            "doc_requests": ["workflow", "git"],
+            "scratchpad": "Verified: parser fixed."
+        }"#;
+        assert_eq!(
+            proto.parse_doc_requests(json),
+            vec![DocTopic::Workflow, DocTopic::Git]
+        );
+        assert_eq!(
+            proto.parse_scratchpad(json).as_deref(),
+            Some("Verified: parser fixed.")
+        );
+
+        let empty = r#"{"message":"Nothing","changes":[],"doc_requests":[],"scratchpad":""}"#;
+        assert!(proto.parse_doc_requests(empty).is_empty());
+        assert_eq!(proto.parse_scratchpad(empty), None);
+    }
+
+    #[test]
+    fn test_structured_protocol_parse_terminal_outcome() {
+        let proto = StructuredEditProtocol;
+
+        let success = r#"{
+            "message": "Done",
+            "changes": [],
+            "outcome": {"status": "success", "summary": "All checks passed", "message": ""}
+        }"#;
+        assert_eq!(
+            proto.parse_terminal_outcome(success),
+            Some(TerminalOutcome::Success {
+                summary: Some("All checks passed".to_string())
+            })
+        );
+
+        let error = r#"{
+            "message": "Failed",
+            "changes": [],
+            "outcome": {"status": "error", "summary": "", "message": "Missing table"}
+        }"#;
+        assert_eq!(
+            proto.parse_terminal_outcome(error),
+            Some(TerminalOutcome::Error {
+                message: "Missing table".to_string()
+            })
+        );
+
+        let ongoing = r#"{
+            "message": "Working",
+            "changes": [],
+            "outcome": {"status": "none", "summary": "", "message": ""}
+        }"#;
+        assert_eq!(proto.parse_terminal_outcome(ongoing), None);
+    }
+
+    #[test]
+    fn test_structured_protocol_parse_blocked() {
+        let proto = StructuredEditProtocol;
+
+        let blocked = r#"{
+            "message": "Cannot proceed",
+            "changes": [],
+            "blocked": {"is_blocked": true, "reason": "Missing table", "details": "users table absent"}
+        }"#;
+        assert_eq!(
+            proto.parse_blocked(blocked),
+            Some((
+                "Missing table".to_string(),
+                Some("users table absent".to_string())
+            ))
+        );
+
+        let clear = r#"{
+            "message": "Fine",
+            "changes": [],
+            "blocked": {"is_blocked": false, "reason": "", "details": ""}
+        }"#;
+        assert_eq!(proto.parse_blocked(clear), None);
+    }
+
+    #[test]
+    fn test_structured_protocol_control_fields_fall_back_to_xml_tags() {
+        let proto = StructuredEditProtocol;
+        let raw = "{\"message\":\"Working\",\"changes\":[]}\n\
+<doc_request topic=\"git\" />\n\
+<scratchpad>Inspect parser</scratchpad>\n\
+<blocked reason=\"Missing table\" details=\"users table absent\" />";
+
+        assert_eq!(proto.parse_doc_requests(raw), vec![DocTopic::Git]);
+        assert_eq!(
+            proto.parse_scratchpad(raw).as_deref(),
+            Some("Inspect parser")
+        );
+        assert_eq!(
+            proto.parse_blocked(raw),
+            Some((
+                "Missing table".to_string(),
+                Some("users table absent".to_string())
+            ))
+        );
+        // A `<blocked>` tag is itself a terminal outcome, so the XML fallback
+        // reports the extracted blocker instead of yielding no outcome at all.
+        assert_eq!(
+            proto.parse_terminal_outcome(raw),
+            Some(TerminalOutcome::Blocked {
+                reason: "Missing table".to_string(),
+                details: Some("users table absent".to_string())
+            })
+        );
+    }
+
+    #[test]
     fn test_structured_protocol_extract_verify_request_without_xml_edits() {
         let proto = StructuredEditProtocol;
         let raw = "{\"message\":\"Done\",\"changes\":[],\"context_requests\":[],\"suggested_actions\":[]}\n<verify target=\"test\" on_success=\"report\" />";
@@ -683,5 +1157,75 @@ mod tests {
         let req = req.unwrap();
         assert_eq!(req.target, VerifyTarget::Test);
         assert_eq!(req.on_success, VerifyOnSuccess::Report);
+    }
+
+    #[test]
+    fn test_structured_protocol_parse_verify_request_from_json_field() {
+        let proto = StructuredEditProtocol;
+        let json = r#"{
+            "message": "Run tests",
+            "changes": [],
+            "verify": {"target": "test", "on_success": "silent"}
+        }"#;
+        let req = proto.parse_verify_request(json).expect("verify request");
+        assert_eq!(req.target, VerifyTarget::Test);
+        assert_eq!(req.on_success, VerifyOnSuccess::Silent);
+
+        let none = r#"{"message":"x","changes":[],"verify":{"target":"none","on_success":"silent"}}"#;
+        assert!(proto.parse_verify_request(none).is_none());
+    }
+
+    #[test]
+    fn test_structured_protocol_parse_user_language_from_json_field() {
+        let proto = StructuredEditProtocol;
+        let json = r#"{"message":"x","changes":[],"user_language":"Russian"}"#;
+        assert_eq!(proto.parse_user_language(json).as_deref(), Some("Russian"));
+        let empty = r#"{"message":"x","changes":[],"user_language":""}"#;
+        assert_eq!(proto.parse_user_language(empty), None);
+    }
+
+    #[test]
+    fn test_structured_protocol_parse_plan_updates_from_json_and_xml() {
+        let proto = StructuredEditProtocol;
+        let json = r#"{
+            "message": "Refine",
+            "changes": [],
+            "plan_update": {"action": "update", "id": "p-1", "title": "Refined"}
+        }"#;
+        let updates = proto.parse_plan_updates(json);
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].id.as_deref(), Some("p-1"));
+        assert_eq!(updates[0].action, tauqe_protocol::DiscussionPlanAction::Update);
+
+        let xml = "Working\n<plan action=\"save\" id=\"p-2\" title=\"P2\"><concept><concept_item id=\"c-1\" title=\"C\" /></concept><item id=\"1\" title=\"Step\" /></plan>";
+        let updates = proto.parse_plan_updates(xml);
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].id.as_deref(), Some("p-2"));
+        assert_eq!(updates[0].action, tauqe_protocol::DiscussionPlanAction::Save);
+    }
+
+    #[test]
+    fn test_structured_schema_declares_verify_and_user_language() {
+        let schema = StructuredEditProtocol::schema(&[]);
+        let required: Vec<&str> = schema["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|field| field.as_str())
+            .collect();
+        assert!(required.contains(&"verify"));
+        assert!(required.contains(&"user_language"));
+
+        let targets = schema["properties"]["verify"]["properties"]["target"]["enum"]
+            .as_array()
+            .unwrap();
+        for target in ["none", "all", "check", "test", "clippy"] {
+            assert!(targets.iter().any(|value| value == target));
+        }
+        assert_eq!(
+            schema["properties"]["user_language"]["type"],
+            "string"
+        );
+        assert!(!schema.to_string().contains("\"null\""));
     }
 }

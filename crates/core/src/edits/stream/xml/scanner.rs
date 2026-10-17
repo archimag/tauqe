@@ -7,111 +7,43 @@
 
 use crate::edits::stream::normalize_hunk;
 
-/// Re-activates unmarked `<scratchpad>` tags that normalization protected as
-/// literal text. Working memory is never user-facing, so the stream filter must
-/// suppress it even when the model omits the turn-marker suffix. The protection
-/// prefix is produced by [`normalize_marked_xml_incremental`](crate::edits::protocol::xml::normalize_marked_xml_incremental).
-pub(super) fn activate_unmarked_scratchpad(normalized: &str, marker: &str) -> String {
+/// Re-activates unmarked hidden control tags that normalization protected as
+/// literal text, so the stream filter can still suppress them from the
+/// user-facing surface when the model omits the turn-marker suffix.
+///
+/// The set of hidden tags is derived from the tag registry: every control tag
+/// declared with `stream_suppress_unmarked` participates. Code-modification
+/// tags are excluded, so an unmarked `<edit>` quoted in conversation stays a
+/// literal and never starts an edit block. The protection prefix is produced by
+/// [`normalize_marked_xml_incremental`](crate::edits::protocol::xml::normalize_marked_xml_incremental).
+pub(super) fn activate_unmarked_hidden_tags(normalized: &str, marker: &str) -> String {
     let protection = format!("\u{e000}{}\u{e001}", marker);
     if !normalized.contains(&protection) {
         return normalized.to_string();
     }
-    normalized
-        .replace(&format!("{}/scratchpad", protection), "</scratchpad")
-        .replace(&format!("{}scratchpad", protection), "<scratchpad")
+    let mut restored = normalized.to_string();
+    for spec in crate::edits::protocol::xml::engine::XML_TAG_SPECS
+        .iter()
+        .filter(|spec| spec.is_control() && spec.stream_suppress_unmarked)
+    {
+        let base = spec.base_name;
+        restored = restored.replace(&format!("{}/{}", protection, base), &format!("</{}", base));
+        restored = restored.replace(&format!("{}{}", protection, base), &format!("<{}", base));
+    }
+    restored
 }
 
+/// Locates the earliest control tag declared by the tag registry.
 pub(super) fn find_next_control_tag(buf: &str) -> Option<(usize, usize)> {
-    let mut candidates = Vec::new();
-    if let Some(cr) = crate::edits::protocol::xml::next_context_request_tag(buf) {
-        candidates.push(cr);
-    }
-    if let Some(rs) = crate::edits::protocol::xml::tags::next_repo_search_tag(buf) {
-        candidates.push(rs);
-    }
-    if let Some(ul) = crate::edits::protocol::xml::next_user_language_tag(buf) {
-        candidates.push(ul);
-    }
-    if let Some(vf) = crate::edits::protocol::xml::next_verify_tag(buf) {
-        candidates.push(vf);
-    }
-    if let Some(dr) = crate::edits::protocol::xml::tags::next_doc_request_tag(buf) {
-        candidates.push(dr);
-    }
-    if let Some(pl) = crate::edits::protocol::xml::tags::next_plan_tag(buf) {
-        candidates.push(pl);
-    }
-    if let Some(sc) = crate::edits::protocol::xml::tags::next_scratchpad_tag(buf) {
-        candidates.push(sc);
-    }
-    if let Some(suc) = crate::edits::protocol::xml::tags::next_success_tag(buf) {
-        candidates.push(suc);
-    }
-    if let Some(err) = crate::edits::protocol::xml::tags::next_error_tag(buf) {
-        candidates.push(err);
-    }
-    if let Some(blk) = crate::edits::protocol::xml::tags::next_blocked_tag(buf) {
-        candidates.push(blk);
-    }
-    candidates.into_iter().min_by_key(|(start, _)| *start)
+    crate::edits::protocol::xml::engine::find_earliest_control_tag(buf)
 }
 
+/// Byte length of `buf` that is safe to emit as conversational text.
+///
+/// A trailing partial tag prefix and any still-open suppressed tag are withheld
+/// so the interface never shows protocol scaffolding mid-tag.
 pub(super) fn safe_text_emit_len(buf: &str) -> usize {
-    const CONTROL_PREFIXES: &[&str] = &[
-        "<tauqe_edits",
-        "<edit",
-        "<create",
-        "<delete",
-        "<move",
-        "<overwrite",
-        "<context_request",
-        "<repo_search",
-        "<doc_request",
-        "<user_language",
-        "<verify",
-        "<plan",
-        "<scratchpad",
-        "<success",
-        "<error",
-        "<blocked",
-    ];
-    let mut limit = buf.len();
-    if let Some(last_lt) = buf.rfind('<') {
-        let trailing = &buf[last_lt..];
-        for prefix in CONTROL_PREFIXES {
-            if prefix.starts_with(trailing) {
-                limit = limit.min(last_lt);
-            }
-        }
-    }
-    for prefix in CONTROL_PREFIXES {
-        if let Some(idx) = buf.rfind(prefix) {
-            let rest = &buf[idx + prefix.len()..];
-            let boundary = rest
-                .chars()
-                .next()
-                .is_some_and(|c| c.is_whitespace() || c == '>' || c == '/' || c == '_' || c == '-');
-            if boundary {
-                let is_closed = match *prefix {
-                    "<user_language" => crate::edits::protocol::xml::next_user_language_tag(&buf[idx..]).is_some(),
-                    "<verify" => crate::edits::protocol::xml::next_verify_tag(&buf[idx..]).is_some(),
-                    "<context_request" => crate::edits::protocol::xml::next_context_request_tag(&buf[idx..]).is_some(),
-                    "<repo_search" => crate::edits::protocol::xml::tags::next_repo_search_tag(&buf[idx..]).is_some(),
-                    "<doc_request" => crate::edits::protocol::xml::tags::next_doc_request_tag(&buf[idx..]).is_some(),
-                    "<plan" => crate::edits::protocol::xml::tags::next_plan_tag(&buf[idx..]).is_some(),
-                    "<scratchpad" => crate::edits::protocol::xml::tags::next_scratchpad_tag(&buf[idx..]).is_some(),
-                    "<success" => crate::edits::protocol::xml::tags::next_success_tag(&buf[idx..]).is_some(),
-                    "<error" => crate::edits::protocol::xml::tags::next_error_tag(&buf[idx..]).is_some(),
-                    "<blocked" => crate::edits::protocol::xml::tags::next_blocked_tag(&buf[idx..]).is_some(),
-                    _ => rest.contains('>'),
-                };
-                if !is_closed {
-                    limit = limit.min(idx);
-                }
-            }
-        }
-    }
-    limit
+    crate::edits::protocol::xml::engine::compute_safe_stream_emit_len(buf)
 }
 
 pub(super) fn find_any_edit_start(buf: &str) -> Option<usize> {

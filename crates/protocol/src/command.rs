@@ -4,8 +4,47 @@ use std::str::FromStr;
 use serde::{Deserialize, Serialize};
 
 use crate::context::ContextAccess;
-use crate::discussion::DiscussionPlanUpdate;
+use crate::discussion::{DiscussionPlanAction, DiscussionPlanUpdate};
 use crate::edit::EditOperation;
+
+/// Phase of the autonomous bounded turn a capability belongs to.
+///
+/// Grouping capabilities by phase lets the harness reason about *when* a
+/// capability is meaningful (gathering context, producing the answer, running
+/// verification, or declaring the terminal outcome) without branching on
+/// individual command types. A phase is a pure declarative property of a
+/// capability, so it stays a single source of truth beside the capability
+/// definition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CapabilityPhase {
+    /// Gathering context and documentation before a proposal is produced.
+    Discovery,
+    /// Producing the answer or the concrete code changes.
+    Execution,
+    /// Running deterministic toolchain verification.
+    Verification,
+    /// Declaring a terminal outcome or a semantic blocker.
+    Outcome,
+}
+
+impl CapabilityPhase {
+    /// Canonical lower-case identifier used on the wire.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Discovery => "discovery",
+            Self::Execution => "execution",
+            Self::Verification => "verification",
+            Self::Outcome => "outcome",
+        }
+    }
+}
+
+impl fmt::Display for CapabilityPhase {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
 
 /// Declarative set of interaction capabilities a prompt protocol may enable.
 ///
@@ -39,6 +78,252 @@ pub enum LlmCapability {
     Blocked,
     /// Detected primary natural language of the user prompt.
     UserLanguage,
+}
+
+impl LlmCapability {
+    /// Every capability in canonical declaration order.
+    ///
+    /// The order matches the enum declaration so iteration, prompt
+    /// composition, and tests stay deterministic.
+    pub const ALL: &'static [LlmCapability] = &[
+        Self::TextMessage,
+        Self::FileEdits,
+        Self::Discovery,
+        Self::DocRequest,
+        Self::ToolchainVerify,
+        Self::PlanCreation,
+        Self::PlanUpdate,
+        Self::Scratchpad,
+        Self::Outcome,
+        Self::Blocked,
+        Self::UserLanguage,
+    ];
+
+    /// Canonical lower-case identifier used on the wire.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::TextMessage => "text_message",
+            Self::FileEdits => "file_edits",
+            Self::Discovery => "discovery",
+            Self::DocRequest => "doc_request",
+            Self::ToolchainVerify => "toolchain_verify",
+            Self::PlanCreation => "plan_creation",
+            Self::PlanUpdate => "plan_update",
+            Self::Scratchpad => "scratchpad",
+            Self::Outcome => "outcome",
+            Self::Blocked => "blocked",
+            Self::UserLanguage => "user_language",
+        }
+    }
+
+    /// Phase of the bounded turn this capability belongs to.
+    pub const fn phase(self) -> CapabilityPhase {
+        match self {
+            Self::Discovery | Self::DocRequest => CapabilityPhase::Discovery,
+            Self::TextMessage
+            | Self::FileEdits
+            | Self::PlanCreation
+            | Self::PlanUpdate
+            | Self::Scratchpad
+            | Self::UserLanguage => CapabilityPhase::Execution,
+            Self::ToolchainVerify => CapabilityPhase::Verification,
+            Self::Outcome | Self::Blocked => CapabilityPhase::Outcome,
+        }
+    }
+}
+
+impl fmt::Display for LlmCapability {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Deterministic, duplicate-free ordered set of [`LlmCapability`] values.
+///
+/// A `CapabilitySet` is the single declarative description of what a protocol
+/// role or operating mode may do. It preserves insertion order so prompts,
+/// diagnostics, and tests stay stable, and it never stores the same capability
+/// twice so composition through [`CapabilitySet::with`] is idempotent.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
+pub struct CapabilitySet {
+    capabilities: Vec<LlmCapability>,
+}
+
+impl CapabilitySet {
+    /// Creates an empty capability set.
+    pub fn new() -> Self {
+        Self {
+            capabilities: Vec::new(),
+        }
+    }
+
+    /// Builds a set from a slice, preserving first-seen order and dropping
+    /// duplicates.
+    pub fn from_slice(capabilities: &[LlmCapability]) -> Self {
+        let mut set = Self::new();
+        for &capability in capabilities {
+            set.insert(capability);
+        }
+        set
+    }
+
+    /// Inserts a capability unless it is already present.
+    fn insert(&mut self, capability: LlmCapability) {
+        if !self.capabilities.contains(&capability) {
+            self.capabilities.push(capability);
+        }
+    }
+
+    /// Reports whether the set contains the given capability.
+    pub fn contains(&self, capability: LlmCapability) -> bool {
+        self.capabilities.contains(&capability)
+    }
+
+    /// Returns a new set with `capability` added.
+    ///
+    /// Adding a capability that is already present leaves the set unchanged.
+    pub fn with(&self, capability: LlmCapability) -> Self {
+        let mut next = self.clone();
+        next.insert(capability);
+        next
+    }
+
+    /// Returns a new set without `capability`.
+    pub fn without(&self, capability: LlmCapability) -> Self {
+        Self {
+            capabilities: self
+                .capabilities
+                .iter()
+                .copied()
+                .filter(|existing| *existing != capability)
+                .collect(),
+        }
+    }
+
+    /// Iterates over the capabilities in their deterministic order.
+    pub fn iter(&self) -> std::slice::Iter<'_, LlmCapability> {
+        self.capabilities.iter()
+    }
+
+    /// Returns the capabilities as a slice in their deterministic order.
+    pub fn as_slice(&self) -> &[LlmCapability] {
+        &self.capabilities
+    }
+
+    /// Reports whether the set is empty.
+    pub fn is_empty(&self) -> bool {
+        self.capabilities.is_empty()
+    }
+
+    /// Returns the subset of capabilities belonging to the given phase,
+    /// preserving order.
+    pub fn by_phase(&self, phase: CapabilityPhase) -> Self {
+        Self {
+            capabilities: self
+                .capabilities
+                .iter()
+                .copied()
+                .filter(|capability| capability.phase() == phase)
+                .collect(),
+        }
+    }
+
+    /// Full interactive XML development capability set.
+    pub fn develop_xml() -> Self {
+        Self::from_slice(LlmCapability::ALL)
+    }
+
+    /// XML capability set for executing one isolated plan step.
+    ///
+    /// Plan creation and modification are excluded: while an isolated step
+    /// runs the plan is immutable and progress is recorded deterministically
+    /// by the harness, never by the model.
+    pub fn isolated_step_xml() -> Self {
+        Self::from_slice(&[
+            LlmCapability::TextMessage,
+            LlmCapability::FileEdits,
+            LlmCapability::Discovery,
+            LlmCapability::DocRequest,
+            LlmCapability::ToolchainVerify,
+            LlmCapability::Scratchpad,
+            LlmCapability::Outcome,
+            LlmCapability::Blocked,
+            LlmCapability::UserLanguage,
+        ])
+    }
+
+    /// Structured-output development capability set.
+    ///
+    /// Structured output transports the same operational surface as the XML
+    /// development set, minus plan authoring: documentation requests,
+    /// scratchpad notes, terminal outcomes, and semantic blockers travel as
+    /// dedicated schema fields instead of control tags. Only plan creation and
+    /// plan modification remain XML-exclusive, because a JSON edit proposal is
+    /// not a planning channel.
+    pub fn develop_structured() -> Self {
+        Self::from_slice(&[
+            LlmCapability::TextMessage,
+            LlmCapability::FileEdits,
+            LlmCapability::Discovery,
+            LlmCapability::DocRequest,
+            LlmCapability::ToolchainVerify,
+            LlmCapability::Scratchpad,
+            LlmCapability::Outcome,
+            LlmCapability::Blocked,
+            LlmCapability::UserLanguage,
+        ])
+    }
+
+    /// Structured-output capability set for executing one isolated plan step.
+    ///
+    /// Plan creation and modification are excluded: while an isolated step runs
+    /// the plan is immutable and progress is recorded deterministically by the
+    /// harness, never by the model. The resulting set therefore matches
+    /// [`CapabilitySet::develop_structured`].
+    pub fn isolated_step_structured() -> Self {
+        Self::develop_structured()
+    }
+
+    /// Discussion and planning capability set.
+    pub fn discussion() -> Self {
+        Self::from_slice(&[
+            LlmCapability::TextMessage,
+            LlmCapability::PlanCreation,
+            LlmCapability::PlanUpdate,
+            LlmCapability::Discovery,
+            LlmCapability::UserLanguage,
+        ])
+    }
+
+    /// Architect discovery capability set.
+    ///
+    /// The architect gathers context and refines plans but never edits files
+    /// or runs toolchain verification, so the file-edit and verification
+    /// capabilities are excluded.
+    pub fn architect_discovery() -> Self {
+        Self::from_slice(&[
+            LlmCapability::TextMessage,
+            LlmCapability::Discovery,
+            LlmCapability::DocRequest,
+            LlmCapability::PlanCreation,
+            LlmCapability::PlanUpdate,
+            LlmCapability::Scratchpad,
+            LlmCapability::Outcome,
+            LlmCapability::Blocked,
+            LlmCapability::UserLanguage,
+        ])
+    }
+}
+
+impl<'de> Deserialize<'de> for CapabilitySet {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let capabilities = Vec::<LlmCapability>::deserialize(deserializer)?;
+        Ok(Self::from_slice(&capabilities))
+    }
 }
 
 /// Topic of a system documentation request.
@@ -189,6 +474,39 @@ pub enum LlmCommand {
     UserLanguage { language: String },
     /// Protocol syntax or validation error encountered while parsing model output.
     ProtocolError { message: String },
+}
+
+impl LlmCommand {
+    /// Capability that this command realizes, or `None` when the command is a
+    /// protocol diagnostic rather than an enabled capability.
+    pub fn capability(&self) -> Option<LlmCapability> {
+        match self {
+            Self::Text { .. } => Some(LlmCapability::TextMessage),
+            Self::Edit { .. } => Some(LlmCapability::FileEdits),
+            Self::ContextRequest { .. } | Self::RepoSearch { .. } => {
+                Some(LlmCapability::Discovery)
+            }
+            Self::DocRequest { .. } => Some(LlmCapability::DocRequest),
+            Self::Verify { .. } => Some(LlmCapability::ToolchainVerify),
+            Self::Plan { update } => Some(match update.action {
+                DiscussionPlanAction::Save => LlmCapability::PlanCreation,
+                DiscussionPlanAction::Update | DiscussionPlanAction::Delete => {
+                    LlmCapability::PlanUpdate
+                }
+            }),
+            Self::Scratchpad { .. } => Some(LlmCapability::Scratchpad),
+            Self::Outcome { .. } => Some(LlmCapability::Outcome),
+            Self::Blocked { .. } => Some(LlmCapability::Blocked),
+            Self::UserLanguage { .. } => Some(LlmCapability::UserLanguage),
+            Self::ProtocolError { .. } => None,
+        }
+    }
+
+    /// Phase of the bounded turn this command belongs to, or `None` for a
+    /// protocol diagnostic.
+    pub fn phase(&self) -> Option<CapabilityPhase> {
+        self.capability().map(LlmCapability::phase)
+    }
 }
 
 /// Deterministic toolchain verification target requested by the model.
@@ -422,5 +740,235 @@ mod tests {
         assert!(json.contains("\"reason\":\"Precondition failed\""));
         assert!(json.contains("\"details\":\"Missing table in db\""));
         assert_eq!(serde_json::from_str::<LlmCommand>(&json).unwrap(), blocked);
+    }
+
+    #[test]
+    fn test_capability_phase_serde_and_display() {
+        let cases = [
+            (CapabilityPhase::Discovery, "\"discovery\""),
+            (CapabilityPhase::Execution, "\"execution\""),
+            (CapabilityPhase::Verification, "\"verification\""),
+            (CapabilityPhase::Outcome, "\"outcome\""),
+        ];
+        for (phase, encoded) in cases {
+            assert_eq!(serde_json::to_string(&phase).unwrap(), encoded);
+            let decoded: CapabilityPhase = serde_json::from_str(encoded).unwrap();
+            assert_eq!(decoded, phase);
+            assert_eq!(phase.as_str(), encoded.trim_matches('"'));
+            assert_eq!(phase.to_string(), encoded.trim_matches('"'));
+        }
+    }
+
+    #[test]
+    fn test_llm_capability_as_str_and_phase() {
+        assert_eq!(LlmCapability::ALL.len(), 11);
+        for capability in LlmCapability::ALL {
+            let encoded = format!("\"{}\"", capability.as_str());
+            assert_eq!(serde_json::to_string(capability).unwrap(), encoded);
+            assert_eq!(capability.to_string(), capability.as_str());
+        }
+
+        let expectations = [
+            (LlmCapability::Discovery, CapabilityPhase::Discovery),
+            (LlmCapability::DocRequest, CapabilityPhase::Discovery),
+            (LlmCapability::TextMessage, CapabilityPhase::Execution),
+            (LlmCapability::FileEdits, CapabilityPhase::Execution),
+            (LlmCapability::PlanCreation, CapabilityPhase::Execution),
+            (LlmCapability::PlanUpdate, CapabilityPhase::Execution),
+            (LlmCapability::Scratchpad, CapabilityPhase::Execution),
+            (LlmCapability::UserLanguage, CapabilityPhase::Execution),
+            (LlmCapability::ToolchainVerify, CapabilityPhase::Verification),
+            (LlmCapability::Outcome, CapabilityPhase::Outcome),
+            (LlmCapability::Blocked, CapabilityPhase::Outcome),
+        ];
+        for (capability, phase) in expectations {
+            assert_eq!(capability.phase(), phase);
+        }
+    }
+
+    #[test]
+    fn test_capability_set_composition_and_dedup() {
+        let empty = CapabilitySet::new();
+        assert!(empty.is_empty());
+        assert!(!empty.contains(LlmCapability::TextMessage));
+
+        // Duplicates are dropped and first-seen order is preserved.
+        let set = CapabilitySet::from_slice(&[
+            LlmCapability::FileEdits,
+            LlmCapability::TextMessage,
+            LlmCapability::FileEdits,
+        ]);
+        assert_eq!(
+            set.as_slice(),
+            &[LlmCapability::FileEdits, LlmCapability::TextMessage]
+        );
+        assert_eq!(set.iter().count(), 2);
+
+        // `with` adds a new capability and is idempotent.
+        let extended = set.with(LlmCapability::Discovery);
+        assert!(extended.contains(LlmCapability::Discovery));
+        assert_eq!(extended.iter().count(), 3);
+        assert_eq!(extended.with(LlmCapability::Discovery), extended);
+
+        // `without` removes a capability and tolerates a missing one.
+        let reduced = set.without(LlmCapability::FileEdits);
+        assert_eq!(reduced.as_slice(), &[LlmCapability::TextMessage]);
+        assert_eq!(reduced.without(LlmCapability::Outcome), reduced);
+
+        // `by_phase` keeps only the requested phase, preserving order.
+        let discovery = extended.by_phase(CapabilityPhase::Discovery);
+        assert_eq!(discovery.as_slice(), &[LlmCapability::Discovery]);
+        assert!(extended.by_phase(CapabilityPhase::Outcome).is_empty());
+    }
+
+    #[test]
+    fn test_capability_set_profiles() {
+        let develop_xml = CapabilitySet::develop_xml();
+        assert_eq!(develop_xml.as_slice(), LlmCapability::ALL);
+
+        let isolated_xml = CapabilitySet::isolated_step_xml();
+        assert!(isolated_xml.contains(LlmCapability::FileEdits));
+        assert!(isolated_xml.contains(LlmCapability::Blocked));
+        assert!(isolated_xml.contains(LlmCapability::ToolchainVerify));
+        assert!(!isolated_xml.contains(LlmCapability::PlanCreation));
+        assert!(!isolated_xml.contains(LlmCapability::PlanUpdate));
+
+        let develop_structured = CapabilitySet::develop_structured();
+        let isolated_structured = CapabilitySet::isolated_step_structured();
+        assert_eq!(develop_structured, isolated_structured);
+        assert!(develop_structured.contains(LlmCapability::FileEdits));
+        assert!(develop_structured.contains(LlmCapability::DocRequest));
+        assert!(develop_structured.contains(LlmCapability::Scratchpad));
+        assert!(develop_structured.contains(LlmCapability::Outcome));
+        assert!(develop_structured.contains(LlmCapability::Blocked));
+        assert!(!develop_structured.contains(LlmCapability::PlanCreation));
+        assert!(!develop_structured.contains(LlmCapability::PlanUpdate));
+        // The structured and isolated-step XML profiles share one operational
+        // surface: only plan authoring distinguishes them from `develop_xml`.
+        assert_eq!(
+            develop_structured.as_slice(),
+            CapabilitySet::isolated_step_xml().as_slice()
+        );
+
+        let discussion = CapabilitySet::discussion();
+        assert!(discussion.contains(LlmCapability::PlanCreation));
+        assert!(discussion.contains(LlmCapability::PlanUpdate));
+        assert!(!discussion.contains(LlmCapability::FileEdits));
+        assert!(!discussion.contains(LlmCapability::ToolchainVerify));
+
+        let architect = CapabilitySet::architect_discovery();
+        assert!(architect.contains(LlmCapability::DocRequest));
+        assert!(architect.contains(LlmCapability::PlanCreation));
+        assert!(!architect.contains(LlmCapability::FileEdits));
+        assert!(!architect.contains(LlmCapability::ToolchainVerify));
+    }
+
+    #[test]
+    fn test_capability_set_serde_normalizes_duplicates() {
+        let set = CapabilitySet::from_slice(&[
+            LlmCapability::TextMessage,
+            LlmCapability::ToolchainVerify,
+        ]);
+        let json = serde_json::to_string(&set).unwrap();
+        assert_eq!(json, "[\"text_message\",\"toolchain_verify\"]");
+
+        let raw = "[\"toolchain_verify\",\"text_message\",\"toolchain_verify\"]";
+        let decoded: CapabilitySet = serde_json::from_str(raw).unwrap();
+        assert_eq!(
+            decoded.as_slice(),
+            &[LlmCapability::ToolchainVerify, LlmCapability::TextMessage]
+        );
+    }
+
+    #[test]
+    fn test_llm_command_capability_and_phase() {
+        let text = LlmCommand::Text {
+            content: "hello".to_string(),
+        };
+        assert_eq!(text.capability(), Some(LlmCapability::TextMessage));
+        assert_eq!(text.phase(), Some(CapabilityPhase::Execution));
+
+        let edit = LlmCommand::Edit {
+            operation: EditOperation::Replace {
+                path: "src/lib.rs".to_string(),
+                old_text: "a".to_string(),
+                new_text: "b".to_string(),
+            },
+        };
+        assert_eq!(edit.capability(), Some(LlmCapability::FileEdits));
+        assert_eq!(edit.phase(), Some(CapabilityPhase::Execution));
+
+        let context = LlmCommand::ContextRequest {
+            path: "src/a.rs".to_string(),
+            access: ContextAccess::ReadOnly,
+        };
+        assert_eq!(context.capability(), Some(LlmCapability::Discovery));
+        assert_eq!(context.phase(), Some(CapabilityPhase::Discovery));
+
+        let search = LlmCommand::RepoSearch {
+            path: "src".to_string(),
+            regex: "fn main".to_string(),
+        };
+        assert_eq!(search.capability(), Some(LlmCapability::Discovery));
+
+        let doc = LlmCommand::DocRequest {
+            topic: DocTopic::Workflow,
+        };
+        assert_eq!(doc.capability(), Some(LlmCapability::DocRequest));
+        assert_eq!(doc.phase(), Some(CapabilityPhase::Discovery));
+
+        let verify = LlmCommand::Verify {
+            target: VerifyTarget::All,
+            on_success: VerifyOnSuccess::Silent,
+        };
+        assert_eq!(verify.capability(), Some(LlmCapability::ToolchainVerify));
+        assert_eq!(verify.phase(), Some(CapabilityPhase::Verification));
+
+        let scratchpad = LlmCommand::Scratchpad {
+            notes: "notes".to_string(),
+        };
+        assert_eq!(scratchpad.capability(), Some(LlmCapability::Scratchpad));
+
+        let outcome = LlmCommand::Outcome {
+            outcome: LlmOutcome::Success { summary: None },
+        };
+        assert_eq!(outcome.capability(), Some(LlmCapability::Outcome));
+        assert_eq!(outcome.phase(), Some(CapabilityPhase::Outcome));
+
+        let blocked = LlmCommand::Blocked {
+            reason: "blocked".to_string(),
+            details: None,
+        };
+        assert_eq!(blocked.capability(), Some(LlmCapability::Blocked));
+
+        let language = LlmCommand::UserLanguage {
+            language: "Russian".to_string(),
+        };
+        assert_eq!(language.capability(), Some(LlmCapability::UserLanguage));
+
+        let error = LlmCommand::ProtocolError {
+            message: "malformed".to_string(),
+        };
+        assert_eq!(error.capability(), None);
+        assert_eq!(error.phase(), None);
+
+        let plan_save = LlmCommand::Plan {
+            update: DiscussionPlanUpdate {
+                action: DiscussionPlanAction::Save,
+                ..Default::default()
+            },
+        };
+        let save_capability = plan_save.capability();
+        assert_eq!(save_capability, Some(LlmCapability::PlanCreation));
+
+        for action in [DiscussionPlanAction::Update, DiscussionPlanAction::Delete] {
+            let plan = LlmCommand::Plan {
+                update: DiscussionPlanUpdate {
+                    action,
+                    ..Default::default()
+                },
+            };
+            assert_eq!(plan.capability(), Some(LlmCapability::PlanUpdate));
+        }
     }
 }

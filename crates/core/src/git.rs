@@ -94,9 +94,13 @@ mod tests {
             "part 2\n"
         );
 
-        // Verify that squash commit has no AI co-author and undo is safely refused
-        let undo_res = undo_last_ai_commit(root);
-        assert!(undo_res.is_err());
+        // Verify that the squash commit has no AI co-author trailer.
+        let squashed_trailers = run_git(
+            Some(root),
+            &["log", "-1", "--format=%(trailers:key=Co-authored-by)"],
+        )
+        .unwrap();
+        assert!(!squashed_trailers.contains("Tauqe AI"));
     }
 
     #[test]
@@ -158,9 +162,6 @@ mod tests {
 
         // No more AI commits in history
         assert_eq!(find_last_non_ai_commit(root).unwrap(), None);
-
-        // Undo on squashed commit is refused
-        assert!(undo_last_ai_commit(root).is_err());
     }
 
     #[test]
@@ -298,34 +299,5 @@ mod tests {
 
         let log = run_git(Some(root), &["log", "--oneline"]).unwrap();
         assert!(!log.contains("tauqe-step:"));
-    }
-
-    #[test]
-    fn test_undo_last_ai_commit_preserves_uncommitted_user_files() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        run_git(Some(root), &["init"]).unwrap();
-        run_git(Some(root), &["config", "user.name", "Test"]).unwrap();
-        run_git(Some(root), &["config", "user.email", "test@test.com"]).unwrap();
-        std::fs::write(root.join("file.txt"), "initial").unwrap();
-        run_git(Some(root), &["add", "file.txt"]).unwrap();
-        run_git(Some(root), &["commit", "-m", "init"]).unwrap();
-
-        std::fs::write(root.join("file.txt"), "ai content").unwrap();
-        let commit_hash =
-            create_ai_commit(root, &["file.txt".to_string()], "AI change").unwrap();
-
-        std::fs::write(root.join("uncommitted.txt"), "keep me").unwrap();
-
-        let res = undo_last_ai_commit(root).unwrap();
-        assert_eq!(res.undone_commit, commit_hash);
-        assert_eq!(
-            std::fs::read_to_string(root.join("file.txt")).unwrap(),
-            "initial"
-        );
-        assert_eq!(
-            std::fs::read_to_string(root.join("uncommitted.txt")).unwrap(),
-            "keep me"
-        );
     }
 }

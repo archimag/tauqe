@@ -2,35 +2,36 @@
 
 use tauqe_protocol::DocTopic;
 
-use super::{next_simple_tag, strip_tags};
-use crate::edits::protocol::xml::extract_attribute;
+use crate::edits::protocol::xml::engine::{self, XmlTagSpec};
 
-/// Locates the next complete `<doc_request .../>` tag.
-pub(crate) fn next_doc_request_tag(text: &str) -> Option<(usize, usize)> {
-    next_simple_tag(text, "<doc_request")
+/// Specification of the `<doc_request>` control tag from the XML tag registry.
+pub(crate) fn tag_spec() -> Option<&'static XmlTagSpec> {
+    engine::tag_spec("doc_request")
 }
 
 /// Removes all documentation request tags from text.
 pub fn strip_doc_request_tags(text: &str) -> String {
-    strip_tags(text, next_doc_request_tag)
+    match tag_spec() {
+        Some(spec) => engine::strip_tag_by_spec(text, spec),
+        None => text.to_string(),
+    }
 }
 
 /// Returns the requested documentation topics; an unknown, empty, or missing
 /// topic resolves to [`DocTopic::All`] via [`DocTopic::parse_lossy`], honoring
 /// Postel's law at the model-output ingest gateway.
 pub(crate) fn parse_doc_request_tags(text: &str) -> Vec<DocTopic> {
-    let mut topics = Vec::new();
-    let mut pos = 0;
-    while let Some((start, end)) = next_doc_request_tag(&text[pos..]) {
-        let tag = &text[pos + start..pos + end];
-        let header_end = tag.find('>').unwrap_or(tag.len());
-        let topic = extract_attribute(&tag[..header_end], "topic")
-            .map(|t| DocTopic::parse_lossy(&t))
-            .unwrap_or(DocTopic::All);
-        topics.push(topic);
-        pos += end;
-    }
-    topics
+    let Some(spec) = tag_spec() else {
+        return Vec::new();
+    };
+    engine::iter_tags(text, spec)
+        .map(|found| {
+            found
+                .attr("topic")
+                .map(|topic| DocTopic::parse_lossy(&topic))
+                .unwrap_or(DocTopic::All)
+        })
+        .collect()
 }
 
 #[cfg(test)]

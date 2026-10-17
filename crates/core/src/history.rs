@@ -109,25 +109,6 @@ impl HistoryManager {
                 commit_hash: commit.clone(),
                 files: files.clone(),
             },
-            HistoryEntry::Undo {
-                commit,
-                restored_checkpoint,
-                ..
-            } => {
-                let text = if *restored_checkpoint {
-                    format!("Undid commit {} and restored uncommitted changes", commit)
-                } else {
-                    format!("Undid commit {}", commit)
-                };
-                UiHistoryItem {
-                    id: final_id,
-                    kind: UiHistoryKind::System,
-                    text,
-                    summary: None,
-                    commit_hash: Some(commit.clone()),
-                    files: Vec::new(),
-                }
-            }
             HistoryEntry::Review {
                 model,
                 user_prompt,
@@ -211,22 +192,6 @@ impl HistoryManager {
         Ok(entry)
     }
 
-    pub fn record_undo(
-        &mut self,
-        commit: impl Into<String>,
-        restored_checkpoint: bool,
-    ) -> Result<HistoryEntry> {
-        self.current_max_id += 1;
-        let entry = HistoryEntry::Undo {
-            id: Some(self.current_max_id),
-            commit: commit.into(),
-            restored_checkpoint,
-        };
-        self.storage.append_entry(&entry)?;
-        self.notify_entry(&entry);
-        Ok(entry)
-    }
-
     pub fn record_review(
         &mut self,
         model: impl Into<String>,
@@ -247,6 +212,28 @@ impl HistoryManager {
         self.storage.append_entry(&entry)?;
         self.notify_entry(&entry);
         Ok(entry)
+    }
+
+    /// Records a deterministic undo of the most recent AI commit.
+    pub fn record_undo(
+        &mut self,
+        undone_commit: &str,
+        restored_checkpoint: bool,
+    ) -> Result<HistoryEntry> {
+        let message = if restored_checkpoint {
+            format!(
+                "Undid commit {} and restored the pre-turn checkpoint.",
+                undone_commit
+            )
+        } else {
+            format!("Undid commit {}.", undone_commit)
+        };
+        self.record_response(
+            message,
+            Some(undone_commit.to_string()),
+            Some("Undo".to_string()),
+            Vec::new(),
+        )
     }
 
     pub fn get_entries(&self) -> Result<Vec<HistoryEntry>> {
@@ -385,16 +372,13 @@ mod tests {
             Some("Fix status check".to_string()),
             vec!["src/git.rs".to_string()],
         ).unwrap();
-        hm.record_undo("f1a2b3c", true).unwrap();
-
         let entries = hm.get_entries().unwrap();
-        assert_eq!(entries.len(), 3);
+        assert_eq!(entries.len(), 2);
 
         let tag = hm.format_history_tag().unwrap();
         assert!(tag.starts_with("<history>\n"));
         assert!(tag.ends_with("\n</history>"));
         assert!(tag.contains(r#"{"type":"turn","id":1,"prompt":"Check git status","context":["src/git.rs"]}"#));
-        assert!(tag.contains(r#"{"type":"undo","id":3,"commit":"f1a2b3c","restored_checkpoint":true}"#));
 
         // Clear
         hm.clear().unwrap();
@@ -426,6 +410,40 @@ mod tests {
             }
             _ => panic!("Expected summary entry first"),
         }
+    }
+
+    #[test]
+    fn test_record_undo_entry() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let mut hm = HistoryManager::new(root);
+
+        let entry = hm.record_undo("abc1234", true).unwrap();
+        match &entry {
+            HistoryEntry::Response {
+                message,
+                commit,
+                summary,
+                ..
+            } => {
+                assert!(message.contains("abc1234"));
+                assert!(message.contains("checkpoint"));
+                assert_eq!(commit.as_deref(), Some("abc1234"));
+                assert_eq!(summary.as_deref(), Some("Undo"));
+            }
+            other => panic!("Expected an undo response entry, got {:?}", other),
+        }
+
+        // A plain undo without a checkpoint must not claim one was restored.
+        let plain = hm.record_undo("def5678", false).unwrap();
+        match &plain {
+            HistoryEntry::Response { message, .. } => {
+                assert!(!message.contains("checkpoint"));
+            }
+            other => panic!("Expected an undo response entry, got {:?}", other),
+        }
+
+        assert_eq!(hm.get_entries().unwrap().len(), 2);
     }
 
     #[test]
@@ -481,35 +499,24 @@ mod tests {
         assert_eq!(item3.summary, Some("Add tests".to_string()));
         assert_eq!(item3.files, vec!["test.rs"]);
 
-        let entry4 = HistoryEntry::Undo {
-            id: Some(4),
-            commit: "a1b2c3d".to_string(),
-            restored_checkpoint: true,
-        };
-        let item4 = HistoryManager::entry_to_ui_item(4, &entry4);
-        assert_eq!(item4.id, 4);
-        assert_eq!(item4.kind, UiHistoryKind::System);
-        assert!(item4.text.contains("a1b2c3d"));
-        assert_eq!(item4.commit_hash, Some("a1b2c3d".to_string()));
-
         // A review record maps its summary into the history item text so the
         // analytical report survives the streaming turn.
-        let entry5 = HistoryEntry::Review {
-            id: Some(5),
+        let entry4 = HistoryEntry::Review {
+            id: Some(4),
             model: "test/reviewer".to_string(),
             user_prompt: Some("Focus on locking".to_string()),
             files: vec!["src/lib.rs".to_string()],
             findings_count: 2,
             summary: Some("Locking is racy under load.".to_string()),
         };
-        let item5 = HistoryManager::entry_to_ui_item(5, &entry5);
-        assert_eq!(item5.id, 5);
-        assert_eq!(item5.kind, UiHistoryKind::System);
-        assert!(item5.text.contains("2 findings"));
-        assert!(item5.text.contains("Focus on locking"));
-        assert!(item5.text.contains("Locking is racy under load."));
-        assert_eq!(item5.summary, Some("Review: 2 findings".to_string()));
-        assert_eq!(item5.files, vec!["src/lib.rs"]);
+        let item4 = HistoryManager::entry_to_ui_item(4, &entry4);
+        assert_eq!(item4.id, 4);
+        assert_eq!(item4.kind, UiHistoryKind::System);
+        assert!(item4.text.contains("2 findings"));
+        assert!(item4.text.contains("Focus on locking"));
+        assert!(item4.text.contains("Locking is racy under load."));
+        assert_eq!(item4.summary, Some("Review: 2 findings".to_string()));
+        assert_eq!(item4.files, vec!["src/lib.rs"]);
     }
 
     #[test]

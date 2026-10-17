@@ -11,12 +11,14 @@ use tauqe_protocol::{DocTopic, EditOutcome, ModelResult};
 use super::ContextRequest;
 
 mod clean;
+pub(crate) mod engine;
 mod marker;
 mod marked;
 mod parser;
 mod prompt;
 pub(crate) mod tags;
 
+use engine::strip_all_control_tags;
 use parser::{extract_summary_from_xml, parse_xml_edits};
 use tags::{parse_context_request_tags, parse_doc_request_tags, parse_repo_search_tags};
 
@@ -35,10 +37,6 @@ pub use tags::{
     strip_success_tags, strip_terminal_outcome_tags, strip_user_language_tags, strip_verify_tags,
     TerminalOutcome, VerifyOnSuccess, VerifyRequest, VerifyTarget,
 };
-pub(crate) use tags::{
-    next_context_request_tag, next_user_language_tag, next_verify_tag,
-};
-
 /// XML-based code edit protocol
 #[derive(Debug, Default, Clone)]
 pub struct XmlEditProtocol;
@@ -99,13 +97,29 @@ impl XmlEditProtocol {
         prompt::base_system_instructions(editable_paths)
     }
 
+    /// Returns system prompt instructions for an explicit capability set.
+    ///
+    /// The reference is composed from the capability registry, so a narrowed set
+    /// never advertises an instruction for a disabled capability. An optional
+    /// turn marker binds every rendered structural tag to the active turn.
+    pub fn system_instructions_for(
+        &self,
+        capabilities: &tauqe_protocol::CapabilitySet,
+        editable_paths: &[String],
+        marker: Option<&str>,
+    ) -> String {
+        let reference = prompt::system_instructions_for(capabilities, editable_paths);
+        match marker {
+            Some(marker) => prompt::apply_turn_marker(&reference, marker),
+            None => reference,
+        }
+    }
+
     /// Parses raw model text into a `ModelResult`.
     pub fn parse_output(&self, raw_text: &str, editable_paths: &[String]) -> ModelResult {
         if !has_xml_edit_tags(raw_text) {
             return ModelResult::Answer {
-                text: strip_terminal_outcome_tags(&strip_scratchpad_tags(&strip_plan_tags(&strip_verify_tags(&strip_user_language_tags(
-                    &strip_doc_request_tags(&strip_repo_search_tags(&strip_context_request_tags(raw_text))),
-                ))))),
+                text: strip_all_control_tags(raw_text),
             };
         }
 

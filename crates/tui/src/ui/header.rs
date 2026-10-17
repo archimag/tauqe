@@ -532,7 +532,6 @@ mod tests {
             confirm_batch_cancel: false,
             batch_cancel_button: crate::app::BatchCancelButton::Continue,
             batch_stopping: false,
-            confirm_undo: false,
             confirm_detach_focus: false,
             confirm_clear_history: false,
             confirm_delete_plan: None,

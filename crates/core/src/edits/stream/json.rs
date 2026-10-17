@@ -13,30 +13,37 @@ pub mod field;
 
 pub use decode::{extract_streamed_string_field, find_string_field_value_start};
 pub use field::JsonFieldStreamFilter;
-use decode::{
-    decode_json_string_body_incremental, extract_incomplete_change_op_and_path,
-    find_json_string_end_from,
-};
+use decode::{extract_incomplete_change_op_and_path, StringFieldCursor};
 
 /// State-machine streaming parser for Structured Output JSON edits using struson.
 ///
 /// It streams the `message` field on the fly as `StreamEvent::TextDelta` while
 /// deserializing and memory-validating completed `changes[i]` elements, emitting
 /// `EditFileStarted`, `EditHunk`, and `EditFileDone`. Arbitrary field order is supported.
+///
+/// The filter synthesizes the same event chain the XML stream filter produces:
+/// one `EditStarted`, one `EditFileStarted` per file, sequential `EditHunk`
+/// entries, and a single `EditFileDone` per file carrying the total hunks. The
+/// JSON-specific detail that the `changes` array only becomes readable once its
+/// elements close is fully encapsulated here, so the user-facing stream is
+/// indistinguishable from the XML experience.
 pub struct JsonStreamFilter {
     /// None = undecided; Some(true) = provider returned plain text (not JSON), stream as-is.
     passthrough: Option<bool>,
     buffer: String,
-    message_value_start: Option<usize>,
-    message_raw_decoded_pos: usize,
-    message_end_scanned_pos: usize,
+    message_cursor: StringFieldCursor,
     message_finished: bool,
     processed_changes_count: usize,
     changes_finished: bool,
     has_emitted_edit_started: bool,
-    started_change_index: Option<usize>,
     editable_paths: Vec<String>,
     staging: StagingSimulator,
+    /// Number of hunks already emitted for each file path.
+    file_hunk_counts: HashMap<String, usize>,
+    /// Path of the file whose `EditFileDone` is still pending, if any.
+    open_file_path: Option<String>,
+    /// Path reported by the pending file's `EditFileDone` (differs for moves).
+    open_file_display: String,
 }
 
 impl JsonStreamFilter {
@@ -44,16 +51,16 @@ impl JsonStreamFilter {
         Self {
             passthrough: None,
             buffer: String::new(),
-            message_value_start: None,
-            message_raw_decoded_pos: 0,
-            message_end_scanned_pos: 0,
+            message_cursor: StringFieldCursor::new(),
             message_finished: false,
             processed_changes_count: 0,
             changes_finished: false,
             has_emitted_edit_started: false,
-            started_change_index: None,
             editable_paths,
             staging: StagingSimulator::new(HashMap::new(), repo_root),
+            file_hunk_counts: HashMap::new(),
+            open_file_path: None,
+            open_file_display: String::new(),
         }
     }
 
@@ -62,10 +69,90 @@ impl JsonStreamFilter {
         self
     }
 
-    fn handle_completed_change(
+    /// Emits the pending `EditFileDone` for the currently open file, if any.
+    ///
+    /// Buffering the completion until the file changes or the array closes is
+    /// what lets several `replace` operations against one file collapse into a
+    /// single terminal event with the exact hunks count, matching the XML filter.
+    fn flush_open_file(&mut self, events: &mut Vec<StreamEvent>) {
+        if let Some(open_path) = self.open_file_path.take() {
+            let hunks_count = self.file_hunk_counts.remove(&open_path).unwrap_or(0);
+            let display = std::mem::take(&mut self.open_file_display);
+            let final_path = if display.is_empty() { open_path } else { display };
+            events.push(StreamEvent::EditFileDone {
+                path: final_path,
+                status: EditFileStatus::Ok,
+                error: None,
+                hunks_count,
+            });
+        }
+    }
+
+    /// Reads the top-level `changes` array and deserializes any newly completed
+    /// element, advancing `processed_changes_count` and flipping
+    /// `changes_finished` once the array closes.
+    fn scan_new_changes(&mut self) -> Vec<StructuredChangeProposal> {
+        let mut new_changes = Vec::new();
+        if self.changes_finished {
+            return new_changes;
+        }
+        if let Some(brace_idx) = self.buffer.find('{') {
+            let json_bytes = &self.buffer.as_bytes()[brace_idx..];
+            let mut reader = JsonStreamReader::new(json_bytes);
+            if reader.begin_object().is_ok() {
+                'outer: while let Ok(true) = reader.has_next() {
+                    let name = match reader.next_name() {
+                        Ok(n) => n.to_string(),
+                        Err(_) => break 'outer,
+                    };
+
+                    if name == "changes" {
+                        if reader.begin_array().is_ok() {
+                            let mut current_idx = 0;
+                            while let Ok(true) = reader.has_next() {
+                                if current_idx < self.processed_changes_count {
+                                    if reader.skip_value().is_err() {
+                                        break 'outer;
+                                    }
+                                    current_idx += 1;
+                                } else {
+                                    let mut de =
+                                        struson::serde::JsonReaderDeserializer::new(&mut reader);
+                                    match StructuredChangeProposal::deserialize(&mut de) {
+                                        Ok(change) => {
+                                            self.processed_changes_count += 1;
+                                            current_idx += 1;
+                                            new_changes.push(change);
+                                        }
+                                        Err(_) => {
+                                            // Incomplete element in stream; wait for more data
+                                            break 'outer;
+                                        }
+                                    }
+                                }
+                            }
+                            if let Ok(false) = reader.has_next() {
+                                let _ = reader.end_array();
+                                self.changes_finished = true;
+                            }
+                        } else {
+                            break 'outer;
+                        }
+                    } else if reader.skip_value().is_err() {
+                        // Value for this property is not fully received yet
+                        break 'outer;
+                    }
+                }
+            }
+        }
+        new_changes
+    }
+
+    /// Applies one completed `changes[i]` element and emits the corresponding
+    /// hunk events, folding completion into the pending file.
+    fn process_completed_change(
         &mut self,
         change: &StructuredChangeProposal,
-        already_started: bool,
         events: &mut Vec<StreamEvent>,
     ) {
         if !self.has_emitted_edit_started {
@@ -77,29 +164,33 @@ impl JsonStreamFilter {
         let is_create = op == EditFileOp::Create;
         let resolved_path = resolve_path(&change.path, &self.editable_paths, is_create);
 
-        if !already_started {
+        if self.open_file_path.as_deref() != Some(resolved_path.as_str()) {
+            self.flush_open_file(events);
             events.push(StreamEvent::EditFileStarted {
                 path: resolved_path.clone(),
                 op_type: op,
             });
+            self.open_file_path = Some(resolved_path.clone());
+            self.open_file_display = resolved_path.clone();
         }
+
+        let hunk_index = self
+            .file_hunk_counts
+            .get(&resolved_path)
+            .copied()
+            .unwrap_or(0);
 
         match op {
             EditFileOp::Create => {
                 let content = normalize_hunk(change.content.as_deref().unwrap_or_default());
                 events.push(StreamEvent::EditHunk {
                     path: resolved_path.clone(),
-                    hunk_index: 0,
+                    hunk_index,
                     old_text: String::new(),
                     new_text: content.clone(),
                 });
                 self.staging.overwrite(&resolved_path, content);
-                events.push(StreamEvent::EditFileDone {
-                    path: resolved_path,
-                    status: EditFileStatus::Ok,
-                    error: None,
-                    hunks_count: 1,
-                });
+                self.file_hunk_counts.insert(resolved_path, hunk_index + 1);
             }
             EditFileOp::Overwrite => {
                 let new_content = normalize_hunk(change.content.as_deref().unwrap_or_default());
@@ -107,47 +198,35 @@ impl JsonStreamFilter {
                     Ok(old_text) => {
                         events.push(StreamEvent::EditHunk {
                             path: resolved_path.clone(),
-                            hunk_index: 0,
+                            hunk_index,
                             old_text,
                             new_text: new_content.clone(),
                         });
                         self.staging.overwrite(&resolved_path, new_content);
-                        events.push(StreamEvent::EditFileDone {
-                            path: resolved_path,
-                            status: EditFileStatus::Ok,
-                            error: None,
-                            hunks_count: 1,
-                        });
+                        self.file_hunk_counts.insert(resolved_path, hunk_index + 1);
                     }
                     Err(err_msg) => {
                         events.push(StreamEvent::EditFileDone {
-                            path: resolved_path,
+                            path: resolved_path.clone(),
                             status: EditFileStatus::Error,
                             error: Some(err_msg),
-                            hunks_count: 0,
+                            hunks_count: hunk_index,
                         });
+                        self.file_hunk_counts.remove(&resolved_path);
+                        self.open_file_path = None;
                     }
                 }
             }
             EditFileOp::Delete => {
-                events.push(StreamEvent::EditFileDone {
-                    path: resolved_path,
-                    status: EditFileStatus::Ok,
-                    error: None,
-                    hunks_count: 0,
-                });
+                // No hunk content; the pending EditFileDone reports zero hunks.
+                self.file_hunk_counts.entry(resolved_path).or_insert(0);
             }
             EditFileOp::Move => {
                 let to_raw = change.to.as_deref().unwrap_or_default();
                 let resolved_to = resolve_path(to_raw, &self.editable_paths, true);
-                let display_path = format!("{} -> {}", resolved_path, resolved_to);
                 self.staging.apply_move(&resolved_path, &resolved_to);
-                events.push(StreamEvent::EditFileDone {
-                    path: display_path,
-                    status: EditFileStatus::Ok,
-                    error: None,
-                    hunks_count: 0,
-                });
+                self.open_file_display = format!("{} -> {}", resolved_path, resolved_to);
+                self.file_hunk_counts.entry(resolved_path).or_insert(0);
             }
             EditFileOp::Replace => {
                 let old_text = normalize_hunk(change.old_text.as_deref().unwrap_or_default());
@@ -162,28 +241,24 @@ impl JsonStreamFilter {
 
                 events.push(StreamEvent::EditHunk {
                     path: resolved_path.clone(),
-                    hunk_index: 0,
+                    hunk_index,
                     old_text: old_text.clone(),
                     new_text: new_text.clone(),
                 });
 
-                let val_res = self.staging.apply_hunk(&resolved_path, &old_text, &new_text);
-                match val_res {
+                match self.staging.apply_hunk(&resolved_path, &old_text, &new_text) {
                     Ok(()) => {
-                        events.push(StreamEvent::EditFileDone {
-                            path: resolved_path,
-                            status: EditFileStatus::Ok,
-                            error: None,
-                            hunks_count: 1,
-                        });
+                        self.file_hunk_counts.insert(resolved_path, hunk_index + 1);
                     }
                     Err(err_msg) => {
                         events.push(StreamEvent::EditFileDone {
-                            path: resolved_path,
+                            path: resolved_path.clone(),
                             status: EditFileStatus::Error,
                             error: Some(err_msg),
-                            hunks_count: 1,
+                            hunks_count: hunk_index + 1,
                         });
+                        self.file_hunk_counts.remove(&resolved_path);
+                        self.open_file_path = None;
                     }
                 }
             }
@@ -228,117 +303,54 @@ impl EditStreamFilter for JsonStreamFilter {
             return events;
         }
 
-        // 1. Stream message field deltas on the fly using incremental decoding
+        // 1. Stream message field deltas on the fly using incremental decoding.
         if !self.message_finished {
-            if self.message_value_start.is_none() {
-                self.message_value_start = find_string_field_value_start(&self.buffer, "message");
+            let (delta, finished) = extract_streamed_string_field(
+                &self.buffer,
+                "message",
+                &mut self.message_cursor,
+            );
+            if let Some(d) = delta {
+                events.push(StreamEvent::TextDelta(d));
             }
-            if let Some(val_start) = self.message_value_start {
-                let content_slice = &self.buffer[val_start..];
-                let (raw_body, is_finished) =
-                    match find_json_string_end_from(content_slice, &mut self.message_end_scanned_pos) {
-                        Some(end) => (&content_slice[..end], true),
-                        None => (content_slice, false),
-                    };
-
-                let delta = decode_json_string_body_incremental(
-                    raw_body,
-                    &mut self.message_raw_decoded_pos,
-                );
-                if is_finished && self.message_raw_decoded_pos >= raw_body.len() {
-                    self.message_finished = true;
-                }
-                if !delta.is_empty() {
-                    events.push(StreamEvent::TextDelta(delta));
-                }
+            if finished {
+                self.message_finished = true;
             }
         }
 
-        // 2. Parse top-level JSON and extract completed changes[i] via struson
-        let mut new_changes = Vec::new();
-        let should_scan_changes = !self.changes_finished
+        // 2. Parse top-level JSON and extract completed changes[i] via struson.
+        let should_scan = !self.changes_finished
             && (chunk.contains('}') || chunk.contains(']') || self.processed_changes_count == 0);
-
-        if should_scan_changes {
-            if let Some(brace_idx) = self.buffer.find('{') {
-                let json_bytes = &self.buffer.as_bytes()[brace_idx..];
-                let mut reader = JsonStreamReader::new(json_bytes);
-                if reader.begin_object().is_ok() {
-                    'outer: while let Ok(true) = reader.has_next() {
-                        let name = match reader.next_name() {
-                            Ok(n) => n.to_string(),
-                            Err(_) => break 'outer,
-                        };
-
-                        if name == "changes" {
-                            if reader.begin_array().is_ok() {
-                                let mut current_idx = 0;
-                                while let Ok(true) = reader.has_next() {
-                                    if current_idx < self.processed_changes_count {
-                                        if reader.skip_value().is_err() {
-                                            break 'outer;
-                                        }
-                                        current_idx += 1;
-                                    } else {
-                                        let mut de =
-                                            struson::serde::JsonReaderDeserializer::new(&mut reader);
-                                        match StructuredChangeProposal::deserialize(&mut de) {
-                                            Ok(change) => {
-                                                self.processed_changes_count += 1;
-                                                current_idx += 1;
-                                                new_changes.push(change);
-                                            }
-                                            Err(_) => {
-                                                // Incomplete element in stream; wait for more data
-                                                break 'outer;
-                                            }
-                                        }
-                                    }
-                                }
-                                if let Ok(false) = reader.has_next() {
-                                    let _ = reader.end_array();
-                                    self.changes_finished = true;
-                                }
-                            } else {
-                                break 'outer;
-                            }
-                        } else if reader.skip_value().is_err() {
-                            // Value for this property is not fully received yet
-                            break 'outer;
-                        }
-                    }
-                }
+        if should_scan {
+            let new_changes = self.scan_new_changes();
+            for change in new_changes {
+                self.process_completed_change(&change, &mut events);
+            }
+            if self.changes_finished {
+                self.flush_open_file(&mut events);
             }
         }
 
-        let start_processed = self
-            .processed_changes_count
-            .saturating_sub(new_changes.len());
-        for (i, change) in new_changes.into_iter().enumerate() {
-            let change_idx = start_processed + i;
-            let already_started = self.started_change_index == Some(change_idx);
-            self.handle_completed_change(&change, already_started, &mut events);
-            if already_started {
-                self.started_change_index = None;
-            }
-        }
-
-        // 3. Early detection of active file in incomplete change
-        if self.started_change_index != Some(self.processed_changes_count) && !self.changes_finished {
+        // 3. Early detection of the file referenced by the still-incomplete element.
+        if !self.changes_finished {
             if let Some((op, path)) =
                 extract_incomplete_change_op_and_path(&self.buffer, self.processed_changes_count)
             {
-                if !self.has_emitted_edit_started {
-                    events.push(StreamEvent::EditStarted);
-                    self.has_emitted_edit_started = true;
-                }
                 let is_create = op == EditFileOp::Create;
                 let resolved_path = resolve_path(&path, &self.editable_paths, is_create);
-                events.push(StreamEvent::EditFileStarted {
-                    path: resolved_path,
-                    op_type: op,
-                });
-                self.started_change_index = Some(self.processed_changes_count);
+                if self.open_file_path.as_deref() != Some(resolved_path.as_str()) {
+                    self.flush_open_file(&mut events);
+                    if !self.has_emitted_edit_started {
+                        events.push(StreamEvent::EditStarted);
+                        self.has_emitted_edit_started = true;
+                    }
+                    events.push(StreamEvent::EditFileStarted {
+                        path: resolved_path.clone(),
+                        op_type: op,
+                    });
+                    self.open_file_path = Some(resolved_path.clone());
+                    self.open_file_display = resolved_path;
+                }
             }
         }
 
@@ -359,18 +371,21 @@ impl EditStreamFilter for JsonStreamFilter {
             }
             return events;
         }
+        // Drain any residual message text. Decoding stops at the closing quote,
+        // so no structural JSON leaks into the TextDelta stream.
         if !self.message_finished {
-            if let Some(val_start) = self.message_value_start {
-                let content_slice = &self.buffer[val_start..];
-                let delta = decode_json_string_body_incremental(
-                    content_slice,
-                    &mut self.message_raw_decoded_pos,
-                );
-                if !delta.is_empty() {
-                    events.push(StreamEvent::TextDelta(delta));
-                }
+            let (delta, _) =
+                extract_streamed_string_field(&self.buffer, "message", &mut self.message_cursor);
+            if let Some(d) = delta {
+                events.push(StreamEvent::TextDelta(d));
             }
         }
+        // Synthesize any edit events left by a truncated or single-shot payload.
+        let new_changes = self.scan_new_changes();
+        for change in new_changes {
+            self.process_completed_change(&change, &mut events);
+        }
+        self.flush_open_file(&mut events);
         events
     }
 }
@@ -378,6 +393,37 @@ impl EditStreamFilter for JsonStreamFilter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn summarize(events: &[StreamEvent]) -> (String, Vec<String>) {
+        let mut text = String::new();
+        let mut edits = Vec::new();
+        for event in events {
+            match event {
+                StreamEvent::TextDelta(d) => text.push_str(d),
+                StreamEvent::EditStarted => edits.push("started".to_string()),
+                StreamEvent::EditFileStarted { path, op_type } => {
+                    edits.push(format!("file_started:{}:{}", path, op_type));
+                }
+                StreamEvent::EditHunk {
+                    path,
+                    hunk_index,
+                    old_text,
+                    new_text,
+                } => edits.push(format!(
+                    "hunk:{}:{}:{:?}:{:?}",
+                    path, hunk_index, old_text, new_text
+                )),
+                StreamEvent::EditFileDone {
+                    path,
+                    status,
+                    hunks_count,
+                    ..
+                } => edits.push(format!("file_done:{}:{}:{}", path, status, hunks_count)),
+                _ => {}
+            }
+        }
+        (text, edits)
+    }
 
     #[test]
     fn test_early_detection_active_file_streaming() {
@@ -640,5 +686,89 @@ mod tests {
             }
         }
         assert_eq!(streamed, text);
+    }
+
+    #[test]
+    fn test_multiple_replaces_same_file_accumulate_hunks() {
+        let root = std::env::temp_dir();
+        let input = r#"{"message":"Go","changes":[{"op":"replace","path":"a.rs","old_text":"x","new_text":"y"},{"op":"replace","path":"a.rs","old_text":"y","new_text":"z"}]}"#;
+        let staged = HashMap::from([("a.rs".to_string(), "x".to_string())]);
+        let mut filter = JsonStreamFilter::new(vec!["a.rs".to_string()], root)
+            .with_staged_contents(staged);
+
+        let mut events = Vec::new();
+        for c in input.chars() {
+            events.extend(filter.push_chunk(&c.to_string()));
+        }
+        events.extend(Box::new(filter).finish());
+
+        // Exactly one EditStarted and one EditFileStarted for the shared file.
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, StreamEvent::EditStarted))
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, StreamEvent::EditFileStarted { .. }))
+                .count(),
+            1
+        );
+
+        // Sequential hunk indices within the single file.
+        let hunk_indices: Vec<usize> = events
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::EditHunk { hunk_index, .. } => Some(*hunk_index),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(hunk_indices, vec![0, 1]);
+
+        // A single terminal event carrying the total hunks count.
+        let done: Vec<(EditFileStatus, usize)> = events
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::EditFileDone {
+                    status,
+                    hunks_count,
+                    ..
+                } => Some((*status, *hunks_count)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(done, vec![(EditFileStatus::Ok, 2)]);
+    }
+
+    #[test]
+    fn test_stream_events_identical_char_by_char_and_whole() {
+        let root = std::env::temp_dir();
+        let input = r#"{"message":"Hello","changes":[{"op":"replace","path":"a.rs","old_text":"x","new_text":"y"},{"op":"replace","path":"a.rs","old_text":"y","new_text":"z"}]}"#;
+        let staged = HashMap::from([("a.rs".to_string(), "x".to_string())]);
+
+        let run = |whole: bool| {
+            let mut filter = JsonStreamFilter::new(vec!["a.rs".to_string()], root.clone())
+                .with_staged_contents(staged.clone());
+            let mut events = Vec::new();
+            if whole {
+                events.extend(filter.push_chunk(input));
+            } else {
+                for c in input.chars() {
+                    events.extend(filter.push_chunk(&c.to_string()));
+                }
+            }
+            events.extend(Box::new(filter).finish());
+            summarize(&events)
+        };
+
+        let char_by_char = run(false);
+        let whole = run(true);
+
+        assert_eq!(char_by_char.0, "Hello");
+        assert_eq!(whole.0, "Hello");
+        assert_eq!(char_by_char.1, whole.1);
     }
 }

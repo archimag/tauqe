@@ -28,13 +28,6 @@ pub enum HistoryEntry {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         files: Vec<String>,
     },
-    Undo {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        id: Option<u64>,
-        commit: String,
-        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-        restored_checkpoint: bool,
-    },
     Review {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         id: Option<u64>,
@@ -55,7 +48,6 @@ impl HistoryEntry {
             HistoryEntry::Summary { id, .. }
             | HistoryEntry::Turn { id, .. }
             | HistoryEntry::Response { id, .. }
-            | HistoryEntry::Undo { id, .. }
             | HistoryEntry::Review { id, .. } => *id,
         }
     }
@@ -120,35 +112,6 @@ mod tests {
 
         let parsed = HistoryEntry::from_jsonl_line(&json).unwrap();
         assert_eq!(parsed, entry);
-    }
-
-    #[test]
-    fn test_undo_serialization() {
-        let entry = HistoryEntry::Undo {
-            id: None,
-            commit: "a1b2c3d".to_string(),
-            restored_checkpoint: true,
-        };
-        let json = entry.to_jsonl_line().unwrap();
-        assert_eq!(
-            json,
-            r#"{"type":"undo","commit":"a1b2c3d","restored_checkpoint":true}"#
-        );
-
-        let parsed = HistoryEntry::from_jsonl_line(&json).unwrap();
-        assert_eq!(parsed, entry);
-
-        // Default restored_checkpoint omitted when false
-        let entry_false = HistoryEntry::Undo {
-            id: None,
-            commit: "deadbeef".to_string(),
-            restored_checkpoint: false,
-        };
-        let json_false = entry_false.to_jsonl_line().unwrap();
-        assert_eq!(json_false, r#"{"type":"undo","commit":"deadbeef"}"#);
-
-        let parsed_false = HistoryEntry::from_jsonl_line(&json_false).unwrap();
-        assert_eq!(parsed_false, entry_false);
     }
 
     #[test]

@@ -547,8 +547,24 @@ fn resolve_turn_protocol(
     develop_protocol: tauqe_protocol::EditProtocolKind,
     marker: Option<&str>,
 ) -> Box<dyn PromptProtocol> {
+    let is_isolated = tauqe_core::plan::prompt::is_plan_step_execution_prompt(prompt)
+        || tauqe_core::review::is_review_step_execution_prompt(prompt);
+
     let base_protocol: Box<dyn PromptProtocol> = if is_readonly_discussion_prompt(prompt) {
         Box::new(JsonPromptProtocol::discussion())
+    } else if is_isolated {
+        match develop_protocol {
+            tauqe_protocol::EditProtocolKind::Structured => {
+                JsonPromptProtocol::with_capabilities(
+                    tauqe_protocol::CapabilitySet::isolated_step_structured(),
+                )
+            }
+            tauqe_protocol::EditProtocolKind::Xml => {
+                XmlPromptProtocol::with_capabilities(
+                    tauqe_protocol::CapabilitySet::isolated_step_xml(),
+                )
+            }
+        }
     } else {
         match develop_protocol {
             tauqe_protocol::EditProtocolKind::Structured => {
@@ -1754,6 +1770,31 @@ mod tests {
         assert!(json_protocol.supports(tauqe_protocol::LlmCapability::ToolchainVerify));
         // The structured edits protocol never advertises plan capabilities.
         assert!(!json_protocol.supports(tauqe_protocol::LlmCapability::PlanUpdate));
+    }
+
+    #[test]
+    fn test_isolated_step_turn_narrows_protocol() {
+        let plan_step_prompt = format!(
+            "{} [p-1:s-1] Implement step\n",
+            tauqe_core::plan::prompt::PLAN_STEP_EXECUTION_PREFIX
+        );
+        let xml_proto = resolve_turn_protocol(
+            &plan_step_prompt,
+            tauqe_protocol::EditProtocolKind::Xml,
+            None,
+        );
+        assert!(xml_proto.supports(tauqe_protocol::LlmCapability::FileEdits));
+        assert!(!xml_proto.supports(tauqe_protocol::LlmCapability::PlanCreation));
+        assert!(!xml_proto.supports(tauqe_protocol::LlmCapability::PlanUpdate));
+
+        let structured_proto = resolve_turn_protocol(
+            &plan_step_prompt,
+            tauqe_protocol::EditProtocolKind::Structured,
+            None,
+        );
+        assert!(structured_proto.supports(tauqe_protocol::LlmCapability::FileEdits));
+        assert!(!structured_proto.supports(tauqe_protocol::LlmCapability::PlanCreation));
+        assert!(!structured_proto.supports(tauqe_protocol::LlmCapability::PlanUpdate));
     }
 
     #[tokio::test]

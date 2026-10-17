@@ -114,7 +114,7 @@ Every phase in the turn is deterministic:
 1. **Discovery:** The model inspects the Tree-sitter Repo Map, searches symbol usages or dependencies via `<repo_search>`, and requests required definitions or system documentation via protocol tags (`<context_request>`, `<doc_request>`). The server adds files to the `auto` context layer, returns search match summaries, or injects documentation blocks and iterates. No manual `/add` required.
 2. **Staging:** No byte touches disk until the entire set of edits converges cleanly in virtual staging.
 3. **Healing:** If the compiler detects an error, the model receives clean toolchain output and fixes only the offending lines without touching unrelated code.
-4. **Git Transaction:** The turn is transactional. Issuing an undo command (`C-Z`) rolls back the working tree to its exact pre-turn state.
+4. **Git Transaction:** The turn is transactional. It is finalized as a single isolated commit only after the full change set converges and verifies cleanly; if the turn fails or is cancelled before that point, the working tree is restored to its exact pre-turn state. Managing the resulting permanent history is left entirely to standard Git tooling.
 
 ### 3.1. Isolated Working Memory: The Turn Scratchpad
 

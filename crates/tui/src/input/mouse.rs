@@ -491,27 +491,6 @@ pub async fn handle_mouse_event(
                         }
                     }
                 }
-                Some(ActiveModal::ConfirmUndo) => {
-                    if st.confirm_undo {
-                        let geom = geometry_of(
-                            term_rect,
-                            &crate::dialogs::render::confirm_undo_params(&st),
-                        );
-                        match check_confirm_hit(&geom, mouse.column, mouse.row) {
-                            ModalHit::Confirm => {
-                                st.confirm_undo = false;
-                                st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
-                                drop(st);
-                                send_request(server_writer, methods::GIT_UNDO, serde_json::json!({})).await?;
-                            }
-                            ModalHit::Cancel | ModalHit::Outside => {
-                                st.confirm_undo = false;
-                                st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
-                            }
-                            ModalHit::InsideBody => {}
-                        }
-                    }
-                }
                 Some(ActiveModal::ConfirmDetachFocus) => {
                     if st.confirm_detach_focus {
                         let geom = geometry_of(

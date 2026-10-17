@@ -602,18 +602,6 @@ pub(crate) async fn handle_dialog_event(
             }
             return Ok(Some(InputResult::Continue));
         }
-        Some(ActiveModal::ConfirmUndo) => {
-            match resolve_confirm(&mut st, key) {
-                ConfirmOutcome::Toggled => {}
-                ConfirmOutcome::Dismissed => st.confirm_undo = false,
-                ConfirmOutcome::Accepted => {
-                    st.confirm_undo = false;
-                    drop(st);
-                    send_request(server_writer, methods::GIT_UNDO, serde_json::json!({})).await?;
-                }
-            }
-            return Ok(Some(InputResult::Continue));
-        }
         Some(ActiveModal::ConfirmDetachFocus) => {
             match resolve_confirm(&mut st, key) {
                 ConfirmOutcome::Toggled => {}

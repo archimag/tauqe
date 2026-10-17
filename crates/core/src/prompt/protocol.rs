@@ -7,7 +7,7 @@
 //! pipeline therefore operates purely on normalized semantics and stays
 //! independent of any single protocol format.
 
-use tauqe_protocol::{LlmCapability, LlmCommand};
+use tauqe_protocol::{CapabilitySet, LlmCapability, LlmCommand};
 
 /// Decodes raw model output into normalized core commands.
 ///
@@ -30,6 +30,21 @@ pub trait PromptProtocol: Send + Sync {
     fn supports(&self, capability: LlmCapability) -> bool {
         self.capabilities().contains(&capability)
     }
+
+    /// Declarative capability set this protocol currently advertises.
+    ///
+    /// The default derives the set from [`PromptProtocol::capabilities`]. A
+    /// protocol that can be narrowed overrides it to report the narrowed set, so
+    /// prompt composition and decoding stay aligned with one source of truth.
+    fn capability_set(&self) -> CapabilitySet {
+        CapabilitySet::from_slice(self.capabilities())
+    }
+
+    /// Returns a variant of this protocol that advertises exactly `capabilities`.
+    ///
+    /// Every concrete protocol implements this, so a caller narrows a turn to a
+    /// capability set without branching on the concrete protocol type.
+    fn with_capability_set(&self, capabilities: CapabilitySet) -> Box<dyn PromptProtocol>;
 
     /// Decodes raw model output into normalized core commands.
     ///
@@ -106,6 +121,12 @@ mod tests {
 
         fn system_instructions(&self, _editable_paths: &[String]) -> String {
             String::new()
+        }
+
+        fn with_capability_set(&self, _capabilities: CapabilitySet) -> Box<dyn PromptProtocol> {
+            // The fixture advertises a fixed capability slice; narrowing is
+            // exercised by the concrete protocols.
+            Box::new(TextOnlyProtocol)
         }
 
         fn create_stream_filter(

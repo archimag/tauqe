@@ -1576,3 +1576,293 @@ fn discussion_prompt_selects_structured_discussion_protocol() {
         ),
     }
 }
+
+/// A Structured Output turn must carry the model's scratchpad notes into the
+/// next proposal round, exactly like the XML control tag does.
+#[tokio::test]
+async fn structured_turn_persists_scratchpad_between_proposal_rounds() {
+    let (_dir, repo_root) = init_repo();
+    std::fs::write(repo_root.join("target.rs"), "pub fn compute() -> i32 { 0 }\n")
+        .expect("write target fixture");
+    std::fs::write(repo_root.join("helper.rs"), "pub const ANSWER: i32 = 42;\n")
+        .expect("write helper fixture");
+    commit_fixture(&repo_root, &["target.rs", "helper.rs"]);
+
+    let mut context = ContextManager::new(repo_root.clone());
+    context
+        .add_file("target.rs", ContextAccess::Editable)
+        .expect("add target to context");
+    let mut history = HistoryManager::new(repo_root.clone());
+
+    let discovery = serde_json::json!({
+        "message": "Recording working notes.",
+        "changes": [],
+        "context_requests": ["helper.rs"],
+        "scratchpad": "Finding: helper.rs holds ANSWER",
+    })
+    .to_string();
+    let edit = serde_json::json!({
+        "message": "Use the helper constant.",
+        "changes": [{
+            "op": "replace",
+            "path": "target.rs",
+            "to": "",
+            "old_text": "pub fn compute() -> i32 { 0 }",
+            "new_text": "pub fn compute() -> i32 { 42 }",
+            "content": ""
+        }],
+        "context_requests": [],
+        "outcome": { "status": "success", "summary": "Constant applied", "message": "" },
+    })
+    .to_string();
+
+    let provider =
+        MockLlmProvider::scripted([MockResponse::text(discovery), MockResponse::text(edit)]);
+    let model = ModelRef::openrouter("mock/model");
+    let protocol = tauqe_core::prompt::json::JsonPromptProtocol::edits();
+    let mut policy = tauqe_core::workflow::policy::DirectApplyPolicy::new();
+    let options = WorkflowOptions::default();
+    let (stream_tx, cancel_rx) = event_channel();
+
+    let output = {
+        let mut env = build_env(
+            &provider,
+            &model,
+            &mut context,
+            &mut history,
+            &protocol,
+            &mut policy,
+            stream_tx,
+            cancel_rx,
+            &options,
+        );
+        AnswerEditLoop::new("Use the helper constant")
+            .execute(&mut env)
+            .await
+            .expect("structured turn executes")
+    };
+
+    assert!(matches!(&output.result, ModelResult::Edit { edits, .. } if !edits.is_empty()));
+    assert_eq!(provider.requests().len(), 2);
+    let follow_up = &provider.requests()[1];
+    assert!(follow_up.messages[0].content.contains("<scratchpad>"));
+    assert!(follow_up.messages[0]
+        .content
+        .contains("Finding: helper.rs holds ANSWER"));
+}
+
+/// A structured `outcome` reporting `error` must terminate the turn as an
+/// unapplied edit carrying the diagnostic, exactly like the XML `<error>` tag.
+#[tokio::test]
+async fn structured_turn_terminates_on_terminal_error_outcome() {
+    let (_dir, repo_root) = init_repo();
+    let mut context = ContextManager::new(repo_root.clone());
+    let mut history = HistoryManager::new(repo_root.clone());
+
+    let response = serde_json::json!({
+        "message": "I cannot proceed.",
+        "changes": [],
+        "context_requests": [],
+        "outcome": { "status": "error", "summary": "", "message": "Missing dependency" },
+    })
+    .to_string();
+
+    let provider = MockLlmProvider::scripted([MockResponse::text(response)]);
+    let model = ModelRef::openrouter("mock/model");
+    let protocol = tauqe_core::prompt::json::JsonPromptProtocol::edits();
+    let mut policy = tauqe_core::workflow::policy::DirectApplyPolicy::new();
+    let options = WorkflowOptions::default();
+    let (stream_tx, cancel_rx) = event_channel();
+
+    let output = {
+        let mut env = build_env(
+            &provider,
+            &model,
+            &mut context,
+            &mut history,
+            &protocol,
+            &mut policy,
+            stream_tx,
+            cancel_rx,
+            &options,
+        );
+        AnswerEditLoop::new("Do something impossible")
+            .execute(&mut env)
+            .await
+            .expect("structured turn executes")
+    };
+
+    match output.result {
+        ModelResult::Edit { outcome, edits, .. } => {
+            assert!(!outcome.applied);
+            assert!(edits.is_empty());
+            assert_eq!(outcome.error.as_deref(), Some("Missing dependency"));
+        }
+        other => panic!("expected a terminated turn, got {other:?}"),
+    }
+    assert_eq!(
+        provider.requests().len(),
+        1,
+        "a terminal error outcome must not trigger retry loops"
+    );
+}
+
+/// A structured `blocked` field must surface as a semantic blocker that aborts
+/// the turn without retries, exactly like the XML `<blocked>` tag.
+#[tokio::test]
+async fn structured_turn_reports_blocked_outcome() {
+    let (_dir, repo_root) = init_repo();
+    let mut context = ContextManager::new(repo_root.clone());
+    let mut history = HistoryManager::new(repo_root.clone());
+
+    let response = serde_json::json!({
+        "message": "Cannot proceed.",
+        "changes": [],
+        "context_requests": [],
+        "blocked": {
+            "is_blocked": true,
+            "reason": "Missing table",
+            "details": "users table absent"
+        },
+    })
+    .to_string();
+
+    let provider = MockLlmProvider::scripted([MockResponse::text(response)]);
+    let model = ModelRef::openrouter("mock/model");
+    let protocol = tauqe_core::prompt::json::JsonPromptProtocol::edits();
+    let mut policy = tauqe_core::workflow::policy::DirectApplyPolicy::new();
+    let options = WorkflowOptions::default();
+    let (stream_tx, cancel_rx) = event_channel();
+
+    let output = {
+        let mut env = build_env(
+            &provider,
+            &model,
+            &mut context,
+            &mut history,
+            &protocol,
+            &mut policy,
+            stream_tx,
+            cancel_rx,
+            &options,
+        );
+        AnswerEditLoop::new("Refactor the persistence layer")
+            .execute(&mut env)
+            .await
+            .expect("structured turn executes")
+    };
+
+    assert_eq!(
+        output.blocked,
+        Some("Missing table\n\nusers table absent".to_string())
+    );
+    assert_eq!(
+        provider.remaining(),
+        0,
+        "a semantic blocker must not trigger retry loops"
+    );
+}
+
+/// Runs one answer/edit turn over `target.rs` and reports its normalized result,
+/// the number of provider requests, and the file content after the turn.
+///
+/// The helper is protocol-agnostic: it borrows the protocol as a trait object, so
+/// the same scenario can be replayed through either wire format.
+async fn run_parity_turn(
+    protocol: &dyn PromptProtocol,
+    response: String,
+) -> (ModelResult, usize, String) {
+    let (_dir, repo_root) = init_repo();
+    std::fs::write(repo_root.join("target.rs"), "pub fn compute() -> i32 { 0 }\n")
+        .expect("write target fixture");
+    commit_fixture(&repo_root, &["target.rs"]);
+
+    let mut context = ContextManager::new(repo_root.clone());
+    context
+        .add_file("target.rs", ContextAccess::Editable)
+        .expect("add target to context");
+    let mut history = HistoryManager::new(repo_root.clone());
+
+    let provider = MockLlmProvider::scripted([MockResponse::text(response)]);
+    let model = ModelRef::openrouter("mock/model");
+    let mut policy = tauqe_core::workflow::policy::DirectApplyPolicy::new();
+    let options = WorkflowOptions::default();
+    let (stream_tx, cancel_rx) = event_channel();
+
+    let output = {
+        let mut env = build_env(
+            &provider,
+            &model,
+            &mut context,
+            &mut history,
+            protocol,
+            &mut policy,
+            stream_tx,
+            cancel_rx,
+            &options,
+        );
+        AnswerEditLoop::new("Change compute to return 42")
+            .execute(&mut env)
+            .await
+            .expect("turn executes")
+    };
+
+    let content =
+        std::fs::read_to_string(repo_root.join("target.rs")).expect("read target fixture");
+    (output.result, provider.requests().len(), content)
+}
+
+/// Both wire formats are architectural peers: one and the same bounded turn,
+/// driven by the same loop and apply policy, must reach the same validated
+/// outcome whether the model speaks marker-protected XML or Structured Output
+/// JSON.
+#[tokio::test]
+async fn xml_and_structured_protocols_are_interchangeable_peers() {
+    let xml_protocol = tauqe_core::prompt::xml::XmlPromptProtocol
+        .with_turn_marker(MARKER)
+        .expect("marker-bound protocol");
+    let (xml_result, xml_requests, xml_content) = run_parity_turn(
+        xml_protocol.as_ref(),
+        edit_block(
+            "Change compute to 42",
+            "target.rs",
+            "pub fn compute() -> i32 { 0 }",
+            "pub fn compute() -> i32 { 42 }",
+        ),
+    )
+    .await;
+
+    let structured_protocol = tauqe_core::prompt::json::JsonPromptProtocol::edits();
+    let structured_response = serde_json::json!({
+        "message": "Change compute to 42",
+        "changes": [{
+            "op": "replace",
+            "path": "target.rs",
+            "to": "",
+            "old_text": "pub fn compute() -> i32 { 0 }",
+            "new_text": "pub fn compute() -> i32 { 42 }",
+            "content": ""
+        }],
+        "context_requests": [],
+        "outcome": { "status": "success", "summary": "Change compute to 42", "message": "" }
+    })
+    .to_string();
+    let (structured_result, structured_requests, structured_content) =
+        run_parity_turn(&structured_protocol, structured_response).await;
+
+    // Neither format costs an extra proposal round.
+    assert_eq!(xml_requests, 1);
+    assert_eq!(structured_requests, 1);
+
+    // Both turns apply a verified edit and leave byte-identical file content.
+    assert!(
+        matches!(xml_result, ModelResult::Edit { outcome, .. } if outcome.applied),
+        "the XML turn must apply its staged edit"
+    );
+    assert!(
+        matches!(structured_result, ModelResult::Edit { outcome, .. } if outcome.applied),
+        "the structured turn must apply its staged edit"
+    );
+    assert_eq!(xml_content, "pub fn compute() -> i32 { 42 }\n");
+    assert_eq!(structured_content, xml_content);
+}

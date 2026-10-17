@@ -8,8 +8,12 @@ use super::{verify_path_within_repo, ContextManager};
 
 impl ContextManager {
     pub fn load_pinned_from_repo(&mut self) {
-        let config = crate::config::load_context_config(&self.repo_root);
-        self.load_pinned(&config.pinned);
+        // Reading `tauqe.toml` and resolving the pinned ancestors is blocking
+        // filesystem work, so it runs off the async executor thread.
+        crate::blocking::run_blocking(|| {
+            let config = crate::config::load_context_config(&self.repo_root);
+            self.load_pinned(&config.pinned);
+        });
     }
 
     pub fn load_pinned(&mut self, pinned_paths: &[String]) {
@@ -25,44 +29,49 @@ impl ContextManager {
     /// every pinned pattern is resolved as a relative path and any existing file is added
     /// to the pinned layer (read-only, deduplicated, never escaping repo root).
     pub(super) fn recompute_pinned(&mut self) -> bool {
-        let mut new_pinned = BTreeMap::new();
+        // The ancestor walk, `verify_path_within_repo` symlink checks, and
+        // `metadata()` inspections are all blocking filesystem work, so the
+        // whole resolution runs off the async executor thread.
+        crate::blocking::run_blocking(|| {
+            let mut new_pinned = BTreeMap::new();
 
-        // 1. Root-level pinned files
-        for pattern in &self.pinned_patterns {
-            if let Ok(clean_path) = self.normalize_path(pattern) {
-                self.insert_pinned_candidate(&mut new_pinned, clean_path);
+            // 1. Root-level pinned files
+            for pattern in &self.pinned_patterns {
+                if let Ok(clean_path) = self.normalize_path(pattern) {
+                    self.insert_pinned_candidate(&mut new_pinned, clean_path);
+                }
             }
-        }
 
-        // 2. Hierarchical pinned files for all items in user and auto layers
-        let mut checked_dirs = BTreeSet::new();
-        for file_path in self.user.keys().chain(self.auto.keys()) {
-            let mut curr = Path::new(file_path).parent();
-            while let Some(parent) = curr {
-                if parent.as_os_str().is_empty() {
-                    break;
-                }
-                if !checked_dirs.insert(parent.to_path_buf()) {
-                    // This directory and all its parent ancestors were already checked
-                    break;
-                }
-                for pattern in &self.pinned_patterns {
-                    let candidate = parent.join(pattern);
-                    let candidate_str = candidate.to_string_lossy().to_string();
-                    if let Ok(clean_candidate) = self.normalize_path(&candidate_str) {
-                        self.insert_pinned_candidate(&mut new_pinned, clean_candidate);
+            // 2. Hierarchical pinned files for all items in user and auto layers
+            let mut checked_dirs = BTreeSet::new();
+            for file_path in self.user.keys().chain(self.auto.keys()) {
+                let mut curr = Path::new(file_path).parent();
+                while let Some(parent) = curr {
+                    if parent.as_os_str().is_empty() {
+                        break;
                     }
+                    if !checked_dirs.insert(parent.to_path_buf()) {
+                        // This directory and all its parent ancestors were already checked
+                        break;
+                    }
+                    for pattern in &self.pinned_patterns {
+                        let candidate = parent.join(pattern);
+                        let candidate_str = candidate.to_string_lossy().to_string();
+                        if let Ok(clean_candidate) = self.normalize_path(&candidate_str) {
+                            self.insert_pinned_candidate(&mut new_pinned, clean_candidate);
+                        }
+                    }
+                    curr = parent.parent();
                 }
-                curr = parent.parent();
             }
-        }
 
-        if self.pinned != new_pinned {
-            self.pinned = new_pinned;
-            true
-        } else {
-            false
-        }
+            if self.pinned != new_pinned {
+                self.pinned = new_pinned;
+                true
+            } else {
+                false
+            }
+        })
     }
 
     fn insert_pinned_candidate(
@@ -231,5 +240,23 @@ mod tests {
 
         primary.merge_turn_context(&turn_snapshot);
         assert!(primary.is_editable("pinned.rs").unwrap());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn recompute_pinned_resolves_hierarchy_on_async_runtime() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        std::fs::write(root.join("Conventions.md"), "# Root Conventions").unwrap();
+        std::fs::create_dir_all(root.join("crates/core/src")).unwrap();
+        std::fs::write(root.join("crates/core/Conventions.md"), "# Core Conventions").unwrap();
+        std::fs::write(root.join("crates/core/src/lib.rs"), "pub fn core() {}").unwrap();
+
+        let mut cm = ContextManager::with_pinned(root, &["Conventions.md".to_string()]);
+        cm.add_file("crates/core/src/lib.rs", ContextAccess::Editable).unwrap();
+        assert!(cm.contains("crates/core/Conventions.md").unwrap());
+
+        cm.clear_user();
+        assert!(cm.contains("Conventions.md").unwrap());
+        assert!(!cm.contains("crates/core/Conventions.md").unwrap());
     }
 }

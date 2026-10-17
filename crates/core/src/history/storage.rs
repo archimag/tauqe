@@ -62,46 +62,52 @@ impl SessionStorage {
 
     pub fn read_entries(&self) -> Result<Vec<HistoryEntry>> {
         let file_path = self.history_path();
-        if !file_path.is_file() {
-            return Ok(Vec::new());
-        }
 
-        let file = File::open(&file_path)
-            .with_context(|| format!("Failed to open history file: {:?}", file_path))?;
-        let reader = BufReader::new(file);
-        let mut entries = Vec::new();
+        // The metadata probe, the open, and the line-by-line JSONL streaming
+        // run off the async executor thread, so a cold or slow disk never
+        // stalls the bounded turn, provider streaming, or RPC handling.
+        crate::blocking::run_blocking(move || -> Result<Vec<HistoryEntry>> {
+            if !file_path.is_file() {
+                return Ok(Vec::new());
+            }
 
-        for (line_idx, line_res) in reader.lines().enumerate() {
-            let line = match line_res {
-                Ok(l) => l,
-                Err(err) => {
-                    tracing::warn!(
-                        "Failed reading line {} from history file {:?}: {}",
-                        line_idx + 1,
-                        file_path,
-                        err
-                    );
+            let file = File::open(&file_path)
+                .with_context(|| format!("Failed to open history file: {:?}", file_path))?;
+            let reader = BufReader::new(file);
+            let mut entries = Vec::new();
+
+            for (line_idx, line_res) in reader.lines().enumerate() {
+                let line = match line_res {
+                    Ok(l) => l,
+                    Err(err) => {
+                        tracing::warn!(
+                            "Failed reading line {} from history file {:?}: {}",
+                            line_idx + 1,
+                            file_path,
+                            err
+                        );
+                        continue;
+                    }
+                };
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
                     continue;
                 }
-            };
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-            match HistoryEntry::from_jsonl_line(trimmed) {
-                Ok(entry) => entries.push(entry),
-                Err(err) => {
-                    tracing::warn!(
-                        "Skipping invalid JSONL at line {} in history file {:?}: {}",
-                        line_idx + 1,
-                        file_path,
-                        err
-                    );
+                match HistoryEntry::from_jsonl_line(trimmed) {
+                    Ok(entry) => entries.push(entry),
+                    Err(err) => {
+                        tracing::warn!(
+                            "Skipping invalid JSONL at line {} in history file {:?}: {}",
+                            line_idx + 1,
+                            file_path,
+                            err
+                        );
+                    }
                 }
             }
-        }
 
-        Ok(entries)
+            Ok(entries)
+        })
     }
 
     /// Atomically rewrites the history file with the provided entries.
@@ -157,11 +163,17 @@ impl SessionStorage {
 
     pub fn clear(&self) -> Result<()> {
         let file_path = self.history_path();
-        if file_path.exists() {
-            std::fs::remove_file(&file_path)
-                .with_context(|| format!("Failed to delete history file: {:?}", file_path))?;
-        }
-        Ok(())
+
+        // The existence probe and the deletion run off the async executor
+        // thread for the same reason the writes do: history cleanup happens
+        // inside the turn pipeline, never on a bare Tokio worker thread.
+        crate::blocking::run_blocking(move || -> Result<()> {
+            if file_path.exists() {
+                std::fs::remove_file(&file_path)
+                    .with_context(|| format!("Failed to delete history file: {:?}", file_path))?;
+            }
+            Ok(())
+        })
     }
 }
 
@@ -245,5 +257,28 @@ mod tests {
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0], entry1);
         assert_eq!(entries[1], entry2);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_storage_read_entries_and_clear_on_multi_thread_runtime() {
+        let dir = tempdir().unwrap();
+        let repo_root = dir.path().to_path_buf();
+        let storage = SessionStorage::new(repo_root);
+
+        // The missing-file fast path must stay valid off the executor too.
+        assert!(storage.read_entries().unwrap().is_empty());
+
+        let entry = HistoryEntry::Turn {
+            id: Some(1),
+            prompt: "Read history off the executor".to_string(),
+            context: vec!["history/storage.rs".to_string()],
+        };
+        storage.append_entry(&entry).unwrap();
+
+        let entries = storage.read_entries().unwrap();
+        assert_eq!(entries, vec![entry]);
+
+        storage.clear().unwrap();
+        assert!(storage.read_entries().unwrap().is_empty());
     }
 }

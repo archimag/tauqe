@@ -33,14 +33,6 @@ pub struct GitCommitCreatedEvent {
     pub changed_files: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GitUndoResult {
-    pub undone_commit: String,
-    pub restored_checkpoint: bool,
-    pub new_head: String,
-    pub message: String,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct GitDiffParams {
     #[serde(default)]
@@ -50,6 +42,14 @@ pub struct GitDiffParams {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GitDiffResult {
     pub diff: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GitUndoResult {
+    pub undone_commit: String,
+    pub restored_checkpoint: bool,
+    pub new_head: String,
+    pub message: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

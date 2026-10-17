@@ -22,13 +22,15 @@ While a turn executes, TAUQE records intermediate `tauqe-step:` commits so that 
 
 ---
 
-## 4.3 Deterministic Undo
+## 4.3 Transactional Turns and Pre-Commit Rollback
 
-Reverting the most recent model commit is instant and deterministic:
-1. The undo command in the TUI (`Ctrl+Z`) opens a confirmation dialog.
-2. TAUQE verifies that HEAD is a Tauqe commit — detected by the co-author trailer, a known body marker, the author, or a `tauqe-step:` / `AI:` subject prefix. If HEAD looks like a human commit, the undo is refused for safety.
-3. The AI commit is unwound with a mixed reset, and only the files touched by that commit are reverted. Unrelated working-tree changes are left intact.
-4. If a developer checkpoint preceded the turn, it is unwound (`git reset HEAD~1`), returning the developer's exact uncommitted files to the working directory without data loss.
+A turn is transactional from the inside: safety is guaranteed before any commit exists, not by rewinding history afterward.
+
+- Every edit is staged and fuzzy-matched in memory before a single byte touches disk, so a mismatched or invalid patch never corrupts the working tree in the first place.
+- If toolchain verification fails and healing cannot converge, or the developer cancels the turn, the working tree is restored to its exact pre-turn state and the temporary `tauqe-step:` commits are discarded. The checkpoint returns any uncommitted developer work that existed before the turn.
+- Only a turn that converges and verifies cleanly is finalized into one isolated commit. That commit is ordinary history: the developer can inspect, amend, or revert it with standard Git tooling like any other.
+
+TAUQE therefore ships no bespoke command to undo an already-finalized commit. Once a turn is committed, permanent history is managed exclusively through the developer's own Git tooling. This keeps repository history under the developer's full control and avoids heuristics that try to guess whether a commit is safe to rewrite.
 
 ---
 

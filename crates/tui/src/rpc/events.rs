@@ -3,7 +3,7 @@ use tokio::sync::Mutex;
 use tauqe_protocol::{
     events, BatchFinishStatus, BatchFinishSummary, ConfigState, ContextState, EditFileDoneEvent,
     EditFileRetryingEvent, EditFileStartedEvent, EditFinishedEvent, EditHunkEvent, Event,
-    GitCommitCreatedEvent, GitSquashApplyResult, GitUndoResult, HistoryCompactedEvent,
+    GitCommitCreatedEvent, GitSquashApplyResult, HistoryCompactedEvent,
     HistoryEntryAddedEvent, ModelDeltaEvent, ModelErrorEvent, ModelFinishedEvent, ModelResult,
     ModelResultEvent, ModelStartedEvent, ModelUsageEvent, PlanBatchFinishedEvent, RepositoryState,
     ReviewBatchFinishedEvent, ReviewContentDeltaEvent, ReviewErrorEvent, ReviewFinishedEvent,
@@ -57,13 +57,6 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
                         f.error = None;
                         f.retry_info = None;
                     }
-                }
-            }
-        }
-        events::GIT_UNDO_COMPLETED => {
-            if let Some(params) = ev.params {
-                if let Ok(data) = serde_json::from_value::<GitUndoResult>(params) {
-                    st.notify_success(data.message);
                 }
             }
         }

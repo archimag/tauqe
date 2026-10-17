@@ -37,24 +37,6 @@ pub static REPL_COMMAND_MAP: CommandMap<ReplAction> = CommandMap::new(&[
         "Send the prompt",
     ),
     CommandSpec::new(
-        KeyChord::Alt(KeyCode::Char('u')),
-        ReplAction::UndoCommit,
-        Essential,
-        "Undo the last AI commit",
-    ),
-    CommandSpec::new(
-        KeyChord::Primary(KeyCode::Char('z')),
-        ReplAction::UndoCommit,
-        Essential,
-        "Undo the last AI commit",
-    ),
-    CommandSpec::new(
-        KeyChord::Ctrl(KeyCode::Char('z')),
-        ReplAction::UndoCommit,
-        Essential,
-        "Undo the last AI commit",
-    ),
-    CommandSpec::new(
         KeyChord::PrimaryOrMeta(KeyCode::Char('s')),
         ReplAction::OpenSquashDialog,
         Essential,
@@ -465,7 +447,6 @@ pub enum ReplAction {
 
     // Workflow actions
     SendPrompt,
-    UndoCommit,
     OpenSquashDialog,
     CopyModelResponse,
     PrevModifiedFile,
@@ -699,16 +680,6 @@ pub async fn handle_repl_key(
                 }
             }
         }
-        ReplAction::UndoCommit => {
-            if st.model.is_busy() {
-                st.notify_warning("Cannot undo while model is generating");
-            } else if st.model.last_commit_hash.is_none() {
-                st.notify_warning("No AI commit to undo");
-            } else {
-                st.confirm_undo = true;
-                st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
-            }
-        }
         ReplAction::OpenSquashDialog => {
             crate::input::open_squash_dialog(&mut st, server_writer).await?;
         }
@@ -881,14 +852,14 @@ mod tests {
             Some(ReplAction::CopyModelResponse)
         );
 
-        // Undo
+        // C-z belongs to the text editor: it never opens an undo dialog.
         assert_eq!(
             resolve_repl_action(key(KeyCode::Char('z'), KeyModifiers::CONTROL), p),
-            Some(ReplAction::UndoCommit)
+            None
         );
         assert_eq!(
             resolve_repl_action(key(KeyCode::Char('u'), KeyModifiers::ALT), p),
-            Some(ReplAction::UndoCommit)
+            None
         );
 
         // Yank via C-y and Shift+Insert
@@ -978,14 +949,14 @@ mod tests {
             Some(ReplAction::CopyModelResponse)
         );
 
-        // Alt+U and Alt+Z both trigger Undo
+        // The undo chord is gone: neither Alt+U nor Alt+Z resolve to an action.
         assert_eq!(
             resolve_repl_action(key(KeyCode::Char('u'), KeyModifiers::ALT), p),
-            Some(ReplAction::UndoCommit)
+            None
         );
         assert_eq!(
             resolve_repl_action(key(KeyCode::Char('z'), KeyModifiers::ALT), p),
-            Some(ReplAction::UndoCommit)
+            None
         );
 
         // Ctrl+U still kills to beginning of line (Readline compatibility)

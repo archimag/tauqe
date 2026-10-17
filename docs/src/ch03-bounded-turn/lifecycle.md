@@ -92,24 +92,34 @@ To eliminate ambiguity at turn conclusion and prevent speculative execution casc
 
 ---
 
-## 3.6 Dual Protocol Circuits: Execution vs Discussion
+## 3.6 Two Wire Formats, One Capability Profile
 
-TAUQE separates model interaction into two dedicated protocol circuits based on functional requirements:
+TAUQE ships two interchangeable wire formats for model interaction. They are
+architectural peers, not separate pipelines: the same FSM, the same normalized
+`Vec<LlmCommand>`, and the same `ApplyPolicy` drive both, so switching the format
+never changes what a turn is allowed to do.
 
-1. **Execution Protocol (Streaming XML):**
-   - Active during code modification and isolated plan step execution.
+1. **XML (marker-protected streaming tags):**
+   - The default format, used whenever a turn must modify code.
    - Employs streaming XML search/replace blocks (`<edit>`, `<create>`, `<delete>`).
    - Resistant to unescaped quotes, arbitrary source formatting, and indentation shifts.
    - Patches are validated in virtual staging before touching disk, followed by the toolchain compiler gate.
 
-2. **Discussion Protocol (Strict Structured Output):**
-   - Active during architectural discussions, plan refinement, and code review triage.
-   - Strictly read-only: file edits, patch proposals, and code modification tags are prohibited.
-   - Governed by JSON Schema (`DiscussionResponse`):
-     - `message`: Markdown explanation streamed immediately to the TUI;
-     - `plan_update`: Structured modifications to project plans (`save`, `update`, `delete`);
-     - `context_requests`: Read-only file inspection requests.
-   - Eliminates turn-marker leaking, regex parsing ambiguities, and history pollution.
+2. **Structured Output (JSON Schema):**
+   - Carries the identical operational surface as schema fields: `message`,
+     `changes`, `context_requests`, `repo_searches`, `doc_requests`,
+     `scratchpad`, `verify`, `outcome`, `blocked`, and `user_language`.
+   - The `message` field streams to the interface while the remaining fields stay
+     hidden, so the REPL experience matches XML exactly.
+   - Removes turn-marker leaking and regex parsing ambiguities from the wire.
+
+Because both formats decode into the same command vocabulary, the capability
+profile — not the wire format — decides what a turn may do. A plan discussion
+narrows the profile to a read-only planning surface (plan `save`/`update`,
+context requests, language) and renders the `DiscussionResponse` schema. A review
+focus dialogue keeps file editing and toolchain verification, so the developer can
+reason about a finding and request the fix in the same anchored turn (see 2.8.3
+and 6.5).
 
 ---
 
@@ -172,7 +182,9 @@ Specialized loops (`workflow/loops.rs`) encode distinct contracts over the same 
 
 `PromptProtocol` (`prompt/protocol.rs`) separates prompt assembly and output decoding from FSM control flow. A protocol declares its `capabilities()`, assembles the system prompt, optionally provides a `response_format()` (JSON Schema for structured output), builds the matching streaming filter, and decodes raw model text into a normalized `Vec<LlmCommand>`.
 
-Because decoding is a trait method, the identical FSM drives XML, JSON, or any future syntax without modification. Concrete implementations include `XmlPromptProtocol`, `MarkedXmlPromptProtocol` (turn-marker protected), and `JsonPromptProtocol`.
+Because decoding is a trait method, the identical FSM drives XML, JSON, or any future syntax without modification. Concrete implementations include `XmlPromptProtocol`, the turn-marker protected XML variant backed by `MarkedXmlEditProtocol`, and `JsonPromptProtocol`.
+
+Prompt assembly is declarative rather than templated. `XmlPromptProtocol` delegates to the capability registry, which folds the contract rules and protocol instructions of exactly the modules enabled by the active `CapabilitySet`. A `PromptRenderContext` supplies the permitted editable paths and the active turn marker, so every tag name the prompt advertises already carries its marker suffix. The same registry decides which commands the decoder accepts: a scoped protocol built with `with_capabilities` or `with_turn_marker` decodes only what its profile enables. Adding a capability therefore means adding one module, not editing a prompt template and a parallel decoder in lockstep.
 
 ### ApplyPolicy: Transactional Application
 
@@ -198,8 +210,33 @@ Cancellation is observed continuously, not only while the response body is strea
 
 The syntax of a protocol (XML tags or JSON Schema) is kept strictly separate from core business logic.
 
-- A protocol declares its behavior as a declarative set of **`LlmCapability`** values: `TextMessage`, `FileEdits`, `Discovery`, `DocRequest`, `ToolchainVerify`, `PlanCreation`, `PlanUpdate`, `Scratchpad`, `Outcome`, and `UserLanguage`. The core queries these capabilities through `supports()` instead of branching on protocol identity, so adding a capability never requires touching the FSM.
-- Model output is decoded into a normalized **`Vec<LlmCommand>`**: `Text`, `Edit`, `ContextRequest`, `ContextDrop`, `DocRequest`, `Verify`, `Plan`, `Scratchpad`, `Outcome`, and `UserLanguage`.
+- A protocol declares its behavior as a declarative set of **`LlmCapability`** values: `TextMessage`, `FileEdits`, `Discovery`, `DocRequest`, `ToolchainVerify`, `PlanCreation`, `PlanUpdate`, `Scratchpad`, `Outcome`, `Blocked`, and `UserLanguage`. The core queries these capabilities through `supports()` instead of branching on protocol identity, so adding a capability never requires touching the FSM.
+- Every capability belongs to a **`CapabilityPhase`** (`Discovery`, `Execution`, `Verification`, `Outcome`). A consumer can therefore reason about the stage a command advances without knowing its wire syntax.
+- A **`CapabilitySet`** is the profile mask naming the capabilities enabled for one role or mode: `develop_xml`, `isolated_step_xml`, `develop_structured`, `isolated_step_structured`, `discussion`, and `architect_discovery`. Profiles, not scattered boolean checks, decide both what the prompt advertises and what the decoder accepts.
+- Model output is decoded into a normalized **`Vec<LlmCommand>`**: `Text`, `Edit`, `ContextRequest`, `RepoSearch`, `DocRequest`, `Verify`, `Plan`, `Scratchpad`, `Outcome`, `Blocked`, `UserLanguage`, and `ProtocolError`.
+
+#### Capability as a Unit: the Registry
+
+The registry in `crates/core/src/capabilities` turns each capability into an autonomous module. A `CapabilityModule` is the single source of truth for one capability and owns four concerns at once:
+
+- the **tag schema** it recognizes, resolved from the parametric `XmlTagSpec` registry instead of being re-declared;
+- the **prompt fragments** it contributes to the core contract section, the XML instruction section, and the structured-output instruction section;
+- the **decoder** that converts raw model output into normalized commands;
+- the **sanitizer** that removes its tags from conversational text.
+
+`CapabilityRegistry::global()` composes exactly the modules a `CapabilitySet` enables. Because the same module supplies the tag, the instruction, and the decoder, the prompt can never advertise a command the decoder rejects, and a disabled capability leaves no trace in either the prompt or the command stream.
+
+#### Parametric XML Engine under Turn-Marker Protection
+
+Every structural tag is declared once as an `XmlTagSpec` in `XML_TAG_SPECS` (`edits/protocol/xml/engine.rs`): its base name, the capability it realizes, its close mode, its marker policy, the unmarked children it accepts, and whether an open tag must be withheld from the stream. Boundary scanning, attribute extraction, stripping, and safe streaming truncation are implemented once and parametrized by that declaration, so a tag cannot drift between its scanner, its stripper, and its stream suppressor.
+
+The turn marker rides on top of the same registry. Each turn generates an unpredictable marker, prompt rendering suffixes every tag with it through `PromptRenderContext::tag_name`, and normalization honors only marker-bound tags. Unsuffixed tags found in source code, diffs, or documentation stay literal. This is why a plan body may keep its readable unmarked `<item>` children while a quoted `</search>` inside a marked edit block can never close anything.
+
+#### Polymorphic Discovery Execution
+
+The Discovery phase does not branch on command variants. Each discovery capability registers a `DiscoveryCapabilityHandler` that declares which commands it handles and executes them, owning its own validation, disk scan, and feedback text. The dispatcher resolves repository facts once per round, folds every handler's findings into a single `DiscoveryRoundOutcome`, and halts the round as soon as the files token budget would be breached, so no capability runs against a context that was never widened.
+
+`DiscoveryRoundOutcome` also answers whether a round made progress. That single question is what lets the FSM and the Architect discovery loop distinguish a productive round from a dead end without inspecting individual request types.
 
 The streaming parser splits the data stream in two. Lightweight streaming events (`EditFileStarted`, `EditHunk`, `TurnPhase`, usage, toolchain status) are emitted to the UI as they arrive for immediate feedback, while the normalized commands are accumulated and handed to the core only once the stream finishes. This is why streaming remains responsive even though the commands themselves are processed deterministically.
 

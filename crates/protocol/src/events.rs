@@ -27,8 +27,8 @@ pub const TOOLCHAIN_FINISHED: &str = "toolchain/finished";
 
 pub const GIT_STATE_CHANGED: &str = "git/stateChanged";
 pub const GIT_COMMIT_CREATED: &str = "git/commitCreated";
-pub const GIT_UNDO_COMPLETED: &str = "git/undoCompleted";
 pub const GIT_SQUASH_COMPLETED: &str = "git/squashCompleted";
+pub const GIT_UNDO_COMPLETED: &str = "git/undoCompleted";
 
 pub const CONFIG_CHANGED: &str = "config/changed";
 

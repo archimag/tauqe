@@ -8,6 +8,7 @@ use crate::edits::protocol::ContextRequest;
 use tauqe_protocol::{DocTopic, EditOperation, ModelResult};
 
 use super::clean::extract_conversational_text;
+use super::engine::allows_unmarked_fallback;
 use super::marker::{normalize_marked_xml, restore_xml_literals};
 use super::prompt;
 use super::tags::{self, TerminalOutcome, VerifyRequest};
@@ -40,21 +41,22 @@ impl MarkedXmlEditProtocol {
     }
 
     /// Runs a marker-normalized parse and retries against the raw text when the
-    /// normalized pass yields nothing.
+    /// normalized pass yields nothing and the tag tolerates an unmarked fallback.
     ///
     /// The turn marker protects literal source tags from being mistaken for
     /// protocol commands. Reasoning models occasionally drop the suffix in long
-    /// monologues, so when no marker-bound construct is found the raw text is
-    /// parsed tolerantly, letting unmarked protocol tags still take effect.
+    /// monologues, so tags declared with a tolerant marker policy fall back to
+    /// the raw text, while strictly bound tags never do.
     fn tolerant_parse<T>(
         &self,
+        base: &str,
         raw_text: &str,
         parse: impl Fn(&str) -> T,
         is_empty: impl Fn(&T) -> bool,
     ) -> T {
         let normalized = normalize_marked_xml(raw_text, &self.marker, true);
         let parsed = parse(&normalized);
-        if is_empty(&parsed) {
+        if is_empty(&parsed) && allows_unmarked_fallback(base) {
             parse(raw_text)
         } else {
             parsed
@@ -89,12 +91,12 @@ impl MarkedXmlEditProtocol {
 
     /// Extracts a verification request, tolerating an unmarked fallback.
     pub fn parse_verify_request(&self, raw_text: &str) -> Option<VerifyRequest> {
-        self.tolerant_parse(raw_text, tags::extract_verify_request, Option::is_none)
+        self.tolerant_parse("verify", raw_text, tags::extract_verify_request, Option::is_none)
     }
 
     /// Extracts the detected user language, tolerating an unmarked fallback.
     pub fn parse_user_language(&self, raw_text: &str) -> Option<String> {
-        self.tolerant_parse(raw_text, tags::extract_user_language, Option::is_none)
+        self.tolerant_parse("user_language", raw_text, tags::extract_user_language, Option::is_none)
     }
 
     /// Extracts plan tags strictly bound to the active turn marker.

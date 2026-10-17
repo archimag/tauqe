@@ -1,11 +1,10 @@
 //! Parser and types for the `<verify>` control tag.
 
-use super::{next_simple_tag, strip_tags};
-use crate::edits::protocol::xml::extract_attribute;
+use crate::edits::protocol::xml::engine::{self, XmlTagSpec};
 
-/// Locates the next complete `<verify .../>` or `<verify>...</verify>` tag.
-pub(crate) fn next_verify_tag(text: &str) -> Option<(usize, usize)> {
-    next_simple_tag(text, "<verify")
+/// Specification of the `<verify>` control tag from the XML tag registry.
+pub(crate) fn tag_spec() -> Option<&'static XmlTagSpec> {
+    engine::tag_spec("verify")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -30,19 +29,17 @@ pub struct VerifyRequest {
 
 /// Extracts verification request if specified by the model.
 pub fn extract_verify_request(text: &str) -> Option<VerifyRequest> {
-    let (start, end) = next_verify_tag(text)?;
-    let tag = &text[start..end];
-    let header_end = tag.find('>').unwrap_or(tag.len());
-    let header = &tag[..header_end];
+    let spec = tag_spec()?;
+    let found = engine::find_next_tag(text, spec)?;
 
-    let target = match extract_attribute(header, "target").as_deref() {
+    let target = match found.attr("target").as_deref() {
         Some("check") => VerifyTarget::Check,
         Some("test") => VerifyTarget::Test,
         Some("clippy") => VerifyTarget::Clippy,
         _ => VerifyTarget::All,
     };
 
-    let on_success = match extract_attribute(header, "on_success").as_deref() {
+    let on_success = match found.attr("on_success").as_deref() {
         Some("silent") => VerifyOnSuccess::Silent,
         _ => VerifyOnSuccess::Report,
     };
@@ -52,5 +49,8 @@ pub fn extract_verify_request(text: &str) -> Option<VerifyRequest> {
 
 /// Removes all verify tags from text.
 pub fn strip_verify_tags(text: &str) -> String {
-    strip_tags(text, next_verify_tag)
+    match tag_spec() {
+        Some(spec) => engine::strip_tag_by_spec(text, spec),
+        None => text.to_string(),
+    }
 }

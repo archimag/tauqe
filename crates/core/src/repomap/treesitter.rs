@@ -67,17 +67,15 @@ impl TreeSitterExtractor {
 
 impl SymbolExtractor for TreeSitterExtractor {
     fn extract_symbols(&self, repo_root: &Path, files: &[String]) -> Result<Vec<RepoFileSymbols>> {
-        let mut state = match self.state.lock() {
-            Ok(state) => state,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        Ok(extract_treesitter_symbols(&mut state, repo_root, files))
+        crate::blocking::run_blocking(|| {
+            Ok(extract_treesitter_symbols(&self.state, repo_root, files))
+        })
     }
 }
 
 /// Extracts symbols from repository files, reusing the parser and symbol cache.
 fn extract_treesitter_symbols(
-    state: &mut ExtractorState,
+    state_lock: &Mutex<ExtractorState>,
     repo_root: &Path,
     files: &[String],
 ) -> Vec<RepoFileSymbols> {
@@ -91,13 +89,25 @@ fn extract_treesitter_symbols(
         let modified = metadata.modified().ok();
         let size = metadata.len();
 
-        if let Some(cached) = state.cache.get(&full_path) {
-            if cached.modified == modified && cached.size == size {
-                if let Some(symbols) = cached.symbols.clone() {
-                    result.push(symbols);
+        let cached_hit = {
+            let state = match state_lock.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            state.cache.get(&full_path).and_then(|cached| {
+                if cached.modified == modified && cached.size == size {
+                    Some(cached.symbols.clone())
+                } else {
+                    None
                 }
-                continue;
+            })
+        };
+
+        if let Some(cached_symbols) = cached_hit {
+            if let Some(symbols) = cached_symbols {
+                result.push(symbols);
             }
+            continue;
         }
 
         let support = match language_for_path(rel_path) {
@@ -108,6 +118,21 @@ fn extract_treesitter_symbols(
             Ok(source) => source,
             Err(_) => continue,
         };
+
+        let mut state = match state_lock.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+
+        if let Some(cached) = state.cache.get(&full_path) {
+            if cached.modified == modified && cached.size == size {
+                if let Some(symbols) = cached.symbols.clone() {
+                    result.push(symbols);
+                }
+                continue;
+            }
+        }
+
         let symbols = extract_symbols_with_support(&mut state.parser, support, rel_path, &source)
             .filter(|file| !file.symbols.is_empty());
         if let Some(symbols) = &symbols {
@@ -285,5 +310,38 @@ pub fn valid_after_error() -> bool {
         let third = extractor.extract_symbols(&root, &files).unwrap();
         assert_eq!(third.len(), 1);
         assert_eq!(third[0].symbols[0].name, "second_value");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_concurrent_symbol_extractions_on_multi_thread_runtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        for i in 0..10 {
+            std::fs::write(
+                root.join(format!("file_{}.rs", i)),
+                format!("pub fn func_{}() -> i32 {{ {} }}\n", i, i),
+            )
+            .unwrap();
+        }
+
+        let extractor = TreeSitterExtractor::new();
+        let mut handles = Vec::new();
+
+        for _ in 0..8 {
+            let extractor = extractor.clone();
+            let root = root.clone();
+            let handle = tokio::spawn(async move {
+                let files: Vec<String> = (0..10).map(|i| format!("file_{}.rs", i)).collect();
+                extractor.extract_symbols(&root, &files).unwrap()
+            });
+            handles.push(handle);
+        }
+
+        for handle in handles {
+            let res = handle.await.unwrap();
+            assert_eq!(res.len(), 10);
+        }
+
+        assert_eq!(extractor.state.lock().unwrap().cache.len(), 10);
     }
 }

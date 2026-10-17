@@ -30,7 +30,6 @@ pub async fn handle_request(req: Request, state: &Arc<AppState>) -> Response {
         methods::REPOSITORY_GET_STATE => git::handle_repository_get_state(req, state).await,
         methods::REPOSITORY_INIT => git::handle_repository_init(req, state).await,
         methods::REPOSITORY_LIST_FILES => git::handle_repository_list_files(req, state).await,
-        methods::GIT_UNDO => git::handle_git_undo(req, state).await,
         methods::GIT_GET_DIFF => git::handle_git_get_diff(req, state).await,
         methods::GIT_SQUASH_PREVIEW => git::handle_git_squash_preview(req, state).await,
         methods::GIT_SQUASH_GENERATE_MESSAGE => {

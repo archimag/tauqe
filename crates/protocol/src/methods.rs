@@ -17,8 +17,8 @@ pub const CONTEXT_CLEAR: &str = "context/clear";
 
 pub const HISTORY_GET: &str = "history/get";
 
-pub const GIT_UNDO: &str = "git/undo";
 pub const GIT_GET_DIFF: &str = "git/getDiff";
+pub const GIT_UNDO: &str = "git/undo";
 pub const GIT_SQUASH_PREVIEW: &str = "git/squashPreview";
 pub const GIT_SQUASH_GENERATE_MESSAGE: &str = "git/squashGenerateMessage";
 pub const GIT_SQUASH_APPLY: &str = "git/squashApply";
@@ -84,8 +84,8 @@ mod tests {
             CONTEXT_SET_ACCESS,
             CONTEXT_CLEAR,
             HISTORY_GET,
-            GIT_UNDO,
             GIT_GET_DIFF,
+            GIT_UNDO,
             GIT_SQUASH_PREVIEW,
             GIT_SQUASH_GENERATE_MESSAGE,
             GIT_SQUASH_APPLY,

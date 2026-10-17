@@ -104,53 +104,6 @@ pub fn render_confirm_quit_popup(frame: &mut ratatui::Frame, state: &AppState) {
     render_modal_confirm(frame, confirm_quit_params(state));
 }
 
-/// Presentation parameters for the undo confirmation.
-pub fn confirm_undo_params(state: &AppState) -> ConfirmModalParams<'_> {
-    let engine = current_engine();
-    let palette = engine.palette();
-    let mut body_lines = vec![
-        Line::raw(""),
-        Line::from(Span::styled(
-            active_t("dialog.confirm_undo.question"),
-            engine.fg(palette.status_warning).bold(),
-        )),
-        Line::raw(""),
-    ];
-
-    if let Some(hash) = &state.model.last_commit_hash {
-        body_lines.push(Line::from(vec![
-            Span::raw(active_t("dialog.confirm_undo.commit_label")),
-            Span::styled(hash.clone(), engine.fg(palette.status_info).bold()),
-        ]));
-    }
-    if let Some(summary) = &state.model.last_commit_summary {
-        body_lines.push(Line::from(vec![
-            Span::raw(active_t("dialog.confirm_undo.summary_label")),
-            Span::styled(summary.clone(), engine.fg(palette.text_primary)),
-        ]));
-    }
-    body_lines.push(Line::raw(""));
-    body_lines.push(Line::from(Span::styled(
-        active_t("dialog.confirm_undo.restore_note"),
-        engine.fg(palette.text_muted),
-    )));
-
-    ConfirmModalParams {
-        title: active_t("dialog.confirm_undo.title"),
-        tone: ModalTone::Dangerous,
-        body_lines,
-        confirm_label: active_t("dialog.button.confirm_undo"),
-        cancel_label: active_t("modal.cancel"),
-        confirm_button: state.confirm_button,
-        destructive: true,
-        width: 58,
-    }
-}
-
-pub fn render_confirm_undo_popup(frame: &mut ratatui::Frame, state: &AppState) {
-    render_modal_confirm(frame, confirm_undo_params(state));
-}
-
 /// Presentation parameters for the discussion-focus detach confirmation.
 ///
 /// Detaching is non-destructive to the working tree, so the confirmation

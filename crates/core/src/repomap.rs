@@ -118,36 +118,38 @@ pub fn generate_repo_map_with_extractor(
     token_budget: usize,
     extractor: &dyn SymbolExtractor,
 ) -> Result<String> {
-    let context_set: HashSet<&str> = context_files.iter().map(|s| s.as_str()).collect();
+    crate::blocking::run_blocking(|| {
+        let context_set: HashSet<&str> = context_files.iter().map(|s| s.as_str()).collect();
 
-    let mut all_git_files: Vec<String> = available_files
-        .iter()
-        .filter(|p| !context_set.contains(p.as_str()))
-        .filter(|p| repo_root.join(p).is_file())
-        .cloned()
-        .collect();
+        let mut all_git_files: Vec<String> = available_files
+            .iter()
+            .filter(|p| !context_set.contains(p.as_str()))
+            .filter(|p| repo_root.join(p).is_file())
+            .cloned()
+            .collect();
 
-    all_git_files.sort();
-    all_git_files.dedup();
+        all_git_files.sort();
+        all_git_files.dedup();
 
-    if all_git_files.is_empty() {
-        return Ok(String::new());
-    }
+        if all_git_files.is_empty() {
+            return Ok(String::new());
+        }
 
-    let eligible_files: Vec<String> = all_git_files
-        .iter()
-        .filter(|p| treesitter::is_supported_path(p.as_str()))
-        .cloned()
-        .collect();
+        let eligible_files: Vec<String> = all_git_files
+            .iter()
+            .filter(|p| treesitter::is_supported_path(p.as_str()))
+            .cloned()
+            .collect();
 
-    let symbols = if eligible_files.is_empty() {
-        Vec::new()
-    } else {
-        extractor.extract_symbols(repo_root, &eligible_files)?
-    };
+        let symbols = if eligible_files.is_empty() {
+            Vec::new()
+        } else {
+            extractor.extract_symbols(repo_root, &eligible_files)?
+        };
 
-    let outline = format_repo_map_with_budget(&symbols, &all_git_files, token_budget);
-    Ok(outline)
+        let outline = format_repo_map_with_budget(&symbols, &all_git_files, token_budget);
+        Ok(outline)
+    })
 }
 
 /// Formats repository symbols into an outline, reducing detail level if `token_budget` is exceeded.
@@ -644,5 +646,22 @@ mod tests {
         let outline = format_repo_map_with_budget(&syms, &all_files, 100);
         assert!(outline.contains("Cargo.toml"));
         assert!(outline.contains("tauqe.toml"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_generate_repo_map_on_multi_thread_runtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        std::fs::write(root.join("main.rs"), "pub fn main() {}\n").unwrap();
+        let available = vec!["main.rs".to_string()];
+        let context = vec![];
+
+        let handle = tokio::spawn(async move {
+            generate_repo_map(&root, &available, &context, 1000).unwrap()
+        });
+
+        let map = handle.await.unwrap();
+        assert!(map.contains("main.rs"));
+        assert!(map.contains("pub fn main"));
     }
 }

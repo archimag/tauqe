@@ -4,13 +4,14 @@ use std::path::PathBuf;
 use tauqe_protocol::{EditFileOp, EditFileStatus};
 
 use super::{normalize_hunk, resolve_path, EditStreamFilter, StagingSimulator};
+use crate::edits::protocol::xml::engine::OpenTag;
 use crate::edits::protocol::xml::is_valid_turn_marker;
 use crate::providers::StreamEvent;
 
 mod scanner;
 
 use scanner::{
-    activate_unmarked_scratchpad, extract_attr, find_any_edit_start, find_file_tag_start,
+    activate_unmarked_hidden_tags, extract_attr, find_any_edit_start, find_file_tag_start,
     find_next_control_tag, find_next_hunk, safe_text_emit_len,
 };
 
@@ -22,7 +23,7 @@ pub struct XmlStreamFilter {
     buffer: String,
     marker: Option<String>,
     raw_buffer: String,
-    marker_stack: Vec<&'static str>,
+    marker_stack: Vec<OpenTag>,
     in_edits_block: bool,
     current_file: Option<CurrentStreamingFile>,
     file_hunks_count: usize,
@@ -369,7 +370,7 @@ impl EditStreamFilter for XmlStreamFilter {
                 &mut self.marker_stack,
                 false,
             );
-            activate_unmarked_scratchpad(&delta, marker)
+            activate_unmarked_hidden_tags(&delta, marker)
         } else {
             chunk.to_string()
         };
@@ -387,7 +388,7 @@ impl EditStreamFilter for XmlStreamFilter {
                 &mut self.marker_stack,
                 true,
             );
-            let remaining = activate_unmarked_scratchpad(&delta, marker);
+            let remaining = activate_unmarked_hidden_tags(&delta, marker);
             events.extend(self.push_normalized_chunk(&remaining));
         }
         if !self.buffer.is_empty() {

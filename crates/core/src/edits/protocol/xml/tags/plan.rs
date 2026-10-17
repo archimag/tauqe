@@ -4,58 +4,24 @@ mod concept;
 mod item;
 
 use super::{is_inside_markdown_code, strip_tags};
+use crate::edits::protocol::xml::engine;
 use crate::edits::protocol::xml::{extract_attribute, find_base_tag_start};
 
 pub use item::ParsedPlanItem;
 use concept::parse_concept_items_with_diagnostics;
 use item::{next_item_tag_bounds, parse_plan_items_with_diagnostics};
 
-/// Locates the next complete `<plan ...>...</plan>` or `<plan .../>` tag.
-pub(crate) fn next_plan_tag(text: &str) -> Option<(usize, usize)> {
-    const OPEN: &str = "<plan";
-    let mut from = 0;
-    while let Some(rel) = text[from..].find(OPEN) {
-        let start = from + rel;
-        let after = start + OPEN.len();
-        let bytes = &text.as_bytes()[after..];
-        let mut idx = 0;
-        if idx < bytes.len() && (bytes[idx] == b'_' || bytes[idx] == b'-') {
-            idx += 1;
-            while idx < bytes.len()
-                && (bytes[idx].is_ascii_alphanumeric() || bytes[idx] == b'_' || bytes[idx] == b'-')
-            {
-                idx += 1;
-            }
-        }
-        let tag_name = &text[start + 1..after + idx];
-        let rest = &text[after + idx..];
-        let boundary = rest
-            .chars()
-            .next()
-            .is_some_and(|c| c.is_whitespace() || c == '>' || c == '/');
-        if boundary {
-            if is_inside_markdown_code(text, start) {
-                from = after;
-                continue;
-            }
-            let gt = rest.find('>')?;
-            let end_open = after + idx + gt + 1;
-            if rest[..gt].trim_end().ends_with('/') {
-                return Some((start, end_open));
-            }
-            let close_tag = format!("</{}>", tag_name);
-            let close_offset = text[end_open..].find(&close_tag)?;
-            let end = end_open + close_offset + close_tag.len();
-            return Some((start, end));
-        }
-        from = after;
-    }
-    None
+/// Specification of the `<plan>` control tag from the XML tag registry.
+pub(crate) fn tag_spec() -> Option<&'static engine::XmlTagSpec> {
+    engine::tag_spec("plan")
 }
 
 /// Removes all plan tags from text.
 pub fn strip_plan_tags(text: &str) -> String {
-    strip_tags(text, next_plan_tag)
+    match tag_spec() {
+        Some(spec) => engine::strip_tag_by_spec(text, spec),
+        None => text.to_string(),
+    }
 }
 
 /// Structured representation of a parsed `<plan>` block.

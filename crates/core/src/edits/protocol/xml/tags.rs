@@ -10,14 +10,7 @@ mod scratchpad;
 mod search;
 mod verify;
 
-pub(crate) use context::next_context_request_tag;
-pub(crate) use docs::next_doc_request_tag;
-pub(crate) use language::next_user_language_tag;
-pub(crate) use outcome::{next_blocked_tag, next_error_tag, next_success_tag};
-pub(crate) use plan::next_plan_tag;
-pub(crate) use scratchpad::next_scratchpad_tag;
-pub(crate) use search::next_repo_search_tag;
-pub(crate) use verify::next_verify_tag;
+use super::engine;
 
 pub(crate) use context::parse_context_request_tags;
 pub(crate) use docs::parse_doc_request_tags;
@@ -39,96 +32,15 @@ pub use verify::{
     extract_verify_request, strip_verify_tags, VerifyOnSuccess, VerifyRequest, VerifyTarget,
 };
 
-/// Locates the next complete tag starting with `open` (e.g. `<verify`), either
-/// self-closing or paired with an immediately following closing tag. The optional
-/// turn-marker suffix is accepted. Returns the byte range `(start, end)`.
-/// Incomplete tags yield None.
-fn next_simple_tag(text: &str, open: &str) -> Option<(usize, usize)> {
-    let mut from = 0;
-    while let Some(rel) = text[from..].find(open) {
-        let start = from + rel;
-        let after = start + open.len();
-        let bytes = text.get(after..).unwrap_or_default().as_bytes();
-        let mut idx = 0;
-        if idx < bytes.len() && (bytes[idx] == b'_' || bytes[idx] == b'-') {
-            idx += 1;
-            while idx < bytes.len()
-                && (bytes[idx].is_ascii_alphanumeric() || bytes[idx] == b'_' || bytes[idx] == b'-')
-            {
-                idx += 1;
-            }
-        }
-        let tag_name = text.get(start + 1..after + idx).unwrap_or_default();
-        let rest = text.get(after + idx..).unwrap_or_default();
-        let boundary = rest
-            .chars()
-            .next()
-            .is_some_and(|c| c.is_whitespace() || c == '>' || c == '/');
-        if boundary {
-            if is_inside_markdown_code(text, start) {
-                from = after;
-                continue;
-            }
-            let gt = rest.find('>')?;
-            let mut end = after + idx + gt + 1;
-            if !rest[..gt].trim_end().ends_with('/') {
-                let close_tag = format!("</{}>", tag_name);
-                let after_open = text.get(end..).unwrap_or_default();
-                let trimmed = after_open.trim_start();
-                if trimmed.starts_with(&close_tag) {
-                    end += (after_open.len() - trimmed.len()) + close_tag.len();
-                }
-            }
-            return Some((start, end));
-        }
-        from = after;
-    }
-    None
-}
-
-fn next_control_tag(text: &str, open: &str) -> Option<(usize, usize)> {
-    let mut from = 0;
-    while let Some(rel) = text[from..].find(open) {
-        let start = from + rel;
-        let after = start + open.len();
-        let bytes = text.get(after..).unwrap_or_default().as_bytes();
-        let mut idx = 0;
-        if idx < bytes.len() && (bytes[idx] == b'_' || bytes[idx] == b'-') {
-            idx += 1;
-            while idx < bytes.len()
-                && (bytes[idx].is_ascii_alphanumeric() || bytes[idx] == b'_' || bytes[idx] == b'-')
-            {
-                idx += 1;
-            }
-        }
-        let tag_name = text.get(start + 1..after + idx).unwrap_or_default();
-        let rest = text.get(after + idx..).unwrap_or_default();
-        let boundary = rest
-            .chars()
-            .next()
-            .is_some_and(|c| c.is_whitespace() || c == '>' || c == '/');
-        if boundary {
-            if is_inside_markdown_code(text, start) {
-                from = after;
-                continue;
-            }
-            let gt = rest.find('>')?;
-            let end_open = after + idx + gt + 1;
-            if rest[..gt].trim_end().ends_with('/') {
-                return Some((start, end_open));
-            }
-            let close_tag = format!("</{}>", tag_name);
-            if let Some(close_offset) = text.get(end_open..).unwrap_or_default().find(&close_tag) {
-                let end = end_open + close_offset + close_tag.len();
-                return Some((start, end));
-            } else {
-                from = after;
-                continue;
-            }
-        }
-        from = after;
-    }
-    None
+/// Locates the next complete tag named by `open` (for example `<verify`).
+///
+/// The close mode is declared by the tag's [`XmlTagSpec`], so every tag family
+/// shares one scanner: self-closing, closed directly after the header, or paired
+/// with a later closing tag. An optional turn-marker suffix is accepted, tags
+/// inside markdown code are ignored, and an incomplete tag yields `None`.
+fn next_tag_bounds(text: &str, open: &str) -> Option<(usize, usize)> {
+    let spec = engine::tag_spec(open.trim_start_matches('<'))?;
+    engine::find_next_tag_bounds(text, spec)
 }
 
 fn strip_tags(text: &str, next: fn(&str) -> Option<(usize, usize)>) -> String {
@@ -243,7 +155,9 @@ fn is_inside_code_fence(text: &str, target_pos: usize) -> bool {
 }
 
 /// Returns true if byte offset `target_pos` in `text` is inside a markdown code block (fenced or inline).
-fn is_inside_markdown_code(text: &str, target_pos: usize) -> bool {
+///
+/// Shared with the tag engine, which refuses to treat code samples as commands.
+pub(crate) fn is_inside_markdown_code(text: &str, target_pos: usize) -> bool {
     is_inside_code_fence(text, target_pos) || is_inside_inline_code(text, target_pos)
 }
 

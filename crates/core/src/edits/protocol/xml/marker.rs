@@ -2,6 +2,8 @@
 //! generation, exact marker matching, and normalization of marker-suffixed tags
 //! into the plain dialect.
 
+use super::engine::{accepts_unmarked_child, tag_bases, tag_spec, OpenTag};
+
 /// Generates a process-unique, unpredictable alphanumeric turn marker.
 ///
 /// The marker binds structural protocol tags to a single turn so that literal
@@ -46,17 +48,6 @@ fn fallback_turn_marker() -> String {
     format!("{:016X}", sequence.fetch_add(1, Ordering::Relaxed))
 }
 
-pub(super) const XML_TAG_BASES: &[&str] = &[
-    "tauqe_edits", "edit", "search", "replace", "create", "delete", "move", "with", "summary",
-    "context_request", "context_drop", "repo_search", "user_language", "verify", "overwrite",
-    "doc_request", "plan", "concept", "concept_item", "item", "description", "details", "title",
-    "scratchpad", "success", "error", "blocked",
-];
-
-const PLAN_CHILD_TAGS: &[&str] = &[
-    "concept", "concept_item", "item", "description", "details", "title", "summary",
-];
-
 fn literal_prefix(marker: &str) -> String {
     format!("\u{e000}{}\u{e001}", marker)
 }
@@ -92,7 +83,7 @@ pub(crate) fn normalize_marked_xml(text: &str, marker: &str, finished: bool) -> 
 pub(crate) fn normalize_marked_xml_incremental(
     raw: &mut String,
     marker: &str,
-    stack: &mut Vec<&'static str>,
+    stack: &mut Vec<OpenTag>,
     finished: bool,
 ) -> String {
     let mut output = String::new();
@@ -117,25 +108,25 @@ pub(crate) fn normalize_marked_xml_incremental(
             break;
         }
         let name = &raw[name_start..name_end];
-        let mut active = XML_TAG_BASES.iter().copied().find(|base| {
-            name.strip_prefix(base)
-                .and_then(|rest| rest.strip_prefix('_').or_else(|| rest.strip_prefix('-')))
-                .map(|suffix| marker_matches(suffix, marker))
-                .unwrap_or(false)
-        });
-        if active.is_none()
-            && stack
-                .iter()
-                .any(|s| *s == "plan" || *s == "concept" || *s == "concept_item")
-        {
-            if let Some(base) = PLAN_CHILD_TAGS.iter().copied().find(|&base| name == base) {
-                active = Some(base);
-            }
+        let mut active = tag_bases()
+            .find(|base| {
+                name.strip_prefix(*base)
+                    .and_then(|rest| rest.strip_prefix('_').or_else(|| rest.strip_prefix('-')))
+                    .map(|suffix| marker_matches(suffix, marker))
+                    .unwrap_or(false)
+            })
+            .map(|base| OpenTag { base, marked: true });
+        if active.is_none() && accepts_unmarked_child(stack, name) {
+            active = tag_spec(name).map(|spec| OpenTag {
+                base: spec.base_name,
+                marked: false,
+            });
         }
         let boundary = raw[name_end..].chars().next()
             .map(|c| c.is_whitespace() || c == '>' || c == '/')
             .unwrap_or(false);
-        if let (true, Some(base)) = (boundary, active) {
+        if let (true, Some(open)) = (boundary, active) {
+            let base = open.base;
             // Find the end of the header without mistaking quoted '>' for its delimiter.
             let mut quote = None;
             let mut end = None;
@@ -158,12 +149,27 @@ pub(crate) fn normalize_marked_xml_incremental(
                 pos = start + 1;
                 continue;
             };
+            // A marker-bound frame is closed only by its own marker-bound tag, so a
+            // literal closing tag quoted inside a marked leaf body stays protected.
+            let close_index = if !closing {
+                None
+            } else if open.marked {
+                stack.iter().rposition(|frame| frame.base == base)
+            } else {
+                // An unmarked closing tag may close only the innermost frame, and
+                // only when that frame was opened unmarked as well.
+                match stack.split_last() {
+                    Some((frame, rest)) if !frame.marked && frame.base == base => Some(rest.len()),
+                    _ => None,
+                }
+            };
             let accepted = if closing {
-                if let Some(p) = stack.iter().rposition(|&s| s == base) {
-                    stack.truncate(p);
-                    true
-                } else {
-                    false
+                match close_index {
+                    Some(index) => {
+                        stack.truncate(index);
+                        true
+                    }
+                    None => false,
                 }
             } else {
                 true
@@ -174,7 +180,7 @@ pub(crate) fn normalize_marked_xml_incremental(
                 output.push_str(base);
                 output.push_str(&raw[name_end..end]);
                 if !closing && !raw[name_end..end].trim_end().ends_with("/>") {
-                    stack.push(base);
+                    stack.push(open);
                 }
                 pos = end;
                 continue;

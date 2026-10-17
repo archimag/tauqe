@@ -3,11 +3,14 @@ pub mod protocol;
 pub mod stream;
 pub mod xml;
 
+use crate::capabilities::CapabilityRegistry;
 use crate::context::ContextFileContent;
 use crate::edits::stream::json::decode::first_json_object_str;
 use crate::prompt::protocol::PromptProtocol;
 use crate::providers::{ChatMessage, JsonSchemaDefinition, ResponseFormat};
-use tauqe_protocol::{ContextAccess, ModelRole, Plan, RepositoryState};
+use tauqe_protocol::{
+    CapabilitySet, ContextAccess, LlmCapability, ModelRole, Plan, RepositoryState,
+};
 
 /// Default model role used for squash commit message synthesis.
 pub const SQUASH_COMMIT_ROLE: ModelRole = ModelRole::Scribe;
@@ -195,6 +198,32 @@ pub fn estimate_tokens(text: &str) -> usize {
     estimate_tokens_from_bytes(text.len() as u64) as usize
 }
 
+/// Renders the operational-tag rule from the active capability set.
+///
+/// The tag list is derived from the capability registry, so a narrowed set never
+/// advertises a tag the model is unable to use.
+fn operational_tags_rule(capabilities: &CapabilitySet) -> String {
+    let tags: Vec<String> = CapabilityRegistry::global()
+        .operational_xml_tags(capabilities)
+        .into_iter()
+        .map(|tag| format!("<{}>", tag))
+        .collect();
+    format!(
+        "1a. Operational Protocol Tags: All operational protocol tags ({}) must be emitted strictly at the end of your response outside markdown code blocks. If you mention, quote, or discuss tags in conversational text, you MUST enclose them in backticks (e.g. `<context_request ...>`) so they are treated as literal text and not operational commands.\n",
+        tags.join(", ")
+    )
+}
+
+/// Keeps only the capabilities present in both sets, preserving `set` order.
+fn intersect_capabilities(set: &CapabilitySet, allowed: &CapabilitySet) -> CapabilitySet {
+    let kept: Vec<LlmCapability> = set
+        .iter()
+        .copied()
+        .filter(|capability| allowed.contains(*capability))
+        .collect();
+    CapabilitySet::from_slice(&kept)
+}
+
 pub struct PromptAssembly {
     pub repo_state: Option<RepositoryState>,
     pub context_revision: u64,
@@ -262,16 +291,14 @@ impl PromptAssembly {
     }
 
     pub fn build_system_prompt(&self, protocol: &dyn PromptProtocol) -> String {
+        let capabilities = self.effective_capabilities(protocol);
+        let effective_protocol = protocol.with_capability_set(capabilities.clone());
         let mut prompt = String::new();
         prompt.push_str("You are Tauqe AI, an expert programming assistant operating inside TAUQE (The Answer to the Ultimate Question of Engineering), an AI-native engineering control environment built on the literal harness paradigm.\n\n");
         prompt.push_str("## Core System Contract\n");
         prompt.push_str("1. Authoritative Source: The files provided in <context> represent the authoritative current state of the project. Do not invent missing code.\n");
-        if self.is_isolated_step {
-            prompt.push_str("1a. Operational Protocol Tags: All operational protocol tags (<context_request>, <repo_search>, <doc_request>, <user_language>, <scratchpad>, <success>, <error>, <blocked>) must be emitted strictly at the end of your response outside markdown code blocks. If you mention, quote, or discuss tags in conversational text, you MUST enclose them in backticks (e.g. `<context_request ...>`) so they are treated as literal text and not operational commands.\n");
-        } else {
-            prompt.push_str("1a. Operational Protocol Tags: All operational protocol tags (<context_request>, <repo_search>, <doc_request>, <verify>, <user_language>, <plan>, <scratchpad>, <success>, <error>, <blocked>) must be emitted strictly at the end of your response outside markdown code blocks. If you mention, quote, or discuss tags in conversational text, you MUST enclose them in backticks (e.g. `<context_request ...>`) so they are treated as literal text and not operational commands.\n");
-        }
-        let marker_suffix = protocol
+        prompt.push_str(&operational_tags_rule(&capabilities));
+        let marker_suffix = effective_protocol
             .turn_marker()
             .map(|m| format!("_{}", m))
             .unwrap_or_default();
@@ -288,47 +315,57 @@ impl PromptAssembly {
             prompt.push_str("3. Editable Scope: Files inside <editable_files> are permitted for modification. You may also create new files using <create path=\"...\"> or move/rename files using <move from=\"...\" to=\"...\" /> when required by the task.\n");
         }
         prompt.push_str("4. No Arbitrary Shell: You do not have shell execution capabilities. Work strictly through the context and actions provided.\n");
-        if !self.is_discussion {
+        if !self.is_discussion && capabilities.contains(LlmCapability::FileEdits) {
             prompt.push_str("5. Minimal Coherent Change: Prefer the smallest coherent modification necessary to complete the task.\n");
             prompt.push_str("6. Always Explain Changes: Whenever you propose file edits, you MUST precede them with a concise conversational explanation (1-3 sentences) explaining what changes were made, why, and how they achieve the user's intent. Never output edits alone without an accompanying explanation.\n");
         }
         prompt.push_str("7. Reasoning in English: Always conduct internal reasoning, planning, and thinking strictly in English to preserve token budget and maximize reasoning quality.\n");
 
-        if let Some(lang) = &self.target_language {
-            prompt.push_str(&format!(
-                "8. Language Consistency: The user's language is {}. All conversational explanations, answers, and messages MUST be in {}. Do NOT switch to English for conversational responses unless requested.\n",
-                lang, lang
-            ));
-        } else if self.is_discussion {
-            prompt.push_str(
-                "8. Language Consistency: Always formulate conversational explanations and user-facing answers in `message` in the same language as the user's request. Identify the user's language in the `user_language` field (e.g. \"Russian\"). Do NOT switch to English for conversational responses unless requested.\n",
-            );
-        } else {
-            prompt.push_str(&format!(
-                "8. Language Consistency: Always formulate conversational explanations and user-facing answers in the same language as the user's request. Identify the user's language using <user_language{}>language_name</user_language{}> (e.g. <user_language{}>Russian</user_language{}>). Do NOT switch to English for conversational responses unless requested.\n",
-                marker_suffix, marker_suffix, marker_suffix, marker_suffix
-            ));
+        if capabilities.contains(LlmCapability::UserLanguage) {
+            if let Some(lang) = &self.target_language {
+                prompt.push_str(&format!(
+                    "8. Language Consistency: The user's language is {}. All conversational explanations, answers, and messages MUST be in {}. Do NOT switch to English for conversational responses unless requested.\n",
+                    lang, lang
+                ));
+            } else if self.is_discussion {
+                prompt.push_str(
+                    "8. Language Consistency: Always formulate conversational explanations and user-facing answers in `message` in the same language as the user's request. Identify the user's language in the `user_language` field (e.g. \"Russian\"). Do NOT switch to English for conversational responses unless requested.\n",
+                );
+            } else {
+                prompt.push_str(&format!(
+                    "8. Language Consistency: Always formulate conversational explanations and user-facing answers in the same language as the user's request. Identify the user's language using <user_language{}>language_name</user_language{}> (e.g. <user_language{}>Russian</user_language{}>). Do NOT switch to English for conversational responses unless requested.\n",
+                    marker_suffix, marker_suffix, marker_suffix, marker_suffix
+                ));
+            }
         }
         if self.is_isolated_step {
             prompt.push_str(
-                "9. Code Verification: Verification on code modifications is handled automatically and deterministically by the harness at the end of each step. Do NOT emit <verify> tags (the harness runs toolchain verification and gating automatically).\n"
+                "9. Code Verification: Verification on code modifications is handled automatically and deterministically by the harness at the end of each step. Do NOT emit verification tags (the harness runs toolchain verification and gating automatically).\n"
             );
-        } else {
+        } else if capabilities.contains(LlmCapability::ToolchainVerify) {
             prompt.push_str(&format!(
                 "9. Code Verification: Verification on code modifications is performed automatically and deterministically by the harness. Emit <verify{0} target=\"all|check|test|clippy\" on_success=\"silent|report\" /> ONLY when the user explicitly requests running verification, compiler checks, or tests to inspect codebase status. Always use on_success=\"silent\" unless the user explicitly asked to see raw command logs or test output. Do NOT emit <verify> on normal code edits, as the harness verifies them automatically.\n",
                 marker_suffix
             ));
         }
-        prompt.push_str(&format!(
-            "10. Self-Knowledge: When the user asks about your identity, capabilities, concepts, workflows, keyboard shortcuts, or configuration, do NOT guess. Request the authoritative documentation using <doc_request{} topic=\"{}\" /> and output nothing else except a short note. You will be called again with <system_documentation> blocks; base your answer strictly on them and formulate it in the user's language.\n",
-            marker_suffix,
-            crate::docs::topic_hint()
-        ));
-        prompt.push_str(&format!(
-            "10a. Turn Scratchpad (Working Memory): To retain working hypotheses, verified findings, or focus across multi-round discovery and verification healing cycles, you may emit <scratchpad{0}>...</scratchpad{0}>. Keep scratchpad notes concise (bullet points of what is verified, current hypothesis, and purpose of requested files). Notes are preserved within the current turn in <scratchpad> and isolated from persistent history.\n",
-            marker_suffix
-        ));
-        if !self.is_isolated_step {
+        if capabilities.contains(LlmCapability::DocRequest) {
+            prompt.push_str(&format!(
+                "10. Self-Knowledge: When the user asks about your identity, capabilities, concepts, workflows, keyboard shortcuts, or configuration, do NOT guess. Request the authoritative documentation using <doc_request{} topic=\"{}\" /> and output nothing else except a short note. You will be called again with <system_documentation> blocks; base your answer strictly on them and formulate it in the user's language.\n",
+                marker_suffix,
+                crate::docs::topic_hint()
+            ));
+        }
+        if capabilities.contains(LlmCapability::Scratchpad) {
+            prompt.push_str(&format!(
+                "10a. Turn Scratchpad (Working Memory): To retain working hypotheses, verified findings, or focus across multi-round discovery and verification healing cycles, you may emit <scratchpad{0}>...</scratchpad{0}>. Keep scratchpad notes concise (bullet points of what is verified, current hypothesis, and purpose of requested files). Notes are preserved within the current turn in <scratchpad> and isolated from persistent history.\n",
+                marker_suffix
+            ));
+        }
+        let plans_enabled = capabilities.contains(LlmCapability::PlanCreation)
+            || capabilities.contains(LlmCapability::PlanUpdate);
+        if self.is_isolated_step {
+            prompt.push_str("11. Step Execution Scope: You are executing a single isolated plan step. Plan creation, modification, status updates, or plan tags are strictly prohibited (step lifecycle and plan tracking are handled deterministically by the harness).\n\n");
+        } else if plans_enabled {
             if self.is_discussion {
                 prompt.push_str(
                     "11. Local Engineering Plans: When formulating or updating a task plan, populate the structured `plan_update` field in your response object with `action: \"save\"|\"update\"|\"delete\"`, plan `id`, `title`, `description`, `concept`, and `items`. Conceptual Foundation Invariant: Every plan in TAUQE is a two-section document and MUST have an architectural concept tree in `concept` defining requirements, design decisions, and system invariants ('What'). When creating a new plan (`action: \"save\"`), you MUST populate `concept` with at least one concept node. Creating a plan without a concept tree is strictly prohibited. Implementation steps in `items` ('How') are either outlined with `concept_refs` pointing to concept nodes, or left empty (`items: []`) to be synthesized subsequently by deep refinement (`plan_refine`). File Attributes Contract: `files` lists target files to create or modify (loaded as editable context), while `readonly_files` lists reference or contract files (loaded as read-only context and never modified). Leaf-Only Files Invariant: `files` and `readonly_files` must be specified exclusively for executable leaf steps without children; parent container items and task groups must have an empty `files: []` and `readonly_files: []` lists. Plan Action Semantics: Use `action: \"save\"` to create or completely overwrite/replace the entire plan; use `action: \"update\"` strictly to modify specific individual nodes or items in place by ID without touching unmentioned items; use `action: \"delete\"` to remove the plan. Reins Invariant: Never mutate the plan (leave `plan_update: null`) without an explicit user instruction to modify it. Questions, analysis, trade-off reviews, and critique must be answered strictly in conversational text in `message`. Planning Objective: Collaborative planning focuses on conceptual comprehension of the objective ('What'), aligning on key architectural decisions and trade-offs, and defining a cohesive concept tree without premature low-level code churn. Step Formulation Contract: Formulate each step around an engineering objective and operational invariants; define what state must be achieved and what invariants preserved. Always provide a clear `description` explaining the overall architecture, boundaries, and rationale. Language Consistency: Formulate plan title, description, concept titles/details, and step titles/details in the same language as the plan description and user's request. In <active_plan>, items marked with [FOCUSED] are focused by the user.\n\n",
@@ -339,8 +376,6 @@ impl PromptAssembly {
                     marker_suffix
                 ));
             }
-        } else {
-            prompt.push_str("11. Step Execution Scope: You are executing a single isolated plan step. Plan creation, modification, status updates, or plan tags (<plan>) are strictly prohibited (step lifecycle and plan tracking are handled deterministically by the harness).\n\n");
         }
 
         if !self.is_discussion {
@@ -352,7 +387,7 @@ impl PromptAssembly {
                 .collect();
 
             // Delegate edit protocol specific instructions
-            prompt.push_str(&protocol.system_instructions(&editable_paths));
+            prompt.push_str(&effective_protocol.system_instructions(&editable_paths));
         } else {
             prompt.push_str("## Mode: Structured Discussion\n");
             prompt.push_str("You are participating in an architectural discussion. Code modifications are strictly prohibited. You cannot edit, create, or delete code files. Focus on conceptual comprehension of the objective ('What'), clarifying requirements, evaluating trade-offs, establishing key design decisions, and formulating or refining plans via structured fields.\n");
@@ -375,6 +410,24 @@ impl PromptAssembly {
         prompt.push_str(&format!("- Edit Protocol: {}\n\n", self.edit_protocol));
 
         prompt
+    }
+
+    /// Computes the capability set this turn actually advertises.
+    ///
+    /// The protocol's own set is narrowed to the active mode: a discussion turn
+    /// is read-only, and an isolated step never advertises toolchain
+    /// verification because the harness verifies it deterministically.
+    fn effective_capabilities(&self, protocol: &dyn PromptProtocol) -> CapabilitySet {
+        let mut capabilities = protocol.capability_set();
+        if self.is_discussion {
+            capabilities = intersect_capabilities(&capabilities, &CapabilitySet::discussion());
+        }
+        if self.is_isolated_step {
+            capabilities =
+                intersect_capabilities(&capabilities, &CapabilitySet::isolated_step_xml());
+            capabilities = capabilities.without(LlmCapability::ToolchainVerify);
+        }
+        capabilities
     }
 
     pub fn format_context_block(&self) -> Option<String> {
@@ -693,6 +746,8 @@ mod tests {
         let sys_prompt = assembly.build_system_prompt(&proto);
         assert!(!sys_prompt.contains("11. Local Engineering Plans"));
         assert!(sys_prompt.contains("11. Step Execution Scope"));
+        assert!(!sys_prompt.contains("<plan"));
+        assert!(!sys_prompt.contains("<verify"));
 
         let messages = assembly.assemble_chat_messages("Execute step", &proto);
         assert!(!messages[0].content.contains("## Active Task Plan Context"));
@@ -766,6 +821,43 @@ mod tests {
         assembly.turn_scratchpad = Some(multi_byte_text);
         let block = assembly.format_scratchpad_block().unwrap();
         assert!(block.contains("... [scratchpad truncated for length] ..."));
+    }
+
+    #[test]
+    fn test_narrowed_capabilities_hide_disabled_instructions() {
+        use crate::prompt::protocol::PromptProtocol;
+        use tauqe_protocol::LlmCommand;
+
+        let assembly = PromptAssembly::new(None, 1, vec![], "git", "xml", None, None);
+        let narrowed = XmlPromptProtocol::with_capabilities(CapabilitySet::from_slice(&[
+            LlmCapability::TextMessage,
+            LlmCapability::FileEdits,
+        ]));
+        let prompt = assembly.build_system_prompt(&*narrowed);
+
+        assert!(prompt.contains("<tauqe_edits summary"));
+        assert!(!prompt.contains("<context_request>"));
+        assert!(!prompt.contains("<verify"));
+        assert!(!prompt.contains("<scratchpad"));
+        assert!(!prompt.contains("<success"));
+        assert!(!prompt.contains("10. Self-Knowledge"));
+        assert!(!prompt.contains("10a. Turn Scratchpad"));
+
+        // The same set narrows decoding, so a disabled capability never reaches
+        // the execution pipeline.
+        let raw =
+            "Working.\n<context_request path=\"src/a.rs\" />\n<scratchpad>notes</scratchpad>\n";
+        let full = XmlPromptProtocol.decode(raw);
+        assert!(full
+            .iter()
+            .any(|command| matches!(command, LlmCommand::ContextRequest { .. })));
+        let filtered = narrowed.decode(raw);
+        assert!(!filtered
+            .iter()
+            .any(|command| matches!(command, LlmCommand::ContextRequest { .. })));
+        assert!(!filtered
+            .iter()
+            .any(|command| matches!(command, LlmCommand::Scratchpad { .. })));
     }
 
     #[test]

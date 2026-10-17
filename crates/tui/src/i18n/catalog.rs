@@ -112,7 +112,6 @@ pub fn canonical_catalog() -> Vec<LocaleCatalogItem> {
         // ------------------------------------------------------------------
         item("dialog.confirm_cancel.title", "Confirm Cancellation", "Title for active turn cancellation popup", None),
         item("dialog.confirm_quit.title", "Confirm Quit", "Title for unsaved changes exit dialog", None),
-        item("dialog.confirm_undo.title", "Undo AI Commit", "Title for Git transaction undo dialog", None),
         item("dialog.confirm_detach_focus.title", "Confirm Detach Focus", "Title for discussion focus detach dialog", None),
         item("dialog.delete_plan.title", "Delete Plan", "Title for plan deletion confirmation dialog", None),
         item("dialog.delete_review.title", "Delete Review", "Title for review session deletion confirmation dialog", None),
@@ -144,7 +143,6 @@ pub fn canonical_catalog() -> Vec<LocaleCatalogItem> {
         // ------------------------------------------------------------------
         item("dialog.button.interrupt", "Interrupt", "Confirm turn interruption button", Some(14)),
         item("dialog.button.quit", "Quit TAUQE", "Confirm application quit button", Some(14)),
-        item("dialog.button.confirm_undo", "Confirm Undo", "Confirm Git undo button", Some(16)),
         item("dialog.button.detach", "Detach", "Confirm discussion focus detach button", Some(12)),
         item("dialog.button.replan_horizon", "Replan Horizon", "Replan the plan horizon button", Some(16)),
         item("dialog.button.dismiss", "Dismiss", "Dismiss dialog button", Some(12)),
@@ -179,11 +177,6 @@ pub fn canonical_catalog() -> Vec<LocaleCatalogItem> {
         item("dialog.confirm_quit.activity_squash_message", "You have an uncommitted squash message in progress.", "Confirm-quit activity line with a squash message", None),
         item("dialog.confirm_quit.activity_default", "Active session work may be lost.", "Confirm-quit default activity line", None),
         item("dialog.confirm_quit.exit_note", "Exiting now will terminate the session and discard active work.", "Confirm-quit note about discarding active work", None),
-
-        item("dialog.confirm_undo.question", "Are you sure you want to undo the last AI commit?", "Confirm-undo dialog question line", None),
-        item("dialog.confirm_undo.commit_label", "Commit: ", "Confirm-undo commit hash field label", None),
-        item("dialog.confirm_undo.summary_label", "Summary: ", "Confirm-undo commit summary field label", None),
-        item("dialog.confirm_undo.restore_note", "Any uncommitted changes from the pre-edit checkpoint will be restored.", "Confirm-undo note about restoring the checkpoint", None),
 
         item("dialog.confirm_detach_focus.question", "Detach the active discussion focus?", "Confirm-detach-focus dialog question line", None),
         item("dialog.confirm_detach_focus.repl_note", "The REPL will return to the free codebase context.", "Confirm-detach-focus note about returning to the REPL", None),
@@ -489,7 +482,6 @@ pub fn canonical_catalog() -> Vec<LocaleCatalogItem> {
         // Command descriptions for the REPL (Develop) view.
         // ------------------------------------------------------------------
         item("cmd.repl.send", "Send the prompt", "REPL command description", None),
-        item("cmd.repl.undo", "Undo the last AI commit", "REPL command description", None),
         item("cmd.repl.squash", "Open the squash AI commits dialog", "REPL command description", None),
         item("cmd.repl.toggle_focus", "Switch focus between the prompt and the Viewport", "REPL command description", None),
         item("cmd.repl.toggle_file_fold", "Fold or unfold the selected file diff", "REPL command description", None),
@@ -599,8 +591,6 @@ pub fn canonical_catalog() -> Vec<LocaleCatalogItem> {
         item("notify.prompt_cleared", "Prompt cleared (C-Y to restore)", "REPL notification after clearing the prompt", None),
         item("notify.prompt_clear_arm", "Press Esc again to clear the prompt", "REPL notification arming the prompt clear", None),
         item("notify.prompt_send_failed", "Failed to send prompt: {}", "REPL notification when sending a prompt fails", None),
-        item("notify.undo_busy", "Cannot undo while model is generating", "REPL notification rejecting an undo while busy", None),
-        item("notify.undo_none", "No AI commit to undo", "REPL notification when no AI commit exists", None),
         item("notify.copy_busy", "Cannot copy while model is generating", "REPL notification rejecting a copy while busy", None),
         item("notify.copy_no_response", "No model response to copy", "REPL notification when there is no response to copy", None),
         item("notify.response_copied", "Model response copied to clipboard", "REPL notification after copying the response", None),
