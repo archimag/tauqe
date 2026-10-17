@@ -3,6 +3,7 @@ use ratatui::style::{Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
+use crate::i18n::active_t;
 use crate::theme::engine::current_engine;
 use crate::ui::centered_rect;
 use crate::ui::header::truncate_to_width;
@@ -19,8 +20,8 @@ pub fn prompt_modal_area(term: Rect) -> Rect {
 pub fn prompt_modal_buttons(term: Rect) -> (Rect, Rect) {
     crate::components::modal::modal_action_buttons(
         prompt_modal_area(term),
-        "Send to AI (Enter)",
-        "Cancel (Esc)",
+        &active_t("modal.send"),
+        &active_t("modal.cancel"),
     )
 }
 
@@ -34,26 +35,28 @@ pub fn render_prompt_modal(
     let (dialog_title, tone, header_lines) = match &modal.target {
         crate::app::PromptModalTarget::Review { review_id, review_title, focused_items } => {
             let title = if let Some((item_id, _)) = focused_items.first() {
-                format!("Discuss Finding: [{}] #{}", review_id, item_id)
+                active_t("dialog.prompt.title_finding")
+                    .replacen("{}", review_id, 1)
+                    .replacen("{}", &item_id.to_string(), 1)
             } else {
-                format!("Discuss Review Session: [{}]", review_id)
+                active_t("dialog.prompt.title_review").replacen("{}", review_id, 1)
             };
             let mut lines = vec![
                 Line::from(vec![
-                    Span::styled(" Review: ", engine.fg(palette.text_muted)),
+                    Span::styled(active_t("dialog.prompt.review_label"), engine.fg(palette.text_muted)),
                     Span::styled(review_title, engine.fg(palette.text_primary).bold()),
                 ]),
             ];
             if focused_items.is_empty() {
                 lines.push(Line::from(vec![
-                    Span::styled(" Scope: ", engine.fg(palette.text_muted)),
-                    Span::styled("Entire review session", engine.fg(palette.status_warning).bold()),
-                    Span::styled(" (discussing code quality findings and resolution plan)", engine.fg(palette.text_muted)),
+                    Span::styled(active_t("dialog.prompt.scope_label"), engine.fg(palette.text_muted)),
+                    Span::styled(active_t("dialog.prompt.scope_review"), engine.fg(palette.status_warning).bold()),
+                    Span::styled(active_t("dialog.prompt.scope_review_note"), engine.fg(palette.text_muted)),
                 ]));
             } else if let Some((id, title)) = focused_items.first() {
                 let max_w = area.width.saturating_sub(22) as usize;
                 lines.push(Line::from(vec![
-                    Span::styled(" Target finding: ", engine.fg(palette.text_muted)),
+                    Span::styled(active_t("dialog.prompt.target_finding_label"), engine.fg(palette.text_muted)),
                     Span::styled(
                         truncate_to_width(&format!("#{} {}", id, title), max_w),
                         engine.fg(palette.status_success).bold(),
@@ -64,26 +67,28 @@ pub fn render_prompt_modal(
         }
         crate::app::PromptModalTarget::Plan { plan_id, plan_title, focused_items } => {
             let title = if let Some((step_id, _)) = focused_items.first() {
-                format!("Discuss Step: [{}] #{}", plan_id, step_id)
+                active_t("dialog.prompt.title_step")
+                    .replacen("{}", plan_id, 1)
+                    .replacen("{}", &step_id.to_string(), 1)
             } else {
-                format!("Discuss Plan: [{}]", plan_id)
+                active_t("dialog.prompt.title_plan").replacen("{}", plan_id, 1)
             };
             let mut lines = vec![
                 Line::from(vec![
-                    Span::styled(" Plan: ", engine.fg(palette.text_muted)),
+                    Span::styled(active_t("dialog.prompt.plan_label"), engine.fg(palette.text_muted)),
                     Span::styled(plan_title, engine.fg(palette.text_primary).bold()),
                 ]),
             ];
             if focused_items.is_empty() {
                 lines.push(Line::from(vec![
-                    Span::styled(" Scope: ", engine.fg(palette.text_muted)),
-                    Span::styled("Entire plan", engine.fg(palette.status_warning).bold()),
-                    Span::styled(" (discussing architecture and overall strategy)", engine.fg(palette.text_muted)),
+                    Span::styled(active_t("dialog.prompt.scope_label"), engine.fg(palette.text_muted)),
+                    Span::styled(active_t("dialog.prompt.scope_plan"), engine.fg(palette.status_warning).bold()),
+                    Span::styled(active_t("dialog.prompt.scope_plan_note"), engine.fg(palette.text_muted)),
                 ]));
             } else if let Some((id, title)) = focused_items.first() {
                 let max_w = area.width.saturating_sub(22) as usize;
                 lines.push(Line::from(vec![
-                    Span::styled(" Target step: ", engine.fg(palette.text_muted)),
+                    Span::styled(active_t("dialog.prompt.target_step_label"), engine.fg(palette.text_muted)),
                     Span::styled(
                         truncate_to_width(&format!("#{} {}", id, title), max_w),
                         engine.fg(palette.status_success).bold(),
@@ -95,23 +100,26 @@ pub fn render_prompt_modal(
     };
 
     let is_actions_focused = modal.focus.is_actions();
+    let confirm_label = active_t("modal.send");
+    let cancel_label = active_t("modal.cancel");
+    // The footer vocabulary is projected through the shared semantic span
+    // renderer: every group reads `CHORD / CHORD verb`, so chords are
+    // emphasized, verbs read as descriptions, and separators recede.
+    let hint = if is_actions_focused {
+        active_t("dialog.prompt.hint_actions")
+    } else {
+        active_t("dialog.prompt.hint_editor")
+    };
     let frame_params = ModalFrameParams {
         title: &dialog_title,
         tone,
         area,
-        confirm_label: "Send to AI (Enter)",
-        cancel_label: "Cancel (Esc)",
+        confirm_label: &confirm_label,
+        cancel_label: &cancel_label,
         actions_state: modal.actions,
         is_actions_focused,
         destructive: false,
-        // The footer vocabulary is projected through the shared semantic span
-        // renderer: every group reads `CHORD / CHORD verb`, so chords are
-        // emphasized, verbs read as descriptions, and separators recede.
-        hint_text: if is_actions_focused {
-            Some("← / → switch • Tab focus • Enter send • y / n select • Esc dismiss")
-        } else {
-            Some("Enter send • Shift+Enter / Alt+Enter / C-J newline • Tab controls • Esc dismiss")
-        },
+        hint_text: Some(&hint),
     };
 
     render_modal_frame(frame, frame_params, |f, body_area| {
@@ -132,7 +140,7 @@ pub fn render_prompt_modal(
             editor_content.push(Line::from(vec![
                 Span::styled(cursor, engine.fg(palette.status_warning)),
                 Span::styled(
-                    " Enter your comments, questions, or directives for Tauqe AI...",
+                    format!(" {}", active_t("dialog.prompt.editor_placeholder")),
                     engine.fg(palette.text_muted),
                 ),
             ]));
@@ -147,7 +155,7 @@ pub fn render_prompt_modal(
         };
 
         let editor_block = Block::default()
-            .title(" Your Comments / Questions (Enter send, Shift+Enter / Alt+Enter / C-J newline) ")
+            .title(format!(" {} ", active_t("dialog.prompt.editor_title")))
             .borders(Borders::ALL)
             .border_style(editor_border_style)
             .style(Style::default().bg(engine.color(palette.surface)));

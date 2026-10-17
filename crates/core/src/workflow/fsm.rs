@@ -53,18 +53,59 @@ pub struct FsmTurnOutcome {
     /// supervisor can move the step to `Blocked` and surface the diagnostic
     /// without running a patch retry or healing cycle.
     pub blocked: Option<String>,
+    /// Whether the model emitted an explicit terminal success signal
+    /// (`<success>`).
+    ///
+    /// A conversational answer without edits is a validated conclusion only
+    /// when the model marked it as such; otherwise the turn is an unverified
+    /// reply that the coder ladder may escalate.
+    pub has_terminal_success: bool,
+    /// Whether the turn applied a plan `save` action that created or fully
+    /// replaced a plan. Propagated to the workflow result so the server can
+    /// mark the emitted `plan/updated` event as a creation.
+    pub plan_saved: bool,
 }
 
-/// Whether a prompt opens a discussion turn rather than a develop turn.
+impl FsmTurnOutcome {
+    /// Whether the turn produced a conversational answer without edits and
+    /// without an explicit terminal success signal.
+    ///
+    /// Such a turn is an unverified reply rather than a validated conclusion:
+    /// with coder-ladder escalation enabled the harness re-runs it on a
+    /// stronger tier instead of accepting the empty answer.
+    pub fn is_unverified_answer(&self) -> bool {
+        matches!(self.result, ModelResult::Answer { .. }) && !self.has_terminal_success
+    }
+}
+
+/// Whether a prompt opens a typed focused dialogue turn rather than a plain
+/// develop turn.
 ///
-/// Discussion turns are assembled by the server with a typed discussion heading,
-/// so prompt assembly activates discussion mode from the heading instead of
-/// re-deriving the mode from free-form text. The server also consults this
-/// predicate to route discussion turns through the structured discussion
-/// protocol regardless of the configured base protocol.
+/// Focused dialogue covers both plan discussions and review focus dialogues, so
+/// the REPL recognises a focused turn from its typed heading instead of
+/// re-deriving the mode from free-form text. Read-only routing is narrower and
+/// lives in [`is_readonly_discussion_prompt`]; the two are deliberately distinct
+/// because a review focus keeps code-editing capability.
 pub fn is_discussion_prompt(prompt: &str) -> bool {
     crate::plan::prompt::is_plan_discussion_prompt(prompt)
         || crate::review::prompt::is_review_discussion_prompt(prompt)
+}
+
+/// Whether a prompt opens a strictly read-only architectural discussion turn.
+///
+/// Only a plan discussion is read-only: the model reasons about and proposes
+/// plan structure but is barred from editing code, so the turn is routed through
+/// the text-only structured discussion protocol.
+///
+/// A review focus dialogue is deliberately excluded. It keeps dual capability
+/// (addressed concept c-3): the developer may reason about a finding and directly
+/// request a code fix, so the turn is routed through the configured edit protocol
+/// — carrying file edits and toolchain verification — and prompt assembly stays
+/// in develop mode. This predicate is the single source of truth consulted by
+/// prompt assembly, the plan-mutation mode, and the server-side protocol
+/// resolver.
+pub fn is_readonly_discussion_prompt(prompt: &str) -> bool {
+    crate::plan::prompt::is_plan_discussion_prompt(prompt)
 }
 
 /// Bookkeeping metadata returned when beginning a session turn.
@@ -299,7 +340,7 @@ pub(super) async fn run_fsm_turn_body(
 
     let plan_mode = if is_isolated_step {
         PlanMutationMode::IsolatedStep
-    } else if is_discussion_prompt(prompt) {
+    } else if is_readonly_discussion_prompt(prompt) {
         PlanMutationMode::Discussion
     } else {
         PlanMutationMode::Develop
@@ -352,6 +393,8 @@ pub(super) async fn run_fsm_turn_body(
             },
             is_cancelled: true,
             blocked: None,
+            has_terminal_success: false,
+            plan_saved: false,
         });
     }
 
@@ -484,6 +527,12 @@ async fn finish_on_error_outcome(ctx: &mut PhaseContext<'_>) -> Option<FsmTurnOu
 /// When the model also requested toolchain verification, the verification
 /// report is appended to the answer text before the turn is recorded.
 async fn finish_answer_without_edits(ctx: &mut PhaseContext<'_>) -> FsmTurnOutcome {
+    // A bare answer is a validated conclusion only when the model marked it
+    // with an explicit `<success>` signal; otherwise it is an unverified reply.
+    let has_terminal_success = matches!(
+        ctx.state.terminal_outcome,
+        Some(tauqe_protocol::LlmOutcome::Success { .. })
+    );
     let mut answer_text = std::mem::take(&mut ctx.accumulated_text);
     if let Some(request) = ctx.state.verify_request.clone() {
         let outcome = run_workflow_verification(
@@ -503,6 +552,8 @@ async fn finish_answer_without_edits(ctx: &mut PhaseContext<'_>) -> FsmTurnOutco
                 },
                 is_cancelled: true,
                 blocked: None,
+                has_terminal_success: false,
+                plan_saved: false,
             };
         }
         if !outcome.report.trim().is_empty() {
@@ -523,14 +574,16 @@ async fn finish_answer_without_edits(ctx: &mut PhaseContext<'_>) -> FsmTurnOutco
     let result = ModelResult::Answer {
         text: answer_text.clone(),
     };
-    finish_turn(
+    let mut outcome = finish_turn(
         answer_text,
         result,
         ctx.repo_root,
         &ctx.state.plans,
         ctx.plan_mode,
     )
-    .await
+    .await;
+    outcome.has_terminal_success = has_terminal_success;
+    outcome
 }
 
 /// Finalizes the turn when patch application failed after every retry.

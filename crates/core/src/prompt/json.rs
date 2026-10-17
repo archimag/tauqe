@@ -127,6 +127,14 @@ impl PromptProtocol for JsonPromptProtocol {
                     });
                 }
 
+                // Discovery: repository searches.
+                for search in structured.parse_repo_searches(raw_text) {
+                    commands.push(LlmCommand::RepoSearch {
+                        path: search.path,
+                        regex: search.regex,
+                    });
+                }
+
                 // Toolchain verification decoded from control tags when present.
                 if let Some(request) = structured.parse_verify_request(raw_text) {
                     commands.push(LlmCommand::Verify {
@@ -163,6 +171,13 @@ impl PromptProtocol for JsonPromptProtocol {
                     });
                 }
 
+                for search in resp.repo_searches {
+                    commands.push(LlmCommand::RepoSearch {
+                        path: search.path,
+                        regex: search.regex,
+                    });
+                }
+
                 if let Some(language) = resp.user_language {
                     commands.push(LlmCommand::UserLanguage { language });
                 }
@@ -181,6 +196,7 @@ impl PromptProtocol for JsonPromptProtocol {
                     - message: Conversational Markdown explanation, reasoning, and answers. This field is streamed directly to the user interface.\n\
                     - plan_update: null (unless the user explicitly instructed to create or modify a plan)\n\
                     - context_requests: list of { path, access } files to add to context\n\
+                    - repo_searches: list of { path, regex } search queries using Rust / ripgrep regex syntax (supports \\b, \\w, \\d, (?:...), (?i); no lookarounds or backreferences)\n\
                     - user_language: detected primary natural language of user prompt (e.g. Russian, English)\n\
                     Output ONLY raw valid JSON matching this schema, without any outer markdown fences or markdown wrapping."
                         .to_string()
@@ -356,7 +372,13 @@ mod tests {
     #[test]
     fn test_decode_discovery_requests() {
         let protocol = JsonPromptProtocol::default();
-        let output = r#"{"message":"Need more context","changes":[],"context_requests":["src/a.rs","editable:src/b.rs"],"suggested_actions":[]}"#;
+        let output = r#"{
+            "message":"Need more context",
+            "changes":[],
+            "context_requests":["src/a.rs","editable:src/b.rs"],
+            "repo_searches":[{"path":"crates/core","regex":"fn execute"}],
+            "suggested_actions":[]
+        }"#;
         let commands = protocol.decode(output);
 
         assert!(commands.contains(&LlmCommand::ContextRequest {
@@ -366,6 +388,10 @@ mod tests {
         assert!(commands.contains(&LlmCommand::ContextRequest {
             path: "src/b.rs".to_string(),
             access: ContextAccess::Editable,
+        }));
+        assert!(commands.contains(&LlmCommand::RepoSearch {
+            path: "crates/core".to_string(),
+            regex: "fn execute".to_string(),
         }));
     }
 
@@ -431,6 +457,12 @@ mod tests {
                     "access": "read_only"
                 }
             ],
+            "repo_searches": [
+                {
+                    "path": "crates/core",
+                    "regex": "fn prompt"
+                }
+            ],
             "user_language": "Russian"
         }"#;
 
@@ -441,6 +473,10 @@ mod tests {
         assert!(commands.contains(&LlmCommand::ContextRequest {
             path: "crates/core/src/lib.rs".to_string(),
             access: ContextAccess::ReadOnly,
+        }));
+        assert!(commands.contains(&LlmCommand::RepoSearch {
+            path: "crates/core".to_string(),
+            regex: "fn prompt".to_string(),
         }));
         assert!(commands.contains(&LlmCommand::UserLanguage {
             language: "Russian".to_string(),

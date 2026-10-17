@@ -243,7 +243,9 @@ fn is_long_running(method: &str) -> bool {
             | methods::PLAN_EXECUTE
             | methods::REVIEW_START
             | methods::REVIEW_EXECUTE
+            | methods::REVIEW_REFINE_ITEM
             | methods::GIT_SQUASH_GENERATE_MESSAGE
+            | methods::LOCALE_GENERATE
     )
 }
 

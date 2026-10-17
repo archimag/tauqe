@@ -171,6 +171,8 @@ pub(super) async fn run_apply_and_verify_phase(
                 },
                 is_cancelled: true,
                 blocked: None,
+                has_terminal_success: false,
+                plan_saved: false,
             });
         }
         if !verify_outcome.success {
@@ -281,6 +283,8 @@ pub(super) async fn run_apply_and_verify_phase(
                     },
                     is_cancelled: true,
                     blocked: None,
+                    has_terminal_success: false,
+                    plan_saved: false,
                 });
             }
             ctx.state.absorb(&step_out);
@@ -394,6 +398,8 @@ pub(super) async fn run_apply_and_verify_phase(
                             },
                             is_cancelled: true,
                             blocked: None,
+                            has_terminal_success: false,
+                            plan_saved: false,
                         });
                     }
                     if !verify_outcome.success {

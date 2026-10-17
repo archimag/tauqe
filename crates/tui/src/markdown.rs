@@ -585,7 +585,7 @@ pub fn render_markdown_with_blocks(
                 if let Some(url) = link_url.take() {
                     let span = Span::styled(format!(" ({})", url), theme.code_border);
                     if let Some(ts) = table_state.as_mut() {
-                        ts.current_cell_len += span.content.chars().count();
+                        ts.current_cell_len += span.width();
                         ts.current_cell_spans.push(span);
                     } else {
                         current_spans.push(span);
@@ -595,7 +595,7 @@ pub fn render_markdown_with_blocks(
             Event::Code(code) => {
                 let code_span = Span::styled(format!(" {} ", code), theme.inline_code);
                 if let Some(ts) = table_state.as_mut() {
-                    ts.current_cell_len += code_span.content.chars().count();
+                    ts.current_cell_len += code_span.width();
                     ts.current_cell_spans.push(code_span);
                 } else {
                     ensure_line_prefix(
@@ -623,7 +623,7 @@ pub fn render_markdown_with_blocks(
 
                     if let Some(ts) = table_state.as_mut() {
                         for span in spans {
-                            ts.current_cell_len += span.content.chars().count();
+                            ts.current_cell_len += span.width();
                             ts.current_cell_spans.push(span);
                         }
                     } else {
@@ -652,7 +652,7 @@ pub fn render_markdown_with_blocks(
                     Span::styled("☐ ", theme.code_border)
                 };
                 if let Some(ts) = table_state.as_mut() {
-                    ts.current_cell_len += marker.content.chars().count();
+                    ts.current_cell_len += marker.width();
                     ts.current_cell_spans.push(marker);
                 } else {
                     ensure_line_prefix(

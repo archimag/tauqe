@@ -198,6 +198,80 @@ async fn answer_edit_loop_accepts_answer_without_edits() {
 }
 
 #[tokio::test]
+async fn answer_edit_loop_discovers_context_via_repo_search() {
+    let (_dir, repo_root) = init_repo();
+    std::fs::write(repo_root.join("target.rs"), "pub fn compute() -> i32 { 0 }\n")
+        .expect("write target fixture");
+    std::fs::create_dir_all(repo_root.join("src")).expect("create src dir");
+    std::fs::write(repo_root.join("src/helper.rs"), "pub const ANSWER: i32 = 42;\n")
+        .expect("write helper fixture");
+    commit_fixture(&repo_root, &["target.rs", "src/helper.rs"]);
+
+    let mut context = ContextManager::new(repo_root.clone());
+    context
+        .add_file("target.rs", ContextAccess::Editable)
+        .expect("add target to context");
+    let mut history = HistoryManager::new(repo_root.clone());
+
+    let search_discovery = format!(
+        "Searching for answer constant.\n<repo_search_{MARKER} path=\"src\" regex=\"pub const ANSWER\" />"
+    );
+    let file_discovery = format!(
+        "Found definition, requesting file.\n<context_request_{MARKER} path=\"src/helper.rs\" access=\"read_only\" />"
+    );
+    let edit = edit_block(
+        "Use the helper constant",
+        "target.rs",
+        "pub fn compute() -> i32 { 0 }",
+        "pub fn compute() -> i32 { 42 }",
+    );
+    let provider = MockLlmProvider::scripted([
+        MockResponse::text(search_discovery),
+        MockResponse::text(file_discovery),
+        MockResponse::text(edit),
+    ]);
+    let model = ModelRef::openrouter("mock/model");
+    let protocol = tauqe_core::prompt::xml::XmlPromptProtocol;
+    let protocol = protocol.with_turn_marker(MARKER).unwrap();
+    let mut policy = tauqe_core::workflow::policy::DirectApplyPolicy::new();
+    let options = WorkflowOptions::default();
+    let (stream_tx, cancel_rx) = event_channel();
+
+    let output = {
+        let mut env = TaskEnv {
+            provider: &provider,
+            model: &model,
+            context: &mut context,
+            history: &mut history,
+            protocol: protocol.as_ref(),
+            policy: &mut policy,
+            workflow_name: "git",
+            stream_tx,
+            cancel_rx,
+            options: &options,
+        };
+        AnswerEditLoop::new("Find and use the answer constant")
+            .execute(&mut env)
+            .await
+            .expect("answer/edit loop executes")
+    };
+
+    assert!(matches!(&output.result, ModelResult::Edit { edits, .. } if !edits.is_empty()));
+    assert_eq!(provider.requests().len(), 3);
+    let second_request = &provider.requests()[1];
+    assert!(second_request.messages[1]
+        .content
+        .contains("<search_feedback path=\"src\" regex=\"pub const ANSWER\">"));
+    assert!(second_request.messages[1]
+        .content
+        .contains("src/helper.rs: 1 match"));
+    let third_request = &provider.requests()[2];
+    assert!(third_request.messages[0]
+        .content
+        .contains("pub const ANSWER: i32 = 42;"));
+}
+
+#[tokio::test]
 async fn answer_edit_loop_discovers_requested_context() {
     let (_dir, repo_root) = init_repo();
     std::fs::write(repo_root.join("target.rs"), "pub fn compute() -> i32 { 0 }\n")

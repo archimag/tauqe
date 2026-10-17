@@ -18,7 +18,7 @@ mod prompt;
 pub(crate) mod tags;
 
 use parser::{extract_summary_from_xml, parse_xml_edits};
-use tags::{parse_context_request_tags, parse_doc_request_tags};
+use tags::{parse_context_request_tags, parse_doc_request_tags, parse_repo_search_tags};
 
 pub use clean::extract_conversational_text;
 pub use marker::generate_turn_marker;
@@ -31,8 +31,8 @@ pub use tags::{
     extract_blocked, extract_error, extract_scratchpad, extract_success, extract_terminal_outcome,
     extract_user_language, extract_verify_request,
     strip_blocked_tags, strip_context_request_tags, strip_doc_request_tags,
-    strip_error_tags, strip_plan_tags, strip_scratchpad_tags, strip_success_tags,
-    strip_terminal_outcome_tags, strip_user_language_tags, strip_verify_tags,
+    strip_error_tags, strip_plan_tags, strip_repo_search_tags, strip_scratchpad_tags,
+    strip_success_tags, strip_terminal_outcome_tags, strip_user_language_tags, strip_verify_tags,
     TerminalOutcome, VerifyOnSuccess, VerifyRequest, VerifyTarget,
 };
 pub(crate) use tags::{
@@ -47,6 +47,11 @@ impl XmlEditProtocol {
     /// Extracts context requests (files the model wants added to context).
     pub fn parse_context_requests(&self, raw_text: &str) -> Vec<ContextRequest> {
         parse_context_request_tags(raw_text)
+    }
+
+    /// Extracts repository search requests (`<repo_search path="..." regex="..." />`).
+    pub fn parse_repo_searches(&self, raw_text: &str) -> Vec<tauqe_protocol::RepoSearchRequest> {
+        parse_repo_search_tags(raw_text)
     }
 
     /// Extracts requested documentation topics (`All` when unspecified).
@@ -99,7 +104,7 @@ impl XmlEditProtocol {
         if !has_xml_edit_tags(raw_text) {
             return ModelResult::Answer {
                 text: strip_terminal_outcome_tags(&strip_scratchpad_tags(&strip_plan_tags(&strip_verify_tags(&strip_user_language_tags(
-                    &strip_doc_request_tags(&strip_context_request_tags(raw_text)),
+                    &strip_doc_request_tags(&strip_repo_search_tags(&strip_context_request_tags(raw_text))),
                 ))))),
             };
         }

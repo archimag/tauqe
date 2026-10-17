@@ -18,6 +18,7 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use crate::app::{ConfirmDialogButton, ModalActionsState};
 use crate::command::dialog::{DialogCommand, DIALOG_COMMAND_MAP};
 use crate::config::{active_meta_modifier, active_primary_modifier};
+use crate::i18n::active_t;
 use crate::theme::color::RgbColor;
 use crate::theme::engine::{current_engine, ThemeEngine};
 
@@ -71,7 +72,7 @@ pub fn button_style(engine: &ThemeEngine, bg: RgbColor, fg: RgbColor, emphasized
 /// `Tab / Shift+Tab` instead of mirroring the registry declaration order. Every
 /// chord is rendered through the configured `C-` / `M-` modifiers, so a footer
 /// never hardcodes a modifier string (Conventions §4, §6).
-fn dialog_hint_group(actions: &[DialogCommand], verb: &str) -> Option<String> {
+fn dialog_hint_group(actions: &[DialogCommand], verb_key: &str) -> Option<String> {
     let primary = active_primary_modifier();
     let meta = active_meta_modifier();
     let mut keys: Vec<String> = Vec::new();
@@ -85,6 +86,9 @@ fn dialog_hint_group(actions: &[DialogCommand], verb: &str) -> Option<String> {
             }
         }
     }
+    // The verb is resolved from the canonical catalog, so a hot-swapped locale
+    // reaches every dialog footer rendered without an `&AppState` (c-1, c-5).
+    let verb = active_t(verb_key);
     (!keys.is_empty()).then(|| format!("{} {}", keys.join(" / "), verb))
 }
 
@@ -95,9 +99,9 @@ fn dialog_hint_group(actions: &[DialogCommand], verb: &str) -> Option<String> {
 pub fn dialog_navigation_hint() -> String {
     let focus = dialog_hint_group(
         &[DialogCommand::FocusNext, DialogCommand::FocusPrev],
-        "focus",
+        "dialog.action.focus",
     );
-    let activate = dialog_hint_group(&[DialogCommand::Activate], "activate");
+    let activate = dialog_hint_group(&[DialogCommand::Activate], "dialog.action.activate");
     [focus, activate]
         .into_iter()
         .flatten()
@@ -109,14 +113,14 @@ pub fn dialog_navigation_hint() -> String {
 pub fn dialog_fast_select_hint() -> String {
     dialog_hint_group(
         &[DialogCommand::ConfirmFast, DialogCommand::CancelFast],
-        "fast select",
+        "dialog.action.fast_select",
     )
     .unwrap_or_default()
 }
 
 /// The dismissal hint (`Esc` / `q`).
 pub fn dialog_dismiss_hint() -> String {
-    dialog_hint_group(&[DialogCommand::Dismiss], "dismiss").unwrap_or_default()
+    dialog_hint_group(&[DialogCommand::Dismiss], "dialog.action.dismiss").unwrap_or_default()
 }
 
 /// The full universal dialog footer hint, used when a dialog supplies no text

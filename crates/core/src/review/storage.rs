@@ -1,7 +1,9 @@
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
-use tauqe_protocol::{ReviewItem, ReviewItemStatus, ReviewSession, ReviewSummary};
+use tauqe_protocol::{
+    IssueStatus, PlanItem, ReviewIssue, ReviewItem, ReviewSession, ReviewSummary,
+};
 
 pub struct ReviewStorage;
 
@@ -48,147 +50,7 @@ impl ReviewStorage {
         }
     }
 
-    /// Migrates legacy monolithic `review.json` or `latest.json` files into the
-    /// multi-file `.tauqe/reviews/{id}.json` layout.
-    ///
-    /// Migration is a startup-only, one-shot operation: read paths never invoke
-    /// it, so listing and loading reviews carry no write side effects (CQS).
-    /// Every failure is logged and degrades gracefully, leaving the legacy
-    /// source file in place instead of aborting the process.
-    pub fn migrate_legacy_if_needed(repo_root: &Path) {
-        let _guard = Self::lock();
-        Self::migrate_legacy_if_needed_unlocked(repo_root);
-    }
-
-    /// Lock-free core of [`Self::migrate_legacy_if_needed`]; caller must hold storage lock.
-    fn migrate_legacy_if_needed_unlocked(repo_root: &Path) {
-        let dir = Self::reviews_dir(repo_root);
-
-        // 1. Legacy `.tauqe/review.json`
-        let legacy_root = repo_root.join(".tauqe").join("review.json");
-        if let Some(mut session) = Self::read_legacy_session(&legacy_root) {
-            if session.id.trim().is_empty() {
-                session.id = "migrated-review".to_string();
-            }
-            Self::store_migrated_session_unlocked(repo_root, &session, &legacy_root);
-        }
-
-        // 2. Legacy `.tauqe/reviews/review.json`
-        let legacy_reviews_file = dir.join("review.json");
-        if let Some(mut session) = Self::read_legacy_session(&legacy_reviews_file) {
-            if session.id.trim().is_empty() {
-                session.id = "default".to_string();
-            }
-            Self::store_migrated_session_unlocked(repo_root, &session, &legacy_reviews_file);
-        }
-
-        // 3. Legacy `.tauqe/reviews/latest.json`
-        let legacy_latest_file = dir.join("latest.json");
-        if let Some(mut session) = Self::read_legacy_session(&legacy_latest_file) {
-            if session.id.trim().is_empty() || session.id == "latest" {
-                session.id = format!("review-{}", session.created_at);
-            }
-            if Self::store_migrated_session_unlocked(repo_root, &session, &legacy_latest_file) {
-                let active_file = dir.join("active");
-                if !active_file.is_file() {
-                    if let Err(err) = Self::save_active_id_unlocked(repo_root, Some(&session.id)) {
-                        tracing::warn!(
-                            "Failed to mark migrated review '{}' as active: {:#}",
-                            session.id,
-                            err
-                        );
-                    }
-                }
-            }
-        }
-    }
-
-    /// Reads and parses a legacy review file.
-    ///
-    /// Returns `None` when the file is absent, and logs a diagnostic (without
-    /// propagating) when it exists but cannot be read or parsed, so a single
-    /// malformed legacy file never blocks startup.
-    fn read_legacy_session(legacy_file: &Path) -> Option<ReviewSession> {
-        let content = match std::fs::read_to_string(legacy_file) {
-            Ok(content) => content,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return None,
-            Err(err) => {
-                tracing::warn!(
-                    "Failed to read legacy review file {}: {}",
-                    legacy_file.display(),
-                    err
-                );
-                return None;
-            }
-        };
-        match serde_json::from_str::<ReviewSession>(&content) {
-            Ok(session) => Some(session),
-            Err(err) => {
-                tracing::warn!(
-                    "Failed to parse legacy review file {}: {}",
-                    legacy_file.display(),
-                    err
-                );
-                None
-            }
-        }
-    }
-
-    /// Stores a migrated session in the multi-file layout and removes the legacy
-    /// source file once the target exists.
-    ///
-    /// Returns `true` when the target session file is present after the call.
-    /// Failures are logged; the legacy source is preserved on failure so no
-    /// review data is silently lost.
-    fn store_migrated_session_unlocked(
-        repo_root: &Path,
-        session: &ReviewSession,
-        legacy_file: &Path,
-    ) -> bool {
-        let dir = Self::reviews_dir(repo_root);
-        let safe_id = Self::sanitize_id(&session.id);
-        let target_file = dir.join(format!("{safe_id}.json"));
-
-        if !target_file.is_file() {
-            if let Err(err) = Self::save_session_unlocked(repo_root, session) {
-                tracing::warn!(
-                    "Failed to migrate legacy review file {}: {:#}",
-                    legacy_file.display(),
-                    err
-                );
-                return false;
-            }
-        }
-
-        // `save_session_unlocked` reuses whichever file already stores this id, so
-        // when the legacy file still embeds the session id the save lands on that
-        // legacy path instead of the canonical one. Rename the artifact onto its
-        // canonical id-based name so the cleanup below never deletes the only copy.
-        if legacy_file != target_file && !target_file.is_file() && legacy_file.is_file() {
-            if let Err(err) = std::fs::rename(legacy_file, &target_file) {
-                tracing::warn!(
-                    "Failed to rename migrated review file {} to {}: {}",
-                    legacy_file.display(),
-                    target_file.display(),
-                    err
-                );
-            }
-        }
-
-        // Discard the legacy source only once the canonical file is safely in place.
-        if legacy_file != target_file && target_file.is_file() && legacy_file.is_file() {
-            if let Err(err) = std::fs::remove_file(legacy_file) {
-                tracing::warn!(
-                    "Migrated legacy review file {} but failed to remove it: {}",
-                    legacy_file.display(),
-                    err
-                );
-            }
-        }
-        true
-    }
-
-    /// Lists summaries of all review sessions, ordered by `created_at` descending.
+    /// Lists summaries of all review sessions, ordered chronologically.
     pub fn list_summaries(repo_root: &Path) -> Result<Vec<ReviewSummary>> {
         let reviews = Self::load_all(repo_root)?;
         Ok(reviews.into_iter().map(|r| r.summary()).collect())
@@ -197,6 +59,71 @@ impl ReviewStorage {
     /// Lists all review sessions from `.tauqe/reviews`, ordered by `created_at` descending.
     pub fn list_reviews(repo_root: &Path) -> Result<Vec<ReviewSession>> {
         Self::load_all(repo_root)
+    }
+
+    /// Migrates a legacy single-file review dump into per-session files.
+    ///
+    /// Earlier Tauqe versions kept the latest review session in a single
+    /// `.tauqe/reviews/latest.json` file. This runs exactly once at daemon
+    /// startup: when the legacy file is present it is read, written back as
+    /// `<session-id>.json`, and removed. Keeping the migration on the startup
+    /// path (and never on reads) keeps listing and loading free of write side
+    /// effects and preserves deterministic read behavior.
+    pub fn migrate_legacy_if_needed(repo_root: &Path) {
+        let _guard = Self::lock();
+        let legacy_file = Self::reviews_dir(repo_root).join("latest.json");
+        if !legacy_file.is_file() {
+            return;
+        }
+
+        let content = match std::fs::read_to_string(&legacy_file) {
+            Ok(content) => content,
+            Err(err) => {
+                tracing::warn!(
+                    path = %legacy_file.display(),
+                    error = %err,
+                    "Failed to read legacy review file"
+                );
+                return;
+            }
+        };
+
+        let session = match serde_json::from_str::<ReviewSession>(&content) {
+            Ok(session) => session,
+            Err(err) => {
+                tracing::warn!(
+                    path = %legacy_file.display(),
+                    error = %err,
+                    "Failed to parse legacy review file"
+                );
+                return;
+            }
+        };
+
+        // Remove the legacy container before writing the migrated session. The
+        // legacy file stores the very session being migrated, so the storage
+        // resolver would otherwise select `latest.json` as this session's
+        // current file and the save would land back in the file we are about to
+        // delete. The raw legacy content is kept in memory and restored if the
+        // write fails, so a failed migration never loses the session.
+        if let Err(err) = std::fs::remove_file(&legacy_file) {
+            tracing::warn!(
+                path = %legacy_file.display(),
+                error = %err,
+                "Failed to remove legacy review file before migration"
+            );
+            return;
+        }
+
+        if let Err(err) = Self::save_session_unlocked(repo_root, &session) {
+            tracing::warn!(
+                path = %legacy_file.display(),
+                error = %err,
+                "Failed to migrate legacy review file"
+            );
+            // Restore the original legacy file so the session is never lost.
+            let _ = std::fs::write(&legacy_file, &content);
+        }
     }
 
     /// Loads all review sessions from disk.
@@ -240,7 +167,16 @@ impl ReviewStorage {
             }
         }
 
-        reviews.sort_by_key(|r| std::cmp::Reverse(r.created_at));
+        // Order chronologically: the persisted `created_at` is the authoritative
+        // instant, and the UUIDv7 embedded timestamp breaks same-second ties so a
+        // directory listing always follows creation order. The raw id is the final
+        // stable tiebreaker, so the order never depends on `read_dir` iteration.
+        reviews.sort_by(|a, b| {
+            b.created_at
+                .cmp(&a.created_at)
+                .then_with(|| session_uuid_timestamp(&b.id).cmp(&session_uuid_timestamp(&a.id)))
+                .then_with(|| b.id.cmp(&a.id))
+        });
         Ok(reviews)
     }
 
@@ -257,14 +193,13 @@ impl ReviewStorage {
         let dir = Self::reviews_dir(repo_root);
         let safe_id = Self::sanitize_id(id);
         let default_target = dir.join(format!("{safe_id}.json"));
-        if default_target.is_file() {
-            if let Ok(content) = std::fs::read_to_string(&default_target) {
-                if let Ok(session) = serde_json::from_str::<ReviewSession>(&content) {
-                    if session.id.eq_ignore_ascii_case(id) {
-                        return Some(default_target);
-                    }
-                }
-            }
+
+        let default_matches = std::fs::read_to_string(&default_target)
+            .ok()
+            .and_then(|content| serde_json::from_str::<ReviewSession>(&content).ok())
+            .is_some_and(|session| session.id.eq_ignore_ascii_case(id));
+        if default_target.is_file() && default_matches {
+            return Some(default_target);
         }
 
         let entries = std::fs::read_dir(&dir).ok()?;
@@ -354,7 +289,6 @@ impl ReviewStorage {
         // from the sanitized id, so saving never spawns a duplicate session file.
         let target_file = Self::find_session_file_unlocked(repo_root, &session.id)
             .unwrap_or(default_target);
-        let temp_file = target_file.with_extension("json.tmp");
 
         // Refuse to overwrite a file that already stores a different review session
         // whose sanitized storage name collides with this one (for example
@@ -379,13 +313,7 @@ impl ReviewStorage {
 
         let json = serde_json::to_string_pretty(session)
             .context("Failed to serialize review session to JSON")?;
-        std::fs::write(&temp_file, json).with_context(|| {
-            format!("Failed to write temporary review file at {}", temp_file.display())
-        })?;
-
-        std::fs::rename(&temp_file, &target_file).with_context(|| {
-            format!("Failed to atomically rename review file to {}", target_file.display())
-        })?;
+        write_atomic(&target_file, json.as_bytes())?;
 
         // If no active review is set, make this session active
         if let Ok(None) = Self::load_active_id_unlocked(repo_root) {
@@ -408,24 +336,23 @@ impl ReviewStorage {
 
         // Delete the file that actually stores this session. When the session lives
         // under a differently sanitized name, removing only the default target would
-        // leave the real artifact behind. If default target exists but stores a different
-        // session (collision), ensure we never delete the unrelated file.
+        // leave the real artifact behind. If the default target exists but stores a
+        // different session (collision), it must never be removed.
         let target_file = match Self::find_session_file_unlocked(repo_root, id) {
             Some(existing) => existing,
             None => {
                 let default_target = dir.join(format!("{safe_id}.json"));
-                if default_target.is_file() {
-                    if let Ok(content) = std::fs::read_to_string(&default_target) {
-                        if let Ok(session) = serde_json::from_str::<ReviewSession>(&content) {
-                            if !session.id.eq_ignore_ascii_case(id) {
-                                return Ok(false);
-                            }
-                        }
-                    }
-                    default_target
-                } else {
+                if !default_target.is_file() {
                     return Ok(false);
                 }
+                let stores_other = std::fs::read_to_string(&default_target)
+                    .ok()
+                    .and_then(|content| serde_json::from_str::<ReviewSession>(&content).ok())
+                    .is_some_and(|session| !session.id.eq_ignore_ascii_case(id));
+                if stores_other {
+                    return Ok(false);
+                }
+                default_target
             }
         };
 
@@ -479,8 +406,7 @@ impl ReviewStorage {
         let active_file = dir.join("active");
         match id {
             Some(val) if !val.trim().is_empty() => {
-                std::fs::write(&active_file, val.trim())
-                    .with_context(|| format!("Failed to write active review marker to {}", active_file.display()))?;
+                write_atomic(&active_file, val.trim().as_bytes())?;
             }
             _ => {
                 if active_file.is_file() {
@@ -491,15 +417,19 @@ impl ReviewStorage {
         Ok(())
     }
 
-    /// Updates a review item by id within a specific session (or active/latest session if None).
+    /// Updates a review item by id within the explicitly named session.
+    ///
+    /// The session id is mandatory: review mutations are strictly scoped to the
+    /// session the caller names, so the process-global active marker is never
+    /// consulted as an implicit fallback.
     pub fn update_session_item<F>(
         repo_root: &Path,
-        review_id: Option<&str>,
+        review_id: &str,
         item_id: u32,
         updater: F,
-    ) -> Result<Option<ReviewItem>>
+    ) -> Result<Option<ReviewIssue>>
     where
-        F: FnOnce(&mut ReviewItem),
+        F: FnOnce(&mut ReviewIssue),
     {
         let _guard = Self::lock();
         Self::update_session_item_unlocked(repo_root, review_id, item_id, updater)
@@ -508,66 +438,128 @@ impl ReviewStorage {
     /// Lock-free core of [`Self::update_session_item`]; caller must hold storage lock.
     fn update_session_item_unlocked<F>(
         repo_root: &Path,
-        review_id: Option<&str>,
+        review_id: &str,
         item_id: u32,
         updater: F,
-    ) -> Result<Option<ReviewItem>>
+    ) -> Result<Option<ReviewIssue>>
     where
-        F: FnOnce(&mut ReviewItem),
+        F: FnOnce(&mut ReviewIssue),
     {
-        let mut session = match review_id {
-            Some(id) => match Self::load_review_unlocked(repo_root, id)? {
-                Some(s) => s,
-                None => return Ok(None),
-            },
-            None => match Self::load_latest_unlocked(repo_root)? {
-                Some(s) => s,
-                None => return Ok(None),
-            },
+        let mut session = match Self::load_review_unlocked(repo_root, review_id)? {
+            Some(s) => s,
+            None => return Ok(None),
         };
 
-        let updated_item = if let Some(item) = session.items.iter_mut().find(|it| it.id == item_id) {
-            updater(item);
-            Some(item.clone())
+        let updated_issue = if let Some(item) = session.items.iter_mut().find(|it| it.id == item_id) {
+            let mut issue = ReviewIssue::from(item.clone());
+            updater(&mut issue);
+            *item = ReviewItem::from(issue.clone());
+            Some(issue)
         } else {
             None
         };
 
-        if updated_item.is_some() {
+        if updated_issue.is_some() {
             Self::save_session_unlocked(repo_root, &session)?;
         }
 
-        Ok(updated_item)
+        Ok(updated_issue)
     }
 
-    /// Updates status of a review item within a specific review session (or latest).
+    /// Updates status of a review item within the explicitly named review session.
     pub fn update_session_item_status(
         repo_root: &Path,
-        review_id: Option<&str>,
+        review_id: &str,
         item_id: u32,
-        status: ReviewItemStatus,
-    ) -> Result<Option<ReviewItem>> {
-        Self::update_session_item(repo_root, review_id, item_id, |item| {
-            item.status = status;
+        status: IssueStatus,
+    ) -> Result<Option<ReviewIssue>> {
+        Self::update_session_item(repo_root, review_id, item_id, |issue| {
+            issue.status = status;
         })
     }
 
-    /// Convenience helper for latest session item update.
-    pub fn update_item<F>(repo_root: &Path, item_id: u32, updater: F) -> Result<Option<ReviewItem>>
-    where
-        F: FnOnce(&mut ReviewItem),
-    {
-        Self::update_session_item(repo_root, None, item_id, updater)
+    /// Replaces the uncompleted horizon of a review item's subplan while preserving
+    /// any already completed (`Done`) steps.
+    pub fn replace_uncompleted_subplan(
+        repo_root: &Path,
+        review_id: &str,
+        item_id: u32,
+        new_subplan: Vec<PlanItem>,
+    ) -> Result<Option<ReviewIssue>> {
+        let _guard = Self::lock();
+        Self::replace_uncompleted_subplan_unlocked(repo_root, review_id, item_id, new_subplan)
     }
 
-    /// Convenience helper for latest session item status update.
-    pub fn update_item_status(
+    /// Lock-free core of [`Self::replace_uncompleted_subplan`]; caller must hold storage lock.
+    fn replace_uncompleted_subplan_unlocked(
         repo_root: &Path,
+        review_id: &str,
         item_id: u32,
-        status: ReviewItemStatus,
-    ) -> Result<Option<ReviewItem>> {
-        Self::update_session_item_status(repo_root, None, item_id, status)
+        new_subplan: Vec<PlanItem>,
+    ) -> Result<Option<ReviewIssue>> {
+        let mut session = match Self::load_review_unlocked(repo_root, review_id)? {
+            Some(s) => s,
+            None => return Ok(None),
+        };
+
+        let updated_issue = if let Some(item) = session.items.iter_mut().find(|it| it.id == item_id) {
+            let merged = crate::plan::storage::merge_subplan(&item.subplan, new_subplan)?;
+            item.subplan = merged;
+            let issue = ReviewIssue::from(item.clone());
+            Some(issue)
+        } else {
+            None
+        };
+
+        if updated_issue.is_some() {
+            Self::save_session_unlocked(repo_root, &session)?;
+        }
+
+        Ok(updated_issue)
     }
+}
+
+/// Atomically replaces `target` with `contents`.
+///
+/// The payload is staged into a uniquely named sibling temporary file, flushed,
+/// and `fsync`ed before the atomic rename. Without the `sync_all` barrier a crash
+/// immediately after the rename could leave a zero-length or truncated file on
+/// disk; the per-process suffix on the staging name also prevents a stale or
+/// concurrent write from colliding on a shared, fixed `<file>.json.tmp` path.
+fn write_atomic(target: &Path, contents: &[u8]) -> Result<()> {
+    use std::io::Write;
+
+    let file_name = target.file_name().and_then(|f| f.to_str()).unwrap_or("file");
+    let temp_file = target.with_file_name(format!("{file_name}.tmp.{}", std::process::id()));
+
+    {
+        let mut file = std::fs::File::create(&temp_file)
+            .with_context(|| format!("Failed to create temp file at {}", temp_file.display()))?;
+        file.write_all(contents)
+            .with_context(|| format!("Failed to write temp file at {}", temp_file.display()))?;
+        file.flush()
+            .with_context(|| format!("Failed to flush temp file at {}", temp_file.display()))?;
+        file.sync_all()
+            .with_context(|| format!("Failed to sync temp file at {}", temp_file.display()))?;
+    }
+
+    std::fs::rename(&temp_file, target).with_context(|| {
+        format!(
+            "Failed to atomically rename {} to {}",
+            temp_file.display(),
+            target.display()
+        )
+    })
+}
+
+/// Extracts the UUIDv7 millisecond timestamp embedded in a session id.
+///
+/// Sessions are identified by UUIDv7, so the leading 48 bits encode the creation
+/// instant and comparing them reproduces creation order. A non-UUIDv7 id (a
+/// hand-written or imported name) has no natural order and falls back to `0`,
+/// sorting before every UUIDv7 id.
+fn session_uuid_timestamp(id: &str) -> u64 {
+    super::uuid::parse_uuid_v7_timestamp(id).unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -594,8 +586,10 @@ mod tests {
                 title: "Security finding".to_string(),
                 model: None,
                 severity: ReviewSeverity::Critical,
-                status: ReviewItemStatus::Discussion,
+                status: IssueStatus::Discussion,
+                recommendations: vec![],
                 files: vec!["crates/core/src/lib.rs".to_string()],
+                readonly_files: vec![],
                 subplan: Vec::new(),
                 resolution_notes: None,
                 body: "Check input validation".to_string(),
@@ -621,13 +615,13 @@ mod tests {
         // 4. Update item status to Fixed
         let updated = ReviewStorage::update_session_item_status(
             root,
-            Some("rev-sec-1"),
+            "rev-sec-1",
             1,
-            ReviewItemStatus::Fixed,
+            IssueStatus::Fixed,
         )
         .unwrap()
         .unwrap();
-        assert_eq!(updated.status, ReviewItemStatus::Fixed);
+        assert_eq!(updated.status, IssueStatus::Fixed);
 
         // 5. Active marker
         assert_eq!(ReviewStorage::load_active_id(root).unwrap(), Some("rev-sec-1".to_string()));
@@ -679,8 +673,10 @@ mod tests {
                 title: format!("Item {i}"),
                 model: None,
                 severity: tauqe_protocol::ReviewSeverity::Suggestion,
-                status: ReviewItemStatus::Todo,
+                status: IssueStatus::Todo,
+                recommendations: vec![],
                 files: vec![],
+                readonly_files: vec![],
                 subplan: Vec::new(),
                 resolution_notes: None,
                 body: "Check".to_string(),
@@ -706,9 +702,9 @@ mod tests {
                 std::thread::spawn(move || {
                     let _ = ReviewStorage::update_session_item_status(
                         &root,
-                        Some("concurrent-review"),
+                        "concurrent-review",
                         i,
-                        ReviewItemStatus::Fixed,
+                        IssueStatus::Fixed,
                     );
                 })
             })
@@ -724,7 +720,7 @@ mod tests {
         let fixed = loaded
             .items
             .iter()
-            .filter(|item| item.status == ReviewItemStatus::Fixed)
+            .filter(|item| item.status == IssueStatus::Fixed)
             .count();
         assert_eq!(fixed, 16);
     }
@@ -898,5 +894,227 @@ mod tests {
 
         let still_exists = ReviewStorage::load_review(root, "team/auth").unwrap();
         assert!(still_exists.is_some());
+    }
+
+    #[test]
+    fn test_update_session_item_targets_only_the_named_session() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+
+        let make_session = |id: &str| ReviewSession {
+            id: id.to_string(),
+            title: id.to_string(),
+            created_at: 1,
+            model: tauqe_protocol::ModelRef::openrouter("test-model"),
+            description: None,
+            user_prompt: None,
+            target_files: vec![],
+            items: vec![ReviewItem {
+                id: 1,
+                title: "Finding".to_string(),
+                model: None,
+                severity: ReviewSeverity::Info,
+                status: IssueStatus::Todo,
+                recommendations: vec![],
+                files: vec![],
+                readonly_files: vec![],
+                subplan: Vec::new(),
+                resolution_notes: None,
+                body: String::new(),
+            }],
+            raw_markdown: String::new(),
+        };
+
+        ReviewStorage::save_session(root, &make_session("rev-a")).unwrap();
+        ReviewStorage::save_session(root, &make_session("rev-b")).unwrap();
+        // The active marker points at `rev-a`, but it is a UI pointer only and
+        // must never steer a mutation.
+        ReviewStorage::save_active_id(root, Some("rev-a")).unwrap();
+
+        let updated =
+            ReviewStorage::update_session_item_status(root, "rev-b", 1, IssueStatus::Fixed)
+                .unwrap()
+                .unwrap();
+        assert_eq!(updated.status, IssueStatus::Fixed);
+
+        let a = ReviewStorage::load_review(root, "rev-a").unwrap().unwrap();
+        assert_eq!(a.find_item(1).unwrap().status, IssueStatus::Todo);
+        let b = ReviewStorage::load_review(root, "rev-b").unwrap().unwrap();
+        assert_eq!(b.find_item(1).unwrap().status, IssueStatus::Fixed);
+
+        // A non-existent id resolves to nothing: there is no implicit fallback
+        // to the active or latest session.
+        let missing =
+            ReviewStorage::update_session_item_status(root, "rev-missing", 1, IssueStatus::Fixed)
+                .unwrap();
+        assert!(missing.is_none());
+    }
+
+    #[test]
+    fn test_atomic_writes_leave_no_temp_files() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+
+        let session = ReviewSession {
+            id: "atomic-review".to_string(),
+            title: "Atomic".to_string(),
+            created_at: 1,
+            model: tauqe_protocol::ModelRef::openrouter("test-model"),
+            description: None,
+            user_prompt: None,
+            target_files: vec![],
+            items: vec![],
+            raw_markdown: String::new(),
+        };
+        ReviewStorage::save_session(root, &session).unwrap();
+        ReviewStorage::save_active_id(root, Some("atomic-review")).unwrap();
+
+        let leftovers: Vec<_> = std::fs::read_dir(ReviewStorage::reviews_dir(root))
+            .unwrap()
+            .flatten()
+            .filter(|entry| entry.file_name().to_string_lossy().contains(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "unexpected temp files: {leftovers:?}");
+
+        assert_eq!(
+            ReviewStorage::load_active_id(root).unwrap(),
+            Some("atomic-review".to_string())
+        );
+    }
+
+    #[test]
+    fn test_review_storage_replace_uncompleted_subplan() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+
+        let session = ReviewSession {
+            id: "rev-subplan-1".to_string(),
+            title: "Subplan Audit".to_string(),
+            created_at: 100,
+            model: tauqe_protocol::ModelRef::openrouter("test-model"),
+            description: None,
+            user_prompt: None,
+            target_files: vec![],
+            items: vec![ReviewItem {
+                id: 1,
+                title: "Finding with subplan".to_string(),
+                model: None,
+                severity: ReviewSeverity::Warning,
+                status: IssueStatus::Discussion,
+                recommendations: vec![],
+                files: vec![],
+                readonly_files: vec![],
+                subplan: vec![
+                    PlanItem {
+                        id: "s-1".to_string(),
+                        title: "Finished step".to_string(),
+                        status: tauqe_protocol::PlanItemStatus::Done,
+                        ..Default::default()
+                    },
+                    PlanItem {
+                        id: "s-2".to_string(),
+                        title: "Old step".to_string(),
+                        status: tauqe_protocol::PlanItemStatus::Todo,
+                        ..Default::default()
+                    },
+                ],
+                resolution_notes: None,
+                body: "Body".to_string(),
+            }],
+            raw_markdown: String::new(),
+        };
+        ReviewStorage::save_session(root, &session).unwrap();
+
+        let new_subplan = vec![PlanItem {
+            id: "s-3".to_string(),
+            title: "New step".to_string(),
+            status: tauqe_protocol::PlanItemStatus::Todo,
+            ..Default::default()
+        }];
+
+        let updated = ReviewStorage::replace_uncompleted_subplan(
+            root,
+            "rev-subplan-1",
+            1,
+            new_subplan,
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(updated.plan.len(), 2);
+        assert_eq!(updated.plan[0].id, "s-1");
+        assert_eq!(updated.plan[0].status, tauqe_protocol::PlanItemStatus::Done);
+        assert_eq!(updated.plan[1].id, "s-3");
+
+        let loaded = ReviewStorage::load_review(root, "rev-subplan-1").unwrap().unwrap();
+        assert_eq!(loaded.items[0].subplan.len(), 2);
+        assert_eq!(loaded.items[0].subplan[0].id, "s-1");
+        assert_eq!(loaded.items[0].subplan[1].id, "s-3");
+    }
+
+    #[test]
+    fn test_review_storage_extended_fields_persistence() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+
+        let session = ReviewSession {
+            id: "rev-ext-1".to_string(),
+            title: "Extended Fields Audit".to_string(),
+            created_at: 2000,
+            model: tauqe_protocol::ModelRef::openrouter("anthropic/claude-3.7-sonnet"),
+            description: Some("Persistence check".to_string()),
+            user_prompt: None,
+            target_files: vec!["crates/core/src/lib.rs".to_string()],
+            items: vec![ReviewItem {
+                id: 1,
+                title: "Finding with extended fields".to_string(),
+                model: None,
+                severity: ReviewSeverity::Warning,
+                status: IssueStatus::Discussion,
+                recommendations: vec!["Step 1: refactor lock".to_string()],
+                files: vec!["crates/core/src/state.rs".to_string()],
+                readonly_files: vec!["crates/protocol/src/lib.rs".to_string()],
+                subplan: Vec::new(),
+                resolution_notes: None,
+                body: "Root cause analysis".to_string(),
+            }],
+            raw_markdown: String::new(),
+        };
+
+        ReviewStorage::save_session(root, &session).unwrap();
+
+        let updated = ReviewStorage::update_session_item(root, "rev-ext-1", 1, |issue| {
+            issue.status = IssueStatus::Fixed;
+            issue.recommendations.push("Step 2: add regression test".to_string());
+            issue.readonly_files.push("crates/core/src/config.rs".to_string());
+            issue.note = Some("Resolved in PR #42".to_string());
+        })
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(updated.status, IssueStatus::Fixed);
+        assert_eq!(
+            updated.recommendations,
+            vec!["Step 1: refactor lock", "Step 2: add regression test"]
+        );
+        assert_eq!(
+            updated.readonly_files,
+            vec!["crates/protocol/src/lib.rs", "crates/core/src/config.rs"]
+        );
+        assert_eq!(updated.note.as_deref(), Some("Resolved in PR #42"));
+
+        let loaded = ReviewStorage::load_review(root, "rev-ext-1").unwrap().unwrap();
+        let issues = loaded.issues();
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].status, IssueStatus::Fixed);
+        assert_eq!(
+            issues[0].recommendations,
+            vec!["Step 1: refactor lock", "Step 2: add regression test"]
+        );
+        assert_eq!(
+            issues[0].readonly_files,
+            vec!["crates/protocol/src/lib.rs", "crates/core/src/config.rs"]
+        );
+        assert_eq!(issues[0].note.as_deref(), Some("Resolved in PR #42"));
     }
 }

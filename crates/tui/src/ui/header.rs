@@ -6,6 +6,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 
 use crate::app::{role_badge, role_title, AppState, HeaderClickAreas, ViewMode};
+use crate::i18n::I18nEngine;
 use crate::theme::engine::{current_engine, ThemeEngine};
 
 /// Helper to truncate a string to a max visual display width, appending `…` if needed.
@@ -30,6 +31,12 @@ pub(crate) fn truncate_to_width(s: &str, max_width: usize) -> String {
     }
     truncated.push('…');
     truncated
+}
+
+/// Terminal display width of a string, measured in columns rather than bytes so
+/// a localized label selects the header tier its visual width deserves (c-3).
+fn display_width(s: &str) -> usize {
+    Span::raw(s).width()
 }
 
 /// Builds the model selector label strictly from the active selection.
@@ -106,7 +113,7 @@ enum HeaderTier {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ClickTarget {
-    DevelopTab,
+    ReplTab,
     ContextTab,
     ReviewTab,
     PlansTab,
@@ -118,7 +125,7 @@ enum ClickTarget {
 
 fn record_click(clicks: &mut HeaderClickAreas, target: ClickTarget, range: (u16, u16)) {
     match target {
-        ClickTarget::DevelopTab => clicks.develop_tab = range,
+        ClickTarget::ReplTab => clicks.repl_tab = range,
         ClickTarget::ContextTab => clicks.context_tab = range,
         ClickTarget::ReviewTab => clicks.review_tab = range,
         ClickTarget::PlansTab => clicks.plans_tab = range,
@@ -136,95 +143,49 @@ fn tab_label(
     ctx_count: usize,
     review_count: usize,
     plans_count: usize,
+    i18n: &I18nEngine,
 ) -> String {
+    // Tab names come from the canonical catalog, so a hot-swapped locale keeps
+    // the header in step with the rest of the interface (c-1, c-5).
+    if mode == ViewMode::Onboarding {
+        let name = i18n.t("tab.onboarding");
+        return match tier {
+            HeaderTier::Compact if mode != active_mode => " ! ".to_string(),
+            _ => format!(" ! {} ", name),
+        };
+    }
+
+    let (number, name, count): (&str, &str, Option<usize>) = match mode {
+        ViewMode::Repl => ("1", i18n.t("tab.repl"), None),
+        ViewMode::Plans => (
+            "2",
+            i18n.t("tab.plans"),
+            (plans_count > 0).then_some(plans_count),
+        ),
+        ViewMode::Review => (
+            "3",
+            i18n.t("tab.review"),
+            (review_count > 0).then_some(review_count),
+        ),
+        ViewMode::Context => ("4", i18n.t("tab.context"), Some(ctx_count)),
+        ViewMode::History => ("5", i18n.t("tab.history"), None),
+        ViewMode::Onboarding => ("!", i18n.t("tab.onboarding"), None),
+    };
+
+    // The three tiers trade count detail for horizontal space: the full tier
+    // shows the count, the medium tier the name only, and the compact tier
+    // collapses inactive tabs to their number.
     match tier {
-        HeaderTier::Full => match mode {
-            ViewMode::Develop => " 1: REPL ".to_string(),
-            ViewMode::Plans => {
-                if plans_count > 0 {
-                    format!(" 2: Plans ({}) ", plans_count)
-                } else {
-                    " 2: Plans ".to_string()
-                }
-            }
-            ViewMode::Review => {
-                if review_count > 0 {
-                    format!(" 3: Review ({}) ", review_count)
-                } else {
-                    " 3: Review ".to_string()
-                }
-            }
-            ViewMode::Context => format!(" 4: Context ({}) ", ctx_count),
-            ViewMode::History => " 5: History ".to_string(),
-            ViewMode::Onboarding => " ! Setup ".to_string(),
+        HeaderTier::Full => match count {
+            Some(c) => format!(" {}: {} ({}) ", number, name, c),
+            None => format!(" {}: {} ", number, name),
         },
-        HeaderTier::Medium => match mode {
-            ViewMode::Develop => " 1: REPL ".to_string(),
-            ViewMode::Plans => {
-                if plans_count > 0 {
-                    format!(" 2: Plan ({}) ", plans_count)
-                } else {
-                    " 2: Plan ".to_string()
-                }
-            }
-            ViewMode::Review => {
-                if review_count > 0 {
-                    format!(" 3: Rev ({}) ", review_count)
-                } else {
-                    " 3: Rev ".to_string()
-                }
-            }
-            ViewMode::Context => format!(" 4: Ctx ({}) ", ctx_count),
-            ViewMode::History => " 5: Hist ".to_string(),
-            ViewMode::Onboarding => " ! Setup ".to_string(),
-        },
+        HeaderTier::Medium => format!(" {}: {} ", number, name),
         HeaderTier::Compact => {
-            let is_active = mode == active_mode;
-            match mode {
-                ViewMode::Develop => {
-                    if is_active {
-                        " 1: REPL ".to_string()
-                    } else {
-                        " 1 ".to_string()
-                    }
-                }
-                ViewMode::Plans => {
-                    if is_active {
-                        if plans_count > 0 {
-                            format!(" 2: Plan ({}) ", plans_count)
-                        } else {
-                            " 2: Plan ".to_string()
-                        }
-                    } else {
-                        " 2 ".to_string()
-                    }
-                }
-                ViewMode::Review => {
-                    if is_active {
-                        if review_count > 0 {
-                            format!(" 3: Rev ({}) ", review_count)
-                        } else {
-                            " 3: Rev ".to_string()
-                        }
-                    } else {
-                        " 3 ".to_string()
-                    }
-                }
-                ViewMode::Context => {
-                    if is_active {
-                        format!(" 4: Ctx ({}) ", ctx_count)
-                    } else {
-                        " 4 ".to_string()
-                    }
-                }
-                ViewMode::History => {
-                    if is_active {
-                        " 5: Hist ".to_string()
-                    } else {
-                        " 5 ".to_string()
-                    }
-                }
-                ViewMode::Onboarding => " ! ".to_string(),
+            if mode == active_mode {
+                format!(" {}: {} ", number, name)
+            } else {
+                format!(" {} ", number)
             }
         }
     }
@@ -273,8 +234,97 @@ fn render_header_with_engine(
 
     let palette = engine.palette();
 
+    // 2. Budget for Left-Side (tabs & project). The right group is measured with
+    // the tentative model budget below and shrunk if the tab row would otherwise
+    // push the buttons past the inner width and into the border.
+    let div_width = Span::raw(" │ ").width();
+    let right_chrome_width = div_width * 2
+        + Span::raw(squash_text.as_str()).width()
+        + Span::raw(help_text.as_str()).width();
+    let mut right_width =
+        Span::raw(format!(" 🧠 {} ", model_selector_label(state, max_model_len))).width()
+            + right_chrome_width;
+
+    let avail_for_left = inner_header_width.saturating_sub(right_width + 1);
+
+    let active_mode = state.view_mode;
+    let ctx_count = state.context.items.len();
+    let review_count = if state.review.sessions.is_empty() && state.review.session.is_some() {
+        1
+    } else {
+        state.review.sessions.len()
+    };
+    let plans_count = state.plans_view.plans.len();
+
+    let tabs = [
+        (ViewMode::Repl, ClickTarget::ReplTab),
+        (ViewMode::Plans, ClickTarget::PlansTab),
+        (ViewMode::Review, ClickTarget::ReviewTab),
+        (ViewMode::Context, ClickTarget::ContextTab),
+        (ViewMode::History, ClickTarget::HistoryTab),
+    ];
+
+    // Tab widths are measured in terminal columns (not bytes), so a localized
+    // label made of multi-byte glyphs selects the same tier its visual width
+    // deserves and the header never desynchronizes from its drawn geometry when
+    // the locale is hot-swapped (c-1, c-3, c-5).
+    let calc_tabs_width = |tier: HeaderTier, i18n: &I18nEngine| -> usize {
+        let mut w: usize = tabs
+            .iter()
+            .map(|(mode, _)| {
+                display_width(&tab_label(
+                    tier,
+                    *mode,
+                    active_mode,
+                    ctx_count,
+                    review_count,
+                    plans_count,
+                    i18n,
+                ))
+            })
+            .sum();
+        w += tabs.len().saturating_sub(1);
+        if active_mode == ViewMode::Onboarding {
+            w += 1
+                + display_width(&tab_label(
+                    tier,
+                    ViewMode::Onboarding,
+                    active_mode,
+                    ctx_count,
+                    review_count,
+                    plans_count,
+                    i18n,
+                ));
+        }
+        w
+    };
+
+    let full_tabs_w = calc_tabs_width(HeaderTier::Full, &state.i18n);
+    let med_tabs_w = calc_tabs_width(HeaderTier::Medium, &state.i18n);
+
+    let (tier, tabs_w) = if avail_for_left >= full_tabs_w + 14 {
+        (HeaderTier::Full, full_tabs_w)
+    } else if avail_for_left >= med_tabs_w + 10 {
+        (HeaderTier::Medium, med_tabs_w)
+    } else {
+        (
+            HeaderTier::Compact,
+            calc_tabs_width(HeaderTier::Compact, &state.i18n),
+        )
+    };
+
+    // Guarantee the right-side group (model chip, Squash, Help) stays inside the
+    // header. Localized tab names widen the left group and a role title is a
+    // fixed-width label, so shrinking only the model-length budget cannot always
+    // recover the space. Truncating the composed chip to whatever remains after
+    // the tabs and the fixed right chrome keeps every tab and button visible and
+    // hit-testable instead of spilling into the border (Conventions §6, §7).
+    let model_budget = inner_header_width
+        .saturating_sub(tabs_w + 1 + right_chrome_width)
+        .max(1);
     let model_label = model_selector_label(state, max_model_len);
-    let model_text = format!(" 🧠 {} ", model_label);
+    let model_text = truncate_to_width(&format!(" 🧠 {} ", model_label), model_budget);
+    right_width = Span::raw(model_text.as_str()).width() + right_chrome_width;
     let model_span = Span::styled(model_text, engine.fg(palette.status_success).bold());
 
     let squash_span = Span::styled(
@@ -303,69 +353,6 @@ fn render_header_with_engine(
         (div_span, None),
         (help_span, Some(ClickTarget::HelpButton)),
     ];
-
-    let right_width: usize = right_items.iter().map(|(s, _)| s.width()).sum();
-
-    // 2. Budget for Left-Side (tabs & project)
-    let avail_for_left = inner_header_width.saturating_sub(right_width + 1);
-
-    let ctx_count = state.context.items.len();
-    let review_count = if state.review.sessions.is_empty() && state.review.session.is_some() {
-        1
-    } else {
-        state.review.sessions.len()
-    };
-    let plans_count = state.plans_view.plans.len();
-
-    let tabs = [
-        (ViewMode::Develop, ClickTarget::DevelopTab),
-        (ViewMode::Plans, ClickTarget::PlansTab),
-        (ViewMode::Review, ClickTarget::ReviewTab),
-        (ViewMode::Context, ClickTarget::ContextTab),
-        (ViewMode::History, ClickTarget::HistoryTab),
-    ];
-
-    let calc_tabs_width = |tier: HeaderTier| -> usize {
-        let mut w: usize = tabs
-            .iter()
-            .map(|(mode, _)| {
-                tab_label(
-                    tier,
-                    *mode,
-                    state.view_mode,
-                    ctx_count,
-                    review_count,
-                    plans_count,
-                )
-                .len()
-            })
-            .sum();
-        w += tabs.len().saturating_sub(1);
-        if state.view_mode == ViewMode::Onboarding {
-            w += 1
-                + tab_label(
-                    tier,
-                    ViewMode::Onboarding,
-                    state.view_mode,
-                    ctx_count,
-                    review_count,
-                    plans_count,
-                )
-                .len();
-        }
-        w
-    };
-
-    let full_tabs_w = calc_tabs_width(HeaderTier::Full);
-    let med_tabs_w = calc_tabs_width(HeaderTier::Medium);
-
-    let (tier, tabs_w) = if avail_for_left >= full_tabs_w + 14 {
-        (HeaderTier::Full, full_tabs_w)
-    } else if avail_for_left >= med_tabs_w + 10 {
-        (HeaderTier::Medium, med_tabs_w)
-    } else {
-        (HeaderTier::Compact, calc_tabs_width(HeaderTier::Compact))
-    };
 
     let active_style = engine
         .bg(palette.button_active_bg)
@@ -409,12 +396,13 @@ fn render_header_with_engine(
         let label = tab_label(
             tier,
             *mode,
-            state.view_mode,
+            active_mode,
             ctx_count,
             review_count,
             plans_count,
+            &state.i18n,
         );
-        let style = if state.view_mode == *mode {
+        let style = if active_mode == *mode {
             active_style
         } else {
             inactive_style
@@ -422,15 +410,16 @@ fn render_header_with_engine(
         left_items.push((Span::styled(label, style), Some(*target)));
     }
 
-    if state.view_mode == ViewMode::Onboarding {
+    if active_mode == ViewMode::Onboarding {
         left_items.push((Span::raw(" "), None));
         let ob_label = tab_label(
             tier,
             ViewMode::Onboarding,
-            state.view_mode,
+            active_mode,
             ctx_count,
             review_count,
             plans_count,
+            &state.i18n,
         );
         left_items.push((
             Span::styled(
@@ -511,7 +500,7 @@ mod tests {
 
     fn test_app_state() -> AppState {
         AppState {
-            view_mode: ViewMode::Develop,
+            view_mode: ViewMode::Repl,
             protocol_version: "1.0".to_string(),
             repo_state: Some(tauqe_protocol::RepositoryState {
                 root: "/projects/tauqe-awesome-workspace".to_string(),
@@ -526,7 +515,7 @@ mod tests {
             available_models: Vec::new(),
             available_workflows: Vec::new(),
             available_edit_protocols: Vec::new(),
-            model: crate::views::develop::DevelopView::default(),
+            model: crate::views::repl::ReplView::default(),
             context: tauqe_protocol::ContextState::default(),
             context_view: crate::views::context::ContextViewState::default(),
             history_view: crate::views::history::HistoryViewState::default(),
@@ -570,6 +559,8 @@ mod tests {
             discussion_focus: tauqe_protocol::DiscussionFocus::None,
             active_theme_preset: crate::theme::presets::ThemePreset::TauqeDark,
             theme_selector: None,
+            i18n: crate::i18n::I18nEngine::english(),
+            locale_dialog: None,
         }
     }
 
@@ -586,50 +577,140 @@ mod tests {
 
     #[test]
     fn test_tab_label_review_count() {
+        let i18n = I18nEngine::english();
+        let label = |tier: HeaderTier,
+                     mode: ViewMode,
+                     active: ViewMode,
+                     ctx: usize,
+                     review: usize,
+                     plans: usize| {
+            tab_label(tier, mode, active, ctx, review, plans, &i18n)
+        };
+
         assert_eq!(
-            tab_label(HeaderTier::Full, ViewMode::Develop, ViewMode::Develop, 0, 0, 0),
+            label(HeaderTier::Full, ViewMode::Repl, ViewMode::Repl, 0, 0, 0),
             " 1: REPL "
         );
         assert_eq!(
-            tab_label(HeaderTier::Medium, ViewMode::Develop, ViewMode::Develop, 0, 0, 0),
+            label(HeaderTier::Medium, ViewMode::Repl, ViewMode::Repl, 0, 0, 0),
             " 1: REPL "
         );
         assert_eq!(
-            tab_label(HeaderTier::Compact, ViewMode::Develop, ViewMode::Develop, 0, 0, 0),
+            label(HeaderTier::Compact, ViewMode::Repl, ViewMode::Repl, 0, 0, 0),
             " 1: REPL "
         );
         assert_eq!(
-            tab_label(HeaderTier::Compact, ViewMode::Develop, ViewMode::Context, 0, 0, 0),
+            label(HeaderTier::Compact, ViewMode::Repl, ViewMode::Context, 0, 0, 0),
             " 1 "
         );
         assert_eq!(
-            tab_label(HeaderTier::Full, ViewMode::Plans, ViewMode::Develop, 0, 0, 0),
+            label(HeaderTier::Full, ViewMode::Plans, ViewMode::Repl, 0, 0, 0),
             " 2: Plans "
         );
         assert_eq!(
-            tab_label(HeaderTier::Full, ViewMode::Plans, ViewMode::Develop, 0, 0, 3),
+            label(HeaderTier::Full, ViewMode::Plans, ViewMode::Repl, 0, 0, 3),
             " 2: Plans (3) "
         );
         assert_eq!(
-            tab_label(HeaderTier::Full, ViewMode::Review, ViewMode::Develop, 0, 0, 0),
+            label(HeaderTier::Full, ViewMode::Review, ViewMode::Repl, 0, 0, 0),
             " 3: Review "
         );
         assert_eq!(
-            tab_label(HeaderTier::Full, ViewMode::Review, ViewMode::Develop, 0, 2, 0),
+            label(HeaderTier::Full, ViewMode::Review, ViewMode::Repl, 0, 2, 0),
             " 3: Review (2) "
         );
         assert_eq!(
-            tab_label(HeaderTier::Medium, ViewMode::Review, ViewMode::Develop, 0, 3, 0),
-            " 3: Rev (3) "
+            label(HeaderTier::Medium, ViewMode::Review, ViewMode::Repl, 0, 3, 0),
+            " 3: Review "
         );
         assert_eq!(
-            tab_label(HeaderTier::Compact, ViewMode::Review, ViewMode::Review, 0, 1, 0),
-            " 3: Rev (1) "
+            label(HeaderTier::Compact, ViewMode::Review, ViewMode::Review, 0, 1, 0),
+            " 3: Review "
         );
         assert_eq!(
-            tab_label(HeaderTier::Compact, ViewMode::Review, ViewMode::Develop, 0, 1, 0),
+            label(HeaderTier::Compact, ViewMode::Review, ViewMode::Repl, 0, 1, 0),
             " 3 "
         );
+    }
+
+    /// Synthesized locale with tab names that fit the catalog column budget
+    /// while differing in visual width from their English originals.
+    fn russian_locale() -> crate::i18n::CustomLocale {
+        let mut translations = std::collections::BTreeMap::new();
+        for (key, value) in [
+            ("tab.repl", "Разраб"),
+            ("tab.plans", "Планы"),
+            ("tab.review", "Обзор"),
+            ("tab.context", "Контекст"),
+            ("tab.history", "История"),
+            ("tab.onboarding", "Настройка"),
+        ] {
+            translations.insert(key.to_string(), value.to_string());
+        }
+        crate::i18n::CustomLocale::new("Russian", translations)
+    }
+
+    /// Asserts every registered header hit area is in bounds and that neither
+    /// the tab group nor the right-side button group overlaps.
+    fn assert_ranges_within_bounds(state: &AppState, width: u16) {
+        let max_col = width.saturating_sub(1);
+        let tab_ranges = [
+            state.header_clicks.repl_tab,
+            state.header_clicks.plans_tab,
+            state.header_clicks.review_tab,
+            state.header_clicks.context_tab,
+            state.header_clicks.history_tab,
+        ];
+        let action_ranges = [
+            state.header_clicks.model_select,
+            state.header_clicks.squash_button,
+            state.header_clicks.help_button,
+        ];
+        let groups: [&[(u16, u16)]; 2] = [&tab_ranges, &action_ranges];
+
+        for group in groups {
+            let mut last_end: Option<u16> = None;
+            for &range in group {
+                if range == (0, 0) {
+                    continue;
+                }
+                assert!(range.0 <= range.1, "malformed range {range:?} at width {width}");
+                assert!(range.1 < max_col, "range {range:?} overflows width {width}");
+                if let Some(prev) = last_end {
+                    assert!(
+                        prev < range.0,
+                        "ranges overlap at width {width}: {prev} vs {range:?}"
+                    );
+                }
+                last_end = Some(range.1);
+            }
+        }
+    }
+
+    #[test]
+    fn test_header_geometry_holds_across_locale_hot_swap() {
+        for &w in &[80u16, 100, 120, 160] {
+            let backend = TestBackend::new(w, 3);
+            let mut terminal = Terminal::new(backend).expect("terminal created");
+            let mut state = test_app_state();
+
+            terminal
+                .draw(|frame| render_header(frame, &mut state, frame.area()))
+                .expect("english draw succeeded");
+            assert_ranges_within_bounds(&state, w);
+
+            // Hot-swap to a synthesized locale; the header must re-render with
+            // the same non-overlapping, in-bounds geometry (c-1, c-5).
+            state.i18n = crate::i18n::I18nEngine::new(Some(russian_locale()));
+            terminal
+                .draw(|frame| render_header(frame, &mut state, frame.area()))
+                .expect("localized draw succeeded");
+            assert_ranges_within_bounds(&state, w);
+            assert!(
+                header_row_text(&terminal, state.header_clicks.row).contains("Разраб"),
+                "localized tab label must render at width {w}"
+            );
+        }
     }
 
     #[test]
@@ -680,9 +761,9 @@ mod tests {
                 w
             );
             assert_ne!(
-                clicks.develop_tab,
+                clicks.repl_tab,
                 (0, 0),
-                "Develop tab must be visible and registered at width {}",
+                "REPL tab must be visible and registered at width {}",
                 w
             );
             assert_ne!(
@@ -697,7 +778,7 @@ mod tests {
             assert!(clicks.help_button.1 < max_col, "Help button exceeds width {} ({:?})", w, clicks.help_button);
             assert!(clicks.squash_button.1 < clicks.help_button.0, "Squash and help button overlap");
             assert!(clicks.model_select.1 < clicks.squash_button.0, "Model and squash button overlap");
-            assert!(clicks.develop_tab.1 < clicks.plans_tab.0, "Develop and plans tab overlap");
+            assert!(clicks.repl_tab.1 < clicks.plans_tab.0, "REPL and plans tab overlap");
 
             assert!(
                 header_row_text(&terminal, clicks.row).contains("C-S"),
@@ -766,7 +847,7 @@ mod tests {
     fn test_model_selector_label_tracks_running_turn() {
         let mut state = test_app_state();
         state.model_choice.selection = ModelSelection::Role(ModelRole::Primary);
-        state.model.status = crate::views::develop::TurnStatus::Thinking;
+        state.model.status = crate::views::repl::TurnStatus::Thinking;
 
         // The live model and its semantic role replace the idle selection.
         state.running_model = Some(crate::app::RunningModel {
@@ -799,7 +880,7 @@ mod tests {
         assert_eq!(model_selector_label(&state, 40), "Primary");
 
         // Once the turn settles the header returns to the developer's selection.
-        state.model.status = crate::views::develop::TurnStatus::Done;
+        state.model.status = crate::views::repl::TurnStatus::Done;
         state.running_model = None;
         assert_eq!(model_selector_label(&state, 40), "Primary");
     }
@@ -836,7 +917,7 @@ mod tests {
             let backend = TestBackend::new(120, 3);
             let mut terminal = Terminal::new(backend).expect("terminal created");
             let mut state = test_app_state();
-            state.view_mode = ViewMode::Develop;
+            state.view_mode = ViewMode::Repl;
 
             terminal
                 .draw(|frame| {
@@ -845,7 +926,7 @@ mod tests {
                 .expect("draw succeeded");
 
             let row = state.header_clicks.row;
-            let (start, end) = state.header_clicks.develop_tab;
+            let (start, end) = state.header_clicks.repl_tab;
             assert!(end >= start);
             let cell = &terminal.backend().buffer()[(start, row)];
             assert_eq!(cell.bg, engine.color(palette.button_active_bg));

@@ -14,7 +14,7 @@ use tokio::sync::mpsc;
 
 use crate::state::{AppState, OperationGuard};
 
-use super::common::{clear_auto_context, emit};
+use super::common::{clear_auto_context, emit, offload_plan};
 use super::engine::{execute_plan_horizon_synthesis, PlanHorizonDiagnosticsOwned};
 use super::step::PlanStepExecutor;
 
@@ -56,7 +56,14 @@ pub(super) async fn run_plan_batch(
     operation: Arc<OperationGuard>,
 ) -> BatchOutcome {
     let repo_root = state.context.read().await.repo_root().to_path_buf();
-    let _ = PlanStorage::save_active_id(&repo_root, Some(plan_id));
+    {
+        let active_root = repo_root.clone();
+        let active_plan_id = plan_id.to_string();
+        let _ = offload_plan(move || {
+            PlanStorage::save_active_id(&active_root, Some(active_plan_id.as_str()))
+        })
+        .await;
+    }
     clear_auto_context(state).await;
 
     tracing::info!(
@@ -179,7 +186,13 @@ pub(super) async fn run_plan_batch(
                         .ok(),
                     );
 
-                    let plan = match PlanStorage::load_plan(&repo_root, plan_id) {
+                    let load_root = repo_root.clone();
+                    let load_plan_id = plan_id.to_string();
+                    let plan = match offload_plan(move || {
+                        PlanStorage::load_plan(&load_root, &load_plan_id)
+                    })
+                    .await
+                    {
                         Ok(Some(p)) => p,
                         Ok(None) => {
                             let err_msg = format!("Plan '{}' not found", plan_id);
@@ -188,9 +201,8 @@ pub(super) async fn run_plan_batch(
                             break;
                         }
                         Err(err) => {
-                            let err_msg = format!("{:#}", err);
-                            last_error = Some(err_msg.clone());
-                            final_stop = BatchStop::Blocked { step_id, reason: err_msg };
+                            last_error = Some(err.clone());
+                            final_stop = BatchStop::Blocked { step_id, reason: err };
                             break;
                         }
                     };
@@ -408,10 +420,18 @@ pub async fn handle_plan_execute(req: Request, state: &Arc<AppState>) -> Respons
     };
 
     let repo_root = state.context.read().await.repo_root().to_path_buf();
-    let plan = match PlanStorage::load_plan(&repo_root, &params.plan_id) {
+    let load_root = repo_root.clone();
+    let load_plan_id = params.plan_id.clone();
+    let plan = match offload_plan(move || PlanStorage::load_plan(&load_root, &load_plan_id)).await {
         Ok(Some(p)) => p,
-        Ok(None) => return Response::err(req.id, errors::NOT_FOUND, format!("Plan '{}' not found", params.plan_id)),
-        Err(err) => return Response::err(req.id, errors::PLAN_LOAD_FAILED, format!("{:#}", err)),
+        Ok(None) => {
+            return Response::err(
+                req.id,
+                errors::NOT_FOUND,
+                format!("Plan '{}' not found", params.plan_id),
+            );
+        }
+        Err(err) => return Response::err(req.id, errors::PLAN_LOAD_FAILED, err),
     };
 
     let steps = match plan.evaluate_scope(params.step_id.as_deref()) {
@@ -588,7 +608,9 @@ pub async fn handle_plan_refine(req: Request, state: &Arc<AppState>) -> Response
 
     let repo_root = state.context.read().await.repo_root().to_path_buf();
     let effective_plan_id = if plan_id.trim().is_empty() {
-        PlanStorage::load_active_id(&repo_root)
+        let active_root = repo_root.clone();
+        offload_plan(move || PlanStorage::load_active_id(&active_root))
+            .await
             .ok()
             .flatten()
             .unwrap_or_default()
@@ -604,7 +626,9 @@ pub async fn handle_plan_refine(req: Request, state: &Arc<AppState>) -> Response
         );
     }
 
-    let plan = match PlanStorage::load_plan(&repo_root, &effective_plan_id) {
+    let load_root = repo_root.clone();
+    let load_plan_id = effective_plan_id.clone();
+    let plan = match offload_plan(move || PlanStorage::load_plan(&load_root, &load_plan_id)).await {
         Ok(Some(p)) => p,
         Ok(None) => {
             return Response::err(
@@ -613,7 +637,7 @@ pub async fn handle_plan_refine(req: Request, state: &Arc<AppState>) -> Response
                 format!("Plan '{}' not found", effective_plan_id),
             );
         }
-        Err(err) => return Response::err(req.id, errors::PLAN_LOAD_FAILED, format!("{:#}", err)),
+        Err(err) => return Response::err(req.id, errors::PLAN_LOAD_FAILED, err),
     };
 
     let operation = match state.try_begin_operation() {
@@ -704,7 +728,9 @@ pub async fn handle_plan_replan(req: Request, state: &Arc<AppState>) -> Response
 
     let repo_root = state.context.read().await.repo_root().to_path_buf();
     let effective_plan_id = if plan_id.trim().is_empty() {
-        PlanStorage::load_active_id(&repo_root)
+        let active_root = repo_root.clone();
+        offload_plan(move || PlanStorage::load_active_id(&active_root))
+            .await
             .ok()
             .flatten()
             .unwrap_or_default()
@@ -723,7 +749,9 @@ pub async fn handle_plan_replan(req: Request, state: &Arc<AppState>) -> Response
         return Response::err(req.id, errors::INVALID_PARAMS, "Missing blocked step ID to replan");
     }
 
-    let plan = match PlanStorage::load_plan(&repo_root, &effective_plan_id) {
+    let load_root = repo_root.clone();
+    let load_plan_id = effective_plan_id.clone();
+    let plan = match offload_plan(move || PlanStorage::load_plan(&load_root, &load_plan_id)).await {
         Ok(Some(p)) => p,
         Ok(None) => {
             return Response::err(
@@ -732,7 +760,7 @@ pub async fn handle_plan_replan(req: Request, state: &Arc<AppState>) -> Response
                 format!("Plan '{}' not found", effective_plan_id),
             );
         }
-        Err(err) => return Response::err(req.id, errors::PLAN_LOAD_FAILED, format!("{:#}", err)),
+        Err(err) => return Response::err(req.id, errors::PLAN_LOAD_FAILED, err),
     };
 
     let step = match plan.find_item(&step_id) {

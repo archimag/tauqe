@@ -128,6 +128,12 @@ impl PlanRefineResult {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlanUpdatedEvent {
     pub plan: Plan,
+    /// Whether this update created or fully replaced the plan (a `save` action
+    /// of the Architect) rather than modifying it incrementally. Clients use
+    /// the flag to focus a freshly created plan; an incremental update reports
+    /// `false`.
+    #[serde(default)]
+    pub is_save: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

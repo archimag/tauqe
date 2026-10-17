@@ -214,6 +214,8 @@ fn merge_output(target: &mut FsmTurnOutcome, next: FsmTurnOutcome, banner: &str)
     target.result = next.result;
     target.is_cancelled = next.is_cancelled;
     target.blocked = next.blocked;
+    target.has_terminal_success = next.has_terminal_success;
+    target.plan_saved = next.plan_saved;
 }
 
 #[cfg(test)]

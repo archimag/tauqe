@@ -1,4 +1,6 @@
-use tauqe_protocol::{DiscussionContextRequest, DiscussionPlanUpdate, DiscussionResponse};
+use tauqe_protocol::{
+    DiscussionContextRequest, DiscussionPlanUpdate, DiscussionResponse, RepoSearchRequest,
+};
 use tracing::{info, warn};
 
 use super::json::decode::{balanced_object_end, strip_code_fence, StringFieldCursor};
@@ -210,6 +212,15 @@ impl DiscussionStreamFilter {
                 })
                 .unwrap_or_default();
 
+            let repo_searches = val
+                .get("repo_searches")
+                .or_else(|| val.get("search_requests"))
+                .filter(|v| !v.is_null())
+                .and_then(|v| {
+                    serde_json::from_value::<Vec<RepoSearchRequest>>(v.clone()).ok()
+                })
+                .unwrap_or_default();
+
             let user_language = val
                 .get("user_language")
                 .and_then(|v| v.as_str())
@@ -219,13 +230,19 @@ impl DiscussionStreamFilter {
                 message,
                 plan_update,
                 context_requests,
+                repo_searches,
                 user_language,
             };
         }
 
         // Non-JSON plain text fallback
         info!("Discussion response parsed as plain text fallback");
-        DiscussionResponse::new(raw.trim())
+        let searches = crate::edits::protocol::xml::tags::parse_repo_search_tags(raw);
+        let mut resp = DiscussionResponse::new(raw.trim());
+        if !searches.is_empty() {
+            resp.repo_searches = searches;
+        }
+        resp
     }
 
     fn sanitize_plan_update(resp: &mut DiscussionResponse) {

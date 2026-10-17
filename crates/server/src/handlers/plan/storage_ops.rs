@@ -102,6 +102,14 @@ pub async fn handle_plan_get(req: Request, state: &Arc<AppState>) -> Response {
 }
 
 pub async fn handle_plan_save(req: Request, state: &Arc<AppState>) -> Response {
+    if let Some(resp) = crate::handlers::reject_if_operation_active(
+        &req.id,
+        state,
+        "Cannot save a plan while a model operation is in progress",
+    ) {
+        return resp;
+    }
+
     let params: PlanSaveParams = match req.params.and_then(|p| serde_json::from_value(p).ok()) {
         Some(p) => p,
         None => return Response::err(req.id, errors::INVALID_PARAMS, "Missing or invalid plan payload"),
@@ -136,7 +144,11 @@ pub async fn handle_plan_save(req: Request, state: &Arc<AppState>) -> Response {
     emit(
         &state.out,
         events::PLAN_UPDATED,
-        serde_json::to_value(PlanUpdatedEvent { plan: plan.clone() }).ok(),
+        serde_json::to_value(PlanUpdatedEvent {
+            plan: plan.clone(),
+            is_save: true,
+        })
+        .ok(),
     );
 
     let list_root = repo_root.clone();
@@ -158,6 +170,14 @@ pub async fn handle_plan_save(req: Request, state: &Arc<AppState>) -> Response {
 }
 
 pub async fn handle_plan_update_item(req: Request, state: &Arc<AppState>) -> Response {
+    if let Some(resp) = crate::handlers::reject_if_operation_active(
+        &req.id,
+        state,
+        "Cannot update a plan item while a model operation is in progress",
+    ) {
+        return resp;
+    }
+
     let params: PlanUpdateItemParams = match req.params.and_then(|p| serde_json::from_value(p).ok()) {
         Some(p) => p,
         None => return Response::err(req.id, errors::INVALID_PARAMS, "Missing or invalid update item params"),
@@ -178,6 +198,7 @@ pub async fn handle_plan_update_item(req: Request, state: &Arc<AppState>) -> Res
                 events::PLAN_UPDATED,
                 serde_json::to_value(PlanUpdatedEvent {
                     plan: plan.clone(),
+                    is_save: false,
                 })
                 .ok(),
             );
@@ -207,6 +228,14 @@ pub async fn handle_plan_update_item(req: Request, state: &Arc<AppState>) -> Res
 }
 
 pub async fn handle_plan_delete(req: Request, state: &Arc<AppState>) -> Response {
+    if let Some(resp) = crate::handlers::reject_if_operation_active(
+        &req.id,
+        state,
+        "Cannot delete a plan while a model operation is in progress",
+    ) {
+        return resp;
+    }
+
     let params: PlanDeleteParams = match req.params.and_then(|p| serde_json::from_value(p).ok()) {
         Some(p) => p,
         None => return Response::err(req.id, errors::INVALID_PARAMS, "Missing or invalid plan ID"),
@@ -240,6 +269,14 @@ pub async fn handle_plan_delete(req: Request, state: &Arc<AppState>) -> Response
 }
 
 pub async fn handle_plan_set_active(req: Request, state: &Arc<AppState>) -> Response {
+    if let Some(resp) = crate::handlers::reject_if_operation_active(
+        &req.id,
+        state,
+        "Cannot change the active plan while a model operation is in progress",
+    ) {
+        return resp;
+    }
+
     // A present payload must parse cleanly: a silent fallback to the default would
     // clear the active plan when the payload is malformed.
     let params: PlanSetActiveParams = match req.params {

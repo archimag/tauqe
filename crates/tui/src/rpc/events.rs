@@ -10,14 +10,15 @@ use tauqe_protocol::{
     ReviewReasoningDeltaEvent, ReviewStartedEvent,
 };
 
-use crate::app::{AppState, RunningModel};
-use crate::views::develop::{
-    DevelopView, EditOp, FileEditStatus, StreamingFileEdit, StreamingHunk, ToolchainState,
+use crate::app::{AppState, RunningModel, ViewMode};
+use crate::i18n::active_t;
+use crate::views::repl::{
+    EditOp, FileEditStatus, ReplView, StreamingFileEdit, StreamingHunk, ToolchainState,
     TurnStatus,
 };
 use super::responses::messages;
 
-pub fn fail_safe_reject_edits(model: &mut DevelopView, reason: &str) {
+pub fn fail_safe_reject_edits(model: &mut ReplView, reason: &str) {
     if !model.edits_active || model.edit_final_applied.is_some() {
         return;
     }
@@ -70,13 +71,19 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
             if let Some(params) = ev.params {
                 if let Ok(data) = serde_json::from_value::<GitSquashApplyResult>(params) {
                     st.squash_dialog = None;
-                    let first_line = data.message.lines().next().unwrap_or("Squashed commit");
-                    st.notify_success(format!(
-                        "Squashed commits into {} ('{}')",
-                        data.squashed_commit, first_line
-                    ));
+                    let first_line = data
+                        .message
+                        .lines()
+                        .next()
+                        .map(str::to_string)
+                        .unwrap_or_else(|| active_t("notify.squashed_commit_fallback"));
+                    st.notify_success(
+                        active_t("notify.squashed_commits")
+                            .replacen("{}", &data.squashed_commit, 1)
+                            .replacen("{}", &first_line, 1),
+                    );
                     st.model.last_commit_hash = Some(data.squashed_commit);
-                    st.model.last_commit_summary = Some(first_line.to_string());
+                    st.model.last_commit_summary = Some(first_line);
                 }
             }
         }
@@ -517,10 +524,15 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
                 if !st.model.is_batch
                     && st.tui_config.notifications.should_notify(elapsed, focused)
                 {
-                    let summary = st.model.last_commit_summary.as_deref().unwrap_or("Turn completed");
+                    let title = active_t("notify.turn_desktop_title");
+                    let summary = st
+                        .model
+                        .last_commit_summary
+                        .clone()
+                        .unwrap_or_else(|| active_t("notify.turn_completed"));
                     crate::terminal::trigger_turn_notification(
-                        "TAUQE",
-                        summary,
+                        &title,
+                        &summary,
                         &st.tui_config.notifications,
                         focused,
                     );
@@ -545,10 +557,7 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
                             f.retry_info = None;
                         }
                     } else {
-                        fail_safe_reject_edits(
-                            &mut st.model,
-                            "Edit state desynchronized: server finished without sending edit/finished",
-                        );
+                        fail_safe_reject_edits(&mut st.model, &active_t("notify.edit_desync"));
                     }
                     st.model.update_markdown();
                     let h = st.last_model_height;
@@ -585,10 +594,7 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
                 }
             }
             st.model.current_cost = None;
-            fail_safe_reject_edits(
-                &mut st.model,
-                "Operation cancelled before edits were applied",
-            );
+            fail_safe_reject_edits(&mut st.model, &active_t("notify.cancelled_before_edits"));
             let h = st.last_model_height;
             st.model.clamp_scroll(h);
         }
@@ -605,9 +611,11 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
                 if !st.model.is_batch
                     && st.tui_config.notifications.should_notify(elapsed, focused)
                 {
+                    let title = active_t("notify.turn_error_desktop_title");
+                    let body = active_t("notify.turn_error_desktop_body");
                     crate::terminal::trigger_turn_notification(
-                        "TAUQE Error",
-                        "Turn failed with error",
+                        &title,
+                        &body,
                         &st.tui_config.notifications,
                         focused,
                     );
@@ -625,10 +633,7 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
                         }
                     }
                     st.model.current_cost = None;
-                    fail_safe_reject_edits(
-                        &mut st.model,
-                        "Operation failed before edits were applied",
-                    );
+                    fail_safe_reject_edits(&mut st.model, &active_t("notify.failed_before_edits"));
                     st.model.error = Some(data.message);
                     let h = st.last_model_height;
                     st.model.clamp_scroll(h);
@@ -687,9 +692,11 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
                 let elapsed = started.elapsed().as_secs();
                 let focused = st.terminal_focused;
                 if st.tui_config.notifications.should_notify(elapsed, focused) {
-                    let summary = format!("Code review completed ({} findings)", findings_count);
+                    let title = active_t("notify.review_desktop_title");
+                    let summary = active_t("notify.review_completed_desktop_body")
+                        .replacen("{}", &findings_count.to_string(), 1);
                     crate::terminal::trigger_turn_notification(
-                        "TAUQE Review",
+                        &title,
                         &summary,
                         &st.tui_config.notifications,
                         focused,
@@ -700,7 +707,7 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
         events::REVIEW_CANCELLED => {
             st.review.running = false;
             st.turn_started_at = None;
-            st.review.error = Some("Review cancelled".to_string());
+            st.review.error = Some(active_t("notify.review_cancelled"));
             end_review_turn(&mut st.model, TurnStatus::Cancelled, None);
         }
         events::REVIEW_ERROR => {
@@ -709,9 +716,11 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
                 let elapsed = started.elapsed().as_secs();
                 let focused = st.terminal_focused;
                 if st.tui_config.notifications.should_notify(elapsed, focused) {
+                    let title = active_t("notify.review_error_desktop_title");
+                    let body = active_t("notify.review_error_desktop_body");
                     crate::terminal::trigger_turn_notification(
-                        "TAUQE Review Error",
-                        "Code review failed",
+                        &title,
+                        &body,
                         &st.tui_config.notifications,
                         focused,
                     );
@@ -727,10 +736,19 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
         events::PLAN_UPDATED => {
             if let Some(params) = ev.params {
                 if let Ok(data) = serde_json::from_value::<tauqe_protocol::PlanUpdatedEvent>(params) {
-                    if let Some(pos) = st.plans_view.plans.iter().position(|p| p.id == data.plan.id) {
+                    let plan_id = data.plan.id.clone();
+                    if let Some(pos) = st.plans_view.plans.iter().position(|p| p.id == plan_id) {
                         st.plans_view.plans[pos] = data.plan;
                     } else {
                         st.plans_view.plans.push(data.plan);
+                    }
+                    // A `save` action creates or fully replaces a plan: switch to
+                    // the Plans tab and anchor the cursor on the fresh plan's
+                    // header instead of leaving the developer in the active view
+                    // (c-4).
+                    if data.is_save {
+                        st.view_mode = ViewMode::Plans;
+                        st.plans_view.focus_plan_header(&plan_id);
                     }
                 }
             }
@@ -786,7 +804,7 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
 /// The review summary is streamed into the main develop canvas, so the buffer
 /// must shed any state left by a prior turn before the reviewer's reasoning and
 /// summary begin to arrive.
-fn begin_review_turn(model: &mut DevelopView, data: &ReviewStartedEvent) {
+fn begin_review_turn(model: &mut ReplView, data: &ReviewStartedEvent) {
     model.operation_id = Some(data.operation_id.clone());
     model.model = Some(data.model.clone());
     model.reasoning.clear();
@@ -817,7 +835,7 @@ fn begin_review_turn(model: &mut DevelopView, data: &ReviewStartedEvent) {
 }
 
 /// Streams a Reviewer reasoning delta into the REPL reasoning buffer.
-fn apply_review_reasoning(model: &mut DevelopView, delta: &str) {
+fn apply_review_reasoning(model: &mut ReplView, delta: &str) {
     if !delta.is_empty() {
         model.status = TurnStatus::Thinking;
     }
@@ -830,7 +848,7 @@ fn apply_review_reasoning(model: &mut DevelopView, delta: &str) {
 /// once, mirroring `MODEL_TEXT_DELTA`: the live tail window is finalized and the
 /// block folds into "▶ Thinking hidden", so the reasoning lifecycle stays
 /// identical across ordinary, discussion, and review turns.
-fn apply_review_content(model: &mut DevelopView, delta: &str) {
+fn apply_review_content(model: &mut ReplView, delta: &str) {
     if delta.is_empty() {
         return;
     }
@@ -844,13 +862,13 @@ fn apply_review_content(model: &mut DevelopView, delta: &str) {
 }
 
 /// Finalizes a completed Reviewer stream into the REPL buffer.
-fn finish_review_turn(model: &mut DevelopView) {
+fn finish_review_turn(model: &mut ReplView) {
     end_review_turn(model, TurnStatus::Done, None);
     model.update_markdown();
 }
 
 /// Settles the REPL buffer into a terminal status and finalizes reasoning.
-fn end_review_turn(model: &mut DevelopView, status: TurnStatus, error: Option<String>) {
+fn end_review_turn(model: &mut ReplView, status: TurnStatus, error: Option<String>) {
     model.reasoning.finalize();
     model.reasoning.show = false;
     model.status = status;
@@ -891,15 +909,15 @@ fn format_batch_summary(kind: &str, summary: &BatchFinishSummary) -> (String, St
         BatchFinishStatus::Cancelled => "cancelled",
         BatchFinishStatus::Stopped => "stopped",
     };
-    let title = format!("TAUQE {} batch {}", kind, status_word);
-    let mut body = format!(
-        "{} '{}': {}/{} steps in {}",
-        kind,
-        summary.owner_id,
-        summary.executed_count,
-        summary.total_count,
-        format_elapsed(summary.elapsed_seconds),
-    );
+    let title = active_t("notify.batch_title")
+        .replacen("{}", kind, 1)
+        .replacen("{}", status_word, 1);
+    let mut body = active_t("notify.batch_body")
+        .replacen("{}", kind, 1)
+        .replacen("{}", &summary.owner_id, 1)
+        .replacen("{}", &summary.executed_count.to_string(), 1)
+        .replacen("{}", &summary.total_count.to_string(), 1)
+        .replacen("{}", &format_elapsed(summary.elapsed_seconds), 1);
     if let Some(err) = summary.error.as_deref() {
         let first_line = err.lines().next().unwrap_or("").trim();
         if !first_line.is_empty() {
@@ -918,10 +936,14 @@ fn format_turn_completion_message(
 ) -> String {
     let summary = commit_summary.map(str::trim).filter(|s| !s.is_empty());
     match (commit_hash, summary) {
-        (Some(hash), Some(summary)) => format!("Turn completed ({}): {}", hash, summary),
-        (Some(hash), None) => format!("Turn completed ({})", hash),
-        (None, Some(summary)) => format!("Turn completed: {}", summary),
-        (None, None) => "Turn completed".to_string(),
+        (Some(hash), Some(summary)) => active_t("notify.turn_completed_hash_summary")
+            .replacen("{}", hash, 1)
+            .replacen("{}", summary, 1),
+        (Some(hash), None) => active_t("notify.turn_completed_hash").replacen("{}", hash, 1),
+        (None, Some(summary)) => {
+            active_t("notify.turn_completed_summary").replacen("{}", summary, 1)
+        }
+        (None, None) => active_t("notify.turn_completed"),
     }
 }
 
@@ -997,7 +1019,7 @@ mod tests {
 
     #[test]
     fn test_review_started_resets_repl_buffer() {
-        let mut model = DevelopView::default();
+        let mut model = ReplView::default();
         apply_review_content(&mut model, "# Stale summary");
         model.error = Some("old error".to_string());
         model.status = TurnStatus::Editing;
@@ -1028,7 +1050,7 @@ mod tests {
 
     #[test]
     fn test_review_reasoning_delta_streams_into_repl() {
-        let mut model = DevelopView {
+        let mut model = ReplView {
             status: TurnStatus::Responding,
             ..Default::default()
         };
@@ -1041,7 +1063,7 @@ mod tests {
 
     #[test]
     fn test_review_content_delta_renders_markdown_in_repl() {
-        let mut model = DevelopView::default();
+        let mut model = ReplView::default();
 
         apply_review_content(&mut model, "# Executive Summary\n\nNo critical issues.");
 
@@ -1052,7 +1074,7 @@ mod tests {
 
     #[test]
     fn test_review_content_delta_finalizes_and_folds_reasoning() {
-        let mut model = DevelopView::default();
+        let mut model = ReplView::default();
         apply_review_reasoning(&mut model, "weighing the options");
         assert!(model.reasoning.is_streaming());
         assert!(model.reasoning.show);
@@ -1071,7 +1093,7 @@ mod tests {
 
     #[test]
     fn test_review_finished_rerenders_markdown_and_marks_done() {
-        let mut model = DevelopView::default();
+        let mut model = ReplView::default();
         apply_review_reasoning(&mut model, "reasoning");
         apply_review_content(&mut model, "# Summary");
         model.markdown_lines.clear();
@@ -1084,13 +1106,13 @@ mod tests {
 
     #[test]
     fn test_review_terminal_statuses_map_to_repl() {
-        let mut cancelled = DevelopView::default();
+        let mut cancelled = ReplView::default();
         cancelled.reasoning.show = true;
         end_review_turn(&mut cancelled, TurnStatus::Cancelled, None);
         assert_eq!(cancelled.status, TurnStatus::Cancelled);
         assert!(!cancelled.reasoning.show);
 
-        let mut failed = DevelopView::default();
+        let mut failed = ReplView::default();
         failed.reasoning.show = true;
         end_review_turn(&mut failed, TurnStatus::Error, Some("boom".to_string()));
         assert_eq!(failed.status, TurnStatus::Error);
@@ -1310,5 +1332,34 @@ mod tests {
             .unwrap_or(u16::MAX)
             .saturating_sub(5);
         assert_eq!(guard.history_view.scroll, expected_scroll);
+    }
+
+    #[tokio::test]
+    async fn test_plan_updated_save_switches_to_plans_and_focuses_the_plan() {
+        let state = Arc::new(Mutex::new(crate::app::test_state()));
+        let mut is_reasoning = false;
+        let ev = Event {
+            method: events::PLAN_UPDATED.to_string(),
+            params: Some(
+                serde_json::to_value(tauqe_protocol::PlanUpdatedEvent {
+                    plan: tauqe_protocol::Plan {
+                        id: "plan-x".to_string(),
+                        title: "Plan X".to_string(),
+                        ..Default::default()
+                    },
+                    is_save: true,
+                })
+                .unwrap(),
+            ),
+        };
+
+        handle_event(ev, &state, &mut is_reasoning).await;
+
+        let guard = state.lock().await;
+        assert_eq!(guard.view_mode, crate::app::ViewMode::Plans);
+        assert!(
+            guard.plans_view.is_plan_expanded("plan-x"),
+            "a saved plan must be expanded so its header is visible"
+        );
     }
 }

@@ -5,28 +5,31 @@ use tauqe_protocol::{methods, DiscussionFocus};
 use tokio::sync::{Mutex, MutexGuard};
 
 use crate::app::{ActiveModal, AppState, BatchCancelButton, HelpTab, ViewMode};
+use crate::command::dialog::{DialogCommand, DIALOG_COMMAND_MAP};
 use crate::input::{squash, InputResult};
 use crate::rpc::{send_request, RpcConnection};
-use crate::views::develop::{DevelopView, TurnStatus};
 use crate::views::history::HistoryViewState;
+use crate::views::repl::{ReplView, TurnStatus};
 
 mod confirm;
+mod locale;
 mod prompt;
 mod refine;
 mod selection;
 mod status;
 
 use confirm::{resolve_batch_cancel, resolve_confirm, BatchCancelOutcome, ConfirmOutcome};
+pub(crate) use locale::click_locale_button;
 pub(crate) use prompt::submit_prompt_modal;
 pub(crate) use refine::{submit_refine_blocked, submit_refine_dialog};
 pub(crate) use selection::activate_selection_item;
 pub(crate) use status::apply_status_dialog;
 
-/// Resets the Develop view and marks the start of a new autonomous turn. Shared by
+/// Resets the REPL view and marks the start of a new autonomous turn. Shared by
 /// every dialog that launches a model request (prompt, discuss, refine, plan and
 /// review execution) so the state transition stays consistent.
-fn begin_develop_turn(st: &mut AppState) {
-    st.view_mode = ViewMode::Develop;
+fn begin_repl_turn(st: &mut AppState) {
+    st.view_mode = ViewMode::Repl;
     // A freshly launched turn starts from a clean batch-cancellation state.
     st.batch_stopping = false;
     // Executing code hands control to the Coder role: detach the discussion
@@ -61,7 +64,7 @@ fn begin_develop_turn(st: &mut AppState) {
 /// file edits, Git checkpoints, and toolchain verification. Surfacing the REPL
 /// keeps that batch fixing fully transparent.
 fn begin_review_execution_turn(st: &mut AppState) {
-    begin_develop_turn(st);
+    begin_repl_turn(st);
     st.model.is_batch = true;
     st.notify_info("Executing review finding(s): switched to REPL for coder execution");
 }
@@ -75,6 +78,9 @@ struct TurnLaunchSnapshot {
     develop_status: TurnStatus,
     turn_started_at: Option<std::time::Instant>,
     review_running: bool,
+    view_mode: ViewMode,
+    plan_refining: bool,
+    plan_refining_id: Option<String>,
 }
 
 impl TurnLaunchSnapshot {
@@ -83,6 +89,9 @@ impl TurnLaunchSnapshot {
             develop_status: st.model.status,
             turn_started_at: st.turn_started_at,
             review_running: st.review.running,
+            view_mode: st.view_mode,
+            plan_refining: st.plans_view.refining,
+            plan_refining_id: st.plans_view.refining_plan_id.clone(),
         }
     }
 
@@ -90,6 +99,9 @@ impl TurnLaunchSnapshot {
         st.model.status = self.develop_status;
         st.turn_started_at = self.turn_started_at;
         st.review.running = self.review_running;
+        st.view_mode = self.view_mode;
+        st.plans_view.refining = self.plan_refining;
+        st.plans_view.refining_plan_id = self.plan_refining_id;
     }
 }
 
@@ -122,8 +134,20 @@ async fn start_turn(
 /// three-way batch-cancel dialog and per-step notification suppression stay
 /// active.
 fn begin_scope_execution_turn(st: &mut AppState) {
-    begin_develop_turn(st);
+    begin_repl_turn(st);
     st.model.is_batch = true;
+}
+
+/// Applies the shared start transition for a plan-refinement turn.
+///
+/// The Architect role takes over the REPL and the plan is flagged as refining
+/// so the Plans view can render the in-flight horizon synthesis. It is the
+/// plan-refine peer of [`begin_review_execution_turn`] and is applied through
+/// `start_turn`, so a failed request rolls the flag back (c-5).
+fn begin_plan_refine_turn(st: &mut AppState, plan_id: String) {
+    begin_repl_turn(st);
+    st.plans_view.refining = true;
+    st.plans_view.refining_plan_id = Some(plan_id);
 }
 
 /// Launches a review-finding batch execution from a developer confirmation.
@@ -215,7 +239,7 @@ pub(crate) async fn confirm_clear_history(
 ) -> anyhow::Result<()> {
     let cost = st.model.session_total_cost;
     let prev_cost = st.model.prev_cost;
-    st.model = DevelopView {
+    st.model = ReplView {
         session_total_cost: cost,
         prev_cost,
         ..Default::default()
@@ -388,8 +412,6 @@ pub(crate) async fn handle_dialog_event(
                 let is_cmd = !is_ctrl_alt
                     && (primary.matches(key.modifiers)
                         || key.modifiers.contains(KeyModifiers::CONTROL));
-                let has_shift = key.modifiers.contains(KeyModifiers::SHIFT);
-                let has_alt = key.modifiers.contains(KeyModifiers::ALT);
 
                 // C-Enter accelerator unconditionally launches review from any section.
                 if matches!(key.code, KeyCode::Enter) && is_cmd {
@@ -398,11 +420,20 @@ pub(crate) async fn handle_dialog_event(
                     return Ok(Some(InputResult::Continue));
                 }
 
-                match key.code {
-                    // Esc always dismisses the dialog (safe cancellation).
-                    KeyCode::Esc => {}
-                    KeyCode::Char('q') if dialog.focus.is_actions() => {}
-                    KeyCode::Tab => {
+                // Resolve the shared dialog vocabulary through its single source
+                // of truth, so confirmation, cancellation, and button navigation
+                // are never re-implemented as ad-hoc key comparisons
+                // (Conventions §3, §5).
+                match DIALOG_COMMAND_MAP
+                    .resolve(key, &st.tui_config.input, false)
+                    .map(|spec| spec.action)
+                {
+                    // `Esc` dismisses from every section; `q` is a dismissal only
+                    // from the action bar, so it stays a literal character inside
+                    // the editors.
+                    Some(DialogCommand::Dismiss)
+                        if dialog.focus.is_actions() || key.code == KeyCode::Esc => {}
+                    Some(DialogCommand::FocusNext) => {
                         if dialog.focus.is_actions()
                             && dialog.confirm_button == crate::app::ConfirmDialogButton::Cancel
                         {
@@ -415,7 +446,7 @@ pub(crate) async fn handle_dialog_event(
                         }
                         st.review_dialog = Some(dialog);
                     }
-                    KeyCode::BackTab => {
+                    Some(DialogCommand::FocusPrev) => {
                         if dialog.focus.is_actions()
                             && dialog.confirm_button == crate::app::ConfirmDialogButton::Confirm
                         {
@@ -428,8 +459,11 @@ pub(crate) async fn handle_dialog_event(
                         }
                         st.review_dialog = Some(dialog);
                     }
-                    // Horizontal stepping moves between the action buttons.
-                    KeyCode::Left | KeyCode::Right if dialog.focus.is_actions() => {
+                    // Button stepping moves between the action buttons without
+                    // leaving the bar.
+                    Some(DialogCommand::StepNext) | Some(DialogCommand::StepPrev)
+                        if dialog.focus.is_actions() =>
+                    {
                         dialog.confirm_button = match dialog.confirm_button {
                             crate::app::ConfirmDialogButton::Cancel => {
                                 crate::app::ConfirmDialogButton::Confirm
@@ -440,9 +474,7 @@ pub(crate) async fn handle_dialog_event(
                         };
                         st.review_dialog = Some(dialog);
                     }
-                    KeyCode::Enter | KeyCode::Char(' ')
-                        if !has_shift && !has_alt && dialog.focus.is_actions() =>
-                    {
+                    Some(DialogCommand::Activate) if dialog.focus.is_actions() => {
                         // Starting a review is a long-running operation: it
                         // begins only from the focused `Confirm` button. The safe
                         // `Cancel` default dismisses the dialog (Conventions §7).
@@ -651,13 +683,16 @@ pub(crate) async fn handle_dialog_event(
             return Ok(Some(InputResult::Continue));
         }
         Some(ActiveModal::RefineDialog) => {
-            return refine::handle_refine_dialog(key, st, server_writer).await;
+            return refine::handle_refine_dialog(key, state, st, server_writer).await;
         }
         Some(ActiveModal::RefineBlocked) => {
-            return refine::handle_refine_blocked(key, st, server_writer).await;
+            return refine::handle_refine_blocked(key, state, st, server_writer).await;
         }
         Some(ActiveModal::Prompt) => {
             return prompt::handle_prompt_modal(key, st, server_writer).await;
+        }
+        Some(ActiveModal::Locale) => {
+            return locale::handle_locale_dialog(key, st, server_writer).await;
         }
         Some(ActiveModal::ClearHistory) => {
             match resolve_confirm(&mut st, key) {
@@ -673,15 +708,21 @@ pub(crate) async fn handle_dialog_event(
         Some(ActiveModal::Status) => {
             if let Some(mut dialog) = st.status_dialog.take() {
                 let total_options = dialog.target.options_count();
+                let visible = crate::dialogs::render::status_dialog_options_area(
+                    st.last_frame_area,
+                    total_options,
+                )
+                .height
+                .max(1) as usize;
 
-                if dialog.selector.handle_nav_key(key, total_options) {
+                if dialog.selector.handle_nav_key(key, visible) {
                     st.status_dialog = Some(dialog);
                     return Ok(Some(InputResult::Continue));
                 }
 
                 match key.code {
                     KeyCode::Esc | KeyCode::Char('q') => {}
-                    KeyCode::Char(c @ '1'..='6') => {
+                    KeyCode::Char(c @ '1'..='7') => {
                         let chosen = c as usize - '1' as usize;
                         st.status_dialog = Some(dialog);
                         if chosen < total_options {
@@ -778,22 +819,24 @@ pub(crate) async fn handle_dialog_event(
 mod tests {
     use std::sync::Arc;
 
-    use tauqe_protocol::{ReviewItem, ReviewItemStatus, ReviewSeverity};
+    use tauqe_protocol::{IssueStatus, IssueType, ReviewIssue};
 
     use super::*;
     use crate::app::{ConfirmDialogButton, ConfirmExecuteReviewState};
 
-    fn review_item(id: u32) -> ReviewItem {
-        ReviewItem {
+    fn review_issue(id: u32) -> ReviewIssue {
+        ReviewIssue {
             id,
             title: format!("Finding {}", id),
             model: None,
-            severity: ReviewSeverity::Warning,
-            status: ReviewItemStatus::Todo,
+            issue_type: IssueType::Bug,
+            status: IssueStatus::Todo,
+            description: String::new(),
+            recommendations: Vec::new(),
             files: Vec::new(),
-            subplan: Vec::new(),
-            resolution_notes: None,
-            body: String::new(),
+            readonly_files: Vec::new(),
+            plan: Vec::new(),
+            note: None,
         }
     }
 
@@ -803,7 +846,7 @@ mod tests {
             review_title: "Session rev-1".to_string(),
             scope_title: "All remaining TODO findings".to_string(),
             item_id: Some(1),
-            items: vec![review_item(1)],
+            items: vec![review_issue(1)],
         }
     }
 
@@ -924,7 +967,7 @@ mod tests {
         let key = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
         let (view, notification, pending) = launch_execute_review(key).await;
 
-        assert_eq!(view, ViewMode::Develop);
+        assert_eq!(view, ViewMode::Repl);
         assert_eq!(
             notification.as_deref(),
             Some("Executing review finding(s): switched to REPL for coder execution")
@@ -937,7 +980,7 @@ mod tests {
         let key = KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE);
         let (view, notification, pending) = launch_execute_review(key).await;
 
-        assert_eq!(view, ViewMode::Develop);
+        assert_eq!(view, ViewMode::Repl);
         assert_eq!(
             notification.as_deref(),
             Some("Executing review finding(s): switched to REPL for coder execution")

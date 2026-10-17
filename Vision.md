@@ -10,7 +10,7 @@ A large language model is a fast, capable, but blind workhorse. If given unrestr
 
 TAUQE holds the model in a firm grip:
 - **Blinkers (Repo Map):** The model perceives codebase contours and symbols through Tree-sitter, sufficient for architectural comprehension without context window bloat.
-- **Bit & Bridle (Strict Protocol):** The model has no arbitrary shell or bash access. It interacts with the world solely through typed protocol operations (virtual in-memory staging, declarative file discovery requests, deterministic toolchain verification).
+- **Bit & Bridle (Strict Protocol):** The model has no arbitrary shell or bash access. It interacts with the world solely through typed protocol operations (virtual in-memory staging, declarative file discovery requests, regex repository searches, deterministic toolchain verification).
 - **Reins (Git Transactions):** The developer steers the objective, while Git ensures an instant, atomic rollback if the model deviates from course.
 
 > **Maximum execution autonomy. Minimum procedural autonomy.**
@@ -93,8 +93,9 @@ Instead of an unbounded `while true` loop, TAUQE implements a deterministic fini
 ```text
                User Prompt
                     ↓
-        ┌─► [Discovery Phase] ──── (requests missing files via <context_request>
-        │           ↓               or system docs via <doc_request>)
+        ┌─► [Discovery Phase] ──── (requests missing files via <context_request>,
+        │           ↓               searches codebase via <repo_search>,
+        │           │               or system docs via <doc_request>)
         │   [Proposal Generation] ─ (generates minimal coherent patches)
         │           ↓
         │   [In-Memory Staging] ── (validates patches in memory with fuzzy matching)
@@ -110,7 +111,7 @@ Instead of an unbounded `while true` loop, TAUQE implements a deterministic fini
 ```
 
 Every phase in the turn is deterministic:
-1. **Discovery:** The model inspects the Tree-sitter Repo Map, identifies required definitions or system documentation, and requests them via protocol tags (`<context_request>`, `<doc_request>`). The server adds files to the `auto` context layer or injects documentation blocks and iterates. No manual `/add` required.
+1. **Discovery:** The model inspects the Tree-sitter Repo Map, searches symbol usages or dependencies via `<repo_search>`, and requests required definitions or system documentation via protocol tags (`<context_request>`, `<doc_request>`). The server adds files to the `auto` context layer, returns search match summaries, or injects documentation blocks and iterates. No manual `/add` required.
 2. **Staging:** No byte touches disk until the entire set of edits converges cleanly in virtual staging.
 3. **Healing:** If the compiler detects an error, the model receives clean toolchain output and fixes only the offending lines without touching unrelated code.
 4. **Git Transaction:** The turn is transactional. Issuing an undo command (`C-Z`) rolls back the working tree to its exact pre-turn state.
@@ -130,7 +131,7 @@ Its purpose is to let the model hold state across multi-round discovery and veri
 
 The model communicates its intent exclusively through typed protocol tags. Each tag is a deterministic command rather than free-form prose:
 
-- Discovery tags (`<context_request>`, `<doc_request>`) request missing files or authoritative reference material.
+- Discovery tags (`<context_request>`, `<repo_search>`, `<doc_request>`) request missing files, search codebase symbols across repository files, or request authoritative reference material.
 - The scratchpad tag (`<scratchpad>`) records isolated, turn-local working memory.
 - The verification tag (`<verify>`) requests deterministic toolchain execution.
 - Terminal outcome tags (`<success>`, `<error>`, `<blocked>`) declare how the turn ends; the `<blocked>` outcome triggers semantic recovery instead of a blind retry.

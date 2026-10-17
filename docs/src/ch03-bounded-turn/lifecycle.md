@@ -9,8 +9,9 @@ Instead of an unbounded background agent loop, TAUQE operates as a **finite-stat
 ```text
                User Prompt
                     ↓
-        ┌─► [Discovery Phase] ──── (requests missing files via <context_request>
-        │           ↓               or system docs via <doc_request>)
+        ┌─► [Discovery Phase] ──── (requests missing files via <context_request>,
+        │           ↓               searches codebase via <repo_search>,
+        │           │               or system docs via <doc_request>)
         │   [Proposal Generation] ─ (generates minimal coherent patches)
         │           ↓
         │   [In-Memory Staging] ── (validates patches in memory with fuzzy matching)
@@ -27,7 +28,7 @@ Instead of an unbounded background agent loop, TAUQE operates as a **finite-stat
 
 ---
 
-- **Discovery & Exploration Phase:** The model inspects the task and navigates the Tree-sitter repository map to locate missing symbols and type signatures, or requests internal system documentation via `<doc_request topic="...">`. If required files are missing from context, the system autonomously fetches them into the `auto` layer and proceeds to the next round. Throughout multi-round discovery, the model retains intermediate findings and working hypotheses in the ephemeral Turn Scratchpad. Code generation is deferred until the model has sufficient clarity to avoid blind speculation.
+- **Discovery & Exploration Phase:** The model inspects the task, navigates the Tree-sitter repository map to locate missing symbols and type signatures, queries the codebase via typed `<repo_search path="..." regex="..." />` commands, or requests internal system documentation via `<doc_request topic="...">`. Search queries run in pure Rust without shell access and report matching file paths with hit counts in `<search_feedback>` blocks. If required files are missing from context, the system autonomously fetches them into the `auto` layer via `<context_request>` and proceeds to the next round. Throughout multi-round discovery, the model retains intermediate findings and working hypotheses in the ephemeral Turn Scratchpad. Code generation is deferred until the model has sufficient clarity to avoid blind speculation.
 
 The five phases of the turn are surfaced to the interface as `TurnPhase` stream events (`Discovery`, `Proposal`, `Staging`, `Verification`, and `Healing`), so the footer pipeline can render which stage is currently active. `Discovery`, `Staging`, and `Healing` carry a `round` counter and a `max_rounds` bound because they may repeat, whereas `Proposal` is emitted for every model interaction and `Verification` runs once per applied proposal.
 

@@ -1,7 +1,16 @@
+pub mod search;
+
 use tauqe_protocol::ContextAccess;
 
 use crate::context::ContextManager;
 use crate::edits::protocol::ContextRequest;
+
+pub use search::{
+    execute_repo_search, execute_repo_searches, format_search_feedback,
+    format_single_search_feedback, normalize_search_path, FileSearchMatch, RepoSearchResult,
+    MAX_MATCHED_FILES_PER_SEARCH, MAX_SEARCHABLE_FILE_SIZE, MAX_SEARCH_REQUESTS_PER_ROUND,
+    REGEX_DFA_SIZE_LIMIT, REGEX_SIZE_LIMIT,
+};
 
 pub(crate) fn access_satisfies(current: Option<ContextAccess>, requested: ContextAccess) -> bool {
     match current {

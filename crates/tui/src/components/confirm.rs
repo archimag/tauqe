@@ -6,15 +6,15 @@
 //! mouse hit-testing. The `[ Cancel ]` button always receives the default focus
 //! so that destructive actions require an explicit choice.
 
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::KeyEvent;
 use ratatui::layout::{Alignment, Rect};
 use ratatui::text::Line;
 use ratatui::widgets::{Paragraph, Wrap};
 
 use crate::app::{ConfirmDialogButton, ModalActionsState};
-use crate::components::editor::is_char_typing;
+use crate::command::dialog::{DialogCommand, DIALOG_COMMAND_MAP};
 use crate::components::modal::{ModalFrame, ModalTone};
-use crate::input::is_keyboard_quit;
+use crate::config::InputConfig;
 use crate::ui::centered_rect;
 
 /// Outcome of resolving a key press inside a confirmation dialog.
@@ -72,16 +72,31 @@ impl ConfirmDialog {
 
     /// Resolves a key event into a [`ConfirmOutcome`].
     ///
-    /// Arrows and `Tab`/`Shift+Tab` cycle the focused button; `Enter`/`Space`
-    /// activates it; `y`/`Y` confirms immediately and `n`/`N`/`Esc`/`q`
-    /// dismisses safely, regardless of which button holds focus.
+    /// The vocabulary is resolved through the shared [`DIALOG_COMMAND_MAP`],
+    /// the single source of truth for the modal interaction contract, so no key
+    /// is matched directly here (Conventions §3, §5). The arrow keys and
+    /// `Tab`/`Shift+Tab` cycle the focused button; `Enter`/`Space` activates it;
+    /// `y`/`Y` confirms immediately and `n`/`N`/`Esc`/`q` dismisses safely,
+    /// regardless of which button holds focus.
     pub fn handle_key(&mut self, key: KeyEvent) -> ConfirmOutcome {
-        match key.code {
-            KeyCode::Left | KeyCode::Right | KeyCode::Tab | KeyCode::BackTab => {
+        // Every dialog chord is physical (`Bare`, `Shift`, or `Ctrl`), so no
+        // abstract modifier is consulted during resolution.
+        let Some(command) = DIALOG_COMMAND_MAP
+            .resolve(key, &InputConfig::default(), false)
+            .map(|spec| spec.action)
+        else {
+            return ConfirmOutcome::Toggled;
+        };
+
+        match command {
+            DialogCommand::FocusNext
+            | DialogCommand::FocusPrev
+            | DialogCommand::StepNext
+            | DialogCommand::StepPrev => {
                 self.toggle();
                 ConfirmOutcome::Toggled
             }
-            KeyCode::Enter | KeyCode::Char(' ') => {
+            DialogCommand::Activate => {
                 let accepted = self.is_confirm();
                 self.reset_to_cancel();
                 if accepted {
@@ -90,25 +105,14 @@ impl ConfirmDialog {
                     ConfirmOutcome::Dismissed
                 }
             }
-            KeyCode::Char('y') | KeyCode::Char('Y') if is_char_typing(key.modifiers) => {
+            DialogCommand::ConfirmFast => {
                 self.reset_to_cancel();
                 ConfirmOutcome::Accepted
             }
-            KeyCode::Char('n') | KeyCode::Char('N') if is_char_typing(key.modifiers) => {
+            DialogCommand::CancelFast | DialogCommand::Dismiss => {
                 self.reset_to_cancel();
                 ConfirmOutcome::Dismissed
             }
-            KeyCode::Esc | KeyCode::Char('q') => {
-                self.reset_to_cancel();
-                ConfirmOutcome::Dismissed
-            }
-            // C-g (keyboard-quit) dismisses every confirmation safely, exactly
-            // like Esc, regardless of which button holds focus.
-            KeyCode::Char('g') if is_keyboard_quit(&key) => {
-                self.reset_to_cancel();
-                ConfirmOutcome::Dismissed
-            }
-            _ => ConfirmOutcome::Toggled,
         }
     }
 }
@@ -153,12 +157,15 @@ pub fn confirm_modal_geometry(
 
 /// Presentation parameters for a confirmation modal.
 pub struct ConfirmModalParams<'a> {
-    pub title: &'a str,
+    /// Modal title, resolved from the runtime locale (Conventions §9, c-1).
+    pub title: String,
     /// Semantic border accent of the modal frame.
     pub tone: ModalTone,
     pub body_lines: Vec<Line<'a>>,
-    pub confirm_label: &'a str,
-    pub cancel_label: &'a str,
+    /// Confirm button verb, resolved from the runtime locale.
+    pub confirm_label: String,
+    /// Cancel button verb, resolved from the runtime locale.
+    pub cancel_label: String,
     pub confirm_button: ConfirmDialogButton,
     pub destructive: bool,
     pub width: u16,
@@ -166,32 +173,43 @@ pub struct ConfirmModalParams<'a> {
 
 /// Renders a confirmation modal using the standardized three-tier frame.
 pub fn render_modal_confirm(frame: &mut ratatui::Frame, params: ConfirmModalParams) {
+    let ConfirmModalParams {
+        title,
+        tone,
+        body_lines,
+        confirm_label,
+        cancel_label,
+        confirm_button,
+        destructive,
+        width,
+    } = params;
+
     let geom = confirm_modal_geometry(
         frame.area(),
-        params.width,
-        params.body_lines.len(),
-        params.confirm_label,
-        params.cancel_label,
+        width,
+        body_lines.len(),
+        &confirm_label,
+        &cancel_label,
     );
 
-    let dialog = ConfirmDialog::from_button(params.confirm_button);
+    let dialog = ConfirmDialog::from_button(confirm_button);
 
     let modal = ModalFrame {
-        title: params.title,
-        tone: params.tone,
+        title: &title,
+        tone,
         area: geom.area,
-        confirm_label: params.confirm_label,
-        cancel_label: params.cancel_label,
+        confirm_label: &confirm_label,
+        cancel_label: &cancel_label,
         actions_state: dialog.actions(),
         is_actions_focused: true,
-        destructive: params.destructive,
+        destructive,
         // `None` lets the frame render the shared dialog vocabulary projected
         // through the configured `C-` / `M-` modifiers.
         hint_text: None,
     };
 
     modal.render(frame, |f, body_area| {
-        let body_widget = Paragraph::new(params.body_lines)
+        let body_widget = Paragraph::new(body_lines)
             .alignment(Alignment::Center)
             .wrap(Wrap { trim: false });
         f.render_widget(body_widget, body_area);

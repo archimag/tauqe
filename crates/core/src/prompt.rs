@@ -267,9 +267,9 @@ impl PromptAssembly {
         prompt.push_str("## Core System Contract\n");
         prompt.push_str("1. Authoritative Source: The files provided in <context> represent the authoritative current state of the project. Do not invent missing code.\n");
         if self.is_isolated_step {
-            prompt.push_str("1a. Operational Protocol Tags: All operational protocol tags (<context_request>, <doc_request>, <user_language>, <scratchpad>, <success>, <error>, <blocked>) must be emitted strictly at the end of your response outside markdown code blocks. If you mention, quote, or discuss tags in conversational text, you MUST enclose them in backticks (e.g. `<context_request ...>`) so they are treated as literal text and not operational commands.\n");
+            prompt.push_str("1a. Operational Protocol Tags: All operational protocol tags (<context_request>, <repo_search>, <doc_request>, <user_language>, <scratchpad>, <success>, <error>, <blocked>) must be emitted strictly at the end of your response outside markdown code blocks. If you mention, quote, or discuss tags in conversational text, you MUST enclose them in backticks (e.g. `<context_request ...>`) so they are treated as literal text and not operational commands.\n");
         } else {
-            prompt.push_str("1a. Operational Protocol Tags: All operational protocol tags (<context_request>, <doc_request>, <verify>, <user_language>, <plan>, <scratchpad>, <success>, <error>, <blocked>) must be emitted strictly at the end of your response outside markdown code blocks. If you mention, quote, or discuss tags in conversational text, you MUST enclose them in backticks (e.g. `<context_request ...>`) so they are treated as literal text and not operational commands.\n");
+            prompt.push_str("1a. Operational Protocol Tags: All operational protocol tags (<context_request>, <repo_search>, <doc_request>, <verify>, <user_language>, <plan>, <scratchpad>, <success>, <error>, <blocked>) must be emitted strictly at the end of your response outside markdown code blocks. If you mention, quote, or discuss tags in conversational text, you MUST enclose them in backticks (e.g. `<context_request ...>`) so they are treated as literal text and not operational commands.\n");
         }
         let marker_suffix = protocol
             .turn_marker()
@@ -279,7 +279,7 @@ impl PromptAssembly {
         if self.is_discussion {
             prompt.push_str("2. Discussion Mode Scope: You are strictly in Discussion mode. Code modifications, file creations, file edits, and file deletions are strictly prohibited. Do NOT output XML edit blocks (<edit>, <create>, <replace>, <overwrite>, <delete>) or any code patch proposals.\n");
             prompt.push_str(
-                "3. Read-Only Context Exploration: Files in <read_only_files> are strictly for reference and architectural understanding. If you need to inspect additional files from the repository map to answer the developer's questions, specify them in the `context_requests` array with `access: \"read_only\"`.\n",
+                "3. Read-Only Context Exploration: Files in <read_only_files> are strictly for reference and architectural understanding. If you need to inspect additional files from the repository map to answer the developer's questions, specify them in the `context_requests` array with `access: \"read_only\"`. To search across repository files, specify queries in `repo_searches`.\n",
             );
         } else {
             prompt.push_str(
@@ -356,7 +356,7 @@ impl PromptAssembly {
         } else {
             prompt.push_str("## Mode: Structured Discussion\n");
             prompt.push_str("You are participating in an architectural discussion. Code modifications are strictly prohibited. You cannot edit, create, or delete code files. Focus on conceptual comprehension of the objective ('What'), clarifying requirements, evaluating trade-offs, establishing key design decisions, and formulating or refining plans via structured fields.\n");
-            prompt.push_str("Output MUST be a JSON object conforming to the discussion schema with `message`, `plan_update`, `context_requests`, and `user_language`.\n\n");
+            prompt.push_str("Output MUST be a JSON object conforming to the discussion schema with `message`, `plan_update`, `context_requests`, `repo_searches`, and `user_language`.\n\n");
         }
 
         prompt.push_str("## Project Metadata\n");
@@ -734,6 +734,7 @@ mod tests {
         assert!(!prompt.contains("Incremental Strategy"));
         assert!(!prompt.contains("Snapshot Strategy"));
         assert!(prompt.contains("<context_request"));
+        assert!(prompt.contains("<repo_search"));
     }
 
     #[test]

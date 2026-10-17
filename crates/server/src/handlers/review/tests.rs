@@ -1,6 +1,19 @@
+use std::sync::Arc;
+
+use super::batch::{run_review_batch, BatchOutcome};
+use super::common::{clear_auto_context, preload_item_files, turn_applied_edits};
 use super::*;
 
+use crate::state::AppState;
+use crate::transport::OutChannel;
 use tauqe_core::providers::mock::{MockLlmProvider, MockResponse};
+use tauqe_core::providers::{ChatMessage, LlmProvider, ResponseFormat, StreamEvent};
+use tauqe_core::review::ReviewStorage;
+use tauqe_protocol::{
+    events, ContextAccess, IssueStatus, ModelSelection, PlanItemStatus, Request, ReviewItem,
+    ReviewSession,
+};
+use tokio::sync::{mpsc, watch};
 
 struct TestDir(std::path::PathBuf);
 impl TestDir {
@@ -36,17 +49,19 @@ fn test_state(dir: &TestDir) -> Arc<AppState> {
     )
 }
 
-fn test_item(id: u32, status: ReviewItemStatus, file: &str) -> tauqe_protocol::ReviewItem {
-    tauqe_protocol::ReviewItem {
+fn test_item(id: u32, status: IssueStatus, file: &str) -> tauqe_protocol::ReviewIssue {
+    tauqe_protocol::ReviewIssue {
         id,
         title: format!("Finding {}", id),
         model: None,
-        severity: tauqe_protocol::ReviewSeverity::Info,
+        issue_type: tauqe_protocol::IssueType::Quality,
         status,
+        description: "Details".to_string(),
+        recommendations: Vec::new(),
         files: vec![file.to_string()],
-        subplan: Vec::new(),
-        resolution_notes: None,
-        body: "Details".to_string(),
+        readonly_files: Vec::new(),
+        plan: Vec::new(),
+        note: None,
     }
 }
 
@@ -54,7 +69,7 @@ fn make_tasks(review_id: &str, ids: &[u32]) -> Vec<(String, u32)> {
     ids.iter().map(|id| (review_id.to_string(), *id)).collect()
 }
 
-fn test_session(id: &str, items: Vec<tauqe_protocol::ReviewItem>) -> ReviewSession {
+fn test_session(id: &str, items: Vec<tauqe_protocol::ReviewIssue>) -> ReviewSession {
     ReviewSession {
         id: id.to_string(),
         title: format!("Session {}", id),
@@ -63,7 +78,7 @@ fn test_session(id: &str, items: Vec<tauqe_protocol::ReviewItem>) -> ReviewSessi
         description: None,
         user_prompt: None,
         target_files: vec!["foo.rs".to_string()],
-        items,
+        items: items.into_iter().map(ReviewItem::from).collect(),
         raw_markdown: String::new(),
     }
 }
@@ -213,10 +228,8 @@ async fn test_review_start_streams_clean_summary_without_json_leakage() {
         Some("The architecture is sound, but locking is racy.")
     );
     assert_eq!(session.items.len(), 1);
-    assert_eq!(
-        session.items[0].severity,
-        tauqe_protocol::ReviewSeverity::Critical
-    );
+    let issues = session.issues();
+    assert_eq!(issues[0].issue_type, tauqe_protocol::IssueType::Bug);
 }
 
 #[tokio::test]
@@ -242,9 +255,9 @@ async fn test_handle_review_execute_validations() {
     let session = test_session(
         "rev-val-1",
         vec![
-            test_item(1, ReviewItemStatus::Discussion, "foo.rs"),
-            test_item(2, ReviewItemStatus::Rejected, "foo.rs"),
-            test_item(3, ReviewItemStatus::Fixed, "foo.rs"),
+            test_item(1, IssueStatus::Discussion, "foo.rs"),
+            test_item(2, IssueStatus::Rejected, "foo.rs"),
+            test_item(3, IssueStatus::Fixed, "foo.rs"),
         ],
     );
     ReviewStorage::save_session(dir.path(), &session).unwrap();
@@ -266,8 +279,8 @@ async fn test_handle_review_execute_validations() {
     let mixed_session = test_session(
         "rev-mixed",
         vec![
-            test_item(1, ReviewItemStatus::Discussion, "foo.rs"),
-            test_item(2, ReviewItemStatus::Todo, "foo.rs"),
+            test_item(1, IssueStatus::Discussion, "foo.rs"),
+            test_item(2, IssueStatus::Todo, "foo.rs"),
         ],
     );
     ReviewStorage::save_session(dir.path(), &mixed_session).unwrap();
@@ -307,9 +320,9 @@ async fn test_handle_review_execute_cross_session_validations() {
     let session_disc = test_session(
         "rev-cross-disc",
         vec![
-            test_item(1, ReviewItemStatus::Discussion, "foo.rs"),
-            test_item(2, ReviewItemStatus::Fixed, "foo.rs"),
-            test_item(3, ReviewItemStatus::Rejected, "foo.rs"),
+            test_item(1, IssueStatus::Discussion, "foo.rs"),
+            test_item(2, IssueStatus::Fixed, "foo.rs"),
+            test_item(3, IssueStatus::Rejected, "foo.rs"),
         ],
     );
     ReviewStorage::save_session(dir.path(), &session_disc).unwrap();
@@ -320,9 +333,9 @@ async fn test_handle_review_execute_cross_session_validations() {
     let session_todo = test_session(
         "rev-cross-todo",
         vec![
-            test_item(1, ReviewItemStatus::Todo, "bar.rs"),
-            test_item(2, ReviewItemStatus::Discussion, "bar.rs"),
-            test_item(3, ReviewItemStatus::InProgress, "bar.rs"),
+            test_item(1, IssueStatus::Todo, "bar.rs"),
+            test_item(2, IssueStatus::Discussion, "bar.rs"),
+            test_item(3, IssueStatus::InProgress, "bar.rs"),
         ],
     );
     ReviewStorage::save_session(dir.path(), &session_todo).unwrap();
@@ -336,17 +349,17 @@ async fn test_handle_review_execute_cross_session_validations() {
 }
 
 #[tokio::test]
-async fn test_review_batch_cross_session_fail_fast_stops_subsequent_sessions() {
+async fn test_review_batch_cross_session_skips_and_continues() {
     let dir = TestDir::new();
     init_repo_with_file(&dir, "src/target.rs");
 
     let session1 = test_session(
-        "rev-cross-fail-1",
-        vec![test_item(1, ReviewItemStatus::Todo, "src/target.rs")],
+        "rev-cross-skip-1",
+        vec![test_item(1, IssueStatus::Todo, "src/target.rs")],
     );
     let session2 = test_session(
-        "rev-cross-fail-2",
-        vec![test_item(2, ReviewItemStatus::Todo, "src/target.rs")],
+        "rev-cross-skip-2",
+        vec![test_item(2, IssueStatus::Todo, "src/target.rs")],
     );
     ReviewStorage::save_session(dir.path(), &session1).unwrap();
     ReviewStorage::save_session(dir.path(), &session2).unwrap();
@@ -358,6 +371,7 @@ async fn test_review_batch_cross_session_fail_fast_stops_subsequent_sessions() {
 
     let provider = Arc::new(MockLlmProvider::scripted([
         MockResponse::text("No code changes proposed."),
+        MockResponse::text("No code changes proposed."),
     ]));
 
     let state = AppState::new(config, dir.path().to_path_buf(), hist_tx, out);
@@ -365,26 +379,23 @@ async fn test_review_batch_cross_session_fail_fast_stops_subsequent_sessions() {
 
     let operation = Arc::new(state.try_begin_operation().expect("register batch operation"));
     let tasks = vec![
-        ("rev-cross-fail-1".to_string(), 1),
-        ("rev-cross-fail-2".to_string(), 2),
+        ("rev-cross-skip-1".to_string(), 1),
+        ("rev-cross-skip-2".to_string(), 2),
     ];
 
     let outcome = run_review_batch(&state, "all", tasks, operation).await;
-    match outcome {
-        BatchOutcome::Failed { completed, item_id, .. } => {
-            assert_eq!(completed, 0);
-            assert_eq!(item_id, 1);
-        }
-        other => panic!("Expected Failed, got {other:?}"),
-    }
+    assert!(
+        matches!(outcome, BatchOutcome::Completed { items: 2 }),
+        "expected the batch to skip and continue across sessions, got {outcome:?}"
+    );
 
-    // Session 1 item 1 failed and was reset to Todo.
-    let reloaded1 = ReviewStorage::load_review(dir.path(), "rev-cross-fail-1").unwrap().unwrap();
-    assert_eq!(reloaded1.find_item(1).unwrap().status, ReviewItemStatus::Todo);
+    // A domain failure skips the finding in its own session without aborting
+    // the queue or leaking into the other session.
+    let reloaded1 = ReviewStorage::load_review(dir.path(), "rev-cross-skip-1").unwrap().unwrap();
+    assert_eq!(reloaded1.find_item(1).unwrap().status, IssueStatus::Skipped);
 
-    // Session 2 item 2 was never attempted (fail-fast) and remains Todo.
-    let reloaded2 = ReviewStorage::load_review(dir.path(), "rev-cross-fail-2").unwrap().unwrap();
-    assert_eq!(reloaded2.find_item(2).unwrap().status, ReviewItemStatus::Todo);
+    let reloaded2 = ReviewStorage::load_review(dir.path(), "rev-cross-skip-2").unwrap().unwrap();
+    assert_eq!(reloaded2.find_item(2).unwrap().status, IssueStatus::Skipped);
 
     // Event review/batch_finished emitted with owner_id "all".
     let mut raw_events = Vec::new();
@@ -396,7 +407,7 @@ async fn test_review_batch_cross_session_fail_fast_stops_subsequent_sessions() {
         .find(|e| e.contains(events::REVIEW_BATCH_FINISHED))
         .expect("review/batch_finished must be emitted");
     assert!(finished.contains("\"all\""));
-    assert!(finished.contains("\"failed\""));
+    assert!(finished.contains("\"completed\""));
 }
 
 #[tokio::test]
@@ -406,11 +417,11 @@ async fn test_review_batch_cross_session_success_and_active_id_tracking() {
 
     let session1 = test_session(
         "rev-cross-ok-1",
-        vec![test_item(1, ReviewItemStatus::Todo, "src/target.rs")],
+        vec![test_item(1, IssueStatus::Todo, "src/target.rs")],
     );
     let session2 = test_session(
         "rev-cross-ok-2",
-        vec![test_item(2, ReviewItemStatus::Todo, "src/target.rs")],
+        vec![test_item(2, IssueStatus::Todo, "src/target.rs")],
     );
     ReviewStorage::save_session(dir.path(), &session1).unwrap();
     ReviewStorage::save_session(dir.path(), &session2).unwrap();
@@ -449,10 +460,10 @@ async fn test_review_batch_cross_session_success_and_active_id_tracking() {
     );
 
     let reloaded1 = ReviewStorage::load_review(dir.path(), "rev-cross-ok-1").unwrap().unwrap();
-    assert_eq!(reloaded1.find_item(1).unwrap().status, ReviewItemStatus::Skipped);
+    assert_eq!(reloaded1.find_item(1).unwrap().status, IssueStatus::Skipped);
 
     let reloaded2 = ReviewStorage::load_review(dir.path(), "rev-cross-ok-2").unwrap().unwrap();
-    assert_eq!(reloaded2.find_item(2).unwrap().status, ReviewItemStatus::Skipped);
+    assert_eq!(reloaded2.find_item(2).unwrap().status, IssueStatus::Skipped);
 
     // Active session ID tracks the latest executed session.
     let active_id = ReviewStorage::load_active_id(dir.path()).unwrap();
@@ -473,8 +484,8 @@ async fn test_review_batch_fail_fast_resets_status_and_preloads_file() {
     let session = test_session(
         "rev-exec-1",
         vec![
-            test_item(1, ReviewItemStatus::Todo, "./src/target.rs"),
-            test_item(2, ReviewItemStatus::Todo, "./src/target.rs"),
+            test_item(1, IssueStatus::Todo, "./src/target.rs"),
+            test_item(2, IssueStatus::Todo, "./src/target.rs"),
         ],
     );
     ReviewStorage::save_session(dir.path(), &session).unwrap();
@@ -511,7 +522,7 @@ async fn test_review_batch_fail_fast_resets_status_and_preloads_file() {
     let updated = ReviewStorage::load_review(dir.path(), "rev-exec-1")
         .unwrap()
         .unwrap();
-    assert!(updated.items.iter().all(|i| i.status == ReviewItemStatus::Todo));
+    assert!(updated.items.iter().all(|i| i.status == IssueStatus::Todo));
 
     let active_id = ReviewStorage::load_active_id(dir.path()).unwrap();
     assert_eq!(active_id.as_deref(), Some("rev-exec-1"));
@@ -523,8 +534,8 @@ async fn test_review_batch_skips_fixed_and_stops_on_rejected() {
     let session = test_session(
         "rev-skip",
         vec![
-            test_item(1, ReviewItemStatus::Fixed, "foo.rs"),
-            test_item(2, ReviewItemStatus::Rejected, "foo.rs"),
+            test_item(1, IssueStatus::Fixed, "foo.rs"),
+            test_item(2, IssueStatus::Rejected, "foo.rs"),
         ],
     );
     ReviewStorage::save_session(dir.path(), &session).unwrap();
@@ -549,8 +560,8 @@ async fn test_review_batch_emits_finished_event() {
     let session = test_session(
         "rev-emit",
         vec![
-            test_item(1, ReviewItemStatus::Todo, "foo.rs"),
-            test_item(2, ReviewItemStatus::Todo, "foo.rs"),
+            test_item(1, IssueStatus::Todo, "foo.rs"),
+            test_item(2, IssueStatus::Todo, "foo.rs"),
         ],
     );
     ReviewStorage::save_session(dir.path(), &session).unwrap();
@@ -587,8 +598,8 @@ async fn test_review_execute_blocked_by_failed_preflight() {
     let session = test_session(
         "rev-preflight",
         vec![
-            test_item(1, ReviewItemStatus::Todo, "foo.rs"),
-            test_item(2, ReviewItemStatus::Todo, "foo.rs"),
+            test_item(1, IssueStatus::Todo, "foo.rs"),
+            test_item(2, IssueStatus::Todo, "foo.rs"),
         ],
     );
     ReviewStorage::save_session(dir.path(), &session).unwrap();
@@ -614,7 +625,7 @@ async fn test_review_execute_blocked_by_failed_preflight() {
     let reloaded = ReviewStorage::load_review(dir.path(), "rev-preflight")
         .unwrap()
         .unwrap();
-    assert!(reloaded.items.iter().all(|i| i.status == ReviewItemStatus::Todo));
+    assert!(reloaded.items.iter().all(|i| i.status == IssueStatus::Todo));
 }
 
 #[test]
@@ -682,13 +693,13 @@ fn test_turn_applied_edits_requires_applied_change() {
 }
 
 #[tokio::test]
-async fn test_review_retry_exhaustion_resets_item_status_to_todo() {
+async fn test_review_retry_exhaustion_skips_item_and_continues() {
     let dir = TestDir::new();
     init_repo_with_file(&dir, "src/target.rs");
 
     let session = test_session(
         "rev-retry-exhaust",
-        vec![test_item(1, ReviewItemStatus::Todo, "src/target.rs")],
+        vec![test_item(1, IssueStatus::Todo, "src/target.rs")],
     );
     ReviewStorage::save_session(dir.path(), &session).unwrap();
 
@@ -705,44 +716,43 @@ async fn test_review_retry_exhaustion_resets_item_status_to_todo() {
 
     let operation = Arc::new(state.try_begin_operation().expect("register batch operation"));
     let outcome = run_review_batch(&state, "rev-retry-exhaust", make_tasks("rev-retry-exhaust", &[1]), operation).await;
-    match outcome {
-        BatchOutcome::Failed {
-            completed,
-            item_id,
-            reason,
-        } => {
-            assert_eq!(completed, 0);
-            assert_eq!(item_id, 1);
-            assert!(reason.contains("no code changes"), "reason: {reason}");
-        }
-        other => panic!("Expected Failed, got {other:?}"),
-    }
+    assert!(
+        matches!(outcome, BatchOutcome::Completed { items: 1 }),
+        "expected the exhausted finding to be skipped and the batch to complete, got {outcome:?}"
+    );
 
-    // Exhausting the attempt budget resets the finding back to TODO.
+    // Exhausting the attempt budget skips the finding with diagnostics instead
+    // of aborting the batch.
     let updated = ReviewStorage::load_review(dir.path(), "rev-retry-exhaust")
         .unwrap()
         .unwrap();
-    assert_eq!(updated.find_item(1).unwrap().status, ReviewItemStatus::Todo);
+    let item = updated.find_item(1).unwrap();
+    assert_eq!(item.status, IssueStatus::Skipped);
+    let notes = item.resolution_notes.as_deref().unwrap_or("");
+    assert!(notes.contains("Skipped after execution failure"), "notes: {notes}");
+    assert!(notes.contains("no code changes"), "notes: {notes}");
 
     // The retry loop is bounded: one initial attempt plus `max_retries`.
     assert_eq!(provider.requests().len(), 2);
 }
 
 #[tokio::test]
-async fn test_review_batch_stops_on_no_changes_without_hanging() {
+async fn test_review_batch_skips_no_change_findings_without_hanging() {
     let dir = TestDir::new();
     init_repo_with_file(&dir, "src/target.rs");
 
     let session = test_session(
         "rev-no-change",
         vec![
-            test_item(1, ReviewItemStatus::Todo, "src/target.rs"),
-            test_item(2, ReviewItemStatus::Todo, "src/target.rs"),
+            test_item(1, IssueStatus::Todo, "src/target.rs"),
+            test_item(2, IssueStatus::Todo, "src/target.rs"),
         ],
     );
     ReviewStorage::save_session(dir.path(), &session).unwrap();
 
     let provider = Arc::new(MockLlmProvider::scripted([
+        MockResponse::text("No edits."),
+        MockResponse::text("No edits."),
         MockResponse::text("No edits."),
         MockResponse::text("No edits."),
     ]));
@@ -753,38 +763,30 @@ async fn test_review_batch_stops_on_no_changes_without_hanging() {
 
     let operation = Arc::new(state.try_begin_operation().expect("register batch operation"));
     let outcome = run_review_batch(&state, "rev-no-change", make_tasks("rev-no-change", &[1, 2]), operation).await;
-    match outcome {
-        BatchOutcome::Failed {
-            completed,
-            item_id,
-            ..
-        } => {
-            assert_eq!(completed, 0);
-            assert_eq!(item_id, 1);
-        }
-        other => panic!("Expected Failed, got {other:?}"),
-    }
+    assert!(
+        matches!(outcome, BatchOutcome::Completed { items: 2 }),
+        "expected the batch to skip both findings and complete, got {outcome:?}"
+    );
 
-    // The batch terminates deterministically instead of hanging: the first
-    // finding is attempted `max_retries + 1` times and the second is never
-    // reached (fail-fast).
-    assert_eq!(provider.requests().len(), 2);
+    // The batch terminates deterministically instead of hanging: each finding is
+    // attempted `max_retries + 1` times before being skipped.
+    assert_eq!(provider.requests().len(), 4);
 
     let updated = ReviewStorage::load_review(dir.path(), "rev-no-change")
         .unwrap()
         .unwrap();
-    assert_eq!(updated.find_item(1).unwrap().status, ReviewItemStatus::Todo);
-    assert_eq!(updated.find_item(2).unwrap().status, ReviewItemStatus::Todo);
+    assert_eq!(updated.find_item(1).unwrap().status, IssueStatus::Skipped);
+    assert_eq!(updated.find_item(2).unwrap().status, IssueStatus::Skipped);
 }
 
 #[tokio::test]
-async fn test_review_semantic_block_stops_batch_without_retry() {
+async fn test_review_semantic_block_skips_finding_without_retry() {
     let dir = TestDir::new();
     init_repo_with_file(&dir, "src/target.rs");
 
     let session = test_session(
         "rev-blocked",
-        vec![test_item(1, ReviewItemStatus::Todo, "src/target.rs")],
+        vec![test_item(1, IssueStatus::Todo, "src/target.rs")],
     );
     ReviewStorage::save_session(dir.path(), &session).unwrap();
 
@@ -796,27 +798,22 @@ async fn test_review_semantic_block_stops_batch_without_retry() {
 
     let operation = Arc::new(state.try_begin_operation().expect("register batch operation"));
     let outcome = run_review_batch(&state, "rev-blocked", make_tasks("rev-blocked", &[1]), operation).await;
-    match outcome {
-        BatchOutcome::Failed {
-            completed,
-            item_id,
-            reason,
-        } => {
-            assert_eq!(completed, 0);
-            assert_eq!(item_id, 1);
-            assert!(reason.contains("Target API was removed"), "reason: {reason}");
-        }
-        other => panic!("Expected Failed, got {other:?}"),
-    }
+    assert!(
+        matches!(outcome, BatchOutcome::Completed { items: 1 }),
+        "expected the blocked finding to be skipped and the batch to complete, got {outcome:?}"
+    );
 
-    // A semantic block aborts immediately: no patch-retry or healing cycle
-    // runs, so the provider is consulted exactly once.
+    // A semantic block skips immediately: no patch-retry or healing cycle runs,
+    // so the provider is consulted exactly once.
     assert_eq!(provider.requests().len(), 1);
 
     let updated = ReviewStorage::load_review(dir.path(), "rev-blocked")
         .unwrap()
         .unwrap();
-    assert_eq!(updated.find_item(1).unwrap().status, ReviewItemStatus::Todo);
+    let item = updated.find_item(1).unwrap();
+    assert_eq!(item.status, IssueStatus::Skipped);
+    let notes = item.resolution_notes.as_deref().unwrap_or("");
+    assert!(notes.contains("Target API was removed"), "notes: {notes}");
 }
 
 #[tokio::test]
@@ -824,7 +821,7 @@ async fn test_review_explicit_model_disables_ladder_escalation() {
     let dir = TestDir::new();
     init_repo_with_file(&dir, "src/target.rs");
 
-    let mut item = test_item(1, ReviewItemStatus::Todo, "src/target.rs");
+    let mut item = test_item(1, IssueStatus::Todo, "src/target.rs");
     item.model = Some(ModelSelection::Specific(tauqe_protocol::ModelRef::openrouter(
         "explicit/model",
     )));
@@ -846,7 +843,7 @@ async fn test_review_explicit_model_disables_ladder_escalation() {
 
     let operation = Arc::new(state.try_begin_operation().expect("register batch operation"));
     let outcome = run_review_batch(&state, "rev-explicit", make_tasks("rev-explicit", &[1]), operation).await;
-    assert!(matches!(outcome, BatchOutcome::Failed { .. }));
+    assert!(matches!(outcome, BatchOutcome::Completed { items: 1 }));
 
     let requests = provider.requests();
     assert_eq!(requests.len(), 2);
@@ -863,7 +860,7 @@ async fn test_review_step_execution_uses_turn_marker() {
 
     let session = test_session(
         "rev-marker",
-        vec![test_item(1, ReviewItemStatus::Todo, "src/target.rs")],
+        vec![test_item(1, IssueStatus::Todo, "src/target.rs")],
     );
     ReviewStorage::save_session(dir.path(), &session).unwrap();
 
@@ -901,7 +898,7 @@ async fn test_review_step_execution_uses_turn_marker() {
     let reloaded = ReviewStorage::load_review(dir.path(), "rev-marker")
         .unwrap()
         .unwrap();
-    assert_eq!(reloaded.find_item(1).unwrap().status, ReviewItemStatus::Fixed);
+    assert_eq!(reloaded.find_item(1).unwrap().status, IssueStatus::Fixed);
 }
 
 #[tokio::test]
@@ -911,7 +908,7 @@ async fn test_review_step_execution_with_skip_tag_marks_skipped_and_saves_notes(
 
     let session = test_session(
         "rev-skip-single",
-        vec![test_item(1, ReviewItemStatus::Todo, "src/target.rs")],
+        vec![test_item(1, IssueStatus::Todo, "src/target.rs")],
     );
     ReviewStorage::save_session(dir.path(), &session).unwrap();
 
@@ -940,7 +937,7 @@ async fn test_review_step_execution_with_skip_tag_marks_skipped_and_saves_notes(
         .unwrap()
         .unwrap();
     let item = reloaded.find_item(1).unwrap();
-    assert_eq!(item.status, ReviewItemStatus::Skipped);
+    assert_eq!(item.status, IssueStatus::Skipped);
     assert_eq!(
         item.resolution_notes.as_deref(),
         Some("Already fixed in prior commit: Refactored earlier")
@@ -955,8 +952,8 @@ async fn test_review_batch_continues_after_skipped_item() {
     let session = test_session(
         "rev-skip-continue",
         vec![
-            test_item(1, ReviewItemStatus::Todo, "src/target.rs"),
-            test_item(2, ReviewItemStatus::Todo, "src/target.rs"),
+            test_item(1, IssueStatus::Todo, "src/target.rs"),
+            test_item(2, IssueStatus::Todo, "src/target.rs"),
         ],
     );
     ReviewStorage::save_session(dir.path(), &session).unwrap();
@@ -993,14 +990,14 @@ async fn test_review_batch_continues_after_skipped_item() {
         .unwrap()
         .unwrap();
     let item1 = reloaded.find_item(1).unwrap();
-    assert_eq!(item1.status, ReviewItemStatus::Skipped);
+    assert_eq!(item1.status, IssueStatus::Skipped);
     assert_eq!(
         item1.resolution_notes.as_deref(),
         Some("False positive: Function contract already guarantees non-null")
     );
 
     let item2 = reloaded.find_item(2).unwrap();
-    assert_eq!(item2.status, ReviewItemStatus::Fixed);
+    assert_eq!(item2.status, IssueStatus::Fixed);
 }
 
 #[tokio::test]
@@ -1023,16 +1020,18 @@ async fn test_review_batch_preloads_multiple_files() {
 
     let session = test_session(
         "rev-preload-multi",
-        vec![tauqe_protocol::ReviewItem {
+        vec![tauqe_protocol::ReviewIssue {
             id: 1,
             title: "Multi-file finding".to_string(),
             model: None,
-            severity: tauqe_protocol::ReviewSeverity::Warning,
-            status: ReviewItemStatus::Todo,
+            issue_type: tauqe_protocol::IssueType::Architecture,
+            status: IssueStatus::Todo,
+            description: "First calls second without validation".to_string(),
+            recommendations: Vec::new(),
             files: vec!["src/first.rs".to_string(), "src/second.rs".to_string()],
-            subplan: Vec::new(),
-            resolution_notes: None,
-            body: "First calls second without validation".to_string(),
+            readonly_files: Vec::new(),
+            plan: Vec::new(),
+            note: None,
         }],
     );
     ReviewStorage::save_session(dir.path(), &session).unwrap();
@@ -1088,8 +1087,8 @@ async fn test_handle_review_update_item_clears_and_updates_notes() {
     let dir = TestDir::new();
     let state = test_state(&dir);
 
-    let mut item = test_item(1, ReviewItemStatus::Todo, "foo.rs");
-    item.resolution_notes = Some("Initial note".to_string());
+    let mut item = test_item(1, IssueStatus::Todo, "foo.rs");
+    item.note = Some("Initial note".to_string());
     let session = test_session("rev-update-notes", vec![item]);
     ReviewStorage::save_session(dir.path(), &session).unwrap();
 
@@ -1137,6 +1136,35 @@ async fn test_handle_review_update_item_clears_and_updates_notes() {
 }
 
 #[tokio::test]
+async fn test_handle_review_update_item_requires_explicit_review_id() {
+    let dir = TestDir::new();
+    let state = test_state(&dir);
+
+    let session = test_session(
+        "rev-iso-1",
+        vec![test_item(1, IssueStatus::Todo, "foo.rs")],
+    );
+    ReviewStorage::save_session(dir.path(), &session).unwrap();
+    ReviewStorage::save_active_id(dir.path(), Some("rev-iso-1")).unwrap();
+
+    // Omitting review_id must never resolve through the process-global active
+    // marker: the update is rejected instead of silently hitting rev-iso-1.
+    let req = Request {
+        id: tauqe_protocol::RequestId::Number(1),
+        method: tauqe_protocol::methods::REVIEW_UPDATE_ITEM.to_string(),
+        params: Some(serde_json::json!({ "item_id": 1 })),
+    };
+    let res = handle_review_update_item(req, &state).await;
+    assert_eq!(res.error.unwrap().code, "INVALID_PARAMS");
+
+    // The active session is left untouched.
+    let reloaded = ReviewStorage::load_review(dir.path(), "rev-iso-1")
+        .unwrap()
+        .unwrap();
+    assert_eq!(reloaded.find_item(1).unwrap().status, IssueStatus::Todo);
+}
+
+#[tokio::test]
 async fn test_handle_review_cancel_soft_keeps_operation_active() {
     let dir = TestDir::new();
     let (out, _rx) = OutChannel::new();
@@ -1173,8 +1201,8 @@ async fn test_review_batch_stops_gracefully_on_soft_stop() {
     let session = test_session(
         "rev-soft-stop",
         vec![
-            test_item(1, ReviewItemStatus::Todo, "foo.rs"),
-            test_item(2, ReviewItemStatus::Todo, "foo.rs"),
+            test_item(1, IssueStatus::Todo, "foo.rs"),
+            test_item(2, IssueStatus::Todo, "foo.rs"),
         ],
     );
     ReviewStorage::save_session(dir.path(), &session).unwrap();
@@ -1207,7 +1235,7 @@ async fn test_review_batch_stops_gracefully_on_soft_stop() {
     let reloaded = ReviewStorage::load_review(dir.path(), "rev-soft-stop")
         .unwrap()
         .unwrap();
-    assert!(reloaded.items.iter().all(|i| i.status == ReviewItemStatus::Todo));
+    assert!(reloaded.items.iter().all(|i| i.status == IssueStatus::Todo));
 
     // The supervisor publishes a single typed completion event carrying the
     // graceful "stopped" status.
@@ -1301,7 +1329,7 @@ async fn test_review_step_execution_records_resolution_notes_on_fixed() {
 
     let session = test_session(
         "rev-fixed-notes",
-        vec![test_item(1, ReviewItemStatus::Todo, "src/target.rs")],
+        vec![test_item(1, IssueStatus::Todo, "src/target.rs")],
     );
     ReviewStorage::save_session(dir.path(), &session).unwrap();
 
@@ -1330,7 +1358,7 @@ async fn test_review_step_execution_records_resolution_notes_on_fixed() {
         .unwrap()
         .unwrap();
     let item = reloaded.find_item(1).unwrap();
-    assert_eq!(item.status, ReviewItemStatus::Fixed);
+    assert_eq!(item.status, IssueStatus::Fixed);
     assert!(item.resolution_notes.is_some());
 }
 
@@ -1354,7 +1382,7 @@ async fn test_handle_review_refine_item_persists_subplan() {
     let dir = TestDir::new();
     let session = test_session(
         "rev-refine",
-        vec![test_item(1, ReviewItemStatus::Todo, "foo.rs")],
+        vec![test_item(1, IssueStatus::Todo, "foo.rs")],
     );
     ReviewStorage::save_session(dir.path(), &session).unwrap();
 
@@ -1407,7 +1435,127 @@ async fn test_handle_review_refine_item_persists_subplan() {
     assert_eq!(item.subplan[0].id, "1.1");
     assert_eq!(item.subplan[1].id, "1.2");
     // Decomposition alone does not change the finding status.
-    assert_eq!(item.status, ReviewItemStatus::Todo);
+    assert_eq!(item.status, IssueStatus::Todo);
+}
+
+#[tokio::test]
+async fn test_handle_review_refine_item_preloads_target_files_into_prompt() {
+    let dir = TestDir::new();
+    init_repo_with_file(&dir, "src/target.rs");
+
+    let session = test_session(
+        "rev-refine-preload",
+        vec![test_item(1, IssueStatus::Todo, "src/target.rs")],
+    );
+    ReviewStorage::save_session(dir.path(), &session).unwrap();
+
+    let refine_output = serde_json::json!({
+        "status": "success",
+        "explanation": "Decomposed the finding",
+        "reason": null,
+        "context_requests": [],
+        "items": [
+            {
+                "id": "1.1",
+                "title": "First sub-step",
+                "status": "todo",
+                "files": ["src/target.rs"],
+                "readonly_files": [],
+                "concept_refs": [],
+                "depends_on": [],
+                "children": []
+            }
+        ]
+    });
+    let provider = Arc::new(MockLlmProvider::scripted([MockResponse::text(
+        refine_output.to_string(),
+    )]));
+    let state = test_state_with_provider(&dir, test_config(), provider.clone()).await;
+
+    let req = Request {
+        id: tauqe_protocol::RequestId::Number(1),
+        method: tauqe_protocol::methods::REVIEW_REFINE_ITEM.to_string(),
+        params: Some(serde_json::json!({ "review_id": "rev-refine-preload", "item_id": 1 })),
+    };
+    let res = handle_review_refine_item(req, &state).await;
+    assert!(res.error.is_none(), "refine failed: {:?}", res.error);
+
+    // The finding's target file is preloaded into the architect prompt on the
+    // very first generation round, so decomposition sees the real code.
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 1);
+    let user_prompt = &requests[0].messages[1].content;
+    assert!(user_prompt.contains("## Active Context Files:"));
+    assert!(user_prompt.contains("### File: `src/target.rs`"));
+    assert!(user_prompt.contains("pub fn target() {}"));
+}
+
+#[tokio::test]
+async fn test_handle_review_refine_item_retries_when_requested_files_already_loaded() {
+    let dir = TestDir::new();
+    init_repo_with_file(&dir, "src/target.rs");
+
+    let session = test_session(
+        "rev-refine-satisfied",
+        vec![test_item(1, IssueStatus::Todo, "src/target.rs")],
+    );
+    ReviewStorage::save_session(dir.path(), &session).unwrap();
+
+    // Round 1: the architect asks for a file that preloading already placed in
+    // context. Round 2: it finalizes once it sees the context feedback.
+    let needs_context = serde_json::json!({
+        "status": "needs_context",
+        "explanation": "Verifying the target contract before decomposing",
+        "reason": null,
+        "context_requests": ["src/target.rs"],
+        "items": []
+    });
+    let success = serde_json::json!({
+        "status": "success",
+        "explanation": "Decomposed after verifying the contract",
+        "reason": null,
+        "context_requests": [],
+        "items": [
+            {
+                "id": "1.1",
+                "title": "Only sub-step",
+                "status": "todo",
+                "files": ["src/target.rs"],
+                "readonly_files": [],
+                "concept_refs": [],
+                "depends_on": [],
+                "children": []
+            }
+        ]
+    });
+    let provider = Arc::new(MockLlmProvider::scripted([
+        MockResponse::text(needs_context.to_string()),
+        MockResponse::text(success.to_string()),
+    ]));
+    let state = test_state_with_provider(&dir, test_config(), provider.clone()).await;
+
+    let req = Request {
+        id: tauqe_protocol::RequestId::Number(1),
+        method: tauqe_protocol::methods::REVIEW_REFINE_ITEM.to_string(),
+        params: Some(serde_json::json!({ "review_id": "rev-refine-satisfied", "item_id": 1 })),
+    };
+    let res = handle_review_refine_item(req, &state).await;
+
+    // Requesting already-loaded files is not a dead end: the round feeds the
+    // context back and the loop proceeds instead of failing with NEEDS_CONTEXT.
+    assert!(res.error.is_none(), "refine failed: {:?}", res.error);
+
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 2);
+    let feedback_prompt = &requests[1].messages[1].content;
+    assert!(feedback_prompt.contains("<context_feedback>"));
+    assert!(feedback_prompt.contains("already loaded in context"));
+
+    let reloaded = ReviewStorage::load_review(dir.path(), "rev-refine-satisfied")
+        .unwrap()
+        .unwrap();
+    let item = reloaded.find_item(1).unwrap();
+    assert_eq!(item.subplan.len(), 1);
 }
 
 #[tokio::test]
@@ -1415,8 +1563,8 @@ async fn test_review_subplan_execution_marks_fixed_when_all_steps_succeed() {
     let dir = TestDir::new();
     init_repo_with_file(&dir, "src/target.rs");
 
-    let mut item = test_item(1, ReviewItemStatus::Todo, "src/target.rs");
-    item.subplan = vec![
+    let mut item = test_item(1, IssueStatus::Todo, "src/target.rs");
+    item.plan = vec![
         subplan_item("1.1", "First step", PlanItemStatus::Todo, vec!["src/target.rs"]),
         subplan_item("1.2", "Second step", PlanItemStatus::Todo, vec!["src/target.rs"]),
     ];
@@ -1460,7 +1608,7 @@ async fn test_review_subplan_execution_marks_fixed_when_all_steps_succeed() {
         .unwrap()
         .unwrap();
     let item = reloaded.find_item(1).unwrap();
-    assert_eq!(item.status, ReviewItemStatus::Fixed);
+    assert_eq!(item.status, IssueStatus::Fixed);
     assert_eq!(item.subplan[0].status, PlanItemStatus::Done);
     assert_eq!(item.subplan[1].status, PlanItemStatus::Done);
     assert_eq!(
@@ -1474,8 +1622,8 @@ async fn test_review_subplan_interruption_preserves_done_and_marks_skipped() {
     let dir = TestDir::new();
     init_repo_with_file(&dir, "src/target.rs");
 
-    let mut item = test_item(1, ReviewItemStatus::Todo, "src/target.rs");
-    item.subplan = vec![
+    let mut item = test_item(1, IssueStatus::Todo, "src/target.rs");
+    item.plan = vec![
         subplan_item("1.1", "First step", PlanItemStatus::Todo, vec!["src/target.rs"]),
         subplan_item("1.2", "Second step", PlanItemStatus::Todo, vec!["src/target.rs"]),
     ];
@@ -1507,8 +1655,8 @@ async fn test_review_subplan_interruption_preserves_done_and_marks_skipped() {
     )
     .await;
     assert!(
-        matches!(outcome, BatchOutcome::Failed { item_id: 1, .. }),
-        "expected a failed batch, got {:?}",
+        matches!(outcome, BatchOutcome::Completed { items: 1 }),
+        "expected the interrupted subplan to be skipped and the batch to complete, got {:?}",
         outcome
     );
 
@@ -1518,9 +1666,281 @@ async fn test_review_subplan_interruption_preserves_done_and_marks_skipped() {
     let item = reloaded.find_item(1).unwrap();
     // The finding is Skipped, its completed sub-step stays Done, the failed
     // one is not, and the stop reason is preserved.
-    assert_eq!(item.status, ReviewItemStatus::Skipped);
+    assert_eq!(item.status, IssueStatus::Skipped);
     assert_eq!(item.subplan[0].status, PlanItemStatus::Done);
     assert_ne!(item.subplan[1].status, PlanItemStatus::Done);
     let notes = item.resolution_notes.as_deref().unwrap_or("");
     assert!(notes.contains("Subplan interrupted"), "notes: {notes}");
+}
+
+#[tokio::test]
+async fn test_review_batch_skips_finding_on_verification_failure_and_continues() {
+    let dir = TestDir::new();
+    tauqe_core::git::init_repository(Some(dir.path()), true).unwrap();
+    // A failing check command makes toolchain verification fail deterministically
+    // without compiling a fixture project, so a verification failure is a domain
+    // failure that must be confined to the current finding.
+    std::fs::write(
+        dir.path().join("tauqe.toml"),
+        "[toolchain]\ncheck_command = \"false\"\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    std::fs::write(dir.path().join("src/target.rs"), "pub fn target() {}\n").unwrap();
+    tauqe_core::git::cmd::stage_files(
+        dir.path(),
+        &["tauqe.toml".to_string(), "src/target.rs".to_string()],
+    )
+    .unwrap();
+    tauqe_core::git::cmd::commit_with_developer_author(dir.path(), "Add fixture", false).unwrap();
+
+    let session = test_session(
+        "rev-verify-skip",
+        vec![
+            test_item(1, IssueStatus::Todo, "src/target.rs"),
+            test_item(2, IssueStatus::Todo, "src/target.rs"),
+        ],
+    );
+    ReviewStorage::save_session(dir.path(), &session).unwrap();
+
+    let edit = "<tauqe_edits summary=\"Fix finding\">\n<edit path=\"src/target.rs\">\n<search>\npub fn target() {}\n</search>\n<replace>\npub fn target() { /* fixed */ }\n</replace>\n</edit>\n</tauqe_edits>";
+    let provider = Arc::new(MockLlmProvider::scripted([
+        MockResponse::text(edit),
+        MockResponse::text(edit),
+    ]));
+
+    let mut config = test_config();
+    config.develop.workflow = tauqe_protocol::WorkflowKind::Git;
+    config.develop.max_retries = 0;
+    let state = test_state_with_provider(&dir, config, provider.clone()).await;
+
+    let operation = Arc::new(state.try_begin_operation().expect("register batch operation"));
+    let outcome = run_review_batch(
+        &state,
+        "rev-verify-skip",
+        make_tasks("rev-verify-skip", &[1, 2]),
+        operation,
+    )
+    .await;
+
+    assert!(
+        matches!(outcome, BatchOutcome::Completed { items: 2 }),
+        "a verification failure is a domain failure: the batch must skip the finding and continue, got {outcome:?}"
+    );
+
+    let updated = ReviewStorage::load_review(dir.path(), "rev-verify-skip")
+        .unwrap()
+        .unwrap();
+    for id in [1u32, 2] {
+        let item = updated.find_item(id).unwrap();
+        assert_eq!(
+            item.status,
+            IssueStatus::Skipped,
+            "finding {id} must be skipped instead of aborting the batch"
+        );
+        let notes = item.resolution_notes.as_deref().unwrap_or("");
+        assert!(
+            notes.contains("Skipped after execution failure"),
+            "finding {id} notes: {notes}"
+        );
+        assert!(notes.contains("verification"), "finding {id} notes: {notes}");
+    }
+
+    // Each failed turn rolled back cleanly, so the source is left unmodified.
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("src/target.rs")).unwrap(),
+        "pub fn target() {}\n"
+    );
+    // One attempt per finding, with no healing round because `max_retries = 0`.
+    assert_eq!(provider.requests().len(), 2);
+}
+
+#[tokio::test]
+async fn test_review_batch_stops_on_provider_error() {
+    let dir = TestDir::new();
+    init_repo_with_file(&dir, "src/target.rs");
+
+    let session = test_session(
+        "rev-provider-abort",
+        vec![
+            test_item(1, IssueStatus::Todo, "src/target.rs"),
+            test_item(2, IssueStatus::Todo, "src/target.rs"),
+        ],
+    );
+    ReviewStorage::save_session(dir.path(), &session).unwrap();
+
+    let provider = Arc::new(MockLlmProvider::scripted([
+        MockResponse::error("Provider connection reset"),
+        MockResponse::text("This response must never be consumed."),
+    ]));
+
+    let state = test_state_with_provider(&dir, test_config(), provider.clone()).await;
+
+    let operation = Arc::new(state.try_begin_operation().expect("register batch operation"));
+    let outcome = run_review_batch(
+        &state,
+        "rev-provider-abort",
+        make_tasks("rev-provider-abort", &[1, 2]),
+        operation,
+    )
+    .await;
+
+    match outcome {
+        BatchOutcome::Failed {
+            completed, item_id, ..
+        } => {
+            assert_eq!(
+                completed, 0,
+                "no finding may be reported completed before the provider aborts the batch"
+            );
+            assert_eq!(item_id, 1);
+        }
+        other => panic!("a provider error must abort the batch, got {other:?}"),
+    }
+
+    // An infrastructure failure is fatal: the failed finding returns to Todo
+    // rather than being skipped, and the next finding is never touched.
+    let updated = ReviewStorage::load_review(dir.path(), "rev-provider-abort")
+        .unwrap()
+        .unwrap();
+    assert_eq!(updated.find_item(1).unwrap().status, IssueStatus::Todo);
+    assert_eq!(updated.find_item(2).unwrap().status, IssueStatus::Todo);
+
+    // The batch stopped before launching the second finding.
+    assert_eq!(provider.remaining(), 1);
+}
+
+#[tokio::test]
+async fn test_parallel_review_updates_are_isolated_by_review_id() {
+    let dir = TestDir::new();
+    let state = test_state(&dir);
+
+    let session_a = test_session(
+        "rev-par-a",
+        vec![test_item(1, IssueStatus::Todo, "foo.rs")],
+    );
+    let session_b = test_session(
+        "rev-par-b",
+        vec![test_item(1, IssueStatus::Todo, "foo.rs")],
+    );
+    ReviewStorage::save_session(dir.path(), &session_a).unwrap();
+    ReviewStorage::save_session(dir.path(), &session_b).unwrap();
+    // The process-global active marker points at session A only; it must never
+    // leak into the update addressed at session B.
+    ReviewStorage::save_active_id(dir.path(), Some("rev-par-a")).unwrap();
+
+    let make_req = |id: u64, review_id: &str, status: &str| Request {
+        id: tauqe_protocol::RequestId::Number(id),
+        method: tauqe_protocol::methods::REVIEW_UPDATE_ITEM.to_string(),
+        params: Some(serde_json::json!({
+            "review_id": review_id,
+            "item_id": 1,
+            "status": status,
+        })),
+    };
+
+    let (res_a, res_b) = tokio::join!(
+        handle_review_update_item(make_req(1, "rev-par-a", "fixed"), &state),
+        handle_review_update_item(make_req(2, "rev-par-b", "rejected"), &state),
+    );
+    assert!(res_a.error.is_none(), "session A update failed: {:?}", res_a.error);
+    assert!(res_b.error.is_none(), "session B update failed: {:?}", res_b.error);
+
+    // Each update is scoped to the session it names: the two findings sharing
+    // id #1 keep their own, independent status.
+    let a = ReviewStorage::load_review(dir.path(), "rev-par-a")
+        .unwrap()
+        .unwrap();
+    let b = ReviewStorage::load_review(dir.path(), "rev-par-b")
+        .unwrap()
+        .unwrap();
+    assert_eq!(a.find_item(1).unwrap().status, IssueStatus::Fixed);
+    assert_eq!(b.find_item(1).unwrap().status, IssueStatus::Rejected);
+}
+
+/// A provider that reports cancellation exclusively through an explicit
+/// `StreamEvent::Cancelled`, without the turn's cancel signal ever being
+/// raised. This reproduces the race the review handler must tolerate:
+/// cancellation reported by the stream event alone.
+struct StreamCancellingProvider;
+
+#[async_trait::async_trait]
+impl LlmProvider for StreamCancellingProvider {
+    fn kind(&self) -> tauqe_protocol::ProviderKind {
+        tauqe_protocol::ProviderKind::OpenRouter
+    }
+
+    async fn stream_chat(
+        &self,
+        _model: &str,
+        _messages: Vec<ChatMessage>,
+        _response_format: Option<ResponseFormat>,
+        tx: mpsc::Sender<StreamEvent>,
+        _cancel_rx: watch::Receiver<bool>,
+    ) -> anyhow::Result<()> {
+        let _ = tx.send(StreamEvent::Cancelled).await;
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn test_review_start_surfaces_stream_cancelled_event() {
+    let dir = TestDir::new();
+    let target_file = dir.path().join("file.rs");
+    std::fs::write(&target_file, "fn foo() {}\n").unwrap();
+
+    let (out, mut rx) = OutChannel::new();
+    let (hist_tx, _hist_rx) = tokio::sync::mpsc::unbounded_channel();
+    let state = AppState::new(
+        tauqe_core::config::AppConfig::default(),
+        dir.path().to_path_buf(),
+        hist_tx,
+        out,
+    );
+    *state.provider_override.lock().await = Some(Arc::new(StreamCancellingProvider));
+
+    state
+        .context
+        .write()
+        .await
+        .add_file("file.rs", ContextAccess::ReadOnly)
+        .unwrap();
+
+    let req = Request {
+        id: tauqe_protocol::RequestId::Number(1),
+        method: tauqe_protocol::methods::REVIEW_START.to_string(),
+        params: None,
+    };
+    let res = handle_review_start(req, &state).await;
+    assert!(
+        res.error.is_none(),
+        "review start must acknowledge the operation"
+    );
+
+    // An explicit `Cancelled` stream event must surface as `review/cancelled`,
+    // never as a truncated-parse error or an empty-review error.
+    let mut saw_cancelled = false;
+    let mut saw_error = false;
+    while let Ok(Some(line)) =
+        tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv()).await
+    {
+        if line.contains(events::REVIEW_CANCELLED) {
+            saw_cancelled = true;
+        }
+        if line.contains(events::REVIEW_ERROR) {
+            saw_error = true;
+        }
+        if saw_cancelled || saw_error {
+            break;
+        }
+    }
+
+    assert!(
+        saw_cancelled,
+        "an explicit Cancelled event must surface as review/cancelled"
+    );
+    assert!(
+        !saw_error,
+        "cancellation must not be misreported as a review error"
+    );
 }

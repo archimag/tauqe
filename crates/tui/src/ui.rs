@@ -18,13 +18,14 @@ use crate::dialogs::render::{
     render_confirm_delete_review_popup, render_confirm_detach_focus_popup,
     render_confirm_execute_review_popup, render_confirm_execute_scope_popup,
     render_confirm_quit_popup, render_confirm_undo_popup, render_disconnected_popup,
-    render_help_popup, render_plan_refine_blocked_dialog, render_plan_refine_dialog,
-    render_prompt_modal, render_review_dialog, render_selection_dialog, render_squash_popup,
+    render_help_popup, render_locale_dialog, render_plan_refine_blocked_dialog,
+    render_plan_refine_dialog, render_prompt_modal, render_review_dialog,
+    render_selection_dialog, render_squash_popup,
     render_status_dialog,
 };
 use crate::views::context::render_context_view;
-use crate::views::develop::render::render_develop_view;
 use crate::views::history::render_history_view;
+use crate::views::repl::render::render_repl_view;
 use crate::views::onboarding::render_onboarding_view;
 use crate::views::plans::render_plans_view;
 use crate::views::review::render_review_view;
@@ -93,11 +94,11 @@ pub fn render_ui(frame: &mut ratatui::Frame, state: &mut AppState) {
     let term_width = area.width;
     let compact = term_height < COMPACT_TERM_HEIGHT;
 
-    // The bottom area is the prompt editor in Develop and a fixed telemetry
-    // strip elsewhere. Only Develop sizes it from the prompt draft, so a draft
+    // The bottom area is the prompt editor in REPL and a fixed telemetry
+    // strip elsewhere. Only REPL sizes it from the prompt draft, so a draft
     // never inflates an unrelated view's info row (Conventions.md §2).
     let is_busy = state.model.is_busy();
-    let (prompt_lines, cursor_visual_line, bottom_height) = if state.view_mode == ViewMode::Develop {
+    let (prompt_lines, cursor_visual_line, bottom_height) = if state.view_mode == ViewMode::Repl {
         let max_input_height = (term_height * 4 / 10).clamp(6, 16);
         let inner_input_width = (term_width.saturating_sub(2)) as usize;
         let (lines, cursor) = state.input_editor.build_prompt_lines(inner_input_width, is_busy);
@@ -128,8 +129,8 @@ pub fn render_ui(frame: &mut ratatui::Frame, state: &mut AppState) {
         ViewMode::Onboarding => {
             render_onboarding_view(frame, state, chunks[1], chunks[2], chunks[3]);
         }
-        ViewMode::Develop => {
-            render_develop_view(
+        ViewMode::Repl => {
+            render_repl_view(
                 frame,
                 state,
                 chunks[1],
@@ -209,6 +210,9 @@ pub fn render_ui(frame: &mut ratatui::Frame, state: &mut AppState) {
             if let Some(modal) = &state.prompt_modal {
                 render_prompt_modal(frame, modal);
             }
+        }
+        Some(ActiveModal::Locale) => {
+            render_locale_dialog(frame, state);
         }
         Some(ActiveModal::ClearHistory) => render_confirm_clear_history_popup(frame, state),
         Some(ActiveModal::Status) => {

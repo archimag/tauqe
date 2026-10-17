@@ -26,6 +26,10 @@ pub fn format_review_discussion_prompt_items(
     focused_item_ids: &[u32],
     user_comment: &str,
 ) -> String {
+    // Findings are rendered through the enriched domain view: the description
+    // states the defect, the recommendations carry the remediation strategy,
+    // and the protected contracts define what a fix must rely on unchanged.
+    let issues = session.issues();
     let mut out = String::new();
     let clean_title = single_line(&session.title);
     let title = if clean_title.is_empty() {
@@ -60,13 +64,13 @@ pub fn format_review_discussion_prompt_items(
         total
     ));
 
-    for item in &session.items {
-        let is_focused = focused_item_ids.contains(&item.id);
+    for issue in &issues {
+        let is_focused = focused_item_ids.contains(&issue.id);
         let focus_mark = if is_focused { " [FOCUSED]" } else { "" };
-        let loc = if item.files.is_empty() {
+        let loc = if issue.files.is_empty() {
             String::new()
         } else {
-            let joined = item
+            let joined = issue
                 .files
                 .iter()
                 .map(|f| escape_xml_text(f))
@@ -76,9 +80,9 @@ pub fn format_review_discussion_prompt_items(
         };
         out.push_str(&format!(
             "  - #{}: [{}] {}{}{}\n",
-            item.id,
-            item.severity,
-            escape_xml_text(&item.title),
+            issue.id,
+            issue.issue_type,
+            escape_xml_text(&issue.title),
             loc,
             focus_mark
         ));
@@ -88,16 +92,16 @@ pub fn format_review_discussion_prompt_items(
     if !focused_item_ids.is_empty() {
         out.push_str("### Items Focused by User for Discussion:\n");
         for id in focused_item_ids {
-            if let Some(item) = session.find_item(*id) {
+            if let Some(issue) = issues.iter().find(|i| i.id == *id) {
                 out.push_str(&format!(
                     "- **#{} [{}] {}** (status: {})\n",
-                    item.id,
-                    item.severity,
-                    escape_xml_text(&item.title),
-                    item.status
+                    issue.id,
+                    issue.issue_type,
+                    escape_xml_text(&issue.title),
+                    issue.status
                 ));
-                if !item.files.is_empty() {
-                    let joined = item
+                if !issue.files.is_empty() {
+                    let joined = issue
                         .files
                         .iter()
                         .map(|f| format!("`{}`", escape_xml_text(f)))
@@ -105,39 +109,38 @@ pub fn format_review_discussion_prompt_items(
                         .join(", ");
                     out.push_str(&format!("  Files: {}\n", joined));
                 }
-                if let Some(notes) = &item.resolution_notes {
-                    if !notes.trim().is_empty() {
+                if !issue.readonly_files.is_empty() {
+                    let joined = issue
+                        .readonly_files
+                        .iter()
+                        .map(|f| format!("`{}`", escape_xml_text(f)))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    out.push_str(&format!("  Protected Contracts (readonly): {}\n", joined));
+                }
+                if !issue.description.trim().is_empty() {
+                    out.push_str(&format!(
+                        "  Description: {}\n",
+                        escape_xml_text(issue.description.trim())
+                    ));
+                }
+                if !issue.recommendations.is_empty() {
+                    out.push_str("  Recommendations:\n");
+                    for (index, rec) in issue.recommendations.iter().enumerate() {
+                        out.push_str(&format!("    {}. {}\n", index + 1, escape_xml_text(rec)));
+                    }
+                }
+                if let Some(note) = &issue.note {
+                    if !note.trim().is_empty() {
                         out.push_str(&format!(
-                            "  Resolution Strategy: {}\n",
-                            escape_xml_text(notes.trim())
+                            "  Resolution Note: {}\n",
+                            escape_xml_text(note.trim())
                         ));
                     }
                 }
-                if !item.body.trim().is_empty() {
-                    out.push_str(&format!("  Details: {}\n", escape_xml_text(item.body.trim())));
-                }
-                if item.has_subplan() {
-                    out.push_str("  Subplan:\n");
-                    fn render_subplan_discussion(
-                        out: &mut String,
-                        items: &[PlanItem],
-                        depth: usize,
-                    ) {
-                        let indent = "  ".repeat(depth + 2);
-                        for sub in items {
-                            out.push_str(&format!(
-                                "{}- #{}: {} ({})\n",
-                                indent,
-                                sub.id,
-                                escape_xml_text(&sub.title),
-                                sub.status
-                            ));
-                            if !sub.children.is_empty() {
-                                render_subplan_discussion(out, &sub.children, depth + 1);
-                            }
-                        }
-                    }
-                    render_subplan_discussion(&mut out, &item.subplan, 0);
+                if !issue.plan.is_empty() {
+                    out.push_str("  Decomposition Plan:\n");
+                    render_plan_discussion(&mut out, &issue.plan, 0);
                 }
             }
         }
@@ -150,11 +153,29 @@ pub fn format_review_discussion_prompt_items(
 
     out.push_str("## Instructions for Model:\n");
     out.push_str("1. Address the developer's question or feedback regarding the code review findings.\n");
-    out.push_str("2. Discuss the problem, edge cases, and potential solutions conceptually. Do NOT emit file edits or code patches in this discussion turn.\n");
+    out.push_str("2. Select the response mode that the developer's request calls for. When the developer is reasoning about the findings, analyze the problem, its edge cases, and potential solutions conceptually. When the developer asks you to resolve a finding, apply the required code changes directly instead of only describing them, while preserving the surrounding review context.\n");
     out.push_str("3. If the review findings or their statuses should be updated based on this discussion, explain the proposed modifications clearly in conversational text in `message`; the developer applies status changes through the review interface.\n");
-    out.push_str("4. If you need to inspect related files to verify your hypothesis, specify them in the `context_requests` array with `access: \"read_only\"`.\n");
+    out.push_str("4. Treat every file listed as a protected contract as immutable: rely on its interfaces and invariants, but never modify it.\n");
+    out.push_str("5. If you need to inspect related files to verify your hypothesis, specify them in the `context_requests` array with `access: \"read_only\"`.\n");
 
     out
+}
+
+/// Renders a finding's decomposition plan as an indented outline.
+fn render_plan_discussion(out: &mut String, items: &[PlanItem], depth: usize) {
+    let indent = "  ".repeat(depth + 2);
+    for sub in items {
+        out.push_str(&format!(
+            "{}- #{}: {} ({})\n",
+            indent,
+            sub.id,
+            escape_xml_text(&sub.title),
+            sub.status
+        ));
+        if !sub.children.is_empty() {
+            render_plan_discussion(out, &sub.children, depth + 1);
+        }
+    }
 }
 
 /// Builds the system prompt for the isolated code review session.
@@ -172,21 +193,28 @@ pub fn build_review_system_prompt() -> String {
     prompt.push_str("5. Idiomatic conventions and testability.\n\n");
 
     prompt.push_str("## Language Invariant\n");
-    prompt.push_str("Formulate the `summary` Markdown narrative and all finding titles and descriptions in the primary natural language established by the user's instructions or prompt, while keeping code identifiers, symbols, and keywords exact.\n\n");
+    prompt.push_str("Formulate the `summary` Markdown narrative and all finding titles, descriptions, and recommendations in the primary natural language established by the user's instructions or prompt, while keeping code identifiers, symbols, and keywords exact.\n\n");
 
     prompt.push_str("## Output Format Specification\n");
     prompt.push_str("You MUST respond with a single JSON object that conforms to the enforced structured output schema. Do not wrap the JSON in markdown code fences and do not add any prose outside the JSON object.\n\n");
-    prompt.push_str("The object contains exactly two fields, emitted in this order:\n");
+    prompt.push_str("The object contains exactly three fields, emitted in this order:\n");
     prompt.push_str("- `summary`: a high-level conclusion formatted as Markdown. Before enumerating concrete findings, synthesize the overall assessment of architectural integrity, separation of concerns, concurrency and safety risks, error handling, and reliability across the reviewed files. Do not merely restate the findings list.\n");
+    prompt.push_str("- `title`: a concise, human-readable title for the review session.\n");
     prompt.push_str("- `findings`: an array of finding objects with the following fields:\n");
-    prompt.push_str("- `title`: concise finding title.\n");
-    prompt.push_str("- `severity`: exactly one of the following string values:\n");
-    prompt.push_str("  - `critical`: severe bug, panic, data corruption, memory leak, or security flaw.\n");
-    prompt.push_str("  - `warning`: architecture violation, potential runtime issue, or poor error handling.\n");
-    prompt.push_str("  - `suggestion`: code cleanup, optimization, or idiomatic improvement.\n");
-    prompt.push_str("  - `info`: general observation or architectural insight.\n");
-    prompt.push_str("- `files`: array of repository-relative file paths affected by this finding (use `[]` when not file-specific).\n");
-    prompt.push_str("- `body`: clear explanation of the problem, why it occurs, and concrete recommendations for how to resolve it.\n\n");
+    prompt.push_str("  - `title`: concise finding title.\n");
+    prompt.push_str("  - `type`: exactly one of the following string values:\n");
+    prompt.push_str("    - `bug`: incorrect behavior, panic, data corruption, or resource leak.\n");
+    prompt.push_str("    - `security`: security flaw or unsafe boundary.\n");
+    prompt.push_str("    - `architecture`: structural or runtime design risk that must be decomposed before implementation.\n");
+    prompt.push_str("    - `performance`: costly hot path or wasted resources.\n");
+    prompt.push_str("    - `quality`: maintainability, readability, or dead-code cleanup.\n");
+    prompt.push_str("  - `description`: the technical defect: what is wrong, why it occurs, and its root cause. State the defect itself; never fold remediation into the description.\n");
+    prompt.push_str("  - `recommendations`: an ordered array of concrete, actionable remediation steps that resolve the defect.\n");
+    prompt.push_str("  - `files`: an array of repository-relative paths to modify when resolving the finding (use `[]` when the finding is not file-specific).\n");
+    prompt.push_str("  - `readonly_files`: an array of repository-relative paths of immutable contracts, interfaces, or invariants the fix must rely on but must never modify (use `[]` when the finding depends on none). These files are protected context.\n\n");
+
+    prompt.push_str("## Decomposition Guidance\n");
+    prompt.push_str("When a finding is a complex architectural defect that cannot be resolved by a single localized change, its `recommendations` MUST begin by instructing that the finding be decomposed through architectural refinement before any implementation begins, so the engineer decomposes the defect into executable steps first.\n\n");
 
     prompt.push_str("If there are no issues, respond with an empty `findings` array.\n");
     prompt.push_str("Do NOT output markdown headers, diffs, or XML edit tags; this is an audit-only review.\n");

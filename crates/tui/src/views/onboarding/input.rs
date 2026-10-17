@@ -175,7 +175,7 @@ pub async fn handle_onboarding_key(
                     st.onboarding.step = OnboardingStep::Workstation;
                     st.onboarding.selected_index = 0;
                 } else if st.onboarding.has_api_key {
-                    st.view_mode = ViewMode::Develop;
+                    st.view_mode = ViewMode::Repl;
                 } else {
                     st.onboarding.step = OnboardingStep::Gatekeeper;
                     st.onboarding.selected_index = 0;
@@ -338,7 +338,7 @@ pub async fn handle_onboarding_key(
                         }
                     },
                     OnboardingStep::Ready => {
-                        st.view_mode = ViewMode::Develop;
+                        st.view_mode = ViewMode::Repl;
                     }
                 }
             }

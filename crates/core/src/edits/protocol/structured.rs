@@ -62,6 +62,25 @@ impl StructuredEditProtocol {
                         "type": "string"
                     }
                 },
+                "repo_searches": {
+                    "type": "array",
+                    "description": "Repository search requests to find symbols or text patterns across files using Rust / ripgrep regex",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "path": {
+                                "type": "string",
+                                "description": "Repository-relative directory or file path to search within (use '' or '.' for repository root)"
+                            },
+                            "regex": {
+                                "type": "string",
+                                "description": "Rust / ripgrep regular expression to search for"
+                            }
+                        },
+                        "required": ["path", "regex"],
+                        "additionalProperties": false
+                    }
+                },
                 "suggested_actions": {
                     "type": "array",
                     "description": "Optional list of suggested follow-up options for the user",
@@ -70,7 +89,7 @@ impl StructuredEditProtocol {
                     }
                 }
             },
-            "required": ["message", "changes", "context_requests", "suggested_actions"],
+            "required": ["message", "changes", "context_requests", "repo_searches", "suggested_actions"],
             "additionalProperties": false
         })
     }
@@ -222,6 +241,7 @@ impl StructuredEditProtocol {
         prompt.push_str("- `message`: Your conversational explanation or answer to the user.\n");
         prompt.push_str("- `changes`: Array of code edit operations (`op`: 'replace'|'create'|'delete'|'move'|'overwrite', `path`, `to`, `old_text`, `new_text`, `content`).\n");
         prompt.push_str("- `context_requests`: Files to add to context. Each entry is a repository-relative path (read-only) or `editable:<path>` for files you need to modify.\n");
+        prompt.push_str("- `repo_searches`: Repository search requests ({ `path`: string, `regex`: string }) to locate symbols or text patterns across files.\n");
         prompt.push_str(
             "- `suggested_actions`: Optional list of suggested follow-up options for the user.\n",
         );
@@ -246,7 +266,8 @@ impl StructuredEditProtocol {
         prompt.push_str("4. For 'create' and 'overwrite', `content` must contain the complete file content from first to last line.\n");
         prompt.push_str("5. If no code changes are needed, set `changes: []` and provide your answer in `message`.\n");
 
-        prompt.push_str("6. Context Discovery: If the task requires files listed in <repo_map> that are not present in the editable or read-only files, request them FIRST: set `changes: []` and list them in `context_requests`. You will be called again with the full file contents added to context. Never request files that are already in context.\n\n");
+        prompt.push_str("6. Context Discovery: If the task requires files listed in <repo_map> that are not present in the editable or read-only files, request them FIRST: set `changes: []` and list them in `context_requests`. You will be called again with the full file contents added to context. Never request files that are already in context.\n");
+        prompt.push_str("7. Repository Search: To locate symbols or patterns across repository files during discovery, specify queries in `repo_searches` with `path` (relative directory/file or \"\" for repository root) and `regex` (Rust / ripgrep regex syntax). Supports `\\b`, `\\w`, `\\d`, non-capturing groups `(?:...)`, case-insensitive flag `(?i)`. Lookaround assertions (`(?=...)`, `(?!...)`, `(?<=...)`, `(?<!...)`) and backreferences (`\\1`) are strictly forbidden.\n\n");
 
         prompt
     }
@@ -276,6 +297,16 @@ impl StructuredEditProtocol {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    /// Extracts repository search requests from a structured proposal or fallback tags.
+    pub fn parse_repo_searches(&self, raw_text: &str) -> Vec<tauqe_protocol::RepoSearchRequest> {
+        if let Some(proposal) = parse_proposal(raw_text) {
+            if !proposal.repo_searches.is_empty() {
+                return proposal.repo_searches;
+            }
+        }
+        super::xml::tags::parse_repo_search_tags(raw_text)
     }
 
     /// Extracts a verification request from XML control tags when present.
@@ -343,7 +374,9 @@ pub fn clean_raw_json_or_text(raw: &str) -> String {
         let joined = msgs.join("\n\n");
         return super::xml::tags::strip_verify_tags(
             &super::xml::tags::strip_user_language_tags(
-                &super::xml::tags::strip_context_request_tags(&joined),
+                &super::xml::tags::strip_repo_search_tags(
+                    &super::xml::tags::strip_context_request_tags(&joined),
+                ),
             ),
         );
     }
@@ -352,7 +385,9 @@ pub fn clean_raw_json_or_text(raw: &str) -> String {
         if !proposal.message.trim().is_empty() {
             return super::xml::tags::strip_verify_tags(
                 &super::xml::tags::strip_user_language_tags(
-                    &super::xml::tags::strip_context_request_tags(&proposal.message),
+                    &super::xml::tags::strip_repo_search_tags(
+                        &super::xml::tags::strip_context_request_tags(&proposal.message),
+                    ),
                 ),
             );
         }
@@ -364,7 +399,9 @@ pub fn clean_raw_json_or_text(raw: &str) -> String {
 
     super::xml::tags::strip_verify_tags(
         &super::xml::tags::strip_user_language_tags(
-            &super::xml::tags::strip_context_request_tags(raw),
+            &super::xml::tags::strip_repo_search_tags(
+                &super::xml::tags::strip_context_request_tags(raw),
+            ),
         ),
     )
 }
@@ -383,6 +420,7 @@ pub fn extract_json_messages(raw: &str) -> Vec<String> {
                     if !trimmed.is_empty()
                         && (val.get("changes").is_some()
                             || val.get("context_requests").is_some()
+                            || val.get("repo_searches").is_some()
                             || val.get("suggested_actions").is_some())
                     {
                         messages.push(trimmed.to_string());
@@ -402,6 +440,22 @@ mod tests {
     use super::*;
     use crate::edits::protocol::xml::tags::{VerifyOnSuccess, VerifyTarget};
     use tauqe_protocol::ContextAccess;
+
+    #[test]
+    fn test_structured_protocol_repo_searches() {
+        let proto = StructuredEditProtocol;
+        let json = r#"{
+            "message": "Let me search",
+            "changes": [],
+            "context_requests": [],
+            "repo_searches": [{"path": "crates/core", "regex": "fn execute"}],
+            "suggested_actions": []
+        }"#;
+        let searches = proto.parse_repo_searches(json);
+        assert_eq!(searches.len(), 1);
+        assert_eq!(searches[0].path, "crates/core");
+        assert_eq!(searches[0].regex, "fn execute");
+    }
 
     #[test]
     fn test_structured_protocol_context_requests() {

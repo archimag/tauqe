@@ -572,6 +572,28 @@ mod tests {
     }
 
     #[test]
+    fn test_repo_search_tags_hidden_from_stream_text() {
+        let input = "Searching symbols.\n<repo_search path=\"src\" regex=\"fn execute\" />\nReady";
+        let mut filter = XmlStreamFilter::new(vec![], std::env::temp_dir());
+        let mut events = Vec::new();
+        for ch in input.chars() {
+            events.extend(filter.push_chunk(&ch.to_string()));
+        }
+        events.extend(Box::new(filter).finish());
+        let text: String = events
+            .iter()
+            .filter_map(|event| match event {
+                StreamEvent::TextDelta(delta) => Some(delta.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text, "Searching symbols.\n\nReady");
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, StreamEvent::EditStarted)));
+    }
+
+    #[test]
     fn test_user_language_and_verify_tags_hidden_from_stream_text() {
         let marker = "M456";
         let input = "Hello!\n<user_language_M456>Russian</user_language_M456>\n<verify_M456 target=\"all\" on_success=\"silent\" />\nHere is my explanation.";

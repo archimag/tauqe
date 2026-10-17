@@ -143,7 +143,7 @@ pub(crate) async fn submit_prompt_modal(
         }
     };
 
-    super::begin_develop_turn(&mut st);
+    super::begin_repl_turn(&mut st);
     st.discussion_focus = focus;
     drop(st);
     let params = ModelAskParams::Discussion(DiscussionRequest {

@@ -369,7 +369,7 @@ pub async fn handle_plans_key(
 
     match action {
         PlansAction::Return => {
-            st.view_mode = ViewMode::Develop;
+            st.view_mode = ViewMode::Repl;
         }
         PlansAction::AccordionNext => {
             st.plans_view.accordion_navigate(true);

@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 
-use crate::discussion::{DiscussionContextRequest, DiscussionRequest};
+use crate::discussion::{
+    deserialize_null_as_default, DiscussionContextRequest, DiscussionRequest, RepoSearchRequest,
+};
 use crate::edit::{EditOperation, EditOutcome, StructuredChangeProposal};
 
 use super::effort::ReasoningEffort;
@@ -97,6 +99,13 @@ pub struct ModelResultProposal {
     pub changes: Vec<StructuredChangeProposal>,
     #[serde(default, deserialize_with = "deserialize_context_request_specs")]
     pub context_requests: Vec<DiscussionContextRequest>,
+    #[serde(
+        default,
+        alias = "search_requests",
+        deserialize_with = "deserialize_null_as_default",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub repo_searches: Vec<RepoSearchRequest>,
     #[serde(default)]
     pub context_drops: Vec<String>,
     #[serde(default)]
@@ -294,6 +303,40 @@ mod tests {
         );
         let de: ModelResult = serde_json::from_str(&json).unwrap();
         assert_eq!(de, result);
+    }
+
+    #[test]
+    fn test_model_result_proposal_repo_searches_serde() {
+        let raw = r#"{
+            "message": "Searching for usage",
+            "changes": [],
+            "context_requests": [],
+            "repo_searches": [{"path": "crates/core", "regex": "struct PlanStorage"}],
+            "context_drops": [],
+            "suggested_actions": []
+        }"#;
+        let proposal: ModelResultProposal = serde_json::from_str(raw).unwrap();
+        assert_eq!(proposal.repo_searches.len(), 1);
+        assert_eq!(proposal.repo_searches[0].path, "crates/core");
+        assert_eq!(proposal.repo_searches[0].regex, "struct PlanStorage");
+
+        // Alias `search_requests` support
+        let raw_alias = r#"{
+            "message": "Alias search",
+            "search_requests": [{"path": "crates/protocol", "regex": "enum LlmCommand"}]
+        }"#;
+        let proposal_alias: ModelResultProposal = serde_json::from_str(raw_alias).unwrap();
+        assert_eq!(proposal_alias.repo_searches.len(), 1);
+        assert_eq!(proposal_alias.repo_searches[0].path, "crates/protocol");
+        assert_eq!(proposal_alias.repo_searches[0].regex, "enum LlmCommand");
+
+        // Null tolerance
+        let raw_null = r#"{
+            "message": "Null search",
+            "repo_searches": null
+        }"#;
+        let proposal_null: ModelResultProposal = serde_json::from_str(raw_null).unwrap();
+        assert!(proposal_null.repo_searches.is_empty());
     }
 
     #[test]

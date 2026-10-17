@@ -111,7 +111,7 @@ pub async fn initialize_connection(
     };
 
     // 4. Query system status for the onboarding check
-    let mut view_mode = ViewMode::Develop;
+    let mut view_mode = ViewMode::Repl;
     let mut onboarding = OnboardingState::default();
 
     let status_req = Request {

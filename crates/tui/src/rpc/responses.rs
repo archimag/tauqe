@@ -7,7 +7,8 @@ use tauqe_protocol::{
 };
 
 use crate::app::{AppState, ViewMode};
-use crate::views::develop::TurnStatus;
+use crate::i18n::active_t;
+use crate::views::repl::TurnStatus;
 use super::transport::{OptimisticRollback, RpcConnection};
 
 /// RPC error code returned by the server when the pre-flight toolchain
@@ -96,7 +97,7 @@ pub(crate) fn apply_system_status_response(
     // surface the diagnostic so the user is not silently switched to other
     // models, budgets, and context limits.
     if let Some(err) = status.config_error.as_deref() {
-        st.notify_warning(format!("Configuration error: {}", err));
+        st.notify_warning(active_t("notify.config_error").replacen("{}", err, 1));
     }
 }
 
@@ -115,7 +116,7 @@ pub async fn handle_response(
         if let RequestId::Number(id) = resp.id {
             if let Some(rollback) = conn.take_optimistic_rollback(id) {
                 match rollback {
-                    OptimisticRollback::ReviewItemStatus { review_id, item_id, prev_status } => {
+                    OptimisticRollback::ReviewIssueStatus { review_id, item_id, prev_status } => {
                         st.review
                             .set_item_status(review_id.as_deref(), item_id, prev_status);
                     }
@@ -138,13 +139,11 @@ pub async fn handle_response(
             st.model.turn_phase = None;
             st.model.turn_phase_detail = None;
             st.model.error = Some(err.message.clone());
-            st.notify_warning(
-                "Pre-flight verification failed: the repository does not build or pass tests. Fix the build/test errors before re-running the batch.",
-            );
+            st.notify_warning(active_t("notify.preflight_failed"));
             return;
         }
 
-        let err_text = format!("Error: {}", err.message);
+        let err_text = active_t("notify.rpc_error").replacen("{}", &err.message, 1);
         match method.as_deref() {
             Some(methods::REVIEW_START) => {
                 st.review.running = false;
@@ -179,6 +178,9 @@ pub async fn handle_response(
             Some(methods::HISTORY_GET) => {
                 st.history_view.loading = false;
             }
+            Some(methods::LOCALE_GENERATE) => {
+                st.locale_dialog = None;
+            }
             _ => {
                 if st.view_mode == ViewMode::Onboarding {
                     st.onboarding.set_error(err.message.clone());
@@ -195,7 +197,7 @@ pub async fn handle_response(
     // session happens to share the numeric finding id.
     let updated_review_id = if let RequestId::Number(id) = resp.id {
         match conn.take_optimistic_rollback(id) {
-            Some(OptimisticRollback::ReviewItemStatus { review_id, .. }) => review_id,
+            Some(OptimisticRollback::ReviewIssueStatus { review_id, .. }) => review_id,
             _ => None,
         }
     } else {
@@ -203,10 +205,10 @@ pub async fn handle_response(
     };
 
     if method.as_deref() == Some(methods::PLAN_DELETE) {
-        st.notify_success("Plan deleted");
+        st.notify_success(active_t("notify.plan_deleted"));
     }
     if method.as_deref() == Some(methods::REVIEW_DELETE) {
-        st.notify_success("Review session deleted");
+        st.notify_success(active_t("notify.review_deleted"));
     }
 
     let Some(val) = resp.result else {
@@ -218,13 +220,19 @@ pub async fn handle_response(
             methods::GIT_SQUASH_APPLY => {
                 if let Ok(applied) = serde_json::from_value::<GitSquashApplyResult>(val) {
                     st.squash_dialog = None;
-                    let first_line = applied.message.lines().next().unwrap_or("Squashed commit");
-                    st.notify_success(format!(
-                        "Squashed commits into {} ('{}')",
-                        applied.squashed_commit, first_line
-                    ));
+                    let first_line = applied
+                        .message
+                        .lines()
+                        .next()
+                        .map(str::to_string)
+                        .unwrap_or_else(|| active_t("notify.squashed_commit_fallback"));
+                    st.notify_success(
+                        active_t("notify.squashed_commits")
+                            .replacen("{}", &applied.squashed_commit, 1)
+                            .replacen("{}", &first_line, 1),
+                    );
                     st.model.last_commit_hash = Some(applied.squashed_commit);
-                    st.model.last_commit_summary = Some(first_line.to_string());
+                    st.model.last_commit_summary = Some(first_line);
                 }
             }
             methods::GIT_SQUASH_PREVIEW => {
@@ -335,15 +343,17 @@ pub async fn handle_response(
                 {
                     st.context = pattern_res.state;
                     if pattern_res.truncated {
-                        st.notify_warning(format!(
-                            "Added {} files (~{} tokens); the match set exceeded the configured batch limit and remaining files were skipped",
-                            pattern_res.added_count, pattern_res.added_tokens
-                        ));
+                        st.notify_warning(
+                            active_t("notify.context_added_truncated")
+                                .replacen("{}", &pattern_res.added_count.to_string(), 1)
+                                .replacen("{}", &pattern_res.added_tokens.to_string(), 1),
+                        );
                     } else {
-                        st.notify_success(format!(
-                            "Added {} files (~{} tokens)",
-                            pattern_res.added_count, pattern_res.added_tokens
-                        ));
+                        st.notify_success(
+                            active_t("notify.context_added")
+                                .replacen("{}", &pattern_res.added_count.to_string(), 1)
+                                .replacen("{}", &pattern_res.added_tokens.to_string(), 1),
+                        );
                     }
                     if st.context_view.adding_file {
                         st.update_filtered_candidates();
@@ -369,10 +379,16 @@ pub async fn handle_response(
                     let items_removed = items_before.saturating_sub(st.context.items.len());
                     match method_name {
                         methods::CONTEXT_REMOVE => {
-                            st.notify_info(format!("Removed {} file(s) from context", items_removed));
+                            st.notify_info(
+                                active_t("notify.context_removed")
+                                    .replacen("{}", &items_removed.to_string(), 1),
+                            );
                         }
                         methods::CONTEXT_CLEAR => {
-                            st.notify_success(format!("Cleared {} file(s) from context", items_removed));
+                            st.notify_success(
+                                active_t("notify.context_cleared")
+                                    .replacen("{}", &items_removed.to_string(), 1),
+                            );
                         }
                         _ => {}
                     }
@@ -450,7 +466,8 @@ pub async fn handle_response(
             }
             methods::REVIEW_UPDATE_ITEM => {
                 if let Ok(res) = serde_json::from_value::<ReviewUpdateItemResult>(val) {
-                    st.review.apply_item(updated_review_id.as_deref(), res.item);
+                    st.review
+                        .apply_item(updated_review_id.as_deref(), res.item);
                 }
             }
             methods::REVIEW_LIST => {
@@ -469,14 +486,17 @@ pub async fn handle_response(
                             st.review.apply_item(review_id.as_deref(), item);
                             let msg = match explanation {
                                 Some(exp) if !exp.trim().is_empty() => {
-                                    format!("Finding decomposed into steps: {}", exp)
+                                    active_t("notify.finding_decomposed").replacen("{}", &exp, 1)
                                 }
-                                _ => "Finding decomposed into steps by the Architect".to_string(),
+                                _ => active_t("notify.finding_decomposed_default"),
                             };
                             st.notify_success(msg);
                         }
                         tauqe_protocol::ReviewRefineItemResult::Blocked { reason } => {
-                            st.notify_warning(format!("Decomposition blocked: {}", reason));
+                            st.notify_warning(
+                                active_t("notify.finding_decompose_blocked")
+                                    .replacen("{}", &reason, 1),
+                            );
                         }
                     }
                 }
@@ -487,7 +507,7 @@ pub async fn handle_response(
                     st.plans_view.clamp_selection();
                 }
             }
-            methods::PLAN_GET | methods::PLAN_SAVE | methods::PLAN_UPDATE_ITEM => {
+            methods::PLAN_GET | methods::PLAN_UPDATE_ITEM => {
                 if let Ok(res) = serde_json::from_value::<tauqe_protocol::PlanGetResult>(val.clone()) {
                     if let Some(plan) = res.plan {
                         if let Some(pos) = st.plans_view.plans.iter().position(|p| p.id == plan.id) {
@@ -503,6 +523,13 @@ pub async fn handle_response(
                         st.plans_view.plans.push(res.plan);
                     }
                 }
+            }
+            methods::PLAN_SAVE => {
+                // A save creates or fully replaces a plan. Its body and cursor
+                // anchor arrive through the preceding `plan/updated` event, so
+                // the response only guarantees the developer lands on the Plans
+                // tab instead of the view the save was triggered from (c-4).
+                st.view_mode = ViewMode::Plans;
             }
             methods::PLAN_SET_ACTIVE => {}
             methods::PLAN_REFINE | methods::PLAN_REPLAN => {
@@ -525,9 +552,16 @@ pub async fn handle_response(
                             st.plans_view.scroll_to_selected();
                             let msg = match explanation {
                                 Some(exp) if !exp.trim().is_empty() => {
-                                    format!("Plan '{}' horizon updated ({}/{} done): {}", plan_title, completed_items, total_items, exp)
+                                    active_t("notify.plan_horizon_updated")
+                                        .replacen("{}", &plan_title, 1)
+                                        .replacen("{}", &completed_items.to_string(), 1)
+                                        .replacen("{}", &total_items.to_string(), 1)
+                                        .replacen("{}", &exp, 1)
                                 }
-                                _ => format!("Plan '{}' horizon updated successfully by architect ({}/{} done)", plan_title, completed_items, total_items),
+                                _ => active_t("notify.plan_horizon_updated_default")
+                                    .replacen("{}", &plan_title, 1)
+                                    .replacen("{}", &completed_items.to_string(), 1)
+                                    .replacen("{}", &total_items.to_string(), 1),
                             };
                             st.notify_success(msg);
                         }
@@ -546,8 +580,32 @@ pub async fn handle_response(
                                 reason,
                             });
                             st.view_mode = ViewMode::Plans;
-                            st.notify_warning("Plan horizon synthesis blocked by architect: manual intervention or replanning required");
+                            st.notify_warning(active_t("notify.plan_horizon_blocked"));
                         }
+                    }
+                }
+            }
+            methods::LOCALE_GENERATE => {
+                st.locale_dialog = None;
+                if let Ok(result) =
+                    serde_json::from_value::<tauqe_protocol::LocaleGenerateResult>(val)
+                {
+                    let language = result.language.clone();
+                    let locale =
+                        crate::i18n::CustomLocale::new(language.clone(), result.translations);
+                    // Hot-swap first so the interface reacts immediately, then
+                    // persist the single custom locale (c-4, c-5). A failed write
+                    // degrades to a session-only swap rather than a fatal error.
+                    st.apply_custom_locale(locale.clone());
+                    match crate::i18n::save_custom_locale(&locale) {
+                        Ok(_) => st.notify_success(
+                            active_t("notify.locale_switched").replacen("{}", &language, 1),
+                        ),
+                        Err(err) => st.notify_warning(
+                            active_t("notify.locale_switched_unsaved")
+                                .replacen("{}", &language, 1)
+                                .replacen("{}", &err.to_string(), 1),
+                        ),
                     }
                 }
             }
@@ -577,7 +635,7 @@ mod tests {
     use super::*;
     use crate::app::NotificationLevel;
     use tauqe_protocol::{
-        ResponseError, ReviewItem, ReviewItemStatus, ReviewSession, ReviewSeverity,
+        IssueStatus, ResponseError, ReviewItem, ReviewItemStatus, ReviewSession, ReviewSeverity,
     };
 
     fn test_state() -> Arc<Mutex<AppState>> {
@@ -727,7 +785,9 @@ mod tests {
             model: None,
             severity: ReviewSeverity::Info,
             status,
+            recommendations: Vec::new(),
             files: Vec::new(),
+            readonly_files: Vec::new(),
             subplan: Vec::new(),
             resolution_notes: None,
             body: String::new(),
@@ -774,10 +834,10 @@ mod tests {
         .unwrap();
         conn.record_optimistic_rollback(
             42,
-            OptimisticRollback::ReviewItemStatus {
+            OptimisticRollback::ReviewIssueStatus {
                 review_id: Some("rev-2".to_string()),
                 item_id: 1,
-                prev_status: ReviewItemStatus::Todo,
+                prev_status: IssueStatus::Todo,
             },
         );
 
@@ -827,10 +887,10 @@ mod tests {
         .unwrap();
         conn.record_optimistic_rollback(
             43,
-            OptimisticRollback::ReviewItemStatus {
+            OptimisticRollback::ReviewIssueStatus {
                 review_id: Some("rev-2".to_string()),
                 item_id: 1,
-                prev_status: ReviewItemStatus::Todo,
+                prev_status: IssueStatus::Todo,
             },
         );
 
@@ -838,7 +898,7 @@ mod tests {
             id: RequestId::Number(43),
             result: Some(
                 serde_json::to_value(ReviewUpdateItemResult {
-                    item: review_item(1, ReviewItemStatus::Fixed),
+                    item: review_item(1, ReviewItemStatus::Fixed).into(),
                 })
                 .unwrap(),
             ),

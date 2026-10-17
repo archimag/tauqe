@@ -5,6 +5,7 @@ use ratatui::widgets::{Block, Borders, Clear, Padding, Paragraph, Wrap};
 use tauqe_protocol::{ContextAccess, ContextLayer};
 
 use crate::app::AppState;
+use crate::i18n::active_t;
 use crate::ui::centered_rect;
 
 use super::ContextRow;
@@ -24,7 +25,7 @@ pub fn render_context_view(
     let auto_count = state.context.items.iter().filter(|i| i.layer == ContextLayer::Auto).count();
 
     context_lines.push(Line::from(vec![
-        Span::raw("Total size: "),
+        Span::raw(format!("{} ", active_t("context.total_size"))),
         Span::styled(
             format!("~{} tokens", state.context.total_estimated_tokens),
             engine.fg(palette.status_info).bold(),
@@ -54,7 +55,7 @@ pub fn render_context_view(
                             .filter(|i| i.layer == ContextLayer::Pinned)
                             .map(|i| i.estimated_tokens)
                             .sum();
-                        (arrow, "Pinned Files", pinned_count, tokens, palette.status_info, " [Protected / Config]")
+                        (arrow, active_t("context.section.pinned"), pinned_count, tokens, palette.status_info, active_t("context.section.pinned_hint"))
                     }
                     ContextLayer::User => {
                         let arrow = if state.context_view.user_expanded { "▼" } else { "▶" };
@@ -62,7 +63,7 @@ pub fn render_context_view(
                             .filter(|i| i.layer == ContextLayer::User)
                             .map(|i| i.estimated_tokens)
                             .sum();
-                        (arrow, "User Files", user_count, tokens, palette.status_warning, " [Editable / Read-Only]")
+                        (arrow, active_t("context.section.user"), user_count, tokens, palette.status_warning, active_t("context.section.user_hint"))
                     }
                     ContextLayer::Auto => {
                         let arrow = if state.context_view.auto_expanded { "▼" } else { "▶" };
@@ -70,7 +71,7 @@ pub fn render_context_view(
                             .filter(|i| i.layer == ContextLayer::Auto)
                             .map(|i| i.estimated_tokens)
                             .sum();
-                        (arrow, "Auto Files", auto_count, tokens, palette.button_active_bg, " [Model Requested]")
+                        (arrow, active_t("context.section.auto"), auto_count, tokens, palette.button_active_bg, active_t("context.section.auto_hint"))
                     }
                 };
 
@@ -97,12 +98,14 @@ pub fn render_context_view(
                 let cursor_prefix = if is_selected { "   ▶ " } else { "     " };
 
                 let (access_badge, access_style) = match item.access {
-                    ContextAccess::Editable => {
-                        ("[EDITABLE] ", engine.fg(palette.status_warning).bold())
-                    }
-                    ContextAccess::ReadOnly => {
-                        ("[READ-ONLY]", engine.fg(palette.status_success))
-                    }
+                    ContextAccess::Editable => (
+                        format!("{} ", active_t("context.badge.editable")),
+                        engine.fg(palette.status_warning).bold(),
+                    ),
+                    ContextAccess::ReadOnly => (
+                        active_t("context.badge.readonly"),
+                        engine.fg(palette.status_success),
+                    ),
                 };
 
                 let line_style = if is_selected {
@@ -151,15 +154,15 @@ pub fn render_context_view(
 
     let info_line = match active_row {
         Some(ContextRow::Header(ContextLayer::Pinned)) => Line::from(Span::styled(
-            "Pinned layer: Architecture & reference documents specified in tauqe.toml",
+            active_t("context.info.pinned"),
             engine.fg(palette.status_info),
         )),
         Some(ContextRow::Header(ContextLayer::User)) => Line::from(Span::styled(
-            "User layer: Persistent files curated by the developer (Editable or Read-Only)",
+            active_t("context.info.user"),
             engine.fg(palette.status_warning),
         )),
         Some(ContextRow::Header(ContextLayer::Auto)) => Line::from(Span::styled(
-            "Auto layer: Files autonomously requested by the model during discovery rounds",
+            active_t("context.info.auto"),
             engine.fg(palette.button_active_bg),
         )),
         Some(ContextRow::Item(ref it)) => match it.layer {
@@ -177,7 +180,7 @@ pub fn render_context_view(
             )),
         },
         None => Line::from(Span::styled(
-            "Context state: 3 layers (Pinned, User, Auto) | Press '?' for commands",
+            active_t("context.info.default"),
             engine.fg(palette.text_muted),
         )),
     };
@@ -202,17 +205,20 @@ fn render_add_file_picker(frame: &mut ratatui::Frame, state: &AppState) {
         .split(area);
 
     let input_line = Line::from(vec![
-        Span::styled(" File / Pattern: ", engine.fg(palette.status_info).bold()),
+        Span::styled(
+            format!(" {} ", active_t("context.picker.file_pattern")),
+            engine.fg(palette.status_info).bold(),
+        ),
         Span::raw(state.context_view.add_input.get_text()),
         Span::styled("█", engine.fg(palette.status_warning)),
     ]);
     let (access_title, border_style) = match state.context_view.add_access {
         ContextAccess::Editable => (
-            " Add EDITABLE to Context (Path, directory or glob like *.rs) ",
+            format!(" {} ", active_t("context.picker.title_editable")),
             engine.fg(palette.status_warning),
         ),
         ContextAccess::ReadOnly => (
-            " Add READ-ONLY to Context (Path, directory or glob like *.rs) ",
+            format!(" {} ", active_t("context.picker.title_readonly")),
             engine.fg(palette.status_info),
         ),
     };
@@ -232,12 +238,12 @@ fn render_add_file_picker(frame: &mut ratatui::Frame, state: &AppState) {
 
     if state.all_repo_files.is_empty() {
         candidate_lines.push(Line::from(Span::styled(
-            "  Loading repository files from server...",
+            format!("  {}", active_t("context.picker.loading")),
             engine.fg(palette.status_warning).italic(),
         )));
     } else if total_candidates == 0 {
         candidate_lines.push(Line::from(Span::styled(
-            "  No matching files found.",
+            format!("  {}", active_t("context.picker.no_match")),
             engine.fg(palette.text_muted),
         )));
     } else {

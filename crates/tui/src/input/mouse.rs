@@ -5,7 +5,7 @@ use ratatui::layout::Rect;
 use tokio::sync::Mutex;
 use tauqe_protocol::{methods, DiscussionFocus};
 
-use crate::app::{ActiveModal, AppState, ViewMode};
+use crate::app::{ActiveModal, AppState, HelpTab, LocaleDialogButton, ViewMode};
 use crate::input::InputResult;
 use crate::rpc::{send_request, RpcConnection};
 
@@ -50,8 +50,8 @@ fn geometry_of(
         term,
         params.width,
         params.body_lines.len(),
-        params.confirm_label,
-        params.cancel_label,
+        &params.confirm_label,
+        &params.cancel_label,
     )
 }
 
@@ -67,7 +67,11 @@ pub async fn handle_mouse_event(
             let term_rect = st.last_frame_area;
             if let Some(ref mut dialog) = st.status_dialog {
                 let count = dialog.target.options_count();
-                dialog.selector.select_prev(count);
+                let visible =
+                    crate::dialogs::render::status_dialog_options_area(term_rect, count)
+                        .height
+                        .max(1) as usize;
+                dialog.selector.select_prev(visible);
                 return Ok(InputResult::Continue);
             }
             if let Some(ref mut dialog) = st.selection_dialog {
@@ -103,7 +107,7 @@ pub async fn handle_mouse_event(
                 return Ok(InputResult::Continue);
             }
             match st.view_mode {
-                ViewMode::Develop => {
+                ViewMode::Repl => {
                     st.model.auto_scroll = false;
                     st.model.scroll = st.model.scroll.saturating_sub(MOUSE_SCROLL_STEP as u16);
                 }
@@ -132,7 +136,11 @@ pub async fn handle_mouse_event(
             let term_rect = st.last_frame_area;
             if let Some(ref mut dialog) = st.status_dialog {
                 let count = dialog.target.options_count();
-                dialog.selector.select_next(count);
+                let visible =
+                    crate::dialogs::render::status_dialog_options_area(term_rect, count)
+                        .height
+                        .max(1) as usize;
+                dialog.selector.select_next(visible);
                 return Ok(InputResult::Continue);
             }
             if let Some(ref mut dialog) = st.selection_dialog {
@@ -168,7 +176,7 @@ pub async fn handle_mouse_event(
                 return Ok(InputResult::Continue);
             }
             match st.view_mode {
-                ViewMode::Develop => {
+                ViewMode::Repl => {
                     let view_height = st.last_model_height;
                     let max = st.model.max_scroll(view_height);
                     st.model.scroll = (st.model.scroll.saturating_add(MOUSE_SCROLL_STEP as u16)).min(max);
@@ -225,17 +233,19 @@ pub async fn handle_mouse_event(
                 Some(ActiveModal::Squash) => {
                     if let Some(ref mut dialog) = st.squash_dialog {
                         if let Some(kind) = dialog.confirm {
-                            let (w, lines_len, c_label, d_label) = match kind {
-                                crate::app::SquashConfirm::Apply => (60, 6, "Confirm Squash (Y)", "Cancel (Esc)"),
-                                crate::app::SquashConfirm::Discard => (58, 4, "Discard (Y)", "Cancel (Esc)"),
+                            // Reuse the exact confirmation parameters the
+                            // renderer builds, so mouse hit-testing can never
+                            // drift from the drawn buttons (Conventions §6, §7).
+                            let geom = match kind {
+                                crate::app::SquashConfirm::Apply => geometry_of(
+                                    term_rect,
+                                    &crate::dialogs::render::squash::squash_apply_params(dialog),
+                                ),
+                                crate::app::SquashConfirm::Discard => geometry_of(
+                                    term_rect,
+                                    &crate::dialogs::render::squash::squash_discard_params(dialog),
+                                ),
                             };
-                            let geom = crate::dialogs::render::confirm_modal_geometry(
-                                term_rect,
-                                w,
-                                lines_len,
-                                c_label,
-                                d_label,
-                            );
                             match check_confirm_hit(&geom, mouse.column, mouse.row) {
                                 ModalHit::Confirm => {
                                     dialog.confirm = None;
@@ -336,6 +346,12 @@ pub async fn handle_mouse_event(
                                 dialog.selector.select_index(index);
                             }
                             dialog.focus = crate::app::ReviewDialogFocus::ModelList;
+                        } else if rect_contains(geo.path_area, mouse.column, mouse.row) {
+                            // Clicking the target-paths field focuses it so the
+                            // next keystroke edits the clicked input.
+                            dialog.focus = crate::app::ReviewDialogFocus::PathEditor;
+                        } else if rect_contains(geo.editor_area, mouse.column, mouse.row) {
+                            dialog.focus = crate::app::ReviewDialogFocus::PromptEditor;
                         }
 
                         st.review_dialog = Some(dialog);
@@ -626,6 +642,7 @@ pub async fn handle_mouse_event(
 
                         if rect_contains(geo.confirm_button, mouse.column, mouse.row) {
                             crate::dialogs::input::submit_refine_dialog(
+                                state,
                                 st,
                                 dialog,
                                 server_writer,
@@ -652,6 +669,11 @@ pub async fn handle_mouse_event(
                                 dialog.selector.select_index(index);
                             }
                             dialog.focus = crate::views::plans::RefineDialogFocus::ModelList;
+                        } else if rect_contains(geo.editor_area, mouse.column, mouse.row) {
+                            // Clicking the instructions editor focuses it so the
+                            // next keystroke edits the clicked input.
+                            dialog.focus =
+                                crate::views::plans::RefineDialogFocus::InstructionsEditor;
                         }
 
                         st.plans_view.refine_dialog = Some(dialog);
@@ -670,6 +692,7 @@ pub async fn handle_mouse_event(
                             ModalHit::Confirm => {
                                 st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
                                 crate::dialogs::input::submit_refine_blocked(
+                                    state,
                                     st,
                                     blocked,
                                     server_writer,
@@ -744,6 +767,10 @@ pub async fn handle_mouse_event(
                         let options_count = dialog.target.options_count();
                         let area =
                             crate::dialogs::render::status_dialog_area(term_rect, options_count);
+                        let options_area = crate::dialogs::render::status_dialog_options_area(
+                            term_rect,
+                            options_count,
+                        );
                         let (apply_btn, cancel_btn) =
                             crate::dialogs::render::status_dialog_buttons(term_rect, options_count);
 
@@ -756,13 +783,18 @@ pub async fn handle_mouse_event(
                             crate::dialogs::input::apply_status_dialog(&mut st, chosen, server_writer).await?;
                         } else if rect_contains(cancel_btn, mouse.column, mouse.row) {
                             st.status_dialog = None;
-                        } else if rect_contains(area, mouse.column, mouse.row) {
-                            let start_y = area.y + 4; // header border (1) + top margin (1) + target preview (2)
-                            let clicked_row = mouse.row.saturating_sub(start_y) as usize;
-                            if mouse.row >= start_y && clicked_row < options_count {
+                        } else if rect_contains(options_area, mouse.column, mouse.row) {
+                            // Map the clicked visual row onto the list index,
+                            // honoring the current scroll offset and the exact
+                            // window the rows are drawn in, so a click on empty
+                            // space below the last option never selects a status
+                            // (Conventions §6.6).
+                            let clicked_row = dialog.selector.scroll_offset()
+                                + (mouse.row - options_area.y) as usize;
+                            if clicked_row < options_count {
                                 crate::dialogs::input::apply_status_dialog(&mut st, clicked_row, server_writer).await?;
                             }
-                        } else {
+                        } else if !rect_contains(area, mouse.column, mouse.row) {
                             st.status_dialog = None;
                         }
                     }
@@ -811,9 +843,50 @@ pub async fn handle_mouse_event(
                         }
                     }
                 }
+                Some(ActiveModal::Locale) => {
+                    // The three action buttons are clickable through the same
+                    // geometry the renderer draws; a click outside the dialog
+                    // dismisses it and a click elsewhere inside leaves the
+                    // language field to the keyboard (Conventions §6.6).
+                    let geom = crate::dialogs::render::locale_dialog_geometry(term_rect);
+                    let button = if rect_contains(geom.synthesize_button, mouse.column, mouse.row) {
+                        Some(LocaleDialogButton::Synthesize)
+                    } else if rect_contains(geom.reset_button, mouse.column, mouse.row) {
+                        Some(LocaleDialogButton::ResetEnglish)
+                    } else if rect_contains(geom.cancel_button, mouse.column, mouse.row) {
+                        Some(LocaleDialogButton::Cancel)
+                    } else {
+                        None
+                    };
+
+                    if let Some(button) = button {
+                        crate::dialogs::input::click_locale_button(st, button, server_writer)
+                            .await?;
+                        return Ok(InputResult::Continue);
+                    }
+                    if !rect_contains(geom.area, mouse.column, mouse.row) {
+                        st.locale_dialog = None;
+                    }
+                }
                 Some(ActiveModal::Help) => {
-                    st.show_help = false;
-                    st.help_scroll = 0;
+                    // A click on a header tab switches that tab; any other
+                    // click dismisses the dialog, preserving the click-to-close
+                    // affordance while making the tabs reachable
+                    // (Conventions §6.6).
+                    let geom = crate::dialogs::render::help::help_tab_geometry(term_rect);
+                    if rect_contains(geom.global_tab, mouse.column, mouse.row) {
+                        st.help_tab = HelpTab::Global;
+                        st.help_scroll = 0;
+                    } else if rect_contains(geom.current_mode_tab, mouse.column, mouse.row) {
+                        st.help_tab = HelpTab::CurrentMode;
+                        st.help_scroll = 0;
+                    } else if rect_contains(geom.text_editor_tab, mouse.column, mouse.row) {
+                        st.help_tab = HelpTab::TextEditor;
+                        st.help_scroll = 0;
+                    } else {
+                        st.show_help = false;
+                        st.help_scroll = 0;
+                    }
                 }
                 None => {
                     // No modal: protect against inline Context input, then route to
@@ -824,8 +897,8 @@ pub async fn handle_mouse_event(
 
                     if st.header_clicks.row > 0 && mouse.row == st.header_clicks.row {
                         let areas = st.header_clicks;
-                        if areas.develop_tab.1 > 0 && mouse.column >= areas.develop_tab.0 && mouse.column <= areas.develop_tab.1 {
-                            crate::input::switch_view(&mut st, ViewMode::Develop, server_writer).await?;
+                        if areas.repl_tab.1 > 0 && mouse.column >= areas.repl_tab.0 && mouse.column <= areas.repl_tab.1 {
+                            crate::input::switch_view(&mut st, ViewMode::Repl, server_writer).await?;
                             return Ok(InputResult::Continue);
                         } else if areas.plans_tab.1 > 0 && mouse.column >= areas.plans_tab.0 && mouse.column <= areas.plans_tab.1 {
                             crate::input::switch_view(&mut st, ViewMode::Plans, server_writer).await?;
@@ -856,7 +929,7 @@ pub async fn handle_mouse_event(
                         }
                     }
 
-                    if st.view_mode == ViewMode::Develop {
+                    if st.view_mode == ViewMode::Repl {
                         let (cx, cy, cw, ch) = st.model.content_rect;
                         if mouse.column >= cx && mouse.column < cx + cw && mouse.row >= cy && mouse.row < cy + ch {
                             let relative_row = (mouse.row - cy) as usize;
@@ -1109,7 +1182,55 @@ mod tests {
         assert_eq!(res, InputResult::Continue);
 
         let st = state.lock().await;
-        assert_eq!(st.view_mode, ViewMode::Develop);
+        assert_eq!(st.view_mode, ViewMode::Repl);
         assert!(st.confirm_execute_review.is_none());
+    }
+
+    /// A click on a Help header tab must switch to that tab without closing the
+    /// dialog.
+    #[tokio::test]
+    async fn help_tab_click_switches_tab_without_closing() {
+        let mut st = crate::app::test_state();
+        st.show_help = true;
+        st.last_frame_area = Rect::new(0, 0, 100, 30);
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+
+        let geo = crate::dialogs::render::help::help_tab_geometry(Rect::new(0, 0, 100, 30));
+        let mouse = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: geo.current_mode_tab.x + 1,
+            row: geo.current_mode_tab.y,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        };
+        let res = handle_mouse_event(mouse, &state, &mut conn).await.unwrap();
+        assert_eq!(res, InputResult::Continue);
+
+        let st = state.lock().await;
+        assert!(st.show_help, "clicking a tab must not close the dialog");
+        assert_eq!(st.help_tab, HelpTab::CurrentMode);
+    }
+
+    /// A click on the locale dialog's `Cancel` button must dismiss it.
+    #[tokio::test]
+    async fn locale_cancel_button_click_dismisses_dialog() {
+        let mut st = crate::app::test_state();
+        st.last_frame_area = Rect::new(0, 0, 100, 30);
+        st.locale_dialog = Some(crate::app::LocaleDialogState::default());
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+
+        let geo = crate::dialogs::render::locale_dialog_geometry(Rect::new(0, 0, 100, 30));
+        let mouse = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: geo.cancel_button.x + 1,
+            row: geo.cancel_button.y,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        };
+        let res = handle_mouse_event(mouse, &state, &mut conn).await.unwrap();
+        assert_eq!(res, InputResult::Continue);
+
+        let st = state.lock().await;
+        assert!(st.locale_dialog.is_none());
     }
 }

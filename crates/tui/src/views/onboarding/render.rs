@@ -4,6 +4,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
 use crate::app::AppState;
+use crate::i18n::active_t;
 
 use super::{format_masked_key, ONBOARDING_STEPS};
 
@@ -78,7 +79,7 @@ pub fn render_onboarding_view(
     match ob.step {
         crate::app::OnboardingStep::Git => {
             lines.push(Line::from(Span::styled(
-                "Step 0: Initialize Git Repository",
+                active_t("onboarding.step.git_title"),
                 engine.fg(palette.status_error).bold(),
             )));
             lines.push(Line::from("The current working directory is not a Git repository."));
@@ -116,7 +117,7 @@ pub fn render_onboarding_view(
         }
         crate::app::OnboardingStep::Config => {
             lines.push(Line::from(Span::styled(
-                "Step 1: Project Configuration (tauqe.toml)",
+                active_t("onboarding.step.config_title"),
                 engine.fg(palette.status_info).bold(),
             )));
             lines.push(Line::from("Configuration file not found in project root."));
@@ -155,7 +156,7 @@ pub fn render_onboarding_view(
         }
         crate::app::OnboardingStep::Credentials => {
             lines.push(Line::from(Span::styled(
-                "Step 2: Credentials and OpenRouter API Key",
+                active_t("onboarding.step.credentials_title"),
                 engine.fg(palette.status_warning).bold(),
             )));
             lines.push(Line::from("OpenRouter API key was not detected in environment (OPENROUTER_API_KEY) or credentials files."));
@@ -197,7 +198,7 @@ pub fn render_onboarding_view(
         }
         crate::app::OnboardingStep::Workstation => {
             lines.push(Line::from(Span::styled(
-                "Step 3: Workstation Keyboard Layout and Mapping (tui.toml)",
+                active_t("onboarding.step.workstation_title"),
                 engine.fg(palette.button_active_bg).bold(),
             )));
             lines.push(Line::from("Configure shortcut key translation and navigation keys for your system layout."));
@@ -238,7 +239,7 @@ pub fn render_onboarding_view(
         }
         crate::app::OnboardingStep::Modifier => {
             lines.push(Line::from(Span::styled(
-                "Step 4: Primary Command Modifier (C-)",
+                active_t("onboarding.step.modifier_title"),
                 engine.fg(palette.overlay).bold(),
             )));
             lines.push(Line::from("In text input mode (prompt buffer, commit message editor), every regular key types text."));
@@ -274,7 +275,7 @@ pub fn render_onboarding_view(
         }
         crate::app::OnboardingStep::Gatekeeper => {
             lines.push(Line::from(Span::styled(
-                "Warning: System Not Ready",
+                active_t("onboarding.step.gatekeeper_title"),
                 engine.fg(palette.status_error).bold(),
             )));
             lines.push(Line::from("Language model calls cannot proceed without an OpenRouter API key."));
@@ -307,7 +308,7 @@ pub fn render_onboarding_view(
         }
         crate::app::OnboardingStep::Ready => {
             lines.push(Line::from(Span::styled(
-                "Step 5: System is successfully configured and ready to use!",
+                active_t("onboarding.step.ready_title"),
                 engine.fg(palette.status_success).bold(),
             )));
             lines.push(Line::raw(""));
@@ -423,7 +424,7 @@ pub fn render_onboarding_view(
     let main_block = Paragraph::new(lines)
         .block(
             Block::default()
-                .title(" Tauqe Initial Setup (Onboarding) ")
+                .title(format!(" {} ", active_t("onboarding.title")))
                 .borders(Borders::ALL)
                 .border_style(engine.fg(palette.status_info)),
         )

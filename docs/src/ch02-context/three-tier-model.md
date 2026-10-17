@@ -28,6 +28,7 @@ The working context is organized into three distinct layers:
 2. **User Layer:**
    - Files explicitly designated by the developer as relevant to the current work session.
    - Preserved across turns until manually cleared or promoted.
+   - **Created files are durable:** A file the model creates on disk during a turn is registered directly in the User layer, not the transient Auto layer, so it survives the end-of-turn Auto sweep and stays editable in subsequent turns.
    - **Precedence:** A file added to the User layer is promoted out of the Auto layer. Because `editable` access always wins over `read_only` across every layer, curating a file as editable in the User layer upgrades its effective permission even when it is also pinned.
    - **Accelerating the Turn Lifecycle:** While the model can autonomously discover files, each discovery step requires an additional round-trip request. Manually adding key task-relevant files to the User layer eliminates discovery rounds, establishing an actionable context immediately and saving time and tokens.
 3. **Auto Layer:**
@@ -51,9 +52,11 @@ Files not present in the active context (visible only in the Tree-sitter Repo Ma
 
 TAUQE balances developer control with model autonomy:
 1. When a task is submitted, the model inspects the Tree-sitter Repo Map alongside the currently loaded files.
-2. If symbols or implementations are missing from context, the model emits protocol requests (e.g., `<context_request path="crates/core/src/context.rs" access="read_only" />`). Files already present in context (including read-only files) do not require a separate discovery round and may be edited directly if required.
-3. The server adds requested files to the `Auto` context layer and immediately initiates the next round.
-4. Once all needed files are loaded, the model produces code modifications.
+2. To locate symbol definitions, trait implementations, or usages across the project, the model can emit typed repository search requests (e.g., `<repo_search path="crates/core" regex="pub trait PromptProtocol" />`).
+3. The harness executes regex searches strictly over Git-tracked files in pure Rust (RE2-compatible linear-time regex without ReDoS risk, automatically skipping `.git`, `target`, `node_modules`, `.tauqe`, and binary files) and returns a compact `<search_feedback>` report containing only matching file paths and hit counts, preventing context bloat.
+4. If symbols or implementations are missing from context, the model emits protocol requests (e.g., `<context_request path="crates/core/src/context.rs" access="read_only" />`). Files already present in context (including read-only files) do not require a separate discovery round and may be edited directly if required.
+5. The server adds requested files to the `Auto` context layer and immediately initiates the next round.
+6. Once all needed files are loaded and verified, the model produces code modifications.
 
 By combining explicit User layer curation with autonomous model Discovery, developers can provide the high-level focus while allowing the harness to fill in detailed dependencies on demand.
 

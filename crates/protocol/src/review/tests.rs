@@ -1,6 +1,7 @@
 use super::*;
 
 use crate::model::{CancelMode, ModelRef, ModelSelection};
+use crate::plan::PlanItem;
 
 #[test]
 fn test_review_execute_params_serde() {
@@ -40,126 +41,59 @@ fn test_review_cancel_params_serde() {
 }
 
 #[test]
-fn test_review_status_lifecycle() {
-    let status = ReviewItemStatus::Discussion;
-    assert_eq!(status.next(), ReviewItemStatus::Todo);
-    assert_eq!(status.next().next(), ReviewItemStatus::InProgress);
-    assert_eq!(status.next().next().next(), ReviewItemStatus::Fixed);
-    assert_eq!(status.next().next().next().next(), ReviewItemStatus::Skipped);
-    assert_eq!(status.next().next().next().next().next(), ReviewItemStatus::Rejected);
-    assert_eq!(status.next().next().next().next().next().next(), ReviewItemStatus::Discussion);
-    assert_eq!(status.to_string(), "DISCUSSION");
-    assert_eq!(ReviewItemStatus::Skipped.to_string(), "SKIPPED");
-    assert_eq!(
-        serde_json::to_string(&ReviewItemStatus::Skipped).unwrap(),
-        "\"skipped\""
-    );
-    assert_eq!(
-        serde_json::from_str::<ReviewItemStatus>("\"skipped\"").unwrap(),
-        ReviewItemStatus::Skipped
-    );
-}
-
-#[test]
-fn test_review_item_serde() {
-    let item = ReviewItem {
+fn test_review_issue_serde() {
+    let issue = ReviewIssue {
         id: 1,
         title: "Potential race condition".to_string(),
         model: Some(ModelSelection::Role(crate::model::ModelRole::Architect)),
-        severity: ReviewSeverity::Critical,
-        status: ReviewItemStatus::Discussion,
+        issue_type: IssueType::Bug,
+        status: IssueStatus::Discussion,
+        description: "Lock is released before turn concludes".to_string(),
+        recommendations: vec!["Acquire lock across turn lifetime".to_string()],
         files: vec!["crates/server/src/state.rs".to_string()],
-        subplan: Vec::new(),
-        resolution_notes: Some("Acquire lock across turn lifetime".to_string()),
-        body: "Lock is released before turn concludes".to_string(),
+        readonly_files: vec!["crates/protocol/src/review.rs".to_string()],
+        plan: Vec::new(),
+        note: Some("Lock design pending".to_string()),
     };
 
-    let json = serde_json::to_string(&item).unwrap();
-    assert!(json.contains("\"critical\""));
+    let json = serde_json::to_string(&issue).unwrap();
+    assert!(json.contains("\"type\":\"bug\""));
     assert!(json.contains("\"discussion\""));
     assert!(json.contains("\"files\":[\"crates/server/src/state.rs\"]"));
-    assert!(json.contains("\"resolution_notes\":\"Acquire lock across turn lifetime\""));
+    assert!(json.contains("\"readonly_files\":[\"crates/protocol/src/review.rs\"]"));
+    assert!(json.contains("\"note\":\"Lock design pending\""));
 
-    let de: ReviewItem = serde_json::from_str(&json).unwrap();
-    assert_eq!(de, item);
+    let de: ReviewIssue = serde_json::from_str(&json).unwrap();
+    assert_eq!(de, issue);
 
     let update_params = ReviewUpdateItemParams {
         review_id: Some("rev-1".to_string()),
         item_id: 1,
-        status: Some(ReviewItemStatus::InProgress),
-        resolution_notes: Some("Plan defined".to_string()),
+        status: Some(IssueStatus::InProgress),
+        note: Some("Plan defined".to_string()),
     };
     let update_json = serde_json::to_string(&update_params).unwrap();
-    assert!(update_json.contains("\"resolution_notes\":\"Plan defined\""));
+    assert!(update_json.contains("\"note\":\"Plan defined\""));
     let de_update: ReviewUpdateItemParams = serde_json::from_str(&update_json).unwrap();
     assert_eq!(de_update, update_params);
 
-    // The legacy "done" status alias still maps to Fixed.
-    let legacy_json = r#"{"id":2,"title":"Legacy","severity":"info","status":"done","body":"","model":"architect"}"#;
-    let de_legacy: ReviewItem = serde_json::from_str(legacy_json).unwrap();
-    assert_eq!(de_legacy.status, ReviewItemStatus::Fixed);
-    assert_eq!(de_legacy.model, Some(ModelSelection::Role(crate::model::ModelRole::Architect)));
+    // The renamed `note` field still accepts the legacy `resolution_notes`
+    // key on read, so older clients keep updating findings unchanged.
+    let legacy_update: ReviewUpdateItemParams =
+        serde_json::from_str(r#"{"item_id":1,"resolution_notes":"legacy note"}"#).unwrap();
+    assert_eq!(legacy_update.note.as_deref(), Some("legacy note"));
+
+    // Legacy "severity", "body", and "done" aliases still map cleanly.
+    let legacy_json = r#"{"id":2,"title":"Legacy","severity":"critical","status":"done","body":"Defect details","model":"architect"}"#;
+    let de_legacy: ReviewIssue = serde_json::from_str(legacy_json).unwrap();
+    assert_eq!(de_legacy.issue_type, IssueType::Bug);
+    assert_eq!(de_legacy.status, IssueStatus::Fixed);
+    assert_eq!(de_legacy.description, "Defect details");
+    assert_eq!(
+        de_legacy.model,
+        Some(ModelSelection::Role(crate::model::ModelRole::Architect))
+    );
     assert!(de_legacy.files.is_empty());
-}
-
-#[test]
-fn test_review_item_legacy_file_path_backward_compatibility() {
-    let legacy_json = r#"{
-        "id": 1,
-        "title": "Legacy Finding",
-        "severity": "warning",
-        "status": "todo",
-        "file_path": "crates/core/src/review.rs",
-        "line_range": [10, 25],
-        "body": "Legacy issue description"
-    }"#;
-
-    let item: ReviewItem = serde_json::from_str(legacy_json).unwrap();
-    assert_eq!(item.id, 1);
-    assert_eq!(item.title, "Legacy Finding");
-    assert_eq!(item.severity, ReviewSeverity::Warning);
-    assert_eq!(item.status, ReviewItemStatus::Todo);
-    assert_eq!(item.files, vec!["crates/core/src/review.rs"]);
-    assert_eq!(item.body, "Legacy issue description");
-
-    // Explicit empty files array falls back to file_path
-    let empty_files_json = r#"{
-        "id": 2,
-        "title": "Empty files fallback",
-        "severity": "info",
-        "status": "discussion",
-        "files": [],
-        "file_path": "crates/tui/src/views.rs",
-        "body": "Empty files details"
-    }"#;
-    let item_empty: ReviewItem = serde_json::from_str(empty_files_json).unwrap();
-    assert_eq!(item_empty.files, vec!["crates/tui/src/views.rs"]);
-
-    // Multi-file finding preserves all paths and Skipped status
-    let multi_json = r#"{
-        "id": 3,
-        "title": "Multi-file Finding",
-        "severity": "critical",
-        "status": "skipped",
-        "files": ["crates/protocol/src/review.rs", "crates/core/src/review.rs"],
-        "resolution_notes": "Skipped because already fixed",
-        "body": "Details"
-    }"#;
-
-    let multi_item: ReviewItem = serde_json::from_str(multi_json).unwrap();
-    assert_eq!(multi_item.id, 3);
-    assert_eq!(multi_item.status, ReviewItemStatus::Skipped);
-    assert_eq!(
-        multi_item.files,
-        vec![
-            "crates/protocol/src/review.rs",
-            "crates/core/src/review.rs"
-        ]
-    );
-    assert_eq!(
-        multi_item.resolution_notes.as_deref(),
-        Some("Skipped because already fixed")
-    );
 }
 
 #[test]
@@ -323,34 +257,33 @@ fn test_review_start_params_path_pattern_backward_compatible() {
 }
 
 #[test]
-fn test_review_item_without_subplan_stays_readable_and_has_none() {
-    // A record predating the subplan field deserializes cleanly with an
-    // empty subplan, keeping older sessions fully readable.
+fn test_review_issue_without_plan_stays_readable_and_has_none() {
+    // A record without a plan deserializes cleanly with an empty plan vector.
     let legacy = r#"{
         "id": 7,
-        "title": "Legacy finding",
-        "severity": "warning",
+        "title": "Finding without plan",
+        "type": "architecture",
         "status": "todo",
         "files": ["crates/core/src/review.rs"],
-        "body": "Legacy body"
+        "description": "Legacy body"
     }"#;
-    let item: ReviewItem = serde_json::from_str(legacy).unwrap();
-    assert!(!item.has_subplan());
-    assert_eq!(item.subplan_stats(), (0, 0));
+    let issue: ReviewIssue = serde_json::from_str(legacy).unwrap();
+    assert!(!issue.has_plan());
+    assert_eq!(issue.plan_stats(), (0, 0));
 
-    // The empty subplan is never serialized back, so the wire stays compact.
-    let json = serde_json::to_string(&item).unwrap();
-    assert!(!json.contains("subplan"));
+    // The empty plan is never serialized back, keeping the wire compact.
+    let json = serde_json::to_string(&issue).unwrap();
+    assert!(!json.contains("\"plan\""));
 }
 
 #[test]
-fn test_review_item_subplan_roundtrip_and_stats() {
+fn test_review_issue_plan_roundtrip_and_stats() {
     let raw = r#"{
         "id": 8,
         "title": "Decomposed finding",
-        "severity": "info",
+        "type": "quality",
         "status": "todo",
-        "subplan": [
+        "plan": [
             {"id": "1.1", "title": "First", "status": "done"},
             {"id": "1.2", "title": "Second", "status": "in_progress"},
             {"id": "1.3", "title": "Dropped", "status": "cancelled"},
@@ -358,18 +291,18 @@ fn test_review_item_subplan_roundtrip_and_stats() {
                 {"id": "1.4.1", "title": "Nested", "status": "done"}
             ]}
         ],
-        "body": "Body"
+        "description": "Body"
     }"#;
-    let item: ReviewItem = serde_json::from_str(raw).unwrap();
-    assert!(item.has_subplan());
+    let issue: ReviewIssue = serde_json::from_str(raw).unwrap();
+    assert!(issue.has_plan());
     // Leaves 1.1, 1.2, and 1.4.1 count; the cancelled 1.3 is excluded and
     // the container 1.4 is skipped in favor of its leaves.
-    assert_eq!(item.subplan_stats(), (3, 2));
+    assert_eq!(issue.plan_stats(), (3, 2));
 
-    let json = serde_json::to_string(&item).unwrap();
-    assert!(json.contains("\"subplan\""));
-    let de: ReviewItem = serde_json::from_str(&json).unwrap();
-    assert_eq!(de, item);
+    let json = serde_json::to_string(&issue).unwrap();
+    assert!(json.contains("\"plan\""));
+    let de: ReviewIssue = serde_json::from_str(&json).unwrap();
+    assert_eq!(de, issue);
 }
 
 #[test]
@@ -395,16 +328,18 @@ fn test_review_refine_item_params_serde() {
 
 #[test]
 fn test_review_refine_item_result_serde_and_helpers() {
-    let item = ReviewItem {
+    let item = ReviewIssue {
         id: 3,
         title: "Finding".to_string(),
         model: None,
-        severity: ReviewSeverity::Info,
-        status: ReviewItemStatus::Todo,
+        issue_type: IssueType::Bug,
+        status: IssueStatus::Todo,
+        description: "Body".to_string(),
+        recommendations: Vec::new(),
         files: Vec::new(),
-        subplan: Vec::new(),
-        resolution_notes: None,
-        body: "Body".to_string(),
+        readonly_files: Vec::new(),
+        plan: Vec::new(),
+        note: None,
     };
 
     let success = ReviewRefineItemResult::Success {
@@ -433,14 +368,158 @@ fn test_review_refine_item_result_serde_and_helpers() {
     assert_eq!(de, blocked);
 }
 
-fn finding(id: u32, status: ReviewItemStatus) -> ReviewItem {
+#[test]
+fn test_issue_type_methods_and_serde() {
+    assert_eq!(IssueType::Bug.as_str(), "bug");
+    assert_eq!(IssueType::Bug.display_badge(), "BUG");
+    assert_eq!(IssueType::Bug.to_string(), "BUG");
+    assert_eq!(serde_json::to_string(&IssueType::Bug).unwrap(), "\"bug\"");
+    assert_eq!(
+        serde_json::from_str::<IssueType>("\"bug\"").unwrap(),
+        IssueType::Bug
+    );
+    assert_eq!(
+        serde_json::from_str::<IssueType>("\"critical\"").unwrap(),
+        IssueType::Bug
+    );
+
+    assert_eq!(IssueType::Security.as_str(), "security");
+    assert_eq!(IssueType::Security.display_badge(), "SEC");
+
+    assert_eq!(IssueType::Architecture.as_str(), "architecture");
+    assert_eq!(IssueType::Architecture.display_badge(), "ARCH");
+    assert_eq!(
+        serde_json::from_str::<IssueType>("\"architecture\"").unwrap(),
+        IssueType::Architecture
+    );
+    assert_eq!(
+        serde_json::from_str::<IssueType>("\"warning\"").unwrap(),
+        IssueType::Architecture
+    );
+
+    assert_eq!(IssueType::Performance.as_str(), "performance");
+    assert_eq!(IssueType::Performance.display_badge(), "PERF");
+
+    assert_eq!(IssueType::Quality.as_str(), "quality");
+    assert_eq!(IssueType::Quality.display_badge(), "QUAL");
+    assert_eq!(IssueType::Quality.to_string(), "QUAL");
+    assert_eq!(
+        serde_json::to_string(&IssueType::Quality).unwrap(),
+        "\"quality\""
+    );
+    assert_eq!(
+        serde_json::from_str::<IssueType>("\"quality\"").unwrap(),
+        IssueType::Quality
+    );
+    assert_eq!(
+        serde_json::from_str::<IssueType>("\"style\"").unwrap(),
+        IssueType::Quality
+    );
+    assert_eq!(
+        serde_json::from_str::<IssueType>("\"suggestion\"").unwrap(),
+        IssueType::Quality
+    );
+}
+
+#[test]
+fn test_issue_status_lifecycle_and_refine() {
+    let status = IssueStatus::Discussion;
+    assert_eq!(status.next(), IssueStatus::Todo);
+    assert_eq!(status.next().next(), IssueStatus::InProgress);
+    assert_eq!(status.next().next().next(), IssueStatus::Refine);
+    assert_eq!(status.next().next().next().next(), IssueStatus::Fixed);
+    assert_eq!(status.next().next().next().next().next(), IssueStatus::Skipped);
+    assert_eq!(status.next().next().next().next().next().next(), IssueStatus::Rejected);
+    assert_eq!(status.next().next().next().next().next().next().next(), IssueStatus::Discussion);
+    assert_eq!(IssueStatus::Refine.to_string(), "REFINE");
+    assert_eq!(
+        serde_json::to_string(&IssueStatus::Refine).unwrap(),
+        "\"refine\""
+    );
+    assert_eq!(
+        serde_json::from_str::<IssueStatus>("\"refine\"").unwrap(),
+        IssueStatus::Refine
+    );
+}
+
+#[test]
+fn test_review_issue_serde_and_plan_stats() {
+    let issue = ReviewIssue {
+        id: 42,
+        title: "Memory leak in cache".to_string(),
+        model: None,
+        issue_type: IssueType::Bug,
+        status: IssueStatus::Refine,
+        description: "Cache entries are never pruned".to_string(),
+        recommendations: vec!["Implement LRU eviction".to_string()],
+        files: vec!["crates/core/src/cache.rs".to_string()],
+        readonly_files: vec!["crates/core/src/traits.rs".to_string()],
+        plan: vec![PlanItem {
+            id: "step-1".to_string(),
+            title: "Eviction helper".to_string(),
+            status: crate::plan::PlanItemStatus::Done,
+            ..Default::default()
+        }],
+        note: Some("Under active refinement".to_string()),
+    };
+
+    assert!(issue.has_plan());
+    assert_eq!(issue.plan_stats(), (1, 1));
+
+    let json = serde_json::to_string(&issue).unwrap();
+    assert!(json.contains("\"type\":\"bug\""));
+    assert!(json.contains("\"status\":\"refine\""));
+    assert!(json.contains("\"description\":\"Cache entries are never pruned\""));
+    assert!(json.contains("\"recommendations\":[\"Implement LRU eviction\"]"));
+    assert!(json.contains("\"files\":[\"crates/core/src/cache.rs\"]"));
+    assert!(json.contains("\"readonly_files\":[\"crates/core/src/traits.rs\"]"));
+    assert!(json.contains("\"note\":\"Under active refinement\""));
+
+    let de: ReviewIssue = serde_json::from_str(&json).unwrap();
+    assert_eq!(de, issue);
+}
+
+#[test]
+fn test_review_session_issues_accessor_and_alias() {
+    let raw = r#"{
+        "id": "rev-test",
+        "title": "Test Review",
+        "created_at": 100,
+        "issues": [
+            {
+                "id": 1,
+                "title": "Bug",
+                "type": "bug",
+                "status": "todo",
+                "description": "Fix bug"
+            }
+        ]
+    }"#;
+    let session: ReviewSession = serde_json::from_str(raw).unwrap();
+    assert_eq!(session.items.len(), 1);
+    let issues = session.issues();
+    assert_eq!(issues.len(), 1);
+    assert_eq!(issues[0].id, 1);
+    assert_eq!(issues[0].issue_type, IssueType::Bug);
+    assert_eq!(issues[0].status, IssueStatus::Todo);
+    assert_eq!(issues[0].description, "Fix bug");
+}
+
+#[test]
+fn test_item_in_refine_error_constant() {
+    assert_eq!(crate::errors::ITEM_IN_REFINE, "ITEM_IN_REFINE");
+}
+
+fn finding(id: u32, status: IssueStatus) -> ReviewItem {
     ReviewItem {
         id,
         title: format!("Finding {id}"),
         model: None,
-        severity: ReviewSeverity::Info,
+        severity: ReviewSeverity::Critical,
         status,
+        recommendations: Vec::new(),
         files: Vec::new(),
+        readonly_files: Vec::new(),
         subplan: Vec::new(),
         resolution_notes: None,
         body: String::new(),
@@ -464,9 +543,9 @@ fn test_review_session_stats_exclude_terminal_non_actionable_findings() {
     // whose findings are all resolved that way must report a full progress
     // bar (`fixed == total`) rather than a fraction that can never reach one.
     let resolved = session_with(vec![
-        finding(1, ReviewItemStatus::Fixed),
-        finding(2, ReviewItemStatus::Skipped),
-        finding(3, ReviewItemStatus::Rejected),
+        finding(1, IssueStatus::Fixed),
+        finding(2, IssueStatus::Skipped),
+        finding(3, IssueStatus::Rejected),
     ]);
     assert_eq!(resolved.stats(), (1, 1));
     let summary = resolved.summary();
@@ -476,20 +555,20 @@ fn test_review_session_stats_exclude_terminal_non_actionable_findings() {
     // Any outstanding finding keeps the denominator above the fixed count, so
     // progress never overstates the remaining engineering work.
     let partial = session_with(vec![
-        finding(1, ReviewItemStatus::Fixed),
-        finding(2, ReviewItemStatus::Todo),
-        finding(3, ReviewItemStatus::InProgress),
-        finding(4, ReviewItemStatus::Discussion),
-        finding(5, ReviewItemStatus::Skipped),
-        finding(6, ReviewItemStatus::Rejected),
+        finding(1, IssueStatus::Fixed),
+        finding(2, IssueStatus::Todo),
+        finding(3, IssueStatus::InProgress),
+        finding(4, IssueStatus::Discussion),
+        finding(5, IssueStatus::Skipped),
+        finding(6, IssueStatus::Rejected),
     ]);
     assert_eq!(partial.stats(), (4, 1));
 
     // A session with nothing left to act on is fully resolved (0/0) instead of
     // an unreachable fraction.
     let all_terminal = session_with(vec![
-        finding(1, ReviewItemStatus::Skipped),
-        finding(2, ReviewItemStatus::Rejected),
+        finding(1, IssueStatus::Skipped),
+        finding(2, IssueStatus::Rejected),
     ]);
     assert_eq!(all_terminal.stats(), (0, 0));
 }

@@ -5,6 +5,7 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 
 use crate::components::modal::render_dialog_footer;
 use crate::config::PrimaryModifier;
+use crate::i18n::active_t;
 use crate::theme::engine::current_engine;
 use crate::ui::centered_rect;
 use super::editor_lines;
@@ -13,10 +14,18 @@ use super::editor_lines;
 pub const REVIEW_DIALOG_WIDTH: u16 = 64;
 /// Height of the review launch dialog, as a percentage of the terminal height.
 pub const REVIEW_DIALOG_HEIGHT: u16 = 54;
-/// Action-bar label for starting a review.
-pub const REVIEW_DIALOG_CONFIRM_LABEL: &str = "[ Start Review (C-Enter) ]";
-/// Action-bar label for cancelling the review dialog.
-pub const REVIEW_DIALOG_CANCEL_LABEL: &str = "[ Cancel ]";
+/// Full drawn confirm-button label, resolved from the runtime locale.
+///
+/// Rendering and mouse hit-testing both measure this label, so the clickable
+/// button can never drift from the drawn one (Conventions §6, §9, c-1).
+fn review_confirm_label() -> String {
+    format!(" [ {} ] ", active_t("modal.start_review"))
+}
+
+/// Full drawn cancel-button label, resolved from the runtime locale.
+fn review_cancel_label() -> String {
+    format!(" [ {} ] ", active_t("modal.cancel"))
+}
 
 /// Height of the header block (summary and target metadata).
 const REVIEW_HEADER_HEIGHT: u16 = 6;
@@ -44,6 +53,10 @@ pub struct ReviewDialogGeometry {
     pub area: Rect,
     /// Inner rows of the reviewer model list (one row per entry).
     pub model_rows: Rect,
+    /// The target-paths input block.
+    pub path_area: Rect,
+    /// The instruction editor block.
+    pub editor_area: Rect,
     /// Confirm button.
     pub confirm_button: Rect,
     /// Cancel button.
@@ -106,10 +119,14 @@ pub fn review_dialog_geometry(term: Rect, entry_count: usize) -> ReviewDialogGeo
     let area = centered_rect(REVIEW_DIALOG_WIDTH, REVIEW_DIALOG_HEIGHT, term);
     let chunks = review_dialog_chunks(area, entry_count);
     let model_rows = inset(chunks[1]);
+    let path_area = chunks[2];
+    let editor_area = chunks[3];
 
     let buttons = chunks[4];
-    let confirm_w = REVIEW_DIALOG_CONFIRM_LABEL.len() as u16 + 2;
-    let cancel_w = REVIEW_DIALOG_CANCEL_LABEL.len() as u16 + 2;
+    // Button widths are measured from the same localized labels the renderer
+    // draws, so hit-testing never desynchronizes from the drawing.
+    let confirm_w = review_confirm_label().chars().count() as u16;
+    let cancel_w = review_cancel_label().chars().count() as u16;
     let gap = 4u16;
     let total = confirm_w + gap + cancel_w;
     let start_x = buttons.x + (buttons.width.saturating_sub(total)) / 2;
@@ -119,6 +136,8 @@ pub fn review_dialog_geometry(term: Rect, entry_count: usize) -> ReviewDialogGeo
     ReviewDialogGeometry {
         area,
         model_rows,
+        path_area,
+        editor_area,
         confirm_button,
         cancel_button,
     }
@@ -136,7 +155,7 @@ pub fn render_review_dialog(
     frame.render_widget(Clear, area);
 
     let outer_block = Block::default()
-        .title(" Launch Code Review ")
+        .title(format!(" {} ", active_t("dialog.review_launch.title")))
         .borders(Borders::ALL)
         .border_style(engine.fg(palette.button_active_bg))
         .style(Style::default().bg(engine.color(palette.surface)));
@@ -151,26 +170,23 @@ pub fn render_review_dialog(
     let header_lines = vec![
         Line::raw(""),
         Line::from(Span::styled(
-            "Run automated code review on active context files?",
+            active_t("dialog.review_launch.question"),
             engine.fg(palette.status_warning).bold(),
         )),
         Line::raw(""),
         Line::from(vec![
-            Span::styled("  Files: ", dim),
+            Span::styled(active_t("dialog.review_launch.files_label"), dim),
             Span::styled(
                 dialog.files_count.to_string(),
                 engine.fg(palette.text_primary).bold(),
             ),
-            Span::styled("    Estimated tokens: ", dim),
+            Span::styled(active_t("dialog.review_launch.tokens_label"), dim),
             Span::styled(
                 format!("~{}", dialog.estimated_tokens),
                 engine.fg(palette.text_primary).bold(),
             ),
         ]),
-        Line::from(Span::styled(
-            "  Only file contents are sent: history and repo map are excluded.",
-            dim,
-        )),
+        Line::from(Span::styled(active_t("dialog.review_launch.note"), dim)),
     ];
     frame.render_widget(
         Paragraph::new(header_lines).wrap(Wrap { trim: false }),
@@ -182,13 +198,11 @@ pub fn render_review_dialog(
     // focus color that shows which section owns the keyboard
     // (c-embedded-model-list, c-unified-dialog-integration).
     let list_title = if entry_count > 1 {
-        format!(
-            " Reviewer Model  [{} of {}] ",
-            dialog.selector.selected_index() + 1,
-            entry_count
-        )
+        active_t("dialog.review_launch.model_list_counter")
+            .replacen("{}", &(dialog.selector.selected_index() + 1).to_string(), 1)
+            .replacen("{}", &entry_count.to_string(), 1)
     } else {
-        " Reviewer Model ".to_string()
+        active_t("dialog.review_launch.model_list_title")
     };
     let list_border = if dialog.focus.is_model_list() {
         engine.fg(palette.button_active_bg).bold()
@@ -205,7 +219,7 @@ pub fn render_review_dialog(
     if entry_count == 0 {
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
-                "  (no reviewer models configured)",
+                active_t("dialog.review_launch.no_models"),
                 dim,
             ))),
             list_inner,
@@ -233,7 +247,7 @@ pub fn render_review_dialog(
             spans.push(Span::styled("█", engine.fg(palette.status_warning)));
         }
         spans.push(Span::styled(
-            " target directory or glob, e.g. src/**/*.rs (optional)",
+            active_t("dialog.review_launch.path_placeholder"),
             dim,
         ));
         path_content.push(Line::from(spans));
@@ -245,7 +259,7 @@ pub fn render_review_dialog(
         }
     }
     let path_block = Block::default()
-        .title(" Target Paths (optional) ")
+        .title(format!(" {} ", active_t("dialog.review_launch.path_title")))
         .borders(Borders::ALL)
         .border_style(path_border)
         .style(Style::default().bg(engine.color(palette.surface)));
@@ -264,7 +278,7 @@ pub fn render_review_dialog(
         engine.fg(palette.border)
     };
     let mut editor_text = vec![Line::from(Span::styled(
-        "  Additional review instructions (optional):",
+        active_t("dialog.review_launch.editor_title"),
         editor_title_style,
     ))];
     if dialog.prompt_editor.is_empty() {
@@ -273,7 +287,7 @@ pub fn render_review_dialog(
             spans.push(Span::styled("█", engine.fg(palette.status_warning)));
         }
         spans.push(Span::styled(
-            " (type additional review focus or leave empty)...",
+            active_t("dialog.review_launch.editor_placeholder"),
             dim,
         ));
         editor_text.push(Line::from(spans));
@@ -311,18 +325,20 @@ pub fn render_review_dialog(
         )
     };
     let nav_hint = if dialog.focus.is_actions() {
-        "Enter confirm • ← / → button • Esc cancel".to_string()
+        active_t("dialog.review_launch.hint_actions")
     } else {
-        format!(
-            "{}Enter start • Tab focus • {} model • Esc cancel",
-            primary.prefix_str(),
-            crate::components::model_selector::model_select_hint(primary)
-        )
+        active_t("dialog.review_launch.hint_fields")
+            .replacen("{}", primary.prefix_str(), 1)
+            .replacen(
+                "{}",
+                &crate::components::model_selector::model_select_hint(primary),
+                1,
+            )
     };
     let actions = Line::from(vec![
-        Span::styled(format!(" {} ", REVIEW_DIALOG_CONFIRM_LABEL), confirm_style),
+        Span::styled(review_confirm_label(), confirm_style),
         Span::raw("    "),
-        Span::styled(format!(" {} ", REVIEW_DIALOG_CANCEL_LABEL), cancel_style),
+        Span::styled(review_cancel_label(), cancel_style),
     ]);
     frame.render_widget(
         Paragraph::new(actions).alignment(Alignment::Center),
@@ -353,6 +369,10 @@ mod tests {
         assert!(geo.model_rows.y >= geo.area.y);
         assert!(geo.model_rows.y + geo.model_rows.height <= geo.area.bottom());
         assert_eq!(geo.model_rows.height, 3, "one row per reviewer entry");
+
+        assert!(geo.path_area.y >= geo.model_rows.bottom());
+        assert!(geo.editor_area.y >= geo.path_area.bottom());
+        assert!(geo.editor_area.bottom() <= geo.area.bottom());
     }
 
     #[test]

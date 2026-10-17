@@ -534,6 +534,36 @@ fn test_plan_normalize_leaf_files() {
 }
 
 #[test]
+fn test_normalize_leaf_files_dedups_readonly_by_canonical_path() {
+    let mut leaf = item("1", "Leaf", PlanItemStatus::Todo, vec![]);
+    // The same file spelled three different ways is one path: `files` wins and
+    // every cosmetically different `readonly_files` spelling is dropped, while a
+    // genuinely distinct reference file is preserved.
+    leaf.files = vec!["src/keep.rs".to_string()];
+    leaf.readonly_files = vec![
+        "./src/keep.rs".to_string(),
+        "src//keep.rs".to_string(),
+        r"src\keep.rs".to_string(),
+        "src/ref.rs".to_string(),
+    ];
+
+    let mut plan = Plan {
+        id: "leaf-readonly-dedup".to_string(),
+        title: "Leaf Readonly Dedup".to_string(),
+        description: None,
+        created_at: 1,
+        updated_at: 1,
+        concept: vec![],
+        items: vec![leaf],
+    };
+
+    plan.normalize_leaf_files();
+
+    assert_eq!(plan.items[0].files, vec!["src/keep.rs".to_string()]);
+    assert_eq!(plan.items[0].readonly_files, vec!["src/ref.rs".to_string()]);
+}
+
+#[test]
 fn test_plan_evaluate_scope() {
     let plan = Plan {
         id: "batch-test".to_string(),
@@ -861,6 +891,31 @@ fn test_plan_validate_item_errors() {
         vec![PlanValidationError::DuplicateItemId("step-1".to_string())]
     );
 
+    // 2b. Empty concept ID (including whitespace-only and nested)
+    let empty_concept = Plan {
+        id: "p".to_string(),
+        title: "P".to_string(),
+        concept: vec![ConceptItem {
+            id: "  ".to_string(),
+            title: "Empty root".to_string(),
+            details: None,
+            children: vec![ConceptItem {
+                id: "".to_string(),
+                title: "Empty child".to_string(),
+                details: None,
+                children: vec![],
+            }],
+        }],
+        ..Default::default()
+    };
+    assert_eq!(
+        empty_concept.validate().unwrap_err(),
+        vec![
+            PlanValidationError::EmptyConceptId,
+            PlanValidationError::EmptyConceptId,
+        ]
+    );
+
     // 3. Duplicate concept ID
     let dup_concept = Plan {
         id: "p".to_string(),
@@ -980,6 +1035,10 @@ fn test_plan_validate_dependency_errors() {
     assert_eq!(
         PlanValidationError::EmptyItemId.to_string(),
         "Step ID cannot be empty"
+    );
+    assert_eq!(
+        PlanValidationError::EmptyConceptId.to_string(),
+        "Concept ID cannot be empty"
     );
     assert_eq!(
         PlanValidationError::SelfDependency("1".to_string()).to_string(),

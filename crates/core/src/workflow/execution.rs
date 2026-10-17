@@ -240,8 +240,12 @@ impl ExecutionMode for SingleExecution {
                 ModelResult::Edit { edits, outcome, .. }
                     if edits.is_empty() && outcome.error.is_none()
             );
+            // A coder that answers without edits and without an explicit
+            // `<success>` signal has not validated the step: escalate it like a
+            // failed or empty edit instead of accepting an idle reply (c-3).
+            let is_unverified_answer = turn.is_unverified_answer();
 
-            if (is_error || is_empty_edit)
+            if (is_error || is_empty_edit || is_unverified_answer)
                 && !turn.is_cancelled
                 && !is_blocked
                 && turn_options.auto_level_up
@@ -300,6 +304,8 @@ impl ExecutionMode for SingleExecution {
                                 }
                                 _ => "Unknown error".to_string(),
                             }
+                        } else if is_unverified_answer {
+                            "Unverified answer without edits".to_string()
                         } else {
                             "No valid edits".to_string()
                         };
@@ -342,6 +348,7 @@ impl ExecutionMode for SingleExecution {
                 result: turn.result,
                 assistant_text: turn.assistant_text,
                 blocked: turn.blocked,
+                plan_saved: turn.plan_saved,
             });
         }
     }
@@ -354,6 +361,7 @@ mod tests {
 
     use crate::context::ContextManager;
     use crate::history::HistoryManager;
+    use crate::providers::mock::{MockLlmProvider, MockResponse};
     use crate::providers::{ChatMessage, LlmProvider, ResponseFormat, StreamEvent};
     use crate::prompt::protocol::PromptProtocol;
     use crate::workflow::policy::DirectApplyPolicy;
@@ -491,6 +499,146 @@ coder = [
         assert_eq!(
             std::fs::read_to_string(repo_root.join("target.rs")).unwrap(),
             "pub fn compute() -> i32 { 42 }\n"
+        );
+    }
+
+    fn repo_with_target() -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_root = dir.path().to_path_buf();
+        crate::git::init_repository(Some(&repo_root), true).unwrap();
+        std::fs::write(repo_root.join("target.rs"), "pub fn compute() -> i32 { 0 }\n")
+            .expect("write target fixture");
+        crate::git::cmd::stage_files(&repo_root, &["target.rs".to_string()]).unwrap();
+        crate::git::cmd::commit_with_developer_author(&repo_root, "Initial commit", false).unwrap();
+        (dir, repo_root)
+    }
+
+    fn coder_ladder_options() -> WorkflowOptions {
+        let models_config: crate::config::ModelsConfig = toml::from_str(
+            r#"
+primary = ["openrouter:base/primary"]
+coder = [
+    "openrouter:base/model",
+    { model = "openrouter:base/model", effort = "high" },
+]
+"#,
+        )
+        .expect("parse coder ladder");
+        WorkflowOptions {
+            auto_level_up: true,
+            initial_selection: Some(tauqe_protocol::ModelSelection::Role(
+                tauqe_protocol::ModelRole::Coder,
+            )),
+            models_config,
+            ..WorkflowOptions::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn single_execution_escalates_coder_on_unverified_answer() {
+        let (_dir, repo_root) = repo_with_target();
+        let mut context = ContextManager::new(repo_root.clone());
+        context
+            .add_file("target.rs", ContextAccess::Editable)
+            .expect("add target to context");
+        let mut history = HistoryManager::new(repo_root.clone());
+
+        let protocol = crate::prompt::xml::XmlPromptProtocol;
+        let protocol = protocol.with_turn_marker(MARKER).unwrap();
+
+        let edit = format!(
+            "<tauqe_edits_{MARKER} summary=\"Set compute to 42\">\n<edit_{MARKER} path=\"target.rs\">\n<search_{MARKER}>\npub fn compute() -> i32 {{ 0 }}\n</search_{MARKER}>\n<replace_{MARKER}>\npub fn compute() -> i32 {{ 42 }}\n</replace_{MARKER}>\n</edit_{MARKER}>\n</tauqe_edits_{MARKER}>"
+        );
+        // The first reply is a bare answer: no edits and no <success> signal.
+        let provider = MockLlmProvider::scripted([
+            MockResponse::text("I need more information before changing the code."),
+            MockResponse::text(edit),
+        ]);
+        let model = ModelRef::openrouter("base/model");
+        let (tx, _rx) = mpsc::channel(256);
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+        let mut policy = DirectApplyPolicy::new();
+
+        let exec = SingleExecution::new(coder_ladder_options());
+        let execution = exec
+            .execute(
+                &mut policy,
+                "Set compute to return 42",
+                &provider,
+                &model,
+                &mut context,
+                &mut history,
+                protocol.as_ref(),
+                tx,
+                cancel_rx,
+            )
+            .await
+            .expect("escalating execution runs to completion");
+
+        match execution.result {
+            ModelResult::Edit { outcome, .. } => {
+                assert!(outcome.applied, "the escalated tier must apply its edits");
+            }
+            other => panic!("expected applied edits after escalation, got {other:?}"),
+        }
+        assert_eq!(
+            provider.requests().len(),
+            2,
+            "an unverified answer must trigger a second coder-tier attempt"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo_root.join("target.rs")).unwrap(),
+            "pub fn compute() -> i32 { 42 }\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn single_execution_accepts_coder_answer_marked_success() {
+        let (_dir, repo_root) = repo_with_target();
+        let mut context = ContextManager::new(repo_root.clone());
+        context
+            .add_file("target.rs", ContextAccess::Editable)
+            .expect("add target to context");
+        let mut history = HistoryManager::new(repo_root.clone());
+
+        let protocol = crate::prompt::xml::XmlPromptProtocol;
+        let protocol = protocol.with_turn_marker(MARKER).unwrap();
+
+        // A terminal <success> marks the answer as a validated conclusion, so
+        // the coder ladder must not escalate. The tag carries the active turn
+        // marker, matching how the harness binds structural tags to the turn:
+        // an unmarked tag would be treated as literal text and the reply as an
+        // unverified answer.
+        let success = format!(
+            "The step is already satisfied.\n<success_{MARKER} summary=\"Verified\" />"
+        );
+        let provider = MockLlmProvider::scripted([MockResponse::text(success)]);
+        let model = ModelRef::openrouter("base/model");
+        let (tx, _rx) = mpsc::channel(256);
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+        let mut policy = DirectApplyPolicy::new();
+
+        let exec = SingleExecution::new(coder_ladder_options());
+        let execution = exec
+            .execute(
+                &mut policy,
+                "Confirm the step is satisfied",
+                &provider,
+                &model,
+                &mut context,
+                &mut history,
+                protocol.as_ref(),
+                tx,
+                cancel_rx,
+            )
+            .await
+            .expect("validated answer runs to completion");
+
+        assert!(matches!(execution.result, ModelResult::Answer { .. }));
+        assert_eq!(
+            provider.requests().len(),
+            1,
+            "a terminal success must not trigger escalation"
         );
     }
 }

@@ -387,7 +387,12 @@ fn apply_edit_proposal_inner(
             let _ = context_manager.update_file_metadata(path);
             let _ = context_manager.set_access(path, tauqe_protocol::ContextAccess::Editable);
         } else {
-            let _ = context_manager.add_auto_file(path, tauqe_protocol::ContextAccess::Editable);
+            // A path absent from context is a newly created file (or a move
+            // destination). Register it in the durable user layer rather than
+            // the transient auto layer: the turn finalizer sweeps the auto
+            // layer at turn completion and would otherwise drop the file the
+            // turn just created.
+            let _ = context_manager.add_file(path, tauqe_protocol::ContextAccess::Editable);
         }
     }
     Ok(result.successful_paths)
@@ -491,7 +496,7 @@ mod staging_tests {
         assert!(cm.is_editable("new.rs").unwrap());
         let state = cm.get_state();
         let new_item = state.items.iter().find(|i| i.path == "new.rs").unwrap();
-        assert_eq!(new_item.layer, ContextLayer::Auto);
+        assert_eq!(new_item.layer, ContextLayer::User);
         let deletion = EditProposal {
             summary: "delete".into(),
             edits: vec![EditOperation::Delete { path: "new.rs".into() }],
@@ -687,5 +692,33 @@ mod staging_tests {
         assert!(empty.is_success());
         assert_eq!(empty.staged_state, result.staged_state);
         assert!(empty.successful_edits.is_empty());
+    }
+
+    #[test]
+    fn created_file_survives_the_auto_layer_sweep() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        let mut cm = ContextManager::new(root.to_path_buf());
+
+        let proposal = EditProposal {
+            summary: "create".into(),
+            edits: vec![EditOperation::Create {
+                path: "generated.rs".into(),
+                content: "pub fn generated() {}\n".into(),
+            }],
+        };
+        apply_edit_proposal(root, &mut cm, &proposal).unwrap();
+        assert!(cm.contains("generated.rs").unwrap());
+        assert!(cm.is_editable("generated.rs").unwrap());
+
+        // The turn finalizer clears the transient auto layer; a created file
+        // must live in the durable user layer so the end-of-turn sweep does
+        // not silently drop the file the turn just produced.
+        cm.clear_auto();
+        assert!(
+            cm.contains("generated.rs").unwrap(),
+            "a created file must survive the end-of-turn auto sweep"
+        );
+        assert!(cm.is_editable("generated.rs").unwrap());
     }
 }

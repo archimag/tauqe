@@ -217,6 +217,17 @@ impl EditStreamFilter for JsonStreamFilter {
             return events;
         }
 
+        // 0b. The payload began with a backtick or fence but never produced a JSON
+        // object. Switch to passthrough so plain text is streamed, not swallowed.
+        if self.passthrough == Some(false) && self.buffer.find('{').is_none() {
+            if self.buffer.len() > 64 {
+                self.passthrough = Some(true);
+                events.push(StreamEvent::TextDelta(self.buffer.clone()));
+                return events;
+            }
+            return events;
+        }
+
         // 1. Stream message field deltas on the fly using incremental decoding
         if !self.message_finished {
             if self.message_value_start.is_none() {
@@ -337,6 +348,15 @@ impl EditStreamFilter for JsonStreamFilter {
     fn finish(mut self: Box<Self>) -> Vec<StreamEvent> {
         let mut events = Vec::new();
         if self.passthrough == Some(true) {
+            return events;
+        }
+        // The payload never resolved to a JSON object: it is plain text that
+        // merely began with a backtick or fence. Flush it verbatim instead of
+        // silently dropping the whole response.
+        if self.buffer.find('{').is_none() {
+            if !self.buffer.is_empty() {
+                events.push(StreamEvent::TextDelta(self.buffer.clone()));
+            }
             return events;
         }
         if !self.message_finished {
@@ -556,5 +576,69 @@ mod tests {
             })
             .collect();
         assert_eq!(text, "Hi \u{1F600}!");
+    }
+
+    #[test]
+    fn test_backtick_plain_text_falls_back_to_passthrough() {
+        let root = std::env::temp_dir();
+        let mut filter = JsonStreamFilter::new(vec![], root);
+        let text =
+            "`foo` is a plain text reply that must not be swallowed by the JSON filter.";
+
+        let mut streamed = String::new();
+        for ev in filter.push_chunk(text) {
+            if let StreamEvent::TextDelta(d) = ev {
+                streamed.push_str(&d);
+            }
+        }
+        for ev in Box::new(filter).finish() {
+            if let StreamEvent::TextDelta(d) = ev {
+                streamed.push_str(&d);
+            }
+        }
+        assert_eq!(streamed, text);
+    }
+
+    #[test]
+    fn test_short_backtick_plain_text_flushed_on_finish() {
+        let root = std::env::temp_dir();
+        let mut filter = JsonStreamFilter::new(vec![], root);
+        let text = "`hi`";
+
+        let mut streamed = String::new();
+        for ev in filter.push_chunk(text) {
+            if let StreamEvent::TextDelta(d) = ev {
+                streamed.push_str(&d);
+            }
+        }
+        for ev in Box::new(filter).finish() {
+            if let StreamEvent::TextDelta(d) = ev {
+                streamed.push_str(&d);
+            }
+        }
+        assert_eq!(streamed, text);
+    }
+
+    #[test]
+    fn test_backtick_plain_text_streams_across_chunks() {
+        let root = std::env::temp_dir();
+        let mut filter = JsonStreamFilter::new(vec![], root);
+        let text =
+            "`cargo build` produced output that is a plain text answer, not JSON.";
+
+        let mut streamed = String::new();
+        for c in text.chars() {
+            for ev in filter.push_chunk(&c.to_string()) {
+                if let StreamEvent::TextDelta(d) = ev {
+                    streamed.push_str(&d);
+                }
+            }
+        }
+        for ev in Box::new(filter).finish() {
+            if let StreamEvent::TextDelta(d) = ev {
+                streamed.push_str(&d);
+            }
+        }
+        assert_eq!(streamed, text);
     }
 }

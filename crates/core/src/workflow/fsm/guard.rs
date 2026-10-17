@@ -161,6 +161,14 @@ pub(super) async fn finish_turn(
         ModelResult::Answer { .. } => true,
         ModelResult::Edit { outcome, .. } => outcome.applied,
     };
+    // A turn "saved" a plan when it carried an explicit `save` action and the
+    // plan mutations were actually applied. Surfacing the flag alongside the
+    // turn result lets the server mark the emitted `plan/updated` event as a
+    // creation instead of re-deriving it from storage.
+    let plan_saved = should_apply_plans
+        && plans
+            .iter()
+            .any(|plan| plan.action == tauqe_protocol::DiscussionPlanAction::Save);
     if should_apply_plans {
         apply_turn_plans(repo_root, plans, mode).await;
     }
@@ -169,6 +177,8 @@ pub(super) async fn finish_turn(
         result,
         is_cancelled: false,
         blocked: None,
+        has_terminal_success: false,
+        plan_saved,
     }
 }
 

@@ -56,7 +56,8 @@ pub(super) async fn run_discovery_phase(
     {
         let requests = step.context_requests();
         let doc_topics = step.doc_requests();
-        if requests.is_empty() && doc_topics.is_empty() {
+        let searches = step.repo_searches();
+        if requests.is_empty() && doc_topics.is_empty() && searches.is_empty() {
             break;
         }
 
@@ -99,11 +100,26 @@ pub(super) async fn run_discovery_phase(
                 result: ModelResult::Answer { text: warn },
                 is_cancelled: false,
                 blocked: None,
+                has_terminal_success: false,
+                plan_saved: false,
             })));
         }
 
+        let search_results = if !searches.is_empty() {
+            let root = ctx.repo_root.to_path_buf();
+            let queries = searches.to_vec();
+            let files = available_files.clone();
+            crate::blocking::run_blocking_async(move || {
+                crate::workflow::discovery::execute_repo_searches(&root, &queries, &files)
+            })
+            .await
+            .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+
         let context_changed = !outcome.added.is_empty() || !outcome.missing.is_empty();
-        if !context_changed && doc_topics.is_empty() {
+        if !context_changed && doc_topics.is_empty() && search_results.is_empty() {
             break;
         }
 
@@ -122,6 +138,7 @@ pub(super) async fn run_discovery_phase(
             round = discovery_round,
             requested = requests.len(),
             doc_topics = doc_topics.len(),
+            searches = search_results.len(),
             added = outcome.added.len(),
             missing = outcome.missing.len(),
             "context discovery round completed"
@@ -135,6 +152,11 @@ pub(super) async fn run_discovery_phase(
                 detail: None,
             })
             .await;
+
+        if !search_results.is_empty() {
+            let feedback = crate::workflow::discovery::format_search_feedback(&search_results);
+            round_prompt.push_str(&format!("\n\n{}", feedback));
+        }
 
         if !outcome.missing.is_empty() {
             round_prompt.push_str(&format!(
@@ -158,10 +180,26 @@ pub(super) async fn run_discovery_phase(
         let ctx_state = ctx.context_manager.get_state();
         let _ = ctx.stream_tx.send(StreamEvent::ContextChanged(ctx_state)).await;
 
+        let mut round_summary = Vec::new();
+        if !outcome.added.is_empty() {
+            round_summary.push(format!("{} file(s) added", outcome.added.len()));
+        }
+        if !search_results.is_empty() {
+            round_summary.push(format!("{} search(es) executed", search_results.len()));
+        }
+        if !doc_topics.is_empty() {
+            round_summary.push(format!("{} doc topic(s) loaded", doc_topics.len()));
+        }
+        let banner_text = if round_summary.is_empty() {
+            format!("{} file(s) added.", outcome.added.len())
+        } else {
+            format!("{}.", round_summary.join(", "))
+        };
+
         let banner = format!(
-            "\n\n---\n**[Round {}]** {} file(s) added.\n\n",
+            "\n\n---\n**[Round {}]** {}\n\n",
             discovery_round + 1,
-            outcome.added.len()
+            banner_text
         );
         let _ = ctx.stream_tx.send(StreamEvent::TextDelta(banner.clone())).await;
         log_fsm_phase(
@@ -209,6 +247,8 @@ pub(super) async fn run_discovery_phase(
                 },
                 is_cancelled: true,
                 blocked: None,
+                has_terminal_success: false,
+                plan_saved: false,
             })));
         }
 
@@ -404,6 +444,8 @@ pub(super) async fn run_staging_phase(
                 },
                 is_cancelled: true,
                 blocked: None,
+                has_terminal_success: false,
+                plan_saved: false,
             })));
         }
         ctx.state.absorb(&step_out);
@@ -763,6 +805,124 @@ mod tests {
             .messages
             .iter()
             .any(|m| m.content.contains("Protocol parsing errors")));
+    }
+
+    #[tokio::test]
+    async fn discovers_context_via_repo_search_and_applies() {
+        let (_dir, root) = setup_repo(&[
+            ("a.rs", TARGET),
+            ("src/helper.rs", "pub const MAGIC_NUMBER: i32 = 42;\n"),
+        ]);
+        let mut context = context_with_target(&root);
+        let mut history = HistoryManager::new(root.clone());
+
+        let provider = MockLlmProvider::scripted([
+            MockResponse::text(
+                "Searching for magic number:\n<repo_search path=\"src\" regex=\"pub const MAGIC_\\w+\" />",
+            ),
+            MockResponse::text(
+                "Found in src/helper.rs, requesting it:\n<context_request path=\"src/helper.rs\" access=\"read_only\" />",
+            ),
+            MockResponse::text(edit_block(
+                "pub fn compute() -> i32 { 0 }",
+                "pub fn compute() -> i32 { 42 }",
+            )),
+        ]);
+        let model = ModelRef::openrouter("mock/model");
+        let protocol = XmlPromptProtocol;
+        let mut policy = DirectApplyPolicy::new();
+        let options = WorkflowOptions::default();
+        let (stream_tx, rx) = mpsc::channel(256);
+        drop(rx);
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+
+        let outcome = run_fsm_turn(
+            "Use magic number from helper",
+            &provider,
+            &model,
+            &mut context,
+            &mut history,
+            &protocol,
+            &mut policy,
+            "git",
+            stream_tx,
+            cancel_rx,
+            &options,
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            outcome.result,
+            ModelResult::Edit { outcome, .. } if outcome.applied
+        ));
+        assert_eq!(provider.requests().len(), 3);
+        let second_req = &provider.requests()[1];
+        assert!(second_req.messages[1]
+            .content
+            .contains("<search_feedback path=\"src\" regex=\"pub const MAGIC_\\w+\">"));
+        assert!(second_req.messages[1]
+            .content
+            .contains("src/helper.rs: 1 match"));
+    }
+
+    #[tokio::test]
+    async fn recovers_from_search_regex_syntax_error() {
+        let (_dir, root) = setup_repo(&[
+            ("a.rs", TARGET),
+            ("src/helper.rs", "pub const MAGIC_NUMBER: i32 = 42;\n"),
+        ]);
+        let mut context = context_with_target(&root);
+        let mut history = HistoryManager::new(root.clone());
+
+        let provider = MockLlmProvider::scripted([
+            // Round 1: Model emits unsupported lookaround regex
+            MockResponse::text(
+                "Searching:\n<repo_search regex=\"(?=MAGIC)\" />",
+            ),
+            // Round 2: Model sees error feedback, falls back to direct context request
+            MockResponse::text(
+                "Correction after regex error:\n<context_request path=\"src/helper.rs\" access=\"read_only\" />",
+            ),
+            // Round 3: Model emits edit
+            MockResponse::text(edit_block(
+                "pub fn compute() -> i32 { 0 }",
+                "pub fn compute() -> i32 { 42 }",
+            )),
+        ]);
+        let model = ModelRef::openrouter("mock/model");
+        let protocol = XmlPromptProtocol;
+        let mut policy = DirectApplyPolicy::new();
+        let options = WorkflowOptions::default();
+        let (stream_tx, rx) = mpsc::channel(256);
+        drop(rx);
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+
+        let outcome = run_fsm_turn(
+            "Use magic number",
+            &provider,
+            &model,
+            &mut context,
+            &mut history,
+            &protocol,
+            &mut policy,
+            "git",
+            stream_tx,
+            cancel_rx,
+            &options,
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            outcome.result,
+            ModelResult::Edit { outcome, .. } if outcome.applied
+        ));
+        assert_eq!(provider.requests().len(), 3);
+        let second_req = &provider.requests()[1];
+        assert!(second_req.messages[1]
+            .content
+            .contains("Lookaround assertions are not supported in Rust regex"));
     }
 
     #[tokio::test]

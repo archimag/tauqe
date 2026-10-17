@@ -313,3 +313,426 @@ pub async fn handle_context_clear(req: Request, state: &Arc<AppState>) -> Respon
 
     Response::ok_typed(req.id, &ctx_state)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::transport::OutChannel;
+    use tauqe_protocol::{methods, ContextAccess, ContextLayer, Request, RequestId};
+
+    struct TestDir(std::path::PathBuf);
+    impl TestDir {
+        fn new() -> Self {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "tauqe-test-context-{}-{}",
+                std::process::id(),
+                COUNTER.fetch_add(1, Ordering::Relaxed)
+            ));
+            let _ = std::fs::create_dir_all(&path);
+            Self(path)
+        }
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn test_state(dir: &TestDir) -> (Arc<AppState>, tokio::sync::mpsc::UnboundedReceiver<String>) {
+        let (out, rx) = OutChannel::new();
+        let (hist_tx, _hist_rx) = tokio::sync::mpsc::unbounded_channel();
+        let state = AppState::new(
+            tauqe_core::config::AppConfig::default(),
+            dir.path().to_path_buf(),
+            hist_tx,
+            out,
+        );
+        (state, rx)
+    }
+
+    #[tokio::test]
+    async fn test_handle_context_get() {
+        let dir = TestDir::new();
+        let (state, _rx) = test_state(&dir);
+
+        let file_path = dir.path().join("lib.rs");
+        std::fs::write(&file_path, "pub fn hello() {}\n").unwrap();
+        state
+            .context
+            .write()
+            .await
+            .add_file("lib.rs", ContextAccess::ReadOnly)
+            .unwrap();
+
+        let req = Request {
+            id: RequestId::Number(1),
+            method: methods::CONTEXT_GET.to_string(),
+            params: None,
+        };
+        let res = handle_context_get(req, &state).await;
+        assert!(res.error.is_none());
+        let ctx_state: tauqe_protocol::ContextState =
+            serde_json::from_value(res.result.unwrap()).unwrap();
+        assert_eq!(ctx_state.items.len(), 1);
+        assert_eq!(ctx_state.items[0].path, "lib.rs");
+    }
+
+    #[tokio::test]
+    async fn test_handle_context_add_and_validation() {
+        let dir = TestDir::new();
+        let (state, mut rx) = test_state(&dir);
+
+        let file_path = dir.path().join("test.rs");
+        std::fs::write(&file_path, "fn test() {}\n").unwrap();
+
+        let make_req = |id: u64, params: Option<serde_json::Value>| Request {
+            id: RequestId::Number(id),
+            method: methods::CONTEXT_ADD.to_string(),
+            params,
+        };
+
+        // Missing params -> INVALID_PARAMS
+        let res = handle_context_add(make_req(1, None), &state).await;
+        assert_eq!(res.error.unwrap().code, errors::INVALID_PARAMS);
+
+        // Pinned layer -> PINNED_PROTECTED
+        let pinned_params = serde_json::to_value(ContextAddParams {
+            path: "test.rs".to_string(),
+            access: ContextAccess::ReadOnly,
+            layer: Some(ContextLayer::Pinned),
+        })
+        .ok();
+        let res = handle_context_add(make_req(2, pinned_params), &state).await;
+        assert_eq!(res.error.unwrap().code, errors::PINNED_PROTECTED);
+
+        // Non-existent file -> ADD_FAILED
+        let missing_params = serde_json::to_value(ContextAddParams {
+            path: "missing.rs".to_string(),
+            access: ContextAccess::ReadOnly,
+            layer: None,
+        })
+        .ok();
+        let res = handle_context_add(make_req(3, missing_params), &state).await;
+        assert_eq!(res.error.unwrap().code, errors::ADD_FAILED);
+
+        // Valid add
+        let ok_params = serde_json::to_value(ContextAddParams {
+            path: "test.rs".to_string(),
+            access: ContextAccess::Editable,
+            layer: Some(ContextLayer::User),
+        })
+        .ok();
+        let res = handle_context_add(make_req(4, ok_params), &state).await;
+        assert!(res.error.is_none());
+        let ctx_state: tauqe_protocol::ContextState =
+            serde_json::from_value(res.result.unwrap()).unwrap();
+        assert_eq!(ctx_state.items.len(), 1);
+        assert_eq!(ctx_state.items[0].path, "test.rs");
+        assert_eq!(ctx_state.items[0].access, ContextAccess::Editable);
+
+        // Verify CONTEXT_CHANGED event
+        let evt = rx.try_recv().expect("event received");
+        assert!(evt.contains(events::CONTEXT_CHANGED));
+    }
+
+    #[tokio::test]
+    async fn test_handle_context_add_pattern() {
+        let dir = TestDir::new();
+        tauqe_core::git::init_repository(Some(dir.path()), true).unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/a.rs"), "fn a() {}\n").unwrap();
+        std::fs::write(dir.path().join("src/b.rs"), "fn b() {}\n").unwrap();
+        tauqe_core::git::cmd::stage_files(
+            dir.path(),
+            &["src/a.rs".to_string(), "src/b.rs".to_string()],
+        )
+        .unwrap();
+        tauqe_core::git::cmd::commit_with_developer_author(dir.path(), "init", false).unwrap();
+
+        let (state, mut rx) = test_state(&dir);
+
+        let make_req = |id: u64, params: Option<serde_json::Value>| Request {
+            id: RequestId::Number(id),
+            method: methods::CONTEXT_ADD_PATTERN.to_string(),
+            params,
+        };
+
+        // Missing params -> INVALID_PARAMS
+        let res = handle_context_add_pattern(make_req(1, None), &state).await;
+        assert_eq!(res.error.unwrap().code, errors::INVALID_PARAMS);
+
+        // Empty pattern -> ADD_PATTERN_FAILED
+        let empty_params = serde_json::to_value(ContextAddPatternParams {
+            pattern: "   ".to_string(),
+            access: ContextAccess::ReadOnly,
+        })
+        .ok();
+        let res = handle_context_add_pattern(make_req(2, empty_params), &state).await;
+        assert_eq!(res.error.unwrap().code, errors::ADD_PATTERN_FAILED);
+
+        // Valid pattern
+        let pat_params = serde_json::to_value(ContextAddPatternParams {
+            pattern: "src/*.rs".to_string(),
+            access: ContextAccess::ReadOnly,
+        })
+        .ok();
+        let res = handle_context_add_pattern(make_req(3, pat_params), &state).await;
+        assert!(res.error.is_none());
+        let result: ContextAddPatternResult =
+            serde_json::from_value(res.result.unwrap()).unwrap();
+        assert_eq!(result.added_count, 2);
+        assert!(!result.truncated);
+        assert_eq!(result.state.items.len(), 2);
+
+        let evt = rx.try_recv().expect("event received");
+        assert!(evt.contains(events::CONTEXT_CHANGED));
+    }
+
+    #[tokio::test]
+    async fn test_handle_context_remove_and_set_access() {
+        let dir = TestDir::new();
+        let (state, mut rx) = test_state(&dir);
+
+        let file_path = dir.path().join("test.rs");
+        std::fs::write(&file_path, "fn test() {}\n").unwrap();
+
+        state
+            .context
+            .write()
+            .await
+            .add_file("test.rs", ContextAccess::ReadOnly)
+            .unwrap();
+
+        let make_set_req = |id: u64, params: Option<serde_json::Value>| Request {
+            id: RequestId::Number(id),
+            method: methods::CONTEXT_SET_ACCESS.to_string(),
+            params,
+        };
+
+        // Set access missing params -> INVALID_PARAMS
+        let res = handle_context_set_access(make_set_req(1, None), &state).await;
+        assert_eq!(res.error.unwrap().code, errors::INVALID_PARAMS);
+
+        // Valid set access to Editable
+        let set_params = serde_json::to_value(ContextSetAccessParams {
+            path: "test.rs".to_string(),
+            access: ContextAccess::Editable,
+        })
+        .ok();
+        let res = handle_context_set_access(make_set_req(2, set_params), &state).await;
+        assert!(res.error.is_none());
+        let ctx_state: tauqe_protocol::ContextState =
+            serde_json::from_value(res.result.unwrap()).unwrap();
+        assert_eq!(ctx_state.items[0].access, ContextAccess::Editable);
+
+        let evt = rx.try_recv().expect("event received");
+        assert!(evt.contains(events::CONTEXT_CHANGED));
+
+        let make_rem_req = |id: u64, params: Option<serde_json::Value>| Request {
+            id: RequestId::Number(id),
+            method: methods::CONTEXT_REMOVE.to_string(),
+            params,
+        };
+
+        // Remove missing params -> INVALID_PARAMS
+        let res = handle_context_remove(make_rem_req(3, None), &state).await;
+        assert_eq!(res.error.unwrap().code, errors::INVALID_PARAMS);
+
+        // Valid remove
+        let rem_params = serde_json::to_value(ContextRemoveParams {
+            path: "test.rs".to_string(),
+        })
+        .ok();
+        let res = handle_context_remove(make_rem_req(4, rem_params), &state).await;
+        assert!(res.error.is_none());
+        let ctx_state: tauqe_protocol::ContextState =
+            serde_json::from_value(res.result.unwrap()).unwrap();
+        assert!(ctx_state.items.is_empty());
+
+        let evt = rx.try_recv().expect("event received");
+        assert!(evt.contains(events::CONTEXT_CHANGED));
+    }
+
+    #[tokio::test]
+    async fn test_handle_context_clear() {
+        let dir = TestDir::new();
+        let (state, mut rx) = test_state(&dir);
+
+        let user_file = dir.path().join("user.rs");
+        let auto_file = dir.path().join("auto.rs");
+        std::fs::write(&user_file, "fn user() {}\n").unwrap();
+        std::fs::write(&auto_file, "fn auto() {}\n").unwrap();
+
+        let make_req = |id: u64, params: Option<serde_json::Value>| Request {
+            id: RequestId::Number(id),
+            method: methods::CONTEXT_CLEAR.to_string(),
+            params,
+        };
+
+        // Clearing pinned -> PINNED_PROTECTED
+        let pinned_clear = serde_json::to_value(ContextClearParams {
+            layer: Some(ContextLayer::Pinned),
+        })
+        .ok();
+        let res = handle_context_clear(make_req(1, pinned_clear), &state).await;
+        assert_eq!(res.error.unwrap().code, errors::PINNED_PROTECTED);
+
+        // Malformed params -> INVALID_PARAMS
+        let malformed = Some(serde_json::json!({ "layer": "nonexistent" }));
+        let res = handle_context_clear(make_req(2, malformed), &state).await;
+        assert_eq!(res.error.unwrap().code, errors::INVALID_PARAMS);
+
+        // Populate user and auto
+        state
+            .context
+            .write()
+            .await
+            .add_file("user.rs", ContextAccess::ReadOnly)
+            .unwrap();
+        state
+            .context
+            .write()
+            .await
+            .add_auto_file("auto.rs", ContextAccess::ReadOnly)
+            .unwrap();
+        assert_eq!(state.context.read().await.get_state().items.len(), 2);
+
+        // Clear Auto only
+        let auto_clear = serde_json::to_value(ContextClearParams {
+            layer: Some(ContextLayer::Auto),
+        })
+        .ok();
+        let res = handle_context_clear(make_req(3, auto_clear), &state).await;
+        assert!(res.error.is_none());
+        let ctx_state: tauqe_protocol::ContextState =
+            serde_json::from_value(res.result.unwrap()).unwrap();
+        assert_eq!(ctx_state.items.len(), 1);
+        assert_eq!(ctx_state.items[0].path, "user.rs");
+
+        // Repopulate auto
+        state
+            .context
+            .write()
+            .await
+            .add_auto_file("auto.rs", ContextAccess::ReadOnly)
+            .unwrap();
+
+        // Clear User only
+        let user_clear = serde_json::to_value(ContextClearParams {
+            layer: Some(ContextLayer::User),
+        })
+        .ok();
+        let res = handle_context_clear(make_req(4, user_clear), &state).await;
+        assert!(res.error.is_none());
+        let ctx_state: tauqe_protocol::ContextState =
+            serde_json::from_value(res.result.unwrap()).unwrap();
+        assert_eq!(ctx_state.items.len(), 1);
+        assert_eq!(ctx_state.items[0].path, "auto.rs");
+
+        // Clear all (None)
+        let res = handle_context_clear(make_req(5, None), &state).await;
+        assert!(res.error.is_none());
+        let ctx_state: tauqe_protocol::ContextState =
+            serde_json::from_value(res.result.unwrap()).unwrap();
+        assert!(ctx_state.items.is_empty());
+
+        let mut events = Vec::new();
+        while let Ok(evt) = rx.try_recv() {
+            events.push(evt);
+        }
+        assert!(events.iter().any(|e| e.contains(events::CONTEXT_CHANGED)));
+    }
+
+    #[tokio::test]
+    async fn test_handle_context_set_access_pinned_rejected() {
+        let dir = TestDir::new();
+        let (state, _rx) = test_state(&dir);
+
+        let pinned_file = dir.path().join("pinned.rs");
+        std::fs::write(&pinned_file, "fn pinned() {}\n").unwrap();
+
+        state
+            .context
+            .write()
+            .await
+            .load_pinned(&["pinned.rs".to_string()]);
+
+        let req = Request {
+            id: RequestId::Number(1),
+            method: methods::CONTEXT_SET_ACCESS.to_string(),
+            params: serde_json::to_value(ContextSetAccessParams {
+                path: "pinned.rs".to_string(),
+                access: ContextAccess::Editable,
+            })
+            .ok(),
+        };
+        let res = handle_context_set_access(req, &state).await;
+        assert_eq!(res.error.unwrap().code, errors::SET_ACCESS_FAILED);
+    }
+
+    #[tokio::test]
+    async fn test_reject_if_busy_blocks_mutations() {
+        let dir = TestDir::new();
+        let (state, _rx) = test_state(&dir);
+
+        let _op = state.try_begin_operation().expect("begin op");
+
+        let make_req = |method: &str, params: Option<serde_json::Value>| Request {
+            id: RequestId::Number(1),
+            method: method.to_string(),
+            params,
+        };
+
+        let add_params = serde_json::to_value(ContextAddParams {
+            path: "foo.rs".to_string(),
+            access: ContextAccess::ReadOnly,
+            layer: None,
+        })
+        .ok();
+        let res = handle_context_add(make_req(methods::CONTEXT_ADD, add_params), &state).await;
+        assert_eq!(res.error.unwrap().code, errors::OPERATION_IN_PROGRESS);
+
+        let pat_params = serde_json::to_value(ContextAddPatternParams {
+            pattern: "*.rs".to_string(),
+            access: ContextAccess::ReadOnly,
+        })
+        .ok();
+        let res = handle_context_add_pattern(
+            make_req(methods::CONTEXT_ADD_PATTERN, pat_params),
+            &state,
+        )
+        .await;
+        assert_eq!(res.error.unwrap().code, errors::OPERATION_IN_PROGRESS);
+
+        let rem_params = serde_json::to_value(ContextRemoveParams {
+            path: "foo.rs".to_string(),
+        })
+        .ok();
+        let res = handle_context_remove(make_req(methods::CONTEXT_REMOVE, rem_params), &state).await;
+        assert_eq!(res.error.unwrap().code, errors::OPERATION_IN_PROGRESS);
+
+        let set_params = serde_json::to_value(ContextSetAccessParams {
+            path: "foo.rs".to_string(),
+            access: ContextAccess::Editable,
+        })
+        .ok();
+        let res =
+            handle_context_set_access(make_req(methods::CONTEXT_SET_ACCESS, set_params), &state)
+                .await;
+        assert_eq!(res.error.unwrap().code, errors::OPERATION_IN_PROGRESS);
+
+        let clear_params = serde_json::to_value(ContextClearParams::default()).ok();
+        let res =
+            handle_context_clear(make_req(methods::CONTEXT_CLEAR, clear_params), &state).await;
+        assert_eq!(res.error.unwrap().code, errors::OPERATION_IN_PROGRESS);
+
+        // Read query still succeeds while busy
+        let res = handle_context_get(make_req(methods::CONTEXT_GET, None), &state).await;
+        assert!(res.error.is_none());
+    }
+}

@@ -5,8 +5,9 @@ use tokio::sync::Mutex;
 use tauqe_protocol::{methods, GitSquashPreviewParams};
 
 use crate::app::{ActiveModal, AppState, SquashDialogFocus, ViewMode};
+use crate::command::global::{GlobalCommand, GLOBAL_COMMAND_MAP};
 use crate::rpc::{send_request, RpcConnection};
-use crate::views::{context, develop, history, onboarding, plans, review};
+use crate::views::{context, history, onboarding, plans, repl, review};
 
 pub mod layout;
 pub mod mouse;
@@ -109,9 +110,13 @@ pub fn is_text_input_active(st: &AppState) -> bool {
         Some(ActiveModal::RefineDialog) => {
             st.plans_view.refine_dialog.as_ref().is_some_and(|d| d.focus.is_instructions_editor())
         }
+        Some(ActiveModal::Locale) => st
+            .locale_dialog
+            .as_ref()
+            .is_some_and(|dialog| dialog.focus.is_editor()),
         Some(_) => false,
         None => match st.view_mode {
-            ViewMode::Develop => true,
+            ViewMode::Repl => true,
             ViewMode::Context => st.context_view.adding_file,
             ViewMode::Onboarding => st.onboarding.input_active,
             ViewMode::Review | ViewMode::Plans | ViewMode::History => false,
@@ -198,12 +203,19 @@ pub fn handle_paste(st: &mut AppState, text: &str) {
                 dialog.instructions_editor.insert_paste(text);
             }
         }
+        Some(ActiveModal::Locale) => {
+            if let Some(dialog) = st.locale_dialog.as_mut() {
+                if dialog.focus.is_editor() {
+                    dialog.language_editor.insert_paste_single_line(text);
+                }
+            }
+        }
         // Blocking modals absorb paste without forwarding it to the background.
         Some(_) => {}
         // No modal: route to the active view's text target.
         None => match st.view_mode {
-            ViewMode::Develop => {
-                st.model.focus = develop::DevelopFocus::Editor;
+            ViewMode::Repl => {
+                st.model.focus = repl::ReplFocus::Editor;
                 st.input_editor.insert_paste(text);
             }
             ViewMode::Context => {
@@ -333,7 +345,7 @@ pub async fn handle_terminal_event(
             // 3. View-specific handlers
             let mode = { state.lock().await.view_mode };
             match mode {
-                ViewMode::Develop => develop::handle_develop_key(key, state, server_writer).await,
+                ViewMode::Repl => repl::handle_repl_key(key, state, server_writer).await,
                 ViewMode::Context => context::handle_context_key(key, state, server_writer).await,
                 ViewMode::Onboarding => onboarding::handle_onboarding_key(key, state, server_writer).await,
                 ViewMode::Review => review::handle_review_key(key, state, server_writer).await,
@@ -383,129 +395,83 @@ async fn handle_global_shortcuts(
     }
 
     let mut st = state.lock().await;
-    let is_primary = st.tui_config.input.is_primary(key.modifiers);
-    let is_meta = st.tui_config.input.is_meta(key.modifiers);
-    let is_command = is_primary || is_meta;
-    let is_ctrl_alt = key.modifiers.contains(KeyModifiers::CONTROL)
-        && key.modifiers.contains(KeyModifiers::ALT);
 
-    // Help trigger (available in every view, including onboarding):
-    // - In text input mode: C-h (or M-h / Ctrl+h) or C-?
-    // - In non-text navigation mode: bare '?', C-h, or C-?
-    let is_c_h = (is_primary || is_meta || key.modifiers.contains(KeyModifiers::CONTROL))
-        && (key.code == KeyCode::Char('h') || key.code == KeyCode::Char('H'));
-
-    let is_help_shortcut = if text_input_active {
-        is_c_h || (is_primary && key.code == KeyCode::Char('?'))
-    } else {
-        is_c_h
-            || (key.code == KeyCode::Char('?')
-                && !key.modifiers.contains(KeyModifiers::CONTROL)
-                && !key.modifiers.contains(KeyModifiers::ALT))
-            || (is_primary && key.code == KeyCode::Char('?'))
+    // Resolve the key once against the single source of truth for global
+    // bindings. The command map already blocks bare structural chords while a
+    // text editor is active, so the unconditional character insertion
+    // invariant holds without any per-key branching here (Conventions §3, §5).
+    let Some(command) = GLOBAL_COMMAND_MAP
+        .resolve(key, &st.tui_config.input, text_input_active)
+        .map(|spec| spec.action)
+    else {
+        return Ok(None);
     };
 
-    if is_help_shortcut {
-        st.show_help = true;
-        st.help_scroll = 0;
-        return Ok(Some(InputResult::Continue));
-    }
-
     // Onboarding is a modal first-run flow. Workspace-level shortcuts (tab
-    // switching, model picker, squash, history clearing, reasoning toggle,
-    // cancel) must not fire before setup completes: for example F6 would issue
-    // a squash request with no repository. Only configuration reload (C-o)
-    // stays available, because the onboarding footer advertises it.
-    if st.view_mode == ViewMode::Onboarding {
-        if is_primary && key.code == KeyCode::Char('o') {
-            reload_configuration(&mut st, server_writer).await?;
-            return Ok(Some(InputResult::Continue));
-        }
+    // switching, model picker, squash, reasoning toggle, cancel) must not fire
+    // before setup completes: for example the squash chord would issue a squash
+    // request with no repository. Only Help and configuration reload stay
+    // available, because the onboarding footer advertises them.
+    if st.view_mode == ViewMode::Onboarding
+        && !matches!(command, GlobalCommand::OpenHelp | GlobalCommand::ReloadConfig)
+    {
         return Ok(None);
     }
 
-    // Tab switching uses portable command chords only: C-1..5 (Primary) and
-    // M-1..5 (Meta). No hardware function keys (Conventions §5).
-    let switch_tab = match key.code {
-        KeyCode::Char('1') if is_command => Some(ViewMode::Develop),
-        KeyCode::Char('2') if is_command => Some(ViewMode::Plans),
-        KeyCode::Char('3') if is_command => Some(ViewMode::Review),
-        KeyCode::Char('4') if is_command => Some(ViewMode::Context),
-        KeyCode::Char('5') if is_command => Some(ViewMode::History),
-        _ => None,
-    };
-
-    if let Some(target_mode) = switch_tab {
-        switch_view(&mut st, target_mode, server_writer).await?;
-        return Ok(Some(InputResult::Continue));
-    }
-
-    // Squash dialog via C-S / M-S (portable chords replace the former F6).
-    if is_command && (key.code == KeyCode::Char('s') || key.code == KeyCode::Char('S')) {
-        open_squash_dialog(&mut st, server_writer).await?;
-        return Ok(Some(InputResult::Continue));
-    }
-
-    // Theme selector via M-T (portable chord replaces the former F7). The
-    // dialog is purely presentational and previews presets live, so it is
-    // available even mid-turn without disturbing the running operation.
-    if is_meta && (key.code == KeyCode::Char('t') || key.code == KeyCode::Char('T')) {
-        st.open_theme_selector();
-        return Ok(Some(InputResult::Continue));
-    }
-
-    // Model selection dialog via C-M / M-M.
-    let is_model_shortcut = is_command
-        && (key.code == KeyCode::Char('m') || key.code == KeyCode::Char('M'));
-
-    if is_model_shortcut {
-        if st.model.is_busy() {
-            st.notify_warning("Cannot change model while model is generating");
-            return Ok(Some(InputResult::Continue));
+    match command {
+        GlobalCommand::OpenHelp => {
+            st.show_help = true;
+            st.help_scroll = 0;
         }
-        if st.open_model_dialog() {
-            return Ok(Some(InputResult::Continue));
+        GlobalCommand::ReloadConfig => {
+            reload_configuration(&mut st, server_writer).await?;
         }
-    }
-
-    let is_cancel_shortcut = !is_ctrl_alt
-        && key.modifiers.contains(KeyModifiers::CONTROL)
-        && (key.code == KeyCode::Char('c') || key.code == KeyCode::Char('C'));
-
-    if is_cancel_shortcut {
-        if st.model.is_batch && st.model.is_busy() {
-            // A batch supervisor runs a bounded queue of isolated turns: offer
-            // the three-way choice between continuing, stopping after the
-            // current member, and aborting immediately instead of a plain
-            // interrupt (Conventions.md §7).
-            st.confirm_batch_cancel = true;
-            st.batch_cancel_button = crate::app::BatchCancelButton::Continue;
-        } else if st.model.is_busy() || st.review.running {
-            st.confirm_cancel = true;
-            st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
-        } else {
-            st.notify_info("Press Ctrl+Q to quit TAUQE, or ? for help");
+        GlobalCommand::ToggleReasoning => {
+            st.model.reasoning.toggle_fold();
+            let h = st.last_model_height;
+            st.model.clamp_scroll(h);
         }
-        return Ok(Some(InputResult::Continue));
-    }
-
-    if is_primary {
-        match key.code {
-            KeyCode::Char('o') => {
-                reload_configuration(&mut st, server_writer).await?;
-                return Ok(Some(InputResult::Continue));
+        GlobalCommand::SwitchView(target_mode) => {
+            switch_view(&mut st, target_mode, server_writer).await?;
+        }
+        GlobalCommand::SquashCommits => {
+            open_squash_dialog(&mut st, server_writer).await?;
+        }
+        GlobalCommand::SelectTheme => {
+            st.open_theme_selector();
+        }
+        GlobalCommand::SelectLocale => {
+            st.open_locale_dialog();
+        }
+        GlobalCommand::SelectModel => {
+            if st.model.is_busy() {
+                st.notify_warning("Cannot change model while model is generating");
+            } else if !st.open_model_dialog() {
+                return Ok(None);
             }
-            KeyCode::Char('r') => {
-                st.model.reasoning.toggle_fold();
-                let h = st.last_model_height;
-                st.model.clamp_scroll(h);
-                return Ok(Some(InputResult::Continue));
-            }
-            _ => {}
         }
+        GlobalCommand::CancelGeneration => {
+            if st.model.is_batch && st.model.is_busy() {
+                // A batch supervisor runs a bounded queue of isolated turns: offer
+                // the three-way choice between continuing, stopping after the
+                // current member, and aborting immediately instead of a plain
+                // interrupt (Conventions.md §7).
+                st.confirm_batch_cancel = true;
+                st.batch_cancel_button = crate::app::BatchCancelButton::Continue;
+            } else if st.model.is_busy() || st.review.running {
+                st.confirm_cancel = true;
+                st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
+            } else {
+                st.notify_info("Press Ctrl+Q to quit TAUQE, or ? for help");
+            }
+        }
+        // Quit and keyboard-quit are consumed earlier in `handle_terminal_event`
+        // (Ctrl+Q handling and the C-g normalization); the arms only satisfy the
+        // exhaustive match over the global command set.
+        GlobalCommand::Quit | GlobalCommand::KeyboardQuit => return Ok(None),
     }
 
-    Ok(None)
+    Ok(Some(InputResult::Continue))
 }
 
 #[cfg(test)]
@@ -575,11 +541,11 @@ mod tests {
     #[test]
     fn test_handle_paste_into_develop_returns_focus_to_editor() {
         let mut st = test_state();
-        st.model.focus = crate::views::develop::DevelopFocus::Viewport;
+        st.model.focus = crate::views::repl::ReplFocus::Viewport;
         handle_paste(&mut st, "hello world");
         assert!(matches!(
             &st.model.focus,
-            crate::views::develop::DevelopFocus::Editor
+            crate::views::repl::ReplFocus::Editor
         ));
         assert_eq!(st.input_editor.get_text(), "hello world");
     }
@@ -825,7 +791,7 @@ mod tests {
 
         let st = state.lock().await;
         assert!(!st.show_help);
-        assert_eq!(st.view_mode, ViewMode::Develop);
+        assert_eq!(st.view_mode, ViewMode::Repl);
         assert!(st.squash_dialog.is_none());
         assert!(st.theme_selector.is_none());
     }
@@ -836,7 +802,7 @@ mod tests {
         st.view_mode = ViewMode::Onboarding;
         let mut conn = RpcConnection::new(Vec::<u8>::new());
 
-        switch_view(&mut st, ViewMode::Develop, &mut conn).await.unwrap();
+        switch_view(&mut st, ViewMode::Repl, &mut conn).await.unwrap();
         assert_eq!(st.view_mode, ViewMode::Onboarding);
         assert!(st.notification.is_some());
         let notif = st.notification.unwrap();
@@ -854,7 +820,7 @@ mod tests {
         let key = KeyEvent::new(KeyCode::Char('2'), altgr);
         let res = handle_global_shortcuts(key, &state, &mut conn, true).await.unwrap();
         assert_eq!(res, None);
-        assert_eq!(state.lock().await.view_mode, ViewMode::Develop);
+        assert_eq!(state.lock().await.view_mode, ViewMode::Repl);
     }
 
     #[tokio::test]
@@ -893,7 +859,7 @@ mod tests {
         // A leaked non-default button focus must be forced back to the safe
         // Cancel whenever a global shortcut arms a confirmation.
         st.confirm_button = ConfirmDialogButton::Confirm;
-        st.model.status = crate::views::develop::TurnStatus::Thinking;
+        st.model.status = crate::views::repl::TurnStatus::Thinking;
 
         let state = Arc::new(Mutex::new(st));
         let mut conn = RpcConnection::new(Vec::<u8>::new());
@@ -910,7 +876,7 @@ mod tests {
     #[tokio::test]
     async fn test_cancel_shortcut_opens_batch_dialog_for_running_batch() {
         let mut st = test_state();
-        st.model.status = crate::views::develop::TurnStatus::Responding;
+        st.model.status = crate::views::repl::TurnStatus::Responding;
         st.model.is_batch = true;
         let state = Arc::new(Mutex::new(st));
         let mut conn = RpcConnection::new(Vec::<u8>::new());
@@ -1081,5 +1047,23 @@ mod tests {
         .unwrap();
         assert_eq!(res, Some(InputResult::Continue));
         assert!(state.lock().await.squash_dialog.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_meta_l_opens_the_locale_dialog() {
+        let state = Arc::new(Mutex::new(test_state()));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+
+        // M-L (Meta) opens the client-only locale dialog.
+        let res = handle_global_shortcuts(
+            KeyEvent::new(KeyCode::Char('l'), KeyModifiers::ALT),
+            &state,
+            &mut conn,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(res, Some(InputResult::Continue));
+        assert!(state.lock().await.locale_dialog.is_some());
     }
 }

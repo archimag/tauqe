@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent};
 use tokio::sync::Mutex;
 use tauqe_protocol::{methods, HistoryGetParams};
 
@@ -248,39 +248,41 @@ pub async fn handle_history_key(
     let total_lines = st.history_view.rendered_lines_count as u16;
     let max_scroll = total_lines.saturating_sub(view_height);
 
-    // Clearing the whole conversation history is destructive and isolated to
-    // this view: it requires Shift+C and arms the existing confirmation dialog,
-    // so the action can never fire from a bare key or a background view
-    // (c-history-clear-isolation). `C-g` is the canonical keyboard-quit chord:
-    // normalized to Esc globally, it simply leaves History for Develop exactly
-    // like the `Esc` arm below.
-    let is_clear_history = key.code == KeyCode::Char('C')
-        || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::SHIFT));
-    if is_clear_history {
-        if st.model.is_busy() {
-            st.notify_warning("Cannot clear history while model is generating");
-        } else {
-            st.confirm_clear_history = true;
-            st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
-        }
-        return Ok(InputResult::Continue);
-    }
+    // Resolve the key through the single source of truth so input dispatch and
+    // the generated Help never drift (c-1). Clearing the whole conversation
+    // history is destructive and isolated to this view: it is bound to Shift+C
+    // and arms the existing confirmation dialog, so it can never fire from a
+    // bare key or a background view (c-history-clear-isolation). `C-g` is the
+    // canonical keyboard-quit chord: normalized to Esc globally, it simply
+    // leaves History for Develop exactly like the `Esc` action below.
+    let action = match HISTORY_COMMAND_MAP.resolve(key, &st.tui_config.input, false) {
+        Some(spec) => spec.action,
+        None => return Ok(InputResult::Continue),
+    };
 
-    match key.code {
-        KeyCode::Esc | KeyCode::Char('q') => {
-            st.view_mode = ViewMode::Develop;
+    match action {
+        HistoryAction::ClearHistory => {
+            if st.model.is_busy() {
+                st.notify_warning("Cannot clear history while model is generating");
+            } else {
+                st.confirm_clear_history = true;
+                st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
+            }
         }
-        KeyCode::Tab | KeyCode::Char(' ') | KeyCode::Enter => {
+        HistoryAction::Return => {
+            st.view_mode = ViewMode::Repl;
+        }
+        HistoryAction::FoldToggle => {
             if let Some(item) = st.history_view.items.get(st.history_view.selected_item_index) {
                 let id = item.id;
                 st.history_view.toggle_expanded(id);
                 st.history_view.scroll_to_selected_item(view_height, Some(content_width));
             }
         }
-        KeyCode::Char('l') | KeyCode::Char('L') => {
+        HistoryAction::Recenter => {
             st.history_view.recenter_selected_item(view_height, Some(content_width));
         }
-        KeyCode::Char('[') | KeyCode::Char('p') | KeyCode::Char('P') => {
+        HistoryAction::NavPrev => {
             if !st.history_view.items.is_empty() {
                 if st.history_view.selected_item_index > 0 {
                     st.history_view.selected_item_index -= 1;
@@ -290,7 +292,7 @@ pub async fn handle_history_key(
                 }
             }
         }
-        KeyCode::Char(']') | KeyCode::Char('n') | KeyCode::Char('N') => {
+        HistoryAction::NavNext => {
             if !st.history_view.items.is_empty()
                 && st.history_view.selected_item_index + 1 < st.history_view.items.len()
             {
@@ -301,18 +303,7 @@ pub async fn handle_history_key(
                 }
             }
         }
-        KeyCode::BackTab => {
-            if !st.history_view.items.is_empty() {
-                if st.history_view.selected_item_index > 0 {
-                    st.history_view.selected_item_index -= 1;
-                } else {
-                    st.history_view.selected_item_index =
-                        st.history_view.items.len().saturating_sub(1);
-                }
-                st.history_view.scroll_to_selected_item(view_height, Some(content_width));
-            }
-        }
-        KeyCode::Char('c') => {
+        HistoryAction::CopyBlock => {
             let sel = st.history_view.selected_item_index;
             let item_info = st
                 .history_view
@@ -385,7 +376,7 @@ pub async fn handle_history_key(
                 }
             }
         }
-        KeyCode::Char('y') | KeyCode::Char('Y') => {
+        HistoryAction::CopyItem => {
             let sel = st.history_view.selected_item_index;
             let item_info = st
                 .history_view
@@ -422,7 +413,7 @@ pub async fn handle_history_key(
                 }
             }
         }
-        KeyCode::Up | KeyCode::Char('k') => {
+        HistoryAction::ScrollUp => {
             st.history_view.auto_scroll = false;
             if st.history_view.scroll > 0 {
                 st.history_view.scroll = st.history_view.scroll.saturating_sub(1);
@@ -431,7 +422,7 @@ pub async fn handle_history_key(
                 request_older_history(&mut st, server_writer, false).await?;
             }
         }
-        KeyCode::PageUp => {
+        HistoryAction::PageUp => {
             let page = view_height.saturating_sub(2).max(1);
             st.history_view.auto_scroll = false;
             if st.history_view.scroll > 0 {
@@ -441,7 +432,7 @@ pub async fn handle_history_key(
                 request_older_history(&mut st, server_writer, false).await?;
             }
         }
-        KeyCode::Down | KeyCode::Char('j') => {
+        HistoryAction::ScrollDown => {
             if st.history_view.scroll < max_scroll {
                 st.history_view.scroll = st.history_view.scroll.saturating_add(1);
                 st.history_view.update_selected_item_from_scroll(view_height, Some(content_width));
@@ -450,7 +441,7 @@ pub async fn handle_history_key(
                 st.history_view.auto_scroll = true;
             }
         }
-        KeyCode::PageDown => {
+        HistoryAction::PageDown => {
             let page = view_height.saturating_sub(2).max(1);
             st.history_view.scroll = (st.history_view.scroll.saturating_add(page)).min(max_scroll);
             st.history_view.update_selected_item_from_scroll(view_height, Some(content_width));
@@ -458,18 +449,17 @@ pub async fn handle_history_key(
                 st.history_view.auto_scroll = true;
             }
         }
-        KeyCode::Home => {
+        HistoryAction::SelectFirst => {
             st.history_view.auto_scroll = false;
             st.history_view.scroll = 0;
             st.history_view.update_selected_item_from_scroll(view_height, Some(content_width));
             request_older_history(&mut st, server_writer, false).await?;
         }
-        KeyCode::End => {
+        HistoryAction::SelectLast => {
             st.history_view.auto_scroll = true;
             st.history_view.scroll = max_scroll;
             st.history_view.update_selected_item_from_scroll(view_height, Some(content_width));
         }
-        _ => {}
     }
 
     Ok(InputResult::Continue)
@@ -518,7 +508,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_shift_c_arms_history_clear_with_safe_cancel() {
-        let key = KeyEvent::new(KeyCode::Char('C'), KeyModifiers::SHIFT);
+        let key = KeyEvent::new(KeyCode::Char('C'), crossterm::event::KeyModifiers::SHIFT);
         let (clear, _cancel, button) = dispatch(key).await;
         assert!(clear, "Shift+C in History must arm the clear confirmation");
         assert_eq!(button, crate::app::ConfirmDialogButton::Cancel);
@@ -526,14 +516,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_bare_c_does_not_arm_history_clear() {
-        let key = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE);
+        let key = KeyEvent::new(KeyCode::Char('c'), crossterm::event::KeyModifiers::NONE);
         let (clear, _cancel, _button) = dispatch(key).await;
         assert!(!clear, "a bare c must never arm the destructive clear");
     }
 
     #[tokio::test]
     async fn test_ctrl_l_no_longer_clears_history() {
-        let key = KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL);
+        let key = KeyEvent::new(KeyCode::Char('l'), crossterm::event::KeyModifiers::CONTROL);
         let (clear, cancel, _button) = dispatch(key).await;
         assert!(!clear, "C-l must recenter and never clear history");
         assert!(!cancel);

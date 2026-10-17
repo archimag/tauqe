@@ -5,7 +5,7 @@ use tauqe_core::prompt::json::JsonPromptProtocol;
 use tauqe_core::prompt::protocol::PromptProtocol;
 use tauqe_core::prompt::xml::XmlPromptProtocol;
 use tauqe_core::providers::{create_provider, LlmProvider, StreamEvent};
-use tauqe_core::workflow::fsm::is_discussion_prompt;
+use tauqe_core::workflow::fsm::is_readonly_discussion_prompt;
 use tauqe_core::workflow::{ExecutionMode, SingleExecution};
 use tauqe_protocol::{
     events, DiscussionClearFocusResult, DiscussionFocus, DiscussionGetFocusResult,
@@ -527,21 +527,27 @@ async fn prepare_turn(
 
 /// Resolves the prompt protocol for a turn.
 ///
-/// Discussion turns (plan or review refinement) are always routed through the
-/// structured discussion protocol, regardless of the configured
-/// `develop.protocol`. The discussion system prompt instructs the model to
-/// answer with the discussion JSON schema, so pairing it with an XML stream
-/// filter would leak the raw JSON scaffolding into the REPL. Non-discussion
-/// turns keep using the configured base protocol. The active turn marker is
-/// bound onto the chosen protocol when its wire format supports it; the
-/// structured discussion protocol encodes its structure in JSON Schema and
-/// therefore declines the marker.
+/// A read-only plan discussion always uses the structured discussion protocol,
+/// regardless of the configured `develop.protocol`: the discussion system prompt
+/// instructs the model to answer with the discussion JSON schema, so pairing it
+/// with an XML stream filter would leak the raw JSON scaffolding into the REPL.
+///
+/// A review focus dialogue and a plain develop turn keep the configured base
+/// protocol. This preserves the dual capability of a focused review (addressed
+/// concept c-3): the developer may reason about a finding and directly request a
+/// code fix, so the turn keeps the file-edit and toolchain-verification
+/// capabilities of the configured protocol instead of collapsing into the
+/// text-only discussion schema.
+///
+/// The active turn marker is bound onto the chosen protocol when its wire format
+/// supports it; the structured discussion protocol encodes its structure in JSON
+/// Schema and therefore declines the marker.
 fn resolve_turn_protocol(
     prompt: &str,
     develop_protocol: tauqe_protocol::EditProtocolKind,
     marker: Option<&str>,
 ) -> Box<dyn PromptProtocol> {
-    let base_protocol: Box<dyn PromptProtocol> = if is_discussion_prompt(prompt) {
+    let base_protocol: Box<dyn PromptProtocol> = if is_readonly_discussion_prompt(prompt) {
         Box::new(JsonPromptProtocol::discussion())
     } else {
         match develop_protocol {
@@ -615,7 +621,15 @@ async fn run_prepared_turn(
                 wf_rx,
             )
             .await;
-        state_clone.context.write().await.merge_turn_context(&local_context);
+        let mut ctx_snapshot = state_clone.context.read().await.clone();
+        if let Ok(updated_ctx) = offload(move || {
+            ctx_snapshot.merge_turn_context(&local_context);
+            ctx_snapshot
+        })
+        .await
+        {
+            *state_clone.context.write().await = updated_ctx;
+        }
         res
     };
 
@@ -1022,6 +1036,7 @@ async fn run_prepared_turn(
                             method: events::PLAN_UPDATED.to_string(),
                             params: serde_json::to_value(tauqe_protocol::PlanUpdatedEvent {
                                 plan: active_plan.clone(),
+                                is_save: wf_result.plan_saved,
                             })
                             .ok(),
                         });
@@ -1264,6 +1279,16 @@ pub async fn handle_model_cancel(req: Request, state: &Arc<AppState>) -> Respons
 }
 
 pub async fn handle_model_clear_history(req: Request, state: &Arc<AppState>) -> Response {
+    // Clearing history while a turn is compacting or recording it would race
+    // the running operation, so the mutation is refused for its duration.
+    if let Some(resp) = crate::handlers::reject_if_operation_active(
+        &req.id,
+        state,
+        "Cannot clear history while a model operation is in progress",
+    ) {
+        return resp;
+    }
+
     let mut history = state.history.lock().await;
     let _ = history.clear();
     drop(history);
@@ -1418,6 +1443,8 @@ fn send_edit_aborted(out: &OutChannel, op_id: &str, error: String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use tauqe_core::providers::mock::{MockLlmProvider, MockResponse};
 
     #[test]
     fn test_model_turn_result_success_evaluation() {
@@ -1656,32 +1683,54 @@ mod tests {
     }
 
     #[test]
-    fn test_discussion_turn_forces_structured_protocol() {
-        // Plan and review discussions must select the structured discussion
+    fn test_plan_discussion_turn_forces_structured_protocol() {
+        // A read-only plan discussion must select the structured discussion
         // protocol even when the configured base protocol is XML.
         let plan_prompt = "# Plan Discussion: [p-1] Refine plan\n".to_string();
+        let protocol =
+            resolve_turn_protocol(&plan_prompt, tauqe_protocol::EditProtocolKind::Xml, None);
+
+        // The discussion protocol carries plan capabilities while hiding file
+        // editing and toolchain verification from the model.
+        assert!(protocol.supports(tauqe_protocol::LlmCapability::PlanCreation));
+        assert!(protocol.supports(tauqe_protocol::LlmCapability::PlanUpdate));
+        assert!(!protocol.supports(tauqe_protocol::LlmCapability::FileEdits));
+        assert!(!protocol.supports(tauqe_protocol::LlmCapability::ToolchainVerify));
+
+        // The model must be told to answer with the discussion JSON schema.
+        match protocol.response_format(&[]) {
+            Some(tauqe_core::providers::ResponseFormat::JsonSchema { json_schema, .. }) => {
+                assert_eq!(json_schema.name, "discussion_response");
+            }
+            _ => panic!("plan discussion turn must advertise the discussion_response schema"),
+        }
+    }
+
+    #[test]
+    fn test_review_focus_turn_keeps_edit_capability() {
+        // A review focus dialogue keeps dual capability (addressed concept c-3):
+        // the developer may reason about a finding and directly request a code
+        // fix, so the turn keeps the file-edit and toolchain-verification
+        // capabilities of the configured protocol instead of collapsing into the
+        // text-only discussion schema.
         let review_prompt = format!(
             "{} [rev-1] Fix issue\n",
             tauqe_core::review::REVIEW_DISCUSSION_PREFIX
         );
 
-        for prompt in [plan_prompt, review_prompt] {
-            let protocol = resolve_turn_protocol(&prompt, tauqe_protocol::EditProtocolKind::Xml, None);
-
-            // The discussion protocol carries plan capabilities while hiding
-            // file editing and toolchain verification from the model.
-            assert!(protocol.supports(tauqe_protocol::LlmCapability::PlanCreation));
-            assert!(protocol.supports(tauqe_protocol::LlmCapability::PlanUpdate));
-            assert!(!protocol.supports(tauqe_protocol::LlmCapability::FileEdits));
-            assert!(!protocol.supports(tauqe_protocol::LlmCapability::ToolchainVerify));
-
-            // The model must be told to answer with the discussion JSON schema.
-            match protocol.response_format(&[]) {
-                Some(tauqe_core::providers::ResponseFormat::JsonSchema { json_schema, .. }) => {
-                    assert_eq!(json_schema.name, "discussion_response");
-                }
-                _ => panic!("discussion turn must advertise the discussion_response schema"),
-            }
+        for kind in [
+            tauqe_protocol::EditProtocolKind::Xml,
+            tauqe_protocol::EditProtocolKind::Structured,
+        ] {
+            let protocol = resolve_turn_protocol(&review_prompt, kind, None);
+            assert!(
+                protocol.supports(tauqe_protocol::LlmCapability::FileEdits),
+                "review focus must keep code editing"
+            );
+            assert!(
+                protocol.supports(tauqe_protocol::LlmCapability::ToolchainVerify),
+                "review focus must keep toolchain verification"
+            );
         }
     }
 
@@ -1770,5 +1819,137 @@ mod tests {
         assert!(*cancel_rx.borrow());
         assert!(!*soft_rx.borrow());
         assert!(state.is_operation_active());
+    }
+
+    /// Temporary git repository hosting a single committed source file.
+    struct FocusTestRepo(std::path::PathBuf);
+
+    impl FocusTestRepo {
+        fn new() -> Self {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+            let root = std::env::temp_dir().join(format!(
+                "tauqe-model-focus-{}-{}",
+                std::process::id(),
+                COUNTER.fetch_add(1, Ordering::Relaxed)
+            ));
+            let _ = std::fs::create_dir_all(root.join("src"));
+            tauqe_core::git::init_repository(Some(&root), true).unwrap();
+            std::fs::write(root.join("src/target.rs"), "pub fn target() {}\n").unwrap();
+            tauqe_core::git::cmd::stage_files(&root, &["src/target.rs".to_string()]).unwrap();
+            tauqe_core::git::cmd::commit_with_developer_author(&root, "Add target", false)
+                .unwrap();
+            Self(root)
+        }
+
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl Drop for FocusTestRepo {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_review_focus_repl_applies_code_edits() {
+        let repo = FocusTestRepo::new();
+        let root = repo.path().to_path_buf();
+
+        let session = tauqe_protocol::ReviewSession {
+            id: "rev-focus".to_string(),
+            title: "Focused Review".to_string(),
+            created_at: 100,
+            model: tauqe_protocol::ModelRef::openrouter("test/reviewer"),
+            description: None,
+            user_prompt: None,
+            target_files: vec!["src/target.rs".to_string()],
+            items: vec![tauqe_protocol::ReviewItem {
+                id: 1,
+                title: "Fix target".to_string(),
+                model: None,
+                severity: tauqe_protocol::ReviewSeverity::Warning,
+                status: tauqe_protocol::ReviewItemStatus::Todo,
+                recommendations: vec![],
+                files: vec!["src/target.rs".to_string()],
+                readonly_files: vec![],
+                subplan: Vec::new(),
+                resolution_notes: None,
+                body: "target needs fixing".to_string(),
+            }],
+            raw_markdown: String::new(),
+        };
+        tauqe_core::review::ReviewStorage::save_session(&root, &session).unwrap();
+
+        let edit = "<tauqe_edits summary=\"Apply the focused fix\">\n<edit path=\"src/target.rs\">\n<search>\npub fn target() {}\n</search>\n<replace>\npub fn target() { /* focused fix */ }\n</replace>\n</edit>\n</tauqe_edits>";
+        let provider: Arc<dyn LlmProvider> =
+            Arc::new(MockLlmProvider::scripted([MockResponse::text(edit)]));
+
+        let (out, _rx) = crate::transport::OutChannel::new();
+        let (hist_tx, _hist_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut config = tauqe_core::config::AppConfig::default();
+        config.develop.workflow = tauqe_protocol::WorkflowKind::Naive;
+        config.develop.protocol = tauqe_protocol::EditProtocolKind::Xml;
+        config.models.auto_level_up = false;
+        let state = AppState::new(config, root.clone(), hist_tx, out);
+        *state.provider_override.lock().await = Some(provider);
+
+        // The finding's file must be editable so the requested change can land.
+        state
+            .context
+            .write()
+            .await
+            .add_file("src/target.rs", tauqe_protocol::ContextAccess::Editable)
+            .unwrap();
+
+        // The REPL is anchored on the finding under discussion.
+        state
+            .set_discussion_focus(DiscussionFocus::review("rev-focus", vec!["1".to_string()]))
+            .await;
+
+        // The focused prompt carries the finding context and keeps edit capability.
+        let prompt = build_model_ask_prompt(
+            &state,
+            ModelAskParams::Prompt {
+                text: "Please apply the fix for this finding".to_string(),
+            },
+        )
+        .await
+        .expect("focused prompt is built");
+        assert!(prompt.starts_with(tauqe_core::review::REVIEW_DISCUSSION_PREFIX));
+        let protocol = resolve_turn_protocol(&prompt, tauqe_protocol::EditProtocolKind::Xml, None);
+        assert!(protocol.supports(tauqe_protocol::LlmCapability::FileEdits));
+
+        // Running the focused turn applies the requested code change.
+        let policy = build_apply_policy(&state, tauqe_protocol::WorkflowKind::Naive);
+        let turn = execute_model_turn(
+            &state,
+            prompt,
+            policy,
+            StepTurnOptions {
+                custom_selection: None,
+                plan_context: None,
+                reasoning_effort: None,
+                marker: None,
+                shared_operation: None,
+            },
+        )
+        .await
+        .expect("focused turn executes");
+
+        assert!(
+            matches!(
+                &turn.result,
+                Some(tauqe_protocol::ModelResult::Edit { outcome, .. }) if outcome.applied
+            ),
+            "a focused review turn must apply code edits, got {:?}",
+            turn.result
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("src/target.rs")).unwrap(),
+            "pub fn target() { /* focused fix */ }\n"
+        );
     }
 }

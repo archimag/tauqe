@@ -4,6 +4,7 @@ use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
 
+use tauqe_core::context::ContextManager;
 use tauqe_core::plan::storage::PlanStorage;
 use tauqe_protocol::{
     events, Event, ModelErrorEvent, Plan, PlanItem, PlanItemStatus, PlanListChangedEvent,
@@ -72,13 +73,26 @@ pub(super) fn report_step_failure(state: &Arc<AppState>, operation_id: &str, mes
 }
 
 /// Publishes the updated plan and refreshed plan list to the client.
-pub(super) fn publish_plan(state: &Arc<AppState>, repo_root: &Path, plan: Plan, active_id: &str) {
+///
+/// The refreshed plan list is read through the blocking pool so the handler
+/// never performs disk I/O on an async worker.
+pub(super) async fn publish_plan(
+    state: &Arc<AppState>,
+    repo_root: &Path,
+    plan: Plan,
+    active_id: &str,
+) {
     emit(
         &state.out,
         events::PLAN_UPDATED,
-        serde_json::to_value(PlanUpdatedEvent { plan }).ok(),
+        serde_json::to_value(PlanUpdatedEvent {
+            plan,
+            is_save: false,
+        })
+        .ok(),
     );
-    if let Ok(plans) = PlanStorage::load_all(repo_root) {
+    let list_root = repo_root.to_path_buf();
+    if let Ok(plans) = offload_plan(move || PlanStorage::load_all(&list_root)).await {
         emit(
             &state.out,
             events::PLAN_LIST_CHANGED,
@@ -92,31 +106,74 @@ pub(super) fn publish_plan(state: &Arc<AppState>, repo_root: &Path, plan: Plan, 
 }
 
 /// Persists a new status for a plan step and publishes the change.
-pub(super) fn set_step_status(
+///
+/// `PlanStorage` serializes through a process-global mutex and writes to disk,
+/// so persisting and reloading the plan must run on the blocking pool rather
+/// than on an async worker.
+pub(super) async fn set_step_status(
     state: &Arc<AppState>,
     repo_root: &Path,
     plan_id: &str,
     step_id: &str,
     status: PlanItemStatus,
 ) {
-    if let Ok(Some(plan)) = PlanStorage::update_item(repo_root, plan_id, step_id, Some(status)) {
-        publish_plan(state, repo_root, plan, plan_id);
+    let update_root = repo_root.to_path_buf();
+    let plan_id_owned = plan_id.to_string();
+    let step_id_owned = step_id.to_string();
+    let updated = offload_plan(move || {
+        PlanStorage::update_item(&update_root, &plan_id_owned, &step_id_owned, Some(status))
+    })
+    .await;
+
+    if let Ok(Some(plan)) = updated {
+        publish_plan(state, repo_root, plan, plan_id).await;
     }
+}
+
+/// Runs a context mutation on the blocking pool without holding the async
+/// context guard across disk I/O.
+///
+/// The context manager is cloned into a private snapshot under a short-lived
+/// read guard, mutated inside the blocking pool, and written back under a
+/// short-lived write guard. This keeps `state.context` free while `std::fs`
+/// metadata reads run, so the async worker is never blocked by the mutation
+/// (and never starves on the guard while a sibling task holds it).
+pub(super) async fn with_context_mutation<T, F>(state: &Arc<AppState>, f: F) -> Result<T, String>
+where
+    F: FnOnce(&mut ContextManager) -> T + Send + 'static,
+    T: Send + 'static,
+{
+    let snapshot = state.context.read().await.clone();
+    let (result, mutated) = crate::handlers::offload(move || {
+        let mut ctx = snapshot;
+        let result = f(&mut ctx);
+        (result, ctx)
+    })
+    .await?;
+
+    {
+        let mut guard = state.context.write().await;
+        *guard = mutated;
+    }
+    Ok(result)
 }
 
 /// Clears the transient auto context layer so a retried attempt starts from a
 /// clean, deterministic basis, then notifies clients of the new snapshot.
 pub(super) async fn clear_auto_context(state: &Arc<AppState>) {
-    let new_ctx_state = {
-        let mut ctx = state.context.write().await;
+    let cleared = with_context_mutation(state, |ctx| {
         ctx.clear_auto();
         ctx.get_state()
-    };
-    emit(
-        &state.out,
-        events::CONTEXT_CHANGED,
-        Some(serde_json::json!({ "state": new_ctx_state })),
-    );
+    })
+    .await;
+
+    if let Ok(new_ctx_state) = cleared {
+        emit(
+            &state.out,
+            events::CONTEXT_CHANGED,
+            Some(serde_json::json!({ "state": new_ctx_state })),
+        );
+    }
 }
 
 /// Whether a completed turn actually applied code edits to disk.

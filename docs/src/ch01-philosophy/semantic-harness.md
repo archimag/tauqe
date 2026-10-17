@@ -14,7 +14,7 @@ A modern large language model is a fast, capable, but blind workhorse:
 
 TAUQE resolves this dilemma by holding the model in a firm grip:
 - **Blinkers (Repo Map):** Tree-sitter extracts symbol signatures across the codebase, providing immediate architectural orientation without context bloat.
-- **Bit & Bridle (Strict Protocol):** The model cannot execute arbitrary shell commands. It interacts solely through typed protocol tags (`<edit>`, `<create>`, `<context_request>`, `<verify>`).
+- **Bit & Bridle (Strict Protocol):** The model cannot execute arbitrary shell commands. It interacts solely through typed protocol tags (`<edit>`, `<create>`, `<context_request>`, `<repo_search>`, `<verify>`). Instead of delegating arbitrary `grep` or `find` to an open-ended bash loop, TAUQE provides typed repository search (`<repo_search>`) implemented natively and safely in Rust.
 - **Reins (Git Transactions):** The developer steers high-level objectives, while Git guarantees instant, deterministic rollback at any sign of divergence.
 
 > **TAUQE is not an agent. It is an environment where the model operates autonomously within a single bounded turn, completely stripped of persistent agentic drift.**

@@ -1,4 +1,8 @@
 //! Global command map: application-wide shortcuts available from any view.
+//!
+//! Descriptions are localization keys (`cmd.global.*`) resolved through the
+//! active locale at render time (Conventions §9), so the Help dialog and the
+//! registered chords cannot drift from the keys the application intercepts.
 
 use crossterm::event::KeyCode;
 
@@ -17,6 +21,7 @@ pub enum GlobalCommand {
     SwitchView(ViewMode),
     SelectModel,
     SelectTheme,
+    SelectLocale,
     ToggleReasoning,
     OpenHelp,
     ReloadConfig,
@@ -31,93 +36,105 @@ pub static GLOBAL_COMMAND_MAP: CommandMap<GlobalCommand> = CommandMap::new(&[
         KeyChord::Ctrl(KeyCode::Char('c')),
         CancelGeneration,
         Essential,
-        "Cancel the active generation",
+        "cmd.global.cancel_generation",
     ),
     CommandSpec::new(
         KeyChord::PrimaryOrMeta(KeyCode::Char('s')),
         SquashCommits,
         Essential,
-        "Open the squash AI commits dialog",
+        "cmd.global.squash_commits",
     ),
     // Interface: view switching, navigation, and ancillary pickers.
     CommandSpec::new(
         KeyChord::PrimaryOrMeta(KeyCode::Char('1')),
-        SwitchView(ViewMode::Develop),
+        SwitchView(ViewMode::Repl),
         Interface,
-        "Switch to the REPL view",
+        "cmd.global.switch_repl",
     ),
     CommandSpec::new(
         KeyChord::PrimaryOrMeta(KeyCode::Char('2')),
         SwitchView(ViewMode::Plans),
         Interface,
-        "Switch to the Plans view",
+        "cmd.global.switch_plans",
     ),
     CommandSpec::new(
         KeyChord::PrimaryOrMeta(KeyCode::Char('3')),
         SwitchView(ViewMode::Review),
         Interface,
-        "Switch to the Review view",
+        "cmd.global.switch_review",
     ),
     CommandSpec::new(
         KeyChord::PrimaryOrMeta(KeyCode::Char('4')),
         SwitchView(ViewMode::Context),
         Interface,
-        "Switch to the Context view",
+        "cmd.global.switch_context",
     ),
     CommandSpec::new(
         KeyChord::PrimaryOrMeta(KeyCode::Char('5')),
         SwitchView(ViewMode::History),
         Interface,
-        "Switch to the History view",
+        "cmd.global.switch_history",
     ),
     CommandSpec::new(
         KeyChord::PrimaryOrMeta(KeyCode::Char('m')),
         SelectModel,
         Interface,
-        "Select the active model",
+        "cmd.global.select_model",
     ),
     CommandSpec::new(
         KeyChord::Meta(KeyCode::Char('t')),
         SelectTheme,
         Interface,
-        "Select the color theme",
+        "cmd.global.select_theme",
+    ),
+    CommandSpec::new(
+        KeyChord::Meta(KeyCode::Char('l')),
+        SelectLocale,
+        Interface,
+        "cmd.global.select_locale",
     ),
     CommandSpec::new(
         KeyChord::Primary(KeyCode::Char('r')),
         ToggleReasoning,
         Interface,
-        "Fold or unfold the reasoning stream",
+        "cmd.global.toggle_reasoning",
     ),
     CommandSpec::new(
         KeyChord::PrimaryOrMeta(KeyCode::Char('h')),
         OpenHelp,
         Interface,
-        "Open the Help dialog",
+        "cmd.global.open_help",
+    ),
+    CommandSpec::new(
+        KeyChord::Primary(KeyCode::Char('?')),
+        OpenHelp,
+        Interface,
+        "cmd.global.open_help",
     ),
     CommandSpec::new(
         KeyChord::Bare(KeyCode::Char('?')),
         OpenHelp,
         Interface,
-        "Open the Help dialog",
+        "cmd.global.open_help",
     ),
     // Helpers: auxiliary and destructive actions.
     CommandSpec::new(
         KeyChord::Primary(KeyCode::Char('o')),
         ReloadConfig,
         Helpers,
-        "Reload configuration from disk",
+        "cmd.global.reload_config",
     ),
     CommandSpec::new(
         KeyChord::Ctrl(KeyCode::Char('q')),
         Quit,
         Helpers,
-        "Quit the application",
+        "cmd.global.quit",
     ),
     CommandSpec::new(
         KeyChord::Ctrl(KeyCode::Char('g')),
         KeyboardQuit,
         Helpers,
-        "Abort the active operation",
+        "cmd.global.keyboard_quit",
     ),
 ]);
 
@@ -196,5 +213,32 @@ mod tests {
             true,
         );
         assert!(typing.is_none());
+    }
+
+    #[test]
+    fn global_map_binds_locale_switch_to_the_meta_chord() {
+        let input = InputConfig::default();
+
+        let meta_l = GLOBAL_COMMAND_MAP.resolve(
+            KeyEvent::new(KeyCode::Char('l'), KeyModifiers::ALT),
+            &input,
+            false,
+        );
+        assert_eq!(
+            meta_l.map(|spec| spec.action),
+            Some(GlobalCommand::SelectLocale)
+        );
+
+        // The locale picker is a client-only dialog, so the chord stays
+        // resolvable from navigation contexts as well as the prompt.
+        let typing = GLOBAL_COMMAND_MAP.resolve(
+            KeyEvent::new(KeyCode::Char('l'), KeyModifiers::ALT),
+            &input,
+            true,
+        );
+        assert_eq!(
+            typing.map(|spec| spec.action),
+            Some(GlobalCommand::SelectLocale)
+        );
     }
 }

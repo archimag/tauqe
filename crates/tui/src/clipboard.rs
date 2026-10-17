@@ -49,6 +49,38 @@ struct ClipboardWorker {
 static CLIPBOARD_WORKER: OnceLock<Option<ClipboardWorker>> = OnceLock::new();
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ActiveBuffer {
+    Standard,
+    Primary,
+}
+
+struct ClipboardTracker {
+    last_standard: Option<String>,
+    last_primary: Option<String>,
+    last_active: ActiveBuffer,
+}
+
+static TRACKER: OnceLock<std::sync::Mutex<ClipboardTracker>> = OnceLock::new();
+
+fn tracker() -> &'static std::sync::Mutex<ClipboardTracker> {
+    TRACKER.get_or_init(|| {
+        std::sync::Mutex::new(ClipboardTracker {
+            last_standard: None,
+            last_primary: None,
+            last_active: ActiveBuffer::Standard,
+        })
+    })
+}
+
+fn update_tracker_on_write(text: &str) {
+    if let Ok(mut tr) = tracker().lock() {
+        tr.last_standard = Some(text.to_string());
+        tr.last_primary = Some(text.to_string());
+        tr.last_active = ActiveBuffer::Standard;
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CopyResult {
     /// Copied to native OS clipboard (X11 / Wayland / Win / macOS).
     Native,
@@ -147,21 +179,11 @@ where
     reply_rx.recv_timeout(NATIVE_CLIPBOARD_TIMEOUT).unwrap_or(fallback)
 }
 
-/// Reads plain text for a standard paste, re-initializing the shared handle if
-/// necessary. When the standard clipboard holds no text, the X11/Wayland
-/// Primary Selection is consulted as a fallback so that a recent mouse selection
-/// remains pasteable.
+/// Reads plain text for a paste operation, detecting the most recently updated
+/// or non-empty buffer between the standard clipboard and the Linux Primary
+/// Selection.
 pub fn get_from_clipboard() -> Option<String> {
-    run_bounded(
-        |clipboard: &mut ClipboardHandle| {
-            if let Some(text) = read_standard_clipboard_now(clipboard) {
-                Some(text)
-            } else {
-                read_primary_selection_now(clipboard)
-            }
-        },
-        None,
-    )
+    run_bounded(read_best_clipboard_now, None)
 }
 
 /// Reads text from the X11/Wayland Primary Selection buffer.
@@ -173,19 +195,77 @@ pub fn get_from_primary_selection() -> Option<String> {
     run_bounded(read_primary_selection_now, None)
 }
 
-/// Reads the best available paste buffer for a middle-click, preferring the
-/// Primary Selection and falling back to the standard clipboard.
+/// Reads the best available paste buffer for a middle-click or Shift+Insert paste,
+/// unified with `get_from_clipboard`.
 pub fn get_primary_or_clipboard() -> Option<String> {
-    run_bounded(
-        |clipboard: &mut ClipboardHandle| {
-            if let Some(text) = read_primary_selection_now(clipboard) {
-                Some(text)
-            } else {
-                read_standard_clipboard_now(clipboard)
+    run_bounded(read_best_clipboard_now, None)
+}
+
+fn read_best_clipboard_now(clipboard: &mut ClipboardHandle) -> Option<String> {
+    let std_text = read_standard_clipboard_now(clipboard);
+    let prim_text = read_primary_selection_now(clipboard);
+    resolve_best_clipboard(std_text, prim_text)
+}
+
+fn resolve_best_clipboard(std_opt: Option<String>, prim_opt: Option<String>) -> Option<String> {
+    let mut tr = tracker().lock().unwrap_or_else(|e| e.into_inner());
+    resolve_best_clipboard_inner(&mut tr, std_opt, prim_opt)
+}
+
+fn resolve_best_clipboard_inner(
+    tr: &mut ClipboardTracker,
+    std_opt: Option<String>,
+    prim_opt: Option<String>,
+) -> Option<String> {
+    match (std_opt, prim_opt) {
+        (None, None) => None,
+        (Some(s), None) => {
+            tr.last_standard = Some(s.clone());
+            tr.last_active = ActiveBuffer::Standard;
+            Some(s)
+        }
+        (None, Some(p)) => {
+            tr.last_primary = Some(p.clone());
+            tr.last_active = ActiveBuffer::Primary;
+            Some(p)
+        }
+        (Some(s), Some(p)) => {
+            if s == p {
+                tr.last_standard = Some(s.clone());
+                tr.last_primary = Some(p.clone());
+                return Some(s);
             }
-        },
-        None,
-    )
+            let std_changed = tr.last_standard.as_deref() != Some(&s);
+            let prim_changed = tr.last_primary.as_deref() != Some(&p);
+
+            let chosen = match (std_changed, prim_changed) {
+                (true, false) => {
+                    tr.last_active = ActiveBuffer::Standard;
+                    s.clone()
+                }
+                (false, true) => {
+                    tr.last_active = ActiveBuffer::Primary;
+                    p.clone()
+                }
+                (true, true) => {
+                    // Both changed externally: on Linux the mouse selection
+                    // is the active ephemeral focus.
+                    tr.last_active = ActiveBuffer::Primary;
+                    p.clone()
+                }
+                (false, false) => {
+                    if tr.last_active == ActiveBuffer::Primary {
+                        p.clone()
+                    } else {
+                        s.clone()
+                    }
+                }
+            };
+            tr.last_standard = Some(s);
+            tr.last_primary = Some(p);
+            Some(chosen)
+        }
+    }
 }
 
 /// Reads text from the standard OS clipboard only, re-initializing the shared
@@ -279,7 +359,7 @@ pub fn copy_to_clipboard(text: &str) -> CopyResult {
     // unreachable from the user's terminal, so only the OSC 52 sequence is
     // meaningful. Report success solely when it was actually emitted, instead of
     // claiming a native copy the user cannot observe.
-    if in_ssh {
+    let result = if in_ssh {
         if osc52_ok {
             CopyResult::Osc52Only
         } else {
@@ -291,7 +371,12 @@ pub fn copy_to_clipboard(text: &str) -> CopyResult {
         CopyResult::Osc52Only
     } else {
         CopyResult::Failed
+    };
+
+    if result.is_success() {
+        update_tracker_on_write(clean_text);
     }
+    result
 }
 
 /// Writes `text` to the native OS clipboard, re-initializing the shared handle
@@ -380,6 +465,41 @@ mod tests {
             .spawn(move || worker_loop(receiver, worker_busy))
             .expect("failed to spawn test clipboard worker");
         ClipboardWorker { sender, busy }
+    }
+
+    #[test]
+    fn test_resolve_best_clipboard_tracking() {
+        let mut tr = ClipboardTracker {
+            last_standard: None,
+            last_primary: None,
+            last_active: ActiveBuffer::Standard,
+        };
+
+        // Initial state: both present and different -> Primary preferred as active mouse selection
+        let got = resolve_best_clipboard_inner(&mut tr, Some("std1".to_string()), Some("prim1".to_string()));
+        assert_eq!(got, Some("prim1".to_string()));
+        assert_eq!(tr.last_active, ActiveBuffer::Primary);
+
+        // Immediate repeat: neither changed -> returns last active (prim1)
+        let got = resolve_best_clipboard_inner(&mut tr, Some("std1".to_string()), Some("prim1".to_string()));
+        assert_eq!(got, Some("prim1".to_string()));
+
+        // Standard clipboard changes (Ctrl+C in another window) -> returns new standard
+        let got = resolve_best_clipboard_inner(&mut tr, Some("std2".to_string()), Some("prim1".to_string()));
+        assert_eq!(got, Some("std2".to_string()));
+        assert_eq!(tr.last_active, ActiveBuffer::Standard);
+
+        // Primary selection changes (mouse selection in another window) -> returns new primary
+        let got = resolve_best_clipboard_inner(&mut tr, Some("std2".to_string()), Some("prim2".to_string()));
+        assert_eq!(got, Some("prim2".to_string()));
+        assert_eq!(tr.last_active, ActiveBuffer::Primary);
+
+        // One empty -> returns non-empty
+        let got = resolve_best_clipboard_inner(&mut tr, None, Some("prim3".to_string()));
+        assert_eq!(got, Some("prim3".to_string()));
+
+        let got = resolve_best_clipboard_inner(&mut tr, Some("std3".to_string()), None);
+        assert_eq!(got, Some("std3".to_string()));
     }
 
     #[test]

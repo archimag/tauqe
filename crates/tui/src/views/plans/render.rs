@@ -4,6 +4,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Padding, Paragraph};
 
 use crate::app::AppState;
+use crate::i18n::active_t;
 
 use super::{compute_unified_plan_lines, status_style, VisiblePlanRow};
 
@@ -34,11 +35,11 @@ pub fn render_plans_view(
             vec![
                 Line::raw(""),
                 Line::from(Span::styled(
-                    "  No local engineering plans yet.",
+                    format!("  {}", active_t("plans.empty_title")),
                     engine.fg(palette.text_muted).bold(),
                 )),
                 Line::from(Span::styled(
-                    "  Ask Tauqe AI in Develop (Ctrl+1) to formulate a multi-step task plan, or press 'r' to refresh.",
+                    format!("  {}", active_t("plans.empty_hint")),
                     engine.fg(palette.text_muted),
                 )),
             ],
@@ -108,7 +109,7 @@ pub fn render_plans_view(
         }
         if state.plans_view.refining {
             status_spans.push(Span::styled(
-                " | [REFINING: AI Architect is analyzing codebase...]",
+                format!(" | {}", active_t("plans.refining")),
                 engine.fg(palette.status_warning).bold(),
             ));
         }
@@ -145,7 +146,7 @@ fn describe_plan_row(
         } => {
             let mut spans = vec![
                 Span::styled(
-                    format!(" Plan: {}", title),
+                    format!(" {} {}", active_t("plans.plan_label"), title),
                     engine.fg(palette.text_primary).bold(),
                 ),
                 Span::styled(format!(" [{}]", status), status_style(*status)),
@@ -163,7 +164,10 @@ fn describe_plan_row(
             spans
         }
         VisiblePlanRow::ConceptHeader { count, .. } => vec![Span::styled(
-            format!(" Concept: {} item(s) of architectural intent", count),
+            format!(
+                " {}",
+                active_t("plans.concept_summary").replacen("{}", &count.to_string(), 1)
+            ),
             engine.fg(palette.button_active_bg),
         )],
         VisiblePlanRow::ConceptItem {
@@ -189,7 +193,12 @@ fn describe_plan_row(
             completed,
             ..
         } => vec![Span::styled(
-            format!(" Execution blueprint: {}/{} done", completed, total),
+            format!(
+                " {}",
+                active_t("plans.execution_blueprint")
+                    .replacen("{}", &completed.to_string(), 1)
+                    .replacen("{}", &total.to_string(), 1)
+            ),
             engine.fg(palette.status_info),
         )],
         VisiblePlanRow::PlanItem {
@@ -216,13 +225,13 @@ fn describe_plan_row(
             }
             if !files.is_empty() {
                 spans.push(Span::styled(
-                    format!("  files: {}", files.join(", ")),
+                    format!("  {} {}", active_t("plans.files_prefix"), files.join(", ")),
                     engine.fg(palette.status_info),
                 ));
             }
             if !readonly_files.is_empty() {
                 spans.push(Span::styled(
-                    format!("  ref: {}", readonly_files.join(", ")),
+                    format!("  {} {}", active_t("plans.ref_prefix"), readonly_files.join(", ")),
                     engine.fg(palette.text_secondary),
                 ));
             }

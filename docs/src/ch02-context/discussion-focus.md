@@ -4,8 +4,9 @@ Planning and review are analytical activities: the developer asks *why* a design
 is shaped a certain way, weighs trade-offs, and refines requirements. They are
 distinct from a Develop turn, whose purpose is to change code. TAUQE keeps the
 two apart through a dedicated **discussion focus**: a typed anchor that binds the
-dialogue to one plan or review session and routes every turn through a
-read-only, structured protocol.
+dialogue to one plan or review session. A discussion anchored to a plan runs on
+a read-only, structured protocol; a focus anchored to a review finding keeps the
+code-editing capability so the same dialogue can also apply the fix.
 
 This section explains why that isolation exists, how the anchor is addressed and
 carried, what the model may emit while the focus is active, and how the focus is
@@ -28,7 +29,11 @@ modes appear:
   wrong.
 
 TAUQE removes both by carrying the mode and its target as typed request fields
-and by giving the discussion turn its own protocol with no write capabilities.
+rather than inferring them from prose. A plan discussion runs on a dedicated
+read-only protocol with no write capabilities, so an analytical answer cannot
+mutate the tree. A review focus instead keeps the edit toolchain on purpose:
+there the developer wants resolution alongside reasoning, and blocking edits
+would force an unnecessary screen switch back to Develop (see 2.8.3 and 6.5).
 
 ## 2.8.2. A Typed Target, Not a Textual Prefix
 
@@ -67,7 +72,15 @@ declared first:
 On top of the schema, the discussion protocol advertises a reduced capability
 set. Plan creation and plan update are available; file edits and toolchain
 verification are not. The model can reason about and propose plan structure, but
-it cannot touch code from inside a discussion.
+it cannot touch code from inside a **plan** discussion.
+
+A focus anchored to a **review finding** is different. It deliberately keeps the
+file-edit capability so the REPL stays actionable: the developer reasons about
+the finding and, in the same anchored turn, asks the model to apply the fix
+directly in the working tree. The prompt is enriched with the live finding body
+and its target files, so the edit is generated with full context and staged,
+verified, and committed like any other Develop change (see 2.8.7 and section
+6.5).
 
 ## 2.8.4. The Focus Anchor and Its Lifecycle
 

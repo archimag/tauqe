@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::model::{CancelMode, ModelRef, ModelSelection};
 
-use super::item::{ReviewItem, ReviewItemStatus};
+use super::item::{IssueStatus, ReviewIssue};
 use super::session::ReviewSession;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -75,9 +75,13 @@ pub struct ReviewUpdateItemParams {
     pub review_id: Option<String>,
     pub item_id: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub status: Option<ReviewItemStatus>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub resolution_notes: Option<String>,
+    pub status: Option<IssueStatus>,
+    /// Resolution note recorded on the finding.
+    ///
+    /// Serialized as `note`; the legacy `resolution_notes` key is still
+    /// accepted on read so older clients keep updating findings unchanged.
+    #[serde(default, alias = "resolution_notes", skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
 }
 
 /// Parameters for `review/refineItem`.
@@ -108,7 +112,7 @@ pub struct ReviewRefineItemParams {
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum ReviewRefineItemResult {
     Success {
-        item: ReviewItem,
+        item: ReviewIssue,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         explanation: Option<String>,
     },
@@ -126,7 +130,7 @@ impl ReviewRefineItemResult {
         matches!(self, Self::Blocked { .. })
     }
 
-    pub fn item(&self) -> Option<&ReviewItem> {
+    pub fn item(&self) -> Option<&ReviewIssue> {
         match self {
             Self::Success { item, .. } => Some(item),
             Self::Blocked { .. } => None,
@@ -143,5 +147,5 @@ impl ReviewRefineItemResult {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReviewUpdateItemResult {
-    pub item: ReviewItem,
+    pub item: ReviewIssue,
 }

@@ -4,6 +4,10 @@
 //! [`ConfirmModalParams`] used for rendering. Mouse hit-testing reuses the same
 //! builders, so the action-button geometry derived from these parameters is
 //! identical for rendering and hit-testing and cannot drift (Conventions.md §7).
+//!
+//! Every visible phrase — title, question, body, and button verb — is resolved
+//! through the runtime locale (`crate::i18n::active_t`), so a hot-swapped locale
+//! reaches the whole dialog without touching the renderers (Conventions §9, c-1).
 
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::Stylize;
@@ -11,6 +15,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
 
 use crate::app::{AppState, BatchCancelButton};
+use crate::i18n::active_t;
 use crate::theme::engine::current_engine;
 use crate::ui::header::truncate_to_width;
 
@@ -24,23 +29,23 @@ pub fn confirm_cancel_params(state: &AppState) -> ConfirmModalParams<'_> {
     let body_lines = vec![
         Line::raw(""),
         Line::from(Span::styled(
-            "Interrupt active model operation?",
+            active_t("dialog.confirm_cancel.question"),
             engine.fg(palette.status_warning).bold(),
         )),
         Line::raw(""),
-        Line::from("Generation will be stopped immediately."),
+        Line::raw(active_t("dialog.confirm_cancel.will_stop")),
         Line::from(Span::styled(
-            "All in-progress edits and uncommitted diffs will be discarded.",
+            active_t("dialog.confirm_cancel.discard_note"),
             engine.fg(palette.text_muted),
         )),
     ];
 
     ConfirmModalParams {
-        title: "Confirm Interruption",
+        title: active_t("dialog.confirm_cancel.title"),
         tone: ModalTone::Warning,
         body_lines,
-        confirm_label: "Interrupt (Y)",
-        cancel_label: "Cancel (Esc)",
+        confirm_label: active_t("dialog.button.interrupt"),
+        cancel_label: active_t("modal.cancel"),
         confirm_button: state.confirm_button,
         destructive: true,
         width: 58,
@@ -56,39 +61,39 @@ pub fn confirm_quit_params(state: &AppState) -> ConfirmModalParams<'_> {
     let engine = current_engine();
     let palette = engine.palette();
     let activity = if state.review.running {
-        "Code review is currently in progress."
+        active_t("dialog.confirm_quit.activity_review")
     } else if state.model.is_busy() {
-        "Model generation / turn is currently in progress."
+        active_t("dialog.confirm_quit.activity_model")
     } else if !state.input_editor.is_empty() {
-        "You have an unsubmitted prompt draft in the editor."
+        active_t("dialog.confirm_quit.activity_draft")
     } else if state.squash_dialog.as_ref().is_some_and(|d| d.applying) {
-        "Squash operation is currently being applied."
+        active_t("dialog.confirm_quit.activity_squash_applying")
     } else if state.squash_dialog.as_ref().is_some_and(|d| !d.message_editor.is_empty()) {
-        "You have an uncommitted squash message in progress."
+        active_t("dialog.confirm_quit.activity_squash_message")
     } else {
-        "Active session work may be lost."
+        active_t("dialog.confirm_quit.activity_default")
     };
 
     let body_lines = vec![
         Line::raw(""),
         Line::from(Span::styled(
-            "Quit TAUQE?",
+            active_t("dialog.confirm_quit.question"),
             engine.fg(palette.status_error).bold(),
         )),
         Line::raw(""),
-        Line::from(activity),
+        Line::raw(activity),
         Line::from(Span::styled(
-            "Exiting now will terminate the session and discard active work.",
+            active_t("dialog.confirm_quit.exit_note"),
             engine.fg(palette.text_muted),
         )),
     ];
 
     ConfirmModalParams {
-        title: "Confirm Quit",
+        title: active_t("dialog.confirm_quit.title"),
         tone: ModalTone::Dangerous,
         body_lines,
-        confirm_label: "Quit TAUQE (Y)",
-        cancel_label: "Cancel (Esc)",
+        confirm_label: active_t("dialog.button.quit"),
+        cancel_label: active_t("modal.cancel"),
         confirm_button: state.confirm_button,
         destructive: true,
         width: 58,
@@ -106,7 +111,7 @@ pub fn confirm_undo_params(state: &AppState) -> ConfirmModalParams<'_> {
     let mut body_lines = vec![
         Line::raw(""),
         Line::from(Span::styled(
-            "Are you sure you want to undo the last AI commit?",
+            active_t("dialog.confirm_undo.question"),
             engine.fg(palette.status_warning).bold(),
         )),
         Line::raw(""),
@@ -114,28 +119,28 @@ pub fn confirm_undo_params(state: &AppState) -> ConfirmModalParams<'_> {
 
     if let Some(hash) = &state.model.last_commit_hash {
         body_lines.push(Line::from(vec![
-            Span::raw("Commit: "),
+            Span::raw(active_t("dialog.confirm_undo.commit_label")),
             Span::styled(hash.clone(), engine.fg(palette.status_info).bold()),
         ]));
     }
     if let Some(summary) = &state.model.last_commit_summary {
         body_lines.push(Line::from(vec![
-            Span::raw("Summary: "),
+            Span::raw(active_t("dialog.confirm_undo.summary_label")),
             Span::styled(summary.clone(), engine.fg(palette.text_primary)),
         ]));
     }
     body_lines.push(Line::raw(""));
     body_lines.push(Line::from(Span::styled(
-        "Any uncommitted changes from the pre-edit checkpoint will be restored.",
+        active_t("dialog.confirm_undo.restore_note"),
         engine.fg(palette.text_muted),
     )));
 
     ConfirmModalParams {
-        title: "Confirm Undo",
+        title: active_t("dialog.confirm_undo.title"),
         tone: ModalTone::Dangerous,
         body_lines,
-        confirm_label: "Confirm Undo (Y)",
-        cancel_label: "Cancel (Esc)",
+        confirm_label: active_t("dialog.button.confirm_undo"),
+        cancel_label: active_t("modal.cancel"),
         confirm_button: state.confirm_button,
         destructive: true,
         width: 58,
@@ -157,23 +162,23 @@ pub fn confirm_detach_focus_params(state: &AppState) -> ConfirmModalParams<'_> {
     let body_lines = vec![
         Line::raw(""),
         Line::from(Span::styled(
-            "Detach the active discussion focus?",
+            active_t("dialog.confirm_detach_focus.question"),
             engine.fg(palette.status_warning).bold(),
         )),
         Line::raw(""),
-        Line::from("The REPL will return to the free codebase context."),
+        Line::raw(active_t("dialog.confirm_detach_focus.repl_note")),
         Line::from(Span::styled(
-            "The plan or review anchor is released until you focus on it again.",
+            active_t("dialog.confirm_detach_focus.anchor_note"),
             engine.fg(palette.text_muted),
         )),
     ];
 
     ConfirmModalParams {
-        title: "Confirm Detach Focus",
+        title: active_t("dialog.confirm_detach_focus.title"),
         tone: ModalTone::Warning,
         body_lines,
-        confirm_label: "Detach (Y)",
-        cancel_label: "Cancel (Esc)",
+        confirm_label: active_t("dialog.button.detach"),
+        cancel_label: active_t("modal.cancel"),
         confirm_button: state.confirm_button,
         destructive: false,
         width: 58,
@@ -193,46 +198,56 @@ pub fn execute_review_params(state: &AppState) -> Option<ConfirmModalParams<'_>>
     let is_all_sessions = target.review_id.is_none();
     let is_single = target.items.len() == 1 && !is_all_sessions;
     let title = if is_all_sessions {
-        "Execute All Review Sessions"
+        active_t("dialog.execute_review.title_all")
     } else if is_single {
-        "Execute Review Finding"
+        active_t("dialog.execute_review.title_single")
     } else {
-        "Execute Review Session"
+        active_t("dialog.execute_review.title_session")
     };
 
     let heading = if is_all_sessions {
-        "Resolve remaining findings sequentially across all sessions with automated verification?"
+        active_t("dialog.execute_review.heading_all")
     } else if is_single {
-        "Resolve target review finding autonomously?"
+        active_t("dialog.execute_review.heading_single")
     } else {
-        "Resolve remaining findings sequentially with automated verification?"
+        active_t("dialog.execute_review.heading_session")
     };
 
     let review_line = if let Some(ref rev_id) = target.review_id {
         Line::from(vec![
-            Span::styled(" Review: ", engine.fg(palette.text_muted)),
+            Span::styled(
+                active_t("dialog.execute_review.review_label"),
+                engine.fg(palette.text_muted),
+            ),
             Span::styled(&target.review_title, engine.fg(palette.text_primary).bold()),
             Span::styled(format!(" [{}]", rev_id), engine.fg(palette.text_muted)),
         ])
     } else {
         Line::from(vec![
-            Span::styled(" Review: ", engine.fg(palette.text_muted)),
+            Span::styled(
+                active_t("dialog.execute_review.review_label"),
+                engine.fg(palette.text_muted),
+            ),
             Span::styled(&target.review_title, engine.fg(palette.text_primary).bold()),
         ])
     };
 
     let mut body_lines = vec![
         Line::raw(""),
-        Line::from(Span::styled(
-            heading,
-            engine.fg(palette.status_info).bold(),
-        )),
+        Line::from(Span::styled(heading, engine.fg(palette.status_info).bold())),
         Line::raw(""),
         review_line,
         Line::from(vec![
-            Span::styled(" Scope: ", engine.fg(palette.text_muted)),
+            Span::styled(
+                active_t("dialog.execute_review.scope_label"),
+                engine.fg(palette.text_muted),
+            ),
             Span::styled(&target.scope_title, engine.fg(palette.status_warning).bold()),
-            Span::styled(format!(" ({} finding(s) to resolve)", target.items.len()), engine.fg(palette.text_primary)),
+            Span::styled(
+                active_t("dialog.execute_review.scope_count")
+                    .replacen("{}", &target.items.len().to_string(), 1),
+                engine.fg(palette.text_primary),
+            ),
         ]),
     ];
 
@@ -241,33 +256,67 @@ pub fn execute_review_params(state: &AppState) -> Option<ConfirmModalParams<'_>>
         if !item.files.is_empty() {
             let loc = item.files.join(", ");
             body_lines.push(Line::from(vec![
-                Span::styled(" Files: ", engine.fg(palette.text_muted)),
+                Span::styled(
+                    active_t("dialog.execute_review.files_label"),
+                    engine.fg(palette.text_muted),
+                ),
                 Span::styled(loc, engine.fg(palette.status_info)),
             ]));
         }
-        let trimmed = item.body.trim();
+        if !item.readonly_files.is_empty() {
+            body_lines.push(Line::from(vec![
+                Span::styled(
+                    active_t("dialog.execute_review.readonly_label"),
+                    engine.fg(palette.text_muted),
+                ),
+                Span::styled(
+                    item.readonly_files.join(", "),
+                    engine.fg(palette.status_warning),
+                ),
+            ]));
+        }
+        let trimmed = item.description.trim();
         if !trimmed.is_empty() {
             let first_line = trimmed.lines().next().unwrap_or("");
             body_lines.push(Line::from(vec![
-                Span::styled(" Recommendation: ", engine.fg(palette.text_muted)),
+                Span::styled(
+                    active_t("dialog.execute_review.description_label"),
+                    engine.fg(palette.text_muted),
+                ),
                 Span::styled(
                     truncate_to_width(first_line, 45),
                     engine.fg(palette.text_secondary),
                 ),
             ]));
         }
+        if let Some(first) = item.recommendations.first() {
+            body_lines.push(Line::from(vec![
+                Span::styled(
+                    active_t("dialog.execute_review.recommendation_label"),
+                    engine.fg(palette.text_muted),
+                ),
+                Span::styled(
+                    truncate_to_width(first, 45),
+                    engine.fg(palette.text_secondary),
+                ),
+            ]));
+        }
     } else {
         body_lines.push(Line::raw(""));
-        body_lines.push(Line::from(Span::styled(" Findings in execution queue:", engine.fg(palette.text_muted))));
+        body_lines.push(Line::from(Span::styled(
+            active_t("dialog.execute_review.queue_header"),
+            engine.fg(palette.text_muted),
+        )));
         for (i, item) in target.items.iter().take(4).enumerate() {
             body_lines.push(Line::from(vec![
                 Span::styled(format!("   {}. ", i + 1), engine.fg(palette.status_info)),
-                Span::styled(format!("[{}] #{} {}", item.severity, item.id, truncate_to_width(&item.title, 36)), engine.fg(palette.text_primary)),
+                Span::styled(format!("[{}] #{} {}", item.issue_type, item.id, truncate_to_width(&item.title, 36)), engine.fg(palette.text_primary)),
             ]));
         }
         if target.items.len() > 4 {
             body_lines.push(Line::from(Span::styled(
-                format!("   ... and {} more finding(s)", target.items.len() - 4),
+                active_t("dialog.execute_review.queue_more")
+                    .replacen("{}", &(target.items.len() - 4).to_string(), 1),
                 engine.fg(palette.text_muted).italic(),
             )));
         }
@@ -275,20 +324,20 @@ pub fn execute_review_params(state: &AppState) -> Option<ConfirmModalParams<'_>>
 
     body_lines.push(Line::raw(""));
     body_lines.push(Line::from(Span::styled(
-        "TAUQE will resolve each finding in an isolated turn with compiler verification gates.",
+        active_t("dialog.execute_review.note"),
         engine.fg(palette.text_muted),
     )));
     if !is_single {
         body_lines.push(Line::from(Span::styled(
-            "Fail-Fast Policy: execution stops and rolls back immediately if any finding fails verification.",
+            active_t("dialog.execute_review.fail_fast"),
             engine.fg(palette.text_muted),
         )));
     }
 
     let confirm_label = if is_single {
-        "Resolve (Enter / Y)"
+        active_t("dialog.button.resolve")
     } else {
-        "Resolve Queue (Enter / Y)"
+        active_t("dialog.button.resolve_queue")
     };
 
     Some(ConfirmModalParams {
@@ -296,7 +345,7 @@ pub fn execute_review_params(state: &AppState) -> Option<ConfirmModalParams<'_>>
         tone: ModalTone::Info,
         body_lines,
         confirm_label,
-        cancel_label: "Cancel (Esc)",
+        cancel_label: active_t("modal.cancel"),
         confirm_button: state.confirm_button,
         destructive: false,
         width: 66,
@@ -317,33 +366,40 @@ pub fn execute_scope_params(state: &AppState) -> Option<ConfirmModalParams<'_>> 
 
     let is_single = target.steps.len() == 1;
     let title = if is_single {
-        "Execute Plan Step"
+        active_t("dialog.execute_scope.title_single")
     } else {
-        "Execute Plan Scope"
+        active_t("dialog.execute_scope.title_scope")
     };
 
     let heading = if is_single {
-        "Execute target plan step autonomously?"
+        active_t("dialog.execute_scope.heading_single")
     } else {
-        "Execute plan steps sequentially with automated verification?"
+        active_t("dialog.execute_scope.heading_scope")
     };
 
     let mut body_lines = vec![
         Line::raw(""),
-        Line::from(Span::styled(
-            heading,
-            engine.fg(palette.status_info).bold(),
-        )),
+        Line::from(Span::styled(heading, engine.fg(palette.status_info).bold())),
         Line::raw(""),
         Line::from(vec![
-            Span::styled(" Plan: ", engine.fg(palette.text_muted)),
+            Span::styled(
+                active_t("dialog.execute_scope.plan_label"),
+                engine.fg(palette.text_muted),
+            ),
             Span::styled(&target.plan_title, engine.fg(palette.text_primary).bold()),
             Span::styled(format!(" [{}]", target.plan_id), engine.fg(palette.text_muted)),
         ]),
         Line::from(vec![
-            Span::styled(" Scope: ", engine.fg(palette.text_muted)),
+            Span::styled(
+                active_t("dialog.execute_scope.scope_label"),
+                engine.fg(palette.text_muted),
+            ),
             Span::styled(&target.scope_title, engine.fg(palette.status_warning).bold()),
-            Span::styled(format!(" ({} step(s) to execute)", target.steps.len()), engine.fg(palette.text_primary)),
+            Span::styled(
+                active_t("dialog.execute_scope.scope_count")
+                    .replacen("{}", &target.steps.len().to_string(), 1),
+                engine.fg(palette.text_primary),
+            ),
         ]),
     ];
 
@@ -354,7 +410,10 @@ pub fn execute_scope_params(state: &AppState) -> Option<ConfirmModalParams<'_>> 
             if !trimmed.is_empty() {
                 let first_line = trimmed.lines().next().unwrap_or("");
                 body_lines.push(Line::from(vec![
-                    Span::styled(" Details: ", engine.fg(palette.text_muted)),
+                    Span::styled(
+                        active_t("dialog.execute_scope.details_label"),
+                        engine.fg(palette.text_muted),
+                    ),
                     Span::styled(
                         truncate_to_width(first_line, 45),
                         engine.fg(palette.text_secondary),
@@ -364,7 +423,10 @@ pub fn execute_scope_params(state: &AppState) -> Option<ConfirmModalParams<'_>> 
         }
     } else {
         body_lines.push(Line::raw(""));
-        body_lines.push(Line::from(Span::styled(" Steps in execution queue:", engine.fg(palette.text_muted))));
+        body_lines.push(Line::from(Span::styled(
+            active_t("dialog.execute_scope.queue_header"),
+            engine.fg(palette.text_muted),
+        )));
         for (i, step) in target.steps.iter().take(4).enumerate() {
             body_lines.push(Line::from(vec![
                 Span::styled(format!("   {}. ", i + 1), engine.fg(palette.status_info)),
@@ -373,7 +435,8 @@ pub fn execute_scope_params(state: &AppState) -> Option<ConfirmModalParams<'_>> 
         }
         if target.steps.len() > 4 {
             body_lines.push(Line::from(Span::styled(
-                format!("   ... and {} more step(s)", target.steps.len() - 4),
+                active_t("dialog.execute_scope.queue_more")
+                    .replacen("{}", &(target.steps.len() - 4).to_string(), 1),
                 engine.fg(palette.text_muted).italic(),
             )));
         }
@@ -381,20 +444,20 @@ pub fn execute_scope_params(state: &AppState) -> Option<ConfirmModalParams<'_>> 
 
     body_lines.push(Line::raw(""));
     body_lines.push(Line::from(Span::styled(
-        "TAUQE will execute each step in an isolated turn with compiler verification gates.",
+        active_t("dialog.execute_scope.note"),
         engine.fg(palette.text_muted),
     )));
     if !is_single {
         body_lines.push(Line::from(Span::styled(
-            "Execution stops immediately if any step fails or is interrupted.",
+            active_t("dialog.execute_scope.fail_fast"),
             engine.fg(palette.text_muted),
         )));
     }
 
     let confirm_label = if is_single {
-        "Execute (Enter / Y)"
+        active_t("dialog.button.execute")
     } else {
-        "Execute Scope (Enter / Y)"
+        active_t("dialog.button.execute_scope")
     };
 
     Some(ConfirmModalParams {
@@ -402,7 +465,7 @@ pub fn execute_scope_params(state: &AppState) -> Option<ConfirmModalParams<'_>> 
         tone: ModalTone::Info,
         body_lines,
         confirm_label,
-        cancel_label: "Cancel (Esc)",
+        cancel_label: active_t("modal.cancel"),
         confirm_button: state.confirm_button,
         destructive: false,
         width: 66,
@@ -430,26 +493,26 @@ pub fn delete_plan_params<'a>(state: &'a AppState, plan_id: &str) -> ConfirmModa
     let body_lines = vec![
         Line::raw(""),
         Line::from(Span::styled(
-            "Are you sure you want to delete this plan?",
+            active_t("dialog.delete_plan.question"),
             engine.fg(palette.status_warning).bold(),
         )),
         Line::raw(""),
         Line::from(vec![
-            Span::raw("Plan: "),
+            Span::raw(active_t("dialog.delete_plan.plan_label")),
             Span::styled(format!("{} ({})", plan_title, plan_id), engine.fg(palette.status_info).bold()),
         ]),
         Line::from(Span::styled(
-            "The plan file in .tauqe/plans/ will be permanently removed.",
+            active_t("dialog.delete_plan.note"),
             engine.fg(palette.text_secondary),
         )),
     ];
 
     ConfirmModalParams {
-        title: "Confirm Delete Plan",
+        title: active_t("dialog.delete_plan.title"),
         tone: ModalTone::Dangerous,
         body_lines,
-        confirm_label: "Confirm Delete (Y)",
-        cancel_label: "Cancel (Esc)",
+        confirm_label: active_t("dialog.button.confirm_delete"),
+        cancel_label: active_t("modal.cancel"),
         confirm_button: state.confirm_button,
         destructive: true,
         width: 58,
@@ -476,26 +539,26 @@ pub fn delete_review_params<'a>(state: &'a AppState, session_id: &str) -> Confir
     let body_lines = vec![
         Line::raw(""),
         Line::from(Span::styled(
-            "Are you sure you want to delete this review session?",
+            active_t("dialog.delete_review.question"),
             engine.fg(palette.status_warning).bold(),
         )),
         Line::raw(""),
         Line::from(vec![
-            Span::raw("Review: "),
+            Span::raw(active_t("dialog.delete_review.review_label")),
             Span::styled(format!("{} ({})", review_title, session_id), engine.fg(palette.status_info).bold()),
         ]),
         Line::from(Span::styled(
-            "The review file in .tauqe/reviews/ will be permanently removed.",
+            active_t("dialog.delete_review.note"),
             engine.fg(palette.text_secondary),
         )),
     ];
 
     ConfirmModalParams {
-        title: "Confirm Delete Review",
+        title: active_t("dialog.delete_review.title"),
         tone: ModalTone::Dangerous,
         body_lines,
-        confirm_label: "Confirm Delete (Y)",
-        cancel_label: "Cancel (Esc)",
+        confirm_label: active_t("dialog.button.confirm_delete"),
+        cancel_label: active_t("modal.cancel"),
         confirm_button: state.confirm_button,
         destructive: true,
         width: 58,
@@ -520,30 +583,30 @@ pub fn clear_auto_params(state: &AppState) -> ConfirmModalParams<'_> {
     let body_lines = vec![
         Line::raw(""),
         Line::from(Span::styled(
-            "Clear all Auto-context files?",
+            active_t("dialog.clear_auto.question"),
             engine.fg(palette.status_warning).bold(),
         )),
         Line::raw(""),
         Line::from(vec![
-            Span::raw("Are you sure you want to remove all "),
+            Span::raw(active_t("dialog.clear_auto.body_prefix")),
             Span::styled(
-                format!("{} file(s)", auto_count),
+                active_t("dialog.clear_auto.body_count").replacen("{}", &auto_count.to_string(), 1),
                 engine.fg(palette.button_active_bg).bold(),
             ),
-            Span::raw(" from the Auto layer?"),
+            Span::raw(active_t("dialog.clear_auto.body_suffix")),
         ]),
         Line::from(Span::styled(
-            "Persistent User files and Pinned files will not be affected.",
+            active_t("dialog.clear_auto.note"),
             engine.fg(palette.text_muted),
         )),
     ];
 
     ConfirmModalParams {
-        title: "Confirm Clear Auto Context",
+        title: active_t("dialog.clear_auto.title"),
         tone: ModalTone::Warning,
         body_lines,
-        confirm_label: "Confirm Clear (Y)",
-        cancel_label: "Cancel (Esc)",
+        confirm_label: active_t("dialog.button.confirm_clear"),
+        cancel_label: active_t("modal.cancel"),
         confirm_button: state.confirm_button,
         destructive: false,
         width: 58,
@@ -570,30 +633,30 @@ pub fn clear_user_params(state: &AppState) -> ConfirmModalParams<'_> {
     let body_lines = vec![
         Line::raw(""),
         Line::from(Span::styled(
-            "Clear all User-context files?",
+            active_t("dialog.clear_user.question"),
             engine.fg(palette.status_warning).bold(),
         )),
         Line::raw(""),
         Line::from(vec![
-            Span::raw("Are you sure you want to remove all "),
+            Span::raw(active_t("dialog.clear_user.body_prefix")),
             Span::styled(
-                format!("{} file(s)", user_count),
+                active_t("dialog.clear_user.body_count").replacen("{}", &user_count.to_string(), 1),
                 engine.fg(palette.button_active_bg).bold(),
             ),
-            Span::raw(" from the User layer?"),
+            Span::raw(active_t("dialog.clear_user.body_suffix")),
         ]),
         Line::from(Span::styled(
-            "Protected Pinned files and Auto-requested files will not be affected.",
+            active_t("dialog.clear_user.note"),
             engine.fg(palette.text_muted),
         )),
     ];
 
     ConfirmModalParams {
-        title: "Confirm Clear User Context",
+        title: active_t("dialog.clear_user.title"),
         tone: ModalTone::Warning,
         body_lines,
-        confirm_label: "Confirm Clear (Y)",
-        cancel_label: "Cancel (Esc)",
+        confirm_label: active_t("dialog.button.confirm_clear"),
+        cancel_label: active_t("modal.cancel"),
         confirm_button: state.confirm_button,
         destructive: false,
         width: 58,
@@ -611,27 +674,27 @@ pub fn clear_history_params(state: &AppState) -> ConfirmModalParams<'_> {
     let body_lines = vec![
         Line::raw(""),
         Line::from(Span::styled(
-            "Are you sure you want to clear conversation history?",
+            active_t("dialog.clear_history.question"),
             engine.fg(palette.status_warning).bold(),
         )),
         Line::raw(""),
-        Line::from("This will permanently erase session history:"),
+        Line::raw(active_t("dialog.clear_history.erase_note")),
         Line::from(Span::styled(
             "  .tauqe/history.jsonl",
             engine.fg(palette.text_muted).italic(),
         )),
         Line::from(Span::styled(
-            "and clear the current model view output.",
+            active_t("dialog.clear_history.view_note"),
             engine.fg(palette.text_muted),
         )),
     ];
 
     ConfirmModalParams {
-        title: "Confirm Clear History",
+        title: active_t("dialog.clear_history.title"),
         tone: ModalTone::Dangerous,
         body_lines,
-        confirm_label: "Confirm Clear (Y)",
-        cancel_label: "Cancel (Esc)",
+        confirm_label: active_t("dialog.button.confirm_clear"),
+        cancel_label: active_t("modal.cancel"),
         confirm_button: state.confirm_button,
         destructive: true,
         width: 58,
@@ -642,12 +705,20 @@ pub fn render_confirm_clear_history_popup(frame: &mut ratatui::Frame, state: &Ap
     render_modal_confirm(frame, clear_history_params(state));
 }
 
-/// Action-button labels of the batch-cancellation dialog, in left-to-right
-/// order. The geometry and the renderer derive their layout from this single
-/// list so the drawn buttons are always the clickable ones.
-const BATCH_CANCEL_LABELS: [&str; 3] = [" Continue (C) ", " Soft Stop (S) ", " Hard Stop (H) "];
 const BATCH_CANCEL_WIDTH: u16 = 64;
 const BATCH_CANCEL_GAP: u16 = 2;
+
+/// Action-button labels of the batch-cancellation dialog, in left-to-right
+/// order, resolved from the locale. The geometry and the renderer derive their
+/// layout from this single list so the drawn buttons are always the clickable
+/// ones (Conventions §6, §9).
+fn batch_cancel_labels() -> [String; 3] {
+    [
+        format!(" {} ", active_t("modal.continue")),
+        format!(" {} ", active_t("modal.soft_stop")),
+        format!(" {} ", active_t("modal.hard_stop")),
+    ]
+}
 
 /// Body content of the batch-cancellation dialog.
 ///
@@ -660,14 +731,14 @@ pub fn batch_cancel_body_lines() -> Vec<Line<'static>> {
     vec![
         Line::raw(""),
         Line::from(Span::styled(
-            "Cancel batch execution?",
+            active_t("dialog.batch_cancel.question"),
             engine.fg(palette.status_warning).bold(),
         )),
         Line::raw(""),
-        Line::from("Continue keeps the batch running."),
-        Line::from("Soft Stop finishes the current step, then stops the queue."),
+        Line::raw(active_t("dialog.batch_cancel.continue_note")),
+        Line::raw(active_t("dialog.batch_cancel.soft_stop_note")),
         Line::from(Span::styled(
-            "Hard Stop aborts the current step immediately.",
+            active_t("dialog.batch_cancel.hard_stop_note"),
             engine.fg(palette.text_muted),
         )),
     ]
@@ -710,10 +781,11 @@ pub fn batch_cancel_modal_geometry(term: Rect) -> BatchCancelModalGeometry {
     let action_bar = chunks[1];
     let btn_y = action_bar.y;
 
+    let labels = batch_cancel_labels();
     let widths: [u16; 3] = [
-        BATCH_CANCEL_LABELS[0].chars().count() as u16,
-        BATCH_CANCEL_LABELS[1].chars().count() as u16,
-        BATCH_CANCEL_LABELS[2].chars().count() as u16,
+        labels[0].chars().count() as u16,
+        labels[1].chars().count() as u16,
+        labels[2].chars().count() as u16,
     ];
     let total = widths[0] + widths[1] + widths[2] + BATCH_CANCEL_GAP * 2;
     let start = action_bar.x + action_bar.width.saturating_sub(total) / 2;
@@ -735,13 +807,14 @@ pub fn batch_cancel_modal_geometry(term: Rect) -> BatchCancelModalGeometry {
 /// Footer hint of the batch-cancellation dialog.
 ///
 /// Navigation and dismissal are the shared dialog vocabulary, projected through
-/// the configured modifiers; the fast-select verbs are the batch's own
-/// `Continue` / `Soft Stop` / `Hard Stop` accelerators, so they are named here
-/// rather than in the universal dialog map.
+/// the configured modifiers; the fast-select accelerators are the batch's own
+/// `Continue` / `Soft Stop` / `Hard Stop` keys, so they are named here rather
+/// than in the universal dialog map.
 fn batch_cancel_hint() -> String {
     format!(
-        "{} • s / h / c fast select • {}",
+        "{} • s / h / c {} • {}",
         crate::components::modal::dialog_navigation_hint(),
+        active_t("dialog.action.fast_select"),
         crate::components::modal::dialog_dismiss_hint(),
     )
 }
@@ -752,10 +825,11 @@ pub fn render_confirm_batch_cancel_popup(frame: &mut ratatui::Frame, state: &App
     let palette = engine.palette();
     let geom = batch_cancel_modal_geometry(frame.area());
 
+    let title = active_t("dialog.batch_cancel.title");
     let inner_area = crate::components::modal::render_modal_container(
         frame,
         geom.area,
-        "Cancel Batch Execution",
+        &title,
         ModalTone::Warning,
     );
 
@@ -773,6 +847,7 @@ pub fn render_confirm_batch_cancel_popup(frame: &mut ratatui::Frame, state: &App
         .wrap(Wrap { trim: false });
     frame.render_widget(body, chunks[0]);
 
+    let [l0, l1, l2] = batch_cancel_labels();
     let focused = state.batch_cancel_button;
     let button_style = |button: BatchCancelButton| {
         if button == focused {
@@ -783,20 +858,11 @@ pub fn render_confirm_batch_cancel_popup(frame: &mut ratatui::Frame, state: &App
     };
 
     let actions_line = Line::from(vec![
-        Span::styled(
-            BATCH_CANCEL_LABELS[0],
-            button_style(BatchCancelButton::Continue),
-        ),
+        Span::styled(l0, button_style(BatchCancelButton::Continue)),
         Span::raw("  "),
-        Span::styled(
-            BATCH_CANCEL_LABELS[1],
-            button_style(BatchCancelButton::SoftStop),
-        ),
+        Span::styled(l1, button_style(BatchCancelButton::SoftStop)),
         Span::raw("  "),
-        Span::styled(
-            BATCH_CANCEL_LABELS[2],
-            button_style(BatchCancelButton::HardStop),
-        ),
+        Span::styled(l2, button_style(BatchCancelButton::HardStop)),
     ]);
     let actions_widget = Paragraph::new(actions_line).alignment(Alignment::Center);
     frame.render_widget(actions_widget, chunks[1]);
@@ -817,11 +883,11 @@ mod tests {
     fn rendered_confirm_buttons_match_hit_geometry() {
         let term = Rect::new(0, 0, 100, 30);
         let params = ConfirmModalParams {
-            title: "Confirm Test",
+            title: "Confirm Test".to_string(),
             tone: ModalTone::Dangerous,
             body_lines: vec![Line::raw(""), Line::from("Body"), Line::raw("")],
-            confirm_label: "Resolve (Enter)",
-            cancel_label: "Cancel (Esc)",
+            confirm_label: "Resolve (Enter)".to_string(),
+            cancel_label: "Cancel (Esc)".to_string(),
             confirm_button: crate::app::ConfirmDialogButton::Cancel,
             destructive: true,
             width: 66,
@@ -868,27 +934,31 @@ mod tests {
             scope_title: "All remaining TODO findings across all sessions (2 items)".to_string(),
             item_id: None,
             items: vec![
-                tauqe_protocol::ReviewItem {
+                tauqe_protocol::ReviewIssue {
                     id: 1,
                     title: "First".to_string(),
                     model: None,
-                    severity: tauqe_protocol::ReviewSeverity::Warning,
-                    status: tauqe_protocol::ReviewItemStatus::Todo,
-                    files: vec![],
-                    subplan: Vec::new(),
-                    resolution_notes: None,
-                    body: String::new(),
+                    issue_type: tauqe_protocol::IssueType::Bug,
+                    status: tauqe_protocol::IssueStatus::Todo,
+                    description: String::new(),
+                    recommendations: Vec::new(),
+                    files: Vec::new(),
+                    readonly_files: Vec::new(),
+                    plan: Vec::new(),
+                    note: None,
                 },
-                tauqe_protocol::ReviewItem {
+                tauqe_protocol::ReviewIssue {
                     id: 2,
                     title: "Second".to_string(),
                     model: None,
-                    severity: tauqe_protocol::ReviewSeverity::Suggestion,
-                    status: tauqe_protocol::ReviewItemStatus::Todo,
-                    files: vec![],
-                    subplan: Vec::new(),
-                    resolution_notes: None,
-                    body: String::new(),
+                    issue_type: tauqe_protocol::IssueType::Quality,
+                    status: tauqe_protocol::IssueStatus::Todo,
+                    description: String::new(),
+                    recommendations: Vec::new(),
+                    files: Vec::new(),
+                    readonly_files: Vec::new(),
+                    plan: Vec::new(),
+                    note: None,
                 },
             ],
         });

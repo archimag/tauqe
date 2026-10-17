@@ -5,15 +5,36 @@ use ratatui::widgets::{Block, Borders, Padding, Paragraph};
 use tauqe_protocol::{DiscussionFocus, DiscussionTarget};
 
 use crate::app::AppState;
-use crate::theme::engine::current_engine;
+use crate::i18n::active_t;
+use crate::theme::color::RgbColor;
+use crate::theme::engine::{current_engine, ThemeEngine};
 use crate::ui::wrap_line;
 
-use super::{compute_model_lines, DevelopFocus, SPINNER_FRAMES};
+use super::state::ReplFocus;
+
+mod model;
+
+pub use self::model::compute_model_lines;
+
+/// Frame glyphs cycled while any animated spinner is visible.
+pub const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+/// Filled indicator style: a semantic background role with inverse text.
+///
+/// Toolchain, commit, and turn-status badges resolve both their surface and
+/// their label from the active palette, so a badge never disappears on a
+/// terminal with a non-standard palette (c-1).
+pub(crate) fn indicator_style(engine: &ThemeEngine, bg: RgbColor) -> Style {
+    engine
+        .bg(bg)
+        .fg(engine.color(engine.palette().text_inverse))
+        .bold()
+}
 
 /// Maximum number of batch steps rendered in the Develop Plan Stepper.
 const MAX_STEPPER_STEPS: usize = 8;
 
-pub fn render_develop_view(
+pub fn render_repl_view(
     frame: &mut ratatui::Frame,
     state: &mut AppState,
     model_area: Rect,
@@ -86,7 +107,7 @@ fn render_discussion_focus_banner(frame: &mut ratatui::Frame, state: &AppState, 
                     .map(|plan| plan.title.clone())
                     .unwrap_or_else(|| id.clone());
                 (
-                    "[PLAN]",
+                    active_t("repl.focus_badge_plan"),
                     palette.status_info,
                     id.clone(),
                     title,
@@ -102,7 +123,7 @@ fn render_discussion_focus_banner(frame: &mut ratatui::Frame, state: &AppState, 
                     .map(|session| session.title.clone())
                     .unwrap_or_else(|| id.clone());
                 (
-                    "[REVIEW]",
+                    active_t("repl.focus_badge_review"),
                     palette.button_active_bg,
                     id.clone(),
                     title,
@@ -140,7 +161,7 @@ fn render_discussion_focus_banner(frame: &mut ratatui::Frame, state: &AppState, 
 
     spans.push(Span::raw("  "));
     spans.push(Span::styled(
-        "[Esc to detach]",
+        active_t("repl.detach_hint"),
         engine.fg(palette.text_muted).bold(),
     ));
 
@@ -164,7 +185,10 @@ fn plan_stepper_lines(state: &AppState) -> Option<Vec<Line<'static>>> {
 
     let mut lines: Vec<Line<'static>> = Vec::new();
     lines.push(Line::from(vec![
-        Span::styled("Plan: ", engine.fg(palette.text_muted).bold()),
+        Span::styled(
+            format!("{} ", active_t("repl.stepper_plan")),
+            engine.fg(palette.text_muted).bold(),
+        ),
         Span::styled(plan.title.clone(), engine.fg(palette.status_info).bold()),
     ]));
 
@@ -374,7 +398,7 @@ fn render_prompt_input(
 
     let engine = current_engine();
     let palette = engine.palette();
-    let in_viewport = state.model.focus == DevelopFocus::Viewport;
+    let in_viewport = state.model.focus == ReplFocus::Viewport;
     let border_style = if is_busy {
         engine.fg(palette.status_warning)
     } else if in_viewport {
@@ -387,7 +411,7 @@ fn render_prompt_input(
         .borders(Borders::ALL)
         .border_style(border_style);
     if in_viewport {
-        input_block = input_block.title(" [VIEWPORT] ");
+        input_block = input_block.title(format!(" {} ", active_t("repl.viewport_title")));
     }
 
     let input_paragraph = Paragraph::new(input_lines)

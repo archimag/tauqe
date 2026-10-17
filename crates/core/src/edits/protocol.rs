@@ -6,8 +6,8 @@ pub mod xml;
 
 pub use structured::StructuredEditProtocol;
 pub use xml::{
-    MarkedXmlEditProtocol, TerminalOutcome, VerifyOnSuccess, VerifyRequest, VerifyTarget,
-    XmlEditProtocol,
+    strip_repo_search_tags, MarkedXmlEditProtocol, TerminalOutcome, VerifyOnSuccess, VerifyRequest,
+    VerifyTarget, XmlEditProtocol,
 };
 
 /// A file the model asks to be added to the context before it proposes edits.

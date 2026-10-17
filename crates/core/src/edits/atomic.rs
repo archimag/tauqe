@@ -70,45 +70,11 @@ fn remove_backup_files(changes: &[PreparedChange]) {
 
 /// Creates the parent directories of a staged write, recording the ones this
 /// commit actually created so rollback can remove them again.
-fn create_parent_dirs(
-    repo_root: &Path,
-    parent: &Path,
-    created: &mut Vec<PathBuf>,
-) -> std::io::Result<()> {
-    if let Ok(canonical_root) = repo_root.canonicalize() {
-        let mut ancestor = parent;
-        while !ancestor.exists() && ancestor.symlink_metadata().is_err() {
-            match ancestor.parent() {
-                Some(p) if !p.as_os_str().is_empty() => ancestor = p,
-                _ => break,
-            }
-        }
-        if ancestor.exists() || ancestor.symlink_metadata().is_ok() {
-            match ancestor.canonicalize() {
-                Ok(canonical_anc) => {
-                    if !canonical_anc.starts_with(&canonical_root) {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::PermissionDenied,
-                            format!(
-                                "Parent directory '{}' escapes repository root via symlink",
-                                parent.display()
-                            ),
-                        ));
-                    }
-                }
-                Err(err) => {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::PermissionDenied,
-                        format!(
-                            "Parent directory '{}' ancestor cannot be resolved: {}",
-                            parent.display(),
-                            err
-                        ),
-                    ));
-                }
-            }
-        }
-    }
+fn create_parent_dirs(parent: &Path, created: &mut Vec<PathBuf>) -> std::io::Result<()> {
+    // Path safety is enforced before staging: `commit_staged_edits` calls
+    // `verify_path_within_repo` for the full target, which walks every ancestor
+    // component and rejects escaping or dangling symlinks. Here we only need to
+    // resolve which directories to create.
 
     // Walk upward and collect the ancestors that do not exist yet, deepest
     // first, so rollback removes exactly the directories this commit created.
@@ -198,7 +164,7 @@ pub(crate) fn commit_staged_edits(
         let backup_path = backup_sibling_path(&final_path);
         let temp_path = if let Some(content) = staged.staged_files.get(path) {
             if let Some(parent) = final_path.parent() {
-                if let Err(err) = create_parent_dirs(repo_root, parent, &mut created_dirs) {
+                if let Err(err) = create_parent_dirs(parent, &mut created_dirs) {
                     remove_temp_files(&prepared);
                     remove_created_dirs(&created_dirs);
                     return Err(EditError::Io(path.clone(), err));
@@ -385,5 +351,41 @@ mod tests {
         let replace_res = stage_and_validate_edits(repo_root, &cm, &[replace_op], None);
         assert!(!replace_res.is_success());
         assert_eq!(std::fs::read_to_string(&secret).unwrap(), "initial");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_stage_and_commit_rejects_dangling_symlink_escaping_repo() {
+        let dir = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let repo_root = dir.path();
+        let outside_root = outside.path();
+
+        // Directory symlink whose target does not exist yet and lives outside
+        // the repository. It must be rejected before any directory is created.
+        let dangling_target = outside_root.join("missing_dir");
+        let sym_dir = repo_root.join("dangling_dir");
+        std::os::unix::fs::symlink(&dangling_target, &sym_dir).unwrap();
+
+        let mut cm = ContextManager::new(repo_root.to_path_buf());
+
+        let create_op = EditOperation::Create {
+            path: "dangling_dir/sub/hacked.txt".into(),
+            content: "payload".into(),
+        };
+        let result =
+            stage_and_validate_edits(repo_root, &cm, std::slice::from_ref(&create_op), None);
+        assert!(!result.is_success());
+        assert!(matches!(
+            &result.failed_files[0].error,
+            EditError::InvalidPath(_, _)
+        ));
+
+        let proposal = EditProposal {
+            summary: "create via dangling escaping symlink".into(),
+            edits: vec![create_op],
+        };
+        assert!(apply_edit_proposal(repo_root, &mut cm, &proposal).is_err());
+        assert!(!outside_root.join("missing_dir").exists());
     }
 }

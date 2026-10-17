@@ -1,6 +1,6 @@
 pub mod batch;
 pub mod common;
-pub(crate) mod discovery;
+pub mod discovery;
 pub mod execution;
 pub mod fsm;
 pub mod git_policy;
@@ -34,6 +34,10 @@ pub struct WorkflowExecutionResult {
     /// Coder's block report when the turn ended with a semantic `<blocked>`
     /// signal. Preserved so the plan supervisor can move the step to `Blocked`.
     pub blocked: Option<String>,
+    /// Whether the turn applied a plan `save` action that created or fully
+    /// replaced a plan. Propagated to the `plan/updated` event so clients can
+    /// focus a freshly created plan instead of an incremental update.
+    pub plan_saved: bool,
 }
 
 /// Factory responsible for reporting and validating the supported workflow names.

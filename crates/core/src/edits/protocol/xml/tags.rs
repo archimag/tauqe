@@ -7,6 +7,7 @@ mod language;
 mod outcome;
 mod plan;
 mod scratchpad;
+mod search;
 mod verify;
 
 pub(crate) use context::next_context_request_tag;
@@ -15,13 +16,16 @@ pub(crate) use language::next_user_language_tag;
 pub(crate) use outcome::{next_blocked_tag, next_error_tag, next_success_tag};
 pub(crate) use plan::next_plan_tag;
 pub(crate) use scratchpad::next_scratchpad_tag;
+pub(crate) use search::next_repo_search_tag;
 pub(crate) use verify::next_verify_tag;
 
 pub(crate) use context::parse_context_request_tags;
 pub(crate) use docs::parse_doc_request_tags;
+pub(crate) use search::parse_repo_search_tags;
 
 pub use context::strip_context_request_tags;
 pub use docs::strip_doc_request_tags;
+pub use search::strip_repo_search_tags;
 pub use language::{extract_user_language, strip_user_language_tags};
 pub use outcome::{
     extract_blocked, extract_error, extract_success, extract_terminal_outcome, strip_blocked_tags,

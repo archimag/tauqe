@@ -1,10 +1,12 @@
+use std::sync::Arc;
+
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use tauqe_protocol::methods;
-use tokio::sync::MutexGuard;
+use tokio::sync::{Mutex, MutexGuard};
 
 use crate::app::{AppState, ConfirmDialogButton};
 use crate::input::InputResult;
-use crate::rpc::{send_request, RpcConnection};
+use crate::rpc::RpcConnection;
 
 /// Routes key events for the plan refine dialog: the embedded Architect model
 /// list, the instructions editor, and the confirm/cancel button pair. Focus
@@ -14,6 +16,7 @@ use crate::rpc::{send_request, RpcConnection};
 /// c-magit-key-navigation, c-unified-dialog-integration).
 pub(super) async fn handle_refine_dialog(
     key: KeyEvent,
+    state: &Arc<Mutex<AppState>>,
     mut st: MutexGuard<'_, AppState>,
     server_writer: &mut RpcConnection,
 ) -> anyhow::Result<Option<InputResult>> {
@@ -76,7 +79,7 @@ pub(super) async fn handle_refine_dialog(
 
     // C-Enter accelerator unconditionally submits from any section.
     if matches!(key.code, KeyCode::Enter) && is_cmd {
-        return submit_refine_dialog(st, dialog, server_writer).await;
+        return submit_refine_dialog(state, st, dialog, server_writer).await;
     }
 
     match key.code {
@@ -120,7 +123,7 @@ pub(super) async fn handle_refine_dialog(
             if !has_shift && !has_alt && dialog.focus.is_actions() =>
         {
             if dialog.confirm_button == ConfirmDialogButton::Confirm {
-                submit_refine_dialog(st, dialog, server_writer).await
+                submit_refine_dialog(state, st, dialog, server_writer).await
             } else {
                 // Safe cancel dismisses without re-attaching the dialog.
                 Ok(Some(InputResult::Continue))
@@ -146,7 +149,13 @@ pub(super) async fn handle_refine_dialog(
 /// consistent: resolve the optional instructions and the selected architect,
 /// flag the plan as refining, then hand the turn to the Develop view. If the
 /// model is already busy the dialog simply stays open.
+///
+/// The optimistic transition is applied through `start_turn`, so a failed
+/// request rolls the refining flag, the view mode, and the turn state back
+/// instead of leaving the Plans view stuck with no server turn to clear it
+/// (c-5).
 pub(crate) async fn submit_refine_dialog(
+    state: &Arc<Mutex<AppState>>,
     mut st: MutexGuard<'_, AppState>,
     dialog: crate::views::plans::PlanRefineDialogState,
     server_writer: &mut RpcConnection,
@@ -173,18 +182,18 @@ pub(crate) async fn submit_refine_dialog(
         model: selected_model,
         instructions,
     };
+    let params = serde_json::to_value(params)?;
 
-    st.plans_view.refining = true;
-    st.plans_view.refining_plan_id = Some(dialog.plan_id.clone());
-    super::begin_develop_turn(&mut st);
-
-    drop(st);
-    send_request(
+    let plan_id = dialog.plan_id.clone();
+    super::start_turn(
+        state,
+        st,
         server_writer,
         methods::PLAN_REFINE,
-        serde_json::to_value(params)?,
+        params,
+        move |st| super::begin_plan_refine_turn(st, plan_id),
     )
-    .await?;
+    .await;
     Ok(Some(InputResult::Continue))
 }
 
@@ -198,6 +207,7 @@ pub(crate) async fn submit_refine_dialog(
 /// context, while dismissing simply closes the modal safely.
 pub(super) async fn handle_refine_blocked(
     key: KeyEvent,
+    state: &Arc<Mutex<AppState>>,
     mut st: MutexGuard<'_, AppState>,
     server_writer: &mut RpcConnection,
 ) -> anyhow::Result<Option<InputResult>> {
@@ -212,7 +222,7 @@ pub(super) async fn handle_refine_blocked(
         }
         super::ConfirmOutcome::Dismissed => {}
         super::ConfirmOutcome::Accepted => {
-            submit_refine_blocked(st, blocked, server_writer).await?;
+            submit_refine_blocked(state, st, blocked, server_writer).await?;
         }
     }
 
@@ -226,7 +236,13 @@ pub(super) async fn handle_refine_blocked(
 /// refine instructions, the plan is flagged as refining, and the turn hands off
 /// to the Develop view. When the model is already busy the dialog is restored so
 /// the developer can retry.
+///
+/// The optimistic transition is applied through `start_turn`, so a failed
+/// request rolls the refining flag, the view mode, and the turn state back
+/// instead of leaving the Plans view stuck with no server turn to clear it
+/// (c-5).
 pub(crate) async fn submit_refine_blocked(
+    state: &Arc<Mutex<AppState>>,
     mut st: MutexGuard<'_, AppState>,
     blocked: crate::views::plans::PlanRefineBlockedState,
     server_writer: &mut RpcConnection,
@@ -246,18 +262,18 @@ pub(crate) async fn submit_refine_blocked(
         model: None,
         instructions,
     };
+    let params = serde_json::to_value(params)?;
 
-    st.plans_view.refining = true;
-    st.plans_view.refining_plan_id = Some(blocked.plan_id);
-    super::begin_develop_turn(&mut st);
-
-    drop(st);
-    send_request(
+    let plan_id = blocked.plan_id.clone();
+    super::start_turn(
+        state,
+        st,
         server_writer,
         methods::PLAN_REFINE,
-        serde_json::to_value(params)?,
+        params,
+        move |st| super::begin_plan_refine_turn(st, plan_id),
     )
-    .await?;
+    .await;
     Ok(())
 }
 
@@ -297,7 +313,7 @@ mod tests {
 
     async fn press(state: &Arc<Mutex<AppState>>, conn: &mut RpcConnection, code: KeyCode) {
         let guard = state.lock().await;
-        super::handle_refine_blocked(key(code), guard, conn)
+        super::handle_refine_blocked(key(code), state, guard, conn)
             .await
             .expect("in-memory dispatch never fails");
     }
@@ -330,7 +346,7 @@ mod tests {
         assert!(guard.plans_view.refine_blocked.is_none());
         assert!(guard.plans_view.refining);
         assert_eq!(guard.plans_view.refining_plan_id.as_deref(), Some("plan-1"));
-        assert_eq!(guard.view_mode, ViewMode::Develop);
+        assert_eq!(guard.view_mode, ViewMode::Repl);
     }
 
     #[tokio::test]

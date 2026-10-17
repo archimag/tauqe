@@ -690,6 +690,291 @@ async fn test_handle_plan_replan_with_mock_provider() {
 }
 
 #[tokio::test]
+async fn test_handle_plan_replan_preloads_blocked_step_files() {
+    let dir = TestDir::new();
+    tauqe_core::git::init_repository(Some(dir.path()), true).unwrap();
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    std::fs::write(dir.path().join("src/target.rs"), "pub fn target() {}\n").unwrap();
+    std::fs::write(
+        dir.path().join("src/reference.rs"),
+        "pub fn reference_helper() -> u64 { 7 }\n",
+    )
+    .unwrap();
+    tauqe_core::git::cmd::stage_files(
+        dir.path(),
+        &["src/target.rs".to_string(), "src/reference.rs".to_string()],
+    )
+    .unwrap();
+    tauqe_core::git::cmd::commit_with_developer_author(dir.path(), "Add files", false).unwrap();
+
+    let mut blocked = test_item("2", PlanItemStatus::Blocked);
+    blocked.title = "Blocked step".to_string();
+    blocked.files = vec!["src/target.rs".to_string()];
+    blocked.readonly_files = vec!["src/reference.rs".to_string()];
+
+    let plan = Plan {
+        id: "replan-preload".to_string(),
+        title: "Replan Preload".to_string(),
+        created_at: 1,
+        updated_at: 1,
+        items: vec![test_item("1", PlanItemStatus::Done), blocked],
+        ..Default::default()
+    };
+    PlanStorage::save_plan(dir.path(), &plan).unwrap();
+
+    let replan_output = serde_json::json!({
+        "status": "success",
+        "explanation": "Replanned the blocked step",
+        "reason": null,
+        "context_requests": [],
+        "items": [
+            {
+                "id": "2.1",
+                "title": "Replacement step",
+                "status": "todo",
+                "files": ["src/target.rs"],
+                "readonly_files": [],
+                "concept_refs": [],
+                "depends_on": [],
+                "children": []
+            }
+        ]
+    });
+    let mock_provider = Arc::new(MockLlmProvider::scripted([MockResponse::text(
+        replan_output.to_string(),
+    )]));
+    let config = tauqe_core::config::AppConfig::default();
+    let state = test_state_with_provider(&dir, config, mock_provider.clone()).await;
+
+    let req = Request {
+        id: tauqe_protocol::RequestId::Number(1),
+        method: tauqe_protocol::methods::PLAN_REPLAN.to_string(),
+        params: Some(serde_json::json!({
+            "plan_id": "replan-preload",
+            "step_id": "2",
+            "reason": "Precondition missing"
+        })),
+    };
+    let res = handle_plan_replan(req, &state).await;
+    assert!(res.error.is_none(), "replan failed: {:?}", res.error);
+
+    // The blocked step's declared target and reference files are preloaded into
+    // the architect prompt before the very first generation round.
+    let requests = mock_provider.requests();
+    assert_eq!(requests.len(), 1);
+    let user_prompt = &requests[0].messages[1].content;
+    assert!(user_prompt.contains("## Active Context Files:"));
+    assert!(user_prompt.contains("### File: `src/target.rs`"));
+    assert!(user_prompt.contains("### File: `src/reference.rs`"));
+    assert!(user_prompt.contains("pub fn target() {}"));
+    assert!(user_prompt.contains("pub fn reference_helper() -> u64 { 7 }"));
+}
+
+#[tokio::test]
+async fn test_handle_plan_replan_retries_when_requested_files_already_loaded() {
+    let dir = TestDir::new();
+    tauqe_core::git::init_repository(Some(dir.path()), true).unwrap();
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    std::fs::write(dir.path().join("src/target.rs"), "pub fn target() {}\n").unwrap();
+    tauqe_core::git::cmd::stage_files(dir.path(), &["src/target.rs".to_string()]).unwrap();
+    tauqe_core::git::cmd::commit_with_developer_author(dir.path(), "Add file", false).unwrap();
+
+    let mut blocked = test_item("2", PlanItemStatus::Blocked);
+    blocked.title = "Blocked step".to_string();
+    blocked.files = vec!["src/target.rs".to_string()];
+
+    let plan = Plan {
+        id: "replan-satisfied".to_string(),
+        title: "Replan Satisfied".to_string(),
+        created_at: 1,
+        updated_at: 1,
+        items: vec![test_item("1", PlanItemStatus::Done), blocked],
+        ..Default::default()
+    };
+    PlanStorage::save_plan(dir.path(), &plan).unwrap();
+
+    // Round 1: the architect asks for a file that preloading already placed in
+    // context. Round 2: it finalizes once it sees the context feedback.
+    let needs_context = serde_json::json!({
+        "status": "needs_context",
+        "explanation": "Verifying the target contract before replanning",
+        "reason": null,
+        "context_requests": ["src/target.rs"],
+        "items": []
+    });
+    let success = serde_json::json!({
+        "status": "success",
+        "explanation": "Replanned after verifying the contract",
+        "reason": null,
+        "context_requests": [],
+        "items": [
+            {
+                "id": "2.1",
+                "title": "Replacement step",
+                "status": "todo",
+                "files": ["src/target.rs"],
+                "readonly_files": [],
+                "concept_refs": [],
+                "depends_on": [],
+                "children": []
+            }
+        ]
+    });
+    let mock_provider = Arc::new(MockLlmProvider::scripted([
+        MockResponse::text(needs_context.to_string()),
+        MockResponse::text(success.to_string()),
+    ]));
+    let config = tauqe_core::config::AppConfig::default();
+    let state = test_state_with_provider(&dir, config, mock_provider.clone()).await;
+
+    let req = Request {
+        id: tauqe_protocol::RequestId::Number(1),
+        method: tauqe_protocol::methods::PLAN_REPLAN.to_string(),
+        params: Some(serde_json::json!({
+            "plan_id": "replan-satisfied",
+            "step_id": "2",
+            "reason": "Precondition missing"
+        })),
+    };
+    let res = handle_plan_replan(req, &state).await;
+
+    // Requesting already-loaded files is not a dead end: the round feeds the
+    // context back and the loop proceeds instead of failing with NEEDS_CONTEXT.
+    assert!(res.error.is_none(), "replan failed: {:?}", res.error);
+
+    let requests = mock_provider.requests();
+    assert_eq!(requests.len(), 2);
+    let feedback_prompt = &requests[1].messages[1].content;
+    assert!(feedback_prompt.contains("<context_feedback>"));
+    assert!(feedback_prompt.contains("already loaded in context"));
+
+    let reloaded = PlanStorage::load_plan(dir.path(), "replan-satisfied")
+        .unwrap()
+        .unwrap();
+    assert!(reloaded.find_item("2.1").is_some());
+}
+
+#[test]
+fn test_collect_plan_context_files_dedups_and_recurses() {
+    let mut nested = test_item("2.1", PlanItemStatus::Todo);
+    nested.files = vec!["src/shared.rs".to_string(), "./src/nested.rs".to_string()];
+    nested.readonly_files = vec!["src/shared.rs".to_string()];
+
+    let parent = tauqe_protocol::PlanItem {
+        id: "2".to_string(),
+        title: "Parent".to_string(),
+        status: PlanItemStatus::Todo,
+        children: vec![nested],
+        ..Default::default()
+    };
+
+    let mut top = test_item("1", PlanItemStatus::Todo);
+    top.files = vec!["src/shared.rs".to_string()];
+    top.readonly_files = vec!["src/ref.rs".to_string()];
+
+    let plan = Plan {
+        id: "collect".to_string(),
+        title: "Collect".to_string(),
+        created_at: 1,
+        updated_at: 1,
+        items: vec![top, parent],
+        ..Default::default()
+    };
+
+    // Recurses into children, collapses normalized duplicates across `files`
+    // and `readonly_files`, and preserves first-seen order.
+    assert_eq!(
+        super::engine::collect_plan_context_files(&plan),
+        vec![
+            "src/shared.rs".to_string(),
+            "src/ref.rs".to_string(),
+            "src/nested.rs".to_string(),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn test_handle_plan_refine_preloads_all_existing_step_files() {
+    let dir = TestDir::new();
+    tauqe_core::git::init_repository(Some(dir.path()), true).unwrap();
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    std::fs::write(dir.path().join("src/a.rs"), "pub fn a() {}\n").unwrap();
+    std::fs::write(dir.path().join("src/b.rs"), "pub fn b() {}\n").unwrap();
+    std::fs::write(dir.path().join("src/ref.rs"), "pub fn r() -> u64 { 1 }\n").unwrap();
+    tauqe_core::git::cmd::stage_files(
+        dir.path(),
+        &[
+            "src/a.rs".to_string(),
+            "src/b.rs".to_string(),
+            "src/ref.rs".to_string(),
+        ],
+    )
+    .unwrap();
+    tauqe_core::git::cmd::commit_with_developer_author(dir.path(), "Add files", false)
+        .unwrap();
+
+    let mut step1 = test_item("1", PlanItemStatus::Todo);
+    step1.files = vec!["src/a.rs".to_string()];
+    step1.readonly_files = vec!["src/ref.rs".to_string()];
+    let mut step2 = test_item("2", PlanItemStatus::Todo);
+    step2.files = vec!["src/b.rs".to_string()];
+
+    let plan = Plan {
+        id: "refine-preload".to_string(),
+        title: "Refine Preload".to_string(),
+        created_at: 1,
+        updated_at: 1,
+        items: vec![step1, step2],
+        ..Default::default()
+    };
+    PlanStorage::save_plan(dir.path(), &plan).unwrap();
+
+    let refine_output = serde_json::json!({
+        "status": "success",
+        "explanation": "Refined the horizon",
+        "items": [
+            {
+                "id": "1",
+                "title": "Refined step 1",
+                "status": "todo",
+                "files": ["src/a.rs"],
+                "readonly_files": [],
+                "concept_refs": [],
+                "depends_on": [],
+                "children": []
+            }
+        ]
+    });
+    let mock_provider = Arc::new(MockLlmProvider::scripted([MockResponse::text(
+        refine_output.to_string(),
+    )]));
+    let config = tauqe_core::config::AppConfig::default();
+    let state = test_state_with_provider(&dir, config, mock_provider.clone()).await;
+
+    let req = Request {
+        id: tauqe_protocol::RequestId::Number(1),
+        method: tauqe_protocol::methods::PLAN_REFINE.to_string(),
+        params: Some(serde_json::json!({ "plan_id": "refine-preload" })),
+    };
+    let res = handle_plan_refine(req, &state).await;
+    assert!(res.error.is_none(), "refine failed: {:?}", res.error);
+
+    // Deep planning preloads every existing step's declared target and
+    // reference files before the architect's first generation round, not just a
+    // single blocked step's.
+    let requests = mock_provider.requests();
+    assert_eq!(requests.len(), 1);
+    let user_prompt = &requests[0].messages[1].content;
+    assert!(user_prompt.contains("## Active Context Files:"));
+    assert!(user_prompt.contains("### File: `src/a.rs`"));
+    assert!(user_prompt.contains("### File: `src/b.rs`"));
+    assert!(user_prompt.contains("### File: `src/ref.rs`"));
+    assert!(user_prompt.contains("pub fn a() {}"));
+    assert!(user_prompt.contains("pub fn b() {}"));
+    assert!(user_prompt.contains("pub fn r() -> u64 { 1 }"));
+}
+
+#[tokio::test]
 async fn test_plan_horizon_synthesis_history_transactionality() {
     let dir = TestDir::new();
     let plan = Plan {
@@ -1037,4 +1322,62 @@ async fn test_plan_batch_stops_gracefully_on_soft_stop() {
         .expect("plan/batch_finished must be emitted");
     assert!(finished.contains("\"soft-stop\""));
     assert!(finished.contains("\"stopped\""));
+}
+
+/// A provider that reports cancellation exclusively through an explicit
+/// `StreamEvent::Cancelled`, without the turn's cancel signal ever being
+/// raised. This reproduces the race the architect stream must tolerate:
+/// cancellation reported by the stream event alone.
+struct StreamCancellingProvider;
+
+#[async_trait::async_trait]
+impl tauqe_core::providers::LlmProvider for StreamCancellingProvider {
+    fn kind(&self) -> tauqe_protocol::ProviderKind {
+        tauqe_protocol::ProviderKind::OpenRouter
+    }
+
+    async fn stream_chat(
+        &self,
+        _model: &str,
+        _messages: Vec<tauqe_core::providers::ChatMessage>,
+        _response_format: Option<tauqe_core::providers::ResponseFormat>,
+        tx: tokio::sync::mpsc::Sender<tauqe_core::providers::StreamEvent>,
+        _cancel_rx: tokio::sync::watch::Receiver<bool>,
+    ) -> anyhow::Result<()> {
+        let _ = tx
+            .send(tauqe_core::providers::StreamEvent::Cancelled)
+            .await;
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn test_plan_refine_reports_cancellation_from_stream_event() {
+    let dir = TestDir::new();
+    let plan = Plan {
+        id: "cancel-refine".to_string(),
+        title: "Cancel Refine".to_string(),
+        created_at: 1,
+        updated_at: 1,
+        items: vec![test_item("1", PlanItemStatus::Todo)],
+        ..Default::default()
+    };
+    PlanStorage::save_plan(dir.path(), &plan).unwrap();
+
+    let provider: Arc<dyn tauqe_core::providers::LlmProvider> =
+        Arc::new(StreamCancellingProvider);
+    let state =
+        test_state_with_provider(&dir, tauqe_core::config::AppConfig::default(), provider).await;
+
+    let req = Request {
+        id: tauqe_protocol::RequestId::Number(1),
+        method: tauqe_protocol::methods::PLAN_REFINE.to_string(),
+        params: Some(serde_json::json!({ "plan_id": "cancel-refine" })),
+    };
+    let res = handle_plan_refine(req, &state).await;
+
+    // An explicit `Cancelled` stream event must collapse into `CANCELLED`,
+    // never into a `PARSE_ERROR` on the truncated JSON buffer.
+    let err = res.error.expect("a cancelled refine must return an error");
+    assert_eq!(err.code, errors::CANCELLED);
 }

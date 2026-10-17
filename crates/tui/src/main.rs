@@ -10,6 +10,7 @@ pub mod components;
 pub mod config;
 pub mod dialogs;
 pub mod editor;
+pub mod i18n;
 pub mod input;
 pub mod markdown;
 pub mod rpc;
@@ -28,7 +29,7 @@ use crate::app::{AppInit, AppState};
 use crate::editor::InputEditor;
 use crate::input::InputResult;
 use crate::ui::render_ui;
-use crate::views::develop::SPINNER_FRAMES;
+use crate::views::repl::SPINNER_FRAMES;
 
 const SPINNER_INTERVAL: Duration = Duration::from_millis(100);
 const FRAME_INTERVAL: Duration = Duration::from_millis(16);
@@ -81,6 +82,10 @@ async fn main() -> anyhow::Result<()> {
     let mut input_editor = InputEditor::default();
     input_editor.set_history_path(editor::default_prompt_history_path());
 
+    // Load the single custom locale (if any) so the interface starts localized
+    // and falls through to English for every missing key (c-4, c-5).
+    let i18n = crate::i18n::I18nEngine::new(crate::i18n::load_custom_locale());
+
     let state = Arc::new(Mutex::new(AppState::new(AppInit {
         view_mode: init.view_mode,
         protocol_version,
@@ -96,6 +101,7 @@ async fn main() -> anyhow::Result<()> {
         onboarding: init.onboarding,
         input_editor,
         tui_config,
+        i18n,
         server_log_path: server_log_path.clone(),
     })));
 

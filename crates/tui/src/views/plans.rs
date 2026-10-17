@@ -504,6 +504,37 @@ impl PlansViewState {
         self.scroll = new_scroll as u16;
     }
 
+    /// Collapses every previously opened plan except `plan_id`, expands the
+    /// given plan, and moves the cursor to its header row.
+    ///
+    /// A `save` action creates or fully replaces a plan, so the developer should
+    /// land directly on it instead of hunting for it among the plans that were
+    /// already expanded (c-4, Conventions.md §4). A request for a plan absent
+    /// from the list is a safe no-op, so a pruned plan never clears the tree.
+    pub fn focus_plan_header(&mut self, plan_id: &str) {
+        if !self.plans.iter().any(|plan| plan.id.as_str() == plan_id) {
+            return;
+        }
+
+        // Collapse every other plan and expand only the target so the fresh
+        // plan stands alone in the tree.
+        self.expanded_plans.clear();
+        self.expanded_plans.insert(plan_id.to_string());
+
+        let target = self.flatten_rows().iter().position(|row| {
+            matches!(
+                row,
+                VisiblePlanRow::PlanHeader { plan_id: header_id, .. }
+                    if header_id.as_str() == plan_id
+            )
+        });
+        if let Some(index) = target {
+            self.selected_index = index;
+        }
+        self.clamp_selection();
+        self.scroll_to_selected();
+    }
+
     /// Accordion-style navigation: moves to the next or previous leaf item in the plan hierarchy,
     /// closing previous siblings/branches and opening the new target item.
     pub fn accordion_navigate(&mut self, forward: bool) {
@@ -660,23 +691,39 @@ impl PlansViewState {
                 }
             }
             Some(VisiblePlanRow::ImplementationHeader { ref plan_id, .. }) => {
-                let first_impl = leaves.iter().position(|l| l.plan_id == *plan_id && !l.is_concept);
-                if forward {
-                    if let Some(first) = first_impl { first } else { return; }
-                } else if let Some(first) = first_impl {
-                    if first > 0 { first - 1 } else { return; }
-                } else {
-                    return;
+                // The implementation section sits directly after the concept
+                // section. Anchor the header at the first implementation leaf
+                // when one exists, or just past the plan's last leaf when the
+                // section is empty, so C-p still crosses into the concept
+                // section's last leaf and C-n continues into the next plan
+                // (c-5, Conventions.md §4).
+                let enter = leaves
+                    .iter()
+                    .position(|l| l.plan_id == *plan_id && !l.is_concept)
+                    .or_else(|| {
+                        leaves
+                            .iter()
+                            .rposition(|l| l.plan_id == *plan_id)
+                            .map(|last| last + 1)
+                    });
+                match enter {
+                    Some(idx) if forward && idx < leaves.len() => idx,
+                    Some(idx) if !forward && idx > 0 => idx - 1,
+                    _ => return,
                 }
             }
             Some(VisiblePlanRow::ConceptHeader { ref plan_id, .. }) => {
-                let first_concept = leaves.iter().position(|l| l.plan_id == *plan_id && l.is_concept);
-                if forward {
-                    if let Some(first) = first_concept { first } else { return; }
-                } else if let Some(first) = first_concept {
-                    if first > 0 { first - 1 } else { return; }
-                } else {
-                    return;
+                // The concept section opens a plan, so its first leaf is the
+                // plan's first leaf; fall back to the plan's first leaf when
+                // the section unexpectedly carries none.
+                let enter = leaves
+                    .iter()
+                    .position(|l| l.plan_id == *plan_id && l.is_concept)
+                    .or_else(|| leaves.iter().position(|l| l.plan_id == *plan_id));
+                match enter {
+                    Some(idx) if forward && idx < leaves.len() => idx,
+                    Some(idx) if !forward && idx > 0 => idx - 1,
+                    _ => return,
                 }
             }
             Some(VisiblePlanRow::PlanHeader { ref plan_id, .. }) => {
@@ -771,7 +818,7 @@ fn focus_badge() -> Span<'static> {
 }
 
 fn pad_line_to_width(mut line: Line<'static>, width: usize, fill_style: Style) -> Line<'static> {
-    let current_width: usize = line.spans.iter().map(|s| s.content.chars().count()).sum();
+    let current_width: usize = line.spans.iter().map(|s| s.width()).sum();
     if current_width < width {
         line.spans.push(Span::styled(" ".repeat(width - current_width), fill_style));
     }
@@ -1229,6 +1276,36 @@ mod tests {
     use super::*;
     use tauqe_protocol::{ConceptItem, PlanItem};
 
+    fn concept_leaf(id: &str, title: &str) -> ConceptItem {
+        ConceptItem {
+            id: id.to_string(),
+            title: title.to_string(),
+            details: None,
+            children: vec![],
+        }
+    }
+
+    fn leaf_item(id: &str, title: &str) -> PlanItem {
+        PlanItem {
+            id: id.to_string(),
+            title: title.to_string(),
+            details: None,
+            status: PlanItemStatus::Todo,
+            files: vec![],
+            readonly_files: vec![],
+            concept_refs: vec![],
+            depends_on: vec![],
+            children: vec![],
+        }
+    }
+
+    fn parent_item(id: &str, title: &str, children: Vec<PlanItem>) -> PlanItem {
+        PlanItem {
+            children,
+            ..leaf_item(id, title)
+        }
+    }
+
     #[test]
     fn test_plans_collapsed_by_default() {
         let mut view = PlansViewState::default();
@@ -1590,6 +1667,146 @@ mod tests {
     }
 
     #[test]
+    fn test_accordion_crosses_concept_implementation_boundary_and_expands_ancestors() {
+        let mut view = PlansViewState::default();
+        let plan = Plan {
+            id: "cross-plan".to_string(),
+            title: "Cross Plan".to_string(),
+            concept: vec![concept_leaf("c-1", "Concept 1")],
+            items: vec![parent_item(
+                "1",
+                "Parent Step",
+                vec![leaf_item("1.1", "Nested Step")],
+            )],
+            ..Default::default()
+        };
+        view.plans = vec![plan];
+        view.expand_all();
+
+        // Forward from the last Concept leaf lands on the first Implementation
+        // leaf and expands its ancestors so it becomes visible.
+        view.selected_index = view
+            .flatten_rows()
+            .iter()
+            .position(|r| matches!(r, VisiblePlanRow::ConceptItem { item_id, .. } if item_id == "c-1"))
+            .expect("concept leaf present");
+        view.accordion_navigate(true);
+        assert!(matches!(
+            view.selected_row(),
+            Some(VisiblePlanRow::PlanItem { ref item_id, .. }) if item_id == "1.1"
+        ));
+        assert!(view.is_item_expanded("cross-plan", "1"));
+
+        // Backward from the first Implementation leaf returns to the last
+        // Concept leaf across the same boundary.
+        view.accordion_navigate(false);
+        assert!(matches!(
+            view.selected_row(),
+            Some(VisiblePlanRow::ConceptItem { ref item_id, .. }) if item_id == "c-1"
+        ));
+    }
+
+    #[test]
+    fn test_accordion_from_implementation_header_reaches_adjacent_extreme_leaves() {
+        let mut view = PlansViewState::default();
+        let plan = Plan {
+            id: "header-plan".to_string(),
+            title: "Header Plan".to_string(),
+            concept: vec![
+                concept_leaf("c-1", "Concept 1"),
+                concept_leaf("c-2", "Concept 2"),
+            ],
+            items: vec![leaf_item("1", "Step 1"), leaf_item("2", "Step 2")],
+            ..Default::default()
+        };
+        view.plans = vec![plan];
+        view.expand_all();
+
+        let header_index = view
+            .flatten_rows()
+            .iter()
+            .position(|r| matches!(r, VisiblePlanRow::ImplementationHeader { .. }))
+            .expect("implementation header present");
+
+        // Backward from the header reaches the last Concept leaf.
+        view.selected_index = header_index;
+        view.accordion_navigate(false);
+        assert!(matches!(
+            view.selected_row(),
+            Some(VisiblePlanRow::ConceptItem { ref item_id, .. }) if item_id == "c-2"
+        ));
+
+        // Forward from the header enters the implementation section on its
+        // first leaf.
+        view.selected_index = header_index;
+        view.accordion_navigate(true);
+        assert!(matches!(
+            view.selected_row(),
+            Some(VisiblePlanRow::PlanItem { ref item_id, .. }) if item_id == "1"
+        ));
+    }
+
+    #[test]
+    fn test_accordion_from_implementation_header_with_empty_implementation_reaches_last_concept_leaf() {
+        let mut view = PlansViewState::default();
+        let plan = Plan {
+            id: "concept-only".to_string(),
+            title: "Concept Only".to_string(),
+            concept: vec![
+                concept_leaf("c-1", "Concept 1"),
+                concept_leaf("c-2", "Concept 2"),
+            ],
+            items: vec![],
+            ..Default::default()
+        };
+        view.plans = vec![plan];
+        view.expand_all();
+
+        view.selected_index = view
+            .flatten_rows()
+            .iter()
+            .position(|r| matches!(r, VisiblePlanRow::ImplementationHeader { .. }))
+            .expect("implementation header present");
+
+        // Even with no implementation leaves, C-p crosses into the concept
+        // section instead of stalling on the header.
+        view.accordion_navigate(false);
+        assert!(matches!(
+            view.selected_row(),
+            Some(VisiblePlanRow::ConceptItem { ref item_id, .. }) if item_id == "c-2"
+        ));
+    }
+
+    #[test]
+    fn test_accordion_from_concept_header_reaches_first_concept_leaf() {
+        let mut view = PlansViewState::default();
+        let plan = Plan {
+            id: "concept-only".to_string(),
+            title: "Concept Only".to_string(),
+            concept: vec![
+                concept_leaf("c-1", "Concept 1"),
+                concept_leaf("c-2", "Concept 2"),
+            ],
+            items: vec![],
+            ..Default::default()
+        };
+        view.plans = vec![plan];
+        view.expand_all();
+
+        view.selected_index = view
+            .flatten_rows()
+            .iter()
+            .position(|r| matches!(r, VisiblePlanRow::ConceptHeader { .. }))
+            .expect("concept header present");
+
+        view.accordion_navigate(true);
+        assert!(matches!(
+            view.selected_row(),
+            Some(VisiblePlanRow::ConceptItem { ref item_id, .. }) if item_id == "c-1"
+        ));
+    }
+
+    #[test]
     fn test_focus_badge_marks_the_anchored_plan_item() {
         let mut view = PlansViewState::default();
         let plan = Plan {
@@ -1657,5 +1874,55 @@ mod tests {
             &rows[0],
             VisiblePlanRow::PlanHeader { focused: true, .. }
         ));
+    }
+
+    #[test]
+    fn test_focus_plan_header_collapses_others_and_selects_the_target() {
+        let mut view = PlansViewState::default();
+        let first = Plan {
+            id: "plan-a".to_string(),
+            title: "Plan A".to_string(),
+            ..Default::default()
+        };
+        let second = Plan {
+            id: "plan-b".to_string(),
+            title: "Plan B".to_string(),
+            ..Default::default()
+        };
+        view.plans = vec![first, second];
+        // Both plans start expanded before the focus request.
+        view.expand_all();
+        assert!(view.is_plan_expanded("plan-a"));
+        assert!(view.is_plan_expanded("plan-b"));
+
+        view.focus_plan_header("plan-b");
+
+        // Only the target plan stays expanded; the cursor anchors on its header.
+        assert!(!view.is_plan_expanded("plan-a"));
+        assert!(view.is_plan_expanded("plan-b"));
+        assert!(matches!(
+            view.selected_row(),
+            Some(VisiblePlanRow::PlanHeader { ref plan_id, .. }) if plan_id == "plan-b"
+        ));
+    }
+
+    #[test]
+    fn test_focus_plan_header_is_a_noop_for_unknown_plan() {
+        let mut view = PlansViewState {
+            plans: vec![Plan {
+                id: "plan-a".to_string(),
+                title: "Plan A".to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        view.expand_all();
+        view.selected_index = 0;
+
+        view.focus_plan_header("missing");
+
+        // Nothing changes: an unknown plan is ignored.
+        assert!(view.is_plan_expanded("plan-a"));
+        assert_eq!(view.selected_index, 0);
     }
 }

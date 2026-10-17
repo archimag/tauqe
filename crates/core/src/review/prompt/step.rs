@@ -102,6 +102,10 @@ pub fn extract_review_step_execution_id(prompt: &str) -> Option<u32> {
 
 /// Formats a targeted prompt for resolving an isolated review finding.
 ///
+/// The prompt renders the enriched finding view: the `description` states the
+/// defect, the `recommendations` carry the remediation strategy, the
+/// `readonly_files` enumerate the protected contracts the fix must preserve
+/// unchanged, and the `plan` exposes any decomposition already produced.
 /// This builder embeds the concrete edit-protocol markers and therefore lives in
 /// the core engine beside the sibling plan step prompt rather than in the
 /// dependency-light wire crate.
@@ -110,9 +114,9 @@ pub fn format_review_step_execution_prompt(
     item_id: u32,
     marker_suffix: &str,
 ) -> Result<String, String> {
-    let item = session
-        .items
-        .iter()
+    let issue = session
+        .issues()
+        .into_iter()
         .find(|i| i.id == item_id)
         .ok_or_else(|| {
             format!(
@@ -122,10 +126,10 @@ pub fn format_review_step_execution_prompt(
         })?;
 
     let mut out = String::new();
-    let clean_title = item.title.replace(['\r', '\n'], " ").trim().to_string();
+    let clean_title = issue.title.replace(['\r', '\n'], " ").trim().to_string();
     out.push_str(&format!(
         "{} [{}:{}] {}\n\n",
-        REVIEW_STEP_EXECUTION_PREFIX, session.id, item.id, clean_title
+        REVIEW_STEP_EXECUTION_PREFIX, session.id, issue.id, clean_title
     ));
 
     let title = if session.title.trim().is_empty() {
@@ -142,11 +146,11 @@ pub fn format_review_step_execution_prompt(
     }
 
     out.push_str("### Target Finding to Resolve:\n");
-    out.push_str(&format!("- **ID**: `#{}`\n", item.id));
-    out.push_str(&format!("- **Severity**: {}\n", item.severity));
-    out.push_str(&format!("- **Title**: {}\n", item.title));
-    if !item.files.is_empty() {
-        let joined = item
+    out.push_str(&format!("- **ID**: `#{}`\n", issue.id));
+    out.push_str(&format!("- **Type**: {}\n", issue.issue_type));
+    out.push_str(&format!("- **Title**: {}\n", issue.title));
+    if !issue.files.is_empty() {
+        let joined = issue
             .files
             .iter()
             .map(|f| format!("`{}`", f))
@@ -154,80 +158,101 @@ pub fn format_review_step_execution_prompt(
             .join(", ");
         out.push_str(&format!("- **Files**: {}\n", joined));
     }
-    if !item.body.trim().is_empty() {
+    if !issue.readonly_files.is_empty() {
+        let joined = issue
+            .readonly_files
+            .iter()
+            .map(|f| format!("`{}`", f))
+            .collect::<Vec<_>>()
+            .join(", ");
         out.push_str(&format!(
-            "- **Details / Recommendation**:\n{}\n",
-            item.body.trim()
+            "- **Protected Contracts (readonly_files)**: {}\n",
+            joined
         ));
     }
-    if let Some(notes) = &item.resolution_notes {
-        let trimmed = notes.trim();
+    if !issue.description.trim().is_empty() {
+        out.push_str(&format!(
+            "- **Description**:\n{}\n",
+            issue.description.trim()
+        ));
+    }
+    if !issue.recommendations.is_empty() {
+        out.push_str("- **Recommendations**:\n");
+        for (index, rec) in issue.recommendations.iter().enumerate() {
+            out.push_str(&format!("  {}. {}\n", index + 1, rec));
+        }
+    }
+    if let Some(note) = &issue.note {
+        let trimmed = note.trim();
         if !trimmed.is_empty() {
             out.push_str(&format!(
-                "- **Solution Strategy (from discussion)**:\n{}\n",
+                "- **Resolution Note (from discussion)**:\n{}\n",
                 trimmed
             ));
         }
     }
-    if item.has_subplan() {
+    if !issue.plan.is_empty() {
         out.push_str("### Decomposed Subplan Steps:\n");
-        fn render_subplan_exec(out: &mut String, items: &[PlanItem], depth: usize) {
-            let indent = "  ".repeat(depth);
-            for sub in items {
-                out.push_str(&format!(
-                    "{}- [{}] #{} {}",
-                    indent,
-                    sub.status,
-                    sub.id,
-                    sub.title
-                ));
-                if !sub.files.is_empty() {
-                    out.push_str(&format!(" (files: {})", sub.files.join(", ")));
-                }
-                if !sub.readonly_files.is_empty() {
-                    out.push_str(&format!(" (readonly: {})", sub.readonly_files.join(", ")));
-                }
-                if let Some(details) = &sub.details {
-                    let trimmed = details.trim();
-                    if !trimmed.is_empty() {
-                        out.push_str(&format!(": {}", trimmed));
-                    }
-                }
-                out.push('\n');
-                if !sub.children.is_empty() {
-                    render_subplan_exec(out, &sub.children, depth + 1);
-                }
-            }
-        }
-        render_subplan_exec(&mut out, &item.subplan, 0);
+        render_subplan_exec(&mut out, &issue.plan, 0);
     }
     out.push('\n');
 
     out.push_str("## Execution Directives:\n");
     out.push_str(&format!(
         "1. Focus STRICTLY and EXCLUSIVELY on resolving review finding `#{}`.\n",
-        item.id
+        issue.id
     ));
     out.push_str("2. Do NOT touch unrelated code or address other findings outside of this scope.\n");
-    out.push_str("3. Keep changes minimal and coherent. Toolchain verification is handled automatically and deterministically by the harness; do NOT emit <verify> tags.\n");
+    out.push_str("3. Treat every file listed under Protected Contracts as immutable: rely on its interfaces and invariants, but NEVER modify it.\n");
+    out.push_str("4. Keep changes minimal and coherent. Toolchain verification is handled automatically and deterministically by the harness; do NOT emit <verify> tags.\n");
     out.push_str(&format!(
-        "4. When implementation and verification are complete, emit the completion tag: <success{0} summary=\"...\" />.\n",
+        "5. When implementation and verification are complete, emit the completion tag: <success{0} summary=\"...\" />.\n",
         marker_suffix
     ));
     out.push_str(&format!(
-        "5. If the finding is already resolved by earlier changes, is a false positive, or requires no code modifications, do NOT emit unnecessary edits; instead emit <skip{0} reason=\"...\">Detailed explanation</skip{0}>.\n",
+        "6. If the finding is already resolved by earlier changes, is a false positive, or requires no code modifications, do NOT emit unnecessary edits; instead emit <skip{0} reason=\"...\">Detailed explanation</skip{0}>.\n",
         marker_suffix
     ));
     out.push_str(&format!(
-        "6. Discovery Phase: If you need to inspect or edit files listed in <repo_map> that are not yet loaded in <context>, request them immediately using <context_request{0} path=\"...\" access=\"read_only|editable\" /> before writing code or explanations. Do NOT halt with conversational text if the necessary files can simply be requested.\n",
+        "7. Discovery Phase: If you need to inspect or edit files listed in <repo_map> that are not yet loaded in <context>, request them immediately using <context_request{0} path=\"...\" access=\"read_only|editable\" /> before writing code or explanations. Do NOT halt with conversational text if the necessary files can simply be requested.\n",
         marker_suffix
     ));
     out.push_str(&format!(
-        "7. If you encounter an insurmountable technical blocker, contradictory requirements, or need developer decisions, emit the terminal error tag: <error{0} message=\"...\" /> explaining the exact blocker.\n",
+        "8. If you encounter an insurmountable technical blocker, contradictory requirements, or need developer decisions, emit the terminal error tag: <error{0} message=\"...\" /> explaining the exact blocker.\n",
         marker_suffix
     ));
 
     Ok(out)
+}
+
+/// Renders a decomposition plan as an indented outline of its steps.
+fn render_subplan_exec(out: &mut String, items: &[PlanItem], depth: usize) {
+    let indent = "  ".repeat(depth);
+    for sub in items {
+        out.push_str(&format!(
+            "{}- [{}] #{} {}",
+            indent,
+            sub.status,
+            sub.id,
+            sub.title
+        ));
+        if !sub.files.is_empty() {
+            out.push_str(&format!(" (files: {})", sub.files.join(", ")));
+        }
+        if !sub.readonly_files.is_empty() {
+            out.push_str(&format!(" (readonly: {})", sub.readonly_files.join(", ")));
+        }
+        if let Some(details) = &sub.details {
+            let trimmed = details.trim();
+            if !trimmed.is_empty() {
+                out.push_str(&format!(": {}", trimmed));
+            }
+        }
+        out.push('\n');
+        if !sub.children.is_empty() {
+            render_subplan_exec(out, &sub.children, depth + 1);
+        }
+    }
 }
 
 /// Extracts a `<skip>` reason and optional body from an assistant response.
@@ -303,5 +328,77 @@ fn extract_reason_attr(header: &str) -> Option<String> {
         None
     } else {
         Some(val.to_string())
+    }
+}
+
+/// Prefix recorded in `resolution_notes` when a domain failure skips a finding.
+const REVIEW_STEP_FAILURE_NOTE_PREFIX: &str = "Skipped after execution failure";
+
+/// Category of a review step execution failure, controlling batch behavior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviewStepFailureKind {
+    /// The finding could not be resolved in code: a patch failed to apply, the
+    /// compiler still reported errors after healing, the retry budget was
+    /// exhausted, or the model emitted a semantic block. The finding is marked
+    /// `Skipped` and the batch continues with the next one.
+    Domain,
+    /// The turn failed before producing a usable result: a provider or
+    /// transport error, a missing credential, an operation-slot conflict, or an
+    /// explicit cancellation. The failure is fatal to the whole batch.
+    Infrastructure,
+}
+
+/// A review step execution failure paired with its batch-impact category.
+///
+/// The category decides whether the batch supervisor aborts or advances: a
+/// [`ReviewStepFailureKind::Domain`] failure is confined to the current finding,
+/// while a [`ReviewStepFailureKind::Infrastructure`] failure stops the queue.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewStepFailure {
+    kind: ReviewStepFailureKind,
+    reason: String,
+}
+
+impl ReviewStepFailure {
+    /// Creates a domain failure: skip the current finding and continue.
+    pub fn domain(reason: impl Into<String>) -> Self {
+        Self {
+            kind: ReviewStepFailureKind::Domain,
+            reason: reason.into(),
+        }
+    }
+
+    /// Creates an infrastructure failure: abort the whole batch.
+    pub fn infrastructure(reason: impl Into<String>) -> Self {
+        Self {
+            kind: ReviewStepFailureKind::Infrastructure,
+            reason: reason.into(),
+        }
+    }
+
+    /// Whether the failure is confined to the current finding.
+    pub fn is_domain(&self) -> bool {
+        matches!(self.kind, ReviewStepFailureKind::Domain)
+    }
+
+    /// Human-readable diagnostic carried by the failure.
+    pub fn reason(&self) -> &str {
+        &self.reason
+    }
+
+    /// Consumes the failure and returns its diagnostic.
+    pub fn into_reason(self) -> String {
+        self.reason
+    }
+}
+
+/// Builds the `resolution_notes` diagnostic recorded when a finding is skipped
+/// because a domain failure prevented it from being resolved in code.
+pub fn format_review_step_failure_note(reason: &str) -> String {
+    let trimmed = reason.trim();
+    if trimmed.is_empty() {
+        format!("{} without diagnostics", REVIEW_STEP_FAILURE_NOTE_PREFIX)
+    } else {
+        format!("{}: {}", REVIEW_STEP_FAILURE_NOTE_PREFIX, trimmed)
     }
 }

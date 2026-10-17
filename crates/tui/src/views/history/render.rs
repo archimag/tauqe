@@ -4,6 +4,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Padding, Paragraph};
 
 use crate::app::AppState;
+use crate::i18n::active_t;
 
 use super::{clamp_u16, layout_history};
 
@@ -74,15 +75,20 @@ pub fn render_history_view(
     let palette = engine.palette();
     let info_line = Line::from(vec![
         Span::styled(
-            format!(" History | Item {}/{} ", sel_idx, total_shown),
+            format!(
+                " {} ",
+                active_t("history.item_counter")
+                    .replacen("{}", &sel_idx.to_string(), 1)
+                    .replacen("{}", &total_shown.to_string(), 1)
+            ),
             engine.fg(palette.text_primary).bold(),
         ),
         Span::raw(" | "),
         Span::styled(
             if state.history_view.auto_scroll {
-                "[Auto-scroll: ON]"
+                active_t("history.auto_scroll_on")
             } else {
-                "[Auto-scroll: OFF]"
+                active_t("history.auto_scroll_off")
             },
             if state.history_view.auto_scroll {
                 engine.fg(palette.status_success).bold()

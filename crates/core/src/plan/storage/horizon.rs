@@ -6,7 +6,53 @@ use tauqe_protocol::{Plan, PlanItem, PlanItemStatus};
 
 use super::PlanStorage;
 
+/// Merges an existing step list with a freshly synthesized horizon while preserving
+/// the immutable `Done` foundation.
+///
+/// Completed steps from `existing` are preserved and protected from ID collisions.
+/// Dependency cycles are rejected, leaf-only file declarations are normalized, and
+/// parent container statuses are refreshed deterministically.
+pub fn merge_subplan(
+    existing: &[PlanItem],
+    new_horizon_items: Vec<PlanItem>,
+) -> Result<Vec<PlanItem>> {
+    let done_foundation = collect_done_foundation(existing);
+    let done_ids: HashSet<String> = done_foundation
+        .iter()
+        .flat_map(collect_subtree_ids)
+        .map(|id| id.to_ascii_lowercase())
+        .collect();
+
+    let mut combined = done_foundation;
+    combined.extend(drop_done_collisions(new_horizon_items, &done_ids));
+
+    if let Some(cycle_step) = detect_dependency_cycle(&combined) {
+        anyhow::bail!(
+            "Dependency cycle detected in synthesized horizon: step '{}' participates in a dependency loop",
+            cycle_step
+        );
+    }
+
+    let mut wrapper = Plan {
+        items: combined,
+        ..Default::default()
+    };
+    wrapper.normalize_leaf_files();
+    wrapper.refresh_parent_statuses();
+
+    Ok(wrapper.items)
+}
+
 impl PlanStorage {
+    /// Merges an existing step list with a freshly synthesized horizon while preserving
+    /// the immutable `Done` foundation.
+    pub fn merge_subplan(
+        existing: &[PlanItem],
+        new_horizon_items: Vec<PlanItem>,
+    ) -> Result<Vec<PlanItem>> {
+        merge_subplan(existing, new_horizon_items)
+    }
+
     /// Replaces the entire uncompleted horizon of a plan with a freshly synthesized
     /// step list while preserving the immutable `Done` foundation.
     ///
@@ -42,29 +88,7 @@ impl PlanStorage {
             None => anyhow::bail!("Plan '{}' not found", plan_id),
         };
 
-        // Preserve the immutable Done foundation, then graft the synthesized horizon
-        // on top of it. Completed ids are protected from an incidental collision with a
-        // stale model id so a completed step can never be reintroduced as pending work.
-        let done_foundation = collect_done_foundation(&plan.items);
-        let done_ids: HashSet<String> = done_foundation
-            .iter()
-            .flat_map(collect_subtree_ids)
-            .map(|id| id.to_ascii_lowercase())
-            .collect();
-
-        let mut combined = done_foundation;
-        combined.extend(drop_done_collisions(new_horizon_items, &done_ids));
-        plan.items = combined;
-
-        if let Some(cycle_step) = detect_dependency_cycle(&plan.items) {
-            anyhow::bail!(
-                "Dependency cycle detected in synthesized horizon: step '{}' participates in a dependency loop",
-                cycle_step
-            );
-        }
-
-        plan.normalize_leaf_files();
-        plan.refresh_parent_statuses();
+        plan.items = merge_subplan(&plan.items, new_horizon_items)?;
         plan.updated_at = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap_or_default()
@@ -187,6 +211,56 @@ fn drop_done_collisions(items: Vec<PlanItem>, done_ids: &HashSet<String>) -> Vec
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn test_merge_subplan_preserves_done_foundation_and_drops_collisions() {
+        let existing = vec![
+            PlanItem {
+                id: "1".to_string(),
+                title: "Completed".to_string(),
+                status: PlanItemStatus::Done,
+                ..Default::default()
+            },
+            PlanItem {
+                id: "2".to_string(),
+                title: "Old Pending".to_string(),
+                status: PlanItemStatus::Todo,
+                ..Default::default()
+            },
+        ];
+
+        let new_horizon = vec![
+            PlanItem {
+                id: "1".to_string(),
+                title: "Stale Duplicate".to_string(),
+                status: PlanItemStatus::Todo,
+                ..Default::default()
+            },
+            PlanItem {
+                id: "3".to_string(),
+                title: "New Step".to_string(),
+                status: PlanItemStatus::Todo,
+                files: vec!["file.rs".to_string()],
+                children: vec![PlanItem {
+                    id: "3.1".to_string(),
+                    title: "Sub-step".to_string(),
+                    status: PlanItemStatus::Todo,
+                    files: vec!["child.rs".to_string()],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        ];
+
+        let merged = merge_subplan(&existing, new_horizon).unwrap();
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].id, "1");
+        assert_eq!(merged[0].status, PlanItemStatus::Done);
+        assert_eq!(merged[1].id, "3");
+        // Leaf file normalization clears parent files
+        assert!(merged[1].files.is_empty());
+        assert_eq!(merged[1].children[0].files, vec!["child.rs".to_string()]);
+    }
 
     #[test]
     fn test_replace_uncompleted_horizon_preserves_done_foundation() {

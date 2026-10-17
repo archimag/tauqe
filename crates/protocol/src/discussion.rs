@@ -53,6 +53,22 @@ pub struct DiscussionPlanUpdate {
     pub items: Vec<PlanItem>,
 }
 
+/// Declarative repository search request emitted during discovery or discussion turns.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepoSearchRequest {
+    pub path: String,
+    pub regex: String,
+}
+
+impl RepoSearchRequest {
+    pub fn new(path: impl Into<String>, regex: impl Into<String>) -> Self {
+        Self {
+            path: path.into(),
+            regex: regex.into(),
+        }
+    }
+}
+
 /// Structured file context request emitted during discussion turns.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DiscussionContextRequest {
@@ -267,6 +283,13 @@ pub struct DiscussionResponse {
         skip_serializing_if = "Vec::is_empty"
     )]
     pub context_requests: Vec<DiscussionContextRequest>,
+    #[serde(
+        default,
+        alias = "search_requests",
+        deserialize_with = "deserialize_null_as_default",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub repo_searches: Vec<RepoSearchRequest>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_language: Option<String>,
 }
@@ -277,6 +300,7 @@ impl DiscussionResponse {
             message: message.into(),
             plan_update: None,
             context_requests: Vec::new(),
+            repo_searches: Vec::new(),
             user_language: None,
         }
     }
@@ -291,13 +315,18 @@ impl DiscussionResponse {
         self
     }
 
+    pub fn with_repo_searches(mut self, searches: Vec<RepoSearchRequest>) -> Self {
+        self.repo_searches = searches;
+        self
+    }
+
     pub fn with_user_language(mut self, language: impl Into<String>) -> Self {
         self.user_language = Some(language.into());
         self
     }
 }
 
-fn deserialize_null_as_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+pub(crate) fn deserialize_null_as_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
 where
     D: serde::Deserializer<'de>,
     T: Default + Deserialize<'de>,
@@ -497,12 +526,25 @@ mod tests {
     }
 
     #[test]
+    fn test_repo_search_request_serde() {
+        let req = RepoSearchRequest::new("crates/protocol", r"pub fn \w+");
+        let json = serde_json::to_string(&req).unwrap();
+        assert_eq!(
+            json,
+            r#"{"path":"crates/protocol","regex":"pub fn \\w+"}"#
+        );
+        let de: RepoSearchRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(de, req);
+    }
+
+    #[test]
     fn test_discussion_response_minimal_serde() {
         let raw = r#"{"message":"Hello developer!"}"#;
         let resp: DiscussionResponse = serde_json::from_str(raw).unwrap();
         assert_eq!(resp.message, "Hello developer!");
         assert!(resp.plan_update.is_none());
         assert!(resp.context_requests.is_empty());
+        assert!(resp.repo_searches.is_empty());
         assert!(resp.user_language.is_none());
     }
 
@@ -512,13 +554,29 @@ mod tests {
             "message": "Acknowledged",
             "plan_update": null,
             "context_requests": null,
+            "repo_searches": null,
             "user_language": null
         }"#;
         let resp: DiscussionResponse = serde_json::from_str(raw).unwrap();
         assert_eq!(resp.message, "Acknowledged");
         assert!(resp.plan_update.is_none());
         assert!(resp.context_requests.is_empty());
+        assert!(resp.repo_searches.is_empty());
         assert!(resp.user_language.is_none());
+    }
+
+    #[test]
+    fn test_discussion_response_search_requests_alias() {
+        let raw = r#"{
+            "message": "Let me search",
+            "search_requests": [
+                {"path": "crates/core", "regex": "fn execute"}
+            ]
+        }"#;
+        let resp: DiscussionResponse = serde_json::from_str(raw).unwrap();
+        assert_eq!(resp.repo_searches.len(), 1);
+        assert_eq!(resp.repo_searches[0].path, "crates/core");
+        assert_eq!(resp.repo_searches[0].regex, "fn execute");
     }
 
     #[test]
@@ -529,6 +587,10 @@ mod tests {
                 DiscussionContextRequest::read_only("crates/core/src/lib.rs"),
                 DiscussionContextRequest::editable("crates/protocol/src/lib.rs"),
             ])
+            .with_repo_searches(vec![RepoSearchRequest::new(
+                "crates/core",
+                r"pub fn run_\w+",
+            )])
             .with_plan_update(DiscussionPlanUpdate {
                 action: DiscussionPlanAction::Update,
                 id: Some("structured-output".to_string()),

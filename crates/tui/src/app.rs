@@ -8,12 +8,13 @@ use crate::components::model_selector::ModelSelector;
 use crate::components::ListSelector;
 use crate::config::TuiConfig;
 use crate::editor::InputEditor;
+use crate::i18n::{active_t, I18nEngine};
 use crate::theme::presets::ThemePreset;
 use crate::theme::selector::ThemeSelectorState;
 use crate::views::context::ContextViewState;
-use crate::views::develop::{DevelopView, TurnStatus};
 use crate::views::history::HistoryViewState;
 use crate::views::plans::PlansViewState;
+use crate::views::repl::{ReplView, TurnStatus};
 use crate::views::review::ReviewViewState;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -95,6 +96,7 @@ pub enum ActiveModal {
     RefineDialog,
     RefineBlocked,
     Prompt,
+    Locale,
     ClearHistory,
     Status,
     Selection,
@@ -403,7 +405,7 @@ impl StatusDialogTarget {
     pub fn options_count(&self) -> usize {
         match self {
             Self::PlanItem { .. } => 6,
-            Self::ReviewItem { .. } => 6,
+            Self::ReviewItem { .. } => 7,
         }
     }
 }
@@ -423,7 +425,7 @@ pub struct ConfirmExecuteReviewState {
     pub review_title: String,
     pub scope_title: String,
     pub item_id: Option<u32>,
-    pub items: Vec<tauqe_protocol::ReviewItem>,
+    pub items: Vec<tauqe_protocol::ReviewIssue>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -459,6 +461,75 @@ impl PromptModalState {
     }
 }
 
+/// Focus section of the locale dialog: the language field or the action bar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LocaleDialogFocus {
+    /// The single-line target-language field owns the keyboard.
+    #[default]
+    Editor,
+    /// The action buttons own the keyboard.
+    Actions,
+}
+
+impl LocaleDialogFocus {
+    pub fn is_editor(&self) -> bool {
+        matches!(self, Self::Editor)
+    }
+
+    pub fn is_actions(&self) -> bool {
+        matches!(self, Self::Actions)
+    }
+}
+
+/// Action selected in the locale dialog's action bar.
+///
+/// Synthesizing spends tokens through the daemon and is the primary action;
+/// resetting reverts to the built-in English; cancel dismisses without a change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LocaleDialogButton {
+    #[default]
+    Synthesize,
+    ResetEnglish,
+    Cancel,
+}
+
+impl LocaleDialogButton {
+    /// Advances focus to the next action button.
+    pub fn cycle_next(&mut self) {
+        *self = match self {
+            Self::Synthesize => Self::ResetEnglish,
+            Self::ResetEnglish => Self::Cancel,
+            Self::Cancel => Self::Synthesize,
+        };
+    }
+
+    /// Moves focus to the previous action button.
+    pub fn cycle_prev(&mut self) {
+        *self = match self {
+            Self::Synthesize => Self::Cancel,
+            Self::ResetEnglish => Self::Synthesize,
+            Self::Cancel => Self::ResetEnglish,
+        };
+    }
+}
+
+/// State of the interface-language (locale) dialog.
+///
+/// The developer names a target language in free form; confirming dispatches
+/// `locale/generate` to the daemon (c-4). The dialog also offers a one-step
+/// reset back to the embedded English (c-5).
+#[derive(Debug, Clone, Default)]
+pub struct LocaleDialogState {
+    /// Single-line target-language field.
+    pub language_editor: InputEditor,
+    /// Section that currently owns the keyboard.
+    pub focus: LocaleDialogFocus,
+    /// Focused action button.
+    pub button: LocaleDialogButton,
+    /// Whether synthesis request is currently in flight.
+    pub generating: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StatusDialogState {
     pub target: StatusDialogTarget,
@@ -474,7 +545,7 @@ impl StatusDialogState {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ViewMode {
-    Develop,
+    Repl,
     Plans,
     Review,
     Context,
@@ -820,7 +891,7 @@ impl OnboardingState {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct HeaderClickAreas {
     pub row: u16,
-    pub develop_tab: (u16, u16),
+    pub repl_tab: (u16, u16),
     pub context_tab: (u16, u16),
     pub review_tab: (u16, u16),
     pub plans_tab: (u16, u16),
@@ -931,6 +1002,7 @@ pub struct AppInit {
     pub onboarding: OnboardingState,
     pub input_editor: InputEditor,
     pub tui_config: TuiConfig,
+    pub i18n: I18nEngine,
     pub server_log_path: std::path::PathBuf,
 }
 
@@ -945,7 +1017,7 @@ pub struct AppState {
     pub available_models: Vec<ModelRef>,
     pub available_workflows: Vec<tauqe_protocol::WorkflowKind>,
     pub available_edit_protocols: Vec<tauqe_protocol::EditProtocolKind>,
-    pub model: DevelopView,
+    pub model: ReplView,
     pub context: ContextState,
     pub context_view: ContextViewState,
     pub history_view: HistoryViewState,
@@ -1001,6 +1073,10 @@ pub struct AppState {
     pub active_theme_preset: ThemePreset,
     /// Interactive theme preset selector, when open.
     pub theme_selector: Option<ThemeSelectorState>,
+    /// Runtime localization engine: canonical English plus the active custom locale.
+    pub i18n: I18nEngine,
+    /// Interface-language (locale) dialog, when open.
+    pub locale_dialog: Option<LocaleDialogState>,
 }
 
 impl AppState {
@@ -1012,7 +1088,7 @@ impl AppState {
             init.tui_config.theme.name.as_deref(),
             init.tui_config.theme.mode.resolve(),
         );
-        Self {
+        let state = Self {
             view_mode: init.view_mode,
             protocol_version: init.protocol_version,
             repo_state: init.repo_state,
@@ -1023,7 +1099,7 @@ impl AppState {
             available_models: init.available_models,
             available_workflows: init.available_workflows,
             available_edit_protocols: init.available_edit_protocols,
-            model: DevelopView::default(),
+            model: ReplView::default(),
             context: init.context,
             context_view: ContextViewState::default(),
             history_view: HistoryViewState::default(),
@@ -1067,7 +1143,14 @@ impl AppState {
             discussion_focus: DiscussionFocus::None,
             active_theme_preset,
             theme_selector: None,
-        }
+            i18n: init.i18n,
+            locale_dialog: None,
+        };
+        // Publish the resolved catalog to the process-wide locale view so chrome
+        // rendered without `&AppState` (modal footers) shares one source of
+        // truth and a hot-swapped locale reaches it too (c-1, c-5).
+        crate::i18n::install_active_locale(&state.i18n);
+        state
     }
 
     pub fn notify(&mut self, text: impl Into<String>, level: NotificationLevel, ttl: std::time::Duration) {
@@ -1220,6 +1303,9 @@ impl AppState {
         if self.prompt_modal.is_some() {
             return Some(ActiveModal::Prompt);
         }
+        if self.locale_dialog.is_some() {
+            return Some(ActiveModal::Locale);
+        }
         if self.confirm_clear_history {
             return Some(ActiveModal::ClearHistory);
         }
@@ -1260,7 +1346,7 @@ impl AppState {
             return None;
         }
         if self.model.is_busy() || self.review.running {
-            self.notify_warning("Model is generating. Press Esc to cancel or wait until done.");
+            self.notify_warning(active_t("notify.model_busy_esc"));
             return None;
         }
         let prompt = self.input_editor.get_text().trim().to_string();
@@ -1340,6 +1426,34 @@ impl AppState {
     pub fn open_theme_selector(&mut self) {
         self.theme_selector = Some(ThemeSelectorState::new(self.active_theme_preset));
     }
+
+    /// Opens the interface-language (locale) dialog.
+    ///
+    /// Blocked when a model turn or review is already running to avoid
+    /// conflicting with active operations, and preserves in-flight locale
+    /// synthesis if one is already generating.
+    pub fn open_locale_dialog(&mut self) {
+        if self.model.is_busy() || self.review.running {
+            self.notify_warning(active_t("notify.locale_busy"));
+            return;
+        }
+        if self.locale_dialog.as_ref().is_some_and(|d| d.generating) {
+            return;
+        }
+        self.locale_dialog = Some(LocaleDialogState::default());
+    }
+
+    /// Hot-swaps the active custom locale, taking effect immediately (c-5).
+    pub fn apply_custom_locale(&mut self, locale: crate::i18n::CustomLocale) {
+        self.i18n.apply_custom_locale(locale);
+        crate::i18n::install_active_locale(&self.i18n);
+    }
+
+    /// Deactivates the custom locale, reverting to embedded English (c-5).
+    pub fn reset_locale_to_english(&mut self) {
+        self.i18n.reset_locale_to_english();
+        crate::i18n::install_active_locale(&self.i18n);
+    }
 }
 
 /// Shared test fixture: a fully constructed [`AppState`] with deterministic
@@ -1347,7 +1461,7 @@ impl AppState {
 #[cfg(test)]
 pub(crate) fn test_state() -> AppState {
     AppState::new(AppInit {
-        view_mode: ViewMode::Develop,
+        view_mode: ViewMode::Repl,
         protocol_version: "1.0".to_string(),
         repo_state: None,
         all_repo_files: Vec::new(),
@@ -1361,6 +1475,7 @@ pub(crate) fn test_state() -> AppState {
         onboarding: OnboardingState::default(),
         input_editor: InputEditor::default(),
         tui_config: TuiConfig::default(),
+        i18n: I18nEngine::english(),
         server_log_path: std::path::PathBuf::from(".tauqe/server.log"),
     })
 }
@@ -1386,6 +1501,33 @@ mod tests {
         st.tui_config.theme.name = Some("catppuccin".to_string());
         st.sync_theme_mode();
         assert_eq!(st.active_theme_preset, ThemePreset::Catppuccin);
+    }
+
+    #[test]
+    fn test_open_locale_dialog_blocked_when_model_busy() {
+        let mut st = test_state();
+        st.model.status = TurnStatus::Responding;
+
+        st.open_locale_dialog();
+        assert!(st.locale_dialog.is_none());
+        let notif = st.active_notification().expect("warning notification");
+        assert!(notif.text.contains("Cannot change locale"));
+    }
+
+    #[test]
+    fn test_open_locale_dialog_does_not_wipe_generating_state() {
+        let mut st = test_state();
+        let mut dialog = LocaleDialogState {
+            generating: true,
+            ..Default::default()
+        };
+        dialog.language_editor.insert_str("French");
+        st.locale_dialog = Some(dialog);
+
+        st.open_locale_dialog();
+        let current = st.locale_dialog.as_ref().expect("dialog remains present");
+        assert!(current.generating);
+        assert_eq!(current.language_editor.get_text(), "French");
     }
 
     #[test]

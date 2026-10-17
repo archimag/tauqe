@@ -48,8 +48,8 @@ fn fallback_turn_marker() -> String {
 
 pub(super) const XML_TAG_BASES: &[&str] = &[
     "tauqe_edits", "edit", "search", "replace", "create", "delete", "move", "with", "summary",
-    "context_request", "context_drop", "user_language", "verify", "overwrite", "doc_request",
-    "plan", "concept", "concept_item", "item", "description", "details", "title",
+    "context_request", "context_drop", "repo_search", "user_language", "verify", "overwrite",
+    "doc_request", "plan", "concept", "concept_item", "item", "description", "details", "title",
     "scratchpad", "success", "error", "blocked",
 ];
 

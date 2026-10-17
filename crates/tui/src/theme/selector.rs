@@ -17,6 +17,7 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
 use crate::app::AppState;
 use crate::components::ListSelector;
+use crate::i18n::active_t;
 use crate::theme::engine::current_engine;
 use crate::theme::presets::ThemePreset;
 
@@ -107,13 +108,25 @@ pub fn handle_theme_selector_click(st: &mut AppState, col: u16, row: u16, term: 
         && row < body.y + body.height;
     if inside_body {
         // The body's first row is the "Preview applies live." caption; preset
-        // rows follow it in declaration order.
+        // rows follow it. The visible window starts at the current scroll
+        // offset, so the clicked visual row maps to the row actually drawn
+        // (`#c-4`, Conventions §6.6).
         let body_row = (row - body.y) as usize;
-        if body_row >= 1 && body_row - 1 < ThemePreset::ALL.len() {
-            let visible = theme_selector_visible_height(term);
-            selector_state.selector.select_index(body_row - 1, visible);
-            let preset = selector_state.selected_preset();
-            st.apply_theme_preset(preset);
+        if body_row >= 1 {
+            let index = selector_state.selector.scroll_offset() + (body_row - 1);
+            if index < ThemePreset::ALL.len() {
+                if index == selector_state.selector.selected_index() {
+                    // A second click on the highlighted preset commits it,
+                    // giving the mouse the same save path as `Enter`.
+                    let preset = selector_state.selected_preset();
+                    commit_preset(st, preset);
+                    return true;
+                }
+                let visible = theme_selector_visible_height(term);
+                selector_state.selector.select_index(index, visible);
+                let preset = selector_state.selected_preset();
+                st.apply_theme_preset(preset);
+            }
         }
     }
 
@@ -149,7 +162,7 @@ fn preset_row(preset: ThemePreset, is_selected: bool, is_active: bool) -> Line<'
     if is_active {
         spans.push(Span::raw(" "));
         spans.push(Span::styled(
-            "[active]",
+            active_t("dialog.theme_select.active_badge"),
             engine.fg(palette.status_success).bold(),
         ));
     }
@@ -164,7 +177,7 @@ pub fn render_theme_selector(frame: &mut ratatui::Frame, state: &ThemeSelectorSt
     frame.render_widget(Clear, area);
 
     let block = Block::default()
-        .title(" Select Theme ")
+        .title(format!(" {} ", active_t("dialog.theme_select.title")))
         .borders(Borders::ALL)
         .border_style(engine.fg(palette.status_info))
         .style(ratatui::style::Style::default().bg(engine.color(palette.surface)));
@@ -177,12 +190,21 @@ pub fn render_theme_selector(frame: &mut ratatui::Frame, state: &ThemeSelectorSt
         .split(inner);
 
     let active = engine.preset();
-    let mut body: Vec<Line<'static>> = Vec::with_capacity(ThemePreset::ALL.len() + 1);
+    // Render only the visible window of presets so the drawn rows always match
+    // the rows the click and keyboard navigation address (`#c-4`).
+    let visible = theme_selector_visible_height(frame.area());
+    let start = state.selector.scroll_offset();
+    let mut body: Vec<Line<'static>> = Vec::with_capacity(visible + 1);
     body.push(Line::from(Span::styled(
-        "Preview applies live.",
+        active_t("dialog.theme_select.preview_note"),
         engine.fg(palette.text_muted),
     )));
-    for (idx, preset) in ThemePreset::ALL.iter().enumerate() {
+    for (idx, preset) in ThemePreset::ALL
+        .iter()
+        .enumerate()
+        .skip(start)
+        .take(visible)
+    {
         body.push(preset_row(
             *preset,
             idx == state.selector.selected_index(),
@@ -192,11 +214,23 @@ pub fn render_theme_selector(frame: &mut ratatui::Frame, state: &ThemeSelectorSt
     frame.render_widget(Paragraph::new(body), chunks[0]);
 
     let footer = Paragraph::new(Span::styled(
-        "n/p navigate • Enter save • Esc cancel",
+        active_t("dialog.theme_select.footer"),
         engine.fg(palette.text_muted),
     ))
     .alignment(Alignment::Center);
     frame.render_widget(footer, chunks[1]);
+}
+
+/// Commits a preset: records it in configuration, applies it live, and persists
+/// it to `tui.toml`. Shared by the keyboard `Enter` path and the mouse click on
+/// the highlighted row (`#c-4`).
+fn commit_preset(st: &mut AppState, preset: ThemePreset) {
+    st.tui_config.theme.name = Some(preset.as_str().to_string());
+    st.apply_theme_preset(preset);
+    match crate::config::save_theme_preset(preset.as_str()) {
+        Ok(_) => st.notify_success(format!("Theme saved: {}", preset.as_str())),
+        Err(err) => st.notify_error(format!("Failed to save theme: {}", err)),
+    }
 }
 
 /// Handles a key event while the theme selector owns the keyboard.
@@ -223,12 +257,7 @@ pub fn handle_theme_selector_key(key: KeyEvent, st: &mut AppState, visible_heigh
         }
         KeyCode::Enter | KeyCode::Char(' ') => {
             let preset = selector_state.selected_preset();
-            st.tui_config.theme.name = Some(preset.as_str().to_string());
-            st.apply_theme_preset(preset);
-            match crate::config::save_theme_preset(preset.as_str()) {
-                Ok(_) => st.notify_success(format!("Theme saved: {}", preset.as_str())),
-                Err(err) => st.notify_error(format!("Failed to save theme: {}", err)),
-            }
+            commit_preset(st, preset);
         }
         _ => {
             st.theme_selector = Some(selector_state);

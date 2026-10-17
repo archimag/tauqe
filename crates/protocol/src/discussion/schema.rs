@@ -117,6 +117,25 @@ pub fn discussion_response_schema() -> serde_json::Value {
                             "additionalProperties": false
                         }
                     },
+                    "repo_searches": {
+                        "type": "array",
+                        "description": "Repository search requests to find symbols or text patterns across files",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "path": {
+                                    "type": "string",
+                                    "description": "Repository-relative directory or file path to search within"
+                                },
+                                "regex": {
+                                    "type": "string",
+                                    "description": "Regular expression pattern to search for"
+                                }
+                            },
+                            "required": ["path", "regex"],
+                            "additionalProperties": false
+                        }
+                    },
                     "user_language": {
                         "anyOf": [
                             { "type": "string" },
@@ -125,7 +144,7 @@ pub fn discussion_response_schema() -> serde_json::Value {
                         "description": "Detected primary natural language of the user prompt"
                     }
                 },
-                "required": ["message", "plan_update", "context_requests", "user_language"],
+                "required": ["message", "plan_update", "context_requests", "repo_searches", "user_language"],
                 "additionalProperties": false,
                 "$defs": {
                     "ConceptItem": {
@@ -243,6 +262,7 @@ mod tests {
     use crate::context::ContextAccess;
     use crate::discussion::{
         DiscussionContextRequest, DiscussionPlanAction, DiscussionPlanUpdate, DiscussionResponse,
+        RepoSearchRequest,
     };
     use crate::plan::{ConceptItem, PlanItem, PlanItemStatus};
 
@@ -261,11 +281,13 @@ mod tests {
         let msg_idx = schema_str.find("\"message\"").expect("message found");
         let plan_idx = schema_str.find("\"plan_update\"").expect("plan_update found");
         let ctx_idx = schema_str.find("\"context_requests\"").expect("context_requests found");
+        let search_idx = schema_str.find("\"repo_searches\"").expect("repo_searches found");
         let lang_idx = schema_str.find("\"user_language\"").expect("user_language found");
 
         assert!(msg_idx < plan_idx);
         assert!(plan_idx < ctx_idx);
-        assert!(ctx_idx < lang_idx);
+        assert!(ctx_idx < search_idx);
+        assert!(search_idx < lang_idx);
     }
 
     #[test]
@@ -315,6 +337,7 @@ mod tests {
                 items: vec![PlanItem::default()],
             })
             .with_context_requests(vec![DiscussionContextRequest::read_only("a.rs")])
+            .with_repo_searches(vec![RepoSearchRequest::new("crates/core", "regex")])
             .with_user_language("English");
         let (props, required) = field_sets(&schema);
         assert_eq!(props, keys(&serde_json::to_value(&response).unwrap()));
@@ -336,6 +359,14 @@ mod tests {
         assert_eq!(
             props,
             keys(&serde_json::to_value(DiscussionContextRequest::read_only("a.rs")).unwrap())
+        );
+        assert_eq!(required, props);
+
+        // 3a. repo_searches item object.
+        let (props, required) = field_sets(&schema["properties"]["repo_searches"]["items"]);
+        assert_eq!(
+            props,
+            keys(&serde_json::to_value(RepoSearchRequest::new("a", "b")).unwrap())
         );
         assert_eq!(required, props);
 

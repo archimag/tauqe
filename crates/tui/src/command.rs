@@ -6,11 +6,6 @@
 //! help generator both read these same structures, so the keys the developer
 //! sees in help can never drift from the keys the application actually
 //! intercepts.
-//!
-//! The module is the foundation of the command-map refactor. The dispatchers and
-//! help surfaces are migrated onto it in later steps, so part of its public
-//! surface is intentionally not yet consumed by production code.
-#![allow(dead_code)]
 
 pub mod dialog;
 pub mod editor;
@@ -139,7 +134,10 @@ fn code_label(code: KeyCode, upper: bool) -> String {
         KeyCode::Char(c) => c.to_string(),
         KeyCode::Enter => "Enter".to_string(),
         KeyCode::Tab => "Tab".to_string(),
-        KeyCode::BackTab => "BackTab".to_string(),
+        // `BackTab` is `Shift+Tab` reported as a dedicated code, so it is
+        // labeled `Tab`: a `Shift` chord then renders as the canonical
+        // `Shift+Tab` and deduplicates against the enhanced-keyboard spelling.
+        KeyCode::BackTab => "Tab".to_string(),
         KeyCode::Esc => "Esc".to_string(),
         KeyCode::Backspace => "Backspace".to_string(),
         KeyCode::Delete => "Del".to_string(),
@@ -171,41 +169,52 @@ pub enum CommandCategory {
 impl CommandCategory {
     /// Canonical display order: Essential, Interface, Helpers.
     pub const ALL: [CommandCategory; 3] = [Self::Essential, Self::Interface, Self::Helpers];
-
-    /// Human-readable section title.
-    pub fn title(self) -> &'static str {
-        match self {
-            Self::Essential => "Essential",
-            Self::Interface => "Interface",
-            Self::Helpers => "Helpers",
-        }
-    }
 }
 
 /// One keyboard command: the abstract chord, its action, its cognitive category,
-/// and its help description.
+/// and the localization key of its help description.
+///
+/// The description is not stored as a literal English string (Conventions §9):
+/// the spec carries an i18n key, and [`CommandSpec::description`] resolves it
+/// through the active locale when Help renders the command. The command registry
+/// stays a single source of truth for both input dispatch and Help rendering.
 #[derive(Debug, Clone, Copy)]
 pub struct CommandSpec<A> {
     pub chord: KeyChord,
     pub action: A,
     pub category: CommandCategory,
-    pub description: &'static str,
+    pub description_key: &'static str,
 }
 
 impl<A> CommandSpec<A> {
-    /// Builds a command specification. `const` so registries are declared as
-    /// `static` values.
+    /// Builds a command specification from its localization key. `const` so
+    /// registries are declared as `static` values.
     pub const fn new(
         chord: KeyChord,
         action: A,
         category: CommandCategory,
-        description: &'static str,
+        description_key: &'static str,
     ) -> Self {
         Self {
             chord,
             action,
             category,
-            description,
+            description_key,
+        }
+    }
+
+    /// Resolves the command description through the active locale.
+    ///
+    /// The stored key is looked up in the canonical catalog (Conventions §9). A
+    /// key that is not registered falls back to its literal text, so a registry
+    /// not yet migrated to the catalog keeps rendering its description instead
+    /// of disappearing from Help.
+    pub fn description(&self) -> String {
+        let localized = crate::i18n::active_t(self.description_key);
+        if localized.is_empty() {
+            self.description_key.to_string()
+        } else {
+            localized
         }
     }
 }
@@ -252,7 +261,16 @@ impl<A: 'static> CommandMap<A> {
 
 #[cfg(test)]
 mod tests {
+    use super::dialog::DIALOG_COMMAND_MAP;
+    use super::editor::EDITOR_COMMAND_MAP;
+    use super::global::GLOBAL_COMMAND_MAP;
     use super::*;
+
+    use crate::views::context::input::CONTEXT_COMMAND_MAP;
+    use crate::views::history::input::HISTORY_COMMAND_MAP;
+    use crate::views::plans::input::PLANS_COMMAND_MAP;
+    use crate::views::repl::input::REPL_COMMAND_MAP;
+    use crate::views::review::input::REVIEW_COMMAND_MAP;
 
     fn ctrl_primary() -> InputConfig {
         InputConfig {
@@ -418,7 +436,6 @@ mod tests {
                 CommandCategory::Helpers,
             ]
         );
-        assert_eq!(CommandCategory::Essential.title(), "Essential");
         assert!(CommandCategory::Essential < CommandCategory::Helpers);
     }
 
@@ -466,5 +483,141 @@ mod tests {
             .map(|spec| spec.action)
             .collect();
         assert_eq!(helpers, vec![3]);
+    }
+
+    // --- Integration tests: single source of truth and anti-drift (c-1, c-2, c-3) ---
+
+    /// Asserts every chord in a map is declared exactly once.
+    ///
+    /// Two specs sharing an abstract chord would make resolution order-dependent
+    /// and would let the generated Help advertise a key that dispatch never
+    /// reaches, so uniqueness is the invariant that keeps a map a true single
+    /// source of truth (c-1).
+    fn assert_unique_chords<A: 'static>(map: &CommandMap<A>, label: &str) {
+        let specs = map.specs();
+        assert!(!specs.is_empty(), "{label}: a command map must not be empty");
+        for (index, spec) in specs.iter().enumerate() {
+            for other in specs.iter().skip(index + 1) {
+                assert_ne!(
+                    spec.chord, other.chord,
+                    "{label}: duplicate key chord {:?}",
+                    spec.chord
+                );
+            }
+        }
+    }
+
+    /// Asserts every command carries a description that resolves to text.
+    ///
+    /// A spec with a blank description would silently disappear from the
+    /// generated Help dialog, which is exactly the drift this suite forbids
+    /// (c-1, c-3).
+    fn assert_every_command_is_described<A: 'static>(map: &CommandMap<A>, label: &str) {
+        for spec in map.specs() {
+            assert!(
+                !spec.description_key.is_empty(),
+                "{label}: every command must carry a description key"
+            );
+            assert!(
+                !spec.description().is_empty(),
+                "{label}: description '{}' must resolve to non-empty text",
+                spec.description_key
+            );
+        }
+    }
+
+    fn physical_primary_modifiers(modifier: PrimaryModifier) -> KeyModifiers {
+        match modifier {
+            PrimaryModifier::Ctrl => KeyModifiers::CONTROL,
+            PrimaryModifier::Alt => KeyModifiers::ALT,
+        }
+    }
+
+    fn physical_meta_modifiers(modifier: MetaModifier) -> KeyModifiers {
+        match modifier {
+            MetaModifier::Alt => KeyModifiers::ALT,
+            MetaModifier::Ctrl => KeyModifiers::CONTROL,
+        }
+    }
+
+    /// Asserts every abstract `Primary` / `Meta` / `PrimaryOrMeta` chord resolves
+    /// to its own action under one modifier configuration.
+    ///
+    /// This is the anti-drift guarantee behind the symmetric modifier
+    /// abstraction (c-2): the physical key tracks the developer's configured
+    /// `primary_modifier` / `meta_modifier`, while the resolved action stays
+    /// anchored to the abstract chord, so a remapped workstation never silently
+    /// rebinds a command.
+    fn assert_abstract_modifiers_for_config<A>(
+        map: &CommandMap<A>,
+        input: &InputConfig,
+        label: &str,
+    ) where
+        A: Copy + PartialEq + std::fmt::Debug + 'static,
+    {
+        for spec in map.specs() {
+            let (code, modifiers) = match spec.chord {
+                KeyChord::Primary(code) => {
+                    (code, physical_primary_modifiers(input.primary_modifier))
+                }
+                KeyChord::Meta(code) => (code, physical_meta_modifiers(input.meta_modifier)),
+                KeyChord::PrimaryOrMeta(code) => {
+                    (code, physical_primary_modifiers(input.primary_modifier))
+                }
+                _ => continue,
+            };
+            let resolved_action = map
+                .resolve(KeyEvent::new(code, modifiers), input, false)
+                .map(|resolved| resolved.action);
+            assert_eq!(
+                resolved_action,
+                Some(spec.action),
+                "{label}: chord {:?} must resolve to its own action under every modifier configuration",
+                spec.chord
+            );
+        }
+    }
+
+    fn assert_map_follows_both_configurations<A>(map: &CommandMap<A>, label: &str)
+    where
+        A: Copy + PartialEq + std::fmt::Debug + 'static,
+    {
+        assert_abstract_modifiers_for_config(map, &ctrl_primary(), label);
+        assert_abstract_modifiers_for_config(map, &alt_primary(), label);
+    }
+
+    #[test]
+    fn every_command_map_declares_unique_key_chords() {
+        assert_unique_chords(&GLOBAL_COMMAND_MAP, "GLOBAL_COMMAND_MAP");
+        assert_unique_chords(&EDITOR_COMMAND_MAP, "EDITOR_COMMAND_MAP");
+        assert_unique_chords(&DIALOG_COMMAND_MAP, "DIALOG_COMMAND_MAP");
+        assert_unique_chords(&CONTEXT_COMMAND_MAP, "CONTEXT_COMMAND_MAP");
+        assert_unique_chords(&HISTORY_COMMAND_MAP, "HISTORY_COMMAND_MAP");
+        assert_unique_chords(&PLANS_COMMAND_MAP, "PLANS_COMMAND_MAP");
+        assert_unique_chords(&REPL_COMMAND_MAP, "REPL_COMMAND_MAP");
+        assert_unique_chords(&REVIEW_COMMAND_MAP, "REVIEW_COMMAND_MAP");
+    }
+
+    #[test]
+    fn every_registered_command_is_described() {
+        assert_every_command_is_described(&GLOBAL_COMMAND_MAP, "GLOBAL_COMMAND_MAP");
+        assert_every_command_is_described(&EDITOR_COMMAND_MAP, "EDITOR_COMMAND_MAP");
+        assert_every_command_is_described(&DIALOG_COMMAND_MAP, "DIALOG_COMMAND_MAP");
+        assert_every_command_is_described(&CONTEXT_COMMAND_MAP, "CONTEXT_COMMAND_MAP");
+        assert_every_command_is_described(&HISTORY_COMMAND_MAP, "HISTORY_COMMAND_MAP");
+        assert_every_command_is_described(&PLANS_COMMAND_MAP, "PLANS_COMMAND_MAP");
+        assert_every_command_is_described(&REPL_COMMAND_MAP, "REPL_COMMAND_MAP");
+        assert_every_command_is_described(&REVIEW_COMMAND_MAP, "REVIEW_COMMAND_MAP");
+    }
+
+    #[test]
+    fn abstract_modifiers_follow_the_configured_primary_and_meta() {
+        assert_map_follows_both_configurations(&GLOBAL_COMMAND_MAP, "GLOBAL_COMMAND_MAP");
+        assert_map_follows_both_configurations(&EDITOR_COMMAND_MAP, "EDITOR_COMMAND_MAP");
+        assert_map_follows_both_configurations(&CONTEXT_COMMAND_MAP, "CONTEXT_COMMAND_MAP");
+        assert_map_follows_both_configurations(&HISTORY_COMMAND_MAP, "HISTORY_COMMAND_MAP");
+        assert_map_follows_both_configurations(&PLANS_COMMAND_MAP, "PLANS_COMMAND_MAP");
+        assert_map_follows_both_configurations(&REPL_COMMAND_MAP, "REPL_COMMAND_MAP");
+        assert_map_follows_both_configurations(&REVIEW_COMMAND_MAP, "REVIEW_COMMAND_MAP");
     }
 }

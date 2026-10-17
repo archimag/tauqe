@@ -80,7 +80,27 @@ fn next_concept_item_bounds(text: &str) -> Option<(usize, usize)> {
     None
 }
 
-pub(super) fn parse_concept_items_with_diagnostics(content: &str) -> (Vec<tauqe_protocol::ConceptItem>, Vec<String>) {
+pub(super) fn parse_concept_items_with_diagnostics(
+    content: &str,
+) -> (Vec<tauqe_protocol::ConceptItem>, Vec<String>) {
+    let (items, errors) = parse_concept_items_inner(content);
+    if items.is_empty() && !content.trim().is_empty() {
+        let fallback_items = parse_concept_items_fallback(content);
+        if !fallback_items.is_empty() {
+            return (fallback_items, errors);
+        }
+    }
+    (items, errors)
+}
+
+/// Parses `<concept_item>` entries within a `<concept>` section.
+///
+/// This is the recursion-safe core: it parses recognized tags and descends
+/// into their bodies, but it never runs the unstructured-text fallback. The
+/// fallback belongs to the section root only (see
+/// [`parse_concept_items_with_diagnostics`]), so `<details>` prose inside a
+/// recognized `<concept_item>` cannot spawn phantom child entries.
+fn parse_concept_items_inner(content: &str) -> (Vec<tauqe_protocol::ConceptItem>, Vec<String>) {
     let mut items = Vec::new();
     let mut errors = Vec::new();
     let mut pos = 0;
@@ -185,7 +205,7 @@ pub(super) fn parse_concept_items_with_diagnostics(content: &str) -> (Vec<tauqe_
 
             if let (Some(cend), Some(cend_full)) = (close_start, close_end) {
                 let body = &content[header_end..cend];
-                let (children, child_errors) = parse_concept_items_with_diagnostics(body);
+                let (children, child_errors) = parse_concept_items_inner(body);
                 errors.extend(child_errors);
                 let text_only = strip_tags(body, next_concept_item_bounds);
 
@@ -242,13 +262,6 @@ pub(super) fn parse_concept_items_with_diagnostics(content: &str) -> (Vec<tauqe_
                 errors.push(format!("Malformed concept item tag: missing closing tag </{tag_name}>"));
                 pos = header_end;
             }
-        }
-    }
-
-    if items.is_empty() && !content.trim().is_empty() {
-        let fallback_items = parse_concept_items_fallback(content);
-        if !fallback_items.is_empty() {
-            return (fallback_items, errors);
         }
     }
 
@@ -390,4 +403,62 @@ fn parse_concept_items_fallback(content: &str) -> Vec<tauqe_protocol::ConceptIte
     }
 
     items
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn single_concept_item_with_details_has_no_phantom_children() {
+        let content = r#"
+<concept_item id="c-1" title="Token Security">
+  <details>
+    Authentication must use short-lived, rotating tokens.
+    Refresh must never leak the signing key.
+  </details>
+</concept_item>
+"#;
+        let (items, errors) = parse_concept_items_with_diagnostics(content);
+        assert!(errors.is_empty(), "Unexpected errors: {:?}", errors);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].id, "c-1");
+        assert!(
+            items[0].children.is_empty(),
+            "details prose must not spawn phantom children"
+        );
+    }
+
+    #[test]
+    fn fallback_runs_once_at_the_section_root() {
+        let content = "- #c-1 Verification Symmetry\n  Preflight runs the same checks.";
+        let (items, errors) = parse_concept_items_with_diagnostics(content);
+        assert!(errors.is_empty(), "Unexpected errors: {:?}", errors);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].id, "c-1");
+        assert_eq!(items[0].title, "Verification Symmetry");
+        assert_eq!(
+            items[0].details.as_deref(),
+            Some("Preflight runs the same checks.")
+        );
+    }
+
+    #[test]
+    fn nested_concept_items_are_parsed_without_fallback_children() {
+        let content = r#"
+<concept_item id="c-1" title="Parent">
+  <details>Parent details stay attached to the parent.</details>
+  <concept_item id="c-1.1" title="Child" />
+</concept_item>
+"#;
+        let (items, errors) = parse_concept_items_with_diagnostics(content);
+        assert!(errors.is_empty(), "Unexpected errors: {:?}", errors);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].children.len(), 1);
+        assert_eq!(items[0].children[0].id, "c-1.1");
+        assert_eq!(
+            items[0].details.as_deref(),
+            Some("Parent details stay attached to the parent.")
+        );
+    }
 }

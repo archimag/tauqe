@@ -19,8 +19,8 @@ use crate::handlers::model::{build_apply_policy, execute_model_turn, StepTurnOpt
 use crate::state::{AppState, OperationGuard};
 
 use super::common::{
-    clear_auto_context, emit, report_step_failure, set_step_status, turn_applied_edits,
-    unmet_dependencies,
+    clear_auto_context, emit, offload_plan, report_step_failure, set_step_status,
+    turn_applied_edits, unmet_dependencies, with_context_mutation,
 };
 
 /// Loads the declared target and reference files of a step into the auto context
@@ -31,14 +31,6 @@ pub(crate) async fn preload_step_files(state: &Arc<AppState>, repo_root: &Path, 
     if item.files.is_empty() && item.readonly_files.is_empty() {
         return;
     }
-    let available_files = {
-        let repo_root = repo_root.to_path_buf();
-        crate::handlers::offload(move || tauqe_core::git::list_repository_files(Some(&repo_root)))
-            .await
-            .ok()
-            .and_then(|files| files.ok())
-            .unwrap_or_default()
-    };
     let mut requests: Vec<ContextRequest> =
         Vec::with_capacity(item.files.len() + item.readonly_files.len());
     requests.extend(item.files.iter().map(|p| ContextRequest {
@@ -50,19 +42,25 @@ pub(crate) async fn preload_step_files(state: &Arc<AppState>, repo_root: &Path, 
         access: ContextAccess::ReadOnly,
     }));
 
-    let (outcome, new_ctx_state) = {
-        let mut ctx = state.context.write().await;
-        let oc = apply_context_requests_detailed(&mut ctx, &requests, &available_files, usize::MAX);
-        let s = ctx.get_state();
-        (oc, s)
-    };
+    let root = repo_root.to_path_buf();
+    let preloaded = with_context_mutation(state, move |ctx| {
+        let available_files = tauqe_core::git::list_repository_files(Some(&root))
+            .ok()
+            .unwrap_or_default();
+        let outcome = apply_context_requests_detailed(ctx, &requests, &available_files, usize::MAX);
+        let new_state = ctx.get_state();
+        (outcome, new_state)
+    })
+    .await;
 
-    if !outcome.added.is_empty() {
-        emit(
-            &state.out,
-            events::CONTEXT_CHANGED,
-            Some(serde_json::json!({ "state": new_ctx_state })),
-        );
+    if let Ok((outcome, new_ctx_state)) = preloaded {
+        if !outcome.added.is_empty() {
+            emit(
+                &state.out,
+                events::CONTEXT_CHANGED,
+                Some(serde_json::json!({ "state": new_ctx_state })),
+            );
+        }
     }
 }
 
@@ -93,10 +91,12 @@ async fn run_plan_step_inner(
     batch_step_ids: &[String],
     operation: Arc<OperationGuard>,
 ) -> BatchStepOutcome {
-    let plan = match PlanStorage::load_plan(repo_root, plan_id) {
+    let load_root = repo_root.to_path_buf();
+    let load_plan_id = plan_id.to_string();
+    let plan = match offload_plan(move || PlanStorage::load_plan(&load_root, &load_plan_id)).await {
         Ok(Some(p)) => p,
         Ok(None) => return BatchStepOutcome::failed(format!("Plan '{}' not found", plan_id)),
-        Err(err) => return BatchStepOutcome::failed(format!("{:#}", err)),
+        Err(err) => return BatchStepOutcome::failed(err),
     };
     let item = match plan.find_item(step_id) {
         Some(i) => i.clone(),
@@ -146,7 +146,7 @@ async fn run_plan_step_inner(
     }
 
     preload_step_files(state, repo_root, &item).await;
-    set_step_status(state, repo_root, plan_id, step_id, PlanItemStatus::InProgress);
+    set_step_status(state, repo_root, plan_id, step_id, PlanItemStatus::InProgress).await;
     tracing::info!(plan_id = plan_id, step_id = step_id, "plan step started");
 
     // Generate the active turn marker before assembling prompts so the target
@@ -164,7 +164,7 @@ async fn run_plan_step_inner(
     ) {
         Ok(p) => p,
         Err(err) => {
-            set_step_status(state, repo_root, plan_id, step_id, PlanItemStatus::Todo);
+            set_step_status(state, repo_root, plan_id, step_id, PlanItemStatus::Todo).await;
             return BatchStepOutcome::failed(err);
         }
     };
@@ -210,7 +210,7 @@ async fn run_plan_step_inner(
         let turn = match turn_result {
             Ok(turn) => turn,
             Err(err) => {
-                set_step_status(state, repo_root, plan_id, step_id, PlanItemStatus::Todo);
+                set_step_status(state, repo_root, plan_id, step_id, PlanItemStatus::Todo).await;
                 let op_id = format!("op-{}", crate::state::next_operation_id());
                 report_step_failure(state, &op_id, &err.message);
                 return BatchStepOutcome::failed(err.message);
@@ -223,7 +223,7 @@ async fn run_plan_step_inner(
         // to the supervisor as a distinct outcome so clients can tell a blocked
         // step apart from a plain failure.
         if let Some(reason) = turn.blocked.clone() {
-            set_step_status(state, repo_root, plan_id, step_id, PlanItemStatus::Blocked);
+            set_step_status(state, repo_root, plan_id, step_id, PlanItemStatus::Blocked).await;
             report_step_failure(state, &turn.operation_id, &reason);
             return BatchStepOutcome::blocked(reason);
         }
@@ -231,7 +231,7 @@ async fn run_plan_step_inner(
         let applied = turn_applied_edits(&turn);
 
         if turn.is_success() && applied {
-            set_step_status(state, repo_root, plan_id, step_id, PlanItemStatus::Done);
+            set_step_status(state, repo_root, plan_id, step_id, PlanItemStatus::Done).await;
             return BatchStepOutcome::succeeded();
         }
 
@@ -239,7 +239,7 @@ async fn run_plan_step_inner(
         // TODO and the supervisor stops with `BatchStop::Cancelled` instead of
         // reporting a spurious failure.
         if turn.is_cancelled {
-            set_step_status(state, repo_root, plan_id, step_id, PlanItemStatus::Todo);
+            set_step_status(state, repo_root, plan_id, step_id, PlanItemStatus::Todo).await;
             return BatchStepOutcome::cancelled();
         }
 
@@ -252,7 +252,7 @@ async fn run_plan_step_inner(
         });
 
         if attempt >= max_retries {
-            set_step_status(state, repo_root, plan_id, step_id, PlanItemStatus::Todo);
+            set_step_status(state, repo_root, plan_id, step_id, PlanItemStatus::Todo).await;
             if turn.error.is_none() {
                 report_step_failure(state, &turn.operation_id, &reason);
             }

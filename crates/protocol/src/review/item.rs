@@ -3,49 +3,71 @@ use serde::{Deserialize, Serialize};
 use crate::model::ModelSelection;
 use crate::plan::{count_leaf_stats, PlanItem};
 
+/// Semantic category of a code review issue.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
-pub enum ReviewSeverity {
-    Critical,
-    Warning,
-    Suggestion,
+pub enum IssueType {
     #[default]
-    Info,
+    #[serde(alias = "critical")]
+    Bug,
+    Security,
+    #[serde(alias = "warning", alias = "warn")]
+    Architecture,
+    Performance,
+    #[serde(alias = "style", alias = "suggestion")]
+    Quality,
 }
 
-impl std::fmt::Display for ReviewSeverity {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl IssueType {
+    pub fn as_str(&self) -> &'static str {
         match self {
-            Self::Critical => write!(f, "CRITICAL"),
-            Self::Warning => write!(f, "WARN"),
-            Self::Suggestion => write!(f, "SUGGESTION"),
-            Self::Info => write!(f, "INFO"),
+            Self::Bug => "bug",
+            Self::Security => "security",
+            Self::Architecture => "architecture",
+            Self::Performance => "performance",
+            Self::Quality => "quality",
+        }
+    }
+
+    pub fn display_badge(&self) -> &'static str {
+        match self {
+            Self::Bug => "BUG",
+            Self::Security => "SEC",
+            Self::Architecture => "ARCH",
+            Self::Performance => "PERF",
+            Self::Quality => "QUAL",
         }
     }
 }
 
+impl std::fmt::Display for IssueType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.display_badge())
+    }
+}
+
+/// Lifecycle status of a review issue, supporting refinement before resolution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
-pub enum ReviewItemStatus {
+pub enum IssueStatus {
     #[default]
     Discussion,
     Todo,
     InProgress,
-    /// Legacy `done` alias retained so review sessions written before the
-    /// rename stay readable; scheduled for removal in 0.2.0 and tracked by the
-    /// wire-contract test in `lib.rs`.
+    Refine,
     #[serde(alias = "done")]
     Fixed,
     Skipped,
     Rejected,
 }
 
-impl ReviewItemStatus {
+impl IssueStatus {
     pub fn next(&self) -> Self {
         match self {
             Self::Discussion => Self::Todo,
             Self::Todo => Self::InProgress,
-            Self::InProgress => Self::Fixed,
+            Self::InProgress => Self::Refine,
+            Self::Refine => Self::Fixed,
             Self::Fixed => Self::Skipped,
             Self::Skipped => Self::Rejected,
             Self::Rejected => Self::Discussion,
@@ -53,12 +75,13 @@ impl ReviewItemStatus {
     }
 }
 
-impl std::fmt::Display for ReviewItemStatus {
+impl std::fmt::Display for IssueStatus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Discussion => write!(f, "DISCUSSION"),
             Self::Todo => write!(f, "TODO"),
             Self::InProgress => write!(f, "IN_PROGRESS"),
+            Self::Refine => write!(f, "REFINE"),
             Self::Fixed => write!(f, "FIXED"),
             Self::Skipped => write!(f, "SKIPPED"),
             Self::Rejected => write!(f, "REJECTED"),
@@ -66,98 +89,171 @@ impl std::fmt::Display for ReviewItemStatus {
     }
 }
 
+/// Unified status alias for review items and findings.
+pub type ReviewItemStatus = IssueStatus;
+
+/// Severity classification for review findings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewSeverity {
+    #[serde(alias = "bug", alias = "security")]
+    Critical,
+    #[serde(alias = "architecture", alias = "performance")]
+    Warning,
+    #[serde(alias = "quality", alias = "style")]
+    Suggestion,
+    #[default]
+    Info,
+}
+
+impl ReviewSeverity {
+    pub fn display_badge(&self) -> &'static str {
+        match self {
+            Self::Critical => "CRIT",
+            Self::Warning => "WARN",
+            Self::Suggestion => "SUGG",
+            Self::Info => "INFO",
+        }
+    }
+}
+
+impl std::fmt::Display for ReviewSeverity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.display_badge())
+    }
+}
+
+impl From<ReviewSeverity> for IssueType {
+    fn from(s: ReviewSeverity) -> Self {
+        match s {
+            ReviewSeverity::Critical => IssueType::Bug,
+            ReviewSeverity::Warning => IssueType::Architecture,
+            ReviewSeverity::Suggestion => IssueType::Quality,
+            ReviewSeverity::Info => IssueType::Quality,
+        }
+    }
+}
+
+impl From<IssueType> for ReviewSeverity {
+    fn from(t: IssueType) -> Self {
+        match t {
+            IssueType::Bug | IssueType::Security => ReviewSeverity::Critical,
+            IssueType::Architecture | IssueType::Performance => ReviewSeverity::Warning,
+            IssueType::Quality => ReviewSeverity::Suggestion,
+        }
+    }
+}
+
+/// A structured review issue with classified type, recommendations, and resolution plan.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(from = "ReviewItemRaw")]
+pub struct ReviewIssue {
+    pub id: u32,
+    pub title: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<ModelSelection>,
+    #[serde(rename = "type", alias = "severity", alias = "issue_type")]
+    pub issue_type: IssueType,
+    #[serde(default)]
+    pub status: IssueStatus,
+    #[serde(default, alias = "body")]
+    pub description: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub recommendations: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub files: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub readonly_files: Vec<String>,
+    #[serde(default, alias = "subplan", skip_serializing_if = "Vec::is_empty")]
+    pub plan: Vec<PlanItem>,
+    #[serde(default, alias = "resolution_notes", skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+impl ReviewIssue {
+    pub fn has_plan(&self) -> bool {
+        !self.plan.is_empty()
+    }
+
+    pub fn plan_stats(&self) -> (usize, usize) {
+        count_leaf_stats(&self.plan)
+    }
+
+    pub fn has_subplan(&self) -> bool {
+        self.has_plan()
+    }
+
+    pub fn subplan_stats(&self) -> (usize, usize) {
+        self.plan_stats()
+    }
+}
+
+/// A review finding stored as an individual item of a review session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReviewItem {
     pub id: u32,
     pub title: String,
-    /// Model tier or explicit model assigned to resolve this finding. `None` means the default tier.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<ModelSelection>,
+    #[serde(rename = "severity", alias = "type", alias = "issue_type", default)]
     pub severity: ReviewSeverity,
+    #[serde(default)]
     pub status: ReviewItemStatus,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub recommendations: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub files: Vec<String>,
-    /// Embedded step plan that decomposes this finding into traceable sub-steps.
-    ///
-    /// The subplan reuses [`PlanItem`] verbatim, so sub-step scheduling,
-    /// dependency evaluation, and status computation share the plan engine's
-    /// single source of truth. An empty vector means the finding carries no
-    /// decomposition.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub readonly_files: Vec<String>,
+    #[serde(default, alias = "plan", skip_serializing_if = "Vec::is_empty")]
     pub subplan: Vec<PlanItem>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, alias = "note", skip_serializing_if = "Option::is_none")]
     pub resolution_notes: Option<String>,
+    #[serde(default, rename = "body", alias = "description")]
     pub body: String,
 }
 
 impl ReviewItem {
-    /// Returns `true` when the finding carries an embedded step plan.
     pub fn has_subplan(&self) -> bool {
         !self.subplan.is_empty()
     }
 
-    /// Counts executable leaves in the embedded subplan as `(total, completed)`.
-    ///
-    /// Delegates to [`crate::plan::count_leaf_stats`], the plan engine's single
-    /// authoritative progress metric, so a finding's subplan progress can never
-    /// drift from a full plan's progress.
     pub fn subplan_stats(&self) -> (usize, usize) {
         count_leaf_stats(&self.subplan)
     }
 }
 
-/// Legacy on-disk shape of a review finding.
-///
-/// Loading goes through this raw shape so sessions written by earlier versions
-/// stay readable. The obsolete `line_range` location field is no longer parsed:
-/// findings now reference whole files through `files`, so the line range is
-/// intentionally dropped during migration instead of being read and silently
-/// discarded.
-#[derive(Deserialize)]
-struct ReviewItemRaw {
-    pub id: u32,
-    pub title: String,
-    #[serde(default)]
-    pub model: Option<ModelSelection>,
-    #[serde(default)]
-    pub severity: ReviewSeverity,
-    #[serde(default)]
-    pub status: ReviewItemStatus,
-    #[serde(default)]
-    pub files: Vec<String>,
-    /// Legacy single-file location folded into `files` on load.
-    #[serde(default)]
-    pub file_path: Option<String>,
-    #[serde(default)]
-    pub subplan: Vec<PlanItem>,
-    #[serde(default)]
-    pub resolution_notes: Option<String>,
-    #[serde(default)]
-    pub body: String,
+impl From<ReviewIssue> for ReviewItem {
+    fn from(issue: ReviewIssue) -> Self {
+        Self {
+            id: issue.id,
+            title: issue.title,
+            model: issue.model,
+            severity: ReviewSeverity::from(issue.issue_type),
+            status: issue.status,
+            recommendations: issue.recommendations,
+            files: issue.files,
+            readonly_files: issue.readonly_files,
+            subplan: issue.plan,
+            resolution_notes: issue.note,
+            body: issue.description,
+        }
+    }
 }
 
-impl From<ReviewItemRaw> for ReviewItem {
-    fn from(raw: ReviewItemRaw) -> Self {
-        let mut files = raw.files;
-        if files.is_empty() {
-            if let Some(path) = raw.file_path {
-                let trimmed = path.trim();
-                if !trimmed.is_empty() {
-                    files.push(trimmed.to_string());
-                }
-            }
-        }
+impl From<ReviewItem> for ReviewIssue {
+    fn from(item: ReviewItem) -> Self {
         Self {
-            id: raw.id,
-            title: raw.title,
-            model: raw.model,
-            severity: raw.severity,
-            status: raw.status,
-            files,
-            subplan: raw.subplan,
-            resolution_notes: raw.resolution_notes,
-            body: raw.body,
+            id: item.id,
+            title: item.title,
+            model: item.model,
+            issue_type: IssueType::from(item.severity),
+            status: item.status,
+            description: item.body,
+            recommendations: item.recommendations,
+            files: item.files,
+            readonly_files: item.readonly_files,
+            plan: item.subplan,
+            note: item.resolution_notes,
         }
     }
 }

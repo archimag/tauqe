@@ -3,8 +3,8 @@ use std::collections::HashSet;
 use ratatui::style::{Style, Stylize};
 use ratatui::text::{Line, Span};
 use tauqe_protocol::{
-    DiscussionFocus, DiscussionTarget, ModelRef, ModelSelection, PlanItem, PlanItemStatus,
-    ReviewItem, ReviewItemStatus, ReviewSession, ReviewSeverity,
+    DiscussionFocus, DiscussionTarget, IssueStatus, IssueType, ModelRef, ModelSelection, PlanItem,
+    PlanItemStatus, ReviewIssue, ReviewItem, ReviewSession,
 };
 
 use crate::theme::engine::current_engine;
@@ -44,14 +44,21 @@ pub enum VisibleReviewRow {
         session_id: String,
         item_id: u32,
         title: String,
-        body: String,
-        severity: ReviewSeverity,
-        status: ReviewItemStatus,
+        /// Classified problem type driving the `[BUG]`/`[SEC]`/... badge.
+        issue_type: IssueType,
+        status: IssueStatus,
         model: Option<ModelSelection>,
         files: Vec<String>,
-        resolution_notes: Option<String>,
+        /// Immutable contracts, interfaces, and invariants the fix must rely on
+        /// but must never modify.
+        readonly_files: Vec<String>,
+        /// Technical description of the defect, rendered as a Markdown block.
+        description: String,
+        /// Concrete, ordered remediation strategy, rendered as a Markdown list.
+        recommendations: Vec<String>,
+        note: Option<String>,
         /// Embedded step plan decomposed by the Architect, rendered on expansion.
-        subplan: Vec<PlanItem>,
+        plan: Vec<PlanItem>,
         is_expanded: bool,
         /// Whether the active discussion focus anchors on this finding.
         focused: bool,
@@ -139,19 +146,22 @@ impl ReviewViewState {
     ///
     /// When `review_id` is set, only the session with that id is touched, so a
     /// finding with the same numeric id in another session is never modified.
-    pub fn apply_item(&mut self, review_id: Option<&str>, item: ReviewItem) {
+    pub fn apply_item(&mut self, review_id: Option<&str>, item: ReviewIssue) {
         let in_scope = |session_id: &str| review_id.is_none_or(|id| id == session_id);
+        // Session storage keeps findings in the durable `ReviewItem` form, so
+        // an incoming `ReviewIssue` is projected onto that form on the way in.
+        let stored: ReviewItem = item.clone().into();
         if let Some(session) = self.session.as_mut() {
             if in_scope(&session.id) {
-                if let Some(existing) = session.items.iter_mut().find(|i| i.id == item.id) {
-                    *existing = item.clone();
+                if let Some(existing) = session.items.iter_mut().find(|i| i.id == stored.id) {
+                    *existing = stored.clone();
                 }
             }
         }
         for session in &mut self.sessions {
             if in_scope(&session.id) {
-                if let Some(existing) = session.items.iter_mut().find(|i| i.id == item.id) {
-                    *existing = item.clone();
+                if let Some(existing) = session.items.iter_mut().find(|i| i.id == stored.id) {
+                    *existing = stored.clone();
                     break;
                 }
             }
@@ -161,7 +171,7 @@ impl ReviewViewState {
     /// Single path for changing a finding status (optimistic update and
     /// rollback). Updates both the session list used for rendering and the
     /// active session copy, scoped by `review_id` when provided.
-    pub fn set_item_status(&mut self, review_id: Option<&str>, item_id: u32, status: ReviewItemStatus) {
+    pub fn set_item_status(&mut self, review_id: Option<&str>, item_id: u32, status: IssueStatus) {
         let in_scope = |session_id: &str| review_id.is_none_or(|id| id == session_id);
         if let Some(session) = self.session.as_mut() {
             if in_scope(&session.id) {
@@ -315,32 +325,32 @@ impl ReviewViewState {
             let fixed = session
                 .items
                 .iter()
-                .filter(|i| i.status == ReviewItemStatus::Fixed)
+                .filter(|i| i.status == IssueStatus::Fixed)
                 .count();
             let todo = session
                 .items
                 .iter()
-                .filter(|i| i.status == ReviewItemStatus::Todo)
+                .filter(|i| i.status == IssueStatus::Todo)
                 .count();
             let in_progress = session
                 .items
                 .iter()
-                .filter(|i| i.status == ReviewItemStatus::InProgress)
+                .filter(|i| i.status == IssueStatus::InProgress)
                 .count();
             let discussion = session
                 .items
                 .iter()
-                .filter(|i| i.status == ReviewItemStatus::Discussion)
+                .filter(|i| i.status == IssueStatus::Discussion)
                 .count();
             let skipped = session
                 .items
                 .iter()
-                .filter(|i| i.status == ReviewItemStatus::Skipped)
+                .filter(|i| i.status == IssueStatus::Skipped)
                 .count();
             let rejected = session
                 .items
                 .iter()
-                .filter(|i| i.status == ReviewItemStatus::Rejected)
+                .filter(|i| i.status == IssueStatus::Rejected)
                 .count();
 
             rows.push(VisibleReviewRow::SessionHeader {
@@ -375,11 +385,18 @@ impl ReviewViewState {
                         });
                     }
                 }
+                // Findings are stored as durable `ReviewItem` values and are
+                // projected onto the richer `ReviewIssue` view vocabulary, so
+                // the row exposes the classified problem type, the split
+                // description/recommendations, the protected readonly
+                // contracts, and the embedded plan through one explicit field
+                // mapping.
                 for item in &session.items {
                     if self.hide_closed
-                        && (item.status == ReviewItemStatus::Fixed
-                            || item.status == ReviewItemStatus::Skipped
-                            || item.status == ReviewItemStatus::Rejected)
+                        && matches!(
+                            item.status,
+                            IssueStatus::Fixed | IssueStatus::Skipped | IssueStatus::Rejected
+                        )
                     {
                         continue;
                     }
@@ -388,13 +405,15 @@ impl ReviewViewState {
                         session_id: session.id.clone(),
                         item_id: item.id,
                         title: item.title.clone(),
-                        body: item.body.clone(),
-                        severity: item.severity,
+                        issue_type: IssueType::from(item.severity),
                         status: item.status,
                         model: item.model.clone(),
                         files: item.files.clone(),
-                        resolution_notes: item.resolution_notes.clone(),
-                        subplan: item.subplan.clone(),
+                        readonly_files: item.readonly_files.clone(),
+                        description: item.body.clone(),
+                        recommendations: item.recommendations.clone(),
+                        note: item.resolution_notes.clone(),
+                        plan: item.subplan.clone(),
                         is_expanded: item_expanded,
                         focused: self.is_item_focused(&session.id, item.id),
                     });
@@ -463,9 +482,9 @@ impl ReviewViewState {
             });
             for item in &session.items {
                 if self.hide_closed
-                    && (item.status == ReviewItemStatus::Fixed
-                        || item.status == ReviewItemStatus::Skipped
-                        || item.status == ReviewItemStatus::Rejected)
+                    && (item.status == IssueStatus::Fixed
+                        || item.status == IssueStatus::Skipped
+                        || item.status == IssueStatus::Rejected)
                 {
                     continue;
                 }
@@ -541,29 +560,73 @@ impl ReviewViewState {
     }
 }
 
-fn severity_style(severity: ReviewSeverity) -> Style {
-    let engine = current_engine();
-    let palette = engine.palette();
-    match severity {
-        ReviewSeverity::Critical => engine.fg(palette.status_error).bold(),
-        ReviewSeverity::Warning => engine.fg(palette.status_warning).bold(),
-        ReviewSeverity::Suggestion => engine.fg(palette.status_info).bold(),
-        ReviewSeverity::Info => engine.fg(palette.text_secondary).bold(),
+/// Short badge text for a classified problem type.
+///
+/// The `quality` category maps to the domain `Style` variant, so it renders as
+/// `[QUAL]` rather than the raw enum name.
+fn issue_type_badge(issue_type: IssueType) -> &'static str {
+    match issue_type {
+        IssueType::Bug => "BUG",
+        IssueType::Security => "SEC",
+        IssueType::Architecture => "ARCH",
+        IssueType::Performance => "PERF",
+        IssueType::Quality => "QUAL",
     }
 }
 
-fn status_style(status: ReviewItemStatus) -> Style {
+/// Emphasized color for a finding's problem type badge.
+fn issue_type_style(issue_type: IssueType) -> Style {
+    let engine = current_engine();
+    let palette = engine.palette();
+    match issue_type {
+        IssueType::Bug | IssueType::Security => engine.fg(palette.status_error).bold(),
+        IssueType::Architecture | IssueType::Performance => {
+            engine.fg(palette.status_warning).bold()
+        }
+        IssueType::Quality => engine.fg(palette.status_info).bold(),
+    }
+}
+
+/// Filled badge style for a finding's lifecycle status, including `Refine`.
+fn issue_status_style(status: IssueStatus) -> Style {
     let engine = current_engine();
     let palette = engine.palette();
     let inverse = engine.color(palette.text_inverse);
     match status {
-        ReviewItemStatus::Discussion => engine.bg(palette.button_active_bg).fg(inverse).bold(),
-        ReviewItemStatus::Todo => engine.bg(palette.status_warning).fg(inverse).bold(),
-        ReviewItemStatus::InProgress => engine.bg(palette.status_info).fg(inverse).bold(),
-        ReviewItemStatus::Fixed => engine.bg(palette.status_success).fg(inverse).bold(),
-        ReviewItemStatus::Skipped => engine.bg(palette.text_muted).fg(inverse).bold(),
-        ReviewItemStatus::Rejected => engine.bg(palette.text_muted).fg(inverse).bold(),
+        IssueStatus::Discussion => engine.bg(palette.button_active_bg).fg(inverse).bold(),
+        IssueStatus::Refine => engine.bg(palette.status_error).fg(inverse).bold(),
+        IssueStatus::Todo => engine.bg(palette.status_warning).fg(inverse).bold(),
+        IssueStatus::InProgress => engine.bg(palette.status_info).fg(inverse).bold(),
+        IssueStatus::Fixed => engine.bg(palette.status_success).fg(inverse).bold(),
+        IssueStatus::Skipped | IssueStatus::Rejected => {
+            engine.bg(palette.text_muted).fg(inverse).bold()
+        }
     }
+}
+
+/// Formats a Unix timestamp (seconds) as a compact UTC calendar instant
+/// (`YYYY-MM-DD HH:MM UTC`) for the session header.
+fn format_created_at(seconds: u64) -> String {
+    let days = (seconds / 86_400) as i64;
+    let rem = seconds % 86_400;
+    let (hour, minute) = (rem / 3_600, (rem % 3_600) / 60);
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if month <= 2 {
+        yoe + era * 400 + 1
+    } else {
+        yoe + era * 400
+    };
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02} UTC",
+        year, month, day, hour, minute
+    )
 }
 
 /// Compact indicator marking the row anchored by the active discussion focus.
@@ -675,14 +738,15 @@ fn model_badge(selection: &ModelSelection) -> Span<'static> {
     }
 }
 
-fn status_label(status: ReviewItemStatus) -> &'static str {
+fn issue_status_label(status: IssueStatus) -> &'static str {
     match status {
-        ReviewItemStatus::Discussion => "DISCUSSION",
-        ReviewItemStatus::Todo => "TODO",
-        ReviewItemStatus::InProgress => "IN_PROGRESS",
-        ReviewItemStatus::Fixed => "FIXED",
-        ReviewItemStatus::Skipped => "SKIP",
-        ReviewItemStatus::Rejected => "REJECTED",
+        IssueStatus::Discussion => "DISCUSSION",
+        IssueStatus::Todo => "TODO",
+        IssueStatus::InProgress => "IN_PROGRESS",
+        IssueStatus::Refine => "REFINE",
+        IssueStatus::Fixed => "FIXED",
+        IssueStatus::Skipped => "SKIP",
+        IssueStatus::Rejected => "REJECTED",
     }
 }
 
@@ -708,7 +772,7 @@ fn split_title_and_file_path(title: &str) -> (&str, Option<&str>) {
 }
 
 fn pad_line_to_width(mut line: Line<'static>, width: usize, fill_style: Style) -> Line<'static> {
-    let current_width: usize = line.spans.iter().map(|s| s.content.chars().count()).sum();
+    let current_width: usize = line.spans.iter().map(|s| s.width()).sum();
     if current_width < width {
         line.spans.push(Span::styled(" ".repeat(width - current_width), fill_style));
     }
@@ -747,6 +811,7 @@ fn compute_unified_review_lines(
                 session_id,
                 title,
                 model,
+                created_at,
                 total,
                 fixed,
                 todo,
@@ -779,6 +844,10 @@ fn compute_unified_review_lines(
                     Span::styled(title.clone(), engine.fg(palette.text_primary).bold()),
                     Span::styled(
                         format!(" ({}) ", model),
+                        engine.fg(palette.text_muted),
+                    ),
+                    Span::styled(
+                        format!("{}  ", format_created_at(*created_at)),
                         engine.fg(palette.text_muted),
                     ),
                     Span::styled(
@@ -859,25 +928,27 @@ fn compute_unified_review_lines(
             VisibleReviewRow::ReviewItem {
                 item_id,
                 title,
-                body,
-                severity,
+                issue_type,
                 status,
                 model,
                 files,
-                resolution_notes,
-                subplan,
+                readonly_files,
+                description,
+                recommendations,
+                note,
+                plan,
                 is_expanded,
                 focused,
                 ..
             } => {
                 let fold_icon = if *is_expanded { "▼ " } else { "▶ " };
-                let label = status_label(*status);
+                let label = issue_status_label(*status);
 
                 let title_style = if is_selected {
                     engine.fg(palette.text_primary).bold()
-                } else if *status == ReviewItemStatus::Fixed
-                    || *status == ReviewItemStatus::Skipped
-                    || *status == ReviewItemStatus::Rejected
+                } else if *status == IssueStatus::Fixed
+                    || *status == IssueStatus::Skipped
+                    || *status == IssueStatus::Rejected
                 {
                     engine.fg(palette.text_secondary)
                 } else {
@@ -891,9 +962,12 @@ fn compute_unified_review_lines(
                     gutter,
                     Span::raw("    "),
                     Span::styled(fold_icon, engine.fg(palette.status_warning).bold()),
-                    Span::styled(format!(" {} ", label), status_style(*status)),
+                    Span::styled(
+                        format!(" {} ", issue_type_badge(*issue_type)),
+                        issue_type_style(*issue_type),
+                    ),
                     Span::raw(" "),
-                    Span::styled(format!("[{}]", severity), severity_style(*severity)),
+                    Span::styled(format!(" {} ", label), issue_status_style(*status)),
                     Span::raw(" "),
                     Span::styled(format!("#{} {}", item_id, display_title), title_style),
                 ];
@@ -910,8 +984,14 @@ fn compute_unified_review_lines(
                         engine.fg(palette.text_muted),
                     ));
                 }
-                if !subplan.is_empty() {
-                    let (done, total) = subplan_progress(subplan.as_slice());
+                if !readonly_files.is_empty() {
+                    spans.push(Span::styled(
+                        format!(" [{} readonly]", readonly_files.len()),
+                        engine.fg(palette.text_muted),
+                    ));
+                }
+                if !plan.is_empty() {
+                    let (done, total) = subplan_progress(plan.as_slice());
                     if total > 0 {
                         spans.push(Span::styled(
                             format!(" [{}/{} steps]", done, total),
@@ -948,10 +1028,23 @@ fn compute_unified_review_lines(
                         }
                     }
 
-                    if let Some(notes) = resolution_notes.as_deref() {
+                    if !readonly_files.is_empty() {
+                        row_lines.push(Line::from(vec![
+                            Span::styled(
+                                "        Readonly (do not modify): ",
+                                engine.fg(palette.status_warning).bold(),
+                            ),
+                            Span::styled(
+                                readonly_files.join(", "),
+                                engine.fg(palette.text_primary),
+                            ),
+                        ]));
+                    }
+
+                    if let Some(notes) = note.as_deref() {
                         let clean_notes = notes.trim();
                         if !clean_notes.is_empty() {
-                            let note_header = if *status == ReviewItemStatus::Skipped {
+                            let note_header = if *status == IssueStatus::Skipped {
                                 "        Skip Reason: "
                             } else {
                                 "        Note: "
@@ -984,8 +1077,11 @@ fn compute_unified_review_lines(
                         }
                     }
 
-                    let clean_body = body.trim();
-                    if !clean_body.is_empty() {
+                    if !description.trim().is_empty() {
+                        row_lines.push(Line::from(Span::styled(
+                            "        Description:",
+                            engine.fg(palette.status_info).bold(),
+                        )));
                         let mut theme =
                             crate::markdown::MarkdownTheme::answer_themed(theme_mode);
                         theme.text_style = engine.fg(palette.text_secondary);
@@ -995,18 +1091,37 @@ fn compute_unified_review_lines(
                             "        │ ",
                             engine.fg(palette.text_muted),
                         ));
-                        let md = crate::markdown::render_markdown(clean_body, &theme);
+                        let md = crate::markdown::render_markdown(description.trim(), &theme);
                         if !md.is_empty() {
                             row_lines.extend(md);
                         }
                     }
 
-                    if !subplan.is_empty() {
+                    if !recommendations.is_empty() {
+                        row_lines.push(Line::from(Span::styled(
+                            "        Recommendations:",
+                            engine.fg(palette.status_success).bold(),
+                        )));
+                        for rec in recommendations {
+                            row_lines.push(Line::from(vec![
+                                Span::styled(
+                                    "        │ • ",
+                                    engine.fg(palette.text_muted),
+                                ),
+                                Span::styled(
+                                    rec.clone(),
+                                    engine.fg(palette.text_primary),
+                                ),
+                            ]));
+                        }
+                    }
+
+                    if !plan.is_empty() {
                         row_lines.push(Line::from(Span::styled(
                             "        Subtasks:",
                             engine.fg(palette.status_info).bold(),
                         )));
-                        row_lines.extend(subplan_lines(subplan.as_slice(), 0));
+                        row_lines.extend(subplan_lines(plan.as_slice(), 0));
                     }
                 }
 
@@ -1021,19 +1136,21 @@ fn compute_unified_review_lines(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tauqe_protocol::{ReviewItem, ReviewItemStatus, ReviewSeverity, ReviewSession};
+    use tauqe_protocol::{IssueStatus, IssueType, ReviewIssue, ReviewSession};
 
-    fn make_item(id: u32) -> ReviewItem {
-        ReviewItem {
+    fn make_item(id: u32) -> ReviewIssue {
+        ReviewIssue {
             id,
             title: format!("Finding {}", id),
             model: None,
-            severity: ReviewSeverity::Warning,
-            status: ReviewItemStatus::Todo,
+            issue_type: IssueType::Architecture,
+            status: IssueStatus::Todo,
+            description: String::new(),
+            recommendations: Vec::new(),
             files: Vec::new(),
-            subplan: vec![],
-            resolution_notes: None,
-            body: String::new(),
+            readonly_files: Vec::new(),
+            plan: vec![],
+            note: None,
         }
     }
 
@@ -1046,7 +1163,10 @@ mod tests {
             description: None,
             user_prompt: None,
             target_files: Vec::new(),
-            items: item_ids.iter().map(|&i| make_item(i)).collect(),
+            items: item_ids
+                .iter()
+                .map(|&i| ReviewItem::from(make_item(i)))
+                .collect(),
             raw_markdown: String::new(),
         }
     }
@@ -1060,29 +1180,29 @@ mod tests {
         view.session = view.sessions.first().cloned();
 
         // Updating rev-2 must not touch the same-numbered finding in rev-1.
-        view.set_item_status(Some("rev-2"), 1, ReviewItemStatus::Fixed);
-        assert_eq!(view.sessions[0].items[0].status, ReviewItemStatus::Todo);
-        assert_eq!(view.sessions[1].items[0].status, ReviewItemStatus::Fixed);
+        view.set_item_status(Some("rev-2"), 1, IssueStatus::Fixed);
+        assert_eq!(view.sessions[0].items[0].status, IssueStatus::Todo);
+        assert_eq!(view.sessions[1].items[0].status, IssueStatus::Fixed);
         assert_eq!(
             view.session.as_ref().map(|s| s.items[0].status),
-            Some(ReviewItemStatus::Todo)
+            Some(IssueStatus::Todo)
         );
 
         // Updating the active session keeps both copies in sync.
-        view.set_item_status(Some("rev-1"), 1, ReviewItemStatus::InProgress);
-        assert_eq!(view.sessions[0].items[0].status, ReviewItemStatus::InProgress);
+        view.set_item_status(Some("rev-1"), 1, IssueStatus::InProgress);
+        assert_eq!(view.sessions[0].items[0].status, IssueStatus::InProgress);
         assert_eq!(
             view.session.as_ref().map(|s| s.items[0].status),
-            Some(ReviewItemStatus::InProgress)
+            Some(IssueStatus::InProgress)
         );
-        assert_eq!(view.sessions[1].items[0].status, ReviewItemStatus::Fixed);
+        assert_eq!(view.sessions[1].items[0].status, IssueStatus::Fixed);
 
         // apply_item is scoped the same way.
         let mut replacement = make_item(1);
-        replacement.status = ReviewItemStatus::Rejected;
+        replacement.status = IssueStatus::Rejected;
         view.apply_item(Some("rev-2"), replacement);
-        assert_eq!(view.sessions[0].items[0].status, ReviewItemStatus::InProgress);
-        assert_eq!(view.sessions[1].items[0].status, ReviewItemStatus::Rejected);
+        assert_eq!(view.sessions[0].items[0].status, IssueStatus::InProgress);
+        assert_eq!(view.sessions[1].items[0].status, IssueStatus::Rejected);
     }
 
     #[test]
@@ -1293,11 +1413,11 @@ mod tests {
     #[test]
     fn test_review_item_skipped_badge_and_skip_reason_notes() {
         let mut session = make_session("rev-skip", &[1, 2]);
-        session.items[0].status = ReviewItemStatus::Skipped;
+        session.items[0].status = IssueStatus::Skipped;
         session.items[0].resolution_notes = Some(
             "Already addressed in previous turn\nVerified no code change needed".to_string(),
         );
-        session.items[1].status = ReviewItemStatus::Fixed;
+        session.items[1].status = IssueStatus::Fixed;
         session.items[1].resolution_notes = Some("Fixed race condition".to_string());
 
         let mut view = ReviewViewState {
@@ -1339,13 +1459,13 @@ mod tests {
     #[test]
     fn test_session_header_statistics_with_skipped() {
         let mut session = make_session("rev-stats", &[1, 2, 3, 4, 5, 6, 7]);
-        session.items[0].status = ReviewItemStatus::Fixed;
-        session.items[1].status = ReviewItemStatus::Todo;
-        session.items[2].status = ReviewItemStatus::InProgress;
-        session.items[3].status = ReviewItemStatus::Discussion;
-        session.items[4].status = ReviewItemStatus::Skipped;
-        session.items[5].status = ReviewItemStatus::Skipped;
-        session.items[6].status = ReviewItemStatus::Rejected;
+        session.items[0].status = IssueStatus::Fixed;
+        session.items[1].status = IssueStatus::Todo;
+        session.items[2].status = IssueStatus::InProgress;
+        session.items[3].status = IssueStatus::Discussion;
+        session.items[4].status = IssueStatus::Skipped;
+        session.items[5].status = IssueStatus::Skipped;
+        session.items[6].status = IssueStatus::Rejected;
 
         let view = ReviewViewState {
             sessions: vec![session],
@@ -1382,6 +1502,61 @@ mod tests {
             header_text.contains("1/7 fixed (1 todo, 1 prog, 1 disc, 2 skip, 1 rej)"),
             "expected session statistics formatted with skip count, got: {header_text}"
         );
+    }
+
+    #[test]
+    fn test_issue_type_badges_and_status_labels() {
+        assert_eq!(issue_type_badge(IssueType::Bug), "BUG");
+        assert_eq!(issue_type_badge(IssueType::Security), "SEC");
+        assert_eq!(issue_type_badge(IssueType::Architecture), "ARCH");
+        assert_eq!(issue_type_badge(IssueType::Performance), "PERF");
+        assert_eq!(issue_type_badge(IssueType::Quality), "QUAL");
+
+        assert_eq!(issue_status_label(IssueStatus::Refine), "REFINE");
+        assert_eq!(issue_status_label(IssueStatus::Skipped), "SKIP");
+        assert_eq!(issue_status_label(IssueStatus::InProgress), "IN_PROGRESS");
+    }
+
+    #[test]
+    fn test_format_created_at_is_utc_and_stable() {
+        assert_eq!(format_created_at(0), "1970-01-01 00:00 UTC");
+        assert_eq!(format_created_at(1_700_000_000), "2023-11-14 22:13 UTC");
+    }
+
+    #[test]
+    fn test_session_header_renders_created_date() {
+        let session = make_session("rev-date", &[1]);
+        let view = ReviewViewState {
+            sessions: vec![session],
+            ..Default::default()
+        };
+        let rows = view.flatten_rows();
+        let (lines, _) =
+            compute_unified_review_lines(&rows, 0, 120, crate::config::ThemeMode::Dark);
+        let header_text = lines[0].to_string();
+        assert!(
+            header_text.contains("1970-01-01 00:00 UTC"),
+            "expected the formatted creation date in the header, got: {header_text}"
+        );
+    }
+
+    #[test]
+    fn test_review_item_renders_issue_type_and_refine_status() {
+        let mut session = make_session("rev-refine-badge", &[1]);
+        session.items[0].severity = IssueType::Bug.into();
+        let mut view = ReviewViewState {
+            sessions: vec![session],
+            ..Default::default()
+        };
+        view.toggle_item_expanded("rev-refine-badge", 1);
+
+        let rows = view.flatten_rows();
+        let (lines, _) =
+            compute_unified_review_lines(&rows, 1, 120, crate::config::ThemeMode::Dark);
+        let text: String = lines.iter().map(|line| line.to_string()).collect();
+
+        // A critical severity projects onto the Bug category and its badge.
+        assert!(text.contains(" BUG "), "expected the issue-type badge: {text}");
     }
 
     #[test]

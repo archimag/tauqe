@@ -170,6 +170,7 @@ trait XmlExtraction {
     fn clean_assistant_text(&self, raw_text: &str) -> String;
     fn parse_output(&self, raw_text: &str, editable_paths: &[String]) -> ModelResult;
     fn parse_context_requests(&self, raw_text: &str) -> Vec<ContextRequest>;
+    fn parse_repo_searches(&self, raw_text: &str) -> Vec<tauqe_protocol::RepoSearchRequest>;
     fn parse_doc_requests(&self, raw_text: &str) -> Vec<DocTopic>;
     fn parse_plan_tags(&self, raw_text: &str) -> (Vec<ParsedPlanTag>, Vec<String>);
     fn parse_verify_request(&self, raw_text: &str) -> Option<VerifyRequest>;
@@ -187,6 +188,9 @@ impl XmlExtraction for XmlEditProtocol {
     }
     fn parse_context_requests(&self, raw_text: &str) -> Vec<ContextRequest> {
         XmlEditProtocol::parse_context_requests(self, raw_text)
+    }
+    fn parse_repo_searches(&self, raw_text: &str) -> Vec<tauqe_protocol::RepoSearchRequest> {
+        XmlEditProtocol::parse_repo_searches(self, raw_text)
     }
     fn parse_doc_requests(&self, raw_text: &str) -> Vec<DocTopic> {
         XmlEditProtocol::parse_doc_requests(self, raw_text)
@@ -217,6 +221,9 @@ impl XmlExtraction for MarkedXmlEditProtocol {
     }
     fn parse_context_requests(&self, raw_text: &str) -> Vec<ContextRequest> {
         MarkedXmlEditProtocol::parse_context_requests(self, raw_text)
+    }
+    fn parse_repo_searches(&self, raw_text: &str) -> Vec<tauqe_protocol::RepoSearchRequest> {
+        MarkedXmlEditProtocol::parse_repo_searches(self, raw_text)
     }
     fn parse_doc_requests(&self, raw_text: &str) -> Vec<DocTopic> {
         MarkedXmlEditProtocol::parse_doc_requests(self, raw_text)
@@ -269,6 +276,14 @@ fn decode_xml_commands(xml: &impl XmlExtraction, raw_text: &str) -> Vec<LlmComma
         commands.push(LlmCommand::ContextRequest {
             path: request.path,
             access: request.access,
+        });
+    }
+
+    // Discovery: repository search requests.
+    for search in xml.parse_repo_searches(raw_text) {
+        commands.push(LlmCommand::RepoSearch {
+            path: search.path,
+            regex: search.regex,
         });
     }
 
@@ -475,6 +490,7 @@ mod tests {
         let output = concat!(
             "Working on it.\n",
             "<context_request path=\"src/a.rs\" access=\"editable\" />\n",
+            "<repo_search path=\"src\" regex=\"fn main\" />\n",
             "<doc_request topic=\"workflow\" />\n",
             "<verify target=\"clippy\" on_success=\"silent\" />\n",
             "<scratchpad>Verified: parser works.</scratchpad>\n",
@@ -489,6 +505,10 @@ mod tests {
         assert!(commands.contains(&LlmCommand::ContextRequest {
             path: "src/a.rs".to_string(),
             access: ContextAccess::Editable,
+        }));
+        assert!(commands.contains(&LlmCommand::RepoSearch {
+            path: "src".to_string(),
+            regex: "fn main".to_string(),
         }));
         assert!(commands.contains(&LlmCommand::DocRequest {
             topic: DocTopic::Workflow,

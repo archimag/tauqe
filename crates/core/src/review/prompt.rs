@@ -23,7 +23,8 @@ pub use refine::{
 pub use step::{
     extract_review_skip_reason, extract_review_step_execution_id,
     extract_review_step_execution_target, format_review_step_execution_prompt,
-    format_review_step_retry_prompt, is_review_step_execution_prompt, ReviewStepTarget,
+    format_review_step_failure_note, format_review_step_retry_prompt,
+    is_review_step_execution_prompt, ReviewStepFailure, ReviewStepTarget,
     REVIEW_STEP_EXECUTION_PREFIX, REVIEW_STEP_RETRY_PREFIX,
 };
 
@@ -73,7 +74,9 @@ mod tests {
                 model: None,
                 severity: ReviewSeverity::Warning,
                 status: ReviewItemStatus::Todo,
+                recommendations: vec![],
                 files: vec!["crates/core/src/lib.rs".to_string()],
+                readonly_files: vec![],
                 subplan: vec![PlanItem {
                     id: "1.1".to_string(),
                     title: "Split module".to_string(),
@@ -114,7 +117,9 @@ mod tests {
                 model: None,
                 severity: ReviewSeverity::Critical,
                 status: ReviewItemStatus::Discussion,
+                recommendations: vec![],
                 files: vec!["crates/core/src/lib.rs".to_string()],
+                readonly_files: vec![],
                 subplan: vec![],
                 resolution_notes: Some("Break into sub-steps".to_string()),
                 body: "Needs structural division".to_string(),
@@ -157,7 +162,9 @@ mod tests {
                 model: None,
                 severity: ReviewSeverity::Warning,
                 status: ReviewItemStatus::Todo,
+                recommendations: vec![],
                 files: vec!["crates/tui/src/view.rs".to_string()],
+                readonly_files: vec![],
                 subplan: Vec::new(),
                 resolution_notes: None,
                 body: "Replace clone with reference borrowing".to_string(),
@@ -198,7 +205,9 @@ mod tests {
                 model: None,
                 severity: ReviewSeverity::Critical,
                 status: ReviewItemStatus::Discussion,
+                recommendations: vec![],
                 files: vec!["src/lib.rs".to_string()],
+                readonly_files: vec![],
                 subplan: Vec::new(),
                 resolution_notes: Some("Extend scope of mutex guard".to_string()),
                 body: "Lock is dropped prematurely.".to_string(),
@@ -210,9 +219,15 @@ mod tests {
             format_review_discussion_prompt(&session, Some(1), "Is this really possible?");
         assert!(prompt.contains("# Review Discussion: [rev-42] Security Audit"));
         assert!(prompt.contains("Race condition in cache"));
-        assert!(prompt.contains("Resolution Strategy: Extend scope of mutex guard"));
+        assert!(prompt.contains("Resolution Note: Extend scope of mutex guard"));
         assert!(prompt.contains("Is this really possible?"));
         assert!(prompt.contains("explain the proposed modifications clearly in conversational text"));
+        // A focused review discussion must let the model either reason about
+        // the finding or apply the requested fix directly.
+        assert!(!prompt.contains("Do NOT emit file edits"));
+        assert!(prompt.contains(
+            "apply the required code changes directly instead of only describing them"
+        ));
     }
 
     #[test]
@@ -220,15 +235,48 @@ mod tests {
         let prompt = build_review_system_prompt();
         assert!(prompt.contains("structured output schema"));
         assert!(prompt.contains("`summary`"));
+        assert!(prompt.contains("`title`"));
         assert!(prompt.contains("`findings`"));
-        assert!(prompt.contains("`severity`"));
+        assert!(prompt.contains("`type`"));
+        assert!(prompt.contains("`description`"));
+        assert!(prompt.contains("`recommendations`"));
+        assert!(prompt.contains("`readonly_files`"));
         assert!(!prompt.contains("## [SEVERITY]"));
+        assert!(
+            !prompt.contains("`severity`"),
+            "the schema must not expose the legacy severity field"
+        );
 
         let summary_idx = prompt.find("`summary`").expect("summary documented");
+        let title_idx = prompt.find("`title`").expect("title documented");
         let findings_idx = prompt.find("`findings`").expect("findings documented");
         assert!(
-            summary_idx < findings_idx,
-            "summary must be specified before findings"
+            summary_idx < title_idx,
+            "summary must be specified before title"
+        );
+        assert!(
+            title_idx < findings_idx,
+            "title must be specified before findings"
+        );
+    }
+
+    #[test]
+    fn test_review_step_failure_classification_and_note() {
+        let domain = ReviewStepFailure::domain("compiler error");
+        assert!(domain.is_domain());
+        assert_eq!(domain.reason(), "compiler error");
+
+        let infra = ReviewStepFailure::infrastructure("429 rate limit");
+        assert!(!infra.is_domain());
+        assert_eq!(infra.into_reason(), "429 rate limit");
+
+        assert_eq!(
+            format_review_step_failure_note("  compiler still fails  "),
+            "Skipped after execution failure: compiler still fails"
+        );
+        assert_eq!(
+            format_review_step_failure_note("   "),
+            "Skipped after execution failure without diagnostics"
         );
     }
 }

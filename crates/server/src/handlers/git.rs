@@ -27,22 +27,53 @@ pub async fn handle_repository_get_state(req: Request, state: &Arc<AppState>) ->
 }
 
 pub async fn handle_repository_init(req: Request, state: &Arc<AppState>) -> Response {
+    if let Some(resp) = super::reject_if_operation_active(
+        &req.id,
+        state,
+        "Cannot initialize a repository while a model operation is in progress",
+    ) {
+        return resp;
+    }
+
     let params: tauqe_protocol::RepositoryInitParams = req
         .params
         .and_then(|p| serde_json::from_value(p).ok())
         .unwrap_or_default();
 
     let initial_commit = params.initial_commit;
-    let init_result =
-        super::offload(move || tauqe_core::git::init_repository(None, initial_commit)).await;
+    // The repository must be initialized at the authoritative shared root, not
+    // the daemon's process CWD, which can drift from the initialized project.
+    let init_root = state.repo_root().await;
+    let init_result = super::offload(move || {
+        tauqe_core::git::init_repository(Some(init_root.as_path()), initial_commit)
+    })
+    .await;
 
     match init_result {
         Ok(Ok(repo_state)) => {
             let repo_path = Path::new(&repo_state.root);
             if !repo_path.as_os_str().is_empty() {
+                // A freshly initialized project may now carry its own
+                // `tauqe.toml`, so reload configuration for the new root and
+                // rebind the config, context, and history managers under
+                // separate short-lived guards, mirroring `initialize`. No guard
+                // is ever held across another subsystem's `.await`.
+                let loaded =
+                    super::config::reload_config_with_overrides(state, Some(repo_path)).await;
                 {
-                    let mut ctx = state.context.write().await;
-                    ctx.set_repo_root(repo_path.to_path_buf());
+                    let mut guard = state.config.lock().await;
+                    guard.selection = loaded.default_selection();
+                    guard.config = loaded;
+                }
+                let mut ctx_snapshot = state.context.read().await.clone();
+                let repo_buf = repo_path.to_path_buf();
+                if let Ok(updated_ctx) = super::offload(move || {
+                    ctx_snapshot.set_repo_root(repo_buf);
+                    ctx_snapshot
+                })
+                .await
+                {
+                    *state.context.write().await = updated_ctx;
                 }
                 let mut hm = tauqe_core::history::HistoryManager::new(repo_path.to_path_buf());
                 let sender = state.history_sender.clone();
@@ -110,17 +141,29 @@ pub async fn handle_git_undo(req: Request, state: &Arc<AppState>) -> Response {
         Err(err) => return Response::err(req.id, errors::UNDO_FAILED, err),
     };
 
-    let ctx_state = {
-        {
-            let mut history = state.history.lock().await;
-            let _ = history.record_undo(
-                &undo_result.undone_commit,
-                undo_result.restored_checkpoint,
-            );
+    {
+        let mut history = state.history.lock().await;
+        let _ = history.record_undo(
+            &undo_result.undone_commit,
+            undo_result.restored_checkpoint,
+        );
+    }
+    let mut ctx_snapshot = state.context.read().await.clone();
+    let ctx_state = match super::offload(move || {
+        ctx_snapshot.prune_missing_files();
+        let current_state = ctx_snapshot.get_state();
+        (ctx_snapshot, current_state)
+    })
+    .await
+    {
+        Ok((updated_ctx, current_state)) => {
+            *state.context.write().await = updated_ctx;
+            current_state
         }
-        let mut ctx = state.context.write().await;
-        ctx.prune_missing_files();
-        ctx.get_state()
+        Err(err) => {
+            tracing::warn!(error = %err, "Failed to prune missing files in offload");
+            state.context.read().await.get_state()
+        }
     };
 
     state.out.send_event(&Event {
@@ -274,7 +317,7 @@ pub async fn handle_git_squash_generate_message(req: Request, state: &Arc<AppSta
         Err(err) => return Response::err(req.id, errors::COMMITS_AHEAD_FAILED, err),
     };
 
-    let pinned_files = {
+    let (ctx_snapshot, pinned_paths) = {
         let ctx = state.context.read().await;
         let state_ctx = ctx.get_state();
         let pinned_paths: std::collections::HashSet<String> = state_ctx
@@ -283,12 +326,18 @@ pub async fn handle_git_squash_generate_message(req: Request, state: &Arc<AppSta
             .filter(|i| i.layer == tauqe_protocol::ContextLayer::Pinned)
             .map(|i| i.path)
             .collect();
-        let all_files = ctx.read_context_files();
+        (ctx.clone(), pinned_paths)
+    };
+
+    let pinned_files = super::offload(move || {
+        let all_files = ctx_snapshot.read_context_files();
         all_files
             .into_iter()
             .filter(|f| pinned_paths.contains(&f.path))
             .collect::<Vec<_>>()
-    };
+    })
+    .await
+    .unwrap_or_default();
 
     let prompt = tauqe_core::prompt::build_squash_commit_prompt(
         &commits_ahead,
@@ -327,6 +376,7 @@ pub async fn handle_git_squash_generate_message(req: Request, state: &Arc<AppSta
         let mut full_text = String::new();
         let mut usage: Option<tauqe_protocol::ModelUsageInfo> = None;
         let mut stream_error: Option<String> = None;
+        let mut cancelled = false;
         while let Some(ev) = rx.recv().await {
             match ev {
                 StreamEvent::TextDelta(delta) => {
@@ -338,8 +388,22 @@ pub async fn handle_git_squash_generate_message(req: Request, state: &Arc<AppSta
                 StreamEvent::Error(msg) => {
                     stream_error = Some(msg);
                 }
+                // An explicit provider cancellation is reported as `CANCELLED`
+                // instead of being swallowed by the catch-all arm and surfacing
+                // later as a generic internal failure.
+                StreamEvent::Cancelled => {
+                    cancelled = true;
+                }
                 _ => {}
             }
+        }
+
+        if cancelled {
+            return Response::err(
+                req.id,
+                errors::CANCELLED,
+                "Squash message generation was cancelled",
+            );
         }
 
         // Surface both a streamed provider error and a failed streaming task so
@@ -533,4 +597,51 @@ pub async fn handle_git_squash_apply(req: Request, state: &Arc<AppState>) -> Res
     });
 
     Response::ok_typed(req.id, &apply_result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tauqe_core::config::AppConfig;
+    use tauqe_protocol::{methods, RepositoryInitParams, RequestId};
+
+    /// Initialization must target the authoritative shared root and never the
+    /// process CWD: a repository created under the wrong directory silently
+    /// desynchronizes every later handler that resolves paths from
+    /// `state.repo_root()`. The initialized project must also have its
+    /// configuration reloaded and rebound.
+    #[tokio::test]
+    async fn repository_init_targets_authoritative_root_not_cwd() {
+        let dir = std::env::temp_dir().join(format!(
+            "tauqe-test-init-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+
+        let (out, _rx) = crate::transport::OutChannel::new();
+        let (history_sender, _hrx) = tokio::sync::mpsc::unbounded_channel();
+        let state = AppState::new(AppConfig::default(), dir.clone(), history_sender, out);
+
+        let req = Request {
+            id: RequestId::Number(1),
+            method: methods::REPOSITORY_INIT.to_string(),
+            params: Some(
+                serde_json::to_value(RepositoryInitParams {
+                    initial_commit: false,
+                })
+                .unwrap(),
+            ),
+        };
+
+        let resp = handle_repository_init(req, &state).await;
+        assert!(resp.error.is_none());
+        // The Git directory is created at the authoritative root, not the CWD.
+        assert!(dir.join(".git").exists());
+        assert_eq!(state.repo_root().await, dir);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

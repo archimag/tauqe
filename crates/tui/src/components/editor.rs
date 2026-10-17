@@ -4,6 +4,8 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::style::{Style, Stylize};
 use ratatui::text::{Line, Span};
 
+use crate::command::editor::{EditorCommand, EDITOR_COMMAND_MAP};
+use crate::config::{active_meta_modifier, active_primary_modifier, InputConfig};
 use crate::theme::engine::current_engine;
 
 /// Walks up from the current directory to the nearest ancestor that looks like
@@ -108,6 +110,19 @@ pub fn is_char_typing(modifiers: KeyModifiers) -> bool {
         || modifiers == (KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SHIFT)
 }
 
+/// Builds the editor's modifier configuration from the process-global snapshot.
+///
+/// The shared [`EDITOR_COMMAND_MAP`] resolves `C-` / `M-` chords through the
+/// developer's configured primary and meta modifiers, so the editor never
+/// hardcodes `KeyModifiers::CONTROL` or `KeyModifiers::ALT`.
+fn active_editor_input_config() -> InputConfig {
+    InputConfig {
+        primary_modifier: active_primary_modifier(),
+        meta_modifier: active_meta_modifier(),
+        ..InputConfig::default()
+    }
+}
+
 /// Unified single/multiline text editor component.
 ///
 /// Every text input surface (Develop prompt, modal discussion comments, squash
@@ -191,11 +206,19 @@ impl TextEditor {
 
     pub fn clear_saving(&mut self) {
         if !self.text.is_empty() {
-            self.kill_ring = self.text.clone();
+            let saved = self.text.clone();
+            self.set_kill_ring(saved);
             self.text.clear();
             self.cursor = 0;
             self.history_index = None;
             self.draft.clear();
+        }
+    }
+
+    fn set_kill_ring(&mut self, text: String) {
+        if !text.is_empty() {
+            crate::clipboard::copy_to_clipboard(&text);
+            self.kill_ring = text;
         }
     }
 
@@ -401,11 +424,11 @@ impl TextEditor {
         if self.cursor == line_end {
             if self.cursor < self.text.len() {
                 let removed = self.text.remove(self.cursor);
-                self.kill_ring = removed.to_string();
+                self.set_kill_ring(removed.to_string());
             }
         } else {
             let killed: String = self.text.drain(self.cursor..line_end).collect();
-            self.kill_ring = killed;
+            self.set_kill_ring(killed);
         }
     }
 
@@ -413,7 +436,7 @@ impl TextEditor {
         let line_start = self.current_line_start();
         if self.cursor > line_start {
             let killed: String = self.text.drain(line_start..self.cursor).collect();
-            self.kill_ring = killed;
+            self.set_kill_ring(killed);
             self.cursor = line_start;
         } else if self.cursor > 0 {
             self.delete_backward();
@@ -421,18 +444,22 @@ impl TextEditor {
     }
 
     pub fn yank(&mut self) {
-        // The kill-ring is the authoritative text-editing buffer: yank restores
-        // from it first. The system clipboard is consulted only as a fallback
-        // when no kill has been recorded yet.
-        if !self.kill_ring.is_empty() {
-            let s = self.kill_ring.clone();
-            self.insert_paste(&s);
-            return;
-        }
-        if let Some(clip) = crate::clipboard::get_from_clipboard() {
+        // Consult the system clipboard (detecting the most recently updated
+        // buffer between standard clipboard and Linux Primary Selection) and
+        // fall back to the internal kill-ring when system clipboard is unavailable.
+        let text = if let Some(clip) = crate::clipboard::get_from_clipboard() {
             if !clip.is_empty() {
-                self.insert_paste(&clip);
+                clip
+            } else {
+                self.kill_ring.clone()
             }
+        } else {
+            self.kill_ring.clone()
+        };
+
+        if !text.is_empty() {
+            self.kill_ring = text.clone();
+            self.insert_paste(&text);
         }
     }
 
@@ -451,7 +478,7 @@ impl TextEditor {
         }
         if first_word_idx.is_none() {
             let killed: String = self.text.drain(self.cursor..).collect();
-            self.kill_ring = killed;
+            self.set_kill_ring(killed);
             return;
         }
         let mut end_idx = after.len();
@@ -465,7 +492,7 @@ impl TextEditor {
             .text
             .drain(self.cursor..self.cursor + end_idx)
             .collect();
-        self.kill_ring = killed;
+        self.set_kill_ring(killed);
     }
 
     pub fn kill_word_backward(&mut self) {
@@ -493,7 +520,7 @@ impl TextEditor {
             .map(|&(idx, c)| idx + c.len_utf8())
             .unwrap_or(0);
         let killed: String = self.text.drain(target_pos..self.cursor).collect();
-        self.kill_ring = killed;
+        self.set_kill_ring(killed);
         self.cursor = target_pos;
     }
 
@@ -603,85 +630,25 @@ impl TextEditor {
     /// Dispatches a key event to the editor and returns `true` when the key was
     /// consumed as an editing or navigation command. Printable characters typed
     /// without a command modifier are always inserted unconditionally.
+    ///
+    /// Command chords resolve through the shared [`EDITOR_COMMAND_MAP`], the
+    /// single source of truth for the editor's readline bindings, so this method
+    /// never performs a raw `KeyModifiers::CONTROL` or `KeyModifiers::ALT` check.
+    /// `is_cmd` carries the caller's precomputed primary-modifier state, while the
+    /// meta modifier and the Shift-only chords (such as `Shift+Insert`) are
+    /// matched from the map.
     pub fn handle_key(&mut self, key: KeyEvent, is_cmd: bool) -> bool {
-        let has_alt = key.modifiers.contains(KeyModifiers::ALT)
-            && !key.modifiers.contains(KeyModifiers::CONTROL);
+        let input = active_editor_input_config();
 
-        if is_cmd {
-            if let KeyCode::Char(c) = key.code {
-                match c.to_ascii_lowercase() {
-                    'w' => {
-                        self.kill_word_backward();
-                        return true;
-                    }
-                    'u' => {
-                        self.kill_to_beginning_of_line();
-                        return true;
-                    }
-                    'k' => {
-                        self.kill_line();
-                        return true;
-                    }
-                    'y' => {
-                        self.yank();
-                        return true;
-                    }
-                    'a' => {
-                        self.move_beginning_of_line();
-                        return true;
-                    }
-                    'e' => {
-                        self.move_end_of_line();
-                        return true;
-                    }
-                    'b' => {
-                        self.move_backward();
-                        return true;
-                    }
-                    'f' => {
-                        self.move_forward();
-                        return true;
-                    }
-                    'd' => {
-                        self.delete_forward();
-                        return true;
-                    }
-                    'j' if self.multiline => {
-                        self.insert_char('\n');
-                        return true;
-                    }
-                    'n' if self.multiline => {
-                        self.move_line_down();
-                        return true;
-                    }
-                    'p' if self.multiline => {
-                        self.move_line_up();
-                        return true;
-                    }
-                    _ => {}
-                }
-            }
-        }
-
-        if has_alt {
-            match key.code {
-                KeyCode::Char('b') | KeyCode::Left => {
-                    self.move_word_backward();
-                    return true;
-                }
-                KeyCode::Char('f') | KeyCode::Right => {
-                    self.move_word_forward();
-                    return true;
-                }
-                KeyCode::Char('d') => {
-                    self.kill_word_forward();
-                    return true;
-                }
-                KeyCode::Backspace => {
-                    self.kill_word_backward();
-                    return true;
-                }
-                _ => {}
+        // Consult the map only for command chords, so a bare key never steals a
+        // character from the buffer (Conventions §5). The map itself is the
+        // authority on which physical modifier satisfies each abstract chord.
+        let command_chord = is_cmd
+            || input.is_meta(key.modifiers)
+            || key.modifiers.contains(KeyModifiers::SHIFT);
+        if command_chord {
+            if let Some(spec) = EDITOR_COMMAND_MAP.resolve(key, &input, true) {
+                return self.apply_editor_command(spec.action);
             }
         }
 
@@ -728,6 +695,48 @@ impl TextEditor {
             }
             _ => false,
         }
+    }
+
+    /// Applies a resolved [`EditorCommand`] to the buffer.
+    ///
+    /// Returns `true` when the command was consumed as an editor command. The
+    /// line-oriented operations report `false` in single-line mode, mirroring the
+    /// historical behaviour where `C-p` / `C-n` / `C-j` were inert outside a
+    /// multiline field.
+    fn apply_editor_command(&mut self, command: EditorCommand) -> bool {
+        match command {
+            EditorCommand::MoveCharBackward => self.move_backward(),
+            EditorCommand::MoveCharForward => self.move_forward(),
+            EditorCommand::MoveWordBackward => self.move_word_backward(),
+            EditorCommand::MoveWordForward => self.move_word_forward(),
+            EditorCommand::MoveBeginningOfLine => self.move_beginning_of_line(),
+            EditorCommand::MoveEndOfLine => self.move_end_of_line(),
+            EditorCommand::MoveLineUp => {
+                if !self.multiline {
+                    return false;
+                }
+                self.move_line_up();
+            }
+            EditorCommand::MoveLineDown => {
+                if !self.multiline {
+                    return false;
+                }
+                self.move_line_down();
+            }
+            EditorCommand::DeleteForward => self.delete_forward(),
+            EditorCommand::InsertNewline => {
+                if !self.multiline {
+                    return false;
+                }
+                self.insert_char('\n');
+            }
+            EditorCommand::KillWordBackward => self.kill_word_backward(),
+            EditorCommand::KillWordForward => self.kill_word_forward(),
+            EditorCommand::KillToBeginningOfLine => self.kill_to_beginning_of_line(),
+            EditorCommand::KillLine => self.kill_line(),
+            EditorCommand::Yank => self.yank(),
+        }
+        true
     }
 
     /// Wraps the buffer into styled prompt lines and reports the visual line of
@@ -943,7 +952,8 @@ fn tokenize_with_offsets(s: &str) -> Vec<(&str, bool, usize)> {
 
 #[cfg(test)]
 mod tests {
-    use super::TextEditor;
+    use super::*;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     #[test]
     fn paste_inserts_unicode_at_cursor_and_normalizes_line_endings() {
@@ -1028,6 +1038,15 @@ mod tests {
     }
 
     #[test]
+    fn shift_insert_yanks_into_editor() {
+        let mut editor = TextEditor::default();
+        editor.set_kill_ring("pasted text".to_string());
+        let key = KeyEvent::new(KeyCode::Insert, KeyModifiers::SHIFT);
+        assert!(editor.handle_key(key, false));
+        assert_eq!(editor.get_text(), "pasted text");
+    }
+
+    #[test]
     fn kill_then_yank_uses_internal_kill_ring() {
         let mut editor = TextEditor::default();
         editor.insert_str("alpha beta");
@@ -1096,5 +1115,41 @@ mod tests {
 
         assert_eq!(lines.len(), 2);
         assert_eq!(cursor_line, 1);
+    }
+
+    #[test]
+    fn command_chords_resolve_through_the_editor_map() {
+        let mut editor = TextEditor::default();
+        editor.insert_str("alpha beta");
+        assert_eq!(editor.cursor, "alpha beta".len());
+
+        // `M-b` (Meta word-backward) is resolved from the shared editor command
+        // map rather than from a hardcoded Alt modifier check.
+        let meta_b = KeyEvent::new(KeyCode::Char('b'), KeyModifiers::ALT);
+        assert!(editor.handle_key(meta_b, false));
+        assert_eq!(editor.cursor, "alpha ".len());
+    }
+
+    #[test]
+    fn meta_backspace_kills_word_through_the_map() {
+        let mut editor = TextEditor::default();
+        editor.insert_str("alpha beta");
+
+        let meta_backspace = KeyEvent::new(KeyCode::Backspace, KeyModifiers::ALT);
+        assert!(editor.handle_key(meta_backspace, false));
+        assert_eq!(editor.get_text(), "alpha ");
+    }
+
+    #[test]
+    fn command_newline_is_inert_in_single_line_mode() {
+        let mut editor = TextEditor {
+            multiline: false,
+            ..Default::default()
+        };
+        editor.insert_str("line");
+
+        let ctrl_j = KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL);
+        assert!(!editor.handle_key(ctrl_j, true));
+        assert_eq!(editor.get_text(), "line");
     }
 }

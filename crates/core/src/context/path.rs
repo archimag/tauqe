@@ -1,13 +1,34 @@
-use anyhow::{bail, Result};
-use std::path::Path;
+use anyhow::{anyhow, bail, Result};
+use std::path::{Path, PathBuf};
 
 use super::ContextManager;
 
-/// Verifies that `relative_path` does not traverse or resolve to a symlink
-/// outside `repo_root`.
+/// Returns the deepest ancestor of `path` that exists on disk, or the symlink
+/// itself when it dangles.
 ///
-/// If `relative_path` (or its deepest existing ancestor) points outside the
-/// canonical repository root, returns an error.
+/// Walking upward stops as soon as a component exists or is present as a
+/// symlink, so the result can be canonicalized to learn where a not-yet-created
+/// suffix would physically land.
+fn deepest_existing_ancestor(path: &Path) -> &Path {
+    let mut ancestor = path;
+    while !ancestor.exists() && ancestor.symlink_metadata().is_err() {
+        match ancestor.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => ancestor = parent,
+            _ => break,
+        }
+    }
+    ancestor
+}
+
+/// Verifies that `relative_path` does not resolve to a symlink outside
+/// `repo_root`.
+///
+/// Every component of the relative path is inspected from the repository root
+/// downward with `symlink_metadata` (lstat), which detects a symlink even when
+/// its target does not exist yet. Each symlink target is read explicitly with
+/// `read_link` and resolved to its deepest existing ancestor, so a link that
+/// dangles outside the repository is rejected instead of being silently
+/// traversed while missing parent directories are created.
 pub fn verify_path_within_repo(repo_root: &Path, relative_path: &str) -> Result<()> {
     let Ok(canonical_root) = repo_root.canonicalize() else {
         // If repo_root cannot be canonicalized (e.g. does not exist in a synthetic test),
@@ -17,58 +38,64 @@ pub fn verify_path_within_repo(repo_root: &Path, relative_path: &str) -> Result<
 
     let full_path = repo_root.join(relative_path);
 
-    // 1. If full_path exists (or is a symlink on disk):
-    // symlink_metadata().is_ok() detects broken symlinks as well as existing files/dirs.
-    if full_path.symlink_metadata().is_ok() {
-        match full_path.canonicalize() {
-            Ok(canonical_target) => {
-                if !canonical_target.starts_with(&canonical_root) {
-                    bail!(
-                        "Path '{}' escapes repository root via symlink pointing to '{}'",
-                        relative_path,
-                        canonical_target.display()
-                    );
-                }
-            }
-            Err(err) => {
-                bail!(
-                    "Path '{}' cannot be canonicalized (broken symlink or inaccessible): {}",
-                    relative_path,
-                    err
-                );
-            }
-        }
-    } else {
-        // 2. If full_path does not exist yet (e.g. a new file to create):
-        // Walk up to find the deepest existing ancestor directory.
-        let mut ancestor = full_path.as_path();
-        while !ancestor.exists() && ancestor.symlink_metadata().is_err() {
-            match ancestor.parent() {
-                Some(p) if !p.as_os_str().is_empty() => ancestor = p,
-                _ => break,
-            }
+    let Ok(relative) = full_path.strip_prefix(repo_root) else {
+        bail!("Path '{}' escapes repository root", relative_path);
+    };
+
+    let mut current = PathBuf::from(repo_root);
+    for component in relative.components() {
+        match component {
+            std::path::Component::Normal(name) => current.push(name),
+            // `normalize_path` collapses `.`/`..` and rejects absolute paths, so
+            // any other component here means an unnormalized path slipped
+            // through; treat it as escaping.
+            _ => bail!("Path '{}' contains an invalid component", relative_path),
         }
 
-        if ancestor.exists() || ancestor.symlink_metadata().is_ok() {
-            match ancestor.canonicalize() {
-                Ok(canonical_ancestor) => {
-                    if !canonical_ancestor.starts_with(&canonical_root) {
-                        bail!(
-                            "Path '{}' parent directory escapes repository root via symlink pointing to '{}'",
-                            relative_path,
-                            canonical_ancestor.display()
-                        );
-                    }
-                }
-                Err(err) => {
-                    bail!(
-                        "Path '{}' ancestor directory '{}' cannot be canonicalized: {}",
-                        relative_path,
-                        ancestor.display(),
-                        err
-                    );
-                }
-            }
+        let Ok(metadata) = current.symlink_metadata() else {
+            // This component does not exist yet, so neither can any deeper one.
+            // The remaining suffix is created as regular entries.
+            break;
+        };
+
+        if !metadata.file_type().is_symlink() {
+            continue;
+        }
+
+        let target = std::fs::read_link(&current).map_err(|err| {
+            anyhow!(
+                "Path '{}' symlink '{}' cannot be read: {}",
+                relative_path,
+                current.display(),
+                err
+            )
+        })?;
+        let absolute_target = if target.is_absolute() {
+            target
+        } else {
+            current
+                .parent()
+                .map(|parent| parent.join(&target))
+                .unwrap_or(target)
+        };
+        let resolved = deepest_existing_ancestor(&absolute_target)
+            .canonicalize()
+            .map_err(|err| {
+                anyhow!(
+                    "Path '{}' symlink '{}' target '{}' cannot be resolved: {}",
+                    relative_path,
+                    current.display(),
+                    absolute_target.display(),
+                    err
+                )
+            })?;
+        if !resolved.starts_with(&canonical_root) {
+            bail!(
+                "Path '{}' escapes repository root via symlink '{}' pointing to '{}'",
+                relative_path,
+                current.display(),
+                resolved.display()
+            );
         }
     }
 
@@ -174,5 +201,36 @@ mod tests {
         let files = cm.read_context_files();
         assert!(files.iter().any(|f| f.path == "sym_lib.rs"));
         assert!(!files.iter().any(|f| f.path == "sym_file.txt"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_dangling_symlink_escaping_repo_is_rejected() {
+        let dir = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let repo_root = dir.path().to_path_buf();
+        let outside_root = outside.path().to_path_buf();
+
+        // A directory symlink whose target does not exist yet and lives outside
+        // the repository. lstat still reports it, so it must be rejected rather
+        // than blindly traversed.
+        let dangling_target = outside_root.join("missing_dir");
+        let sym_dir = repo_root.join("dangling_dir");
+        std::os::unix::fs::symlink(&dangling_target, &sym_dir).unwrap();
+
+        let mut cm = ContextManager::new(repo_root.clone());
+
+        assert!(cm.normalize_path("dangling_dir/sub/new_file.txt").is_err());
+        assert!(cm
+            .add_file("dangling_dir/sub/new_file.txt", ContextAccess::Editable)
+            .is_err());
+        assert!(!outside_root.join("missing_dir").exists());
+
+        // A dangling symlink pointing back inside the repository stays within
+        // the boundary and is accepted.
+        let internal_target = repo_root.join("generated");
+        let internal_sym = repo_root.join("dangling_internal");
+        std::os::unix::fs::symlink(&internal_target, &internal_sym).unwrap();
+        assert!(cm.normalize_path("dangling_internal/file.txt").is_ok());
     }
 }

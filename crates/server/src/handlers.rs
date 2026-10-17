@@ -2,6 +2,7 @@ pub mod config;
 pub mod context;
 pub mod git;
 pub mod history;
+pub mod locale;
 pub mod model;
 // The plan handlers still drive the legacy single-step `graft_subtree`; silence the
 // deprecation until the horizon-replanning migration replaces them.
@@ -16,7 +17,9 @@ use tauqe_core::edits::protocol::VerifyTarget;
 use tauqe_core::edits::EditProtocolFactory;
 use tauqe_core::history::HistoryManager;
 use tauqe_core::workflow::WorkflowFactory;
-use tauqe_protocol::{methods, InitializeResult, Request, Response, PROTOCOL_VERSION};
+use tauqe_protocol::{
+    errors, methods, InitializeResult, Request, RequestId, Response, PROTOCOL_VERSION,
+};
 
 use crate::state::AppState;
 
@@ -54,6 +57,8 @@ pub async fn handle_request(req: Request, state: &Arc<AppState>) -> Response {
         methods::DISCUSSION_GET_FOCUS => model::handle_discussion_get_focus(req, state).await,
         methods::DISCUSSION_CLEAR_FOCUS => model::handle_discussion_clear_focus(req, state).await,
 
+        methods::LOCALE_GENERATE => locale::handle_locale_generate(req, state).await,
+
         methods::REVIEW_START => review::handle_review_start(req, state).await,
         methods::REVIEW_CANCEL => review::handle_review_cancel(req, state).await,
         methods::REVIEW_LIST => review::handle_review_list(req, state).await,
@@ -88,6 +93,30 @@ pub async fn handle_request(req: Request, state: &Arc<AppState>) -> Response {
             tauqe_protocol::errors::METHOD_NOT_FOUND,
             format!("Method '{}' not found", req.method),
         ),
+    }
+}
+
+/// Rejects a state-mutating request while a turn, plan batch, or review batch
+/// is active.
+///
+/// A running operation holds a clone of the context and history and writes them
+/// back when it finishes, and plan and review batches read and write their
+/// on-disk records directly. A mutation applied in between would be overwritten
+/// or would race the operation's own writes, so mutations are refused for the
+/// duration of the operation instead of being silently lost.
+pub(crate) fn reject_if_operation_active(
+    req_id: &RequestId,
+    state: &Arc<AppState>,
+    message: &str,
+) -> Option<Response> {
+    if state.is_operation_active() {
+        Some(Response::err(
+            req_id.clone(),
+            errors::OPERATION_IN_PROGRESS,
+            message,
+        ))
+    } else {
+        None
     }
 }
 
@@ -136,6 +165,17 @@ pub(crate) async fn run_preflight_verification(repo_root: &Path) -> Result<(), S
 }
 
 async fn handle_client_initialize(req: Request, state: &Arc<AppState>) -> Response {
+    // Re-initialization rebinds the config, context, and history; refuse it
+    // while a turn or batch is running so the running operation's frozen
+    // snapshot is not overwritten underneath it.
+    if let Some(resp) = reject_if_operation_active(
+        &req.id,
+        state,
+        "Cannot re-initialize the repository while a model operation is in progress",
+    ) {
+        return resp;
+    }
+
     // Reading the repository state shells out to git, so it is offloaded and
     // resolved from the authoritative shared root instead of the process CWD.
     let repo_root = state.repo_root().await;
@@ -162,9 +202,15 @@ async fn handle_client_initialize(req: Request, state: &Arc<AppState>) -> Respon
             guard.selection = loaded.default_selection();
             guard.config = loaded;
         }
+        let mut ctx_snapshot = state.context.read().await.clone();
+        let repo_buf = repo_path.to_path_buf();
+        if let Ok(updated_ctx) = offload(move || {
+            ctx_snapshot.set_repo_root(repo_buf);
+            ctx_snapshot
+        })
+        .await
         {
-            let mut ctx = state.context.write().await;
-            ctx.set_repo_root(repo_path.to_path_buf());
+            *state.context.write().await = updated_ctx;
         }
         let mut hm = HistoryManager::new(repo_path.to_path_buf());
         let sender = state.history_sender.clone();

@@ -9,8 +9,8 @@
 
 use tokio::sync::{mpsc, watch};
 use tauqe_protocol::{
-    ContextAccess, DocTopic, EditOperation, LlmCommand, LlmOutcome, ModelRef, VerifyOnSuccess,
-    VerifyTarget,
+    ContextAccess, DocTopic, EditOperation, LlmCommand, LlmOutcome, ModelRef, RepoSearchRequest,
+    VerifyOnSuccess, VerifyTarget,
 };
 
 use crate::context::{ContextFileContent, ContextManager};
@@ -26,7 +26,7 @@ use crate::providers::{LlmProvider, StreamEvent};
 use crate::workflow::WorkflowOptions;
 
 use super::cache::TurnInputCache;
-use super::is_discussion_prompt;
+use super::is_readonly_discussion_prompt;
 
 /// Normalized proposal returned by a single model interaction.
 ///
@@ -40,6 +40,7 @@ pub(super) struct ProposalStep {
     edits: Vec<EditOperation>,
     context_requests: Vec<ContextRequest>,
     doc_requests: Vec<DocTopic>,
+    repo_searches: Vec<RepoSearchRequest>,
     verify_request: Option<EditVerifyRequest>,
     terminal_outcome: Option<LlmOutcome>,
     blocked: Option<String>,
@@ -70,6 +71,9 @@ impl ProposalStep {
                     step.context_requests.push(ContextRequest { path, access });
                 }
                 LlmCommand::DocRequest { topic } => step.doc_requests.push(topic),
+                LlmCommand::RepoSearch { path, regex } => {
+                    step.repo_searches.push(RepoSearchRequest::new(path, regex));
+                }
                 LlmCommand::Verify { target, on_success } => {
                     if step.verify_request.is_none() {
                         step.verify_request = Some(to_edit_verify_request(target, on_success));
@@ -127,6 +131,11 @@ impl ProposalStep {
         &self.doc_requests
     }
 
+    /// Repository search requests carried by the proposal, if any.
+    pub(super) fn repo_searches(&self) -> &[RepoSearchRequest] {
+        &self.repo_searches
+    }
+
     /// Toolchain verification request carried by the proposal, if any.
     pub(super) fn verify_request(&self) -> Option<&EditVerifyRequest> {
         self.verify_request.as_ref()
@@ -172,6 +181,7 @@ pub(super) struct TurnState {
     pub(super) terminal_outcome: Option<LlmOutcome>,
     pub(super) blocked: Option<String>,
     pub(super) plans: Vec<tauqe_protocol::DiscussionPlanUpdate>,
+    pub(super) repo_searches: Vec<RepoSearchRequest>,
 }
 
 impl TurnState {
@@ -193,6 +203,8 @@ impl TurnState {
             self.blocked = Some(reason.to_string());
         }
         self.plans.extend(step.plans().iter().cloned());
+        self.repo_searches
+            .extend(step.repo_searches().iter().cloned());
     }
 }
 
@@ -371,7 +383,7 @@ pub(super) async fn run_proposal_step(
     );
     assembly.target_language = target_language.map(|language| language.to_string());
     assembly.is_isolated_step = is_isolated_step;
-    assembly.is_discussion = is_discussion_prompt(prompt);
+    assembly.is_discussion = is_readonly_discussion_prompt(prompt);
     assembly.turn_scratchpad = turn_scratchpad.map(|notes| notes.to_string());
 
     let messages = assembly.assemble_chat_messages(prompt, protocol);

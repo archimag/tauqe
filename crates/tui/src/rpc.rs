@@ -15,7 +15,7 @@ pub use transport::{
 mod tests {
     use super::*;
     use tauqe_protocol::ModelRef;
-    use crate::views::develop::{DevelopView, EditOp, FileEditStatus, StreamingFileEdit};
+    use crate::views::repl::{ReplView, EditOp, FileEditStatus, StreamingFileEdit};
 
     #[test]
     fn test_optimistic_rollback_storage() {
@@ -48,7 +48,7 @@ mod tests {
 
     #[test]
     fn test_fail_safe_reject_edits_clears_retrying_files() {
-        let mut model = DevelopView {
+        let mut model = ReplView {
             edits_active: true,
             files: vec![
                 StreamingFileEdit {

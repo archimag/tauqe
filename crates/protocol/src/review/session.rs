@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::model::{deserialize_model_ref_lenient, ModelRef};
 
-use super::item::{ReviewItem, ReviewItemStatus};
+use super::item::{ReviewIssue, ReviewItem, ReviewItemStatus};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct ReviewSession {
@@ -18,7 +18,7 @@ pub struct ReviewSession {
     pub user_prompt: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub target_files: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, alias = "issues", skip_serializing_if = "Vec::is_empty")]
     pub items: Vec<ReviewItem>,
     #[serde(default)]
     pub raw_markdown: String,
@@ -94,5 +94,10 @@ impl ReviewSession {
 
     pub fn find_item_mut(&mut self, item_id: u32) -> Option<&mut ReviewItem> {
         self.items.iter_mut().find(|i| i.id == item_id)
+    }
+
+    /// Access session findings as a collection of domain [`ReviewIssue`] instances.
+    pub fn issues(&self) -> Vec<ReviewIssue> {
+        self.items.iter().cloned().map(ReviewIssue::from).collect()
     }
 }

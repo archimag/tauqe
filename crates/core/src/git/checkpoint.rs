@@ -45,6 +45,15 @@ fn is_ancestor_of_head(dir: &Path, ancestor: &str) -> bool {
     run_git(Some(dir), &["merge-base", "--is-ancestor", ancestor, "HEAD"]).is_ok()
 }
 
+/// Reports whether the working tree carries uncommitted developer changes for
+/// the given repository-relative path, either as a modification to a tracked
+/// file or as a newly created untracked file.
+fn has_uncommitted_changes(dir: &Path, file: &str) -> bool {
+    run_git(Some(dir), &["status", "--porcelain", "--", file])
+        .map(|out| !out.trim().is_empty())
+        .unwrap_or(false)
+}
+
 /// Persists the checkpoint of an open transaction so crash recovery can tell a
 /// genuine interrupted Tauqe transaction apart from an unrelated commit that
 /// merely shares the step-commit subject prefix.
@@ -474,6 +483,12 @@ pub fn create_ai_commit(dir: &Path, changed_files: &[String], summary: &str) -> 
 }
 
 /// Undoes the last AI commit deterministically.
+///
+/// The reset restores the committed state, but any touched file that the
+/// developer modified in the working tree after the AI commit is preserved
+/// untouched and reported, so an undo never discards in-progress work. Undoing
+/// a repository's very first commit is supported by uncommitting the root
+/// instead of resetting to a parent that does not exist.
 pub fn undo_last_ai_commit(dir: &Path) -> Result<GitUndoResult> {
     // 1. Verify that HEAD exists and is an AI commit
     let head_hash = run_git(Some(dir), &["rev-parse", "--short", "HEAD"])?
@@ -503,10 +518,18 @@ pub fn undo_last_ai_commit(dir: &Path) -> Result<GitUndoResult> {
         );
     }
 
-    // 2. Identify files changed in this AI commit before unwinding
+    // 2. Identify files changed in this AI commit before unwinding. `--root`
+    // makes a root commit list the files it introduced instead of an empty diff.
     let touched_output = run_git(
         Some(dir),
-        &["diff-tree", "--no-commit-id", "--name-only", "-r", "HEAD"],
+        &[
+            "diff-tree",
+            "--root",
+            "--no-commit-id",
+            "--name-only",
+            "-r",
+            "HEAD",
+        ],
     )
     .unwrap_or_default();
     let touched_files: Vec<String> = touched_output
@@ -515,14 +538,41 @@ pub fn undo_last_ai_commit(dir: &Path) -> Result<GitUndoResult> {
         .filter(|l| !l.is_empty())
         .collect();
 
-    // 3. Mixed reset to HEAD~1
-    run_git(Some(dir), &["reset", "HEAD~1"]).context("Failed to reset AI commit")?;
-
-    // 4. Revert only the touched files in the working tree to the new HEAD.
-    // Failures are collected rather than silently ignored so a partial rollback
-    // is never reported as a clean success.
-    let mut rollback_errors: Vec<String> = Vec::new();
+    // 2b. Separate touched files that carry uncommitted developer edits made
+    // after the AI commit. This must be read before the reset: once HEAD moves
+    // to the parent, every touched file differs from the index and the original
+    // signal is lost. Preserved files are left untouched so an undo never
+    // destroys in-progress developer work.
+    let mut preserved_files: Vec<String> = Vec::new();
+    let mut files_to_revert: Vec<String> = Vec::new();
     for file in &touched_files {
+        if has_uncommitted_changes(dir, file) {
+            preserved_files.push(file.clone());
+        } else {
+            files_to_revert.push(file.clone());
+        }
+    }
+
+    // 3. Move HEAD back to the parent commit. The repository's very first commit
+    // has no parent, so a plain `reset HEAD~1` would fail with an ambiguous
+    // argument; instead delete the branch ref and clear the index, leaving the
+    // repository in its original unborn state.
+    let has_parent = run_git(Some(dir), &["rev-parse", "--verify", "--quiet", "HEAD^"]).is_ok();
+    if has_parent {
+        run_git(Some(dir), &["reset", "HEAD~1"]).context("Failed to reset AI commit")?;
+    } else {
+        run_git(Some(dir), &["update-ref", "-d", "HEAD"])
+            .context("Failed to uncommit root AI commit")?;
+        run_git(Some(dir), &["read-tree", "--empty"])
+            .context("Failed to clear the index after undoing root AI commit")?;
+    }
+
+    // 4. Revert the touched files that the developer did not modify in the
+    // working tree back to the new HEAD. Failures are collected rather than
+    // silently ignored so a partial rollback is never reported as a clean
+    // success.
+    let mut rollback_errors: Vec<String> = Vec::new();
+    for file in &files_to_revert {
         let exists_in_head =
             run_git(Some(dir), &["cat-file", "-e", &format!("HEAD:{}", file)]).is_ok();
         if exists_in_head {
@@ -553,6 +603,14 @@ pub fn undo_last_ai_commit(dir: &Path) -> Result<GitUndoResult> {
     } else {
         format!("Undid AI commit {} ('{}').", head_hash, subject)
     };
+
+    if !preserved_files.is_empty() {
+        msg.push_str(&format!(
+            " Preserved {} file(s) with uncommitted developer changes: {}",
+            preserved_files.len(),
+            preserved_files.join(", ")
+        ));
+    }
 
     if !rollback_errors.is_empty() {
         msg.push_str(&format!(
@@ -948,5 +1006,78 @@ mod tests {
             .to_string();
         assert_eq!(head_before, head_after);
         assert!(read_transaction_marker(path).is_some());
+    }
+
+    #[test]
+    fn test_undo_preserves_uncommitted_developer_edits() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+        crate::git::state::init_repository(Some(path), true).unwrap();
+
+        // The AI commit introduces a new file.
+        fs::write(path.join("foo.rs"), "pub fn ai() {}").unwrap();
+        let ai_hash =
+            create_ai_commit(path, &["foo.rs".to_string()], "feat: add foo").unwrap();
+
+        // The developer keeps working on the file after the AI commit.
+        fs::write(path.join("foo.rs"), "pub fn ai() {}\n\n// developer edit\n").unwrap();
+
+        let result = undo_last_ai_commit(path).unwrap();
+
+        assert_eq!(result.undone_commit, ai_hash);
+        // The developer's in-progress edit survives the undo untouched.
+        assert_eq!(
+            fs::read_to_string(path.join("foo.rs")).unwrap(),
+            "pub fn ai() {}\n\n// developer edit\n"
+        );
+        assert!(result.message.contains("Preserved"));
+    }
+
+    #[test]
+    fn test_undo_uncommits_root_ai_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+        // The repository's only commit will be the AI commit, so it has no parent.
+        crate::git::state::init_repository(Some(path), false).unwrap();
+
+        fs::write(path.join("root.rs"), "pub fn root() {}").unwrap();
+        let ai_hash =
+            create_ai_commit(path, &["root.rs".to_string()], "chore: add root").unwrap();
+
+        let result = undo_last_ai_commit(path).unwrap();
+
+        assert_eq!(result.undone_commit, ai_hash);
+        // The AI-introduced file is removed and the branch is unborn again.
+        assert!(!path.join("root.rs").exists());
+        assert!(crate::git::cmd::run_git(Some(path), &["rev-parse", "HEAD"]).is_err());
+    }
+
+    #[test]
+    fn test_undo_preserves_recreated_deleted_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+        crate::git::state::init_repository(Some(path), true).unwrap();
+
+        // A developer commit adds foo.rs.
+        fs::write(path.join("foo.rs"), "original").unwrap();
+        crate::git::cmd::run_git(Some(path), &["add", "foo.rs"]).unwrap();
+        crate::git::cmd::commit_with_developer_author(path, "feat: add foo", false).unwrap();
+
+        // The AI commit deletes foo.rs.
+        fs::remove_file(path.join("foo.rs")).unwrap();
+        create_ai_commit(path, &["foo.rs".to_string()], "refactor: drop foo").unwrap();
+
+        // The developer recreates the file with their own content.
+        fs::write(path.join("foo.rs"), "developer recreation").unwrap();
+
+        let result = undo_last_ai_commit(path).unwrap();
+
+        // The recreated file is preserved instead of being overwritten by the
+        // version restored from the parent commit.
+        assert_eq!(
+            fs::read_to_string(path.join("foo.rs")).unwrap(),
+            "developer recreation"
+        );
+        assert!(result.message.contains("Preserved"));
     }
 }

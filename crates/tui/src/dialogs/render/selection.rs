@@ -7,13 +7,22 @@ use crate::app::{
     compact_model_name, numbered_entry_label, SelectionDialogKind, SelectionItem,
 };
 use crate::components::modal::{render_dialog_footer, render_modal_container_styled};
+use crate::i18n::active_t;
 use crate::theme::engine::current_engine;
 
-/// Select button label as drawn by [`render_selection_dialog`], including its
-/// surrounding `[ ]` decoration.
-const SELECT_BUTTON_LABEL: &str = " [ Select (Enter) ] ";
-/// Cancel button label decoration.
-const CANCEL_BUTTON_LABEL: &str = " [ Cancel (Esc) ] ";
+/// Full drawn select-button label, resolved from the runtime locale.
+///
+/// Rendering and mouse hit-testing both measure this label, so the clickable
+/// button can never drift from the drawn one (Conventions §6, §9, c-1).
+fn select_button_label() -> String {
+    format!(" [ {} ] ", active_t("dialog.button.select"))
+}
+
+/// Full drawn cancel-button label, resolved from the runtime locale.
+fn cancel_button_label() -> String {
+    format!(" [ {} ] ", active_t("modal.cancel"))
+}
+
 /// Spacing drawn between the two action buttons.
 const BUTTON_GAP: &str = "    ";
 
@@ -41,9 +50,8 @@ fn selection_item_label(item: &SelectionItem, index: usize) -> String {
     match item {
         SelectionItem::Primary(entry) => numbered_entry_label(index, entry),
         SelectionItem::Model(model) => compact_model_name(model).to_string(),
-        SelectionItem::Catalog => {
-            format!("[{}] Others... (full model catalog)", index + 1)
-        }
+        SelectionItem::Catalog => active_t("dialog.model_select.catalog_row")
+            .replacen("{}", &(index + 1).to_string(), 1),
     }
 }
 
@@ -74,8 +82,8 @@ pub fn selection_dialog_buttons(term: Rect, item_count: usize) -> (Rect, Rect) {
         .split(inner);
     let bar = chunks[2];
 
-    let select_w = SELECT_BUTTON_LABEL.chars().count() as u16;
-    let cancel_w = CANCEL_BUTTON_LABEL.chars().count() as u16;
+    let select_w = select_button_label().chars().count() as u16;
+    let cancel_w = cancel_button_label().chars().count() as u16;
     let gap_w = BUTTON_GAP.chars().count() as u16;
     let total = select_w + gap_w + cancel_w;
     let start_x = bar.x + bar.width.saturating_sub(total) / 2;
@@ -93,12 +101,10 @@ pub fn render_selection_dialog(
     let area = selection_dialog_area(frame.area(), dialog.items.len());
 
     let title = match dialog.kind {
-        SelectionDialogKind::PrimaryModels => "Select Primary Model".to_string(),
-        SelectionDialogKind::ModelCatalog => format!(
-            "Select Model ({}/{})",
-            dialog.selector.selected_index() + 1,
-            dialog.items.len()
-        ),
+        SelectionDialogKind::PrimaryModels => active_t("dialog.model_select.title_primary"),
+        SelectionDialogKind::ModelCatalog => active_t("dialog.model_select.title_catalog")
+            .replacen("{}", &(dialog.selector.selected_index() + 1).to_string(), 1)
+            .replacen("{}", &dialog.items.len().to_string(), 1),
     };
 
     let engine = current_engine();
@@ -122,8 +128,8 @@ pub fn render_selection_dialog(
         .split(inner_area);
 
     let intro = match dialog.kind {
-        SelectionDialogKind::PrimaryModels => " Models configured under [models.primary] in tauqe.toml",
-        SelectionDialogKind::ModelCatalog => " All available models",
+        SelectionDialogKind::PrimaryModels => active_t("dialog.model_select.intro_primary"),
+        SelectionDialogKind::ModelCatalog => active_t("dialog.model_select.intro_catalog"),
     };
     frame.render_widget(
         Paragraph::new(Span::styled(intro, engine.fg(palette.text_muted))),
@@ -167,9 +173,15 @@ pub fn render_selection_dialog(
     frame.render_widget(list_widget, chunks[1]);
 
     let actions = Line::from(vec![
-        Span::styled(SELECT_BUTTON_LABEL, engine.bg(palette.button_active_bg).fg(engine.color(palette.text_inverse)).bold()),
+        Span::styled(
+            select_button_label(),
+            engine.bg(palette.button_active_bg).fg(engine.color(palette.text_inverse)).bold(),
+        ),
         Span::raw(BUTTON_GAP),
-        Span::styled(CANCEL_BUTTON_LABEL, engine.bg(palette.button_bg).fg(engine.color(palette.button_fg))),
+        Span::styled(
+            cancel_button_label(),
+            engine.bg(palette.button_bg).fg(engine.color(palette.button_fg)),
+        ),
     ]);
     let actions_widget = Paragraph::new(actions).alignment(ratatui::layout::Alignment::Center);
     frame.render_widget(actions_widget, chunks[2]);
@@ -178,12 +190,10 @@ pub fn render_selection_dialog(
     // filled with `palette.overlay`, so it reads as persistent chrome instead
     // of a second line of buttons (c-1, c-2).
     let footer_hint = match dialog.kind {
-        SelectionDialogKind::PrimaryModels => {
-            "1-9 quick select • n / p navigate • Enter select • Esc dismiss"
-        }
-        SelectionDialogKind::ModelCatalog => "n / p navigate • Enter select • Esc dismiss",
+        SelectionDialogKind::PrimaryModels => active_t("dialog.model_select.footer_primary"),
+        SelectionDialogKind::ModelCatalog => active_t("dialog.model_select.footer_catalog"),
     };
-    render_dialog_footer(frame, chunks[3], footer_hint);
+    render_dialog_footer(frame, chunks[3], &footer_hint);
 }
 
 #[cfg(test)]

@@ -75,6 +75,12 @@ impl MarkedXmlEditProtocol {
         tags::parse_context_request_tags(&normalized)
     }
 
+    /// Extracts repository search requests strictly bound to the active turn marker.
+    pub fn parse_repo_searches(&self, raw_text: &str) -> Vec<tauqe_protocol::RepoSearchRequest> {
+        let normalized = normalize_marked_xml(raw_text, &self.marker, true);
+        tags::parse_repo_search_tags(&normalized)
+    }
+
     /// Extracts documentation topics strictly bound to the active turn marker.
     pub fn parse_doc_requests(&self, raw_text: &str) -> Vec<DocTopic> {
         let normalized = normalize_marked_xml(raw_text, &self.marker, true);
@@ -503,6 +509,32 @@ let s = \"clean\";\n\
         );
         let requests = proto.parse_context_requests(output);
         assert!(requests.is_empty());
+    }
+
+    #[test]
+    fn test_marked_xml_repo_search_requires_marker_and_ignores_unmarked() {
+        let marker = "M987654";
+        let proto = MarkedXmlEditProtocol::new(marker);
+
+        let output = format!(
+            "Searching example in discussion: `<repo_search path=\"crates/core\" regex=\"fn old\" />`.\n\
+            Real discovery search:\n\
+            <repo_search_{m} path=\"crates/core\" regex=\"fn execute\" />\n\
+            Done.",
+            m = marker
+        );
+
+        let searches = proto.parse_repo_searches(&output);
+        assert_eq!(searches.len(), 1);
+        assert_eq!(searches[0].path, "crates/core");
+        assert_eq!(searches[0].regex, "fn execute");
+
+        let unmarked_only = "Discussion with <repo_search path=\"crates/server\" regex=\"fn run\" /> alone.";
+        assert!(proto.parse_repo_searches(unmarked_only).is_empty());
+
+        let cleaned = proto.clean_assistant_text(&output);
+        assert!(cleaned.contains("`<repo_search path=\"crates/core\" regex=\"fn old\" />`"));
+        assert!(!cleaned.contains("fn execute"));
     }
 
     #[test]

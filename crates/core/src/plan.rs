@@ -8,4 +8,4 @@ pub use prompt::{
     plan_refine_response_schema, plan_refine_response_schema_definition,
     format_active_plan_context, PlanRefinementOutput,
 };
-pub use storage::PlanStorage;
+pub use storage::{merge_subplan, PlanStorage};

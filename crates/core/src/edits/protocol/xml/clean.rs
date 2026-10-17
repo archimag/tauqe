@@ -5,8 +5,9 @@
 
 use super::parser::find_base_tag_start;
 use super::tags::{
-    strip_context_request_tags, strip_doc_request_tags, strip_plan_tags, strip_scratchpad_tags,
-    strip_terminal_outcome_tags, strip_user_language_tags, strip_verify_tags,
+    strip_context_request_tags, strip_doc_request_tags, strip_plan_tags, strip_repo_search_tags,
+    strip_scratchpad_tags, strip_terminal_outcome_tags, strip_user_language_tags,
+    strip_verify_tags,
 };
 
 /// Extracts conversational text from model output by stripping edit tags
@@ -163,6 +164,7 @@ pub fn extract_conversational_text(raw_text: &str) -> String {
     let text = strip_user_language_tags(&text);
     let text = strip_verify_tags(&text);
     let text = strip_context_request_tags(&text);
+    let text = strip_repo_search_tags(&text);
     let text = strip_doc_request_tags(&text);
     let text = strip_plan_tags(&text);
     let text = strip_scratchpad_tags(&text);

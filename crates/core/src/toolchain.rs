@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::path::Path;
+use tokio::io::AsyncReadExt;
 use tokio::sync::watch;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -468,7 +469,7 @@ async fn run_toolchain_check_core(
         cmd.as_std_mut().process_group(0);
     }
 
-    let child = match cmd.spawn() {
+    let mut child = match cmd.spawn() {
         Ok(child) => child,
         Err(err) => {
             return ToolchainCheckResult {
@@ -483,6 +484,16 @@ async fn run_toolchain_check_core(
     };
 
     let child_pid = child.id();
+
+    // Drain the child pipes on dedicated tasks. `Child::wait_with_output` is
+    // deliberately avoided: it consumes and reaps the `Child`, so a timeout or a
+    // cancellation that wins the race below would leave only a recycled PID to
+    // signal. Keeping `child` owned here keeps its PID reserved and lets the
+    // whole process group (the direct child and its descendants) be torn down
+    // while the child is still alive.
+    let stdout_task = spawn_pipe_reader(child.stdout.take());
+    let stderr_task = spawn_pipe_reader(child.stderr.take());
+
     let cancel_fut = async {
         if let Some(rx) = cancel_rx {
             wait_for_cancel(rx.clone()).await;
@@ -491,12 +502,26 @@ async fn run_toolchain_check_core(
         }
     };
 
-    tokio::select! {
-        output_res = child.wait_with_output() => {
-            match output_res {
-                Ok(output) => {
-                    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-                    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    enum RaceOutcome {
+        Exited(std::io::Result<std::process::ExitStatus>),
+        TimedOut,
+        Cancelled,
+    }
+
+    let outcome = tokio::select! {
+        status = child.wait() => RaceOutcome::Exited(status),
+        _ = tokio::time::sleep(std::time::Duration::from_secs(timeout_secs)) => RaceOutcome::TimedOut,
+        _ = cancel_fut => RaceOutcome::Cancelled,
+    };
+
+    match outcome {
+        RaceOutcome::Exited(status_res) => {
+            let stdout_bytes = stdout_task.await.unwrap_or_default();
+            let stderr_bytes = stderr_task.await.unwrap_or_default();
+            match status_res {
+                Ok(status) => {
+                    let stdout = String::from_utf8_lossy(&stdout_bytes).to_string();
+                    let stderr = String::from_utf8_lossy(&stderr_bytes).to_string();
                     let mut combined = String::new();
                     if !stdout.is_empty() {
                         combined.push_str(&stdout);
@@ -509,7 +534,7 @@ async fn run_toolchain_check_core(
                     }
 
                     ToolchainCheckResult {
-                        success: output.status.success(),
+                        success: status.success(),
                         is_cancelled: false,
                         command: command_str.to_string(),
                         stdout,
@@ -527,10 +552,10 @@ async fn run_toolchain_check_core(
                 },
             }
         }
-        _ = tokio::time::sleep(std::time::Duration::from_secs(timeout_secs)) => {
-            if let Some(pid) = child_pid {
-                kill_process_group(pid);
-            }
+        RaceOutcome::TimedOut => {
+            kill_and_reap(&mut child, child_pid).await;
+            stdout_task.abort();
+            stderr_task.abort();
             ToolchainCheckResult {
                 success: false,
                 is_cancelled: false,
@@ -540,10 +565,10 @@ async fn run_toolchain_check_core(
                 combined_output: format!("Command '{}' timed out after {}s", command_str, timeout_secs),
             }
         }
-        _ = cancel_fut => {
-            if let Some(pid) = child_pid {
-                kill_process_group(pid);
-            }
+        RaceOutcome::Cancelled => {
+            kill_and_reap(&mut child, child_pid).await;
+            stdout_task.abort();
+            stderr_task.abort();
             ToolchainCheckResult {
                 success: false,
                 is_cancelled: true,
@@ -554,6 +579,39 @@ async fn run_toolchain_check_core(
             }
         }
     }
+}
+
+/// Drains a child pipe to EOF on a dedicated task.
+///
+/// Reading the pipes independently of `Child::wait` lets the caller keep the
+/// `Child` handle (and therefore the reserved PID) alive while a timeout or a
+/// cancellation runs, and it prevents the child from blocking on a full pipe.
+fn spawn_pipe_reader<R>(pipe: Option<R>) -> tokio::task::JoinHandle<Vec<u8>>
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+{
+    tokio::spawn(async move {
+        let mut buffer = Vec::new();
+        if let Some(mut pipe) = pipe {
+            let _ = pipe.read_to_end(&mut buffer).await;
+        }
+        buffer
+    })
+}
+
+/// Tears down and reaps the verification process.
+///
+/// The process group led by `pid` is signalled first, while the direct child is
+/// still un-reaped, so the leader's PID cannot have been recycled and the whole
+/// descendant tree is killed. The child is then terminated on every platform and
+/// collected so no zombie survives and its PID is released only after the group
+/// signal has been delivered.
+async fn kill_and_reap(child: &mut tokio::process::Child, pid: Option<u32>) {
+    if let Some(pid) = pid {
+        kill_process_group(pid);
+    }
+    let _ = child.start_kill();
+    let _ = child.wait().await;
 }
 
 /// Splits a command line into program and arguments honoring shell-style quoting.
@@ -812,5 +870,32 @@ warning: unused import: `std::fmt`
         let summary = summarize_toolchain_failure(&result);
         assert!(summary.contains("first_errors="));
         assert!(summary.contains('…'));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_run_toolchain_check_timeout_kills_entire_process_group() {
+        let dir = tempdir().unwrap();
+        // The direct child spawns a grandchild that keeps a heartbeat alive. A
+        // timeout must tear down the whole process group, so the grandchild has
+        // to stop writing as well.
+        let command =
+            "sh -c 'sh -c \"while true; do echo tick >> heartbeat.log; sleep 1; done\" & wait'";
+        let res = run_toolchain_check_with_timeout(dir.path(), command, 1, None).await;
+        assert!(!res.success, "expected a timeout: {}", res.combined_output);
+        assert!(
+            res.combined_output.contains("timed out"),
+            "output: {}",
+            res.combined_output
+        );
+
+        let heartbeat = dir.path().join("heartbeat.log");
+        let size_at_kill = std::fs::metadata(&heartbeat).map(|m| m.len()).unwrap_or(0);
+        tokio::time::sleep(std::time::Duration::from_millis(2200)).await;
+        let size_later = std::fs::metadata(&heartbeat).map(|m| m.len()).unwrap_or(0);
+        assert_eq!(
+            size_at_kill, size_later,
+            "the grandchild kept writing after the process-group kill"
+        );
     }
 }

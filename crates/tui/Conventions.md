@@ -229,4 +229,32 @@ This document specifies mandatory architectural and UX invariants for the Tauqe 
 
 5. **Projection Transparency:**
    - View code must never attempt manual ANSI downsampling, 16-color degradation branching, or separate light/dark logic branches.
-   - The `ThemeEngine` automatically projects semantic tokens through the active `ColorProjector` (`Truecolor` → `ANSI 256` → `ANSI 16` fallback with attributes), guaranteeing legibility and WCAG contrast in all terminal environments.
+   - The `ThemeEngine` automatically projects semantic tokens through the active `ColorProjector` (`Truecolor` → `ANSI 256` → `ANSI 16` fallback with attributes), гарантируя legibility and WCAG contrast in all terminal environments.
+
+---
+
+## 9. Zero-Hardcode User-Facing Text Invariant (100% Localized Presentation)
+
+1. **Single Source of Localized Text (`i18n.t` and `active_t`):**
+   - Every user-facing string rendered by the TUI (tab titles, modal dialog titles and bodies, button labels, key descriptions in `CommandSpec`, bounded-turn lifecycle badges, status messages, notifications `notify_*`, confirmation alerts) must be resolved dynamically through `i18n.t("key")` (or the process-global snapshot `active_t("key")`).
+   - Hardcoding raw user-facing string literals in `Span::raw("...")`, `Line::from("...")`, `Paragraph::new("...")`, or `Button::new("...")` is strictly prohibited and classified as an architectural defect.
+
+2. **Canonical Catalog as Embedded SSOT (`canonical_catalog`):**
+   - Every user-facing text key must be declared in `crates/tui/src/i18n/catalog.rs` inside `canonical_catalog()`.
+   - Each entry defines:
+     - `key` — stable dot-notated identifier (`category.item`);
+     - `english` — authoritative English source text;
+     - `context` — semantic usage description for the LLM translation engine (e.g. "confirmation button in modal dialog", "help description for cancelling current turn");
+     - `max_width` — explicit physical terminal column budget (`Some(N)`) for buttons, badges, tabs, and columns; or `None` (unbounded) for documentation, command descriptions, and multi-line explanations.
+
+3. **Budgeted vs Unbounded Text Geometry:**
+   - Elements constrained by fixed grid layouts (`Constraint::Length`) must specify a realistic `max_width` budget to prevent terminal grid overflow.
+   - Elements rendered within scrollable or wrapping views (Help dialog, command lists, multi-line explanations) must use `max_width = None` so translations remain natural and uncompromised.
+
+4. **Allowed Non-Localized Exceptions (Technical Artifacts):**
+   - Raw string literals are permissible exclusively for:
+     - LLM generation output and streaming response payloads (markdown, code blocks, diff hunks);
+     - File system paths, Git commit hashes, branch names, and repository metadata;
+     - Model and provider identifiers (e.g. `anthropic/claude-3.7-sonnet`);
+     - Technical chrome and non-verbal syntax separators (`/`, `•`, ` : `, `[+]`, `[-]`, `...`, borders);
+     - Key chord notation rendered by `KeyChord::display()` (e.g. `C-`, `M-`, `Tab`).

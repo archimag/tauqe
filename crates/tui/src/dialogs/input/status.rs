@@ -67,10 +67,14 @@ pub(crate) async fn apply_status_dialog(
             current_status,
             ..
         } => {
+            // The review lifecycle carries seven statuses: `Refine` sits between
+            // `InProgress` and `Fixed`, matching the option order rendered by
+            // `render/status.rs` and the fast-select range advertised there.
             let statuses = [
                 tauqe_protocol::ReviewItemStatus::Discussion,
                 tauqe_protocol::ReviewItemStatus::Todo,
                 tauqe_protocol::ReviewItemStatus::InProgress,
+                tauqe_protocol::ReviewItemStatus::Refine,
                 tauqe_protocol::ReviewItemStatus::Fixed,
                 tauqe_protocol::ReviewItemStatus::Skipped,
                 tauqe_protocol::ReviewItemStatus::Rejected,
@@ -96,7 +100,7 @@ pub(crate) async fn apply_status_dialog(
                 let req_id = crate::rpc::allocate_request_id();
                 server_writer.record_optimistic_rollback(
                     req_id,
-                    crate::rpc::OptimisticRollback::ReviewItemStatus {
+                    crate::rpc::OptimisticRollback::ReviewIssueStatus {
                         review_id: target_review_id.clone(),
                         item_id,
                         prev_status: current_status,
@@ -106,7 +110,7 @@ pub(crate) async fn apply_status_dialog(
                     review_id: target_review_id,
                     item_id,
                     status: Some(new_status),
-                    resolution_notes: None,
+                    note: None,
                 };
                 crate::rpc::send_request_with_id(
                     server_writer,
@@ -135,7 +139,9 @@ mod tests {
             model: None,
             severity: ReviewSeverity::Warning,
             status: ReviewItemStatus::Todo,
+            recommendations: Vec::new(),
             files: Vec::new(),
+            readonly_files: Vec::new(),
             subplan: Vec::new(),
             resolution_notes: None,
             body: String::new(),
@@ -188,5 +194,31 @@ mod tests {
             st.review.session.as_ref().map(|s| s.items[0].status),
             Some(ReviewItemStatus::Todo)
         );
+    }
+
+    #[tokio::test]
+    async fn applies_refine_status_optimistically() {
+        let mut st = crate::app::test_state();
+        st.review = ReviewViewState {
+            sessions: vec![session("rev-1")],
+            session: Some(session("rev-1")),
+            ..Default::default()
+        };
+        st.status_dialog = Some(StatusDialogState::new(
+            StatusDialogTarget::ReviewItem {
+                review_id: Some("rev-1".to_string()),
+                item_id: 1,
+                item_title: "Finding 1".to_string(),
+                current_status: ReviewItemStatus::Todo,
+            },
+            // Option index 3 is REFINE in the seven-status lifecycle.
+            3,
+        ));
+
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+        apply_status_dialog(&mut st, 3, &mut conn).await.unwrap();
+
+        assert_eq!(st.review.sessions[0].items[0].status, ReviewItemStatus::Refine);
+        assert_eq!(st.status_dialog, None, "the dialog must be consumed");
     }
 }

@@ -11,6 +11,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
 
 use crate::components::modal::{render_dialog_footer, render_modal_container, ModalTone};
+use crate::i18n::active_t;
 use crate::theme::engine::current_engine;
 use crate::ui::centered_rect;
 
@@ -47,7 +48,7 @@ pub fn disconnected_button_geometry(term: Rect) -> DisconnectedModalGeometry {
         .split(inner);
     let action_bar = chunks[1];
 
-    let quit_len = " [ Quit TAUQE (q / Ctrl+Q) ] ".chars().count() as u16;
+    let quit_len = disconnected_quit_label().chars().count() as u16;
     let start_x = action_bar.x + action_bar.width.saturating_sub(quit_len) / 2;
 
     DisconnectedModalGeometry {
@@ -56,14 +57,20 @@ pub fn disconnected_button_geometry(term: Rect) -> DisconnectedModalGeometry {
     }
 }
 
+/// Label of the quit button, resolved from the locale so the hit-test geometry
+/// and the drawn button stay in lockstep (Conventions §6, §9).
+fn disconnected_quit_label() -> String {
+    format!(" [ {} (q / Ctrl+Q) ] ", active_t("dialog.button.quit"))
+}
+
 /// Renders the disconnection modal with a docked exit panel.
 pub fn render_disconnected_popup(frame: &mut ratatui::Frame, message: &str) {
     let engine = current_engine();
     let palette = engine.palette();
     let geom = disconnected_button_geometry(frame.area());
 
-    let inner_area =
-        render_modal_container(frame, geom.area, "Server Disconnected", ModalTone::Dangerous);
+    let title = active_t("dialog.server_disconnected.title");
+    let inner_area = render_modal_container(frame, geom.area, &title, ModalTone::Dangerous);
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -77,7 +84,7 @@ pub fn render_disconnected_popup(frame: &mut ratatui::Frame, message: &str) {
     let lines = vec![
         Line::raw(""),
         Line::from(Span::styled(
-            "Connection to tauqe-server was terminated",
+            active_t("dialog.server_disconnected.terminated"),
             engine.fg(palette.status_error).bold(),
         )),
         Line::raw(""),
@@ -89,7 +96,7 @@ pub fn render_disconnected_popup(frame: &mut ratatui::Frame, message: &str) {
     frame.render_widget(body, chunks[0]);
 
     let quit_line = Line::from(Span::styled(
-        " [ Quit TAUQE (q / Ctrl+Q) ] ",
+        disconnected_quit_label(),
         engine
             .bg(palette.status_error)
             .fg(engine.color(palette.text_inverse))
@@ -98,7 +105,7 @@ pub fn render_disconnected_popup(frame: &mut ratatui::Frame, message: &str) {
     let actions = Paragraph::new(quit_line).alignment(Alignment::Center);
     frame.render_widget(actions, chunks[1]);
 
-    render_dialog_footer(frame, chunks[2], "q / Esc / Ctrl+Q quit");
+    render_dialog_footer(frame, chunks[2], &active_t("dialog.server_disconnected.footer"));
 }
 
 #[cfg(test)]

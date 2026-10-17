@@ -4,6 +4,9 @@
 //! file picker, and the onboarding fields, so its Emacs/Readline bindings are
 //! specified once here and surfaced through a dedicated Help tab rather than
 //! duplicated into every mode.
+//!
+//! Descriptions are localization keys (`cmd.editor.*`) resolved through the
+//! active locale at render time (Conventions §9).
 
 use crossterm::event::KeyCode;
 
@@ -39,110 +42,116 @@ pub static EDITOR_COMMAND_MAP: CommandMap<EditorCommand> = CommandMap::new(&[
         KeyChord::Primary(KeyCode::Char('b')),
         MoveCharBackward,
         Interface,
-        "Move one character backward",
+        "cmd.editor.move_char_backward",
     ),
     CommandSpec::new(
         KeyChord::Primary(KeyCode::Char('f')),
         MoveCharForward,
         Interface,
-        "Move one character forward",
+        "cmd.editor.move_char_forward",
     ),
     CommandSpec::new(
         KeyChord::Meta(KeyCode::Char('b')),
         MoveWordBackward,
         Interface,
-        "Move one word backward",
+        "cmd.editor.move_word_backward",
     ),
     CommandSpec::new(
         KeyChord::Meta(KeyCode::Left),
         MoveWordBackward,
         Interface,
-        "Move one word backward",
+        "cmd.editor.move_word_backward",
     ),
     CommandSpec::new(
         KeyChord::Meta(KeyCode::Char('f')),
         MoveWordForward,
         Interface,
-        "Move one word forward",
+        "cmd.editor.move_word_forward",
     ),
     CommandSpec::new(
         KeyChord::Meta(KeyCode::Right),
         MoveWordForward,
         Interface,
-        "Move one word forward",
+        "cmd.editor.move_word_forward",
     ),
     CommandSpec::new(
         KeyChord::Primary(KeyCode::Char('a')),
         MoveBeginningOfLine,
         Interface,
-        "Move to the beginning of the line",
+        "cmd.editor.move_beginning_of_line",
     ),
     CommandSpec::new(
         KeyChord::Primary(KeyCode::Char('e')),
         MoveEndOfLine,
         Interface,
-        "Move to the end of the line",
+        "cmd.editor.move_end_of_line",
     ),
     CommandSpec::new(
         KeyChord::Primary(KeyCode::Char('p')),
         MoveLineUp,
         Interface,
-        "Move the cursor one line up",
+        "cmd.editor.move_line_up",
     ),
     CommandSpec::new(
         KeyChord::Primary(KeyCode::Char('n')),
         MoveLineDown,
         Interface,
-        "Move the cursor one line down",
+        "cmd.editor.move_line_down",
     ),
     CommandSpec::new(
         KeyChord::Primary(KeyCode::Char('d')),
         DeleteForward,
         Interface,
-        "Delete the character forward",
+        "cmd.editor.delete_forward",
     ),
     CommandSpec::new(
         KeyChord::Primary(KeyCode::Char('j')),
         InsertNewline,
         Interface,
-        "Insert a newline",
+        "cmd.editor.insert_newline",
     ),
     // Helpers: kill-ring and clipboard operations.
     CommandSpec::new(
         KeyChord::Primary(KeyCode::Char('w')),
         KillWordBackward,
         Helpers,
-        "Kill the word before the cursor",
+        "cmd.editor.kill_word_backward",
     ),
     CommandSpec::new(
         KeyChord::Meta(KeyCode::Backspace),
         KillWordBackward,
         Helpers,
-        "Kill the word before the cursor",
+        "cmd.editor.kill_word_backward",
     ),
     CommandSpec::new(
         KeyChord::Meta(KeyCode::Char('d')),
         KillWordForward,
         Helpers,
-        "Kill the word after the cursor",
+        "cmd.editor.kill_word_forward",
     ),
     CommandSpec::new(
         KeyChord::Primary(KeyCode::Char('u')),
         KillToBeginningOfLine,
         Helpers,
-        "Kill to the beginning of the line",
+        "cmd.editor.kill_to_beginning",
     ),
     CommandSpec::new(
         KeyChord::Primary(KeyCode::Char('k')),
         KillLine,
         Helpers,
-        "Kill to the end of the line",
+        "cmd.editor.kill_line",
     ),
     CommandSpec::new(
         KeyChord::Primary(KeyCode::Char('y')),
         Yank,
         Helpers,
-        "Yank from the kill ring or the clipboard",
+        "cmd.editor.yank",
+    ),
+    CommandSpec::new(
+        KeyChord::Shift(KeyCode::Insert),
+        Yank,
+        Helpers,
+        "cmd.editor.yank",
     ),
 ]);
 
@@ -184,6 +193,16 @@ mod tests {
         assert_eq!(
             word_back.map(|spec| spec.action),
             Some(EditorCommand::MoveWordBackward)
+        );
+
+        let shift_insert = EDITOR_COMMAND_MAP.resolve(
+            KeyEvent::new(KeyCode::Insert, KeyModifiers::SHIFT),
+            &input,
+            true,
+        );
+        assert_eq!(
+            shift_insert.map(|spec| spec.action),
+            Some(EditorCommand::Yank)
         );
     }
 }

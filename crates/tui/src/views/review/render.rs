@@ -2,13 +2,14 @@ use ratatui::layout::Rect;
 use ratatui::style::Stylize;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Padding, Paragraph};
-use tauqe_protocol::ReviewItemStatus;
+use tauqe_protocol::IssueStatus;
 
 use crate::app::AppState;
+use crate::i18n::active_t;
 
 use super::{
-    compute_unified_review_lines, location, model_badge, severity_style, status_label,
-    status_style, VisibleReviewRow,
+    compute_unified_review_lines, format_created_at, issue_status_label, issue_status_style,
+    issue_type_badge, issue_type_style, location, model_badge, VisibleReviewRow,
 };
 
 pub fn render_review_view(
@@ -38,11 +39,11 @@ pub fn render_review_view(
             vec![
                 Line::raw(""),
                 Line::from(Span::styled(
-                    "  Review in progress...",
+                    format!("  {}", active_t("review.in_progress")),
                     engine.fg(palette.status_warning).bold(),
                 )),
                 Line::from(Span::styled(
-                    "  Streaming findings and summary in Develop view (Ctrl+1).",
+                    format!("  {}", active_t("review.running_hint")),
                     engine.fg(palette.text_muted),
                 )),
             ]
@@ -50,11 +51,11 @@ pub fn render_review_view(
             vec![
                 Line::raw(""),
                 Line::from(Span::styled(
-                    "  No code reviews yet.",
+                    format!("  {}", active_t("review.empty_title")),
                     engine.fg(palette.text_muted).bold(),
                 )),
                 Line::from(Span::styled(
-                    "  Add files to Context (Ctrl+2), then press 'r' to run a code review.",
+                    format!("  {}", active_t("review.empty_hint")),
                     engine.fg(palette.text_muted),
                 )),
             ]
@@ -102,11 +103,11 @@ pub fn render_review_view(
     let total_items: usize = effective.iter().map(|s| s.items.len()).sum();
     let fixed_items: usize = effective
         .iter()
-        .map(|s| s.items.iter().filter(|i| i.status == ReviewItemStatus::Fixed).count())
+        .map(|s| s.items.iter().filter(|i| i.status == IssueStatus::Fixed).count())
         .sum();
     let skipped_items: usize = effective
         .iter()
-        .map(|s| s.items.iter().filter(|i| i.status == ReviewItemStatus::Skipped).count())
+        .map(|s| s.items.iter().filter(|i| i.status == IssueStatus::Skipped).count())
         .sum();
 
     let mut status_spans = Vec::new();
@@ -115,7 +116,7 @@ pub fn render_review_view(
     } else {
         if state.review.running {
             status_spans.push(Span::styled(
-                " Review in progress... ",
+                format!(" {} ", active_t("review.in_progress")),
                 engine.fg(palette.status_warning).bold(),
             ));
         }
@@ -130,11 +131,14 @@ pub fn render_review_view(
             engine.fg(palette.text_muted),
         ));
         if state.review.hide_closed {
-            status_spans.push(Span::styled(" | Filter: Open only", engine.fg(palette.status_warning)));
+            status_spans.push(Span::styled(
+                format!(" | {}", active_t("review.filter_open")),
+                engine.fg(palette.status_warning),
+            ));
         }
         if state.review.refining.is_some() {
             status_spans.push(Span::styled(
-                " | [Refining: Architect is decomposing the finding...]",
+                format!(" | {}", active_t("review.refining")),
                 engine.fg(palette.status_warning).bold(),
             ));
         }
@@ -170,6 +174,7 @@ fn describe_review_row(
             title,
             description,
             model,
+            created_at,
             total,
             fixed,
             todo,
@@ -181,11 +186,15 @@ fn describe_review_row(
         } => {
             let mut spans = vec![
                 Span::styled(
-                    format!(" Review: {}", title),
+                    format!(" {} {}", active_t("review.session_label"), title),
                     engine.fg(palette.text_primary).bold(),
                 ),
                 Span::styled(
                     format!(" ({})", model),
+                    engine.fg(palette.text_muted),
+                ),
+                Span::styled(
+                    format!("  {} ", format_created_at(*created_at)),
                     engine.fg(palette.text_muted),
                 ),
                 Span::styled(
@@ -211,7 +220,8 @@ fn describe_review_row(
         } => {
             let mut spans = vec![Span::styled(
                 format!(
-                    " Executive Summary{}",
+                    " {}{}",
+                    active_t("review.executive_summary"),
                     if *is_expanded { "" } else { " (folded)" }
                 ),
                 engine.fg(palette.status_success).bold(),
@@ -227,8 +237,8 @@ fn describe_review_row(
         VisibleReviewRow::ReviewItem {
             item_id,
             title,
-            body,
-            severity,
+            description,
+            issue_type,
             status,
             model,
             files,
@@ -239,11 +249,13 @@ fn describe_review_row(
                     format!(" #{} ", item_id),
                     engine.fg(palette.text_secondary),
                 ),
-                Span::styled(format!("[{}]", severity), severity_style(*severity)),
-                Span::raw(" "),
                 Span::styled(
-                    format!(" {} ", status_label(*status)),
-                    status_style(*status),
+                    format!(" [{}] ", issue_type_badge(*issue_type)),
+                    issue_type_style(*issue_type),
+                ),
+                Span::styled(
+                    format!(" {} ", issue_status_label(*status)),
+                    issue_status_style(*status),
                 ),
                 Span::styled(title.clone(), engine.fg(palette.text_primary).bold()),
             ];
@@ -256,7 +268,7 @@ fn describe_review_row(
                     engine.fg(palette.status_info),
                 ));
             }
-            if let Some(desc) = first_content_line(Some(body.as_str())) {
+            if let Some(desc) = first_content_line(Some(description.as_str())) {
                 spans.push(Span::styled(
                     format!("  —  {}", desc),
                     engine.fg(palette.text_muted),
@@ -307,7 +319,7 @@ mod tests {
 
     #[test]
     fn executive_summary_remains_visible_after_session_set() {
-        use tauqe_protocol::{ReviewItem, ReviewItemStatus, ReviewSeverity, ReviewSession};
+        use tauqe_protocol::{IssueStatus, IssueType, ReviewIssue, ReviewSession};
 
         let mut review = ReviewViewState::default();
 
@@ -319,17 +331,20 @@ mod tests {
             description: Some("## Executive overview\n\nThe architecture is sound.".to_string()),
             user_prompt: None,
             target_files: Vec::new(),
-            items: vec![ReviewItem {
+            items: vec![ReviewIssue {
                 id: 1,
                 title: "Finding".to_string(),
                 model: None,
-                severity: ReviewSeverity::Warning,
-                status: ReviewItemStatus::Todo,
+                issue_type: IssueType::Architecture,
+                status: IssueStatus::Todo,
+                description: String::new(),
+                recommendations: Vec::new(),
                 files: Vec::new(),
-                subplan: Vec::new(),
-                resolution_notes: None,
-                body: String::new(),
-            }],
+                readonly_files: Vec::new(),
+                plan: Vec::new(),
+                note: None,
+            }
+            .into()],
             raw_markdown: String::new(),
         };
         review.set_session(session);
@@ -378,7 +393,7 @@ mod tests {
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         let mut state = crate::app::test_state();
-        state.model.status = crate::views::develop::TurnStatus::Responding;
+        state.model.status = crate::views::repl::TurnStatus::Responding;
         state.review.running = false;
 
         terminal

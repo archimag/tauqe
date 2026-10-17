@@ -164,6 +164,8 @@ pub enum LlmCommand {
     Edit { operation: EditOperation },
     /// A request to add a file to the context at a given access level.
     ContextRequest { path: String, access: ContextAccess },
+    /// A search request across repository files using Rust/ripgrep regex.
+    RepoSearch { path: String, regex: String },
     /// A request for system documentation by topic.
     DocRequest { topic: DocTopic },
     /// A request to run deterministic toolchain verification.
@@ -282,6 +284,16 @@ mod tests {
         assert!(json.contains("\"type\":\"context_request\""));
         assert!(json.contains("\"access\":\"editable\""));
         assert_eq!(serde_json::from_str::<LlmCommand>(&json).unwrap(), request);
+
+        let search = LlmCommand::RepoSearch {
+            path: "src".to_string(),
+            regex: "fn main".to_string(),
+        };
+        let json = serde_json::to_string(&search).unwrap();
+        assert!(json.contains("\"type\":\"repo_search\""));
+        assert!(json.contains("\"path\":\"src\""));
+        assert!(json.contains("\"regex\":\"fn main\""));
+        assert_eq!(serde_json::from_str::<LlmCommand>(&json).unwrap(), search);
 
         let doc = LlmCommand::DocRequest {
             topic: DocTopic::Workflow,

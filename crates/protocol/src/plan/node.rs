@@ -9,6 +9,7 @@ use super::item::{ConceptItem, PlanItem, PlanItemStatus};
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PlanValidationError {
     EmptyItemId,
+    EmptyConceptId,
     DuplicateItemId(String),
     DuplicateConceptId(String),
     MissingDependency { item_id: String, depends_on: String },
@@ -21,6 +22,7 @@ impl fmt::Display for PlanValidationError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::EmptyItemId => write!(f, "Step ID cannot be empty"),
+            Self::EmptyConceptId => write!(f, "Concept ID cannot be empty"),
             Self::DuplicateItemId(id) => write!(f, "Duplicate step ID: '{id}'"),
             Self::DuplicateConceptId(id) => write!(f, "Duplicate concept ID: '{id}'"),
             Self::MissingDependency { item_id, depends_on } => {
@@ -50,6 +52,20 @@ impl std::error::Error for PlanValidationError {}
 /// into one key used everywhere.
 pub(super) fn id_key(id: &str) -> String {
     id.trim().to_ascii_lowercase()
+}
+
+/// Canonical comparison key for a leaf file path.
+///
+/// `files` and `readonly_files` hold user-authored path strings that may differ
+/// only by cosmetic spelling (`./src/x.rs`, `src//x.rs`, `src\x.rs`). Collapsing
+/// them through the crate's shared [`crate::edit::normalize_repo_path`] routine
+/// lets `normalize_leaf_files` treat those spellings as the same file, so a path
+/// listed as both editable and reference is resolved consistently. When a path
+/// cannot be normalized (it is absolute, traversing, or empty) the trimmed raw
+/// string is kept as the key, so the comparison stays total and never drops a
+/// badge through a failed normalization.
+fn path_key(raw: &str) -> String {
+    crate::edit::normalize_repo_path(raw).unwrap_or_else(|_| raw.trim().to_string())
 }
 
 /// Two-section engineering plan: Concept Tree ("What") and Implementation Blueprint ("How").
@@ -284,7 +300,10 @@ impl Plan {
             for item in items.iter_mut() {
                 if item.children.is_empty() {
                     if !item.readonly_files.is_empty() && !item.files.is_empty() {
-                        item.readonly_files.retain(|r| !item.files.contains(r));
+                        let file_keys: HashSet<String> =
+                            item.files.iter().map(|f| path_key(f)).collect();
+                        item.readonly_files
+                            .retain(|r| !file_keys.contains(&path_key(r)));
                     }
                     continue;
                 }
@@ -360,7 +379,9 @@ impl Plan {
         ) {
             for c in concepts {
                 let key = id_key(&c.id);
-                if !key.is_empty() && !seen.insert(key) {
+                if key.is_empty() {
+                    errors.push(PlanValidationError::EmptyConceptId);
+                } else if !seen.insert(key) {
                     errors.push(PlanValidationError::DuplicateConceptId(c.id.clone()));
                 }
                 walk_concepts(&c.children, seen, errors);

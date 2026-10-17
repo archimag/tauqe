@@ -13,6 +13,7 @@ pub mod edits;
 pub(crate) mod escape;
 pub mod git;
 pub mod history;
+pub mod locale;
 pub mod plan;
 pub mod prompt;
 pub mod providers;

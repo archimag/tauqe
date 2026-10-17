@@ -8,6 +8,8 @@ mod apply;
 mod horizon;
 mod immutability;
 
+pub use horizon::merge_subplan;
+
 /// Execution mode governing plan mutation permissions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlanMutationMode {
@@ -239,8 +241,6 @@ impl PlanStorage {
         } else {
             Self::find_plan_file_unlocked(repo_root, &plan.id).unwrap_or(default_target)
         };
-        let temp_file = target_file.with_extension("json.tmp");
-
         let existing = if target_file.is_file() {
             let content = std::fs::read_to_string(&target_file)
                 .with_context(|| format!("Failed to read existing plan file at {}", target_file.display()))?;
@@ -264,13 +264,7 @@ impl PlanStorage {
 
         let json = serde_json::to_string_pretty(&normalized)
             .context("Failed to serialize plan to JSON")?;
-        std::fs::write(&temp_file, json).with_context(|| {
-            format!("Failed to write temporary plan file at {}", temp_file.display())
-        })?;
-
-        std::fs::rename(&temp_file, &target_file).with_context(|| {
-            format!("Failed to atomically rename plan file to {}", target_file.display())
-        })?;
+        write_atomic(&target_file, json.as_bytes())?;
 
         // If no active plan is set, make this plan active so clients always have
         // a persisted active-plan marker to render.
@@ -355,8 +349,7 @@ impl PlanStorage {
         let active_file = dir.join("active");
         match id {
             Some(val) if !val.trim().is_empty() => {
-                std::fs::write(&active_file, val.trim())
-                    .with_context(|| format!("Failed to write active plan marker to {}", active_file.display()))?;
+                write_atomic(&active_file, val.trim().as_bytes())?;
             }
             _ => {
                 if active_file.is_file() {
@@ -483,6 +476,39 @@ impl PlanStorage {
             Ok(None)
         }
     }
+}
+
+/// Atomically replaces `target` with `contents`.
+///
+/// The payload is staged into a uniquely named sibling temporary file, flushed,
+/// and `fsync`ed before the atomic rename. Without the `sync_all` barrier a crash
+/// immediately after the rename could leave a zero-length or truncated file on
+/// disk; the per-process suffix on the staging name also prevents a stale or
+/// concurrent write from colliding on a shared, fixed `<file>.json.tmp` path.
+fn write_atomic(target: &Path, contents: &[u8]) -> Result<()> {
+    use std::io::Write;
+
+    let file_name = target.file_name().and_then(|f| f.to_str()).unwrap_or("file");
+    let temp_file = target.with_file_name(format!("{file_name}.tmp.{}", std::process::id()));
+
+    {
+        let mut file = std::fs::File::create(&temp_file)
+            .with_context(|| format!("Failed to create temp file at {}", temp_file.display()))?;
+        file.write_all(contents)
+            .with_context(|| format!("Failed to write temp file at {}", temp_file.display()))?;
+        file.flush()
+            .with_context(|| format!("Failed to flush temp file at {}", temp_file.display()))?;
+        file.sync_all()
+            .with_context(|| format!("Failed to sync temp file at {}", temp_file.display()))?;
+    }
+
+    std::fs::rename(&temp_file, target).with_context(|| {
+        format!(
+            "Failed to atomically rename {} to {}",
+            temp_file.display(),
+            target.display()
+        )
+    })
 }
 
 /// Result of applying plan operations from model output.
@@ -878,5 +904,31 @@ mod tests {
 
         let still_exists = PlanStorage::load_plan(root, "team/auth").unwrap();
         assert!(still_exists.is_some());
+    }
+
+    #[test]
+    fn test_atomic_writes_leave_no_temp_files() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+
+        let plan = Plan {
+            id: "atomic-plan".to_string(),
+            title: "Atomic".to_string(),
+            ..Default::default()
+        };
+        PlanStorage::save_plan(root, &plan).unwrap();
+        PlanStorage::save_active_id(root, Some("atomic-plan")).unwrap();
+
+        let leftovers: Vec<_> = std::fs::read_dir(PlanStorage::plans_dir(root))
+            .unwrap()
+            .flatten()
+            .filter(|entry| entry.file_name().to_string_lossy().contains(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "unexpected temp files: {leftovers:?}");
+
+        assert_eq!(
+            PlanStorage::load_active_id(root).unwrap(),
+            Some("atomic-plan".to_string())
+        );
     }
 }

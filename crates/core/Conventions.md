@@ -9,7 +9,7 @@ This document specifies mandatory architectural and operational conventions for 
 The interaction protocol between Tauqe and large language models is strictly divided into two orthogonal operational contours:
 
 ### 1.1. Code Modification Contour (Develop & Step Execution)
-- **Protocol:** Strict XML marker protocol (`<tauqe_edits_...>`, `<context_request_...>`, `<verify_...>`, `<plan_...>`, etc.).
+- **Protocol:** Strict XML marker protocol (`<tauqe_edits_...>`, `<context_request_...>`, `<repo_search_...>`, `<verify_...>`, `<plan_...>`, etc.).
 - **Purpose:** Virtual in-memory staging, atomic search/replace patch application, toolchain verification healing, and deterministic Git transactions.
 - **Scope:** Used exclusively when the model is tasked with creating, editing, renaming, or deleting codebase files.
 
@@ -27,6 +27,12 @@ The interaction protocol between Tauqe and large language models is strictly div
   - Prevents prompt injection and instruction drift.
   - Guarantees compile-time schema conformance and deterministic deserialization.
   - Decouples cognitive reasoning and conversational workflows from file-patching machinery.
+
+### 1.3. Turn-Marker Tag Protection Invariant (Unified XML Defense)
+- **Unified Registration SSOT:** Every structural XML control tag emitted by the model (`<tauqe_edits>`, `<edit>`, `<search>`, `<replace>`, `<create>`, `<overwrite>`, `<delete>`, `<move>`, `<context_request>`, `<repo_search>`, `<doc_request>`, `<plan>`, `<verify>`, `<scratchpad>`, `<success>`, `<error>`, `<blocked>`, `<user_language>`) MUST participate in the unified turn-marker protection mechanism. Introducing any control tag without registering it in `XML_TAG_BASES` (`crates/core/src/edits/protocol/xml/marker.rs`) is strictly prohibited.
+- **Cryptographic Turn Binding:** For each bounded turn, the engine generates an unpredictable alphanumeric turn marker (`generate_turn_marker`). System prompt instructions append this marker suffix to every control tag (`<{base}_{marker}>`).
+- **Strict Normalization and Injection Defense:** Active execution parsers (`MarkedXmlEditProtocol`) strictly decode only marker-suffixed tags via `normalize_marked_xml`. Unsuffixed tags occurring in source code, diffs, conversational text, or documentation are protected as literals (`restore_xml_literals`) and must NEVER trigger commands, context mutations, repository searches, plan changes, or patch staging.
+- **Streaming Suppression:** Stream filters (`XmlStreamFilter`, `find_next_control_tag`) detect marker-suffixed tags during generation and suppress them from leaking into the user-facing `TextDelta` stream.
 
 ---
 

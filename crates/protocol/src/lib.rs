@@ -22,6 +22,7 @@ pub mod events;
 pub mod git;
 pub mod glob;
 pub mod history;
+pub mod locale;
 pub mod message;
 pub mod methods;
 pub mod model;
@@ -50,7 +51,7 @@ pub use discussion::{
     DiscussionClearFocusResult, DiscussionContextRequest, DiscussionFocus,
     DiscussionFocusChangedEvent, DiscussionGetFocusParams, DiscussionGetFocusResult,
     DiscussionPlanAction, DiscussionPlanUpdate, DiscussionRequest, DiscussionResponse,
-    DiscussionSetFocusParams, DiscussionSetFocusResult, DiscussionTarget,
+    DiscussionSetFocusParams, DiscussionSetFocusResult, DiscussionTarget, RepoSearchRequest,
 };
 pub use edit::{
     EditFileDoneEvent, EditFileOp, EditFileRetryingEvent, EditFileStartedEvent, EditFileStatus,
@@ -62,15 +63,15 @@ pub use errors::{
     CREDENTIALS_SAVE_FAILED, CREDENTIALS_STUB_FAILED, EMPTY_CONTEXT, EMPTY_ITEMS, GET_DIFF_FAILED,
     INIT_FAILED, INTERNAL_ERROR, INVALID_KEY, INVALID_MODEL, INVALID_PARAMS, INVALID_PLAN_ID,
     INVALID_PLAN_TREE, INVALID_PROTOCOL, INVALID_REQUEST, INVALID_WORKFLOW, ITEM_IN_DISCUSSION,
-    ITEM_REJECTED, LIST_FILES_FAILED, METHOD_NOT_FOUND, MODEL_ERROR, NEEDS_CONTEXT, NOT_FOUND,
-    NOTHING_TO_EXECUTE, NOT_A_LEAF, NO_API_KEY, OPERATION_IN_PROGRESS,
-    PARSE_ERROR, PINNED_PROTECTED, PLAN_DELETE_FAILED, PLAN_GET_FAILED,
-    PLAN_LIST_FAILED, PLAN_LOAD_FAILED, PLAN_SAVE_FAILED, PLAN_SET_ACTIVE_FAILED,
-    PLAN_UPDATE_FAILED, PREFLIGHT_VERIFICATION_FAILED, REMOVE_FAILED, REPOSITORY_STATE_FAILED,
-    REVIEW_DELETE_FAILED, REVIEW_GET_FAILED, REVIEW_LIST_FAILED, REVIEW_LOAD_FAILED,
-    REVIEW_UPDATE_FAILED, SCHEMA_ERROR, SET_ACCESS_FAILED, SQUASH_FAILED, SQUASH_PREVIEW_FAILED,
-    STEP_BLOCKED, STEP_BLOCKED_BY_DEPENDENCIES, STEP_CANCELLED, STEP_IMMUTABLE,
-    STEP_IN_DISCUSSION, UNDO_FAILED, UNEXPECTED_STATUS,
+    ITEM_IN_REFINE, ITEM_REJECTED, LIST_FILES_FAILED, METHOD_NOT_FOUND, MODEL_ERROR,
+    NEEDS_CONTEXT, NOT_FOUND, NOTHING_TO_EXECUTE, NOT_A_LEAF, NO_API_KEY, OPERATION_IN_PROGRESS,
+    PARSE_ERROR, PINNED_PROTECTED, PLAN_DELETE_FAILED, PLAN_GET_FAILED, PLAN_LIST_FAILED,
+    PLAN_LOAD_FAILED, PLAN_SAVE_FAILED, PLAN_SET_ACTIVE_FAILED, PLAN_UPDATE_FAILED,
+    PREFLIGHT_VERIFICATION_FAILED, REMOVE_FAILED, REPOSITORY_STATE_FAILED, REVIEW_DELETE_FAILED,
+    REVIEW_GET_FAILED, REVIEW_LIST_FAILED, REVIEW_LOAD_FAILED, REVIEW_UPDATE_FAILED, SCHEMA_ERROR,
+    SET_ACCESS_FAILED, SQUASH_FAILED, SQUASH_PREVIEW_FAILED, STEP_BLOCKED,
+    STEP_BLOCKED_BY_DEPENDENCIES, STEP_CANCELLED, STEP_IMMUTABLE, STEP_IN_DISCUSSION, UNDO_FAILED,
+    UNEXPECTED_STATUS,
 };
 pub use git::{
     GitCommitCreatedEvent, GitDiffParams, GitDiffResult, GitSquashApplyParams,
@@ -83,6 +84,7 @@ pub use history::{
     HistoryCompactedEvent, HistoryEntryAddedEvent, HistoryGetParams, HistoryGetResult,
     UiHistoryItem, UiHistoryKind,
 };
+pub use locale::{LocaleCatalogItem, LocaleGenerateParams, LocaleGenerateResult};
 pub use message::{
     Event, InitializeParams, InitializeResult, Message, Request, RequestId, Response,
     ResponseError,
@@ -107,13 +109,13 @@ pub use plan::{
     PlanUpdateItemResult, PlanUpdatedEvent, PlanValidationError,
 };
 pub use review::{
-    ReviewCancelParams, ReviewContentDeltaEvent, ReviewDeleteParams, ReviewDeleteResult,
-    ReviewErrorEvent, ReviewExecuteParams, ReviewFinishedEvent, ReviewGetParams,
-    ReviewGetResult, ReviewItem, ReviewItemStatus, ReviewListChangedEvent, ReviewListParams,
-    ReviewListResult, ReviewReasoningDeltaEvent, ReviewRefineItemParams,
-    ReviewRefineItemResult, ReviewSession, ReviewSeverity, ReviewStartParams,
-    ReviewStartedEvent, ReviewSummary, ReviewUpdateItemParams, ReviewUpdateItemResult,
-    ReviewUpdatedEvent,
+    IssueStatus, IssueType, ReviewCancelParams, ReviewContentDeltaEvent, ReviewDeleteParams,
+    ReviewDeleteResult, ReviewErrorEvent, ReviewExecuteParams, ReviewFinishedEvent,
+    ReviewGetParams, ReviewGetResult, ReviewIssue, ReviewItem, ReviewItemStatus,
+    ReviewListChangedEvent, ReviewListParams, ReviewListResult, ReviewReasoningDeltaEvent,
+    ReviewRefineItemParams, ReviewRefineItemResult, ReviewSession, ReviewSeverity,
+    ReviewStartParams, ReviewStartedEvent, ReviewSummary, ReviewUpdateItemParams,
+    ReviewUpdateItemResult, ReviewUpdatedEvent,
 };
 
 #[cfg(test)]
@@ -141,7 +143,8 @@ mod wire_contract_tracking {
     /// - `DocTopic`: `plans`
     /// - `WorkflowKind`: `single`, `direct`
     /// - `EditProtocolKind`: `structured_output`, `json_schema`, `json`
-    /// - `ReviewItemStatus`: `done`
+    /// - `IssueStatus`: `done`
+    /// - `ReviewUpdateItemParams`: `resolution_notes`
     /// - `PlanReplanParams`: `id`, `item_id`
     #[test]
     fn legacy_aliases_must_be_removed_by_0_2_0() {
@@ -152,8 +155,9 @@ mod wire_contract_tracking {
             (major, minor) < (0, 2),
             "Crate version {}. The legacy aliases (DocTopic `plans`; WorkflowKind \
              `single`/`direct`; EditProtocolKind `structured_output`/`json_schema`/\
-             `json`; ReviewItemStatus `done`; PlanReplanParams `id`/`item_id`) were \
-             scheduled for removal in 0.2.0. Remove them and delete this test.",
+             `json`; IssueStatus `done`; ReviewUpdateItemParams `resolution_notes`; \
+             PlanReplanParams `id`/`item_id`) were scheduled for removal in 0.2.0. \
+             Remove them and delete this test.",
             PROTOCOL_VERSION
         );
     }

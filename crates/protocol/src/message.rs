@@ -313,11 +313,25 @@ impl<'de> Deserialize<'de> for Message {
                     params: raw.params,
                 })),
             },
-            None => Ok(Message::Response(Response {
-                id: raw.id.unwrap_or(RequestId::Null),
-                result: raw.result,
-                error: raw.error,
-            })),
+            None => {
+                // Without `method` the payload can only be a response, and a
+                // response is meaningful only when it carries at least one of
+                // `id`, `result`, or `error`. An empty or unrelated object
+                // (`{}`, `{"foo":"bar"}`) is a malformed wire payload and must
+                // surface as a parse error instead of being silently accepted
+                // as a vacuous response.
+                if raw.id.is_none() && raw.result.is_none() && raw.error.is_none() {
+                    return Err(serde::de::Error::custom(
+                        "message object carries neither `method`, `id`, `result`, nor `error`",
+                    ));
+                }
+
+                Ok(Message::Response(Response {
+                    id: raw.id.unwrap_or(RequestId::Null),
+                    result: raw.result,
+                    error: raw.error,
+                }))
+            }
         }
     }
 }
@@ -449,6 +463,35 @@ mod tests {
         let json = serde_json::to_string(&uncorrelated).unwrap();
         match serde_json::from_str::<Message>(&json).unwrap() {
             Message::Response(response) => assert_eq!(response.id, RequestId::Null),
+            other => panic!("Expected Response, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_message_rejects_vacuous_object_instead_of_accepting_as_response() {
+        // An object without `method`, `id`, `result`, or `error` carries no
+        // message and must surface as a parse error instead of being silently
+        // absorbed as a vacuous response.
+        assert!(serde_json::from_str::<Message>("{}").is_err());
+        assert!(serde_json::from_str::<Message>(r#"{"foo":"bar"}"#).is_err());
+
+        // A payload that carries at least one response field is still a
+        // response, even when `result` and `error` are omitted.
+        match serde_json::from_str::<Message>(r#"{"id":1}"#).unwrap() {
+            Message::Response(response) => {
+                assert_eq!(response.id, RequestId::Number(1));
+                assert!(response.result.is_none());
+                assert!(response.error.is_none());
+            }
+            other => panic!("Expected Response, got {other:?}"),
+        }
+
+        // A response that carries only a result (no id, no error) is accepted.
+        match serde_json::from_str::<Message>(r#"{"result":{"ok":true}}"#).unwrap() {
+            Message::Response(response) => {
+                assert_eq!(response.id, RequestId::Null);
+                assert!(response.result.is_some());
+            }
             other => panic!("Expected Response, got {other:?}"),
         }
     }

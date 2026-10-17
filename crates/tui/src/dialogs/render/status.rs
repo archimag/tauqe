@@ -4,6 +4,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
 use crate::components::modal::{render_dialog_footer, render_modal_container, ModalTone};
+use crate::i18n::active_t;
 use crate::theme::engine::current_engine;
 use crate::ui::centered_rect;
 use crate::ui::header::truncate_to_width;
@@ -17,7 +18,9 @@ pub fn status_dialog_area(term: Rect, options_count: usize) -> Rect {
 /// Fast-select hint rendered on the Apply button, matching the `1..N` digits
 /// the dialog accepts for the current option count.
 fn status_fast_select_label(options_count: usize) -> &'static str {
-    if options_count >= 6 {
+    if options_count >= 7 {
+        "1-7"
+    } else if options_count >= 6 {
         "1-6"
     } else if options_count >= 5 {
         "1-5"
@@ -30,13 +33,16 @@ fn status_fast_select_label(options_count: usize) -> &'static str {
 /// surrounding `[ ]` decoration.
 fn status_apply_label(options_count: usize) -> String {
     format!(
-        " [ Apply (Enter / {}) ] ",
+        " [ {} (Enter / {}) ] ",
+        active_t("dialog.button.apply"),
         status_fast_select_label(options_count)
     )
 }
 
-/// Cancel button label decoration.
-const STATUS_CANCEL_LABEL: &str = " [ Cancel (Esc) ] ";
+/// Cancel button label decoration, resolved from the locale.
+fn status_cancel_label() -> String {
+    format!(" [ {} (Esc) ] ", active_t("modal.cancel"))
+}
 /// Spacing drawn between the two action buttons.
 const STATUS_BUTTON_GAP: &str = "    ";
 
@@ -73,7 +79,7 @@ pub fn status_dialog_buttons(term: Rect, options_count: usize) -> (Rect, Rect) {
     let bar = status_dialog_chunks(area, options_count)[2];
 
     let apply_w = status_apply_label(options_count).chars().count() as u16;
-    let cancel_w = STATUS_CANCEL_LABEL.chars().count() as u16;
+    let cancel_w = status_cancel_label().chars().count() as u16;
     let gap_w = STATUS_BUTTON_GAP.chars().count() as u16;
     let total = apply_w + gap_w + cancel_w;
     let start_x = bar.x + bar.width.saturating_sub(total) / 2;
@@ -82,6 +88,14 @@ pub fn status_dialog_buttons(term: Rect, options_count: usize) -> (Rect, Rect) {
         Rect::new(start_x, bar.y, apply_w, 1),
         Rect::new(start_x + apply_w + gap_w, bar.y, cancel_w, 1),
     )
+}
+
+/// Options area of the status dialog: the scrollable rows listing every
+/// selectable status. Shared by rendering and mouse hit-testing so a click
+/// resolves against the exact window the rows are drawn in (Conventions §6.6).
+pub fn status_dialog_options_area(term: Rect, options_count: usize) -> Rect {
+    let area = status_dialog_area(term, options_count);
+    status_dialog_chunks(area, options_count)[1]
 }
 
 pub fn render_status_dialog(
@@ -104,44 +118,46 @@ pub fn render_status_dialog(
                 tauqe_protocol::PlanItemStatus::Cancelled => 5,
             };
             let opts = vec![
-                ("DISCUSSION", palette.button_active_bg, palette.text_inverse, "Under review / requires discussion"),
-                ("TODO", palette.status_warning, palette.text_inverse, "Approved / ready for execution"),
-                ("IN_PROGRESS", palette.status_info, palette.text_inverse, "Currently in active development"),
-                ("DONE", palette.status_success, palette.text_inverse, "Completed and verified"),
-                ("BLOCKED", palette.status_error, palette.text_inverse, "Blocked by unmet prerequisites / needs replanning"),
-                ("CANCELLED", palette.button_bg, palette.text_muted, "Superseded or cancelled"),
+                ("DISCUSSION", palette.button_active_bg, palette.text_inverse, active_t("dialog.status.option.discussion")),
+                ("TODO", palette.status_warning, palette.text_inverse, active_t("dialog.status.plan.option.todo")),
+                ("IN_PROGRESS", palette.status_info, palette.text_inverse, active_t("dialog.status.plan.option.in_progress")),
+                ("DONE", palette.status_success, palette.text_inverse, active_t("dialog.status.plan.option.done")),
+                ("BLOCKED", palette.status_error, palette.text_inverse, active_t("dialog.status.plan.option.blocked")),
+                ("CANCELLED", palette.button_bg, palette.text_muted, active_t("dialog.status.plan.option.cancelled")),
             ];
-            (" Change Task Status ", item_title.as_str(), cur, opts)
+            (active_t("dialog.status.plan.title"), item_title.as_str(), cur, opts)
         }
         crate::app::StatusDialogTarget::ReviewItem { item_title, current_status, .. } => {
             let cur = match current_status {
                 tauqe_protocol::ReviewItemStatus::Discussion => 0,
                 tauqe_protocol::ReviewItemStatus::Todo => 1,
                 tauqe_protocol::ReviewItemStatus::InProgress => 2,
-                tauqe_protocol::ReviewItemStatus::Fixed => 3,
-                tauqe_protocol::ReviewItemStatus::Skipped => 4,
-                tauqe_protocol::ReviewItemStatus::Rejected => 5,
+                tauqe_protocol::ReviewItemStatus::Refine => 3,
+                tauqe_protocol::ReviewItemStatus::Fixed => 4,
+                tauqe_protocol::ReviewItemStatus::Skipped => 5,
+                tauqe_protocol::ReviewItemStatus::Rejected => 6,
             };
             let opts = vec![
-                ("DISCUSSION", palette.button_active_bg, palette.text_inverse, "Under review / requires discussion"),
-                ("TODO", palette.status_warning, palette.text_inverse, "Approved / ready for implementation"),
-                ("IN_PROGRESS", palette.status_info, palette.text_inverse, "Currently being fixed"),
-                ("FIXED", palette.status_success, palette.text_inverse, "Resolved and addressed in code"),
-                ("SKIPPED", palette.button_bg, palette.text_muted, "Skipped / no code changes needed"),
-                ("REJECTED", palette.button_bg, palette.text_muted, "False positive / won't fix"),
+                ("DISCUSSION", palette.button_active_bg, palette.text_inverse, active_t("dialog.status.option.discussion")),
+                ("TODO", palette.status_warning, palette.text_inverse, active_t("dialog.status.review.option.todo")),
+                ("IN_PROGRESS", palette.status_info, palette.text_inverse, active_t("dialog.status.review.option.in_progress")),
+                ("REFINE", palette.status_error, palette.text_inverse, active_t("dialog.status.review.option.refine")),
+                ("FIXED", palette.status_success, palette.text_inverse, active_t("dialog.status.review.option.fixed")),
+                ("SKIPPED", palette.button_bg, palette.text_muted, active_t("dialog.status.review.option.skipped")),
+                ("REJECTED", palette.button_bg, palette.text_muted, active_t("dialog.status.review.option.rejected")),
             ];
-            (" Change Finding Status ", item_title.as_str(), cur, opts)
+            (active_t("dialog.status.review.title"), item_title.as_str(), cur, opts)
         }
     };
 
-    render_modal_container(frame, area, title, ModalTone::Info);
+    render_modal_container(frame, area, &title, ModalTone::Info);
 
     let chunks = status_dialog_chunks(area, options_count);
 
     let max_title_w = chunks[0].width.saturating_sub(10) as usize;
     let target_preview = truncate_to_width(raw_target_title.trim(), max_title_w);
     let target_line = Line::from(vec![
-        Span::styled(" Item: ", engine.fg(palette.text_muted)),
+        Span::styled(active_t("dialog.status.item_label"), engine.fg(palette.text_muted)),
         Span::styled(target_preview, engine.fg(palette.text_primary).bold()),
     ]);
     frame.render_widget(Paragraph::new(vec![Line::raw(""), target_line, Line::raw("")]), chunks[0]);
@@ -176,7 +192,7 @@ pub fn render_status_dialog(
             Span::styled(key_shortcut, engine.fg(palette.status_warning).bold()),
             Span::styled(format!(" {:<11} ", label), badge_style),
             Span::raw(" "),
-            Span::styled(*desc, if is_cursor { engine.fg(palette.text_primary) } else { engine.fg(palette.text_secondary) }),
+            Span::styled(desc.clone(), if is_cursor { engine.fg(palette.text_primary) } else { engine.fg(palette.text_secondary) }),
         ]).style(row_style));
     }
     frame.render_widget(Paragraph::new(body_lines), chunks[1]);
@@ -188,7 +204,7 @@ pub fn render_status_dialog(
         ),
         Span::raw(STATUS_BUTTON_GAP),
         Span::styled(
-            STATUS_CANCEL_LABEL,
+            status_cancel_label(),
             engine.bg(palette.button_bg).fg(engine.color(palette.button_fg)),
         ),
     ]);
@@ -199,10 +215,8 @@ pub fn render_status_dialog(
     // filled with `palette.overlay`, so it reads as persistent chrome instead
     // of a second line of buttons (c-1, c-2).
     let fast_select_label = status_fast_select_label(options_count);
-    let footer_hint = format!(
-        "{} fast select • n / p or j / k navigate • Enter apply • Esc cancel",
-        fast_select_label
-    );
+    let footer_hint =
+        active_t("dialog.status.fast_select_hint").replacen("{}", fast_select_label, 1);
     render_dialog_footer(frame, chunks[3], &footer_hint);
 }
 
@@ -211,6 +225,46 @@ mod tests {
     use super::*;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
+
+    /// The review status dialog exposes the full seven-status lifecycle,
+    /// including `REFINE`, and advertises the `1-7` fast-select range.
+    #[test]
+    fn review_status_dialog_renders_seven_options_including_refine() {
+        let term = Rect::new(0, 0, 100, 30);
+        let dialog = crate::app::StatusDialogState::new(
+            crate::app::StatusDialogTarget::ReviewItem {
+                review_id: Some("rev-1".to_string()),
+                item_id: 1,
+                item_title: "Finding".to_string(),
+                current_status: tauqe_protocol::ReviewItemStatus::Todo,
+            },
+            0,
+        );
+        assert_eq!(dialog.target.options_count(), 7);
+
+        let mut terminal = Terminal::new(TestBackend::new(term.width, term.height)).unwrap();
+        terminal
+            .draw(|f| render_status_dialog(f, &dialog))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+
+        let mut text = String::new();
+        for y in 0..term.height {
+            for x in 0..term.width {
+                text.push_str(buffer[(x, y)].symbol());
+            }
+            text.push('\n');
+        }
+        assert!(text.contains("REFINE"), "expected the REFINE option: {text}");
+        assert!(text.contains("FIXED"), "expected the FIXED option: {text}");
+        assert!(text.contains("1-7"), "expected the 1-7 fast-select hint: {text}");
+
+        let (apply_btn, cancel_btn) = status_dialog_buttons(term, 7);
+        assert!(
+            apply_btn.right() <= cancel_btn.x,
+            "action buttons must not overlap"
+        );
+    }
 
     /// Mouse hit-testing must compute the same button rectangles the renderer
     /// draws for the status dialog action bar, so a click on Apply resolves to
@@ -257,5 +311,19 @@ mod tests {
             apply_btn.right() <= cancel_btn.x,
             "action buttons must not overlap"
         );
+    }
+
+    /// The options area sits between the header and the action buttons, so a
+    /// click mapped to it can never collide with the button row.
+    #[test]
+    fn status_options_area_sits_between_header_and_buttons() {
+        let term = Rect::new(0, 0, 100, 30);
+        let area = status_dialog_area(term, 6);
+        let options = status_dialog_options_area(term, 6);
+        let (apply_btn, _cancel_btn) = status_dialog_buttons(term, 6);
+
+        assert!(options.y > area.y);
+        assert_eq!(options.bottom(), apply_btn.y);
+        assert!(options.height >= 1);
     }
 }

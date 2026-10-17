@@ -9,6 +9,7 @@ use crate::command::global::GLOBAL_COMMAND_MAP;
 use crate::command::{CommandCategory, CommandMap};
 use crate::components::modal::{button_style, render_modal_container, ModalTone};
 use crate::config::{MetaModifier, PrimaryModifier};
+use crate::i18n::active_t;
 use crate::theme::engine::{current_engine, ThemeEngine};
 use crate::ui::centered_rect;
 
@@ -29,13 +30,33 @@ pub const ONBOARDING_COMMANDS: &[crate::app::KeyCommand] = &[
 /// One rendered help command: the projected chord label and its description.
 pub struct HelpCommand {
     pub key: String,
-    pub description: &'static str,
+    pub description: String,
 }
 
 /// One titled block of help commands: a cognitive tier or a single mode's list.
 struct HelpSection {
-    heading: &'static str,
+    heading: String,
     commands: Vec<HelpCommand>,
+}
+
+/// Localized display title of a Help tab, resolved from the canonical catalog so
+/// the tab bar and the tab hit-test geometry share one source of truth
+/// (Conventions §9, c-1).
+fn help_tab_title(tab: HelpTab) -> String {
+    active_t(match tab {
+        HelpTab::Global => "help.tab.global",
+        HelpTab::CurrentMode => "help.tab.current_mode",
+        HelpTab::TextEditor => "help.tab.text_editor",
+    })
+}
+
+/// Localized display title of a command cognitive tier.
+fn category_title(category: CommandCategory) -> String {
+    active_t(match category {
+        CommandCategory::Essential => "help.category.essential",
+        CommandCategory::Interface => "help.category.interface",
+        CommandCategory::Helpers => "help.category.helpers",
+    })
 }
 
 /// Renders an abstract command chord for display: every `C-` (primary) and `M-`
@@ -106,7 +127,7 @@ fn command_map_filtered_sections<A: 'static>(
                 if seen.insert(key.clone()) {
                     commands.push(HelpCommand {
                         key,
-                        description: spec.description,
+                        description: spec.description(),
                     });
                 }
             }
@@ -114,7 +135,7 @@ fn command_map_filtered_sections<A: 'static>(
                 None
             } else {
                 Some(HelpSection {
-                    heading: category.title(),
+                    heading: category_title(*category),
                     commands,
                 })
             }
@@ -129,11 +150,11 @@ fn mode_help_sections(
     meta: MetaModifier,
 ) -> Vec<HelpSection> {
     match mode {
-        ViewMode::Develop => command_map_filtered_sections(
-            &crate::views::develop::DEVELOP_COMMAND_MAP,
+        ViewMode::Repl => command_map_filtered_sections(
+            &crate::views::repl::REPL_COMMAND_MAP,
             primary,
             meta,
-            |action| !crate::views::develop::input::is_editor_action(*action),
+            |action| !crate::views::repl::input::is_editor_action(*action),
         ),
         ViewMode::Plans => command_map_filtered_sections(
             &crate::views::plans::PLANS_COMMAND_MAP,
@@ -160,7 +181,7 @@ fn mode_help_sections(
             |_| true,
         ),
         ViewMode::Onboarding => vec![HelpSection {
-            heading: "Setup",
+            heading: active_t("tab.onboarding"),
             commands: list_help_commands(ONBOARDING_COMMANDS, primary, meta),
         }],
     }
@@ -193,7 +214,7 @@ fn push_command(
     engine: &ThemeEngine,
 ) {
     let palette = engine.palette();
-    let mut wrapped = wrap_words(command.description, desc_w).into_iter();
+    let mut wrapped = wrap_words(&command.description, desc_w).into_iter();
     let first = wrapped.next().unwrap_or_default();
     lines.push(Line::from(vec![
         Span::styled(
@@ -237,7 +258,7 @@ fn build_help_body(
             lines.push(Line::raw(""));
         }
         lines.push(Line::from(Span::styled(
-            section.heading.to_string(),
+            section.heading.clone(),
             engine.fg(palette.status_info).bold(),
         )));
         for command in &section.commands {
@@ -265,10 +286,81 @@ fn render_help_tab_bar(
         } else {
             button_style(engine, palette.button_bg, palette.button_fg, false)
         };
-        spans.push(Span::styled(format!(" {} ", tab.title()), style));
+        spans.push(Span::styled(format!(" {} ", help_tab_title(*tab)), style));
     }
     let line = Line::from(spans).alignment(Alignment::Center);
     frame.render_widget(Paragraph::new(line), area);
+}
+
+/// Clickable rectangles of the Help modal header bar.
+///
+/// Rendering and mouse hit-testing derive the tabs from the same layout, so a
+/// click on a tab switches it instead of dismissing the dialog
+/// (Conventions §6.6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HelpTabGeometry {
+    /// Whole dialog frame.
+    pub area: Rect,
+    /// The `Global` tab button.
+    pub global_tab: Rect,
+    /// The `Current Mode` tab button.
+    pub current_mode_tab: Rect,
+    /// The `Text Editor` tab button.
+    pub text_editor_tab: Rect,
+}
+
+/// Computes the Help dialog frame and the header tab rectangles from the same
+/// layout [`render_help_popup`] draws.
+pub fn help_tab_geometry(term: Rect) -> HelpTabGeometry {
+    let area = centered_rect(76, 75, term);
+    let inner = Rect::new(
+        area.x + 1,
+        area.y + 1,
+        area.width.saturating_sub(2),
+        area.height.saturating_sub(2),
+    );
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(2),
+            Constraint::Min(4),
+            Constraint::Length(3),
+        ])
+        .split(inner);
+    let bar = chunks[0];
+
+    // The tab bar is one centered line of ` {title} ` chips separated by four
+    // spaces, matching `render_help_tab_bar`.
+    let titles = [
+        help_tab_title(HelpTab::Global),
+        help_tab_title(HelpTab::CurrentMode),
+        help_tab_title(HelpTab::TextEditor),
+    ];
+    let widths: [u16; 3] = [
+        titles[0].chars().count() as u16 + 2,
+        titles[1].chars().count() as u16 + 2,
+        titles[2].chars().count() as u16 + 2,
+    ];
+    let gap = 4u16;
+    let total = widths[0] + widths[1] + widths[2] + gap * 2;
+    let start = bar.x + bar.width.saturating_sub(total) / 2;
+    let y = bar.y;
+
+    let global_tab = Rect::new(start, y, widths[0], 1);
+    let current_mode_tab = Rect::new(start + widths[0] + gap, y, widths[1], 1);
+    let text_editor_tab = Rect::new(
+        start + widths[0] + gap + widths[1] + gap,
+        y,
+        widths[2],
+        1,
+    );
+
+    HelpTabGeometry {
+        area,
+        global_tab,
+        current_mode_tab,
+        text_editor_tab,
+    }
 }
 
 /// Converts a legacy key-command list into help rows, projecting `C-` / `M-`.
@@ -281,7 +373,7 @@ fn list_help_commands(
         .iter()
         .map(|command| HelpCommand {
             key: format_command_key(command.key, primary, meta),
-            description: command.description,
+            description: command.description.to_string(),
         })
         .collect()
 }
@@ -297,7 +389,7 @@ pub fn get_mode_key_commands(
     meta: MetaModifier,
 ) -> (&'static str, Vec<HelpCommand>) {
     let title = match mode {
-        ViewMode::Develop => "REPL",
+        ViewMode::Repl => "REPL",
         ViewMode::Plans => "Plans",
         ViewMode::Context => "Context",
         ViewMode::History => "History",
@@ -321,7 +413,8 @@ pub fn render_help_popup(
     let engine = current_engine();
     let palette = engine.palette();
 
-    let inner_area = render_modal_container(frame, area, "Help", ModalTone::Warning);
+    let title = active_t("dialog.help.title");
+    let inner_area = render_modal_container(frame, area, &title, ModalTone::Warning);
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -346,13 +439,14 @@ pub fn render_help_popup(
     let help_widget = Paragraph::new(help_lines).scroll((*scroll, 0));
     frame.render_widget(help_widget, chunks[1]);
 
+    let close_label = format!(" [ {} (Esc / q / ?) ] ", active_t("help.close"));
     let actions = vec![
         Line::from(Span::styled(
-            " [ Close Help (Esc / q / ?) ] ",
+            close_label,
             button_style(&engine, palette.button_bg, palette.button_fg, true),
         )),
         Line::from(Span::styled(
-            "Tab / Shift+Tab · 1 / 2 / 3 switch tabs • n/p or j/k scroll • PgUp/PgDn page • Home top",
+            active_t("help.footer"),
             engine.fg(palette.text_muted),
         )),
     ];
@@ -425,17 +519,17 @@ mod tests {
 
     #[test]
     fn help_tabs_do_not_leak_commands_into_each_other() {
-        let global = rendered_text(HelpTab::Global, ViewMode::Develop);
+        let global = rendered_text(HelpTab::Global, ViewMode::Repl);
         assert!(global.contains("Cancel the active generation"));
         assert!(!global.contains("Send the prompt"));
         assert!(!global.contains("Yank from the kill ring or the clipboard"));
 
-        let mode = rendered_text(HelpTab::CurrentMode, ViewMode::Develop);
+        let mode = rendered_text(HelpTab::CurrentMode, ViewMode::Repl);
         assert!(!mode.contains("Cancel the active generation"));
         assert!(mode.contains("Send the prompt"));
         assert!(!mode.contains("Yank from the kill ring or the clipboard"));
 
-        let editor = rendered_text(HelpTab::TextEditor, ViewMode::Develop);
+        let editor = rendered_text(HelpTab::TextEditor, ViewMode::Repl);
         assert!(!editor.contains("Cancel the active generation"));
         assert!(!editor.contains("Send the prompt"));
         assert!(editor.contains("Yank from the kill ring or the clipboard"));
@@ -469,7 +563,7 @@ mod tests {
                 .map(|spec| spec.chord.display(primary, meta)),
         );
         for mode in [
-            ViewMode::Develop,
+            ViewMode::Repl,
             ViewMode::Context,
             ViewMode::History,
             ViewMode::Review,
@@ -490,5 +584,41 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The tab rectangles used for mouse hit-testing must land exactly on the
+    /// drawn tabs.
+    #[test]
+    fn help_tab_buttons_match_hit_geometry() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let term = Rect::new(0, 0, 100, 30);
+        let mut terminal = Terminal::new(TestBackend::new(term.width, term.height)).unwrap();
+        let mut scroll = 0u16;
+        terminal
+            .draw(|f| {
+                render_help_popup(
+                    f,
+                    ViewMode::Plans,
+                    HelpTab::Global,
+                    &mut scroll,
+                    PrimaryModifier::Ctrl,
+                    MetaModifier::Alt,
+                )
+            })
+            .unwrap();
+
+        let geom = help_tab_geometry(term);
+        let buffer = terminal.backend().buffer();
+        let read = |rect: Rect| -> String {
+            (rect.x..rect.x + rect.width)
+                .map(|x| buffer[(x, rect.y)].symbol())
+                .collect()
+        };
+
+        assert!(read(geom.global_tab).contains("Global"));
+        assert!(read(geom.current_mode_tab).contains("Current Mode"));
+        assert!(read(geom.text_editor_tab).contains("Text Editor"));
     }
 }

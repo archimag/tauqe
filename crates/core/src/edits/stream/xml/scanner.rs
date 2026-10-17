@@ -26,6 +26,9 @@ pub(super) fn find_next_control_tag(buf: &str) -> Option<(usize, usize)> {
     if let Some(cr) = crate::edits::protocol::xml::next_context_request_tag(buf) {
         candidates.push(cr);
     }
+    if let Some(rs) = crate::edits::protocol::xml::tags::next_repo_search_tag(buf) {
+        candidates.push(rs);
+    }
     if let Some(ul) = crate::edits::protocol::xml::next_user_language_tag(buf) {
         candidates.push(ul);
     }
@@ -62,6 +65,7 @@ pub(super) fn safe_text_emit_len(buf: &str) -> usize {
         "<move",
         "<overwrite",
         "<context_request",
+        "<repo_search",
         "<doc_request",
         "<user_language",
         "<verify",
@@ -92,6 +96,7 @@ pub(super) fn safe_text_emit_len(buf: &str) -> usize {
                     "<user_language" => crate::edits::protocol::xml::next_user_language_tag(&buf[idx..]).is_some(),
                     "<verify" => crate::edits::protocol::xml::next_verify_tag(&buf[idx..]).is_some(),
                     "<context_request" => crate::edits::protocol::xml::next_context_request_tag(&buf[idx..]).is_some(),
+                    "<repo_search" => crate::edits::protocol::xml::tags::next_repo_search_tag(&buf[idx..]).is_some(),
                     "<doc_request" => crate::edits::protocol::xml::tags::next_doc_request_tag(&buf[idx..]).is_some(),
                     "<plan" => crate::edits::protocol::xml::tags::next_plan_tag(&buf[idx..]).is_some(),
                     "<scratchpad" => crate::edits::protocol::xml::tags::next_scratchpad_tag(&buf[idx..]).is_some(),

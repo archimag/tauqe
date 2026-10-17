@@ -56,6 +56,8 @@ pub const DISCUSSION_SET_FOCUS: &str = "discussion/setFocus";
 pub const DISCUSSION_GET_FOCUS: &str = "discussion/getFocus";
 pub const DISCUSSION_CLEAR_FOCUS: &str = "discussion/clearFocus";
 
+pub const LOCALE_GENERATE: &str = "locale/generate";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -114,6 +116,7 @@ mod tests {
             DISCUSSION_SET_FOCUS,
             DISCUSSION_GET_FOCUS,
             DISCUSSION_CLEAR_FOCUS,
+            LOCALE_GENERATE,
         ]
     }
 

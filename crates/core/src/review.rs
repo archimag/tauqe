@@ -1,6 +1,7 @@
 pub mod parser;
 pub mod prompt;
 pub mod storage;
+pub mod uuid;
 
 pub use parser::{
     parse_review_findings, parse_review_output, review_findings_response_format,
@@ -12,4 +13,6 @@ pub use prompt::{
     REVIEW_DISCUSSION_PREFIX,
     REVIEW_STEP_EXECUTION_PREFIX,
 };
+pub use crate::plan::merge_subplan;
 pub use storage::ReviewStorage;
+pub use uuid::{generate_uuid_v7, is_valid_uuid_v7, parse_uuid_v7_timestamp};

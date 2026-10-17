@@ -148,7 +148,7 @@ pub(super) fn parse_plan_items_with_diagnostics(content: &str) -> (Vec<ParsedPla
         let raw_title = extract_attribute(header, "title").unwrap_or_default().trim().to_string();
         let status_str = extract_attribute(header, "status");
         let status = status_str.map(|s| match s.trim().to_lowercase().as_str() {
-            "discussion" | "discuss" | "question" | "?" | "обсуждение" => tauqe_protocol::PlanItemStatus::Discussion,
+            "discussion" | "discuss" | "question" | "?" => tauqe_protocol::PlanItemStatus::Discussion,
             "in_progress" | "inprogress" | "doing" => tauqe_protocol::PlanItemStatus::InProgress,
             "done" | "completed" | "finished" => tauqe_protocol::PlanItemStatus::Done,
             "blocked" | "block" => tauqe_protocol::PlanItemStatus::Blocked,

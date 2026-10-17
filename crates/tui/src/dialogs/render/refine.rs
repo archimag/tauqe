@@ -8,6 +8,7 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 
 use crate::components::modal::render_dialog_footer;
 use crate::config::PrimaryModifier;
+use crate::i18n::active_t;
 use crate::theme::engine::current_engine;
 use crate::ui::centered_rect;
 use super::{editor_lines, render_modal_confirm, ConfirmModalParams, ModalTone};
@@ -16,10 +17,18 @@ use super::{editor_lines, render_modal_confirm, ConfirmModalParams, ModalTone};
 pub const REFINE_DIALOG_WIDTH: u16 = 68;
 /// Height of the refine dialog, as a percentage of the terminal height.
 pub const REFINE_DIALOG_HEIGHT: u16 = 56;
-/// Action-bar label for starting a refinement.
-pub const REFINE_DIALOG_CONFIRM_LABEL: &str = "[ Start Refinement (C-Enter) ]";
-/// Action-bar label for cancelling the refine dialog.
-pub const REFINE_DIALOG_CANCEL_LABEL: &str = "[ Cancel ]";
+/// Full drawn confirm-button label, resolved from the runtime locale.
+///
+/// Rendering and mouse hit-testing both measure this label, so the clickable
+/// button can never drift from the drawn one (Conventions §6, §9, c-1).
+fn refine_confirm_label() -> String {
+    format!(" [ {} ] ", active_t("modal.start_refinement"))
+}
+
+/// Full drawn cancel-button label, resolved from the runtime locale.
+fn refine_cancel_label() -> String {
+    format!(" [ {} ] ", active_t("modal.cancel"))
+}
 
 /// Height of the header block (plan label and description).
 const REFINE_HEADER_HEIGHT: u16 = 4;
@@ -45,6 +54,8 @@ pub struct RefineDialogGeometry {
     pub area: Rect,
     /// Inner rows of the architect model list (one row per entry).
     pub model_rows: Rect,
+    /// The instructions editor block.
+    pub editor_area: Rect,
     /// Confirm button.
     pub confirm_button: Rect,
     /// Cancel button.
@@ -101,10 +112,13 @@ pub fn refine_dialog_geometry(term: Rect, entry_count: usize) -> RefineDialogGeo
     let area = centered_rect(REFINE_DIALOG_WIDTH, REFINE_DIALOG_HEIGHT, term);
     let chunks = refine_dialog_chunks(area, entry_count);
     let model_rows = inset(chunks[1]);
+    let editor_area = chunks[2];
 
     let buttons = chunks[3];
-    let confirm_w = REFINE_DIALOG_CONFIRM_LABEL.len() as u16 + 2;
-    let cancel_w = REFINE_DIALOG_CANCEL_LABEL.len() as u16 + 2;
+    // Button widths are measured from the same localized labels the renderer
+    // draws, so hit-testing never desynchronizes from the drawing.
+    let confirm_w = refine_confirm_label().chars().count() as u16;
+    let cancel_w = refine_cancel_label().chars().count() as u16;
     let gap = 4u16;
     let total = confirm_w + gap + cancel_w;
     let start_x = buttons.x + (buttons.width.saturating_sub(total)) / 2;
@@ -114,6 +128,7 @@ pub fn refine_dialog_geometry(term: Rect, entry_count: usize) -> RefineDialogGeo
     RefineDialogGeometry {
         area,
         model_rows,
+        editor_area,
         confirm_button,
         cancel_button,
     }
@@ -131,7 +146,7 @@ pub fn render_plan_refine_dialog(
     frame.render_widget(Clear, area);
 
     let outer_block = Block::default()
-        .title(" Deep Plan Refinement (AI Architect) ")
+        .title(format!(" {} ", active_t("dialog.refine.title")))
         .borders(Borders::ALL)
         .border_style(engine.fg(palette.status_info))
         .style(Style::default().bg(engine.color(palette.surface)));
@@ -145,14 +160,11 @@ pub fn render_plan_refine_dialog(
     // Header: what is about to be refined.
     let header_lines = vec![
         Line::from(vec![
-            Span::styled(" Plan: ", dim),
+            Span::styled(active_t("dialog.refine.plan_label"), dim),
             Span::styled(&dialog.plan_title, engine.fg(palette.text_primary).bold()),
             Span::styled(format!(" [{}]", dialog.plan_id), dim),
         ]),
-        Line::from(Span::styled(
-            " Decomposes high-level tasks into verified atomic engineering steps without altering agreed architecture.",
-            dim,
-        )),
+        Line::from(Span::styled(active_t("dialog.refine.header_note"), dim)),
     ];
     frame.render_widget(Paragraph::new(header_lines), header_area);
 
@@ -161,13 +173,11 @@ pub fn render_plan_refine_dialog(
     // focus color that shows which section owns the keyboard
     // (c-embedded-model-list, c-unified-dialog-integration).
     let list_title = if entry_count > 1 {
-        format!(
-            " Architect Model  [{} of {}] ",
-            dialog.selector.selected_index() + 1,
-            entry_count
-        )
+        active_t("dialog.refine.model_list_counter")
+            .replacen("{}", &(dialog.selector.selected_index() + 1).to_string(), 1)
+            .replacen("{}", &entry_count.to_string(), 1)
     } else {
-        " Architect Model ".to_string()
+        active_t("dialog.refine.model_list_title")
     };
     let list_border = if dialog.focus.is_model_list() {
         engine.fg(palette.status_info).bold()
@@ -184,7 +194,7 @@ pub fn render_plan_refine_dialog(
     if entry_count == 0 {
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
-                "  (no architect models configured)",
+                active_t("dialog.refine.no_models"),
                 dim,
             ))),
             list_inner,
@@ -203,7 +213,7 @@ pub fn render_plan_refine_dialog(
             spans.push(Span::styled("█", engine.fg(palette.status_warning)));
         }
         spans.push(Span::styled(
-            " Additional refinement directives (e.g. 'split step 2 into atomic subtasks') [optional]...",
+            active_t("dialog.refine.editor_placeholder"),
             dim,
         ));
         editor_content.push(Line::from(spans));
@@ -220,7 +230,7 @@ pub fn render_plan_refine_dialog(
         engine.fg(palette.border)
     };
     let editor_block = Block::default()
-        .title(" Architect Instructions (optional) ")
+        .title(format!(" {} ", active_t("dialog.refine.editor_title")))
         .borders(Borders::ALL)
         .border_style(editor_border)
         .style(Style::default().bg(engine.color(palette.surface)));
@@ -253,18 +263,20 @@ pub fn render_plan_refine_dialog(
         )
     };
     let nav_hint = if dialog.focus.is_actions() {
-        "Enter confirm • ← / → button • Esc cancel".to_string()
+        active_t("dialog.refine.hint_actions")
     } else {
-        format!(
-            "{}Enter start • Tab focus • {} model • Esc cancel",
-            primary.prefix_str(),
-            crate::components::model_selector::model_select_hint(primary)
-        )
+        active_t("dialog.refine.hint_fields")
+            .replacen("{}", primary.prefix_str(), 1)
+            .replacen(
+                "{}",
+                &crate::components::model_selector::model_select_hint(primary),
+                1,
+            )
     };
     let actions = Line::from(vec![
-        Span::styled(format!(" {} ", REFINE_DIALOG_CONFIRM_LABEL), confirm_style),
+        Span::styled(refine_confirm_label(), confirm_style),
         Span::raw("    "),
-        Span::styled(format!(" {} ", REFINE_DIALOG_CANCEL_LABEL), cancel_style),
+        Span::styled(refine_cancel_label(), cancel_style),
     ]);
     frame.render_widget(
         Paragraph::new(actions).alignment(Alignment::Center),
@@ -289,37 +301,43 @@ pub fn refine_blocked_params<'a>(
     let mut body_lines = vec![
         Line::raw(""),
         Line::from(Span::styled(
-            "AI Architect Refused Decomposition (Blockers Detected)",
+            active_t("dialog.refine_blocked.heading"),
             engine.fg(palette.status_warning).bold(),
         )),
         Line::raw(""),
         Line::from(vec![
-            Span::styled("Plan: ", engine.fg(palette.text_muted)),
+            Span::styled(active_t("dialog.refine_blocked.plan_label"), engine.fg(palette.text_muted)),
             Span::styled(
                 format!("{} [{}]", blocked.plan_title, blocked.plan_id),
                 engine.fg(palette.text_primary).bold(),
             ),
         ]),
         Line::raw(""),
-        Line::from(Span::styled("Reason / Contradiction:", engine.fg(palette.status_error).bold())),
+        Line::from(Span::styled(
+            active_t("dialog.refine_blocked.reason_label"),
+            engine.fg(palette.status_error).bold(),
+        )),
     ];
 
     for line in blocked.reason.lines() {
-        body_lines.push(Line::from(Span::styled(format!("  {}", line), engine.fg(palette.text_primary))));
+        body_lines.push(Line::from(Span::styled(
+            format!("  {}", line),
+            engine.fg(palette.text_primary),
+        )));
     }
 
     body_lines.push(Line::raw(""));
     body_lines.push(Line::from(Span::styled(
-        "TAUQE prohibits speculative guessing. Replan uncompleted horizon addressing architectural blockers.",
+        active_t("dialog.refine_blocked.note"),
         engine.fg(palette.text_muted),
     )));
 
     ConfirmModalParams {
-        title: "Plan Refinement Blocked",
+        title: active_t("dialog.refine_blocked.title"),
         tone: ModalTone::Dangerous,
         body_lines,
-        confirm_label: "Replan Horizon (Y)",
-        cancel_label: "Dismiss (Esc)",
+        confirm_label: active_t("dialog.button.replan_horizon"),
+        cancel_label: active_t("dialog.button.dismiss"),
         confirm_button,
         destructive: false,
         width: 70,
@@ -352,5 +370,8 @@ mod tests {
         assert!(geo.model_rows.y >= geo.area.y);
         assert!(geo.model_rows.y + geo.model_rows.height <= geo.area.bottom());
         assert_eq!(geo.model_rows.height, 3, "one row per architect entry");
+
+        assert!(geo.editor_area.y >= geo.model_rows.bottom());
+        assert!(geo.editor_area.bottom() <= geo.area.bottom());
     }
 }

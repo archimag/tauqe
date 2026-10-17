@@ -1,7 +1,10 @@
 use std::sync::Arc;
 
 use crossterm::event::{KeyCode, KeyEvent};
-use tauqe_protocol::{methods, ModelRole, ModelSelection, ReviewItem, ReviewRefineItemParams};
+use tauqe_protocol::{
+    methods, IssueStatus, IssueType, ModelRole, ModelSelection, ReviewIssue, ReviewItem,
+    ReviewRefineItemParams,
+};
 use tokio::sync::Mutex;
 
 use crate::app::{AppState, ReviewDialogState, ViewMode};
@@ -354,29 +357,43 @@ fn execute_review_scope_action(
             }
         };
 
+        // A finding still awaiting architectural decomposition must be refined
+        // before any Coder turn runs: the Architect owns the "what", the Coder
+        // owns the "how".
+        if item.status == IssueStatus::Refine {
+            st.notify_warning(format!(
+                "Finding #{} is in REFINE status: decompose it into steps with the Architect (R) before executing.",
+                item.id
+            ));
+            return;
+        }
+
         match item.status {
-            tauqe_protocol::ReviewItemStatus::Discussion => {
+            IssueStatus::Discussion => {
                 st.notify_warning(format!(
                     "Finding #{} is in DISCUSSION status; approve or change status to TODO (t) before executing.",
                     item.id
                 ));
             }
-            tauqe_protocol::ReviewItemStatus::Fixed => {
+            IssueStatus::Fixed => {
                 st.notify_info(format!("Finding #{} is already FIXED.", item.id));
             }
-            tauqe_protocol::ReviewItemStatus::Skipped => {
+            IssueStatus::Skipped => {
                 st.notify_info(format!(
                     "Finding #{} is SKIPPED; change status to TODO (t) before executing.",
                     item.id
                 ));
             }
-            tauqe_protocol::ReviewItemStatus::Rejected => {
+            IssueStatus::Rejected => {
                 st.notify_warning(format!(
                     "Finding #{} is REJECTED; change status to TODO (t) before executing.",
                     item.id
                 ));
             }
-            tauqe_protocol::ReviewItemStatus::Todo | tauqe_protocol::ReviewItemStatus::InProgress => {
+            // REFINE is intercepted by the earlier guard, which returns before
+            // this match, so the finding is never dispatched to a Coder turn.
+            IssueStatus::Refine => {}
+            IssueStatus::Todo | IssueStatus::InProgress => {
                 st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
                 st.confirm_execute_review = Some(crate::app::ConfirmExecuteReviewState {
                     review_id: Some(session.id.clone()),
@@ -387,19 +404,19 @@ fn execute_review_scope_action(
                     },
                     scope_title: scope_title.to_string(),
                     item_id: Some(item.id),
-                    items: vec![item],
+                    items: vec![ReviewIssue::from(item)],
                 });
             }
         }
     } else {
-        let todo_items: Vec<_> = session
+        let todo_items: Vec<ReviewIssue> = session
             .items
             .iter()
             .filter(|i| {
-                i.status == tauqe_protocol::ReviewItemStatus::Todo
-                    || i.status == tauqe_protocol::ReviewItemStatus::InProgress
+                i.status == IssueStatus::Todo || i.status == IssueStatus::InProgress
             })
             .cloned()
+            .map(ReviewIssue::from)
             .collect();
 
         if todo_items.is_empty() {
@@ -439,7 +456,7 @@ pub(crate) fn execute_all_reviews_action(st: &mut AppState) {
         return;
     }
 
-    let mut todo_items = Vec::new();
+    let mut todo_items: Vec<ReviewIssue> = Vec::new();
     let mut total_items = 0;
     let mut discussion_count = 0;
     let mut fixed_count = 0;
@@ -448,13 +465,13 @@ pub(crate) fn execute_all_reviews_action(st: &mut AppState) {
         for item in &session.items {
             total_items += 1;
             match item.status {
-                tauqe_protocol::ReviewItemStatus::Todo | tauqe_protocol::ReviewItemStatus::InProgress => {
-                    todo_items.push(item.clone());
+                IssueStatus::Todo | IssueStatus::InProgress => {
+                    todo_items.push(ReviewIssue::from(item.clone()));
                 }
-                tauqe_protocol::ReviewItemStatus::Discussion => {
+                IssueStatus::Discussion => {
                     discussion_count += 1;
                 }
-                tauqe_protocol::ReviewItemStatus::Fixed => {
+                IssueStatus::Fixed => {
                     fixed_count += 1;
                 }
                 _ => {}
@@ -491,7 +508,7 @@ pub(crate) fn execute_all_reviews_action(st: &mut AppState) {
 }
 
 fn format_item_for_clipboard(item: &ReviewItem) -> String {
-    let mut text = format!("[{}] {}", item.severity, item.title);
+    let mut text = format!("[{}] {}", IssueType::from(item.severity), item.title);
     if !item.files.is_empty() {
         text.push('\n');
         text.push_str(&item.files.join(", "));
@@ -564,66 +581,60 @@ pub async fn handle_review_key(
 ) -> anyhow::Result<InputResult> {
     let mut st = state.lock().await;
 
-    let primary_mod = st.tui_config.input.primary_modifier;
-    let is_ctrl_alt = key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL)
-        && key.modifiers.contains(crossterm::event::KeyModifiers::ALT);
-    let is_primary = !is_ctrl_alt && primary_mod.matches(key.modifiers);
-    let is_ctrl = key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL);
-
-    let is_ctrl_n = !is_ctrl_alt
-        && (is_ctrl || is_primary)
-        && matches!(key.code, KeyCode::Char('n') | KeyCode::Char('N'));
-    let is_ctrl_p = !is_ctrl_alt
-        && (is_ctrl || is_primary)
-        && matches!(key.code, KeyCode::Char('p') | KeyCode::Char('P'));
-
-    if is_ctrl_n {
-        st.review.accordion_navigate(true);
-        return Ok(InputResult::Continue);
-    }
-    if is_ctrl_p {
-        st.review.accordion_navigate(false);
-        return Ok(InputResult::Continue);
-    }
+    // Resolve the key through the single source of truth so input dispatch and
+    // the generated Help never drift (c-1). The command map already blocks bare
+    // structural chords while a text editor is active, encodes the
+    // case-differentiated chords (Shift+<key>) explicitly, and routes the
+    // abstract primary modifier to the accordion commands (c-2).
+    let action = match REVIEW_COMMAND_MAP.resolve(key, &st.tui_config.input, false) {
+        Some(spec) => spec.action,
+        None => return Ok(InputResult::Continue),
+    };
 
     let rows_len = st.review.flatten_rows().len();
     let page = st.review.view_height.saturating_sub(2).max(1);
 
-    match key.code {
-        KeyCode::Esc | KeyCode::Char('q') => {
-            st.view_mode = ViewMode::Develop;
+    match action {
+        ReviewAction::Return => {
+            st.view_mode = ViewMode::Repl;
         }
-        KeyCode::Up | KeyCode::Char('p') | KeyCode::Char('P') if !is_ctrl && !is_primary => {
+        ReviewAction::NavPrev => {
             if st.review.selected_index > 0 {
                 st.review.selected_index -= 1;
                 st.review.scroll_to_selected();
             }
         }
-        KeyCode::Down | KeyCode::Char('n') | KeyCode::Char('N') if !is_ctrl && !is_primary => {
+        ReviewAction::NavNext => {
             if rows_len > 0 && st.review.selected_index + 1 < rows_len {
                 st.review.selected_index += 1;
                 st.review.scroll_to_selected();
             }
         }
-        KeyCode::Home => {
+        ReviewAction::AccordionNext => {
+            st.review.accordion_navigate(true);
+        }
+        ReviewAction::AccordionPrev => {
+            st.review.accordion_navigate(false);
+        }
+        ReviewAction::SelectFirst => {
             st.review.selected_index = 0;
             st.review.scroll_to_selected();
         }
-        KeyCode::End => {
+        ReviewAction::SelectLast => {
             if rows_len > 0 {
                 st.review.selected_index = rows_len - 1;
                 st.review.scroll_to_selected();
             }
         }
-        KeyCode::PageUp => {
+        ReviewAction::PageUp => {
             st.review.scroll = st.review.scroll.saturating_sub(page);
         }
-        KeyCode::PageDown => {
+        ReviewAction::PageDown => {
             let max = (st.review.rendered_lines as u16)
                 .saturating_sub(st.review.view_height);
             st.review.scroll = st.review.scroll.saturating_add(page).min(max);
         }
-        KeyCode::Tab | KeyCode::Char(' ') => {
+        ReviewAction::FoldToggle => {
             let sel_row = st.review.selected_row();
             if let Some(row) = sel_row {
                 match row {
@@ -649,7 +660,7 @@ pub async fn handle_review_key(
                 }
             }
         }
-        KeyCode::Enter => {
+        ReviewAction::Activate => {
             let sel_row = st.review.selected_row();
             if let Some(row) = sel_row {
                 match row {
@@ -674,35 +685,31 @@ pub async fn handle_review_key(
                 }
             }
         }
-        KeyCode::Char('X') => {
+        ReviewAction::ExecuteAll => {
             execute_all_reviews_action(&mut st);
         }
-        KeyCode::Char('x') => {
-            if key.modifiers.contains(crossterm::event::KeyModifiers::SHIFT) {
-                execute_all_reviews_action(&mut st);
-            } else {
-                let sel_row = st.review.selected_row();
-                if let Some(row) = sel_row {
-                    match row {
-                        VisibleReviewRow::SessionHeader { session_id, title, .. } => {
-                            execute_review_scope_action(&mut st, &session_id, None, &title);
-                        }
-                        VisibleReviewRow::SessionSummary { session_id, .. } => {
-                            execute_review_scope_action(&mut st, &session_id, None, &session_id);
-                        }
-                        VisibleReviewRow::ReviewItem {
-                            session_id,
-                            item_id,
-                            title,
-                            ..
-                        } => {
-                            execute_review_scope_action(&mut st, &session_id, Some(item_id), &title);
-                        }
+        ReviewAction::Execute => {
+            let sel_row = st.review.selected_row();
+            if let Some(row) = sel_row {
+                match row {
+                    VisibleReviewRow::SessionHeader { session_id, title, .. } => {
+                        execute_review_scope_action(&mut st, &session_id, None, &title);
+                    }
+                    VisibleReviewRow::SessionSummary { session_id, .. } => {
+                        execute_review_scope_action(&mut st, &session_id, None, &session_id);
+                    }
+                    VisibleReviewRow::ReviewItem {
+                        session_id,
+                        item_id,
+                        title,
+                        ..
+                    } => {
+                        execute_review_scope_action(&mut st, &session_id, Some(item_id), &title);
                     }
                 }
             }
         }
-        KeyCode::Char('d') | KeyCode::Char('D') => {
+        ReviewAction::Discuss => {
             let sel_row = st.review.selected_row();
             if let Some(row) = sel_row {
                 let session_id = row.session_id().to_string();
@@ -740,11 +747,7 @@ pub async fn handle_review_key(
                 }
             }
         }
-        KeyCode::Char('f')
-            if !is_ctrl
-                && !is_primary
-                && !key.modifiers.contains(crossterm::event::KeyModifiers::SHIFT) =>
-        {
+        ReviewAction::SetFocus => {
             let sel_row = st.review.selected_row();
             if let Some(row) = sel_row {
                 let session_id = row.session_id().to_string();
@@ -789,7 +792,7 @@ pub async fn handle_review_key(
                 st.notify_info(message);
             }
         }
-        KeyCode::Char('t') | KeyCode::Char('T') | KeyCode::Char('s') | KeyCode::Char('S') => {
+        ReviewAction::ChangeStatus => {
             let sel_row = st.review.selected_row();
             if let Some(VisibleReviewRow::ReviewItem {
                 session_id,
@@ -799,13 +802,16 @@ pub async fn handle_review_key(
                 ..
             }) = sel_row
             {
+                // The status picker speaks the canonical `IssueStatus`
+                // vocabulary shared by the plan and review domains.
                 let cur_idx = match status {
-                    tauqe_protocol::ReviewItemStatus::Discussion => 0,
-                    tauqe_protocol::ReviewItemStatus::Todo => 1,
-                    tauqe_protocol::ReviewItemStatus::InProgress => 2,
-                    tauqe_protocol::ReviewItemStatus::Fixed => 3,
-                    tauqe_protocol::ReviewItemStatus::Skipped => 4,
-                    tauqe_protocol::ReviewItemStatus::Rejected => 5,
+                    IssueStatus::Discussion => 0,
+                    IssueStatus::Todo => 1,
+                    IssueStatus::InProgress => 2,
+                    IssueStatus::Refine => 3,
+                    IssueStatus::Fixed => 4,
+                    IssueStatus::Skipped => 5,
+                    IssueStatus::Rejected => 6,
                 };
                 st.status_dialog = Some(crate::app::StatusDialogState::new(
                     crate::app::StatusDialogTarget::ReviewItem {
@@ -818,28 +824,23 @@ pub async fn handle_review_key(
                 ));
             }
         }
-        KeyCode::Char('F') | KeyCode::Char('f')
-            if key.modifiers.contains(crossterm::event::KeyModifiers::SHIFT) =>
-        {
+        ReviewAction::ToggleHideClosed => {
             st.review.toggle_hide_closed();
             st.review.scroll_to_selected();
         }
-        KeyCode::Char('a') | KeyCode::Char('A') => {
+        ReviewAction::FoldAll => {
             st.review.toggle_fold_all();
             st.review.clamp_selection();
             st.review.scroll_to_selected();
         }
-        KeyCode::Delete => {
+        ReviewAction::DeleteReview => {
             let sel_row = st.review.selected_row();
             if let Some(row) = sel_row {
                 st.confirm_delete_review = Some(row.session_id().to_string());
                 st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
             }
         }
-        KeyCode::Char('c')
-        | KeyCode::Char('C')
-        | KeyCode::Char('y')
-        | KeyCode::Char('Y') => {
+        ReviewAction::Copy => {
             let sel_row = st.review.selected_row();
             let text = match sel_row {
                 Some(VisibleReviewRow::ReviewItem {
@@ -875,7 +876,7 @@ pub async fn handle_review_key(
                 }
             }
         }
-        KeyCode::Char('r') if !key.modifiers.contains(crossterm::event::KeyModifiers::SHIFT) => {
+        ReviewAction::RunReview => {
             if st.model.is_busy() {
                 st.review.error =
                     Some("Cannot start a review while the model is generating".to_string());
@@ -925,16 +926,12 @@ pub async fn handle_review_key(
         }
         // Decompose the selected finding into an embedded step plan via the
         // Architect role (`review/refineItem`).
-        KeyCode::Char('R') => {
-            drop(st);
-            refine_selected_finding(state, server_writer).await?;
-        }
-        KeyCode::Char('r') if key.modifiers.contains(crossterm::event::KeyModifiers::SHIFT) => {
+        ReviewAction::Refine => {
             drop(st);
             refine_selected_finding(state, server_writer).await?;
         }
         // Refresh review sessions from the server.
-        KeyCode::Char('g') | KeyCode::Char('G') => {
+        ReviewAction::Refresh => {
             drop(st);
             send_request(
                 server_writer,
@@ -943,7 +940,6 @@ pub async fn handle_review_key(
             )
             .await?;
         }
-        _ => {}
     }
 
     Ok(InputResult::Continue)
@@ -1025,10 +1021,10 @@ mod tests {
 
     #[test]
     fn test_execute_review_scope_action_defaults_to_safe_cancel() {
-        use tauqe_protocol::{ReviewItem, ReviewItemStatus, ReviewSession, ReviewSeverity};
+        use tauqe_protocol::{IssueStatus, IssueType, ReviewIssue, ReviewSession};
 
         let mut st = crate::app::test_state();
-        st.model.status = crate::views::develop::TurnStatus::Idle;
+        st.model.status = crate::views::repl::TurnStatus::Idle;
         // Start on the destructive button to prove the action resets the focus.
         st.confirm_button = crate::app::ConfirmDialogButton::Confirm;
 
@@ -1040,17 +1036,20 @@ mod tests {
             description: None,
             user_prompt: None,
             target_files: Vec::new(),
-            items: vec![ReviewItem {
+            items: vec![ReviewIssue {
                 id: 1,
                 title: "Finding".to_string(),
                 model: None,
-                severity: ReviewSeverity::Warning,
-                status: ReviewItemStatus::Todo,
+                issue_type: IssueType::Architecture,
+                status: IssueStatus::Todo,
+                description: String::new(),
+                recommendations: Vec::new(),
                 files: Vec::new(),
-                subplan: Vec::new(),
-                resolution_notes: None,
-                body: String::new(),
-            }],
+                readonly_files: Vec::new(),
+                plan: Vec::new(),
+                note: None,
+            }
+            .into()],
             raw_markdown: String::new(),
         };
         st.review.sessions = vec![session.clone()];
@@ -1074,7 +1073,7 @@ mod tests {
 
     #[test]
     fn test_execute_all_reviews_action_discussion_only_warns() {
-        use tauqe_protocol::{ReviewItem, ReviewItemStatus, ReviewSession, ReviewSeverity};
+        use tauqe_protocol::{IssueStatus, IssueType, ReviewIssue, ReviewSession};
 
         let mut st = crate::app::test_state();
         let session = ReviewSession {
@@ -1086,28 +1085,34 @@ mod tests {
             user_prompt: None,
             target_files: Vec::new(),
             items: vec![
-                ReviewItem {
+                ReviewIssue {
                     id: 1,
                     title: "Finding 1".to_string(),
                     model: None,
-                    severity: ReviewSeverity::Warning,
-                    status: ReviewItemStatus::Discussion,
+                    issue_type: IssueType::Architecture,
+                    status: IssueStatus::Discussion,
+                    description: String::new(),
+                    recommendations: Vec::new(),
                     files: Vec::new(),
-                    subplan: Vec::new(),
-                    resolution_notes: None,
-                    body: String::new(),
-                },
-                ReviewItem {
+                    readonly_files: Vec::new(),
+                    plan: Vec::new(),
+                    note: None,
+                }
+                .into(),
+                ReviewIssue {
                     id: 2,
                     title: "Finding 2".to_string(),
                     model: None,
-                    severity: ReviewSeverity::Suggestion,
-                    status: ReviewItemStatus::Discussion,
+                    issue_type: IssueType::Quality,
+                    status: IssueStatus::Discussion,
+                    description: String::new(),
+                    recommendations: Vec::new(),
                     files: Vec::new(),
-                    subplan: Vec::new(),
-                    resolution_notes: None,
-                    body: String::new(),
-                },
+                    readonly_files: Vec::new(),
+                    plan: Vec::new(),
+                    note: None,
+                }
+                .into(),
             ],
             raw_markdown: String::new(),
         };
@@ -1131,7 +1136,7 @@ mod tests {
 
     #[test]
     fn test_execute_all_reviews_action_with_todo_opens_modal() {
-        use tauqe_protocol::{ReviewItem, ReviewItemStatus, ReviewSession, ReviewSeverity};
+        use tauqe_protocol::{IssueStatus, IssueType, ReviewIssue, ReviewSession};
 
         let mut st = crate::app::test_state();
         let session1 = ReviewSession {
@@ -1143,28 +1148,34 @@ mod tests {
             user_prompt: None,
             target_files: Vec::new(),
             items: vec![
-                ReviewItem {
+                ReviewIssue {
                     id: 1,
                     title: "Finding 1".to_string(),
                     model: None,
-                    severity: ReviewSeverity::Warning,
-                    status: ReviewItemStatus::Todo,
+                    issue_type: IssueType::Architecture,
+                    status: IssueStatus::Todo,
+                    description: String::new(),
+                    recommendations: Vec::new(),
                     files: Vec::new(),
-                    subplan: Vec::new(),
-                    resolution_notes: None,
-                    body: String::new(),
-                },
-                ReviewItem {
+                    readonly_files: Vec::new(),
+                    plan: Vec::new(),
+                    note: None,
+                }
+                .into(),
+                ReviewIssue {
                     id: 2,
                     title: "Finding 2".to_string(),
                     model: None,
-                    severity: ReviewSeverity::Info,
-                    status: ReviewItemStatus::Fixed,
+                    issue_type: IssueType::Quality,
+                    status: IssueStatus::Fixed,
+                    description: String::new(),
+                    recommendations: Vec::new(),
                     files: Vec::new(),
-                    subplan: Vec::new(),
-                    resolution_notes: None,
-                    body: String::new(),
-                },
+                    readonly_files: Vec::new(),
+                    plan: Vec::new(),
+                    note: None,
+                }
+                .into(),
             ],
             raw_markdown: String::new(),
         };
@@ -1177,28 +1188,34 @@ mod tests {
             user_prompt: None,
             target_files: Vec::new(),
             items: vec![
-                ReviewItem {
+                ReviewIssue {
                     id: 1,
                     title: "Finding 3".to_string(),
                     model: None,
-                    severity: ReviewSeverity::Critical,
-                    status: ReviewItemStatus::InProgress,
+                    issue_type: IssueType::Bug,
+                    status: IssueStatus::InProgress,
+                    description: String::new(),
+                    recommendations: Vec::new(),
                     files: Vec::new(),
-                    subplan: Vec::new(),
-                    resolution_notes: None,
-                    body: String::new(),
-                },
-                ReviewItem {
+                    readonly_files: Vec::new(),
+                    plan: Vec::new(),
+                    note: None,
+                }
+                .into(),
+                ReviewIssue {
                     id: 2,
                     title: "Finding 4".to_string(),
                     model: None,
-                    severity: ReviewSeverity::Suggestion,
-                    status: ReviewItemStatus::Discussion,
+                    issue_type: IssueType::Quality,
+                    status: IssueStatus::Discussion,
+                    description: String::new(),
+                    recommendations: Vec::new(),
                     files: Vec::new(),
-                    subplan: Vec::new(),
-                    resolution_notes: None,
-                    body: String::new(),
-                },
+                    readonly_files: Vec::new(),
+                    plan: Vec::new(),
+                    note: None,
+                }
+                .into(),
             ],
             raw_markdown: String::new(),
         };
@@ -1220,7 +1237,7 @@ mod tests {
 
     #[test]
     fn test_execute_all_reviews_action_all_fixed_notifies() {
-        use tauqe_protocol::{ReviewItem, ReviewItemStatus, ReviewSession, ReviewSeverity};
+        use tauqe_protocol::{IssueStatus, IssueType, ReviewIssue, ReviewSession};
 
         let mut st = crate::app::test_state();
         let session = ReviewSession {
@@ -1231,17 +1248,20 @@ mod tests {
             description: None,
             user_prompt: None,
             target_files: Vec::new(),
-            items: vec![ReviewItem {
+            items: vec![ReviewIssue {
                 id: 1,
                 title: "Finding 1".to_string(),
                 model: None,
-                severity: ReviewSeverity::Warning,
-                status: ReviewItemStatus::Fixed,
+                issue_type: IssueType::Architecture,
+                status: IssueStatus::Fixed,
+                description: String::new(),
+                recommendations: Vec::new(),
                 files: Vec::new(),
-                subplan: Vec::new(),
-                resolution_notes: None,
-                body: String::new(),
-            }],
+                readonly_files: Vec::new(),
+                plan: Vec::new(),
+                note: None,
+            }
+            .into()],
             raw_markdown: String::new(),
         };
         st.review.sessions = vec![session];
@@ -1255,7 +1275,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_review_key_capital_x_triggers_batch_execute() {
-        use tauqe_protocol::{ReviewItem, ReviewItemStatus, ReviewSession, ReviewSeverity};
+        use tauqe_protocol::{IssueStatus, IssueType, ReviewIssue, ReviewSession};
 
         let mut st = crate::app::test_state();
         st.view_mode = ViewMode::Review;
@@ -1267,17 +1287,20 @@ mod tests {
             description: None,
             user_prompt: None,
             target_files: Vec::new(),
-            items: vec![ReviewItem {
+            items: vec![ReviewIssue {
                 id: 1,
                 title: "Todo Finding".to_string(),
                 model: None,
-                severity: ReviewSeverity::Warning,
-                status: ReviewItemStatus::Todo,
+                issue_type: IssueType::Architecture,
+                status: IssueStatus::Todo,
+                description: String::new(),
+                recommendations: Vec::new(),
                 files: Vec::new(),
-                subplan: Vec::new(),
-                resolution_notes: None,
-                body: String::new(),
-            }],
+                readonly_files: Vec::new(),
+                plan: Vec::new(),
+                note: None,
+            }
+            .into()],
             raw_markdown: String::new(),
         };
         st.review.sessions = vec![session];
@@ -1296,7 +1319,7 @@ mod tests {
     }
 
     fn todo_session(id: &str, item_id: u32) -> tauqe_protocol::ReviewSession {
-        use tauqe_protocol::{ReviewItem, ReviewItemStatus, ReviewSession, ReviewSeverity};
+        use tauqe_protocol::{IssueStatus, IssueType, ReviewIssue, ReviewSession};
 
         ReviewSession {
             id: id.to_string(),
@@ -1306,17 +1329,20 @@ mod tests {
             description: None,
             user_prompt: None,
             target_files: Vec::new(),
-            items: vec![ReviewItem {
+            items: vec![ReviewIssue {
                 id: item_id,
                 title: "Todo Finding".to_string(),
                 model: None,
-                severity: ReviewSeverity::Warning,
-                status: ReviewItemStatus::Todo,
+                issue_type: IssueType::Architecture,
+                status: IssueStatus::Todo,
+                description: String::new(),
+                recommendations: Vec::new(),
                 files: Vec::new(),
-                subplan: Vec::new(),
-                resolution_notes: None,
-                body: String::new(),
-            }],
+                readonly_files: Vec::new(),
+                plan: Vec::new(),
+                note: None,
+            }
+            .into()],
             raw_markdown: String::new(),
         }
     }

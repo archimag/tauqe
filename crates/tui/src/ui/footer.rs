@@ -4,10 +4,11 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 
 use crate::app::{AppState, ViewMode};
+use crate::i18n::active_t;
 use crate::theme::color::RgbColor;
 use crate::theme::engine::{current_engine, ThemeEngine};
 use crate::theme::palette::ThemePalette;
-use crate::views::develop::{FileEditStatus, ToolchainState, TurnStatus, SPINNER_FRAMES};
+use crate::views::repl::{FileEditStatus, ToolchainState, TurnStatus, SPINNER_FRAMES};
 
 pub fn render_footer(frame: &mut ratatui::Frame, state: &AppState, area: Rect) {
     let engine = current_engine();
@@ -54,7 +55,7 @@ fn render_footer_with_engine(
     if state.review.running {
         let spin = SPINNER_FRAMES[state.model.spinner_frame % SPINNER_FRAMES.len()];
         footer_spans.push(Span::styled(
-            format!("{} Reviewing", spin),
+            format!("{} {}", spin, active_t("footer.reviewing")),
             engine.fg(palette.button_active_bg).bold(),
         ));
         if let Some(notif) = active_notif {
@@ -69,23 +70,31 @@ fn render_footer_with_engine(
         let spin = SPINNER_FRAMES[state.model.spinner_frame % SPINNER_FRAMES.len()];
 
         let (status_name, status_color) = match state.model.turn_phase {
-            Some(tauqe_protocol::TurnPhase::Discovery) => ("Discovery", palette.status_info),
+            Some(tauqe_protocol::TurnPhase::Discovery) => {
+                (active_t("status.discovery"), palette.status_info)
+            }
             Some(tauqe_protocol::TurnPhase::Proposal) => {
                 if state.model.status == TurnStatus::Thinking {
-                    ("Thinking", palette.text_secondary)
+                    (active_t("status.thinking"), palette.text_secondary)
                 } else {
-                    ("Proposal", palette.status_warning)
+                    (active_t("phase.proposal"), palette.status_warning)
                 }
             }
-            Some(tauqe_protocol::TurnPhase::Staging) => ("Staging", palette.button_active_bg),
-            Some(tauqe_protocol::TurnPhase::Verification) => ("Verifying", palette.status_info),
-            Some(tauqe_protocol::TurnPhase::Healing) => ("Healing", palette.status_error),
+            Some(tauqe_protocol::TurnPhase::Staging) => {
+                (active_t("status.staging"), palette.button_active_bg)
+            }
+            Some(tauqe_protocol::TurnPhase::Verification) => {
+                (active_t("status.verifying"), palette.status_info)
+            }
+            Some(tauqe_protocol::TurnPhase::Healing) => {
+                (active_t("status.healing"), palette.status_error)
+            }
             None => match state.model.status {
-                TurnStatus::Thinking => ("Thinking", palette.text_secondary),
-                TurnStatus::Editing => ("Editing", palette.button_active_bg),
-                TurnStatus::Verifying => ("Verifying", palette.status_info),
-                TurnStatus::Responding => ("Responding", palette.status_warning),
-                TurnStatus::Awaiting => ("Awaiting", palette.status_warning),
+                TurnStatus::Thinking => (active_t("status.thinking"), palette.text_secondary),
+                TurnStatus::Editing => (active_t("status.editing"), palette.button_active_bg),
+                TurnStatus::Verifying => (active_t("status.verifying"), palette.status_info),
+                TurnStatus::Responding => (active_t("status.responding"), palette.status_warning),
+                TurnStatus::Awaiting => (active_t("status.awaiting"), palette.status_warning),
                 other => (other.label(), palette.status_warning),
             },
         };
@@ -101,7 +110,7 @@ fn render_footer_with_engine(
         if state.batch_stopping {
             footer_spans.push(Span::raw(" "));
             footer_spans.push(Span::styled(
-                "[Stopping after current step]",
+                active_t("footer.stopping"),
                 engine.fg(palette.status_warning).bold(),
             ));
         }
@@ -194,10 +203,16 @@ fn render_footer_with_engine(
         ));
     } else {
         let (status_lbl, status_style) = match state.model.status {
-            TurnStatus::Done => ("Done", engine.fg(palette.status_success).bold()),
-            TurnStatus::Cancelled => ("Cancelled", engine.fg(palette.status_error).bold()),
-            TurnStatus::Error => ("Error", engine.fg(palette.status_error).bold()),
-            _ => ("Ready", engine.fg(palette.status_success)),
+            TurnStatus::Done => {
+                (active_t("footer.done"), engine.fg(palette.status_success).bold())
+            }
+            TurnStatus::Cancelled => {
+                (active_t("footer.cancelled"), engine.fg(palette.status_error).bold())
+            }
+            TurnStatus::Error => {
+                (active_t("footer.error"), engine.fg(palette.status_error).bold())
+            }
+            _ => (active_t("footer.ready"), engine.fg(palette.status_success)),
         };
         footer_spans.push(Span::styled(status_lbl, status_style));
     }
@@ -227,7 +242,9 @@ fn render_footer_with_engine(
         }
         let tokens = state.history_view.get_estimated_tokens();
         let total = state.history_view.total_count;
-        let hist_stats = format!("{} entries (~{} tokens)", total, tokens);
+        let hist_stats = active_t("footer.history_stats")
+            .replacen("{}", &total.to_string(), 1)
+            .replacen("{}", &tokens.to_string(), 1);
         right_spans.push(Span::styled(
             hist_stats,
             engine.fg(palette.status_info).bold(),
@@ -235,8 +252,8 @@ fn render_footer_with_engine(
     }
 
     if !right_spans.is_empty() {
-        let left_len: usize = footer_spans.iter().map(|s| s.content.chars().count()).sum();
-        let right_len: usize = right_spans.iter().map(|s| s.content.chars().count()).sum();
+        let left_len: usize = footer_spans.iter().map(|s| s.width()).sum();
+        let right_len: usize = right_spans.iter().map(|s| s.width()).sum();
         let target_right_len = right_len + 1;
         if left_len + target_right_len < inner_width {
             let padding = inner_width - left_len - target_right_len;
@@ -283,23 +300,24 @@ pub fn render_turn_phase_pipeline(
 ) -> Vec<Span<'static>> {
     let palette = engine.palette();
     let phases = [
-        (tauqe_protocol::TurnPhase::Discovery, "Discovery"),
-        (tauqe_protocol::TurnPhase::Proposal, "Proposal"),
-        (tauqe_protocol::TurnPhase::Staging, "Staging"),
-        (tauqe_protocol::TurnPhase::Verification, "Verify"),
-        (tauqe_protocol::TurnPhase::Healing, "Heal"),
+        (tauqe_protocol::TurnPhase::Discovery, "phase.discovery"),
+        (tauqe_protocol::TurnPhase::Proposal, "phase.proposal"),
+        (tauqe_protocol::TurnPhase::Staging, "phase.staging"),
+        (tauqe_protocol::TurnPhase::Verification, "phase.verification"),
+        (tauqe_protocol::TurnPhase::Healing, "phase.healing"),
     ];
 
     let mut spans = Vec::new();
     spans.push(Span::styled("[", engine.fg(palette.text_muted)));
-    for (idx, (phase, label)) in phases.iter().enumerate() {
+    for (idx, (phase, key)) in phases.iter().enumerate() {
         if idx > 0 {
             spans.push(Span::styled("→", engine.fg(palette.text_muted)));
         }
+        let label = active_t(key);
         if *phase == current {
-            spans.push(Span::styled(*label, engine.fg(palette.status_info).bold()));
+            spans.push(Span::styled(label, engine.fg(palette.status_info).bold()));
         } else {
-            spans.push(Span::styled(*label, engine.fg(palette.text_muted)));
+            spans.push(Span::styled(label, engine.fg(palette.text_muted)));
         }
     }
     spans.push(Span::styled("]", engine.fg(palette.text_muted)));
@@ -323,7 +341,7 @@ fn extract_bracketed(slice: &str) -> Option<String> {
 }
 
 pub fn format_repomap_tokens(tokens: usize) -> String {
-    format!("map: {} tok", tokens)
+    active_t("footer.repomap_tokens").replacen("{}", &tokens.to_string(), 1)
 }
 
 pub fn format_footer_cost(
