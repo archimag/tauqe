@@ -316,6 +316,20 @@ pub(super) fn record_session_response(
     record_workflow_response(history_manager, &outcome.result, &outcome.assistant_text, Vec::new());
 }
 
+/// Returns the capability set of an isolated step, narrowed from `protocol`.
+///
+/// Plan authoring is removed from whatever the active protocol advertises, so an
+/// isolated step never advertises plan mutations regardless of the concrete wire
+/// format. Removing a capability the protocol does not carry is a no-op, which
+/// keeps the narrowing protocol-agnostic: no caller branches on a protocol name
+/// or on a concrete protocol type.
+fn isolated_step_capabilities(protocol: &dyn PromptProtocol) -> tauqe_protocol::CapabilitySet {
+    protocol
+        .capability_set()
+        .without(tauqe_protocol::LlmCapability::PlanCreation)
+        .without(tauqe_protocol::LlmCapability::PlanUpdate)
+}
+
 /// Runs the FSM turn cycle without session bookkeeping.
 ///
 /// Performs discovery, staging, verification, and healing against the shared
@@ -349,16 +363,8 @@ pub(super) async fn run_fsm_turn_body(
     };
 
     let isolated_protocol;
-    let protocol: &dyn PromptProtocol = if is_isolated_step
-        && (protocol.supports(tauqe_protocol::LlmCapability::PlanCreation)
-            || protocol.supports(tauqe_protocol::LlmCapability::PlanUpdate))
-    {
-        let narrowed_caps = if protocol.name() == "structured" {
-            tauqe_protocol::CapabilitySet::isolated_step_structured()
-        } else {
-            tauqe_protocol::CapabilitySet::isolated_step_xml()
-        };
-        isolated_protocol = protocol.with_capability_set(narrowed_caps);
+    let protocol: &dyn PromptProtocol = if is_isolated_step {
+        isolated_protocol = protocol.with_capability_set(isolated_step_capabilities(protocol));
         isolated_protocol.as_ref()
     } else {
         protocol
@@ -1038,6 +1044,24 @@ mod tests {
         assert!(outcome_res.is_err(), "turn must fail fast on stream error");
         assert_eq!(std::fs::read_to_string(root.join("a.rs")).unwrap(), TARGET);
         assert!(history.get_entries().unwrap().is_empty());
+    }
+
+    #[test]
+    fn isolated_step_capabilities_are_protocol_agnostic() {
+        let xml = isolated_step_capabilities(&XmlPromptProtocol);
+        assert_eq!(xml, tauqe_protocol::CapabilitySet::isolated_step_xml());
+        assert!(!xml.contains(tauqe_protocol::LlmCapability::PlanCreation));
+        assert!(!xml.contains(tauqe_protocol::LlmCapability::PlanUpdate));
+        assert!(xml.contains(tauqe_protocol::LlmCapability::FileEdits));
+
+        let structured = isolated_step_capabilities(&crate::prompt::json::JsonPromptProtocol::edits());
+        assert_eq!(
+            structured,
+            tauqe_protocol::CapabilitySet::isolated_step_structured()
+        );
+        assert!(!structured.contains(tauqe_protocol::LlmCapability::PlanCreation));
+        assert!(!structured.contains(tauqe_protocol::LlmCapability::PlanUpdate));
+        assert!(structured.contains(tauqe_protocol::LlmCapability::FileEdits));
     }
 
     #[tokio::test]

@@ -1,3 +1,4 @@
+use crate::escape::{escape_xml_text, single_line};
 use tauqe_protocol::{Plan, PlanItem, PlanItemStatus};
 
 pub const PLAN_STEP_EXECUTION_PREFIX: &str = "# Target Plan Step Execution:";
@@ -55,6 +56,15 @@ pub fn extract_plan_step_execution_id(prompt: &str) -> Option<String> {
     extract_plan_step_execution_target(prompt).map(|t| t.step_id)
 }
 
+/// Joins identifiers or paths into a single escaped, comma-separated line.
+fn escape_list(items: &[String]) -> String {
+    items
+        .iter()
+        .map(|item| escape_xml_text(item))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// Formats a targeted prompt for executing a specific leaf step of a plan in isolation.
 ///
 /// Excludes unrelated chat history and focuses the model entirely on completing
@@ -76,17 +86,23 @@ pub fn format_plan_step_execution_prompt(
     }
 
     let mut out = String::new();
-    let clean_title = step.title.replace(['\r', '\n'], " ").trim().to_string();
+    let clean_title = escape_xml_text(&single_line(&step.title));
     out.push_str(&format!(
         "{} [{}:{}] {}\n\n",
-        PLAN_STEP_EXECUTION_PREFIX, plan.id, step.id, clean_title
+        PLAN_STEP_EXECUTION_PREFIX,
+        single_line(&plan.id),
+        single_line(&step.id),
+        clean_title
     ));
 
-    out.push_str(&format!("## Plan: {}\n", plan.title));
+    out.push_str(&format!(
+        "## Plan: {}\n",
+        escape_xml_text(&single_line(&plan.title))
+    ));
     if let Some(desc) = &plan.description {
         let trimmed = desc.trim();
         if !trimmed.is_empty() {
-            out.push_str(&format!("{}\n\n", trimmed));
+            out.push_str(&format!("{}\n\n", escape_xml_text(trimmed)));
         }
     }
 
@@ -95,11 +111,16 @@ pub fn format_plan_step_execution_prompt(
         fn render_concept(out: &mut String, items: &[tauqe_protocol::ConceptItem], depth: usize) {
             let indent = "  ".repeat(depth);
             for item in items {
-                out.push_str(&format!("{}- #{} {}", indent, item.id, item.title));
+                out.push_str(&format!(
+                    "{}- #{} {}",
+                    indent,
+                    escape_xml_text(&item.id),
+                    escape_xml_text(&item.title)
+                ));
                 if let Some(details) = &item.details {
                     let trimmed = details.trim();
                     if !trimmed.is_empty() {
-                        out.push_str(&format!(": {}", trimmed));
+                        out.push_str(&format!(": {}", escape_xml_text(trimmed)));
                     }
                 }
                 out.push('\n');
@@ -124,36 +145,52 @@ pub fn format_plan_step_execution_prompt(
     if !completed_items.is_empty() {
         out.push_str("### Already Completed Prerequisites:\n");
         for (id, title) in completed_items {
-            out.push_str(&format!("- [x] #{} {}\n", id, title));
+            out.push_str(&format!(
+                "- [x] #{} {}\n",
+                escape_xml_text(id),
+                escape_xml_text(title)
+            ));
         }
         out.push('\n');
     }
 
     out.push_str("### Target Step to Implement:\n");
-    out.push_str(&format!("- **ID**: `{}`\n", step.id));
-    out.push_str(&format!("- **Title**: {}\n", step.title));
+    out.push_str(&format!("- **ID**: `{}`\n", escape_xml_text(&step.id)));
+    out.push_str(&format!(
+        "- **Title**: {}\n",
+        escape_xml_text(&step.title)
+    ));
     if !step.concept_refs.is_empty() {
-        out.push_str(&format!("- **Addressed Concept Nodes**: {}\n", step.concept_refs.join(", ")));
+        out.push_str(&format!(
+            "- **Addressed Concept Nodes**: {}\n",
+            escape_list(&step.concept_refs)
+        ));
     }
     if !step.files.is_empty() {
-        out.push_str(&format!("- **Target Files (to modify)**: {}\n", step.files.join(", ")));
+        out.push_str(&format!(
+            "- **Target Files (to modify)**: {}\n",
+            escape_list(&step.files)
+        ));
     }
     if !step.readonly_files.is_empty() {
         out.push_str(&format!(
             "- **Reference Files (read-only context)**: {}\n",
-            step.readonly_files.join(", ")
+            escape_list(&step.readonly_files)
         ));
     }
     if !step.depends_on.is_empty() {
         out.push_str(&format!(
             "- **Prerequisite Steps (must be DONE)**: {}\n",
-            step.depends_on.join(", ")
+            escape_list(&step.depends_on)
         ));
     }
     if let Some(details) = &step.details {
         let trimmed = details.trim();
         if !trimmed.is_empty() {
-            out.push_str(&format!("- **Details**:\n{}\n", trimmed));
+            out.push_str(&format!(
+                "- **Details**:\n{}\n",
+                escape_xml_text(trimmed)
+            ));
         }
     }
     out.push('\n');
@@ -161,7 +198,7 @@ pub fn format_plan_step_execution_prompt(
     out.push_str("## Execution Directives:\n");
     out.push_str(&format!(
         "1. Focus STRICTLY and EXCLUSIVELY on implementing step `{}` while upholding the Architectural Concept invariants.\n",
-        step.id
+        escape_xml_text(&step.id)
     ));
     out.push_str("2. Do NOT implement any upcoming or subsequent steps from the plan.\n");
     out.push_str("3. Keep changes minimal and coherent. Toolchain verification is handled automatically and deterministically by the harness; do NOT emit <verify> tags.\n");
@@ -201,7 +238,7 @@ pub fn format_plan_step_retry_prompt(assistant_text: &str, error: Option<&str>) 
         out.push_str("(empty response)\n\n");
     } else {
         out.push_str("<previous_response>\n");
-        out.push_str(previous);
+        out.push_str(&escape_xml_text(previous));
         out.push_str("\n</previous_response>\n\n");
     }
 
@@ -209,7 +246,7 @@ pub fn format_plan_step_retry_prompt(assistant_text: &str, error: Option<&str>) 
         let trimmed = err.trim();
         if !trimmed.is_empty() {
             out.push_str("## Diagnostic Feedback:\n");
-            out.push_str(trimmed);
+            out.push_str(&escape_xml_text(trimmed));
             out.push_str("\n\n");
         }
     }

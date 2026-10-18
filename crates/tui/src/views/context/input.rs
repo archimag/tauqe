@@ -25,23 +25,28 @@ pub enum ContextAction {
     Activate,
     NavPrev,
     NavNext,
+    SelectFirst,
+    SelectLast,
+    PageUp,
+    PageDown,
     FoldToggle,
+    FoldAll,
     Return,
     Remove,
     ClearAuto,
     ClearUser,
+    Copy,
+    Refresh,
 }
 
 /// Single source of truth for the Context view keybindings.
 ///
 /// Essential commands mutate the three context layers; Interface commands
-/// navigate and fold the section tree; Helpers remove a file or clear a whole
-/// layer. The map drives the generated Help dialog. The destructive
-/// layer-clearing chords are declared first so a shifted `C` always resolves to
-/// clearing the persistent User layer instead of the Auto layer.
+/// navigate and fold the section tree; Helpers copy paths, refresh state,
+/// remove a file, or clear a whole layer with modal confirmation. The map
+/// drives input resolution and the generated Help dialog.
 pub static CONTEXT_COMMAND_MAP: CommandMap<ContextAction> = CommandMap::new(&[
-    // Destructive layer clearing, declared before the bare `c` binding so the
-    // shifted chords never fall through to the Auto-layer action.
+    // Destructive layer clearing: uppercase Shift chords with modal confirmation.
     CommandSpec::new(
         KeyChord::Bare(KeyCode::Char('C')),
         ContextAction::ClearUser,
@@ -55,10 +60,47 @@ pub static CONTEXT_COMMAND_MAP: CommandMap<ContextAction> = CommandMap::new(&[
         "Clear all persistent User files",
     ),
     CommandSpec::new(
-        KeyChord::Bare(KeyCode::Char('c')),
+        KeyChord::Bare(KeyCode::Char('A')),
         ContextAction::ClearAuto,
         Helpers,
         "Clear all Auto-requested files",
+    ),
+    CommandSpec::new(
+        KeyChord::Shift(KeyCode::Char('a')),
+        ContextAction::ClearAuto,
+        Helpers,
+        "Clear all Auto-requested files",
+    ),
+    // Helpers: clipboard copying, refresh, and single-file deletion.
+    CommandSpec::new(
+        KeyChord::Bare(KeyCode::Char('c')),
+        ContextAction::Copy,
+        Helpers,
+        "Copy file path to clipboard",
+    ),
+    CommandSpec::new(
+        KeyChord::Bare(KeyCode::Char('y')),
+        ContextAction::Copy,
+        Helpers,
+        "Copy file path to clipboard",
+    ),
+    CommandSpec::new(
+        KeyChord::Bare(KeyCode::Char('g')),
+        ContextAction::Refresh,
+        Helpers,
+        "Refresh context from the server",
+    ),
+    CommandSpec::new(
+        KeyChord::Bare(KeyCode::Char('d')),
+        ContextAction::Remove,
+        Helpers,
+        "Remove the selected file from context",
+    ),
+    CommandSpec::new(
+        KeyChord::Bare(KeyCode::Delete),
+        ContextAction::Remove,
+        Helpers,
+        "Remove the selected file from context",
     ),
     // Essential: context layer mutations.
     CommandSpec::new(
@@ -69,12 +111,6 @@ pub static CONTEXT_COMMAND_MAP: CommandMap<ContextAction> = CommandMap::new(&[
     ),
     CommandSpec::new(
         KeyChord::Bare(KeyCode::Char('r')),
-        ContextAction::AddReadOnly,
-        Essential,
-        "Add a file to context as read-only",
-    ),
-    CommandSpec::new(
-        KeyChord::Bare(KeyCode::Char('a')),
         ContextAction::AddReadOnly,
         Essential,
         "Add a file to context as read-only",
@@ -97,7 +133,7 @@ pub static CONTEXT_COMMAND_MAP: CommandMap<ContextAction> = CommandMap::new(&[
         Essential,
         "Promote an Auto file or fold / unfold the selected section",
     ),
-    // Interface: navigation and folding.
+    // Interface: navigation, folding, and view switching.
     CommandSpec::new(
         KeyChord::Bare(KeyCode::Esc),
         ContextAction::Return,
@@ -109,6 +145,24 @@ pub static CONTEXT_COMMAND_MAP: CommandMap<ContextAction> = CommandMap::new(&[
         ContextAction::Return,
         Interface,
         "Return to the REPL",
+    ),
+    CommandSpec::new(
+        KeyChord::Bare(KeyCode::Char('a')),
+        ContextAction::FoldAll,
+        Interface,
+        "Toggle fold or unfold for all context sections",
+    ),
+    CommandSpec::new(
+        KeyChord::Bare(KeyCode::Tab),
+        ContextAction::FoldToggle,
+        Interface,
+        "Fold or unfold the selected section",
+    ),
+    CommandSpec::new(
+        KeyChord::Bare(KeyCode::Char(' ')),
+        ContextAction::FoldToggle,
+        Interface,
+        "Fold or unfold the selected section",
     ),
     CommandSpec::new(
         KeyChord::Bare(KeyCode::Up),
@@ -147,35 +201,52 @@ pub static CONTEXT_COMMAND_MAP: CommandMap<ContextAction> = CommandMap::new(&[
         "Select the next row",
     ),
     CommandSpec::new(
-        KeyChord::Bare(KeyCode::Tab),
-        ContextAction::FoldToggle,
+        KeyChord::Bare(KeyCode::Home),
+        ContextAction::SelectFirst,
         Interface,
-        "Fold or unfold the selected section",
+        "Select the first row",
     ),
     CommandSpec::new(
-        KeyChord::Bare(KeyCode::Char(' ')),
-        ContextAction::FoldToggle,
+        KeyChord::Meta(KeyCode::Char('<')),
+        ContextAction::SelectFirst,
         Interface,
-        "Fold or unfold the selected section",
-    ),
-    // Helpers: removal.
-    CommandSpec::new(
-        KeyChord::Bare(KeyCode::Char('d')),
-        ContextAction::Remove,
-        Helpers,
-        "Remove the selected file from context",
+        "Select the first row",
     ),
     CommandSpec::new(
-        KeyChord::Bare(KeyCode::Char('x')),
-        ContextAction::Remove,
-        Helpers,
-        "Remove the selected file from context",
+        KeyChord::Ctrl(KeyCode::Home),
+        ContextAction::SelectFirst,
+        Interface,
+        "Select the first row",
     ),
     CommandSpec::new(
-        KeyChord::Bare(KeyCode::Delete),
-        ContextAction::Remove,
-        Helpers,
-        "Remove the selected file from context",
+        KeyChord::Bare(KeyCode::End),
+        ContextAction::SelectLast,
+        Interface,
+        "Select the last row",
+    ),
+    CommandSpec::new(
+        KeyChord::Meta(KeyCode::Char('>')),
+        ContextAction::SelectLast,
+        Interface,
+        "Select the last row",
+    ),
+    CommandSpec::new(
+        KeyChord::Ctrl(KeyCode::End),
+        ContextAction::SelectLast,
+        Interface,
+        "Select the last row",
+    ),
+    CommandSpec::new(
+        KeyChord::Bare(KeyCode::PageUp),
+        ContextAction::PageUp,
+        Interface,
+        "Scroll the context view up a page",
+    ),
+    CommandSpec::new(
+        KeyChord::Bare(KeyCode::PageDown),
+        ContextAction::PageDown,
+        Interface,
+        "Scroll the context view down a page",
     ),
 ]);
 
@@ -320,14 +391,56 @@ pub async fn handle_context_key(
                 st.context_view.cursor_index += 1;
             }
         }
+        ContextAction::SelectFirst => {
+            st.context_view.cursor_index = 0;
+        }
+        ContextAction::SelectLast => {
+            if total_rows > 0 {
+                st.context_view.cursor_index = total_rows - 1;
+            }
+        }
+        ContextAction::PageUp => {
+            let page = if st.context_view.view_height > 2 {
+                st.context_view.view_height.saturating_sub(2)
+            } else {
+                10
+            };
+            st.context_view.cursor_index = st.context_view.cursor_index.saturating_sub(page);
+        }
+        ContextAction::PageDown => {
+            let page = if st.context_view.view_height > 2 {
+                st.context_view.view_height.saturating_sub(2)
+            } else {
+                10
+            };
+            if total_rows > 0 {
+                st.context_view.cursor_index =
+                    (st.context_view.cursor_index + page).min(total_rows - 1);
+            }
+        }
         ContextAction::FoldToggle => {
             if let Some(ContextRow::Header(layer)) = current_row {
                 st.context_view.toggle_section(layer);
+                let rows_len = st.context_view.compute_rows(&st.context.items).len();
+                if rows_len > 0 && st.context_view.cursor_index >= rows_len {
+                    st.context_view.cursor_index = rows_len - 1;
+                }
+            }
+        }
+        ContextAction::FoldAll => {
+            st.context_view.toggle_fold_all();
+            let rows_len = st.context_view.compute_rows(&st.context.items).len();
+            if rows_len > 0 && st.context_view.cursor_index >= rows_len {
+                st.context_view.cursor_index = rows_len - 1;
             }
         }
         ContextAction::Activate => match current_row {
             Some(ContextRow::Header(layer)) => {
                 st.context_view.toggle_section(layer);
+                let rows_len = st.context_view.compute_rows(&st.context.items).len();
+                if rows_len > 0 && st.context_view.cursor_index >= rows_len {
+                    st.context_view.cursor_index = rows_len - 1;
+                }
             }
             Some(ContextRow::Item(ref item)) if item.layer == ContextLayer::Auto => {
                 let path = item.path.clone();
@@ -398,6 +511,54 @@ pub async fn handle_context_key(
                 st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
                 st.context_view.confirm_clear_user = true;
             }
+        }
+        ContextAction::Copy => {
+            let to_copy = match current_row {
+                Some(ContextRow::Item(ref item)) => Some(item.path.clone()),
+                Some(ContextRow::Header(layer)) => {
+                    let paths: Vec<String> = st
+                        .context
+                        .items
+                        .iter()
+                        .filter(|i| i.layer == layer)
+                        .map(|i| i.path.clone())
+                        .collect();
+                    if paths.is_empty() {
+                        None
+                    } else {
+                        Some(paths.join("\n"))
+                    }
+                }
+                None => None,
+            };
+
+            if let Some(text) = to_copy {
+                drop(st);
+                let res = crate::clipboard::copy_to_clipboard(&text);
+                let mut st = state.lock().await;
+                match res {
+                    crate::clipboard::CopyResult::Native => {
+                        st.notify_success("File path copied to clipboard");
+                    }
+                    crate::clipboard::CopyResult::Osc52Only => {
+                        st.notify_info("File path sent to terminal clipboard (OSC 52)");
+                    }
+                    crate::clipboard::CopyResult::Failed => {
+                        st.notify_error("Failed to copy to clipboard");
+                    }
+                }
+            } else if let Some(ContextRow::Header(_)) = current_row {
+                st.notify_info("No files in section to copy");
+            }
+        }
+        ContextAction::Refresh => {
+            drop(st);
+            send_request(
+                server_writer,
+                methods::CONTEXT_GET,
+                serde_json::json!({}),
+            )
+            .await?;
         }
         ContextAction::AddEditable => {
             st.context_view.adding_file = true;
@@ -550,11 +711,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_lowercase_c_clears_auto_not_user() {
+    async fn test_shift_a_opens_clear_auto_confirmation() {
+        let mut st = test_state();
+        st.view_mode = ViewMode::Context;
+        st.context.items.push(item("auto.rs", ContextLayer::Auto));
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+
+        let key = KeyEvent::new(KeyCode::Char('A'), crossterm::event::KeyModifiers::SHIFT);
+        handle_context_key(key, &state, &mut conn).await.unwrap();
+
+        let st = state.lock().await;
+        assert!(st.context_view.confirm_clear_auto);
+        assert!(!st.context_view.confirm_clear_user);
+    }
+
+    #[tokio::test]
+    async fn test_lowercase_c_copies_and_does_not_clear() {
         let mut st = test_state();
         st.view_mode = ViewMode::Context;
         st.context.items.push(item("src/lib.rs", ContextLayer::User));
         st.context.items.push(item("auto.rs", ContextLayer::Auto));
+        // Select an item
+        st.context_view.cursor_index = 2; // User file item
         let state = Arc::new(Mutex::new(st));
         let mut conn = RpcConnection::new(Vec::<u8>::new());
 
@@ -562,8 +741,42 @@ mod tests {
         handle_context_key(key, &state, &mut conn).await.unwrap();
 
         let st = state.lock().await;
-        assert!(st.context_view.confirm_clear_auto);
+        assert!(!st.context_view.confirm_clear_auto);
         assert!(!st.context_view.confirm_clear_user);
+    }
+
+    #[tokio::test]
+    async fn test_x_does_not_remove_file() {
+        let mut st = test_state();
+        st.view_mode = ViewMode::Context;
+        st.context.items.push(item("src/lib.rs", ContextLayer::User));
+        st.context_view.cursor_index = 2; // User file item
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+
+        let key = KeyEvent::new(KeyCode::Char('x'), crossterm::event::KeyModifiers::NONE);
+        let res = handle_context_key(key, &state, &mut conn).await.unwrap();
+        assert!(matches!(res, InputResult::Continue));
+        // x is unmapped in context view (reserved for execute), so connection buffer is empty
+        assert!(conn.written().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_a_toggles_fold_all() {
+        let mut st = test_state();
+        st.view_mode = ViewMode::Context;
+        assert!(st.context_view.is_all_expanded());
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+
+        let key = KeyEvent::new(KeyCode::Char('a'), crossterm::event::KeyModifiers::NONE);
+        handle_context_key(key, &state, &mut conn).await.unwrap();
+
+        let guard = state.lock().await;
+        assert!(!guard.context_view.is_all_expanded());
+        assert!(!guard.context_view.pinned_expanded);
+        assert!(!guard.context_view.user_expanded);
+        assert!(!guard.context_view.auto_expanded);
     }
 
     #[test]

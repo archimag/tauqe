@@ -13,7 +13,7 @@ use crate::theme::presets::ThemePreset;
 use crate::theme::selector::ThemeSelectorState;
 use crate::views::context::ContextViewState;
 use crate::views::history::HistoryViewState;
-use crate::views::plans::PlansViewState;
+use crate::views::plans::{PlansViewState, RefineDialogFocus};
 use crate::views::repl::{ReplView, TurnStatus};
 use crate::views::review::ReviewViewState;
 
@@ -82,6 +82,8 @@ pub enum ActiveModal {
     ServerDisconnected,
     Squash,
     Review,
+    /// Review-finding decomposition dialog opened with `r` in the Review view.
+    ReviewRefine,
     ConfirmCancel,
     ConfirmQuit,
     BatchCancel,
@@ -418,13 +420,83 @@ pub struct ConfirmExecuteScopeState {
     pub steps: Vec<tauqe_protocol::PlanItem>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct ConfirmExecuteReviewState {
     pub review_id: Option<String>,
     pub review_title: String,
     pub scope_title: String,
     pub item_id: Option<u32>,
+    /// Concrete subplan step targeted by point execution, when the developer
+    /// confirmed from a step row.
+    pub step_id: Option<String>,
     pub items: Vec<tauqe_protocol::ReviewIssue>,
+    /// Coder-role model selector: configured entries, cyclic navigation, and the
+    /// shared embedded-list rendering (concept #c-3).
+    pub selector: ModelSelector,
+    /// Optional implementation directives forwarded to the Coder turn.
+    pub instructions_editor: InputEditor,
+    /// Section of the dialog that currently owns the keyboard.
+    pub focus: RefineDialogFocus,
+    /// Focused action button; the safe `Cancel` holds the default.
+    pub confirm_button: ConfirmDialogButton,
+}
+
+impl ConfirmExecuteReviewState {
+    /// Builds a review-execution confirmation over the configured Coder entries.
+    ///
+    /// One constructor serves both shapes: point execution (one finding or one
+    /// subplan step, which exposes the Coder selector and the directives editor)
+    /// and the batch queue, so the state definition cannot drift between them
+    /// (concept #c-3).
+    pub fn new(
+        review_id: Option<String>,
+        review_title: String,
+        scope_title: String,
+        item_id: Option<u32>,
+        step_id: Option<String>,
+        items: Vec<tauqe_protocol::ReviewIssue>,
+        coder_entries: Vec<tauqe_protocol::ModelEntry>,
+    ) -> Self {
+        Self {
+            review_id,
+            review_title,
+            scope_title,
+            item_id,
+            step_id,
+            items,
+            selector: ModelSelector::new(ModelRole::Coder, coder_entries, 0),
+            instructions_editor: InputEditor::default(),
+            focus: RefineDialogFocus::default(),
+            confirm_button: ConfirmDialogButton::Cancel,
+        }
+    }
+
+    /// Currently selected Coder entry, if any.
+    pub fn selected_entry(&self) -> Option<&tauqe_protocol::ModelEntry> {
+        self.selector.selected_entry()
+    }
+
+    /// Whether point execution targets exactly one finding or subplan step.
+    ///
+    /// Only this shape exposes the Coder selector and the directives editor; a
+    /// batch runs autonomously on the configured role defaults (concept #c-3).
+    pub fn is_single_target(&self) -> bool {
+        self.review_id.is_some() && self.items.len() == 1
+    }
+}
+
+impl Default for ConfirmExecuteReviewState {
+    fn default() -> Self {
+        Self::new(
+            None,
+            String::new(),
+            String::new(),
+            None,
+            None,
+            Vec::new(),
+            Vec::new(),
+        )
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1245,6 +1317,38 @@ impl AppState {
         true
     }
 
+    /// Resolves the Coder model entries a review-execution dialog offers.
+    ///
+    /// Configured Coder entries win; otherwise the resolved Coder role (or the
+    /// active model) backs the dialog so it always presents a valid selection.
+    /// This mirrors the Architect ladder lookup of the decomposition dialogs, so
+    /// the Coder role can never silently disappear from the picker.
+    pub fn coder_entries(&self) -> Vec<tauqe_protocol::ModelEntry> {
+        self.model_choice
+            .roles
+            .as_ref()
+            .and_then(|roles| roles.entries.as_ref())
+            .map(|entries| entries.coder.clone())
+            .filter(|entries| !entries.is_empty())
+            .unwrap_or_else(|| {
+                let fallback_model = self
+                    .model_choice
+                    .resolve(&ModelSelection::Role(ModelRole::Coder))
+                    .unwrap_or_else(|| self.active_model.clone());
+                let fallback_effort = self
+                    .model_choice
+                    .roles
+                    .as_ref()
+                    .and_then(|roles| roles.efforts.as_ref())
+                    .and_then(|efforts| efforts.coder);
+                vec![tauqe_protocol::ModelEntry::new(
+                    fallback_model,
+                    fallback_effort,
+                    None,
+                )]
+            })
+    }
+
     /// Returns the highest-priority active modal surface, or `None` when no modal
     /// is open. This is the canonical ordering consulted by keyboard dispatch,
     /// rendering, mouse hit-testing, and paste routing.
@@ -1257,6 +1361,9 @@ impl AppState {
         }
         if self.review_dialog.is_some() {
             return Some(ActiveModal::Review);
+        }
+        if self.review.refine_dialog.is_some() {
+            return Some(ActiveModal::ReviewRefine);
         }
         if self.confirm_cancel {
             return Some(ActiveModal::ConfirmCancel);

@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use super::batch::{run_review_batch, BatchOutcome};
+use super::batch::{run_review_batch, run_review_batch_with_options, BatchOutcome};
 use super::common::{clear_auto_context, preload_item_files, turn_applied_edits};
 use super::*;
 
@@ -1024,7 +1024,10 @@ async fn test_review_batch_preloads_multiple_files() {
             id: 1,
             title: "Multi-file finding".to_string(),
             model: None,
-            issue_type: tauqe_protocol::IssueType::Architecture,
+            // A `Quality` finding requires no autonomous architect
+            // decomposition, so the test stays focused on multi-file
+            // preloading instead of consuming a decomposition turn.
+            issue_type: tauqe_protocol::IssueType::Quality,
             status: IssueStatus::Todo,
             description: "First calls second without validation".to_string(),
             recommendations: Vec::new(),
@@ -1943,4 +1946,421 @@ async fn test_review_start_surfaces_stream_cancelled_event() {
         !saw_error,
         "cancellation must not be misreported as a review error"
     );
+}
+
+fn architecture_edit(marker: &str, replacement: &str) -> String {
+    format!(
+        "<tauqe_edits_{m} summary=\"Apply fix\">\n<edit_{m} path=\"src/target.rs\">\n<search_{m}>\npub fn target() {{}}\n</search_{m}>\n<replace_{m}>\n{body}\n</replace_{m}>\n</edit_{m}>\n<success_{m} summary=\"done\" />\n</tauqe_edits_{m}>",
+        m = marker,
+        body = replacement
+    )
+}
+
+#[tokio::test]
+async fn test_review_autonomous_architecture_decomposition_before_coding() {
+    let dir = TestDir::new();
+    init_repo_with_file(&dir, "src/target.rs");
+
+    let mut issue = test_item(1, IssueStatus::Todo, "src/target.rs");
+    issue.issue_type = tauqe_protocol::IssueType::Architecture;
+    let session = test_session("rev-auto-arch", vec![issue]);
+    ReviewStorage::save_session(dir.path(), &session).unwrap();
+
+    let refine_output = serde_json::json!({
+        "status": "success",
+        "explanation": "Decomposed architecture finding",
+        "reason": null,
+        "context_requests": [],
+        "items": [{
+            "id": "1.1",
+            "title": "Apply architectural fix",
+            "status": "todo",
+            "files": ["src/target.rs"],
+            "readonly_files": [],
+            "concept_refs": [],
+            "depends_on": [],
+            "children": []
+        }]
+    });
+    let marker = "ARCHAUTO1";
+    let edit = architecture_edit(marker, "pub fn target() { /* fixed */ }");
+    let provider = Arc::new(MockLlmProvider::scripted([
+        MockResponse::text(refine_output.to_string()),
+        MockResponse::text(edit),
+    ]));
+
+    let mut config = test_config();
+    config.develop.max_retries = 0;
+    let state = test_state_with_provider(&dir, config, provider.clone()).await;
+    *state.marker_override.lock().await = Some(marker.to_string());
+
+    let operation = Arc::new(state.try_begin_operation().expect("register batch operation"));
+    let outcome = run_review_batch(
+        &state,
+        "rev-auto-arch",
+        make_tasks("rev-auto-arch", &[1]),
+        operation,
+    )
+    .await;
+    assert!(
+        matches!(outcome, BatchOutcome::Completed { items: 1 }),
+        "expected completed autonomous decomposition batch, got {outcome:?}"
+    );
+
+    // Two provider calls: the Architect decomposition, then the Coder step.
+    assert_eq!(provider.requests().len(), 2);
+
+    let reloaded = ReviewStorage::load_review(dir.path(), "rev-auto-arch")
+        .unwrap()
+        .unwrap();
+    let item = reloaded.find_item(1).unwrap();
+    assert_eq!(item.subplan.len(), 1);
+    assert_eq!(item.subplan[0].status, PlanItemStatus::Done);
+    assert_eq!(item.status, IssueStatus::Fixed);
+}
+
+#[tokio::test]
+async fn test_review_refine_status_autonomous_decomposition() {
+    let dir = TestDir::new();
+    init_repo_with_file(&dir, "src/target.rs");
+
+    // A finding in `Refine` status is decomposed before coding even when its
+    // severity alone would not require it.
+    let issue = test_item(1, IssueStatus::Refine, "src/target.rs");
+    let session = test_session("rev-auto-refine", vec![issue]);
+    ReviewStorage::save_session(dir.path(), &session).unwrap();
+
+    let refine_output = serde_json::json!({
+        "status": "success",
+        "explanation": "Decomposed refine finding",
+        "reason": null,
+        "context_requests": [],
+        "items": [{
+            "id": "1.1",
+            "title": "Apply refine fix",
+            "status": "todo",
+            "files": ["src/target.rs"],
+            "readonly_files": [],
+            "concept_refs": [],
+            "depends_on": [],
+            "children": []
+        }]
+    });
+    let marker = "REFINEAUTO1";
+    let edit = architecture_edit(marker, "pub fn target() { /* refined */ }");
+    let provider = Arc::new(MockLlmProvider::scripted([
+        MockResponse::text(refine_output.to_string()),
+        MockResponse::text(edit),
+    ]));
+
+    let mut config = test_config();
+    config.develop.max_retries = 0;
+    let state = test_state_with_provider(&dir, config, provider.clone()).await;
+    *state.marker_override.lock().await = Some(marker.to_string());
+
+    let operation = Arc::new(state.try_begin_operation().expect("register batch operation"));
+    let outcome = run_review_batch(
+        &state,
+        "rev-auto-refine",
+        make_tasks("rev-auto-refine", &[1]),
+        operation,
+    )
+    .await;
+    assert!(
+        matches!(outcome, BatchOutcome::Completed { items: 1 }),
+        "expected completed autonomous refine batch, got {outcome:?}"
+    );
+    assert_eq!(provider.requests().len(), 2);
+
+    let reloaded = ReviewStorage::load_review(dir.path(), "rev-auto-refine")
+        .unwrap()
+        .unwrap();
+    let item = reloaded.find_item(1).unwrap();
+    assert_eq!(item.subplan.len(), 1);
+    assert_eq!(item.status, IssueStatus::Fixed);
+}
+
+#[tokio::test]
+async fn test_review_autonomous_decomposition_blocked_skips_finding() {
+    let dir = TestDir::new();
+    init_repo_with_file(&dir, "src/target.rs");
+
+    let issue = test_item(1, IssueStatus::Refine, "src/target.rs");
+    let session = test_session("rev-auto-blocked", vec![issue]);
+    ReviewStorage::save_session(dir.path(), &session).unwrap();
+
+    let refine_blocked = serde_json::json!({
+        "status": "blocked",
+        "explanation": "Cannot decompose the finding",
+        "reason": "Missing domain model",
+        "context_requests": [],
+        "items": []
+    });
+    let provider = Arc::new(MockLlmProvider::scripted([MockResponse::text(
+        refine_blocked.to_string(),
+    )]));
+
+    let state = test_state_with_provider(&dir, test_config(), provider.clone()).await;
+
+    let operation = Arc::new(state.try_begin_operation().expect("register batch operation"));
+    let outcome = run_review_batch(
+        &state,
+        "rev-auto-blocked",
+        make_tasks("rev-auto-blocked", &[1]),
+        operation,
+    )
+    .await;
+    assert!(
+        matches!(outcome, BatchOutcome::Completed { items: 1 }),
+        "a blocked decomposition skips the finding and completes the batch, got {outcome:?}"
+    );
+
+    // A blocked Architect stops execution before any Coder turn runs.
+    assert_eq!(provider.requests().len(), 1);
+
+    let reloaded = ReviewStorage::load_review(dir.path(), "rev-auto-blocked")
+        .unwrap()
+        .unwrap();
+    let item = reloaded.find_item(1).unwrap();
+    assert_eq!(item.status, IssueStatus::Skipped);
+    let notes = item.resolution_notes.as_deref().unwrap_or("");
+    assert!(notes.contains("Missing domain model"), "notes: {notes}");
+}
+
+#[tokio::test]
+async fn test_review_subplan_emits_in_progress_updates() {
+    let dir = TestDir::new();
+    init_repo_with_file(&dir, "src/target.rs");
+
+    let mut item = test_item(1, IssueStatus::Todo, "src/target.rs");
+    item.plan = vec![subplan_item(
+        "1.1",
+        "First step",
+        PlanItemStatus::Todo,
+        vec!["src/target.rs"],
+    )];
+    let session = test_session("rev-inprog", vec![item]);
+    ReviewStorage::save_session(dir.path(), &session).unwrap();
+
+    let marker = "INPROG1";
+    let edit = architecture_edit(marker, "pub fn target() { /* done */ }");
+    let provider = Arc::new(MockLlmProvider::scripted([MockResponse::text(edit)]));
+
+    let (out, mut rx) = OutChannel::new();
+    let (hist_tx, _hist_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut config = test_config();
+    config.develop.max_retries = 0;
+    let state = AppState::new(config, dir.path().to_path_buf(), hist_tx, out);
+    *state.provider_override.lock().await = Some(provider);
+    *state.marker_override.lock().await = Some(marker.to_string());
+
+    let operation = Arc::new(state.try_begin_operation().expect("register batch operation"));
+    let _ = run_review_batch(&state, "rev-inprog", make_tasks("rev-inprog", &[1]), operation).await;
+
+    let mut saw_substep_in_progress = false;
+    while let Ok(line) = rx.try_recv() {
+        let Ok(val) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        if val.get("method").and_then(|m| m.as_str()) != Some(events::REVIEW_UPDATED) {
+            continue;
+        }
+        let Some(subplan) = val
+            .pointer("/params/session/items/0/subplan")
+            .and_then(|v| v.as_array())
+        else {
+            continue;
+        };
+        if subplan
+            .iter()
+            .any(|s| s.get("status").and_then(|v| v.as_str()) == Some("in_progress"))
+        {
+            saw_substep_in_progress = true;
+            break;
+        }
+    }
+    assert!(
+        saw_substep_in_progress,
+        "expected a review/updated event marking a subplan step in_progress"
+    );
+}
+
+#[tokio::test]
+async fn test_handle_review_execute_validates_step_target() {
+    let dir = TestDir::new();
+    let state = test_state(&dir);
+
+    let mut item = test_item(1, IssueStatus::Todo, "foo.rs");
+    let mut second = subplan_item("1.2", "Second", PlanItemStatus::Todo, vec!["foo.rs"]);
+    second.depends_on = vec!["1.1".to_string()];
+    item.plan = vec![
+        subplan_item("1.1", "First", PlanItemStatus::Todo, vec!["foo.rs"]),
+        second,
+    ];
+    let session = test_session("rev-step-val", vec![item]);
+    ReviewStorage::save_session(dir.path(), &session).unwrap();
+
+    let make_req = |id: u64, params: serde_json::Value| Request {
+        id: tauqe_protocol::RequestId::Number(id),
+        method: tauqe_protocol::methods::REVIEW_EXECUTE.to_string(),
+        params: Some(params),
+    };
+
+    // step_id requires review_id and item_id.
+    let res = handle_review_execute(make_req(1, serde_json::json!({ "step_id": "1.1" })), &state)
+        .await;
+    assert_eq!(res.error.unwrap().code, "INVALID_PARAMS");
+
+    // An unknown sub-step is rejected.
+    let res = handle_review_execute(
+        make_req(
+            2,
+            serde_json::json!({ "review_id": "rev-step-val", "item_id": 1, "step_id": "9.9" }),
+        ),
+        &state,
+    )
+    .await;
+    assert_eq!(res.error.unwrap().code, "NOT_FOUND");
+
+    // A sub-step whose dependency is not done is rejected before starting.
+    let res = handle_review_execute(
+        make_req(
+            3,
+            serde_json::json!({ "review_id": "rev-step-val", "item_id": 1, "step_id": "1.2" }),
+        ),
+        &state,
+    )
+    .await;
+    assert_eq!(res.error.unwrap().code, "STEP_BLOCKED_BY_DEPENDENCIES");
+
+    // A finding without a subplan cannot be targeted.
+    let session_nosub = test_session(
+        "rev-step-nosub",
+        vec![test_item(1, IssueStatus::Todo, "foo.rs")],
+    );
+    ReviewStorage::save_session(dir.path(), &session_nosub).unwrap();
+    let res = handle_review_execute(
+        make_req(
+            4,
+            serde_json::json!({ "review_id": "rev-step-nosub", "item_id": 1, "step_id": "1.1" }),
+        ),
+        &state,
+    )
+    .await;
+    assert_eq!(res.error.unwrap().code, "INVALID_PARAMS");
+}
+
+#[tokio::test]
+async fn test_review_subplan_targeted_step_execution() {
+    let dir = TestDir::new();
+    init_repo_with_file(&dir, "src/target.rs");
+
+    let mut item = test_item(1, IssueStatus::Todo, "src/target.rs");
+    let mut second = subplan_item("1.2", "Second", PlanItemStatus::Todo, vec!["src/target.rs"]);
+    second.depends_on = vec!["1.1".to_string()];
+    item.plan = vec![
+        subplan_item("1.1", "First", PlanItemStatus::Todo, vec!["src/target.rs"]),
+        second,
+    ];
+    let session = test_session("rev-target-step", vec![item]);
+    ReviewStorage::save_session(dir.path(), &session).unwrap();
+
+    let marker = "TARGETSTEP";
+    let edit = architecture_edit(marker, "pub fn target() { /* first */ }");
+    let provider = Arc::new(MockLlmProvider::scripted([MockResponse::text(edit)]));
+
+    let mut config = test_config();
+    config.develop.max_retries = 0;
+    let state = test_state_with_provider(&dir, config, provider.clone()).await;
+    *state.marker_override.lock().await = Some(marker.to_string());
+
+    let operation = Arc::new(state.try_begin_operation().expect("register batch operation"));
+    let outcome = run_review_batch_with_options(
+        &state,
+        "rev-target-step",
+        make_tasks("rev-target-step", &[1]),
+        Some("1.1".to_string()),
+        None,
+        None,
+        operation,
+    )
+    .await;
+    assert!(
+        matches!(outcome, BatchOutcome::Completed { items: 1 }),
+        "expected the targeted sub-step batch to complete, got {outcome:?}"
+    );
+    assert_eq!(provider.requests().len(), 1);
+
+    let reloaded = ReviewStorage::load_review(dir.path(), "rev-target-step")
+        .unwrap()
+        .unwrap();
+    let item = reloaded.find_item(1).unwrap();
+    assert_eq!(item.subplan[0].status, PlanItemStatus::Done);
+    assert_ne!(item.subplan[1].status, PlanItemStatus::Done);
+    // The whole subplan is not done yet, so the finding stays actionable.
+    assert_eq!(item.status, IssueStatus::Todo);
+}
+
+#[tokio::test]
+async fn test_review_subplan_targeted_step_model_and_instructions() {
+    let dir = TestDir::new();
+    init_repo_with_file(&dir, "src/target.rs");
+
+    let mut item = test_item(1, IssueStatus::Todo, "src/target.rs");
+    item.plan = vec![subplan_item(
+        "1.1",
+        "Only step",
+        PlanItemStatus::Todo,
+        vec!["src/target.rs"],
+    )];
+    let session = test_session("rev-step-opts", vec![item]);
+    ReviewStorage::save_session(dir.path(), &session).unwrap();
+
+    let marker = "STEPOPTS1";
+    let edit = architecture_edit(marker, "pub fn target() { /* options */ }");
+    let provider = Arc::new(MockLlmProvider::scripted([MockResponse::text(edit)]));
+
+    let mut config = test_config();
+    config.develop.max_retries = 0;
+    let state = test_state_with_provider(&dir, config, provider.clone()).await;
+    *state.marker_override.lock().await = Some(marker.to_string());
+
+    let model = ModelSelection::Specific(tauqe_protocol::ModelRef::openrouter("custom/coder"));
+    let operation = Arc::new(state.try_begin_operation().expect("register batch operation"));
+    let outcome = run_review_batch_with_options(
+        &state,
+        "rev-step-opts",
+        make_tasks("rev-step-opts", &[1]),
+        Some("1.1".to_string()),
+        Some(model),
+        Some("Prefer minimal edits".to_string()),
+        operation,
+    )
+    .await;
+    assert!(
+        matches!(outcome, BatchOutcome::Completed { items: 1 }),
+        "expected the targeted options batch to complete, got {outcome:?}"
+    );
+
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        requests[0].model, "custom/coder",
+        "the request-level model must override the Coder role"
+    );
+    assert!(
+        requests[0]
+            .messages
+            .iter()
+            .any(|m| m.content.contains("## Developer Directives")
+                && m.content.contains("Prefer minimal edits")),
+        "developer directives must be appended to the execution prompt"
+    );
+
+    let reloaded = ReviewStorage::load_review(dir.path(), "rev-step-opts")
+        .unwrap()
+        .unwrap();
+    let item = reloaded.find_item(1).unwrap();
+    assert_eq!(item.subplan[0].status, PlanItemStatus::Done);
+    assert_eq!(item.status, IssueStatus::Fixed);
 }

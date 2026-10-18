@@ -348,6 +348,10 @@ impl ExecutionMode for SingleExecution {
                 result: turn.result,
                 assistant_text: turn.assistant_text,
                 blocked: turn.blocked,
+                // The FSM normalizes a semantic `<skip>` into an answer
+                // without edits and does not yet carry the skip report on the
+                // turn outcome, so the single-turn mode reports no skip here.
+                skip_reason: None,
                 plan_saved: turn.plan_saved,
             });
         }

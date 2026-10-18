@@ -9,7 +9,7 @@ use crate::i18n::active_t;
 
 use super::{
     compute_unified_review_lines, format_created_at, issue_status_label, issue_status_style,
-    issue_type_badge, issue_type_style, location, model_badge, VisibleReviewRow,
+    issue_type_badge, issue_type_style, location, model_badge, plan_status_style, VisibleReviewRow,
 };
 
 pub fn render_review_view(
@@ -269,6 +269,44 @@ fn describe_review_row(
                 ));
             }
             if let Some(desc) = first_content_line(Some(description.as_str())) {
+                spans.push(Span::styled(
+                    format!("  —  {}", desc),
+                    engine.fg(palette.text_muted),
+                ));
+            }
+            spans
+        }
+        VisibleReviewRow::SubplanItem {
+            item_id,
+            step_id,
+            title,
+            status,
+            files,
+            details,
+            ..
+        } => {
+            let mut spans = vec![
+                Span::styled(
+                    format!(" #{} ", item_id),
+                    engine.fg(palette.text_secondary),
+                ),
+                Span::styled(
+                    format!(" step #{} ", step_id),
+                    engine.fg(palette.text_secondary),
+                ),
+                Span::styled(
+                    format!(" {} ", status),
+                    plan_status_style(*status),
+                ),
+                Span::styled(title.clone(), engine.fg(palette.text_primary).bold()),
+            ];
+            if let Some(loc) = location(files) {
+                spans.push(Span::styled(
+                    format!("  {}", loc),
+                    engine.fg(palette.status_info),
+                ));
+            }
+            if let Some(desc) = first_content_line(details.as_deref()) {
                 spans.push(Span::styled(
                     format!("  —  {}", desc),
                     engine.fg(palette.text_muted),

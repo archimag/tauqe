@@ -230,7 +230,31 @@ pub static HISTORY_COMMAND_MAP: CommandMap<HistoryAction> = CommandMap::new(&[
         "Jump to the oldest message",
     ),
     CommandSpec::new(
+        KeyChord::Meta(KeyCode::Char('<')),
+        HistoryAction::SelectFirst,
+        Interface,
+        "Jump to the oldest message",
+    ),
+    CommandSpec::new(
+        KeyChord::Ctrl(KeyCode::Home),
+        HistoryAction::SelectFirst,
+        Interface,
+        "Jump to the oldest message",
+    ),
+    CommandSpec::new(
         KeyChord::Bare(KeyCode::End),
+        HistoryAction::SelectLast,
+        Interface,
+        "Jump to the newest message",
+    ),
+    CommandSpec::new(
+        KeyChord::Meta(KeyCode::Char('>')),
+        HistoryAction::SelectLast,
+        Interface,
+        "Jump to the newest message",
+    ),
+    CommandSpec::new(
+        KeyChord::Ctrl(KeyCode::End),
         HistoryAction::SelectLast,
         Interface,
         "Jump to the newest message",

@@ -1,4 +1,4 @@
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::model::ModelSelection;
 use crate::plan::{count_leaf_stats, PlanItem};
@@ -14,7 +14,7 @@ pub enum IssueType {
     #[serde(alias = "warning", alias = "warn")]
     Architecture,
     Performance,
-    #[serde(alias = "style", alias = "suggestion")]
+    #[serde(alias = "style", alias = "suggestion", alias = "info")]
     Quality,
 }
 
@@ -188,13 +188,25 @@ impl ReviewIssue {
 }
 
 /// A review finding stored as an individual item of a review session.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// The semantic category (`issue_type`) is the single source of truth on the
+/// wire: it preserves every category losslessly, including the pairs the
+/// coarser severity classification merges (`Bug`/`Security` and
+/// `Architecture`/`Performance`). `severity` is a presentation-only
+/// classification recomputed from the category whenever an item is read from
+/// storage, so the two can never drift apart.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ReviewItem {
     pub id: u32,
     pub title: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<ModelSelection>,
-    #[serde(rename = "severity", alias = "type", alias = "issue_type", default)]
+    /// Authoritative semantic category of the finding.
+    #[serde(rename = "type")]
+    pub issue_type: IssueType,
+    /// Coarse severity derived from `issue_type`; never read from or written
+    /// to the wire.
+    #[serde(skip)]
     pub severity: ReviewSeverity,
     #[serde(default)]
     pub status: ReviewItemStatus,
@@ -210,6 +222,65 @@ pub struct ReviewItem {
     pub resolution_notes: Option<String>,
     #[serde(default, rename = "body", alias = "description")]
     pub body: String,
+}
+
+/// Deserialization shadow of [`ReviewItem`].
+///
+/// Findings written before the semantic category was stored verbatim carry only
+/// a coarse `severity` spelling. The shadow accepts every historical key for the
+/// category (`type`, `severity`, `issue_type`) and lets the item recompute its
+/// presentation severity from it, so exactly one classification is read and a
+/// session file can never desynchronize the two.
+#[derive(Deserialize)]
+struct ReviewItemWire {
+    id: u32,
+    title: String,
+    #[serde(default)]
+    model: Option<ModelSelection>,
+    #[serde(rename = "type", alias = "severity", alias = "issue_type", default)]
+    issue_type: IssueType,
+    #[serde(default)]
+    status: ReviewItemStatus,
+    #[serde(default)]
+    recommendations: Vec<String>,
+    #[serde(default)]
+    files: Vec<String>,
+    #[serde(default)]
+    readonly_files: Vec<String>,
+    #[serde(default, alias = "plan")]
+    subplan: Vec<PlanItem>,
+    #[serde(default, alias = "note")]
+    resolution_notes: Option<String>,
+    #[serde(default, alias = "description")]
+    body: String,
+}
+
+impl From<ReviewItemWire> for ReviewItem {
+    fn from(wire: ReviewItemWire) -> Self {
+        Self {
+            id: wire.id,
+            title: wire.title,
+            model: wire.model,
+            issue_type: wire.issue_type,
+            severity: ReviewSeverity::from(wire.issue_type),
+            status: wire.status,
+            recommendations: wire.recommendations,
+            files: wire.files,
+            readonly_files: wire.readonly_files,
+            subplan: wire.subplan,
+            resolution_notes: wire.resolution_notes,
+            body: wire.body,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ReviewItem {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        ReviewItemWire::deserialize(deserializer).map(ReviewItem::from)
+    }
 }
 
 impl ReviewItem {
@@ -228,6 +299,7 @@ impl From<ReviewIssue> for ReviewItem {
             id: issue.id,
             title: issue.title,
             model: issue.model,
+            issue_type: issue.issue_type,
             severity: ReviewSeverity::from(issue.issue_type),
             status: issue.status,
             recommendations: issue.recommendations,
@@ -246,7 +318,7 @@ impl From<ReviewItem> for ReviewIssue {
             id: item.id,
             title: item.title,
             model: item.model,
-            issue_type: IssueType::from(item.severity),
+            issue_type: item.issue_type,
             status: item.status,
             description: item.body,
             recommendations: item.recommendations,

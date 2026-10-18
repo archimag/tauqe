@@ -9,7 +9,7 @@
 use tauqe_protocol::LlmCapability;
 
 use super::extract_attribute;
-use super::tags::is_inside_markdown_code;
+use super::tags::{is_inside_markdown_code_with_fences, CodeFences};
 
 /// How a tag's closing boundary is delimited.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -194,6 +194,11 @@ pub(crate) const XML_TAG_SPECS: &[XmlTagSpec] = &[
         TagCloseMode::Control,
         MarkerPolicy::Strict,
     ),
+    // Parse-only outcome tag. `<skip>` is deliberately not a capability
+    // control tag: the review contour reads it back from the cleaned assistant
+    // text to record why a finding was skipped, so `strip_all_control_tags`
+    // must never remove it.
+    spec("skip", TagCloseMode::Control, false),
     XmlTagSpec {
         base_name: "plan",
         capability: Some(LlmCapability::PlanUpdate),
@@ -314,8 +319,13 @@ impl<'a> XmlTagMatch<'a> {
 /// An optional turn-marker suffix is accepted, occurrences inside markdown code
 /// are ignored, and an incomplete tag yields `None` so streaming callers can
 /// wait for more bytes.
-pub(crate) fn find_next_tag_bounds(text: &str, spec: &XmlTagSpec) -> Option<(usize, usize)> {
-    let mut from = 0;
+pub(crate) fn find_next_tag_bounds_with_fences(
+    text: &str,
+    spec: &XmlTagSpec,
+    from_pos: usize,
+    fences: &CodeFences,
+) -> Option<(usize, usize)> {
+    let mut from = from_pos;
     while let Some(offset) = text[from..].find('<') {
         let start = from + offset;
         let after_lt = &text[start + 1..];
@@ -326,7 +336,7 @@ pub(crate) fn find_next_tag_bounds(text: &str, spec: &XmlTagSpec) -> Option<(usi
                 .chars()
                 .next()
                 .is_some_and(|c| c.is_whitespace() || c == '>' || c == '/');
-            if boundary && !is_inside_markdown_code(text, start) {
+            if boundary && !is_inside_markdown_code_with_fences(text, start, fences) {
                 let name_end = start + 1 + spec.base_name.len() + suffix_len;
                 if let Some(bounds) = tag_close_bounds(text, start, name_end, spec) {
                     return Some(bounds);
@@ -338,9 +348,18 @@ pub(crate) fn find_next_tag_bounds(text: &str, spec: &XmlTagSpec) -> Option<(usi
     None
 }
 
-/// Locates the next complete tag of `spec` and decomposes it.
-pub(crate) fn find_next_tag<'a>(text: &'a str, spec: &XmlTagSpec) -> Option<XmlTagMatch<'a>> {
-    let (start, end) = find_next_tag_bounds(text, spec)?;
+pub(crate) fn find_next_tag_bounds(text: &str, spec: &XmlTagSpec) -> Option<(usize, usize)> {
+    find_next_tag_bounds_with_fences(text, spec, 0, &CodeFences::find(text))
+}
+
+/// Locates the next complete tag of `spec` and decomposes it using precomputed code fences.
+pub(crate) fn find_next_tag_with_fences<'a>(
+    text: &'a str,
+    spec: &XmlTagSpec,
+    from_pos: usize,
+    fences: &CodeFences,
+) -> Option<XmlTagMatch<'a>> {
+    let (start, end) = find_next_tag_bounds_with_fences(text, spec, from_pos, fences)?;
     let tag = text.get(start..end)?;
     let header_end = tag.find('>')?;
     let header = &tag[..header_end];
@@ -368,24 +387,25 @@ pub(crate) fn find_next_tag<'a>(text: &'a str, spec: &XmlTagSpec) -> Option<XmlT
     })
 }
 
+/// Locates the next complete tag of `spec` and decomposes it.
+pub(crate) fn find_next_tag<'a>(text: &'a str, spec: &XmlTagSpec) -> Option<XmlTagMatch<'a>> {
+    find_next_tag_with_fences(text, spec, 0, &CodeFences::find(text))
+}
+
 /// Iterates every match of `spec` in `text`, in order.
 pub(crate) fn iter_tags<'a>(
     text: &'a str,
     spec: &'static XmlTagSpec,
 ) -> std::vec::IntoIter<XmlTagMatch<'a>> {
+    let fences = CodeFences::find(text);
     let mut matches = Vec::new();
     let mut pos = 0;
     while pos < text.len() {
-        let Some(found) = find_next_tag(&text[pos..], spec) else {
+        let Some(found) = find_next_tag_with_fences(text, spec, pos, &fences) else {
             break;
         };
-        let shifted = XmlTagMatch {
-            start: found.start + pos,
-            end: found.end + pos,
-            ..found
-        };
-        pos = shifted.end.max(pos + 1);
-        matches.push(shifted);
+        pos = found.end.max(pos + 1);
+        matches.push(found);
     }
     matches.into_iter()
 }
@@ -416,11 +436,32 @@ pub(crate) fn strip_all_control_tags(text: &str) -> String {
 
 /// Locates the earliest complete control tag in `text`.
 pub(crate) fn find_earliest_control_tag(text: &str) -> Option<(usize, usize)> {
-    XML_TAG_SPECS
-        .iter()
-        .filter(|spec| spec.is_control())
-        .filter_map(|spec| find_next_tag_bounds(text, spec))
-        .min_by_key(|(start, _)| *start)
+    let fences = CodeFences::find(text);
+    let mut from = 0;
+    while let Some(offset) = text[from..].find('<') {
+        let start = from + offset;
+        if !is_inside_markdown_code_with_fences(text, start, &fences) {
+            let after_lt = &text[start + 1..];
+            for spec in XML_TAG_SPECS.iter().filter(|spec| spec.is_control()) {
+                if let Some(after_base) = after_lt.strip_prefix(spec.base_name) {
+                    let suffix_len = marker_suffix_len(after_base);
+                    let rest = &after_base[suffix_len..];
+                    let boundary = rest
+                        .chars()
+                        .next()
+                        .is_some_and(|c| c.is_whitespace() || c == '>' || c == '/');
+                    if boundary {
+                        let name_end = start + 1 + spec.base_name.len() + suffix_len;
+                        if let Some(bounds) = tag_close_bounds(text, start, name_end, spec) {
+                            return Some(bounds);
+                        }
+                    }
+                }
+            }
+        }
+        from = start + 1;
+    }
+    None
 }
 
 /// Byte length of `buf` that is safe to emit as conversational text.
@@ -428,16 +469,19 @@ pub(crate) fn find_earliest_control_tag(text: &str) -> Option<(usize, usize)> {
 /// A trailing partial tag prefix and any still-open suppressed tag are
 /// withheld so the interface never shows protocol scaffolding mid-tag.
 pub(crate) fn compute_safe_stream_emit_len(buf: &str) -> usize {
+    let fences = CodeFences::find(buf);
     let mut limit = buf.len();
 
     if let Some(last_lt) = buf.rfind('<') {
-        let trailing = &buf[last_lt..];
-        let partial = XML_TAG_SPECS
-            .iter()
-            .filter(|spec| spec.stream_suppress_unmarked)
-            .any(|spec| is_partial_tag_open(trailing, spec.base_name));
-        if partial {
-            limit = limit.min(last_lt);
+        if !is_inside_markdown_code_with_fences(buf, last_lt, &fences) {
+            let trailing = &buf[last_lt..];
+            let partial = XML_TAG_SPECS
+                .iter()
+                .filter(|spec| spec.stream_suppress_unmarked)
+                .any(|spec| is_partial_tag_open(trailing, spec.base_name));
+            if partial {
+                limit = limit.min(last_lt);
+            }
         }
     }
 
@@ -445,7 +489,7 @@ pub(crate) fn compute_safe_stream_emit_len(buf: &str) -> usize {
         .iter()
         .filter(|spec| spec.stream_suppress_unmarked)
     {
-        let Some(idx) = rfind_tag_open(buf, spec.base_name) else {
+        let Some(idx) = rfind_tag_open(buf, spec.base_name, &fences) else {
             continue;
         };
         let rest = &buf[idx + 1 + spec.base_name.len()..];
@@ -457,7 +501,10 @@ pub(crate) fn compute_safe_stream_emit_len(buf: &str) -> usize {
             continue;
         }
         let closed = if spec.is_control() {
-            find_next_tag_bounds(&buf[idx..], spec).is_some()
+            matches!(
+                find_next_tag_bounds_with_fences(buf, spec, idx, &fences),
+                Some((s, _)) if s == idx
+            )
         } else {
             rest.contains('>')
         };
@@ -526,13 +573,15 @@ fn is_partial_tag_open(trailing: &str, base: &str) -> bool {
     }
 }
 
-/// Finds the byte offset of the last `"<base"` occurrence in `buf`.
-fn rfind_tag_open(buf: &str, base: &str) -> Option<usize> {
+/// Finds the byte offset of the last `"<base"` occurrence in `buf` outside markdown code.
+fn rfind_tag_open(buf: &str, base: &str, fences: &CodeFences) -> Option<usize> {
     let mut last = None;
     let mut from = 0;
     while let Some(offset) = buf[from..].find('<') {
         let start = from + offset;
-        if buf[start + 1..].starts_with(base) {
+        if !is_inside_markdown_code_with_fences(buf, start, fences)
+            && buf[start + 1..].starts_with(base)
+        {
             last = Some(start);
         }
         from = start + 1;
@@ -584,6 +633,26 @@ mod tests {
         assert!(allows_unmarked_fallback("scratchpad"));
         assert!(!allows_unmarked_fallback("context_request"));
         assert!(!allows_unmarked_fallback("success"));
+    }
+
+    #[test]
+    fn registry_declares_skip_as_a_parse_only_outcome_tag() {
+        // The review contour reads `<skip>` back from the cleaned assistant
+        // text, so the tag stays parseable but is never stripped as a control
+        // tag.
+        let spec = spec_of("skip");
+        assert_eq!(spec.capability, None);
+        assert!(!spec.is_control());
+        assert!(!spec.stream_suppress_unmarked);
+        assert!(!allows_unmarked_fallback("skip"));
+
+        let text = "<skip reason=\"False positive\">already handled</skip>";
+        let found = match find_next_tag(text, spec) {
+            Some(found) => found,
+            None => panic!("skip tag not found"),
+        };
+        assert_eq!(found.attr("reason").as_deref(), Some("False positive"));
+        assert_eq!(found.body, Some("already handled"));
     }
 
     #[test]
@@ -653,6 +722,11 @@ mod tests {
         // Code-modification tags belong to the edit contour and stay untouched.
         let edits = "<create path=\"a.rs\">x</create>";
         assert_eq!(strip_all_control_tags(edits), edits);
+
+        // `<skip>` is parse-only: the review contour reads it back from the
+        // cleaned assistant text, so it survives conversational cleaning.
+        let skip = "<skip reason=\"False positive\">already handled</skip>";
+        assert_eq!(strip_all_control_tags(skip), skip);
     }
 
     #[test]
@@ -687,5 +761,45 @@ mod tests {
 
         let open = "hello <success>done";
         assert_eq!(compute_safe_stream_emit_len(open), "hello ".len());
+    }
+
+    #[test]
+    fn safe_stream_emit_len_ignores_markdown_fences_and_inline_code() {
+        let fenced_with_fake = "Text\n```rust\nif a < b && c < d {\n    <verify\n}\n```\nOutside";
+        assert_eq!(
+            compute_safe_stream_emit_len(fenced_with_fake),
+            fenced_with_fake.len()
+        );
+
+        let inline_code_with_partial = "Note: `<verify` is not active";
+        assert_eq!(
+            compute_safe_stream_emit_len(inline_code_with_partial),
+            inline_code_with_partial.len()
+        );
+    }
+
+    #[test]
+    fn earliest_control_tag_ignores_code_blocks_with_comparisons() {
+        let text = r#"
+Explanation:
+```rust
+let x = a < b;
+let y = c < d;
+<error message="fake" />
+```
+Real outcome:
+<verify target="all" />
+"#;
+        let (start, end) = find_earliest_control_tag(text).expect("should find real control tag");
+        assert_eq!(&text[start..end], "<verify target=\"all\" />");
+    }
+
+    #[test]
+    fn iter_tags_honors_code_fences_and_returns_absolute_offsets() {
+        let text = "First <verify target=\"check\" /> inside\n```\n<verify target=\"test\" />\n```\nand second <verify target=\"all\" />";
+        let matches: Vec<_> = iter_tags(text, spec_of("verify")).collect();
+        assert_eq!(matches.len(), 2);
+        assert_eq!(&text[matches[0].start..matches[0].end], "<verify target=\"check\" />");
+        assert_eq!(&text[matches[1].start..matches[1].end], "<verify target=\"all\" />");
     }
 }

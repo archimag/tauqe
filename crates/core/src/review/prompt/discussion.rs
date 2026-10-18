@@ -243,7 +243,7 @@ pub fn build_review_user_prompt(
         out.push_str("No files provided in context.\n");
     } else {
         for f in files {
-            out.push_str(&format!("<file path=\"{}\">\n", f.path));
+            out.push_str(&format!("<file path=\"{}\">\n", escape_xml_attr(&f.path)));
             out.push_str(&f.content);
             if !f.content.ends_with('\n') {
                 out.push('\n');

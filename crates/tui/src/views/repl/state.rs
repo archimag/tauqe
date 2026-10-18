@@ -12,6 +12,37 @@ use super::render::compute_model_lines;
 /// Minimum interval between full markdown re-parses while a response is streaming.
 const MARKDOWN_THROTTLE: Duration = Duration::from_millis(80);
 
+/// Wall-clock budget of the kinetic glyph assembly phase.
+///
+/// The glyphs of the product name converge toward their final slots within
+/// this window; the typewriter stays silent until the monolith has fully
+/// assembled, so the two phases never overlap (c-kinetic-phases).
+const SPLASH_ASSEMBLY_DURATION: Duration = Duration::from_millis(700);
+
+/// Total wall-clock budget of the splash: assembly followed by the motto.
+///
+/// Once this budget is exhausted both phases are complete and the view stops
+/// requesting animation frames, so an idle REPL costs no redraws (c-2).
+const SPLASH_TOTAL_DURATION: Duration = Duration::from_millis(2200);
+
+/// Wall-clock budget of the typewriter phase alone.
+///
+/// It is derived from the total budget so the two amounts can never drift
+/// apart, and it is zero-safe because the total always exceeds the assembly.
+const SPLASH_TYPING_BUDGET: Duration = SPLASH_TOTAL_DURATION.saturating_sub(SPLASH_ASSEMBLY_DURATION);
+
+/// Normalizes `elapsed` against `budget` into a clamped `0.0..=1.0` fraction.
+///
+/// A zero budget would divide by zero, so it degrades to a completed phase
+/// instead of producing a non-finite progress value.
+fn elapsed_fraction(elapsed: Duration, budget: Duration) -> f32 {
+    let budget = budget.as_secs_f32();
+    if budget <= 0.0 {
+        return 1.0;
+    }
+    (elapsed.as_secs_f32() / budget).clamp(0.0, 1.0)
+}
+
 /// Lifecycle status of a model turn as tracked by the Develop view.
 ///
 /// Replacing free-form status strings with an enum lets the compiler enforce
@@ -183,6 +214,8 @@ pub struct ReplView {
     pub scroll: u16,
     pub auto_scroll: bool,
     pub focus: ReplFocus,
+    /// Instant the application started, anchoring the splash animation clock.
+    pub splash_started: Instant,
 
     // Structured Org-Mode Edits & Git State
     pub edits_active: bool,
@@ -237,6 +270,7 @@ impl Default for ReplView {
             scroll: 0,
             auto_scroll: true,
             focus: ReplFocus::Editor,
+            splash_started: Instant::now(),
             edits_active: false,
             files: Vec::new(),
             selected_file_index: 0,
@@ -350,11 +384,66 @@ impl ReplView {
         }
     }
 
-    /// True while any animated spinner is visible and needs frame advancement.
-    pub fn needs_spinner(&self) -> bool {
+    /// True while the response area is empty and the splash greeting owns it.
+    ///
+    /// The greeting never competes with real output: as soon as the turn
+    /// produces text, an error, a toolchain report, or a streamed edit, the
+    /// regular viewport takes over on the very next frame (c-1).
+    pub fn splash_visible(&self) -> bool {
+        !self.is_busy()
+            && self.text.is_empty()
+            && self.error.is_none()
+            && self.toolchain.is_none()
+            && self.files.is_empty()
+            && !self.edits_active
+    }
+
+    /// Fraction of the kinetic glyph assembly already played, clamped to
+    /// `0.0..=1.0`.
+    pub fn splash_assembly_progress(&self) -> f32 {
+        elapsed_fraction(self.splash_started.elapsed(), SPLASH_ASSEMBLY_DURATION)
+    }
+
+    /// True once the glyphs have reached their final slots.
+    pub fn splash_assembly_done(&self) -> bool {
+        self.splash_assembly_progress() >= 1.0
+    }
+
+    /// Fraction of the splash motto already revealed, clamped to `0.0..=1.0`.
+    ///
+    /// The typewriter starts strictly after the assembly phase completes, so
+    /// the motto never competes with the converging logo (c-kinetic-phases).
+    pub fn splash_typing_progress(&self) -> f32 {
+        let typing_elapsed = self
+            .splash_started
+            .elapsed()
+            .saturating_sub(SPLASH_ASSEMBLY_DURATION);
+        elapsed_fraction(typing_elapsed, SPLASH_TYPING_BUDGET)
+    }
+
+    /// True once the typewriter has revealed the whole motto.
+    pub fn splash_typing_done(&self) -> bool {
+        self.splash_typing_progress() >= 1.0
+    }
+
+    /// True while the splash still has frames left in either phase.
+    fn splash_animating(&self) -> bool {
+        self.splash_visible() && !(self.splash_assembly_done() && self.splash_typing_done())
+    }
+
+    /// True when a turn or background operation is actively executing.
+    pub fn background_active(&self) -> bool {
         self.is_busy()
             || self.toolchain.as_ref().is_some_and(ToolchainState::is_running)
             || (self.edits_active && self.edit_final_applied.is_none())
+    }
+
+    /// True while any animated spinner or the splash typewriter needs a frame.
+    ///
+    /// The splash keeps requesting frames only until the typewriter completes,
+    /// so the shared timer loop settles into its idle cadence afterwards (c-2).
+    pub fn needs_spinner(&self) -> bool {
+        self.splash_animating() || self.background_active()
     }
 
     pub fn max_scroll(&mut self, view_height: u16) -> u16 {
@@ -456,5 +545,235 @@ impl ReplView {
 
     pub fn is_busy(&self) -> bool {
         self.status.is_busy()
+    }
+}
+
+#[cfg(test)]
+mod splash_tests {
+    use super::*;
+
+    #[test]
+    fn empty_view_opens_with_pending_typing() {
+        let view = ReplView::default();
+        assert!(view.splash_visible());
+        assert!(!view.splash_typing_done());
+        assert!(view.splash_typing_progress() < 1.0);
+        assert!(view.needs_spinner());
+    }
+
+    #[test]
+    fn any_output_or_busy_turn_hides_the_splash() {
+        let view = ReplView {
+            text: "answer".to_string(),
+            ..ReplView::default()
+        };
+        assert!(!view.splash_visible());
+
+        let busy = ReplView {
+            status: TurnStatus::Thinking,
+            ..ReplView::default()
+        };
+        assert!(!busy.splash_visible());
+    }
+
+    #[test]
+    fn completed_typing_stops_the_redraw_loop() {
+        let view = ReplView {
+            splash_started: Instant::now()
+                .checked_sub(SPLASH_TOTAL_DURATION + Duration::from_millis(1))
+                .expect("system uptime exceeds the splash duration"),
+            ..ReplView::default()
+        };
+
+        assert!(view.splash_typing_done());
+        assert!((view.splash_typing_progress() - 1.0).abs() < f32::EPSILON);
+        assert!(!view.needs_spinner());
+    }
+
+    #[test]
+    fn all_hiding_conditions_displace_splash_immediately() {
+        // 1. Error message
+        let view_err = ReplView {
+            error: Some("Turn failed".to_string()),
+            ..ReplView::default()
+        };
+        assert!(!view_err.splash_visible());
+        assert!(!view_err.splash_animating());
+
+        // 2. Running toolchain
+        let view_toolchain = ReplView {
+            toolchain: Some(ToolchainState::Running {
+                command: "cargo test".to_string(),
+            }),
+            ..ReplView::default()
+        };
+        assert!(!view_toolchain.splash_visible());
+
+        // 3. Active file edits
+        let view_edits = ReplView {
+            edits_active: true,
+            ..ReplView::default()
+        };
+        assert!(!view_edits.splash_visible());
+
+        // 4. Streamed files list
+        let view_files = ReplView {
+            files: vec![StreamingFileEdit {
+                path: "crates/tui/src/main.rs".to_string(),
+                op_type: EditOp::Replace,
+                status: FileEditStatus::Ok,
+                error: None,
+                hunks: Vec::new(),
+                expanded: false,
+                retry_info: None,
+            }],
+            ..ReplView::default()
+        };
+        assert!(!view_files.splash_visible());
+
+        // 5. All busy TurnStatus variants
+        let busy_statuses = [
+            TurnStatus::Awaiting,
+            TurnStatus::Thinking,
+            TurnStatus::Responding,
+            TurnStatus::Editing,
+            TurnStatus::Verifying,
+            TurnStatus::Discovery,
+            TurnStatus::Staging,
+            TurnStatus::Healing,
+        ];
+        for status in busy_statuses {
+            let busy_view = ReplView {
+                status,
+                ..ReplView::default()
+            };
+            assert!(
+                !busy_view.splash_visible(),
+                "status {:?} must hide splash",
+                status
+            );
+        }
+    }
+
+    #[test]
+    fn assembly_and_typing_phases_run_strictly_in_sequence() {
+        let now = Instant::now();
+
+        // Phase 1 start: the glyphs are still apart, the motto stays hidden.
+        let view_start = ReplView {
+            splash_started: now,
+            ..ReplView::default()
+        };
+        assert!(view_start.splash_assembly_progress() <= 0.05);
+        assert!(!view_start.splash_assembly_done());
+        assert!(view_start.splash_typing_progress() <= 0.05);
+        assert!(!view_start.splash_typing_done());
+        assert!(view_start.splash_animating());
+
+        // Phase 1 middle: assembly is half played, typing has not started.
+        let view_half = ReplView {
+            splash_started: now
+                .checked_sub(SPLASH_ASSEMBLY_DURATION / 2)
+                .expect("valid uptime"),
+            ..ReplView::default()
+        };
+        let assembly = view_half.splash_assembly_progress();
+        assert!((assembly - 0.5).abs() < 0.05);
+        assert!(!view_half.splash_assembly_done());
+        assert!(view_half.splash_typing_progress() <= 0.0);
+        assert!(view_half.splash_animating());
+
+        // Phase 1 complete: the typewriter starts from its very beginning.
+        let view_assembled = ReplView {
+            splash_started: now
+                .checked_sub(SPLASH_ASSEMBLY_DURATION)
+                .expect("valid uptime"),
+            ..ReplView::default()
+        };
+        assert!(view_assembled.splash_assembly_done());
+        assert!(view_assembled.splash_typing_progress() <= 0.05);
+        assert!(!view_assembled.splash_typing_done());
+        assert!(view_assembled.splash_animating());
+
+        // Phase 2 middle: the motto is half revealed.
+        let view_typing_half = ReplView {
+            splash_started: now
+                .checked_sub(SPLASH_ASSEMBLY_DURATION + SPLASH_TYPING_BUDGET / 2)
+                .expect("valid uptime"),
+            ..ReplView::default()
+        };
+        let typing = view_typing_half.splash_typing_progress();
+        assert!((typing - 0.5).abs() < 0.05);
+        assert!(!view_typing_half.splash_typing_done());
+        assert!(view_typing_half.splash_animating());
+
+        // Both phases complete: no frames are requested any more.
+        let view_done = ReplView {
+            splash_started: now
+                .checked_sub(SPLASH_TOTAL_DURATION + Duration::from_millis(50))
+                .expect("valid uptime"),
+            ..ReplView::default()
+        };
+        assert_eq!(view_done.splash_assembly_progress(), 1.0);
+        assert_eq!(view_done.splash_typing_progress(), 1.0);
+        assert!(view_done.splash_typing_done());
+        assert!(!view_done.splash_animating());
+        assert!(!view_done.needs_spinner());
+
+        // Mid-typing displacement stops the animation immediately.
+        let mut interrupted = view_typing_half;
+        interrupted.text.push_str("first byte of stream");
+        assert!(!interrupted.splash_visible());
+        assert!(!interrupted.splash_animating());
+    }
+
+    #[test]
+    fn needs_spinner_stays_active_until_the_second_phase_ends() {
+        let now = Instant::now();
+
+        let assembling = ReplView {
+            splash_started: now
+                .checked_sub(SPLASH_ASSEMBLY_DURATION / 2)
+                .expect("valid uptime"),
+            ..ReplView::default()
+        };
+        assert!(!assembling.background_active());
+        assert!(assembling.needs_spinner());
+
+        let typing = ReplView {
+            splash_started: now
+                .checked_sub(SPLASH_ASSEMBLY_DURATION + SPLASH_TYPING_BUDGET / 4)
+                .expect("valid uptime"),
+            ..ReplView::default()
+        };
+        assert!(typing.splash_assembly_done());
+        assert!(!typing.splash_typing_done());
+        assert!(typing.needs_spinner());
+    }
+
+    #[test]
+    fn background_active_vs_needs_spinner_separation() {
+        let empty_view = ReplView::default();
+        // Background is idle, but typewriter is animating
+        assert!(!empty_view.background_active());
+        assert!(empty_view.needs_spinner());
+
+        // When typing finishes and view is idle, neither requires spinner
+        let finished_view = ReplView {
+            splash_started: Instant::now()
+                .checked_sub(SPLASH_TOTAL_DURATION + Duration::from_millis(10))
+                .expect("valid uptime"),
+            ..ReplView::default()
+        };
+        assert!(!finished_view.background_active());
+        assert!(!finished_view.needs_spinner());
+
+        // When a turn runs, background_active and needs_spinner both activate
+        let busy_view = ReplView {
+            status: TurnStatus::Thinking,
+            ..finished_view
+        };
+        assert!(busy_view.background_active());
+        assert!(busy_view.needs_spinner());
     }
 }

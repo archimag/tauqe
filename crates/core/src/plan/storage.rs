@@ -37,6 +37,10 @@ impl PlanStorage {
     ///
     /// Recovers the guard if the lock was poisoned by a previous panic, so a single
     /// failure never permanently wedges plan storage.
+    ///
+    /// Every public entry point acquires this lock inside
+    /// [`crate::blocking::run_blocking`], so neither the wait for the lock nor the
+    /// file I/O that follows it ever occupies a Tokio worker thread.
     fn lock() -> MutexGuard<'static, ()> {
         PLAN_STORAGE_LOCK
             .lock()
@@ -73,8 +77,10 @@ impl PlanStorage {
     /// Acquires the process-global storage lock so a listing never observes a plan
     /// file mid-rename while another task is persisting it.
     pub fn list_plans(repo_root: &Path) -> Result<Vec<PlanSummary>> {
-        let _guard = Self::lock();
-        Self::list_plans_unlocked(repo_root)
+        crate::blocking::run_blocking(|| {
+            let _guard = Self::lock();
+            Self::list_plans_unlocked(repo_root)
+        })
     }
 
     /// Lock-free core of [`Self::list_plans`]; the caller must hold the storage lock.
@@ -90,8 +96,10 @@ impl PlanStorage {
     /// Acquires the process-global storage lock, so a read never races a concurrent
     /// atomic rename in a write path.
     pub fn load_plan(repo_root: &Path, id: &str) -> Result<Option<Plan>> {
-        let _guard = Self::lock();
-        Self::load_plan_unlocked(repo_root, id)
+        crate::blocking::run_blocking(|| {
+            let _guard = Self::lock();
+            Self::load_plan_unlocked(repo_root, id)
+        })
     }
 
     /// Lock-free core of [`Self::load_plan`]; the caller must hold the storage lock.
@@ -130,8 +138,10 @@ impl PlanStorage {
     /// Acquires the process-global storage lock, so a read never races a concurrent
     /// atomic rename in a write path.
     pub fn load_all(repo_root: &Path) -> Result<Vec<Plan>> {
-        let _guard = Self::lock();
-        Self::load_all_unlocked(repo_root)
+        crate::blocking::run_blocking(|| {
+            let _guard = Self::lock();
+            Self::load_all_unlocked(repo_root)
+        })
     }
 
     /// Lock-free core of [`Self::load_all`]; the caller must hold the storage lock.
@@ -208,8 +218,10 @@ impl PlanStorage {
     /// Serializes against concurrent storage mutations through the process-global
     /// plan storage lock, so the read-validate-write cycle never interleaves.
     pub fn save_plan(repo_root: &Path, plan: &Plan) -> Result<()> {
-        let _guard = Self::lock();
-        Self::save_plan_unlocked(repo_root, plan)
+        crate::blocking::run_blocking(|| {
+            let _guard = Self::lock();
+            Self::save_plan_unlocked(repo_root, plan)
+        })
     }
 
     /// Lock-free core of [`Self::save_plan`]; the caller must hold the storage lock.
@@ -279,8 +291,10 @@ impl PlanStorage {
     ///
     /// Serializes against concurrent storage mutations through the process-global lock.
     pub fn delete_plan(repo_root: &Path, id: &str) -> Result<bool> {
-        let _guard = Self::lock();
-        Self::delete_plan_unlocked(repo_root, id)
+        crate::blocking::run_blocking(|| {
+            let _guard = Self::lock();
+            Self::delete_plan_unlocked(repo_root, id)
+        })
     }
 
     /// Lock-free core of [`Self::delete_plan`]; the caller must hold the storage lock.
@@ -310,8 +324,10 @@ impl PlanStorage {
 
     /// Loads the active plan ID from `.tauqe/plans/active`.
     pub fn load_active_id(repo_root: &Path) -> Result<Option<String>> {
-        let _guard = Self::lock();
-        Self::load_active_id_unlocked(repo_root)
+        crate::blocking::run_blocking(|| {
+            let _guard = Self::lock();
+            Self::load_active_id_unlocked(repo_root)
+        })
     }
 
     /// Lock-free core of [`Self::load_active_id`]; the caller must hold the storage lock.
@@ -335,8 +351,10 @@ impl PlanStorage {
     ///
     /// Serializes against concurrent storage mutations through the process-global lock.
     pub fn save_active_id(repo_root: &Path, id: Option<&str>) -> Result<()> {
-        let _guard = Self::lock();
-        Self::save_active_id_unlocked(repo_root, id)
+        crate::blocking::run_blocking(|| {
+            let _guard = Self::lock();
+            Self::save_active_id_unlocked(repo_root, id)
+        })
     }
 
     /// Lock-free core of [`Self::save_active_id`]; the caller must hold the storage lock.
@@ -368,8 +386,10 @@ impl PlanStorage {
         title: Option<&str>,
         details: Option<&str>,
     ) -> Result<Option<Plan>> {
-        let _guard = Self::lock();
-        Self::update_concept_item_unlocked(repo_root, plan_id, concept_id, title, details)
+        crate::blocking::run_blocking(|| {
+            let _guard = Self::lock();
+            Self::update_concept_item_unlocked(repo_root, plan_id, concept_id, title, details)
+        })
     }
 
     /// Lock-free core of [`Self::update_concept_item`]; the caller must hold the storage lock.
@@ -428,8 +448,10 @@ impl PlanStorage {
         item_id: &str,
         status: Option<PlanItemStatus>,
     ) -> Result<Option<Plan>> {
-        let _guard = Self::lock();
-        Self::update_item_unlocked(repo_root, plan_id, item_id, status)
+        crate::blocking::run_blocking(|| {
+            let _guard = Self::lock();
+            Self::update_item_unlocked(repo_root, plan_id, item_id, status)
+        })
     }
 
     /// Lock-free core of [`Self::update_item`]; the caller must hold the storage lock.
@@ -486,28 +508,34 @@ impl PlanStorage {
 /// disk; the per-process suffix on the staging name also prevents a stale or
 /// concurrent write from colliding on a shared, fixed `<file>.json.tmp` path.
 fn write_atomic(target: &Path, contents: &[u8]) -> Result<()> {
-    use std::io::Write;
+    // The temp-file creation, the write, the `fsync` barrier, and the atomic
+    // rename all run off the async executor thread, so a slow disk never stalls
+    // the bounded turn, provider streaming, or RPC handling. Nested inside
+    // another blocking scope the helper degrades to a direct call.
+    crate::blocking::run_blocking(move || -> Result<()> {
+        use std::io::Write;
 
-    let file_name = target.file_name().and_then(|f| f.to_str()).unwrap_or("file");
-    let temp_file = target.with_file_name(format!("{file_name}.tmp.{}", std::process::id()));
+        let file_name = target.file_name().and_then(|f| f.to_str()).unwrap_or("file");
+        let temp_file = target.with_file_name(format!("{file_name}.tmp.{}", std::process::id()));
 
-    {
-        let mut file = std::fs::File::create(&temp_file)
-            .with_context(|| format!("Failed to create temp file at {}", temp_file.display()))?;
-        file.write_all(contents)
-            .with_context(|| format!("Failed to write temp file at {}", temp_file.display()))?;
-        file.flush()
-            .with_context(|| format!("Failed to flush temp file at {}", temp_file.display()))?;
-        file.sync_all()
-            .with_context(|| format!("Failed to sync temp file at {}", temp_file.display()))?;
-    }
+        {
+            let mut file = std::fs::File::create(&temp_file)
+                .with_context(|| format!("Failed to create temp file at {}", temp_file.display()))?;
+            file.write_all(contents)
+                .with_context(|| format!("Failed to write temp file at {}", temp_file.display()))?;
+            file.flush()
+                .with_context(|| format!("Failed to flush temp file at {}", temp_file.display()))?;
+            file.sync_all()
+                .with_context(|| format!("Failed to sync temp file at {}", temp_file.display()))?;
+        }
 
-    std::fs::rename(&temp_file, target).with_context(|| {
-        format!(
-            "Failed to atomically rename {} to {}",
-            temp_file.display(),
-            target.display()
-        )
+        std::fs::rename(&temp_file, target).with_context(|| {
+            format!(
+                "Failed to atomically rename {} to {}",
+                temp_file.display(),
+                target.display()
+            )
+        })
     })
 }
 
@@ -930,5 +958,78 @@ mod tests {
             PlanStorage::load_active_id(root).unwrap(),
             Some("atomic-plan".to_string())
         );
+    }
+
+    // Plan storage performs blocking file I/O and waits on a synchronous mutex.
+    // Driving the full lifecycle from async tasks on a multi-threaded runtime
+    // must neither panic nor stall the executor.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_plan_storage_lifecycle_on_multi_thread_runtime() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+
+        let plan = Plan {
+            id: "runtime-plan".to_string(),
+            title: "Runtime Plan".to_string(),
+            concept: vec![tauqe_protocol::ConceptItem {
+                id: "c-1".to_string(),
+                title: "Invariant".to_string(),
+                details: None,
+                children: vec![],
+            }],
+            items: vec![PlanItem {
+                id: "1".to_string(),
+                title: "Step".to_string(),
+                status: PlanItemStatus::Todo,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        PlanStorage::save_plan(&root, &plan).unwrap();
+        assert!(PlanStorage::plans_dir(&root)
+            .join("runtime-plan.json")
+            .is_file());
+        assert_eq!(
+            PlanStorage::load_active_id(&root).unwrap(),
+            Some("runtime-plan".to_string())
+        );
+
+        let summaries = PlanStorage::list_plans(&root).unwrap();
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].id, "runtime-plan");
+
+        let loaded = PlanStorage::load_plan(&root, "runtime-plan")
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.items.len(), 1);
+        assert_eq!(loaded.items[0].status, PlanItemStatus::Todo);
+
+        let updated = PlanStorage::update_item(
+            &root,
+            "runtime-plan",
+            "1",
+            Some(PlanItemStatus::Done),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(updated.items[0].status, PlanItemStatus::Done);
+
+        let refined = PlanStorage::update_concept_item(
+            &root,
+            "runtime-plan",
+            "c-1",
+            Some("Refined invariant"),
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(refined.concept[0].title, "Refined invariant");
+
+        PlanStorage::save_active_id(&root, None).unwrap();
+        assert_eq!(PlanStorage::load_active_id(&root).unwrap(), None);
+
+        assert!(PlanStorage::delete_plan(&root, "runtime-plan").unwrap());
+        assert!(PlanStorage::load_all(&root).unwrap().is_empty());
     }
 }

@@ -1911,6 +1911,7 @@ mod tests {
                 id: 1,
                 title: "Fix target".to_string(),
                 model: None,
+                issue_type: tauqe_protocol::IssueType::Architecture,
                 severity: tauqe_protocol::ReviewSeverity::Warning,
                 status: tauqe_protocol::ReviewItemStatus::Todo,
                 recommendations: vec![],

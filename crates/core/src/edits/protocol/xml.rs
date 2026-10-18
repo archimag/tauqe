@@ -26,16 +26,18 @@ pub use clean::extract_conversational_text;
 pub use marker::generate_turn_marker;
 pub use marked::MarkedXmlEditProtocol;
 pub use parser::has_xml_edit_tags;
-pub(crate) use marker::{normalize_marked_xml_incremental, restore_xml_literals};
+pub(crate) use marker::{
+    normalize_marked_xml, normalize_marked_xml_incremental, restore_xml_literals,
+};
 pub(crate) use marked::is_valid_turn_marker;
 pub(crate) use parser::{extract_attribute, find_base_tag_start};
 pub use tags::{
-    extract_blocked, extract_error, extract_scratchpad, extract_success, extract_terminal_outcome,
-    extract_user_language, extract_verify_request,
+    extract_blocked, extract_error, extract_scratchpad, extract_skip, extract_success,
+    extract_terminal_outcome, extract_user_language, extract_verify_request,
     strip_blocked_tags, strip_context_request_tags, strip_doc_request_tags,
     strip_error_tags, strip_plan_tags, strip_repo_search_tags, strip_scratchpad_tags,
-    strip_success_tags, strip_terminal_outcome_tags, strip_user_language_tags, strip_verify_tags,
-    TerminalOutcome, VerifyOnSuccess, VerifyRequest, VerifyTarget,
+    strip_skip_tags, strip_success_tags, strip_terminal_outcome_tags, strip_user_language_tags,
+    strip_verify_tags, TerminalOutcome, VerifyOnSuccess, VerifyRequest, VerifyTarget,
 };
 /// XML-based code edit protocol
 #[derive(Debug, Default, Clone)]
@@ -85,6 +87,11 @@ impl XmlEditProtocol {
     /// Extracts a blocker or error message (`<error>`) when present.
     pub fn parse_error(&self, raw_text: &str) -> Option<String> {
         tags::extract_error(raw_text)
+    }
+
+    /// Extracts a skip reason (`<skip>`) when present.
+    pub fn parse_skip(&self, raw_text: &str) -> Option<String> {
+        tags::extract_skip(raw_text)
     }
 
     /// Cleans model output for presentation and history by stripping protocol control tags.
@@ -204,6 +211,22 @@ pub fn new_fn() {}
         let raw = "Intro\n<context_request_A1B2C3 path=\"src/a.rs\" access=\"read_only\" />\nMiddle\n<context_request_A1B2C3 path=\"src/b.rs\"></context_request_A1B2C3>\nOutro";
         let stripped = strip_context_request_tags(raw);
         assert_eq!(stripped.trim(), "Intro\n\nMiddle\n\nOutro");
+    }
+
+    #[test]
+    fn test_extract_and_strip_skip_request() {
+        let text = "Not applicable here.\n<skip reason=\"Finding does not apply to this crate\" />\nDone.";
+        assert_eq!(
+            XmlEditProtocol.parse_skip(text),
+            Some("Finding does not apply to this crate".to_string())
+        );
+        assert_eq!(
+            strip_skip_tags(text).trim(),
+            "Not applicable here.\n\nDone."
+        );
+
+        // The shared terminal strip keeps `<skip>` for the review contour.
+        assert!(strip_terminal_outcome_tags(text).contains("<skip"));
     }
 
     #[test]

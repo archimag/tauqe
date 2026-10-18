@@ -6,6 +6,11 @@
 //! (`run_architect_discovery_loop`). The merged subplan is persisted through the
 //! core domain primitive `ReviewStorage::replace_uncompleted_subplan`, so no
 //! plan-tree manipulation happens in the server crate.
+//!
+//! The synthesis itself lives in [`refine_finding_with_architect`], a typed
+//! helper shared by the `review/refineItem` RPC handler and the autonomous
+//! decomposition that runs before coding a `Warning`-severity or `Refine`
+//! finding (see `step.rs`).
 
 use std::path::Path;
 use std::sync::Arc;
@@ -15,7 +20,8 @@ use tauqe_core::providers::{JsonSchemaDefinition, ResponseFormat};
 use tauqe_core::review::ReviewStorage;
 use tauqe_protocol::{
     errors, events, ModelDeltaEvent, ModelRole, ModelSelection, ModelStartedEvent, Request,
-    Response, ReviewItem, ReviewRefineItemParams, ReviewRefineItemResult, ReviewSession,
+    Response, ResponseError, ReviewIssue, ReviewItem, ReviewRefineItemParams,
+    ReviewRefineItemResult, ReviewSession,
 };
 
 use crate::handlers::plan::{
@@ -36,7 +42,8 @@ const OPERATION_TITLE: &str = "Review Finding Decomposition";
 ///
 /// Plan refinement and finding decomposition are conceptually the same operation:
 /// both dispatch to the Architect role, so the handler mirrors the plan horizon
-/// synthesis flow and reuses its streaming infrastructure.
+/// synthesis flow and reuses its streaming infrastructure through
+/// [`refine_finding_with_architect`].
 pub async fn handle_review_refine_item(req: Request, state: &Arc<AppState>) -> Response {
     let params: ReviewRefineItemParams =
         match req.params.and_then(|p| serde_json::from_value(p).ok()) {
@@ -110,38 +117,66 @@ pub async fn handle_review_refine_item(req: Request, state: &Arc<AppState>) -> R
         }
     };
 
-    execute_review_finding_refine(
-        req.id,
+    match refine_finding_with_architect(
         state,
         &repo_root,
-        session,
-        item,
+        &session,
+        &item,
         params.model,
         params.instructions,
         &operation,
     )
     .await
+    {
+        Ok(RefineOutcome::Success { item, explanation }) => Response::ok_typed(
+            req.id,
+            &ReviewRefineItemResult::Success {
+                item,
+                explanation: Some(explanation),
+            },
+        ),
+        Ok(RefineOutcome::Blocked { reason }) => {
+            Response::ok_typed(req.id, &ReviewRefineItemResult::Blocked { reason })
+        }
+        Err(err) => Response {
+            id: req.id,
+            result: None,
+            error: Some(err),
+        },
+    }
 }
 
-/// Unified engine for Architect review finding decomposition.
+/// Typed outcome of an Architect-driven finding decomposition.
+pub(super) enum RefineOutcome {
+    /// The finding was decomposed and persisted with an embedded subplan.
+    Success {
+        item: ReviewIssue,
+        explanation: String,
+    },
+    /// The Architect reported that the finding cannot be decomposed as stated.
+    Blocked { reason: String },
+}
+
+/// Runs an Architect-driven decomposition of a single review finding.
 ///
-/// Drives streaming structured communication with the architect model through the
-/// shared [`run_architect_discovery_loop`], runs multi-round context discovery on
-/// `needs_context`, validates the synthesized subplan, and persists it while
-/// preserving the immutable `Done` foundation of any previously completed
-/// sub-steps. Session history is recorded strictly after the subplan is persisted,
+/// Shared by the `review/refineItem` RPC handler and the autonomous
+/// decomposition that runs before coding a `Warning`-severity or `Refine`
+/// finding. The function drives streaming structured communication with the
+/// architect model through the shared [`run_architect_discovery_loop`], runs
+/// multi-round context discovery on `needs_context`, validates the synthesized
+/// subplan, and persists it through the core domain primitive, which preserves
+/// the immutable `Done` foundation and promotes the finding from `Refine` to
+/// `Todo`. Session history is recorded strictly after the subplan is persisted,
 /// so a failed synthesis never poisons the audit trail.
-#[allow(clippy::too_many_arguments)]
-async fn execute_review_finding_refine(
-    req_id: tauqe_protocol::RequestId,
+pub(super) async fn refine_finding_with_architect(
     state: &Arc<AppState>,
     repo_root: &Path,
-    session: ReviewSession,
-    item: ReviewItem,
+    session: &ReviewSession,
+    item: &ReviewItem,
     custom_model: Option<ModelSelection>,
     instructions: Option<String>,
     operation: &OperationGuard,
-) -> Response {
+) -> Result<RefineOutcome, ResponseError> {
     let (
         provider,
         model,
@@ -169,7 +204,7 @@ async fn execute_review_finding_refine(
         };
         let provider = match resolve_architect_provider(state, &cfg, model.provider).await {
             Ok(p) => p,
-            Err(err) => return Response::err(req_id, errors::NO_API_KEY, err),
+            Err(err) => return Err(refine_error(errors::NO_API_KEY, err)),
         };
         (
             provider,
@@ -241,7 +276,7 @@ async fn execute_review_finding_refine(
         let schema_val = tauqe_core::plan::prompt::plan_refine_response_schema_definition();
         match serde_json::from_value::<JsonSchemaDefinition>(schema_val) {
             Ok(schema) => ResponseFormat::JsonSchema { json_schema: schema },
-            Err(err) => return Response::err(req_id, errors::SCHEMA_ERROR, err.to_string()),
+            Err(err) => return Err(refine_error(errors::SCHEMA_ERROR, err.to_string())),
         }
     };
     let system_prompt = tauqe_core::review::prompt::build_review_finding_refine_system_prompt();
@@ -260,8 +295,8 @@ async fn execute_review_finding_refine(
 
     let build_user_prompt = |context_files: &[ContextFileContent], repo_map: Option<&str>| {
         tauqe_core::review::prompt::build_review_finding_refine_user_prompt(
-            &session,
-            &item,
+            session,
+            item,
             context_files,
             repo_map,
             instructions.as_deref(),
@@ -299,26 +334,22 @@ async fn execute_review_finding_refine(
                 )),
                 Vec::new(),
             );
-            return Response::ok_typed(
-                req_id,
-                &ReviewRefineItemResult::Blocked { reason: warn_msg },
-            );
+            return Ok(RefineOutcome::Blocked { reason: warn_msg });
         }
         Err(ArchitectDiscoveryError::Cancelled) => {
             clear_auto_context(state).await;
-            return Response::err(
-                req_id,
+            return Err(refine_error(
                 errors::CANCELLED,
                 format!("{} was cancelled", OPERATION_TITLE),
-            );
+            ));
         }
         Err(ArchitectDiscoveryError::ModelError(err)) => {
             clear_auto_context(state).await;
-            return Response::err(req_id, errors::MODEL_ERROR, err);
+            return Err(refine_error(errors::MODEL_ERROR, err));
         }
         Err(ArchitectDiscoveryError::ParseError(err)) => {
             clear_auto_context(state).await;
-            return Response::err(req_id, errors::PARSE_ERROR, err);
+            return Err(refine_error(errors::PARSE_ERROR, err));
         }
     };
 
@@ -334,48 +365,44 @@ async fn execute_review_finding_refine(
             Some(format!("{}: Blocked ({})", OPERATION_TITLE, item.title)),
             Vec::new(),
         );
-        return Response::ok_typed(req_id, &ReviewRefineItemResult::Blocked { reason });
+        return Ok(RefineOutcome::Blocked { reason });
     }
 
     if output.status.eq_ignore_ascii_case("needs_context") {
-        return Response::err(
-            req_id,
+        return Err(refine_error(
             errors::NEEDS_CONTEXT,
             format!(
                 "Architect requested additional context but no discovery rounds remain (limit: {}). Narrow the finding scope or raise the discovery round limit, then refine again",
                 max_discovery_rounds
             ),
-        );
+        ));
     }
 
     if !output.status.eq_ignore_ascii_case("success") {
-        return Response::err(
-            req_id,
+        return Err(refine_error(
             errors::UNEXPECTED_STATUS,
             format!(
                 "Architect returned unsupported status '{}'; expected 'success' or 'blocked'",
                 output.status
             ),
-        );
+        ));
     }
 
     if output.items.is_empty() {
-        return Response::err(
-            req_id,
+        return Err(refine_error(
             errors::EMPTY_ITEMS,
             "Model returned success status but an empty items array",
-        );
+        ));
     }
 
     if let Some(duplicate) = find_duplicate_item_ids(&output.items) {
-        return Response::err(
-            req_id,
+        return Err(refine_error(
             errors::INVALID_PLAN_TREE,
             format!(
                 "Architect returned a subplan with a duplicate or empty step ID: '{}'",
                 duplicate
             ),
-        );
+        ));
     }
 
     // Persist the merged subplan through the core domain primitive, which
@@ -399,16 +426,15 @@ async fn execute_review_finding_refine(
     {
         Ok(Some(issue)) => issue,
         Ok(None) => {
-            return Response::err(
-                req_id,
+            return Err(refine_error(
                 errors::NOT_FOUND,
                 format!(
                     "Review item #{} not found in session '{}'",
                     item_id, review_id
                 ),
-            );
+            ));
         }
-        Err(err) => return Response::err(req_id, errors::PLAN_SAVE_FAILED, err),
+        Err(err) => return Err(refine_error(errors::PLAN_SAVE_FAILED, err)),
     };
 
     let (subplan_total, _) = updated.subplan_stats();
@@ -432,11 +458,17 @@ async fn execute_review_finding_refine(
 
     publish_review(state, repo_root, &review_id).await;
 
-    Response::ok_typed(
-        req_id,
-        &ReviewRefineItemResult::Success {
-            item: updated,
-            explanation: Some(explanation),
-        },
-    )
+    Ok(RefineOutcome::Success {
+        item: updated,
+        explanation,
+    })
+}
+
+/// Builds a typed error for the decomposition helper, mirroring `Response::err`.
+fn refine_error(code: &'static str, message: impl Into<String>) -> ResponseError {
+    ResponseError {
+        code: code.to_string(),
+        message: message.into(),
+        data: None,
+    }
 }

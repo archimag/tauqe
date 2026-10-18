@@ -16,7 +16,75 @@ use super::{ContextRequest, TerminalOutcome, VerifyOnSuccess, VerifyRequest, Ver
 pub struct StructuredEditProtocol;
 
 impl StructuredEditProtocol {
-    pub fn schema(_editable_paths: &[String]) -> serde_json::Value {
+    /// Fields owned by each capability in the structured-output schema.
+    ///
+    /// The mapping is the single source of truth for schema pruning: a field
+    /// disappears from the wire schema as soon as the capability that owns it
+    /// is disabled.
+    const CAPABILITY_FIELDS: &'static [(LlmCapability, &'static [&'static str])] = &[
+        (LlmCapability::FileEdits, &["changes"]),
+        (
+            LlmCapability::Discovery,
+            &["context_requests", "repo_searches"],
+        ),
+        (LlmCapability::DocRequest, &["doc_requests"]),
+        (LlmCapability::ToolchainVerify, &["verify"]),
+        (LlmCapability::Scratchpad, &["scratchpad"]),
+        (LlmCapability::Outcome, &["outcome"]),
+        (LlmCapability::Blocked, &["blocked"]),
+        (LlmCapability::UserLanguage, &["user_language"]),
+    ];
+
+    /// Returns the edit schema for the full development capability set.
+    pub fn schema(editable_paths: &[String]) -> serde_json::Value {
+        Self::schema_for(&CapabilitySet::develop_structured(), editable_paths)
+    }
+
+    /// Builds the edit schema for exactly the enabled capabilities.
+    ///
+    /// Prompt instructions, decoding, and the wire schema are all derived from
+    /// one [`CapabilitySet`], so a disabled capability contributes neither an
+    /// instruction nor a schema field. Keeping them in step prevents the model
+    /// from proposing a field the decoder would silently drop. Because the
+    /// schema is strict, pruning a property also prunes its `required` entry.
+    pub fn schema_for(
+        capabilities: &CapabilitySet,
+        editable_paths: &[String],
+    ) -> serde_json::Value {
+        let mut schema = Self::full_schema(editable_paths);
+
+        let mut disabled: Vec<&'static str> = Vec::new();
+        for (capability, fields) in Self::CAPABILITY_FIELDS {
+            if !capabilities.contains(*capability) {
+                disabled.extend(fields.iter().copied());
+            }
+        }
+        if disabled.is_empty() {
+            return schema;
+        }
+
+        if let Some(properties) = schema
+            .get_mut("properties")
+            .and_then(|value| value.as_object_mut())
+        {
+            for field in &disabled {
+                properties.remove(*field);
+            }
+        }
+        if let Some(required) = schema
+            .get_mut("required")
+            .and_then(|value| value.as_array_mut())
+        {
+            required.retain(|field| match field.as_str() {
+                Some(name) => !disabled.contains(&name),
+                None => true,
+            });
+        }
+        schema
+    }
+
+    /// Complete edit-mode schema before capability pruning.
+    fn full_schema(_editable_paths: &[String]) -> serde_json::Value {
         serde_json::json!({
             "type": "object",
             "properties": {
@@ -104,8 +172,8 @@ impl StructuredEditProtocol {
                     "properties": {
                         "status": {
                             "type": "string",
-                            "enum": ["none", "success", "error"],
-                            "description": "'none' while the turn continues, 'success' when it succeeds, 'error' when it fails"
+                            "enum": ["none", "success", "error", "skip"],
+                            "description": "'none' while the turn continues, 'success' when it succeeds, 'error' when it fails, 'skip' when the work is already satisfied and no change is required"
                         },
                         "summary": {
                             "type": "string",
@@ -114,9 +182,13 @@ impl StructuredEditProtocol {
                         "message": {
                             "type": "string",
                             "description": "Error message (empty string otherwise)"
+                        },
+                        "reason": {
+                            "type": "string",
+                            "description": "Skip reason (empty string otherwise)"
                         }
                     },
-                    "required": ["status", "summary", "message"],
+                    "required": ["status", "summary", "message", "reason"],
                     "additionalProperties": false
                 },
                 "blocked": {
@@ -375,11 +447,21 @@ impl StructuredEditProtocol {
 
     /// Returns the JSON-schema response format used to constrain generation.
     pub fn response_format(&self, editable_paths: &[String]) -> Option<ResponseFormat> {
+        self.response_format_for(&CapabilitySet::develop_structured(), editable_paths)
+    }
+
+    /// Returns the JSON-schema response format for an explicit capability set,
+    /// so the wire schema matches the advertised capability surface.
+    pub fn response_format_for(
+        &self,
+        capabilities: &CapabilitySet,
+        editable_paths: &[String],
+    ) -> Option<ResponseFormat> {
         Some(ResponseFormat::JsonSchema {
             json_schema: JsonSchemaDefinition {
                 name: "tauqe_edit_proposal".to_string(),
                 description: Some("Structured code modification proposal and response".to_string()),
-                schema: Self::schema(editable_paths),
+                schema: Self::schema_for(capabilities, editable_paths),
                 strict: Some(true),
             },
         })
@@ -465,6 +547,16 @@ impl StructuredEditProtocol {
                             .to_string();
                         return Some(TerminalOutcome::Error { message });
                     }
+                    "skip" | "skipped" => {
+                        let reason = outcome
+                            .reason
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|reason| !reason.is_empty())
+                            .unwrap_or("Step skipped without a stated reason")
+                            .to_string();
+                        return Some(TerminalOutcome::Skip { reason });
+                    }
                     _ => {}
                 }
             }
@@ -501,7 +593,7 @@ impl StructuredEditProtocol {
     /// falling back to XML control tags when the JSON field is absent or
     /// reports `none`.
     pub fn parse_verify_request(&self, raw_text: &str) -> Option<VerifyRequest> {
-        if let Some(value) = parse_proposal_value(raw_text) {
+        if let Some(value) = parse_json_object(raw_text) {
             if let Some(verify) = value.get("verify").and_then(|field| field.as_object()) {
                 let target = verify
                     .get("target")
@@ -538,7 +630,7 @@ impl StructuredEditProtocol {
     /// field, falling back to XML control tags when the field is absent or
     /// blank.
     pub fn parse_user_language(&self, raw_text: &str) -> Option<String> {
-        if let Some(value) = parse_proposal_value(raw_text) {
+        if let Some(value) = parse_json_object(raw_text) {
             if let Some(language) = value.get("user_language").and_then(|field| field.as_str()) {
                 let trimmed = language.trim();
                 if !trimmed.is_empty() {
@@ -553,7 +645,7 @@ impl StructuredEditProtocol {
     /// `plan_update` field, falling back to `<plan>` control tags when the field
     /// is absent.
     pub fn parse_plan_updates(&self, raw_text: &str) -> Vec<tauqe_protocol::DiscussionPlanUpdate> {
-        if let Some(value) = parse_proposal_value(raw_text) {
+        if let Some(value) = parse_json_object(raw_text) {
             if let Some(plan_update) = value.get("plan_update") {
                 if let Ok(update) =
                     serde_json::from_value::<tauqe_protocol::DiscussionPlanUpdate>(plan_update.clone())
@@ -587,41 +679,22 @@ impl StructuredEditProtocol {
     }
 }
 
-/// Robustly deserializes a proposal regardless of key order or surrounding text.
+/// Robustly parses raw model text into a generic JSON object, tolerating code
+/// fences and surrounding prose.
 ///
 /// UTF-8 Slicing Invariant:
 /// Offsets `start` and `end` are derived strictly from ASCII byte matches:
-/// - `find('{')` locates the ASCII byte `0x7B`, so both `start` and `start + 1` are valid UTF-8 boundaries.
-/// - `balanced_object_end` terminates on matching ASCII `}` (`0x7D`), returning `i + 1`, which is also a valid UTF-8 boundary.
+/// - `find('{')` locates the ASCII byte `0x7B`, so both `start` and `start + 1`
+///   are valid UTF-8 boundaries.
+/// - `balanced_object_end` terminates on matching ASCII `}` (`0x7D`), returning
+///   `i + 1`, which is also a valid UTF-8 boundary.
 ///
 /// Thus `&raw[start..end]` and `raw[from..]` never split multi-byte characters.
-fn parse_proposal(raw: &str) -> Option<ModelResultProposal> {
-    let clean = strip_code_fence(raw);
-    if let Ok(p) = serde_json::from_str::<ModelResultProposal>(clean) {
-        return Some(p);
-    }
-
-    let mut from = 0;
-    while let Some(rel) = raw[from..].find('{') {
-        let start = from + rel;
-        if let Some(end) = balanced_object_end(raw, start) {
-            if let Ok(p) = serde_json::from_str::<ModelResultProposal>(&raw[start..end]) {
-                return Some(p);
-            }
-        }
-        from = start + 1;
-    }
-    None
-}
-
-/// Parses raw model text into a generic JSON object, tolerating fences and
-/// wrapper prose.
 ///
 /// The structured proposal DTO does not model every control field (verification,
 /// detected language, and plan updates travel through dedicated decoders), so
-/// these fields are read straight from the parsed object. Offsets are derived
-/// strictly from ASCII byte matches, keeping the slicing UTF-8 safe.
-fn parse_proposal_value(raw: &str) -> Option<serde_json::Value> {
+/// these fields are read straight from the parsed object.
+fn parse_json_object(raw: &str) -> Option<serde_json::Value> {
     let clean = strip_code_fence(raw);
     if let Ok(value) = serde_json::from_str::<serde_json::Value>(clean) {
         return Some(value);
@@ -638,6 +711,12 @@ fn parse_proposal_value(raw: &str) -> Option<serde_json::Value> {
         from = start + 1;
     }
     None
+}
+
+/// Deserializes a structured proposal from the parsed JSON object, ignoring
+/// unknown fields and tolerating any key order.
+fn parse_proposal(raw: &str) -> Option<ModelResultProposal> {
+    parse_json_object(raw).and_then(|value| serde_json::from_value(value).ok())
 }
 
 /// Converts a parsed `<plan>` tag into a normalized plan update.
@@ -1118,6 +1197,71 @@ mod tests {
     }
 
     #[test]
+    fn test_structured_protocol_parse_skip_outcome() {
+        let proto = StructuredEditProtocol;
+
+        let skip = r#"{
+            "message": "Already satisfied",
+            "changes": [],
+            "outcome": {
+                "status": "skip",
+                "summary": "",
+                "message": "",
+                "reason": "Step already implemented"
+            }
+        }"#;
+        assert_eq!(
+            proto.parse_terminal_outcome(skip),
+            Some(TerminalOutcome::Skip {
+                reason: "Step already implemented".to_string()
+            })
+        );
+
+        // The `skipped` alias and an empty reason both fall back to a
+        // deterministic reason instead of dropping the outcome.
+        let skipped_alias = r#"{
+            "message": "Already satisfied",
+            "changes": [],
+            "outcome": {"status": "skipped", "summary": "", "message": "", "reason": "  "}
+        }"#;
+        assert_eq!(
+            proto.parse_terminal_outcome(skipped_alias),
+            Some(TerminalOutcome::Skip {
+                reason: "Step skipped without a stated reason".to_string()
+            })
+        );
+
+        let schema = StructuredEditProtocol::schema(&[]);
+        let outcome = &schema["properties"]["outcome"];
+        let statuses = outcome["properties"]["status"]["enum"]
+            .as_array()
+            .expect("status enum");
+        for status in ["none", "success", "error", "skip"] {
+            assert!(
+                statuses.iter().any(|value| value == status),
+                "the outcome status enum must declare '{status}'"
+            );
+        }
+
+        let required: Vec<&str> = outcome["required"]
+            .as_array()
+            .expect("required array")
+            .iter()
+            .filter_map(|field| field.as_str())
+            .collect();
+        assert_eq!(
+            required.len(),
+            outcome["properties"]
+                .as_object()
+                .expect("properties object")
+                .len(),
+            "a strict outcome object must require every declared property"
+        );
+        assert!(required.contains(&"reason"));
+        assert_eq!(outcome["properties"]["reason"]["type"], "string");
+    }
+
+    #[test]
     fn test_structured_protocol_control_fields_fall_back_to_xml_tags() {
         let proto = StructuredEditProtocol;
         let raw = "{\"message\":\"Working\",\"changes\":[]}\n\
@@ -1227,5 +1371,88 @@ mod tests {
             "string"
         );
         assert!(!schema.to_string().contains("\"null\""));
+    }
+
+    #[test]
+    fn test_structured_schema_reflects_the_capability_set() {
+        let full = StructuredEditProtocol::schema(&[]);
+        let full_properties = full["properties"].as_object().expect("properties object");
+        for field in [
+            "message",
+            "changes",
+            "context_requests",
+            "repo_searches",
+            "doc_requests",
+            "scratchpad",
+            "outcome",
+            "blocked",
+            "verify",
+            "user_language",
+            "suggested_actions",
+        ] {
+            assert!(
+                full_properties.contains_key(field),
+                "the development schema must declare '{field}'"
+            );
+        }
+        assert_eq!(
+            full["required"].as_array().map(|required| required.len()),
+            Some(full_properties.len()),
+            "a strict schema must require every declared property"
+        );
+
+        let narrowed = StructuredEditProtocol::schema_for(
+            &CapabilitySet::from_slice(&[LlmCapability::TextMessage, LlmCapability::FileEdits]),
+            &[],
+        );
+        let properties = narrowed["properties"]
+            .as_object()
+            .expect("properties object");
+        assert!(properties.contains_key("message"));
+        assert!(properties.contains_key("changes"));
+        for field in [
+            "context_requests",
+            "repo_searches",
+            "doc_requests",
+            "scratchpad",
+            "outcome",
+            "blocked",
+            "verify",
+            "user_language",
+        ] {
+            assert!(
+                !properties.contains_key(field),
+                "a disabled capability must not advertise '{field}'"
+            );
+        }
+
+        let required: Vec<&str> = narrowed["required"]
+            .as_array()
+            .expect("required array")
+            .iter()
+            .filter_map(|field| field.as_str())
+            .collect();
+        assert_eq!(
+            required.len(),
+            properties.len(),
+            "pruning a property must also prune its required entry"
+        );
+        assert_eq!(narrowed["additionalProperties"], serde_json::json!(false));
+    }
+
+    #[test]
+    fn test_structured_response_format_follows_the_capability_set() {
+        let narrowed = CapabilitySet::from_slice(&[LlmCapability::TextMessage]);
+        match StructuredEditProtocol.response_format_for(&narrowed, &[]) {
+            Some(ResponseFormat::JsonSchema { json_schema, .. }) => {
+                let properties = json_schema.schema["properties"]
+                    .as_object()
+                    .expect("properties object");
+                assert!(properties.contains_key("message"));
+                assert!(!properties.contains_key("changes"));
+                assert!(!properties.contains_key("verify"));
+            }
+            other => panic!("expected a JSON schema response format, got {other:?}"),
+        }
     }
 }

@@ -201,16 +201,25 @@ pub fn estimate_tokens(text: &str) -> usize {
 /// Renders the operational-tag rule from the active capability set.
 ///
 /// The tag list is derived from the capability registry, so a narrowed set never
-/// advertises a tag the model is unable to use.
-fn operational_tags_rule(capabilities: &CapabilitySet) -> String {
+/// advertises a tag the model is unable to use. When the active protocol is bound
+/// to a turn marker, the marker suffix is applied to every listed tag.
+fn operational_tags_rule(capabilities: &CapabilitySet, marker: Option<&str>) -> String {
     let tags: Vec<String> = CapabilityRegistry::global()
         .operational_xml_tags(capabilities)
         .into_iter()
-        .map(|tag| format!("<{}>", tag))
+        .map(|tag| match marker {
+            Some(m) => format!("<{}_{}>", tag, m),
+            None => format!("<{}>", tag),
+        })
         .collect();
+    let eg_tag = match marker {
+        Some(m) => format!("<context_request_{m} ...>"),
+        None => "<context_request ...>".to_string(),
+    };
     format!(
-        "1a. Operational Protocol Tags: All operational protocol tags ({}) must be emitted strictly at the end of your response outside markdown code blocks. If you mention, quote, or discuss tags in conversational text, you MUST enclose them in backticks (e.g. `<context_request ...>`) so they are treated as literal text and not operational commands.\n",
-        tags.join(", ")
+        "1a. Operational Protocol Tags: All operational protocol tags ({}) must be emitted strictly at the end of your response outside markdown code blocks. If you mention, quote, or discuss tags in conversational text, you MUST enclose them in backticks (e.g. `{}`) so they are treated as literal text and not operational commands.\n",
+        tags.join(", "),
+        eg_tag
     )
 }
 
@@ -295,13 +304,14 @@ impl PromptAssembly {
         let effective_protocol = protocol.with_capability_set(capabilities.clone());
         let mut prompt = String::new();
         prompt.push_str("You are Tauqe AI, an expert programming assistant operating inside TAUQE (The Answer to the Ultimate Question of Engineering), an AI-native engineering control environment built on the literal harness paradigm.\n\n");
-        prompt.push_str("## Core System Contract\n");
-        prompt.push_str("1. Authoritative Source: The files provided in <context> represent the authoritative current state of the project. Do not invent missing code.\n");
-        prompt.push_str(&operational_tags_rule(&capabilities));
         let marker_suffix = effective_protocol
             .turn_marker()
             .map(|m| format!("_{}", m))
             .unwrap_or_default();
+
+        prompt.push_str("## Core System Contract\n");
+        prompt.push_str("1. Authoritative Source: The files provided in <context> represent the authoritative current state of the project. Do not invent missing code.\n");
+        prompt.push_str(&operational_tags_rule(&capabilities, effective_protocol.turn_marker()));
 
         if self.is_discussion {
             prompt.push_str("2. Discussion Mode Scope: You are strictly in Discussion mode. Code modifications, file creations, file edits, and file deletions are strictly prohibited. Do NOT output XML edit blocks (<edit>, <create>, <replace>, <overwrite>, <delete>) or any code patch proposals.\n");
@@ -312,7 +322,10 @@ impl PromptAssembly {
             prompt.push_str(
                 "2. Read-Only Scope: Files inside <read_only_files> are provided for reference, context, and structural comprehension. Prefer modifying files in <editable_files>. If completing the task requires editing a file present in <read_only_files>, you may propose edits to it directly without an extra discovery round — the environment will automatically promote it to editable upon applying the changes.\n"
             );
-            prompt.push_str("3. Editable Scope: Files inside <editable_files> are permitted for modification. You may also create new files using <create path=\"...\"> or move/rename files using <move from=\"...\" to=\"...\" /> when required by the task.\n");
+            prompt.push_str(&format!(
+                "3. Editable Scope: Files inside <editable_files> are permitted for modification. You may also create new files using <create{0} path=\"...\"> or move/rename files using <move{0} from=\"...\" to=\"...\" /> when required by the task.\n",
+                marker_suffix
+            ));
         }
         prompt.push_str("4. No Arbitrary Shell: You do not have shell execution capabilities. Work strictly through the context and actions provided.\n");
         if !self.is_discussion && capabilities.contains(LlmCapability::FileEdits) {
@@ -357,7 +370,7 @@ impl PromptAssembly {
         }
         if capabilities.contains(LlmCapability::Scratchpad) {
             prompt.push_str(&format!(
-                "10a. Turn Scratchpad (Working Memory): To retain working hypotheses, verified findings, or focus across multi-round discovery and verification healing cycles, you may emit <scratchpad{0}>...</scratchpad{0}>. Keep scratchpad notes concise (bullet points of what is verified, current hypothesis, and purpose of requested files). Notes are preserved within the current turn in <scratchpad> and isolated from persistent history.\n",
+                "10a. Turn Scratchpad (Working Memory): To retain working hypotheses, verified findings, or focus across multi-round discovery and verification healing cycles, you may emit <scratchpad{0}>...</scratchpad{0}>. Keep scratchpad notes concise (bullet points of what is verified, current hypothesis, and purpose of requested files). Notes are preserved within the current turn in <scratchpad{0}> and isolated from persistent history.\n",
                 marker_suffix
             ));
         }
@@ -372,7 +385,7 @@ impl PromptAssembly {
                 );
             } else {
                 prompt.push_str(&format!(
-                    "11. Local Engineering Plans: When formulating a task plan, wrap structured plan items in <plan{0} action=\"save\" id=\"plan-id\" title=\"Plan Title\">...</plan{0}>. In Develop mode, you may ONLY propose new plans (action=\"save\"). Updating plan statuses, closing steps, or modifying existing plans from Develop mode is strictly prohibited (step execution and completion occur strictly in isolated step turns, while plan modifications and re-scoping belong exclusively in Discussion mode). Conceptual Foundation Invariant: Every plan MUST contain an architectural concept tree in <concept>...</concept> defining the core requirements, design decisions, and system invariants ('What'). Inside <concept>, define architectural nodes using structured <concept_item id=\"c-...\" title=\"...\"><details>...</details></concept_item> tags. Plan creation without <concept> containing at least one <concept_item> is strictly prohibited. Implementation steps in <item> define 'How', may be included with concept_refs=\"c-...\", files=\"...\", and readonly=\"...\", or omitted if awaiting deep refinement. File Attributes Contract: the `files` attribute lists target files to create or modify (loaded as editable context), while the `readonly` attribute lists reference or contract files such as subsystem conventions, protocol types, and interfaces (loaded as read-only context and never modified). Leaf-Only Files Invariant: the `files` and `readonly` attributes must be specified exclusively for executable leaf steps without child items; parent container items and task groups must never have files. Planning Objective: Plan synthesis focuses on conceptual comprehension of the objective ('What'), aligning on key architectural decisions and trade-offs, and defining a cohesive concept tree without premature low-level code churn or deep file inspection. Step Formulation Contract: Formulate each step around an engineering objective and operational invariants rather than detailed procedural micro-instructions; define what state must be achieved and what invariants preserved. Always provide a clear <description> explaining the overall architecture, boundaries, and rationale. Plan Creation Invariant: Whenever you propose a new plan, you MUST precede the tag with a concise conversational explanation of the proposed plan, and you MUST emit the structured <plan{0} action=\"save\" ...> tag in the same response containing both <concept> (mandatory) and optional <item> elements. Language Consistency: Formulate the plan title, description, concept nodes, step titles, and step details in the same language as the user's request.\nStructured Plan XML Format:\n<plan{0} action=\"save\" id=\"plan-id\" title=\"Plan Title\">\n  <description>Overall architecture and rationale</description>\n  <concept>\n    <concept_item id=\"c-1\" title=\"Core Invariant\">\n      <details>Design rationale and invariants</details>\n    </concept_item>\n  </concept>\n  <item id=\"1\" title=\"Step Title\" concept_refs=\"c-1\" files=\"path/to/file.rs\" readonly=\"path/to/contract.rs\">\n    <details>Engineering objective and verification criteria</details>\n  </item>\n</plan{0}>\n\n",
+                    "11. Local Engineering Plans: When formulating a task plan, wrap structured plan items in <plan{0} action=\"save\" id=\"plan-id\" title=\"Plan Title\">...</plan{0}>. In Develop mode, you may ONLY propose new plans (action=\"save\"). Updating plan statuses, closing steps, or modifying existing plans from Develop mode is strictly prohibited (step execution and completion occur strictly in isolated step turns, while plan modifications and re-scoping belong exclusively in Discussion mode). Conceptual Foundation Invariant: Every plan MUST contain an architectural concept tree in <concept{0}>...</concept{0}> defining the core requirements, design decisions, and system invariants ('What'). Inside <concept{0}>, define architectural nodes using structured <concept_item{0} id=\"c-...\" title=\"...\"><details{0}>...</details{0}></concept_item{0}> tags. Plan creation without <concept{0}> containing at least one <concept_item{0}> is strictly prohibited. Implementation steps in <item{0}> define 'How', may be included with concept_refs=\"c-...\", files=\"...\", and readonly=\"...\", or omitted if awaiting deep refinement. File Attributes Contract: the `files` attribute lists target files to create or modify (loaded as editable context), while the `readonly` attribute lists reference or contract files such as subsystem conventions, protocol types, and interfaces (loaded as read-only context and never modified). Leaf-Only Files Invariant: the `files` and `readonly` attributes must be specified exclusively for executable leaf steps without child items; parent container items and task groups must never have files. Planning Objective: Plan synthesis focuses on conceptual comprehension of the objective ('What'), aligning on key architectural decisions and trade-offs, and defining a cohesive concept tree without premature low-level code churn or deep file inspection. Step Formulation Contract: Formulate each step around an engineering objective and operational invariants rather than detailed procedural micro-instructions; define what state must be achieved and what invariants preserved. Always provide a clear <description{0}> explaining the overall architecture, boundaries, and rationale. Plan Creation Invariant: Whenever you propose a new plan, you MUST precede the tag with a concise conversational explanation of the proposed plan, and you MUST emit the structured <plan{0} action=\"save\" ...> tag in the same response containing both <concept{0}> (mandatory) and optional <item{0}> elements. Language Consistency: Formulate the plan title, description, concept nodes, step titles, and step details in the same language as the user's request.\nStructured Plan XML Format:\n<plan{0} action=\"save\" id=\"plan-id\" title=\"Plan Title\">\n  <description{0}>Overall architecture and rationale</description{0}>\n  <concept{0}>\n    <concept_item{0} id=\"c-1\" title=\"Core Invariant\">\n      <details{0}>Design rationale and invariants</details{0}>\n    </concept_item{0}>\n  </concept{0}>\n  <item{0} id=\"1\" title=\"Step Title\" concept_refs=\"c-1\" files=\"path/to/file.rs\" readonly=\"path/to/contract.rs\">\n    <details{0}>Engineering objective and verification criteria</details{0}>\n  </item{0}>\n</plan{0}>\n\n",
                     marker_suffix
                 ));
             }
@@ -898,6 +911,10 @@ mod tests {
         let prompt = assembly.build_system_prompt(&*marked);
         assert!(prompt.contains("<scratchpad_M12345>"));
         assert!(prompt.contains("</scratchpad_M12345>"));
+        assert!(prompt.contains("<plan_M12345"));
+        assert!(prompt.contains("<concept_M12345>"));
+        assert!(prompt.contains("<concept_item_M12345"));
+        assert!(prompt.contains("<context_request_M12345>"));
 
         let messages = assembly.assemble_chat_messages("Go", &*marked);
         assert!(messages[0].content.contains("<scratchpad_M12345>"));

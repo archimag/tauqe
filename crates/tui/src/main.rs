@@ -25,7 +25,7 @@ use std::time::{Duration, Instant};
 use tauqe_protocol::{methods, HistoryGetParams, Message};
 use tokio::sync::Mutex;
 
-use crate::app::{AppInit, AppState};
+use crate::app::{AppInit, AppState, ViewMode};
 use crate::editor::InputEditor;
 use crate::input::InputResult;
 use crate::ui::render_ui;
@@ -159,16 +159,27 @@ async fn main() -> anyhow::Result<()> {
     let mut last_spinner_tick = Instant::now();
     let mut last_draw: Option<Instant> = None;
     let mut dirty = true;
+    let mut was_spinning = false;
 
     loop {
         let (needs_spin, has_active_notif) = {
             let mut st = state.lock().await;
-            let spin = st.model.needs_spinner() || st.review.running;
+            let spin = (if st.view_mode == ViewMode::Repl {
+                st.model.needs_spinner()
+            } else {
+                st.model.background_active()
+            }) || st.review.running;
+
             if spin && last_spinner_tick.elapsed() >= SPINNER_INTERVAL {
                 st.model.spinner_frame = (st.model.spinner_frame + 1) % SPINNER_FRAMES.len();
                 last_spinner_tick = Instant::now();
                 dirty = true;
+            } else if was_spinning && !spin {
+                // When animation settles (e.g. splash typewriter completes),
+                // request a final draw to render the resting state.
+                dirty = true;
             }
+            was_spinning = spin;
 
             if dirty && last_draw.is_none_or(|t| t.elapsed() >= FRAME_INTERVAL) {
                 st.model.flush_pending_markdown();

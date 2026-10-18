@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 use tauqe_protocol::{
-    IssueStatus, PlanItem, ReviewIssue, ReviewItem, ReviewSession, ReviewSummary,
+    IssueStatus, Plan, PlanItem, ReviewIssue, ReviewItem, ReviewSession, ReviewSummary,
 };
 
 pub struct ReviewStorage;
@@ -19,6 +19,10 @@ impl ReviewStorage {
     ///
     /// Recovers the guard if the lock was poisoned by a previous panic, so a single
     /// failure never permanently wedges review storage.
+    ///
+    /// Every public entry point acquires this lock inside
+    /// [`crate::blocking::run_blocking`], so neither the wait for the lock nor the
+    /// file I/O that follows it ever occupies a Tokio worker thread.
     fn lock() -> MutexGuard<'static, ()> {
         REVIEW_STORAGE_LOCK
             .lock()
@@ -70,7 +74,15 @@ impl ReviewStorage {
     /// path (and never on reads) keeps listing and loading free of write side
     /// effects and preserves deterministic read behavior.
     pub fn migrate_legacy_if_needed(repo_root: &Path) {
-        let _guard = Self::lock();
+        crate::blocking::run_blocking(|| {
+            let _guard = Self::lock();
+            Self::migrate_legacy_if_needed_unlocked(repo_root);
+        });
+    }
+
+    /// Lock-free core of [`Self::migrate_legacy_if_needed`]; the caller must hold
+    /// the storage lock.
+    fn migrate_legacy_if_needed_unlocked(repo_root: &Path) {
         let legacy_file = Self::reviews_dir(repo_root).join("latest.json");
         if !legacy_file.is_file() {
             return;
@@ -131,8 +143,10 @@ impl ReviewStorage {
     /// Acquires the process-global review storage lock, so a read never races a
     /// concurrent atomic rename in a write path.
     pub fn load_all(repo_root: &Path) -> Result<Vec<ReviewSession>> {
-        let _guard = Self::lock();
-        Self::load_all_unlocked(repo_root)
+        crate::blocking::run_blocking(|| {
+            let _guard = Self::lock();
+            Self::load_all_unlocked(repo_root)
+        })
     }
 
     /// Lock-free core of [`Self::load_all`]; the caller must hold the storage lock.
@@ -231,8 +245,10 @@ impl ReviewStorage {
     /// Acquires the process-global review storage lock, so a read never races a
     /// concurrent atomic rename in a write path.
     pub fn load_review(repo_root: &Path, id: &str) -> Result<Option<ReviewSession>> {
-        let _guard = Self::lock();
-        Self::load_review_unlocked(repo_root, id)
+        crate::blocking::run_blocking(|| {
+            let _guard = Self::lock();
+            Self::load_review_unlocked(repo_root, id)
+        })
     }
 
     /// Lock-free core of [`Self::load_review`]; the caller must hold the storage lock.
@@ -251,8 +267,10 @@ impl ReviewStorage {
 
     /// Loads the active or latest review session.
     pub fn load_latest(repo_root: &Path) -> Result<Option<ReviewSession>> {
-        let _guard = Self::lock();
-        Self::load_latest_unlocked(repo_root)
+        crate::blocking::run_blocking(|| {
+            let _guard = Self::lock();
+            Self::load_latest_unlocked(repo_root)
+        })
     }
 
     /// Lock-free core of [`Self::load_latest`]; the caller must hold the storage lock.
@@ -271,8 +289,10 @@ impl ReviewStorage {
 
     /// Saves a review session into `.tauqe/reviews/<id>.json` atomically.
     pub fn save_session(repo_root: &Path, session: &ReviewSession) -> Result<()> {
-        let _guard = Self::lock();
-        Self::save_session_unlocked(repo_root, session)
+        crate::blocking::run_blocking(|| {
+            let _guard = Self::lock();
+            Self::save_session_unlocked(repo_root, session)
+        })
     }
 
     /// Lock-free core of [`Self::save_session`]; caller must hold storage lock.
@@ -325,8 +345,10 @@ impl ReviewStorage {
 
     /// Deletes a review session from storage. Returns `true` if a file was deleted.
     pub fn delete_review(repo_root: &Path, id: &str) -> Result<bool> {
-        let _guard = Self::lock();
-        Self::delete_review_unlocked(repo_root, id)
+        crate::blocking::run_blocking(|| {
+            let _guard = Self::lock();
+            Self::delete_review_unlocked(repo_root, id)
+        })
     }
 
     /// Lock-free core of [`Self::delete_review`]; caller must hold storage lock.
@@ -369,8 +391,10 @@ impl ReviewStorage {
 
     /// Loads the active review ID from `.tauqe/reviews/active`.
     pub fn load_active_id(repo_root: &Path) -> Result<Option<String>> {
-        let _guard = Self::lock();
-        Self::load_active_id_unlocked(repo_root)
+        crate::blocking::run_blocking(|| {
+            let _guard = Self::lock();
+            Self::load_active_id_unlocked(repo_root)
+        })
     }
 
     /// Lock-free core of [`Self::load_active_id`]; the caller must hold the storage lock.
@@ -392,8 +416,10 @@ impl ReviewStorage {
 
     /// Saves or clears the active review ID in `.tauqe/reviews/active`.
     pub fn save_active_id(repo_root: &Path, id: Option<&str>) -> Result<()> {
-        let _guard = Self::lock();
-        Self::save_active_id_unlocked(repo_root, id)
+        crate::blocking::run_blocking(|| {
+            let _guard = Self::lock();
+            Self::save_active_id_unlocked(repo_root, id)
+        })
     }
 
     /// Lock-free core of [`Self::save_active_id`]; caller must hold storage lock.
@@ -431,8 +457,10 @@ impl ReviewStorage {
     where
         F: FnOnce(&mut ReviewIssue),
     {
-        let _guard = Self::lock();
-        Self::update_session_item_unlocked(repo_root, review_id, item_id, updater)
+        crate::blocking::run_blocking(|| {
+            let _guard = Self::lock();
+            Self::update_session_item_unlocked(repo_root, review_id, item_id, updater)
+        })
     }
 
     /// Lock-free core of [`Self::update_session_item`]; caller must hold storage lock.
@@ -486,8 +514,10 @@ impl ReviewStorage {
         item_id: u32,
         new_subplan: Vec<PlanItem>,
     ) -> Result<Option<ReviewIssue>> {
-        let _guard = Self::lock();
-        Self::replace_uncompleted_subplan_unlocked(repo_root, review_id, item_id, new_subplan)
+        crate::blocking::run_blocking(|| {
+            let _guard = Self::lock();
+            Self::replace_uncompleted_subplan_unlocked(repo_root, review_id, item_id, new_subplan)
+        })
     }
 
     /// Lock-free core of [`Self::replace_uncompleted_subplan`]; caller must hold storage lock.
@@ -504,7 +534,18 @@ impl ReviewStorage {
 
         let updated_issue = if let Some(item) = session.items.iter_mut().find(|it| it.id == item_id) {
             let merged = crate::plan::storage::merge_subplan(&item.subplan, new_subplan)?;
-            item.subplan = merged;
+            let mut plan_wrapper = Plan {
+                items: merged,
+                ..Default::default()
+            };
+            plan_wrapper.normalize_leaf_files();
+            plan_wrapper.refresh_parent_statuses();
+            item.subplan = plan_wrapper.items;
+
+            if item.status == IssueStatus::Refine && !item.subplan.is_empty() {
+                item.status = IssueStatus::Todo;
+            }
+
             let issue = ReviewIssue::from(item.clone());
             Some(issue)
         } else {
@@ -527,28 +568,34 @@ impl ReviewStorage {
 /// disk; the per-process suffix on the staging name also prevents a stale or
 /// concurrent write from colliding on a shared, fixed `<file>.json.tmp` path.
 fn write_atomic(target: &Path, contents: &[u8]) -> Result<()> {
-    use std::io::Write;
+    // The temp-file creation, the write, the `fsync` barrier, and the atomic
+    // rename all run off the async executor thread, so a slow disk never stalls
+    // the bounded turn, provider streaming, or RPC handling. Nested inside
+    // another blocking scope the helper degrades to a direct call.
+    crate::blocking::run_blocking(move || -> Result<()> {
+        use std::io::Write;
 
-    let file_name = target.file_name().and_then(|f| f.to_str()).unwrap_or("file");
-    let temp_file = target.with_file_name(format!("{file_name}.tmp.{}", std::process::id()));
+        let file_name = target.file_name().and_then(|f| f.to_str()).unwrap_or("file");
+        let temp_file = target.with_file_name(format!("{file_name}.tmp.{}", std::process::id()));
 
-    {
-        let mut file = std::fs::File::create(&temp_file)
-            .with_context(|| format!("Failed to create temp file at {}", temp_file.display()))?;
-        file.write_all(contents)
-            .with_context(|| format!("Failed to write temp file at {}", temp_file.display()))?;
-        file.flush()
-            .with_context(|| format!("Failed to flush temp file at {}", temp_file.display()))?;
-        file.sync_all()
-            .with_context(|| format!("Failed to sync temp file at {}", temp_file.display()))?;
-    }
+        {
+            let mut file = std::fs::File::create(&temp_file)
+                .with_context(|| format!("Failed to create temp file at {}", temp_file.display()))?;
+            file.write_all(contents)
+                .with_context(|| format!("Failed to write temp file at {}", temp_file.display()))?;
+            file.flush()
+                .with_context(|| format!("Failed to flush temp file at {}", temp_file.display()))?;
+            file.sync_all()
+                .with_context(|| format!("Failed to sync temp file at {}", temp_file.display()))?;
+        }
 
-    std::fs::rename(&temp_file, target).with_context(|| {
-        format!(
-            "Failed to atomically rename {} to {}",
-            temp_file.display(),
-            target.display()
-        )
+        std::fs::rename(&temp_file, target).with_context(|| {
+            format!(
+                "Failed to atomically rename {} to {}",
+                temp_file.display(),
+                target.display()
+            )
+        })
     })
 }
 
@@ -565,7 +612,7 @@ fn session_uuid_timestamp(id: &str) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tauqe_protocol::ReviewSeverity;
+    use tauqe_protocol::{IssueType, ReviewSeverity};
     use tempfile::tempdir;
 
     #[test]
@@ -585,6 +632,7 @@ mod tests {
                 id: 1,
                 title: "Security finding".to_string(),
                 model: None,
+                issue_type: IssueType::Security,
                 severity: ReviewSeverity::Critical,
                 status: IssueStatus::Discussion,
                 recommendations: vec![],
@@ -608,6 +656,10 @@ mod tests {
         // 3. Load by ID and Load Latest
         let loaded = ReviewStorage::load_review(root, "rev-sec-1").unwrap().unwrap();
         assert_eq!(loaded.title, "Security Audit");
+        // Persisting and reloading a finding keeps its exact category instead
+        // of collapsing it into the coarse severity class.
+        assert_eq!(loaded.items[0].issue_type, IssueType::Security);
+        assert_eq!(loaded.issues()[0].issue_type, IssueType::Security);
 
         let latest = ReviewStorage::load_latest(root).unwrap().unwrap();
         assert_eq!(latest.id, "rev-sec-1");
@@ -672,6 +724,7 @@ mod tests {
                 id: i,
                 title: format!("Item {i}"),
                 model: None,
+                issue_type: tauqe_protocol::IssueType::Quality,
                 severity: tauqe_protocol::ReviewSeverity::Suggestion,
                 status: IssueStatus::Todo,
                 recommendations: vec![],
@@ -913,7 +966,8 @@ mod tests {
                 id: 1,
                 title: "Finding".to_string(),
                 model: None,
-                severity: ReviewSeverity::Info,
+                issue_type: IssueType::Quality,
+                severity: ReviewSeverity::Suggestion,
                 status: IssueStatus::Todo,
                 recommendations: vec![],
                 files: vec![],
@@ -982,6 +1036,93 @@ mod tests {
         );
     }
 
+    // Review storage performs blocking file I/O and waits on a synchronous mutex.
+    // Driving the full lifecycle from an async task on a multi-threaded runtime
+    // must neither panic nor stall the executor.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_review_storage_lifecycle_on_multi_thread_runtime() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+
+        let session = ReviewSession {
+            id: "runtime-review".to_string(),
+            title: "Runtime Review".to_string(),
+            created_at: 500,
+            model: tauqe_protocol::ModelRef::openrouter("test-model"),
+            description: None,
+            user_prompt: None,
+            target_files: vec![],
+            items: vec![ReviewItem {
+                id: 1,
+                title: "Finding".to_string(),
+                model: None,
+                issue_type: IssueType::Architecture,
+                severity: ReviewSeverity::Warning,
+                status: IssueStatus::Discussion,
+                recommendations: vec![],
+                files: vec![],
+                readonly_files: vec![],
+                subplan: Vec::new(),
+                resolution_notes: None,
+                body: "Body".to_string(),
+            }],
+            raw_markdown: String::new(),
+        };
+
+        ReviewStorage::save_session(&root, &session).unwrap();
+        assert!(ReviewStorage::reviews_dir(&root)
+            .join("runtime-review.json")
+            .is_file());
+        assert_eq!(
+            ReviewStorage::load_active_id(&root).unwrap(),
+            Some("runtime-review".to_string())
+        );
+
+        let loaded = ReviewStorage::load_review(&root, "runtime-review")
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.items.len(), 1);
+        assert_eq!(loaded.items[0].status, IssueStatus::Discussion);
+
+        let updated = ReviewStorage::update_session_item_status(
+            &root,
+            "runtime-review",
+            1,
+            IssueStatus::Todo,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(updated.status, IssueStatus::Todo);
+
+        let replaced = ReviewStorage::replace_uncompleted_subplan(
+            &root,
+            "runtime-review",
+            1,
+            vec![PlanItem {
+                id: "s-1".to_string(),
+                title: "Step".to_string(),
+                status: tauqe_protocol::PlanItemStatus::Todo,
+                ..Default::default()
+            }],
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(replaced.plan.len(), 1);
+        assert_eq!(replaced.plan[0].id, "s-1");
+
+        assert_eq!(ReviewStorage::load_all(&root).unwrap().len(), 1);
+        assert_eq!(
+            ReviewStorage::load_latest(&root).unwrap().unwrap().id,
+            "runtime-review"
+        );
+
+        ReviewStorage::save_active_id(&root, None).unwrap();
+        assert_eq!(ReviewStorage::load_active_id(&root).unwrap(), None);
+
+        assert!(ReviewStorage::delete_review(&root, "runtime-review").unwrap());
+        assert!(ReviewStorage::load_all(&root).unwrap().is_empty());
+    }
+
     #[test]
     fn test_review_storage_replace_uncompleted_subplan() {
         let dir = tempdir().unwrap();
@@ -999,6 +1140,7 @@ mod tests {
                 id: 1,
                 title: "Finding with subplan".to_string(),
                 model: None,
+                issue_type: IssueType::Architecture,
                 severity: ReviewSeverity::Warning,
                 status: IssueStatus::Discussion,
                 recommendations: vec![],
@@ -1053,6 +1195,59 @@ mod tests {
     }
 
     #[test]
+    fn test_replace_uncompleted_subplan_transitions_refine_to_todo() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+
+        let session = ReviewSession {
+            id: "rev-refine-to-todo".to_string(),
+            title: "Refine Transition Audit".to_string(),
+            created_at: 100,
+            model: tauqe_protocol::ModelRef::openrouter("test-model"),
+            description: None,
+            user_prompt: None,
+            target_files: vec![],
+            items: vec![ReviewItem {
+                id: 1,
+                title: "Architectural finding".to_string(),
+                model: None,
+                issue_type: IssueType::Architecture,
+                severity: ReviewSeverity::Warning,
+                status: IssueStatus::Refine,
+                recommendations: vec![],
+                files: vec![],
+                readonly_files: vec![],
+                subplan: Vec::new(),
+                resolution_notes: None,
+                body: "Body".to_string(),
+            }],
+            raw_markdown: String::new(),
+        };
+        ReviewStorage::save_session(root, &session).unwrap();
+
+        let new_subplan = vec![PlanItem {
+            id: "step-1".to_string(),
+            title: "Implementation step".to_string(),
+            status: tauqe_protocol::PlanItemStatus::Todo,
+            ..Default::default()
+        }];
+
+        let updated = ReviewStorage::replace_uncompleted_subplan(
+            root,
+            "rev-refine-to-todo",
+            1,
+            new_subplan,
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(updated.status, IssueStatus::Todo);
+
+        let loaded = ReviewStorage::load_review(root, "rev-refine-to-todo").unwrap().unwrap();
+        assert_eq!(loaded.items[0].status, IssueStatus::Todo);
+    }
+
+    #[test]
     fn test_review_storage_extended_fields_persistence() {
         let dir = tempdir().unwrap();
         let root = dir.path();
@@ -1069,6 +1264,7 @@ mod tests {
                 id: 1,
                 title: "Finding with extended fields".to_string(),
                 model: None,
+                issue_type: IssueType::Architecture,
                 severity: ReviewSeverity::Warning,
                 status: IssueStatus::Discussion,
                 recommendations: vec!["Step 1: refactor lock".to_string()],
@@ -1116,5 +1312,68 @@ mod tests {
             vec!["crates/protocol/src/lib.rs", "crates/core/src/config.rs"]
         );
         assert_eq!(issues[0].note.as_deref(), Some("Resolved in PR #42"));
+    }
+
+    /// A finding update round-trips through `ReviewIssue` and back into
+    /// `ReviewItem`. The semantic category is the single source of truth and
+    /// must survive that trip verbatim: the pairs the coarse severity
+    /// projection merges (`Bug`/`Security`, `Architecture`/`Performance`) must
+    /// never collapse into one another, and the derived severity must be
+    /// recomputed from the stored category on the next read.
+    #[test]
+    fn test_update_session_item_preserves_the_exact_issue_category() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+
+        let make_item = |id: u32, issue_type: IssueType, severity: ReviewSeverity| ReviewItem {
+            id,
+            title: format!("Finding {id}"),
+            model: None,
+            issue_type,
+            severity,
+            status: IssueStatus::Todo,
+            recommendations: vec![],
+            files: vec![],
+            readonly_files: vec![],
+            subplan: Vec::new(),
+            resolution_notes: None,
+            body: String::new(),
+        };
+
+        let session = ReviewSession {
+            id: "rev-category-fidelity".to_string(),
+            title: "Category Fidelity".to_string(),
+            created_at: 100,
+            model: tauqe_protocol::ModelRef::openrouter("test-model"),
+            description: None,
+            user_prompt: None,
+            target_files: vec![],
+            items: vec![
+                make_item(1, IssueType::Security, ReviewSeverity::Critical),
+                make_item(2, IssueType::Performance, ReviewSeverity::Warning),
+            ],
+            raw_markdown: String::new(),
+        };
+        ReviewStorage::save_session(root, &session).unwrap();
+
+        let updated = ReviewStorage::update_session_item(root, "rev-category-fidelity", 1, |issue| {
+            issue.status = IssueStatus::Fixed;
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(updated.issue_type, IssueType::Security);
+
+        let loaded = ReviewStorage::load_review(root, "rev-category-fidelity")
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.find_item(1).unwrap().issue_type, IssueType::Security);
+        assert_eq!(loaded.find_item(2).unwrap().issue_type, IssueType::Performance);
+        // The presentation severity is derived from the stored category.
+        assert_eq!(loaded.find_item(1).unwrap().severity, ReviewSeverity::Critical);
+        assert_eq!(loaded.find_item(2).unwrap().severity, ReviewSeverity::Warning);
+
+        let issues = loaded.issues();
+        assert_eq!(issues[0].issue_type, IssueType::Security);
+        assert_eq!(issues[1].issue_type, IssueType::Performance);
     }
 }

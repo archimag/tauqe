@@ -1,13 +1,19 @@
 //! Review findings batch supervisor and execution entry point.
 //!
 //! `handle_review_execute` resolves the findings to run (a single session, a
-//! single finding, or every Todo/InProgress finding across all sessions),
-//! performs a deterministic pre-flight verification, and hands control to the
-//! core `BatchExecution` supervisor through `ReviewItemExecutor`. The supervisor
+//! single finding, or every actionable finding across all sessions), performs a
+//! deterministic pre-flight verification, and hands control to the core
+//! `BatchExecution` supervisor through `ReviewItemExecutor`. The supervisor
 //! enforces ordered, fail-fast traversal; findings fixed before the first failure
 //! stay `Fixed`. Once it terminates, a typed `review/batch_finished` event
 //! carries the aggregate status, finding counters, and elapsed time, so clients
 //! can raise a single notice for the whole batch.
+//!
+//! A finding in `Refine` (or a `Warning`-severity finding without a subplan) is
+//! decomposed by the Architect autonomously inside the executing step, so the
+//! batch queue never hands an undecomposed architecture finding to the Coder.
+//! A caller may target a single leaf sub-step by `step_id` and supply a Coder
+//! model override plus developer directives.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -19,8 +25,9 @@ use tauqe_core::workflow::batch::{
     BatchExecution, BatchStep, BatchStepExecutor, BatchStepOutcome, BatchStop,
 };
 use tauqe_protocol::{
-    errors, events, BatchFinishStatus, BatchFinishSummary, IssueStatus, Request, Response,
-    ReviewBatchFinishedEvent, ReviewExecuteParams,
+    errors, events, BatchFinishStatus, BatchFinishSummary, IssueStatus, ModelSelection, PlanItem,
+    PlanItemStatus, Request, Response, ResponseError, ReviewBatchFinishedEvent,
+    ReviewExecuteParams, ReviewItem,
 };
 use tokio::sync::{mpsc, watch};
 
@@ -48,6 +55,97 @@ pub(super) enum BatchOutcome {
     },
 }
 
+/// Locates a leaf sub-step by identifier within a finding's embedded subplan.
+fn find_leaf_step<'a>(items: &'a [PlanItem], step_id: &str) -> Option<&'a PlanItem> {
+    fn walk<'a>(items: &'a [PlanItem], step_id: &str) -> Option<&'a PlanItem> {
+        for item in items {
+            if item.children.is_empty() {
+                if item.id.eq_ignore_ascii_case(step_id) {
+                    return Some(item);
+                }
+            } else if let Some(found) = walk(&item.children, step_id) {
+                return Some(found);
+            }
+        }
+        None
+    }
+    walk(items, step_id)
+}
+
+/// Validates that a targeted sub-step exists, is runnable, and has its internal
+/// dependencies satisfied before a batch is allowed to start.
+fn validate_step_target(item: &ReviewItem, step_id: &str) -> Result<(), ResponseError> {
+    if !item.has_subplan() {
+        return Err(response_error(
+            errors::INVALID_PARAMS,
+            format!(
+                "Review item #{} has no subplan; cannot target sub-step '{}'",
+                item.id, step_id
+            ),
+        ));
+    }
+    let step = find_leaf_step(&item.subplan, step_id).ok_or_else(|| {
+        response_error(
+            errors::NOT_FOUND,
+            format!(
+                "Sub-step '{}' not found in review item #{}",
+                step_id, item.id
+            ),
+        )
+    })?;
+    if !step.children.is_empty() {
+        return Err(response_error(
+            errors::INVALID_PARAMS,
+            format!(
+                "Sub-step '{}' is not a leaf item and cannot be executed directly",
+                step.id
+            ),
+        ));
+    }
+    if step.status == PlanItemStatus::Done {
+        return Err(response_error(
+            errors::NOTHING_TO_EXECUTE,
+            format!("Sub-step '{}' is already DONE", step.id),
+        ));
+    }
+    if step.status == PlanItemStatus::Cancelled {
+        return Err(response_error(
+            errors::NOTHING_TO_EXECUTE,
+            format!("Sub-step '{}' is CANCELLED and cannot be executed", step.id),
+        ));
+    }
+    let unmet: Vec<String> = step
+        .depends_on
+        .iter()
+        .filter(|dep| {
+            find_leaf_step(&item.subplan, dep)
+                .map(|d| d.status != PlanItemStatus::Done && d.status != PlanItemStatus::Cancelled)
+                .unwrap_or(true)
+        })
+        .cloned()
+        .collect();
+    if !unmet.is_empty() {
+        return Err(response_error(
+            errors::STEP_BLOCKED_BY_DEPENDENCIES,
+            format!(
+                "Sub-step '{}' depends on unfinished sub-step(s): {}",
+                step.id,
+                unmet.join(", ")
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Builds a typed protocol error, mirroring `Response::err`.
+fn response_error(code: &str, message: impl Into<String>) -> ResponseError {
+    ResponseError {
+        code: code.to_string(),
+        message: message.into(),
+        data: None,
+    }
+}
+
 /// Adapter that executes a single review finding as a [`BatchStepExecutor`] step.
 ///
 /// Finding status synchronization (InProgress/Fixed/Todo) and file preloading
@@ -58,6 +156,9 @@ struct ReviewItemExecutor<'a> {
     state: &'a Arc<AppState>,
     repo_root: &'a Path,
     operation: &'a Arc<OperationGuard>,
+    step_id: Option<&'a str>,
+    model: Option<ModelSelection>,
+    instructions: Option<String>,
 }
 
 #[async_trait]
@@ -88,13 +189,19 @@ impl BatchStepExecutor for ReviewItemExecutor<'_> {
         // Switch the active review session to match the finding being executed.
         let save_root = self.repo_root.to_path_buf();
         let session_id_owned = session_id.clone();
-        let _ = offload_review(move || ReviewStorage::save_active_id(&save_root, Some(&session_id_owned))).await;
+        let _ = offload_review(move || {
+            ReviewStorage::save_active_id(&save_root, Some(&session_id_owned))
+        })
+        .await;
 
         match run_review_step(
             self.state,
             self.repo_root,
             &session_id,
             item_id,
+            self.step_id,
+            self.model.clone(),
+            self.instructions.clone(),
             Arc::clone(self.operation),
         )
         .await
@@ -114,22 +221,31 @@ impl BatchStepExecutor for ReviewItemExecutor<'_> {
     }
 }
 
-/// Runs the review findings through the core [`BatchExecution`] supervisor, which
-/// enforces ordered, fail-fast traversal. Findings fixed before the first failure
-/// stay FIXED. Once the supervisor terminates, a typed `review/batch_finished`
-/// event carries the aggregate status, finding counters, and elapsed time, so
-/// clients can raise a single notice for the whole batch.
-pub(super) async fn run_review_batch(
+/// Runs the review findings through the core [`BatchExecution`] supervisor with
+/// explicit execution options (targeted sub-step, model override, directives).
+///
+/// Ordered, fail-fast traversal is preserved; findings fixed before the first
+/// failure stay FIXED. Once the supervisor terminates, a typed
+/// `review/batch_finished` event carries the aggregate status, finding counters,
+/// and elapsed time, so clients can raise a single notice for the whole batch.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn run_review_batch_with_options(
     state: &Arc<AppState>,
     owner_id: &str,
     tasks: Vec<(String, u32)>,
+    step_id: Option<String>,
+    model: Option<ModelSelection>,
+    instructions: Option<String>,
     operation: Arc<OperationGuard>,
 ) -> BatchOutcome {
     let repo_root = state.context.read().await.repo_root().to_path_buf();
     if owner_id != "all" {
         let save_root = repo_root.clone();
         let owner_owned = owner_id.to_string();
-        let _ = offload_review(move || ReviewStorage::save_active_id(&save_root, Some(&owner_owned))).await;
+        let _ = offload_review(move || {
+            ReviewStorage::save_active_id(&save_root, Some(&owner_owned))
+        })
+        .await;
     }
     clear_auto_context(state).await;
 
@@ -138,10 +254,14 @@ pub(super) async fn run_review_batch(
     let steps: Vec<BatchStep> = tasks
         .iter()
         .map(|(session_id, item_id)| {
-            BatchStep::new(
-                format!("{}:{}", session_id, item_id),
-                format!("Fix review finding #{} in session '{}'", item_id, session_id),
-            )
+            let label = match step_id.as_deref() {
+                Some(step) => format!(
+                    "Fix sub-step '{}' of review finding #{} in session '{}'",
+                    step, item_id, session_id
+                ),
+                None => format!("Fix review finding #{} in session '{}'", item_id, session_id),
+            };
+            BatchStep::new(format!("{}:{}", session_id, item_id), label)
         })
         .collect();
 
@@ -160,6 +280,9 @@ pub(super) async fn run_review_batch(
         state,
         repo_root: &repo_root,
         operation: &operation,
+        step_id: step_id.as_deref(),
+        model,
+        instructions,
     };
 
     let report = BatchExecution::new()
@@ -244,6 +367,18 @@ pub(super) async fn run_review_batch(
     outcome
 }
 
+/// Convenience entry point used by tests: runs a batch without targeted
+/// sub-step selection, model override, or developer directives.
+#[cfg(test)]
+pub(super) async fn run_review_batch(
+    state: &Arc<AppState>,
+    owner_id: &str,
+    tasks: Vec<(String, u32)>,
+    operation: Arc<OperationGuard>,
+) -> BatchOutcome {
+    run_review_batch_with_options(state, owner_id, tasks, None, None, None, operation).await
+}
+
 pub async fn handle_review_execute(req: Request, state: &Arc<AppState>) -> Response {
     let params: ReviewExecuteParams = match req.params.and_then(|p| serde_json::from_value(p).ok()) {
         Some(p) => p,
@@ -252,7 +387,7 @@ pub async fn handle_review_execute(req: Request, state: &Arc<AppState>) -> Respo
 
     let repo_root = state.context.read().await.repo_root().to_path_buf();
 
-    let (owner_id, tasks) = match params.review_id.as_deref() {
+    let (owner_id, tasks, step_id) = match params.review_id.as_deref() {
         Some(review_id) => {
             let load_root = repo_root.clone();
             let load_id = review_id.to_string();
@@ -262,57 +397,78 @@ pub async fn handle_review_execute(req: Request, state: &Arc<AppState>) -> Respo
                 Err(err) => return Response::err(req.id, errors::REVIEW_LOAD_FAILED, err),
             };
 
+            let mut target_step: Option<String> = None;
             let item_ids: Vec<u32> = match params.item_id {
                 Some(item_id) => {
                     let item = match session.find_item(item_id) {
                         Some(i) => i,
                         None => return Response::err(req.id, errors::NOT_FOUND, format!("Review item #{} not found in session '{}'", item_id, review_id)),
                     };
-                    match item.status {
-                        IssueStatus::Discussion => {
-                            return Response::err(
-                                req.id,
-                                errors::ITEM_IN_DISCUSSION,
-                                format!("Review item #{} is in DISCUSSION status and cannot be executed autonomously until reviewed (change status to TODO first)", item.id),
-                            );
+                    match params.step_id.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                        Some(step) => {
+                            if let Err(err) = validate_step_target(item, step) {
+                                return Response {
+                                    id: req.id,
+                                    result: None,
+                                    error: Some(err),
+                                };
+                            }
+                            target_step = Some(step.to_string());
+                            vec![item_id]
                         }
-                        IssueStatus::Rejected => {
-                            return Response::err(
-                                req.id,
-                                errors::ITEM_REJECTED,
-                                format!("Review item #{} is REJECTED and cannot be executed", item.id),
-                            );
-                        }
-                        IssueStatus::Fixed => {
-                            return Response::err(
-                                req.id,
-                                errors::NOTHING_TO_EXECUTE,
-                                format!("Review item #{} is already FIXED", item.id),
-                            );
-                        }
-                        IssueStatus::Skipped => {
-                            return Response::err(
-                                req.id,
-                                errors::NOTHING_TO_EXECUTE,
-                                format!("Review item #{} is already SKIPPED", item.id),
-                            );
-                        }
-                        IssueStatus::Refine => {
-                            return Response::err(
-                                req.id,
-                                errors::ITEM_IN_REFINE,
-                                format!("Review item #{} is in REFINE status and cannot be executed autonomously until it is decomposed into steps (press R)", item.id),
-                            );
-                        }
-                        IssueStatus::Todo | IssueStatus::InProgress => vec![item_id],
+                        None => match item.status {
+                            IssueStatus::Discussion => {
+                                return Response::err(
+                                    req.id,
+                                    errors::ITEM_IN_DISCUSSION,
+                                    format!("Review item #{} is in DISCUSSION status and cannot be executed autonomously until reviewed (change status to TODO first)", item.id),
+                                );
+                            }
+                            IssueStatus::Rejected => {
+                                return Response::err(
+                                    req.id,
+                                    errors::ITEM_REJECTED,
+                                    format!("Review item #{} is REJECTED and cannot be executed", item.id),
+                                );
+                            }
+                            IssueStatus::Fixed => {
+                                return Response::err(
+                                    req.id,
+                                    errors::NOTHING_TO_EXECUTE,
+                                    format!("Review item #{} is already FIXED", item.id),
+                                );
+                            }
+                            IssueStatus::Skipped => {
+                                return Response::err(
+                                    req.id,
+                                    errors::NOTHING_TO_EXECUTE,
+                                    format!("Review item #{} is already SKIPPED", item.id),
+                                );
+                            }
+                            IssueStatus::Refine | IssueStatus::Todo | IssueStatus::InProgress => {
+                                vec![item_id]
+                            }
+                        },
                     }
                 }
                 None => {
+                    if params.step_id.is_some() {
+                        return Response::err(
+                            req.id,
+                            errors::INVALID_PARAMS,
+                            "step_id requires both review_id and item_id",
+                        );
+                    }
                     let ids: Vec<u32> = session
                         .items
                         .iter()
                         .filter(|i| {
-                            i.status == IssueStatus::Todo || i.status == IssueStatus::InProgress
+                            matches!(
+                                i.status,
+                                IssueStatus::Todo
+                                    | IssueStatus::InProgress
+                                    | IssueStatus::Refine
+                            )
                         })
                         .map(|i| i.id)
                         .collect();
@@ -327,14 +483,14 @@ pub async fn handle_review_execute(req: Request, state: &Arc<AppState>) -> Respo
                 }
             };
             let tasks: Vec<(String, u32)> = item_ids.into_iter().map(|id| (review_id.to_string(), id)).collect();
-            (review_id.to_string(), tasks)
+            (review_id.to_string(), tasks, target_step)
         }
         None => {
-            if params.item_id.is_some() {
+            if params.item_id.is_some() || params.step_id.is_some() {
                 return Response::err(
                     req.id,
                     errors::INVALID_PARAMS,
-                    "item_id cannot be specified when review_id is omitted",
+                    "item_id and step_id cannot be specified when review_id is omitted",
                 );
             }
             let list_root = repo_root.clone();
@@ -345,7 +501,10 @@ pub async fn handle_review_execute(req: Request, state: &Arc<AppState>) -> Respo
             let mut tasks: Vec<(String, u32)> = Vec::new();
             for session in sessions {
                 for item in &session.items {
-                    if item.status == IssueStatus::Todo || item.status == IssueStatus::InProgress {
+                    if matches!(
+                        item.status,
+                        IssueStatus::Todo | IssueStatus::InProgress | IssueStatus::Refine
+                    ) {
                         tasks.push((session.id.clone(), item.id));
                     }
                 }
@@ -357,7 +516,7 @@ pub async fn handle_review_execute(req: Request, state: &Arc<AppState>) -> Respo
                     "No TODO findings to execute across all review sessions",
                 );
             }
-            ("all".to_string(), tasks)
+            ("all".to_string(), tasks, None)
         }
     };
 
@@ -388,6 +547,8 @@ pub async fn handle_review_execute(req: Request, state: &Arc<AppState>) -> Respo
     state.clear_discussion_focus().await;
 
     let item_ids: Vec<u32> = tasks.iter().map(|(_, id)| *id).collect();
+    let model_selection = params.model.clone();
+    let developer_instructions = params.instructions.clone();
     let response = Response::ok(
         req.id,
         serde_json::json!({ "review_id": params.review_id, "item_ids": item_ids }),
@@ -395,7 +556,17 @@ pub async fn handle_review_execute(req: Request, state: &Arc<AppState>) -> Respo
 
     let state = Arc::clone(state);
     tokio::spawn(async move {
-        match run_review_batch(&state, &owner_id, tasks, operation).await {
+        match run_review_batch_with_options(
+            &state,
+            &owner_id,
+            tasks,
+            step_id,
+            model_selection,
+            developer_instructions,
+            operation,
+        )
+        .await
+        {
             BatchOutcome::Completed { items } => {
                 tracing::info!("Review batch '{}' completed: {} finding(s)", owner_id, items);
             }

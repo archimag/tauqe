@@ -2,8 +2,7 @@ use std::sync::Arc;
 
 use crossterm::event::{KeyCode, KeyEvent};
 use tauqe_protocol::{
-    methods, IssueStatus, IssueType, ModelRole, ModelSelection, ReviewIssue, ReviewItem,
-    ReviewRefineItemParams,
+    methods, IssueStatus, ModelRole, ModelSelection, ReviewIssue, ReviewRefineItemParams,
 };
 use tokio::sync::Mutex;
 
@@ -13,7 +12,7 @@ use crate::command::{CommandMap, CommandSpec, KeyChord};
 use crate::input::InputResult;
 use crate::rpc::{send_request, RpcConnection};
 
-use super::VisibleReviewRow;
+use super::{RefineTarget, ReviewRefineDialogState, VisibleReviewRow};
 
 /// Keyboard actions available in the Review view.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -25,6 +24,7 @@ pub enum ReviewAction {
     RunReview,
     Discuss,
     Refine,
+    RefineAll,
     ChangeStatus,
     SetFocus,
     ToggleHideClosed,
@@ -71,20 +71,37 @@ pub static REVIEW_COMMAND_MAP: CommandMap<ReviewAction> = CommandMap::new(&[
         "Execute the selected finding or all Todo findings in the session",
     ),
     // Case-differentiated decomposition chords, declared before the bare `r`.
+    // Lowercase `r` decomposes the selection, uppercase `R` decomposes every
+    // finding that still awaits decomposition (Conventions §4.5).
     CommandSpec::new(
         KeyChord::Bare(KeyCode::Char('R')),
-        ReviewAction::Refine,
+        ReviewAction::RefineAll,
         Essential,
-        "Decompose the selected finding into steps with the Architect",
+        "Decompose every finding awaiting architectural refinement",
     ),
     CommandSpec::new(
         KeyChord::Shift(KeyCode::Char('r')),
+        ReviewAction::RefineAll,
+        Essential,
+        "Decompose every finding awaiting architectural refinement",
+    ),
+    CommandSpec::new(
+        KeyChord::Bare(KeyCode::Char('r')),
         ReviewAction::Refine,
         Essential,
         "Decompose the selected finding into steps with the Architect",
     ),
+    // Starting a new review session is a creation verb, so it takes `N`; `r` and
+    // `R` stay reserved for the Architect and refresh keeps the canonical `g`
+    // (Conventions §4.5, §4.6).
     CommandSpec::new(
-        KeyChord::Bare(KeyCode::Char('r')),
+        KeyChord::Bare(KeyCode::Char('N')),
+        ReviewAction::RunReview,
+        Essential,
+        "Run a code review on the current context",
+    ),
+    CommandSpec::new(
+        KeyChord::Shift(KeyCode::Char('n')),
         ReviewAction::RunReview,
         Essential,
         "Run a code review on the current context",
@@ -177,12 +194,6 @@ pub static REVIEW_COMMAND_MAP: CommandMap<ReviewAction> = CommandMap::new(&[
         "Select the previous row",
     ),
     CommandSpec::new(
-        KeyChord::Bare(KeyCode::Char('P')),
-        ReviewAction::NavPrev,
-        Interface,
-        "Select the previous row",
-    ),
-    CommandSpec::new(
         KeyChord::Bare(KeyCode::Down),
         ReviewAction::NavNext,
         Interface,
@@ -190,12 +201,6 @@ pub static REVIEW_COMMAND_MAP: CommandMap<ReviewAction> = CommandMap::new(&[
     ),
     CommandSpec::new(
         KeyChord::Bare(KeyCode::Char('n')),
-        ReviewAction::NavNext,
-        Interface,
-        "Select the next row",
-    ),
-    CommandSpec::new(
-        KeyChord::Bare(KeyCode::Char('N')),
         ReviewAction::NavNext,
         Interface,
         "Select the next row",
@@ -231,7 +236,31 @@ pub static REVIEW_COMMAND_MAP: CommandMap<ReviewAction> = CommandMap::new(&[
         "Select the first row",
     ),
     CommandSpec::new(
+        KeyChord::Meta(KeyCode::Char('<')),
+        ReviewAction::SelectFirst,
+        Interface,
+        "Select the first row",
+    ),
+    CommandSpec::new(
+        KeyChord::Ctrl(KeyCode::Home),
+        ReviewAction::SelectFirst,
+        Interface,
+        "Select the first row",
+    ),
+    CommandSpec::new(
         KeyChord::Bare(KeyCode::End),
+        ReviewAction::SelectLast,
+        Interface,
+        "Select the last row",
+    ),
+    CommandSpec::new(
+        KeyChord::Meta(KeyCode::Char('>')),
+        ReviewAction::SelectLast,
+        Interface,
+        "Select the last row",
+    ),
+    CommandSpec::new(
+        KeyChord::Ctrl(KeyCode::End),
         ReviewAction::SelectLast,
         Interface,
         "Select the last row",
@@ -317,10 +346,18 @@ pub static REVIEW_COMMAND_MAP: CommandMap<ReviewAction> = CommandMap::new(&[
     ),
 ]);
 
+/// Arms the execution confirmation for a finding, a subplan step, or a session
+/// queue.
+///
+/// The confirmation state is built through the single constructor shared with
+/// the mouse path, so point execution (one finding or one step) always carries
+/// the Coder selector and the directives editor while a queue runs on the
+/// configured role defaults (concept #c-3).
 fn execute_review_scope_action(
     st: &mut AppState,
     session_id: &str,
     target_item_id: Option<u32>,
+    target_step_id: Option<String>,
     scope_title: &str,
 ) {
     if st.model.is_busy() {
@@ -348,6 +385,12 @@ fn execute_review_scope_action(
         }
     };
 
+    let session_title = if session.title.trim().is_empty() {
+        session.id.clone()
+    } else {
+        session.title.clone()
+    };
+
     if let Some(item_id) = target_item_id {
         let item = match session.find_item(item_id) {
             Some(i) => i.clone(),
@@ -357,17 +400,10 @@ fn execute_review_scope_action(
             }
         };
 
-        // A finding still awaiting architectural decomposition must be refined
-        // before any Coder turn runs: the Architect owns the "what", the Coder
-        // owns the "how".
-        if item.status == IssueStatus::Refine {
-            st.notify_warning(format!(
-                "Finding #{} is in REFINE status: decompose it into steps with the Architect (R) before executing.",
-                item.id
-            ));
-            return;
-        }
-
+        // Every status that can still produce work is dispatched: a `REFINE`
+        // finding is decomposed by the Architect before the first Coder call on
+        // the server, so the client never blocks execution on a missing subplan
+        // (#c-1).
         match item.status {
             IssueStatus::Discussion => {
                 st.notify_warning(format!(
@@ -390,30 +426,37 @@ fn execute_review_scope_action(
                     item.id
                 ));
             }
-            // REFINE is intercepted by the earlier guard, which returns before
-            // this match, so the finding is never dispatched to a Coder turn.
-            IssueStatus::Refine => {}
-            IssueStatus::Todo | IssueStatus::InProgress => {
+            // A `REFINE` finding runs exactly like a planned one: the server
+            // decomposes it with the Architect before the first Coder call, so a
+            // missing subplan never blocks execution (#c-1).
+            IssueStatus::Refine | IssueStatus::Todo | IssueStatus::InProgress => {
+                // Point execution opens the Coder form so the implementing model
+                // and the directives are chosen before a bounded turn runs
+                // (concept #c-3).
+                let coder_entries = st.coder_entries();
                 st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
-                st.confirm_execute_review = Some(crate::app::ConfirmExecuteReviewState {
-                    review_id: Some(session.id.clone()),
-                    review_title: if session.title.trim().is_empty() {
-                        session.id.clone()
-                    } else {
-                        session.title.clone()
-                    },
-                    scope_title: scope_title.to_string(),
-                    item_id: Some(item.id),
-                    items: vec![ReviewIssue::from(item)],
-                });
+                st.confirm_execute_review = Some(crate::app::ConfirmExecuteReviewState::new(
+                    Some(session.id.clone()),
+                    session_title,
+                    scope_title.to_string(),
+                    Some(item.id),
+                    target_step_id.clone(),
+                    vec![ReviewIssue::from(item)],
+                    coder_entries,
+                ));
             }
         }
     } else {
+        // A finding still awaiting architectural decomposition belongs to the
+        // queue too: the server refines it before running its steps (#c-1).
         let todo_items: Vec<ReviewIssue> = session
             .items
             .iter()
             .filter(|i| {
-                i.status == IssueStatus::Todo || i.status == IssueStatus::InProgress
+                matches!(
+                    i.status,
+                    IssueStatus::Refine | IssueStatus::Todo | IssueStatus::InProgress
+                )
             })
             .cloned()
             .map(ReviewIssue::from)
@@ -429,18 +472,19 @@ fn execute_review_scope_action(
             return;
         }
 
+        // A session-wide queue is a batch: it runs autonomously on the configured
+        // Coder defaults, so no model selector is exposed (concept #c-3).
+        let coder_entries = st.coder_entries();
         st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
-        st.confirm_execute_review = Some(crate::app::ConfirmExecuteReviewState {
-            review_id: Some(session.id.clone()),
-            review_title: if session.title.trim().is_empty() {
-                session.id.clone()
-            } else {
-                session.title.clone()
-            },
-            scope_title: format!("All remaining TODO findings ({} items)", todo_items.len()),
-            item_id: None,
-            items: todo_items,
-        });
+        st.confirm_execute_review = Some(crate::app::ConfirmExecuteReviewState::new(
+            Some(session.id.clone()),
+            session_title,
+            format!("All remaining TODO findings ({} items)", todo_items.len()),
+            None,
+            None,
+            todo_items,
+            coder_entries,
+        ));
     }
 }
 
@@ -494,72 +538,72 @@ pub(crate) fn execute_all_reviews_action(st: &mut AppState) {
         return;
     }
 
+    let coder_entries = st.coder_entries();
     st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
-    st.confirm_execute_review = Some(crate::app::ConfirmExecuteReviewState {
-        review_id: None,
-        review_title: "All Review Sessions".to_string(),
-        scope_title: format!(
+    st.confirm_execute_review = Some(crate::app::ConfirmExecuteReviewState::new(
+        None,
+        "All Review Sessions".to_string(),
+        format!(
             "All remaining TODO findings across all sessions ({} items)",
             todo_items.len()
         ),
-        item_id: None,
-        items: todo_items,
-    });
+        None,
+        None,
+        todo_items,
+        coder_entries,
+    ));
 }
 
-fn format_item_for_clipboard(item: &ReviewItem) -> String {
-    let mut text = format!("[{}] {}", IssueType::from(item.severity), item.title);
-    if !item.files.is_empty() {
+/// Title of the finding that owns a subplan step.
+///
+/// Executing a step runs the owning finding's bounded turn, so the confirmation
+/// dialog must name the finding instead of the individual step.
+fn finding_scope_title(st: &AppState, session_id: &str, item_id: u32) -> String {
+    st.review
+        .sessions
+        .iter()
+        .chain(st.review.session.iter())
+        .find(|session| session.id == session_id)
+        .and_then(|session| session.items.iter().find(|item| item.id == item_id))
+        .map(|item| item.title.clone())
+        .unwrap_or_else(|| format!("Finding #{}", item_id))
+}
+
+fn format_item_for_clipboard(issue: &ReviewIssue) -> String {
+    let mut text = format!("[{}] {}", issue.issue_type, issue.title);
+    if !issue.files.is_empty() {
         text.push('\n');
-        text.push_str(&item.files.join(", "));
+        text.push_str(&issue.files.join(", "));
     }
-    if let Some(notes) = &item.resolution_notes {
-        let trimmed = notes.trim();
+    if let Some(note) = issue.note.as_deref() {
+        let trimmed = note.trim();
         if !trimmed.is_empty() {
             text.push_str("\n\nResolution: ");
             text.push_str(trimmed);
         }
     }
-    if !item.body.trim().is_empty() {
+    if !issue.description.trim().is_empty() {
         text.push_str("\n\n");
-        text.push_str(item.body.trim());
+        text.push_str(issue.description.trim());
     }
     text
 }
 
-/// Decomposes the selected finding into an embedded step plan via the Architect
-/// role (`review/refineItem`).
+/// Dispatches one Architect decomposition request for a finding.
 ///
-/// The Architect either produces a decomposed subplan carried by the updated
-/// finding or reports a semantic block; both outcomes arrive as a typed
-/// `review/refineItem` response and are applied by the response dispatcher. The
-/// developer stays in the Review view, which surfaces the resulting sub-steps.
-async fn refine_selected_finding(
-    state: &Arc<Mutex<AppState>>,
+/// The Architect owns the "what": it decomposes a single finding into an
+/// embedded step plan, and the typed `review/refineItem` response applies the
+/// result. A batch therefore drains one finding per call, so every dispatch goes
+/// through this single point.
+async fn send_refine_request(
     server_writer: &mut RpcConnection,
+    target: RefineTarget,
 ) -> anyhow::Result<()> {
-    let params = {
-        let mut st = state.lock().await;
-        if st.model.is_busy() || st.review.running || st.review.refining.is_some() {
-            st.notify_warning("Model is currently busy; wait for operation to finish");
-            return Ok(());
-        }
-        let (review_id, item_id) = match st.review.selected_row() {
-            Some(VisibleReviewRow::ReviewItem {
-                session_id, item_id, ..
-            }) => (session_id, item_id),
-            _ => {
-                st.notify_info("Select a finding to decompose into steps (R)");
-                return Ok(());
-            }
-        };
-        st.review.refining = Some(review_id.clone());
-        ReviewRefineItemParams {
-            review_id: Some(review_id),
-            item_id,
-            model: None,
-            instructions: None,
-        }
+    let params = ReviewRefineItemParams {
+        review_id: Some(target.review_id),
+        item_id: target.item_id,
+        model: None,
+        instructions: None,
     };
     send_request(
         server_writer,
@@ -567,6 +611,87 @@ async fn refine_selected_finding(
         serde_json::to_value(&params)?,
     )
     .await?;
+    Ok(())
+}
+
+/// Opens the Architect decomposition dialog for the finding under the cursor.
+///
+/// The Architect owns the "what", so decomposition is an explicit request with
+/// its own model choice and directives rather than an implicit retry: the dialog
+/// carries the selected architect and the optional instructions into
+/// `review/refineItem`. When more than one architect is configured, focus starts
+/// on the model list for instant selection.
+fn open_refine_dialog(st: &mut AppState) {
+    if st.model.is_busy() || st.review.running || st.review.refining.is_some() {
+        st.notify_warning("Model is currently busy; wait for operation to finish");
+        return;
+    }
+
+    let (review_id, item_id, item_title) = match st.review.selected_row() {
+        Some(VisibleReviewRow::ReviewItem {
+            session_id,
+            item_id,
+            title,
+            ..
+        }) => (session_id, item_id, title),
+        _ => {
+            st.notify_info("Select a finding to decompose into steps (r)");
+            return;
+        }
+    };
+
+    let review_title = st
+        .review
+        .sessions
+        .iter()
+        .find(|session| session.id == review_id)
+        .map(|session| session.title.clone())
+        .or_else(|| {
+            st.review
+                .session
+                .as_ref()
+                .filter(|session| session.id == review_id)
+                .map(|session| session.title.clone())
+        })
+        .unwrap_or_else(|| review_id.clone());
+
+    let entries = crate::views::plans::architect_entries(st);
+    let mut dialog =
+        ReviewRefineDialogState::new(review_id, review_title, item_id, item_title, entries);
+    if dialog.selector.len() > 1 {
+        dialog.focus = crate::views::plans::RefineDialogFocus::ModelList;
+    }
+    st.review.refine_dialog = Some(dialog);
+}
+
+/// Decomposes every finding that still awaits architectural refinement.
+///
+/// A finding in `REFINE` status has been classified by the Reviewer but not yet
+/// broken into executable steps, so the batch is exactly the set of findings the
+/// Architect still owes a decomposition for. The queue drains one finding per
+/// `review/refineItem` response, and a failed or refused decomposition aborts the
+/// remaining queue instead of spending further tokens.
+async fn refine_all_findings(
+    state: &Arc<Mutex<AppState>>,
+    server_writer: &mut RpcConnection,
+) -> anyhow::Result<()> {
+    let target = {
+        let mut st = state.lock().await;
+        if st.model.is_busy() || st.review.running || st.review.refining.is_some() {
+            st.notify_warning("Model is currently busy; wait for operation to finish");
+            return Ok(());
+        }
+        let targets = st.review.pending_refine_targets();
+        if targets.is_empty() {
+            st.notify_info("No findings require architectural decomposition");
+            return Ok(());
+        }
+        st.review.begin_refine_batch(targets)
+    };
+    let Some(target) = target else {
+        return Ok(());
+    };
+    send_refine_request(server_writer, target).await?;
     state
         .lock()
         .await
@@ -657,6 +782,17 @@ pub async fn handle_review_key(
                         st.review.clamp_selection();
                         st.review.scroll_to_selected();
                     }
+                    VisibleReviewRow::SubplanItem {
+                        session_id,
+                        item_id,
+                        step_id,
+                        ..
+                    } => {
+                        st.review
+                            .toggle_subplan_item_expanded(&session_id, item_id, &step_id);
+                        st.review.clamp_selection();
+                        st.review.scroll_to_selected();
+                    }
                 }
             }
         }
@@ -680,7 +816,31 @@ pub async fn handle_review_key(
                         title,
                         ..
                     } => {
-                        execute_review_scope_action(&mut st, &session_id, Some(item_id), &title);
+                        execute_review_scope_action(
+                            &mut st,
+                            &session_id,
+                            Some(item_id),
+                            None,
+                            &title,
+                        );
+                    }
+                    VisibleReviewRow::SubplanItem {
+                        session_id,
+                        item_id,
+                        step_id,
+                        ..
+                    } => {
+                        // Confirming on a step row targets that step, so the
+                        // bounded turn implements exactly the inspected leaf
+                        // (concept #c-4).
+                        let title = finding_scope_title(&st, &session_id, item_id);
+                        execute_review_scope_action(
+                            &mut st,
+                            &session_id,
+                            Some(item_id),
+                            Some(step_id),
+                            &title,
+                        );
                     }
                 }
             }
@@ -693,10 +853,16 @@ pub async fn handle_review_key(
             if let Some(row) = sel_row {
                 match row {
                     VisibleReviewRow::SessionHeader { session_id, title, .. } => {
-                        execute_review_scope_action(&mut st, &session_id, None, &title);
+                        execute_review_scope_action(&mut st, &session_id, None, None, &title);
                     }
                     VisibleReviewRow::SessionSummary { session_id, .. } => {
-                        execute_review_scope_action(&mut st, &session_id, None, &session_id);
+                        execute_review_scope_action(
+                            &mut st,
+                            &session_id,
+                            None,
+                            None,
+                            &session_id,
+                        );
                     }
                     VisibleReviewRow::ReviewItem {
                         session_id,
@@ -704,7 +870,28 @@ pub async fn handle_review_key(
                         title,
                         ..
                     } => {
-                        execute_review_scope_action(&mut st, &session_id, Some(item_id), &title);
+                        execute_review_scope_action(
+                            &mut st,
+                            &session_id,
+                            Some(item_id),
+                            None,
+                            &title,
+                        );
+                    }
+                    VisibleReviewRow::SubplanItem {
+                        session_id,
+                        item_id,
+                        step_id,
+                        ..
+                    } => {
+                        let title = finding_scope_title(&st, &session_id, item_id);
+                        execute_review_scope_action(
+                            &mut st,
+                            &session_id,
+                            Some(item_id),
+                            Some(step_id),
+                            &title,
+                        );
                     }
                 }
             }
@@ -848,14 +1035,48 @@ pub async fn handle_review_key(
                     item_id,
                     ..
                 }) => {
-                    let s_opt = st.review.sessions.iter().find(|s| s.id == session_id).or(st.review.session.as_ref());
-                    s_opt.and_then(|s| s.items.iter().find(|i| i.id == item_id)).map(format_item_for_clipboard)
+                    let s_opt = st
+                        .review
+                        .sessions
+                        .iter()
+                        .find(|s| s.id == session_id)
+                        .or(st.review.session.as_ref());
+                    s_opt
+                        .and_then(|s| s.items.iter().find(|i| i.id == item_id))
+                        .map(|item| format_item_for_clipboard(&ReviewIssue::from(item.clone())))
                 }
                 Some(VisibleReviewRow::SessionHeader { session_id, .. }) => {
                     let s_opt = st.review.sessions.iter().find(|s| s.id == session_id).or(st.review.session.as_ref());
                     s_opt.map(|s| s.raw_markdown.clone())
                 }
                 Some(VisibleReviewRow::SessionSummary { description, .. }) => Some(description),
+                Some(VisibleReviewRow::SubplanItem {
+                    step_id,
+                    title,
+                    status,
+                    files,
+                    readonly_files,
+                    details,
+                    ..
+                }) => {
+                    let mut text = format!("#{} [{}] {}", step_id, status, title);
+                    if !files.is_empty() {
+                        text.push_str("\nfiles: ");
+                        text.push_str(&files.join(", "));
+                    }
+                    if !readonly_files.is_empty() {
+                        text.push_str("\nref: ");
+                        text.push_str(&readonly_files.join(", "));
+                    }
+                    if let Some(details) = details {
+                        let trimmed = details.trim();
+                        if !trimmed.is_empty() {
+                            text.push_str("\n\n");
+                            text.push_str(trimmed);
+                        }
+                    }
+                    Some(text)
+                }
                 None => None,
             };
 
@@ -925,10 +1146,14 @@ pub async fn handle_review_key(
             }
         }
         // Decompose the selected finding into an embedded step plan via the
-        // Architect role (`review/refineItem`).
+        // Architect role: the dialog carries the architect model and directives.
         ReviewAction::Refine => {
+            open_refine_dialog(&mut st);
+        }
+        // Decompose every finding that still awaits architectural refinement.
+        ReviewAction::RefineAll => {
             drop(st);
-            refine_selected_finding(state, server_writer).await?;
+            refine_all_findings(state, server_writer).await?;
         }
         // Refresh review sessions from the server.
         ReviewAction::Refresh => {
@@ -1006,7 +1231,8 @@ mod tests {
         let state = Arc::new(Mutex::new(st));
         let mut conn = RpcConnection::new(Vec::<u8>::new());
 
-        let key = KeyEvent::new(KeyCode::Char('r'), crossterm::event::KeyModifiers::NONE);
+        // `N` creates a new review session over the current context.
+        let key = KeyEvent::new(KeyCode::Char('N'), crossterm::event::KeyModifiers::NONE);
         let res = handle_review_key(key, &state, &mut conn).await.unwrap();
         assert_eq!(res, InputResult::Continue);
 
@@ -1055,7 +1281,7 @@ mod tests {
         st.review.sessions = vec![session.clone()];
         st.review.session = Some(session);
 
-        execute_review_scope_action(&mut st, "rev-1", Some(1), "Finding");
+        execute_review_scope_action(&mut st, "rev-1", Some(1), None, "Finding");
 
         assert_eq!(
             st.confirm_button,
@@ -1227,10 +1453,17 @@ mod tests {
             .confirm_execute_review
             .as_ref()
             .expect("modal confirmation must be armed");
-        assert_eq!(target.review_id, None, "cross-session execution must have review_id: None");
+        assert_eq!(
+            target.review_id, None,
+            "cross-session execution must have review_id: None"
+        );
         assert_eq!(target.review_title, "All Review Sessions");
         assert_eq!(st.confirm_button, crate::app::ConfirmDialogButton::Cancel);
-        assert_eq!(target.items.len(), 2, "must include exactly the Todo and InProgress items");
+        assert_eq!(
+            target.items.len(),
+            2,
+            "must include exactly the Todo and InProgress items"
+        );
         assert_eq!(target.items[0].title, "Finding 1");
         assert_eq!(target.items[1].title, "Finding 3");
     }
@@ -1347,8 +1580,20 @@ mod tests {
         }
     }
 
+    fn session_with_status(
+        id: &str,
+        item_id: u32,
+        status: IssueStatus,
+    ) -> tauqe_protocol::ReviewSession {
+        let mut session = todo_session(id, item_id);
+        if let Some(item) = session.items.first_mut() {
+            item.status = status;
+        }
+        session
+    }
+
     #[tokio::test]
-    async fn test_capital_r_decomposes_selected_finding() {
+    async fn test_lowercase_r_opens_the_decomposition_dialog() {
         let mut st = crate::app::test_state();
         st.view_mode = ViewMode::Review;
         st.review.sessions = vec![todo_session("rev-1", 1)];
@@ -1358,12 +1603,66 @@ mod tests {
         let state = Arc::new(Mutex::new(st));
         let mut conn = RpcConnection::new(Vec::<u8>::new());
 
-        let key = KeyEvent::new(KeyCode::Char('R'), crossterm::event::KeyModifiers::NONE);
+        let key = KeyEvent::new(KeyCode::Char('r'), crossterm::event::KeyModifiers::NONE);
         let res = handle_review_key(key, &state, &mut conn).await.unwrap();
         assert_eq!(res, InputResult::Continue);
 
         let st = state.lock().await;
+        // The dialog opens instead of dispatching immediately, so the developer
+        // can choose the architect and add directives before spending a turn.
+        let dialog = st
+            .review
+            .refine_dialog
+            .as_ref()
+            .expect("the decomposition dialog must open");
+        assert_eq!(dialog.review_id, "rev-1");
+        assert_eq!(dialog.item_id, 1);
+        assert_eq!(dialog.selector.len(), 1);
+        assert!(st.review.refining.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_lowercase_r_on_session_header_requires_a_finding() {
+        let mut st = crate::app::test_state();
+        st.view_mode = ViewMode::Review;
+        st.review.sessions = vec![todo_session("rev-1", 1)];
+        st.review.selected_index = 0; // session header row
+
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+
+        let key = KeyEvent::new(KeyCode::Char('r'), crossterm::event::KeyModifiers::NONE);
+        handle_review_key(key, &state, &mut conn).await.unwrap();
+
+        let st = state.lock().await;
+        assert!(st.review.refining.is_none());
+        assert_eq!(
+            st.active_notification().map(|n| n.text.as_str()),
+            Some("Select a finding to decompose into steps (r)")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_capital_r_decomposes_every_finding_awaiting_refinement() {
+        let mut st = crate::app::test_state();
+        st.view_mode = ViewMode::Review;
+        st.review.sessions = vec![
+            session_with_status("rev-1", 1, IssueStatus::Refine),
+            todo_session("rev-2", 2),
+        ];
+        st.review.selected_index = 0;
+
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+
+        let key = KeyEvent::new(KeyCode::Char('R'), crossterm::event::KeyModifiers::NONE);
+        handle_review_key(key, &state, &mut conn).await.unwrap();
+
+        let st = state.lock().await;
+        // Only the REFINE finding is owed a decomposition, so the batch
+        // dispatches it and leaves nothing queued behind.
         assert_eq!(st.review.refining.as_deref(), Some("rev-1"));
+        assert!(st.review.refine_queue.is_empty());
         assert_eq!(
             st.active_notification().map(|n| n.text.as_str()),
             Some("Decomposing finding with the Architect...")
@@ -1371,11 +1670,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_capital_r_on_session_header_requires_a_finding() {
+    async fn test_capital_r_without_refinable_findings_notifies() {
         let mut st = crate::app::test_state();
         st.view_mode = ViewMode::Review;
         st.review.sessions = vec![todo_session("rev-1", 1)];
-        st.review.selected_index = 0; // session header row
 
         let state = Arc::new(Mutex::new(st));
         let mut conn = RpcConnection::new(Vec::<u8>::new());
@@ -1385,9 +1683,10 @@ mod tests {
 
         let st = state.lock().await;
         assert!(st.review.refining.is_none());
+        assert!(st.review.refine_queue.is_empty());
         assert_eq!(
             st.active_notification().map(|n| n.text.as_str()),
-            Some("Select a finding to decompose into steps (R)")
+            Some("No findings require architectural decomposition")
         );
     }
 }

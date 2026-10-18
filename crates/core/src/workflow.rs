@@ -34,6 +34,10 @@ pub struct WorkflowExecutionResult {
     /// Coder's block report when the turn ended with a semantic `<blocked>`
     /// signal. Preserved so the plan supervisor can move the step to `Blocked`.
     pub blocked: Option<String>,
+    /// Coder's skip report when the turn ended with a semantic `<skip>`
+    /// signal. Preserved so a review supervisor can mark the finding as
+    /// skipped instead of failing it.
+    pub skip_reason: Option<String>,
     /// Whether the turn applied a plan `save` action that created or fully
     /// replaced a plan. Propagated to the `plan/updated` event so clients can
     /// focus a freshly created plan instead of an incremental update.

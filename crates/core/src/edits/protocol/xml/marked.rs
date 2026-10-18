@@ -55,7 +55,18 @@ impl MarkedXmlEditProtocol {
         is_empty: impl Fn(&T) -> bool,
     ) -> T {
         let normalized = normalize_marked_xml(raw_text, &self.marker, true);
-        let parsed = parse(&normalized);
+        self.tolerant_parse_normalized(base, &normalized, raw_text, parse, is_empty)
+    }
+
+    fn tolerant_parse_normalized<T>(
+        &self,
+        base: &str,
+        normalized: &str,
+        raw_text: &str,
+        parse: impl Fn(&str) -> T,
+        is_empty: impl Fn(&T) -> bool,
+    ) -> T {
+        let parsed = parse(normalized);
         if is_empty(&parsed) && allows_unmarked_fallback(base) {
             parse(raw_text)
         } else {
@@ -68,25 +79,45 @@ impl MarkedXmlEditProtocol {
         Some(&self.marker)
     }
 
+    /// Extracts context requests from pre-normalized text.
+    pub fn parse_context_requests_normalized(&self, normalized: &str) -> Vec<ContextRequest> {
+        tags::parse_context_request_tags(normalized)
+    }
+
     /// Extracts context requests strictly bound to the active turn marker.
     ///
     /// Discovery requests mutate context and must not be triggered by unmarked
     /// example tags in conversational text or source code.
     pub fn parse_context_requests(&self, raw_text: &str) -> Vec<ContextRequest> {
         let normalized = normalize_marked_xml(raw_text, &self.marker, true);
-        tags::parse_context_request_tags(&normalized)
+        self.parse_context_requests_normalized(&normalized)
+    }
+
+    /// Extracts repository search requests from pre-normalized text.
+    pub fn parse_repo_searches_normalized(&self, normalized: &str) -> Vec<tauqe_protocol::RepoSearchRequest> {
+        tags::parse_repo_search_tags(normalized)
     }
 
     /// Extracts repository search requests strictly bound to the active turn marker.
     pub fn parse_repo_searches(&self, raw_text: &str) -> Vec<tauqe_protocol::RepoSearchRequest> {
         let normalized = normalize_marked_xml(raw_text, &self.marker, true);
-        tags::parse_repo_search_tags(&normalized)
+        self.parse_repo_searches_normalized(&normalized)
+    }
+
+    /// Extracts documentation topics from pre-normalized text.
+    pub fn parse_doc_requests_normalized(&self, normalized: &str) -> Vec<DocTopic> {
+        tags::parse_doc_request_tags(normalized)
     }
 
     /// Extracts documentation topics strictly bound to the active turn marker.
     pub fn parse_doc_requests(&self, raw_text: &str) -> Vec<DocTopic> {
         let normalized = normalize_marked_xml(raw_text, &self.marker, true);
-        tags::parse_doc_request_tags(&normalized)
+        self.parse_doc_requests_normalized(&normalized)
+    }
+
+    /// Extracts a verification request from pre-normalized text with unmarked fallback.
+    pub fn parse_verify_request_normalized(&self, normalized: &str, raw_text: &str) -> Option<VerifyRequest> {
+        self.tolerant_parse_normalized("verify", normalized, raw_text, tags::extract_verify_request, Option::is_none)
     }
 
     /// Extracts a verification request, tolerating an unmarked fallback.
@@ -94,9 +125,19 @@ impl MarkedXmlEditProtocol {
         self.tolerant_parse("verify", raw_text, tags::extract_verify_request, Option::is_none)
     }
 
+    /// Extracts the detected user language from pre-normalized text with unmarked fallback.
+    pub fn parse_user_language_normalized(&self, normalized: &str, raw_text: &str) -> Option<String> {
+        self.tolerant_parse_normalized("user_language", normalized, raw_text, tags::extract_user_language, Option::is_none)
+    }
+
     /// Extracts the detected user language, tolerating an unmarked fallback.
     pub fn parse_user_language(&self, raw_text: &str) -> Option<String> {
         self.tolerant_parse("user_language", raw_text, tags::extract_user_language, Option::is_none)
+    }
+
+    /// Extracts plan tags from pre-normalized text.
+    pub fn parse_plan_tags_normalized(&self, normalized: &str) -> (Vec<tags::ParsedPlanTag>, Vec<String>) {
+        tags::parse_plan_tags_with_diagnostics(normalized)
     }
 
     /// Extracts plan tags strictly bound to the active turn marker.
@@ -105,7 +146,14 @@ impl MarkedXmlEditProtocol {
     /// in conversation or documentation.
     pub fn parse_plan_tags(&self, raw_text: &str) -> (Vec<tags::ParsedPlanTag>, Vec<String>) {
         let normalized = normalize_marked_xml(raw_text, &self.marker, true);
-        tags::parse_plan_tags_with_diagnostics(&normalized)
+        self.parse_plan_tags_normalized(&normalized)
+    }
+
+    /// Extracts scratchpad notes from pre-normalized text, falling back to raw unmarked notes.
+    pub fn parse_scratchpad_normalized(&self, normalized: &str, raw_text: &str) -> Option<String> {
+        tags::extract_scratchpad(normalized)
+            .map(|notes| restore_xml_literals(&notes, &self.marker))
+            .or_else(|| tags::extract_scratchpad(raw_text))
     }
 
     /// Extracts scratchpad notes, preferring marker-bound notes over unmarked ones.
@@ -114,24 +162,21 @@ impl MarkedXmlEditProtocol {
     /// a reasoning model that dropped the suffix still keeps its working memory.
     pub fn parse_scratchpad(&self, raw_text: &str) -> Option<String> {
         let normalized = normalize_marked_xml(raw_text, &self.marker, true);
-        tags::extract_scratchpad(&normalized)
-            .map(|notes| restore_xml_literals(&notes, &self.marker))
-            .or_else(|| tags::extract_scratchpad(raw_text))
+        self.parse_scratchpad_normalized(&normalized, raw_text)
     }
 
-    /// Extracts the terminal outcome strictly bound to the active turn marker.
-    ///
-    /// Terminal outcomes determine control flow and must never fall back to
-    /// unmarked tags quoted in source code or explanations.
-    pub fn parse_terminal_outcome(&self, raw_text: &str) -> Option<TerminalOutcome> {
-        let normalized = normalize_marked_xml(raw_text, &self.marker, true);
-        let outcome = tags::extract_terminal_outcome(&normalized)?;
+    /// Extracts the terminal outcome from pre-normalized text.
+    pub fn parse_terminal_outcome_normalized(&self, normalized: &str) -> Option<TerminalOutcome> {
+        let outcome = tags::extract_terminal_outcome(normalized)?;
         Some(match outcome {
             TerminalOutcome::Success { summary } => TerminalOutcome::Success {
                 summary: summary.map(|s| restore_xml_literals(&s, &self.marker)),
             },
             TerminalOutcome::Error { message } => TerminalOutcome::Error {
                 message: restore_xml_literals(&message, &self.marker),
+            },
+            TerminalOutcome::Skip { reason } => TerminalOutcome::Skip {
+                reason: restore_xml_literals(&reason, &self.marker),
             },
             TerminalOutcome::Blocked { reason, details } => TerminalOutcome::Blocked {
                 reason: restore_xml_literals(&reason, &self.marker),
@@ -140,10 +185,24 @@ impl MarkedXmlEditProtocol {
         })
     }
 
+    /// Extracts the terminal outcome strictly bound to the active turn marker.
+    ///
+    /// Terminal outcomes determine control flow and must never fall back to
+    /// unmarked tags quoted in source code or explanations.
+    pub fn parse_terminal_outcome(&self, raw_text: &str) -> Option<TerminalOutcome> {
+        let normalized = normalize_marked_xml(raw_text, &self.marker, true);
+        self.parse_terminal_outcome_normalized(&normalized)
+    }
+
+    /// Extracts a blocker or error message from pre-normalized text.
+    pub fn parse_error_normalized(&self, normalized: &str) -> Option<String> {
+        tags::extract_error(normalized).map(|message| restore_xml_literals(&message, &self.marker))
+    }
+
     /// Extracts a blocker or error message bound to the active turn marker.
     pub fn parse_error(&self, raw_text: &str) -> Option<String> {
         let normalized = normalize_marked_xml(raw_text, &self.marker, true);
-        tags::extract_error(&normalized).map(|message| restore_xml_literals(&message, &self.marker))
+        self.parse_error_normalized(&normalized)
     }
 
     /// Cleans model output, stripping terminal outcome and scratchpad tags.
@@ -175,9 +234,9 @@ impl MarkedXmlEditProtocol {
     /// Code edits must carry the active turn marker. Unmarked edit blocks in
     /// conversation or source code are treated as literals, preventing injection
     /// or unintentional patch application.
-    pub fn parse_output(&self, raw_text: &str, editable_paths: &[String]) -> ModelResult {
-        let normalized = normalize_marked_xml(raw_text, &self.marker, true);
-        let mut result = XmlEditProtocol.parse_output(&normalized, editable_paths);
+    /// Parses pre-normalized model text into a `ModelResult`.
+    pub fn parse_output_normalized(&self, normalized: &str, editable_paths: &[String]) -> ModelResult {
+        let mut result = XmlEditProtocol.parse_output(normalized, editable_paths);
         match &mut result {
             ModelResult::Answer { text } => *text = restore_xml_literals(text, &self.marker),
             ModelResult::Edit { summary, edits, proposal, outcome, .. } => {
@@ -210,7 +269,7 @@ impl MarkedXmlEditProtocol {
                     }
                 }
                 let message =
-                    restore_xml_literals(&extract_conversational_text(&normalized), &self.marker);
+                    restore_xml_literals(&extract_conversational_text(normalized), &self.marker);
                 *proposal = Some(tauqe_protocol::ModelResultProposal {
                     message,
                     ..Default::default()
@@ -218,6 +277,11 @@ impl MarkedXmlEditProtocol {
             }
         }
         result
+    }
+
+    pub fn parse_output(&self, raw_text: &str, editable_paths: &[String]) -> ModelResult {
+        let normalized = normalize_marked_xml(raw_text, &self.marker, true);
+        self.parse_output_normalized(&normalized, editable_paths)
     }
 }
 

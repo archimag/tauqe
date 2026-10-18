@@ -267,3 +267,66 @@ pub fn compute_model_lines(model: &mut ReplView) -> Vec<Line<'static>> {
 
     model_lines
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_compute_model_lines_empty_when_splash_visible() {
+        let mut model = ReplView::default();
+        assert!(model.splash_visible());
+        let lines = compute_model_lines(&mut model);
+        assert!(
+            lines.is_empty(),
+            "splash state must leave model lines empty as splash is rendered separately"
+        );
+    }
+
+    #[test]
+    fn test_compute_model_lines_yields_on_output() {
+        let mut model = ReplView {
+            text: "Hello from model".to_string(),
+            ..ReplView::default()
+        };
+        assert!(!model.splash_visible());
+        let lines = compute_model_lines(&mut model);
+        assert!(!lines.is_empty());
+        let rendered: String = lines[0]
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(rendered, "Hello from model");
+    }
+
+    #[test]
+    fn test_compute_model_lines_yields_on_error() {
+        let mut model = ReplView {
+            error: Some("Failed to connect".to_string()),
+            ..ReplView::default()
+        };
+        assert!(!model.splash_visible());
+        let lines = compute_model_lines(&mut model);
+        assert!(!lines.is_empty());
+        assert!(lines
+            .iter()
+            .any(|l| l.spans.iter().any(|s| s.content.contains("Failed to connect"))));
+    }
+
+    #[test]
+    fn test_compute_model_lines_yields_on_toolchain() {
+        let mut model = ReplView {
+            toolchain: Some(ToolchainState::Running {
+                command: "cargo check".to_string(),
+            }),
+            ..ReplView::default()
+        };
+        assert!(!model.splash_visible());
+        let lines = compute_model_lines(&mut model);
+        assert!(!lines.is_empty());
+        assert!(lines
+            .iter()
+            .any(|l| l.spans.iter().any(|s| s.content.contains("cargo check"))));
+    }
+}

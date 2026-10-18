@@ -541,6 +541,8 @@ pub enum LlmOutcome {
     Success { summary: Option<String> },
     /// The task is blocked, with an explanatory message.
     Error { message: String },
+    /// The task is skipped, with an explanatory reason.
+    Skip { reason: String },
 }
 
 #[cfg(test)]
@@ -727,6 +729,30 @@ mod tests {
         let json = serde_json::to_string(&error).unwrap();
         assert!(json.contains("\"status\":\"error\""));
         assert_eq!(serde_json::from_str::<LlmCommand>(&json).unwrap(), error);
+
+        let skip = LlmCommand::Outcome {
+            outcome: LlmOutcome::Skip {
+                reason: "Already implemented".to_string(),
+            },
+        };
+        let json = serde_json::to_string(&skip).unwrap();
+        assert!(json.contains("\"status\":\"skip\""));
+        assert!(json.contains("\"reason\":\"Already implemented\""));
+        assert_eq!(serde_json::from_str::<LlmCommand>(&json).unwrap(), skip);
+    }
+
+    #[test]
+    fn test_llm_outcome_skip_serde_roundtrip() {
+        let skip = LlmOutcome::Skip {
+            reason: "Requirements already met".to_string(),
+        };
+        let json = serde_json::to_string(&skip).unwrap();
+        assert_eq!(
+            json,
+            "{\"status\":\"skip\",\"reason\":\"Requirements already met\"}"
+        );
+        let decoded: LlmOutcome = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, skip);
     }
 
     #[test]

@@ -357,6 +357,50 @@ pub async fn handle_mouse_event(
                         st.review_dialog = Some(dialog);
                     }
                 }
+                Some(ActiveModal::ReviewRefine) => {
+                    if let Some(mut dialog) = st.review.refine_dialog.take() {
+                        let geo = crate::dialogs::render::refine::refine_dialog_geometry(
+                            term_rect,
+                            dialog.selector.len(),
+                        );
+
+                        if rect_contains(geo.confirm_button, mouse.column, mouse.row) {
+                            crate::dialogs::input::submit_review_refine_dialog(
+                                state,
+                                st,
+                                dialog,
+                                server_writer,
+                            )
+                            .await?;
+                            return Ok(InputResult::Continue);
+                        }
+
+                        if rect_contains(geo.cancel_button, mouse.column, mouse.row)
+                            || !rect_contains(geo.area, mouse.column, mouse.row)
+                        {
+                            // Safe cancellation: dismiss without starting a turn.
+                            return Ok(InputResult::Continue);
+                        }
+
+                        // Clicking an architect row selects it and moves focus to
+                        // the list, mirroring keyboard navigation.
+                        if rect_contains(geo.model_rows, mouse.column, mouse.row) {
+                            let visible = geo.model_rows.height as usize;
+                            let start = dialog.selector.visible_start(visible);
+                            let clicked_row = (mouse.row - geo.model_rows.y) as usize;
+                            let index = start + clicked_row;
+                            if index < dialog.selector.len() {
+                                dialog.selector.select_index(index);
+                            }
+                            dialog.focus = crate::views::plans::RefineDialogFocus::ModelList;
+                        } else if rect_contains(geo.editor_area, mouse.column, mouse.row) {
+                            dialog.focus =
+                                crate::views::plans::RefineDialogFocus::InstructionsEditor;
+                        }
+
+                        st.review.refine_dialog = Some(dialog);
+                    }
+                }
                 Some(ActiveModal::ConfirmCancel) => {
                     if st.confirm_cancel {
                         let geom = geometry_of(
@@ -561,6 +605,59 @@ pub async fn handle_mouse_event(
                     }
                 }
                 Some(ActiveModal::ExecuteReview) => {
+                    // Point execution draws the Coder form dialog, whose action
+                    // buttons, model rows, and editor area come from one geometry
+                    // source shared with the renderer (Conventions §6, §7).
+                    let single_target = st
+                        .confirm_execute_review
+                        .as_ref()
+                        .is_some_and(|target| target.is_single_target());
+                    if single_target {
+                        if let Some(mut target) = st.confirm_execute_review.take() {
+                            let geo = crate::dialogs::render::execute_review_dialog_geometry(
+                                term_rect,
+                                target.selector.len(),
+                            );
+
+                            if rect_contains(geo.confirm_button, mouse.column, mouse.row) {
+                                st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
+                                crate::dialogs::input::confirm_execute_review(
+                                    state,
+                                    st,
+                                    server_writer,
+                                    target,
+                                )
+                                .await?;
+                                return Ok(InputResult::Continue);
+                            }
+
+                            if rect_contains(geo.cancel_button, mouse.column, mouse.row)
+                                || !rect_contains(geo.area, mouse.column, mouse.row)
+                            {
+                                // Safe cancellation: dismiss without a turn.
+                                st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
+                                return Ok(InputResult::Continue);
+                            }
+
+                            if rect_contains(geo.model_rows, mouse.column, mouse.row) {
+                                let visible = geo.model_rows.height as usize;
+                                let start = target.selector.visible_start(visible);
+                                let clicked_row = (mouse.row - geo.model_rows.y) as usize;
+                                let index = start + clicked_row;
+                                if index < target.selector.len() {
+                                    target.selector.select_index(index);
+                                }
+                                target.focus =
+                                    crate::views::plans::RefineDialogFocus::ModelList;
+                            } else if rect_contains(geo.editor_area, mouse.column, mouse.row) {
+                                target.focus =
+                                    crate::views::plans::RefineDialogFocus::InstructionsEditor;
+                            }
+
+                            st.confirm_execute_review = Some(target);
+                        }
+                        return Ok(InputResult::Continue);
+                    }
                     if let Some(target) = st.confirm_execute_review.clone() {
                         let geom = match crate::dialogs::render::execute_review_params(&st) {
                             Some(params) => geometry_of(term_rect, &params),
@@ -1130,23 +1227,43 @@ mod tests {
         );
     }
 
+    /// A click on the point-execution `Resolve` button must launch the same
+    /// bounded Coder turn the keyboard confirmation starts.
     #[tokio::test]
     async fn execute_review_confirm_click_launches_turn() {
         let mut st = crate::app::test_state();
         st.view_mode = ViewMode::Review;
         st.last_frame_area = Rect::new(0, 0, 100, 30);
-        st.confirm_execute_review = Some(crate::app::ConfirmExecuteReviewState {
-            review_id: Some("rev-1".to_string()),
-            review_title: "Session rev-1".to_string(),
-            scope_title: "All remaining TODO findings".to_string(),
-            item_id: Some(1),
-            items: vec![],
-        });
+        let entries = st.coder_entries();
+        st.confirm_execute_review = Some(crate::app::ConfirmExecuteReviewState::new(
+            Some("rev-1".to_string()),
+            "Session rev-1".to_string(),
+            "All remaining TODO findings".to_string(),
+            Some(1),
+            None,
+            vec![tauqe_protocol::ReviewIssue {
+                id: 1,
+                title: "Finding".to_string(),
+                model: None,
+                issue_type: tauqe_protocol::IssueType::Architecture,
+                status: tauqe_protocol::IssueStatus::Todo,
+                description: String::new(),
+                recommendations: Vec::new(),
+                files: Vec::new(),
+                readonly_files: Vec::new(),
+                plan: Vec::new(),
+                note: None,
+            }],
+            entries,
+        ));
 
         let term = st.last_frame_area;
-        let geom = crate::dialogs::render::execute_review_params(&st)
-            .map(|p| geometry_of(term, &p))
-            .unwrap();
+        let entry_count = st
+            .confirm_execute_review
+            .as_ref()
+            .map(|target| target.selector.len())
+            .unwrap_or(0);
+        let geom = crate::dialogs::render::execute_review_dialog_geometry(term, entry_count);
 
         let mouse = MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
@@ -1211,5 +1328,124 @@ mod tests {
 
         let st = state.lock().await;
         assert!(st.locale_dialog.is_none());
+    }
+
+    fn architect_entry(name: &str) -> tauqe_protocol::ModelEntry {
+        tauqe_protocol::ModelEntry::new(tauqe_protocol::ModelRef::openrouter(name), None, None)
+    }
+
+    fn state_with_review_refine_dialog() -> crate::app::AppState {
+        let mut st = crate::app::test_state();
+        st.last_frame_area = Rect::new(0, 0, 120, 40);
+        st.review.refine_dialog = Some(crate::views::review::ReviewRefineDialogState::new(
+            "rev-1".to_string(),
+            "Session rev-1".to_string(),
+            2,
+            "Missing auth guard".to_string(),
+            vec![architect_entry("arch-a"), architect_entry("arch-b")],
+        ));
+        st
+    }
+
+    fn left_click(column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column,
+            row,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        }
+    }
+
+    /// A click on the review-refine `Start Refinement` button must launch the
+    /// same `review/refineItem` request the keyboard confirm does.
+    #[tokio::test]
+    async fn review_refine_confirm_click_submits_the_request() {
+        let st = state_with_review_refine_dialog();
+        let geo = crate::dialogs::render::refine::refine_dialog_geometry(st.last_frame_area, 2);
+        let mouse = left_click(geo.confirm_button.x + 1, geo.confirm_button.y);
+
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+        let res = handle_mouse_event(mouse, &state, &mut conn).await.unwrap();
+        assert_eq!(res, InputResult::Continue);
+
+        let payload = String::from_utf8(conn.written().to_vec()).expect("utf-8 payload");
+        assert!(payload.contains("review/refineItem"), "{payload}");
+
+        let guard = state.lock().await;
+        assert!(guard.review.refine_dialog.is_none());
+        assert_eq!(guard.review.refining.as_deref(), Some("rev-1"));
+    }
+
+    /// A click on the `Cancel` button must dismiss the dialog without sending a
+    /// request, leaving the Review view idle.
+    #[tokio::test]
+    async fn review_refine_cancel_click_dismisses_without_a_request() {
+        let st = state_with_review_refine_dialog();
+        let geo = crate::dialogs::render::refine::refine_dialog_geometry(st.last_frame_area, 2);
+        let mouse = left_click(geo.cancel_button.x + 1, geo.cancel_button.y);
+
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+        let res = handle_mouse_event(mouse, &state, &mut conn).await.unwrap();
+        assert_eq!(res, InputResult::Continue);
+
+        let guard = state.lock().await;
+        assert!(guard.review.refine_dialog.is_none());
+        assert!(guard.review.refining.is_none());
+        assert!(conn.written().is_empty());
+    }
+
+    /// Clicking an architect row selects that model and moves focus to the
+    /// list, mirroring keyboard list navigation.
+    #[tokio::test]
+    async fn review_refine_model_row_click_selects_and_focuses_the_list() {
+        let st = state_with_review_refine_dialog();
+        let geo = crate::dialogs::render::refine::refine_dialog_geometry(st.last_frame_area, 2);
+        let mouse = left_click(geo.model_rows.x + 1, geo.model_rows.y + 1);
+
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+        let res = handle_mouse_event(mouse, &state, &mut conn).await.unwrap();
+        assert_eq!(res, InputResult::Continue);
+
+        let guard = state.lock().await;
+        let dialog = guard
+            .review
+            .refine_dialog
+            .as_ref()
+            .expect("dialog stays open");
+        assert_eq!(dialog.selector.selected_index(), 1);
+        assert_eq!(
+            dialog.focus,
+            crate::views::plans::RefineDialogFocus::ModelList
+        );
+        assert!(conn.written().is_empty());
+    }
+
+    /// Clicking the instructions area must move focus there so the next
+    /// keystroke edits the clicked field.
+    #[tokio::test]
+    async fn review_refine_editor_click_moves_focus_and_keeps_the_dialog() {
+        let st = state_with_review_refine_dialog();
+        let geo = crate::dialogs::render::refine::refine_dialog_geometry(st.last_frame_area, 2);
+        let mouse = left_click(geo.editor_area.x + 1, geo.editor_area.y + 1);
+
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+        let res = handle_mouse_event(mouse, &state, &mut conn).await.unwrap();
+        assert_eq!(res, InputResult::Continue);
+
+        let guard = state.lock().await;
+        let dialog = guard
+            .review
+            .refine_dialog
+            .as_ref()
+            .expect("dialog stays open");
+        assert_eq!(
+            dialog.focus,
+            crate::views::plans::RefineDialogFocus::InstructionsEditor
+        );
+        assert!(conn.written().is_empty());
     }
 }

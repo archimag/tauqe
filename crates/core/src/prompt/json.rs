@@ -203,6 +203,11 @@ impl PromptProtocol for JsonPromptProtocol {
                         outcome: LlmOutcome::Error { message },
                     });
                 }
+                TerminalOutcome::Skip { reason } => {
+                    commands.push(LlmCommand::Outcome {
+                        outcome: LlmOutcome::Skip { reason },
+                    });
+                }
                 TerminalOutcome::Blocked { .. } => {}
             }
         }
@@ -268,7 +273,9 @@ impl PromptProtocol for JsonPromptProtocol {
         editable_paths: &[String],
     ) -> Option<crate::providers::ResponseFormat> {
         match &self.mode {
-            JsonPromptMode::Edits => StructuredEditProtocol.response_format(editable_paths),
+            JsonPromptMode::Edits => {
+                StructuredEditProtocol.response_format_for(&self.capabilities, editable_paths)
+            }
             JsonPromptMode::Discussion { .. } => {
                 Some(crate::providers::ResponseFormat::JsonSchema {
                     json_schema: crate::providers::JsonSchemaDefinition {

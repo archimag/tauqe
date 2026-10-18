@@ -130,22 +130,22 @@ mod tests {
     use super::*;
     use crate::app::{StatusDialogState, StatusDialogTarget};
     use crate::views::review::ReviewViewState;
-    use tauqe_protocol::{ReviewItem, ReviewItemStatus, ReviewSeverity, ReviewSession};
+    use tauqe_protocol::{IssueType, ReviewIssue, ReviewItem, ReviewItemStatus, ReviewSession};
 
     fn item(id: u32) -> ReviewItem {
-        ReviewItem {
+        ReviewItem::from(ReviewIssue {
             id,
             title: format!("Finding {id}"),
             model: None,
-            severity: ReviewSeverity::Warning,
+            issue_type: IssueType::Architecture,
             status: ReviewItemStatus::Todo,
+            description: String::new(),
             recommendations: Vec::new(),
             files: Vec::new(),
             readonly_files: Vec::new(),
-            subplan: Vec::new(),
-            resolution_notes: None,
-            body: String::new(),
-        }
+            plan: Vec::new(),
+            note: None,
+        })
     }
 
     fn session(id: &str) -> ReviewSession {

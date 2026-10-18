@@ -21,8 +21,9 @@ pub use docs::strip_doc_request_tags;
 pub use search::strip_repo_search_tags;
 pub use language::{extract_user_language, strip_user_language_tags};
 pub use outcome::{
-    extract_blocked, extract_error, extract_success, extract_terminal_outcome, strip_blocked_tags,
-    strip_error_tags, strip_success_tags, strip_terminal_outcome_tags, TerminalOutcome,
+    extract_blocked, extract_error, extract_skip, extract_success, extract_terminal_outcome,
+    strip_blocked_tags, strip_error_tags, strip_skip_tags, strip_success_tags,
+    strip_terminal_outcome_tags, TerminalOutcome,
 };
 pub use plan::{
     parse_plan_tags_with_diagnostics, strip_plan_tags, ParsedPlanItem, ParsedPlanTag,
@@ -90,75 +91,108 @@ fn is_inside_inline_code(text: &str, target_pos: usize) -> bool {
     false
 }
 
-/// Returns true if byte offset `target_pos` in `text` is inside a markdown fenced code block (``` or ~~~).
-fn is_inside_code_fence(text: &str, target_pos: usize) -> bool {
-    let mut in_fence: Option<(char, usize)> = None;
-    let mut line_start = 0;
-
-    while line_start < text.len() {
-        let (line, next_line_start) = match text[line_start..].find('\n') {
-            Some(nl) => (&text[line_start..line_start + nl], line_start + nl + 1),
-            None => (&text[line_start..], text.len()),
-        };
-        let line_trimmed_cr = line.strip_suffix('\r').unwrap_or(line);
-        let trimmed = line_trimmed_cr.trim_start();
-        let leading_spaces = line_trimmed_cr.len() - trimmed.len();
-
-        let is_fence_line = if leading_spaces <= 3 {
-            match trimmed.chars().next() {
-                Some(ch @ ('`' | '~')) => {
-                    let count = trimmed.chars().take_while(|&c| c == ch).count();
-                    if count >= 3 {
-                        Some((ch, count))
-                    } else {
-                        None
-                    }
-                }
-                _ => None,
-            }
-        } else {
-            None
-        };
-
-        if let Some((ch, count)) = is_fence_line {
-            if let Some((active_ch, active_count)) = in_fence {
-                if ch == active_ch && count >= active_count {
-                    if target_pos >= line_start && target_pos < next_line_start {
-                        return true;
-                    }
-                    in_fence = None;
-                    line_start = next_line_start;
-                    continue;
-                }
-            } else {
-                if target_pos >= line_start && target_pos < next_line_start {
-                    return true;
-                }
-                in_fence = Some((ch, count));
-                line_start = next_line_start;
-                continue;
-            }
-        }
-
-        if in_fence.is_some() && target_pos >= line_start && target_pos < next_line_start {
-            return true;
-        }
-
-        if line_start > target_pos {
-            break;
-        }
-
-        line_start = next_line_start;
-    }
-
-    in_fence.is_some() && target_pos >= line_start
+/// Sorted, non-overlapping byte ranges covered by markdown fenced code blocks.
+///
+/// An interval is half-open: `start <= pos < end` means `pos` belongs to a
+/// block. It starts at the first byte of the opening fence line and ends after
+/// the closing fence line, or at `text.len()` when the block is never closed.
+#[derive(Debug)]
+pub(crate) struct CodeFences {
+    intervals: Vec<(usize, usize)>,
 }
 
-/// Returns true if byte offset `target_pos` in `text` is inside a markdown code block (fenced or inline).
+impl CodeFences {
+    /// Single pass over `text` that records every fenced code block.
+    ///
+    /// The CommonMark rules that matter for tag detection are enforced: a fence
+    /// is indented by at most three spaces, is built from at least three
+    /// backticks or tildes, and only a fence with the same character, at least
+    /// as long as the opening one, and free of trailing content closes a block.
+    /// An unterminated fence extends to the end of `text`.
+    pub(crate) fn find(text: &str) -> Self {
+        let mut intervals: Vec<(usize, usize)> = Vec::new();
+        let mut open: Option<(char, usize, usize)> = None;
+        let mut line_start = 0;
+
+        while line_start < text.len() {
+            let line_end = text[line_start..]
+                .find('\n')
+                .map_or(text.len(), |nl| line_start + nl);
+            let next_line_start = (line_end + 1).min(text.len());
+            let raw_line = &text[line_start..line_end];
+            let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
+            let trimmed = line.trim_start();
+            let indent = line.len() - trimmed.len();
+            let marker = if indent <= 3 {
+                fence_marker(trimmed)
+            } else {
+                None
+            };
+
+            match (open, marker) {
+                (Some((open_ch, open_len, start)), Some((ch, len, rest)))
+                    if ch == open_ch && len >= open_len && rest.trim().is_empty() =>
+                {
+                    intervals.push((start, next_line_start));
+                    open = None;
+                }
+                (None, Some((ch, len, _))) => open = Some((ch, len, line_start)),
+                _ => {}
+            }
+
+            line_start = next_line_start;
+        }
+
+        if let Some((_, _, start)) = open {
+            intervals.push((start, text.len()));
+        }
+
+        Self { intervals }
+    }
+
+    /// Returns true when `target_pos` falls inside any recorded block.
+    ///
+    /// Intervals are sorted and disjoint, so the lookup is a binary search
+    /// costing `O(log K)` for `K` blocks and ends immediately when none exist.
+    pub(crate) fn is_inside(&self, target_pos: usize) -> bool {
+        let idx = self
+            .intervals
+            .partition_point(|&(start, _)| start <= target_pos);
+        match idx.checked_sub(1).and_then(|i| self.intervals.get(i)) {
+            Some(&(_, end)) => target_pos < end,
+            None => false,
+        }
+    }
+}
+
+/// Splits the start of a trimmed line into `(fence char, fence length, rest)`.
 ///
-/// Shared with the tag engine, which refuses to treat code samples as commands.
-pub(crate) fn is_inside_markdown_code(text: &str, target_pos: usize) -> bool {
-    is_inside_code_fence(text, target_pos) || is_inside_inline_code(text, target_pos)
+/// Returns `None` when the line does not open with at least three identical
+/// backticks or tildes. `rest` keeps the remainder of the line so a caller can
+/// tell an opening info string from forbidden closing-fence content.
+fn fence_marker(trimmed: &str) -> Option<(char, usize, &str)> {
+    let ch = trimmed.chars().next()?;
+    if ch != '`' && ch != '~' {
+        return None;
+    }
+    let len = trimmed.chars().take_while(|&c| c == ch).count();
+    if len < 3 {
+        return None;
+    }
+    Some((ch, len, &trimmed[len..]))
+}
+
+/// Returns true if byte offset `target_pos` in `text` is inside a markdown code block.
+///
+/// Fenced blocks come from a precomputed [`CodeFences`] index, so a caller that
+/// probes many offsets pays for a single scan; inline spans are checked on the
+/// spot for the queried position.
+pub(crate) fn is_inside_markdown_code_with_fences(
+    text: &str,
+    target_pos: usize,
+    fences: &CodeFences,
+) -> bool {
+    fences.is_inside(target_pos) || is_inside_inline_code(text, target_pos)
 }
 
 #[cfg(test)]
@@ -305,5 +339,108 @@ Real outcome:
         assert!(stripped.contains("<success summary=\"Mock success\" />"));
         assert!(stripped.contains("`<error message=\"inline\" />`"));
         assert!(!stripped.contains("<error message=\"Real blocker\" />"));
+    }
+
+    #[test]
+    fn code_fences_record_nothing_without_blocks() {
+        let fences = CodeFences::find("plain text\nwith `inline` spans");
+        assert!(fences.intervals.is_empty());
+        assert!(!fences.is_inside(0));
+        assert!(!fences.is_inside(11));
+    }
+
+    #[test]
+    fn code_fences_record_single_block() {
+        let text = "intro\n```\ncode\n```\noutro";
+        let fences = CodeFences::find(text);
+        assert_eq!(fences.intervals, vec![(6, 19)]);
+        assert!(!fences.is_inside(5));
+        assert!(fences.is_inside(6));
+        assert!(fences.is_inside(18));
+        assert!(!fences.is_inside(19));
+    }
+
+    #[test]
+    fn code_fences_record_multiple_blocks_with_both_markers() {
+        let text = "```\na\n```\nmid\n~~~\nb\n~~~\ntail";
+        let fences = CodeFences::find(text);
+        assert_eq!(fences.intervals, vec![(0, 10), (14, 24)]);
+        assert!(fences.is_inside(0));
+        assert!(!fences.is_inside(10));
+        assert!(!fences.is_inside(13));
+        assert!(fences.is_inside(14));
+        assert!(fences.is_inside(23));
+        assert!(!fences.is_inside(24));
+    }
+
+    #[test]
+    fn code_fences_extend_unclosed_block_to_end() {
+        let text = "note\n```\nstill open";
+        let fences = CodeFences::find(text);
+        assert_eq!(fences.intervals, vec![(5, text.len())]);
+        assert!(fences.is_inside(5));
+        assert!(fences.is_inside(text.len() - 1));
+        assert!(!fences.is_inside(text.len()));
+    }
+
+    #[test]
+    fn code_fences_require_matching_closing_marker() {
+        let text = "````\n```\n````\n";
+        let fences = CodeFences::find(text);
+        assert_eq!(fences.intervals, vec![(0, text.len())]);
+        assert!(fences.is_inside(6));
+        assert!(fences.is_inside(9));
+        assert!(!fences.is_inside(text.len()));
+    }
+
+    #[test]
+    fn code_fences_ignore_other_marker_character() {
+        let text = "```\n~~~~\n```\n";
+        let fences = CodeFences::find(text);
+        assert_eq!(fences.intervals, vec![(0, 13)]);
+        assert!(fences.is_inside(4));
+        assert!(!fences.is_inside(13));
+    }
+
+    #[test]
+    fn code_fences_allow_at_most_three_spaces_of_indent() {
+        let text = "   ```\nx\n   ```";
+        let fences = CodeFences::find(text);
+        assert_eq!(fences.intervals, vec![(0, text.len())]);
+        assert!(fences.is_inside(text.len() - 1));
+
+        let deep = "    ```\nx\n    ```";
+        let deep_fences = CodeFences::find(deep);
+        assert!(deep_fences.intervals.is_empty());
+        assert!(!deep_fences.is_inside(5));
+    }
+
+    #[test]
+    fn code_fences_reject_closing_line_with_trailing_content() {
+        let text = "```\n```rust\n```\n";
+        let fences = CodeFences::find(text);
+        assert_eq!(fences.intervals, vec![(0, 16)]);
+    }
+
+    #[test]
+    fn code_fences_handle_multibyte_offsets() {
+        let text = "привет\n```\nкод\n```";
+        let fences = CodeFences::find(text);
+        assert_eq!(fences.intervals, vec![(13, text.len())]);
+        assert!(!fences.is_inside(12));
+        assert!(fences.is_inside(13));
+        assert!(fences.is_inside(text.len() - 1));
+    }
+
+    #[test]
+    fn markdown_code_combines_fences_and_inline_spans() {
+        let text = "inline `x` here\n```\nfenced\n```";
+        let fences = CodeFences::find(text);
+        let fenced_pos = text.find("fenced").unwrap();
+
+        assert!(is_inside_markdown_code_with_fences(text, 8, &fences));
+        assert!(!fences.is_inside(8));
+        assert!(is_inside_markdown_code_with_fences(text, fenced_pos, &fences));
+        assert!(!is_inside_markdown_code_with_fences(text, 0, &fences));
     }
 }

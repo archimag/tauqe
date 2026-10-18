@@ -12,9 +12,11 @@ use crate::views::history::HistoryViewState;
 use crate::views::repl::{ReplView, TurnStatus};
 
 mod confirm;
+mod execute_review;
 mod locale;
 mod prompt;
 mod refine;
+mod review_refine;
 mod selection;
 mod status;
 
@@ -22,6 +24,7 @@ use confirm::{resolve_batch_cancel, resolve_confirm, BatchCancelOutcome, Confirm
 pub(crate) use locale::click_locale_button;
 pub(crate) use prompt::submit_prompt_modal;
 pub(crate) use refine::{submit_refine_blocked, submit_refine_dialog};
+pub(crate) use review_refine::submit_review_refine_dialog;
 pub(crate) use selection::activate_selection_item;
 pub(crate) use status::apply_status_dialog;
 
@@ -162,9 +165,31 @@ pub(crate) async fn confirm_execute_review(
     server_writer: &mut RpcConnection,
     target: crate::app::ConfirmExecuteReviewState,
 ) -> anyhow::Result<()> {
+    // Point execution carries the developer's explicit Coder choice and
+    // directives; a batch runs autonomously on the configured role defaults
+    // (concept #c-3).
+    let single = target.is_single_target();
+    let instructions = {
+        let text = target.instructions_editor.get_text().trim().to_string();
+        if single && !text.is_empty() {
+            Some(text)
+        } else {
+            None
+        }
+    };
+    let model = if single {
+        target
+            .selected_entry()
+            .map(|entry| tauqe_protocol::ModelSelection::Specific(entry.model.clone()))
+    } else {
+        None
+    };
     let params = tauqe_protocol::ReviewExecuteParams {
         review_id: target.review_id,
         item_id: target.item_id,
+        step_id: target.step_id,
+        model,
+        instructions,
     };
     let params = serde_json::to_value(params)?;
     start_turn(
@@ -474,6 +499,17 @@ pub(crate) async fn handle_dialog_event(
                         };
                         st.review_dialog = Some(dialog);
                     }
+                    // Fast accelerators mirror the shared dialog vocabulary. They
+                    // are limited to the action bar so bare letters stay literal
+                    // text inside the path and prompt editors (Conventions §3, §5).
+                    Some(DialogCommand::ConfirmFast) if dialog.focus.is_actions() => {
+                        let params = serde_json::to_value(dialog.start_params())?;
+                        confirm_start_review(state, st, server_writer, params).await?;
+                        return Ok(Some(InputResult::Continue));
+                    }
+                    Some(DialogCommand::CancelFast) if dialog.focus.is_actions() => {
+                        // Safe cancellation: drop the dialog without a request.
+                    }
                     Some(DialogCommand::Activate) if dialog.focus.is_actions() => {
                         // Starting a review is a long-running operation: it
                         // begins only from the focused `Confirm` button. The safe
@@ -647,6 +683,21 @@ pub(crate) async fn handle_dialog_event(
             return Ok(Some(InputResult::Continue));
         }
         Some(ActiveModal::ExecuteReview) => {
+            // Point execution is a form dialog (Coder selector, directives,
+            // action buttons); only the batch queue is a binary confirmation.
+            let single_target = st
+                .confirm_execute_review
+                .as_ref()
+                .is_some_and(|target| target.is_single_target());
+            if single_target {
+                return execute_review::handle_execute_review_dialog(
+                    key,
+                    state,
+                    st,
+                    server_writer,
+                )
+                .await;
+            }
             if let Some(target) = st.confirm_execute_review.take() {
                 match resolve_confirm(&mut st, key) {
                     ConfirmOutcome::Toggled => st.confirm_execute_review = Some(target),
@@ -675,6 +726,9 @@ pub(crate) async fn handle_dialog_event(
         }
         Some(ActiveModal::RefineBlocked) => {
             return refine::handle_refine_blocked(key, state, st, server_writer).await;
+        }
+        Some(ActiveModal::ReviewRefine) => {
+            return review_refine::handle_review_refine_dialog(key, state, st, server_writer).await;
         }
         Some(ActiveModal::Prompt) => {
             return prompt::handle_prompt_modal(key, st, server_writer).await;
@@ -829,13 +883,17 @@ mod tests {
     }
 
     fn execute_review_target() -> ConfirmExecuteReviewState {
-        ConfirmExecuteReviewState {
-            review_id: Some("rev-1".to_string()),
-            review_title: "Session rev-1".to_string(),
-            scope_title: "All remaining TODO findings".to_string(),
-            item_id: Some(1),
-            items: vec![review_issue(1)],
-        }
+        // Two findings: the batch confirmation shape, which keeps the binary
+        // confirm/cancel vocabulary under test here.
+        ConfirmExecuteReviewState::new(
+            Some("rev-1".to_string()),
+            "Session rev-1".to_string(),
+            "All remaining TODO findings".to_string(),
+            None,
+            None,
+            vec![review_issue(1), review_issue(2)],
+            Vec::new(),
+        )
     }
 
     /// Drives the ExecuteReview confirmation through `handle_dialog_event` and

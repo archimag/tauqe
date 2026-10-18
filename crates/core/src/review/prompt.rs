@@ -21,11 +21,10 @@ pub use refine::{
     build_review_refine_system_prompt, build_review_refine_user_prompt, MAX_REVIEW_SUBPLAN_DEPTH,
 };
 pub use step::{
-    extract_review_skip_reason, extract_review_step_execution_id,
-    extract_review_step_execution_target, format_review_step_execution_prompt,
-    format_review_step_failure_note, format_review_step_retry_prompt,
-    is_review_step_execution_prompt, ReviewStepFailure, ReviewStepTarget,
-    REVIEW_STEP_EXECUTION_PREFIX, REVIEW_STEP_RETRY_PREFIX,
+    extract_review_step_execution_id, extract_review_step_execution_target,
+    format_review_step_execution_prompt, format_review_step_failure_note,
+    format_review_step_retry_prompt, is_review_step_execution_prompt, ReviewStepFailure,
+    ReviewStepTarget, REVIEW_STEP_EXECUTION_PREFIX, REVIEW_STEP_RETRY_PREFIX,
 };
 
 #[cfg(test)]
@@ -57,7 +56,7 @@ mod tests {
 
     #[test]
     fn test_format_review_step_execution_prompt_with_subplan() {
-        use tauqe_protocol::review::{ReviewItem, ReviewItemStatus, ReviewSeverity};
+        use tauqe_protocol::review::{IssueType, ReviewItem, ReviewItemStatus};
         use tauqe_protocol::PlanItemStatus;
 
         let session = ReviewSession {
@@ -72,7 +71,8 @@ mod tests {
                 id: 1,
                 title: "Refactor architecture".to_string(),
                 model: None,
-                severity: ReviewSeverity::Warning,
+                issue_type: IssueType::Architecture,
+                severity: tauqe_protocol::ReviewSeverity::Warning,
                 status: ReviewItemStatus::Todo,
                 recommendations: vec![],
                 files: vec!["crates/core/src/lib.rs".to_string()],
@@ -101,7 +101,7 @@ mod tests {
 
     #[test]
     fn test_build_review_finding_refine_prompts() {
-        use tauqe_protocol::review::{ReviewItem, ReviewItemStatus, ReviewSeverity};
+        use tauqe_protocol::review::{IssueType, ReviewItem, ReviewItemStatus};
 
         let session = ReviewSession {
             id: "rev-ref".to_string(),
@@ -115,7 +115,8 @@ mod tests {
                 id: 42,
                 title: "Decompose this issue".to_string(),
                 model: None,
-                severity: ReviewSeverity::Critical,
+                issue_type: IssueType::Bug,
+                severity: tauqe_protocol::ReviewSeverity::Critical,
                 status: ReviewItemStatus::Discussion,
                 recommendations: vec![],
                 files: vec!["crates/core/src/lib.rs".to_string()],
@@ -146,7 +147,7 @@ mod tests {
 
     #[test]
     fn test_format_review_step_execution_prompt() {
-        use tauqe_protocol::review::{ReviewItem, ReviewItemStatus, ReviewSeverity};
+        use tauqe_protocol::review::{IssueType, ReviewItem, ReviewItemStatus};
 
         let session = ReviewSession {
             id: "rev-7".to_string(),
@@ -160,7 +161,8 @@ mod tests {
                 id: 3,
                 title: "Excessive clone in hot path".to_string(),
                 model: None,
-                severity: ReviewSeverity::Warning,
+                issue_type: IssueType::Performance,
+                severity: tauqe_protocol::ReviewSeverity::Warning,
                 status: ReviewItemStatus::Todo,
                 recommendations: vec![],
                 files: vec!["crates/tui/src/view.rs".to_string()],
@@ -188,7 +190,7 @@ mod tests {
 
     #[test]
     fn test_review_discussion_prompt_formatting() {
-        use tauqe_protocol::review::{ReviewItem, ReviewItemStatus, ReviewSeverity};
+        use tauqe_protocol::review::{IssueType, ReviewItem, ReviewItemStatus};
         use tauqe_protocol::ModelRef;
 
         let session = ReviewSession {
@@ -203,7 +205,8 @@ mod tests {
                 id: 1,
                 title: "Race condition in cache".to_string(),
                 model: None,
-                severity: ReviewSeverity::Critical,
+                issue_type: IssueType::Bug,
+                severity: tauqe_protocol::ReviewSeverity::Critical,
                 status: ReviewItemStatus::Discussion,
                 recommendations: vec![],
                 files: vec!["src/lib.rs".to_string()],

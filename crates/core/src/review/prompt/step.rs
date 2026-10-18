@@ -1,7 +1,26 @@
+use crate::escape::{escape_xml_text, single_line};
 use tauqe_protocol::review::ReviewSession;
 use tauqe_protocol::PlanItem;
 
 pub const REVIEW_STEP_RETRY_PREFIX: &str = "# Correction Required: Review Finding Turn Incomplete";
+
+/// Joins identifiers or paths into a single escaped, comma-separated line.
+fn escape_list(items: &[String]) -> String {
+    items
+        .iter()
+        .map(|item| escape_xml_text(item))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Renders repository paths as escaped, backticked breadcrumbs.
+fn render_paths(paths: &[String]) -> String {
+    paths
+        .iter()
+        .map(|path| format!("`{}`", escape_xml_text(path)))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
 
 /// Builds a corrective reprompt for a review finding turn that ended without
 /// valid code edits and without a terminal success tag.
@@ -22,7 +41,7 @@ pub fn format_review_step_retry_prompt(assistant_text: &str, error: Option<&str>
         out.push_str("(empty response)\n\n");
     } else {
         out.push_str("<previous_response>\n");
-        out.push_str(previous);
+        out.push_str(&escape_xml_text(previous));
         out.push_str("\n</previous_response>\n\n");
     }
 
@@ -30,7 +49,7 @@ pub fn format_review_step_retry_prompt(assistant_text: &str, error: Option<&str>
         let trimmed = err.trim();
         if !trimmed.is_empty() {
             out.push_str("## Diagnostic Feedback:\n");
-            out.push_str(trimmed);
+            out.push_str(&escape_xml_text(trimmed));
             out.push_str("\n\n");
         }
     }
@@ -126,60 +145,58 @@ pub fn format_review_step_execution_prompt(
         })?;
 
     let mut out = String::new();
-    let clean_title = issue.title.replace(['\r', '\n'], " ").trim().to_string();
+    let clean_title = escape_xml_text(&single_line(&issue.title));
     out.push_str(&format!(
         "{} [{}:{}] {}\n\n",
-        REVIEW_STEP_EXECUTION_PREFIX, session.id, issue.id, clean_title
+        REVIEW_STEP_EXECUTION_PREFIX,
+        single_line(&session.id),
+        issue.id,
+        clean_title
     ));
 
-    let title = if session.title.trim().is_empty() {
-        &session.id
+    let session_title = single_line(&session.title);
+    let title = if session_title.is_empty() {
+        session.id.as_str()
     } else {
-        session.title.trim()
+        session_title.as_str()
     };
-    out.push_str(&format!("## Review Session: {}\n", title));
+    out.push_str(&format!("## Review Session: {}\n", escape_xml_text(title)));
     if let Some(desc) = &session.description {
         let trimmed = desc.trim();
         if !trimmed.is_empty() {
-            out.push_str(&format!("{}\n\n", trimmed));
+            out.push_str(&format!("{}\n\n", escape_xml_text(trimmed)));
         }
     }
 
     out.push_str("### Target Finding to Resolve:\n");
     out.push_str(&format!("- **ID**: `#{}`\n", issue.id));
     out.push_str(&format!("- **Type**: {}\n", issue.issue_type));
-    out.push_str(&format!("- **Title**: {}\n", issue.title));
+    out.push_str(&format!(
+        "- **Title**: {}\n",
+        escape_xml_text(&issue.title)
+    ));
     if !issue.files.is_empty() {
-        let joined = issue
-            .files
-            .iter()
-            .map(|f| format!("`{}`", f))
-            .collect::<Vec<_>>()
-            .join(", ");
-        out.push_str(&format!("- **Files**: {}\n", joined));
+        out.push_str(&format!(
+            "- **Files**: {}\n",
+            render_paths(&issue.files)
+        ));
     }
     if !issue.readonly_files.is_empty() {
-        let joined = issue
-            .readonly_files
-            .iter()
-            .map(|f| format!("`{}`", f))
-            .collect::<Vec<_>>()
-            .join(", ");
         out.push_str(&format!(
             "- **Protected Contracts (readonly_files)**: {}\n",
-            joined
+            render_paths(&issue.readonly_files)
         ));
     }
     if !issue.description.trim().is_empty() {
         out.push_str(&format!(
             "- **Description**:\n{}\n",
-            issue.description.trim()
+            escape_xml_text(issue.description.trim())
         ));
     }
     if !issue.recommendations.is_empty() {
         out.push_str("- **Recommendations**:\n");
         for (index, rec) in issue.recommendations.iter().enumerate() {
-            out.push_str(&format!("  {}. {}\n", index + 1, rec));
+            out.push_str(&format!("  {}. {}\n", index + 1, escape_xml_text(rec)));
         }
     }
     if let Some(note) = &issue.note {
@@ -187,7 +204,7 @@ pub fn format_review_step_execution_prompt(
         if !trimmed.is_empty() {
             out.push_str(&format!(
                 "- **Resolution Note (from discussion)**:\n{}\n",
-                trimmed
+                escape_xml_text(trimmed)
             ));
         }
     }
@@ -233,101 +250,28 @@ fn render_subplan_exec(out: &mut String, items: &[PlanItem], depth: usize) {
             "{}- [{}] #{} {}",
             indent,
             sub.status,
-            sub.id,
-            sub.title
+            escape_xml_text(&sub.id),
+            escape_xml_text(&sub.title)
         ));
         if !sub.files.is_empty() {
-            out.push_str(&format!(" (files: {})", sub.files.join(", ")));
+            out.push_str(&format!(" (files: {})", escape_list(&sub.files)));
         }
         if !sub.readonly_files.is_empty() {
-            out.push_str(&format!(" (readonly: {})", sub.readonly_files.join(", ")));
+            out.push_str(&format!(
+                " (readonly: {})",
+                escape_list(&sub.readonly_files)
+            ));
         }
         if let Some(details) = &sub.details {
             let trimmed = details.trim();
             if !trimmed.is_empty() {
-                out.push_str(&format!(": {}", trimmed));
+                out.push_str(&format!(": {}", escape_xml_text(trimmed)));
             }
         }
         out.push('\n');
         if !sub.children.is_empty() {
             render_subplan_exec(out, &sub.children, depth + 1);
         }
-    }
-}
-
-/// Extracts a `<skip>` reason and optional body from an assistant response.
-///
-/// Recognizes both turn-marker-bound tags (`<skip_MARKER ...>`) and unmarked
-/// `<skip ...>` tags, combining the `reason` attribute and inner text when both
-/// are present.
-pub fn extract_review_skip_reason(text: &str, marker: Option<&str>) -> Option<String> {
-    let mut candidates = Vec::new();
-    if let Some(m) = marker {
-        let trimmed = m.trim();
-        if !trimmed.is_empty() {
-            candidates.push(format!("skip_{}", trimmed));
-        }
-    }
-    candidates.push("skip".to_string());
-
-    for tag_name in &candidates {
-        let open_prefix = format!("<{}", tag_name);
-        let mut search_from = 0;
-        while let Some(rel) = text[search_from..].find(&open_prefix) {
-            let start = search_from + rel;
-            let after_name = start + open_prefix.len();
-            let next_ch = text[after_name..].chars().next();
-            if !matches!(next_ch, Some(' ') | Some('\t') | Some('\n') | Some('\r') | Some('>') | Some('/')) {
-                search_from = after_name;
-                continue;
-            }
-            let Some(gt_rel) = text[after_name..].find('>') else {
-                break;
-            };
-            let gt_pos = after_name + gt_rel;
-            let header = &text[after_name..gt_pos];
-            let self_closing = header.trim_end().ends_with('/');
-            let reason_attr = extract_reason_attr(header);
-
-            let body = if self_closing {
-                String::new()
-            } else {
-                let close_tag = format!("</{}>", tag_name);
-                if let Some(close_rel) = text[gt_pos + 1..].find(&close_tag) {
-                    text[gt_pos + 1..gt_pos + 1 + close_rel].trim().to_string()
-                } else {
-                    String::new()
-                }
-            };
-
-            let combined = match (reason_attr, body.is_empty()) {
-                (Some(r), true) => r,
-                (Some(r), false) if r == body => r,
-                (Some(r), false) => format!("{}: {}", r, body),
-                (None, false) => body,
-                (None, true) => "Skipped without additional details".to_string(),
-            };
-            return Some(combined);
-        }
-    }
-    None
-}
-
-fn extract_reason_attr(header: &str) -> Option<String> {
-    let idx = header.find("reason")?;
-    let rest = header[idx + "reason".len()..].trim_start();
-    let rest = rest.strip_prefix('=')?.trim_start();
-    let quote = rest.chars().next()?;
-    if quote != '"' && quote != '\'' {
-        return None;
-    }
-    let after_quote = &rest[quote.len_utf8()..];
-    let end = after_quote.find(quote)?;
-    let val = after_quote[..end].trim();
-    if val.is_empty() {
-        None
-    } else {
-        Some(val.to_string())
     }
 }
 

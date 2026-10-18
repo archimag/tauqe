@@ -10,7 +10,7 @@ use crate::command::{CommandMap, CommandSpec, KeyChord};
 use crate::input::InputResult;
 use crate::rpc::{send_request, RpcConnection};
 
-use super::VisiblePlanRow;
+use super::{architect_entries, VisiblePlanRow};
 
 /// Keyboard actions available in the Plans view.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -27,6 +27,7 @@ pub enum PlansAction {
     FoldToggle,
     Activate,
     Execute,
+    ExecuteAll,
     Discuss,
     SetFocus,
     FoldAll,
@@ -34,6 +35,7 @@ pub enum PlansAction {
     DeletePlan,
     CopyMarkdown,
     Replan,
+    ReplanAll,
     Refresh,
 }
 
@@ -58,15 +60,21 @@ pub static PLANS_COMMAND_MAP: CommandMap<PlansAction> = CommandMap::new(&[
     ),
     CommandSpec::new(
         KeyChord::Bare(KeyCode::Char('X')),
-        PlansAction::Execute,
+        PlansAction::ExecuteAll,
         Essential,
-        "Execute the selected step, group, or entire plan",
+        "Execute every ready step of the selected plan as one batch (with confirmation)",
+    ),
+    CommandSpec::new(
+        KeyChord::Bare(KeyCode::Char('r')),
+        PlansAction::Replan,
+        Essential,
+        "Refine or replan the selected plan horizon with the Architect",
     ),
     CommandSpec::new(
         KeyChord::Bare(KeyCode::Char('R')),
-        PlansAction::Replan,
+        PlansAction::ReplanAll,
         Essential,
-        "Refine or replan the horizon with the Architect",
+        "Replan the horizon to resolve every blocked step with the Architect",
     ),
     CommandSpec::new(
         KeyChord::Bare(KeyCode::Char('d')),
@@ -196,7 +204,31 @@ pub static PLANS_COMMAND_MAP: CommandMap<PlansAction> = CommandMap::new(&[
         "Select the first row",
     ),
     CommandSpec::new(
+        KeyChord::Meta(KeyCode::Char('<')),
+        PlansAction::SelectFirst,
+        Interface,
+        "Select the first row",
+    ),
+    CommandSpec::new(
+        KeyChord::Ctrl(KeyCode::Home),
+        PlansAction::SelectFirst,
+        Interface,
+        "Select the first row",
+    ),
+    CommandSpec::new(
         KeyChord::Bare(KeyCode::End),
+        PlansAction::SelectLast,
+        Interface,
+        "Select the last row",
+    ),
+    CommandSpec::new(
+        KeyChord::Meta(KeyCode::Char('>')),
+        PlansAction::SelectLast,
+        Interface,
+        "Select the last row",
+    ),
+    CommandSpec::new(
+        KeyChord::Ctrl(KeyCode::End),
         PlansAction::SelectLast,
         Interface,
         "Select the last row",
@@ -269,7 +301,13 @@ pub static PLANS_COMMAND_MAP: CommandMap<PlansAction> = CommandMap::new(&[
         "Copy the plan as Markdown to the clipboard",
     ),
     CommandSpec::new(
-        KeyChord::Bare(KeyCode::Char('r')),
+        KeyChord::Bare(KeyCode::Char('g')),
+        PlansAction::Refresh,
+        Helpers,
+        "Refresh plans from the server",
+    ),
+    CommandSpec::new(
+        KeyChord::Bare(KeyCode::Char('G')),
         PlansAction::Refresh,
         Helpers,
         "Refresh plans from the server",
@@ -353,6 +391,21 @@ fn execute_scope_action(st: &mut AppState, plan_id: &str, scope_id: Option<&str>
             });
         }
     }
+}
+
+/// Opens the Architect refine dialog for a plan, optionally pre-seeding the
+/// instructions. When more than one architect is configured and no instructions
+/// were seeded, focus starts on the architect list for instant digit selection.
+fn open_refine_dialog(st: &mut AppState, plan: tauqe_protocol::Plan, seed: Option<String>) {
+    let entries = architect_entries(st);
+    let mut dialog = super::PlanRefineDialogState::new(plan.id, plan.title, entries);
+    if let Some(seed) = seed {
+        dialog.instructions_editor.insert_str(&seed);
+    }
+    if dialog.selector.len() > 1 && dialog.instructions_editor.is_empty() {
+        dialog.focus = super::RefineDialogFocus::ModelList;
+    }
+    st.plans_view.refine_dialog = Some(dialog);
 }
 
 pub async fn handle_plans_key(
@@ -525,6 +578,16 @@ pub async fn handle_plans_key(
                 }
             }
         }
+        PlansAction::ExecuteAll => {
+            // `X` executes the entire selected plan as one batch, regardless of
+            // which row the cursor rests on: the queue is every ready leaf step
+            // of the plan horizon, dispatched through the unified server batch
+            // (c-1, c-5).
+            if let Some(row) = st.plans_view.selected_row() {
+                let plan_id = row.plan_id().to_string();
+                execute_scope_action(&mut st, &plan_id, None, "Entire plan");
+            }
+        }
         PlansAction::Discuss => {
             let sel_row = st.plans_view.selected_row();
             if let Some(row) = sel_row {
@@ -659,59 +722,49 @@ pub async fn handle_plans_key(
                 st.notify_warning("Model is currently busy; wait for operation to finish");
                 return Ok(InputResult::Continue);
             }
-            let sel_row = st.plans_view.selected_row();
-            if let Some(row) = sel_row {
+            if let Some(row) = st.plans_view.selected_row() {
                 let plan_id = row.plan_id().to_string();
                 if let Some(plan) = st.plans_view.plans.iter().find(|p| p.id == plan_id).cloned() {
-                    // Prefer the configured Architect entries; fall back to the
-                    // resolved Architect role (or the active model) when none
-                    // are configured, so the dialog always offers a valid pick.
-                    let architect_entries = st
-                        .model_choice
-                        .roles
-                        .as_ref()
-                        .and_then(|roles| roles.entries.as_ref())
-                        .map(|entries| entries.architect.clone())
-                        .filter(|entries| !entries.is_empty())
-                        .unwrap_or_else(|| {
-                            let fallback_model = st
-                                .model_choice
-                                .resolve(&tauqe_protocol::ModelSelection::Role(
-                                    tauqe_protocol::ModelRole::Architect,
-                                ))
-                                .unwrap_or_else(|| st.active_model.clone());
-                            let fallback_effort = st
-                                .model_choice
-                                .roles
-                                .as_ref()
-                                .and_then(|roles| roles.efforts.as_ref())
-                                .and_then(|efforts| efforts.architect);
-                            vec![tauqe_protocol::ModelEntry::new(
-                                fallback_model,
-                                fallback_effort,
-                                None,
-                            )]
-                        });
-
-                    let mut dialog = super::PlanRefineDialogState::new(
-                        plan.id,
-                        plan.title,
-                        architect_entries,
-                    );
-                    if let VisiblePlanRow::PlanItem { item_id, title, status: tauqe_protocol::PlanItemStatus::Blocked, .. } = &row {
-                        dialog.instructions_editor.insert_str(&format!(
+                    // A blocked step under the cursor seeds the instruction with
+                    // its own context so a single `r` replans the horizon around
+                    // exactly that failure (c-3).
+                    let seed = match &row {
+                        VisiblePlanRow::PlanItem {
+                            item_id,
+                            title,
+                            status: tauqe_protocol::PlanItemStatus::Blocked,
+                            ..
+                        } => Some(format!(
                             "Replan uncompleted horizon around blocked step #{}: {}",
                             item_id, title
-                        ));
-                    }
-                    // Open on the architect list when more than one model is
-                    // configured and instructions are empty so it can be picked
-                    // instantly with the digit shortcuts; if pre-seeded with
-                    // instructions, keep focus on the editor.
-                    if dialog.selector.len() > 1 && dialog.instructions_editor.is_empty() {
-                        dialog.focus = super::RefineDialogFocus::ModelList;
-                    }
-                    st.plans_view.refine_dialog = Some(dialog);
+                        )),
+                        _ => None,
+                    };
+                    open_refine_dialog(&mut st, plan, seed);
+                }
+            }
+        }
+        PlansAction::ReplanAll => {
+            if st.model.is_busy() || st.review.running || st.plans_view.refining {
+                st.notify_warning("Model is currently busy; wait for operation to finish");
+                return Ok(InputResult::Continue);
+            }
+            if let Some(row) = st.plans_view.selected_row() {
+                let plan_id = row.plan_id().to_string();
+                if let Some(plan) = st.plans_view.plans.iter().find(|p| p.id == plan_id).cloned() {
+                    // `R` addresses the whole blocked frontier of the plan at
+                    // once, seeding the instruction with every blocked step the
+                    // scope reports (c-1, c-3).
+                    let seed = match plan.evaluate_scope(None) {
+                        tauqe_protocol::PlanScopeEvaluation::BlockedByBlockers(items) => Some(
+                            format!(
+                                "Replan the uncompleted horizon addressing every blocked step:\n{}",
+                                items.join("\n")
+                            ),
+                        ),
+                        _ => Some("Replan the uncompleted horizon of this plan".to_string()),
+                    };
+                    open_refine_dialog(&mut st, plan, seed);
                 }
             }
         }
@@ -743,8 +796,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn test_r_key_on_blocked_step_seeds_replan_instructions() {
+    fn blocked_plan_state() -> crate::app::AppState {
         let mut st = crate::app::test_state();
         let plan = tauqe_protocol::Plan {
             id: "plan-blocked".to_string(),
@@ -760,11 +812,15 @@ mod tests {
         st.plans_view.plans = vec![plan];
         st.plans_view.expand_all();
         st.plans_view.selected_index = 1; // Step 1
+        st
+    }
 
-        let state = Arc::new(Mutex::new(st));
+    #[tokio::test]
+    async fn test_lowercase_r_on_blocked_step_seeds_replan_instructions() {
+        let state = Arc::new(Mutex::new(blocked_plan_state()));
         let mut conn = RpcConnection::new(Vec::<u8>::new());
         let res = handle_plans_key(
-            KeyEvent::new(KeyCode::Char('R'), crossterm::event::KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char('r'), crossterm::event::KeyModifiers::NONE),
             &state,
             &mut conn,
         )
@@ -779,5 +835,86 @@ mod tests {
             .get_text()
             .contains("Replan uncompleted horizon around blocked step #1: Failing step"));
         assert!(dialog.focus.is_instructions_editor());
+    }
+
+    #[tokio::test]
+    async fn test_uppercase_r_seeds_all_blocked_steps() {
+        let state = Arc::new(Mutex::new(blocked_plan_state()));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+        handle_plans_key(
+            KeyEvent::new(KeyCode::Char('R'), crossterm::event::KeyModifiers::NONE),
+            &state,
+            &mut conn,
+        )
+        .await
+        .unwrap();
+
+        let guard = state.lock().await;
+        let dialog = guard.plans_view.refine_dialog.as_ref().expect("dialog opened");
+        let text = dialog.instructions_editor.get_text();
+        assert!(text.contains("addressing every blocked step"), "seed: {text}");
+        assert!(text.contains("#1 Failing step"), "seed: {text}");
+    }
+
+    #[tokio::test]
+    async fn test_g_refreshes_plans_and_r_no_longer_refreshes() {
+        let state = Arc::new(Mutex::new(blocked_plan_state()));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+
+        // `g` triggers a lightweight PLAN_LIST refresh (no dialog opens).
+        let res = handle_plans_key(
+            KeyEvent::new(KeyCode::Char('g'), crossterm::event::KeyModifiers::NONE),
+            &state,
+            &mut conn,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(res, InputResult::Continue));
+        assert!(state.lock().await.plans_view.refine_dialog.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_uppercase_x_opens_whole_plan_batch_confirmation() {
+        let mut st = crate::app::test_state();
+        let plan = tauqe_protocol::Plan {
+            id: "plan-ready".to_string(),
+            title: "Ready Plan".to_string(),
+            items: vec![
+                tauqe_protocol::PlanItem {
+                    id: "1".to_string(),
+                    title: "First step".to_string(),
+                    status: tauqe_protocol::PlanItemStatus::Todo,
+                    ..Default::default()
+                },
+                tauqe_protocol::PlanItem {
+                    id: "2".to_string(),
+                    title: "Second step".to_string(),
+                    status: tauqe_protocol::PlanItemStatus::Todo,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        st.plans_view.plans = vec![plan];
+        st.plans_view.expand_all();
+
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+        handle_plans_key(
+            KeyEvent::new(KeyCode::Char('X'), crossterm::event::KeyModifiers::NONE),
+            &state,
+            &mut conn,
+        )
+        .await
+        .unwrap();
+
+        let guard = state.lock().await;
+        let target = guard
+            .confirm_execute_scope
+            .as_ref()
+            .expect("batch confirmation must be armed");
+        assert_eq!(target.plan_id, "plan-ready");
+        assert!(target.step_id.is_none(), "the batch covers the whole plan");
+        assert_eq!(target.steps.len(), 2);
     }
 }

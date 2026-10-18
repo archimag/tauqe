@@ -10,9 +10,9 @@
 //! reaches the whole dialog without touching the renderers (Conventions §9, c-1).
 
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
-use ratatui::style::Stylize;
+use ratatui::style::{Style, Stylize};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 
 use crate::app::{AppState, BatchCancelButton};
 use crate::i18n::active_t;
@@ -306,9 +306,349 @@ pub fn execute_review_params(state: &AppState) -> Option<ConfirmModalParams<'_>>
 }
 
 pub fn render_confirm_execute_review_popup(frame: &mut ratatui::Frame, state: &AppState) {
+    if state
+        .confirm_execute_review
+        .as_ref()
+        .is_some_and(|target| target.is_single_target())
+    {
+        render_execute_review_dialog(frame, state);
+        return;
+    }
     if let Some(params) = execute_review_params(state) {
         render_modal_confirm(frame, params);
     }
+}
+
+/// Width of the single-target execution dialog, as a percentage of the terminal.
+const EXECUTE_REVIEW_DIALOG_WIDTH: u16 = 68;
+/// Height of the single-target execution dialog, as a percentage of the terminal.
+const EXECUTE_REVIEW_DIALOG_HEIGHT: u16 = 56;
+/// Header rows: the review, the finding, an optional step, and target files.
+const EXECUTE_REVIEW_HEADER_HEIGHT: u16 = 4;
+/// Footer rows: the action bar (2) plus the docked hint strip (1).
+const EXECUTE_REVIEW_FOOTER_HEIGHT: u16 = 3;
+/// Minimum height kept for the directives editor on short terminals.
+const EXECUTE_REVIEW_EDITOR_MIN_HEIGHT: u16 = 3;
+/// Maximum Coder rows drawn before the list scrolls.
+const EXECUTE_REVIEW_MODEL_LIST_MAX_ROWS: u16 = 6;
+
+/// Full drawn confirm-button label, resolved from the runtime locale (c-1).
+fn execute_review_confirm_label() -> String {
+    format!(" [ {} ] ", active_t("dialog.button.resolve"))
+}
+
+/// Full drawn cancel-button label, resolved from the runtime locale (c-1).
+fn execute_review_cancel_label() -> String {
+    format!(" [ {} ] ", active_t("modal.cancel"))
+}
+
+/// Number of Coder rows drawn for `entry_count` entries, before borders.
+fn execute_review_model_list_rows(entry_count: usize) -> u16 {
+    (entry_count.max(1) as u16).min(EXECUTE_REVIEW_MODEL_LIST_MAX_ROWS)
+}
+
+/// Insets a rectangle by a one-cell border on every side.
+fn inset(area: Rect) -> Rect {
+    Rect::new(
+        area.x + 1,
+        area.y + 1,
+        area.width.saturating_sub(2),
+        area.height.saturating_sub(2),
+    )
+}
+
+/// Rectangles of the single-target execution dialog, shared by the renderer and
+/// the mouse hit-tester so the surface that is drawn is the surface that is
+/// clicked (Conventions §6, §7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExecuteReviewDialogGeometry {
+    /// Whole dialog frame.
+    pub area: Rect,
+    /// Inner rows of the Coder model list (one row per entry).
+    pub model_rows: Rect,
+    /// The directives editor block.
+    pub editor_area: Rect,
+    /// Confirm button.
+    pub confirm_button: Rect,
+    /// Cancel button.
+    pub cancel_button: Rect,
+}
+
+/// Splits the dialog interior into
+/// `[header, coder list, editor, buttons, footer]`.
+///
+/// The footer, list, and header are sized first so the dialog stays usable on
+/// short terminals; the directives editor absorbs whatever height remains and
+/// the hint strip is pinned to the card's bottom edge.
+fn execute_review_dialog_chunks(area: Rect, entry_count: usize) -> [Rect; 5] {
+    let inner = inset(area);
+
+    let footer_h = EXECUTE_REVIEW_FOOTER_HEIGHT.min(inner.height);
+    let after_footer = inner.height - footer_h;
+
+    let list_h = (execute_review_model_list_rows(entry_count) + 2).min(after_footer / 2);
+    let after_list = after_footer - list_h;
+
+    let header_h = EXECUTE_REVIEW_HEADER_HEIGHT
+        .min(after_list.saturating_sub(EXECUTE_REVIEW_EDITOR_MIN_HEIGHT));
+    let editor_h = after_list - header_h;
+
+    let header = Rect::new(inner.x, inner.y, inner.width, header_h);
+    let list = Rect::new(inner.x, inner.y + header_h, inner.width, list_h);
+    let editor = Rect::new(inner.x, list.y + list_h, inner.width, editor_h);
+
+    let docked_h = 1.min(footer_h);
+    let buttons_h = footer_h - docked_h;
+    let buttons = Rect::new(inner.x, editor.y + editor_h, inner.width, buttons_h);
+    let footer = Rect::new(inner.x, buttons.y + buttons_h, inner.width, docked_h);
+    [header, list, editor, buttons, footer]
+}
+
+/// Computes the dialog frame, the Coder-row area, and the action buttons from
+/// the same layout the renderer uses (Conventions §6, §7).
+pub fn execute_review_dialog_geometry(
+    term: Rect,
+    entry_count: usize,
+) -> ExecuteReviewDialogGeometry {
+    let area = crate::ui::centered_rect(
+        EXECUTE_REVIEW_DIALOG_WIDTH,
+        EXECUTE_REVIEW_DIALOG_HEIGHT,
+        term,
+    );
+    let chunks = execute_review_dialog_chunks(area, entry_count);
+    let model_rows = inset(chunks[1]);
+    let editor_area = chunks[2];
+
+    let buttons = chunks[3];
+    // Button widths are measured from the same localized labels the renderer
+    // draws, so hit-testing never desynchronizes from the drawing.
+    let confirm_w = execute_review_confirm_label().chars().count() as u16;
+    let cancel_w = execute_review_cancel_label().chars().count() as u16;
+    let gap = 4u16;
+    let total = confirm_w + gap + cancel_w;
+    let start_x = buttons.x + (buttons.width.saturating_sub(total)) / 2;
+    let confirm_button = Rect::new(start_x, buttons.y, confirm_w, 1);
+    let cancel_button = Rect::new(start_x + confirm_w + gap, buttons.y, cancel_w, 1);
+
+    ExecuteReviewDialogGeometry {
+        area,
+        model_rows,
+        editor_area,
+        confirm_button,
+        cancel_button,
+    }
+}
+
+/// Renders the single-target review-execution confirmation.
+///
+/// Point execution exposes the Coder ladder and a directives editor, so the
+/// developer picks the implementing model and adds instructions before a bounded
+/// turn spends tokens. The layout mirrors the Architect refinement dialogs —
+/// header, embedded model list, editor, action bar, docked hint strip — so both
+/// pickers read identically (concept #c-3, Conventions §6, §7).
+pub fn render_execute_review_dialog(frame: &mut ratatui::Frame, state: &AppState) {
+    let Some(target) = state.confirm_execute_review.as_ref() else {
+        return;
+    };
+
+    let engine = current_engine();
+    let palette = engine.palette();
+    let dim = engine.fg(palette.text_muted);
+    let entry_count = target.selector.len();
+    let area = crate::ui::centered_rect(
+        EXECUTE_REVIEW_DIALOG_WIDTH,
+        EXECUTE_REVIEW_DIALOG_HEIGHT,
+        frame.area(),
+    );
+    frame.render_widget(Clear, area);
+
+    let outer_block = Block::default()
+        .title(format!(" {} ", active_t("dialog.execute_review.title_point")))
+        .borders(Borders::ALL)
+        .border_style(ModalTone::Info.border_style(&engine))
+        .style(Style::default().bg(engine.color(palette.surface)));
+    frame.render_widget(outer_block, area);
+
+    let [header_area, list_area, editor_area, buttons_area, footer_area] =
+        execute_review_dialog_chunks(area, entry_count);
+
+    // Header: which review, finding, and step are about to be resolved.
+    let mut review_spans = vec![
+        Span::styled(active_t("dialog.execute_review.review_label"), dim),
+        Span::styled(
+            target.review_title.clone(),
+            engine.fg(palette.text_primary).bold(),
+        ),
+    ];
+    if let Some(review_id) = target.review_id.as_deref() {
+        review_spans.push(Span::styled(format!(" [{}]", review_id), dim));
+    }
+    let mut header_lines = vec![Line::from(review_spans)];
+
+    if let Some(item) = target.items.first() {
+        header_lines.push(Line::from(vec![
+            Span::styled(active_t("dialog.execute_review.finding_label"), dim),
+            Span::styled(
+                format!("#{} {}", item.id, truncate_to_width(&item.title, 44)),
+                engine.fg(palette.text_primary).bold(),
+            ),
+        ]));
+        if let Some(step_id) = target.step_id.as_deref() {
+            header_lines.push(Line::from(vec![
+                Span::styled(active_t("dialog.execute_review.step_label"), dim),
+                Span::styled(
+                    step_id.to_string(),
+                    engine.fg(palette.status_warning).bold(),
+                ),
+            ]));
+        }
+        if !item.files.is_empty() {
+            header_lines.push(Line::from(vec![
+                Span::styled(active_t("dialog.execute_review.files_label"), dim),
+                Span::styled(
+                    truncate_to_width(&item.files.join(", "), 58),
+                    engine.fg(palette.status_info),
+                ),
+            ]));
+        }
+    }
+    frame.render_widget(Paragraph::new(header_lines), header_area);
+
+    // Coder list. The shared `ModelSelector` owns the rows, numbering, scrolling,
+    // and empty-list safety; the block adds framing and the focus color.
+    let list_title = if entry_count > 1 {
+        active_t("dialog.execute_review.model_list_counter")
+            .replacen("{}", &(target.selector.selected_index() + 1).to_string(), 1)
+            .replacen("{}", &entry_count.to_string(), 1)
+    } else {
+        active_t("dialog.execute_review.model_list_title")
+    };
+    let list_border = if target.focus.is_model_list() {
+        engine.fg(palette.status_info).bold()
+    } else {
+        engine.fg(palette.border)
+    };
+    let list_block = Block::default()
+        .title(list_title)
+        .borders(Borders::ALL)
+        .border_style(list_border)
+        .style(Style::default().bg(engine.color(palette.surface)));
+    let list_inner = list_block.inner(list_area);
+    frame.render_widget(list_block, list_area);
+    if entry_count == 0 {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                active_t("dialog.execute_review.no_models"),
+                dim,
+            ))),
+            list_inner,
+        );
+    } else {
+        let rows = target.selector.render_list_lines(list_inner.height as usize);
+        frame.render_widget(Paragraph::new(rows), list_inner);
+    }
+
+    // Directives editor. The cursor is drawn only when the editor owns focus.
+    let show_cursor = target.focus.is_instructions_editor();
+    let mut editor_content = Vec::new();
+    if target.instructions_editor.is_empty() {
+        let mut spans = vec![Span::raw("> ")];
+        if show_cursor {
+            spans.push(Span::styled("█", engine.fg(palette.status_warning)));
+        }
+        spans.push(Span::styled(
+            active_t("dialog.execute_review.editor_placeholder"),
+            dim,
+        ));
+        editor_content.push(Line::from(spans));
+    } else {
+        for line in super::editor_lines(&target.instructions_editor, show_cursor) {
+            let mut spans = vec![Span::raw("> ")];
+            spans.extend(line.spans);
+            editor_content.push(Line::from(spans));
+        }
+    }
+    let editor_border = if target.focus.is_instructions_editor() {
+        engine.fg(palette.status_success).bold()
+    } else {
+        engine.fg(palette.border)
+    };
+    let editor_block = Block::default()
+        .title(format!(
+            " {} ",
+            active_t("dialog.execute_review.editor_title")
+        ))
+        .borders(Borders::ALL)
+        .border_style(editor_border)
+        .style(Style::default().bg(engine.color(palette.surface)));
+    frame.render_widget(
+        Paragraph::new(editor_content)
+            .block(editor_block)
+            .wrap(Wrap { trim: false }),
+        editor_area,
+    );
+
+    // Action bar with focus-aware styling.
+    let in_actions = target.focus.is_actions();
+    let confirm_selected = target.confirm_button == crate::app::ConfirmDialogButton::Confirm;
+    let (confirm_style, cancel_style) = if in_actions {
+        if confirm_selected {
+            (
+                engine
+                    .bg(palette.status_success)
+                    .fg(engine.color(palette.text_inverse))
+                    .bold(),
+                engine
+                    .bg(palette.button_bg)
+                    .fg(engine.color(palette.button_fg)),
+            )
+        } else {
+            (
+                engine
+                    .bg(palette.button_bg)
+                    .fg(engine.color(palette.button_fg)),
+                engine
+                    .bg(palette.button_active_bg)
+                    .fg(engine.color(palette.text_inverse))
+                    .bold(),
+            )
+        }
+    } else {
+        (
+            engine
+                .bg(palette.button_bg)
+                .fg(engine.color(palette.button_fg)),
+            engine
+                .bg(palette.button_bg)
+                .fg(engine.color(palette.button_fg)),
+        )
+    };
+    let actions = Line::from(vec![
+        Span::styled(execute_review_confirm_label(), confirm_style),
+        Span::raw("    "),
+        Span::styled(execute_review_cancel_label(), cancel_style),
+    ]);
+    frame.render_widget(
+        Paragraph::new(actions).alignment(Alignment::Center),
+        buttons_area,
+    );
+
+    // The hint is docked to the card's bottom edge as its own strip filled with
+    // `palette.overlay`, so it reads as persistent chrome instead of a second
+    // row of buttons (Conventions §6.4).
+    let primary = state.tui_config.input.primary_modifier;
+    let nav_hint = if in_actions {
+        active_t("dialog.execute_review.hint_actions")
+    } else {
+        active_t("dialog.execute_review.hint_fields")
+            .replacen("{}", primary.prefix_str(), 1)
+            .replacen(
+                "{}",
+                &crate::components::model_selector::model_select_hint(primary),
+                1,
+            )
+    };
+    crate::components::modal::render_dialog_footer(frame, footer_area, &nav_hint);
 }
 
 /// Presentation parameters for the plan-step execution confirmation.
@@ -881,12 +1221,13 @@ mod tests {
     #[test]
     fn test_execute_review_params_all_sessions() {
         let mut st = crate::app::test_state();
-        st.confirm_execute_review = Some(crate::app::ConfirmExecuteReviewState {
-            review_id: None,
-            review_title: "All Review Sessions".to_string(),
-            scope_title: "All remaining TODO findings across all sessions (2 items)".to_string(),
-            item_id: None,
-            items: vec![
+        st.confirm_execute_review = Some(crate::app::ConfirmExecuteReviewState::new(
+            None,
+            "All Review Sessions".to_string(),
+            "All remaining TODO findings across all sessions (2 items)".to_string(),
+            None,
+            None,
+            vec![
                 tauqe_protocol::ReviewIssue {
                     id: 1,
                     title: "First".to_string(),
@@ -914,7 +1255,8 @@ mod tests {
                     note: None,
                 },
             ],
-        });
+            Vec::new(),
+        ));
 
         let params = execute_review_params(&st).expect("params should be generated");
         assert_eq!(params.title, "Execute All Review Sessions");

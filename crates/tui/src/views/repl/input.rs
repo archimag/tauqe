@@ -289,6 +289,30 @@ pub static REPL_COMMAND_MAP: CommandMap<ReplAction> = CommandMap::new(&[
         Interface,
         "Move the cursor to the end of the line",
     ),
+    CommandSpec::new(
+        KeyChord::Meta(KeyCode::Char('<')),
+        ReplAction::MoveBufferStart,
+        Interface,
+        "Move the cursor to the beginning of the buffer",
+    ),
+    CommandSpec::new(
+        KeyChord::Ctrl(KeyCode::Home),
+        ReplAction::MoveBufferStart,
+        Interface,
+        "Move the cursor to the beginning of the buffer",
+    ),
+    CommandSpec::new(
+        KeyChord::Meta(KeyCode::Char('>')),
+        ReplAction::MoveBufferEnd,
+        Interface,
+        "Move the cursor to the end of the buffer",
+    ),
+    CommandSpec::new(
+        KeyChord::Ctrl(KeyCode::End),
+        ReplAction::MoveBufferEnd,
+        Interface,
+        "Move the cursor to the end of the buffer",
+    ),
     // Helpers: editing and clipboard operations.
     CommandSpec::new(
         KeyChord::Bare(KeyCode::Tab),
@@ -432,6 +456,8 @@ pub enum ReplAction {
     KillWordForward,
     MoveBeginningOfLine,
     MoveEndOfLine,
+    MoveBufferStart,
+    MoveBufferEnd,
     MoveCharBackward,
     MoveCharForward,
     MoveWordBackward,
@@ -485,6 +511,8 @@ pub fn is_editor_action(action: ReplAction) -> bool {
             | ReplAction::KillWordForward
             | ReplAction::MoveBeginningOfLine
             | ReplAction::MoveEndOfLine
+            | ReplAction::MoveBufferStart
+            | ReplAction::MoveBufferEnd
             | ReplAction::MoveCharBackward
             | ReplAction::MoveCharForward
             | ReplAction::MoveWordBackward
@@ -623,6 +651,12 @@ pub async fn handle_repl_key(
         }
         ReplAction::MoveEndOfLine => {
             st.input_editor.move_end_of_line();
+        }
+        ReplAction::MoveBufferStart => {
+            st.input_editor.move_buffer_start();
+        }
+        ReplAction::MoveBufferEnd => {
+            st.input_editor.move_buffer_end();
         }
         ReplAction::MoveCharBackward => {
             st.input_editor.move_backward();

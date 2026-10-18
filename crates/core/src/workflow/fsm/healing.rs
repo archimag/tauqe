@@ -20,7 +20,7 @@ use crate::edits::protocol::{
     VerifyTarget as EditVerifyTarget,
 };
 use crate::providers::StreamEvent;
-use crate::workflow::discovery::reconcile_discovery_context;
+use crate::workflow::discovery::execute_discovery_commands;
 use crate::workflow::verification::{
     build_verification_missing_edits_prompt, build_verification_retry_prompt, extract_error_paths,
     run_workflow_verification, VerificationOutcome,
@@ -323,28 +323,20 @@ pub(super) async fn run_apply_and_verify_phase(
                 return Ok(outcome);
             }
 
-            let requests = step_out.context_requests();
-            if !requests.is_empty() {
-                let available_files = {
-                    let root = ctx.repo_root.to_path_buf();
-                    crate::blocking::run_blocking_async(move || {
-                        crate::git::list_repository_files(Some(&root)).unwrap_or_default()
-                    })
-                    .await
-                    .unwrap_or_default()
-                };
-                // Discovery reconciliation canonicalizes paths and reads file
-                // metadata, so it runs off the async executor thread.
-                let files_token_budget = ctx.options.files_token_budget;
-                let outcome = crate::blocking::run_blocking(|| {
-                    reconcile_discovery_context(
-                        guard.context_manager,
-                        requests,
-                        &available_files,
-                        files_token_budget,
-                    )
-                });
-                if !outcome.added.is_empty() {
+            // Discovery commands emitted during healing run through the same
+            // dispatcher as the Discovery phase, so every capability (context
+            // files, repository searches, documentation) behaves identically and
+            // owns its own blocking offload and budget checks.
+            if step_out.has_discovery_commands() {
+                let discovery_outcome = execute_discovery_commands(
+                    guard.context_manager,
+                    ctx.repo_root,
+                    step_out.commands(),
+                    ctx.options.files_token_budget,
+                    false,
+                )
+                .await;
+                if !discovery_outcome.added_files.is_empty() {
                     let ctx_state = guard.context_manager.get_state();
                     let _ = ctx.stream_tx.send(StreamEvent::ContextChanged(ctx_state)).await;
                 }

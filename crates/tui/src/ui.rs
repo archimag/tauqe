@@ -205,6 +205,15 @@ pub fn render_ui(frame: &mut ratatui::Frame, state: &mut AppState) {
                 render_plan_refine_blocked_dialog(frame, blocked, state.confirm_button);
             }
         }
+        Some(ActiveModal::ReviewRefine) => {
+            if let Some(dialog) = &state.review.refine_dialog {
+                crate::dialogs::render::refine::render_review_refine_dialog(
+                    frame,
+                    dialog,
+                    state.tui_config.input.primary_modifier,
+                );
+            }
+        }
         Some(ActiveModal::Prompt) => {
             if let Some(modal) = &state.prompt_modal {
                 render_prompt_modal(frame, modal);

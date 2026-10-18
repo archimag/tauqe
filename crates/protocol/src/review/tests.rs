@@ -9,10 +9,16 @@ fn test_review_execute_params_serde() {
         serde_json::from_str(r#"{"review_id":"rev-1","item_id":2}"#).unwrap();
     assert_eq!(single.review_id.as_deref(), Some("rev-1"));
     assert_eq!(single.item_id, Some(2));
+    assert_eq!(single.step_id, None);
+    assert_eq!(single.model, None);
+    assert_eq!(single.instructions, None);
 
     let cross_session: ReviewExecuteParams = serde_json::from_str(r#"{}"#).unwrap();
     assert_eq!(cross_session.review_id, None);
     assert_eq!(cross_session.item_id, None);
+    assert_eq!(cross_session.step_id, None);
+    assert_eq!(cross_session.model, None);
+    assert_eq!(cross_session.instructions, None);
 
     let json = serde_json::to_string(&cross_session).unwrap();
     assert_eq!(json, "{}");
@@ -21,6 +27,23 @@ fn test_review_execute_params_serde() {
         serde_json::from_str(r#"{"review_id":"rev-2"}"#).unwrap();
     assert_eq!(single_session_only.review_id.as_deref(), Some("rev-2"));
     assert_eq!(single_session_only.item_id, None);
+    assert_eq!(single_session_only.step_id, None);
+    assert_eq!(single_session_only.model, None);
+    assert_eq!(single_session_only.instructions, None);
+
+    let full = ReviewExecuteParams {
+        review_id: Some("rev-3".to_string()),
+        item_id: Some(5),
+        step_id: Some("5.1".to_string()),
+        model: Some(ModelSelection::Role(crate::model::ModelRole::Coder)),
+        instructions: Some("focus on unit tests".to_string()),
+    };
+    let full_json = serde_json::to_string(&full).unwrap();
+    assert!(full_json.contains("\"step_id\":\"5.1\""));
+    assert!(full_json.contains("\"model\":\"coder\""));
+    assert!(full_json.contains("\"instructions\":\"focus on unit tests\""));
+    let de_full: ReviewExecuteParams = serde_json::from_str(&full_json).unwrap();
+    assert_eq!(de_full, full);
 }
 
 #[test]
@@ -515,6 +538,7 @@ fn finding(id: u32, status: IssueStatus) -> ReviewItem {
         id,
         title: format!("Finding {id}"),
         model: None,
+        issue_type: IssueType::Bug,
         severity: ReviewSeverity::Critical,
         status,
         recommendations: Vec::new(),
@@ -571,4 +595,111 @@ fn test_review_session_stats_exclude_terminal_non_actionable_findings() {
         finding(2, IssueStatus::Rejected),
     ]);
     assert_eq!(all_terminal.stats(), (0, 0));
+}
+
+const ALL_ISSUE_TYPES: [IssueType; 5] = [
+    IssueType::Bug,
+    IssueType::Security,
+    IssueType::Architecture,
+    IssueType::Performance,
+    IssueType::Quality,
+];
+
+fn categorized_finding(id: u32, issue_type: IssueType) -> ReviewItem {
+    ReviewItem::from(ReviewIssue {
+        id,
+        title: format!("Finding {}", issue_type.as_str()),
+        model: None,
+        issue_type,
+        status: IssueStatus::Todo,
+        description: String::new(),
+        recommendations: Vec::new(),
+        files: Vec::new(),
+        readonly_files: Vec::new(),
+        plan: Vec::new(),
+        note: None,
+    })
+}
+
+#[test]
+fn test_review_session_preserves_every_issue_type() {
+    let items = ALL_ISSUE_TYPES
+        .iter()
+        .enumerate()
+        .map(|(index, issue_type)| categorized_finding(index as u32 + 1, *issue_type))
+        .collect::<Vec<_>>();
+    let session = session_with(items);
+
+    // Reading a session must keep `Security` distinct from `Bug` and
+    // `Performance` distinct from `Architecture`.
+    let issues = session.issues();
+    assert_eq!(issues.len(), ALL_ISSUE_TYPES.len());
+    let read_back: Vec<IssueType> = issues.iter().map(|issue| issue.issue_type).collect();
+    assert_eq!(read_back, ALL_ISSUE_TYPES.to_vec());
+
+    // The category is the persisted classification; the derived severity is
+    // never written, so a stored session cannot desynchronize the two.
+    let serialized = serde_json::to_string(&session).unwrap();
+    assert!(serialized.contains("\"type\":\"security\""));
+    assert!(serialized.contains("\"type\":\"performance\""));
+    assert!(!serialized.contains("\"severity\""));
+
+    let restored: ReviewSession = serde_json::from_str(&serialized).unwrap();
+    let restored_types: Vec<IssueType> = restored
+        .issues()
+        .iter()
+        .map(|issue| issue.issue_type)
+        .collect();
+    assert_eq!(restored_types, ALL_ISSUE_TYPES.to_vec());
+    assert_eq!(restored.items[0].severity, ReviewSeverity::Critical);
+    assert_eq!(restored.items[3].severity, ReviewSeverity::Warning);
+}
+
+#[test]
+fn test_review_item_accepts_legacy_category_spellings() {
+    // Sessions written before the category was stored verbatim describe it with
+    // a coarse severity, and older clients also used the `type` and
+    // `issue_type` keys directly.
+    let raw = r#"{
+        "id": "rev-legacy-categories",
+        "created_at": 1,
+        "items": [
+            {"id": 1, "title": "Critical", "severity": "critical", "body": "b1"},
+            {"id": 2, "title": "Warning", "severity": "warning", "body": "b2"},
+            {"id": 3, "title": "Suggestion", "severity": "suggestion", "body": "b3"},
+            {"id": 4, "title": "Info", "severity": "info", "body": "b4"},
+            {"id": 5, "title": "Typed", "type": "security", "body": "b5"},
+            {"id": 6, "title": "Aliased", "issue_type": "performance", "description": "b6"},
+            {"id": 7, "title": "Unclassified", "body": "b7"}
+        ]
+    }"#;
+
+    let session: ReviewSession = serde_json::from_str(raw).unwrap();
+    let issues = session.issues();
+    let categories: Vec<IssueType> = issues.iter().map(|issue| issue.issue_type).collect();
+    assert_eq!(
+        categories,
+        vec![
+            IssueType::Bug,
+            IssueType::Architecture,
+            IssueType::Quality,
+            IssueType::Quality,
+            IssueType::Security,
+            IssueType::Performance,
+            IssueType::Bug,
+        ]
+    );
+
+    // The description alias still feeds the finding body.
+    assert_eq!(issues[5].description, "b6");
+    assert_eq!(issues[6].description, "b7");
+
+    // The presentation severity is derived from the category, so it can never
+    // disagree with the stored classification.
+    assert_eq!(session.items[0].severity, ReviewSeverity::Critical);
+    assert_eq!(session.items[1].severity, ReviewSeverity::Warning);
+    assert_eq!(session.items[2].severity, ReviewSeverity::Suggestion);
+    assert_eq!(session.items[3].severity, ReviewSeverity::Suggestion);
+    assert_eq!(session.items[4].severity, ReviewSeverity::Critical);
+    assert_eq!(session.items[6].severity, ReviewSeverity::Critical);
 }

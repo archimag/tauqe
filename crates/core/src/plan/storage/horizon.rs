@@ -72,8 +72,13 @@ impl PlanStorage {
         plan_id: &str,
         new_horizon_items: Vec<PlanItem>,
     ) -> Result<Plan> {
-        let _guard = Self::lock();
-        Self::replace_uncompleted_horizon_unlocked(repo_root, plan_id, new_horizon_items)
+        // The lock wait, the plan read, and the atomic rewrite of the synthesized
+        // horizon run off the async executor thread, so a slow disk never stalls
+        // the bounded turn, provider streaming, or RPC handling.
+        crate::blocking::run_blocking(move || {
+            let _guard = Self::lock();
+            Self::replace_uncompleted_horizon_unlocked(repo_root, plan_id, new_horizon_items)
+        })
     }
 
     /// Lock-free core of [`Self::replace_uncompleted_horizon`]; the caller must hold the

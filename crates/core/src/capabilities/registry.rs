@@ -139,66 +139,66 @@ impl XmlParser {
         }
     }
 
-    pub(crate) fn parse_output(&self, text: &str, editable_paths: &[String]) -> ModelResult {
+    pub(crate) fn parse_output(&self, normalized: &str, editable_paths: &[String]) -> ModelResult {
         match self {
-            Self::Unmarked(protocol) => protocol.parse_output(text, editable_paths),
-            Self::Marked(protocol) => protocol.parse_output(text, editable_paths),
+            Self::Unmarked(protocol) => protocol.parse_output(normalized, editable_paths),
+            Self::Marked(protocol) => protocol.parse_output_normalized(normalized, editable_paths),
         }
     }
 
-    pub(crate) fn parse_context_requests(&self, text: &str) -> Vec<ContextRequest> {
+    pub(crate) fn parse_context_requests(&self, normalized: &str) -> Vec<ContextRequest> {
         match self {
-            Self::Unmarked(protocol) => protocol.parse_context_requests(text),
-            Self::Marked(protocol) => protocol.parse_context_requests(text),
+            Self::Unmarked(protocol) => protocol.parse_context_requests(normalized),
+            Self::Marked(protocol) => protocol.parse_context_requests_normalized(normalized),
         }
     }
 
-    pub(crate) fn parse_repo_searches(&self, text: &str) -> Vec<RepoSearchRequest> {
+    pub(crate) fn parse_repo_searches(&self, normalized: &str) -> Vec<RepoSearchRequest> {
         match self {
-            Self::Unmarked(protocol) => protocol.parse_repo_searches(text),
-            Self::Marked(protocol) => protocol.parse_repo_searches(text),
+            Self::Unmarked(protocol) => protocol.parse_repo_searches(normalized),
+            Self::Marked(protocol) => protocol.parse_repo_searches_normalized(normalized),
         }
     }
 
-    pub(crate) fn parse_doc_requests(&self, text: &str) -> Vec<DocTopic> {
+    pub(crate) fn parse_doc_requests(&self, normalized: &str) -> Vec<DocTopic> {
         match self {
-            Self::Unmarked(protocol) => protocol.parse_doc_requests(text),
-            Self::Marked(protocol) => protocol.parse_doc_requests(text),
+            Self::Unmarked(protocol) => protocol.parse_doc_requests(normalized),
+            Self::Marked(protocol) => protocol.parse_doc_requests_normalized(normalized),
         }
     }
 
-    pub(crate) fn parse_plan_tags(&self, text: &str) -> (Vec<ParsedPlanTag>, Vec<String>) {
+    pub(crate) fn parse_plan_tags(&self, normalized: &str) -> (Vec<ParsedPlanTag>, Vec<String>) {
         match self {
-            Self::Unmarked(protocol) => protocol.parse_plan_tags(text),
-            Self::Marked(protocol) => protocol.parse_plan_tags(text),
+            Self::Unmarked(protocol) => protocol.parse_plan_tags(normalized),
+            Self::Marked(protocol) => protocol.parse_plan_tags_normalized(normalized),
         }
     }
 
-    pub(crate) fn parse_verify_request(&self, text: &str) -> Option<VerifyRequest> {
+    pub(crate) fn parse_verify_request(&self, normalized: &str, raw_text: &str) -> Option<VerifyRequest> {
         match self {
-            Self::Unmarked(protocol) => protocol.parse_verify_request(text),
-            Self::Marked(protocol) => protocol.parse_verify_request(text),
+            Self::Unmarked(protocol) => protocol.parse_verify_request(normalized),
+            Self::Marked(protocol) => protocol.parse_verify_request_normalized(normalized, raw_text),
         }
     }
 
-    pub(crate) fn parse_scratchpad(&self, text: &str) -> Option<String> {
+    pub(crate) fn parse_scratchpad(&self, normalized: &str, raw_text: &str) -> Option<String> {
         match self {
-            Self::Unmarked(protocol) => protocol.parse_scratchpad(text),
-            Self::Marked(protocol) => protocol.parse_scratchpad(text),
+            Self::Unmarked(protocol) => protocol.parse_scratchpad(normalized),
+            Self::Marked(protocol) => protocol.parse_scratchpad_normalized(normalized, raw_text),
         }
     }
 
-    pub(crate) fn parse_terminal_outcome(&self, text: &str) -> Option<TerminalOutcome> {
+    pub(crate) fn parse_terminal_outcome(&self, normalized: &str) -> Option<TerminalOutcome> {
         match self {
-            Self::Unmarked(protocol) => protocol.parse_terminal_outcome(text),
-            Self::Marked(protocol) => protocol.parse_terminal_outcome(text),
+            Self::Unmarked(protocol) => protocol.parse_terminal_outcome(normalized),
+            Self::Marked(protocol) => protocol.parse_terminal_outcome_normalized(normalized),
         }
     }
 
-    pub(crate) fn parse_user_language(&self, text: &str) -> Option<String> {
+    pub(crate) fn parse_user_language(&self, normalized: &str, raw_text: &str) -> Option<String> {
         match self {
-            Self::Unmarked(protocol) => protocol.parse_user_language(text),
-            Self::Marked(protocol) => protocol.parse_user_language(text),
+            Self::Unmarked(protocol) => protocol.parse_user_language(normalized),
+            Self::Marked(protocol) => protocol.parse_user_language_normalized(normalized, raw_text),
         }
     }
 }
@@ -321,9 +321,19 @@ impl CapabilityRegistry {
         marker: Option<&str>,
         editable_paths: &[String],
     ) -> Vec<LlmCommand> {
+        let normalized_storage;
+        let normalized_text = match marker {
+            Some(m) => {
+                normalized_storage = crate::edits::protocol::xml::normalize_marked_xml(
+                    raw_text, m, true,
+                );
+                normalized_storage.as_str()
+            }
+            None => raw_text,
+        };
         let mut commands = Vec::new();
         for module in self.enabled(set) {
-            commands.extend(module.decode_xml(raw_text, raw_text, marker, editable_paths));
+            commands.extend(module.decode_xml(normalized_text, raw_text, marker, editable_paths));
         }
         commands.retain(|command| match command.capability() {
             Some(capability) => set.contains(capability),

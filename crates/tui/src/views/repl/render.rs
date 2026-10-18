@@ -13,6 +13,9 @@ use crate::ui::wrap_line;
 use super::state::ReplFocus;
 
 mod model;
+mod splash;
+
+use self::splash::render_splash;
 
 pub use self::model::compute_model_lines;
 
@@ -296,6 +299,14 @@ fn render_model_pane(frame: &mut ratatui::Frame, state: &mut AppState, area: Rec
             state.model.copy_flash = None;
             state.model.update_markdown();
         }
+    }
+
+    // An empty viewport is owned by the transient startup greeting. It yields
+    // to the regular viewport on the first byte of output, so the greeting
+    // never competes with real work (c-1).
+    if state.model.splash_visible() {
+        render_splash(frame, &state.model, inner);
+        return;
     }
 
     let raw_lines = compute_model_lines(&mut state.model);

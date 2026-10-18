@@ -3,6 +3,15 @@ use tauqe_protocol::{ConceptItem, Plan, PlanItem, PlanItemStatus};
 
 pub const PLAN_DISCUSSION_PREFIX: &str = "# Plan Discussion:";
 
+/// Joins identifiers or paths into a single escaped, comma-separated line.
+fn join_escaped(items: &[String]) -> String {
+    items
+        .iter()
+        .map(|item| escape_xml_text(item))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// Returns true if the prompt represents an explicit plan discussion turn.
 pub fn is_plan_discussion_prompt(prompt: &str) -> bool {
     prompt.trim_start().starts_with(PLAN_DISCUSSION_PREFIX)
@@ -103,7 +112,7 @@ pub fn format_plan_discussion_prompt(
                 indent,
                 escape_xml_text(&item.title),
                 focus_marker,
-                item.id,
+                escape_xml_text(&item.id),
                 item.status
             ));
             if let Some(details) = &item.details {
@@ -186,7 +195,10 @@ pub fn format_active_plan_context(plan: &Plan) -> Option<String> {
     ));
 
     if let Some(desc) = &plan.description {
-        out.push_str(&format!("  <description>{}</description>\n", desc.trim()));
+        out.push_str(&format!(
+            "  <description>{}</description>\n",
+            escape_xml_text(desc.trim())
+        ));
     }
 
     if !plan.concept.is_empty() {
@@ -194,11 +206,16 @@ pub fn format_active_plan_context(plan: &Plan) -> Option<String> {
         fn render_concept(out: &mut String, items: &[tauqe_protocol::ConceptItem], depth: usize) {
             let indent = "  ".repeat(depth + 2);
             for item in items {
-                out.push_str(&format!("{}- {} (id: \"{}\")", indent, item.title, item.id));
+                out.push_str(&format!(
+                    "{}- {} (id: \"{}\")",
+                    indent,
+                    escape_xml_text(&item.title),
+                    escape_xml_text(&item.id)
+                ));
                 if let Some(details) = &item.details {
                     let trimmed = details.trim();
                     if !trimmed.is_empty() {
-                        out.push_str(&format!(": {}", trimmed));
+                        out.push_str(&format!(": {}", escape_xml_text(trimmed)));
                     }
                 }
                 out.push('\n');
@@ -226,23 +243,32 @@ pub fn format_active_plan_context(plan: &Plan) -> Option<String> {
 
                 out.push_str(&format!(
                     "{}- {} (id: \"{}\", status: {})",
-                    indent, item.title, item.id, status_mark
+                    indent,
+                    escape_xml_text(&item.title),
+                    escape_xml_text(&item.id),
+                    status_mark
                 ));
 
                 if !item.concept_refs.is_empty() {
-                    out.push_str(&format!(" [concept_refs: {}]", item.concept_refs.join(", ")));
+                    out.push_str(&format!(
+                        " [concept_refs: {}]",
+                        join_escaped(&item.concept_refs)
+                    ));
                 }
                 if !item.files.is_empty() {
-                    out.push_str(&format!(" [files: {}]", item.files.join(", ")));
+                    out.push_str(&format!(" [files: {}]", join_escaped(&item.files)));
                 }
                 if !item.depends_on.is_empty() {
-                    out.push_str(&format!(" [depends_on: {}]", item.depends_on.join(", ")));
+                    out.push_str(&format!(
+                        " [depends_on: {}]",
+                        join_escaped(&item.depends_on)
+                    ));
                 }
 
                 if let Some(details) = &item.details {
                     let trimmed = details.trim();
                     if !trimmed.is_empty() {
-                        out.push_str(&format!(": {}", trimmed));
+                        out.push_str(&format!(": {}", escape_xml_text(trimmed)));
                     }
                 }
                 out.push('\n');

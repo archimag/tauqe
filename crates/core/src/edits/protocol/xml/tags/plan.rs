@@ -3,7 +3,7 @@
 mod concept;
 mod item;
 
-use super::{is_inside_markdown_code, strip_tags};
+use super::{is_inside_markdown_code_with_fences, strip_tags, CodeFences};
 use crate::edits::protocol::xml::engine;
 use crate::edits::protocol::xml::{extract_attribute, find_base_tag_start};
 
@@ -95,6 +95,7 @@ fn extract_and_strip_inner_tag(text: &str, base_name: &str) -> (Option<String>, 
 
 /// Parses `<plan ...>...</plan>` blocks and collects syntax and structural diagnostics.
 pub fn parse_plan_tags_with_diagnostics(text: &str) -> (Vec<ParsedPlanTag>, Vec<String>) {
+    let fences = CodeFences::find(text);
     let mut plans = Vec::new();
     let mut errors = Vec::new();
     let mut pos = 0;
@@ -118,7 +119,7 @@ pub fn parse_plan_tags_with_diagnostics(text: &str) -> (Vec<ParsedPlanTag>, Vec<
             continue;
         }
 
-        if is_inside_markdown_code(text, tag_start) {
+        if is_inside_markdown_code_with_fences(text, tag_start, &fences) {
             pos = after_plan;
             continue;
         }
@@ -401,6 +402,34 @@ Here is our plan:
         assert!(plans.is_empty());
         assert_eq!(errors.len(), 1);
         assert!(errors[0].contains("is present but empty or invalid"));
+    }
+
+    #[test]
+    fn test_parse_plan_tags_ignores_markdown_blocks_with_comparisons_and_fake_plans() {
+        let text = r#"
+Discussion with code:
+```rust
+fn check(a: i32, b: i32) -> bool {
+    let flag = a < b;
+    let other = b < 100;
+    // <plan action="save" id="fake">
+    //   <concept><concept_item id="c-1" title="Fake" /></concept>
+    // </plan>
+    flag && other
+}
+```
+Now the actual plan:
+<plan action="save" id="real-opt" title="Real Plan">
+  <concept>
+    <concept_item id="c-1" title="Real Concept" />
+  </concept>
+  <item id="1" title="Step One" status="todo" />
+</plan>
+"#;
+        let (plans, errors) = parse_plan_tags_with_diagnostics(text);
+        assert!(errors.is_empty(), "Unexpected errors: {:?}", errors);
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0].id, "real-opt");
     }
 
     #[test]

@@ -40,7 +40,8 @@ pub(crate) fn current_file_content(
     if let Some(content) = staged.get(path) {
         return Ok(content.clone());
     }
-    std::fs::read_to_string(repo_root.join(path))
+    let full_path = repo_root.join(path);
+    crate::blocking::run_blocking(|| std::fs::read_to_string(&full_path))
         .map_err(|e| format!("Cannot read file '{}': {}", path, e))
 }
 
@@ -116,7 +117,8 @@ impl StagingSimulator {
             self.staged_contents.insert(to.to_string(), content);
         } else {
             let full_from = self.repo_root.join(from);
-            if let Ok(content) = std::fs::read_to_string(&full_from) {
+            let read = crate::blocking::run_blocking(|| std::fs::read_to_string(&full_from));
+            if let Ok(content) = read {
                 self.staged_contents.insert(to.to_string(), content);
             }
         }
@@ -125,5 +127,57 @@ impl StagingSimulator {
     /// Records full file content for a create or overwrite operation.
     pub(crate) fn overwrite(&mut self, path: &str, content: String) {
         self.staged_contents.insert(path.to_string(), content);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::StagingSimulator;
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TEST_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    /// Creates a unique temporary directory for a single test case.
+    fn unique_test_dir() -> PathBuf {
+        let seq = TEST_DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let mut dir = std::env::temp_dir();
+        dir.push(format!(
+            "tauqe-stream-blocking-{}-{}",
+            std::process::id(),
+            seq
+        ));
+        std::fs::create_dir_all(&dir).expect("create test dir");
+        dir
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reads_files_and_moves_without_stalling_the_runtime() {
+        let repo_root = unique_test_dir();
+        std::fs::write(repo_root.join("source.txt"), "hello world")
+            .expect("write source file");
+
+        let mut simulator = StagingSimulator::new(HashMap::new(), repo_root.clone());
+
+        assert_eq!(
+            simulator.current_content("source.txt").unwrap(),
+            "hello world"
+        );
+        assert_eq!(
+            simulator
+                .apply_hunk("source.txt", "hello", "goodbye")
+                .map(|()| simulator.current_content("source.txt").unwrap())
+                .unwrap(),
+            "goodbye world"
+        );
+
+        simulator.apply_move("source.txt", "moved.txt");
+        assert_eq!(
+            simulator.current_content("moved.txt").unwrap(),
+            "goodbye world"
+        );
+
+        std::fs::remove_dir_all(&repo_root).ok();
     }
 }

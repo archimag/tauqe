@@ -24,6 +24,8 @@ pub enum EditorCommand {
     MoveWordForward,
     MoveBeginningOfLine,
     MoveEndOfLine,
+    MoveBufferStart,
+    MoveBufferEnd,
     MoveLineUp,
     MoveLineDown,
     DeleteForward,
@@ -85,6 +87,33 @@ pub static EDITOR_COMMAND_MAP: CommandMap<EditorCommand> = CommandMap::new(&[
         MoveEndOfLine,
         Interface,
         "cmd.editor.move_end_of_line",
+    ),
+    // Interface: buffer boundaries. `M-<` / `M->` are the Emacs spellings, the
+    // raw `C-Home` / `C-End` chords the terminal-native equivalents, so the
+    // beginning and the end of the buffer stay reachable on every keyboard.
+    CommandSpec::new(
+        KeyChord::Meta(KeyCode::Char('<')),
+        MoveBufferStart,
+        Interface,
+        "cmd.editor.move_buffer_start",
+    ),
+    CommandSpec::new(
+        KeyChord::Ctrl(KeyCode::Home),
+        MoveBufferStart,
+        Interface,
+        "cmd.editor.move_buffer_start",
+    ),
+    CommandSpec::new(
+        KeyChord::Meta(KeyCode::Char('>')),
+        MoveBufferEnd,
+        Interface,
+        "cmd.editor.move_buffer_end",
+    ),
+    CommandSpec::new(
+        KeyChord::Ctrl(KeyCode::End),
+        MoveBufferEnd,
+        Interface,
+        "cmd.editor.move_buffer_end",
     ),
     CommandSpec::new(
         KeyChord::Primary(KeyCode::Char('p')),
@@ -203,6 +232,54 @@ mod tests {
         assert_eq!(
             shift_insert.map(|spec| spec.action),
             Some(EditorCommand::Yank)
+        );
+    }
+
+    #[test]
+    fn editor_map_resolves_buffer_boundary_chords() {
+        let input = InputConfig::default();
+
+        let meta_less = EDITOR_COMMAND_MAP.resolve(
+            KeyEvent::new(
+                KeyCode::Char('<'),
+                KeyModifiers::ALT | KeyModifiers::SHIFT,
+            ),
+            &input,
+            true,
+        );
+        assert_eq!(
+            meta_less.map(|spec| spec.action),
+            Some(EditorCommand::MoveBufferStart)
+        );
+
+        let ctrl_home = EDITOR_COMMAND_MAP.resolve(
+            KeyEvent::new(KeyCode::Home, KeyModifiers::CONTROL),
+            &input,
+            true,
+        );
+        assert_eq!(
+            ctrl_home.map(|spec| spec.action),
+            Some(EditorCommand::MoveBufferStart)
+        );
+
+        let meta_greater = EDITOR_COMMAND_MAP.resolve(
+            KeyEvent::new(KeyCode::Char('>'), KeyModifiers::ALT),
+            &input,
+            true,
+        );
+        assert_eq!(
+            meta_greater.map(|spec| spec.action),
+            Some(EditorCommand::MoveBufferEnd)
+        );
+
+        let ctrl_end = EDITOR_COMMAND_MAP.resolve(
+            KeyEvent::new(KeyCode::End, KeyModifiers::CONTROL),
+            &input,
+            true,
+        );
+        assert_eq!(
+            ctrl_end.map(|spec| spec.action),
+            Some(EditorCommand::MoveBufferEnd)
         );
     }
 }

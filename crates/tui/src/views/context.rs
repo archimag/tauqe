@@ -18,6 +18,7 @@ pub enum ContextRow {
 pub struct ContextViewState {
     pub cursor_index: usize,
     pub scroll: u16,
+    pub view_height: usize,
     pub pinned_expanded: bool,
     pub user_expanded: bool,
     pub auto_expanded: bool,
@@ -36,6 +37,7 @@ impl Default for ContextViewState {
         Self {
             cursor_index: 0,
             scroll: 0,
+            view_height: 10,
             pinned_expanded: true,
             user_expanded: true,
             auto_expanded: true,
@@ -84,6 +86,30 @@ impl ContextViewState {
             ContextLayer::Pinned => self.pinned_expanded = !self.pinned_expanded,
             ContextLayer::User => self.user_expanded = !self.user_expanded,
             ContextLayer::Auto => self.auto_expanded = !self.auto_expanded,
+        }
+    }
+
+    pub fn is_all_expanded(&self) -> bool {
+        self.pinned_expanded && self.user_expanded && self.auto_expanded
+    }
+
+    pub fn expand_all(&mut self) {
+        self.pinned_expanded = true;
+        self.user_expanded = true;
+        self.auto_expanded = true;
+    }
+
+    pub fn collapse_all(&mut self) {
+        self.pinned_expanded = false;
+        self.user_expanded = false;
+        self.auto_expanded = false;
+    }
+
+    pub fn toggle_fold_all(&mut self) {
+        if self.is_all_expanded() {
+            self.collapse_all();
+        } else {
+            self.expand_all();
         }
     }
 

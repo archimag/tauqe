@@ -196,6 +196,16 @@ pub fn canonical_catalog() -> Vec<LocaleCatalogItem> {
         item("dialog.execute_review.queue_more", "   ... and {} more finding(s)", "Execute-review queue overflow line", None),
         item("dialog.execute_review.note", "TAUQE will resolve each finding in an isolated turn with compiler verification gates.", "Execute-review note about isolated turns", None),
         item("dialog.execute_review.fail_fast", "Fail-Fast Policy: execution stops and rolls back immediately if any finding fails verification.", "Execute-review fail-fast policy note", None),
+        item("dialog.execute_review.title_point", "Resolve Review Finding", "Title for point execution of a single finding or subplan step", None),
+        item("dialog.execute_review.finding_label", " Finding: ", "Execute-review finding field label", None),
+        item("dialog.execute_review.step_label", " Step: ", "Execute-review subplan step field label", None),
+        item("dialog.execute_review.model_list_title", " Coder Model ", "Execute-review coder model list title with a single entry", None),
+        item("dialog.execute_review.model_list_counter", " Coder Model  [{} of {}] ", "Execute-review coder model list title with a position counter", None),
+        item("dialog.execute_review.no_models", "  (no coder models configured)", "Execute-review empty coder model list placeholder", None),
+        item("dialog.execute_review.editor_title", "Coder Instructions (optional)", "Execute-review instructions editor block title", None),
+        item("dialog.execute_review.editor_placeholder", " Additional implementation directives [optional]...", "Execute-review empty instructions placeholder", None),
+        item("dialog.execute_review.hint_actions", "Enter resolve • ← / → button • Esc cancel", "Execute-review dialog footer hint while the action bar has focus", None),
+        item("dialog.execute_review.hint_fields", "{}Enter resolve • Tab focus • {} model • Esc cancel", "Execute-review dialog footer hint while a field has focus", None),
 
         item("dialog.execute_scope.heading_single", "Execute target plan step autonomously?", "Execute-single-step dialog heading", None),
         item("dialog.execute_scope.heading_scope", "Execute plan steps sequentially with automated verification?", "Execute-scope dialog heading", None),
@@ -325,6 +335,15 @@ pub fn canonical_catalog() -> Vec<LocaleCatalogItem> {
         item("review.filter_open", "Filter: Open only", "Review view open-findings filter indicator", None),
 
         // ------------------------------------------------------------------
+        // REPL (Develop) startup greeting. The greeting is a transient welcome
+        // surface shown only while the response area is empty, so its motto and
+        // quick-start verbs are localized like every other interface text.
+        // ------------------------------------------------------------------
+        item("splash.motto", "The Answer to the Ultimate Question of Engineering", "Develop splash motto revealed by the typewriter effect", None),
+        item("splash.hint.help", "Help", "Develop splash quick-start hint verb for opening Help", None),
+        item("splash.hint.send", "Send prompt", "Develop splash quick-start hint verb for sending a prompt", None),
+
+        // ------------------------------------------------------------------
         // REPL (Develop) view badges and hints.
         // ------------------------------------------------------------------
         item("repl.focus_badge_plan", "[PLAN]", "Develop discussion focus badge for a plan", Some(12)),
@@ -373,6 +392,8 @@ pub fn canonical_catalog() -> Vec<LocaleCatalogItem> {
         item("cmd.editor.move_word_forward", "Move one word forward", "Text editor command description", None),
         item("cmd.editor.move_beginning_of_line", "Move to the beginning of the line", "Text editor command description", None),
         item("cmd.editor.move_end_of_line", "Move to the end of the line", "Text editor command description", None),
+        item("cmd.editor.move_buffer_start", "Move to the beginning of the buffer", "Text editor command description", None),
+        item("cmd.editor.move_buffer_end", "Move to the end of the buffer", "Text editor command description", None),
         item("cmd.editor.move_line_up", "Move the cursor one line up", "Text editor command description", None),
         item("cmd.editor.move_line_down", "Move the cursor one line down", "Text editor command description", None),
         item("cmd.editor.delete_forward", "Delete the character forward", "Text editor command description", None),
@@ -406,7 +427,14 @@ pub fn canonical_catalog() -> Vec<LocaleCatalogItem> {
         item("cmd.context.return", "Return to the REPL", "Context command description", None),
         item("cmd.context.nav_prev", "Select the previous row", "Context command description", None),
         item("cmd.context.nav_next", "Select the next row", "Context command description", None),
+        item("cmd.context.select_first", "Select the first row", "Context command description", None),
+        item("cmd.context.select_last", "Select the last row", "Context command description", None),
+        item("cmd.context.page_up", "Scroll the context view up a page", "Context command description", None),
+        item("cmd.context.page_down", "Scroll the context view down a page", "Context command description", None),
         item("cmd.context.fold_toggle", "Fold or unfold the selected section", "Context command description", None),
+        item("cmd.context.fold_all", "Toggle fold or unfold for all context sections", "Context command description", None),
+        item("cmd.context.copy", "Copy file path to clipboard", "Context command description", None),
+        item("cmd.context.refresh", "Refresh context from the server", "Context command description", None),
         item("cmd.context.remove", "Remove the selected file from context", "Context command description", None),
 
         // ------------------------------------------------------------------
@@ -432,7 +460,9 @@ pub fn canonical_catalog() -> Vec<LocaleCatalogItem> {
         // ------------------------------------------------------------------
         item("cmd.plans.activate", "Execute a leaf step, or fold groups and headers", "Plans command description", None),
         item("cmd.plans.execute", "Execute the selected step, group, or entire plan", "Plans command description", None),
-        item("cmd.plans.replan", "Refine or replan the horizon with the Architect", "Plans command description", None),
+        item("cmd.plans.execute_all", "Execute every ready step of the selected plan as one batch (with confirmation)", "Plans command description", None),
+        item("cmd.plans.replan", "Refine or replan the selected plan horizon with the Architect", "Plans command description", None),
+        item("cmd.plans.replan_all", "Replan the horizon to resolve every blocked step with the Architect", "Plans command description", None),
         item("cmd.plans.discuss", "Discuss the selection with AI in the REPL", "Plans command description", None),
         item("cmd.plans.change_status", "Change the step status", "Plans command description", None),
         item("cmd.plans.return", "Return to the REPL", "Plans command description", None),
@@ -457,6 +487,7 @@ pub fn canonical_catalog() -> Vec<LocaleCatalogItem> {
         item("cmd.review.execute_all", "Execute all Todo findings across all sessions (with confirmation)", "Review command description", None),
         item("cmd.review.execute", "Execute the selected finding or all Todo findings in the session", "Review command description", None),
         item("cmd.review.refine", "Decompose the selected finding into steps with the Architect", "Review command description", None),
+        item("cmd.review.refine_all", "Decompose every finding awaiting architectural refinement", "Review command description", None),
         item("cmd.review.run", "Run a code review on the current context", "Review command description", None),
         item("cmd.review.toggle_hide_closed", "Toggle the filter between all findings and open findings only", "Review command description", None),
         item("cmd.review.set_focus", "Set the discussion focus to the selection without leaving the view", "Review command description", None),
@@ -686,6 +717,14 @@ pub fn canonical_catalog() -> Vec<LocaleCatalogItem> {
         item("dialog.refine_blocked.plan_label", "Plan: ", "Refine-blocked dialog plan field label", None),
         item("dialog.refine_blocked.reason_label", "Reason / Contradiction:", "Refine-blocked dialog reason field label", None),
         item("dialog.refine_blocked.note", "TAUQE prohibits speculative guessing. Replan uncompleted horizon addressing architectural blockers.", "Refine-blocked dialog note about replanning", None),
+
+        // ------------------------------------------------------------------
+        // Review finding decomposition (architect) dialog.
+        // ------------------------------------------------------------------
+        item("dialog.review_refine.title", "Decompose Review Finding (AI Architect)", "Title for the review finding decomposition dialog", None),
+        item("dialog.review_refine.review_label", " Review: ", "Review finding decomposition dialog session field label", None),
+        item("dialog.review_refine.finding_label", " Finding: ", "Review finding decomposition dialog finding field label", None),
+        item("dialog.review_refine.header_note", " Decomposes the finding into verified atomic engineering steps without altering agreed architecture.", "Review finding decomposition dialog header note", None),
 
         // ------------------------------------------------------------------
         // Code review launch dialog.

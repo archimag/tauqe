@@ -67,14 +67,43 @@ This document specifies mandatory architectural and UX invariants for the Tauqe 
 
 ---
 
-## 4. Hierarchical Tree Navigation and Org-Mode Paradigm
+## 4. Hierarchical Tree Navigation, Org-Mode Paradigm, and Semantic Key Matrix
 
-- **Hierarchical Tree Structures (Plans, Review):**
-  - Implement the conceptual Org-mode paradigm for structured trees without burdening navigation with complex Emacs-specific modifier chords.
-  - **Visibility Cycling:** Support clear local folding on items (`Tab` or `Space`) and global folding (`a`) to toggle between dense overview (all collapsed) and expanded states.
-  - **Orthogonal Status and Execution:** Task lifecycle statuses (`TODO`, `IN_PROGRESS`, `DONE`, `CANCELLED`, consciously chosen via modal dialog `t`) are strictly separated from execution (`x`).
-  - **High Information Density (No Decorative Gaps):** Collapsed tree items must be rendered tightly adjacent without artificial blank gaps or trailing empty lines. Expanded items with markdown details must be cleanly separated by exactly one line.
-  - **Simple Dedicated Navigation:** In view modes without text input (Plans, Review, Context), prioritize simple direct keys (`n`/`p`, `↑`/`↓`, `x` for execute, `c` for copy, `s` for status filter, `t` for status dialog) rather than multi-key chord sequences.
+1. **Hierarchical Tree Structures (Plans, Review):**
+   - Implement the conceptual Org-mode paradigm for structured trees without burdening navigation with complex Emacs-specific modifier chords.
+   - **Visibility Cycling:** Support clear local folding on items (`Tab` or `Space`) and global folding (`a`) to toggle between dense overview (all collapsed) and expanded states.
+   - **Orthogonal Status and Execution:** Task lifecycle statuses (`TODO`, `IN_PROGRESS`, `DONE`, `CANCELLED`, consciously chosen via modal dialog `t`) are strictly separated from execution (`x`).
+   - **High Information Density (No Decorative Gaps):** Collapsed tree items must be rendered tightly adjacent without artificial blank gaps or trailing empty lines. Expanded items with markdown details must be cleanly separated by exactly one line.
+   - **Simple Dedicated Navigation:** In view modes without text input (Plans, Review, Context, History), prioritize simple direct keys (`n`/`p`, `↑`/`↓`, `x` for execute, `r` for refine, `c` for copy, `t` for the status dialog) rather than multi-key chord sequences.
+
+2. **Case Invariant: Lowercase Acts on the Selection, Uppercase Acts on Everything:**
+   - The letter case of a structural command encodes the scale of its effect. This rule is mandatory in every navigation view (Plans, Review, Context, History).
+   - A lowercase letter applies one verb to the single item under the cursor: `x` executes the selected step or finding, `r` refines the selected item, `c` copies the selected item.
+   - The uppercase (`Shift`) counterpart applies the same verb to every applicable item: `X` executes every ready step or open finding, `R` refines every item awaiting decomposition.
+   - The scale is chosen before the letter. A verb never acquires a letter whose sibling already carries the opposite scale, and a batch command is never bound to a lowercase key.
+
+3. **`x` / `X` Are Reserved for Constructive Execution:**
+   - `x` executes the selected target and `X` executes the batch of every applicable target. The reservation holds in the Develop viewport, Plans, and Review alike.
+   - Binding `x` to deletion, cancellation, dismissal, or any other destructive effect is forbidden: a keystroke pressed while disproving a step must never destroy it.
+   - Removing a single entity is bound to `Delete` and always opens a confirmation dialog whose default focus is `Cancel` (§5.4).
+
+4. **Clipboard Is Isolated from Destructive Clearing (`c` / `y`):**
+   - In navigation views, lowercase `c` and `y` exclusively place content, a path, or item text into the clipboard (copy / yank). They never clear, delete, or reset state.
+   - Clearing a whole collection — the auto context layer, the user context layer, the session history, or a stored list — requires the `Shift+C` chord plus an interactive modal confirmation that defaults to `Cancel` (§5.4).
+   - `Shift+C` is deliberately uppercase-only, because removing one entity is `Delete` and a single clear has no safe meaning. A view that needs both a copy and a clear keeps `c` for copy and `Shift+C` for the mass clear, never the reverse.
+
+5. **`N` Creates, `r` / `R` Decompose (New Entity versus Refine Invariant):**
+   - Creating a new analysis entity is separated from decomposing an existing one, so the two verbs never compete for a letter. Starting a new Review session over the current context is bound to `N`.
+   - `r` and `R` are reserved for the Architect in Plans and Review: lowercase `r` decomposes the selected item (refining the plan horizon or turning a finding into a subplan), and `R` runs the Architect over every item that requires decomposition.
+   - Refresh therefore never claims `r`; it uses the canonical `g` (§4.6).
+
+6. **Navigation Minimum and Canonical Refresh (`g`):**
+   - Every structural navigation view implements the same symmetric movement set: `n` / `p` (and `↑` / `↓`) for the next and previous row, `Home`, `M-<`, or `C-Home` for the first row, `End`, `M->`, or `C-End` for the last row, `PgUp` / `PgDn` for paged scrolling, and `C-n` / `C-p` for the accordion walk. The shared text editor honors the same boundary chords (`M-<` / `M->`, `C-Home` / `C-End`) for the beginning and the end of the buffer.
+   - Requesting a lightweight state refresh from the daemon — no LLM call and no bounded turn — is bound to `g` in the Plans, Review, and Context tabs, following the Magit/Dired convention.
+   - `g` is a cheap, non-destructive helper, so it needs no confirmation dialog.
+
+7. **Unified Batch Execution (`X`):**
+   - A batch launch always reuses the single `BatchExecution` supervisor instead of a per-mode loop. The queue is assembled from every unfinished leaf step of the ready plans, the confirmation dialog states the total scope of work, one progress view tracks the run, and interruption is governed by the three-way `BatchCancel` dialog (§6.3).
 
 ---
 
@@ -84,7 +113,7 @@ This document specifies mandatory architectural and UX invariants for the Tauqe 
    - **Magit / Org-Mode Structural Navigation (Non-Input Contexts):**
      In all views, dialogs, and panels where a text buffer is NOT actively receiving text (Plans, Review, History, Context file list, dialog button toggling):
      - Canonical navigation uses simple, direct keys: `n` (*next*) and `p` (*previous*), following the Magit/Dired standard. Arrows `↑`/`↓` are preserved as secondary aliases.
-     - Actions use direct bare keys (`x` for execute step/session, `t` for status dialog, `s` for filter, `c`/`y` for copy, `Tab`/`Space` for folding, `Enter`, `Esc`, `q` to return/bury buffer, `?` for help).
+     - Actions use direct bare keys: `x` / `X` for single versus batch execution, `r` / `R` for single versus batch Architect decomposition, `N` for a new review session, `g` for refresh, `t` for the status dialog, `c` / `y` for copy, `Shift+C` for mass clearing, `Tab` / `Space` for local folding, `a` for fold-all, plus `Delete`, `Enter`, `Esc`, `q` to return/bury the buffer, and `?` for help (§4.2–§4.7).
      - Modifier chords are never required for basic browsing, folding, or status toggling.
      - Never intercept these single keys when a text editor becomes active.
    - **Emacs-Style Commands with Zero Modal Ambiguity (Text-Input Contexts):**

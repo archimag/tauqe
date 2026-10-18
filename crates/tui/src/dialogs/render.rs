@@ -23,7 +23,8 @@ pub(crate) mod status;
 pub(crate) use confirm::{
     batch_cancel_modal_geometry, clear_auto_params, clear_history_params, clear_user_params,
     confirm_cancel_params, confirm_detach_focus_params, confirm_quit_params, delete_plan_params,
-    delete_review_params, execute_review_params, execute_scope_params,
+    delete_review_params, execute_review_dialog_geometry, execute_review_params,
+    execute_scope_params,
     render_confirm_batch_cancel_popup, render_confirm_cancel_popup,
     render_confirm_clear_auto_popup, render_confirm_clear_history_popup,
     render_confirm_clear_user_popup, render_confirm_delete_plan_popup,

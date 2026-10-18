@@ -266,11 +266,11 @@ mod tests {
     use super::global::GLOBAL_COMMAND_MAP;
     use super::*;
 
-    use crate::views::context::input::CONTEXT_COMMAND_MAP;
+    use crate::views::context::input::{ContextAction, CONTEXT_COMMAND_MAP};
     use crate::views::history::input::HISTORY_COMMAND_MAP;
-    use crate::views::plans::input::PLANS_COMMAND_MAP;
+    use crate::views::plans::input::{PlansAction, PLANS_COMMAND_MAP};
     use crate::views::repl::input::REPL_COMMAND_MAP;
-    use crate::views::review::input::REVIEW_COMMAND_MAP;
+    use crate::views::review::input::{ReviewAction, REVIEW_COMMAND_MAP};
 
     fn ctrl_primary() -> InputConfig {
         InputConfig {
@@ -424,6 +424,44 @@ mod tests {
         let (ap, am) = (alt.primary_modifier, alt.meta_modifier);
         assert_eq!(KeyChord::Primary(KeyCode::Char('s')).display(ap, am), "Alt+S");
         assert_eq!(KeyChord::Meta(KeyCode::Char('s')).display(ap, am), "Ctrl+S");
+    }
+
+    #[test]
+    fn boundary_chords_match_meta_angles_and_ctrl_home_end() {
+        let input = ctrl_primary();
+
+        // `M-<` arrives as the `<` character with Alt, optionally with Shift
+        // when the developer is forced to press `Shift+,` on a US layout.
+        let meta_less = KeyChord::Meta(KeyCode::Char('<'));
+        assert!(meta_less.matches(
+            key(KeyCode::Char('<'), KeyModifiers::ALT | KeyModifiers::SHIFT),
+            &input,
+            false
+        ));
+        assert!(meta_less.matches(key(KeyCode::Char('<'), KeyModifiers::ALT), &input, false));
+        assert!(!meta_less.matches(key(KeyCode::Char('<'), KeyModifiers::NONE), &input, false));
+
+        let meta_greater = KeyChord::Meta(KeyCode::Char('>'));
+        assert!(meta_greater.matches(key(KeyCode::Char('>'), KeyModifiers::ALT), &input, false));
+        assert!(!meta_greater.matches(key(KeyCode::Char('<'), KeyModifiers::ALT), &input, false));
+
+        // The dedicated buffer-end keys are raw Ctrl chords, distinct from the
+        // bare `Home` / `End` structural bindings.
+        let ctrl_home = KeyChord::Ctrl(KeyCode::Home);
+        assert!(ctrl_home.matches(key(KeyCode::Home, KeyModifiers::CONTROL), &input, false));
+        assert!(!ctrl_home.matches(key(KeyCode::Home, KeyModifiers::NONE), &input, false));
+        assert!(!ctrl_home.matches(key(KeyCode::End, KeyModifiers::CONTROL), &input, false));
+
+        let ctrl_end = KeyChord::Ctrl(KeyCode::End);
+        assert!(ctrl_end.matches(key(KeyCode::End, KeyModifiers::CONTROL), &input, false));
+        assert!(!ctrl_end.matches(key(KeyCode::End, KeyModifiers::NONE), &input, false));
+
+        // Display keeps the angle glyphs intact so Help names the real keys.
+        let (p, m) = (input.primary_modifier, input.meta_modifier);
+        assert_eq!(meta_less.display(p, m), "Alt+<");
+        assert_eq!(meta_greater.display(p, m), "Alt+>");
+        assert_eq!(ctrl_home.display(p, m), "Ctrl+Home");
+        assert_eq!(ctrl_end.display(p, m), "Ctrl+End");
     }
 
     #[test]
@@ -619,5 +657,143 @@ mod tests {
         assert_map_follows_both_configurations(&PLANS_COMMAND_MAP, "PLANS_COMMAND_MAP");
         assert_map_follows_both_configurations(&REPL_COMMAND_MAP, "REPL_COMMAND_MAP");
         assert_map_follows_both_configurations(&REVIEW_COMMAND_MAP, "REVIEW_COMMAND_MAP");
+    }
+
+    /// Resolves a key event against a command map with text input inactive.
+    fn resolve_action<A: Copy + 'static>(
+        map: &CommandMap<A>,
+        key: KeyEvent,
+        input: &InputConfig,
+    ) -> Option<A> {
+        map.resolve(key, input, false).map(|spec| spec.action)
+    }
+
+    /// Asserts `Home`, `M-<`, and `C-Home` all select the first row in a view.
+    fn assert_first_row_chords_agree<A>(map: &CommandMap<A>, label: &str)
+    where
+        A: Copy + PartialEq + std::fmt::Debug + 'static,
+    {
+        let input = ctrl_primary();
+        let home = resolve_action(map, key(KeyCode::Home, KeyModifiers::NONE), &input);
+        let meta_less = resolve_action(map, key(KeyCode::Char('<'), KeyModifiers::ALT), &input);
+        let ctrl_home = resolve_action(map, key(KeyCode::Home, KeyModifiers::CONTROL), &input);
+        assert!(home.is_some(), "{label}: Home must select the first row");
+        assert_eq!(home, meta_less, "{label}: M-< must match Home");
+        assert_eq!(home, ctrl_home, "{label}: C-Home must match Home");
+    }
+
+    /// Asserts `End`, `M->`, and `C-End` all select the last row in a view.
+    fn assert_last_row_chords_agree<A>(map: &CommandMap<A>, label: &str)
+    where
+        A: Copy + PartialEq + std::fmt::Debug + 'static,
+    {
+        let input = ctrl_primary();
+        let end = resolve_action(map, key(KeyCode::End, KeyModifiers::NONE), &input);
+        let meta_greater = resolve_action(map, key(KeyCode::Char('>'), KeyModifiers::ALT), &input);
+        let ctrl_end = resolve_action(map, key(KeyCode::End, KeyModifiers::CONTROL), &input);
+        assert!(end.is_some(), "{label}: End must select the last row");
+        assert_eq!(end, meta_greater, "{label}: M-> must match End");
+        assert_eq!(end, ctrl_end, "{label}: C-End must match End");
+    }
+
+    #[test]
+    fn boundary_navigation_chords_are_unified_across_views() {
+        assert_first_row_chords_agree(&CONTEXT_COMMAND_MAP, "CONTEXT_COMMAND_MAP");
+        assert_last_row_chords_agree(&CONTEXT_COMMAND_MAP, "CONTEXT_COMMAND_MAP");
+        assert_first_row_chords_agree(&PLANS_COMMAND_MAP, "PLANS_COMMAND_MAP");
+        assert_last_row_chords_agree(&PLANS_COMMAND_MAP, "PLANS_COMMAND_MAP");
+        assert_first_row_chords_agree(&REVIEW_COMMAND_MAP, "REVIEW_COMMAND_MAP");
+        assert_last_row_chords_agree(&REVIEW_COMMAND_MAP, "REVIEW_COMMAND_MAP");
+    }
+
+    #[test]
+    fn x_reserved_for_execution_never_destructive() {
+        let input = ctrl_primary();
+
+        assert_eq!(
+            resolve_action(&PLANS_COMMAND_MAP, key(KeyCode::Char('x'), KeyModifiers::NONE), &input),
+            Some(PlansAction::Execute),
+            "x must execute the selected plan step"
+        );
+        assert_eq!(
+            resolve_action(&PLANS_COMMAND_MAP, key(KeyCode::Char('X'), KeyModifiers::NONE), &input),
+            Some(PlansAction::ExecuteAll),
+            "X must execute the plan batch"
+        );
+
+        assert_eq!(
+            resolve_action(&REVIEW_COMMAND_MAP, key(KeyCode::Char('x'), KeyModifiers::NONE), &input),
+            Some(ReviewAction::Execute),
+            "x must execute the selected finding"
+        );
+        assert_eq!(
+            resolve_action(&REVIEW_COMMAND_MAP, key(KeyCode::Char('X'), KeyModifiers::NONE), &input),
+            Some(ReviewAction::ExecuteAll),
+            "X must execute the review batch"
+        );
+
+        assert_eq!(
+            resolve_action(&CONTEXT_COMMAND_MAP, key(KeyCode::Char('x'), KeyModifiers::NONE), &input),
+            None,
+            "x must never be bound in the Context view"
+        );
+    }
+
+    #[test]
+    fn r_refines_selection_and_shift_r_refines_everything() {
+        let input = ctrl_primary();
+
+        assert_eq!(
+            resolve_action(&PLANS_COMMAND_MAP, key(KeyCode::Char('r'), KeyModifiers::NONE), &input),
+            Some(PlansAction::Replan),
+            "lowercase r must refine the selected plan horizon"
+        );
+        assert_eq!(
+            resolve_action(&PLANS_COMMAND_MAP, key(KeyCode::Char('R'), KeyModifiers::NONE), &input),
+            Some(PlansAction::ReplanAll),
+            "uppercase R must replan every blocked step"
+        );
+
+        assert_eq!(
+            resolve_action(&REVIEW_COMMAND_MAP, key(KeyCode::Char('r'), KeyModifiers::NONE), &input),
+            Some(ReviewAction::Refine),
+            "lowercase r must decompose the selected finding"
+        );
+        assert_eq!(
+            resolve_action(&REVIEW_COMMAND_MAP, key(KeyCode::Char('R'), KeyModifiers::NONE), &input),
+            Some(ReviewAction::RefineAll),
+            "uppercase R must decompose every awaiting finding"
+        );
+    }
+
+    #[test]
+    fn shift_n_starts_a_new_review_session() {
+        let input = ctrl_primary();
+        assert_eq!(
+            resolve_action(&REVIEW_COMMAND_MAP, key(KeyCode::Char('N'), KeyModifiers::NONE), &input),
+            Some(ReviewAction::RunReview),
+            "uppercase N must start a new review session"
+        );
+    }
+
+    #[test]
+    fn lowercase_g_refreshes_in_every_navigation_view() {
+        let input = ctrl_primary();
+        let refresh = key(KeyCode::Char('g'), KeyModifiers::NONE);
+        assert_eq!(
+            resolve_action(&PLANS_COMMAND_MAP, refresh, &input),
+            Some(PlansAction::Refresh),
+            "Plans: g must refresh"
+        );
+        assert_eq!(
+            resolve_action(&REVIEW_COMMAND_MAP, refresh, &input),
+            Some(ReviewAction::Refresh),
+            "Review: g must refresh"
+        );
+        assert_eq!(
+            resolve_action(&CONTEXT_COMMAND_MAP, refresh, &input),
+            Some(ContextAction::Refresh),
+            "Context: g must refresh"
+        );
     }
 }

@@ -188,7 +188,7 @@ pub fn build_review_refine_user_prompt(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tauqe_protocol::review::{ReviewItemStatus, ReviewSeverity};
+    use tauqe_protocol::review::{IssueType, ReviewItemStatus, ReviewSeverity};
     use tauqe_protocol::ModelRef;
 
     fn sample_session() -> ReviewSession {
@@ -204,6 +204,7 @@ mod tests {
                 id: 42,
                 title: "Decompose this issue".to_string(),
                 model: None,
+                issue_type: IssueType::Bug,
                 severity: ReviewSeverity::Critical,
                 status: ReviewItemStatus::Discussion,
                 recommendations: vec![],

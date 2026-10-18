@@ -135,6 +135,7 @@ pub fn render_context_view(
     }
 
     let inner_height = main_area.height as usize;
+    state.context_view.view_height = inner_height;
     if inner_height > 0 {
         let target_line = state.context_view.cursor_index + 2;
         if target_line < state.context_view.scroll as usize {

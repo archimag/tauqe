@@ -36,6 +36,7 @@ use super::is_readonly_discussion_prompt;
 /// self-documenting and make a new command kind impossible to miss silently.
 #[derive(Default)]
 pub(super) struct ProposalStep {
+    commands: Vec<LlmCommand>,
     text: String,
     edits: Vec<EditOperation>,
     context_requests: Vec<ContextRequest>,
@@ -58,30 +59,35 @@ impl ProposalStep {
     /// language) keep their first occurrence, matching the previous scan order.
     fn from_commands(commands: Vec<LlmCommand>) -> Self {
         let mut step = ProposalStep::default();
-        for command in commands {
+        for command in &commands {
             match command {
                 LlmCommand::Text { content } => {
                     if !step.text.is_empty() {
                         step.text.push('\n');
                     }
-                    step.text.push_str(&content);
+                    step.text.push_str(content);
                 }
-                LlmCommand::Edit { operation } => step.edits.push(operation),
+                LlmCommand::Edit { operation } => step.edits.push(operation.clone()),
                 LlmCommand::ContextRequest { path, access } => {
-                    step.context_requests.push(ContextRequest { path, access });
+                    step.context_requests.push(ContextRequest {
+                        path: path.clone(),
+                        access: *access,
+                    });
                 }
-                LlmCommand::DocRequest { topic } => step.doc_requests.push(topic),
+                LlmCommand::DocRequest { topic } => step.doc_requests.push(*topic),
                 LlmCommand::RepoSearch { path, regex } => {
-                    step.repo_searches.push(RepoSearchRequest::new(path, regex));
+                    step.repo_searches
+                        .push(RepoSearchRequest::new(path.clone(), regex.clone()));
                 }
                 LlmCommand::Verify { target, on_success } => {
                     if step.verify_request.is_none() {
-                        step.verify_request = Some(to_edit_verify_request(target, on_success));
+                        step.verify_request =
+                            Some(to_edit_verify_request(*target, *on_success));
                     }
                 }
                 LlmCommand::Outcome { outcome } => {
                     if step.terminal_outcome.is_none() {
-                        step.terminal_outcome = Some(outcome);
+                        step.terminal_outcome = Some(outcome.clone());
                     }
                 }
                 LlmCommand::Blocked { reason, details } => {
@@ -90,30 +96,50 @@ impl ProposalStep {
                             Some(details) if !details.trim().is_empty() => {
                                 format!("{}\n\n{}", reason.trim(), details.trim())
                             }
-                            _ => reason,
+                            _ => reason.clone(),
                         });
                     }
                 }
                 LlmCommand::Scratchpad { notes } => {
                     if step.scratchpad.is_none() {
-                        step.scratchpad = Some(notes);
+                        step.scratchpad = Some(notes.clone());
                     }
                 }
                 LlmCommand::UserLanguage { language } => {
                     if step.language.is_none() {
-                        step.language = Some(language);
+                        step.language = Some(language.clone());
                     }
                 }
-                LlmCommand::Plan { update } => step.plans.push(update),
-                LlmCommand::ProtocolError { message } => step.protocol_errors.push(message),
+                LlmCommand::Plan { update } => step.plans.push(update.clone()),
+                LlmCommand::ProtocolError { message } => step.protocol_errors.push(message.clone()),
             }
         }
+        step.commands = commands;
         step
     }
 
     /// Cleaned conversational text assembled from the decoded text commands.
     pub(super) fn text(&self) -> &str {
         &self.text
+    }
+
+    /// Raw decoded command vector preserved from the proposal round.
+    pub(super) fn commands(&self) -> &[LlmCommand] {
+        &self.commands
+    }
+
+    /// Reports whether the proposal carries any command a registered Discovery
+    /// handler owns.
+    ///
+    /// The predicate consults the same handler registry the Discovery
+    /// dispatcher uses, so it can never advertise a capability the round would
+    /// not actually execute.
+    #[allow(dead_code)]
+    pub(super) fn has_discovery_commands(&self) -> bool {
+        let handlers = crate::workflow::discovery::discovery_handlers();
+        self.commands()
+            .iter()
+            .any(|command| handlers.iter().any(|handler| handler.handles(command)))
     }
 
     /// File edit operations carried by the proposal.
@@ -476,4 +502,59 @@ pub(super) async fn run_proposal_step(
     let commands = protocol.decode(&assistant_text);
 
     Ok(ProposalStep::from_commands(commands))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn from_commands_preserves_the_decoded_command_vector() {
+        let step = ProposalStep::from_commands(vec![
+            LlmCommand::Text {
+                content: "hello".to_string(),
+            },
+            LlmCommand::ContextRequest {
+                path: "src/a.rs".to_string(),
+                access: ContextAccess::ReadOnly,
+            },
+        ]);
+
+        assert_eq!(step.commands().len(), 2);
+        assert!(matches!(
+            &step.commands()[0],
+            LlmCommand::Text { content } if content == "hello"
+        ));
+        assert!(matches!(
+            &step.commands()[1],
+            LlmCommand::ContextRequest { path, .. } if path == "src/a.rs"
+        ));
+    }
+
+    #[test]
+    fn has_discovery_commands_detects_discovery_capabilities() {
+        let context_request = ProposalStep::from_commands(vec![LlmCommand::ContextRequest {
+            path: "src/a.rs".to_string(),
+            access: ContextAccess::ReadOnly,
+        }]);
+        assert!(context_request.has_discovery_commands());
+
+        let doc_request = ProposalStep::from_commands(vec![LlmCommand::DocRequest {
+            topic: DocTopic::Workflow,
+        }]);
+        assert!(doc_request.has_discovery_commands());
+
+        let repo_search = ProposalStep::from_commands(vec![LlmCommand::RepoSearch {
+            path: String::new(),
+            regex: "pub fn".to_string(),
+        }]);
+        assert!(repo_search.has_discovery_commands());
+
+        let plain_answer = ProposalStep::from_commands(vec![LlmCommand::Text {
+            content: "just an answer".to_string(),
+        }]);
+        assert!(!plain_answer.has_discovery_commands());
+
+        assert!(!ProposalStep::default().has_discovery_commands());
+    }
 }

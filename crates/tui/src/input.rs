@@ -110,6 +110,11 @@ pub fn is_text_input_active(st: &AppState) -> bool {
         Some(ActiveModal::RefineDialog) => {
             st.plans_view.refine_dialog.as_ref().is_some_and(|d| d.focus.is_instructions_editor())
         }
+        Some(ActiveModal::ReviewRefine) => st
+            .review
+            .refine_dialog
+            .as_ref()
+            .is_some_and(|d| d.focus.is_instructions_editor()),
         Some(ActiveModal::Locale) => st
             .locale_dialog
             .as_ref()
@@ -200,6 +205,11 @@ pub fn handle_paste(st: &mut AppState, text: &str) {
         }
         Some(ActiveModal::RefineDialog) => {
             if let Some(dialog) = st.plans_view.refine_dialog.as_mut() {
+                dialog.instructions_editor.insert_paste(text);
+            }
+        }
+        Some(ActiveModal::ReviewRefine) => {
+            if let Some(dialog) = st.review.refine_dialog.as_mut() {
                 dialog.instructions_editor.insert_paste(text);
             }
         }
@@ -1065,5 +1075,61 @@ mod tests {
         .unwrap();
         assert_eq!(res, Some(InputResult::Continue));
         assert!(state.lock().await.locale_dialog.is_some());
+    }
+
+    fn review_refine_dialog_with_focus(
+        focus: crate::views::plans::RefineDialogFocus,
+    ) -> crate::views::review::ReviewRefineDialogState {
+        let mut dialog = crate::views::review::ReviewRefineDialogState::new(
+            "rev-1".to_string(),
+            "Session rev-1".to_string(),
+            2,
+            "Missing auth guard".to_string(),
+            Vec::new(),
+        );
+        dialog.focus = focus;
+        dialog
+    }
+
+    #[test]
+    fn test_is_text_input_active_in_review_refine_dialog() {
+        let mut st = test_state();
+        st.view_mode = ViewMode::Review;
+        st.review.refine_dialog = Some(review_refine_dialog_with_focus(
+            crate::views::plans::RefineDialogFocus::ModelList,
+        ));
+        assert!(!is_text_input_active(&st));
+
+        st.review.refine_dialog = Some(review_refine_dialog_with_focus(
+            crate::views::plans::RefineDialogFocus::InstructionsEditor,
+        ));
+        assert!(is_text_input_active(&st));
+
+        st.review.refine_dialog = Some(review_refine_dialog_with_focus(
+            crate::views::plans::RefineDialogFocus::Actions,
+        ));
+        assert!(!is_text_input_active(&st));
+    }
+
+    #[test]
+    fn test_handle_paste_into_review_refine_instructions_editor() {
+        let mut st = test_state();
+        st.view_mode = ViewMode::Review;
+        st.review.refine_dialog = Some(review_refine_dialog_with_focus(
+            crate::views::plans::RefineDialogFocus::InstructionsEditor,
+        ));
+
+        handle_paste(&mut st, "split the finding into executable steps");
+
+        assert_eq!(
+            st.review
+                .refine_dialog
+                .as_ref()
+                .expect("dialog stays open")
+                .instructions_editor
+                .get_text(),
+            "split the finding into executable steps"
+        );
+        assert_eq!(st.input_editor.get_text(), "");
     }
 }

@@ -16,18 +16,6 @@ use crate::edits::protocol::{TerminalOutcome, VerifyOnSuccess, VerifyTarget};
 
 use super::registry::{resolve_specs, CapabilityModule, PromptRenderContext, XmlParser};
 
-/// Chooses the buffer a decoder parses.
-///
-/// A marker-bound protocol normalizes the raw text internally, so the raw
-/// buffer is authoritative; otherwise the pre-normalized buffer is used.
-fn working_text<'a>(marker: Option<&str>, normalized_text: &'a str, raw_text: &'a str) -> &'a str {
-    if marker.is_some() {
-        raw_text
-    } else {
-        normalized_text
-    }
-}
-
 /// Textual conversational response.
 pub(crate) struct TextMessageModule;
 
@@ -50,13 +38,12 @@ impl CapabilityModule for TextMessageModule {
 
     fn decode_xml(
         &self,
-        normalized_text: &str,
+        _normalized_text: &str,
         raw_text: &str,
         marker: Option<&str>,
         _editable_paths: &[String],
     ) -> Vec<LlmCommand> {
-        let text = working_text(marker, normalized_text, raw_text);
-        let cleaned = XmlParser::new(marker).clean_assistant_text(text);
+        let cleaned = XmlParser::new(marker).clean_assistant_text(raw_text);
         if cleaned.trim().is_empty() {
             Vec::new()
         } else {
@@ -128,12 +115,11 @@ impl CapabilityModule for FileEditsModule {
     fn decode_xml(
         &self,
         normalized_text: &str,
-        raw_text: &str,
+        _raw_text: &str,
         marker: Option<&str>,
         editable_paths: &[String],
     ) -> Vec<LlmCommand> {
-        let text = working_text(marker, normalized_text, raw_text);
-        match XmlParser::new(marker).parse_output(text, editable_paths) {
+        match XmlParser::new(marker).parse_output(normalized_text, editable_paths) {
             ModelResult::Edit { edits, outcome, .. } => {
                 let mut commands = Vec::new();
                 if let Some(message) = outcome.error {
@@ -186,20 +172,19 @@ impl CapabilityModule for DiscoveryModule {
     fn decode_xml(
         &self,
         normalized_text: &str,
-        raw_text: &str,
+        _raw_text: &str,
         marker: Option<&str>,
         _editable_paths: &[String],
     ) -> Vec<LlmCommand> {
-        let text = working_text(marker, normalized_text, raw_text);
         let parser = XmlParser::new(marker);
         let mut commands = Vec::new();
-        for request in parser.parse_context_requests(text) {
+        for request in parser.parse_context_requests(normalized_text) {
             commands.push(LlmCommand::ContextRequest {
                 path: request.path,
                 access: request.access,
             });
         }
-        for search in parser.parse_repo_searches(text) {
+        for search in parser.parse_repo_searches(normalized_text) {
             commands.push(LlmCommand::RepoSearch {
                 path: search.path,
                 regex: search.regex,
@@ -248,13 +233,12 @@ impl CapabilityModule for DocRequestModule {
     fn decode_xml(
         &self,
         normalized_text: &str,
-        raw_text: &str,
+        _raw_text: &str,
         marker: Option<&str>,
         _editable_paths: &[String],
     ) -> Vec<LlmCommand> {
-        let text = working_text(marker, normalized_text, raw_text);
         XmlParser::new(marker)
-            .parse_doc_requests(text)
+            .parse_doc_requests(normalized_text)
             .into_iter()
             .map(|topic| LlmCommand::DocRequest { topic })
             .collect()
@@ -322,8 +306,7 @@ impl CapabilityModule for ToolchainVerifyModule {
         marker: Option<&str>,
         _editable_paths: &[String],
     ) -> Vec<LlmCommand> {
-        let text = working_text(marker, normalized_text, raw_text);
-        match XmlParser::new(marker).parse_verify_request(text) {
+        match XmlParser::new(marker).parse_verify_request(normalized_text, raw_text) {
             Some(request) => vec![LlmCommand::Verify {
                 target: map_verify_target(request.target),
                 on_success: map_verify_on_success(request.on_success),
@@ -404,12 +387,11 @@ impl CapabilityModule for PlanCreationModule {
     fn decode_xml(
         &self,
         normalized_text: &str,
-        raw_text: &str,
+        _raw_text: &str,
         marker: Option<&str>,
         _editable_paths: &[String],
     ) -> Vec<LlmCommand> {
-        let text = working_text(marker, normalized_text, raw_text);
-        let (plans, _diagnostics) = XmlParser::new(marker).parse_plan_tags(text);
+        let (plans, _diagnostics) = XmlParser::new(marker).parse_plan_tags(normalized_text);
         plans
             .into_iter()
             .filter(|tag| tag.action == "save")
@@ -437,12 +419,11 @@ impl CapabilityModule for PlanUpdateModule {
     fn decode_xml(
         &self,
         normalized_text: &str,
-        raw_text: &str,
+        _raw_text: &str,
         marker: Option<&str>,
         _editable_paths: &[String],
     ) -> Vec<LlmCommand> {
-        let text = working_text(marker, normalized_text, raw_text);
-        let (plans, _diagnostics) = XmlParser::new(marker).parse_plan_tags(text);
+        let (plans, _diagnostics) = XmlParser::new(marker).parse_plan_tags(normalized_text);
         plans
             .into_iter()
             .filter(|tag| tag.action != "save")
@@ -494,8 +475,7 @@ impl CapabilityModule for ScratchpadModule {
         marker: Option<&str>,
         _editable_paths: &[String],
     ) -> Vec<LlmCommand> {
-        let text = working_text(marker, normalized_text, raw_text);
-        match XmlParser::new(marker).parse_scratchpad(text) {
+        match XmlParser::new(marker).parse_scratchpad(normalized_text, raw_text) {
             Some(notes) => vec![LlmCommand::Scratchpad { notes }],
             None => Vec::new(),
         }
@@ -537,23 +517,25 @@ impl CapabilityModule for OutcomeModule {
     }
 
     fn render_structured_instruction(&self, _ctx: &PromptRenderContext<'_>) -> Option<String> {
-        Some("- `outcome`: terminal outcome object with `status` ('none' while the turn continues, 'success' when it succeeds, 'error' when it fails), `summary` for a success summary, and `message` for an error message; unrelated fields stay empty.".to_string())
+        Some("- `outcome`: terminal outcome object with `status` ('none' while the turn continues, 'success' when it succeeds, 'error' when it fails, 'skip' when the work is already satisfied and no change is required), `summary` for a success summary, `message` for an error message, and `reason` for a skip reason; unrelated fields stay empty.".to_string())
     }
 
     fn decode_xml(
         &self,
         normalized_text: &str,
-        raw_text: &str,
+        _raw_text: &str,
         marker: Option<&str>,
         _editable_paths: &[String],
     ) -> Vec<LlmCommand> {
-        let text = working_text(marker, normalized_text, raw_text);
-        match XmlParser::new(marker).parse_terminal_outcome(text) {
+        match XmlParser::new(marker).parse_terminal_outcome(normalized_text) {
             Some(TerminalOutcome::Success { summary }) => vec![LlmCommand::Outcome {
                 outcome: LlmOutcome::Success { summary },
             }],
             Some(TerminalOutcome::Error { message }) => vec![LlmCommand::Outcome {
                 outcome: LlmOutcome::Error { message },
+            }],
+            Some(TerminalOutcome::Skip { reason }) => vec![LlmCommand::Outcome {
+                outcome: LlmOutcome::Skip { reason },
             }],
             _ => Vec::new(),
         }
@@ -599,12 +581,11 @@ impl CapabilityModule for BlockedModule {
     fn decode_xml(
         &self,
         normalized_text: &str,
-        raw_text: &str,
+        _raw_text: &str,
         marker: Option<&str>,
         _editable_paths: &[String],
     ) -> Vec<LlmCommand> {
-        let text = working_text(marker, normalized_text, raw_text);
-        match XmlParser::new(marker).parse_terminal_outcome(text) {
+        match XmlParser::new(marker).parse_terminal_outcome(normalized_text) {
             Some(TerminalOutcome::Blocked { reason, details }) => {
                 vec![LlmCommand::Blocked { reason, details }]
             }
@@ -656,8 +637,7 @@ impl CapabilityModule for UserLanguageModule {
         marker: Option<&str>,
         _editable_paths: &[String],
     ) -> Vec<LlmCommand> {
-        let text = working_text(marker, normalized_text, raw_text);
-        match XmlParser::new(marker).parse_user_language(text) {
+        match XmlParser::new(marker).parse_user_language(normalized_text, raw_text) {
             Some(language) => vec![LlmCommand::UserLanguage { language }],
             None => Vec::new(),
         }

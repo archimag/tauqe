@@ -76,6 +76,8 @@ impl RpcTracker {
 pub struct RpcConnection {
     writer: Box<dyn AsyncWrite + Unpin + Send>,
     tracker: RpcTracker,
+    #[cfg(test)]
+    written: Vec<u8>,
 }
 
 impl RpcConnection {
@@ -84,6 +86,8 @@ impl RpcConnection {
         Self {
             writer: Box::new(writer),
             tracker: RpcTracker::default(),
+            #[cfg(test)]
+            written: Vec::new(),
         }
     }
 
@@ -93,10 +97,18 @@ impl RpcConnection {
         let mut bytes = Vec::with_capacity(line.len() + 1);
         bytes.extend_from_slice(line.as_bytes());
         bytes.push(b'\n');
+        #[cfg(test)]
+        self.written.extend_from_slice(&bytes);
         let writer = self.writer.as_mut();
         writer.write_all(&bytes).await?;
         writer.flush().await?;
         Ok(())
+    }
+
+    /// Returns the bytes written across the connection during tests.
+    #[cfg(test)]
+    pub fn written(&self) -> &[u8] {
+        &self.written
     }
 
     /// Removes and returns the method recorded for a request id.
@@ -257,6 +269,7 @@ mod tests {
             .expect("an in-memory sink never fails to write");
         assert_eq!(conn.take_pending_request(id).as_deref(), Some("model/ask"));
         assert!(conn.take_pending_request(id).is_none());
+        assert!(!conn.written().is_empty());
     }
 
     #[test]

@@ -8,7 +8,7 @@ TAUQE's terminal UI combines the design philosophies of **Magit** (structured, l
 
 To guarantee universal compatibility across modern and legacy terminal emulators alike, all primary view modes and key actions are bound to portable Emacs/Readline chords instead of function keys:
 
-Throughout this chapter, `Ctrl+<key>` denotes the abstract **Primary Command Modifier** (`C-<key>`) and `Alt+<key>` the abstract **Meta Command Modifier** (`M-<key>`). Both are independent personal workstation settings that can be swapped in `tui.toml` (see section 5.5). Function keys (`F1`..`F12`) are never bound: window managers, terminal multiplexers, and laptop firmware intercept them unpredictably, and 60% and compact keyboards omit them entirely, so every action lives in the main alphanumeric block or on a dedicated navigation key.
+Throughout this chapter, `Ctrl+<key>` denotes the abstract **Primary Command Modifier** (`C-<key>`) and `Alt+<key>` the abstract **Meta Command Modifier** (`M-<key>`). Both are independent personal workstation settings that can be swapped in `tui.toml` (see section 5.5). Function keys (`F1`..`F12`) are never bound: window managers, terminal multiplexers, and laptop firmware intercept them unpredictably, and 60% and compact keyboards omit them entirely, so every action lives in the main alphanumeric block or on a dedicated navigation key. Every structural view also obeys one shared verb scale — a lowercase letter acts on the selected item, its uppercase counterpart on every applicable item — and one navigation minimum; the full matrix is specified in section 5.12.
 
 - **`Ctrl+1` / `Alt+1` (REPL View):**
   - The central engineering cockpit and execution canvas where coding turns take place.
@@ -41,30 +41,32 @@ Reasoning output during an active turn is a progress indicator, not a document t
 
 - **`Ctrl+2` / `Alt+2` (Plans View):**
   - Workspace for managing tactical task hierarchies and execution roadmaps, split into an immutable Concept section (system invariants) and an Implementation section (executable steps).
-  - Unified navigation: `n` / `p` (or `↑` / `↓`), with `Ctrl+N` / `Ctrl+P` for accordion inspection of the next / previous item.
+  - Unified navigation: `n` / `p` (or `↑` / `↓`), `Home` / `Alt+<` for the first row, `End` / `Alt+>` for the last row, `PgUp` / `PgDn` to page, and `Ctrl+N` / `Ctrl+P` for accordion inspection of the next / previous item.
   - Interactive tree of tasks with explicit statuses: Discussion, Todo, InProgress, Done, Blocked, and Cancelled.
-  - Execution: `x` executes the target step, group, or entire plan (with confirmation); `Enter` executes a leaf step and folds/unfolds on groups and plan headers.
-  - Discussion and refinement: `d` discusses the selected concept/step or the whole plan in REPL; `R` deep-refines plan architecture and steps with the Architect.
+  - Execution: `x` executes the selected step, group, or plan (with confirmation); `X` queues every unfinished leaf step of all ready plans as one batch execution (with confirmation); `Enter` executes a leaf step and folds/unfolds on groups and plan headers.
+  - Discussion and refinement: `d` discusses the selected concept/step or the whole plan in REPL; `r` deep-refines the selected item with the Architect; `R` refines every item awaiting decomposition in one batch.
   - Intentional status assignment: Press `t` or `s` to open the status dialog (`1` Discussion, `2` Todo, `3` InProgress, `4` Done, `5` Blocked, `6` Cancelled).
-  - Bulk folding (`a`), plan refresh (`r`), deletion (`Delete`, with confirmation), and Markdown copy (`c` / `y`).
+  - Bulk folding (`a`), refresh of plan state from the daemon (`g`), deletion (`Delete`, with confirmation), and Markdown copy (`c` / `y`).
 - **`Ctrl+3` / `Alt+3` (Review View):**
   - Dedicated code review workspace for static architectural and security audits.
-  - Unified navigation: `n` / `p` (or `↑` / `↓`), with `Ctrl+N` / `Ctrl+P` for accordion inspection of the next / previous finding.
-  - Interactive findings checklist: fold/unfold items (`Tab` / `Space`), execute the selected finding or every Todo finding in the session (`x`, with confirmation), run cross-session execution across all review sessions (`X` / `Shift+X`, with confirmation), and discuss the finding or the whole session in REPL (`d`).
+  - Unified navigation: `n` / `p` (or `↑` / `↓`), `Home` / `Alt+<` for the first row, `End` / `Alt+>` for the last row, `PgUp` / `PgDn` to page, and `Ctrl+N` / `Ctrl+P` for accordion inspection of the next / previous finding.
+  - Interactive findings checklist: fold/unfold items (`Tab` / `Space`), execute the selected finding (`x`, with confirmation), execute every Todo finding across all sessions as one batch (`X`, with confirmation), and discuss the finding or the whole session in REPL (`d`).
+  - Architect refinement: `r` turns the selected finding into a subplan; `R` refines every finding awaiting decomposition (status REFINE) in one batch.
   - Intentional status assignment: Press `t` or `s` to open the status selection dialog (`1` Discussion, `2` Todo, `3` InProgress, `4` Fixed, `5` Rejected).
   - Filtering and bulk folding: `f` toggles between all findings and hide-closed (FIXED / REJECTED); `a` folds or unfolds every session and finding.
-  - Run and refresh: `r` starts a new review of the current context; `Shift+R` refreshes the session list from the server.
+  - New session and refresh: `N` starts a new review of the current context; `g` refreshes the session list from the daemon.
   - Clipboard and lifecycle: `c` / `y` copy the selected finding or session; `Delete` deletes a session (with confirmation); `Ctrl+R` folds or unfolds the thinking stream.
 - **`Ctrl+4` / `Alt+4` (Context View):**
   - Displays Pinned, User, and Auto context layers with token metrics.
-  - Quick keys: `e` (add file as editable), `r` / `a` (add file as read-only), `t` (toggle access Editable ↔ Read-Only), `u` (promote an Auto file to persistent User), `c` / `C` (clear all auto-requested files), `d` / `x` / `Del` (remove a file from context).
+  - Quick keys: `e` (add file as editable), `r` / `a` (add file as read-only), `t` (toggle access Editable ↔ Read-Only), `u` (promote an Auto file to persistent User), `c` / `y` (copy the selected path), `Shift+C` (clear all auto-requested files, with confirmation), and `Delete` (remove a file from context).
   - Navigation and folding: `n` / `p` (or `j` / `k`, `↑` / `↓`) move the selection; `Space` / `Tab` or `Enter` fold or unfold a section; `Enter` also promotes an Auto file to User. `Esc` / `q` return to the REPL view.
 - **`Ctrl+5` / `Alt+5` (History View):**
   - Paginated audit log of semantic turns, code review runs, AI commit hashes, and file modifications.
   - Collapsible items: All entries are folded by default, displaying the role badge, commit summary, and preview lines.
   - Press `Tab`, `Space`, or `Enter` to fold/unfold the active entry and inspect the full response and modified files.
-  - Item navigation & clipboard: Use `n` / `p` or `[` / `]` to navigate turns, `l` to recenter the active item, `c` to copy a code block, and `y` to copy the item text to the clipboard.
-  - Scroll keys `↑` / `↓` (or `k` / `j`) fetch older turns as the top of the log is reached; `Home` / `End` jump to the oldest / newest message.
+  - Item navigation and clipboard: Use `n` / `p` or `[` / `]` to navigate turns, `Ctrl+L` to recenter the active item, `c` to copy a code block, and `y` to copy the item text to the clipboard.
+  - Scroll keys `↑` / `↓` (or `k` / `j`) fetch older turns as the top of the log is reached; `Home` / `End` (or `Alt+<` / `Alt+>`) jump to the oldest / newest message; `PgUp` / `PgDn` scroll by full pages.
+  - Clearing: `Shift+C` clears the entire session history only after a confirmation dialog whose default focus is `Cancel`.
   - Header visibility guarantee: Active entry headers are automatically kept visible in the viewport during navigation.
 
 ---
@@ -370,3 +372,64 @@ Tiers keep their canonical order and any empty tier is omitted. Each command bel
 ### 5.11.4 Text Editor and Dialog Help
 
 The shared text editor backs the REPL prompt, the squash message field, the review prompt, the file picker, and the onboarding fields. Its Emacs/Readline bindings are documented once on a dedicated Text Editor Help tab, next to the active mode's own shortcut tab, so the editor vocabulary is never duplicated into every mode's list. Modal dialogs follow the same principle: their footer hints are generated from the shared dialog command map with the configured `C-` / `M-` labels, so a footer advertises exactly the chords the dialog intercepts. That hint is rendered as the docked help panel described in section 5.4, with its chords, verbs, and separators styled through the semantic text roles.
+
+---
+
+## 5.12 Semantic Key Matrix and Case Invariant
+
+Five views could easily grow five dialects: the same letter executing a step here, deleting a session there, and refreshing a list somewhere else. The interface instead owns one verb matrix. The verbs stay fixed across Plans, Review, Context, History, and the REPL viewport; only the data underneath changes.
+
+### 5.12.1 Case Encodes Scale
+
+A lowercase letter acts on the single item under the cursor. Its uppercase (`Shift`) counterpart runs the same verb over every applicable item.
+
+| Intent | Selection (lowercase) | Batch (uppercase) |
+| --- | --- | --- |
+| Execute | `x` — run the selected step or finding | `X` — run every ready step or open finding |
+| Architect refinement | `r` — decompose the selected item | `R` — refine every item awaiting decomposition |
+| Copy | `c` / `y` — copy the selected item | — (there is no batch copy) |
+| Clear a collection | — | `Shift+C` — clear the whole layer, list, or history |
+| Remove one entity | `Delete` | — |
+| Fold | `Tab` / `Space` — fold the selected node | `a` — fold or unfold everything |
+| Status | `t` — open the status dialog | — |
+| Refresh | `g` — re-read state from the daemon | — |
+
+The scale is fixed before the letter. A batch command bound to a lowercase key turns a stray keystroke into destroyed work, while a local command bound to an uppercase key makes the cheapest and most frequent gesture cost a `Shift`. `Shift+C` is deliberately uppercase-only: removing one entity is `Delete`, so a single clear has no safe meaning, and the mass clear must be harder to type than the copy it sits next to.
+
+### 5.12.2 Reserved Keys
+
+- **`x` / `X` mean execution only.** In the REPL viewport, Plans, and Review they run the selected target or queue the batch. Binding `x` to deletion, cancellation, or dismissal is forbidden: a key pressed while disproving a step must never destroy it.
+- **`r` / `R` belong to the Architect.** In Plans they refine the plan horizon; in Review they turn a finding into a subplan. Refresh therefore never claims `r`; it moved to `g`.
+- **`N` creates a new Review session** over the current context files. Creation is a different act from decomposition, so it gets its own letter instead of overloading `r`.
+- **`c` / `y` copy only.** They place item text, a code block, Markdown, or a path into the clipboard and never mutate state.
+- **`Delete` removes one entity** and always asks for confirmation.
+
+### 5.12.3 Clipboard versus Destructive Clearing
+
+Copying is cheap, frequent, and safe; clearing an entire context layer or the whole session history is irreversible and rare. The two therefore never share a lowercase key. `c` and `y` copy in every navigation view, while bulk clearing requires `Shift+C` followed by an interactive confirmation dialog whose default focus is `Cancel` (section 5.4). If a stray `Shift` slips in, the dialog still stops the action, so the chord and the dialog guard the same decision from two sides.
+
+### 5.12.4 Navigation Minimum and Canonical Refresh
+
+Every structural view implements the same symmetric movement set:
+
+| Motion | Keys |
+| --- | --- |
+| Next / previous row | `n` / `p`, `↑` / `↓`, `k` / `j` |
+| First row | `Home`, `Alt+<`, `Ctrl+Home` |
+| Last row | `End`, `Alt+>`, `Ctrl+End` |
+| Paged scrolling | `PgUp` / `PgDn` |
+| Accordion walk | `Ctrl+N` / `Ctrl+P` |
+| Recenter the active item | `Ctrl+L` |
+| Refresh state from the daemon | `g` |
+
+The redundancy is intentional. `Alt+<` and `Alt+>` mirror Emacs `M-<` and `M->` (beginning and end of buffer), `Home` and `End` stay as universal fallbacks for terminals that swallow `Alt`, and `Ctrl+Home` / `Ctrl+End` cover terminals and multiplexers that intercept both. `k` / `j` remain accepted where a view already documents them (History, Context), so a Vim-trained hand is not punished.
+
+`g` is the Magit/Dired refresh: it re-reads plan, review, or context state from the server daemon without starting a turn and without spending tokens. Because it is cheap and non-destructive, it needs no confirmation dialog.
+
+### 5.12.5 Unified Batch Execution
+
+`X` is not a per-view loop; it feeds the single `BatchExecution` supervisor (section 5.6.2). In Plans the queue is assembled from every unfinished leaf step of the ready plans, the confirmation dialog states the total scope before anything runs, one progress view tracks the whole run, and interruption is governed by the three-way cancel dialog of section 5.4 (`Continue`, `Soft Stop`, `Hard Stop`). Review's `X` reuses the same supervisor over every open finding, so batch behavior, cancellation semantics, progress reporting, and the aggregated finish notification are identical in both views.
+
+### 5.12.6 Declaration Through the Command Map
+
+Every command above is declared once as a `CommandSpec` in its view's command map (section 5.11), with its description living in the canonical i18n catalog. The dispatcher and the Help window read the same declarations, so the matrix described here and the keys the application intercepts cannot drift apart.

@@ -97,9 +97,9 @@ pub struct ModelDeltaEvent {
 /// Structured output carries the terminal outcome as an explicit object field
 /// instead of a `<success>` / `<error>` control tag. `status` is kept as the raw
 /// model-declared string so the decoding layer owns tolerant normalization,
-/// while `summary` and `message` carry the optional success summary or error
-/// text.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// while `summary`, `message`, and `reason` carry the optional success summary,
+/// error text, or skip reason.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct StructuredOutcomeProposal {
     #[serde(default)]
     pub status: String,
@@ -107,6 +107,26 @@ pub struct StructuredOutcomeProposal {
     pub summary: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+impl StructuredOutcomeProposal {
+    /// Reports whether the status represents a skipped outcome ("skip" or "skipped").
+    pub fn is_skip(&self) -> bool {
+        let s = self.status.trim();
+        s.eq_ignore_ascii_case("skip") || s.eq_ignore_ascii_case("skipped")
+    }
+
+    /// Reports whether the status represents a successful outcome ("success").
+    pub fn is_success(&self) -> bool {
+        self.status.trim().eq_ignore_ascii_case("success")
+    }
+
+    /// Reports whether the status represents an error outcome ("error").
+    pub fn is_error(&self) -> bool {
+        self.status.trim().eq_ignore_ascii_case("error")
+    }
 }
 
 /// Semantic blocker declared through a structured proposal.
@@ -453,6 +473,7 @@ mod tests {
         assert_eq!(outcome.status, "success");
         assert_eq!(outcome.summary.as_deref(), Some("All checks passed"));
         assert!(outcome.message.is_none());
+        assert!(outcome.reason.is_none());
         assert!(proposal.blocked.is_none());
 
         let json = serde_json::to_string(&proposal).unwrap();
@@ -497,5 +518,44 @@ mod tests {
         assert!(minimal.scratchpad.is_none());
         assert!(minimal.outcome.is_none());
         assert!(minimal.blocked.is_none());
+    }
+
+    #[test]
+    fn test_structured_outcome_proposal_skip_and_roundtrip() {
+        let proposal = StructuredOutcomeProposal {
+            status: "skip".to_string(),
+            summary: None,
+            message: None,
+            reason: Some("Task already satisfied".to_string()),
+        };
+        assert!(proposal.is_skip());
+        assert!(!proposal.is_success());
+        assert!(!proposal.is_error());
+
+        let json = serde_json::to_string(&proposal).unwrap();
+        assert!(json.contains("\"status\":\"skip\""));
+        assert!(json.contains("\"reason\":\"Task already satisfied\""));
+        assert!(!json.contains("\"summary\""));
+        assert!(!json.contains("\"message\""));
+
+        let de: StructuredOutcomeProposal = serde_json::from_str(&json).unwrap();
+        assert_eq!(de, proposal);
+
+        // Also test "skipped" alias variant
+        let proposal_skipped = StructuredOutcomeProposal {
+            status: "skipped".to_string(),
+            summary: None,
+            message: None,
+            reason: Some("Step not needed".to_string()),
+        };
+        assert!(proposal_skipped.is_skip());
+
+        // Backwards compatibility: empty/minimal JSON
+        let minimal: StructuredOutcomeProposal = serde_json::from_str("{}").unwrap();
+        assert_eq!(minimal.status, "");
+        assert_eq!(minimal.summary, None);
+        assert_eq!(minimal.message, None);
+        assert_eq!(minimal.reason, None);
+        assert!(!minimal.is_skip());
     }
 }

@@ -7,6 +7,7 @@ use tauqe_protocol::{
     PlanItemStatus,
 };
 
+use crate::app::AppState;
 use crate::components::model_selector::ModelSelector;
 use crate::theme::engine::current_engine;
 use crate::ui::wrap_lines;
@@ -180,6 +181,37 @@ impl PlanRefineDialogState {
     pub fn selected_entry(&self) -> Option<&ModelEntry> {
         self.selector.selected_entry()
     }
+}
+
+/// Resolves the Architect model entries a decomposition dialog offers.
+///
+/// Configured Architect entries win; otherwise the resolved Architect role (or
+/// the active model) backs the dialog so it always presents a valid selection.
+/// Both the plan horizon refinement and the review finding decomposition dialogs
+/// read this single helper, so the architect ladder can never drift between the
+/// two refinement surfaces (Conventions §1.3).
+pub fn architect_entries(st: &AppState) -> Vec<ModelEntry> {
+    st.model_choice
+        .roles
+        .as_ref()
+        .and_then(|roles| roles.entries.as_ref())
+        .map(|entries| entries.architect.clone())
+        .filter(|entries| !entries.is_empty())
+        .unwrap_or_else(|| {
+            let fallback_model = st
+                .model_choice
+                .resolve(&tauqe_protocol::ModelSelection::Role(
+                    ModelRole::Architect,
+                ))
+                .unwrap_or_else(|| st.active_model.clone());
+            let fallback_effort = st
+                .model_choice
+                .roles
+                .as_ref()
+                .and_then(|roles| roles.efforts.as_ref())
+                .and_then(|efforts| efforts.architect);
+            vec![ModelEntry::new(fallback_model, fallback_effort, None)]
+        })
 }
 
 #[derive(Debug, Clone)]

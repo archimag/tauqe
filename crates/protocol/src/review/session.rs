@@ -97,6 +97,11 @@ impl ReviewSession {
     }
 
     /// Access session findings as a collection of domain [`ReviewIssue`] instances.
+    ///
+    /// The conversion is lossless: the stored semantic category is carried
+    /// through unchanged, so `Bug`/`Security` and `Architecture`/`Performance`
+    /// never collapse into their coarser severity classes when a session is
+    /// read back.
     pub fn issues(&self) -> Vec<ReviewIssue> {
         self.items.iter().cloned().map(ReviewIssue::from).collect()
     }

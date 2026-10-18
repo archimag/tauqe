@@ -14,7 +14,6 @@ use tauqe_protocol::{EditOperation, ModelResult, TurnPhase};
 
 use crate::edits::{EditError, StagedEditsState};
 use crate::providers::StreamEvent;
-use crate::workflow::discovery::reconcile_discovery_context;
 use crate::workflow::retry::{
     build_patch_retry_prompt, format_patch_retry_reason, prepare_staged_for_retry,
     retain_retried_failed_files,
@@ -54,34 +53,23 @@ pub(super) async fn run_discovery_phase(
         && step.edits().is_empty()
         && step.protocol_errors().is_empty()
     {
-        let requests = step.context_requests();
-        let doc_topics = step.doc_requests();
-        let searches = step.repo_searches();
-        if requests.is_empty() && doc_topics.is_empty() && searches.is_empty() {
+        let has_discovery = !step.context_requests().is_empty()
+            || !step.doc_requests().is_empty()
+            || !step.repo_searches().is_empty();
+        if !has_discovery {
             break;
         }
 
-        let available_files = {
-            let root = ctx.repo_root.to_path_buf();
-            crate::blocking::run_blocking_async(move || {
-                crate::git::list_repository_files(Some(&root)).unwrap_or_default()
-            })
-            .await
-            .unwrap_or_default()
-        };
-        // Discovery reconciliation canonicalizes paths and reads file metadata,
-        // so it runs off the async executor thread.
-        let files_token_budget = ctx.options.files_token_budget;
-        let outcome = crate::blocking::run_blocking(|| {
-            reconcile_discovery_context(
-                ctx.context_manager,
-                requests,
-                &available_files,
-                files_token_budget,
-            )
-        });
+        let outcome = crate::workflow::discovery::execute_discovery_commands(
+            ctx.context_manager,
+            ctx.repo_root,
+            step.commands(),
+            ctx.options.files_token_budget,
+            false,
+        )
+        .await;
 
-        if let Some(limit) = outcome.limit_exceeded {
+        if let Some(limit) = &outcome.limit_exceeded {
             let warn = format!(
                 "Context files token budget exceeded (files_token_budget = {}). The model requested {} tokens in new file(s) [{}], but the context already contains {} tokens. Scope the task down or decompose it into a plan.",
                 limit.token_budget,
@@ -105,21 +93,7 @@ pub(super) async fn run_discovery_phase(
             })));
         }
 
-        let search_results = if !searches.is_empty() {
-            let root = ctx.repo_root.to_path_buf();
-            let queries = searches.to_vec();
-            let files = available_files.clone();
-            crate::blocking::run_blocking_async(move || {
-                crate::workflow::discovery::execute_repo_searches(&root, &queries, &files)
-            })
-            .await
-            .unwrap_or_default()
-        } else {
-            Vec::new()
-        };
-
-        let context_changed = !outcome.added.is_empty() || !outcome.missing.is_empty();
-        if !context_changed && doc_topics.is_empty() && search_results.is_empty() {
+        if !outcome.has_progress(false) {
             break;
         }
 
@@ -136,11 +110,10 @@ pub(super) async fn run_discovery_phase(
             workflow = ctx.workflow_name,
             model = %ctx.model,
             round = discovery_round,
-            requested = requests.len(),
-            doc_topics = doc_topics.len(),
-            searches = search_results.len(),
-            added = outcome.added.len(),
-            missing = outcome.missing.len(),
+            added = outcome.added_files.len(),
+            missing = outcome.missing_files.len(),
+            searches = outcome.searches_executed.len(),
+            doc_topics = outcome.doc_topics_loaded.len(),
             "context discovery round completed"
         );
         let _ = ctx
@@ -153,48 +126,15 @@ pub(super) async fn run_discovery_phase(
             })
             .await;
 
-        if !search_results.is_empty() {
-            let feedback = crate::workflow::discovery::format_search_feedback(&search_results);
+        let feedback = outcome.combined_feedback();
+        if !feedback.is_empty() {
             round_prompt.push_str(&format!("\n\n{}", feedback));
-        }
-
-        if !outcome.missing.is_empty() {
-            round_prompt.push_str(&format!(
-                "\n\n<context_feedback>\nThe following requested files do not exist in the repository: [{}]\nPlease check <repo_map> for exact existing file paths.\n</context_feedback>",
-                outcome.missing.join(", ")
-            ));
-        }
-
-        if !doc_topics.is_empty() {
-            let documentation = doc_topics
-                .iter()
-                .map(|topic| crate::docs::get_documentation(*topic))
-                .collect::<Vec<_>>()
-                .join("\n\n");
-            round_prompt.push_str(&format!(
-                "\n\n<system_documentation>\n{}\n</system_documentation>",
-                documentation
-            ));
         }
 
         let ctx_state = ctx.context_manager.get_state();
         let _ = ctx.stream_tx.send(StreamEvent::ContextChanged(ctx_state)).await;
 
-        let mut round_summary = Vec::new();
-        if !outcome.added.is_empty() {
-            round_summary.push(format!("{} file(s) added", outcome.added.len()));
-        }
-        if !search_results.is_empty() {
-            round_summary.push(format!("{} search(es) executed", search_results.len()));
-        }
-        if !doc_topics.is_empty() {
-            round_summary.push(format!("{} doc topic(s) loaded", doc_topics.len()));
-        }
-        let banner_text = if round_summary.is_empty() {
-            format!("{} file(s) added.", outcome.added.len())
-        } else {
-            format!("{}.", round_summary.join(", "))
-        };
+        let banner_text = outcome.fsm_banner_summary();
 
         let banner = format!(
             "\n\n---\n**[Round {}]** {}\n\n",
@@ -923,6 +863,76 @@ mod tests {
         assert!(second_req.messages[1]
             .content
             .contains("Lookaround assertions are not supported in Rust regex"));
+    }
+
+    #[tokio::test]
+    async fn discovers_via_doc_and_repo_search_across_rounds() {
+        let (_dir, root) = setup_repo(&[
+            ("a.rs", TARGET),
+            ("src/helper.rs", "pub const MAGIC_NUMBER: i32 = 42;\n"),
+        ]);
+        let mut context = context_with_target(&root);
+        let mut history = HistoryManager::new(root.clone());
+
+        let provider = MockLlmProvider::scripted([
+            MockResponse::text("Reviewing workflow docs:\n<doc_request topic=\"workflow\" />"),
+            MockResponse::text(
+                "Searching for the constant:\n<repo_search path=\"src\" regex=\"pub const MAGIC_\\w+\" />",
+            ),
+            MockResponse::text(
+                "Requesting the helper:\n<context_request path=\"src/helper.rs\" access=\"read_only\" />",
+            ),
+            MockResponse::text(edit_block(
+                "pub fn compute() -> i32 { 0 }",
+                "pub fn compute() -> i32 { 42 }",
+            )),
+        ]);
+        let model = ModelRef::openrouter("mock/model");
+        let protocol = XmlPromptProtocol;
+        let mut policy = DirectApplyPolicy::new();
+        let options = WorkflowOptions {
+            max_discovery_rounds: 4,
+            ..Default::default()
+        };
+        let (stream_tx, rx) = mpsc::channel(256);
+        drop(rx);
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+
+        let outcome = run_fsm_turn(
+            "Use magic number from helper",
+            &provider,
+            &model,
+            &mut context,
+            &mut history,
+            &protocol,
+            &mut policy,
+            "git",
+            stream_tx,
+            cancel_rx,
+            &options,
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            outcome.result,
+            ModelResult::Edit { outcome, .. } if outcome.applied
+        ));
+        assert_eq!(provider.requests().len(), 4);
+
+        // Documentation feedback reaches the proposal round after the doc request.
+        let doc_request = &provider.requests()[1];
+        assert!(doc_request
+            .messages
+            .iter()
+            .any(|m| m.content.contains("<system_documentation>")));
+
+        // Search feedback reaches the proposal round after the repo search.
+        let search_request = &provider.requests()[2];
+        assert!(search_request
+            .messages
+            .iter()
+            .any(|m| m.content.contains("<search_feedback")));
     }
 
     #[tokio::test]

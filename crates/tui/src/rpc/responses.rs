@@ -154,7 +154,10 @@ pub async fn handle_response(
                 st.plans_view.refining_plan_id = None;
             }
             Some(methods::REVIEW_REFINE_ITEM) => {
+                // A failed decomposition aborts the rest of the batch instead of
+                // spending further tokens behind a broken call.
                 st.review.refining = None;
+                st.review.refine_queue.clear();
             }
             Some(methods::GIT_SQUASH_PREVIEW)
             | Some(methods::GIT_SQUASH_GENERATE_MESSAGE)
@@ -474,6 +477,14 @@ pub async fn handle_response(
                 {
                     match res {
                         tauqe_protocol::ReviewRefineItemResult::Success { item, explanation } => {
+                            let item_id = item.id;
+                            let target_review_id = review_id
+                                .clone()
+                                .or_else(|| st.review.session.as_ref().map(|s| s.id.clone()));
+                            if let Some(ref rid) = target_review_id {
+                                st.review.expanded_items.insert(format!("{}:{}", rid, item_id));
+                                st.review.collapsed_sessions.remove(rid);
+                            }
                             st.review.apply_item(review_id.as_deref(), item);
                             let msg = match explanation {
                                 Some(exp) if !exp.trim().is_empty() => {
@@ -482,8 +493,13 @@ pub async fn handle_response(
                                 _ => active_t("notify.finding_decomposed_default"),
                             };
                             st.notify_success(msg);
+                            st.review.clamp_selection();
+                            st.review.scroll_to_selected();
                         }
                         tauqe_protocol::ReviewRefineItemResult::Blocked { reason } => {
+                            // A refusal is a semantic stop, not a transient
+                            // failure: draining the queue would only repeat it.
+                            st.review.refine_queue.clear();
                             st.notify_warning(
                                 active_t("notify.finding_decompose_blocked")
                                     .replacen("{}", &reason, 1),
@@ -619,6 +635,27 @@ pub async fn handle_response(
             _ => {}
         }
     }
+
+    // A batch decomposition drains one finding at a time: after each settled
+    // `review/refineItem` response, dispatch the next queued finding, or drop the
+    // busy marker once the queue is exhausted. The state lock is released before
+    // writing the request so the UI never blocks on transport I/O.
+    if method.as_deref() == Some(methods::REVIEW_REFINE_ITEM) {
+        let next = st.review.next_refine_target();
+        drop(st);
+        if let Some(target) = next {
+            let params = tauqe_protocol::ReviewRefineItemParams {
+                review_id: Some(target.review_id),
+                item_id: target.item_id,
+                model: None,
+                instructions: None,
+            };
+            if let Ok(value) = serde_json::to_value(&params) {
+                let _ = super::transport::send_request(conn, methods::REVIEW_REFINE_ITEM, value)
+                    .await;
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -626,7 +663,7 @@ mod tests {
     use super::*;
     use crate::app::NotificationLevel;
     use tauqe_protocol::{
-        IssueStatus, ResponseError, ReviewItem, ReviewItemStatus, ReviewSession, ReviewSeverity,
+        IssueStatus, IssueType, ResponseError, ReviewIssue, ReviewItemStatus, ReviewSession,
     };
 
     fn test_state() -> Arc<Mutex<AppState>> {
@@ -769,19 +806,19 @@ mod tests {
         assert_eq!(blocked.reason, "Contradiction found");
     }
 
-    fn review_item(id: u32, status: ReviewItemStatus) -> ReviewItem {
-        ReviewItem {
+    fn review_item(id: u32, status: ReviewItemStatus) -> ReviewIssue {
+        ReviewIssue {
             id,
             title: format!("Finding {id}"),
             model: None,
-            severity: ReviewSeverity::Info,
+            issue_type: IssueType::Quality,
             status,
+            description: String::new(),
             recommendations: Vec::new(),
             files: Vec::new(),
             readonly_files: Vec::new(),
-            subplan: Vec::new(),
-            resolution_notes: None,
-            body: String::new(),
+            plan: Vec::new(),
+            note: None,
         }
     }
 
@@ -794,7 +831,7 @@ mod tests {
             description: None,
             user_prompt: None,
             target_files: Vec::new(),
-            items: vec![review_item(1, status)],
+            items: vec![review_item(1, status).into()],
             raw_markdown: String::new(),
         }
     }
@@ -889,7 +926,7 @@ mod tests {
             id: RequestId::Number(43),
             result: Some(
                 serde_json::to_value(ReviewUpdateItemResult {
-                    item: review_item(1, ReviewItemStatus::Fixed).into(),
+                    item: review_item(1, ReviewItemStatus::Fixed),
                 })
                 .unwrap(),
             ),

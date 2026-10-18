@@ -1,12 +1,13 @@
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 
 use ratatui::style::{Style, Stylize};
 use ratatui::text::{Line, Span};
 use tauqe_protocol::{
-    DiscussionFocus, DiscussionTarget, IssueStatus, IssueType, ModelRef, ModelSelection, PlanItem,
-    PlanItemStatus, ReviewIssue, ReviewItem, ReviewSession,
+    DiscussionFocus, DiscussionTarget, IssueStatus, IssueType, ModelEntry, ModelRef,
+    ModelSelection, PlanItem, PlanItemStatus, ReviewIssue, ReviewItem, ReviewSession,
 };
 
+use crate::components::model_selector::ModelSelector;
 use crate::theme::engine::current_engine;
 use crate::ui::wrap_lines;
 
@@ -63,6 +64,26 @@ pub enum VisibleReviewRow {
         /// Whether the active discussion focus anchors on this finding.
         focused: bool,
     },
+    /// One interactive row of an expanded finding's embedded subplan.
+    ///
+    /// Subplan steps are full tree nodes, so the cursor can rest on a single
+    /// step, fold its details and files, and execute the owning finding from it
+    /// (Conventions §4.4).
+    SubplanItem {
+        session_id: String,
+        /// Numeric id of the owning finding inside the session.
+        item_id: u32,
+        step_id: String,
+        title: String,
+        details: Option<String>,
+        status: PlanItemStatus,
+        files: Vec<String>,
+        readonly_files: Vec<String>,
+        depends_on: Vec<String>,
+        depth: usize,
+        is_expandable: bool,
+        is_expanded: bool,
+    },
 }
 
 impl VisibleReviewRow {
@@ -71,9 +92,122 @@ impl VisibleReviewRow {
             Self::SessionHeader { session_id, .. } => session_id,
             Self::SessionSummary { session_id, .. } => session_id,
             Self::ReviewItem { session_id, .. } => session_id,
+            Self::SubplanItem { session_id, .. } => session_id,
         }
     }
 }
+
+/// A finding queued for Architect decomposition.
+///
+/// The Architect decomposes one finding per bounded call, so a batch refinement
+/// keeps an ordered queue of the findings still awaiting decomposition and
+/// drains it one response at a time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefineTarget {
+    /// Review session the finding belongs to.
+    pub review_id: String,
+    /// Numeric finding id inside that session.
+    pub item_id: u32,
+}
+
+/// Review-finding decomposition dialog state.
+///
+/// The Architect decomposes one finding per bounded call, so `r` opens this
+/// dialog to choose the architect model and, optionally, to describe how the
+/// finding should be decomposed. Submitting dispatches `review/refineItem` with
+/// the selected model and directives, keeping the "what" decision explicit
+/// instead of an implicit retry (Vision.md §1.2).
+#[derive(Debug, Clone)]
+pub struct ReviewRefineDialogState {
+    pub review_id: String,
+    pub review_title: String,
+    pub item_id: u32,
+    pub item_title: String,
+    pub selector: ModelSelector,
+    pub instructions_editor: crate::editor::InputEditor,
+    /// Section that currently owns the keyboard.
+    pub focus: crate::views::plans::RefineDialogFocus,
+    pub confirm_button: crate::app::ConfirmDialogButton,
+}
+
+impl ReviewRefineDialogState {
+    /// Builds the dialog over the configured `architect_entries`.
+    pub fn new(
+        review_id: String,
+        review_title: String,
+        item_id: u32,
+        item_title: String,
+        architect_entries: Vec<ModelEntry>,
+    ) -> Self {
+        Self {
+            review_id,
+            review_title,
+            item_id,
+            item_title,
+            selector: ModelSelector::new(
+                tauqe_protocol::ModelRole::Architect,
+                architect_entries,
+                0,
+            ),
+            instructions_editor: crate::editor::InputEditor::default(),
+            focus: crate::views::plans::RefineDialogFocus::default(),
+            confirm_button: crate::app::ConfirmDialogButton::Cancel,
+        }
+    }
+
+    /// Currently selected architect entry, if any.
+    pub fn selected_entry(&self) -> Option<&ModelEntry> {
+        self.selector.selected_entry()
+    }
+}
+
+/*
+#[derive(Debug, Clone, Default)]
+pub struct ReviewViewState {</search_6DFEFD4296DDA92B>
+</edit>
+<edit path="crates/tui/src/views/review.rs">
+<search>    /// Findings awaiting Architect decomposition, in dispatch order.
+    ///
+    /// The Architect decomposes one finding per bounded call, so a batch
+    /// refinement drains this queue one `review/refineItem` response at a time.
+    pub refine_queue: VecDeque<RefineTarget>,
+}</search>
+<replace>    /// Findings awaiting Architect decomposition, in dispatch order.
+    ///
+    /// The Architect decomposes one finding per bounded call, so a batch
+    /// refinement drains this queue one `review/refineItem` response at a time.
+    pub refine_queue: VecDeque<RefineTarget>,
+    /// Architect decomposition dialog for the selected finding, when open.
+    pub refine_dialog: Option<ReviewRefineDialogState>,
+}
+    pub running: bool,
+    /// Review id currently under Architect decomposition (`review/refineItem`),
+    /// if any. Drives the in-flight footer indicator and blocks re-entry.
+    pub refining: Option<String>,
+    pub sessions: Vec<ReviewSession>,
+    pub session: Option<ReviewSession>,
+    pub selected_index: usize,
+    pub scroll: u16,
+    pub collapsed_sessions: HashSet<String>,
+    pub collapsed_summaries: HashSet<String>,
+    pub expanded_items: HashSet<String>,
+    pub hide_closed: bool,
+    pub error: Option<String>,
+    pub view_height: u16,
+    pub content_width: usize,
+    pub rendered_lines: usize,
+    pub theme_mode: crate::config::ThemeMode,
+    /// Active discussion focus mirrored from the server, used to render the
+    /// `[FOCUS]` indicator. Synced from `AppState::discussion_focus` on render.
+    pub discussion_focus: DiscussionFocus,
+    /// Findings awaiting Architect decomposition, in dispatch order.
+    ///
+    /// The Architect decomposes one finding per bounded call, so a batch
+    /// refinement drains this queue one `review/refineItem` response at a time.
+    pub refine_queue: VecDeque<RefineTarget>,
+}
+
+*/
 
 #[derive(Debug, Clone, Default)]
 pub struct ReviewViewState {
@@ -97,6 +231,13 @@ pub struct ReviewViewState {
     /// Active discussion focus mirrored from the server, used to render the
     /// `[FOCUS]` indicator. Synced from `AppState::discussion_focus` on render.
     pub discussion_focus: DiscussionFocus,
+    /// Findings awaiting Architect decomposition, in dispatch order.
+    ///
+    /// The Architect decomposes one finding per bounded call, so a batch
+    /// refinement drains this queue one `review/refineItem` response at a time.
+    pub refine_queue: VecDeque<RefineTarget>,
+    /// Architect decomposition dialog for the selected finding, when open.
+    pub refine_dialog: Option<ReviewRefineDialogState>,
 }
 
 impl ReviewViewState {
@@ -224,13 +365,40 @@ impl ReviewViewState {
         }
     }
 
+    /// Whether a single subplan step of a finding is expanded.
+    ///
+    /// A leaf step reveals its details and file lists; a container step reveals
+    /// its nested child steps.
+    pub fn is_subplan_item_expanded(
+        &self,
+        session_id: &str,
+        item_id: u32,
+        step_id: &str,
+    ) -> bool {
+        self.expanded_items
+            .contains(&subplan_key(session_id, item_id, step_id))
+    }
+
+    pub fn toggle_subplan_item_expanded(
+        &mut self,
+        session_id: &str,
+        item_id: u32,
+        step_id: &str,
+    ) {
+        let key = subplan_key(session_id, item_id, step_id);
+        if !self.expanded_items.remove(&key) {
+            self.expanded_items.insert(key);
+        }
+    }
+
     pub fn expand_all(&mut self) {
         self.collapsed_sessions.clear();
         self.collapsed_summaries.clear();
         let effective = self.effective_sessions();
         for s in &effective {
-            for item in &s.items {
-                self.expanded_items.insert(format!("{}:{}", s.id, item.id));
+            for issue in s.issues() {
+                self.expanded_items.insert(format!("{}:{}", s.id, issue.id));
+                collect_subplan_keys(&s.id, issue.id, &issue.plan, &mut self.expanded_items);
             }
         }
     }
@@ -258,9 +426,15 @@ impl ReviewViewState {
         }
         effective.iter().all(|s| {
             self.is_summary_expanded(&s.id)
-                && s.items.iter().all(|item| {
+                && s.issues().iter().all(|issue| {
                     self.expanded_items
-                        .contains(&format!("{}:{}", s.id, item.id))
+                        .contains(&format!("{}:{}", s.id, issue.id))
+                        && subplan_all_expanded(
+                            &self.expanded_items,
+                            &s.id,
+                            issue.id,
+                            &issue.plan,
+                        )
                 })
         })
     }
@@ -276,6 +450,48 @@ impl ReviewViewState {
     pub fn toggle_hide_closed(&mut self) {
         self.hide_closed = !self.hide_closed;
         self.clamp_selection();
+    }
+
+    /// Findings still awaiting Architect decomposition, in session order.
+    ///
+    /// A finding in `REFINE` status has been classified by the Reviewer but not
+    /// yet broken into executable steps, so this set is exactly what the batch
+    /// decomposition (`R`) owes the developer.
+    pub fn pending_refine_targets(&self) -> Vec<RefineTarget> {
+        let mut targets = Vec::new();
+        for session in self.effective_sessions() {
+            for item in &session.items {
+                if item.status == IssueStatus::Refine {
+                    targets.push(RefineTarget {
+                        review_id: session.id.clone(),
+                        item_id: item.id,
+                    });
+                }
+            }
+        }
+        targets
+    }
+
+    /// Replaces the refine queue with `targets` and returns the first finding to
+    /// dispatch, or `None` when nothing is queued.
+    pub fn begin_refine_batch(&mut self, targets: Vec<RefineTarget>) -> Option<RefineTarget> {
+        self.refine_queue = targets.into();
+        self.next_refine_target()
+    }
+
+    /// Pops the next finding to decompose and marks the view busy while the
+    /// queue drains, clearing the marker once the queue is exhausted.
+    pub fn next_refine_target(&mut self) -> Option<RefineTarget> {
+        match self.refine_queue.pop_front() {
+            Some(target) => {
+                self.refining = Some(target.review_id.clone());
+                Some(target)
+            }
+            None => {
+                self.refining = None;
+                None
+            }
+        }
     }
 
     pub(crate) fn effective_sessions(&self) -> Vec<ReviewSession> {
@@ -391,36 +607,96 @@ impl ReviewViewState {
                 // description/recommendations, the protected readonly
                 // contracts, and the embedded plan through one explicit field
                 // mapping.
-                for item in &session.items {
+                for issue in session.issues() {
                     if self.hide_closed
                         && matches!(
-                            item.status,
+                            issue.status,
                             IssueStatus::Fixed | IssueStatus::Skipped | IssueStatus::Rejected
                         )
                     {
                         continue;
                     }
-                    let item_expanded = self.is_item_expanded(&session.id, item.id);
+                    let item_expanded = self.is_item_expanded(&session.id, issue.id);
+                    let focused = self.is_item_focused(&session.id, issue.id);
                     rows.push(VisibleReviewRow::ReviewItem {
                         session_id: session.id.clone(),
-                        item_id: item.id,
-                        title: item.title.clone(),
-                        issue_type: IssueType::from(item.severity),
-                        status: item.status,
-                        model: item.model.clone(),
-                        files: item.files.clone(),
-                        readonly_files: item.readonly_files.clone(),
-                        description: item.body.clone(),
-                        recommendations: item.recommendations.clone(),
-                        note: item.resolution_notes.clone(),
-                        plan: item.subplan.clone(),
+                        item_id: issue.id,
+                        title: issue.title,
+                        issue_type: issue.issue_type,
+                        status: issue.status,
+                        model: issue.model,
+                        files: issue.files,
+                        readonly_files: issue.readonly_files,
+                        description: issue.description,
+                        recommendations: issue.recommendations,
+                        note: issue.note,
+                        plan: issue.plan.clone(),
                         is_expanded: item_expanded,
-                        focused: self.is_item_focused(&session.id, item.id),
+                        focused,
                     });
+
+                    // An expanded finding exposes its decomposed steps as
+                    // first-class interactive rows, so the cursor can rest on a
+                    // single step and fold its own details (Conventions §4.4).
+                    if item_expanded {
+                        self.flatten_subplan_rows(
+                            &session.id,
+                            issue.id,
+                            &issue.plan,
+                            0,
+                            &mut rows,
+                        );
+                    }
                 }
             }
         }
         rows
+    }
+
+    /// Flattens an embedded subplan into interactive step rows.
+    ///
+    /// Top-level steps always follow an expanded finding; nested steps appear
+    /// only after their container step is expanded, so the tree stays dense
+    /// until the developer drills into a step.
+    fn flatten_subplan_rows(
+        &self,
+        session_id: &str,
+        item_id: u32,
+        steps: &[PlanItem],
+        depth: usize,
+        out: &mut Vec<VisibleReviewRow>,
+    ) {
+        for step in steps {
+            let has_children = !step.children.is_empty();
+            let has_details = step
+                .details
+                .as_deref()
+                .map(|details| !details.trim().is_empty())
+                .unwrap_or(false);
+            let has_meta = !step.files.is_empty()
+                || !step.readonly_files.is_empty()
+                || !step.depends_on.is_empty();
+            let is_expanded = self.is_subplan_item_expanded(session_id, item_id, &step.id);
+
+            out.push(VisibleReviewRow::SubplanItem {
+                session_id: session_id.to_string(),
+                item_id,
+                step_id: step.id.clone(),
+                title: step.title.clone(),
+                details: step.details.clone(),
+                status: step.status,
+                files: step.files.clone(),
+                readonly_files: step.readonly_files.clone(),
+                depends_on: step.depends_on.clone(),
+                depth,
+                is_expandable: has_children || has_details || has_meta,
+                is_expanded,
+            });
+
+            if has_children && is_expanded {
+                self.flatten_subplan_rows(session_id, item_id, &step.children, depth + 1, out);
+            }
+        }
     }
 
     pub fn selected_row(&self) -> Option<VisibleReviewRow> {
@@ -464,13 +740,36 @@ impl ReviewViewState {
         self.scroll = new_scroll as u16;
     }
 
-    /// Accordion-style navigation: moves to the next or previous finding/session,
-    /// closing previous items and opening the new target item.
+    /// Accordion-style navigation: moves to the next or previous finding,
+    /// session, or subplan step, closing previous items and opening the new
+    /// target item.
     pub fn accordion_navigate(&mut self, forward: bool) {
         #[derive(Clone)]
         struct ReviewNodeRef {
             session_id: String,
             item_id: Option<u32>,
+            step_id: Option<String>,
+            ancestor_steps: Vec<String>,
+        }
+
+        fn collect_subplan_nodes(
+            session_id: &str,
+            item_id: u32,
+            steps: &[PlanItem],
+            ancestors: &mut Vec<String>,
+            out: &mut Vec<ReviewNodeRef>,
+        ) {
+            for step in steps {
+                out.push(ReviewNodeRef {
+                    session_id: session_id.to_string(),
+                    item_id: Some(item_id),
+                    step_id: Some(step.id.clone()),
+                    ancestor_steps: ancestors.clone(),
+                });
+                ancestors.push(step.id.clone());
+                collect_subplan_nodes(session_id, item_id, &step.children, ancestors, out);
+                ancestors.pop();
+            }
         }
 
         let effective = self.effective_sessions();
@@ -479,19 +778,31 @@ impl ReviewViewState {
             all_nodes.push(ReviewNodeRef {
                 session_id: session.id.clone(),
                 item_id: None,
+                step_id: None,
+                ancestor_steps: Vec::new(),
             });
-            for item in &session.items {
+            for issue in session.issues() {
                 if self.hide_closed
-                    && (item.status == IssueStatus::Fixed
-                        || item.status == IssueStatus::Skipped
-                        || item.status == IssueStatus::Rejected)
+                    && (issue.status == IssueStatus::Fixed
+                        || issue.status == IssueStatus::Skipped
+                        || issue.status == IssueStatus::Rejected)
                 {
                     continue;
                 }
                 all_nodes.push(ReviewNodeRef {
                     session_id: session.id.clone(),
-                    item_id: Some(item.id),
+                    item_id: Some(issue.id),
+                    step_id: None,
+                    ancestor_steps: Vec::new(),
                 });
+                let mut ancestors = Vec::new();
+                collect_subplan_nodes(
+                    &session.id,
+                    issue.id,
+                    &issue.plan,
+                    &mut ancestors,
+                    &mut all_nodes,
+                );
             }
         }
 
@@ -501,15 +812,30 @@ impl ReviewViewState {
 
         let sel_row = self.selected_row();
         let cur_idx = match sel_row {
-            Some(VisibleReviewRow::SessionHeader { session_id, .. }) => {
-                all_nodes.iter().position(|n| n.session_id == session_id && n.item_id.is_none()).unwrap_or(0)
-            }
-            Some(VisibleReviewRow::SessionSummary { session_id, .. }) => {
-                all_nodes.iter().position(|n| n.session_id == session_id && n.item_id.is_none()).unwrap_or(0)
-            }
-            Some(VisibleReviewRow::ReviewItem { session_id, item_id, .. }) => {
-                all_nodes.iter().position(|n| n.session_id == session_id && n.item_id == Some(item_id)).unwrap_or(0)
-            }
+            Some(VisibleReviewRow::SessionHeader { session_id, .. })
+            | Some(VisibleReviewRow::SessionSummary { session_id, .. }) => all_nodes
+                .iter()
+                .position(|n| n.session_id == session_id && n.item_id.is_none())
+                .unwrap_or(0),
+            Some(VisibleReviewRow::ReviewItem { session_id, item_id, .. }) => all_nodes
+                .iter()
+                .position(|n| {
+                    n.session_id == session_id && n.item_id == Some(item_id) && n.step_id.is_none()
+                })
+                .unwrap_or(0),
+            Some(VisibleReviewRow::SubplanItem {
+                session_id,
+                item_id,
+                step_id,
+                ..
+            }) => all_nodes
+                .iter()
+                .position(|n| {
+                    n.session_id == session_id
+                        && n.item_id == Some(item_id)
+                        && n.step_id.as_deref() == Some(step_id.as_str())
+                })
+                .unwrap_or(0),
             None => 0,
         };
 
@@ -528,12 +854,8 @@ impl ReviewViewState {
         let target = all_nodes[target_idx].clone();
 
         for session in &effective {
-            if session.id == target.session_id {
-                if target.item_id.is_some() {
-                    self.collapsed_sessions.remove(&target.session_id);
-                } else {
-                    self.collapsed_sessions.insert(target.session_id.clone());
-                }
+            if session.id == target.session_id && target.item_id.is_some() {
+                self.collapsed_sessions.remove(&target.session_id);
             } else {
                 self.collapsed_sessions.insert(session.id.clone());
             }
@@ -541,23 +863,90 @@ impl ReviewViewState {
 
         self.expanded_items.clear();
         if let Some(item_id) = target.item_id {
-            self.expanded_items.insert(format!("{}:{}", target.session_id, item_id));
+            self.expanded_items
+                .insert(format!("{}:{}", target.session_id, item_id));
+            for ancestor in &target.ancestor_steps {
+                self.expanded_items.insert(subplan_key(
+                    &target.session_id,
+                    item_id,
+                    ancestor,
+                ));
+            }
+            if let Some(step_id) = target.step_id.as_deref() {
+                self.expanded_items.insert(subplan_key(
+                    &target.session_id,
+                    item_id,
+                    step_id,
+                ));
+            }
         }
 
         let rows = self.flatten_rows();
-        if let Some(pos) = rows.iter().position(|r| match (r, target.item_id) {
-            (VisibleReviewRow::SessionHeader { session_id, .. }, None) => session_id == &target.session_id,
-            (VisibleReviewRow::ReviewItem { session_id, item_id, .. }, Some(tid)) => {
-                session_id == &target.session_id && *item_id == tid
-            }
-            _ => false,
-        }) {
+        if let Some(pos) = rows
+            .iter()
+            .position(|r| match (r, target.item_id, &target.step_id) {
+                (VisibleReviewRow::SessionHeader { session_id, .. }, None, None) => {
+                    session_id == &target.session_id
+                }
+                (VisibleReviewRow::SessionSummary { session_id, .. }, None, None) => {
+                    session_id == &target.session_id
+                }
+                (VisibleReviewRow::ReviewItem { session_id, item_id, .. }, Some(tid), None) => {
+                    session_id == &target.session_id && *item_id == tid
+                }
+                (
+                    VisibleReviewRow::SubplanItem {
+                        session_id,
+                        item_id,
+                        step_id,
+                        ..
+                    },
+                    Some(tid),
+                    Some(sid),
+                ) => session_id == &target.session_id && *item_id == tid && step_id == sid,
+                _ => false,
+            })
+        {
             self.selected_index = pos;
         }
 
         self.clamp_selection();
         self.scroll_to_selected();
     }
+}
+
+/// Expansion key of one subplan step inside a finding's embedded plan.
+///
+/// The `s:` segment keeps step keys disjoint from the `session:item` keys that
+/// mark an expanded finding, so the two expansion scopes never collide.
+fn subplan_key(session_id: &str, item_id: u32, step_id: &str) -> String {
+    format!("{}:{}:s:{}", session_id, item_id, step_id)
+}
+
+/// Records every subplan step of a finding as expanded.
+fn collect_subplan_keys(
+    session_id: &str,
+    item_id: u32,
+    steps: &[PlanItem],
+    out: &mut HashSet<String>,
+) {
+    for step in steps {
+        out.insert(subplan_key(session_id, item_id, &step.id));
+        collect_subplan_keys(session_id, item_id, &step.children, out);
+    }
+}
+
+/// Whether every subplan step of a finding is expanded.
+fn subplan_all_expanded(
+    expanded: &HashSet<String>,
+    session_id: &str,
+    item_id: u32,
+    steps: &[PlanItem],
+) -> bool {
+    steps.iter().all(|step| {
+        expanded.contains(&subplan_key(session_id, item_id, &step.id))
+            && subplan_all_expanded(expanded, session_id, item_id, &step.children)
+    })
 }
 
 /// Short badge text for a classified problem type.
@@ -683,31 +1072,6 @@ fn subplan_progress(items: &[PlanItem]) -> (usize, usize) {
     let mut completed = 0;
     walk(items, &mut total, &mut completed);
     (completed, total)
-}
-
-/// Renders the embedded subplan tree as indented, status-badged rows shown when
-/// a finding is expanded.
-fn subplan_lines(items: &[PlanItem], depth: usize) -> Vec<Line<'static>> {
-    let engine = current_engine();
-    let palette = engine.palette();
-    let mut out = Vec::new();
-    for item in items {
-        let mut prefix = String::from("        │ ");
-        prefix.push_str(&"  ".repeat(depth));
-        out.push(Line::from(vec![
-            Span::styled(prefix, engine.fg(palette.text_muted)),
-            Span::styled(format!(" {} ", item.status), plan_status_style(item.status)),
-            Span::raw(" "),
-            Span::styled(
-                format!("#{} {}", item.id, item.title),
-                engine.fg(palette.text_primary),
-            ),
-        ]));
-        if !item.children.is_empty() {
-            out.extend(subplan_lines(&item.children, depth + 1));
-        }
-    }
-    out
 }
 
 fn model_badge(selection: &ModelSelection) -> Span<'static> {
@@ -1116,12 +1480,127 @@ fn compute_unified_review_lines(
                         }
                     }
 
-                    if !plan.is_empty() {
-                        row_lines.push(Line::from(Span::styled(
-                            "        Subtasks:",
-                            engine.fg(palette.status_info).bold(),
-                        )));
-                        row_lines.extend(subplan_lines(plan.as_slice(), 0));
+                }
+
+                all_lines.extend(wrap_lines(row_lines, width));
+            }
+            VisibleReviewRow::SubplanItem {
+                step_id,
+                title,
+                details,
+                status,
+                files,
+                readonly_files,
+                depends_on,
+                depth,
+                is_expandable,
+                is_expanded,
+                ..
+            } => {
+                let indent = format!("    {}", "  ".repeat(*depth));
+                let fold_icon = if *is_expandable {
+                    if *is_expanded {
+                        "▼ "
+                    } else {
+                        "▶ "
+                    }
+                } else if is_selected {
+                    "▶ "
+                } else {
+                    "• "
+                };
+                let fold_style = if *is_expandable {
+                    engine.fg(palette.status_warning).bold()
+                } else if is_selected {
+                    engine.fg(palette.status_info).bold()
+                } else {
+                    engine.fg(palette.text_muted)
+                };
+                let title_style = if is_selected {
+                    engine.fg(palette.text_primary).bold()
+                } else if *status == PlanItemStatus::Done
+                    || *status == PlanItemStatus::Cancelled
+                {
+                    engine.fg(palette.text_secondary)
+                } else {
+                    Style::default().bold()
+                };
+
+                let clean_title = title.replace(['\r', '\n'], " ").trim().to_string();
+
+                let mut spans = vec![
+                    gutter,
+                    Span::raw(indent.clone()),
+                    Span::styled(fold_icon, fold_style),
+                    Span::styled(format!(" {} ", status), plan_status_style(*status)),
+                    Span::raw(" "),
+                    Span::styled(format!("#{} {}", step_id, clean_title), title_style),
+                ];
+                if !files.is_empty() || !readonly_files.is_empty() {
+                    let mut parts = Vec::new();
+                    if !files.is_empty() {
+                        parts.push(format!(
+                            "{} file{}",
+                            files.len(),
+                            if files.len() == 1 { "" } else { "s" }
+                        ));
+                    }
+                    if !readonly_files.is_empty() {
+                        parts.push(format!("{} ref", readonly_files.len()));
+                    }
+                    spans.push(Span::styled(
+                        format!(" [{}]", parts.join(" + ")),
+                        engine.fg(palette.text_muted),
+                    ));
+                }
+
+                let mut row_line = Line::from(spans).style(row_style);
+                if is_selected {
+                    row_line = pad_line_to_width(row_line, width, row_style);
+                }
+                let mut row_lines = vec![row_line];
+
+                if *is_expanded {
+                    let meta_prefix = format!("{}    │ ", indent);
+                    if !files.is_empty() {
+                        row_lines.push(Line::from(vec![
+                            Span::styled(meta_prefix.clone(), engine.fg(palette.text_muted)),
+                            Span::styled("files: ", engine.fg(palette.text_muted)),
+                            Span::styled(files.join(", "), engine.fg(palette.status_info)),
+                        ]));
+                    }
+                    if !readonly_files.is_empty() {
+                        row_lines.push(Line::from(vec![
+                            Span::styled(meta_prefix.clone(), engine.fg(palette.text_muted)),
+                            Span::styled("ref: ", engine.fg(palette.text_muted)),
+                            Span::styled(
+                                readonly_files.join(", "),
+                                engine.fg(palette.status_info),
+                            ),
+                        ]));
+                    }
+                    if !depends_on.is_empty() {
+                        row_lines.push(Line::from(vec![
+                            Span::styled(meta_prefix.clone(), engine.fg(palette.text_muted)),
+                            Span::styled("depends_on: ", engine.fg(palette.text_muted)),
+                            Span::styled(depends_on.join(", "), engine.fg(palette.status_warning)),
+                        ]));
+                    }
+                    if let Some(det) = details {
+                        let trimmed = det.trim();
+                        if !trimmed.is_empty() {
+                            let mut theme =
+                                crate::markdown::MarkdownTheme::answer_themed(theme_mode);
+                            theme.text_style = engine.fg(palette.text_secondary);
+                            theme.hard_breaks = true;
+                            theme.compact = true;
+                            theme.line_prefix =
+                                Some(Span::styled(meta_prefix, engine.fg(palette.text_muted)));
+                            let md = crate::markdown::render_markdown(trimmed, &theme);
+                            if !md.is_empty() {
+                                row_lines.extend(md);
+                            }
+                        }
                     }
                 }
 
@@ -1413,12 +1892,18 @@ mod tests {
     #[test]
     fn test_review_item_skipped_badge_and_skip_reason_notes() {
         let mut session = make_session("rev-skip", &[1, 2]);
-        session.items[0].status = IssueStatus::Skipped;
-        session.items[0].resolution_notes = Some(
-            "Already addressed in previous turn\nVerified no code change needed".to_string(),
-        );
-        session.items[1].status = IssueStatus::Fixed;
-        session.items[1].resolution_notes = Some("Fixed race condition".to_string());
+        session.items[0] = ReviewItem::from(ReviewIssue {
+            status: IssueStatus::Skipped,
+            note: Some(
+                "Already addressed in previous turn\nVerified no code change needed".to_string(),
+            ),
+            ..make_item(1)
+        });
+        session.items[1] = ReviewItem::from(ReviewIssue {
+            status: IssueStatus::Fixed,
+            note: Some("Fixed race condition".to_string()),
+            ..make_item(2)
+        });
 
         let mut view = ReviewViewState {
             sessions: vec![session],
@@ -1543,7 +2028,7 @@ mod tests {
     #[test]
     fn test_review_item_renders_issue_type_and_refine_status() {
         let mut session = make_session("rev-refine-badge", &[1]);
-        session.items[0].severity = IssueType::Bug.into();
+        session.items[0].issue_type = IssueType::Bug;
         let mut view = ReviewViewState {
             sessions: vec![session],
             ..Default::default()
@@ -1555,27 +2040,30 @@ mod tests {
             compute_unified_review_lines(&rows, 1, 120, crate::config::ThemeMode::Dark);
         let text: String = lines.iter().map(|line| line.to_string()).collect();
 
-        // A critical severity projects onto the Bug category and its badge.
+        // The authoritative category drives the badge directly.
         assert!(text.contains(" BUG "), "expected the issue-type badge: {text}");
     }
 
     #[test]
     fn test_review_focus_badge_and_subplan_rendering() {
         let mut session = make_session("rev-focus", &[1]);
-        session.items[0].subplan = vec![
-            PlanItem {
-                id: "1.1".to_string(),
-                title: "First subtask".to_string(),
-                status: PlanItemStatus::Done,
-                ..Default::default()
-            },
-            PlanItem {
-                id: "1.2".to_string(),
-                title: "Second subtask".to_string(),
-                status: PlanItemStatus::InProgress,
-                ..Default::default()
-            },
-        ];
+        session.items[0] = ReviewItem::from(ReviewIssue {
+            plan: vec![
+                PlanItem {
+                    id: "1.1".to_string(),
+                    title: "First subtask".to_string(),
+                    status: PlanItemStatus::Done,
+                    ..Default::default()
+                },
+                PlanItem {
+                    id: "1.2".to_string(),
+                    title: "Second subtask".to_string(),
+                    status: PlanItemStatus::InProgress,
+                    ..Default::default()
+                },
+            ],
+            ..make_item(1)
+        });
         let mut view = ReviewViewState {
             sessions: vec![session],
             ..Default::default()
@@ -1608,8 +2096,177 @@ mod tests {
         }
         assert!(text.contains("[FOCUS]"), "focus badge expected: {text}");
         assert!(text.contains("[1/2 steps]"), "subplan badge expected: {text}");
-        assert!(text.contains("Subtasks:"), "subtask header expected: {text}");
         assert!(text.contains("#1.1 First subtask"), "subtask expected: {text}");
         assert!(text.contains("#1.2 Second subtask"), "subtask expected: {text}");
+    }
+
+    fn subplan_step(id: &str, title: &str, status: PlanItemStatus) -> PlanItem {
+        PlanItem {
+            id: id.to_string(),
+            title: title.to_string(),
+            status,
+            ..Default::default()
+        }
+    }
+
+    fn step_rows(rows: &[VisibleReviewRow]) -> Vec<(String, usize)> {
+        rows.iter()
+            .filter_map(|row| match row {
+                VisibleReviewRow::SubplanItem { step_id, depth, .. } => {
+                    Some((step_id.clone(), *depth))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_subplan_steps_flatten_into_interactive_rows() {
+        let mut session = make_session("rev-sub", &[1]);
+        session.items[0] = ReviewItem::from(ReviewIssue {
+            plan: vec![PlanItem {
+                children: vec![
+                    subplan_step("1.1", "First leaf", PlanItemStatus::Todo),
+                    subplan_step("1.2", "Second leaf", PlanItemStatus::Done),
+                ],
+                ..subplan_step("1", "Parent step", PlanItemStatus::InProgress)
+            }],
+            ..make_item(1)
+        });
+        let mut view = ReviewViewState {
+            sessions: vec![session],
+            ..Default::default()
+        };
+
+        // A collapsed finding exposes no subplan rows at all.
+        assert!(step_rows(&view.flatten_rows()).is_empty());
+
+        // An expanded finding exposes its top-level step only; children stay
+        // folded until the container step is expanded.
+        view.toggle_item_expanded("rev-sub", 1);
+        assert_eq!(
+            step_rows(&view.flatten_rows()),
+            vec![("1".to_string(), 0)]
+        );
+
+        view.toggle_subplan_item_expanded("rev-sub", 1, "1");
+        assert_eq!(
+            step_rows(&view.flatten_rows()),
+            vec![
+                ("1".to_string(), 0),
+                ("1.1".to_string(), 1),
+                ("1.2".to_string(), 1),
+            ]
+        );
+
+        // A row carries the owning finding, the step status, and its path.
+        assert!(view.flatten_rows().iter().any(|row| matches!(
+            row,
+            VisibleReviewRow::SubplanItem {
+                item_id: 1,
+                step_id,
+                status: PlanItemStatus::Done,
+                ..
+            } if step_id == "1.2"
+        )));
+    }
+
+    #[test]
+    fn test_subplan_step_details_and_files_render_when_expanded() {
+        let mut session = make_session("rev-sub", &[1]);
+        session.items[0] = ReviewItem::from(ReviewIssue {
+            plan: vec![PlanItem {
+                id: "1.1".to_string(),
+                title: "Wire the auth guard".to_string(),
+                details: Some("Guard must reject anonymous callers.".to_string()),
+                status: PlanItemStatus::InProgress,
+                files: vec!["src/auth.rs".to_string()],
+                readonly_files: vec!["contracts/api.md".to_string()],
+                depends_on: vec!["1".to_string()],
+                ..Default::default()
+            }],
+            ..make_item(1)
+        });
+        let mut view = ReviewViewState {
+            sessions: vec![session],
+            ..Default::default()
+        };
+        view.toggle_item_expanded("rev-sub", 1);
+
+        // Folded step shows only its title and the file badge.
+        let rows = view.flatten_rows();
+        let (lines, _) =
+            compute_unified_review_lines(&rows, 2, 160, crate::config::ThemeMode::Dark);
+        let folded: String = lines
+            .iter()
+            .flat_map(|line| line.spans.iter().map(|span| span.content.to_string()))
+            .collect();
+        assert!(folded.contains("#1.1 Wire the auth guard"), "{folded}");
+        assert!(folded.contains("[1 file + 1 ref]"), "{folded}");
+        assert!(!folded.contains("depends_on: 1"), "{folded}");
+
+        // Expanded step reveals target files, references, dependencies, and the
+        // formatted description block.
+        view.toggle_subplan_item_expanded("rev-sub", 1, "1.1");
+        let rows = view.flatten_rows();
+        let (lines, _) =
+            compute_unified_review_lines(&rows, 2, 160, crate::config::ThemeMode::Dark);
+        let expanded: String = lines
+            .iter()
+            .flat_map(|line| line.spans.iter().map(|span| span.content.to_string()))
+            .collect();
+        assert!(expanded.contains("files: src/auth.rs"), "{expanded}");
+        assert!(expanded.contains("ref: contracts/api.md"), "{expanded}");
+        assert!(expanded.contains("depends_on: 1"), "{expanded}");
+        assert!(
+            expanded.contains("Guard must reject anonymous callers."),
+            "{expanded}"
+        );
+    }
+
+    #[test]
+    fn test_accordion_navigation_walks_subplan_steps() {
+        let mut session = make_session("rev-acc", &[1]);
+        session.items[0] = ReviewItem::from(ReviewIssue {
+            plan: vec![
+                PlanItem {
+                    children: vec![subplan_step("1.1", "Leaf one", PlanItemStatus::Todo)],
+                    ..subplan_step("1", "Container", PlanItemStatus::Todo)
+                },
+                subplan_step("2", "Second top step", PlanItemStatus::Todo),
+            ],
+            ..make_item(1)
+        });
+        let mut view = ReviewViewState {
+            sessions: vec![session],
+            ..Default::default()
+        };
+        // Row 0 is the session header, row 1 is the finding.
+        view.selected_index = 1;
+
+        view.accordion_navigate(true);
+        assert!(matches!(
+            view.selected_row(),
+            Some(VisibleReviewRow::SubplanItem { ref step_id, .. }) if step_id == "1"
+        ));
+
+        view.accordion_navigate(true);
+        assert!(matches!(
+            view.selected_row(),
+            Some(VisibleReviewRow::SubplanItem { ref step_id, .. }) if step_id == "1.1"
+        ));
+
+        view.accordion_navigate(true);
+        assert!(matches!(
+            view.selected_row(),
+            Some(VisibleReviewRow::SubplanItem { ref step_id, .. }) if step_id == "2"
+        ));
+
+        // Backward navigation crosses the folded container into its last leaf.
+        view.accordion_navigate(false);
+        assert!(matches!(
+            view.selected_row(),
+            Some(VisibleReviewRow::SubplanItem { ref step_id, .. }) if step_id == "1.1"
+        ));
     }
 }

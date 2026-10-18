@@ -419,6 +419,16 @@ impl TextEditor {
         self.cursor = self.current_line_end();
     }
 
+    /// Moves the cursor to the very beginning of the buffer (`M-<`, `C-Home`).
+    pub fn move_buffer_start(&mut self) {
+        self.cursor = 0;
+    }
+
+    /// Moves the cursor to the very end of the buffer (`M->`, `C-End`).
+    pub fn move_buffer_end(&mut self) {
+        self.cursor = self.text.len();
+    }
+
     pub fn kill_line(&mut self) {
         let line_end = self.current_line_end();
         if self.cursor == line_end {
@@ -643,9 +653,14 @@ impl TextEditor {
         // Consult the map only for command chords, so a bare key never steals a
         // character from the buffer (Conventions §5). The map itself is the
         // authority on which physical modifier satisfies each abstract chord.
+        // Raw Ctrl chords (the buffer-boundary `C-Home` / `C-End`) must reach
+        // the map even when Ctrl is not the configured command modifier, so the
+        // raw modifier joins the abstract ones in the gate.
         let command_chord = is_cmd
             || input.is_meta(key.modifiers)
-            || key.modifiers.contains(KeyModifiers::SHIFT);
+            || key.modifiers.contains(KeyModifiers::SHIFT)
+            || key.modifiers.contains(KeyModifiers::CONTROL);
+
         if command_chord {
             if let Some(spec) = EDITOR_COMMAND_MAP.resolve(key, &input, true) {
                 return self.apply_editor_command(spec.action);
@@ -711,6 +726,8 @@ impl TextEditor {
             EditorCommand::MoveWordForward => self.move_word_forward(),
             EditorCommand::MoveBeginningOfLine => self.move_beginning_of_line(),
             EditorCommand::MoveEndOfLine => self.move_end_of_line(),
+            EditorCommand::MoveBufferStart => self.move_buffer_start(),
+            EditorCommand::MoveBufferEnd => self.move_buffer_end(),
             EditorCommand::MoveLineUp => {
                 if !self.multiline {
                     return false;
@@ -1138,6 +1155,37 @@ mod tests {
         let meta_backspace = KeyEvent::new(KeyCode::Backspace, KeyModifiers::ALT);
         assert!(editor.handle_key(meta_backspace, false));
         assert_eq!(editor.get_text(), "alpha ");
+    }
+
+    #[test]
+    fn buffer_boundary_chords_move_the_cursor_to_the_edges() {
+        let mut editor = TextEditor {
+            multiline: true,
+            ..Default::default()
+        };
+        editor.insert_str("first line\nsecond line");
+
+        // `M-<` (Alt+Shift+,) jumps to the beginning of the buffer.
+        let meta_less = KeyEvent::new(
+            KeyCode::Char('<'),
+            KeyModifiers::ALT | KeyModifiers::SHIFT,
+        );
+        assert!(editor.handle_key(meta_less, false));
+        assert_eq!(editor.cursor, 0);
+
+        // `C-End` jumps to the end of the buffer, not of the current line.
+        let ctrl_end = KeyEvent::new(KeyCode::End, KeyModifiers::CONTROL);
+        assert!(editor.handle_key(ctrl_end, false));
+        assert_eq!(editor.cursor, editor.text.len());
+
+        // `M->` and `C-Home` mirror the same boundaries in the other direction.
+        let meta_greater = KeyEvent::new(KeyCode::Char('>'), KeyModifiers::ALT);
+        assert!(editor.handle_key(meta_greater, false));
+        assert_eq!(editor.cursor, editor.text.len());
+
+        let ctrl_home = KeyEvent::new(KeyCode::Home, KeyModifiers::CONTROL);
+        assert!(editor.handle_key(ctrl_home, false));
+        assert_eq!(editor.cursor, 0);
     }
 
     #[test]
