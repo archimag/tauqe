@@ -140,7 +140,10 @@ fn handle_custom_input(dialog: &mut SquashDialogState, key: KeyEvent, is_cmd: bo
             }
             dialog.pending_base = Some((SquashBaseMode::Custom, custom.clone()));
             dialog.loading = true;
-            dialog.status_message = Some(format!("Checking base '{}'...", custom));
+            dialog.status_message = Some(
+                crate::i18n::active_t("dialog.squash.status_checking_base")
+                    .replace("{}", &custom),
+            );
             SquashAction::Preview(custom)
         }
         _ => {
@@ -175,7 +178,7 @@ fn handle_browse(dialog: &mut SquashDialogState, key: KeyEvent, is_cmd: bool) ->
                 dialog,
                 SquashBaseMode::Session,
                 base,
-                "Session base commit not available (no AI commits in session).",
+                &crate::i18n::active_t("dialog.squash.status_no_session_base"),
             )
         }
         KeyCode::Char('2') => {
@@ -184,7 +187,7 @@ fn handle_browse(dialog: &mut SquashDialogState, key: KeyEvent, is_cmd: bool) ->
                 dialog,
                 SquashBaseMode::Upstream,
                 base,
-                "No upstream branch configured or detected.",
+                &crate::i18n::active_t("dialog.squash.status_no_upstream_base"),
             )
         }
         KeyCode::Char('3') => {
@@ -268,7 +271,10 @@ fn switch_base(
         Some(base_ref) => {
             dialog.pending_base = Some((mode, base_ref.clone()));
             dialog.loading = true;
-            dialog.status_message = Some(format!("Switching base to '{}'...", base_ref));
+            dialog.status_message = Some(
+                crate::i18n::active_t("dialog.squash.status_switching_base")
+                    .replace("{}", &base_ref),
+            );
             SquashAction::Preview(base_ref)
         }
         None => {
@@ -283,13 +289,13 @@ fn begin_generate(dialog: &mut SquashDialogState) -> SquashAction {
         return SquashAction::None;
     }
     dialog.generating_message = true;
-    dialog.status_message = Some("Generating Conventional Commit message with AI...".to_string());
+    dialog.status_message = Some(crate::i18n::active_t("dialog.squash.status_generating_message"));
     SquashAction::Generate(dialog.base_ref.clone())
 }
 
 fn begin_apply(dialog: &mut SquashDialogState) -> GitSquashApplyParams {
     dialog.applying = true;
-    dialog.status_message = Some("Applying squash...".to_string());
+    dialog.status_message = Some(crate::i18n::active_t("dialog.squash.status_applying"));
     GitSquashApplyParams {
         base_ref: dialog.base_ref.clone(),
         message: dialog.message_editor.get_text().trim().to_string(),
@@ -298,24 +304,24 @@ fn begin_apply(dialog: &mut SquashDialogState) -> GitSquashApplyParams {
 
 fn request_apply_confirm(dialog: &mut SquashDialogState) {
     if dialog.loading {
-        dialog.status_message = Some("Diff is still loading, please wait...".to_string());
+        dialog.status_message = Some(crate::i18n::active_t("dialog.squash.status_loading_diff"));
         return;
     }
     if dialog.generating_message {
-        dialog.status_message = Some("Commit message is generating, please wait...".to_string());
+        dialog.status_message = Some(crate::i18n::active_t("dialog.squash.status_message_generating"));
         return;
     }
     if dialog.base_ref.trim().is_empty() {
-        dialog.status_message = Some("Invalid or empty base ref.".to_string());
+        dialog.status_message = Some(crate::i18n::active_t("dialog.squash.status_invalid_base"));
         return;
     }
     if dialog.commits.is_empty() {
-        dialog.status_message = Some("No commits ahead of base to squash.".to_string());
+        dialog.status_message = Some(crate::i18n::active_t("dialog.squash.status_no_commits"));
         return;
     }
     if dialog.message_editor.get_text().trim().is_empty() {
         dialog.status_message =
-            Some("Commit message cannot be empty (Ctrl+G to generate, or type one).".to_string());
+            Some(crate::i18n::active_t("dialog.squash.status_empty_message"));
         dialog.focus = SquashDialogFocus::MessageEditor;
         return;
     }

@@ -89,7 +89,6 @@ pub(super) fn render_code_block(
     cb: &CodeBlockState,
     out_lines: &mut Vec<Line<'static>>,
     is_streaming: bool,
-    _block_id: usize,
     is_flashing: bool,
 ) {
     let raw_lines: Vec<&str> = cb.content.lines().collect();

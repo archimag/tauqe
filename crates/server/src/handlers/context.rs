@@ -3,7 +3,7 @@ use std::sync::Arc;
 use tauqe_protocol::{
     errors, events, ContextAddParams, ContextAddPatternParams, ContextAddPatternResult,
     ContextClearParams, ContextLayer, ContextRemoveParams, ContextSetAccessParams, Event, Request,
-    RequestId, Response, ResponseError,
+    RequestId, Response,
 };
 
 use crate::state::AppState;
@@ -40,15 +40,11 @@ pub async fn handle_context_add(req: Request, state: &Arc<AppState>) -> Response
     let params: ContextAddParams = match req.params.and_then(|p| serde_json::from_value(p).ok()) {
         Some(p) => p,
         None => {
-            return Response {
-                id: req.id,
-                result: None,
-                error: Some(ResponseError {
-                    code: errors::INVALID_PARAMS.to_string(),
-                    message: "Missing or invalid path/access".to_string(),
-                    data: None,
-                }),
-            };
+            return Response::err(
+                req.id,
+                errors::INVALID_PARAMS,
+                "Missing or invalid path/access",
+            );
         }
     };
 
@@ -63,21 +59,20 @@ pub async fn handle_context_add(req: Request, state: &Arc<AppState>) -> Response
         );
     }
 
-    let ctx_state = {
-        let mut ctx = state.context.write().await;
-        match ctx.add_file_to_layer(&params.path, params.access, layer) {
-            Ok(_) => ctx.get_state(),
-            Err(err) => {
-                return Response {
-                    id: req.id,
-                    result: None,
-                    error: Some(ResponseError {
-                        code: errors::ADD_FAILED.to_string(),
-                        message: err.to_string(),
-                        data: None,
-                    }),
-                };
-            }
+    // Metadata reads and path verification touch the disk, so the mutation runs
+    // on the blocking pool while the exclusive context guard is held for the
+    // whole read-modify-write sequence.
+    let outcome = super::with_context_mutation(state, move |ctx| {
+        ctx.add_file_to_layer(&params.path, params.access, layer)
+            .map(|_| ctx.get_state())
+            .map_err(|err| err.to_string())
+    })
+    .await;
+
+    let ctx_state = match outcome {
+        Ok(Ok(state)) => state,
+        Ok(Err(err)) | Err(err) => {
+            return Response::err(req.id, errors::ADD_FAILED, err);
         }
     };
 
@@ -98,15 +93,11 @@ pub async fn handle_context_add_pattern(req: Request, state: &Arc<AppState>) -> 
         match req.params.and_then(|p| serde_json::from_value(p).ok()) {
             Some(p) => p,
             None => {
-                return Response {
-                    id: req.id,
-                    result: None,
-                    error: Some(ResponseError {
-                        code: errors::INVALID_PARAMS.to_string(),
-                        message: "Missing or invalid pattern/access".to_string(),
-                        data: None,
-                    }),
-                };
+                return Response::err(
+                    req.id,
+                    errors::INVALID_PARAMS,
+                    "Missing or invalid pattern/access",
+                );
             }
         };
 
@@ -125,34 +116,32 @@ pub async fn handle_context_add_pattern(req: Request, state: &Arc<AppState>) -> 
     .map(|result| result.unwrap_or_default())
     .unwrap_or_default();
 
-    let (added_count, added_tokens, truncated, ctx_state) = {
-        let mut ctx = state.context.write().await;
-        match ctx.add_files_by_pattern(
+    // The batch reads metadata of up to `max_pattern_batch` files from disk, so
+    // the whole application runs inside the blocking closure.
+    let outcome = super::with_context_mutation(state, move |ctx| {
+        ctx.add_files_by_pattern(
             &params.pattern,
             params.access,
             &available_files,
             max_batch,
-        ) {
-            Ok(outcome) => {
-                let state = ctx.get_state();
-                (
-                    outcome.added_items.len(),
-                    outcome.added_tokens,
-                    outcome.truncated,
-                    state,
-                )
-            }
-            Err(err) => {
-                return Response {
-                    id: req.id,
-                    result: None,
-                    error: Some(ResponseError {
-                        code: errors::ADD_PATTERN_FAILED.to_string(),
-                        message: err.to_string(),
-                        data: None,
-                    }),
-                };
-            }
+        )
+        .map(|outcome| {
+            let state = ctx.get_state();
+            (
+                outcome.added_items.len(),
+                outcome.added_tokens,
+                outcome.truncated,
+                state,
+            )
+        })
+        .map_err(|err| err.to_string())
+    })
+    .await;
+
+    let (added_count, added_tokens, truncated, ctx_state) = match outcome {
+        Ok(Ok(value)) => value,
+        Ok(Err(err)) | Err(err) => {
+            return Response::err(req.id, errors::ADD_PATTERN_FAILED, err);
         }
     };
 
@@ -180,33 +169,21 @@ pub async fn handle_context_remove(req: Request, state: &Arc<AppState>) -> Respo
     {
         Some(p) => p,
         None => {
-            return Response {
-                id: req.id,
-                result: None,
-                error: Some(ResponseError {
-                    code: errors::INVALID_PARAMS.to_string(),
-                    message: "Missing or invalid path".to_string(),
-                    data: None,
-                }),
-            };
+            return Response::err(req.id, errors::INVALID_PARAMS, "Missing or invalid path");
         }
     };
 
-    let ctx_state = {
-        let mut ctx = state.context.write().await;
-        match ctx.remove_file(&params.path) {
-            Ok(_) => ctx.get_state(),
-            Err(err) => {
-                return Response {
-                    id: req.id,
-                    result: None,
-                    error: Some(ResponseError {
-                        code: errors::REMOVE_FAILED.to_string(),
-                        message: err.to_string(),
-                        data: None,
-                    }),
-                };
-            }
+    let outcome = super::with_context_mutation(state, move |ctx| {
+        ctx.remove_file(&params.path)
+            .map(|_| ctx.get_state())
+            .map_err(|err| err.to_string())
+    })
+    .await;
+
+    let ctx_state = match outcome {
+        Ok(Ok(state)) => state,
+        Ok(Err(err)) | Err(err) => {
+            return Response::err(req.id, errors::REMOVE_FAILED, err);
         }
     };
 
@@ -227,33 +204,21 @@ pub async fn handle_context_set_access(req: Request, state: &Arc<AppState>) -> R
         match req.params.and_then(|p| serde_json::from_value(p).ok()) {
             Some(p) => p,
             None => {
-                return Response {
-                    id: req.id,
-                    result: None,
-                    error: Some(ResponseError {
-                        code: errors::INVALID_PARAMS.to_string(),
-                        message: "Missing or invalid parameters".to_string(),
-                        data: None,
-                    }),
-                };
+                return Response::err(req.id, errors::INVALID_PARAMS, "Missing or invalid parameters");
             }
         };
 
-    let ctx_state = {
-        let mut ctx = state.context.write().await;
-        match ctx.set_access(&params.path, params.access) {
-            Ok(_) => ctx.get_state(),
-            Err(err) => {
-                return Response {
-                    id: req.id,
-                    result: None,
-                    error: Some(ResponseError {
-                        code: errors::SET_ACCESS_FAILED.to_string(),
-                        message: err.to_string(),
-                        data: None,
-                    }),
-                };
-            }
+    let outcome = super::with_context_mutation(state, move |ctx| {
+        ctx.set_access(&params.path, params.access)
+            .map(|_| ctx.get_state())
+            .map_err(|err| err.to_string())
+    })
+    .await;
+
+    let ctx_state = match outcome {
+        Ok(Ok(state)) => state,
+        Ok(Err(err)) | Err(err) => {
+            return Response::err(req.id, errors::SET_ACCESS_FAILED, err);
         }
     };
 
@@ -296,14 +261,20 @@ pub async fn handle_context_clear(req: Request, state: &Arc<AppState>) -> Respon
         );
     }
 
-    let ctx_state = {
-        let mut ctx = state.context.write().await;
+    // Clearing recomputes hierarchical pinned files, which stats the disk, so it
+    // runs on the blocking pool like every other context mutation.
+    let ctx_state = match super::with_context_mutation(state, move |ctx| {
         match params.layer {
             Some(ContextLayer::Auto) => ctx.clear_auto(),
             Some(ContextLayer::User) => ctx.clear_user(),
             _ => ctx.clear(),
         }
         ctx.get_state()
+    })
+    .await
+    {
+        Ok(state) => state,
+        Err(err) => return Response::err(req.id, errors::INTERNAL_ERROR, err),
     };
 
     state.out.send_event(&Event {

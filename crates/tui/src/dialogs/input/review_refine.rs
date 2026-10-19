@@ -158,7 +158,7 @@ pub(crate) async fn submit_review_refine_dialog(
     server_writer: &mut RpcConnection,
 ) -> anyhow::Result<Option<InputResult>> {
     if st.model.is_busy() || st.review.running || st.review.refining.is_some() {
-        st.notify_warning("Model is currently busy; wait for operation to finish");
+        st.notify_warning(crate::i18n::active_t("notify.model_busy"));
         st.review.refine_dialog = Some(dialog);
         return Ok(Some(InputResult::Continue));
     }
@@ -187,14 +187,14 @@ pub(crate) async fn submit_review_refine_dialog(
     };
     let previous_refining = st.review.refining.clone();
     st.review.begin_refine_batch(vec![target]);
-    st.notify_info("Decomposing finding with the Architect...");
+    st.notify_info(crate::i18n::active_t("notify.review_refining"));
     drop(st);
 
     if let Err(err) = send_request(server_writer, methods::REVIEW_REFINE_ITEM, params).await {
         let mut st = state.lock().await;
         st.review.refining = previous_refining;
         st.review.refine_queue.clear();
-        st.notify_error(format!("Failed to start decomposition: {}", err));
+        st.notify_error(crate::i18n::active_t("notify.turn_start_failed").replace("{}", &err.to_string()));
     }
 
     Ok(Some(InputResult::Continue))

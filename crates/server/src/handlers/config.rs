@@ -5,9 +5,9 @@ use tauqe_core::config::{load_config_with_options, AppConfig, ConfigLoadOptions}
 use tauqe_core::edits::EditProtocolFactory;
 use tauqe_core::workflow::WorkflowFactory;
 use tauqe_protocol::{
-    events, ConfigSetParams, ConfigState, CredentialsSaveParams, Event, ModelRole,
+    errors, events, ConfigSetParams, ConfigState, CredentialsSaveParams, Event, ModelRole,
     ModelRolesEffort, ModelRolesEntries, ModelRolesSummary, ModelSelection, Request, Response,
-    ResponseError, SystemStatusResult,
+    SystemStatusResult,
 };
 
 use crate::state::AppState;
@@ -82,6 +82,23 @@ pub(crate) async fn explicit_cli_paths(
     )
 }
 
+/// Builds the fallback configuration used when a reload fails.
+///
+/// The daemon's `--config` and `--credentials` overrides are stored inside
+/// [`AppConfig`], so falling back to bare defaults would permanently erase them
+/// for the rest of the daemon's lifetime. Re-attaching the captured overrides
+/// keeps every later reload honoring the same CLI paths.
+fn fallback_config_with_cli_paths(
+    explicit_config: Option<PathBuf>,
+    explicit_credentials: Option<PathBuf>,
+) -> AppConfig {
+    AppConfig {
+        explicit_config_path: explicit_config,
+        explicit_credentials_path: explicit_credentials,
+        ..AppConfig::default()
+    }
+}
+
 /// Reloads configuration for `repo_root`, re-applying the explicit path
 /// overrides captured at startup.
 pub(crate) async fn reload_config_with_overrides(
@@ -89,6 +106,12 @@ pub(crate) async fn reload_config_with_overrides(
     repo_root: Option<&Path>,
 ) -> AppConfig {
     let (explicit_config, explicit_credentials) = explicit_cli_paths(state).await;
+    // Keep the CLI overrides alongside the closure inputs so a failed reload
+    // can restore them: callers replace `state.config` with whatever this
+    // function returns, so the `--config` / `--credentials` paths captured at
+    // daemon startup must survive on every code path, including the fallback.
+    let fallback_config = explicit_config.clone();
+    let fallback_credentials = explicit_credentials.clone();
     let repo_root = repo_root.map(Path::to_path_buf);
     // Loading configuration reads files from disk; offload it so the async
     // worker thread is never blocked.
@@ -103,8 +126,11 @@ pub(crate) async fn reload_config_with_overrides(
     {
         Ok(cfg) => cfg,
         Err(err) => {
-            tracing::warn!(error = %err, "Failed to reload configuration; keeping defaults");
-            AppConfig::default()
+            tracing::warn!(
+                error = %err,
+                "Failed to reload configuration; keeping defaults with CLI overrides preserved"
+            );
+            fallback_config_with_cli_paths(fallback_config, fallback_credentials)
         }
     }
 }
@@ -181,31 +207,17 @@ pub async fn handle_config_get(req: Request, state: &Arc<AppState>) -> Response 
 
 pub async fn handle_config_set(req: Request, state: &Arc<AppState>) -> Response {
     if state.is_operation_active() {
-        return Response {
-            id: req.id,
-            result: None,
-            error: Some(ResponseError {
-                code: "OPERATION_IN_PROGRESS".to_string(),
-                message:
-                    "Cannot change workflow, edit protocol or model while a model operation is in progress"
-                        .to_string(),
-                data: None,
-            }),
-        };
+        return Response::err(
+            req.id,
+            errors::OPERATION_IN_PROGRESS,
+            "Cannot change workflow, edit protocol or model while a model operation is in progress",
+        );
     }
 
     let params: ConfigSetParams = match req.params.and_then(|p| serde_json::from_value(p).ok()) {
         Some(p) => p,
         None => {
-            return Response {
-                id: req.id,
-                result: None,
-                error: Some(ResponseError {
-                    code: "INVALID_PARAMS".to_string(),
-                    message: "Missing or invalid parameters".to_string(),
-                    data: None,
-                }),
-            };
+            return Response::err(req.id, errors::INVALID_PARAMS, "Missing or invalid parameters");
         }
     };
 
@@ -220,45 +232,37 @@ pub async fn handle_config_set(req: Request, state: &Arc<AppState>) -> Response 
             let effective = guard.config.resolve_model(sel);
             let available = guard.config.available_models();
             if !available.contains(&effective) {
-                return Response {
-                    id: req.id,
-                    result: None,
-                    error: Some(ResponseError {
-                        code: "INVALID_MODEL".to_string(),
-                        message: format!(
-                            "Unknown model '{}'. Available models: {}",
-                            effective,
-                            available
-                                .iter()
-                                .map(ToString::to_string)
-                                .collect::<Vec<_>>()
-                                .join(", ")
-                        ),
-                        data: None,
-                    }),
-                };
+                return Response::err(
+                    req.id,
+                    errors::INVALID_MODEL,
+                    format!(
+                        "Unknown model '{}'. Available models: {}",
+                        effective,
+                        available
+                            .iter()
+                            .map(ToString::to_string)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                );
             }
             new_selection = sel.clone();
         } else if let Some(ref requested_model) = params.model {
             let available = guard.config.available_models();
             if !available.contains(requested_model) {
-                return Response {
-                    id: req.id,
-                    result: None,
-                    error: Some(ResponseError {
-                        code: "INVALID_MODEL".to_string(),
-                        message: format!(
-                            "Unknown model '{}'. Available models: {}",
-                            requested_model,
-                            available
-                                .iter()
-                                .map(ToString::to_string)
-                                .collect::<Vec<_>>()
-                                .join(", ")
-                        ),
-                        data: None,
-                    }),
-                };
+                return Response::err(
+                    req.id,
+                    errors::INVALID_MODEL,
+                    format!(
+                        "Unknown model '{}'. Available models: {}",
+                        requested_model,
+                        available
+                            .iter()
+                            .map(ToString::to_string)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                );
             }
             new_selection = ModelSelection::Specific(requested_model.clone());
         }
@@ -267,23 +271,19 @@ pub async fn handle_config_set(req: Request, state: &Arc<AppState>) -> Response 
         if let Some(ref hist_model) = params.history_model {
             let available = guard.config.available_models();
             if !available.contains(hist_model) {
-                return Response {
-                    id: req.id,
-                    result: None,
-                    error: Some(ResponseError {
-                        code: "INVALID_MODEL".to_string(),
-                        message: format!(
-                            "Unknown history model '{}'. Available models: {}",
-                            hist_model,
-                            available
-                                .iter()
-                                .map(ToString::to_string)
-                                .collect::<Vec<_>>()
-                                .join(", ")
-                        ),
-                        data: None,
-                    }),
-                };
+                return Response::err(
+                    req.id,
+                    errors::INVALID_MODEL,
+                    format!(
+                        "Unknown history model '{}'. Available models: {}",
+                        hist_model,
+                        available
+                            .iter()
+                            .map(ToString::to_string)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                );
             }
             new_scribe = Some(hist_model.clone());
         }
@@ -329,16 +329,11 @@ pub async fn handle_system_status(req: Request, state: &Arc<AppState>) -> Respon
 
 pub async fn handle_config_reload(req: Request, state: &Arc<AppState>) -> Response {
     if state.is_operation_active() {
-        return Response {
-            id: req.id,
-            result: None,
-            error: Some(ResponseError {
-                code: "OPERATION_IN_PROGRESS".to_string(),
-                message: "Cannot reload configuration while a model operation is in progress"
-                    .to_string(),
-                data: None,
-            }),
-        };
+        return Response::err(
+            req.id,
+            errors::OPERATION_IN_PROGRESS,
+            "Cannot reload configuration while a model operation is in progress",
+        );
     }
 
     let repo_root = resolved_repo_root(state).await;
@@ -368,16 +363,11 @@ pub async fn handle_config_reload(req: Request, state: &Arc<AppState>) -> Respon
 
 pub async fn handle_config_create(req: Request, state: &Arc<AppState>) -> Response {
     if state.is_operation_active() {
-        return Response {
-            id: req.id,
-            result: None,
-            error: Some(ResponseError {
-                code: "OPERATION_IN_PROGRESS".to_string(),
-                message: "Cannot create configuration while a model operation is in progress"
-                    .to_string(),
-                data: None,
-            }),
-        };
+        return Response::err(
+            req.id,
+            errors::OPERATION_IN_PROGRESS,
+            "Cannot create configuration while a model operation is in progress",
+        );
     }
 
     let repo_root = resolved_repo_root(state).await;
@@ -394,27 +384,15 @@ pub async fn handle_config_create(req: Request, state: &Arc<AppState>) -> Respon
     {
         Ok(outcome) => outcome,
         Err(err) => {
-            return Response {
-                id: req.id,
-                result: None,
-                error: Some(ResponseError {
-                    code: "CONFIG_CREATE_FAILED".to_string(),
-                    message: err,
-                    data: None,
-                }),
-            };
+            return Response::err(req.id, errors::CONFIG_CREATE_FAILED, err);
         }
     };
     if let Err(err) = write_outcome {
-        return Response {
-            id: req.id,
-            result: None,
-            error: Some(ResponseError {
-                code: "CONFIG_CREATE_FAILED".to_string(),
-                message: format!("Failed to create config file at {:?}: {}", target_path, err),
-                data: None,
-            }),
-        };
+        return Response::err(
+            req.id,
+            errors::CONFIG_CREATE_FAILED,
+            format!("Failed to create config file at {:?}: {}", target_path, err),
+        );
     }
 
     let new_cfg = reload_config_with_overrides(state, repo_opt).await;
@@ -441,37 +419,32 @@ pub async fn handle_config_create(req: Request, state: &Arc<AppState>) -> Respon
 }
 
 pub async fn handle_credentials_save(req: Request, state: &Arc<AppState>) -> Response {
+    if state.is_operation_active() {
+        return Response::err(
+            req.id,
+            errors::OPERATION_IN_PROGRESS,
+            "Cannot save credentials while a model operation is in progress",
+        );
+    }
+
     let repo_root = resolved_repo_root(state).await;
     let repo_opt = repo_root.as_deref();
 
-    let params: CredentialsSaveParams = match req.params.and_then(|p| serde_json::from_value(p).ok())
-    {
-        Some(p) => p,
-        None => {
-            return Response {
-                id: req.id,
-                result: None,
-                error: Some(ResponseError {
-                    code: "INVALID_PARAMS".to_string(),
-                    message: "Missing or invalid parameters".to_string(),
-                    data: None,
-                }),
-            };
-        }
-    };
+    let params: CredentialsSaveParams =
+        match req.params.and_then(|p| serde_json::from_value(p).ok()) {
+            Some(p) => p,
+            None => {
+                return Response::err(
+                    req.id,
+                    errors::INVALID_PARAMS,
+                    "Missing or invalid parameters",
+                );
+            }
+        };
 
     let api_key = params.api_key.trim();
-
     if api_key.is_empty() {
-        return Response {
-            id: req.id,
-            result: None,
-            error: Some(ResponseError {
-                code: "INVALID_KEY".to_string(),
-                message: "API key cannot be empty".to_string(),
-                data: None,
-            }),
-        };
+        return Response::err(req.id, errors::INVALID_KEY, "API key cannot be empty");
     }
 
     let (_, explicit_credentials) = explicit_cli_paths(state).await;
@@ -486,30 +459,18 @@ pub async fn handle_credentials_save(req: Request, state: &Arc<AppState>) -> Res
     {
         Ok(outcome) => outcome,
         Err(err) => {
-            return Response {
-                id: req.id,
-                result: None,
-                error: Some(ResponseError {
-                    code: "CREDENTIALS_SAVE_FAILED".to_string(),
-                    message: err,
-                    data: None,
-                }),
-            };
+            return Response::err(req.id, errors::CREDENTIALS_SAVE_FAILED, err);
         }
     };
     if let Err(err) = write_outcome {
-        return Response {
-            id: req.id,
-            result: None,
-            error: Some(ResponseError {
-                code: "CREDENTIALS_SAVE_FAILED".to_string(),
-                message: format!(
-                    "Failed to write credentials file at {:?}: {}",
-                    target_path, err
-                ),
-                data: None,
-            }),
-        };
+        return Response::err(
+            req.id,
+            errors::CREDENTIALS_SAVE_FAILED,
+            format!(
+                "Failed to write credentials file at {:?}: {}",
+                target_path, err
+            ),
+        );
     }
 
     let new_cfg = reload_config_with_overrides(state, repo_opt).await;
@@ -541,6 +502,14 @@ pub async fn handle_credentials_save(req: Request, state: &Arc<AppState>) -> Res
 }
 
 pub async fn handle_credentials_create_stub(req: Request, state: &Arc<AppState>) -> Response {
+    if state.is_operation_active() {
+        return Response::err(
+            req.id,
+            errors::OPERATION_IN_PROGRESS,
+            "Cannot create a credentials stub while a model operation is in progress",
+        );
+    }
+
     let repo_root = resolved_repo_root(state).await;
     let repo_opt = repo_root.as_deref();
 
@@ -555,30 +524,18 @@ pub async fn handle_credentials_create_stub(req: Request, state: &Arc<AppState>)
     {
         Ok(outcome) => outcome,
         Err(err) => {
-            return Response {
-                id: req.id,
-                result: None,
-                error: Some(ResponseError {
-                    code: "CREDENTIALS_STUB_FAILED".to_string(),
-                    message: err,
-                    data: None,
-                }),
-            };
+            return Response::err(req.id, errors::CREDENTIALS_STUB_FAILED, err);
         }
     };
     if let Err(err) = write_outcome {
-        return Response {
-            id: req.id,
-            result: None,
-            error: Some(ResponseError {
-                code: "CREDENTIALS_STUB_FAILED".to_string(),
-                message: format!(
-                    "Failed to write credentials stub at {:?}: {}",
-                    target_path, err
-                ),
-                data: None,
-            }),
-        };
+        return Response::err(
+            req.id,
+            errors::CREDENTIALS_STUB_FAILED,
+            format!(
+                "Failed to write credentials stub at {:?}: {}",
+                target_path, err
+            ),
+        );
     }
 
     let has_git = repo_has_git(repo_opt).await;
@@ -654,13 +611,16 @@ mod tests {
         let req = Request {
             id: tauqe_protocol::RequestId::Number(1),
             method: "config/set".to_string(),
-            params: Some(serde_json::to_value(ConfigSetParams {
-                workflow: None,
-                edit_protocol: None,
-                model: None,
-                selection: Some(ModelSelection::Role(ModelRole::Scribe)),
-                history_model: None,
-            }).unwrap()),
+            params: Some(
+                serde_json::to_value(ConfigSetParams {
+                    workflow: None,
+                    edit_protocol: None,
+                    model: None,
+                    selection: Some(ModelSelection::Role(ModelRole::Scribe)),
+                    history_model: None,
+                })
+                .unwrap(),
+            ),
         };
 
         let resp = handle_config_set(req, &state).await;
@@ -683,13 +643,16 @@ mod tests {
         let req = Request {
             id: tauqe_protocol::RequestId::Number(2),
             method: "config/set".to_string(),
-            params: Some(serde_json::to_value(ConfigSetParams {
-                workflow: Some(WorkflowKind::Naive),
-                edit_protocol: Some(EditProtocolKind::Structured),
-                model: None,
-                selection: None,
-                history_model: None,
-            }).unwrap()),
+            params: Some(
+                serde_json::to_value(ConfigSetParams {
+                    workflow: Some(WorkflowKind::Naive),
+                    edit_protocol: Some(EditProtocolKind::Structured),
+                    model: None,
+                    selection: None,
+                    history_model: None,
+                })
+                .unwrap(),
+            ),
         };
 
         let resp = handle_config_set(req, &state).await;
@@ -698,5 +661,41 @@ mod tests {
         let res_state: ConfigState = serde_json::from_value(resp.result.unwrap()).unwrap();
         assert_eq!(res_state.workflow, WorkflowKind::Naive);
         assert_eq!(res_state.edit_protocol, EditProtocolKind::Structured);
+    }
+
+    /// A failed reload must not erase the CLI overrides captured at daemon
+    /// startup, or every later reload would silently stop honoring the explicit
+    /// `--config` / `--credentials` paths.
+    #[test]
+    fn fallback_config_preserves_explicit_cli_paths() {
+        let cfg_path = PathBuf::from("/tmp/tauqe/custom.toml");
+        let creds_path = PathBuf::from("/tmp/tauqe/credentials.toml");
+
+        let fallback =
+            fallback_config_with_cli_paths(Some(cfg_path.clone()), Some(creds_path.clone()));
+
+        assert_eq!(fallback.explicit_config_path, Some(cfg_path));
+        assert_eq!(fallback.explicit_credentials_path, Some(creds_path));
+    }
+
+    #[tokio::test]
+    async fn test_credentials_create_stub_rejected_while_operation_active() {
+        let (out, _rx) = crate::transport::OutChannel::new();
+        let (history_sender, _hrx) = tokio::sync::mpsc::unbounded_channel();
+        let state = AppState::new(AppConfig::default(), std::env::temp_dir(), history_sender, out);
+
+        let _guard = state
+            .try_begin_operation()
+            .expect("operation slot must be free");
+
+        let req = Request {
+            id: tauqe_protocol::RequestId::Number(3),
+            method: "credentials/create_stub".to_string(),
+            params: None,
+        };
+
+        let resp = handle_credentials_create_stub(req, &state).await;
+        let err = resp.error.expect("stub creation must be rejected");
+        assert_eq!(err.code, errors::OPERATION_IN_PROGRESS);
     }
 }

@@ -9,7 +9,6 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use tauqe_core::context::ContextManager;
 use tauqe_core::edits::protocol::ContextRequest;
 use tauqe_core::review::prompt::format_review_step_failure_note;
 use tauqe_core::review::ReviewStorage;
@@ -107,20 +106,56 @@ pub(super) async fn set_item_status(
     }
 }
 
+/// Maximum number of Unicode scalar values retained from the model's final
+/// comment when a finding is skipped, so a long response never bloats the note.
+const SKIP_COMMENT_MAX_CHARS: usize = 2000;
+
+/// Appends the model's final comment to a base diagnostic, truncating the
+/// comment on a Unicode scalar boundary.
+///
+/// The comment is truncated with `chars().take(..)`, never with a raw byte
+/// offset, so multibyte text (Cyrillic, CJK, emoji) stays intact and can never
+/// trigger a `byte index is not a char boundary` panic. An empty comment leaves
+/// the base diagnostic untouched.
+pub(super) fn append_model_comment(base: String, assistant_text: &str) -> String {
+    let comment = assistant_text.trim();
+    if comment.is_empty() {
+        return base;
+    }
+    let total_chars = comment.chars().count();
+    let truncated: String = comment.chars().take(SKIP_COMMENT_MAX_CHARS).collect();
+    if total_chars > SKIP_COMMENT_MAX_CHARS {
+        format!("{}\n\n## Model Response (truncated):\n{}…", base, truncated)
+    } else {
+        format!("{}\n\n## Model Response:\n{}", base, truncated)
+    }
+}
+
+/// Builds the `resolution_notes` diagnostic recorded when a finding is skipped.
+///
+/// The diagnostic combines the failure reason with the model's final response, so
+/// the developer can inspect both why the finding could not be resolved and what
+/// the model reported as it gave up.
+fn build_skip_note(assistant_text: &str, reason: &str) -> String {
+    append_model_comment(format_review_step_failure_note(reason), assistant_text)
+}
+
 /// Marks a finding as `Skipped` and records a domain failure diagnostic in its
 /// resolution notes.
 ///
 /// A domain failure is confined to the current finding: the batch supervisor
 /// keeps running, and the recorded diagnostic lets the developer inspect why the
-/// finding could not be resolved in code.
+/// finding could not be resolved in code. The model's final comment is preserved
+/// alongside the reason whenever it is available.
 pub(super) async fn skip_finding_with_diagnostic(
     state: &Arc<AppState>,
     repo_root: &Path,
     review_id: &str,
     item_id: u32,
+    assistant_text: &str,
     reason: &str,
 ) {
-    let notes = format_review_step_failure_note(reason);
+    let notes = build_skip_note(assistant_text, reason);
     let update_root = repo_root.to_path_buf();
     let review_id_owned = review_id.to_string();
     let notes_clone = notes.clone();
@@ -155,33 +190,12 @@ pub(super) fn report_item_failure(state: &Arc<AppState>, operation_id: &str, mes
     );
 }
 
-/// Runs a context mutation on the blocking pool without holding the async
-/// context guard across disk I/O.
+/// Runs a context mutation atomically under the exclusive context write lock.
 ///
-/// The context manager is cloned into a private snapshot under a short-lived
-/// read guard, mutated inside the blocking pool, and written back under a
-/// short-lived write guard. This keeps `state.context` free while `std::fs`
-/// metadata reads run, so the async worker is never blocked by the mutation
-/// (and never starves on the guard while a sibling task holds it).
-pub(super) async fn with_context_mutation<T, F>(state: &Arc<AppState>, f: F) -> Result<T, String>
-where
-    F: FnOnce(&mut ContextManager) -> T + Send + 'static,
-    T: Send + 'static,
-{
-    let snapshot = state.context.read().await.clone();
-    let (result, mutated) = crate::handlers::offload(move || {
-        let mut ctx = snapshot;
-        let result = f(&mut ctx);
-        (result, ctx)
-    })
-    .await?;
-
-    {
-        let mut guard = state.context.write().await;
-        *guard = mutated;
-    }
-    Ok(result)
-}
+/// The single implementation lives in `crate::handlers`; re-exporting it here
+/// keeps review-side call sites unchanged while removing the duplicated body
+/// that cloned the manager and overwrote the shared state afterwards.
+pub(super) use crate::handlers::with_context_mutation;
 
 /// Loads the target finding's files into the read-only auto context layer before
 /// the architect begins decomposition, guaranteeing baseline visibility of the
@@ -301,5 +315,52 @@ pub(super) fn turn_applied_edits(turn: &crate::handlers::model::ModelTurnResult)
             outcome.applied && outcome.error.is_none()
         }
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn skip_note_keeps_comment_and_reason() {
+        let note = build_skip_note("I could not patch the file safely.", "retry budget exhausted");
+        assert!(note.contains("retry budget exhausted"));
+        assert!(note.contains("I could not patch the file safely."));
+        assert!(note.contains("## Model Response:"));
+        assert!(!note.contains("(truncated)"));
+    }
+
+    #[test]
+    fn skip_note_without_comment_falls_back_to_reason() {
+        let note = build_skip_note("   ", "compiler errors persisted");
+        assert!(note.contains("compiler errors persisted"));
+        assert!(!note.contains("## Model Response"));
+    }
+
+    #[test]
+    fn append_model_comment_preserves_base_and_comment() {
+        let note = append_model_comment(
+            "Subplan interrupted before completion: patch failed".to_string(),
+            "I stopped after the second hunk failed.",
+        );
+        assert!(note.contains("Subplan interrupted before completion: patch failed"));
+        assert!(note.contains("I stopped after the second hunk failed."));
+    }
+
+    #[test]
+    fn skip_note_truncates_on_utf8_boundary() {
+        let text: String = "я".repeat(SKIP_COMMENT_MAX_CHARS + 500);
+        let note = build_skip_note(&text, "retry budget exhausted");
+        assert!(note.contains("## Model Response (truncated):"));
+        let comment_part = note
+            .split_once("## Model Response (truncated):\n")
+            .map(|(_, rest)| rest)
+            .expect("truncated marker present");
+        let trailing = comment_part
+            .strip_suffix('…')
+            .expect("ellipsis suffix present");
+        assert_eq!(trailing.chars().count(), SKIP_COMMENT_MAX_CHARS);
+        assert!(trailing.chars().all(|c| c == 'я'));
     }
 }

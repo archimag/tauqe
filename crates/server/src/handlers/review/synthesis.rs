@@ -10,7 +10,10 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use tauqe_core::edits::stream::json::JsonFieldStreamFilter;
-use tauqe_core::providers::{create_provider, ChatMessage, LlmProvider, StreamEvent};
+use tauqe_core::providers::{
+    create_provider, format_session_id, ChatMessage, LlmProvider, SESSION_PREFIX_REVIEW,
+    StreamEvent,
+};
 use tauqe_core::review::parser::ReviewFindingsOutput;
 use tauqe_core::review::{
     build_review_system_prompt, build_review_user_prompt, parse_review_findings,
@@ -18,8 +21,8 @@ use tauqe_core::review::{
 };
 use tauqe_protocol::{
     errors, events, ContextAccess, ModelRole, ModelUsageEvent, ModelUsageInfo, Request, Response,
-    ReviewCancelParams, ReviewContentDeltaEvent, ReviewFinishedEvent, ReviewItem,
-    ReviewListChangedEvent, ReviewReasoningDeltaEvent, ReviewSession, ReviewStartParams,
+    ReviewCancelParams, ReviewContentDeltaEvent, ReviewFinishedEvent, ReviewListChangedEvent,
+    ReviewItem, ReviewReasoningDeltaEvent, ReviewSession, ReviewStartParams,
     ReviewStartedEvent, ReviewUpdatedEvent,
 };
 use tokio::sync::mpsc;
@@ -169,6 +172,12 @@ pub async fn handle_review_start(req: Request, state: &Arc<AppState>) -> Respons
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
+    // A review audit is one long-lived logical context: the synthesis, the
+    // refinement of its findings, and every finding and sub-plan turn share one
+    // identifier, so the backend keeps a single warm prompt-prefix cache. The
+    // identifier is minted before the streamed call because the request needs it.
+    let review_id = generate_uuid_v7();
+    let session_id = format_session_id(SESSION_PREFIX_REVIEW, &review_id);
 
     emit(
         &state.out,
@@ -201,6 +210,10 @@ pub async fn handle_review_start(req: Request, state: &Arc<AppState>) -> Respons
         let state = state_for_spawn;
         let op_id = op_id_for_spawn;
         let cancel_rx = operation.cancel_receiver();
+        // Open the shared usage ledger before the provider call: this audit
+        // reports both the usage the provider returns and the duration the
+        // harness measures, so every operation kind feeds one snapshot.
+        let usage_guard = state.begin_usage().await;
 
         let (tx, mut rx) = mpsc::channel::<StreamEvent>(100);
         let err_tx = tx.clone();
@@ -208,11 +221,12 @@ pub async fn handle_review_start(req: Request, state: &Arc<AppState>) -> Respons
         let stream_cancel = cancel_rx.clone();
         let stream_task = tokio::spawn(async move {
             if let Err(err) = provider
-                .stream_chat_with_effort(
+                .stream_chat_with_session(
                     &model_name,
                     messages,
                     Some(response_format),
                     reasoning_effort,
+                    Some(session_id.as_str()),
                     tx,
                     stream_cancel,
                 )
@@ -273,6 +287,20 @@ pub async fn handle_review_start(req: Request, state: &Arc<AppState>) -> Respons
                 _ => {}
             }
         }
+
+        // The streamed provider call has resolved, so the slot must stop
+        // pointing at it: a later hard-cancel would otherwise abort an already
+        // finished task while the operation is still finalizing and persisting.
+        operation.clear_abort_handle();
+
+        // Account for the tokens, cost, and duration the audit consumed through
+        // the shared ledger before any early return, so a failed or cancelled
+        // audit is still charged and leaves no in-flight window behind for the
+        // next operation.
+        let reported_usage = usage.unwrap_or_default();
+        usage_guard.observe(&reported_usage).await;
+        usage_guard.flush().await;
+        let usage_snapshot = state.usage.lock().await.clone();
 
         let cancelled = *cancel_rx.borrow() || stream_cancelled;
 
@@ -337,9 +365,11 @@ pub async fn handle_review_start(req: Request, state: &Arc<AppState>) -> Respons
             .unwrap_or_else(|| format!("Review {}", created_at));
 
         let session = ReviewSession {
-            // A UUIDv7 carries a millisecond timestamp plus random bits, so two
-            // reviews started within the same second never share a session file.
-            id: generate_uuid_v7(),
+            // The UUIDv7 minted before the streamed call carries a millisecond
+            // timestamp plus random bits, so two reviews started within the same
+            // second never share a session file, and the same string keys the
+            // provider session.
+            id: review_id,
             title,
             created_at,
             model: model.clone(),
@@ -349,6 +379,19 @@ pub async fn handle_review_start(req: Request, state: &Arc<AppState>) -> Respons
             items: issues.into_iter().map(ReviewItem::from).collect(),
             raw_markdown: raw_buffer,
         };
+        // A cancel delivered after the stream resolved — during parsing, or
+        // across a storage round-trip — must not persist an artifact the
+        // developer already abandoned, so the signal is re-checked right before
+        // the session touches disk.
+        if *cancel_rx.borrow() {
+            emit(
+                &state.out,
+                events::REVIEW_CANCELLED,
+                Some(serde_json::json!({ "operation_id": op_id })),
+            );
+            return;
+        }
+
         let save_root = repo_root.clone();
         let session_clone = session.clone();
         if let Err(err) =
@@ -380,24 +423,40 @@ pub async fn handle_review_start(req: Request, state: &Arc<AppState>) -> Respons
             );
         }
 
-        {
-            let mut history = state.history.lock().await;
-            let _ = history.record_review(
-                model.to_string(),
-                params.user_prompt.clone(),
-                session.description.clone(),
-                session.target_files.clone(),
-                session.items.len(),
+        // Recording the review appends to `history.jsonl` behind an `fsync`
+        // barrier, so it runs on the blocking pool under the exclusive history
+        // guard instead of stalling an async worker thread.
+        let history_model = model.to_string();
+        let history_prompt = params.user_prompt.clone();
+        let history_description = session.description.clone();
+        let history_files = session.target_files.clone();
+        let history_items = session.items.len();
+        // The blocking mutation closure takes ownership of its own handle, so
+        // the shared state stays usable afterwards for cost aggregation and
+        // the terminal events.
+        let history_state = Arc::clone(&state);
+        let recorded = crate::handlers::with_history_mutation(&history_state, move |history| {
+            history.record_review(
+                history_model,
+                history_prompt,
+                history_description,
+                history_files,
+                history_items,
+            )
+        })
+        .await;
+        if let Err(err) = recorded {
+            tracing::warn!(
+                error = %err,
+                "Failed to record the review in interaction history"
             );
         }
 
-        let usage = usage.unwrap_or_default();
+        let usage = reported_usage;
         let cost = usage.cost.unwrap_or(0.0);
-        let total_cost = {
-            let mut total = state.total_cost.lock().await;
-            *total += cost;
-            *total
-        };
+        // The session total comes from the authoritative ledger rather than a
+        // second, independently accumulated counter.
+        let session_total_cost = usage_snapshot.session.cost;
 
         emit(
             &state.out,
@@ -405,7 +464,7 @@ pub async fn handle_review_start(req: Request, state: &Arc<AppState>) -> Respons
             serde_json::to_value(ModelUsageEvent {
                 operation_id: op_id.clone(),
                 usage: usage.clone(),
-                session_total_cost: total_cost,
+                session_total_cost,
                 current_cost: Some(cost),
             })
             .ok(),
@@ -417,7 +476,7 @@ pub async fn handle_review_start(req: Request, state: &Arc<AppState>) -> Respons
                 operation_id: op_id,
                 session,
                 usage: Some(usage),
-                session_total_cost: Some(total_cost),
+                session_total_cost: Some(session_total_cost),
                 current_cost: Some(cost),
             })
             .ok(),

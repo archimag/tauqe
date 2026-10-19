@@ -8,17 +8,19 @@ use tauqe_core::context::ContextFileContent;
 use tauqe_core::edits::protocol::ContextRequest;
 use tauqe_core::plan::storage::PlanStorage;
 use tauqe_core::providers::{
-    create_provider, ChatMessage, JsonSchemaDefinition, LlmProvider, ResponseFormat, StreamEvent,
+    create_provider, format_session_id, ChatMessage, JsonSchemaDefinition, LlmProvider,
+    ResponseFormat, SESSION_PREFIX_ARCHITECT, StreamEvent,
 };
 use tauqe_core::workflow::common::apply_context_requests_detailed;
 use tauqe_protocol::{
-    errors, events, ContextAccess, Event, ModelDeltaEvent, ModelErrorEvent, ModelFinishedEvent,
-    ModelRole, ModelSelection, ModelStartedEvent, Plan, PlanItem, PlanRefineResult, Response,
-    TurnPhase, TurnPhaseEvent,
+    errors, events, ArchitectTier, ContextAccess, Event, ModelDeltaEvent, ModelErrorEvent,
+    ModelFinishedEvent, ModelRole, ModelSelection, ModelStartedEvent, Plan, PlanItem,
+    PlanRefineResult, Response, TurnPhase, TurnPhaseEvent,
 };
 use tokio::sync::mpsc;
 
 use crate::state::{AppState, OperationGuard};
+use crate::usage::UsageGuard;
 
 use super::common::{
     clear_auto_context, emit, find_duplicate_item_ids, offload_plan, with_context_mutation,
@@ -43,6 +45,72 @@ pub(crate) async fn resolve_architect_provider(
         .map_err(|err| err.to_string())
 }
 
+/// The Architect escalation applied to one replanning wave.
+///
+/// `from` carries the configuration recorded on the plan, which is `None` when
+/// the plan predates provenance recording; `to` is the rung the ladder handed
+/// out for this wave.
+struct ArchitectLevelUp {
+    from: Option<ArchitectTier>,
+    to: ArchitectTier,
+}
+
+/// Renders an Architect configuration for user-facing banners and logs.
+fn format_architect_tier(tier: &ArchitectTier) -> String {
+    match tier.effort {
+        Some(effort) => format!("{} ({})", tier.model, effort),
+        None => tier.model.to_string(),
+    }
+}
+
+/// Alias of the configured Architect entry backing a resolved rung, if any.
+///
+/// The alias is looked up by the rung's model and reasoning depth, so an
+/// escalated wave shows the label of the configuration it actually runs on
+/// instead of the base entry's label.
+fn architect_alias(cfg: &tauqe_core::config::AppConfig, tier: &ArchitectTier) -> Option<String> {
+    cfg.models
+        .role_entries(ModelRole::Architect)
+        .into_iter()
+        .find(|entry| entry.model == tier.model && entry.effort == tier.effort)
+        .and_then(|entry| entry.alias)
+}
+
+/// Resolves the Architect configuration for one horizon synthesis round.
+///
+/// An explicit developer selection is an override: the architect ladder is not
+/// consulted and no escalation is reported. Otherwise a replanning wave
+/// (`diagnostics` present) extracts the configuration recorded on the plan and
+/// asks the ladder for the next rung, while the first synthesis of a horizon
+/// always starts from the base rung. The returned [`ArchitectLevelUp`] is
+/// `Some` only when a replanning wave escalated the Architect.
+fn resolve_architect_tier(
+    cfg: &tauqe_core::config::AppConfig,
+    plan: &Plan,
+    custom_model: Option<&ModelSelection>,
+    diagnostics: Option<&PlanHorizonDiagnosticsOwned>,
+) -> (ArchitectTier, Option<String>, Option<ArchitectLevelUp>) {
+    if let Some(selection) = custom_model {
+        let tier = ArchitectTier::new(
+            cfg.resolve_model(selection),
+            cfg.models.resolve_effort(ModelRole::Architect),
+        );
+        let alias = architect_alias(cfg, &tier);
+        return (tier, alias, None);
+    }
+
+    let tier = match diagnostics {
+        Some(_) => cfg.models.next_architect_tier(plan.architect.as_ref()),
+        None => cfg.models.architect_tier(0),
+    };
+    let level_up = diagnostics.map(|_| ArchitectLevelUp {
+        from: plan.architect.clone(),
+        to: tier.clone(),
+    });
+    let alias = architect_alias(cfg, &tier);
+    (tier, alias, level_up)
+}
+
 pub(crate) struct ArchitectStreamOutcome {
     pub(crate) raw_text: String,
     pub(crate) streamed_explanation_bytes: usize,
@@ -56,6 +124,14 @@ pub(crate) enum ArchitectStreamError {
 /// Executes a streaming structured-chat turn with the architect model, streaming
 /// reasoning deltas and explanation text deltas to the client, handling cancellation
 /// and errors, and committing token usage to session state.
+///
+/// `session_id` binds the round to the architect's long-lived design context, so
+/// the provider keeps one warm prompt-prefix cache across the discovery rounds of
+/// a synthesis and the later replanning waves of the same plan or finding.
+///
+/// `usage` is the window of the whole synthesis, not of this one round: every
+/// round reports into the same window, so a multi-round synthesis is accounted
+/// as a single operation instead of one artificial operation per round.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_architect_stream(
     state: &Arc<AppState>,
@@ -64,8 +140,10 @@ pub(crate) async fn run_architect_stream(
     messages: Vec<ChatMessage>,
     response_format: Option<ResponseFormat>,
     reasoning_effort: Option<tauqe_protocol::ReasoningEffort>,
+    session_id: Option<String>,
     operation: &OperationGuard,
     op_id: &str,
+    usage: &UsageGuard,
 ) -> Result<ArchitectStreamOutcome, ArchitectStreamError> {
     let cancel_rx = operation.cancel_receiver();
     let (tx, mut rx) = mpsc::channel::<StreamEvent>(100);
@@ -74,11 +152,12 @@ pub(crate) async fn run_architect_stream(
 
     let stream_task = tokio::spawn(async move {
         provider_stream
-            .stream_chat_with_effort(
+            .stream_chat_with_session(
                 &model_name,
                 messages,
                 response_format,
                 reasoning_effort,
+                session_id.as_deref(),
                 tx,
                 stream_cancel,
             )
@@ -88,7 +167,6 @@ pub(crate) async fn run_architect_stream(
     operation.set_abort_handle(stream_task.abort_handle());
 
     let mut raw_text = String::new();
-    let mut usage = None;
     let mut failure = None;
     let mut stream_cancelled = false;
     let mut passthrough: Option<bool> = None;
@@ -158,7 +236,7 @@ pub(crate) async fn run_architect_stream(
                     }
                 }
             }
-            StreamEvent::Usage(u) => usage = Some(u),
+            StreamEvent::Usage(reported) => usage.observe(&reported).await,
             StreamEvent::Done => break,
             // The provider may report cancellation as an explicit stream event
             // even when the turn's cancel signal has not been observed yet, so
@@ -178,6 +256,7 @@ pub(crate) async fn run_architect_stream(
     let cancelled = *cancel_rx.borrow() || stream_cancelled;
     if cancelled {
         stream_task.abort();
+        operation.clear_abort_handle();
         state.out.send_event(&Event {
             method: events::MODEL_CANCELLED.to_string(),
             params: Some(serde_json::json!({ "operation_id": op_id })),
@@ -186,6 +265,7 @@ pub(crate) async fn run_architect_stream(
     }
     if let Some(err) = failure {
         stream_task.abort();
+        operation.clear_abort_handle();
         state.out.send_event(&Event {
             method: events::MODEL_ERROR.to_string(),
             params: serde_json::to_value(ModelErrorEvent {
@@ -197,7 +277,14 @@ pub(crate) async fn run_architect_stream(
         return Err(ArchitectStreamError::ModelError(err));
     }
 
-    if let Err(join_err) = stream_task.await {
+    // The streamed task has resolved, so its handle is dropped from the
+    // operation slot immediately: the discovery loop keeps working between
+    // rounds, and a hard-cancel arriving there must not target a task that is
+    // already finished.
+    let join_result = stream_task.await;
+    operation.clear_abort_handle();
+
+    if let Err(join_err) = join_result {
         let err_msg = join_err.to_string();
         state.out.send_event(&Event {
             method: events::MODEL_ERROR.to_string(),
@@ -210,24 +297,10 @@ pub(crate) async fn run_architect_stream(
         return Err(ArchitectStreamError::ModelError(err_msg));
     }
 
-    let usage = usage.unwrap_or_default();
-    let cost = usage.cost.unwrap_or(0.0);
-    let total_cost = {
-        let mut total = state.total_cost.lock().await;
-        *total += cost;
-        *total
-    };
-
-    state.out.send_event(&Event {
-        method: events::MODEL_USAGE.to_string(),
-        params: serde_json::to_value(tauqe_protocol::ModelUsageEvent {
-            operation_id: op_id.to_string(),
-            usage,
-            session_total_cost: total_cost,
-            current_cost: Some(cost),
-        })
-        .ok(),
-    });
+    // The aggregate snapshot travels through `model/usageTotals`; the legacy
+    // per-operation channel is mirrored from that same snapshot, so both
+    // channels always agree instead of accumulating independently.
+    crate::handlers::model::emit_legacy_usage_event(state, op_id).await;
 
     Ok(ArchitectStreamOutcome {
         raw_text,
@@ -254,6 +327,9 @@ pub(crate) struct ArchitectDiscoveryRequest<'a> {
     pub(crate) repomap_budget: usize,
     pub(crate) max_discovery_rounds: usize,
     pub(crate) files_token_budget: usize,
+    /// Provider session the whole synthesis binds to, so the backend keeps one
+    /// warm prompt-prefix cache across its discovery rounds.
+    pub(crate) session_id: Option<String>,
 }
 
 /// Outcome of a completed architect discovery loop.
@@ -276,6 +352,10 @@ pub(crate) enum ArchitectDiscoveryError {
 /// resolving `needs_context` rounds against the repository, enforcing the files
 /// token budget, and feeding `<context_feedback>` back to the model.
 ///
+/// The repository map is generated once before the first round and reused by
+/// every round, so a discovery round never shrinks the map or rewrites the
+/// prompt prefix the provider has already cached.
+///
 /// The loop emits the `Proposal` and `Discovery` turn phases, streams the
 /// architect's explanation and round banners, and terminates once the model
 /// finalizes a status or a discovery round adds nothing new. Cancellation,
@@ -296,6 +376,42 @@ pub(crate) async fn run_architect_discovery_loop<F>(
 where
     F: Fn(&[ContextFileContent], Option<&str>) -> String + Send,
 {
+    // The whole synthesis is one accounted operation: every discovery round
+    // reports into the same open window, and the window closes exactly once on
+    // every terminal path — success, cancellation, and failure alike — so the
+    // tokens and time the synthesis already consumed are charged instead of
+    // dropped.
+    let usage = state.begin_usage().await;
+    let outcome = run_architect_discovery_rounds(
+        state,
+        provider,
+        model_name,
+        request,
+        build_user_prompt,
+        reasoning_effort,
+        operation,
+        &usage,
+    )
+    .await;
+    usage.flush().await;
+    outcome
+}
+
+/// Runs the discovery rounds of one synthesis inside an open usage window.
+#[allow(clippy::too_many_arguments)]
+async fn run_architect_discovery_rounds<F>(
+    state: &Arc<AppState>,
+    provider: Arc<dyn LlmProvider>,
+    model_name: &str,
+    request: ArchitectDiscoveryRequest<'_>,
+    build_user_prompt: F,
+    reasoning_effort: Option<tauqe_protocol::ReasoningEffort>,
+    operation: &OperationGuard,
+    usage: &UsageGuard,
+) -> Result<ArchitectDiscoveryOutcome, ArchitectDiscoveryError>
+where
+    F: Fn(&[ContextFileContent], Option<&str>) -> String + Send,
+{
     let ArchitectDiscoveryRequest {
         repo_root,
         op_id,
@@ -307,13 +423,61 @@ where
         repomap_budget,
         max_discovery_rounds,
         files_token_budget,
+        session_id,
     } = request;
 
+    // One receiver is observed for the whole loop, so a cancel signal raised
+    // while discovery commands run stays visible to every later round.
+    let cancel_rx = operation.cancel_receiver();
     let mut discovery_round = 0usize;
-    let mut feedback: Option<String> = None;
+    // Append-only discovery feedback: each round extends the previous request
+    // instead of rewriting it, so the model keeps the full history of search
+    // results and documentation it already received.
+    let mut feedback = String::new();
     let mut accumulated_full_text = intro_header.to_string();
 
+    // The repository map is deterministic for the whole loop, so it is
+    // generated once from the turn's opening context and reused by every round.
+    // A map regenerated after a discovery round added files to the context
+    // would drop those nodes and rewrite the middle of the prompt, discarding
+    // the prefix the provider has already cached.
+    let repo_map = {
+        let opening_context_paths: Vec<String> = {
+            let ctx = state.context.read().await;
+            ctx.get_state()
+                .items
+                .into_iter()
+                .map(|item| item.path)
+                .collect()
+        };
+        let root = repo_root.to_path_buf();
+        crate::handlers::offload(move || {
+            let all_files =
+                tauqe_core::git::list_repository_files(Some(&root)).unwrap_or_default();
+            tauqe_core::repomap::generate_repo_map(
+                &root,
+                &all_files,
+                &opening_context_paths,
+                repomap_budget,
+            )
+            .ok()
+        })
+        .await
+        .unwrap_or(None)
+    };
+
     let output = loop {
+        // Every round launches a fresh provider request, so the cancel signal is
+        // re-checked here instead of only inside the streaming task.
+        if *cancel_rx.borrow() {
+            emit(
+                &state.out,
+                events::MODEL_CANCELLED,
+                Some(serde_json::json!({ "operation_id": op_id })),
+            );
+            return Err(ArchitectDiscoveryError::Cancelled);
+        }
+
         emit(
             &state.out,
             events::TURN_PHASE,
@@ -328,37 +492,18 @@ where
         );
 
         // Snapshot the context manager under a short-lived read guard, then
-        // release the guard before any disk or git work. Reading the files and
-        // generating the repo map are offloaded so they never stall an async
-        // worker thread.
+        // release the guard before any disk work. Reading the files is offloaded
+        // so it never stalls an async worker thread.
         let ctx_snapshot = state.context.read().await.clone();
         let context_files = crate::handlers::offload(move || ctx_snapshot.read_context_files())
             .await
             .unwrap_or_default();
-        let context_paths: Vec<String> =
-            context_files.iter().map(|f| f.path.clone()).collect();
-        let repo_map = {
-            let root = repo_root.to_path_buf();
-            crate::handlers::offload(move || {
-                let all_files =
-                    tauqe_core::git::list_repository_files(Some(&root)).unwrap_or_default();
-                tauqe_core::repomap::generate_repo_map(
-                    &root,
-                    &all_files,
-                    &context_paths,
-                    repomap_budget,
-                )
-                .ok()
-            })
-            .await
-            .unwrap_or(None)
-        };
 
         let mut user_prompt = build_user_prompt(&context_files, repo_map.as_deref());
 
-        if let Some(ref fb) = feedback {
+        if !feedback.is_empty() {
             user_prompt.push_str("\n\n");
-            user_prompt.push_str(fb);
+            user_prompt.push_str(&feedback);
         }
 
         if discovery_round >= max_discovery_rounds {
@@ -380,8 +525,10 @@ where
             messages,
             Some(response_format.clone()),
             reasoning_effort,
+            session_id.clone(),
             operation,
             op_id,
+            usage,
         )
         .await
         {
@@ -523,6 +670,19 @@ where
                 );
             }
 
+            // Loading context files and searching the repository are the
+            // longest non-streaming stretches of a round, so the cancel signal
+            // is re-checked before deciding whether another provider round is
+            // worth launching.
+            if *cancel_rx.borrow() {
+                emit(
+                    &state.out,
+                    events::MODEL_CANCELLED,
+                    Some(serde_json::json!({ "operation_id": op_id })),
+                );
+                return Err(ArchitectDiscoveryError::Cancelled);
+            }
+
             // A round that only re-requests files already present in context is
             // not a dead end: the model still needs their feedback and another
             // analysis round, so the loop terminates only when a round adds
@@ -620,7 +780,12 @@ where
                     outcome.already_satisfied.join(", ")
                 ));
             }
-            feedback = if fb.is_empty() { None } else { Some(fb) };
+            if !fb.is_empty() {
+                if !feedback.is_empty() {
+                    feedback.push('\n');
+                }
+                feedback.push_str(&fb);
+            }
             continue;
         }
 
@@ -730,6 +895,30 @@ async fn preload_readonly_files(state: &Arc<AppState>, repo_root: &Path, files: 
     }
 }
 
+/// Records an Architect synthesis interaction atomically once it reaches a
+/// terminal outcome.
+///
+/// The user turn and its response are written together under a single history
+/// mutation, only after the synthesis has produced a durable result. Recording
+/// the turn before the discovery loop would leave an orphaned user entry in the
+/// transcript whenever the round is cancelled, fails, or is rejected before a
+/// response exists. Persistence is `fsync`-bounded, so it runs on the blocking
+/// pool through `crate::handlers::with_history_mutation` instead of stalling an
+/// async worker thread.
+async fn record_synthesis_history(
+    state: &Arc<AppState>,
+    turn_prompt: String,
+    context_paths: Vec<String>,
+    response_message: String,
+    response_summary: Option<String>,
+) {
+    let _ = crate::handlers::with_history_mutation(state, move |history| {
+        let _ = history.record_turn(turn_prompt, context_paths);
+        let _ = history.record_response(response_message, None, response_summary, Vec::new());
+    })
+    .await;
+}
+
 /// Unified engine for architect plan horizon synthesis.
 ///
 /// Drives streaming structured communication with the architect model, runs multi-round
@@ -748,6 +937,7 @@ pub(super) async fn execute_plan_horizon_synthesis(
     custom_model: Option<ModelSelection>,
     instructions: Option<String>,
     operation_title: &str,
+    is_batch: bool,
     operation: &OperationGuard,
 ) -> Response {
     let repo_root = state.context.read().await.repo_root().to_path_buf();
@@ -762,43 +952,48 @@ pub(super) async fn execute_plan_horizon_synthesis(
 
     let (
         provider,
-        model,
-        reasoning_effort,
+        architect_tier,
         alias,
+        level_up,
         repomap_budget,
         max_discovery_rounds,
         files_token_budget,
     ) = {
         let cfg = state.config.lock().await.config.clone();
-        let architect_entry = cfg
-            .models
-            .role_entries(ModelRole::Architect)
-            .into_iter()
-            .next();
-        let model = match &custom_model {
-            Some(m) => cfg.resolve_model(m),
-            None => cfg.resolve_role(ModelRole::Architect),
-        };
-        let reasoning_effort = cfg.models.resolve_effort(ModelRole::Architect);
-        let alias = if custom_model.is_some() {
-            None
-        } else {
-            architect_entry.and_then(|entry| entry.alias)
-        };
-        let provider = match resolve_architect_provider(state, &cfg, model.provider).await {
-            Ok(p) => p,
-            Err(err) => return Response::err(req_id, errors::NO_API_KEY, err),
-        };
+        let (architect_tier, alias, level_up) =
+            resolve_architect_tier(&cfg, &plan, custom_model.as_ref(), diagnostics.as_ref());
+        let provider =
+            match resolve_architect_provider(state, &cfg, architect_tier.model.provider).await {
+                Ok(p) => p,
+                Err(err) => return Response::err(req_id, errors::NO_API_KEY, err),
+            };
         (
             provider,
-            model,
-            reasoning_effort,
+            architect_tier,
             alias,
+            level_up,
             cfg.context.repomap_token_budget,
             cfg.context.max_discovery_rounds,
             cfg.context.files_token_budget,
         )
     };
+    // The resolved rung is recorded with the synthesized horizon so a later
+    // wave can reproduce or escalate it instead of re-deriving one. A replan
+    // wave escalates that recorded configuration rather than retrying the one
+    // that already failed, so the transition is journalled once here.
+    if let Some(level) = &level_up {
+        tracing::warn!(
+            plan_id = %plan.id,
+            operation = operation_title,
+            blocked_step_id = diagnostics
+                .as_ref()
+                .map(|d| d.blocked_step_id.as_str())
+                .unwrap_or_default(),
+            from_tier = ?level.from,
+            to_tier = ?level.to,
+            "architect level up"
+        );
+    }
 
     clear_auto_context(state).await;
 
@@ -816,24 +1011,40 @@ pub(super) async fn execute_plan_horizon_synthesis(
         method: events::MODEL_STARTED.to_string(),
         params: serde_json::to_value(ModelStartedEvent {
             operation_id: op_id.clone(),
-            model: model.clone(),
+            model: architect_tier.model.clone(),
             role: Some(ModelRole::Architect),
             alias,
-            effort: reasoning_effort,
+            effort: architect_tier.effort,
             plan_context: None,
-            is_batch: false,
+            is_batch,
         })
         .ok(),
     });
 
+    let level_up_note = level_up
+        .as_ref()
+        .map(|level| {
+            let from = level
+                .from
+                .as_ref()
+                .map(format_architect_tier)
+                .unwrap_or_else(|| "not recorded".to_string());
+            format!(
+                "\n> Architect level up: {} → {}",
+                from,
+                format_architect_tier(&level.to)
+            )
+        })
+        .unwrap_or_default();
+
     let intro_header = match &diagnostics {
         Some(diag) => format!(
-            "# {}: [{}] {}\n*Replanning uncompleted horizon around blocked step `{}`...*\n\n---\n\n",
-            operation_title, plan.id, plan.title, diag.blocked_step_id
+            "# {}: [{}] {}\n*Replanning uncompleted horizon around blocked step `{}`...*{}\n\n---\n\n",
+            operation_title, plan.id, plan.title, diag.blocked_step_id, level_up_note
         ),
         None => format!(
-            "# {}: [{}] {}\n*Analyzing codebase contours and decomposing architectural plan...*\n\n---\n\n",
-            operation_title, plan.id, plan.title
+            "# {}: [{}] {}\n*Analyzing codebase contours and decomposing architectural plan...*{}\n\n---\n\n",
+            operation_title, plan.id, plan.title, level_up_note
         ),
     };
     state.out.send_event(&Event {
@@ -845,7 +1056,12 @@ pub(super) async fn execute_plan_horizon_synthesis(
         .ok(),
     });
 
-    {
+    // The user turn and its response are recorded together once the synthesis
+    // reaches a terminal outcome, so a cancelled, failed, or rejected round
+    // leaves no orphaned user turn in the transcript. The prompt and context
+    // paths are captured here because they describe the state the Architect
+    // actually saw.
+    let (history_turn_prompt, history_context_paths) = {
         let ctx = state.context.read().await;
         let context_paths: Vec<String> = ctx
             .get_state()
@@ -867,12 +1083,8 @@ pub(super) async fn execute_plan_horizon_synthesis(
                 history_turn_prompt.push_str(&format!("\nDirectives: {}\n", trimmed));
             }
         }
-        let _ = state
-            .history
-            .lock()
-            .await
-            .record_turn(history_turn_prompt, context_paths);
-    }
+        (history_turn_prompt, context_paths)
+    };
 
     let response_format = {
         let schema_val = tauqe_core::plan::prompt::plan_refine_response_schema_definition();
@@ -893,6 +1105,9 @@ pub(super) async fn execute_plan_horizon_synthesis(
         repomap_budget,
         max_discovery_rounds,
         files_token_budget,
+        // Horizon synthesis is an isolated design dialogue: its cache is keyed
+        // by the plan, never by the interactive REPL session.
+        session_id: Some(format_session_id(SESSION_PREFIX_ARCHITECT, &plan.id)),
     };
 
     let build_user_prompt = |context_files: &[ContextFileContent], repo_map: Option<&str>| {
@@ -915,10 +1130,10 @@ pub(super) async fn execute_plan_horizon_synthesis(
     let output = match run_architect_discovery_loop(
         state,
         Arc::clone(&provider),
-        &model.name,
+        &architect_tier.model.name,
         discovery,
         build_user_prompt,
-        reasoning_effort,
+        architect_tier.effort,
         operation,
     )
     .await
@@ -931,15 +1146,17 @@ pub(super) async fn execute_plan_horizon_synthesis(
             budget_exceeded: Some(warn_msg),
             ..
         }) => {
-            let _ = state.history.lock().await.record_response(
+            record_synthesis_history(
+                state,
+                history_turn_prompt,
+                history_context_paths,
                 warn_msg.clone(),
-                None,
                 Some(format!(
                     "{}: Token Budget Exceeded ({})",
                     operation_title, plan.title
                 )),
-                Vec::new(),
-            );
+            )
+            .await;
             return Response::ok_typed(req_id, &PlanRefineResult::Blocked { reason: warn_msg });
         }
         Err(ArchitectDiscoveryError::Cancelled) => {
@@ -969,12 +1186,14 @@ pub(super) async fn execute_plan_horizon_synthesis(
         );
         let blocked_msg =
             format!("Architect reported blockers for plan [{}]:\n\n{}", plan.id, reason);
-        let _ = state.history.lock().await.record_response(
+        record_synthesis_history(
+            state,
+            history_turn_prompt,
+            history_context_paths,
             blocked_msg,
-            None,
             Some(format!("{}: Blocked ({})", operation_title, plan.title)),
-            Vec::new(),
-        );
+        )
+        .await;
         return Response::ok_typed(req_id, &PlanRefineResult::Blocked { reason });
     }
 
@@ -1027,8 +1246,14 @@ pub(super) async fn execute_plan_horizon_synthesis(
     let horizon_root = repo_root.clone();
     let horizon_plan_id = plan.id.clone();
     let horizon_items = output.items;
+    let horizon_architect = architect_tier;
     let updated_plan = match offload_plan(move || {
-        PlanStorage::replace_uncompleted_horizon(&horizon_root, &horizon_plan_id, horizon_items)
+        PlanStorage::replace_uncompleted_horizon(
+            &horizon_root,
+            &horizon_plan_id,
+            horizon_items,
+            horizon_architect,
+        )
     })
     .await
     {
@@ -1050,12 +1275,14 @@ pub(super) async fn execute_plan_horizon_synthesis(
         "Plan [{}] horizon synthesized successfully ({} total, {} completed).\n\n{}",
         updated_plan.id, total_items, completed_items, output.explanation
     );
-    let _ = state.history.lock().await.record_response(
+    record_synthesis_history(
+        state,
+        history_turn_prompt,
+        history_context_paths,
         history_response,
-        None,
         Some(format!("{}: {}", operation_title, updated_plan.title)),
-        Vec::new(),
-    );
+    )
+    .await;
 
     emit(
         &state.out,

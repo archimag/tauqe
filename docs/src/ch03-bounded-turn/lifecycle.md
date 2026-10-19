@@ -271,3 +271,235 @@ The turn lifecycle is traced at its significant boundaries rather than at its da
 ### Anti-Bloat Guard
 
 The journal never carries raw generation stream deltas, full prompt bodies, context file contents, `RepoMap` dumps, or raw diffs in normal operation. It records interaction metadata, compact identifiers, and aggregated token and time metrics only. This keeps the file analytically useful and prevents a single verbose turn from defeating rotation.
+
+---
+
+## 3.9 Turn Intent and the Dynamic System Contract
+
+Every bounded turn runs in exactly one execution regime, and the harness must know
+that regime before the first token is generated. This section explains where that
+knowledge comes from, what it decides, and why it is a typed value rather than a
+property of the prompt text.
+
+### 3.9.1 TurnIntent as the Single Typed Source of Truth
+
+`TurnIntent` (`crates/protocol/src/intent.rs`) is the authoritative vocabulary of
+turn modes:
+
+- `InteractiveRepl` — free interactive dialogue started from the REPL, including
+  a dialogue anchored on a review finding.
+- `ReadonlyDiscussion` — read-only architectural discussion of a plan.
+- `IsolatedStep` — isolated execution of one plan step or one review finding.
+
+Deterministic predicates — `is_interactive_repl()`, `is_readonly_discussion()`,
+and `is_isolated_step()` — are mutually exclusive: exactly one holds for every
+variant. Callers branch on these predicates instead of on strings, so a new
+regime is a compile-time addition rather than a runtime guess.
+
+The type deliberately implements neither `Default` nor any implicit conversion.
+Every turn must name its mode, because a default value would turn a forgotten
+argument into a silent mode substitution.
+
+### 3.9.2 Where the Intent Comes From
+
+The server produces the intent from typed RPC parameters, before the prompt is
+assembled:
+
+- `ModelAskParams::Discussion` carries a typed `DiscussionTarget`
+  (`Plan { id }` or `Review { id }`). A plan target establishes
+  `ReadonlyDiscussion`; a review target stays `InteractiveRepl`, because the
+  developer may ask for the fix in the same anchored turn (see 2.8.3).
+- A plain prompt that continues an active `DiscussionFocus` inherits the intent of
+  the focused entity. A stale focus — the plan or review was deleted elsewhere —
+  drops the anchor and answers the raw prompt as `InteractiveRepl` instead of
+  failing the turn.
+- The plan-step and review-finding supervisors start their turns directly as
+  `IsolatedStep`.
+
+The wire contract does not change: the mode travels inside parameters that
+already carry the target, so no client — including the TUI — has to send or
+interpret a mode flag.
+
+### 3.9.3 What the Intent Decides
+
+One value drives four decisions that would otherwise drift apart:
+
+- **Wire protocol.** A read-only plan discussion always resolves to the structured
+  discussion schema, regardless of `develop.protocol`, because the discussion
+  prompt instructs the model to answer with that schema. An isolated step narrows
+  the configured protocol to the isolated-step capability set.
+- **Capability surface.** `TurnIntent::narrow_capabilities` is the single mapping
+  from intent onto a `CapabilitySet`, so the prompt instructions, the structured
+  response schema, the stream filter, and the command decoder observe one surface.
+  A capability can neither be advertised while undecodable nor accepted while
+  hidden from the instructions.
+- **Plan mutation mode.** The storage layer receives the matching
+  `PlanMutationMode`, so a develop turn cannot silently rewrite an executing plan.
+- **History recording.** Isolated steps do not append a turn entry to the session
+  history, which keeps batch execution out of the interactive transcript.
+
+### 3.9.4 Why a Prompt Prefix Must Never Decide the Mode
+
+A textual heuristic is a silent failure class, not a contract:
+
+- **Wording fragility.** If the mode were inferred from a prompt prefix or a
+  heading, editing one sentence of prompt assembly would change the turn's
+  permissions without touching a single line of execution code.
+- **Unverifiable.** The compiler cannot check that a string starts with the right
+  words; a regex or keyword scan is guarded only by the tests someone remembered
+  to write.
+- **Hidden coupling.** Frontend prose would become a domain control channel, so a
+  user message that merely resembles an internal heading could switch the turn
+  into the wrong regime, and identifiers read out of prose could be wrong.
+
+`Conventions.md` §1 (*Typed Intent over Textual Inference*) therefore forbids
+deriving an execution mode, an execution restriction, or an operation type from
+unstructured text: when a subsystem needs its calling context, the caller passes a
+typed DTO or enum. The bounded turn is the canonical example of that rule, and
+subsystem conventions reference it instead of restating it.
+
+### 3.9.5 The Dynamic System Contract
+
+The `## Core System Contract` section of the system prompt is assembled, not
+templated. Each rule is a typed `ContractRule { title, body }` value, and a single
+rendering loop numbers the ordered sequence monotonically from `1` to `N`.
+
+Rule numbers never appear in a string literal. Consequently:
+
+- enabling or disabling a capability (`doc_request`, `scratchpad`, `file_edits`)
+  leaves neither a gap nor a lettered surrogate such as `1a.` or `10a.` in the
+  numbering;
+- a rule is placed by typed inputs (`TurnIntent` and `CapabilitySet`) rather than
+  by editing text in the middle of a numbered block;
+- adding a capability module contributes its own fragments — contract rule, XML
+  instruction, structured-output instruction, decoder, and sanitizer — without
+  renumbering anything by hand.
+
+This is the same single-source discipline described for the capability registry in
+3.7: the prompt advertises exactly the modules the active capability set enables,
+and the decoder accepts exactly the same set.
+
+### 3.9.6 Balanced Authorization Rules
+
+Two classes of rule are deliberately scoped differently.
+
+- **Action Authorization** applies only to `InteractiveRepl` turns with
+  `FileEdits` enabled. When the required change is clear, specific, and
+  unambiguous (direct requests, straightforward bug fixes, obvious error
+  corrections), the model proceeds directly with minimal coherent edits. It
+  proposes, analyzes, and seeks confirmation first only when there is genuine
+  architectural ambiguity, competing trade-offs, multiple viable approaches, or
+  open exploratory questions.
+- **Minimal Coherent Change** and **Always Explain Changes** apply everywhere
+  `FileEdits` is enabled, including plan steps and review findings. Quality rules
+  describe how a change must be made, so they hold in every editing regime,
+  whereas the authorization rule describes whether a change is wanted at all — a
+  question only an interactive turn can leave open.
+
+An isolated step turn is itself the explicit instruction to change code, so the
+authorization rule is omitted there instead of being contradicted; a read-only
+discussion has no editing capability and never reaches it.
+
+---
+
+## 3.10 Prompt Layout for Provider Prefix Caching
+
+Every round of a bounded turn re-sends the whole assembled prompt. Providers
+cache the longest unchanged token prefix of a request (KV cache reuse, prompt
+caching), so the price of a round depends far less on the total prompt size than
+on how much of it moved since the previous round. A layout that reshuffles an
+early block wastes that cache and forces the provider to reprocess every token
+after the change.
+
+TAUQE therefore renders the prompt as an append-only document: a frozen head that
+must never move inside a turn, and a volatile tail that is expected to change on
+every round. Four invariants define that layout, and the tests in
+`crates/core/tests/fsm_tests.rs` hold the implementation to them (§3.10.5).
+
+### 3.10.1 Prefix Invariance
+
+Every round of one bounded turn extends the previous request instead of
+rewriting it. The head of the system message is rendered in a fixed order:
+
+```text
+Core System Contract   invariant rules of the turn
+Repository Map         frozen for the whole turn
+Session History        rewritten only by compaction
+Context Files          insertion order
+Active Plan            read-only discussion and develop turns
+Language Directive     once the user language is known
+---
+Turn Scratchpad        volatile tail, rewritten on every round
+```
+
+The turn prompt is the user message, and round feedback appends to it.
+
+Nothing before the context block may carry dynamic data: no context revision
+counter, no per-round list of files discovered in this round, no round banner.
+Such a value invalidates the cache from its own offset onward, so the turn pays
+for a change that carries no information the model needs.
+
+### 3.10.2 Turn-Frozen Repository Map
+
+The repository map is generated once, on the first proposal round of a turn, and
+frozen until the turn ends.
+
+A regenerated map would drop the files that discovery pulled into the context,
+because the map excludes whatever is already rendered in full below it. Dropping
+a node rewrites a block that may hold thousands of tokens and invalidates
+everything after it. The frozen map is also semantically correct: it describes
+the repository contours the turn started from, and every file the turn requested
+is rendered completely in the context block right beneath it. Listing a file
+twice is cheap; a cache invalidated by the turn's own discovery is not.
+
+### 3.10.3 Insertion-Order Context
+
+Context files are rendered in the order they were added, not in alphabetical
+order. A file requested through `<context_request>` is appended to the end of the
+context block, so the tokens of every earlier file keep their position.
+Promoting a read-only file to editable rewrites only that file's own `access`
+attribute in place, so a promotion neither moves the file nor reshuffles its
+neighbors.
+
+Staged content follows the same rule: the body of a file already in context is
+replaced where it stands, and files created during the turn are appended in path
+order. A round therefore never relocates a file that an earlier round already
+rendered.
+
+Alphabetical ordering is a presentation decision and lives exclusively in the
+interface, which sorts rows for the developer.
+
+### 3.10.4 Cumulative Feedback and the Volatile Tail
+
+Round-specific data is appended behind the stable head:
+
+- **Discovery feedback** — search reports, documentation blocks, and missing-path
+  notes — is appended to the user message of the next round.
+- **Patch-retry reports** accumulate in one append-only repair log, so retry `n`
+  carries the full history of attempts `1..n` instead of replacing it.
+- **Verification diagnostics** and the healing instruction are appended to the
+  user message of the healing round.
+- **The turn scratchpad** is rendered as the last block of the system message,
+  after the context and the active plan.
+
+Everything in this tail changes on every round by design. Keeping it last means
+a change starts after the frozen head, so the cached prefix survives.
+
+### 3.10.5 What the Tests Enforce
+
+The invariants are covered by end-to-end tests in
+`crates/core/tests/fsm_tests.rs`. They drive real discovery, patch-retry, and
+scratchpad rounds against a scripted provider and inspect the recorded requests:
+
+- the head of the system message is byte-identical across a discovery round, and
+  the context block extends instead of being reshaped;
+- the repository map block is byte-identical across rounds and still lists the
+  file a discovery round added to the context;
+- the scratchpad appears only after the context block, in the last position of
+  the system message;
+- a patch retry leaves the system message untouched and appends its report to
+  the user message.
+
+These tests are the regression guard. A change that reintroduces a moving value
+into the stable head fails them immediately, instead of silently paying for a
+cache miss on every round.

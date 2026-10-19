@@ -64,61 +64,6 @@ pub fn format_review_step_retry_prompt(assistant_text: &str, error: Option<&str>
 
 pub const REVIEW_STEP_EXECUTION_PREFIX: &str = "# Target Review Step Execution:";
 
-/// Target review and item identifiers parsed from an isolated review step execution prompt.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ReviewStepTarget {
-    pub review_id: Option<String>,
-    pub item_id: u32,
-}
-
-/// Returns true if the prompt represents an isolated review step execution turn.
-pub fn is_review_step_execution_prompt(prompt: &str) -> bool {
-    let trimmed = prompt.trim_start();
-    trimmed.starts_with(REVIEW_STEP_EXECUTION_PREFIX)
-        || trimmed.starts_with(REVIEW_STEP_RETRY_PREFIX)
-}
-
-/// Extracts the target review ID and item ID from an isolated review step execution prompt.
-pub fn extract_review_step_execution_target(prompt: &str) -> Option<ReviewStepTarget> {
-    let trimmed = prompt.trim_start();
-    if !trimmed.starts_with(REVIEW_STEP_EXECUTION_PREFIX) {
-        return None;
-    }
-    let rest = trimmed
-        .strip_prefix(REVIEW_STEP_EXECUTION_PREFIX)?
-        .trim_start();
-    if let Some(rest) = rest.strip_prefix('[') {
-        let (spec, _) = rest.split_once(']')?;
-        let spec = spec.trim();
-        if spec.is_empty() {
-            return None;
-        }
-        if let Some((rev_id, item_id_str)) = spec.split_once(':') {
-            let rev_id = rev_id.trim();
-            let item_id: u32 = item_id_str.trim().parse().ok()?;
-            return Some(ReviewStepTarget {
-                review_id: if rev_id.is_empty() {
-                    None
-                } else {
-                    Some(rev_id.to_string())
-                },
-                item_id,
-            });
-        } else if let Ok(item_id) = spec.parse::<u32>() {
-            return Some(ReviewStepTarget {
-                review_id: None,
-                item_id,
-            });
-        }
-    }
-    None
-}
-
-/// Extracts the target item ID from an isolated review step execution prompt.
-pub fn extract_review_step_execution_id(prompt: &str) -> Option<u32> {
-    extract_review_step_execution_target(prompt).map(|t| t.item_id)
-}
-
 /// Formats a targeted prompt for resolving an isolated review finding.
 ///
 /// The prompt renders the enriched finding view: the `description` states the
@@ -301,6 +246,7 @@ pub enum ReviewStepFailureKind {
 pub struct ReviewStepFailure {
     kind: ReviewStepFailureKind,
     reason: String,
+    failed_step: Option<String>,
 }
 
 impl ReviewStepFailure {
@@ -309,6 +255,7 @@ impl ReviewStepFailure {
         Self {
             kind: ReviewStepFailureKind::Domain,
             reason: reason.into(),
+            failed_step: None,
         }
     }
 
@@ -317,7 +264,23 @@ impl ReviewStepFailure {
         Self {
             kind: ReviewStepFailureKind::Infrastructure,
             reason: reason.into(),
+            failed_step: None,
         }
+    }
+
+    /// Attributes the failure to the sub-step whose execution failed.
+    ///
+    /// A sub-step identity is the diagnostic the Architect needs to reproject the
+    /// remaining horizon around the failed approach, so it is attached where the
+    /// sub-step actually failed rather than reconstructed by the caller.
+    pub fn with_step(mut self, step_id: impl Into<String>) -> Self {
+        self.failed_step = Some(step_id.into());
+        self
+    }
+
+    /// The sub-step whose execution failed, when the failure is attributable to one.
+    pub fn failed_step(&self) -> Option<&str> {
+        self.failed_step.as_deref()
     }
 
     /// Whether the failure is confined to the current finding.

@@ -6,7 +6,7 @@ use ratatui::widgets::{Block, Padding, Paragraph};
 use crate::app::AppState;
 use crate::i18n::active_t;
 
-use super::{compute_unified_plan_lines, status_style, VisiblePlanRow};
+use super::{architect_badge, compute_unified_plan_lines, status_style, VisiblePlanRow};
 
 pub fn render_plans_view(
     frame: &mut ratatui::Frame,
@@ -142,6 +142,7 @@ fn describe_plan_row(
             status,
             total,
             completed,
+            architect,
             ..
         } => {
             let mut spans = vec![
@@ -160,6 +161,9 @@ fn describe_plan_row(
                     format!("  —  {}", desc),
                     engine.fg(palette.text_muted),
                 ));
+            }
+            if let Some(tier) = architect {
+                spans.push(architect_badge(tier));
             }
             spans
         }

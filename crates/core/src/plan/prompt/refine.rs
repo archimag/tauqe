@@ -1,4 +1,5 @@
 use crate::context::ContextFileContent;
+use crate::edits::stream::json::decode::{first_json_object_str, strip_code_fence};
 use serde::{Deserialize, Serialize};
 use tauqe_protocol::{ConceptItem, Plan, PlanItem, PlanItemStatus, RepoSearchRequest};
 
@@ -18,18 +19,27 @@ pub struct PlanRefinementOutput {
 }
 
 /// Parses the raw JSON string returned by the model into a `PlanRefinementOutput`.
+///
+/// Decoding goes through the shared structured-output helpers
+/// (`strip_code_fence`, `first_json_object_str`) so this parser behaves exactly
+/// like every other structured-output parser in the engine: a markdown code
+/// fence is unwrapped first, and when the payload is surrounded by wrapper
+/// prose the outermost balanced JSON object is extracted instead of failing on
+/// trailing or leading characters.
 pub fn parse_plan_refinement_output(raw_json: &str) -> anyhow::Result<PlanRefinementOutput> {
-    let trimmed = raw_json.trim();
-    let cleaned = trimmed
-        .strip_prefix("```json")
-        .or_else(|| trimmed.strip_prefix("```"))
-        .unwrap_or(trimmed);
-    let cleaned = cleaned
-        .strip_suffix("```")
-        .unwrap_or(cleaned)
-        .trim();
-    serde_json::from_str(cleaned)
-        .map_err(|e| anyhow::anyhow!("Failed to parse plan refinement JSON output: {e}"))
+    let unfenced = strip_code_fence(raw_json);
+    let error = match serde_json::from_str::<PlanRefinementOutput>(unfenced) {
+        Ok(output) => return Ok(output),
+        Err(error) => error,
+    };
+    if let Some(object) = first_json_object_str(raw_json) {
+        if let Ok(output) = serde_json::from_str::<PlanRefinementOutput>(object) {
+            return Ok(output);
+        }
+    }
+    Err(anyhow::anyhow!(
+        "Failed to parse plan refinement JSON output: {error}"
+    ))
 }
 
 /// Maximum supported hierarchy nesting depth for structured plan refinement output.
@@ -477,5 +487,32 @@ mod tests {
         assert_eq!(parsed.repo_searches.len(), 1);
         assert_eq!(parsed.repo_searches[0].path, "crates/core");
         assert_eq!(parsed.repo_searches[0].regex, "pub trait PromptProtocol");
+    }
+
+    #[test]
+    fn test_parse_plan_refinement_output_tolerates_fences_and_wrapper_prose() {
+        let json = r#"{
+            "status": "success",
+            "explanation": "Decomposed into cohesive steps",
+            "reason": null,
+            "context_requests": [],
+            "repo_searches": [],
+            "items": []
+        }"#;
+
+        let fenced = format!("Here is the refined horizon:\n```json\n{json}\n```\nLet me know.");
+        let parsed = parse_plan_refinement_output(&fenced).unwrap();
+        assert_eq!(parsed.status, "success");
+        assert_eq!(parsed.explanation, "Decomposed into cohesive steps");
+
+        let bare = format!("Preamble without a fence. {json} Trailing notes.");
+        let parsed = parse_plan_refinement_output(&bare).unwrap();
+        assert_eq!(parsed.status, "success");
+    }
+
+    #[test]
+    fn test_parse_plan_refinement_output_rejects_garbage() {
+        assert!(parse_plan_refinement_output("not json at all").is_err());
+        assert!(parse_plan_refinement_output("").is_err());
     }
 }

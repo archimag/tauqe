@@ -7,6 +7,7 @@ use crate::app::{ActiveModal, AppState, ViewMode};
 use crate::theme::engine::current_engine;
 
 pub mod footer;
+pub mod format;
 pub mod geometry;
 pub mod header;
 pub mod wrap;
@@ -16,21 +17,20 @@ use crate::dialogs::render::{
     render_confirm_clear_auto_popup, render_confirm_clear_history_popup,
     render_confirm_clear_user_popup, render_confirm_delete_plan_popup,
     render_confirm_delete_review_popup, render_confirm_detach_focus_popup,
-    render_confirm_execute_review_popup, render_confirm_execute_scope_popup,
-    render_confirm_quit_popup, render_disconnected_popup,
+    render_confirm_execute_pipeline_popup, render_confirm_execute_review_popup,
+    render_confirm_execute_scope_popup, render_confirm_quit_popup, render_disconnected_popup,
     render_help_popup, render_locale_dialog, render_plan_refine_blocked_dialog,
-    render_plan_refine_dialog, render_prompt_modal, render_review_dialog,
-    render_selection_dialog, render_squash_popup,
-    render_status_dialog,
+    render_plan_refine_dialog, render_prompt_modal, render_review_dialog, render_selection_dialog,
+    render_squash_popup, render_status_dialog, render_usage_summary,
 };
 use crate::views::context::render_context_view;
 use crate::views::history::render_history_view;
-use crate::views::repl::render::render_repl_view;
 use crate::views::onboarding::render_onboarding_view;
 use crate::views::plans::render_plans_view;
+use crate::views::repl::render::render_repl_view;
 use crate::views::review::render_review_view;
 
-pub use footer::{extract_current_round, format_footer_cost, render_footer};
+pub use footer::{extract_current_round, render_footer};
 pub use geometry::centered_rect;
 pub use header::render_header;
 pub use wrap::{wrap_line, wrap_lines};
@@ -66,10 +66,18 @@ fn render_terminal_too_small(frame: &mut ratatui::Frame) {
             engine.fg(engine.palette().status_warning).bold(),
         )),
         Line::from(format!("Current: {}x{}", area.width, area.height)),
-        Line::from(format!("Required: {}x{} (Ctrl+Q to exit)", MIN_TERM_WIDTH, MIN_TERM_HEIGHT)),
+        Line::from(format!(
+            "Required: {}x{} (Ctrl+Q to exit)",
+            MIN_TERM_WIDTH, MIN_TERM_HEIGHT
+        )),
     ];
     let height = area.height.min(3);
-    let rect = Rect::new(area.x, area.y + area.height.saturating_sub(height) / 2, area.width, height);
+    let rect = Rect::new(
+        area.x,
+        area.y + area.height.saturating_sub(height) / 2,
+        area.width,
+        height,
+    );
     frame.render_widget(Paragraph::new(lines).alignment(Alignment::Center), rect);
 }
 
@@ -180,8 +188,18 @@ pub fn render_ui(frame: &mut ratatui::Frame, state: &mut AppState) {
         Some(ActiveModal::BatchCancel) => render_confirm_batch_cancel_popup(frame, state),
         Some(ActiveModal::ClearAuto) => render_confirm_clear_auto_popup(frame, state),
         Some(ActiveModal::ClearUser) => render_confirm_clear_user_popup(frame, state),
-        Some(ActiveModal::ConfirmDetachFocus) => {
-            render_confirm_detach_focus_popup(frame, state)
+        Some(ActiveModal::ConfirmDetachFocus) => render_confirm_detach_focus_popup(frame, state),
+        Some(ActiveModal::ClearHorizon) => {
+            if let Some(plan_id) = &state.confirm_clear_horizon {
+                crate::dialogs::render::render_confirm_clear_horizon_popup(frame, plan_id, state);
+            }
+        }
+        Some(ActiveModal::ClearHorizonFinal) => {
+            if let Some(plan_id) = &state.confirm_clear_horizon_final {
+                crate::dialogs::render::render_confirm_clear_horizon_final_popup(
+                    frame, plan_id, state,
+                );
+            }
         }
         Some(ActiveModal::DeletePlan) => {
             if let Some(plan_id) = &state.confirm_delete_plan {
@@ -194,6 +212,7 @@ pub fn render_ui(frame: &mut ratatui::Frame, state: &mut AppState) {
             }
         }
         Some(ActiveModal::ExecuteReview) => render_confirm_execute_review_popup(frame, state),
+        Some(ActiveModal::ExecutePipeline) => render_confirm_execute_pipeline_popup(frame, state),
         Some(ActiveModal::ExecuteScope) => render_confirm_execute_scope_popup(frame, state),
         Some(ActiveModal::RefineDialog) => {
             if let Some(dialog) = &state.plans_view.refine_dialog {
@@ -236,6 +255,11 @@ pub fn render_ui(frame: &mut ratatui::Frame, state: &mut AppState) {
         Some(ActiveModal::ThemeSelector) => {
             if let Some(dialog) = &state.theme_selector {
                 crate::theme::selector::render_theme_selector(frame, dialog);
+            }
+        }
+        Some(ActiveModal::UsageSummary) => {
+            if let Some(summary) = state.usage_summary.as_mut() {
+                render_usage_summary(frame, &state.model.usage_totals, &mut summary.scroll);
             }
         }
         Some(ActiveModal::Help) => {

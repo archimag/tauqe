@@ -162,6 +162,48 @@ If a request requires a feature, use provider routing that requires the requeste
 
 This is particularly important for Structured Output because different provider endpoints serving the same model may support different parameters.
 
+## 3.1. Session Affinity (Sticky Provider Routing)
+
+OpenRouter distributes requests across independent provider backends. When one
+logical context spans several requests (discovery rounds, patch retries,
+verification healing, or successive turns of a long dialogue), the affinity of
+those requests to a single backend decides whether its prompt-prefix cache is
+reused or discarded.
+
+The adapter therefore sends a top-level `session_id` on every request that
+belongs to a stable logical session:
+
+```json
+{
+  "model": "<model>",
+  "session_id": "tauqe-plan-p-42",
+  "messages": []
+}
+```
+
+Identifier shapes (at most 256 characters, truncated on a Unicode scalar
+boundary):
+
+```text
+tauqe-repl-{session}        interactive REPL dialogue
+tauqe-plan-{plan_id}        plan execution, its steps and retries
+tauqe-architect-{plan_id}   architect plan horizon synthesis
+tauqe-review-{review_id}    review audit and finding subplans
+```
+
+Rules:
+
+```text
+omit the field when no stable session identity exists
+one logical context maps to one identifier; never share one across contexts
+keep the prompt prefix byte-identical inside a session, otherwise affinity
+buys nothing
+the identifier is metadata only; it never changes the response contract
+```
+
+Reasoning effort, Structured Output, and streaming are orthogonal to session
+affinity: every effort/output combination may carry a `session_id`.
+
 ---
 
 # Ordinary Text Mode

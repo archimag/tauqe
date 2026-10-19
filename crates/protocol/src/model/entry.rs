@@ -264,6 +264,65 @@ impl From<ModelRef> for CoderTier {
     }
 }
 
+/// Serializes a `{ model, effort }` rung.
+///
+/// A rung without a reasoning depth is written as the bare model string, so
+/// every rung kind shares a single wire form and the kinds cannot drift apart.
+fn serialize_rung<S>(
+    model: &ModelRef,
+    effort: Option<ReasoningEffort>,
+    name: &'static str,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    match effort {
+        Some(effort) => {
+            use serde::ser::SerializeStruct;
+            let mut state = serializer.serialize_struct(name, 2)?;
+            state.serialize_field("model", &model.to_spec())?;
+            state.serialize_field("effort", &effort)?;
+            state.end()
+        }
+        None => serializer.serialize_str(&model.to_spec()),
+    }
+}
+
+/// The Architect configuration that produced a decomposition.
+///
+/// A plan and a review finding both record which Architect model, at which
+/// reasoning depth, produced their decomposition. Recording the pair makes a
+/// later refinement reproducible with the same Architect configuration instead
+/// of re-deriving one, and keeps the *What* role's provenance visible in the
+/// document itself.
+///
+/// Deserializes from either a bare model string or a `{ model, effort }` table
+/// through the shared entry spec, and carries no alias, exactly like
+/// [`CoderTier`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArchitectTier {
+    pub model: ModelRef,
+    pub effort: Option<ReasoningEffort>,
+}
+
+impl ArchitectTier {
+    /// Creates an Architect configuration from a model and an optional
+    /// reasoning depth.
+    pub fn new(model: ModelRef, effort: Option<ReasoningEffort>) -> Self {
+        Self { model, effort }
+    }
+}
+
+impl From<ModelRef> for ArchitectTier {
+    fn from(model: ModelRef) -> Self {
+        Self {
+            model,
+            effort: None,
+        }
+    }
+}
+
 impl<'de> Deserialize<'de> for CoderTier {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -279,16 +338,26 @@ impl Serialize for CoderTier {
     where
         S: serde::Serializer,
     {
-        match self.effort {
-            Some(effort) => {
-                use serde::ser::SerializeStruct;
-                let mut state = serializer.serialize_struct("CoderTier", 2)?;
-                state.serialize_field("model", &self.model.to_spec())?;
-                state.serialize_field("effort", &effort)?;
-                state.end()
-            }
-            None => serializer.serialize_str(&self.model.to_spec()),
-        }
+        serialize_rung(&self.model, self.effort, "CoderTier", serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for ArchitectTier {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let spec = ModelEntrySpec::deserialize_with(deserializer, false)?;
+        Ok(ArchitectTier::new(spec.model, spec.effort))
+    }
+}
+
+impl Serialize for ArchitectTier {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serialize_rung(&self.model, self.effort, "ArchitectTier", serializer)
     }
 }
 
@@ -396,6 +465,65 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(err.contains("Unknown reasoning effort"), "got: {err}");
+    }
+
+    #[test]
+    fn test_architect_tier_shares_entry_spec_parsing() {
+        let tier_str: ArchitectTier =
+            serde_json::from_str("\"openrouter:planner/model\"").unwrap();
+        assert_eq!(
+            tier_str,
+            ArchitectTier::new(ModelRef::openrouter("planner/model"), None)
+        );
+
+        let tier_table: ArchitectTier =
+            serde_json::from_str(r#"{"model":"openrouter:planner/model","effort":"xhigh"}"#)
+                .unwrap();
+        assert_eq!(
+            tier_table,
+            ArchitectTier::new(
+                ModelRef::openrouter("planner/model"),
+                Some(ReasoningEffort::XHigh)
+            )
+        );
+
+        // A rung without a reasoning depth is written as the bare model string,
+        // so the terse and detailed forms round-trip exactly.
+        assert_eq!(
+            serde_json::to_string(&tier_str).unwrap(),
+            "\"openrouter:planner/model\""
+        );
+        let table_json = serde_json::to_string(&tier_table).unwrap();
+        assert_eq!(
+            table_json,
+            "{\"model\":\"openrouter:planner/model\",\"effort\":\"xhigh\"}"
+        );
+        let restored: ArchitectTier = serde_json::from_str(&table_json).unwrap();
+        assert_eq!(restored, tier_table);
+
+        // A bare model reference promotes into a rung without a depth.
+        assert_eq!(
+            ArchitectTier::from(ModelRef::openrouter("planner/model")),
+            tier_str
+        );
+
+        // A bad effort surfaces the precise diagnostic through the shared spec.
+        let err = serde_json::from_str::<ArchitectTier>(
+            r#"{"model":"openrouter:planner/model","effort":"extreme"}"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("Unknown reasoning effort"), "got: {err}");
+
+        // The Architect rung carries no alias, exactly like the Coder rung; a
+        // supplied one is rejected instead of being silently dropped.
+        let err = serde_json::from_str::<ArchitectTier>(
+            r#"{"model":"openrouter:planner/model","alias":"Planner"}"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("unknown field"), "got: {err}");
+        assert!(err.contains("alias"), "got: {err}");
     }
 
     #[test]

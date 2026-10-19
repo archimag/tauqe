@@ -10,6 +10,7 @@ pub enum ReasoningEffort {
     Medium,
     High,
     XHigh,
+    Max,
 }
 
 impl ReasoningEffort {
@@ -20,6 +21,7 @@ impl ReasoningEffort {
             ReasoningEffort::Medium => "medium",
             ReasoningEffort::High => "high",
             ReasoningEffort::XHigh => "xhigh",
+            ReasoningEffort::Max => "max",
         }
     }
 }
@@ -39,8 +41,9 @@ impl std::str::FromStr for ReasoningEffort {
             "medium" => Ok(ReasoningEffort::Medium),
             "high" => Ok(ReasoningEffort::High),
             "xhigh" => Ok(ReasoningEffort::XHigh),
+            "max" => Ok(ReasoningEffort::Max),
             other => Err(format!(
-                "Unknown reasoning effort '{}'. Expected low, medium, high, or xhigh",
+                "Unknown reasoning effort '{}'. Expected low, medium, high, xhigh, or max",
                 other
             )),
         }
@@ -143,6 +146,11 @@ mod tests {
             ReasoningEffort::High
         );
         assert_eq!(ReasoningEffort::XHigh.to_string(), "xhigh");
+        assert_eq!(ReasoningEffort::Max.to_string(), "max");
+        assert_eq!(
+            " MAX ".parse::<ReasoningEffort>().unwrap(),
+            ReasoningEffort::Max
+        );
         assert!("extreme".parse::<ReasoningEffort>().is_err());
 
         let json = serde_json::to_string(&ReasoningEffort::XHigh).unwrap();

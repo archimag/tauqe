@@ -8,8 +8,8 @@
 use std::path::Path;
 
 use tauqe_core::context::ContextManager;
-use tauqe_core::prompt::protocol::PromptProtocol;
 use tauqe_core::history::HistoryManager;
+use tauqe_core::prompt::protocol::PromptProtocol;
 use tauqe_core::providers::mock::{MockLlmProvider, MockResponse};
 use tauqe_core::providers::{LlmProvider, StreamEvent};
 use tauqe_core::workflow::policy::ApplyPolicy;
@@ -72,6 +72,45 @@ fn event_channel() -> (mpsc::Sender<StreamEvent>, watch::Receiver<bool>) {
     (stream_tx, cancel_rx)
 }
 
+/// Returns the repository map body rendered into a recorded system message.
+fn repo_map_block(content: &str) -> &str {
+    let start = content
+        .find("<repo_map>\n")
+        .expect("the system prompt must render the repository map block")
+        + "<repo_map>\n".len();
+    let end = start
+        + content[start..]
+            .find("\n</repo_map>")
+            .expect("the repository map block must be closed");
+    &content[start..end]
+}
+
+/// Returns the head of a system message: everything rendered before the
+/// context block.
+///
+/// The core contract, the frozen repository map, and the session history live
+/// here, so this region must stay byte-identical from one round of a turn to
+/// the next.
+fn stable_system_prefix(content: &str) -> &str {
+    match content.find("## Project Context") {
+        Some(index) => &content[..index],
+        None => content,
+    }
+}
+
+/// Returns the rendered context block without its `<context>` delimiters.
+fn rendered_context_body(content: &str) -> &str {
+    let start = content
+        .find("<context>\n")
+        .expect("the system prompt must render the context block")
+        + "<context>\n".len();
+    let end = start
+        + content[start..]
+            .find("</context>")
+            .expect("the context block must be closed");
+    &content[start..end]
+}
+
 /// Borrows the shared turn fixtures into a [`TaskEnv`] ready for execution.
 #[allow(clippy::too_many_arguments)]
 fn build_env<'a>(
@@ -86,6 +125,7 @@ fn build_env<'a>(
     options: &'a WorkflowOptions,
 ) -> TaskEnv<'a> {
     TaskEnv {
+        intent: tauqe_protocol::TurnIntent::InteractiveRepl,
         provider,
         model,
         context,
@@ -126,6 +166,7 @@ async fn answer_edit_loop_stages_matching_edits() {
     let (stream_tx, cancel_rx) = event_channel();
 
     let mut env = TaskEnv {
+        intent: tauqe_protocol::TurnIntent::InteractiveRepl,
         provider: &provider,
         model: &model,
         context: &mut context,
@@ -177,6 +218,7 @@ async fn answer_edit_loop_accepts_answer_without_edits() {
     let (stream_tx, cancel_rx) = event_channel();
 
     let mut env = TaskEnv {
+        intent: tauqe_protocol::TurnIntent::InteractiveRepl,
         provider: &provider,
         model: &model,
         context: &mut context,
@@ -239,6 +281,7 @@ async fn answer_edit_loop_discovers_context_via_repo_search() {
 
     let output = {
         let mut env = TaskEnv {
+            intent: tauqe_protocol::TurnIntent::InteractiveRepl,
             provider: &provider,
             model: &model,
             context: &mut context,
@@ -306,6 +349,7 @@ async fn answer_edit_loop_discovers_requested_context() {
 
     let output = {
         let mut env = TaskEnv {
+            intent: tauqe_protocol::TurnIntent::InteractiveRepl,
             provider: &provider,
             model: &model,
             context: &mut context,
@@ -366,6 +410,7 @@ async fn answer_edit_loop_heals_failed_patch_application() {
     let (stream_tx, cancel_rx) = event_channel();
 
     let mut env = TaskEnv {
+        intent: tauqe_protocol::TurnIntent::InteractiveRepl,
         provider: &provider,
         model: &model,
         context: &mut context,
@@ -418,6 +463,7 @@ async fn edit_loop_retries_until_edits_are_produced() {
     let (stream_tx, cancel_rx) = event_channel();
 
     let mut env = TaskEnv {
+        intent: tauqe_protocol::TurnIntent::InteractiveRepl,
         provider: &provider,
         model: &model,
         context: &mut context,
@@ -484,6 +530,7 @@ async fn git_workflow_heals_compiler_failure() {
         .execute(
             &mut policy,
             "Fix the mismatched return types in src/lib.rs",
+            tauqe_protocol::TurnIntent::InteractiveRepl,
             &provider,
             &model,
             &mut context,
@@ -554,6 +601,7 @@ async fn git_workflow_verifies_and_heals_when_verify_tag_omitted_by_model() {
         .execute(
             &mut policy,
             "Fix return types in src/lib.rs",
+            tauqe_protocol::TurnIntent::InteractiveRepl,
             &provider,
             &model,
             &mut context,
@@ -620,6 +668,7 @@ async fn git_workflow_skips_verification_when_auto_verify_disabled() {
         .execute(
             &mut policy,
             "Fix alpha in src/lib.rs",
+            tauqe_protocol::TurnIntent::InteractiveRepl,
             &provider,
             &model,
             &mut context,
@@ -699,6 +748,7 @@ async fn git_workflow_heals_when_verification_response_has_text_only() {
         .execute(
             &mut policy,
             "Fix the mismatched return types in src/lib.rs",
+            tauqe_protocol::TurnIntent::InteractiveRepl,
             &provider,
             &model,
             &mut context,
@@ -784,6 +834,7 @@ async fn scratchpad_from_discovery_reaches_verification_healing() {
         .execute(
             &mut policy,
             "Fix the mismatched return types in src/lib.rs",
+            tauqe_protocol::TurnIntent::InteractiveRepl,
             &provider,
             &model,
             &mut context,
@@ -844,6 +895,7 @@ async fn fsm_turn_respects_cancellation() {
 
     let outcome = tauqe_core::workflow::fsm::run_fsm_turn(
         "Change compute to return 42",
+        tauqe_protocol::TurnIntent::InteractiveRepl,
         &provider,
         &model,
         &mut context,
@@ -935,7 +987,6 @@ async fn fsm_turn_saves_and_activates_plan() {
     assert_eq!(active.as_deref(), Some("integration-plan"));
 }
 
-    
 #[tokio::test]
 async fn scratchpad_persists_between_proposal_rounds() {
     let (_dir, repo_root) = init_repo();
@@ -999,7 +1050,11 @@ async fn scratchpad_persists_between_proposal_rounds() {
         .contains("Finding: helper.rs holds ANSWER"));
 }
 
-fn event_channel_with_rx() -> (mpsc::Sender<StreamEvent>, mpsc::Receiver<StreamEvent>, watch::Receiver<bool>) {
+fn event_channel_with_rx() -> (
+    mpsc::Sender<StreamEvent>,
+    mpsc::Receiver<StreamEvent>,
+    watch::Receiver<bool>,
+) {
     let (stream_tx, rx) = mpsc::channel(512);
     let (_cancel_tx, cancel_rx) = watch::channel(false);
     (stream_tx, rx, cancel_rx)
@@ -1022,7 +1077,7 @@ async fn answer_discussing_protocol_tags_never_starts_edits() {
     let protocol = protocol.with_turn_marker(MARKER).unwrap();
     let mut policy = tauqe_core::workflow::policy::DirectApplyPolicy::new();
     let options = WorkflowOptions::default();
-    
+
     let (stream_tx, mut stream_rx, cancel_rx) = event_channel_with_rx();
 
     let mut env = build_env(
@@ -1036,14 +1091,14 @@ async fn answer_discussing_protocol_tags_never_starts_edits() {
         cancel_rx,
         &options,
     );
-    
+
     let output = AnswerEditLoop::new("How to save a plan?")
         .execute(&mut env)
         .await
         .expect("answer/edit loop executes");
 
     assert!(matches!(output.result, ModelResult::Answer { .. }));
-    
+
     let mut saw_edit_started = false;
     while let Ok(ev) = stream_rx.try_recv() {
         if matches!(ev, StreamEvent::EditStarted | StreamEvent::EditFileStarted { .. }) {
@@ -1059,9 +1114,9 @@ async fn terminal_error_outcome_blocks_without_applying_edits() {
     let mut context = ContextManager::new(repo_root.clone());
     let mut history = HistoryManager::new(repo_root.clone());
 
-    let provider = MockLlmProvider::scripted([MockResponse::text(
-        format!("I cannot proceed.\n<error_{MARKER} message=\"Missing dependencies\" />")
-    )]);
+    let provider = MockLlmProvider::scripted([MockResponse::text(format!(
+        "I cannot proceed.\n<error_{MARKER} message=\"Missing dependencies\" />"
+    ))]);
     let model = ModelRef::openrouter("mock/model");
     let protocol = tauqe_core::prompt::xml::XmlPromptProtocol;
     let protocol = protocol.with_turn_marker(MARKER).unwrap();
@@ -1080,7 +1135,7 @@ async fn terminal_error_outcome_blocks_without_applying_edits() {
         cancel_rx,
         &options,
     );
-    
+
     let output = AnswerEditLoop::new("Do something impossible")
         .execute(&mut env)
         .await
@@ -1100,7 +1155,7 @@ async fn terminal_success_outcome_labels_applied_edits() {
     let (_dir, repo_root) = init_repo();
     std::fs::write(repo_root.join("target.rs"), "pub fn compute() -> i32 { 0 }\n").unwrap();
     commit_fixture(&repo_root, &["target.rs"]);
-    
+
     let mut context = ContextManager::new(repo_root.clone());
     context.add_file("target.rs", ContextAccess::Editable).unwrap();
     let mut history = HistoryManager::new(repo_root.clone());
@@ -1111,10 +1166,10 @@ async fn terminal_success_outcome_labels_applied_edits() {
         "pub fn compute() -> i32 { 0 }",
         "pub fn compute() -> i32 { 42 }",
     );
-    
-    let provider = MockLlmProvider::scripted([MockResponse::text(
-        format!("{edits}\n<success_{MARKER} summary=\"Operation completed successfully\" />")
-    )]);
+
+    let provider = MockLlmProvider::scripted([MockResponse::text(format!(
+        "{edits}\n<success_{MARKER} summary=\"Operation completed successfully\" />"
+    ))]);
     let model = ModelRef::openrouter("mock/model");
     let protocol = tauqe_core::prompt::xml::XmlPromptProtocol;
     let protocol = protocol.with_turn_marker(MARKER).unwrap();
@@ -1133,7 +1188,7 @@ async fn terminal_success_outcome_labels_applied_edits() {
         cancel_rx,
         &options,
     );
-    
+
     let output = AnswerEditLoop::new("Fix target")
         .execute(&mut env)
         .await
@@ -1179,6 +1234,7 @@ async fn fsm_turn_semantic_blocked_outcome_aborts_and_rolls_back() {
         .execute(
             &mut policy,
             "Refactor compute",
+            tauqe_protocol::TurnIntent::InteractiveRepl,
             &provider,
             &model,
             &mut context,
@@ -1300,6 +1356,10 @@ async fn plan_semantic_recovery_lifecycle_end_to_end() {
         &repo_root,
         "recovery-plan",
         replacement,
+        tauqe_protocol::ArchitectTier::new(
+            tauqe_protocol::ModelRef::openrouter("test/architect"),
+            None,
+        ),
     )
     .expect("replace uncompleted horizon over blocked step");
 
@@ -1393,10 +1453,7 @@ async fn discussion_turn_streams_clean_markdown_without_json_leakage() {
     let protocol = tauqe_core::prompt::json::JsonPromptProtocol::discussion();
 
     let plan_prompt = "# Plan Discussion: [discussion-plan] Refine plan\n";
-    assert!(
-        tauqe_core::workflow::fsm::is_discussion_prompt(plan_prompt),
-        "a plan discussion heading must be detected as a discussion turn"
-    );
+    let intent = tauqe_protocol::TurnIntent::ReadonlyDiscussion;
 
     let mut policy = tauqe_core::workflow::policy::DirectApplyPolicy::new();
     let options = WorkflowOptions::default();
@@ -1404,6 +1461,7 @@ async fn discussion_turn_streams_clean_markdown_without_json_leakage() {
 
     let outcome = tauqe_core::workflow::fsm::run_fsm_turn(
         plan_prompt,
+        intent,
         &provider,
         &model,
         &mut context,
@@ -1502,6 +1560,7 @@ async fn discussion_turn_persists_plan_update_and_active_marker() {
 
     let outcome = tauqe_core::workflow::fsm::run_fsm_turn(
         plan_prompt,
+        tauqe_protocol::TurnIntent::ReadonlyDiscussion,
         &provider,
         &model,
         &mut context,
@@ -1538,24 +1597,16 @@ async fn discussion_turn_persists_plan_update_and_active_marker() {
     assert_eq!(active.as_deref(), Some("discussion-plan"));
 }
 
-/// Discussion prompts must be detected deterministically and routed to the
-/// structured discussion protocol regardless of the configured base protocol
-/// (which may be `xml`). That protocol hides code editing and advertises the
-/// discussion JSON schema, so the REPL stays isolated from service markup.
+/// A read-only discussion is a distinct typed turn intent, and the structured
+/// discussion protocol it selects hides code editing while keeping plan
+/// authoring. The protocol choice itself is resolved by the server from that
+/// intent, never from the prompt text.
 #[test]
-fn discussion_prompt_selects_structured_discussion_protocol() {
-    let plan_prompt = "# Plan Discussion: [p-1] Refine plan\n";
-    let review_prompt = format!(
-        "{} [rev-1] Fix issue\n",
-        tauqe_core::review::REVIEW_DISCUSSION_PREFIX
-    );
-
-    for prompt in [plan_prompt, review_prompt.as_str()] {
-        assert!(
-            tauqe_core::workflow::fsm::is_discussion_prompt(prompt),
-            "discussion prompt must be detected: {prompt:?}"
-        );
-    }
+fn readonly_discussion_intent_selects_structured_discussion_protocol() {
+    let intent = tauqe_protocol::TurnIntent::ReadonlyDiscussion;
+    assert!(intent.is_readonly_discussion());
+    assert!(!intent.is_interactive_repl());
+    assert!(!intent.is_isolated_step());
 
     // The core-level contract the server's protocol resolver relies on: a
     // discussion turn always uses the structured discussion protocol, whose
@@ -1578,7 +1629,7 @@ fn discussion_prompt_selects_structured_discussion_protocol() {
 }
 
 /// A Structured Output turn must carry the model's scratchpad notes into the
-/// next proposal round, exactly like the XML control tag does.
+/// next proposal round, exactly like the XML control tag.
 #[tokio::test]
 async fn structured_turn_persists_scratchpad_between_proposal_rounds() {
     let (_dir, repo_root) = init_repo();
@@ -1865,4 +1916,265 @@ async fn xml_and_structured_protocols_are_interchangeable_peers() {
     );
     assert_eq!(xml_content, "pub fn compute() -> i32 { 42 }\n");
     assert_eq!(structured_content, xml_content);
+}
+
+/// A discovery round must extend the cached prompt prefix instead of
+/// reshaping it.
+///
+/// The head of the system message (core contract, frozen repository map,
+/// session history) is rendered byte-identically, the requested file extends
+/// the context block in insertion order, and the discovery feedback appends to
+/// the user message rather than being woven into the head.
+#[tokio::test]
+async fn discovery_round_extends_the_stable_prompt_prefix() {
+    let (_dir, repo_root) = init_repo();
+    std::fs::write(repo_root.join("target.rs"), "pub fn compute() -> i32 { 0 }\n")
+        .expect("write target fixture");
+    std::fs::write(repo_root.join("helper.rs"), "pub const ANSWER: i32 = 42;\n")
+        .expect("write helper fixture");
+    commit_fixture(&repo_root, &["target.rs", "helper.rs"]);
+
+    let mut context = ContextManager::new(repo_root.clone());
+    context
+        .add_file("target.rs", ContextAccess::Editable)
+        .expect("add target to context");
+    let mut history = HistoryManager::new(repo_root.clone());
+
+    let discovery = format!(
+        "I need the constant definitions.\n<context_request_{MARKER} path=\"helper.rs\" access=\"read_only\" />"
+    );
+    let edit = edit_block(
+        "Use the helper constant",
+        "target.rs",
+        "pub fn compute() -> i32 { 0 }",
+        "pub fn compute() -> i32 { 42 }",
+    );
+    let provider =
+        MockLlmProvider::scripted([MockResponse::text(discovery), MockResponse::text(edit)]);
+    let model = ModelRef::openrouter("mock/model");
+    let protocol = tauqe_core::prompt::xml::XmlPromptProtocol
+        .with_turn_marker(MARKER)
+        .expect("marker-bound protocol");
+    let mut policy = tauqe_core::workflow::policy::DirectApplyPolicy::new();
+    let options = WorkflowOptions::default();
+    let (stream_tx, cancel_rx) = event_channel();
+
+    let output = {
+        let mut env = build_env(
+            &provider,
+            &model,
+            &mut context,
+            &mut history,
+            protocol.as_ref(),
+            &mut policy,
+            stream_tx,
+            cancel_rx,
+            &options,
+        );
+        AnswerEditLoop::new("Use the helper constant")
+            .execute(&mut env)
+            .await
+            .expect("answer/edit loop executes")
+    };
+
+    assert!(matches!(
+        &output.result,
+        ModelResult::Edit { edits, .. } if !edits.is_empty()
+    ));
+    assert_eq!(provider.requests().len(), 2);
+
+    let first_system = &provider.requests()[0].messages[0].content;
+    let second_system = &provider.requests()[1].messages[0].content;
+
+    // The head of the system message never moves, so the provider reuses its
+    // cached prefix on the second round.
+    assert_eq!(
+        stable_system_prefix(second_system),
+        stable_system_prefix(first_system),
+        "the head of the system message must stay byte-identical across rounds"
+    );
+
+    // The repository map is frozen: it still lists the file the round added,
+    // instead of being regenerated without it.
+    assert_eq!(
+        repo_map_block(second_system),
+        repo_map_block(first_system),
+        "the repository map block must be frozen for the whole turn"
+    );
+    assert!(repo_map_block(first_system).contains("helper.rs"));
+
+    // The requested file extends the context block, so every earlier file keeps
+    // its position and its tokens.
+    let first_context = rendered_context_body(first_system);
+    let second_context = rendered_context_body(second_system);
+    assert!(
+        second_context.starts_with(first_context),
+        "discovery must append to the context block instead of reshaping it"
+    );
+    assert!(second_context.contains("path=\"helper.rs\" access=\"read_only\""));
+
+    // Discovery feedback appends to the user message, never to the head.
+    assert!(provider.requests()[1].messages[1]
+        .content
+        .starts_with(&provider.requests()[0].messages[1].content));
+}
+
+/// The turn scratchpad is volatile: it appears as the last block of the system
+/// message, behind the every-round-stable context and plan blocks, and never
+/// shifts the cached prefix.
+#[tokio::test]
+async fn scratchpad_renders_in_the_volatile_tail() {
+    let (_dir, repo_root) = init_repo();
+    std::fs::write(repo_root.join("target.rs"), "pub fn compute() -> i32 { 0 }\n")
+        .expect("write target fixture");
+    std::fs::write(repo_root.join("helper.rs"), "pub const ANSWER: i32 = 42;\n")
+        .expect("write helper fixture");
+    commit_fixture(&repo_root, &["target.rs", "helper.rs"]);
+
+    let mut context = ContextManager::new(repo_root.clone());
+    context
+        .add_file("target.rs", ContextAccess::Editable)
+        .expect("add target to context");
+    let mut history = HistoryManager::new(repo_root.clone());
+
+    let discovery = format!(
+        "Recording working notes.\n\
+        <scratchpad_{MARKER}>\n- Finding: helper.rs holds ANSWER\n</scratchpad_{MARKER}>\n\
+        <context_request_{MARKER} path=\"helper.rs\" access=\"read_only\" />"
+    );
+    let edit = edit_block(
+        "Use the helper constant",
+        "target.rs",
+        "pub fn compute() -> i32 { 0 }",
+        "pub fn compute() -> i32 { 42 }",
+    );
+    let provider =
+        MockLlmProvider::scripted([MockResponse::text(discovery), MockResponse::text(edit)]);
+    let model = ModelRef::openrouter("mock/model");
+    let protocol = tauqe_core::prompt::xml::XmlPromptProtocol
+        .with_turn_marker(MARKER)
+        .expect("marker-bound protocol");
+    let mut policy = tauqe_core::workflow::policy::DirectApplyPolicy::new();
+    let options = WorkflowOptions::default();
+    let (stream_tx, cancel_rx) = event_channel();
+
+    let output = {
+        let mut env = build_env(
+            &provider,
+            &model,
+            &mut context,
+            &mut history,
+            protocol.as_ref(),
+            &mut policy,
+            stream_tx,
+            cancel_rx,
+            &options,
+        );
+        AnswerEditLoop::new("Use the helper constant")
+            .execute(&mut env)
+            .await
+            .expect("answer/edit loop executes")
+    };
+
+    assert!(matches!(
+        &output.result,
+        ModelResult::Edit { edits, .. } if !edits.is_empty()
+    ));
+    assert_eq!(provider.requests().len(), 2);
+
+    let first_system = &provider.requests()[0].messages[0].content;
+    let second_system = &provider.requests()[1].messages[0].content;
+
+    assert_eq!(
+        stable_system_prefix(second_system),
+        stable_system_prefix(first_system),
+        "carrying the scratchpad forward must not move the cached head"
+    );
+    assert!(!first_system.contains("## Turn Scratchpad"));
+
+    let scratchpad = second_system
+        .find("## Turn Scratchpad (Working Memory)")
+        .expect("the scratchpad must reach the next round");
+    let context_block = second_system
+        .find("## Project Context")
+        .expect("the context block must be rendered");
+    assert!(
+        scratchpad > context_block,
+        "the scratchpad belongs in the volatile tail, after the context block"
+    );
+    assert!(second_system[scratchpad..].contains("Finding: helper.rs holds ANSWER"));
+}
+
+/// A patch retry reports its diagnostics in the user message and leaves the
+/// system message untouched, so the retry round hits the cache instead of
+/// paying for a full reprocessing.
+#[tokio::test]
+async fn patch_retry_appends_diagnostics_without_reshaping_the_system_prompt() {
+    let (_dir, repo_root) = init_repo();
+    std::fs::write(repo_root.join("target.rs"), "pub fn compute() -> i32 { 0 }\n")
+        .expect("write target fixture");
+    commit_fixture(&repo_root, &["target.rs"]);
+
+    let mut context = ContextManager::new(repo_root.clone());
+    context
+        .add_file("target.rs", ContextAccess::Editable)
+        .expect("add target to context");
+    let mut history = HistoryManager::new(repo_root.clone());
+
+    let broken = edit_block(
+        "Broken attempt",
+        "target.rs",
+        "this text does not exist in the file",
+        "irrelevant replacement",
+    );
+    let corrected = edit_block(
+        "Change compute to 42",
+        "target.rs",
+        "pub fn compute() -> i32 { 0 }",
+        "pub fn compute() -> i32 { 42 }",
+    );
+    let provider =
+        MockLlmProvider::scripted([MockResponse::text(broken), MockResponse::text(corrected)]);
+    let model = ModelRef::openrouter("mock/model");
+    let protocol = tauqe_core::prompt::xml::XmlPromptProtocol
+        .with_turn_marker(MARKER)
+        .expect("marker-bound protocol");
+    let mut policy = tauqe_core::workflow::policy::DirectApplyPolicy::new();
+    let options = WorkflowOptions::default();
+    let (stream_tx, cancel_rx) = event_channel();
+
+    let output = {
+        let mut env = build_env(
+            &provider,
+            &model,
+            &mut context,
+            &mut history,
+            protocol.as_ref(),
+            &mut policy,
+            stream_tx,
+            cancel_rx,
+            &options,
+        );
+        AnswerEditLoop::new("Change compute to return 42")
+            .execute(&mut env)
+            .await
+            .expect("answer/edit loop executes")
+    };
+
+    assert!(matches!(
+        &output.result,
+        ModelResult::Edit { edits, .. } if !edits.is_empty()
+    ));
+    assert_eq!(provider.requests().len(), 2);
+
+    assert_eq!(
+        provider.requests()[1].messages[0].content, provider.requests()[0].messages[0].content,
+        "a patch retry must not reshape the cached system prompt"
+    );
+    assert!(provider.requests()[1].messages[1]
+        .content
+        .contains("Failed files and errors:"));
+    assert!(!provider.requests()[0].messages[1]
+        .content
+        .contains("Failed files and errors:"));
 }

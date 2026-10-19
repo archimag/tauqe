@@ -4,6 +4,9 @@ use std::path::Path;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
+use classify::{classify_repo_path, RepoPathKind, SymlinkStatus, SymlinkTarget};
+
+pub mod classify;
 pub mod treesitter;
 
 pub use treesitter::TreeSitterExtractor;
@@ -121,25 +124,35 @@ pub fn generate_repo_map_with_extractor(
     crate::blocking::run_blocking(|| {
         let context_set: HashSet<&str> = context_files.iter().map(|s| s.as_str()).collect();
 
-        let mut all_git_files: Vec<String> = available_files
-            .iter()
-            .filter(|p| !context_set.contains(p.as_str()))
-            .filter(|p| repo_root.join(p).is_file())
-            .cloned()
-            .collect();
+        let mut all_git_files: Vec<String> = Vec::new();
+        let mut eligible_files: Vec<String> = Vec::new();
+
+        for path in available_files {
+            if context_set.contains(path.as_str()) {
+                continue;
+            }
+            match classify_repo_path(repo_root, path.as_str()) {
+                RepoPathKind::RegularFile => {
+                    if treesitter::is_supported_path(path.as_str()) {
+                        eligible_files.push(path.to_string());
+                    }
+                    all_git_files.push(path.to_string());
+                }
+                RepoPathKind::Symlink(link) => {
+                    all_git_files.push(format_map_symlink(path.as_str(), &link));
+                }
+                RepoPathKind::Other => {}
+            }
+        }
 
         all_git_files.sort();
         all_git_files.dedup();
+        eligible_files.sort();
+        eligible_files.dedup();
 
         if all_git_files.is_empty() {
             return Ok(String::new());
         }
-
-        let eligible_files: Vec<String> = all_git_files
-            .iter()
-            .filter(|p| treesitter::is_supported_path(p.as_str()))
-            .cloned()
-            .collect();
 
         let symbols = if eligible_files.is_empty() {
             Vec::new()
@@ -150,6 +163,25 @@ pub fn generate_repo_map_with_extractor(
         let outline = format_repo_map_with_budget(&symbols, &all_git_files, token_budget);
         Ok(outline)
     })
+}
+
+/// Renders a tracked symbolic link as a repository-map entry naming its target.
+///
+/// The link never enters the Tree-sitter outline, so an internal link cannot
+/// duplicate the target's symbols and an escaping link cannot leak external
+/// content. Only the link path and its stored target are shown, with a suffix
+/// when the link is broken or leaves the repository.
+fn format_map_symlink(path: &str, link: &SymlinkTarget) -> String {
+    let suffix = match link.status {
+        SymlinkStatus::Internal => "",
+        SymlinkStatus::OutsideRepository => " (outside repository)",
+        SymlinkStatus::Broken => " (broken)",
+    };
+    if link.target.is_empty() {
+        format!("{path}{suffix}")
+    } else {
+        format!("{path} -> {}{suffix}", link.target)
+    }
 }
 
 /// Formats repository symbols into an outline, reducing detail level if `token_budget` is exceeded.
@@ -663,5 +695,172 @@ mod tests {
         let map = handle.await.unwrap();
         assert!(map.contains("main.rs"));
         assert!(map.contains("pub fn main"));
+    }
+
+    #[test]
+    fn test_format_map_symlink_markers() {
+        let internal = SymlinkTarget {
+            target: "src/lib.rs".to_string(),
+            status: SymlinkStatus::Internal,
+        };
+        assert_eq!(
+            format_map_symlink("alias.rs", &internal),
+            "alias.rs -> src/lib.rs"
+        );
+
+        let outside = SymlinkTarget {
+            target: "/etc/passwd".to_string(),
+            status: SymlinkStatus::OutsideRepository,
+        };
+        assert_eq!(
+            format_map_symlink("escape.rs", &outside),
+            "escape.rs -> /etc/passwd (outside repository)"
+        );
+
+        let broken = SymlinkTarget {
+            target: "missing.rs".to_string(),
+            status: SymlinkStatus::Broken,
+        };
+        assert_eq!(
+            format_map_symlink("dangling.rs", &broken),
+            "dangling.rs -> missing.rs (broken)"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_generate_repo_map_excludes_symlinks_from_outline() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("lib.rs"), "pub fn real_fn() {}\n").unwrap();
+        std::os::unix::fs::symlink("lib.rs", root.join("alias.rs")).unwrap();
+
+        let available = vec!["alias.rs".to_string(), "lib.rs".to_string()];
+        let map = generate_repo_map(root, &available, &[], 1000).unwrap();
+
+        // The link is never parsed, so the declaration is rendered exactly once.
+        assert_eq!(map.matches("pub fn real_fn").count(), 1);
+        // The link is still listed in the file map, annotated with its target.
+        assert!(map.contains("alias.rs -> lib.rs"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_generate_repo_map_marks_broken_symlinks() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::os::unix::fs::symlink("missing.rs", root.join("dangling.rs")).unwrap();
+
+        let available = vec!["dangling.rs".to_string()];
+        let map = generate_repo_map(root, &available, &[], 1000).unwrap();
+
+        assert!(map.contains("dangling.rs -> missing.rs (broken)"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_generate_repo_map_marks_outside_symlinks_without_parsing() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let outside_file = outside.path().join("secret.rs");
+        std::fs::write(&outside_file, "pub fn secret() {}\n").unwrap();
+        let root = dir.path();
+        std::os::unix::fs::symlink(&outside_file, root.join("secret.rs")).unwrap();
+
+        let available = vec!["secret.rs".to_string()];
+        let map = generate_repo_map(root, &available, &[], 1000).unwrap();
+
+        assert!(map.contains("(outside repository)"));
+        // The escaping target is never fed to the symbol extractor.
+        assert!(!map.contains("pub fn secret"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_generate_repo_map_marks_directory_symlinks_without_parsing() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/lib.rs"), "pub fn dir_fn() {}\n").unwrap();
+        std::os::unix::fs::symlink("src", root.join("crate")).unwrap();
+
+        let available = vec!["crate".to_string(), "src/lib.rs".to_string()];
+        let map = generate_repo_map(root, &available, &[], 1000).unwrap();
+
+        // A directory link is never traversed, so its symbols appear once.
+        assert_eq!(map.matches("pub fn dir_fn").count(), 1);
+        // It is still listed with its target.
+        assert!(map.contains("crate -> src"));
+        assert!(!map.contains("(outside repository)"));
+        assert!(!map.contains("(broken)"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_generate_repo_map_deduplicates_repeated_symlink_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("lib.rs"), "pub fn real_fn() {}\n").unwrap();
+        std::os::unix::fs::symlink("lib.rs", root.join("alias.rs")).unwrap();
+
+        let available = vec![
+            "alias.rs".to_string(),
+            "alias.rs".to_string(),
+            "lib.rs".to_string(),
+        ];
+        let map = generate_repo_map(root, &available, &[], 1000).unwrap();
+
+        assert_eq!(map.matches("alias.rs -> lib.rs").count(), 1);
+        assert_eq!(map.matches("pub fn real_fn").count(), 1);
+    }
+
+    #[test]
+    fn test_format_repo_map_budget_drops_symlink_markers() {
+        let syms = vec![RepoFileSymbols {
+            path: "src/a.rs".to_string(),
+            symbols: vec![Symbol::new(
+                "a",
+                SymbolKind::Function,
+                Some("pub fn a()".into()),
+                true,
+                1,
+            )],
+            line_count: 1,
+        }];
+        let all_files = vec!["src/a.rs".to_string(), "alias.rs -> lib.rs".to_string()];
+
+        let generous = format_repo_map_with_budget(&syms, &all_files, 500);
+        assert!(generous.contains("src/a.rs (1 line)"));
+        assert!(generous.contains("alias.rs -> lib.rs"));
+
+        // A budget below the cost of the marker drops it instead of overshooting.
+        let tight = format_repo_map_with_budget(&syms, &all_files, 1);
+        assert!(!tight.contains("alias.rs -> lib.rs"));
+        assert!(crate::prompt::estimate_tokens(&tight) <= 1);
+    }
+
+    #[test]
+    fn test_format_repo_map_greedy_truncation_keeps_marker_within_budget() {
+        let symbols_outline = RepoFileSymbols {
+            path: "src/a.rs".to_string(),
+            symbols: vec![Symbol::new(
+                "a",
+                SymbolKind::Function,
+                Some("pub fn a()".into()),
+                true,
+                1,
+            )],
+            line_count: 1,
+        };
+        let all_files = vec!["src/a.rs".to_string(), "alias.rs -> lib.rs".to_string()];
+
+        // Budget admits the symbol block but not the additional marker entry.
+        let symbol_only = format_repo_map_with_budget(std::slice::from_ref(&symbols_outline), &[], 500);
+        let budget = crate::prompt::estimate_tokens(&symbol_only) + 2;
+        let truncated = format_repo_map_with_budget(&[symbols_outline], &all_files, budget);
+
+        assert!(truncated.contains("pub fn a"));
+        assert!(!truncated.contains("alias.rs -> lib.rs"));
+        assert!(crate::prompt::estimate_tokens(&truncated) <= budget);
     }
 }

@@ -67,6 +67,8 @@ pub struct MockRequest {
     pub messages: Vec<ChatMessage>,
     pub response_format: Option<ResponseFormat>,
     pub reasoning_effort: Option<ReasoningEffort>,
+    /// Session identifier forwarded by the caller, captured for assertions.
+    pub session_id: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -140,6 +142,7 @@ impl MockLlmProvider {
         messages: &[ChatMessage],
         response_format: Option<&ResponseFormat>,
         reasoning_effort: Option<ReasoningEffort>,
+        session_id: Option<&str>,
     ) {
         self.with_state(|state| {
             state.requests.push(MockRequest {
@@ -147,20 +150,29 @@ impl MockLlmProvider {
                 messages: messages.to_vec(),
                 response_format: response_format.cloned(),
                 reasoning_effort,
+                session_id: session_id.map(str::to_string),
             });
         });
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn replay(
         &self,
         model: &str,
         messages: Vec<ChatMessage>,
         response_format: Option<ResponseFormat>,
         reasoning_effort: Option<ReasoningEffort>,
+        session_id: Option<&str>,
         tx: mpsc::Sender<StreamEvent>,
         cancel_rx: &watch::Receiver<bool>,
     ) -> anyhow::Result<()> {
-        self.record(model, &messages, response_format.as_ref(), reasoning_effort);
+        self.record(
+            model,
+            &messages,
+            response_format.as_ref(),
+            reasoning_effort,
+            session_id,
+        );
 
         let cancelled = *cancel_rx.borrow();
         if cancelled {
@@ -216,7 +228,7 @@ impl LlmProvider for MockLlmProvider {
         tx: mpsc::Sender<StreamEvent>,
         cancel_rx: watch::Receiver<bool>,
     ) -> anyhow::Result<()> {
-        self.replay(model, messages, response_format, None, tx, &cancel_rx)
+        self.replay(model, messages, response_format, None, None, tx, &cancel_rx)
             .await
     }
 
@@ -234,6 +246,29 @@ impl LlmProvider for MockLlmProvider {
             messages,
             response_format,
             reasoning_effort,
+            None,
+            tx,
+            &cancel_rx,
+        )
+        .await
+    }
+
+    async fn stream_chat_with_session(
+        &self,
+        model: &str,
+        messages: Vec<ChatMessage>,
+        response_format: Option<ResponseFormat>,
+        reasoning_effort: Option<ReasoningEffort>,
+        session_id: Option<&str>,
+        tx: mpsc::Sender<StreamEvent>,
+        cancel_rx: watch::Receiver<bool>,
+    ) -> anyhow::Result<()> {
+        self.replay(
+            model,
+            messages,
+            response_format,
+            reasoning_effort,
+            session_id,
             tx,
             &cancel_rx,
         )
@@ -330,6 +365,32 @@ mod tests {
         assert_eq!(requests[0].model, "test-model");
         assert_eq!(requests[0].messages[0].content, "first");
         assert_eq!(requests[1].messages[0].content, "second");
+        assert!(requests[0].session_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn records_session_id_from_session_call() {
+        let provider = MockLlmProvider::scripted([MockResponse::text("x")]);
+        let (tx, mut rx) = mpsc::channel(16);
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+
+        let stream = provider.stream_chat_with_session(
+            "test-model",
+            Vec::new(),
+            None,
+            None,
+            Some("tauqe-repl-abc"),
+            tx,
+            cancel_rx,
+        );
+        let collect = async {
+            while rx.recv().await.is_some() {}
+        };
+        let (result, ()) = tokio::join!(stream, collect);
+        result.expect("mock stream should succeed");
+
+        let request = provider.last_request().expect("recorded request");
+        assert_eq!(request.session_id.as_deref(), Some("tauqe-repl-abc"));
     }
 
     #[tokio::test]

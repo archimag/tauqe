@@ -31,6 +31,12 @@ This document specifies mandatory engineering and architectural conventions for 
    - Never duplicate wire-contract parsers, validation rules, or ad-hoc converters across crates. Derive, share via `protocol`/`core`, or compute from the single source of truth.
 4. **Dead code removal:**
    - Code that is superseded or rendered obsolete (such as legacy protocols, abandoned memory concepts, or deprecated modes) must be deleted completely, never commented out or hidden behind dormant feature flags.
+5. **Typed Intent over Textual Inference:**
+   - It is strictly forbidden to determine an execution mode, an execution restriction, or an operation type by parsing unstructured text: no prefix checks (`starts_with`), no regular expressions, no keyword searches. A prefix, a heading, or a keyword is a guess, not a contract. It silently changes behavior when the wording changes and is never checked by the compiler.
+   - When a subsystem needs to know its calling context, the caller must pass it as a strictly typed DTO or enum. The receiving side reads typed fields and matches variants; it never inspects the text it was given.
+   - The canonical example is the bounded turn: its mode is declared by `TurnIntent` and is never derived from the body of a prompt.
+   - This is the operational form of the harness invariant *"Never guess what is deterministically known"*.
+   - Subsystem conventions do not duplicate this rule; they reference it instead.
 
 ---
 

@@ -6,6 +6,7 @@ use tauqe_protocol::IssueStatus;
 
 use crate::app::AppState;
 use crate::i18n::active_t;
+use crate::views::plans::architect_badge;
 
 use super::{
     compute_unified_review_lines, format_created_at, issue_status_label, issue_status_style,
@@ -242,6 +243,7 @@ fn describe_review_row(
             status,
             model,
             files,
+            subplan_architect,
             ..
         } => {
             let mut spans = vec![
@@ -273,6 +275,9 @@ fn describe_review_row(
                     format!("  —  {}", desc),
                     engine.fg(palette.text_muted),
                 ));
+            }
+            if let Some(tier) = subplan_architect {
+                spans.push(architect_badge(tier));
             }
             spans
         }

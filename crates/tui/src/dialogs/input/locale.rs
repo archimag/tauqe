@@ -11,7 +11,7 @@ use tauqe_protocol::{methods, LocaleGenerateParams};
 use tokio::sync::MutexGuard;
 
 use crate::app::{AppState, LocaleDialogButton, LocaleDialogFocus, LocaleDialogState};
-use crate::i18n::{canonical_catalog, delete_custom_locale};
+use crate::i18n::{active_t, canonical_catalog, delete_custom_locale};
 use crate::input::InputResult;
 use crate::rpc::{send_request, RpcConnection};
 
@@ -126,13 +126,13 @@ async fn synthesize(
 ) -> anyhow::Result<Option<InputResult>> {
     let language = dialog.language_editor.get_text().trim().to_string();
     if language.is_empty() {
-        st.notify_warning("Enter a target language (for example, Russian)");
+        st.notify_warning(active_t("notify.locale_empty_target"));
         st.locale_dialog = Some(dialog);
         return Ok(Some(InputResult::Continue));
     }
 
     if st.model.is_busy() || st.review.running {
-        st.notify_warning("Model is currently busy; wait for the turn to finish");
+        st.notify_warning(active_t("notify.model_busy"));
         st.locale_dialog = Some(dialog);
         return Ok(Some(InputResult::Continue));
     }
@@ -141,7 +141,7 @@ async fn synthesize(
         language: language.clone(),
         items: canonical_catalog(),
     };
-    st.notify_info(format!("Synthesizing the {} locale with Scribe...", language));
+    st.notify_info(active_t("notify.locale_synthesizing").replace("{}", &language));
     dialog.generating = true;
     st.locale_dialog = Some(dialog);
     drop(st);
@@ -166,7 +166,7 @@ async fn cancel_synthesis(
 ) -> anyhow::Result<()> {
     let unrelated_busy = st.model.is_busy() || st.review.running;
     st.locale_dialog = None;
-    st.notify_info("Locale generation cancelled");
+    st.notify_info(active_t("notify.locale_cancelled"));
     drop(st);
     if !unrelated_busy {
         let _ = send_request(
@@ -217,11 +217,10 @@ pub async fn click_locale_button(
 fn reset_to_english(mut st: MutexGuard<'_, AppState>) -> anyhow::Result<Option<InputResult>> {
     st.reset_locale_to_english();
     match delete_custom_locale() {
-        Ok(()) => st.notify_success("Interface language reset to English"),
-        Err(err) => st.notify_warning(format!(
-            "Interface language reset to English, but the saved locale could not be removed: {}",
-            err
-        )),
+        Ok(()) => st.notify_success(active_t("notify.locale_reset_english")),
+        Err(err) => st.notify_warning(
+            active_t("notify.locale_reset_unsaved").replace("{}", &err.to_string()),
+        ),
     }
     Ok(Some(InputResult::Continue))
 }

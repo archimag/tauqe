@@ -158,20 +158,21 @@ pub fn format_desktop_notification(
 ) -> Vec<u8> {
     let clean_title = sanitize_notification_text(title, 64);
     let clean_body = sanitize_notification_text(body, 160);
-    let mut out = Vec::new();
-    match protocol {
+    let payload = match protocol {
         DesktopNotificationProtocol::Osc9 => {
-            let _ = write!(out, "\x1b]9;{}: {}\x1b\\", clean_title, clean_body);
+            format!("\x1b]9;{}: {}\x1b\\", clean_title, clean_body)
         }
         DesktopNotificationProtocol::Osc777 => {
-            let _ = write!(out, "\x1b]777;notify;{};{}\x1b\\", clean_title, clean_body);
+            format!("\x1b]777;notify;{};{}\x1b\\", clean_title, clean_body)
         }
-        DesktopNotificationProtocol::Both => {
-            let _ = write!(out, "\x1b]777;notify;{};{}\x1b\\", clean_title, clean_body);
-            let _ = write!(out, "\x1b]9;{}: {}\x1b\\", clean_title, clean_body);
-        }
-    }
-    out
+        DesktopNotificationProtocol::Both => format!(
+            "\x1b]777;notify;{};{}\x1b\\\x1b]9;{}: {}\x1b\\",
+            clean_title, clean_body, clean_title, clean_body
+        ),
+    };
+    // Under `tmux` the emitted OSC sequence must travel inside a DCS passthrough
+    // frame, otherwise the multiplexer swallows it before reaching the terminal.
+    wrap_osc_payload(&payload)
 }
 
 pub fn trigger_turn_notification(
@@ -274,16 +275,24 @@ mod tests {
 
     #[test]
     fn test_format_desktop_notification_protocols() {
+        // Compare against `wrap_osc_payload` so the assertion holds whether or
+        // not the test process itself runs inside `tmux`.
         let osc9 = format_desktop_notification("Title", "Body", DesktopNotificationProtocol::Osc9);
-        assert_eq!(String::from_utf8(osc9).unwrap(), "\x1b]9;Title: Body\x1b\\");
+        assert_eq!(
+            osc9,
+            wrap_osc_payload("\x1b]9;Title: Body\x1b\\")
+        );
 
         let osc777 = format_desktop_notification("Title", "Body", DesktopNotificationProtocol::Osc777);
-        assert_eq!(String::from_utf8(osc777).unwrap(), "\x1b]777;notify;Title;Body\x1b\\");
+        assert_eq!(
+            osc777,
+            wrap_osc_payload("\x1b]777;notify;Title;Body\x1b\\")
+        );
 
         let both = format_desktop_notification("Title", "Body", DesktopNotificationProtocol::Both);
         assert_eq!(
-            String::from_utf8(both).unwrap(),
-            "\x1b]777;notify;Title;Body\x1b\\\x1b]9;Title: Body\x1b\\"
+            both,
+            wrap_osc_payload("\x1b]777;notify;Title;Body\x1b\\\x1b]9;Title: Body\x1b\\")
         );
     }
 }

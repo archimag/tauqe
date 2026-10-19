@@ -10,10 +10,11 @@ use std::sync::OnceLock;
 
 use tauqe_protocol::{
     CapabilityPhase, CapabilitySet, DocTopic, LlmCapability, LlmCommand, ModelResult,
-    RepoSearchRequest,
+    RepoSearchRequest, TurnIntent,
 };
 
 use crate::edits::protocol::xml::engine::{self, XmlTagSpec};
+use crate::edits::protocol::xml::normalize_marked_xml;
 use crate::edits::protocol::xml::tags::ParsedPlanTag;
 use crate::edits::protocol::{
     ContextRequest, MarkedXmlEditProtocol, TerminalOutcome, VerifyRequest, XmlEditProtocol,
@@ -24,6 +25,7 @@ use super::builtin::{
     PlanCreationModule, PlanUpdateModule, ScratchpadModule, TextMessageModule,
     ToolchainVerifyModule, UserLanguageModule,
 };
+use super::regime;
 
 /// Context handed to capability modules when they render prompt fragments.
 ///
@@ -54,6 +56,78 @@ impl<'a> PromptRenderContext<'a> {
     }
 }
 
+/// One rule of the `Core System Contract` section.
+///
+/// A rule is data, never a numbered string literal. The number is derived from
+/// the rule's position by [`render_contract_rules`], so the rendered sequence is
+/// always dense `1..N` and no surrogate numbering (`1a.`, `10a.`) can appear.
+pub struct ContractRule {
+    /// Short title stating the invariant.
+    pub title: String,
+    /// Body text rendered after the title.
+    pub body: String,
+}
+
+impl ContractRule {
+    /// Creates a contract rule from its title and body.
+    pub fn new(title: impl Into<String>, body: impl Into<String>) -> Self {
+        Self {
+            title: title.into(),
+            body: body.into(),
+        }
+    }
+}
+
+/// Renders contract rules as a densely numbered `1..N` list.
+pub fn render_contract_rules(rules: &[ContractRule]) -> String {
+    let mut rendered = String::new();
+    for (index, rule) in rules.iter().enumerate() {
+        rendered.push_str(&format!(
+            "{}. {}: {}\n",
+            index + 1,
+            rule.title,
+            rule.body.trim_end()
+        ));
+    }
+    rendered
+}
+
+/// Render inputs available to a contract rule.
+///
+/// Tags keep folding through [`PromptRenderContext`], and the rule variant is
+/// selected by typed inputs — the declared turn intent and the concrete target
+/// language — never by inspecting rendered text.
+pub struct ContractContext<'a> {
+    /// Tag-rendering context shared with the protocol instruction composers.
+    pub render: PromptRenderContext<'a>,
+    /// Declared intent of the turn this contract is rendered for.
+    pub intent: TurnIntent,
+    /// Concrete response language, when the caller already resolved it.
+    pub target_language: Option<&'a str>,
+}
+
+impl<'a> ContractContext<'a> {
+    /// Creates a contract context for the given intent and render context.
+    pub fn new(intent: TurnIntent, render: PromptRenderContext<'a>) -> Self {
+        Self {
+            render,
+            intent,
+            target_language: None,
+        }
+    }
+
+    /// Sets the concrete target language, when the caller already resolved it.
+    pub fn with_target_language(mut self, target_language: Option<&'a str>) -> Self {
+        self.target_language = target_language;
+        self
+    }
+
+    /// Returns a tag name with the active turn-marker suffix applied.
+    pub fn tag_name(&self, base: &str) -> String {
+        self.render.tag_name(base)
+    }
+}
+
 /// One autonomous capability: tags, prompt text, decoding, and sanitization.
 ///
 /// A module advertises exactly one [`LlmCapability`] and belongs to exactly one
@@ -79,7 +153,7 @@ pub trait CapabilityModule: Send + Sync {
     }
 
     /// Rule contributed to the `Core System Contract` section.
-    fn render_contract_rule(&self, _ctx: &PromptRenderContext<'_>) -> Option<String> {
+    fn render_contract_rule(&self, _ctx: &ContractContext<'_>) -> Option<ContractRule> {
         None
     }
 
@@ -174,7 +248,11 @@ impl XmlParser {
         }
     }
 
-    pub(crate) fn parse_verify_request(&self, normalized: &str, raw_text: &str) -> Option<VerifyRequest> {
+    pub(crate) fn parse_verify_request(
+        &self,
+        normalized: &str,
+        raw_text: &str,
+    ) -> Option<VerifyRequest> {
         match self {
             Self::Unmarked(protocol) => protocol.parse_verify_request(normalized),
             Self::Marked(protocol) => protocol.parse_verify_request_normalized(normalized, raw_text),
@@ -277,14 +355,53 @@ impl CapabilityRegistry {
     }
 
     /// Composes `Core System Contract` rules for the enabled capabilities.
-    pub fn compose_contract_rules(
+    ///
+    /// The section is assembled from typed inputs only: the regime trunk
+    /// selected by the declared turn intent and the capability surface, the
+    /// operational tag rule derived from the enabled capabilities, and every
+    /// enabled module's rule in registry order. The whole sequence is rendered
+    /// by one loop, so rule numbers come purely from position.
+    pub fn compose_contract_rules(&self, set: &CapabilitySet, ctx: &ContractContext<'_>) -> String {
+        let mut rules = regime::regime_contract_rules(ctx, set);
+        if let Some(rule) = self.operational_tags_rule(set, ctx) {
+            // Position 0 always holds the authoritative-source rule, so the
+            // operational-tag rule becomes the second entry of the contract.
+            rules.insert(rules.len().min(1), rule);
+        }
+        for module in self.enabled(set) {
+            if let Some(rule) = module.render_contract_rule(ctx) {
+                rules.push(rule);
+            }
+        }
+        render_contract_rules(&rules)
+    }
+
+    /// Builds the operational tag rule from the enabled capability set.
+    ///
+    /// The rule is skipped when the set exposes no control tags, so a narrowed
+    /// surface never advertises an operational protocol it cannot accept.
+    fn operational_tags_rule(
         &self,
         set: &CapabilitySet,
-        ctx: &PromptRenderContext<'_>,
-    ) -> String {
-        self.compose(set, ctx, |module, render_ctx| {
-            module.render_contract_rule(render_ctx)
-        })
+        ctx: &ContractContext<'_>,
+    ) -> Option<ContractRule> {
+        let tags = self.operational_xml_tags(set);
+        if tags.is_empty() {
+            return None;
+        }
+        let listed = tags
+            .iter()
+            .map(|tag| format!("<{}>", ctx.tag_name(tag)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let example = format!("<{} ...>", ctx.tag_name("context_request"));
+        Some(ContractRule::new(
+            "Operational Protocol Tags",
+            format!(
+                "All operational protocol tags ({}) must be emitted strictly at the end of your response outside markdown code blocks. If you mention, quote, or discuss tags in conversational text, you MUST enclose them in backticks (e.g. `{}`) so they are treated as literal text and not operational commands.",
+                listed, example
+            ),
+        ))
     }
 
     /// Composes XML code-modification instructions for the enabled capabilities.
@@ -324,9 +441,7 @@ impl CapabilityRegistry {
         let normalized_storage;
         let normalized_text = match marker {
             Some(m) => {
-                normalized_storage = crate::edits::protocol::xml::normalize_marked_xml(
-                    raw_text, m, true,
-                );
+                normalized_storage = normalize_marked_xml(raw_text, m, true);
                 normalized_storage.as_str()
             }
             None => raw_text,
@@ -346,12 +461,7 @@ impl CapabilityRegistry {
     ///
     /// When the text capability is enabled the full protocol cleaning is used;
     /// otherwise stripping is scoped strictly to the enabled tag specs.
-    pub fn clean_text(
-        &self,
-        set: &CapabilitySet,
-        raw_text: &str,
-        marker: Option<&str>,
-    ) -> String {
+    pub fn clean_text(&self, set: &CapabilitySet, raw_text: &str, marker: Option<&str>) -> String {
         if set.contains(LlmCapability::TextMessage) {
             return XmlParser::new(marker).clean_assistant_text(raw_text);
         }
@@ -381,7 +491,25 @@ impl CapabilityRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tauqe_protocol::{CapabilitySet, LlmCapability, LlmCommand};
+
+    /// Collects the rule numbers rendered at the start of contract lines.
+    fn rule_numbers(rendered: &str) -> Vec<usize> {
+        rendered
+            .lines()
+            .filter_map(|line| {
+                let (prefix, _) = line.split_once(". ")?;
+                prefix.parse::<usize>().ok()
+            })
+            .collect()
+    }
+
+    /// Builds the default contract context for a plain interactive turn.
+    fn plain_context() -> ContractContext<'static> {
+        ContractContext::new(
+            TurnIntent::InteractiveRepl,
+            PromptRenderContext::new(&[], None),
+        )
+    }
 
     #[test]
     fn registry_covers_every_capability() {
@@ -440,14 +568,106 @@ mod tests {
     #[test]
     fn contract_rules_reflect_the_capability_set() {
         let registry = CapabilityRegistry::global();
-        let ctx = PromptRenderContext::new(&[], None);
+        let ctx = plain_context();
 
         let develop = registry.compose_contract_rules(&CapabilitySet::develop_xml(), &ctx);
         assert!(develop.contains("context_request"));
         assert!(develop.contains("Minimal Coherent Change"));
+        assert!(develop.contains("1. Authoritative Source: "));
+        assert!(develop.contains("Operational Protocol Tags: "));
 
         let discussion = registry.compose_contract_rules(&CapabilitySet::discussion(), &ctx);
         assert!(!discussion.contains("Minimal Coherent Change"));
+    }
+
+    #[test]
+    fn contract_rules_are_numbered_monotonically() {
+        let rules = vec![
+            ContractRule::new("First", "Alpha."),
+            ContractRule::new("Second", "Beta.\n"),
+        ];
+        assert_eq!(
+            render_contract_rules(&rules),
+            "1. First: Alpha.\n2. Second: Beta.\n"
+        );
+    }
+
+    #[test]
+    fn contract_rules_keep_dense_numbering_for_narrowed_sets() {
+        let registry = CapabilityRegistry::global();
+        let narrowed = CapabilitySet::from_slice(&[
+            LlmCapability::TextMessage,
+            LlmCapability::FileEdits,
+        ]);
+        let rendered = registry.compose_contract_rules(&narrowed, &plain_context());
+
+        // File-edit tags are not control tags, so the operational rule is
+        // skipped instead of advertising an empty protocol surface.
+        assert!(!rendered.contains("Operational Protocol Tags"));
+        assert_eq!(rule_numbers(&rendered), vec![1, 2, 3, 4, 5, 6, 7, 8]);
+        assert!(rendered.contains("1. Authoritative Source: "));
+        assert!(rendered.contains("2. Read-Only Scope: "));
+        assert!(rendered.contains("3. Editable Scope: "));
+        assert!(rendered.contains("4. No Arbitrary Shell: "));
+        assert!(rendered.contains("5. Action Authorization: "));
+        assert!(rendered.contains("6. Reasoning in English: "));
+        assert!(rendered.contains("7. Conversational Response: "));
+        assert!(rendered.contains("8. Minimal Coherent Change: "));
+    }
+
+    #[test]
+    fn develop_contract_has_no_lettered_rule_numbers() {
+        let registry = CapabilityRegistry::global();
+        let rendered =
+            registry.compose_contract_rules(&CapabilitySet::develop_xml(), &plain_context());
+
+        for surrogate in ["1a.", "2a.", "4a.", "8a.", "10a.", "11a."] {
+            assert!(!rendered.contains(surrogate), "surrogate {surrogate}");
+        }
+        let numbers = rule_numbers(&rendered);
+        assert!(numbers.len() > 5);
+        assert_eq!(numbers, (1..=numbers.len()).collect::<Vec<_>>());
+        assert!(rendered.contains("Conceptual Foundation Invariant"));
+        assert!(rendered.contains("Leaf-Only Files Invariant"));
+        assert!(rendered.contains("File Attributes Contract"));
+        assert!(rendered.contains("Planning Objective: "));
+        assert!(rendered.contains("Step Formulation Contract: "));
+        assert!(rendered.contains("Structured Plan XML Format:"));
+    }
+
+    #[test]
+    fn contract_rules_follow_typed_inputs() {
+        let registry = CapabilityRegistry::global();
+        let set = CapabilitySet::develop_xml();
+
+        let rendered = registry.compose_contract_rules(&set, &plain_context());
+        assert!(rendered.contains("Language Consistency: Always formulate"));
+
+        let localized = plain_context().with_target_language(Some("Russian"));
+        let rendered = registry.compose_contract_rules(&set, &localized);
+        assert!(rendered.contains("Language Consistency: The user's language is Russian."));
+
+        let discussion = ContractContext::new(
+            TurnIntent::ReadonlyDiscussion,
+            PromptRenderContext::new(&[], None),
+        );
+        let rendered = registry.compose_contract_rules(&CapabilitySet::discussion(), &discussion);
+        assert!(rendered.contains("Language Consistency: Always formulate"));
+        assert!(rendered.contains("`user_language` field"));
+    }
+
+    #[test]
+    fn contract_rules_apply_the_turn_marker() {
+        let registry = CapabilityRegistry::global();
+        let ctx = ContractContext::new(
+            TurnIntent::InteractiveRepl,
+            PromptRenderContext::new(&[], Some("M12345")),
+        );
+        let rendered = registry.compose_contract_rules(&CapabilitySet::develop_xml(), &ctx);
+        assert!(rendered.contains("<context_request_M12345 path"));
+        assert!(rendered.contains("<scratchpad_M12345>"));
+        assert!(rendered.contains("<plan_M12345 action"));
+        assert!(!rendered.contains("<context_request path"));
     }
 
     #[test]
@@ -455,7 +675,8 @@ mod tests {
         let registry = CapabilityRegistry::global();
         let marker = "M12345";
         let ctx = PromptRenderContext::new(&[], Some(marker));
-        let marked = registry.compose_xml_protocol_instructions(&CapabilitySet::develop_xml(), &ctx);
+        let marked =
+            registry.compose_xml_protocol_instructions(&CapabilitySet::develop_xml(), &ctx);
         assert!(marked.contains(&format!("tauqe_edits_{marker}")));
         assert!(marked.contains(&format!("context_request_{marker}")));
 
@@ -470,8 +691,8 @@ mod tests {
         let registry = CapabilityRegistry::global();
         let ctx = PromptRenderContext::new(&[], None);
 
-        let json =
-            registry.compose_structured_protocol_instructions(&CapabilitySet::develop_structured(), &ctx);
+        let json = registry
+            .compose_structured_protocol_instructions(&CapabilitySet::develop_structured(), &ctx);
         assert!(json.contains("changes"));
         assert!(json.contains("message"));
         assert!(json.contains("`doc_requests`"));
@@ -576,14 +797,5 @@ mod tests {
                 .and_then(|module| module.json_property_name());
             assert_eq!(property, Some(expected), "property name for {}", capability);
         }
-
-        // Verification now exposes a structured-output property under the same
-        // capability set that advertises it.
-        assert_eq!(
-            registry
-                .module(LlmCapability::ToolchainVerify)
-                .and_then(|module| module.json_property_name()),
-            Some("verify")
-        );
     }
 }

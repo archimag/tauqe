@@ -72,7 +72,7 @@ impl PlanStorage {
         }
     }
 
-    /// Lists all stored plans from `.tauqe/plans`, ordered by `updated_at` descending.
+    /// Lists all stored plans from `.tauqe/plans`, ordered by `created_at` descending.
     ///
     /// Acquires the process-global storage lock so a listing never observes a plan
     /// file mid-rename while another task is persisting it.
@@ -176,7 +176,10 @@ impl PlanStorage {
             }
         }
 
-        plans.sort_by_key(|p| std::cmp::Reverse(p.updated_at));
+        // Creation time, not modification time, defines the tree order: a
+        // long-lived plan that was edited a moment ago must not jump above a
+        // newly created one, so the listing stays stable across edits.
+        plans.sort_by_key(|p| std::cmp::Reverse(p.created_at));
         Ok(plans)
     }
 
@@ -562,6 +565,7 @@ mod tests {
             description: Some("OAuth2 + JWT".to_string()),
             created_at: 100,
             updated_at: 100,
+            architect: None,
             concept: vec![],
             items: vec![
                 PlanItem {
@@ -651,6 +655,7 @@ mod tests {
             description: None,
             created_at: 100,
             updated_at: 100,
+            architect: None,
             concept: vec![tauqe_protocol::ConceptItem {
                 id: "c-1".to_string(),
                 title: "Original title".to_string(),
@@ -686,6 +691,7 @@ mod tests {
             description: None,
             created_at: 1,
             updated_at: 1,
+            architect: None,
             concept: vec![],
             items: vec![PlanItem {
                 id: "1".to_string(),
@@ -798,6 +804,40 @@ mod tests {
         let all = PlanStorage::load_all(root).unwrap();
         assert_eq!(all.len(), 1);
         assert_eq!(all[0].id, "valid-plan");
+    }
+
+    #[test]
+    fn test_list_plans_orders_by_creation_time() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+
+        // The two plans disagree on which timestamp is larger: the older plan
+        // was modified most recently, while the newer plan was never touched
+        // after creation. Creation time must decide the order, so a freshly
+        // edited plan never climbs above a newly created one.
+        let older = Plan {
+            id: "older".to_string(),
+            title: "Older".to_string(),
+            created_at: 100,
+            updated_at: 900,
+            ..Default::default()
+        };
+        let newer = Plan {
+            id: "newer".to_string(),
+            title: "Newer".to_string(),
+            created_at: 200,
+            updated_at: 200,
+            ..Default::default()
+        };
+        PlanStorage::save_plan(root, &older).unwrap();
+        PlanStorage::save_plan(root, &newer).unwrap();
+
+        let ids: Vec<String> = PlanStorage::list_plans(root)
+            .unwrap()
+            .into_iter()
+            .map(|summary| summary.id)
+            .collect();
+        assert_eq!(ids, vec!["newer".to_string(), "older".to_string()]);
     }
 
     #[test]

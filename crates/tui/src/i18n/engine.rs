@@ -10,6 +10,9 @@
 //! operational (c-5).
 
 use std::collections::HashMap;
+use std::sync::LazyLock;
+
+#[cfg(not(test))]
 use std::sync::RwLock;
 
 use unicode_width::UnicodeWidthStr;
@@ -23,10 +26,30 @@ struct CatalogEntry {
     max_width: Option<u16>,
 }
 
+/// Process-wide cache of the embedded English catalog.
+///
+/// Built once from [`canonical_catalog`] and reused by every engine instance,
+/// every global snapshot installation, and every `english_default` fallback, so
+/// a lookup never rebuilds the multi-hundred-entry catalog vector and its
+/// thousands of heap-allocated strings.
+static EN_CATALOG: LazyLock<HashMap<String, CatalogEntry>> = LazyLock::new(|| {
+    canonical_catalog()
+        .into_iter()
+        .map(|item| {
+            (
+                item.key,
+                CatalogEntry {
+                    english: item.english,
+                    max_width: item.max_width,
+                },
+            )
+        })
+        .collect()
+});
+
 /// Resolves interface strings against the embedded English catalog and the
 /// optional active custom locale, validating each translation's terminal width.
 pub struct I18nEngine {
-    catalog: HashMap<String, CatalogEntry>,
     custom: Option<CustomLocale>,
 }
 
@@ -34,20 +57,7 @@ impl I18nEngine {
     /// Builds the engine, seeding the canonical catalog and activating the
     /// supplied custom locale when it carries a non-blank language name.
     pub fn new(custom: Option<CustomLocale>) -> Self {
-        let catalog = canonical_catalog()
-            .into_iter()
-            .map(|item| {
-                (
-                    item.key,
-                    CatalogEntry {
-                        english: item.english,
-                        max_width: item.max_width,
-                    },
-                )
-            })
-            .collect();
         Self {
-            catalog,
             custom: normalize_custom(custom),
         }
     }
@@ -73,7 +83,7 @@ impl I18nEngine {
     /// falls through to the canonical English original. An unknown key yields
     /// an empty string rather than panicking.
     pub fn t(&self, key: &str) -> &str {
-        let Some(entry) = self.catalog.get(key) else {
+        let Some(entry) = EN_CATALOG.get(key) else {
             return "";
         };
         if let Some(locale) = &self.custom {
@@ -108,42 +118,81 @@ impl I18nEngine {
 /// hot-swapped locale takes effect everywhere without threading the engine
 /// through every render call. English is the transparent fallback while no
 /// locale has been installed (c-1, c-5).
+#[cfg(not(test))]
 static ACTIVE_LOCALE: RwLock<Option<HashMap<String, String>>> = RwLock::new(None);
+
+#[cfg(test)]
+thread_local! {
+    /// Per-thread replacement of the process-wide snapshot, active only in the
+    /// crate's own test build.
+    ///
+    /// The test harness runs every `#[test]` in its own thread inside one
+    /// shared process, so a single global snapshot lets a concurrently running
+    /// test overwrite the locale another test has just installed. Scoping the
+    /// test snapshot to the thread keeps each test's installation private,
+    /// while the production build keeps the single process-wide projection.
+    static ACTIVE_LOCALE: std::cell::RefCell<Option<HashMap<String, String>>> =
+        const { std::cell::RefCell::new(None) };
+}
 
 /// Publishes the resolved string snapshot of `engine` as the process-wide active
 /// locale. Called whenever the active locale changes, keeping the global view in
 /// step with the `AppState` engine (c-4, c-5).
 pub fn install_active_locale(engine: &I18nEngine) {
-    let snapshot: HashMap<String, String> = canonical_catalog()
-        .into_iter()
-        .map(|item| {
-            let resolved = engine.t(&item.key).to_string();
-            (item.key, resolved)
-        })
+    let snapshot: HashMap<String, String> = EN_CATALOG
+        .keys()
+        .map(|key| (key.clone(), engine.t(key).to_string()))
         .collect();
+    publish_snapshot(snapshot);
+}
+
+#[cfg(not(test))]
+fn publish_snapshot(snapshot: HashMap<String, String>) {
     if let Ok(mut guard) = ACTIVE_LOCALE.write() {
         *guard = Some(snapshot);
     }
 }
 
+#[cfg(test)]
+fn publish_snapshot(snapshot: HashMap<String, String>) {
+    let _ = ACTIVE_LOCALE.try_with(move |cell| {
+        if let Ok(mut guard) = cell.try_borrow_mut() {
+            *guard = Some(snapshot);
+        }
+    });
+}
+
 /// Resolves `key` against the process-wide active locale, degrading to the
 /// embedded English catalog when no locale has been installed (c-5).
 pub fn active_t(key: &str) -> String {
-    if let Ok(guard) = ACTIVE_LOCALE.read() {
-        if let Some(snapshot) = guard.as_ref() {
-            return snapshot.get(key).cloned().unwrap_or_default();
-        }
-    }
-    english_default(key)
+    lookup_snapshot(key).unwrap_or_else(|| english_default(key))
+}
+
+#[cfg(not(test))]
+fn lookup_snapshot(key: &str) -> Option<String> {
+    let guard = ACTIVE_LOCALE.read().ok()?;
+    let snapshot = guard.as_ref()?;
+    Some(snapshot.get(key).cloned().unwrap_or_default())
+}
+
+#[cfg(test)]
+fn lookup_snapshot(key: &str) -> Option<String> {
+    ACTIVE_LOCALE.with(|cell| {
+        let guard = cell.borrow();
+        let snapshot = guard.as_ref()?;
+        Some(snapshot.get(key).cloned().unwrap_or_default())
+    })
 }
 
 /// Canonical English text for `key`, the transparent fallback used before any
 /// locale has been installed.
+///
+/// Resolves through the process-wide [`EN_CATALOG`] cache, so the fallback is a
+/// single hash lookup rather than a full catalog rebuild on every call.
 fn english_default(key: &str) -> String {
-    canonical_catalog()
-        .into_iter()
-        .find(|item| item.key == key)
-        .map(|item| item.english)
+    EN_CATALOG
+        .get(key)
+        .map(|entry| entry.english.clone())
         .unwrap_or_default()
 }
 
@@ -342,5 +391,7 @@ mod tests {
         assert_eq!(active_t("tab.repl"), "Разраб");
         assert_eq!(active_t("modal.confirm"), "Confirm");
         assert_eq!(active_t("definitely.unknown.key"), "");
+        // Clean up after test to avoid bleeding into concurrent/subsequent tests
+        install_active_locale(&I18nEngine::english());
     }
 }

@@ -1,7 +1,8 @@
 use std::time::{Duration, Instant};
 
 use ratatui::text::Line;
-use tauqe_protocol::{ModelRef, ModelResult, ModelUsageEvent};
+use tauqe_protocol::model::UsageTotalsSnapshot;
+use tauqe_protocol::{ModelRef, ModelResult};
 
 use crate::i18n::active_t;
 
@@ -204,10 +205,12 @@ pub struct ReplView {
     pub theme_mode: crate::config::ThemeMode,
     pub text: String,
     pub markdown_lines: Vec<Line<'static>>,
-    pub usage: Option<ModelUsageEvent>,
-    pub prev_cost: Option<f64>,
-    pub current_cost: Option<f64>,
-    pub session_total_cost: f64,
+    /// Authoritative usage snapshot mirrored from `model/usageTotals`.
+    ///
+    /// The daemon is the single accumulator of tokens, money, and time, so the
+    /// view stores the reported snapshot verbatim instead of folding counters
+    /// locally (c-1, c-2).
+    pub usage_totals: UsageTotalsSnapshot,
     pub status: TurnStatus,
     pub error: Option<String>,
     pub result: Option<ModelResult>,
@@ -260,10 +263,7 @@ impl Default for ReplView {
             theme_mode: crate::config::ThemeMode::default(),
             text: String::new(),
             markdown_lines: Vec::new(),
-            usage: None,
-            prev_cost: None,
-            current_cost: None,
-            session_total_cost: 0.0,
+            usage_totals: UsageTotalsSnapshot::default(),
             status: TurnStatus::default(),
             error: None,
             result: None,
@@ -545,6 +545,15 @@ impl ReplView {
 
     pub fn is_busy(&self) -> bool {
         self.status.is_busy()
+    }
+
+    /// Closes the in-flight usage window when a turn reaches a terminal status.
+    ///
+    /// The daemon owns accumulation and publishes the flushed snapshot, so this
+    /// only drops a window a cancelled or failed turn left open; without it the
+    /// footer would keep presenting a finished operation as still running (c-1).
+    pub fn end_in_flight_usage(&mut self) {
+        self.usage_totals.cur = None;
     }
 }
 

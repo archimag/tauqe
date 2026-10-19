@@ -221,13 +221,26 @@ fn render_header_with_engine(
     // The squash button advertises the portable C-S / M-S chord, following the
     // configured primary modifier instead of the former F6 hardware key.
     let squash_hint = format!("{}S", state.tui_config.input.primary_modifier.emacs_prefix());
+    // Button labels resolve through the locale catalog, so a hot-swapped
+    // language relabels the header actions instead of leaving the English
+    // literals behind (Conventions §9, c-1).
+    let squash_label = state.i18n.t("header.squash").to_string();
+    let help_label = state.i18n.t("header.help").to_string();
     let (max_model_len, squash_text, help_text): (usize, String, String) =
         if inner_header_width >= 125 {
-            (20, format!(" [{} Squash] ", squash_hint), format!(" [{}] Help ", help_hint))
+            (
+                20,
+                format!(" [{} {}] ", squash_hint, squash_label),
+                format!(" [{}] {} ", help_hint, help_label),
+            )
         } else if inner_header_width >= 95 {
-            (12, format!(" [{} Squash] ", squash_hint), format!(" [{}] Help ", help_hint))
+            (
+                12,
+                format!(" [{} {}] ", squash_hint, squash_label),
+                format!(" [{}] {} ", help_hint, help_label),
+            )
         } else if inner_header_width >= 75 {
-            (8, format!(" [{}] ", squash_hint), format!(" [{}] Help ", help_hint))
+            (8, format!(" [{}] ", squash_hint), format!(" [{}] {} ", help_hint, help_label))
         } else {
             (6, format!(" [{}] ", squash_hint), format!(" [{}] ", help_hint))
         };
@@ -368,7 +381,7 @@ fn render_header_with_engine(
             .and_then(|n| n.to_str())
             .unwrap_or(&repo.root)
             .to_string(),
-        None => "no repository".to_string(),
+        None => state.i18n.t("header.no_repository").to_string(),
     };
 
     let mut left_items: Vec<(Span, Option<ClickTarget>)> = Vec::new();
@@ -533,10 +546,13 @@ mod tests {
             batch_cancel_button: crate::app::BatchCancelButton::Continue,
             batch_stopping: false,
             confirm_detach_focus: false,
+            confirm_clear_horizon: None,
+            confirm_clear_horizon_final: None,
             confirm_clear_history: false,
             confirm_delete_plan: None,
             confirm_delete_review: None,
             confirm_execute_scope: None,
+            confirm_execute_pipeline: None,
             confirm_execute_review: None,
             confirm_button: crate::app::ConfirmDialogButton::Cancel,
             selection_dialog: None,
@@ -560,6 +576,7 @@ mod tests {
             theme_selector: None,
             i18n: crate::i18n::I18nEngine::english(),
             locale_dialog: None,
+            usage_summary: None,
         }
     }
 
@@ -710,6 +727,48 @@ mod tests {
                 "localized tab label must render at width {w}"
             );
         }
+    }
+
+    /// A customized locale must reach the header action buttons and the
+    /// no-repository placeholder; the English literals must never render in
+    /// their place (Conventions §9, c-1).
+    #[test]
+    fn test_header_actions_and_placeholder_follow_custom_locale() {
+        let mut translations = std::collections::BTreeMap::new();
+        for (key, value) in [
+            ("tab.repl", "Разраб"),
+            ("header.squash", "Сквиш"),
+            ("header.help", "Справка"),
+            ("header.no_repository", "нет репозитория"),
+        ] {
+            translations.insert(key.to_string(), value.to_string());
+        }
+
+        let backend = TestBackend::new(160, 3);
+        let mut terminal = Terminal::new(backend).expect("terminal created");
+        let mut state = test_app_state();
+        state.repo_state = None;
+        state.i18n = crate::i18n::I18nEngine::new(Some(crate::i18n::CustomLocale::new(
+            "Russian",
+            translations,
+        )));
+
+        terminal
+            .draw(|frame| render_header(frame, &mut state, frame.area()))
+            .expect("localized draw succeeded");
+
+        let row = header_row_text(&terminal, state.header_clicks.row);
+        assert!(row.contains("Сквиш"), "squash label must be localized: {row}");
+        assert!(row.contains("Справка"), "help label must be localized: {row}");
+        assert!(
+            row.contains("нет репозитория"),
+            "repository placeholder must be localized: {row}"
+        );
+        assert!(
+            !row.contains("Squash") && !row.contains("Help"),
+            "english action literals must not render: {row}"
+        );
+        assert_ranges_within_bounds(&state, 160);
     }
 
     #[test]

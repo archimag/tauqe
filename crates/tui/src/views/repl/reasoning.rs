@@ -165,7 +165,7 @@ impl ReasoningState {
                 reasoning_badge,
                 Span::raw(" "),
                 Span::styled(
-                    "▶ Thinking hidden",
+                    format!("▶ {}", crate::i18n::active_t("repl.thinking_hidden")),
                     engine.fg(palette.text_muted).bold(),
                 ),
             ]));
@@ -177,7 +177,12 @@ impl ReasoningState {
                 reasoning_badge,
                 Span::raw(" "),
                 Span::styled(
-                    format!("Thinking… ({} lines)", self.total_lines()),
+                    format!(
+                        "{} {}",
+                        crate::i18n::active_t("repl.thinking_streaming"),
+                        crate::i18n::active_t("repl.thinking_lines")
+                            .replacen("{}", &self.total_lines().to_string(), 1),
+                    ),
                     engine.fg(palette.status_info).bold(),
                 ),
             ]));
@@ -190,7 +195,10 @@ impl ReasoningState {
             lines.push(Line::from(vec![
                 reasoning_badge,
                 Span::raw(" "),
-                Span::styled("Thinking", engine.fg(palette.status_info).bold()),
+                Span::styled(
+                    crate::i18n::active_t("repl.thinking"),
+                    engine.fg(palette.status_info).bold(),
+                ),
             ]));
 
             if !self.lines.is_empty() {
@@ -204,5 +212,69 @@ impl ReasoningState {
         }
 
         lines
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rendered_text(state: &ReasoningState) -> String {
+        state
+            .render_lines()
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.to_string())
+            .collect::<Vec<_>>()
+            .join("")
+    }
+
+    #[test]
+    fn test_streaming_reasoning_badge_is_localized() {
+        let mut state = ReasoningState::new();
+        state.append_delta("first line\nsecond line\n");
+
+        let rendered = rendered_text(&state);
+        assert!(
+            rendered.contains("Thinking (streaming)..."),
+            "streaming badge must render the localized label, got: {rendered}"
+        );
+        assert!(
+            rendered.contains("(2 lines)"),
+            "streaming badge must render the localized line counter, got: {rendered}"
+        );
+    }
+
+    #[test]
+    fn test_hidden_reasoning_badge_is_localized() {
+        let mut state = ReasoningState::new();
+        state.append_delta("folded reasoning");
+        state.show = false;
+
+        let rendered = rendered_text(&state);
+        assert!(
+            rendered.contains("Thinking (hidden)"),
+            "folded badge must render the localized label, got: {rendered}"
+        );
+    }
+
+    #[test]
+    fn test_settled_reasoning_badge_is_localized() {
+        let mut state = ReasoningState::new();
+        state.append_delta("settled reasoning");
+        state.finalize();
+
+        let collapsed = rendered_text(&state);
+        assert!(
+            collapsed.contains("Thinking (hidden)"),
+            "a settled stream folds its transcript, got: {collapsed}"
+        );
+
+        state.show = true;
+        let expanded = rendered_text(&state);
+        assert!(
+            expanded.contains("Thinking..."),
+            "settled badge must render the localized label, got: {expanded}"
+        );
     }
 }

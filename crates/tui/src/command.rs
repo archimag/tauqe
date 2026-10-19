@@ -68,10 +68,11 @@ impl KeyChord {
                     && lenient_code(expected, key.code)
             }
             KeyChord::Shift(expected) => {
-                key.modifiers.contains(KeyModifiers::SHIFT)
-                    && !ctrl
+                !ctrl
                     && !alt
-                    && lenient_code(expected, key.code)
+                    && (key.modifiers.contains(KeyModifiers::SHIFT)
+                        || matches!(key.code, KeyCode::BackTab))
+                    && shift_code(expected, key.code)
             }
             KeyChord::Ctrl(expected) => ctrl && !alt && lenient_code(expected, key.code),
             KeyChord::Alt(expected) => alt && !ctrl && lenient_code(expected, key.code),
@@ -106,14 +107,51 @@ impl KeyChord {
 
 /// Matches a bare structural-navigation key.
 ///
-/// A character code already encodes its Shift state, so the exact character is
-/// the whole test (`c` and `C` are distinct bindings). Navigation keys carry
-/// Shift meaningfully, so a bare navigation key never matches while Shift is
-/// held, leaving `Shift` chords unambiguous.
+/// A bare character is selected by its exact case, but a terminal reports the
+/// Shift state of a letter inconsistently: a lowercase character pressed with
+/// `Shift` arrives either as the uppercase character alone or as the lowercase
+/// character carrying the `SHIFT` modifier. Both spellings must reach the same
+/// binding and never bleed into the sibling case, so the two letter cases are
+/// matched deliberately:
+///
+/// - a lowercase expectation (`c`) matches only the lowercase character without
+///   `Shift`, so the destructive `Shift+C` chord can never be captured by the
+///   copy binding;
+/// - an uppercase expectation (`C`) matches the uppercase character with or
+///   without `Shift`, and the lowercase character carrying `Shift`, so the
+///   destructive chord stays reachable on every terminal.
+///
+/// Symbols, digits, and dedicated navigation keys keep the exact-code test, and
+/// a navigation key never matches while `Shift` is held, leaving `Shift` chords
+/// unambiguous.
 fn bare_code(expected: KeyCode, key: KeyEvent) -> bool {
+    let shift = key.modifiers.contains(KeyModifiers::SHIFT);
     match expected {
+        KeyCode::Char(expected_char) if expected_char.is_ascii_lowercase() => {
+            !shift && matches!(key.code, KeyCode::Char(actual) if actual == expected_char)
+        }
+        KeyCode::Char(expected_char) if expected_char.is_ascii_uppercase() => match key.code {
+            KeyCode::Char(actual) => {
+                actual.eq_ignore_ascii_case(&expected_char)
+                    && (shift || actual.is_ascii_uppercase())
+            }
+            _ => false,
+        },
         KeyCode::Char(_) => expected == key.code,
-        _ => !key.modifiers.contains(KeyModifiers::SHIFT) && expected == key.code,
+        _ => !shift && expected == key.code,
+    }
+}
+
+/// Compares key codes for an explicit `Shift` chord.
+///
+/// `Shift+Tab` reaches the application in two spellings: the dedicated
+/// `BackTab` code of enhanced keyboards and the plain `Tab` code carrying the
+/// `SHIFT` modifier. Both name the same intent, so the chord matches either one
+/// and reverse motion is never lost on a modern terminal.
+fn shift_code(expected: KeyCode, actual: KeyCode) -> bool {
+    match (expected, actual) {
+        (KeyCode::Tab, KeyCode::BackTab) | (KeyCode::BackTab, KeyCode::Tab) => true,
+        (expected, actual) => lenient_code(expected, actual),
     }
 }
 
@@ -373,6 +411,23 @@ mod tests {
             &input,
             false
         ));
+    }
+
+    #[test]
+    fn shift_chord_accepts_the_backtab_spelling_of_shift_tab() {
+        let input = ctrl_primary();
+
+        // An enhanced keyboard reports `Shift+Tab` as the dedicated `BackTab`
+        // code, and some terminals omit the `SHIFT` modifier with it. Both
+        // spellings must resolve to the same action.
+        let chord = KeyChord::Shift(KeyCode::Tab);
+        assert!(chord.matches(key(KeyCode::BackTab, KeyModifiers::SHIFT), &input, false));
+        assert!(chord.matches(key(KeyCode::BackTab, KeyModifiers::NONE), &input, false));
+        assert!(!chord.matches(key(KeyCode::Tab, KeyModifiers::NONE), &input, false));
+
+        let backtab_chord = KeyChord::Shift(KeyCode::BackTab);
+        assert!(backtab_chord.matches(key(KeyCode::Tab, KeyModifiers::SHIFT), &input, false));
+        assert!(backtab_chord.matches(key(KeyCode::BackTab, KeyModifiers::NONE), &input, false));
     }
 
     #[test]
@@ -648,6 +703,48 @@ mod tests {
         assert_every_command_is_described(&REVIEW_COMMAND_MAP, "REVIEW_COMMAND_MAP");
     }
 
+    /// Asserts every command description key is registered in the canonical
+    /// catalog.
+    ///
+    /// The command maps now carry localization keys instead of raw English
+    /// literals, so a key that is missing from the catalog would render an
+    /// empty Help description at runtime. Iterating all eight maps against the
+    /// catalog turns that silent drift into a deterministic test failure
+    /// (Conventions §3, §9).
+    #[test]
+    fn every_command_description_key_exists_in_canonical_catalog() {
+        use crate::i18n::catalog::canonical_catalog;
+        use std::collections::HashSet;
+
+        let catalog: HashSet<String> = canonical_catalog()
+            .into_iter()
+            .map(|item| item.key)
+            .collect();
+
+        fn assert_keys<A: 'static>(
+            map: &CommandMap<A>,
+            catalog: &HashSet<String>,
+            label: &str,
+        ) {
+            for spec in map.specs() {
+                assert!(
+                    catalog.contains(spec.description_key),
+                    "{label}: description key '{}' is missing from the canonical catalog",
+                    spec.description_key
+                );
+            }
+        }
+
+        assert_keys(&GLOBAL_COMMAND_MAP, &catalog, "GLOBAL_COMMAND_MAP");
+        assert_keys(&EDITOR_COMMAND_MAP, &catalog, "EDITOR_COMMAND_MAP");
+        assert_keys(&DIALOG_COMMAND_MAP, &catalog, "DIALOG_COMMAND_MAP");
+        assert_keys(&CONTEXT_COMMAND_MAP, &catalog, "CONTEXT_COMMAND_MAP");
+        assert_keys(&HISTORY_COMMAND_MAP, &catalog, "HISTORY_COMMAND_MAP");
+        assert_keys(&PLANS_COMMAND_MAP, &catalog, "PLANS_COMMAND_MAP");
+        assert_keys(&REPL_COMMAND_MAP, &catalog, "REPL_COMMAND_MAP");
+        assert_keys(&REVIEW_COMMAND_MAP, &catalog, "REVIEW_COMMAND_MAP");
+    }
+
     #[test]
     fn abstract_modifiers_follow_the_configured_primary_and_meta() {
         assert_map_follows_both_configurations(&GLOBAL_COMMAND_MAP, "GLOBAL_COMMAND_MAP");
@@ -795,5 +892,113 @@ mod tests {
             Some(ContextAction::Refresh),
             "Context: g must refresh"
         );
+    }
+
+    // --- Exhaustive key-event collision detector (c-2) ---
+
+    /// Builds the exhaustive matrix of physical key events a terminal can
+    /// report: every printable ASCII character and every dedicated navigation
+    /// key, each crossed with the `None`, `Shift`, `Ctrl`, and `Alt` modifier
+    /// states.
+    ///
+    /// The matrix deliberately includes both spellings a terminal uses for a
+    /// shifted letter — the uppercase character alone and the lowercase
+    /// character carrying `SHIFT` — so the discriminator between a bare `c` and
+    /// the destructive `Shift+C` is exercised rather than assumed (c-1, c-2).
+    fn key_event_matrix() -> Vec<(KeyCode, KeyModifiers)> {
+        let modifiers = [
+            KeyModifiers::NONE,
+            KeyModifiers::SHIFT,
+            KeyModifiers::CONTROL,
+            KeyModifiers::ALT,
+        ];
+        let mut events = Vec::new();
+        for byte in 0x20u8..=0x7e {
+            let character = byte as char;
+            for modifier in modifiers {
+                events.push((KeyCode::Char(character), modifier));
+            }
+        }
+        let navigation = [
+            KeyCode::Enter,
+            KeyCode::Tab,
+            KeyCode::BackTab,
+            KeyCode::Esc,
+            KeyCode::Backspace,
+            KeyCode::Delete,
+            KeyCode::Insert,
+            KeyCode::Left,
+            KeyCode::Right,
+            KeyCode::Up,
+            KeyCode::Down,
+            KeyCode::Home,
+            KeyCode::End,
+            KeyCode::PageUp,
+            KeyCode::PageDown,
+        ];
+        for code in navigation {
+            for modifier in modifiers {
+                events.push((code, modifier));
+            }
+        }
+        events
+    }
+
+    /// Asserts that no single key event is claimed by two commands with
+    /// different actions.
+    ///
+    /// Comparing chords for equality is insufficient: distinct [`KeyChord`]
+    /// variants (`Bare`, `Shift`, `Primary`, `Meta`, `Ctrl`, `Alt`) can match the
+    /// same physical [`KeyEvent`]. The detector resolves the full event matrix
+    /// against every specification and fails when two specs with different
+    /// actions both match, which is exactly the ambiguity that makes a command
+    /// map order-dependent and lets one key silently shadow another (c-2).
+    fn assert_no_key_event_collisions<A>(
+        map: &CommandMap<A>,
+        input: &InputConfig,
+        label: &str,
+    ) where
+        A: Copy + PartialEq + std::fmt::Debug + 'static,
+    {
+        for (code, modifiers) in key_event_matrix() {
+            let mut claimed: Option<&'static CommandSpec<A>> = None;
+            for spec in map.specs() {
+                if !spec.chord.matches(KeyEvent::new(code, modifiers), input, false) {
+                    continue;
+                }
+                match claimed {
+                    None => claimed = Some(spec),
+                    Some(existing) if existing.action == spec.action => {}
+                    Some(existing) => panic!(
+                        "{label}: key event {code:?} with modifiers {modifiers:?} is \
+                         ambiguous: claimed by {:?} (chord {:?}) and {:?} (chord {:?})",
+                        existing.action, existing.chord, spec.action, spec.chord,
+                    ),
+                }
+            }
+        }
+    }
+
+    /// Proves every registered command map is deterministic over the physical
+    /// keyboard, so the order of declaration can never change which action a key
+    /// resolves to (c-2).
+    ///
+    /// The maps are authored against the canonical modifier assignment (`C-` on
+    /// `Ctrl`, `M-` on `Alt`); resolving the event matrix under that assignment
+    /// turns `Primary` into `Ctrl` and `Meta` into `Alt`, so the abstract chords
+    /// are covered by the physical `Ctrl` and `Alt` modifier states of the
+    /// matrix without overloading the raw navigation chords.
+    #[test]
+    fn no_key_event_collisions_across_all_command_maps() {
+        let input = ctrl_primary();
+
+        assert_no_key_event_collisions(&GLOBAL_COMMAND_MAP, &input, "GLOBAL_COMMAND_MAP");
+        assert_no_key_event_collisions(&EDITOR_COMMAND_MAP, &input, "EDITOR_COMMAND_MAP");
+        assert_no_key_event_collisions(&DIALOG_COMMAND_MAP, &input, "DIALOG_COMMAND_MAP");
+        assert_no_key_event_collisions(&CONTEXT_COMMAND_MAP, &input, "CONTEXT_COMMAND_MAP");
+        assert_no_key_event_collisions(&HISTORY_COMMAND_MAP, &input, "HISTORY_COMMAND_MAP");
+        assert_no_key_event_collisions(&PLANS_COMMAND_MAP, &input, "PLANS_COMMAND_MAP");
+        assert_no_key_event_collisions(&REPL_COMMAND_MAP, &input, "REPL_COMMAND_MAP");
+        assert_no_key_event_collisions(&REVIEW_COMMAND_MAP, &input, "REVIEW_COMMAND_MAP");
     }
 }

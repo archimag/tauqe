@@ -7,8 +7,9 @@ use tauqe_core::providers::StreamEvent;
 use tauqe_core::workflow::batch::{BatchExecution, BatchStep, BatchStop};
 use tauqe_protocol::{
     errors, events, BatchFinishStatus, BatchFinishSummary, PlanBatchFinishedEvent,
-    PlanExecuteParams, PlanItemStatus, PlanRefineParams, PlanRefineResult, PlanReplanParams,
-    PlanScopeEvaluation, Request, Response, TurnPhase, TurnPhaseEvent,
+    PlanExecuteParams, PlanExecutePipelineParams, PlanItemStatus, PlanRefineParams,
+    PlanRefineResult, PlanReplanParams, PlanScopeEvaluation, Request, Response, TurnPhase,
+    TurnPhaseEvent,
 };
 use tokio::sync::mpsc;
 
@@ -42,6 +43,70 @@ pub(super) enum BatchOutcome {
     },
 }
 
+/// Emits the single terminal `plan/batch_finished` event for a batch run.
+///
+/// Every batched turn — including JIT horizon synthesis and the plan pipeline —
+/// funnels its terminal state through this emitter, so a client that opened a
+/// batch-mode turn always receives exactly one finish notification carrying the
+/// aggregate status, step counters, elapsed time, and optional error.
+pub(super) fn emit_plan_batch_finished(
+    state: &Arc<AppState>,
+    owner_id: &str,
+    status: BatchFinishStatus,
+    executed_count: usize,
+    total_count: usize,
+    elapsed: std::time::Duration,
+    error: Option<String>,
+) {
+    emit(
+        &state.out,
+        events::PLAN_BATCH_FINISHED,
+        serde_json::to_value(PlanBatchFinishedEvent {
+            operation_id: format!("op-{}", crate::state::next_operation_id()),
+            summary: BatchFinishSummary {
+                owner_id: owner_id.to_string(),
+                status,
+                executed_count,
+                total_count: total_count.max(executed_count),
+                elapsed_seconds: elapsed.as_secs(),
+                error,
+            },
+        })
+        .ok(),
+    );
+}
+
+/// Finalizes a batch that could not launch a single step and returns the
+/// matching terminal outcome.
+///
+/// A batch that fails before its first step — an unschedulable scope, an
+/// unreadable plan, or a failed just-in-time synthesis — still owes the client
+/// exactly one `plan/batch_finished` event. Producing the emitter call and the
+/// [`BatchOutcome`] together keeps every early exit consistent instead of
+/// duplicating the event payload at each of them.
+fn reject_batch(
+    state: &Arc<AppState>,
+    plan_id: &str,
+    started_at: std::time::Instant,
+    scheduled: usize,
+    reason: String,
+) -> BatchOutcome {
+    emit_plan_batch_finished(
+        state,
+        plan_id,
+        BatchFinishStatus::Failed,
+        0,
+        scheduled,
+        started_at.elapsed(),
+        Some(reason.clone()),
+    );
+    BatchOutcome::Failed {
+        completed: 0,
+        step_id: plan_id.to_string(),
+        reason,
+    }
+}
+
 /// Runs the plan steps through the core [`BatchExecution`] supervisor, which
 /// enforces ordered, fail-fast traversal. Steps completed before the first
 /// failure stay DONE. When a coder step reports a semantic block (`<blocked>`),
@@ -52,8 +117,23 @@ pub(super) enum BatchOutcome {
 pub(super) async fn run_plan_batch(
     state: &Arc<AppState>,
     plan_id: &str,
-    mut current_step_ids: Vec<String>,
+    step_ids: Vec<String>,
     operation: Arc<OperationGuard>,
+) -> BatchOutcome {
+    run_plan_batch_with(state, plan_id, step_ids, &operation).await
+}
+
+/// Runs one plan's scheduled steps while borrowing the caller's operation.
+///
+/// A pipeline queues several plans under a single registered operation, so the
+/// guard is borrowed instead of owned: the slot stays held for the whole queue
+/// and a cancel delivered between plans is honoured. Every other caller keeps
+/// owning its guard through [`run_plan_batch`].
+pub(super) async fn run_plan_batch_with(
+    state: &Arc<AppState>,
+    plan_id: &str,
+    mut current_step_ids: Vec<String>,
+    operation: &Arc<OperationGuard>,
 ) -> BatchOutcome {
     let repo_root = state.context.read().await.repo_root().to_path_buf();
     {
@@ -101,8 +181,138 @@ pub(super) async fn run_plan_batch(
         }
 
         if current_step_ids.is_empty() {
-            final_stop = BatchStop::Completed;
-            break;
+            // A plan that carries an architectural concept but no synthesized
+            // horizon has no leaf to schedule yet. The Architect projects the
+            // first horizon just-in-time, and the resulting leaves join this
+            // same supervisor loop instead of the batch finishing with an empty
+            // scope.
+            let load_root = repo_root.clone();
+            let load_plan_id = plan_id.to_string();
+            let plan = match offload_plan(move || {
+                PlanStorage::load_plan(&load_root, &load_plan_id)
+            })
+            .await
+            {
+                Ok(Some(plan)) => plan,
+                Ok(None) => {
+                    clear_auto_context(state).await;
+                    return reject_batch(
+                        state,
+                        plan_id,
+                        started_at,
+                        total_scheduled,
+                        format!("Plan '{}' not found", plan_id),
+                    );
+                }
+                Err(err) => {
+                    clear_auto_context(state).await;
+                    return reject_batch(state, plan_id, started_at, total_scheduled, err);
+                }
+            };
+
+            if plan.items.is_empty() && !plan.concept.is_empty() {
+                tracing::info!(
+                    plan_id = plan_id,
+                    "plan carries no synthesized horizon; projecting it just-in-time"
+                );
+
+                let res = execute_plan_horizon_synthesis(
+                    tauqe_protocol::RequestId::Null,
+                    state,
+                    plan,
+                    None,
+                    None,
+                    None,
+                    "Just-in-Time Plan Refinement",
+                    true,
+                    operation.as_ref(),
+                )
+                .await;
+
+                if *cancel_rx.borrow() {
+                    final_stop = BatchStop::Cancelled;
+                    break;
+                }
+
+                if let Some(err) = res.error {
+                    if err.code == errors::CANCELLED {
+                        final_stop = BatchStop::Cancelled;
+                        break;
+                    }
+                    clear_auto_context(state).await;
+                    return reject_batch(
+                        state,
+                        plan_id,
+                        started_at,
+                        total_scheduled,
+                        format!("Just-in-time plan refinement failed: {}", err.message),
+                    );
+                }
+
+                let refine_res = res
+                    .result
+                    .and_then(|v| serde_json::from_value::<PlanRefineResult>(v).ok());
+
+                match refine_res {
+                    Some(PlanRefineResult::Success {
+                        plan: synthesized, ..
+                    }) => match synthesized.evaluate_scope(None) {
+                        PlanScopeEvaluation::Ready(steps) => {
+                            current_step_ids = steps.into_iter().map(|s| s.id).collect();
+                            total_scheduled = current_step_ids.len();
+                            tracing::info!(
+                                plan_id = plan_id,
+                                steps = total_scheduled,
+                                "just-in-time horizon synthesized"
+                            );
+                            continue;
+                        }
+                        PlanScopeEvaluation::AllCompleted => {
+                            final_stop = BatchStop::Completed;
+                            break;
+                        }
+                        other => {
+                            let msg =
+                                format!("Just-in-time horizon cannot be executed: {:?}", other);
+                            clear_auto_context(state).await;
+                            return reject_batch(
+                                state,
+                                plan_id,
+                                started_at,
+                                total_scheduled,
+                                msg,
+                            );
+                        }
+                    },
+                    Some(PlanRefineResult::Blocked { reason }) => {
+                        clear_auto_context(state).await;
+                        return reject_batch(
+                            state,
+                            plan_id,
+                            started_at,
+                            total_scheduled,
+                            format!(
+                                "Architect reported blockers during just-in-time refinement: {}",
+                                reason
+                            ),
+                        );
+                    }
+                    None => {
+                        clear_auto_context(state).await;
+                        return reject_batch(
+                            state,
+                            plan_id,
+                            started_at,
+                            total_scheduled,
+                            "Just-in-time plan refinement returned an unrecognized result"
+                                .to_string(),
+                        );
+                    }
+                }
+            } else {
+                final_stop = BatchStop::Completed;
+                break;
+            }
         }
 
         let steps: Vec<BatchStep> = current_step_ids
@@ -115,7 +325,7 @@ pub(super) async fn run_plan_batch(
             repo_root: &repo_root,
             plan_id,
             batch_step_ids: &current_step_ids,
-            operation: &operation,
+            operation,
         };
 
         let report = BatchExecution::new()
@@ -221,7 +431,8 @@ pub(super) async fn run_plan_batch(
                         None,
                         None,
                         "Automated Plan Replanning",
-                        &operation,
+                        true,
+                        operation.as_ref(),
                     )
                     .await;
 
@@ -262,6 +473,7 @@ pub(super) async fn run_plan_batch(
                                         plan_id = plan_id,
                                         new_horizon_steps = current_step_ids.len(),
                                         replan_round = replans_count,
+                                        architect = ?updated_plan.architect,
                                         "automated replanning produced a new horizon"
                                     );
                                     continue;
@@ -393,21 +605,14 @@ pub(super) async fn run_plan_batch(
 
     clear_auto_context(state).await;
 
-    emit(
-        &state.out,
-        events::PLAN_BATCH_FINISHED,
-        serde_json::to_value(PlanBatchFinishedEvent {
-            operation_id: format!("op-{}", crate::state::next_operation_id()),
-            summary: BatchFinishSummary {
-                owner_id: plan_id.to_string(),
-                status,
-                executed_count: total_executed_count,
-                total_count: total_scheduled.max(total_executed_count),
-                elapsed_seconds: started_at.elapsed().as_secs(),
-                error,
-            },
-        })
-        .ok(),
+    emit_plan_batch_finished(
+        state,
+        plan_id,
+        status,
+        total_executed_count,
+        total_scheduled,
+        started_at.elapsed(),
+        error,
     );
 
     outcome
@@ -474,7 +679,15 @@ pub async fn handle_plan_execute(req: Request, state: &Arc<AppState>) -> Respons
             );
         }
         PlanScopeEvaluation::AllCompleted => {
-            return Response::err(req.id, errors::NOTHING_TO_EXECUTE, "All steps in this scope are already completed");
+            // A plan that carries an architectural concept but no synthesized
+            // horizon has no leaf to schedule yet: the batch projects the first
+            // horizon just-in-time, so the request is not rejected as a
+            // completed scope.
+            if plan.items.is_empty() && !plan.concept.is_empty() {
+                Vec::<tauqe_protocol::PlanItem>::new()
+            } else {
+                return Response::err(req.id, errors::NOTHING_TO_EXECUTE, "All steps in this scope are already completed");
+            }
         }
         PlanScopeEvaluation::Cancelled => {
             return Response::err(req.id, errors::STEP_CANCELLED, "Step is CANCELLED and cannot be executed");
@@ -661,6 +874,7 @@ pub async fn handle_plan_refine(req: Request, state: &Arc<AppState>) -> Response
         custom_model,
         instructions,
         "Deep Plan Refinement",
+        false,
         &operation,
     )
     .await
@@ -826,7 +1040,140 @@ pub async fn handle_plan_replan(req: Request, state: &Arc<AppState>) -> Response
         custom_model,
         instructions,
         "Plan Replanning",
+        false,
         &operation,
     )
     .await
+}
+
+/// Runs a queue of plans sequentially under one registered operation.
+///
+/// A pipeline is a super-batch: every plan is loaded and scheduled before the
+/// first turn starts, then the plans execute one after another while the
+/// operation slot stays held. A plan that carries only its architectural
+/// concept has no leaf to schedule yet, so the shared batch supervisor projects
+/// its first horizon just-in-time instead of skipping it.
+pub async fn handle_plan_execute_pipeline(req: Request, state: &Arc<AppState>) -> Response {
+    let params: PlanExecutePipelineParams =
+        match req.params.and_then(|p| serde_json::from_value(p).ok()) {
+            Some(params) => params,
+            None => {
+                return Response::err(
+                    req.id,
+                    errors::INVALID_PARAMS,
+                    "Missing or invalid plan execute pipeline params",
+                );
+            }
+        };
+
+    if params.plan_ids.is_empty() {
+        return Response::err(
+            req.id,
+            errors::INVALID_PARAMS,
+            "Pipeline must reference at least one plan",
+        );
+    }
+
+    let repo_root = state.context.read().await.repo_root().to_path_buf();
+
+    // Every plan is loaded and scheduled before the first turn starts, so an
+    // unknown or unschedulable plan rejects the whole pipeline instead of
+    // surfacing halfway through it.
+    let mut scheduled: Vec<(String, Vec<String>)> = Vec::new();
+    for plan_id in &params.plan_ids {
+        let load_root = repo_root.clone();
+        let load_plan_id = plan_id.clone();
+        let plan =
+            match offload_plan(move || PlanStorage::load_plan(&load_root, &load_plan_id)).await {
+                Ok(Some(plan)) => plan,
+                Ok(None) => {
+                    return Response::err(
+                        req.id,
+                        errors::NOT_FOUND,
+                        format!("Plan '{}' not found", plan_id),
+                    );
+                }
+                Err(err) => return Response::err(req.id, errors::PLAN_LOAD_FAILED, err),
+            };
+
+        let step_ids: Vec<String> = match plan.evaluate_scope(None) {
+            PlanScopeEvaluation::Ready(steps) => steps.into_iter().map(|step| step.id).collect(),
+            PlanScopeEvaluation::AllCompleted
+                if plan.items.is_empty() && !plan.concept.is_empty() =>
+            {
+                // Concept-only plan: the supervisor projects its horizon.
+                Vec::new()
+            }
+            PlanScopeEvaluation::AllCompleted => continue,
+            other => {
+                return Response::err(
+                    req.id,
+                    errors::STEP_BLOCKED,
+                    format!("Plan '{}' cannot be executed: {:?}", plan.id, other),
+                );
+            }
+        };
+
+        scheduled.push((plan.id, step_ids));
+    }
+
+    if scheduled.is_empty() {
+        return Response::err(
+            req.id,
+            errors::NOTHING_TO_EXECUTE,
+            "Every plan in the pipeline is already completed",
+        );
+    }
+
+    let operation = match state.try_begin_operation() {
+        Ok(guard) => Arc::new(guard),
+        Err(()) => {
+            return Response::err(
+                req.id,
+                errors::OPERATION_IN_PROGRESS,
+                "Another operation is already running",
+            );
+        }
+    };
+
+    // Pre-flight verification runs while the pipeline is already registered, so
+    // no competing mutation can slip in between verification and the first turn.
+    if let Err(report) = crate::handlers::run_preflight_verification(&repo_root).await {
+        let message = format!(
+            "Pre-flight verification failed: the repository does not build cleanly. Pipeline execution was blocked before starting any plan.\n\n{}",
+            report
+        );
+        return Response::err(req.id, errors::PREFLIGHT_VERIFICATION_FAILED, message);
+    }
+
+    // Execution hands control to the Coder role, so no discussion anchor
+    // survives into code generation.
+    state.clear_discussion_focus().await;
+
+    let plan_ids: Vec<String> = scheduled
+        .iter()
+        .map(|(plan_id, _)| plan_id.clone())
+        .collect();
+    let response = Response::ok(req.id, serde_json::json!({ "plan_ids": plan_ids }));
+
+    let state = Arc::clone(state);
+    tokio::spawn(async move {
+        for (plan_id, step_ids) in scheduled {
+            let outcome = run_plan_batch_with(&state, &plan_id, step_ids, &operation).await;
+            match outcome {
+                BatchOutcome::Completed { steps } => {
+                    tracing::info!("Pipeline plan '{}' completed: {} step(s)", plan_id, steps);
+                }
+                other => {
+                    // A failed, blocked, cancelled, or stopped plan ends the
+                    // queue: the later plans depend on the state it never
+                    // reached.
+                    tracing::warn!("Pipeline stopped at plan '{}': {:?}", plan_id, other);
+                    break;
+                }
+            }
+        }
+    });
+
+    response
 }

@@ -20,10 +20,10 @@ models = [
 # Every entry accepts either a bare model string ("~provider/model") or a table
 # ({ model = "...", effort = "high", alias = "Alias" }). An optional `alias`
 # replaces the raw model name in the model picker; `effort` sets the reasoning
-# depth ("low", "medium", "high", "xhigh") for that entry.
+# depth ("low", "medium", "high", "xhigh", "max") for that entry.
 primary = [
-  { model = "~google/gemini-flash-latest", alias = "Gemini Flash" },
-  "~deepseek/deepseek-flash-latest",
+  { model = "~deepseek/deepseek-flash-latest", effort = "low" },
+  { model = "~google/gemini-flash-latest" },
 ]
 scribe = "~anthropic/claude-haiku-latest"    # history compaction, git squash commit messages, diff summarization
 # The coder list is the natural escalation ladder (level up): on verification
@@ -31,18 +31,18 @@ scribe = "~anthropic/claude-haiku-latest"    # history compaction, git squash co
 # saturating on the last one. Escalation stays strictly within the Coder role and
 # never switches to Architect, preserving the What vs How role isolation.
 coder = [
-  "~deepseek/deepseek-flash-latest",
-  { model = "~google/gemini-flash-latest", effort = "medium" },
+  { model = "~deepseek/deepseek-flash-latest", effort = "high" },
+  { model = "~deepseek/deepseek-flash-latest", effort = "max" },
 ]
 architect = [
-  { model = "~google/gemini-flash-latest", effort = "high", alias = "Gemini Flash" },
-  { model = "google/gemini-4-argon", alias = "Gemini Argon" },
-  { model = "~anthropic/claude-sonnet-latest", alias = "Sonnet" }
+  { model = "~deepseek/deepseek-flash-latest", effort = "max" },
+  { model = "~google/gemini-flash-latest", effort = "high" },
+  "google/gemini-4-argon",
 ]    # conceptual design, plan refinement, blocked-step replanning
 reviewer = [
-  { model = "~google/gemini-flash-latest", effort = "high", alias = "Gemini Flash" },
+  { model = "~deepseek/deepseek-flash-latest", effort = "max" },
+  { model = "~google/gemini-flash-latest", effort = "high" },
   "google/gemini-4-argon",
-  { model = "~anthropic/claude-sonnet-latest", alias = "Sonnet" }
 ]   # automated code review of active context files
 
 # Automatically escalate the Coder along its ladder when verification healing stalls,

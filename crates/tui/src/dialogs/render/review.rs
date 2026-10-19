@@ -29,20 +29,6 @@ fn review_cancel_label() -> String {
 
 /// Height of the header block (summary and target metadata).
 const REVIEW_HEADER_HEIGHT: u16 = 6;
-/// Height of the footer block: the action bar (2 rows) plus the docked hint
-/// strip (1 row).
-const REVIEW_FOOTER_HEIGHT: u16 = 3;
-/// Minimum height kept for the instruction editor on short terminals.
-const REVIEW_EDITOR_MIN_HEIGHT: u16 = 3;
-/// Maximum reviewer rows drawn before the list scrolls.
-const REVIEW_MODEL_LIST_MAX_ROWS: u16 = 6;
-/// Height of the target-paths field: a single-line input inside a border.
-const REVIEW_PATH_HEIGHT: u16 = 3;
-
-/// Number of reviewer rows drawn for `entry_count` entries, before borders.
-fn review_model_list_rows(entry_count: usize) -> u16 {
-    (entry_count.max(1) as u16).min(REVIEW_MODEL_LIST_MAX_ROWS)
-}
 
 /// Rectangles of the review dialog, shared by the renderer and the mouse
 /// hit-tester so the surface that is drawn is the surface that is clicked
@@ -63,81 +49,31 @@ pub struct ReviewDialogGeometry {
     pub cancel_button: Rect,
 }
 
-/// Insets a rectangle by a one-cell border on every side.
-fn inset(area: Rect) -> Rect {
-    Rect::new(
-        area.x + 1,
-        area.y + 1,
-        area.width.saturating_sub(2),
-        area.height.saturating_sub(2),
-    )
-}
-
-/// Splits the dialog interior into
-/// `[header, reviewer list, path field, editor, buttons, footer]`.
-///
-/// The action bar, list, path field, and header are sized first so the dialog
-/// stays usable on short terminals; the instruction editor absorbs whatever
-/// height remains. The path field keeps its reserved single-line height and the
-/// header yields before it, so the target directory or glob stays visible. The
-/// footer block splits into the interactive action bar and a one-row docked
-/// hint strip pinned to the card's bottom edge.
-fn review_dialog_chunks(area: Rect, entry_count: usize) -> [Rect; 6] {
-    let inner = inset(area);
-
-    let footer_h = REVIEW_FOOTER_HEIGHT.min(inner.height);
-    let after_footer = inner.height - footer_h;
-
-    // The list never takes more than half of the room left after the footer, so
-    // the header and editors always keep space on short terminals.
-    let list_h = (review_model_list_rows(entry_count) + 2).min(after_footer / 2);
-    let after_list = after_footer - list_h;
-
-    let path_h = REVIEW_PATH_HEIGHT.min(after_list.saturating_sub(REVIEW_EDITOR_MIN_HEIGHT));
-    let after_path = after_list - path_h;
-
-    let header_h = REVIEW_HEADER_HEIGHT.min(after_path.saturating_sub(REVIEW_EDITOR_MIN_HEIGHT));
-    let editor_h = after_path - header_h;
-
-    let header = Rect::new(inner.x, inner.y, inner.width, header_h);
-    let list = Rect::new(inner.x, inner.y + header_h, inner.width, list_h);
-    let path = Rect::new(inner.x, list.y + list_h, inner.width, path_h);
-    let editor = Rect::new(inner.x, path.y + path_h, inner.width, editor_h);
-
-    // Split the footer into the action buttons and the docked hint strip so the
-    // hint reads as persistent chrome rather than a second row of buttons (c-1).
-    let docked_h = 1.min(footer_h);
-    let buttons_h = footer_h - docked_h;
-    let buttons = Rect::new(inner.x, editor.y + editor_h, inner.width, buttons_h);
-    let footer = Rect::new(inner.x, buttons.y + buttons_h, inner.width, docked_h);
-    [header, list, path, editor, buttons, footer]
-}
-
 /// Computes the dialog frame, the reviewer-row area, and the action buttons
 /// from the same layout the renderer uses.
 pub fn review_dialog_geometry(term: Rect, entry_count: usize) -> ReviewDialogGeometry {
     let area = centered_rect(REVIEW_DIALOG_WIDTH, REVIEW_DIALOG_HEIGHT, term);
-    let chunks = review_dialog_chunks(area, entry_count);
-    let model_rows = inset(chunks[1]);
-    let path_area = chunks[2];
-    let editor_area = chunks[3];
+    let chunks = super::picker_dialog_chunks(
+        area,
+        entry_count,
+        REVIEW_HEADER_HEIGHT,
+        super::PICKER_DIALOG_PATH_HEIGHT,
+    );
+    let model_rows = super::inset(chunks.list);
 
-    let buttons = chunks[4];
-    // Button widths are measured from the same localized labels the renderer
-    // draws, so hit-testing never desynchronizes from the drawing.
-    let confirm_w = review_confirm_label().chars().count() as u16;
-    let cancel_w = review_cancel_label().chars().count() as u16;
-    let gap = 4u16;
-    let total = confirm_w + gap + cancel_w;
-    let start_x = buttons.x + (buttons.width.saturating_sub(total)) / 2;
-    let confirm_button = Rect::new(start_x, buttons.y, confirm_w, 1);
-    let cancel_button = Rect::new(start_x + confirm_w + gap, buttons.y, cancel_w, 1);
+    // The button geometry is measured from the same localized labels the
+    // renderer draws, so hit-testing never desynchronizes from the drawing.
+    let (confirm_button, cancel_button) = super::picker_button_rects(
+        chunks.buttons,
+        &review_confirm_label(),
+        &review_cancel_label(),
+    );
 
     ReviewDialogGeometry {
         area,
         model_rows,
-        path_area,
-        editor_area,
+        path_area: chunks.path,
+        editor_area: chunks.editor,
         confirm_button,
         cancel_button,
     }
@@ -161,8 +97,19 @@ pub fn render_review_dialog(
         .style(Style::default().bg(engine.color(palette.surface)));
     frame.render_widget(outer_block, area);
 
-    let [header_area, list_area, path_area, editor_area, buttons_area, footer_area] =
-        review_dialog_chunks(area, entry_count);
+    let super::PickerDialogChunks {
+        header: header_area,
+        list: list_area,
+        path: path_area,
+        editor: editor_area,
+        buttons: buttons_area,
+        footer: footer_area,
+    } = super::picker_dialog_chunks(
+        area,
+        entry_count,
+        REVIEW_HEADER_HEIGHT,
+        super::PICKER_DIALOG_PATH_HEIGHT,
+    );
 
     let dim = engine.fg(palette.text_muted);
 
@@ -379,10 +326,22 @@ mod tests {
     fn test_review_dialog_chunks_reserve_path_field_between_list_and_editor() {
         let term = Rect::new(0, 0, 120, 40);
         let area = centered_rect(REVIEW_DIALOG_WIDTH, REVIEW_DIALOG_HEIGHT, term);
-        let [header, list, path, editor, buttons, footer] = review_dialog_chunks(area, 3);
+        let super::super::PickerDialogChunks {
+            header,
+            list,
+            path,
+            editor,
+            buttons,
+            footer,
+        } = super::super::picker_dialog_chunks(
+            area,
+            3,
+            REVIEW_HEADER_HEIGHT,
+            super::super::PICKER_DIALOG_PATH_HEIGHT,
+        );
 
         // The reserved single-line path field is fully visible on a normal terminal.
-        assert_eq!(path.height, REVIEW_PATH_HEIGHT);
+        assert_eq!(path.height, super::super::PICKER_DIALOG_PATH_HEIGHT);
 
         // The interior stacks top-to-bottom without gaps or overlap, and the
         // footer block ends in a one-row docked hint strip.

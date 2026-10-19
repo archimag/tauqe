@@ -1,8 +1,8 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::SystemTime;
-use tauqe_protocol::{Plan, PlanItem, PlanItemStatus};
+use tauqe_protocol::{ArchitectTier, Plan, PlanItem, PlanItemStatus};
 
 use super::PlanStorage;
 
@@ -67,17 +67,27 @@ impl PlanStorage {
     /// a dependency cycle is rejected before anything reaches disk, leaving the stored
     /// plan intact. Leaf-only file invariants and derived container statuses are
     /// normalized before the plan is persisted atomically.
+    ///
+    /// `architect` is the configuration that actually produced the synthesized
+    /// horizon. It is recorded on the plan so a later replanning wave can
+    /// reproduce or escalate that configuration instead of re-deriving one.
     pub fn replace_uncompleted_horizon(
         repo_root: &Path,
         plan_id: &str,
         new_horizon_items: Vec<PlanItem>,
+        architect: ArchitectTier,
     ) -> Result<Plan> {
         // The lock wait, the plan read, and the atomic rewrite of the synthesized
         // horizon run off the async executor thread, so a slow disk never stalls
         // the bounded turn, provider streaming, or RPC handling.
         crate::blocking::run_blocking(move || {
             let _guard = Self::lock();
-            Self::replace_uncompleted_horizon_unlocked(repo_root, plan_id, new_horizon_items)
+            Self::replace_uncompleted_horizon_unlocked(
+                repo_root,
+                plan_id,
+                new_horizon_items,
+                architect,
+            )
         })
     }
 
@@ -87,6 +97,7 @@ impl PlanStorage {
         repo_root: &Path,
         plan_id: &str,
         new_horizon_items: Vec<PlanItem>,
+        architect: ArchitectTier,
     ) -> Result<Plan> {
         let mut plan = match Self::load_plan_unlocked(repo_root, plan_id)? {
             Some(p) => p,
@@ -94,6 +105,9 @@ impl PlanStorage {
         };
 
         plan.items = merge_subplan(&plan.items, new_horizon_items)?;
+        // Planning is the "What" role's output, so the persisted plan records
+        // which Architect configuration produced this horizon.
+        plan.architect = Some(architect);
         plan.updated_at = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap_or_default()
@@ -101,6 +115,59 @@ impl PlanStorage {
 
         Self::save_plan_unlocked(repo_root, &plan)?;
         Ok(plan)
+    }
+
+    /// Clears the entire implementation horizon of a plan while preserving its
+    /// architectural concept.
+    ///
+    /// This is the explicit, user-authorized counterpart to
+    /// [`Self::replace_uncompleted_horizon`]: the developer discards the whole
+    /// step list so the remaining work can be reprojected from scratch, while the
+    /// "What" section survives intact. The operation removes `Done` steps too, so
+    /// it deliberately bypasses the `Done` immutability guard enforced by
+    /// [`Self::save_plan`]; the client is responsible for demanding the strict
+    /// two-tier confirmation documented on
+    /// [`Plan::has_started_or_completed_steps`] before dispatching it.
+    ///
+    /// Returns `None` when no stored plan carries the requested id.
+    pub fn clear_horizon(repo_root: &Path, plan_id: &str) -> Result<Option<Plan>> {
+        // The lock wait, the plan read, and the atomic rewrite of the cleared
+        // horizon run off the async executor thread, so a slow disk never stalls
+        // the bounded turn, provider streaming, or RPC handling.
+        crate::blocking::run_blocking(move || {
+            let _guard = Self::lock();
+            Self::clear_horizon_unlocked(repo_root, plan_id)
+        })
+    }
+
+    /// Lock-free core of [`Self::clear_horizon`]; the caller must hold the storage
+    /// lock.
+    fn clear_horizon_unlocked(repo_root: &Path, plan_id: &str) -> Result<Option<Plan>> {
+        let mut plan = match Self::load_plan_unlocked(repo_root, plan_id)? {
+            Some(p) => p,
+            None => return Ok(None),
+        };
+
+        plan.items.clear();
+        // The cleared horizon leaves no synthesized decomposition behind, so the
+        // Architect configuration recorded for it is dropped with it.
+        plan.architect = None;
+        plan.updated_at = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        // The write is inlined instead of going through `save_plan_unlocked`,
+        // because that path rejects the removal of a completed step, and clearing
+        // the horizon is exactly an authorized removal of every step.
+        let json =
+            serde_json::to_string_pretty(&plan).context("Failed to serialize plan to JSON")?;
+        let target_file = Self::find_plan_file_unlocked(repo_root, &plan.id).unwrap_or_else(|| {
+            Self::plans_dir(repo_root).join(format!("{}.json", Self::sanitize_id(&plan.id)))
+        });
+        super::write_atomic(&target_file, json.as_bytes())?;
+
+        Ok(Some(plan))
     }
 }
 
@@ -215,7 +282,13 @@ fn drop_done_collisions(items: Vec<PlanItem>, done_ids: &HashSet<String>) -> Vec
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tauqe_protocol::ModelRef;
     use tempfile::tempdir;
+
+    /// Architect provenance recorded by the synthesis primitive under test.
+    fn test_architect() -> ArchitectTier {
+        ArchitectTier::new(ModelRef::openrouter("test/architect"), None)
+    }
 
     #[test]
     fn test_merge_subplan_preserves_done_foundation_and_drops_collisions() {
@@ -309,8 +382,14 @@ mod tests {
             },
         ];
 
-        let updated =
-            PlanStorage::replace_uncompleted_horizon(root, "horizon-plan", new_horizon).unwrap();
+        let architect = test_architect();
+        let updated = PlanStorage::replace_uncompleted_horizon(
+            root,
+            "horizon-plan",
+            new_horizon,
+            architect.clone(),
+        )
+        .unwrap();
 
         assert_eq!(updated.items.len(), 3);
         assert_eq!(updated.items[0].id, "1");
@@ -319,6 +398,9 @@ mod tests {
         assert_eq!(updated.items[2].id, "4");
         // The superseded non-Done step is replaced by the synthesized horizon.
         assert!(updated.find_item("2").is_none());
+        // The Architect configuration that produced the horizon is recorded on
+        // the stored plan, so a later wave can reproduce or escalate it.
+        assert_eq!(updated.architect, Some(architect));
     }
 
     #[test]
@@ -340,8 +422,13 @@ mod tests {
             ..Default::default()
         }];
 
-        let updated =
-            PlanStorage::replace_uncompleted_horizon(root, "empty-plan", new_horizon).unwrap();
+        let updated = PlanStorage::replace_uncompleted_horizon(
+            root,
+            "empty-plan",
+            new_horizon,
+            test_architect(),
+        )
+        .unwrap();
         assert_eq!(updated.items.len(), 1);
         assert_eq!(updated.items[0].id, "1");
         assert_eq!(updated.items[0].status, PlanItemStatus::Todo);
@@ -381,8 +468,13 @@ mod tests {
             },
         ];
 
-        let updated =
-            PlanStorage::replace_uncompleted_horizon(root, "collision-plan", new_horizon).unwrap();
+        let updated = PlanStorage::replace_uncompleted_horizon(
+            root,
+            "collision-plan",
+            new_horizon,
+            test_architect(),
+        )
+        .unwrap();
 
         assert_eq!(updated.items.len(), 2);
         // The completed step is preserved verbatim; the colliding horizon item is dropped.
@@ -431,8 +523,13 @@ mod tests {
             ..Default::default()
         }];
 
-        let updated =
-            PlanStorage::replace_uncompleted_horizon(root, "hoist-plan", new_horizon).unwrap();
+        let updated = PlanStorage::replace_uncompleted_horizon(
+            root,
+            "hoist-plan",
+            new_horizon,
+            test_architect(),
+        )
+        .unwrap();
 
         // The completed leaf is hoisted out of the discarded container scaffold.
         assert_eq!(updated.items.len(), 2);
@@ -471,8 +568,13 @@ mod tests {
             },
         ];
 
-        let err = PlanStorage::replace_uncompleted_horizon(root, "cycle-plan", new_horizon)
-            .unwrap_err();
+        let err = PlanStorage::replace_uncompleted_horizon(
+            root,
+            "cycle-plan",
+            new_horizon,
+            test_architect(),
+        )
+        .unwrap_err();
         assert!(err
             .to_string()
             .contains("Dependency cycle detected in synthesized horizon"));
@@ -480,13 +582,107 @@ mod tests {
         // The rejected synthesis never touches the stored plan.
         let stored = PlanStorage::load_plan(root, "cycle-plan").unwrap().unwrap();
         assert!(stored.items.is_empty());
+        assert!(stored.architect.is_none());
     }
 
     #[test]
     fn test_replace_uncompleted_horizon_missing_plan_errors() {
         let dir = tempdir().unwrap();
-        let err = PlanStorage::replace_uncompleted_horizon(dir.path(), "ghost", Vec::new())
-            .unwrap_err();
+        let err =
+            PlanStorage::replace_uncompleted_horizon(dir.path(), "ghost", Vec::new(), test_architect())
+                .unwrap_err();
         assert!(err.to_string().contains("not found"));
+    }
+
+    #[test]
+    fn test_clear_horizon_removes_steps_and_keeps_concept() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+
+        let plan = Plan {
+            id: "clear-plan".to_string(),
+            title: "Clear Plan".to_string(),
+            updated_at: 10,
+            architect: Some(test_architect()),
+            concept: vec![tauqe_protocol::ConceptItem {
+                id: "c-1".to_string(),
+                title: "Invariant".to_string(),
+                details: None,
+                children: vec![],
+            }],
+            items: vec![PlanItem {
+                id: "1".to_string(),
+                title: "Pending step".to_string(),
+                status: PlanItemStatus::Todo,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        PlanStorage::save_plan(root, &plan).unwrap();
+
+        let cleared = PlanStorage::clear_horizon(root, "clear-plan")
+            .unwrap()
+            .unwrap();
+
+        // The "What" section and the plan identity survive the cleared horizon.
+        assert_eq!(cleared.id, "clear-plan");
+        assert_eq!(cleared.concept.len(), 1);
+        assert_eq!(cleared.concept[0].id, "c-1");
+        assert!(cleared.items.is_empty());
+        // The synthesized decomposition is gone, so its Architect provenance is
+        // gone with it.
+        assert!(cleared.architect.is_none());
+        assert!(cleared.updated_at >= 10);
+
+        // The persisted plan is the cleared one, not the previous state.
+        let stored = PlanStorage::load_plan(root, "clear-plan").unwrap().unwrap();
+        assert!(stored.items.is_empty());
+        assert_eq!(stored.concept.len(), 1);
+        assert!(stored.architect.is_none());
+    }
+
+    #[test]
+    fn test_clear_horizon_discards_completed_steps_despite_immutability_guard() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+
+        let plan = Plan {
+            id: "clear-done-plan".to_string(),
+            title: "Clear Done".to_string(),
+            items: vec![PlanItem {
+                id: "1".to_string(),
+                title: "Finished".to_string(),
+                status: PlanItemStatus::Done,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        PlanStorage::save_plan(root, &plan).unwrap();
+
+        // Saving the same plan without its completed step is rejected...
+        let truncated = Plan {
+            items: Vec::new(),
+            ..plan.clone()
+        };
+        assert!(PlanStorage::save_plan(root, &truncated).is_err());
+
+        // ...but clearing the horizon is the explicit, user-authorized removal.
+        let cleared = PlanStorage::clear_horizon(root, "clear-done-plan")
+            .unwrap()
+            .unwrap();
+        assert!(cleared.items.is_empty());
+        assert!(PlanStorage::load_plan(root, "clear-done-plan")
+            .unwrap()
+            .unwrap()
+            .items
+            .is_empty());
+    }
+
+    #[test]
+    fn test_clear_horizon_missing_plan_returns_none() {
+        let dir = tempdir().unwrap();
+        assert!(PlanStorage::clear_horizon(dir.path(), "ghost")
+            .unwrap()
+            .is_none());
     }
 }

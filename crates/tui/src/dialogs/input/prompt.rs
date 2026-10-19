@@ -101,7 +101,7 @@ pub(crate) async fn submit_prompt_modal(
 ) -> anyhow::Result<Option<InputResult>> {
     let user_comment = dialog.prompt_editor.get_text().trim().to_string();
     if user_comment.is_empty() {
-        st.notify_warning("Comment is empty");
+        st.notify_warning(crate::i18n::active_t("notify.comment_empty"));
         st.prompt_modal = Some(dialog);
         return Ok(Some(InputResult::Continue));
     }

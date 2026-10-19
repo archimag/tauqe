@@ -72,8 +72,9 @@ impl Task for EditLoop {
     async fn execute(&self, env: &mut TaskEnv<'_>) -> anyhow::Result<FsmTurnOutcome> {
         // Session bookkeeping runs once for the whole task so retried attempts
         // never duplicate the user prompt in history or re-run compaction.
-        let session_turn = begin_session_turn(
+        let turn_id = begin_session_turn(
             &self.prompt,
+            env.intent,
             env.context,
             env.history,
             env.provider,
@@ -83,11 +84,11 @@ impl Task for EditLoop {
         .await;
 
         let res = async {
-            let mut output =
-                run_task_turn_body(&self.prompt, session_turn.is_isolated_step, env).await?;
+            let mut output = run_task_turn_body(&self.prompt, env).await?;
 
             let mut attempt = 0;
             while !output.is_cancelled
+                && output.skip_reason.is_none()
                 && !has_valid_edits(&output.result)
                 && attempt < env.options.max_retries
             {
@@ -102,8 +103,7 @@ impl Task for EditLoop {
                     .await;
 
                 let retry_prompt = build_edit_retry_prompt(None);
-                let next =
-                    run_task_turn_body(&retry_prompt, session_turn.is_isolated_step, env).await?;
+                let next = run_task_turn_body(&retry_prompt, env).await?;
                 let cancelled = next.is_cancelled;
                 merge_output(&mut output, next, &banner);
                 if cancelled {
@@ -117,7 +117,7 @@ impl Task for EditLoop {
         match res {
             Ok(output) => {
                 if output.is_cancelled {
-                    if let Some(id) = session_turn.turn_id {
+                    if let Some(id) = turn_id {
                         let _ = env.history.rollback_entry(id);
                     }
                 } else {
@@ -126,7 +126,7 @@ impl Task for EditLoop {
                 Ok(output)
             }
             Err(err) => {
-                if let Some(id) = session_turn.turn_id {
+                if let Some(id) = turn_id {
                     let _ = env.history.rollback_entry(id);
                 }
                 Err(err)
@@ -142,6 +142,7 @@ impl Task for EditLoop {
 async fn run_task_turn(prompt: &str, env: &mut TaskEnv<'_>) -> anyhow::Result<FsmTurnOutcome> {
     run_fsm_turn(
         prompt,
+        env.intent,
         env.provider,
         env.model,
         env.context,
@@ -161,13 +162,10 @@ async fn run_task_turn(prompt: &str, env: &mut TaskEnv<'_>) -> anyhow::Result<Fs
 /// Used by tasks that issue several attempts within a single bounded turn; the
 /// caller performs the session bookkeeping once so retries never duplicate the
 /// user prompt or the response in history.
-async fn run_task_turn_body(
-    prompt: &str,
-    is_isolated_step: bool,
-    env: &mut TaskEnv<'_>,
-) -> anyhow::Result<FsmTurnOutcome> {
+async fn run_task_turn_body(prompt: &str, env: &mut TaskEnv<'_>) -> anyhow::Result<FsmTurnOutcome> {
     run_fsm_turn_body(
         prompt,
+        env.intent,
         env.provider,
         env.model,
         env.context,
@@ -178,7 +176,6 @@ async fn run_task_turn_body(
         env.stream_tx.clone(),
         env.cancel_rx.clone(),
         env.options,
-        is_isolated_step,
     )
     .await
 }
@@ -216,6 +213,7 @@ fn merge_output(target: &mut FsmTurnOutcome, next: FsmTurnOutcome, banner: &str)
     target.blocked = next.blocked;
     target.has_terminal_success = next.has_terminal_success;
     target.plan_saved = next.plan_saved;
+    target.skip_reason = next.skip_reason;
 }
 
 #[cfg(test)]
@@ -229,8 +227,8 @@ mod tests {
 
     use crate::context::ContextManager;
     use crate::history::HistoryManager;
-    use crate::providers::{ChatMessage, LlmProvider, ResponseFormat, StreamEvent};
     use crate::prompt::protocol::PromptProtocol;
+    use crate::providers::{ChatMessage, LlmProvider, ResponseFormat, StreamEvent};
     use crate::workflow::policy::DirectApplyPolicy;
     use crate::workflow::WorkflowOptions;
 
@@ -335,6 +333,7 @@ mod tests {
         let mut policy = DirectApplyPolicy::new();
 
         let mut env = TaskEnv {
+            intent: tauqe_protocol::TurnIntent::InteractiveRepl,
             provider: &provider,
             model: &model,
             context: &mut context,
@@ -374,6 +373,7 @@ mod tests {
         let mut policy = DirectApplyPolicy::new();
 
         let mut env = TaskEnv {
+            intent: tauqe_protocol::TurnIntent::InteractiveRepl,
             provider: &provider,
             model: &model,
             context: &mut context,
@@ -416,6 +416,7 @@ mod tests {
         let mut policy = DirectApplyPolicy::new();
 
         let mut env = TaskEnv {
+            intent: tauqe_protocol::TurnIntent::InteractiveRepl,
             provider: &provider,
             model: &model,
             context: &mut context,
@@ -466,6 +467,7 @@ mod tests {
         let mut policy = DirectApplyPolicy::new();
 
         let mut env = TaskEnv {
+            intent: tauqe_protocol::TurnIntent::InteractiveRepl,
             provider: &provider,
             model: &model,
             context: &mut context,

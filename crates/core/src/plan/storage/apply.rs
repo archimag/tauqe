@@ -147,6 +147,7 @@ impl PlanStorage {
                         description: tag.description.clone(),
                         created_at: now,
                         updated_at: now,
+                        architect: None,
                         concept: Vec::new(),
                         items: Vec::new(),
                     });
@@ -505,6 +506,7 @@ Step 1 is done:
             description: None,
             created_at: 1,
             updated_at: 1,
+            architect: None,
             concept: vec![],
             items: vec![PlanItem {
                 id: "1".to_string(),
@@ -597,6 +599,7 @@ Step 1 is done:
             description: Some("Desc".to_string()),
             created_at: 100,
             updated_at: 100,
+            architect: None,
             concept: vec![],
             items: vec![PlanItem {
                 id: "1".to_string(),

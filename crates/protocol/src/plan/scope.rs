@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 
 use super::item::{PlanItem, PlanItemStatus};
-use super::node::{compute_items_status, id_key, Plan};
+use super::node::{compute_direct_status, id_key, Plan};
 
 /// Evaluation result of a targeted plan execution scope.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -141,16 +141,24 @@ impl Plan {
         // status here keeps readiness independent of a possibly stale stored
         // value that was never refreshed in memory.
         fn collect_done(items: &[PlanItem], satisfied: &mut HashSet<String>) {
-            for item in items {
-                let is_done = if item.is_leaf() {
-                    item.status == PlanItemStatus::Done
+            // Post-order walk: a node's status is derived from the statuses its
+            // children return, so each subtree is scanned exactly once instead
+            // of re-running `compute_items_status` on every container.
+            fn walk(item: &PlanItem, satisfied: &mut HashSet<String>) -> PlanItemStatus {
+                let status = if item.is_leaf() {
+                    item.status
                 } else {
-                    compute_items_status(&item.children) == PlanItemStatus::Done
+                    compute_direct_status(
+                        item.children.iter().map(|child| walk(child, satisfied)),
+                    )
                 };
-                if is_done {
+                if status == PlanItemStatus::Done {
                     satisfied.insert(id_key(&item.id));
                 }
-                collect_done(&item.children, satisfied);
+                status
+            }
+            for item in items {
+                walk(item, satisfied);
             }
         }
         collect_done(&self.items, &mut satisfied);

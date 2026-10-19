@@ -457,7 +457,7 @@ pub fn render_markdown_with_blocks(
                     block_counter += 1;
                     let is_flashing = flashing_block_id == Some(id);
                     let start_line = out_lines.len();
-                    render_code_block(theme, &cb, &mut out_lines, false, id, is_flashing);
+                    render_code_block(theme, &cb, &mut out_lines, false, is_flashing);
                     let end_line = out_lines.len().saturating_sub(1);
                     extracted_blocks.push(ExtractedCodeBlock {
                         id,
@@ -698,7 +698,7 @@ pub fn render_markdown_with_blocks(
         let id = block_counter;
         let is_flashing = flashing_block_id == Some(id);
         let start_line = out_lines.len();
-        render_code_block(theme, &cb, &mut out_lines, true, id, is_flashing);
+        render_code_block(theme, &cb, &mut out_lines, true, is_flashing);
         let end_line = out_lines.len().saturating_sub(1);
         extracted_blocks.push(ExtractedCodeBlock {
             id,

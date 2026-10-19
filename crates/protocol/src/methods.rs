@@ -48,7 +48,9 @@ pub const PLAN_SAVE: &str = "plan/save";
 pub const PLAN_UPDATE_ITEM: &str = "plan/updateItem";
 pub const PLAN_DELETE: &str = "plan/delete";
 pub const PLAN_SET_ACTIVE: &str = "plan/setActive";
+pub const PLAN_CLEAR_HORIZON: &str = "plan/clearHorizon";
 pub const PLAN_EXECUTE: &str = "plan/execute";
+pub const PLAN_EXECUTE_PIPELINE: &str = "plan/executePipeline";
 pub const PLAN_REFINE: &str = "plan/refine";
 pub const PLAN_REPLAN: &str = "plan/replan";
 
@@ -110,7 +112,9 @@ mod tests {
             PLAN_UPDATE_ITEM,
             PLAN_DELETE,
             PLAN_SET_ACTIVE,
+            PLAN_CLEAR_HORIZON,
             PLAN_EXECUTE,
+            PLAN_EXECUTE_PIPELINE,
             PLAN_REFINE,
             PLAN_REPLAN,
             DISCUSSION_SET_FOCUS,

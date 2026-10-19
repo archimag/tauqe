@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use tauqe_protocol::{
-    ModelEntry, ModelRef, ModelRole, ModelRolesSummary, ModelSelection, ReasoningEffort,
+    ArchitectTier, ModelEntry, ModelRef, ModelRole, ModelRolesSummary, ModelSelection,
+    ReasoningEffort,
 };
 
 pub const BUILTIN_DEFAULT_SCRIBE_MODEL: &str = "~anthropic/claude-haiku-latest";
@@ -207,6 +208,66 @@ impl ModelsConfig {
         ModelEntry::from(self.resolve_role_with_fallback(ModelRole::Coder, None))
     }
 
+    /// Returns the ordered architect ladder.
+    ///
+    /// The ladder is the architect list when present, otherwise the inherited
+    /// `primary` list, so re-planning never loses access to the configured
+    /// Architect models. When even that is empty it degrades to a single rung
+    /// resolved through the role chain, so escalation always has a base.
+    pub fn architect_ladder(&self) -> Vec<ArchitectTier> {
+        let ladder: Vec<ArchitectTier> = self
+            .role_entries(ModelRole::Architect)
+            .into_iter()
+            .map(|entry| ArchitectTier::new(entry.model, entry.effort))
+            .collect();
+        if ladder.is_empty() {
+            vec![self.fallback_architect_tier()]
+        } else {
+            ladder
+        }
+    }
+
+    /// Returns the architect rung at `idx`, saturating at the strongest entry.
+    ///
+    /// Out-of-range indices clamp to the last rung, so escalation never panics
+    /// once the ladder is exhausted.
+    pub fn architect_tier(&self, idx: usize) -> ArchitectTier {
+        let ladder = self.architect_ladder();
+        let last = ladder.len().saturating_sub(1);
+        ladder
+            .get(idx.min(last))
+            .cloned()
+            .unwrap_or_else(|| self.fallback_architect_tier())
+    }
+
+    /// Fallback architect rung derived from the deterministic role resolution chain.
+    fn fallback_architect_tier(&self) -> ArchitectTier {
+        ArchitectTier::from(self.resolve_role_with_fallback(ModelRole::Architect, None))
+    }
+
+    /// Returns the ladder position of a recorded Architect configuration.
+    ///
+    /// `None` means the record does not belong to the current ladder: the
+    /// configuration changed between waves, so its position cannot be trusted.
+    pub fn architect_tier_index(&self, recorded: Option<&ArchitectTier>) -> Option<usize> {
+        let recorded = recorded?;
+        self.architect_ladder()
+            .iter()
+            .position(|tier| tier == recorded)
+    }
+
+    /// Returns the rung that follows a recorded Architect configuration.
+    ///
+    /// A recorded rung that is absent from the current ladder restarts from the
+    /// base rung, so escalation never guesses a position. The last rung
+    /// saturates, so an exhausted ladder keeps the strongest Architect.
+    pub fn next_architect_tier(&self, recorded: Option<&ArchitectTier>) -> ArchitectTier {
+        match self.architect_tier_index(recorded) {
+            Some(idx) => self.architect_tier(idx + 1),
+            None => self.architect_tier(0),
+        }
+    }
+
     /// Summary of effective concrete models assigned to all semantic roles.
     pub fn roles_summary(&self) -> ModelRolesSummary {
         self.roles_summary_with_fallback(None)
@@ -373,6 +434,63 @@ architect = ["openrouter:only/architect"]
         assert_eq!(ladder[1].model, ModelRef::openrouter("second/primary"));
         assert_eq!(config.coder_tier(0), ladder[0]);
         assert_eq!(config.coder_tier(5), ladder[1]);
+    }
+
+    #[test]
+    fn test_architect_ladder_derives_from_role_list() {
+        let config: ModelsConfig = toml::from_str(
+            r#"
+primary = ["openrouter:base/primary"]
+architect = [
+    { model = "openrouter:planner/one", effort = "high" },
+    { model = "openrouter:planner/two", effort = "xhigh" },
+]
+"#,
+        )
+        .expect("parse models config");
+
+        let ladder = config.architect_ladder();
+        assert_eq!(ladder.len(), 2);
+        assert_eq!(
+            ladder[0],
+            ArchitectTier::new(
+                ModelRef::openrouter("planner/one"),
+                Some(ReasoningEffort::High)
+            )
+        );
+        assert_eq!(
+            ladder[1],
+            ArchitectTier::new(
+                ModelRef::openrouter("planner/two"),
+                Some(ReasoningEffort::XHigh)
+            )
+        );
+
+        // Escalation advances one rung at a time and saturates on the strongest.
+        assert_eq!(config.next_architect_tier(None), ladder[0]);
+        assert_eq!(config.next_architect_tier(Some(&ladder[0])), ladder[1]);
+        assert_eq!(config.next_architect_tier(Some(&ladder[1])), ladder[1]);
+        assert_eq!(config.architect_tier(7), ladder[1]);
+    }
+
+    #[test]
+    fn test_architect_ladder_restarts_when_recorded_rung_is_unknown() {
+        let config: ModelsConfig = toml::from_str(
+            r#"
+primary = ["openrouter:base/primary"]
+architect = ["openrouter:planner/one"]
+"#,
+        )
+        .expect("parse models config");
+
+        let unknown = ArchitectTier::new(ModelRef::openrouter("planner/retired"), None);
+        assert_eq!(config.architect_tier_index(Some(&unknown)), None);
+        // A configuration that no longer exists restarts from the base rung
+        // instead of guessing a position on the current ladder.
+        assert_eq!(
+            config.next_architect_tier(Some(&unknown)),
+            ArchitectTier::new(ModelRef::openrouter("planner/one"), None)
+        );
     }
 
     #[test]

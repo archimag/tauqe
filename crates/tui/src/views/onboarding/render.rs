@@ -8,27 +8,43 @@ use crate::i18n::active_t;
 
 use super::{format_masked_key, ONBOARDING_STEPS};
 
+/// Fills the single `{}` placeholder of a localized template with `value`.
+fn fill_one(template: &str, value: &str) -> String {
+    template.replacen("{}", value, 1)
+}
+
 pub fn render_onboarding_step_badge(current_step: crate::app::OnboardingStep) -> Line<'static> {
     let engine = crate::theme::engine::current_engine();
     let palette = engine.palette();
     if current_step == crate::app::OnboardingStep::Gatekeeper {
-        return Line::from(vec![
-            Span::styled(
-                " 0. Git [OK] ─── 1. Configuration [OK] ─── ",
-                engine.fg(palette.status_success),
-            ),
-            Span::styled(
-                "[Warning: API Key Missing]",
-                engine
-                    .bg(palette.status_error)
-                    .fg(engine.color(palette.text_inverse))
-                    .bold(),
-            ),
-            Span::styled(
-                " ─── 3. Layout ─── 4. Modifier ─── 5. Ready",
-                engine.fg(palette.text_muted),
-            ),
-        ]);
+        // The warning badge replaces the credentials step instead of inventing a
+        // parallel pipeline, so the chain always mirrors `ONBOARDING_STEPS` and
+        // stays localized as one unit (Conventions §9).
+        let mut spans = Vec::new();
+        for (idx, meta) in ONBOARDING_STEPS.iter().enumerate() {
+            if idx > 0 {
+                spans.push(Span::styled(" ─── ", engine.fg(palette.text_muted)));
+            }
+            if meta.step == crate::app::OnboardingStep::Credentials {
+                spans.push(Span::styled(
+                    format!(" {} ", active_t("onboarding.gatekeeper_badge")),
+                    engine
+                        .bg(palette.status_error)
+                        .fg(engine.color(palette.text_inverse))
+                        .bold(),
+                ));
+            } else if meta.step == crate::app::OnboardingStep::Git
+                || meta.step == crate::app::OnboardingStep::Config
+            {
+                spans.push(Span::styled(
+                    format!("{}{} [OK]", if idx == 0 { " " } else { "" }, meta.name),
+                    engine.fg(palette.status_success),
+                ));
+            } else {
+                spans.push(Span::styled(meta.name, engine.fg(palette.text_muted)));
+            }
+        }
+        return Line::from(spans);
     }
 
     let current_idx = ONBOARDING_STEPS
@@ -82,20 +98,20 @@ pub fn render_onboarding_view(
                 active_t("onboarding.step.git_title"),
                 engine.fg(palette.status_error).bold(),
             )));
-            lines.push(Line::from("The current working directory is not a Git repository."));
-            lines.push(Line::from("Tauqe strictly requires Git: isolated pre-edit checkpoints, atomic turn commits,"));
-            lines.push(Line::from("instant rollback (undo), and feature commit squashing."));
+            lines.push(Line::from(active_t("onboarding.git.body_not_repo")));
+            lines.push(Line::from(active_t("onboarding.git.body_requires")));
+            lines.push(Line::from(active_t("onboarding.git.body_rollback")));
             lines.push(Line::raw(""));
             lines.push(Line::from(Span::styled(
-                "Select an action (arrows ↑/↓, then Enter):",
+                active_t("onboarding.git.select_prompt"),
                 engine.fg(palette.text_primary).bold(),
             )));
             lines.push(Line::raw(""));
 
             let options = [
-                "Initialize Git repository (git init)".to_string(),
-                "Initialize and create initial commit (git init && git commit)".to_string(),
-                "Exit Tauqe".to_string(),
+                active_t("onboarding.git.option_init"),
+                active_t("onboarding.git.option_init_commit"),
+                active_t("onboarding.git.option_exit"),
             ];
 
             for (idx, opt) in options.iter().enumerate() {
@@ -120,21 +136,21 @@ pub fn render_onboarding_view(
                 active_t("onboarding.step.config_title"),
                 engine.fg(palette.status_info).bold(),
             )));
-            lines.push(Line::from("Configuration file not found in project root."));
-            lines.push(Line::from(format!(
-                "It will be created at: {}",
-                ob.default_config_path
+            lines.push(Line::from(active_t("onboarding.config.body_not_found")));
+            lines.push(Line::from(fill_one(
+                &active_t("onboarding.config.body_will_create"),
+                &ob.default_config_path.to_string(),
             )));
             lines.push(Line::raw(""));
             lines.push(Line::from(Span::styled(
-                "Select configuration option (arrows ↑/↓, then Enter):",
+                active_t("onboarding.config.select_prompt"),
                 engine.fg(palette.text_primary).bold(),
             )));
             lines.push(Line::raw(""));
 
             let options = [
-                "Create default tauqe.toml (recommended configuration)".to_string(),
-                "Skip (use built-in defaults without creating tauqe.toml)".to_string(),
+                active_t("onboarding.config.option_create"),
+                active_t("onboarding.config.option_skip"),
             ];
 
             for (idx, opt) in options.iter().enumerate() {
@@ -159,24 +175,27 @@ pub fn render_onboarding_view(
                 active_t("onboarding.step.credentials_title"),
                 engine.fg(palette.status_warning).bold(),
             )));
-            lines.push(Line::from("OpenRouter API key was not detected in environment (OPENROUTER_API_KEY) or credentials files."));
-            lines.push(Line::from("An API key is required to query models (obtain at https://openrouter.ai/keys)."));
-            lines.push(Line::from(format!(
-                "Recommended secure file location: {}",
-                ob.default_credentials_path
+            lines.push(Line::from(active_t("onboarding.credentials.body_not_detected")));
+            lines.push(Line::from(active_t("onboarding.credentials.body_required")));
+            lines.push(Line::from(fill_one(
+                &active_t("onboarding.credentials.body_location"),
+                &ob.default_credentials_path.to_string(),
             )));
             lines.push(Line::raw(""));
             lines.push(Line::from(Span::styled(
-                "Select key setup method (arrows ↑/↓, then Enter):",
+                active_t("onboarding.credentials.select_prompt"),
                 engine.fg(palette.text_primary).bold(),
             )));
             lines.push(Line::raw(""));
 
             let options = [
-                format!("Enter API key now (save with 0600 permissions to {})", ob.default_credentials_path),
-                "Create stub credentials.toml file (fill manually in editor)".to_string(),
-                "Configured via OPENROUTER_API_KEY environment variable (Check again)".to_string(),
-                "Skip".to_string(),
+                fill_one(
+                    &active_t("onboarding.credentials.option_enter"),
+                    &ob.default_credentials_path.to_string(),
+                ),
+                active_t("onboarding.credentials.option_stub"),
+                active_t("onboarding.credentials.option_env"),
+                active_t("onboarding.credentials.option_skip"),
             ];
 
             for (idx, opt) in options.iter().enumerate() {
@@ -201,23 +220,23 @@ pub fn render_onboarding_view(
                 active_t("onboarding.step.workstation_title"),
                 engine.fg(palette.button_active_bg).bold(),
             )));
-            lines.push(Line::from("Configure shortcut key translation and navigation keys for your system layout."));
-            lines.push(Line::from(format!(
-                "Configuration file: {}",
-                ob.default_tui_config_path
+            lines.push(Line::from(active_t("onboarding.workstation.body_configure")));
+            lines.push(Line::from(fill_one(
+                &active_t("onboarding.workstation.body_file"),
+                &ob.default_tui_config_path.to_string(),
             )));
             lines.push(Line::raw(""));
             lines.push(Line::from(Span::styled(
-                "Select keyboard layout option (arrows ↑/↓, then Enter):",
+                active_t("onboarding.workstation.select_prompt"),
                 engine.fg(palette.text_primary).bold(),
             )));
             lines.push(Line::raw(""));
 
             let options = [
-                "Standard (No translation, default QWERTY / layout-neutral)".to_string(),
-                "Russian JCUKEN (Translate Cyrillic ЙЦУКЕН to QWERTY for shortcuts & navigation)".to_string(),
-                "Custom Langmap (Input custom character mapping: e.g. Greek, Hebrew, etc.)".to_string(),
-                "Skip (Use defaults without creating tui.toml)".to_string(),
+                active_t("onboarding.workstation.option_standard"),
+                active_t("onboarding.workstation.option_jcuken"),
+                active_t("onboarding.workstation.option_custom"),
+                active_t("onboarding.workstation.option_skip"),
             ];
 
             for (idx, opt) in options.iter().enumerate() {
@@ -242,18 +261,18 @@ pub fn render_onboarding_view(
                 active_t("onboarding.step.modifier_title"),
                 engine.fg(palette.overlay).bold(),
             )));
-            lines.push(Line::from("In text input mode (prompt buffer, commit message editor), every regular key types text."));
-            lines.push(Line::from("Functional commands (send prompt, undo, squash, model picker, tabs) use the primary modifier."));
+            lines.push(Line::from(active_t("onboarding.modifier.body_input")));
+            lines.push(Line::from(active_t("onboarding.modifier.body_commands")));
             lines.push(Line::raw(""));
             lines.push(Line::from(Span::styled(
-                "Select primary command modifier (arrows ↑/↓, then Enter):",
+                active_t("onboarding.modifier.select_prompt"),
                 engine.fg(palette.text_primary).bold(),
             )));
             lines.push(Line::raw(""));
 
             let options = [
-                "Ctrl (Default — standard Emacs C- shortcuts: Ctrl+Enter, Ctrl+Z, Ctrl+S, Ctrl+M)".to_string(),
-                "Alt (Meta modifier — Alt+Enter, Alt+Z, Alt+S, Alt+M; robust on macOS and legacy terminals)".to_string(),
+                active_t("onboarding.modifier.option_ctrl"),
+                active_t("onboarding.modifier.option_alt"),
             ];
 
             for (idx, opt) in options.iter().enumerate() {
@@ -278,15 +297,18 @@ pub fn render_onboarding_view(
                 active_t("onboarding.step.gatekeeper_title"),
                 engine.fg(palette.status_error).bold(),
             )));
-            lines.push(Line::from("Language model calls cannot proceed without an OpenRouter API key."));
-            lines.push(Line::from("You can input the key now, create credentials.toml, or export:"));
-            lines.push(Line::from(Span::styled("  export OPENROUTER_API_KEY=\"sk-or-v1-...\"", engine.fg(palette.status_info).bold())));
+            lines.push(Line::from(active_t("onboarding.gatekeeper.body_no_key")));
+            lines.push(Line::from(active_t("onboarding.gatekeeper.body_options")));
+            lines.push(Line::from(Span::styled(
+                active_t("onboarding.gatekeeper.body_export"),
+                engine.fg(palette.status_info).bold(),
+            )));
             lines.push(Line::raw(""));
 
             let options = [
-                "Go back and configure OpenRouter API key".to_string(),
-                "Check again (reload environment and credentials files)".to_string(),
-                "Exit Tauqe".to_string(),
+                active_t("onboarding.gatekeeper.option_go_back"),
+                active_t("onboarding.gatekeeper.option_recheck"),
+                active_t("onboarding.gatekeeper.option_exit"),
             ];
 
             for (idx, opt) in options.iter().enumerate() {
@@ -313,34 +335,50 @@ pub fn render_onboarding_view(
             )));
             lines.push(Line::raw(""));
             lines.push(Line::from(vec![
-                Span::styled("• Model: ", engine.fg(palette.text_primary).bold()),
+                Span::styled(
+                    format!("• {} ", active_t("onboarding.ready.model_label")),
+                    engine.fg(palette.text_primary).bold(),
+                ),
                 Span::styled(state.active_model.to_string(), engine.fg(palette.status_info)),
             ]));
+
+            let config_value = ob
+                .config_path
+                .clone()
+                .unwrap_or_else(|| active_t("onboarding.ready.builtin_defaults"));
             lines.push(Line::from(vec![
-                Span::styled("• Configuration: ", engine.fg(palette.text_primary).bold()),
                 Span::styled(
-                    ob.config_path.as_deref().unwrap_or("Built-in defaults"),
-                    engine.fg(palette.text_primary),
+                    format!("• {} ", active_t("onboarding.ready.config_label")),
+                    engine.fg(palette.text_primary).bold(),
                 ),
+                Span::styled(config_value, engine.fg(palette.text_primary)),
             ]));
             lines.push(Line::from(vec![
-                Span::styled("• OpenRouter Key: ", engine.fg(palette.text_primary).bold()),
-                Span::styled("[OK] Configured", engine.fg(palette.status_success).bold()),
-            ]));
-            lines.push(Line::from(vec![
-                Span::styled("• Command Modifier: ", engine.fg(palette.text_primary).bold()),
                 Span::styled(
-                    match state.tui_config.input.primary_modifier {
-                        crate::config::PrimaryModifier::Ctrl => "Ctrl (Default)",
-                        crate::config::PrimaryModifier::Alt => "Alt",
-                    },
-                    engine.fg(palette.status_info).bold(),
+                    format!("• {} ", active_t("onboarding.ready.key_label")),
+                    engine.fg(palette.text_primary).bold(),
                 ),
+                Span::styled(
+                    active_t("onboarding.ready.key_configured"),
+                    engine.fg(palette.status_success).bold(),
+                ),
+            ]));
+
+            let modifier_value = match state.tui_config.input.primary_modifier {
+                crate::config::PrimaryModifier::Ctrl => active_t("onboarding.ready.modifier_ctrl"),
+                crate::config::PrimaryModifier::Alt => active_t("onboarding.ready.modifier_alt"),
+            };
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("• {} ", active_t("onboarding.ready.modifier_label")),
+                    engine.fg(palette.text_primary).bold(),
+                ),
+                Span::styled(modifier_value, engine.fg(palette.status_info).bold()),
             ]));
             lines.push(Line::raw(""));
-            lines.push(Line::from("Press Enter to open the development workspace."));
+            lines.push(Line::from(active_t("onboarding.ready.press_enter")));
             lines.push(Line::from(Span::styled(
-                "Press '?' at any time to view the hotkey reference.",
+                active_t("onboarding.ready.help_hint"),
                 engine.fg(palette.text_muted),
             )));
             lines.push(Line::raw(""));
@@ -352,7 +390,10 @@ pub fn render_onboarding_view(
                 .bold();
             lines.push(Line::from(vec![
                 Span::styled(prefix, engine.fg(palette.status_success).bold()),
-                Span::styled(" Start Session (Open Terminal) ", style),
+                Span::styled(
+                    format!(" {} ", active_t("onboarding.ready.start_session")),
+                    style,
+                ),
             ]));
         }
     }
@@ -360,15 +401,18 @@ pub fn render_onboarding_view(
     if ob.input_active {
         lines.push(Line::raw(""));
         if ob.input_langmap {
-            let prompt = "Enter Custom Langmap (e.g. 'йцукен;qwerty' or 'йq,цw'): ";
+            let prompt = active_t("onboarding.input.langmap_prompt");
             lines.push(Line::from(vec![
                 Span::styled(prompt, engine.fg(palette.button_active_bg).bold()),
                 Span::styled(ob.input_buffer.get_text(), engine.fg(palette.text_primary).bold()),
                 Span::styled("█", engine.fg(palette.button_active_bg)),
-                Span::styled("  (Enter: Save, Esc: Cancel)", engine.fg(palette.text_muted)),
+                Span::styled(
+                    active_t("onboarding.input.langmap_hint"),
+                    engine.fg(palette.text_muted),
+                ),
             ]));
         } else {
-            let prompt = "Enter OpenRouter API Key: ";
+            let prompt = active_t("onboarding.input.api_key_prompt");
 
             let displayed = if ob.show_key {
                 if ob.input_buffer.is_empty() {
@@ -385,17 +429,14 @@ pub fn render_onboarding_view(
             };
 
             let prefix = state.tui_config.input.primary_modifier.prefix_str();
-            let hint = if ob.show_key {
-                format!(
-                    "  ({}R: Hide, {}V: Paste, Enter: Save, Esc: Cancel)",
-                    prefix, prefix
-                )
+            let hint_key = if ob.show_key {
+                "onboarding.input.key_hint_show"
             } else {
-                format!(
-                    "  ({}R: Show, {}V: Paste, Enter: Save, Esc: Cancel)",
-                    prefix, prefix
-                )
+                "onboarding.input.key_hint_hide"
             };
+            let hint = active_t(hint_key)
+                .replacen("{}", prefix, 1)
+                .replacen("{}", prefix, 1);
 
             lines.push(Line::from(vec![
                 Span::styled(prompt, engine.fg(palette.status_warning).bold()),
@@ -409,14 +450,14 @@ pub fn render_onboarding_view(
     if let Some(err) = &ob.error_message {
         lines.push(Line::raw(""));
         lines.push(Line::from(Span::styled(
-            format!("Error: {}", err),
+            fill_one(&active_t("onboarding.error_prefix"), err),
             engine.fg(palette.status_error).bold(),
         )));
     }
     if let Some(msg) = &ob.status_message {
         lines.push(Line::raw(""));
         lines.push(Line::from(Span::styled(
-            format!("✓ {}", msg),
+            fill_one(&active_t("onboarding.status_prefix"), msg),
             engine.fg(palette.status_success).bold(),
         )));
     }
@@ -432,16 +473,23 @@ pub fn render_onboarding_view(
     frame.render_widget(main_block, main_area);
 
     let info_text = match ob.step {
-        crate::app::OnboardingStep::Git => "Tauqe relies on Git for checkpoints, atomic step commits, and safe undo.",
-        crate::app::OnboardingStep::Config => "Create default tauqe.toml or skip to use built-in defaults.",
-        crate::app::OnboardingStep::Credentials => "Secure credential storage: created with 0600 file permissions (owner-only read/write).",
-        crate::app::OnboardingStep::Workstation => "Workstation configuration: personal settings stored in ~/.config/tauqe/tui.toml.",
-        crate::app::OnboardingStep::Modifier => "Primary command modifier for text input: choose Ctrl (default) or Alt for legacy/macOS terminals.",
-        crate::app::OnboardingStep::Gatekeeper => "OpenRouter API key is required for LLM calls. Select an action.",
-        crate::app::OnboardingStep::Ready => "All parameters verified. Press Enter to start.",
+        crate::app::OnboardingStep::Git => active_t("onboarding.info.git"),
+        crate::app::OnboardingStep::Config => active_t("onboarding.info.config"),
+        crate::app::OnboardingStep::Credentials => active_t("onboarding.info.credentials"),
+        crate::app::OnboardingStep::Workstation => active_t("onboarding.info.workstation"),
+        crate::app::OnboardingStep::Modifier => active_t("onboarding.info.modifier"),
+        crate::app::OnboardingStep::Gatekeeper => active_t("onboarding.info.gatekeeper"),
+        crate::app::OnboardingStep::Ready => active_t("onboarding.info.ready"),
     };
-    let info_block = Paragraph::new(Line::from(Span::styled(info_text, engine.fg(palette.text_muted))))
-        .block(Block::default().title(" Information ").borders(Borders::ALL));
+    let info_block = Paragraph::new(Line::from(Span::styled(
+        info_text,
+        engine.fg(palette.text_muted),
+    )))
+    .block(
+        Block::default()
+            .title(format!(" {} ", active_t("onboarding.info_title")))
+            .borders(Borders::ALL),
+    );
     frame.render_widget(info_block, info_area);
 
     // The footer is reserved for operational telemetry (Conventions §1.2, §3.2):
@@ -475,6 +523,8 @@ mod tests {
         let badge_gatekeeper = render_onboarding_step_badge(crate::app::OnboardingStep::Gatekeeper);
         let text_gatekeeper = badge_gatekeeper.to_string();
         assert!(text_gatekeeper.contains("Warning: API Key Missing"));
+        assert!(text_gatekeeper.contains("0. Git [OK]"));
+        assert!(text_gatekeeper.contains("5. Ready"));
     }
 
     #[test]

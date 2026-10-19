@@ -103,6 +103,8 @@ The simplest way, however, is to **ask TAUQE directly** in the interactive envir
 
 Pull requests containing raw code are not accepted. In the modern LLM paradigm, synthesizing raw code carries negligible marginal cost—code is no longer the scarce resource. What truly matters is conceptual clarity, invariant design, and cohesive system architecture.
 
+Not a single line of code in this repository was written by a human, and never will be. TAUQE is built exclusively through its own semantic harness: every change is synthesized and verified by the model inside a deterministic bounded turn. The repository is a living proof of its own paradigm.
+
 If you would like to contribute:
 - Open an issue to discuss conceptual ideas, architectural trade-offs, or UX workflows.
 - Better yet, contribute well-defined, ready-to-implement engineering specifications and formal invariants.

@@ -125,6 +125,11 @@ pub fn delete_custom_locale_at(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// Builds a unique temporary sibling path next to `target`.
+///
+/// The name combines the process id with the current timestamp so two
+/// concurrent TAUQE processes (or a coarse clock that repeats a timestamp)
+/// never share the same intermediate file and clobber each other's write.
 fn temp_sibling_path(target: &Path) -> PathBuf {
     use std::time::{SystemTime, UNIX_EPOCH};
     let nanos = SystemTime::now()
@@ -132,11 +137,12 @@ fn temp_sibling_path(target: &Path) -> PathBuf {
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     let filename = format!(
-        ".{}.tmp.{}",
+        ".{}.tmp.{}.{}",
         target
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("custom_locale"),
+        std::process::id(),
         nanos
     );
     match target.parent() {
@@ -190,6 +196,17 @@ mod tests {
         assert_eq!(loaded, None);
 
         let _ = fs::remove_file(&temp_file);
+    }
+
+    #[test]
+    fn test_temp_sibling_path_includes_process_id() {
+        let target = Path::new("/tmp/custom_locale.json");
+        let temp = temp_sibling_path(target);
+        let name = temp.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+
+        assert!(name.starts_with(".custom_locale.json.tmp."));
+        assert!(name.contains(&format!(".tmp.{}.", std::process::id())));
+        assert_eq!(temp.parent(), target.parent());
     }
 
     #[test]

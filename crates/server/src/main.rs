@@ -17,6 +17,7 @@ mod handlers;
 mod logging;
 mod state;
 mod transport;
+mod usage;
 
 use handlers::handle_request;
 use state::AppState;
@@ -82,10 +83,14 @@ async fn main() -> anyhow::Result<()> {
     let state_for_history = Arc::clone(&state);
     tokio::spawn(async move {
         while let Some(mutation) = history_rx.recv().await {
-            let estimated_tokens = {
-                let h = state_for_history.history.lock().await;
-                h.estimated_tokens().ok()
-            };
+            // The token estimate reads the persisted journal from disk, so the
+            // probe goes through the owned-guard blocking-pool helper instead
+            // of stalling the async worker thread on a synchronous read.
+            let estimated_tokens = state_for_history
+                .mutate_history(|h| h.estimated_tokens().ok())
+                .await
+                .ok()
+                .flatten();
             let ev = match mutation {
                 HistoryMutation::Appended { item } => Event {
                     method: events::HISTORY_ENTRY_ADDED.to_string(),
@@ -228,16 +233,19 @@ const SHUTDOWN_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_se
 /// Poll cadence while waiting for in-flight work to unwind during shutdown.
 const SHUTDOWN_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
 
-/// Methods whose handlers block on long-running work — an LLM turn, a turn
-/// entry point that performs synchronous setup or disk I/O, or the
-/// deterministic pre-flight toolchain verification — and must therefore be
-/// offloaded from the read loop. Offloading keeps the loop free to accept
-/// cancels and to observe stdin EOF. Every other method is short and runs
-/// inline to preserve request ordering.
+/// Methods whose handlers block on long-running work — an LLM turn, a
+/// repository lifecycle request that reloads configuration and rebuilds the
+/// history manager from disk, a Git history rewrite, or the deterministic
+/// pre-flight toolchain verification — and must therefore be offloaded from the
+/// read loop. Offloading keeps the loop free to accept cancels and to observe
+/// stdin EOF. Every other method is short and runs inline to preserve request
+/// ordering.
 fn is_long_running(method: &str) -> bool {
     matches!(
         method,
-        methods::MODEL_ASK
+        methods::CLIENT_INITIALIZE
+            | methods::REPOSITORY_INIT
+            | methods::MODEL_ASK
             | methods::PLAN_REFINE
             | methods::PLAN_REPLAN
             | methods::PLAN_EXECUTE
@@ -245,6 +253,7 @@ fn is_long_running(method: &str) -> bool {
             | methods::REVIEW_EXECUTE
             | methods::REVIEW_REFINE_ITEM
             | methods::GIT_SQUASH_GENERATE_MESSAGE
+            | methods::GIT_SQUASH_APPLY
             | methods::LOCALE_GENERATE
     )
 }
@@ -335,5 +344,32 @@ fn log_request_outcome(
             duration_ms,
             "RPC request completed",
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Repository lifecycle requests reload configuration, re-anchor the
+    /// context, and rebuild the history manager from disk, while
+    /// `git/squashApply` rewrites history and records the result behind an
+    /// `fsync` barrier. All of them must be offloaded, otherwise the stdin
+    /// reader loop stalls and can observe neither cancels nor EOF while they
+    /// run.
+    #[test]
+    fn repository_lifecycle_requests_are_offloaded() {
+        for method in [
+            methods::CLIENT_INITIALIZE,
+            methods::REPOSITORY_INIT,
+            methods::GIT_SQUASH_APPLY,
+        ] {
+            assert!(is_long_running(method), "'{method}' must be offloaded");
+        }
+
+        // Short requests stay inline so their responses keep the client's
+        // request order.
+        assert!(!is_long_running(methods::CONFIG_GET));
+        assert!(!is_long_running(methods::HISTORY_GET));
     }
 }

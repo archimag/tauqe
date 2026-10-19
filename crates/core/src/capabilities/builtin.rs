@@ -14,7 +14,9 @@ use crate::edits::protocol::xml::engine::XmlTagSpec;
 use crate::edits::protocol::xml::tags::{ParsedPlanItem, ParsedPlanTag};
 use crate::edits::protocol::{TerminalOutcome, VerifyOnSuccess, VerifyTarget};
 
-use super::registry::{resolve_specs, CapabilityModule, PromptRenderContext, XmlParser};
+use super::registry::{
+    resolve_specs, CapabilityModule, ContractContext, ContractRule, PromptRenderContext, XmlParser,
+};
 
 /// Textual conversational response.
 pub(crate) struct TextMessageModule;
@@ -28,8 +30,11 @@ impl CapabilityModule for TextMessageModule {
         Some("message")
     }
 
-    fn render_contract_rule(&self, _ctx: &PromptRenderContext<'_>) -> Option<String> {
-        Some("- Conversational Response: deliver every user-facing explanation, answer, and summary as conversational text in the user's language.".to_string())
+    fn render_contract_rule(&self, _ctx: &ContractContext<'_>) -> Option<ContractRule> {
+        Some(ContractRule::new(
+            "Conversational Response",
+            "Deliver every user-facing explanation, answer, and summary as conversational text in the user's language.",
+        ))
     }
 
     fn render_structured_instruction(&self, _ctx: &PromptRenderContext<'_>) -> Option<String> {
@@ -83,8 +88,11 @@ impl CapabilityModule for FileEditsModule {
         Some("changes")
     }
 
-    fn render_contract_rule(&self, _ctx: &PromptRenderContext<'_>) -> Option<String> {
-        Some("- Minimal Coherent Change: prefer the smallest coherent modification that satisfies the intent, and explain each edit (what changed, why, and how it achieves the goal).".to_string())
+    fn render_contract_rule(&self, _ctx: &ContractContext<'_>) -> Option<ContractRule> {
+        Some(ContractRule::new(
+            "Minimal Coherent Change",
+            "Prefer the smallest coherent modification that satisfies the intent. Whenever you propose file edits, precede them with a concise 1-3 sentence explanation of what changed, why, and how the edits achieve the goal; never output edits alone.",
+        ))
     }
 
     fn render_xml_instruction(&self, ctx: &PromptRenderContext<'_>) -> Option<String> {
@@ -96,15 +104,9 @@ impl CapabilityModule for FileEditsModule {
         let overwrite = ctx.tag_name("overwrite");
         let move_tag = ctx.tag_name("move");
         let delete_tag = ctx.tag_name("delete");
-        let mut instruction = format!(
-            "- Code edits: wrap operations in <{edits} summary=\"...\">...</{edits}>. Use <{edit} path=\"...\"> with a <{search}>...</{search}> block and a <{replace}>...</{replace}> block for existing files, <{create} path=\"...\">...</{create}> for new files, <{overwrite} path=\"...\">...</{overwrite}> for a full rewrite, <{move_tag} from=\"...\" to=\"...\" /> to move or rename, and <{delete_tag} path=\"...\" /> to delete.\n  - The `summary` attribute of <{edits}> is the Git commit message: imperative mood, English, lowercase, no trailing period.\n  - An <{edit}> `path` MUST match a file present in <context>; a <{create}> path MUST be a valid repository-relative path.\n  - A <{search}> block MUST match EXACTLY ONE location in the target file, including whitespace and line breaks, and MUST stay as concise as possible while unique.\n  - Prefer <{edit}> for local changes and <{overwrite}> with the COMPLETE new content when most of a file changes; never use <{create}> for a path that already exists.\n  - Several operations may appear inside one <{edits}> block; if no code changes are needed, answer in plain text without any XML edit tags."
+        let instruction = format!(
+            "- Code edits: wrap operations in <{edits} summary=\"...\">...</{edits}>. Use <{edit} path=\"...\"> with a <{search}>...</{search}> block and a <{replace}>...</{replace}> block for existing files, <{create} path=\"...\">...</{create}> for new files, <{overwrite} path=\"...\">...</{overwrite}> for a full rewrite, <{move_tag} from=\"...\" to=\"...\" /> to move or rename, and <{delete_tag} path=\"...\" /> to delete.\n  - The `summary` attribute of <{edits}> is the Git commit message: imperative mood, English, lowercase, no trailing period.\n  - An <{edit}> `path` MUST match a file present in <context>; a <{create}> path MUST be a valid repository-relative path.\n  - Files inside <context> declare their status through the `access` attribute: `access=\"editable\"` files may be modified directly, while a file marked `access=\"read_only\"` is provided for reference and becomes editable automatically once you propose a change to it.\n  - A <{search}> block MUST match EXACTLY ONE location in the target file, including whitespace and line breaks, and MUST stay as concise as possible while unique.\n  - Prefer <{edit}> for local changes and <{overwrite}> with the COMPLETE new content when most of a file changes; never use <{create}> for a path that already exists.\n  - Several operations may appear inside one <{edits}> block; if no code changes are needed, answer in plain text without any XML edit tags."
         );
-        if !ctx.editable_paths.is_empty() {
-            instruction.push_str(&format!(
-                "\n  - Permitted editable files: {}.",
-                ctx.editable_paths.join(", ")
-            ));
-        }
         Some(instruction)
     }
 
@@ -149,11 +151,14 @@ impl CapabilityModule for DiscoveryModule {
         resolve_specs(&DISCOVERY_SPECS, &["context_request", "repo_search"])
     }
 
-    fn render_contract_rule(&self, ctx: &PromptRenderContext<'_>) -> Option<String> {
+    fn render_contract_rule(&self, ctx: &ContractContext<'_>) -> Option<ContractRule> {
         let request = ctx.tag_name("context_request");
         let search = ctx.tag_name("repo_search");
-        Some(format!(
-            "- Discovery First: request missing files with <{request} path=\"...\" access=\"read_only|editable\" /> and locate symbols with <{search} path=\"...\" regex=\"...\" />; place these tags at the end of the response, outside markdown code."
+        Some(ContractRule::new(
+            "Discovery First",
+            format!(
+                "Request missing files with <{request} path=\"...\" access=\"read_only|editable\" /> and locate symbols with <{search} path=\"...\" regex=\"...\" />; place these tags at the end of the response, outside markdown code."
+            ),
         ))
     }
 
@@ -212,10 +217,14 @@ impl CapabilityModule for DocRequestModule {
         Some("doc_requests")
     }
 
-    fn render_contract_rule(&self, ctx: &PromptRenderContext<'_>) -> Option<String> {
+    fn render_contract_rule(&self, ctx: &ContractContext<'_>) -> Option<ContractRule> {
         let doc = ctx.tag_name("doc_request");
-        Some(format!(
-            "- Self-Knowledge: request authoritative documentation via <{doc} topic=\"overview|context|workflow|git|interface|review|plan|all\" /> before answering questions about identity, capabilities, or workflows."
+        Some(ContractRule::new(
+            "Self-Knowledge",
+            format!(
+                "Never guess answers about your identity, capabilities, concepts, workflows, keyboard shortcuts, or configuration. Request the authoritative documentation via <{doc} topic=\"{}\" /> and output nothing else except a short note; answer strictly from the returned <system_documentation> blocks in the user's language.",
+                crate::docs::topic_hint()
+            ),
         ))
     }
 
@@ -281,10 +290,13 @@ impl CapabilityModule for ToolchainVerifyModule {
         Some("verify")
     }
 
-    fn render_contract_rule(&self, ctx: &PromptRenderContext<'_>) -> Option<String> {
+    fn render_contract_rule(&self, ctx: &ContractContext<'_>) -> Option<ContractRule> {
         let verify = ctx.tag_name("verify");
-        Some(format!(
-            "- Verification Discipline: rely on automatic verification; emit <{verify} target=\"all|check|test|clippy\" on_success=\"silent|report\" /> only when the user explicitly asks to run verification or inspect codebase status."
+        Some(ContractRule::new(
+            "Code Verification",
+            format!(
+                "Toolchain verification is performed automatically and deterministically by the harness. Emit <{verify} target=\"all|check|test|clippy\" on_success=\"silent|report\" /> only when the user explicitly asks to run verification, compiler checks, or tests to inspect codebase status, and keep on_success=\"silent\" unless the user asked to see raw command output."
+            ),
         ))
     }
 
@@ -345,6 +357,22 @@ fn plan_tag_to_command(tag: ParsedPlanTag) -> LlmCommand {
     }
 }
 
+/// Contract rule body used when plans are discussed through structured output.
+const PLAN_DISCUSSION_BODY: &str = "When formulating or updating a task plan, populate the structured `plan_update` field in your response object with `action: \"save\"|\"update\"|\"delete\"`, plan `id`, `title`, `description`, `concept`, and `items`. Conceptual Foundation Invariant: Every plan in TAUQE is a two-section document and MUST have an architectural concept tree in `concept` defining requirements, design decisions, and system invariants ('What'). When creating a new plan (`action: \"save\"`), you MUST populate `concept` with at least one concept node. Creating a plan without a concept tree is strictly prohibited. Implementation steps in `items` ('How') are either outlined with `concept_refs` pointing to concept nodes, or left empty (`items: []`) to be synthesized subsequently by deep refinement (`plan_refine`). File Attributes Contract: `files` lists target files to create or modify (loaded as editable context), while `readonly_files` lists reference or contract files (loaded as read-only context and never modified). Leaf-Only Files Invariant: `files` and `readonly_files` must be specified exclusively for executable leaf steps without children; parent container items and task groups must have an empty `files: []` and `readonly_files: []` lists. Plan Action Semantics: Use `action: \"save\"` to create or completely overwrite/replace the entire plan; use `action: \"update\"` strictly to modify specific individual nodes or items in place by ID without touching unmentioned items; use `action: \"delete\"` to remove the plan. Reins Invariant: Never mutate the plan (leave `plan_update: null`) without an explicit user instruction to modify it. Questions, analysis, trade-off reviews, and critique must be answered strictly in conversational text in `message`. Planning Objective: Collaborative planning focuses on conceptual comprehension of the objective ('What'), aligning on key architectural decisions and trade-offs, and defining a cohesive concept tree without premature low-level code churn. Step Formulation Contract: Formulate each step around an engineering objective and operational invariants; define what state must be achieved and what invariants preserved. Always provide a clear `description` explaining the overall architecture, boundaries, and rationale. Language Consistency: Formulate plan title, description, concept titles/details, and step titles/details in the same language as the plan description and user's request. In <active_plan>, items marked with [FOCUSED] are focused by the user.";
+
+/// Contract rule body used when plans are authored through XML edit tags.
+fn plan_xml_body(ctx: &ContractContext<'_>) -> String {
+    let plan = ctx.tag_name("plan");
+    let description = ctx.tag_name("description");
+    let concept = ctx.tag_name("concept");
+    let concept_item = ctx.tag_name("concept_item");
+    let details = ctx.tag_name("details");
+    let item = ctx.tag_name("item");
+    format!(
+        "When formulating a task plan, wrap structured plan items in <{plan} action=\"save\" id=\"plan-id\" title=\"Plan Title\">...</{plan}>. In Develop mode, you may ONLY propose new plans (action=\"save\"). Updating plan statuses, closing steps, or modifying existing plans from Develop mode is strictly prohibited (step execution and completion occur strictly in isolated step turns, while plan modifications and re-scoping belong exclusively in Discussion mode). Conceptual Foundation Invariant: Every plan MUST contain an architectural concept tree in <{concept}>...</{concept}> defining the core requirements, design decisions, and system invariants ('What'). Inside <{concept}>, define architectural nodes using structured <{concept_item} id=\"c-...\" title=\"...\"><{details}>...</{details}></{concept_item}> tags. Plan creation without <{concept}> containing at least one <{concept_item}> is strictly prohibited. Implementation steps in <{item}> define 'How', may be included with concept_refs=\"c-...\", files=\"...\", and readonly=\"...\", or omitted if awaiting deep refinement. File Attributes Contract: the `files` attribute lists target files to create or modify (loaded as editable context), while the `readonly` attribute lists reference or contract files such as subsystem conventions, protocol types, and interfaces (loaded as read-only context and never modified). Leaf-Only Files Invariant: the `files` and `readonly` attributes must be specified exclusively for executable leaf steps without child items; parent container items and task groups must never have files. Planning Objective: Plan synthesis focuses on conceptual comprehension of the objective ('What'), aligning on key architectural decisions and trade-offs, and defining a cohesive concept tree without premature low-level code churn or deep file inspection. Step Formulation Contract: Formulate each step around an engineering objective and operational invariants rather than detailed procedural micro-instructions; define what state must be achieved and what invariants preserved. Always provide a clear <{description}> explaining the overall architecture, boundaries, and rationale. Plan Creation Invariant: Whenever you propose a new plan, you MUST precede the tag with a concise conversational explanation of the proposed plan, and you MUST emit the structured <{plan} action=\"save\" ...> tag in the same response containing both <{concept}> (mandatory) and optional <{item}> elements. Language Consistency: Formulate the plan title, description, concept nodes, step titles, and step details in the same language as the user's request.\nStructured Plan XML Format:\n<{plan} action=\"save\" id=\"plan-id\" title=\"Plan Title\">\n  <{description}>Overall architecture and rationale</{description}>\n  <{concept}>\n    <{concept_item} id=\"c-1\" title=\"Core Invariant\">\n      <{details}>Design rationale and invariants</{details}>\n    </{concept_item}>\n  </{concept}>\n  <{item} id=\"1\" title=\"Step Title\" concept_refs=\"c-1\" files=\"path/to/file.rs\" readonly=\"path/to/contract.rs\">\n    <{details}>Engineering objective and verification criteria</{details}>\n  </{item}>\n</{plan}>"
+    )
+}
+
 /// Project plan creation.
 pub(crate) struct PlanCreationModule;
 
@@ -361,15 +389,16 @@ impl CapabilityModule for PlanCreationModule {
         Some("plan_update")
     }
 
-    fn render_structured_instruction(&self, _ctx: &PromptRenderContext<'_>) -> Option<String> {
-        Some("- `plan_update`: structured plan creation or modification (`action`, `id`, `title`, `description`, `concept`, `items`), or null when the plan is not being changed.".to_string())
+    fn render_contract_rule(&self, ctx: &ContractContext<'_>) -> Option<ContractRule> {
+        Some(if ctx.intent.is_readonly_discussion() {
+            ContractRule::new("Local Engineering Plans", PLAN_DISCUSSION_BODY)
+        } else {
+            ContractRule::new("Local Engineering Plans", plan_xml_body(ctx))
+        })
     }
 
-    fn render_contract_rule(&self, ctx: &PromptRenderContext<'_>) -> Option<String> {
-        let plan = ctx.tag_name("plan");
-        Some(format!(
-            "- Plan Invariants: every plan needs a concept section defining 'What'; steps define 'How'; propose plans via <{plan} action=\"save\" id=\"...\" title=\"...\">...</{plan}> and never mutate existing plans without an explicit user instruction."
-        ))
+    fn render_structured_instruction(&self, _ctx: &PromptRenderContext<'_>) -> Option<String> {
+        Some("- `plan_update`: structured plan creation or modification (`action`, `id`, `title`, `description`, `concept`, `items`), or null when the plan is not being changed.".to_string())
     }
 
     fn render_xml_instruction(&self, ctx: &PromptRenderContext<'_>) -> Option<String> {
@@ -450,10 +479,13 @@ impl CapabilityModule for ScratchpadModule {
         Some("scratchpad")
     }
 
-    fn render_contract_rule(&self, ctx: &PromptRenderContext<'_>) -> Option<String> {
+    fn render_contract_rule(&self, ctx: &ContractContext<'_>) -> Option<ContractRule> {
         let scratchpad = ctx.tag_name("scratchpad");
-        Some(format!(
-            "- Working Memory: use <{scratchpad}>...</{scratchpad}> to hold hypotheses, verified findings, and context intent across discovery and healing rounds; scratchpad notes never enter history."
+        Some(ContractRule::new(
+            "Turn Scratchpad (Working Memory)",
+            format!(
+                "Use <{scratchpad}>...</{scratchpad}> to keep working hypotheses, verified findings, and the purpose of requested files across multi-round discovery and verification healing cycles. Keep notes concise and bullet-shaped; notes stay isolated to the current turn and never enter persisted history."
+            ),
         ))
     }
 
@@ -500,11 +532,14 @@ impl CapabilityModule for OutcomeModule {
         Some("outcome")
     }
 
-    fn render_contract_rule(&self, ctx: &PromptRenderContext<'_>) -> Option<String> {
+    fn render_contract_rule(&self, ctx: &ContractContext<'_>) -> Option<ContractRule> {
         let success = ctx.tag_name("success");
         let error = ctx.tag_name("error");
-        Some(format!(
-            "- Terminal Outcome: conclude every turn with an explicit <{success} summary=\"...\" /> on success or <{error} message=\"...\" /> on failure."
+        Some(ContractRule::new(
+            "Terminal Outcome",
+            format!(
+                "Conclude every turn with an explicit <{success} summary=\"...\" /> on success or <{error} message=\"...\" /> on failure."
+            ),
         ))
     }
 
@@ -560,10 +595,13 @@ impl CapabilityModule for BlockedModule {
         Some("blocked")
     }
 
-    fn render_contract_rule(&self, ctx: &PromptRenderContext<'_>) -> Option<String> {
+    fn render_contract_rule(&self, ctx: &ContractContext<'_>) -> Option<ContractRule> {
         let blocked = ctx.tag_name("blocked");
-        Some(format!(
-            "- Semantic Blocker: emit <{blocked} reason=\"...\" details=\"...\" /> when a precondition or assumption fails instead of guessing or silently failing."
+        Some(ContractRule::new(
+            "Semantic Blocker",
+            format!(
+                "Emit <{blocked} reason=\"...\" details=\"...\" /> when a precondition or assumption fails instead of guessing or silently failing."
+            ),
         ))
     }
 
@@ -612,11 +650,20 @@ impl CapabilityModule for UserLanguageModule {
         Some("user_language")
     }
 
-    fn render_contract_rule(&self, ctx: &PromptRenderContext<'_>) -> Option<String> {
-        let language = ctx.tag_name("user_language");
-        Some(format!(
-            "- Language Consistency: answer in the user's language and report it via <{language}>language</{language}>; keep internal reasoning in English."
-        ))
+    fn render_contract_rule(&self, ctx: &ContractContext<'_>) -> Option<ContractRule> {
+        let body = if let Some(language) = ctx.target_language {
+            format!(
+                "The user's language is {language}. All conversational explanations, answers, and messages MUST be in {language}. Do NOT switch to English for conversational responses unless requested."
+            )
+        } else if ctx.intent.is_readonly_discussion() {
+            "Always formulate conversational explanations and user-facing answers in `message` in the same language as the user's request. Identify the user's language in the `user_language` field (e.g. \"Russian\"). Do NOT switch to English for conversational responses unless requested.".to_string()
+        } else {
+            let language = ctx.tag_name("user_language");
+            format!(
+                "Always formulate conversational explanations and user-facing answers in the same language as the user's request. Identify the user's language using <{language}>language_name</{language}> (e.g. <{language}>Russian</{language}>). Do NOT switch to English for conversational responses unless requested."
+            )
+        };
+        Some(ContractRule::new("Language Consistency", body))
     }
 
     fn render_xml_instruction(&self, ctx: &PromptRenderContext<'_>) -> Option<String> {

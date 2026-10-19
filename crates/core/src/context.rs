@@ -1,7 +1,6 @@
 use anyhow::{bail, Result};
 use crate::prompt::estimate_tokens_from_bytes;
-use std::collections::BTreeMap;
-use std::collections::BTreeSet;
+use indexmap::IndexMap;
 use std::path::{Path, PathBuf};
 pub use tauqe_protocol::matches_glob_pattern;
 use tauqe_protocol::{ContextAccess, ContextItem, ContextLayer, ContextState, GlobPattern};
@@ -37,15 +36,15 @@ pub struct ContextManager {
     repo_root: PathBuf,
     revision: u64,
     pinned_patterns: Vec<String>,
-    pinned: BTreeMap<String, ContextItem>,
-    user: BTreeMap<String, ContextItem>,
-    auto: BTreeMap<String, ContextItem>,
+    pinned: IndexMap<String, ContextItem>,
+    user: IndexMap<String, ContextItem>,
+    auto: IndexMap<String, ContextItem>,
 }
 
 /// Stores `item` in `layer`, returning `true` only when the layer contents
 /// actually changed. Centralizing this check keeps every mutation path from
 /// advancing the context revision on a no-op.
-fn store_item(layer: &mut BTreeMap<String, ContextItem>, item: ContextItem) -> bool {
+fn store_item(layer: &mut IndexMap<String, ContextItem>, item: ContextItem) -> bool {
     if layer.get(&item.path) == Some(&item) {
         return false;
     }
@@ -70,9 +69,9 @@ impl ContextManager {
             repo_root,
             revision: 1,
             pinned_patterns: Vec::new(),
-            pinned: BTreeMap::new(),
-            user: BTreeMap::new(),
-            auto: BTreeMap::new(),
+            pinned: IndexMap::new(),
+            user: IndexMap::new(),
+            auto: IndexMap::new(),
         };
         cm.load_pinned_from_repo();
         cm
@@ -83,9 +82,9 @@ impl ContextManager {
             repo_root,
             revision: 1,
             pinned_patterns: Vec::new(),
-            pinned: BTreeMap::new(),
-            user: BTreeMap::new(),
-            auto: BTreeMap::new(),
+            pinned: IndexMap::new(),
+            user: IndexMap::new(),
+            auto: IndexMap::new(),
         };
         cm.load_pinned(pinned_patterns);
         cm
@@ -158,23 +157,32 @@ impl ContextManager {
         // Reading every context file is blocking file I/O. Run it through the
         // blocking helper so a large context never stalls an async worker.
         crate::blocking::run_blocking(|| {
-            let mut distinct_paths = BTreeSet::new();
-            distinct_paths.extend(self.pinned.keys().cloned());
-            distinct_paths.extend(self.user.keys().cloned());
-            distinct_paths.extend(self.auto.keys().cloned());
-
+            // Files are emitted in layer order (pinned -> user -> auto) and in
+            // each layer's insertion order. The context block is the stable
+            // prefix of every later round within a turn, so an alphabetical
+            // re-sort here would shift tokens and invalidate the provider
+            // prefix cache.
+            let mut seen = std::collections::HashSet::new();
             let mut files = Vec::new();
-            for path in distinct_paths {
-                if verify_path_within_repo(&self.repo_root, &path).is_err() {
+            for path in self
+                .pinned
+                .keys()
+                .chain(self.user.keys())
+                .chain(self.auto.keys())
+            {
+                if !seen.insert(path.as_str()) {
                     continue;
                 }
-                let full_path = self.repo_root.join(&path);
+                if verify_path_within_repo(&self.repo_root, path).is_err() {
+                    continue;
+                }
+                let full_path = self.repo_root.join(path);
                 if let Ok(content) = std::fs::read_to_string(&full_path) {
                     let access = self
-                        .effective_access_for(&path)
+                        .effective_access_for(path)
                         .unwrap_or(ContextAccess::ReadOnly);
                     files.push(ContextFileContent {
-                        path,
+                        path: path.clone(),
                         access,
                         content,
                     });
@@ -241,7 +249,7 @@ impl ContextManager {
             ContextLayer::User => {
                 // Adding to the user layer promotes the path out of auto, so
                 // the eviction is itself a change.
-                let evicted = self.auto.remove(&clean_path).is_some();
+                let evicted = self.auto.shift_remove(&clean_path).is_some();
                 store_item(&mut self.user, item.clone()) || evicted
             }
             ContextLayer::Auto => {
@@ -293,7 +301,7 @@ impl ContextManager {
 
     pub fn promote_auto_to_user(&mut self, relative_path: &str) -> Result<bool> {
         let clean_path = self.normalize_path(relative_path)?;
-        if let Some(mut item) = self.auto.remove(&clean_path) {
+        if let Some(mut item) = self.auto.shift_remove(&clean_path) {
             item.layer = ContextLayer::User;
             self.user.insert(clean_path, item);
             self.revision += 1;
@@ -325,7 +333,7 @@ impl ContextManager {
     /// Files present in `user` or `pinned` layers are never removed and return `Ok(false)`.
     pub fn drop_auto_file(&mut self, relative_path: &str) -> Result<bool> {
         let clean_path = self.normalize_path(relative_path)?;
-        if self.auto.remove(&clean_path).is_some() {
+        if self.auto.shift_remove(&clean_path).is_some() {
             self.recompute_pinned();
             self.revision += 1;
             Ok(true)
@@ -385,7 +393,9 @@ impl ContextManager {
 
         for path in matched_files {
             let rev_before = self.revision;
-            if let Ok(item) = self.add_file_to_layer_internal(&path, access, ContextLayer::User, false) {
+            if let Ok(item) =
+                self.add_file_to_layer_internal(&path, access, ContextLayer::User, false)
+            {
                 total_added_tokens += item.estimated_tokens;
                 added_items.push(item);
                 if self.revision > rev_before {
@@ -435,8 +445,8 @@ impl ContextManager {
     /// silently succeeding.
     pub fn remove_file(&mut self, relative_path: &str) -> Result<bool> {
         let clean_path = self.normalize_path(relative_path)?;
-        let removed_user = self.user.remove(&clean_path).is_some();
-        let removed_auto = self.auto.remove(&clean_path).is_some();
+        let removed_user = self.user.shift_remove(&clean_path).is_some();
+        let removed_auto = self.auto.shift_remove(&clean_path).is_some();
         if removed_user || removed_auto {
             self.recompute_pinned();
             self.revision += 1;
@@ -457,10 +467,10 @@ impl ContextManager {
         let mut found_item = None;
         let mut found_layer = None;
 
-        if let Some(item) = self.user.remove(&clean_from) {
+        if let Some(item) = self.user.shift_remove(&clean_from) {
             found_item = Some(item);
             found_layer = Some(ContextLayer::User);
-        } else if let Some(item) = self.auto.remove(&clean_from) {
+        } else if let Some(item) = self.auto.shift_remove(&clean_from) {
             found_item = Some(item);
             found_layer = Some(ContextLayer::Auto);
         } else if self.pinned.contains_key(&clean_from) {
@@ -531,14 +541,14 @@ impl ContextManager {
     /// Prunes files from context that no longer exist on disk (e.g. after undoing AI creation).
     pub fn prune_missing_files(&mut self) -> Vec<String> {
         let mut removed = Vec::new();
-        let prune_layer = |layer: &mut BTreeMap<String, ContextItem>, root: &Path| -> Vec<String> {
+        let prune_layer = |layer: &mut IndexMap<String, ContextItem>, root: &Path| -> Vec<String> {
             let to_remove: Vec<String> = layer
                 .keys()
                 .filter(|p| !root.join(p).is_file())
                 .cloned()
                 .collect();
             for p in &to_remove {
-                layer.remove(p);
+                layer.shift_remove(p);
             }
             to_remove
         };
@@ -730,10 +740,14 @@ mod tests {
 
         // Turn starts with a snapshot
         let mut turn_snapshot = primary.clone();
-        turn_snapshot.add_auto_file("auto.rs", ContextAccess::ReadOnly).unwrap();
+        turn_snapshot
+            .add_auto_file("auto.rs", ContextAccess::ReadOnly)
+            .unwrap();
 
         // While turn is running, user adds a new file to primary
-        primary.add_file("user_added.rs", ContextAccess::Editable).unwrap();
+        primary
+            .add_file("user_added.rs", ContextAccess::Editable)
+            .unwrap();
 
         // Turn completes and merges back
         primary.merge_turn_context(&turn_snapshot);
@@ -790,7 +804,9 @@ mod tests {
         primary.add_file("file.rs", ContextAccess::ReadOnly).unwrap();
 
         let mut turn_snapshot = primary.clone();
-        turn_snapshot.add_auto_file("file.rs", ContextAccess::Editable).unwrap();
+        turn_snapshot
+            .add_auto_file("file.rs", ContextAccess::Editable)
+            .unwrap();
         assert!(turn_snapshot.is_editable("file.rs").unwrap());
 
         primary.merge_turn_context(&turn_snapshot);
@@ -857,7 +873,9 @@ mod tests {
         let mut primary = ContextManager::new(root.clone());
         primary.load_pinned(&["pinned.rs".to_string()]);
         primary.add_file("user.rs", ContextAccess::ReadOnly).unwrap();
-        primary.add_auto_file("auto1.rs", ContextAccess::ReadOnly).unwrap();
+        primary
+            .add_auto_file("auto1.rs", ContextAccess::ReadOnly)
+            .unwrap();
 
         let mut turn = primary.clone();
         // During turn, auto1 is dropped/evicted, auto2 is added
@@ -911,5 +929,69 @@ mod tests {
 
         assert_eq!(cm.get_state().revision, rev_before);
         assert!(cm.contains("auto.rs").unwrap());
+    }
+
+    #[test]
+    fn test_layers_preserve_insertion_order_not_alphabetical() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        for name in ["pinned.rs", "zeta.rs", "alpha.rs", "beta.rs", "gamma.rs"] {
+            std::fs::write(root.join(name), "fn f() {}\n").unwrap();
+        }
+
+        let mut cm = ContextManager::new(root);
+        cm.load_pinned(&["pinned.rs".to_string()]);
+        // Insertion order deliberately contradicts alphabetical order.
+        cm.add_file("zeta.rs", ContextAccess::ReadOnly).unwrap();
+        cm.add_file("alpha.rs", ContextAccess::ReadOnly).unwrap();
+        cm.add_auto_file("beta.rs", ContextAccess::ReadOnly).unwrap();
+        cm.add_auto_file("gamma.rs", ContextAccess::ReadOnly).unwrap();
+
+        let state = cm.get_state();
+        let paths: Vec<&str> = state.items.iter().map(|i| i.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            vec!["pinned.rs", "zeta.rs", "alpha.rs", "beta.rs", "gamma.rs"]
+        );
+    }
+
+    #[test]
+    fn test_re_adding_existing_file_keeps_its_position() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        std::fs::write(root.join("zeta.rs"), "fn zeta() {}\n").unwrap();
+        std::fs::write(root.join("alpha.rs"), "fn alpha() {}\n").unwrap();
+
+        let mut cm = ContextManager::new(root);
+        cm.add_file("zeta.rs", ContextAccess::ReadOnly).unwrap();
+        cm.add_file("alpha.rs", ContextAccess::ReadOnly).unwrap();
+        // Re-adding an existing path upgrades access without moving the entry.
+        cm.add_file("zeta.rs", ContextAccess::Editable).unwrap();
+
+        let state = cm.get_state();
+        let paths: Vec<&str> = state.items.iter().map(|i| i.path.as_str()).collect();
+        assert_eq!(paths, vec!["zeta.rs", "alpha.rs"]);
+        let zeta = state.items.iter().find(|i| i.path == "zeta.rs").unwrap();
+        assert_eq!(zeta.access, ContextAccess::Editable);
+    }
+
+    #[test]
+    fn test_read_context_files_preserves_layer_and_insertion_order() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        for name in ["pinned.rs", "zeta.rs", "alpha.rs"] {
+            std::fs::write(root.join(name), "fn f() {}\n").unwrap();
+        }
+
+        let mut cm = ContextManager::new(root);
+        cm.load_pinned(&["pinned.rs".to_string()]);
+        cm.add_file("zeta.rs", ContextAccess::ReadOnly).unwrap();
+        cm.add_file("alpha.rs", ContextAccess::Editable).unwrap();
+
+        let files = cm.read_context_files();
+        let paths: Vec<&str> = files.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(paths, vec!["pinned.rs", "zeta.rs", "alpha.rs"]);
+        let alpha = files.iter().find(|f| f.path == "alpha.rs").unwrap();
+        assert_eq!(alpha.access, ContextAccess::Editable);
     }
 }

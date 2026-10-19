@@ -1,7 +1,7 @@
 use ratatui::style::{Style, Stylize};
 use ratatui::text::{Line, Span};
-
 use crate::theme::engine::current_engine;
+use crate::ui::format::format_tokens;
 
 use super::super::state::{EditOp, FileEditStatus, ReplView, ToolchainState};
 use super::indicator_style;
@@ -115,7 +115,12 @@ pub fn compute_model_lines(model: &mut ReplView) -> Vec<Line<'static>> {
             header_badge,
             Span::raw(" "),
             Span::styled(
-                format!("Proposed Edits ({}/{} files)", ok_files, total_files),
+                format!(
+                    "{} ({}/{} files)",
+                    crate::i18n::active_t("repl.proposed_edits"),
+                    ok_files,
+                    total_files
+                ),
                 engine.fg(palette.status_info).bold(),
             ),
         ];
@@ -217,7 +222,7 @@ pub fn compute_model_lines(model: &mut ReplView) -> Vec<Line<'static>> {
                     model_lines.push(Line::from(vec![
                         Span::raw("      "),
                         Span::styled(
-                            "Validation Error: ",
+                            format!("{} ", crate::i18n::active_t("repl.validation_error")),
                             engine.fg(palette.status_error).bold(),
                         ),
                         Span::styled(err_msg.clone(), engine.fg(palette.status_warning)),
@@ -231,35 +236,50 @@ pub fn compute_model_lines(model: &mut ReplView) -> Vec<Line<'static>> {
         }
     }
 
-    if let Some(usage) = &model.usage {
+    // The usage line mirrors the daemon's single accumulator: the operation in
+    // flight while a turn runs, otherwise the last completed one. An empty
+    // snapshot renders no line at all (c-1, c-3).
+    let totals = model.usage_totals.operation_totals().clone();
+
+    if !totals.is_empty() {
         model_lines.push(Line::raw(""));
         let mut usage_spans = vec![
-            Span::styled("Tokens: ", engine.fg(palette.text_muted).bold()),
+            Span::styled(
+                format!("{}: ", crate::i18n::active_t("repl.usage.tokens")),
+                engine.fg(palette.text_muted).bold(),
+            ),
             Span::styled(
                 format!(
-                    "{} prompt, {} completion",
-                    usage.usage.prompt_tokens, usage.usage.completion_tokens,
+                    "{} {}, {} {}",
+                    format_tokens(totals.prompt_tokens),
+                    crate::i18n::active_t("repl.usage.prompt"),
+                    format_tokens(totals.completion_tokens),
+                    crate::i18n::active_t("repl.usage.completion"),
                 ),
                 engine.fg(palette.text_muted),
             ),
         ];
 
-        if let Some(reason_tokens) = usage.usage.reasoning_tokens {
-            if reason_tokens > 0 {
-                usage_spans.push(Span::styled(
-                    format!(", {} reasoning", reason_tokens),
-                    engine.fg(palette.text_secondary),
-                ));
-            }
+        if let Some(reasoning_tokens) = totals.reasoning_tokens.filter(|tokens| *tokens > 0) {
+            usage_spans.push(Span::styled(
+                format!(
+                    ", {} {}",
+                    format_tokens(reasoning_tokens),
+                    crate::i18n::active_t("repl.usage.reasoning")
+                ),
+                engine.fg(palette.text_secondary),
+            ));
         }
 
-        if let Some(cached_tokens) = usage.usage.cached_tokens {
-            if cached_tokens > 0 {
-                usage_spans.push(Span::styled(
-                    format!(", {} cached", cached_tokens),
-                    engine.fg(palette.status_info),
-                ));
-            }
+        if let Some(cached_tokens) = totals.cached_tokens.filter(|tokens| *tokens > 0) {
+            usage_spans.push(Span::styled(
+                format!(
+                    ", {} {}",
+                    format_tokens(cached_tokens),
+                    crate::i18n::active_t("repl.usage.cached")
+                ),
+                engine.fg(palette.status_info),
+            ));
         }
 
         model_lines.push(Line::from(usage_spans));
@@ -271,6 +291,7 @@ pub fn compute_model_lines(model: &mut ReplView) -> Vec<Line<'static>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tauqe_protocol::model::UsageTotals;
 
     #[test]
     fn test_compute_model_lines_empty_when_splash_visible() {
@@ -328,5 +349,39 @@ mod tests {
         assert!(lines
             .iter()
             .any(|l| l.spans.iter().any(|s| s.content.contains("cargo check"))));
+    }
+
+    #[test]
+    fn usage_line_prefers_the_in_flight_operation() {
+        let mut model = ReplView {
+            text: "answer".to_string(),
+            ..ReplView::default()
+        };
+        model.usage_totals = tauqe_protocol::model::UsageTotalsSnapshot {
+            session: UsageTotals {
+                total_tokens: 900,
+                ..UsageTotals::default()
+            },
+            prev: UsageTotals {
+                total_tokens: 300,
+                ..UsageTotals::default()
+            },
+            cur: Some(UsageTotals {
+                prompt_tokens: 7,
+                completion_tokens: 3,
+                total_tokens: 10,
+                ..UsageTotals::default()
+            }),
+            operations: 1,
+        };
+
+        let lines = compute_model_lines(&mut model);
+        let rendered: String = lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert!(rendered.contains("7 prompt"), "{rendered}");
+        assert!(rendered.contains("3 completion"), "{rendered}");
     }
 }

@@ -12,9 +12,9 @@
 ///   not act as a directory prefix (use a trailing slash such as `build*/` to
 ///   match all paths beneath matching directories).
 ///
-/// Leading, trailing and repeated slashes, as well as interior `.` segments,
-/// are normalized before matching, so `"/src//lib.rs"` and `"src/./lib.rs"`
-/// both match `"src/lib.rs"`.
+/// Leading, trailing and repeated separators (both `/` and `\`), as well as
+/// interior `.` segments, are normalized before matching, so `"/src//lib.rs"`,
+/// `"src/./lib.rs"` and `"src\\lib.rs"` all match `"src/lib.rs"`.
 ///
 /// This convenience wrapper compiles `pattern` on every call. When matching many
 /// paths against one pattern, compile once with [`GlobPattern::new`] and reuse it.
@@ -45,7 +45,7 @@ impl GlobPattern {
     pub fn new(pattern: &str) -> Self {
         let trimmed = pattern.trim();
         let clean = normalize_path(trimmed);
-        let trailing_slash = trimmed.ends_with('/');
+        let trailing_slash = trimmed.ends_with('/') || trimmed.ends_with('\\');
         let has_meta = contains_glob_meta(&clean);
         let has_slash = clean.contains('/');
         let prefix = format!("{clean}/");
@@ -106,12 +106,14 @@ impl GlobPattern {
 
 /// Normalizes a path or pattern into a canonical slash-separated form.
 ///
-/// Surrounding whitespace is trimmed, and empty segments (from leading,
-/// trailing or repeated slashes) and `.` segments are dropped, so
-/// `"/src//lib.rs"` and `"src/./lib.rs"` both canonicalize to `"src/lib.rs"`.
+/// Surrounding whitespace is trimmed, Windows-style backslash separators are
+/// converted to slashes, and empty segments (from leading, trailing or
+/// repeated separators) and `.` segments are dropped. As a result
+/// `"/src//lib.rs"`, `"src/./lib.rs"` and `"src\\lib.rs"` all canonicalize to
+/// `"src/lib.rs"`.
 fn normalize_path(input: &str) -> String {
-    input
-        .trim()
+    let normalized = input.trim().replace('\\', "/");
+    normalized
         .split('/')
         .filter(|segment| !segment.is_empty() && *segment != ".")
         .collect::<Vec<&str>>()
@@ -484,5 +486,44 @@ mod tests {
         assert!(matches_glob_pattern("foo]", "foo]/bar.rs"));
         assert!(matches_glob_pattern("foo]", "foo]"));
         assert!(!matches_glob_pattern("foo]", "food/bar.rs"));
+    }
+
+    #[test]
+    fn test_backslash_separators_are_normalized() {
+        assert!(matches_glob_pattern("src\\lib.rs", "src/lib.rs"));
+        assert!(matches_glob_pattern("src/lib.rs", "src\\lib.rs"));
+        assert!(matches_glob_pattern("src\\*.rs", "src/lib.rs"));
+        assert!(matches_glob_pattern("src\\**\\*.rs", "src/a/b.rs"));
+        assert!(!matches_glob_pattern("src\\main.rs", "src/lib.rs"));
+    }
+
+    #[test]
+    fn test_backslash_trailing_separator_marks_directory() {
+        assert!(matches_glob_pattern("src\\", "src/lib.rs"));
+        assert!(!matches_glob_pattern("src\\", "src"));
+        assert!(matches_glob_pattern("crates\\*\\", "crates/foo/src/lib.rs"));
+        assert!(!matches_glob_pattern("crates\\*\\", "crates/foo"));
+    }
+
+    #[test]
+    fn test_negated_char_class_with_leading_dash() {
+        // `[!-]` is a negated class whose only member is a literal `-`.
+        assert!(!matches_glob_pattern("[!-]", "-"));
+        assert!(matches_glob_pattern("[!-]", "a"));
+        assert!(matches_glob_pattern("[!-]", "ф"));
+    }
+
+    #[test]
+    fn test_unterminated_negated_char_class_degrades_to_literal_bracket() {
+        // Without a closing `]` the class degrades to a literal `[` prefix.
+        assert!(matches_glob_pattern("[!abc", "[!abc"));
+        assert!(!matches_glob_pattern("[!abc", "abc"));
+        assert!(!matches_glob_pattern("[!abc", "x"));
+    }
+
+    #[test]
+    fn test_caret_negation_marker() {
+        assert!(matches_glob_pattern("[^a-z]", "1"));
+        assert!(!matches_glob_pattern("[^a-z]", "q"));
     }
 }

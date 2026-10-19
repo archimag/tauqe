@@ -22,6 +22,7 @@ pub enum GlobalCommand {
     SelectModel,
     SelectTheme,
     SelectLocale,
+    OpenUsageSummary,
     ToggleReasoning,
     OpenHelp,
     ReloadConfig,
@@ -92,6 +93,12 @@ pub static GLOBAL_COMMAND_MAP: CommandMap<GlobalCommand> = CommandMap::new(&[
         SelectLocale,
         Interface,
         "cmd.global.select_locale",
+    ),
+    CommandSpec::new(
+        KeyChord::Meta(KeyCode::Char('u')),
+        OpenUsageSummary,
+        Interface,
+        "cmd.global.open_usage_summary",
     ),
     CommandSpec::new(
         KeyChord::Primary(KeyCode::Char('r')),
@@ -239,6 +246,34 @@ mod tests {
         assert_eq!(
             typing.map(|spec| spec.action),
             Some(GlobalCommand::SelectLocale)
+        );
+    }
+
+    /// The full usage breakdown is read-only telemetry: reading it never spends
+    /// tokens, so the chord stays reachable from the prompt as well as from the
+    /// navigation views, unlike the commands that start work.
+    #[test]
+    fn global_map_binds_the_usage_breakdown_to_the_meta_chord() {
+        let input = InputConfig::default();
+
+        let meta_u = GLOBAL_COMMAND_MAP.resolve(
+            KeyEvent::new(KeyCode::Char('u'), KeyModifiers::ALT),
+            &input,
+            false,
+        );
+        assert_eq!(
+            meta_u.map(|spec| spec.action),
+            Some(GlobalCommand::OpenUsageSummary)
+        );
+
+        let typing = GLOBAL_COMMAND_MAP.resolve(
+            KeyEvent::new(KeyCode::Char('u'), KeyModifiers::ALT),
+            &input,
+            true,
+        );
+        assert_eq!(
+            typing.map(|spec| spec.action),
+            Some(GlobalCommand::OpenUsageSummary)
         );
     }
 }

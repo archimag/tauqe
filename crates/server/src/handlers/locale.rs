@@ -71,6 +71,11 @@ pub async fn handle_locale_generate(req: Request, state: &Arc<AppState>) -> Resp
         }
     };
 
+    // Open the shared usage ledger: this call reports both the tokens the
+    // provider returned and the duration the harness measured, so every
+    // operation kind feeds one consistent snapshot.
+    let usage_guard = state.begin_usage().await;
+
     // Locale synthesis never produces code changes, so it is a Structured
     // Output operation (see `crates/core/Conventions.md`, section 1.2): the
     // model answers with the enforced JSON schema instead of free-form text.
@@ -129,8 +134,12 @@ pub async fn handle_locale_generate(req: Request, state: &Arc<AppState>) -> Resp
         }
     }
 
-    // Account for the provider cost of this one-shot call.
+    // Account for the provider cost and duration of this one-shot call through
+    // the shared usage ledger before the legacy per-operation channel reports
+    // the monetary counter.
     let usage = usage.unwrap_or_default();
+    usage_guard.observe(&usage).await;
+    usage_guard.flush().await;
     let cost = usage.cost.unwrap_or(0.0);
     let total_cost = {
         let mut total = state.total_cost.lock().await;

@@ -5,57 +5,6 @@ pub const PLAN_STEP_EXECUTION_PREFIX: &str = "# Target Plan Step Execution:";
 
 pub const PLAN_STEP_RETRY_PREFIX: &str = "# Correction Required: Plan Step Turn Incomplete";
 
-/// Target plan and step identifiers parsed from an isolated plan step execution prompt.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PlanStepTarget {
-    pub plan_id: Option<String>,
-    pub step_id: String,
-}
-
-/// Returns true if the prompt represents an isolated plan step execution turn.
-pub fn is_plan_step_execution_prompt(prompt: &str) -> bool {
-    let trimmed = prompt.trim_start();
-    trimmed.starts_with(PLAN_STEP_EXECUTION_PREFIX)
-        || trimmed.starts_with(PLAN_STEP_RETRY_PREFIX)
-}
-
-/// Extracts the target plan ID and step ID from an isolated plan step execution prompt.
-pub fn extract_plan_step_execution_target(prompt: &str) -> Option<PlanStepTarget> {
-    let trimmed = prompt.trim_start();
-    if !trimmed.starts_with(PLAN_STEP_EXECUTION_PREFIX) {
-        return None;
-    }
-    let rest = trimmed.strip_prefix(PLAN_STEP_EXECUTION_PREFIX)?.trim_start();
-    if let Some(rest) = rest.strip_prefix('[') {
-        let (spec, _) = rest.split_once(']')?;
-        let spec = spec.trim();
-        if spec.is_empty() {
-            return None;
-        }
-        if let Some((plan_id, step_id)) = spec.split_once(':') {
-            let plan_id = plan_id.trim();
-            let step_id = step_id.trim();
-            if !step_id.is_empty() {
-                return Some(PlanStepTarget {
-                    plan_id: if plan_id.is_empty() { None } else { Some(plan_id.to_string()) },
-                    step_id: step_id.to_string(),
-                });
-            }
-        } else {
-            return Some(PlanStepTarget {
-                plan_id: None,
-                step_id: spec.to_string(),
-            });
-        }
-    }
-    None
-}
-
-/// Extracts the target step ID from an isolated plan step execution prompt.
-pub fn extract_plan_step_execution_id(prompt: &str) -> Option<String> {
-    extract_plan_step_execution_target(prompt).map(|t| t.step_id)
-}
-
 /// Joins identifiers or paths into a single escaped, comma-separated line.
 fn escape_list(items: &[String]) -> String {
     items

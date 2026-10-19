@@ -7,6 +7,7 @@ use tokio::sync::Mutex;
 use crate::app::{AppState, ViewMode};
 use crate::command::CommandCategory::{Essential, Helpers, Interface};
 use crate::command::{CommandMap, CommandSpec, KeyChord};
+use crate::i18n::engine::active_t;
 use crate::input::InputResult;
 use crate::rpc::{send_request, RpcConnection};
 
@@ -34,6 +35,7 @@ pub enum PlansAction {
     ChangeStatus,
     DeletePlan,
     CopyMarkdown,
+    ClearHorizon,
     Replan,
     ReplanAll,
     Refresh,
@@ -50,289 +52,321 @@ pub static PLANS_COMMAND_MAP: CommandMap<PlansAction> = CommandMap::new(&[
         KeyChord::Bare(KeyCode::Enter),
         PlansAction::Activate,
         Essential,
-        "Execute a leaf step, or fold groups and headers",
+        "cmd.plans.activate",
     ),
     CommandSpec::new(
         KeyChord::Bare(KeyCode::Char('x')),
         PlansAction::Execute,
         Essential,
-        "Execute the selected step, group, or entire plan",
+        "cmd.plans.execute",
     ),
     CommandSpec::new(
         KeyChord::Bare(KeyCode::Char('X')),
         PlansAction::ExecuteAll,
         Essential,
-        "Execute every ready step of the selected plan as one batch (with confirmation)",
+        "cmd.plans.execute_all",
     ),
     CommandSpec::new(
         KeyChord::Bare(KeyCode::Char('r')),
         PlansAction::Replan,
         Essential,
-        "Refine or replan the selected plan horizon with the Architect",
+        "cmd.plans.replan",
     ),
     CommandSpec::new(
         KeyChord::Bare(KeyCode::Char('R')),
         PlansAction::ReplanAll,
         Essential,
-        "Replan the horizon to resolve every blocked step with the Architect",
+        "cmd.plans.replan_all",
     ),
     CommandSpec::new(
         KeyChord::Bare(KeyCode::Char('d')),
         PlansAction::Discuss,
         Essential,
-        "Discuss the selection with AI in the REPL",
+        "cmd.plans.discuss",
     ),
     CommandSpec::new(
         KeyChord::Bare(KeyCode::Char('D')),
         PlansAction::Discuss,
         Essential,
-        "Discuss the selection with AI in the REPL",
+        "cmd.plans.discuss",
     ),
     CommandSpec::new(
         KeyChord::Bare(KeyCode::Char('t')),
         PlansAction::ChangeStatus,
         Essential,
-        "Change the step status",
+        "cmd.plans.change_status",
     ),
     CommandSpec::new(
         KeyChord::Bare(KeyCode::Char('T')),
         PlansAction::ChangeStatus,
         Essential,
-        "Change the step status",
+        "cmd.plans.change_status",
     ),
     CommandSpec::new(
         KeyChord::Bare(KeyCode::Char('s')),
         PlansAction::ChangeStatus,
         Essential,
-        "Change the step status",
+        "cmd.plans.change_status",
     ),
     CommandSpec::new(
         KeyChord::Bare(KeyCode::Char('S')),
         PlansAction::ChangeStatus,
         Essential,
-        "Change the step status",
+        "cmd.plans.change_status",
     ),
     // Interface: navigation, accordion walk, folding, and scrolling.
     CommandSpec::new(
         KeyChord::Bare(KeyCode::Esc),
         PlansAction::Return,
         Interface,
-        "Return to the REPL",
+        "cmd.plans.return",
     ),
     CommandSpec::new(
         KeyChord::Bare(KeyCode::Char('q')),
         PlansAction::Return,
         Interface,
-        "Return to the REPL",
+        "cmd.plans.return",
     ),
     CommandSpec::new(
         KeyChord::Ctrl(KeyCode::Char('n')),
         PlansAction::AccordionNext,
         Interface,
-        "Walk to the next item (accordion)",
+        "cmd.plans.accordion_next",
     ),
     CommandSpec::new(
         KeyChord::Primary(KeyCode::Char('n')),
         PlansAction::AccordionNext,
         Interface,
-        "Walk to the next item (accordion)",
+        "cmd.plans.accordion_next",
     ),
     CommandSpec::new(
         KeyChord::Ctrl(KeyCode::Char('p')),
         PlansAction::AccordionPrev,
         Interface,
-        "Walk to the previous item (accordion)",
+        "cmd.plans.accordion_prev",
     ),
     CommandSpec::new(
         KeyChord::Primary(KeyCode::Char('p')),
         PlansAction::AccordionPrev,
         Interface,
-        "Walk to the previous item (accordion)",
+        "cmd.plans.accordion_prev",
     ),
     CommandSpec::new(
         KeyChord::Alt(KeyCode::Char('n')),
         PlansAction::NavNext,
         Interface,
-        "Select the next row",
+        "cmd.plans.nav_next",
     ),
     CommandSpec::new(
         KeyChord::Alt(KeyCode::Char('p')),
         PlansAction::NavPrev,
         Interface,
-        "Select the previous row",
+        "cmd.plans.nav_prev",
     ),
     CommandSpec::new(
         KeyChord::Bare(KeyCode::Down),
         PlansAction::NavNext,
         Interface,
-        "Select the next row",
+        "cmd.plans.nav_next",
     ),
     CommandSpec::new(
         KeyChord::Bare(KeyCode::Char('n')),
         PlansAction::NavNext,
         Interface,
-        "Select the next row",
+        "cmd.plans.nav_next",
     ),
     CommandSpec::new(
         KeyChord::Bare(KeyCode::Char('N')),
         PlansAction::NavNext,
         Interface,
-        "Select the next row",
+        "cmd.plans.nav_next",
     ),
     CommandSpec::new(
         KeyChord::Bare(KeyCode::Up),
         PlansAction::NavPrev,
         Interface,
-        "Select the previous row",
+        "cmd.plans.nav_prev",
     ),
     CommandSpec::new(
         KeyChord::Bare(KeyCode::Char('p')),
         PlansAction::NavPrev,
         Interface,
-        "Select the previous row",
+        "cmd.plans.nav_prev",
     ),
     CommandSpec::new(
         KeyChord::Bare(KeyCode::Char('P')),
         PlansAction::NavPrev,
         Interface,
-        "Select the previous row",
+        "cmd.plans.nav_prev",
     ),
     CommandSpec::new(
         KeyChord::Bare(KeyCode::Home),
         PlansAction::SelectFirst,
         Interface,
-        "Select the first row",
+        "cmd.plans.select_first",
     ),
     CommandSpec::new(
         KeyChord::Meta(KeyCode::Char('<')),
         PlansAction::SelectFirst,
         Interface,
-        "Select the first row",
+        "cmd.plans.select_first",
     ),
     CommandSpec::new(
         KeyChord::Ctrl(KeyCode::Home),
         PlansAction::SelectFirst,
         Interface,
-        "Select the first row",
+        "cmd.plans.select_first",
     ),
     CommandSpec::new(
         KeyChord::Bare(KeyCode::End),
         PlansAction::SelectLast,
         Interface,
-        "Select the last row",
+        "cmd.plans.select_last",
     ),
     CommandSpec::new(
         KeyChord::Meta(KeyCode::Char('>')),
         PlansAction::SelectLast,
         Interface,
-        "Select the last row",
+        "cmd.plans.select_last",
     ),
     CommandSpec::new(
         KeyChord::Ctrl(KeyCode::End),
         PlansAction::SelectLast,
         Interface,
-        "Select the last row",
+        "cmd.plans.select_last",
     ),
     CommandSpec::new(
         KeyChord::Bare(KeyCode::Tab),
         PlansAction::FoldToggle,
         Interface,
-        "Fold or unfold the selected plan, section, or step",
+        "cmd.plans.fold_toggle",
     ),
     CommandSpec::new(
         KeyChord::Bare(KeyCode::Char(' ')),
         PlansAction::FoldToggle,
         Interface,
-        "Fold or unfold the selected plan, section, or step",
+        "cmd.plans.fold_toggle",
     ),
     CommandSpec::new(
         KeyChord::Bare(KeyCode::Char('a')),
         PlansAction::FoldAll,
         Interface,
-        "Toggle fold or unfold for all plans, sections, and items",
+        "cmd.plans.fold_all",
     ),
     CommandSpec::new(
         KeyChord::Bare(KeyCode::Char('A')),
         PlansAction::FoldAll,
         Interface,
-        "Toggle fold or unfold for all plans, sections, and items",
+        "cmd.plans.fold_all",
     ),
     CommandSpec::new(
         KeyChord::Bare(KeyCode::PageUp),
         PlansAction::PageUp,
         Interface,
-        "Scroll the plan view up a page",
+        "cmd.plans.page_up",
     ),
     CommandSpec::new(
         KeyChord::Bare(KeyCode::PageDown),
         PlansAction::PageDown,
         Interface,
-        "Scroll the plan view down a page",
+        "cmd.plans.page_down",
     ),
     CommandSpec::new(
         KeyChord::Bare(KeyCode::Char('f')),
         PlansAction::SetFocus,
         Interface,
-        "Set the discussion focus to the selection without leaving the view",
+        "cmd.plans.set_focus",
     ),
     // Helpers: clipboard, refresh, and destructive operations.
+    //
+    // Copy (`c` / `y`) and the destructive mass clear (`Shift+C`) are declared as
+    // disjoint chord sets so the two verbs never compete for the same key event
+    // (Conventions §4.4). Every copy chord is grouped first and every clear chord
+    // second; the grouping is documentation only, because resolution depends
+    // solely on the chord and never on its position in the map.
     CommandSpec::new(
         KeyChord::Bare(KeyCode::Char('c')),
         PlansAction::CopyMarkdown,
         Helpers,
-        "Copy the plan as Markdown to the clipboard",
-    ),
-    CommandSpec::new(
-        KeyChord::Bare(KeyCode::Char('C')),
-        PlansAction::CopyMarkdown,
-        Helpers,
-        "Copy the plan as Markdown to the clipboard",
+        "cmd.plans.copy_markdown",
     ),
     CommandSpec::new(
         KeyChord::Bare(KeyCode::Char('y')),
         PlansAction::CopyMarkdown,
         Helpers,
-        "Copy the plan as Markdown to the clipboard",
+        "cmd.plans.copy_markdown",
     ),
     CommandSpec::new(
         KeyChord::Bare(KeyCode::Char('Y')),
         PlansAction::CopyMarkdown,
         Helpers,
-        "Copy the plan as Markdown to the clipboard",
+        "cmd.plans.copy_markdown",
+    ),
+    // `Shift+C` is the mass clear of the plan horizon. It is registered under
+    // the uppercase bare chord and the raw `Shift` chord because terminals
+    // report a shifted letter inconsistently; both spellings resolve to the same
+    // destructive action and never to the copy binding (Conventions §4.4).
+    CommandSpec::new(
+        KeyChord::Bare(KeyCode::Char('C')),
+        PlansAction::ClearHorizon,
+        Helpers,
+        "cmd.plans.clear_horizon",
+    ),
+    CommandSpec::new(
+        KeyChord::Shift(KeyCode::Char('c')),
+        PlansAction::ClearHorizon,
+        Helpers,
+        "cmd.plans.clear_horizon",
     ),
     CommandSpec::new(
         KeyChord::Bare(KeyCode::Char('g')),
         PlansAction::Refresh,
         Helpers,
-        "Refresh plans from the server",
+        "cmd.plans.refresh",
     ),
     CommandSpec::new(
         KeyChord::Bare(KeyCode::Char('G')),
         PlansAction::Refresh,
         Helpers,
-        "Refresh plans from the server",
+        "cmd.plans.refresh",
     ),
     CommandSpec::new(
         KeyChord::Bare(KeyCode::Delete),
         PlansAction::DeletePlan,
         Helpers,
-        "Delete the plan",
+        "cmd.plans.delete",
     ),
 ]);
 
 fn execute_scope_action(st: &mut AppState, plan_id: &str, scope_id: Option<&str>, scope_title: &str) {
     if st.model.is_busy() || st.review.running {
-        st.notify_warning("Model is currently busy; wait for turn to finish or press Esc to cancel");
+        st.notify_warning(active_t("notify.model_busy_esc"));
         return;
     }
 
     let plan = match st.plans_view.plans.iter().find(|p| p.id == plan_id).cloned() {
         Some(p) => p,
         None => {
-            st.notify_error(format!("Plan '{}' not found", plan_id));
+            st.notify_error(active_t("notify.plan_not_found").replace("{}", plan_id));
             return;
         }
     };
+
+    // A plan that carries only its architectural concept has no synthesized
+    // horizon yet: the batch projects the first horizon just-in-time, so the
+    // confirmation arms with an empty queue instead of reporting a finished
+    // scope (c-5).
+    if plan.items.is_empty() && !plan.concept.is_empty() && scope_id.is_none() {
+        st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
+        st.confirm_execute_scope = Some(crate::app::ConfirmExecuteScopeState {
+            plan_id: plan.id.clone(),
+            plan_title: plan.title.clone(),
+            scope_title: scope_title.to_string(),
+            step_id: None,
+            steps: Vec::new(),
+        });
+        return;
+    }
 
     match plan.evaluate_scope(scope_id) {
         tauqe_protocol::PlanScopeEvaluation::BlockedByDiscussion(items) => {
@@ -341,10 +375,11 @@ fn execute_scope_action(st: &mut AppState, plan_id: &str, scope_id: Option<&str>
             } else {
                 format!("{}, and {} more", items[..2].join(", "), items.len() - 2)
             };
-            st.notify_warning(format!(
-                "Scope contains {} item(s) in DISCUSSION ({}). Review or approve before executing.",
-                items.len(), preview
-            ));
+            st.notify_warning(
+                active_t("notify.plan_scope_discussion")
+                    .replacen("{}", &items.len().to_string(), 1)
+                    .replace("{}", &preview),
+            );
         }
         tauqe_protocol::PlanScopeEvaluation::BlockedByBlockers(items) => {
             let preview = if items.len() <= 2 {
@@ -352,13 +387,14 @@ fn execute_scope_action(st: &mut AppState, plan_id: &str, scope_id: Option<&str>
             } else {
                 format!("{}, and {} more", items[..2].join(", "), items.len() - 2)
             };
-            st.notify_warning(format!(
-                "Scope contains {} step(s) in BLOCKED status ({}). Resolve blockers or press 'R' to replan horizon before executing.",
-                items.len(), preview
-            ));
+            st.notify_warning(
+                active_t("notify.plan_scope_blocked")
+                    .replacen("{}", &items.len().to_string(), 1)
+                    .replace("{}", &preview),
+            );
         }
         tauqe_protocol::PlanScopeEvaluation::AllCompleted => {
-            st.notify_info("All steps in this scope are already completed.");
+            st.notify_info(active_t("notify.plan_scope_all_completed"));
         }
         tauqe_protocol::PlanScopeEvaluation::BlockedByDependencies(items) => {
             let preview = if items.len() <= 2 {
@@ -366,19 +402,20 @@ fn execute_scope_action(st: &mut AppState, plan_id: &str, scope_id: Option<&str>
             } else {
                 format!("{}, and {} more", items[..2].join(", "), items.len() - 2)
             };
-            st.notify_warning(format!(
-                "Scope contains {} step(s) with unmet dependencies ({}). Complete prerequisites first.",
-                items.len(), preview
-            ));
+            st.notify_warning(
+                active_t("notify.plan_scope_dependencies")
+                    .replacen("{}", &items.len().to_string(), 1)
+                    .replace("{}", &preview),
+            );
         }
         tauqe_protocol::PlanScopeEvaluation::StepBlocked => {
-            st.notify_warning("Step is BLOCKED; resolve the blocker or press 'R' to replan horizon before executing.");
+            st.notify_warning(active_t("notify.plan_step_blocked"));
         }
         tauqe_protocol::PlanScopeEvaluation::Cancelled => {
-            st.notify_warning("Step is CANCELLED; change status to TODO before executing.");
+            st.notify_warning(active_t("notify.plan_step_cancelled"));
         }
         tauqe_protocol::PlanScopeEvaluation::NotFound => {
-            st.notify_error("Target item not found in plan.");
+            st.notify_error(active_t("notify.plan_item_not_found"));
         }
         tauqe_protocol::PlanScopeEvaluation::Ready(steps) => {
             st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
@@ -525,7 +562,7 @@ pub async fn handle_plans_key(
                             st.plans_view.clamp_selection();
                             st.plans_view.scroll_to_selected();
                         } else {
-                            st.notify_info("Concept items define architectural requirements. Press 'd' to discuss in Develop.");
+                            st.notify_info(active_t("notify.plan_concept_discuss"));
                         }
                     }
                     VisiblePlanRow::ImplementationHeader { plan_id, .. } => {
@@ -559,10 +596,10 @@ pub async fn handle_plans_key(
                         execute_scope_action(&mut st, &plan_id, None, &title);
                     }
                     VisiblePlanRow::ConceptHeader { .. } => {
-                        st.notify_warning("Concept section cannot be executed; execute implementation steps below.");
+                        st.notify_warning(active_t("notify.plan_concept_section_not_executable"));
                     }
                     VisiblePlanRow::ConceptItem { .. } => {
-                        st.notify_warning("Concept item cannot be executed directly; execute implementation steps or press 'd' to discuss.");
+                        st.notify_warning(active_t("notify.plan_concept_item_not_executable"));
                     }
                     VisiblePlanRow::ImplementationHeader { plan_id, .. } => {
                         execute_scope_action(&mut st, &plan_id, None, "Implementation Scope");
@@ -579,14 +616,46 @@ pub async fn handle_plans_key(
             }
         }
         PlansAction::ExecuteAll => {
-            // `X` executes the entire selected plan as one batch, regardless of
-            // which row the cursor rests on: the queue is every ready leaf step
-            // of the plan horizon, dispatched through the unified server batch
+            // `X` executes every ready plan as one pipeline, regardless of which
+            // row the cursor rests on: the queue is assembled from every plan
+            // that carries a ready leaf horizon or only its architectural
+            // concept, and the whole queue runs under one registered operation
             // (c-1, c-5).
-            if let Some(row) = st.plans_view.selected_row() {
-                let plan_id = row.plan_id().to_string();
-                execute_scope_action(&mut st, &plan_id, None, "Entire plan");
+            let plans: Vec<tauqe_protocol::Plan> = st.plans_view.plans.clone();
+            let mut plan_ids = Vec::new();
+            let mut plan_titles = Vec::new();
+            let mut steps = Vec::new();
+            let mut pending_synthesis = Vec::new();
+
+            for plan in &plans {
+                if plan.items.is_empty() && !plan.concept.is_empty() {
+                    // Concept-only plan: the batch projects its first horizon
+                    // just-in-time before the queue reaches it.
+                    plan_ids.push(plan.id.clone());
+                    plan_titles.push(plan.title.clone());
+                    pending_synthesis.push(plan.title.clone());
+                    continue;
+                }
+                if let tauqe_protocol::PlanScopeEvaluation::Ready(ready) = plan.evaluate_scope(None)
+                {
+                    plan_ids.push(plan.id.clone());
+                    plan_titles.push(plan.title.clone());
+                    steps.extend(ready);
+                }
             }
+
+            if plan_ids.is_empty() {
+                st.notify_info(active_t("notify.plan_pipeline_empty"));
+                return Ok(InputResult::Continue);
+            }
+
+            st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
+            st.confirm_execute_pipeline = Some(crate::app::ConfirmExecutePipelineState {
+                plan_ids,
+                plan_titles,
+                steps,
+                pending_synthesis,
+            });
         }
         PlansAction::Discuss => {
             let sel_row = st.plans_view.selected_row();
@@ -638,10 +707,10 @@ pub async fn handle_plans_key(
                 st.discussion_focus = focus.clone();
                 let params = tauqe_protocol::DiscussionSetFocusParams { focus };
                 let message = match target_label {
-                    Some(label) => {
-                        format!("Discussion focus set to {} in plan '{}'", label, plan_title)
-                    }
-                    None => format!("Discussion focus set to plan '{}'", plan_title),
+                    Some(label) => active_t("notify.plan_focus_item_set")
+                        .replacen("{}", &label, 1)
+                        .replace("{}", &plan_title),
+                    None => active_t("notify.plan_focus_set").replace("{}", &plan_title),
                 };
                 drop(st);
                 send_request(
@@ -682,7 +751,7 @@ pub async fn handle_plans_key(
                     ));
                 }
                 Some(VisiblePlanRow::ConceptItem { .. }) => {
-                    st.notify_info("Concept items define architectural requirements and do not have task statuses. Press 'd' to discuss.");
+                    st.notify_info(active_t("notify.plan_concept_no_status"));
                 }
                 _ => {}
             }
@@ -705,21 +774,46 @@ pub async fn handle_plans_key(
                     let mut st = state.lock().await;
                     match res {
                         crate::clipboard::CopyResult::Native => {
-                            st.notify_success("Plan copied to clipboard");
+                            st.notify_success(active_t("notify.plan_copied"));
                         }
                         crate::clipboard::CopyResult::Osc52Only => {
-                            st.notify_info("Plan sent to terminal clipboard (OSC 52)");
+                            st.notify_info(active_t("notify.plan_copied_osc52"));
                         }
                         crate::clipboard::CopyResult::Failed => {
-                            st.notify_error("Failed to copy plan to clipboard");
+                            st.notify_error(active_t("notify.plan_copy_failed"));
                         }
                     }
                 }
             }
         }
+        PlansAction::ClearHorizon => {
+            let Some(row) = st.plans_view.selected_row() else {
+                return Ok(InputResult::Continue);
+            };
+            let plan_id = row.plan_id().to_string();
+            if !st.plans_view.plans.iter().any(|p| p.id == plan_id) {
+                st.notify_error(active_t("notify.plan_not_found").replace("{}", &plan_id));
+                return Ok(InputResult::Continue);
+            }
+            let horizon_empty = st
+                .plans_view
+                .plans
+                .iter()
+                .find(|p| p.id == plan_id)
+                .map(|p| p.items.is_empty())
+                .unwrap_or(false);
+            // An empty horizon has nothing to clear, so the confirmation is
+            // skipped and the developer is told why (Conventions §4.4).
+            if horizon_empty {
+                st.notify_info(active_t("notify.plan_horizon_already_empty"));
+                return Ok(InputResult::Continue);
+            }
+            st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
+            st.confirm_clear_horizon = Some(plan_id);
+        }
         PlansAction::Replan => {
             if st.model.is_busy() || st.review.running || st.plans_view.refining {
-                st.notify_warning("Model is currently busy; wait for operation to finish");
+                st.notify_warning(active_t("notify.model_busy"));
                 return Ok(InputResult::Continue);
             }
             if let Some(row) = st.plans_view.selected_row() {
@@ -746,7 +840,7 @@ pub async fn handle_plans_key(
         }
         PlansAction::ReplanAll => {
             if st.model.is_busy() || st.review.running || st.plans_view.refining {
-                st.notify_warning("Model is currently busy; wait for operation to finish");
+                st.notify_warning(active_t("notify.model_busy"));
                 return Ok(InputResult::Continue);
             }
             if let Some(row) = st.plans_view.selected_row() {
@@ -874,7 +968,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_uppercase_x_opens_whole_plan_batch_confirmation() {
+    async fn test_uppercase_x_opens_whole_plan_pipeline_confirmation() {
         let mut st = crate::app::test_state();
         let plan = tauqe_protocol::Plan {
             id: "plan-ready".to_string(),
@@ -910,11 +1004,271 @@ mod tests {
 
         let guard = state.lock().await;
         let target = guard
+            .confirm_execute_pipeline
+            .as_ref()
+            .expect("pipeline confirmation must be armed");
+        assert_eq!(target.plan_ids, vec!["plan-ready".to_string()]);
+        assert_eq!(target.plan_titles, vec!["Ready Plan".to_string()]);
+        assert_eq!(target.steps.len(), 2);
+        assert!(target.pending_synthesis.is_empty());
+        assert!(guard.confirm_execute_scope.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_uppercase_x_queues_concept_only_plan_for_jit_synthesis() {
+        let mut st = crate::app::test_state();
+        st.plans_view.plans = vec![
+            tauqe_protocol::Plan {
+                id: "plan-concept".to_string(),
+                title: "Concept Plan".to_string(),
+                concept: vec![tauqe_protocol::ConceptItem {
+                    id: "c1".to_string(),
+                    title: "Invariant".to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            tauqe_protocol::Plan {
+                id: "plan-ready".to_string(),
+                title: "Ready Plan".to_string(),
+                items: vec![tauqe_protocol::PlanItem {
+                    id: "1".to_string(),
+                    title: "First step".to_string(),
+                    status: tauqe_protocol::PlanItemStatus::Todo,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        ];
+        st.plans_view.expand_all();
+
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+        handle_plans_key(
+            KeyEvent::new(KeyCode::Char('X'), crossterm::event::KeyModifiers::NONE),
+            &state,
+            &mut conn,
+        )
+        .await
+        .unwrap();
+
+        let guard = state.lock().await;
+        let target = guard
+            .confirm_execute_pipeline
+            .as_ref()
+            .expect("pipeline confirmation must be armed");
+        assert_eq!(
+            target.plan_ids,
+            vec!["plan-concept".to_string(), "plan-ready".to_string()]
+        );
+        assert_eq!(target.steps.len(), 1);
+        assert_eq!(target.pending_synthesis, vec!["Concept Plan".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn test_executing_concept_only_plan_arms_jit_confirmation() {
+        let mut st = crate::app::test_state();
+        st.plans_view.plans = vec![tauqe_protocol::Plan {
+            id: "plan-concept".to_string(),
+            title: "Concept Plan".to_string(),
+            concept: vec![tauqe_protocol::ConceptItem {
+                id: "c1".to_string(),
+                title: "Invariant".to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }];
+        st.plans_view.expand_all();
+
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+        handle_plans_key(
+            KeyEvent::new(KeyCode::Char('x'), crossterm::event::KeyModifiers::NONE),
+            &state,
+            &mut conn,
+        )
+        .await
+        .unwrap();
+
+        let guard = state.lock().await;
+        let target = guard
             .confirm_execute_scope
             .as_ref()
-            .expect("batch confirmation must be armed");
-        assert_eq!(target.plan_id, "plan-ready");
-        assert!(target.step_id.is_none(), "the batch covers the whole plan");
-        assert_eq!(target.steps.len(), 2);
+            .expect("just-in-time confirmation must be armed");
+        assert_eq!(target.plan_id, "plan-concept");
+        assert!(target.step_id.is_none());
+        assert!(target.steps.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_clear_horizon_arms_level_one_when_steps_exist() {
+        let mut st = crate::app::test_state();
+        st.plans_view.plans = vec![tauqe_protocol::Plan {
+            id: "plan-steps".to_string(),
+            title: "Steps Plan".to_string(),
+            items: vec![tauqe_protocol::PlanItem {
+                id: "1".to_string(),
+                title: "Todo step".to_string(),
+                status: tauqe_protocol::PlanItemStatus::Todo,
+                ..Default::default()
+            }],
+            ..Default::default()
+        }];
+        st.plans_view.expand_all();
+
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+        handle_plans_key(
+            KeyEvent::new(KeyCode::Char('C'), crossterm::event::KeyModifiers::NONE),
+            &state,
+            &mut conn,
+        )
+        .await
+        .unwrap();
+
+        let guard = state.lock().await;
+        assert_eq!(guard.confirm_clear_horizon.as_deref(), Some("plan-steps"));
+        assert_eq!(guard.confirm_button, crate::app::ConfirmDialogButton::Cancel);
+    }
+
+    #[tokio::test]
+    async fn test_clear_horizon_on_empty_plan_notifies_without_arming() {
+        let mut st = crate::app::test_state();
+        st.plans_view.plans = vec![tauqe_protocol::Plan {
+            id: "plan-empty".to_string(),
+            title: "Empty Plan".to_string(),
+            ..Default::default()
+        }];
+        st.plans_view.expand_all();
+
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+        handle_plans_key(
+            KeyEvent::new(KeyCode::Char('C'), crossterm::event::KeyModifiers::NONE),
+            &state,
+            &mut conn,
+        )
+        .await
+        .unwrap();
+
+        let guard = state.lock().await;
+        assert!(guard.confirm_clear_horizon.is_none());
+        let notif = guard.active_notification().expect("notification");
+        assert!(notif.text.contains("no implementation steps"));
+    }
+
+    /// Resolves a raw key event against the Plans command map with structural
+    /// navigation active (text input inactive).
+    fn resolve_plans(
+        code: KeyCode,
+        modifiers: crossterm::event::KeyModifiers,
+    ) -> Option<PlansAction> {
+        PLANS_COMMAND_MAP
+            .resolve(
+                KeyEvent::new(code, modifiers),
+                &crate::config::InputConfig::default(),
+                false,
+            )
+            .map(|spec| spec.action)
+    }
+
+    /// Proves `Shift+C` is canonized as the destructive `ClearHorizon` and is
+    /// never intercepted by the copy binding, under every terminal spelling of a
+    /// shifted letter (Conventions §4.4, c-1, c-3).
+    #[test]
+    fn shift_c_is_canonized_as_clear_horizon_not_copy() {
+        use crossterm::event::KeyModifiers;
+
+        // Uppercase `C` alone (the canonical `Shift+C` spelling on most
+        // terminals), `C` carrying `SHIFT`, and the lowercase `c` carrying
+        // `SHIFT` all open the destructive clear-horizon confirmation.
+        assert_eq!(
+            resolve_plans(KeyCode::Char('C'), KeyModifiers::NONE),
+            Some(PlansAction::ClearHorizon)
+        );
+        assert_eq!(
+            resolve_plans(KeyCode::Char('C'), KeyModifiers::SHIFT),
+            Some(PlansAction::ClearHorizon)
+        );
+        assert_eq!(
+            resolve_plans(KeyCode::Char('c'), KeyModifiers::SHIFT),
+            Some(PlansAction::ClearHorizon)
+        );
+
+        // Lowercase `c` and both `y` cases stay copy, so the clipboard is never
+        // bound to the destructive reset.
+        assert_eq!(
+            resolve_plans(KeyCode::Char('c'), KeyModifiers::NONE),
+            Some(PlansAction::CopyMarkdown)
+        );
+        assert_eq!(
+            resolve_plans(KeyCode::Char('y'), KeyModifiers::NONE),
+            Some(PlansAction::CopyMarkdown)
+        );
+        assert_eq!(
+            resolve_plans(KeyCode::Char('Y'), KeyModifiers::NONE),
+            Some(PlansAction::CopyMarkdown)
+        );
+    }
+
+    /// Proves that the copy and clear chords resolve identically when declared
+    /// in the opposite order, so the destructive `Shift+C` is never shadowed by
+    /// a positional declaration of copy (c-1, c-3).
+    #[test]
+    fn clear_horizon_and_copy_resolution_is_order_independent() {
+        use crossterm::event::KeyModifiers;
+
+        static REVERSED: &[CommandSpec<PlansAction>] = &[
+            CommandSpec::new(
+                KeyChord::Bare(KeyCode::Char('C')),
+                PlansAction::ClearHorizon,
+                Helpers,
+                "cmd.plans.clear_horizon",
+            ),
+            CommandSpec::new(
+                KeyChord::Shift(KeyCode::Char('c')),
+                PlansAction::ClearHorizon,
+                Helpers,
+                "cmd.plans.clear_horizon",
+            ),
+            CommandSpec::new(
+                KeyChord::Bare(KeyCode::Char('Y')),
+                PlansAction::CopyMarkdown,
+                Helpers,
+                "cmd.plans.copy_markdown",
+            ),
+            CommandSpec::new(
+                KeyChord::Bare(KeyCode::Char('y')),
+                PlansAction::CopyMarkdown,
+                Helpers,
+                "cmd.plans.copy_markdown",
+            ),
+            CommandSpec::new(
+                KeyChord::Bare(KeyCode::Char('c')),
+                PlansAction::CopyMarkdown,
+                Helpers,
+                "cmd.plans.copy_markdown",
+            ),
+        ];
+
+        let map = CommandMap::new(REVERSED);
+        let input = crate::config::InputConfig::default();
+        let resolve = |code, modifiers| {
+            map.resolve(KeyEvent::new(code, modifiers), &input, false)
+                .map(|spec| spec.action)
+        };
+
+        assert_eq!(
+            resolve(KeyCode::Char('C'), KeyModifiers::NONE),
+            Some(PlansAction::ClearHorizon)
+        );
+        assert_eq!(
+            resolve(KeyCode::Char('c'), KeyModifiers::SHIFT),
+            Some(PlansAction::ClearHorizon)
+        );
+        assert_eq!(
+            resolve(KeyCode::Char('c'), KeyModifiers::NONE),
+            Some(PlansAction::CopyMarkdown)
+        );
     }
 }

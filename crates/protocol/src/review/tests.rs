@@ -545,6 +545,7 @@ fn finding(id: u32, status: IssueStatus) -> ReviewItem {
         files: Vec::new(),
         readonly_files: Vec::new(),
         subplan: Vec::new(),
+        subplan_architect: None,
         resolution_notes: None,
         body: String::new(),
     }

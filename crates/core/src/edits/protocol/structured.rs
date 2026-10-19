@@ -423,21 +423,19 @@ impl StructuredEditProtocol {
 
         prompt.push_str("Every field of a change is required: use an empty string \"\" for fields that do not apply to the operation (e.g. `old_text`/`new_text` for 'create'/'delete', `content` for 'replace').\n\n");
 
-        if editable_paths.is_empty() {
-            prompt.push_str("NOTE: No existing files are currently marked as editable. Answer questions in `message` or create new files with `op: 'create'` in `changes`.\n\n");
+        prompt.push_str("Files inside <context> declare their status through a declarative `access` attribute: `access=\"editable\"` files may be modified directly, while a file marked `access=\"read_only\"` is provided for reference and becomes editable automatically once you propose a change to it. ");
+        // The reachability of a file absent from <context> depends on whether
+        // the discovery capability is enabled: only a set that advertises
+        // `context_requests` in the schema may be told to use it.
+        if capabilities.contains(LlmCapability::Discovery) {
+            prompt.push_str("A file absent from <context> is reached through `context_requests` or created with `op: 'create'`.\n\n");
         } else {
-            prompt.push_str("Currently permitted existing target files for modification:\n");
-            for path in editable_paths {
-                prompt.push_str(&format!("- {}\n", path));
-            }
-            prompt.push('\n');
+            prompt.push_str("A file absent from <context> must be created with `op: 'create'`.\n\n");
         }
 
         prompt.push_str("CRITICAL INVARIANTS:\n");
         prompt.push_str("1. Output MUST be valid JSON adhering to the specified schema.\n");
-        prompt.push_str(
-            "2. For 'replace', `path` MUST match one of the permitted files in <editable_files>.\n",
-        );
+        prompt.push_str("2. For 'replace', `path` MUST match a file present in <context>.\n");
         prompt.push_str("3. For 'replace', `old_text` must match EXACTLY ONE location in the target file, including indentation and whitespace.\n");
         prompt.push_str("4. For 'create' and 'overwrite', `content` must contain the complete file content from first to last line.\n");
         prompt.push_str("5. If no code changes are needed, set `changes: []` and provide your answer in `message`.\n");

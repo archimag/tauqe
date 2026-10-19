@@ -26,6 +26,7 @@ thiserror.workspace = true
 async-trait = "0.1"
 getrandom = "0.2"
 regex.workspace = true
+indexmap.workspace = true
 struson = { version = "0.5", features = ["serde"] }
 tree-sitter = "0.22"
 tree-sitter-rust = "0.21"

@@ -10,7 +10,7 @@
 //! are persisted through `ReviewStorage`, so no plan-tree manipulation happens
 //! in the server crate.
 //!
-//! Two invariants govern this module:
+//! Three invariants govern this module:
 //! - #c-1: an `Architecture`-class or `Refine` finding without a subplan is
 //!   decomposed by the Architect autonomously before any coding starts. The
 //!   decision reads the authoritative `issue_type` category, never the coarse
@@ -18,15 +18,21 @@
 //! - #c-2: the active leaf sub-step is marked `InProgress` and persisted on disk
 //!   (with a `review/updated` event) for honest telemetry; the finding becomes
 //!   `Fixed` only once every remaining leaf sub-step is `Done`.
+//! - #c-3: a sub-step that fails with a domain failure is replanned up to
+//!   `max_replans` times: the Architect reprojects the remaining horizon from the
+//!   immutable `Done` foundation and the failure diagnostics, and the finding is
+//!   resumed from the synthesized horizon instead of being abandoned.
 
 use std::path::Path;
 use std::sync::Arc;
 
+use tauqe_core::providers::{format_session_id, SESSION_PREFIX_REVIEW};
+use tauqe_core::review::prompt::refine::ReviewRefineDiagnostics;
 use tauqe_core::review::prompt::ReviewStepFailure;
 use tauqe_core::review::ReviewStorage;
 use tauqe_protocol::{
-    IssueStatus, IssueType, ModelRole, ModelSelection, Plan, PlanItem, PlanItemStatus, ReviewItem,
-    ReviewSession,
+    IssueStatus, IssueType, ModelRole, ModelSelection, Plan, PlanItemStatus, PlanScopeEvaluation,
+    ReviewItem, ReviewSession, TurnIntent,
 };
 
 use crate::handlers::model::{execute_model_turn, StepTurnOptions};
@@ -34,8 +40,8 @@ use crate::handlers::plan::preload_step_files;
 use crate::state::{next_operation_id, AppState, OperationGuard};
 
 use super::common::{
-    clear_auto_context, offload_review, preload_item_files, publish_review, report_item_failure,
-    set_item_status, skip_finding_with_diagnostic, turn_applied_edits,
+    append_model_comment, clear_auto_context, offload_review, preload_item_files, publish_review,
+    report_item_failure, set_item_status, skip_finding_with_diagnostic, turn_applied_edits,
 };
 use super::refine::{refine_finding_with_architect, RefineOutcome};
 
@@ -86,28 +92,10 @@ async fn run_review_step_inner(
     instructions: Option<String>,
     operation: Arc<OperationGuard>,
 ) -> Result<(), ReviewStepFailure> {
-    let load_root = repo_root.to_path_buf();
-    let load_id = review_id.to_string();
-    let mut session =
-        match offload_review(move || ReviewStorage::load_review(&load_root, &load_id)).await {
-            Ok(Some(s)) => s,
-            Ok(None) => {
-                return Err(ReviewStepFailure::infrastructure(format!(
-                    "Review session '{}' not found",
-                    review_id
-                )));
-            }
-            Err(err) => return Err(ReviewStepFailure::infrastructure(err)),
-        };
-    let mut item = match session.find_item(item_id) {
-        Some(i) => i.clone(),
-        None => {
-            return Err(ReviewStepFailure::infrastructure(format!(
-                "Review item #{} not found in session '{}'",
-                item_id, review_id
-            )));
-        }
-    };
+    // Every finding turn of one audit extends the same provider prefix cache, so
+    // the session identifier is derived from the review, not from the dialogue.
+    let session_id = Some(format_session_id(SESSION_PREFIX_REVIEW, review_id));
+    let (mut session, mut item) = reload_finding(repo_root, review_id, item_id).await?;
 
     match item.status {
         // A finished finding is not re-executed. The sole exception is a targeted
@@ -115,8 +103,8 @@ async fn run_review_step_inner(
         // `Skipped` after its subplan stalled, yet the developer may resume the
         // remaining step directly.
         IssueStatus::Fixed | IssueStatus::Skipped => {
-            let targeted_incomplete =
-                step_id.is_some() && item.has_subplan() && has_uncompleted_leaves(&item.subplan);
+            let (total, done) = item.subplan_stats();
+            let targeted_incomplete = step_id.is_some() && item.has_subplan() && done < total;
             if !targeted_incomplete {
                 return Ok(());
             }
@@ -157,6 +145,7 @@ async fn run_review_step_inner(
             &item,
             None,
             None,
+            None,
             &operation,
         )
         .await
@@ -170,43 +159,20 @@ async fn run_review_step_inner(
                 );
             }
             Ok(RefineOutcome::Blocked { reason }) => {
-                skip_finding_with_diagnostic(state, repo_root, review_id, item_id, &reason).await;
+                skip_finding_with_diagnostic(state, repo_root, review_id, item_id, "", &reason)
+                    .await;
                 return Err(ReviewStepFailure::domain(reason));
             }
             Err(err) => return Err(ReviewStepFailure::infrastructure(err.message)),
         }
         clear_auto_context(state).await;
-
-        let reload_root = repo_root.to_path_buf();
-        let reload_id = review_id.to_string();
-        session =
-            match offload_review(move || ReviewStorage::load_review(&reload_root, &reload_id))
-                .await
-            {
-                Ok(Some(s)) => s,
-                Ok(None) => {
-                    return Err(ReviewStepFailure::infrastructure(format!(
-                        "Review session '{}' not found after decomposition",
-                        review_id
-                    )));
-                }
-                Err(err) => return Err(ReviewStepFailure::infrastructure(err)),
-            };
-        item = match session.find_item(item_id) {
-            Some(i) => i.clone(),
-            None => {
-                return Err(ReviewStepFailure::infrastructure(format!(
-                    "Review item #{} not found in session '{}' after decomposition",
-                    item_id, review_id
-                )));
-            }
-        };
+        (session, item) = reload_finding(repo_root, review_id, item_id).await?;
     }
 
     // A finding decomposed into an embedded subplan executes its sub-steps one by
     // one instead of a single monolithic turn.
     if item.has_subplan() {
-        return run_review_subplan(
+        return run_review_subplan_with_replans(
             state,
             repo_root,
             review_id,
@@ -275,11 +241,13 @@ async fn run_review_step_inner(
             prompt.clone(),
             policy,
             StepTurnOptions {
+                intent: TurnIntent::IsolatedStep,
                 custom_selection: Some(selection.clone()),
                 plan_context: None,
                 reasoning_effort,
                 marker: marker.clone(),
                 shared_operation: Some(Arc::clone(&operation)),
+                session_id: session_id.clone(),
             },
         )
         .await;
@@ -302,7 +270,15 @@ async fn run_review_step_inner(
         // cycle.
         if let Some(reason) = turn.blocked.clone() {
             report_item_failure(state, &turn.operation_id, &reason);
-            skip_finding_with_diagnostic(state, repo_root, review_id, item_id, &reason).await;
+            skip_finding_with_diagnostic(
+                state,
+                repo_root,
+                review_id,
+                item_id,
+                &turn.assistant_text,
+                &reason,
+            )
+            .await;
             return Err(ReviewStepFailure::domain(reason));
         }
 
@@ -398,7 +374,15 @@ async fn run_review_step_inner(
             if turn.error.is_none() {
                 report_item_failure(state, &turn.operation_id, &reason);
             }
-            skip_finding_with_diagnostic(state, repo_root, review_id, item_id, &reason).await;
+            skip_finding_with_diagnostic(
+                state,
+                repo_root,
+                review_id,
+                item_id,
+                &turn.assistant_text,
+                &reason,
+            )
+            .await;
             return Err(ReviewStepFailure::domain(reason));
         }
 
@@ -432,112 +416,39 @@ async fn run_review_step_inner(
     }
 }
 
-/// Collects the leaf sub-step identifiers of a subplan in declaration order.
+/// Renders why a review subplan scope cannot be executed right now.
 ///
-/// Only leaf steps carry executable work; conceptual container items are skipped.
-fn collect_leaf_step_ids(items: &[PlanItem]) -> Vec<String> {
-    fn walk(items: &[PlanItem], ids: &mut Vec<String>) {
-        for item in items {
-            if item.children.is_empty() {
-                ids.push(item.id.clone());
-            } else {
-                walk(&item.children, ids);
-            }
+/// The shared scope evaluator is the single source of truth for readiness, so
+/// its stall variants are translated into a developer-facing diagnostic here
+/// instead of being re-derived from the plan tree.
+fn format_scope_stall(step_id: Option<&str>, evaluation: &PlanScopeEvaluation) -> String {
+    let target = step_id.unwrap_or("subplan");
+    match evaluation {
+        PlanScopeEvaluation::BlockedByDiscussion(items) => format!(
+            "Sub-step scope '{}' is still in DISCUSSION: {}",
+            target,
+            items.join(", ")
+        ),
+        PlanScopeEvaluation::BlockedByBlockers(items) => format!(
+            "Sub-step scope '{}' is BLOCKED: {}",
+            target,
+            items.join(", ")
+        ),
+        PlanScopeEvaluation::BlockedByDependencies(items) => format!(
+            "Sub-step scope '{}' has unmet dependencies: {}",
+            target,
+            items.join(", ")
+        ),
+        PlanScopeEvaluation::StepBlocked => format!("Sub-step '{}' is BLOCKED", target),
+        PlanScopeEvaluation::Cancelled => format!("Sub-step scope '{}' is CANCELLED", target),
+        PlanScopeEvaluation::NotFound => {
+            format!("Sub-step '{}' not found in the subplan", target)
+        }
+        // `Ready` and `AllCompleted` never reach the stall diagnostic.
+        PlanScopeEvaluation::Ready(_) | PlanScopeEvaluation::AllCompleted => {
+            format!("Sub-step scope '{}' is already complete", target)
         }
     }
-    let mut ids = Vec::new();
-    walk(items, &mut ids);
-    ids
-}
-
-/// Locates a leaf sub-step by identifier, recursing into containers.
-fn find_leaf_step<'a>(items: &'a [PlanItem], step_id: &str) -> Option<&'a PlanItem> {
-    fn walk<'a>(items: &'a [PlanItem], step_id: &str) -> Option<&'a PlanItem> {
-        for item in items {
-            if item.children.is_empty() {
-                if item.id.eq_ignore_ascii_case(step_id) {
-                    return Some(item);
-                }
-            } else if let Some(found) = walk(&item.children, step_id) {
-                return Some(found);
-            }
-        }
-        None
-    }
-    walk(items, step_id)
-}
-
-/// Reports whether any leaf sub-step remains executable (not `Done`/`Cancelled`).
-fn has_uncompleted_leaves(items: &[PlanItem]) -> bool {
-    items.iter().any(|item| {
-        if item.children.is_empty() {
-            item.status != PlanItemStatus::Done && item.status != PlanItemStatus::Cancelled
-        } else {
-            has_uncompleted_leaves(&item.children)
-        }
-    })
-}
-
-/// Returns the declared dependencies of a sub-step that are not yet `Done`.
-fn unmet_substep_dependencies(subplan: &[PlanItem], step: &PlanItem) -> Vec<String> {
-    step.depends_on
-        .iter()
-        .filter(|dep| {
-            find_leaf_step(subplan, dep)
-                .map(|d| d.status != PlanItemStatus::Done && d.status != PlanItemStatus::Cancelled)
-                .unwrap_or(true)
-        })
-        .cloned()
-        .collect()
-}
-
-/// Recursively assigns a status to the sub-step with the given identifier.
-fn mark_substep_status(items: &mut [PlanItem], step_id: &str, status: PlanItemStatus) {
-    for item in items.iter_mut() {
-        if item.id.eq_ignore_ascii_case(step_id) {
-            item.status = status;
-            return;
-        }
-        mark_substep_status(&mut item.children, step_id, status);
-    }
-}
-
-/// Returns an `InProgress` sub-step to `Todo` after an interrupted attempt.
-fn revert_substep_in_progress(items: &mut [PlanItem], step_id: &str) {
-    for item in items.iter_mut() {
-        if item.id.eq_ignore_ascii_case(step_id) {
-            if item.status == PlanItemStatus::InProgress {
-                item.status = PlanItemStatus::Todo;
-            }
-            return;
-        }
-        revert_substep_in_progress(&mut item.children, step_id);
-    }
-}
-
-/// Counts actionable and completed leaves as `(total, done)`.
-///
-/// `Cancelled` leaves are excluded from the total, mirroring how a plan's
-/// progress metric drops terminal, non-actionable outcomes.
-fn subplan_progress(items: &[PlanItem]) -> (usize, usize) {
-    fn walk(items: &[PlanItem], total: &mut usize, done: &mut usize) {
-        for item in items {
-            if item.children.is_empty() {
-                if item.status != PlanItemStatus::Cancelled {
-                    *total += 1;
-                    if item.status == PlanItemStatus::Done {
-                        *done += 1;
-                    }
-                }
-            } else {
-                walk(&item.children, total, done);
-            }
-        }
-    }
-    let mut total = 0;
-    let mut done = 0;
-    walk(items, &mut total, &mut done);
-    (total, done)
 }
 
 /// Appends the developer directives section to an execution prompt when present.
@@ -549,60 +460,60 @@ fn append_developer_directives(prompt: &mut String, instructions: Option<&str>) 
     }
 }
 
-/// Recomputes derived container statuses and persists the subplan atomically.
+/// Persists the working subplan atomically.
+///
+/// Container statuses are derived, so they are recomputed before the write and
+/// the replacement itself is delegated to `ReviewStorage::update_subplan`, the
+/// single storage entry point that normalizes and stores a subplan.
 async fn persist_subplan(
     repo_root: &Path,
     review_id: &str,
     item_id: u32,
-    subplan: &mut Vec<PlanItem>,
+    plan: &mut Plan,
 ) -> Result<(), String> {
-    let mut plan = Plan {
-        items: subplan.clone(),
-        ..Default::default()
-    };
     plan.refresh_parent_statuses();
-    *subplan = plan.items;
-
-    let snapshot = subplan.clone();
+    let subplan = plan.items.clone();
     let save_root = repo_root.to_path_buf();
     let review_id_owned = review_id.to_string();
     offload_review(move || {
-        ReviewStorage::update_session_item(&save_root, &review_id_owned, item_id, move |it| {
-            it.plan = snapshot.clone();
-        })
+        ReviewStorage::update_subplan(&save_root, &review_id_owned, item_id, subplan)
     })
     .await?;
     Ok(())
 }
 
+/// Prefix of the resolution note recorded when a subplan stops before completion.
+const SUBPLAN_INTERRUPTED_NOTE_PREFIX: &str = "Subplan interrupted before completion";
+
 /// Records an interrupted subplan.
 ///
-/// Completed sub-steps keep their `Done` status, the stop reason is preserved in
-/// `resolution_notes`, and the finding becomes `Skipped` so the developer can
-/// inspect the cause and decide how to proceed without losing finished work.
+/// Completed sub-steps keep their `Done` status, the stop reason and the model's
+/// final comment are preserved in `resolution_notes`, and the finding becomes
+/// `Skipped` so the developer can inspect the cause and decide how to proceed
+/// without losing finished work.
 async fn finish_subplan_interrupted(
     state: &Arc<AppState>,
     repo_root: &Path,
     review_id: &str,
     item_id: u32,
-    subplan: Vec<PlanItem>,
+    plan: &mut Plan,
+    assistant_text: &str,
     reason: &str,
 ) {
-    let mut plan = Plan {
-        items: subplan,
-        ..Default::default()
-    };
     plan.refresh_parent_statuses();
-    let subplan = plan.items;
-    let notes = format!("Subplan interrupted before completion: {}", reason);
+    let subplan = plan.items.clone();
+    let notes = append_model_comment(
+        format!("{}: {}", SUBPLAN_INTERRUPTED_NOTE_PREFIX, reason),
+        assistant_text,
+    );
 
     let save_root = repo_root.to_path_buf();
     let review_id_owned = review_id.to_string();
     let _ = offload_review(move || {
         ReviewStorage::update_session_item(&save_root, &review_id_owned, item_id, move |it| {
             it.status = IssueStatus::Skipped;
-            it.plan = subplan.clone();
-            it.note = Some(notes.clone());
+            it.plan = subplan;
+            it.note = Some(notes);
         })
     })
     .await;
@@ -634,6 +545,9 @@ async fn run_review_subplan(
     instructions: Option<String>,
     operation: Arc<OperationGuard>,
 ) -> Result<(), ReviewStepFailure> {
+    // The sub-plan walk of one review session keeps a single warm provider
+    // prefix cache across its sub-steps and their retries.
+    let session_id = Some(format_session_id(SESSION_PREFIX_REVIEW, review_id));
     let item_id = item.id;
     set_item_status(state, repo_root, review_id, item_id, IssueStatus::InProgress).await;
 
@@ -653,67 +567,69 @@ async fn run_review_subplan(
     };
 
     let explicit_selection = model.or_else(|| item.model.clone());
-    let mut subplan = item.subplan.clone();
 
-    // Determine which leaf sub-steps this call executes.
-    let run_ids: Vec<String> = match step_id {
-        Some(target) => match find_leaf_step(&subplan, target) {
-            Some(step) if step.children.is_empty() => {
-                if step.status == PlanItemStatus::Done {
-                    Vec::new()
-                } else {
-                    let unmet = unmet_substep_dependencies(&subplan, step);
-                    if !unmet.is_empty() {
-                        set_item_status(state, repo_root, review_id, item_id, IssueStatus::Todo)
-                            .await;
-                        return Err(ReviewStepFailure::infrastructure(format!(
-                            "Sub-step '{}' depends on unfinished sub-step(s): {}",
-                            step.id,
-                            unmet.join(", ")
-                        )));
-                    }
-                    vec![step.id.clone()]
-                }
-            }
-            _ => {
-                set_item_status(state, repo_root, review_id, item_id, IssueStatus::Todo).await;
-                return Err(ReviewStepFailure::infrastructure(format!(
-                    "Sub-step '{}' not found in review item #{}",
-                    target, item.id
-                )));
-            }
-        },
-        None => collect_leaf_step_ids(&subplan),
+    // The embedded subplan is the working state of this walk: every status
+    // transition goes through `Plan::update_item_status`, so container statuses
+    // stay derived and readiness follows the shared scope evaluator.
+    let mut plan = Plan {
+        id: session.id.clone(),
+        title: session.title.clone(),
+        items: item.subplan.clone(),
+        ..Default::default()
+    };
+
+    // Resolve the leaf sub-steps this call executes through the shared scope
+    // evaluator, so dependency ordering and terminal states are derived exactly
+    // as they are for a plan.
+    let evaluation = match step_id {
+        Some(target) if plan.is_leaf_item(target) == Some(true) => plan.evaluate_scope(Some(target)),
+        Some(target) => {
+            set_item_status(state, repo_root, review_id, item_id, IssueStatus::Todo).await;
+            return Err(ReviewStepFailure::infrastructure(format!(
+                "Sub-step '{}' not found in review item #{}",
+                target, item.id
+            )));
+        }
+        None => plan.evaluate_scope(None),
+    };
+
+    let run_ids: Vec<String> = match evaluation {
+        PlanScopeEvaluation::Ready(steps) => steps.into_iter().map(|step| step.id).collect(),
+        // Nothing actionable is left: every leaf is already `Done`.
+        PlanScopeEvaluation::AllCompleted => Vec::new(),
+        stall => {
+            set_item_status(state, repo_root, review_id, item_id, IssueStatus::Todo).await;
+            return Err(ReviewStepFailure::infrastructure(format_scope_stall(
+                step_id, &stall,
+            )));
+        }
     };
 
     for current_step_id in &run_ids {
-        let step_snapshot = match find_leaf_step(&subplan, current_step_id) {
-            Some(s) => s.clone(),
-            None => continue,
+        let step_snapshot = match plan.find_item(current_step_id) {
+            Some(step) if step.status != PlanItemStatus::Done => step.clone(),
+            _ => continue,
         };
-        if step_snapshot.status == PlanItemStatus::Done {
-            continue;
-        }
 
         preload_step_files(state, repo_root, &step_snapshot).await;
 
         // #c-2: mark the active sub-step InProgress and persist it atomically.
-        mark_substep_status(&mut subplan, current_step_id, PlanItemStatus::InProgress);
-        persist_subplan(repo_root, review_id, item_id, &mut subplan)
+        if !plan.update_item_status(current_step_id, PlanItemStatus::InProgress) {
+            continue;
+        }
+        persist_subplan(repo_root, review_id, item_id, &mut plan)
             .await
             .map_err(ReviewStepFailure::infrastructure)?;
         publish_review(state, repo_root, review_id).await;
 
-        let plan = Plan {
-            id: session.id.clone(),
-            title: session.title.clone(),
-            items: subplan.clone(),
-            ..Default::default()
-        };
         let step = match plan.find_item(current_step_id) {
-            Some(s) => s.clone(),
+            Some(step) => step.clone(),
             None => continue,
         };
+
+        // Track the model's most recent response for this sub-step so a later
+        // interruption can preserve it alongside the stop reason.
+        let mut step_assistant_text = String::new();
 
         let mut prompt = match tauqe_core::plan::prompt::format_plan_step_execution_prompt(
             &plan,
@@ -722,9 +638,17 @@ async fn run_review_subplan(
         ) {
             Ok(p) => p,
             Err(err) => {
-                revert_substep_in_progress(&mut subplan, current_step_id);
-                finish_subplan_interrupted(state, repo_root, review_id, item_id, subplan, &err)
-                    .await;
+                plan.update_item_status(current_step_id, PlanItemStatus::Todo);
+                finish_subplan_interrupted(
+                    state,
+                    repo_root,
+                    review_id,
+                    item_id,
+                    &mut plan,
+                    &step_assistant_text,
+                    &err,
+                )
+                .await;
                 return Err(ReviewStepFailure::infrastructure(err));
             }
         };
@@ -746,11 +670,13 @@ async fn run_review_subplan(
                 prompt.clone(),
                 policy,
                 StepTurnOptions {
+                    intent: TurnIntent::IsolatedStep,
                     custom_selection: Some(selection.clone()),
                     plan_context: None,
                     reasoning_effort,
                     marker: marker.clone(),
                     shared_operation: Some(Arc::clone(&operation)),
+                    session_id: session_id.clone(),
                 },
             )
             .await;
@@ -759,6 +685,8 @@ async fn run_review_subplan(
                 Ok(turn) => turn,
                 Err(err) => break Err(ReviewStepFailure::infrastructure(err.message)),
             };
+
+            step_assistant_text = turn.assistant_text.clone();
 
             if let Some(reason) = turn.blocked.clone() {
                 break Err(ReviewStepFailure::domain(reason));
@@ -829,20 +757,31 @@ async fn run_review_subplan(
 
         match step_result {
             Ok(()) => {
-                mark_substep_status(&mut subplan, current_step_id, PlanItemStatus::Done);
-                persist_subplan(repo_root, review_id, item_id, &mut subplan)
+                plan.update_item_status(current_step_id, PlanItemStatus::Done);
+                persist_subplan(repo_root, review_id, item_id, &mut plan)
                     .await
                     .map_err(ReviewStepFailure::infrastructure)?;
                 publish_review(state, repo_root, review_id).await;
             }
             Err(failure) => {
-                // Revert the interrupted sub-step before recording the stop.
-                revert_substep_in_progress(&mut subplan, current_step_id);
+                // Revert the interrupted sub-step before recording the stop, and
+                // attribute the failure to it so the supervisor can replan the
+                // remaining horizon around the failed approach.
+                plan.update_item_status(current_step_id, PlanItemStatus::Todo);
+                let failure = failure.with_step(current_step_id.as_str());
                 let reason = failure.reason().to_string();
                 let op_id = format!("op-{}", next_operation_id());
                 report_item_failure(state, &op_id, &reason);
-                finish_subplan_interrupted(state, repo_root, review_id, item_id, subplan, &reason)
-                    .await;
+                finish_subplan_interrupted(
+                    state,
+                    repo_root,
+                    review_id,
+                    item_id,
+                    &mut plan,
+                    &step_assistant_text,
+                    &reason,
+                )
+                .await;
                 return Err(failure);
             }
         }
@@ -850,7 +789,7 @@ async fn run_review_subplan(
     clear_auto_context(state).await;
 
     // #c-2: a finding is Fixed only when every remaining leaf sub-step is Done.
-    let (total, done) = subplan_progress(&subplan);
+    let (total, done) = plan.count_stats();
     if total > 0 && done == total {
         let notes = format!(
             "Subplan completed: all {} sub-step(s) applied successfully",
@@ -862,7 +801,7 @@ async fn run_review_subplan(
             ReviewStorage::update_session_item(&save_root, &review_id_owned, item_id, move |it| {
                 it.status = IssueStatus::Fixed;
                 if it.note.is_none() {
-                    it.note = Some(notes.clone());
+                    it.note = Some(notes);
                 }
             })
         })
@@ -872,4 +811,210 @@ async fn run_review_subplan(
         set_item_status(state, repo_root, review_id, item_id, IssueStatus::Todo).await;
     }
     Ok(())
+}
+
+/// Reloads the review session and the target finding from disk.
+///
+/// Execution and replanning both need the persisted state of the finding: the
+/// subplan mutated by a failed sub-step, the status written by an interruption,
+/// and the horizon synthesized by the Architect.
+async fn reload_finding(
+    repo_root: &Path,
+    review_id: &str,
+    item_id: u32,
+) -> Result<(ReviewSession, ReviewItem), ReviewStepFailure> {
+    let load_root = repo_root.to_path_buf();
+    let load_id = review_id.to_string();
+    let session =
+        match offload_review(move || ReviewStorage::load_review(&load_root, &load_id)).await {
+            Ok(Some(s)) => s,
+            Ok(None) => {
+                return Err(ReviewStepFailure::infrastructure(format!(
+                    "Review session '{}' not found",
+                    review_id
+                )));
+            }
+            Err(err) => return Err(ReviewStepFailure::infrastructure(err)),
+        };
+    let item = match session.find_item(item_id) {
+        Some(i) => i.clone(),
+        None => {
+            return Err(ReviewStepFailure::infrastructure(format!(
+                "Review item #{} not found in session '{}'",
+                item_id, review_id
+            )));
+        }
+    };
+    Ok((session, item))
+}
+
+/// Whether a subplan still contains the given sub-step id.
+fn subplan_contains(items: &[tauqe_protocol::PlanItem], step_id: &str) -> bool {
+    items
+        .iter()
+        .any(|item| item.id == step_id || subplan_contains(&item.children, step_id))
+}
+
+/// Resumes a finding after the Architect reprojected its remaining horizon.
+///
+/// The interrupted sub-step reverted to `Todo` and the finding was marked
+/// `Skipped` with an interruption note. That note describes a superseded horizon,
+/// so it is cleared here and the finding returns to `Todo` before the retry; a
+/// successful retry then records its own outcome note instead of inheriting the
+/// diagnostic of an approach that no longer exists.
+async fn resume_finding_after_replan(
+    state: &Arc<AppState>,
+    repo_root: &Path,
+    review_id: &str,
+    item_id: u32,
+) {
+    let save_root = repo_root.to_path_buf();
+    let review_id_owned = review_id.to_string();
+    let _ = offload_review(move || {
+        ReviewStorage::update_session_item(&save_root, &review_id_owned, item_id, |it| {
+            it.status = IssueStatus::Todo;
+            let superseded = it
+                .note
+                .as_deref()
+                .is_some_and(|note| note.starts_with(SUBPLAN_INTERRUPTED_NOTE_PREFIX));
+            if superseded {
+                it.note = None;
+            }
+        })
+    })
+    .await;
+    publish_review(state, repo_root, review_id).await;
+}
+
+/// Executes a decomposed finding's subplan, replanning the remaining horizon
+/// around a failed sub-step up to `max_replans` times.
+///
+/// [`run_review_subplan`] confines a failure to the current finding: the failed
+/// sub-step returns to `Todo`, the completed foundation stays `Done`, and the
+/// finding is marked `Skipped` with an interruption note. When the failure is a
+/// domain failure attributable to a concrete sub-step and the replan budget
+/// allows it, the Architect reprojects the remaining horizon from the immutable
+/// `Done` foundation and the failure diagnostics — exactly as plan replanning
+/// does — and the finding is resumed from the synthesized horizon. An exhausted
+/// budget or a blocked Architect leaves the finding `Skipped`, so the batch
+/// advances instead of retrying a hopeless approach.
+#[allow(clippy::too_many_arguments)]
+async fn run_review_subplan_with_replans(
+    state: &Arc<AppState>,
+    repo_root: &Path,
+    review_id: &str,
+    session: &ReviewSession,
+    item: &ReviewItem,
+    step_id: Option<&str>,
+    model: Option<ModelSelection>,
+    instructions: Option<String>,
+    operation: Arc<OperationGuard>,
+) -> Result<(), ReviewStepFailure> {
+    let max_replans = state.config.lock().await.config.develop.max_replans;
+    let mut replans_count = 0usize;
+    let mut session = session.clone();
+    let mut item = item.clone();
+    let mut target = step_id.map(str::to_string);
+
+    loop {
+        let failure = match run_review_subplan(
+            state,
+            repo_root,
+            review_id,
+            &session,
+            &item,
+            target.as_deref(),
+            model.clone(),
+            instructions.clone(),
+            Arc::clone(&operation),
+        )
+        .await
+        {
+            Ok(()) => return Ok(()),
+            Err(failure) => failure,
+        };
+
+        // Only a domain failure attributable to a concrete sub-step carries a
+        // diagnostic the Architect can reproject the horizon from: an
+        // infrastructure failure aborts the batch, and a failure without a step
+        // has no failed approach to replace.
+        let failed_step = if failure.is_domain() {
+            failure.failed_step().map(str::to_string)
+        } else {
+            None
+        };
+        let Some(failed_step) = failed_step else {
+            return Err(failure);
+        };
+
+        if replans_count >= max_replans {
+            tracing::warn!(
+                review_id = review_id,
+                item_id = item.id,
+                failed_step_id = failed_step.as_str(),
+                max_replans = max_replans,
+                "review finding replanning limit reached"
+            );
+            return Err(failure);
+        }
+        replans_count += 1;
+
+        tracing::warn!(
+            review_id = review_id,
+            item_id = item.id,
+            failed_step_id = failed_step.as_str(),
+            replan_round = replans_count,
+            max_replans = max_replans,
+            reason = failure.reason(),
+            "review finding replanning started"
+        );
+
+        // The Architect must see the subplan as persisted after the failed
+        // sub-step was reverted, so the finding is reloaded before synthesis.
+        let reloaded = reload_finding(repo_root, review_id, item.id).await?;
+        session = reloaded.0;
+        item = reloaded.1;
+
+        match refine_finding_with_architect(
+            state,
+            repo_root,
+            &session,
+            &item,
+            None,
+            None,
+            Some(ReviewRefineDiagnostics {
+                failed_step_id: failed_step.as_str(),
+                failure_reason: Some(failure.reason()),
+            }),
+            &operation,
+        )
+        .await
+        {
+            Ok(RefineOutcome::Success { .. }) => {}
+            Ok(RefineOutcome::Blocked { reason }) => {
+                skip_finding_with_diagnostic(state, repo_root, review_id, item.id, "", &reason)
+                    .await;
+                return Err(ReviewStepFailure::domain(reason));
+            }
+            Err(err) => return Err(ReviewStepFailure::infrastructure(err.message)),
+        }
+
+        // Resume the finding from the synthesized horizon: the interruption note
+        // recorded for the failed sub-step is superseded by the replan and must
+        // not survive a successful retry.
+        resume_finding_after_replan(state, repo_root, review_id, item.id).await;
+        let reloaded = reload_finding(repo_root, review_id, item.id).await?;
+        session = reloaded.0;
+        item = reloaded.1;
+
+        // A targeted sub-step that the synthesized horizon replaced can no
+        // longer be resumed by id; the retry then walks the whole remaining
+        // horizon instead of failing on a vanished target.
+        let vanished = target
+            .as_deref()
+            .is_some_and(|current| !subplan_contains(&item.subplan, current));
+        if vanished {
+            target = None;
+        }
+    }
 }

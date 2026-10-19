@@ -161,7 +161,7 @@ pub(crate) async fn submit_refine_dialog(
     server_writer: &mut RpcConnection,
 ) -> anyhow::Result<Option<InputResult>> {
     if st.model.is_busy() || st.review.running || st.plans_view.refining {
-        st.notify_warning("Model is currently busy; wait for operation to finish");
+        st.notify_warning(crate::i18n::active_t("notify.model_busy"));
         st.plans_view.refine_dialog = Some(dialog);
         return Ok(Some(InputResult::Continue));
     }
@@ -248,7 +248,7 @@ pub(crate) async fn submit_refine_blocked(
     server_writer: &mut RpcConnection,
 ) -> anyhow::Result<()> {
     if st.model.is_busy() || st.review.running || st.plans_view.refining {
-        st.notify_warning("Model is currently busy; wait for operation to finish");
+        st.notify_warning(crate::i18n::active_t("notify.model_busy"));
         st.plans_view.refine_blocked = Some(blocked);
         return Ok(());
     }
@@ -296,6 +296,7 @@ mod tests {
             description: None,
             created_at: 0,
             updated_at: 0,
+            architect: None,
             concept: vec![],
             items: vec![],
         }];

@@ -10,8 +10,8 @@ use tauqe_core::providers::mock::{MockLlmProvider, MockResponse};
 use tauqe_core::providers::{ChatMessage, LlmProvider, ResponseFormat, StreamEvent};
 use tauqe_core::review::ReviewStorage;
 use tauqe_protocol::{
-    events, ContextAccess, IssueStatus, ModelSelection, PlanItemStatus, Request, ReviewItem,
-    ReviewSession,
+    events, ContextAccess, IssueStatus, ModelSelection, PlanItemStatus, Request, ReviewIssue,
+    ReviewItem, ReviewSession,
 };
 use tokio::sync::{mpsc, watch};
 
@@ -726,9 +726,9 @@ async fn test_review_retry_exhaustion_skips_item_and_continues() {
     let updated = ReviewStorage::load_review(dir.path(), "rev-retry-exhaust")
         .unwrap()
         .unwrap();
-    let item = updated.find_item(1).unwrap();
-    assert_eq!(item.status, IssueStatus::Skipped);
-    let notes = item.resolution_notes.as_deref().unwrap_or("");
+    let issue = ReviewIssue::from(updated.find_item(1).unwrap().clone());
+    assert_eq!(issue.status, IssueStatus::Skipped);
+    let notes = issue.note.as_deref().unwrap_or("");
     assert!(notes.contains("Skipped after execution failure"), "notes: {notes}");
     assert!(notes.contains("no code changes"), "notes: {notes}");
 
@@ -810,9 +810,9 @@ async fn test_review_semantic_block_skips_finding_without_retry() {
     let updated = ReviewStorage::load_review(dir.path(), "rev-blocked")
         .unwrap()
         .unwrap();
-    let item = updated.find_item(1).unwrap();
-    assert_eq!(item.status, IssueStatus::Skipped);
-    let notes = item.resolution_notes.as_deref().unwrap_or("");
+    let issue = ReviewIssue::from(updated.find_item(1).unwrap().clone());
+    assert_eq!(issue.status, IssueStatus::Skipped);
+    let notes = issue.note.as_deref().unwrap_or("");
     assert!(notes.contains("Target API was removed"), "notes: {notes}");
 }
 
@@ -936,10 +936,10 @@ async fn test_review_step_execution_with_skip_tag_marks_skipped_and_saves_notes(
     let reloaded = ReviewStorage::load_review(dir.path(), "rev-skip-single")
         .unwrap()
         .unwrap();
-    let item = reloaded.find_item(1).unwrap();
-    assert_eq!(item.status, IssueStatus::Skipped);
+    let issue = ReviewIssue::from(reloaded.find_item(1).unwrap().clone());
+    assert_eq!(issue.status, IssueStatus::Skipped);
     assert_eq!(
-        item.resolution_notes.as_deref(),
+        issue.note.as_deref(),
         Some("Already fixed in prior commit: Refactored earlier")
     );
 }
@@ -989,15 +989,15 @@ async fn test_review_batch_continues_after_skipped_item() {
     let reloaded = ReviewStorage::load_review(dir.path(), "rev-skip-continue")
         .unwrap()
         .unwrap();
-    let item1 = reloaded.find_item(1).unwrap();
-    assert_eq!(item1.status, IssueStatus::Skipped);
+    let issue1 = ReviewIssue::from(reloaded.find_item(1).unwrap().clone());
+    assert_eq!(issue1.status, IssueStatus::Skipped);
     assert_eq!(
-        item1.resolution_notes.as_deref(),
+        issue1.note.as_deref(),
         Some("False positive: Function contract already guarantees non-null")
     );
 
-    let item2 = reloaded.find_item(2).unwrap();
-    assert_eq!(item2.status, IssueStatus::Fixed);
+    let issue2 = ReviewIssue::from(reloaded.find_item(2).unwrap().clone());
+    assert_eq!(issue2.status, IssueStatus::Fixed);
 }
 
 #[tokio::test]
@@ -1112,7 +1112,7 @@ async fn test_handle_review_update_item_clears_and_updates_notes() {
         .unwrap()
         .unwrap();
     assert_eq!(
-        reloaded.find_item(1).unwrap().resolution_notes.as_deref(),
+        ReviewIssue::from(reloaded.find_item(1).unwrap().clone()).note.as_deref(),
         Some("Updated note")
     );
 
@@ -1133,7 +1133,7 @@ async fn test_handle_review_update_item_clears_and_updates_notes() {
         .unwrap()
         .unwrap();
     assert_eq!(
-        reloaded_cleared.find_item(1).unwrap().resolution_notes,
+        ReviewIssue::from(reloaded_cleared.find_item(1).unwrap().clone()).note,
         None
     );
 }
@@ -1360,9 +1360,9 @@ async fn test_review_step_execution_records_resolution_notes_on_fixed() {
     let reloaded = ReviewStorage::load_review(dir.path(), "rev-fixed-notes")
         .unwrap()
         .unwrap();
-    let item = reloaded.find_item(1).unwrap();
-    assert_eq!(item.status, IssueStatus::Fixed);
-    assert!(item.resolution_notes.is_some());
+    let issue = ReviewIssue::from(reloaded.find_item(1).unwrap().clone());
+    assert_eq!(issue.status, IssueStatus::Fixed);
+    assert!(issue.note.is_some());
 }
 
 fn subplan_item(
@@ -1433,12 +1433,12 @@ async fn test_handle_review_refine_item_persists_subplan() {
     let reloaded = ReviewStorage::load_review(dir.path(), "rev-refine")
         .unwrap()
         .unwrap();
-    let item = reloaded.find_item(1).unwrap();
-    assert_eq!(item.subplan.len(), 2);
-    assert_eq!(item.subplan[0].id, "1.1");
-    assert_eq!(item.subplan[1].id, "1.2");
+    let issue = ReviewIssue::from(reloaded.find_item(1).unwrap().clone());
+    assert_eq!(issue.plan.len(), 2);
+    assert_eq!(issue.plan[0].id, "1.1");
+    assert_eq!(issue.plan[1].id, "1.2");
     // Decomposition alone does not change the finding status.
-    assert_eq!(item.status, IssueStatus::Todo);
+    assert_eq!(issue.status, IssueStatus::Todo);
 }
 
 #[tokio::test]
@@ -1557,8 +1557,8 @@ async fn test_handle_review_refine_item_retries_when_requested_files_already_loa
     let reloaded = ReviewStorage::load_review(dir.path(), "rev-refine-satisfied")
         .unwrap()
         .unwrap();
-    let item = reloaded.find_item(1).unwrap();
-    assert_eq!(item.subplan.len(), 1);
+    let issue = ReviewIssue::from(reloaded.find_item(1).unwrap().clone());
+    assert_eq!(issue.plan.len(), 1);
 }
 
 #[tokio::test]
@@ -1610,10 +1610,10 @@ async fn test_review_subplan_execution_marks_fixed_when_all_steps_succeed() {
     let reloaded = ReviewStorage::load_review(dir.path(), "rev-subplan-ok")
         .unwrap()
         .unwrap();
-    let item = reloaded.find_item(1).unwrap();
-    assert_eq!(item.status, IssueStatus::Fixed);
-    assert_eq!(item.subplan[0].status, PlanItemStatus::Done);
-    assert_eq!(item.subplan[1].status, PlanItemStatus::Done);
+    let issue = ReviewIssue::from(reloaded.find_item(1).unwrap().clone());
+    assert_eq!(issue.status, IssueStatus::Fixed);
+    assert_eq!(issue.plan[0].status, PlanItemStatus::Done);
+    assert_eq!(issue.plan[1].status, PlanItemStatus::Done);
     assert_eq!(
         std::fs::read_to_string(dir.path().join("src/target.rs")).unwrap(),
         "pub fn target() { /* two */ }\n"
@@ -1646,6 +1646,11 @@ async fn test_review_subplan_interruption_preserves_done_and_marks_skipped() {
     let mut config = test_config();
     config.develop.workflow = tauqe_protocol::WorkflowKind::Naive;
     config.develop.max_retries = 0;
+    // Automated replanning is disabled so a failed sub-step is terminal for the
+    // finding: this test asserts that an interruption preserves the completed
+    // foundation. With a replan budget the Architect would instead reproject the
+    // remaining horizon, which is covered by its own test below.
+    config.develop.max_replans = 0;
     let state = test_state_with_provider(&dir, config, provider).await;
     *state.marker_override.lock().await = Some(marker.to_string());
 
@@ -1666,14 +1671,105 @@ async fn test_review_subplan_interruption_preserves_done_and_marks_skipped() {
     let reloaded = ReviewStorage::load_review(dir.path(), "rev-subplan-stop")
         .unwrap()
         .unwrap();
-    let item = reloaded.find_item(1).unwrap();
+    let issue = ReviewIssue::from(reloaded.find_item(1).unwrap().clone());
     // The finding is Skipped, its completed sub-step stays Done, the failed
     // one is not, and the stop reason is preserved.
-    assert_eq!(item.status, IssueStatus::Skipped);
-    assert_eq!(item.subplan[0].status, PlanItemStatus::Done);
-    assert_ne!(item.subplan[1].status, PlanItemStatus::Done);
-    let notes = item.resolution_notes.as_deref().unwrap_or("");
+    assert_eq!(issue.status, IssueStatus::Skipped);
+    assert_eq!(issue.plan[0].status, PlanItemStatus::Done);
+    assert_ne!(issue.plan[1].status, PlanItemStatus::Done);
+    let notes = issue.note.as_deref().unwrap_or("");
     assert!(notes.contains("Subplan interrupted"), "notes: {notes}");
+}
+
+#[tokio::test]
+async fn test_review_subplan_replans_remaining_horizon_after_failed_step() {
+    let dir = TestDir::new();
+    init_repo_with_file(&dir, "src/target.rs");
+
+    let mut item = test_item(1, IssueStatus::Todo, "src/target.rs");
+    item.plan = vec![
+        subplan_item("1.1", "First step", PlanItemStatus::Todo, vec!["src/target.rs"]),
+        subplan_item("1.2", "Second step", PlanItemStatus::Todo, vec!["src/target.rs"]),
+    ];
+    let session = test_session("rev-subplan-replan", vec![item]);
+    ReviewStorage::save_session(dir.path(), &session).unwrap();
+
+    let marker = "SUBPLANREP1";
+    let edit1 = format!(
+        "<tauqe_edits_{m} summary=\"Step 1\">\n<edit_{m} path=\"src/target.rs\">\n<search_{m}>\npub fn target() {{}}\n</search_{m}>\n<replace_{m}>\npub fn target() {{ /* one */ }}\n</replace_{m}>\n</edit_{m}>\n<success_{m} summary=\"step 1 done\" />\n</tauqe_edits_{m}>",
+        m = marker
+    );
+    let replanned_edit = format!(
+        "<tauqe_edits_{m} summary=\"Replanned step\">\n<edit_{m} path=\"src/target.rs\">\n<search_{m}>\npub fn target() {{ /* one */ }}\n</search_{m}>\n<replace_{m}>\npub fn target() {{ /* replanned */ }}\n</replace_{m}>\n</edit_{m}>\n<success_{m} summary=\"replanned step done\" />\n</tauqe_edits_{m}>",
+        m = marker
+    );
+    let replan_output = serde_json::json!({
+        "status": "success",
+        "explanation": "Reprojected the remaining horizon around the failed step",
+        "reason": null,
+        "context_requests": [],
+        "items": [{
+            "id": "2",
+            "title": "Replanned remaining step",
+            "status": "todo",
+            "files": ["src/target.rs"],
+            "readonly_files": [],
+            "concept_refs": [],
+            "depends_on": [],
+            "children": []
+        }]
+    });
+    let provider = Arc::new(MockLlmProvider::scripted([
+        MockResponse::text(edit1),
+        MockResponse::text("No edits proposed for the second step."),
+        MockResponse::text(replan_output.to_string()),
+        MockResponse::text(replanned_edit),
+    ]));
+
+    let mut config = test_config();
+    config.develop.workflow = tauqe_protocol::WorkflowKind::Naive;
+    config.develop.max_retries = 0;
+    // One replanning round is allowed, so a failed sub-step engages the
+    // Architect instead of leaving the finding skipped.
+    config.develop.max_replans = 1;
+    let state = test_state_with_provider(&dir, config, provider.clone()).await;
+    *state.marker_override.lock().await = Some(marker.to_string());
+
+    let operation = Arc::new(state.try_begin_operation().expect("register batch operation"));
+    let outcome = run_review_batch(
+        &state,
+        "rev-subplan-replan",
+        make_tasks("rev-subplan-replan", &[1]),
+        operation,
+    )
+    .await;
+    assert!(
+        matches!(outcome, BatchOutcome::Completed { items: 1 }),
+        "expected the replanned finding to be fixed and the batch to complete, got {outcome:?}"
+    );
+
+    // Four provider calls: step 1.1, the failed step 1.2, the Architect replan,
+    // and the replanned step.
+    assert_eq!(provider.requests().len(), 4);
+
+    let reloaded = ReviewStorage::load_review(dir.path(), "rev-subplan-replan")
+        .unwrap()
+        .unwrap();
+    let issue = ReviewIssue::from(reloaded.find_item(1).unwrap().clone());
+    assert_eq!(issue.status, IssueStatus::Fixed);
+    // The completed foundation survives the replan and the synthesized step
+    // replaces the failed one.
+    assert_eq!(issue.plan[0].id, "1.1");
+    assert_eq!(issue.plan[0].status, PlanItemStatus::Done);
+    assert!(
+        issue.plan.iter().any(|step| step.id == "2"),
+        "the synthesized step must be present: {:?}",
+        issue.plan
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("src/target.rs")).unwrap(),
+        "pub fn target() { /* replanned */ }\n"
+    );
 }
 
 #[tokio::test]
@@ -1735,13 +1831,13 @@ async fn test_review_batch_skips_finding_on_verification_failure_and_continues()
         .unwrap()
         .unwrap();
     for id in [1u32, 2] {
-        let item = updated.find_item(id).unwrap();
+        let issue = ReviewIssue::from(updated.find_item(id).unwrap().clone());
         assert_eq!(
-            item.status,
+            issue.status,
             IssueStatus::Skipped,
             "finding {id} must be skipped instead of aborting the batch"
         );
-        let notes = item.resolution_notes.as_deref().unwrap_or("");
+        let notes = issue.note.as_deref().unwrap_or("");
         assert!(
             notes.contains("Skipped after execution failure"),
             "finding {id} notes: {notes}"
@@ -2013,10 +2109,10 @@ async fn test_review_autonomous_architecture_decomposition_before_coding() {
     let reloaded = ReviewStorage::load_review(dir.path(), "rev-auto-arch")
         .unwrap()
         .unwrap();
-    let item = reloaded.find_item(1).unwrap();
-    assert_eq!(item.subplan.len(), 1);
-    assert_eq!(item.subplan[0].status, PlanItemStatus::Done);
-    assert_eq!(item.status, IssueStatus::Fixed);
+    let issue = ReviewIssue::from(reloaded.find_item(1).unwrap().clone());
+    assert_eq!(issue.plan.len(), 1);
+    assert_eq!(issue.plan[0].status, PlanItemStatus::Done);
+    assert_eq!(issue.status, IssueStatus::Fixed);
 }
 
 #[tokio::test]
@@ -2075,9 +2171,9 @@ async fn test_review_refine_status_autonomous_decomposition() {
     let reloaded = ReviewStorage::load_review(dir.path(), "rev-auto-refine")
         .unwrap()
         .unwrap();
-    let item = reloaded.find_item(1).unwrap();
-    assert_eq!(item.subplan.len(), 1);
-    assert_eq!(item.status, IssueStatus::Fixed);
+    let issue = ReviewIssue::from(reloaded.find_item(1).unwrap().clone());
+    assert_eq!(issue.plan.len(), 1);
+    assert_eq!(issue.status, IssueStatus::Fixed);
 }
 
 #[tokio::test]
@@ -2121,9 +2217,9 @@ async fn test_review_autonomous_decomposition_blocked_skips_finding() {
     let reloaded = ReviewStorage::load_review(dir.path(), "rev-auto-blocked")
         .unwrap()
         .unwrap();
-    let item = reloaded.find_item(1).unwrap();
-    assert_eq!(item.status, IssueStatus::Skipped);
-    let notes = item.resolution_notes.as_deref().unwrap_or("");
+    let issue = ReviewIssue::from(reloaded.find_item(1).unwrap().clone());
+    assert_eq!(issue.status, IssueStatus::Skipped);
+    let notes = issue.note.as_deref().unwrap_or("");
     assert!(notes.contains("Missing domain model"), "notes: {notes}");
 }
 
@@ -2294,11 +2390,11 @@ async fn test_review_subplan_targeted_step_execution() {
     let reloaded = ReviewStorage::load_review(dir.path(), "rev-target-step")
         .unwrap()
         .unwrap();
-    let item = reloaded.find_item(1).unwrap();
-    assert_eq!(item.subplan[0].status, PlanItemStatus::Done);
-    assert_ne!(item.subplan[1].status, PlanItemStatus::Done);
+    let issue = ReviewIssue::from(reloaded.find_item(1).unwrap().clone());
+    assert_eq!(issue.plan[0].status, PlanItemStatus::Done);
+    assert_ne!(issue.plan[1].status, PlanItemStatus::Done);
     // The whole subplan is not done yet, so the finding stays actionable.
-    assert_eq!(item.status, IssueStatus::Todo);
+    assert_eq!(issue.status, IssueStatus::Todo);
 }
 
 #[tokio::test]
@@ -2360,7 +2456,147 @@ async fn test_review_subplan_targeted_step_model_and_instructions() {
     let reloaded = ReviewStorage::load_review(dir.path(), "rev-step-opts")
         .unwrap()
         .unwrap();
-    let item = reloaded.find_item(1).unwrap();
-    assert_eq!(item.subplan[0].status, PlanItemStatus::Done);
-    assert_eq!(item.status, IssueStatus::Fixed);
+    let issue = ReviewIssue::from(reloaded.find_item(1).unwrap().clone());
+    assert_eq!(issue.plan[0].status, PlanItemStatus::Done);
+    assert_eq!(issue.status, IssueStatus::Fixed);
+}
+
+/// Builds a subplan container (non-leaf) node from its children.
+fn subplan_container(
+    id: &str,
+    title: &str,
+    children: Vec<tauqe_protocol::PlanItem>,
+) -> tauqe_protocol::PlanItem {
+    tauqe_protocol::PlanItem {
+        id: id.to_string(),
+        title: title.to_string(),
+        children,
+        ..Default::default()
+    }
+}
+
+/// Builds a leaf sub-step that declares the given dependencies.
+fn dependent_subplan_item(
+    id: &str,
+    title: &str,
+    deps: &[&str],
+) -> tauqe_protocol::PlanItem {
+    tauqe_protocol::PlanItem {
+        id: id.to_string(),
+        title: title.to_string(),
+        status: PlanItemStatus::Todo,
+        files: vec!["src/target.rs".to_string()],
+        depends_on: deps.iter().map(|d| d.to_string()).collect(),
+        ..Default::default()
+    }
+}
+
+/// Saves a single-finding session whose finding carries the given subplan.
+fn save_subplan_session(dir: &TestDir, review_id: &str, subplan: Vec<tauqe_protocol::PlanItem>) {
+    let mut item = test_item(1, IssueStatus::Todo, "src/target.rs");
+    item.plan = subplan;
+    let session = test_session(review_id, vec![item]);
+    ReviewStorage::save_session(dir.path(), &session).unwrap();
+}
+
+/// Sends a `review/execute` request targeting a single sub-step.
+async fn execute_substep(state: &Arc<AppState>, review_id: &str, step_id: &str) -> tauqe_protocol::Response {
+    let req = Request {
+        id: tauqe_protocol::RequestId::Number(1),
+        method: tauqe_protocol::methods::REVIEW_EXECUTE.to_string(),
+        params: Some(serde_json::json!({
+            "review_id": review_id,
+            "item_id": 1,
+            "step_id": step_id,
+        })),
+    };
+    handle_review_execute(req, state).await
+}
+
+#[tokio::test]
+async fn test_validate_step_target_rejects_cancelled_dependency() {
+    let dir = TestDir::new();
+    let state = test_state(&dir);
+
+    // A cancelled prerequisite can never satisfy a dependency: the dependent
+    // sub-step must be rejected instead of silently starting.
+    save_subplan_session(
+        &dir,
+        "rev-cancelled-dep",
+        vec![
+            subplan_item("1.1", "First", PlanItemStatus::Cancelled, vec!["src/target.rs"]),
+            dependent_subplan_item("1.2", "Second", &["1.1"]),
+        ],
+    );
+
+    let res = execute_substep(&state, "rev-cancelled-dep", "1.2").await;
+    let err = res
+        .error
+        .expect("a cancelled prerequisite must block the dependent sub-step");
+    assert_eq!(err.code, "STEP_BLOCKED_BY_DEPENDENCIES");
+    assert!(err.message.contains("#1.1"), "message: {}", err.message);
+}
+
+#[tokio::test]
+async fn test_validate_step_target_resolves_composite_container_dependency_when_done() {
+    let dir = TestDir::new();
+    let state = test_state(&dir);
+
+    // A dependency declared on a container is satisfied exactly when every one
+    // of its leaves is Done, because a container status is derived.
+    save_subplan_session(
+        &dir,
+        "rev-container-done",
+        vec![
+            subplan_container(
+                "1.2",
+                "Composite prerequisite",
+                vec![
+                    subplan_item("1.2.1", "Child one", PlanItemStatus::Done, vec!["src/target.rs"]),
+                    subplan_item("1.2.2", "Child two", PlanItemStatus::Done, vec!["src/target.rs"]),
+                ],
+            ),
+            dependent_subplan_item("1.3", "Third", &["1.2"]),
+        ],
+    );
+
+    let res = execute_substep(&state, "rev-container-done", "1.3").await;
+    assert!(
+        res.error.is_none(),
+        "a fully done composite prerequisite must allow the sub-step: {:?}",
+        res.error
+    );
+    let val: serde_json::Value = res.result.expect("execution must be acknowledged");
+    assert_eq!(val["item_ids"], serde_json::json!([1]));
+}
+
+#[tokio::test]
+async fn test_validate_step_target_blocks_composite_container_dependency_when_unfinished() {
+    let dir = TestDir::new();
+    let state = test_state(&dir);
+
+    // One unfinished leaf keeps the whole container unfinished, so the
+    // dependent sub-step stays blocked by unmet dependencies.
+    save_subplan_session(
+        &dir,
+        "rev-container-partial",
+        vec![
+            subplan_container(
+                "1.2",
+                "Composite prerequisite",
+                vec![
+                    subplan_item("1.2.1", "Child one", PlanItemStatus::Done, vec!["src/target.rs"]),
+                    subplan_item("1.2.2", "Child two", PlanItemStatus::Todo, vec!["src/target.rs"]),
+                ],
+            ),
+            dependent_subplan_item("1.3", "Third", &["1.2"]),
+        ],
+    );
+
+    let res = execute_substep(&state, "rev-container-partial", "1.3").await;
+    let err = res
+        .error
+        .expect("an unfinished composite prerequisite must block the sub-step");
+    assert_eq!(err.code, "STEP_BLOCKED_BY_DEPENDENCIES");
+    assert!(err.message.contains("#1.2"), "message: {}", err.message);
 }

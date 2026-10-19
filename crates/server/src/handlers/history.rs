@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use tauqe_protocol::{HistoryGetParams, HistoryGetResult, Request, Response, ResponseError};
+use tauqe_protocol::{errors, HistoryGetParams, HistoryGetResult, Request, Response};
 
 use crate::state::AppState;
 
@@ -10,10 +10,22 @@ pub async fn handle_history_get(req: Request, state: &Arc<AppState>) -> Response
         .and_then(|p| serde_json::from_value(p).ok())
         .unwrap_or_default();
     let limit = params.limit.unwrap_or(10);
-    let history = state.history.lock().await;
-    let estimated_tokens = history.estimated_tokens().unwrap_or(0);
-    match history.get_ui_slice(limit, params.before_id) {
-        Ok((items, has_more, total_count)) => {
+    let before_id = params.before_id;
+
+    // Both the token estimate and the page slice touch `history.jsonl`, so the
+    // read runs on the blocking pool while the exclusive history guard is held,
+    // keeping it serialized against concurrent appends and compactions.
+    let loaded = crate::handlers::with_history_mutation(state, move |history| {
+        let estimated_tokens = history.estimated_tokens().unwrap_or(0);
+        history
+            .get_ui_slice(limit, before_id)
+            .map(|(items, has_more, total_count)| (items, has_more, total_count, estimated_tokens))
+            .map_err(|err| err.to_string())
+    })
+    .await;
+
+    match loaded {
+        Ok(Ok((items, has_more, total_count, estimated_tokens))) => {
             let result = HistoryGetResult {
                 items,
                 has_more,
@@ -22,15 +34,8 @@ pub async fn handle_history_get(req: Request, state: &Arc<AppState>) -> Response
             };
             Response::ok_typed(req.id, &result)
         }
-        Err(err) => Response {
-            id: req.id,
-            result: None,
-            error: Some(ResponseError {
-                code: "HISTORY_GET_FAILED".to_string(),
-                message: err.to_string(),
-                data: None,
-            }),
-        },
+        Ok(Err(err)) => Response::err(req.id, errors::HISTORY_GET_FAILED, err),
+        Err(err) => Response::err(req.id, errors::HISTORY_GET_FAILED, err),
     }
 }
 

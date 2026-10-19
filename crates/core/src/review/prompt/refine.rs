@@ -1,6 +1,7 @@
 use crate::context::ContextFileContent;
 use crate::escape::single_line;
 use tauqe_protocol::review::{ReviewIssue, ReviewItem, ReviewSession};
+use tauqe_protocol::PlanItem;
 
 /// Target size range (in changed lines) for one cohesive leaf implementation step.
 const LEAF_STEP_TARGET_LINES: (usize, usize) = (150, 400);
@@ -24,6 +25,8 @@ pub fn build_review_finding_refine_system_prompt() -> String {
 
     out.push_str("2. Subplan Synthesis Contract:\n");
     out.push_str("   - Return the hierarchical list of executable implementation steps with `status: \"todo\"`.\n");
+    out.push_str("   - Return ONLY the unfinished steps: already completed (DONE) sub-steps are preserved verbatim by the harness, so restating them is a contract violation.\n");
+    out.push_str("   - When failure diagnostics of an already executed sub-step are provided, reproject the remaining horizon around that failure instead of repeating the failed approach.\n");
     out.push_str("   - Synthesize a coherent roadmap that completely resolves the finding without breaking existing subsystem invariants.\n\n");
 
     out.push_str("3. Strict Blocker Protocol (Refusal to Plan):\n");
@@ -64,12 +67,40 @@ pub fn build_review_refine_system_prompt() -> String {
     build_review_finding_refine_system_prompt()
 }
 
+/// Diagnostics describing a failed sub-step that triggered horizon replanning.
+///
+/// Replanning a finding is the same Architect operation as its initial
+/// decomposition: both reproject the unfinished horizon from the immutable `Done`
+/// foundation. The failure diagnostics are therefore carried into the same
+/// prompt instead of a parallel template, so a single contract governs both.
+#[derive(Debug, Clone, Copy)]
+pub struct ReviewRefineDiagnostics<'a> {
+    /// Identifier of the sub-step whose execution failed.
+    pub failed_step_id: &'a str,
+    /// Diagnostic reported by the failed execution, when one is available.
+    pub failure_reason: Option<&'a str>,
+}
+
+/// Resolves a sub-step by id inside the finding's embedded subplan.
+fn find_subplan_item<'a>(items: &'a [PlanItem], step_id: &str) -> Option<&'a PlanItem> {
+    for item in items {
+        if item.id == step_id {
+            return Some(item);
+        }
+        if let Some(found) = find_subplan_item(&item.children, step_id) {
+            return Some(found);
+        }
+    }
+    None
+}
+
 /// Builds the user prompt for refining a single review finding into a subplan.
 pub fn build_review_finding_refine_user_prompt(
     session: &ReviewSession,
     item: &ReviewItem,
     context_files: &[ContextFileContent],
     repo_map: Option<&str>,
+    diagnostics: Option<ReviewRefineDiagnostics<'_>>,
     instructions: Option<&str>,
 ) -> String {
     // The refinement workspace renders the enriched finding view: the
@@ -138,6 +169,41 @@ pub fn build_review_finding_refine_user_prompt(
     }
     out.push('\n');
 
+    if let Some(diag) = diagnostics {
+        out.push_str("## Failed Sub-step Diagnostics:\n");
+        let failed = find_subplan_item(&issue.plan, diag.failed_step_id);
+        match failed {
+            Some(step) => out.push_str(&format!(
+                "- **Failed Sub-step**: #{} {}\n",
+                step.id, step.title
+            )),
+            None => out.push_str(&format!(
+                "- **Failed Sub-step**: #{}\n",
+                diag.failed_step_id
+            )),
+        }
+        if let Some(step) = failed {
+            if !step.files.is_empty() {
+                out.push_str(&format!(
+                    "- **Declared Target Files**: {}\n",
+                    step.files.join(", ")
+                ));
+            }
+            if let Some(details) = &step.details {
+                let trimmed = details.trim();
+                if !trimmed.is_empty() {
+                    out.push_str(&format!("- **Declared Contract**:\n{}\n", trimmed));
+                }
+            }
+        }
+        match diag.failure_reason.map(str::trim).filter(|s| !s.is_empty()) {
+            Some(reason) => out.push_str(&format!("- **Execution Failure Report**: {}\n", reason)),
+            None => out.push_str("- **Execution Failure Report**: (no diagnostics provided)\n"),
+        }
+        out.push_str("- **Horizon Contract**: return ONLY the new, unfinished steps that remain. Completed (DONE) sub-steps are preserved verbatim by the harness and MUST NOT be restated.\n");
+        out.push('\n');
+    }
+
     if let Some(rm) = repo_map {
         let trimmed = rm.trim();
         if !trimmed.is_empty() {
@@ -174,7 +240,7 @@ pub fn build_review_finding_refine_user_prompt(
     out
 }
 
-/// Alias for `build_review_finding_refine_user_prompt`.
+/// Alias for `build_review_finding_refine_user_prompt` without diagnostics.
 pub fn build_review_refine_user_prompt(
     session: &ReviewSession,
     item: &ReviewItem,
@@ -182,7 +248,14 @@ pub fn build_review_refine_user_prompt(
     repo_map: Option<&str>,
     instructions: Option<&str>,
 ) -> String {
-    build_review_finding_refine_user_prompt(session, item, context_files, repo_map, instructions)
+    build_review_finding_refine_user_prompt(
+        session,
+        item,
+        context_files,
+        repo_map,
+        None,
+        instructions,
+    )
 }
 
 #[cfg(test)]
@@ -211,6 +284,7 @@ mod tests {
                 files: vec!["crates/core/src/lib.rs".to_string()],
                 readonly_files: vec![],
                 subplan: vec![],
+                subplan_architect: None,
                 resolution_notes: None,
                 body: "Needs structural division".to_string(),
             }],
@@ -237,8 +311,28 @@ mod tests {
             &[],
             None,
             None,
+            None,
         );
         assert!(user.contains("Architect Discovery Protocol"));
         assert!(user.contains("needs_context"));
+    }
+
+    #[test]
+    fn test_review_refine_user_prompt_renders_failed_step_diagnostics() {
+        let session = sample_session();
+        let user = build_review_finding_refine_user_prompt(
+            &session,
+            &session.items[0],
+            &[],
+            None,
+            Some(ReviewRefineDiagnostics {
+                failed_step_id: "42",
+                failure_reason: Some("sub-step finished without applying any code changes"),
+            }),
+            None,
+        );
+        assert!(user.contains("## Failed Sub-step Diagnostics:"));
+        assert!(user.contains("sub-step finished without applying any code changes"));
+        assert!(user.contains("MUST NOT be restated"));
     }
 }

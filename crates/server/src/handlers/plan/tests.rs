@@ -1,4 +1,7 @@
-use super::batch::{handle_plan_execute, handle_plan_refine, handle_plan_replan, run_plan_batch, BatchOutcome};
+use super::batch::{
+    handle_plan_execute, handle_plan_execute_pipeline, handle_plan_refine, handle_plan_replan,
+    run_plan_batch, BatchOutcome,
+};
 use super::common::{turn_applied_edits, unmet_dependencies};
 use crate::state::AppState;
 use crate::transport::OutChannel;
@@ -854,6 +857,106 @@ async fn test_handle_plan_replan_retries_when_requested_files_already_loaded() {
     assert!(reloaded.find_item("2.1").is_some());
 }
 
+#[tokio::test]
+async fn test_plan_refine_binds_the_architect_session() {
+    let dir = TestDir::new();
+    let plan = Plan {
+        id: "arch-session".to_string(),
+        title: "Architect Session".to_string(),
+        created_at: 1,
+        updated_at: 1,
+        items: vec![test_item("1", PlanItemStatus::Todo)],
+        ..Default::default()
+    };
+    PlanStorage::save_plan(dir.path(), &plan).unwrap();
+
+    let refine_output = serde_json::json!({
+        "status": "success",
+        "explanation": "Synthesized the horizon",
+        "items": [
+            {
+                "id": "1",
+                "title": "Refined step 1",
+                "status": "todo",
+                "files": [],
+                "readonly_files": [],
+                "concept_refs": [],
+                "depends_on": [],
+                "children": []
+            }
+        ]
+    });
+    let mock_provider = Arc::new(MockLlmProvider::scripted([MockResponse::text(
+        refine_output.to_string(),
+    )]));
+    let state = test_state_with_provider(
+        &dir,
+        tauqe_core::config::AppConfig::default(),
+        mock_provider.clone(),
+    )
+    .await;
+
+    let req = Request {
+        id: tauqe_protocol::RequestId::Number(1),
+        method: tauqe_protocol::methods::PLAN_REFINE.to_string(),
+        params: Some(serde_json::json!({ "plan_id": "arch-session" })),
+    };
+    let res = handle_plan_refine(req, &state).await;
+    assert!(res.error.is_none(), "refine failed: {:?}", res.error);
+
+    // Architect synthesis is an isolated design dialogue: its cached prefix is
+    // keyed by the plan, so the very first round already binds the session.
+    let requests = mock_provider.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        requests[0].session_id.as_deref(),
+        Some("tauqe-architect-arch-session")
+    );
+}
+
+#[tokio::test]
+async fn test_plan_step_binds_the_plan_session() {
+    let dir = TestDir::new();
+    tauqe_core::git::init_repository(Some(dir.path()), true).unwrap();
+    std::fs::write(dir.path().join("src.rs"), "pub fn value() -> i32 { 0 }\n").unwrap();
+    tauqe_core::git::cmd::stage_files(dir.path(), &["src.rs".to_string()]).unwrap();
+    tauqe_core::git::cmd::commit_with_developer_author(dir.path(), "Initial", false).unwrap();
+
+    let mut item = test_item("1", PlanItemStatus::Todo);
+    item.title = "Step 1".to_string();
+    item.files = vec!["src.rs".to_string()];
+    let plan = Plan {
+        id: "plan-session".to_string(),
+        title: "Plan Session".to_string(),
+        created_at: 1,
+        updated_at: 1,
+        items: vec![item],
+        ..Default::default()
+    };
+    PlanStorage::save_plan(dir.path(), &plan).unwrap();
+
+    let response = "<tauqe_edits summary=\"Set value\">\n<edit path=\"src.rs\">\n<search>\npub fn value() -> i32 { 0 }\n</search>\n<replace>\npub fn value() -> i32 { 1 }\n</replace>\n</edit>\n<success summary=\"done\" />\n</tauqe_edits>";
+    let mock_provider = Arc::new(MockLlmProvider::scripted([MockResponse::text(response)]));
+
+    let mut config = tauqe_core::config::AppConfig::default();
+    config.develop.workflow = tauqe_protocol::WorkflowKind::Naive;
+    config.develop.protocol = tauqe_protocol::EditProtocolKind::Xml;
+    config.models.auto_level_up = false;
+    let state = test_state_with_provider(&dir, config, mock_provider.clone()).await;
+
+    let operation = Arc::new(state.try_begin_operation().expect("register batch operation"));
+    let outcome = run_plan_batch(&state, "plan-session", vec!["1".to_string()], operation).await;
+    assert_eq!(outcome, BatchOutcome::Completed { steps: 1 });
+
+    // Every step and retry of one plan extends the same warm provider prefix.
+    let requests = mock_provider.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        requests[0].session_id.as_deref(),
+        Some("tauqe-plan-plan-session")
+    );
+}
+
 #[test]
 fn test_collect_plan_context_files_dedups_and_recurses() {
     let mut nested = test_item("2.1", PlanItemStatus::Todo);
@@ -1380,4 +1483,177 @@ async fn test_plan_refine_reports_cancellation_from_stream_event() {
     // never into a `PARSE_ERROR` on the truncated JSON buffer.
     let err = res.error.expect("a cancelled refine must return an error");
     assert_eq!(err.code, errors::CANCELLED);
+}
+
+#[tokio::test]
+async fn test_plan_batch_projects_conceptual_horizon_just_in_time() {
+    let dir = TestDir::new();
+    tauqe_core::git::init_repository(Some(dir.path()), true).unwrap();
+    std::fs::write(dir.path().join("src.rs"), "pub fn value() -> i32 { 0 }\n").unwrap();
+    tauqe_core::git::cmd::stage_files(dir.path(), &["src.rs".to_string()]).unwrap();
+    tauqe_core::git::cmd::commit_with_developer_author(dir.path(), "Initial", false).unwrap();
+
+    // A plan carrying only its architectural concept has no leaf to schedule.
+    let plan = Plan {
+        id: "jit-horizon".to_string(),
+        title: "JIT Horizon".to_string(),
+        created_at: 1,
+        updated_at: 1,
+        concept: vec![tauqe_protocol::ConceptItem {
+            id: "c-1".to_string(),
+            title: "Invariant".to_string(),
+            details: None,
+            children: Vec::new(),
+        }],
+        ..Default::default()
+    };
+    PlanStorage::save_plan(dir.path(), &plan).unwrap();
+
+    let marker = "JITHORIZONM1";
+    // 1. The Architect projects the first horizon just-in-time:
+    let refine_output = serde_json::json!({
+        "status": "success",
+        "explanation": "Projected the first horizon",
+        "items": [
+            {
+                "id": "1",
+                "title": "Step 1",
+                "status": "todo",
+                "files": ["src.rs"],
+                "readonly_files": [],
+                "concept_refs": ["c-1"],
+                "depends_on": [],
+                "children": []
+            }
+        ]
+    });
+    // 2. The projected step is then executed by the coder:
+    let success_response = format!(
+        "<tauqe_edits_{m} summary=\"Set value\">\n<edit_{m} path=\"src.rs\">\n<search_{m}>\npub fn value() -> i32 {{ 0 }}\n</search_{m}>\n<replace_{m}>\npub fn value() -> i32 {{ 5 }}\n</replace_{m}>\n</edit_{m}>\n<success_{m} summary=\"done\" />\n</tauqe_edits_{m}>",
+        m = marker
+    );
+
+    let provider = Arc::new(MockLlmProvider::scripted([
+        MockResponse::text(refine_output.to_string()),
+        MockResponse::text(success_response),
+    ]));
+
+    let mut config = tauqe_core::config::AppConfig::default();
+    config.develop.workflow = tauqe_protocol::WorkflowKind::Naive;
+    config.develop.protocol = tauqe_protocol::EditProtocolKind::Xml;
+    config.models.auto_level_up = false;
+
+    let state = test_state_with_provider(&dir, config, provider).await;
+    *state.marker_override.lock().await = Some(marker.to_string());
+
+    let operation = Arc::new(state.try_begin_operation().expect("register batch operation"));
+    let outcome = run_plan_batch(&state, "jit-horizon", Vec::new(), operation).await;
+
+    // An empty scheduled scope is not a finished batch: the synthesized step is
+    // executed within the same supervisor run.
+    assert_eq!(outcome, BatchOutcome::Completed { steps: 1 });
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("src.rs")).unwrap(),
+        "pub fn value() -> i32 { 5 }\n"
+    );
+    let reloaded = PlanStorage::load_plan(dir.path(), "jit-horizon")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        reloaded.find_item("1").unwrap().status,
+        PlanItemStatus::Done
+    );
+}
+
+#[tokio::test]
+async fn test_handle_plan_execute_pipeline_validation() {
+    let dir = TestDir::new();
+    let state = test_state(&dir);
+    let make_req = |id: u64, params: Option<serde_json::Value>| Request {
+        id: tauqe_protocol::RequestId::Number(id),
+        method: tauqe_protocol::methods::PLAN_EXECUTE_PIPELINE.to_string(),
+        params,
+    };
+
+    // Missing params entirely.
+    let res = handle_plan_execute_pipeline(make_req(1, None), &state).await;
+    assert_eq!(res.error.unwrap().code, "INVALID_PARAMS");
+
+    // An empty queue is not a pipeline.
+    let res = handle_plan_execute_pipeline(
+        make_req(2, Some(serde_json::json!({ "plan_ids": [] }))),
+        &state,
+    )
+    .await;
+    assert_eq!(res.error.unwrap().code, "INVALID_PARAMS");
+
+    // Unknown plan rejects the whole queue before any turn starts.
+    let res = handle_plan_execute_pipeline(
+        make_req(3, Some(serde_json::json!({ "plan_ids": ["missing"] }))),
+        &state,
+    )
+    .await;
+    assert_eq!(res.error.unwrap().code, "NOT_FOUND");
+
+    // A queue whose plans are all finished has no leaf to schedule.
+    let plan = Plan {
+        id: "done-pipeline".to_string(),
+        title: "Done Pipeline".to_string(),
+        created_at: 1,
+        updated_at: 1,
+        items: vec![test_item("1", PlanItemStatus::Done)],
+        ..Default::default()
+    };
+    PlanStorage::save_plan(dir.path(), &plan).unwrap();
+
+    let res = handle_plan_execute_pipeline(
+        make_req(
+            4,
+            Some(serde_json::json!({ "plan_ids": ["done-pipeline"] })),
+        ),
+        &state,
+    )
+    .await;
+    assert_eq!(res.error.unwrap().code, "NOTHING_TO_EXECUTE");
+
+    // No rejected pipeline leaves the operation slot registered.
+    assert!(!state.is_operation_active());
+}
+
+#[tokio::test]
+async fn test_plan_pipeline_blocked_by_failed_preflight() {
+    let dir = TestDir::new();
+    let plan = Plan {
+        id: "pipeline-preflight".to_string(),
+        title: "Pipeline Preflight".to_string(),
+        created_at: 1,
+        updated_at: 1,
+        items: vec![test_item("1", PlanItemStatus::Todo)],
+        ..Default::default()
+    };
+    PlanStorage::save_plan(dir.path(), &plan).unwrap();
+    // A malformed manifest makes the deterministic toolchain pipeline fail.
+    std::fs::write(dir.path().join("Cargo.toml"), "[package\n").unwrap();
+    let state = test_state(&dir);
+
+    let req = Request {
+        id: tauqe_protocol::RequestId::Number(1),
+        method: tauqe_protocol::methods::PLAN_EXECUTE_PIPELINE.to_string(),
+        params: Some(serde_json::json!({ "plan_ids": ["pipeline-preflight"] })),
+    };
+    let res = handle_plan_execute_pipeline(req, &state).await;
+
+    let err = res.error.expect("preflight must block the pipeline");
+    assert_eq!(err.code, "PREFLIGHT_VERIFICATION_FAILED");
+    assert!(err.message.contains("Pre-flight verification failed"));
+
+    // The failure is detected before any plan starts: no active operation.
+    assert!(!state.is_operation_active());
+    let reloaded = PlanStorage::load_plan(dir.path(), "pipeline-preflight")
+        .unwrap()
+        .unwrap();
+    assert!(reloaded
+        .items
+        .iter()
+        .all(|i| i.status == PlanItemStatus::Todo));
 }

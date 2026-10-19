@@ -9,6 +9,7 @@ use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::Stylize;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
+use unicode_width::UnicodeWidthStr;
 
 use crate::components::modal::{render_dialog_footer, render_modal_container, ModalTone};
 use crate::i18n::active_t;
@@ -48,7 +49,7 @@ pub fn disconnected_button_geometry(term: Rect) -> DisconnectedModalGeometry {
         .split(inner);
     let action_bar = chunks[1];
 
-    let quit_len = disconnected_quit_label().chars().count() as u16;
+    let quit_len = UnicodeWidthStr::width(disconnected_quit_label().as_str()) as u16;
     let start_x = action_bar.x + action_bar.width.saturating_sub(quit_len) / 2;
 
     DisconnectedModalGeometry {

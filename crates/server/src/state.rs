@@ -8,6 +8,7 @@ use tauqe_core::context::ContextManager;
 use tauqe_core::history::{HistoryManager, HistoryMutation};
 use tauqe_protocol::{
     events, DiscussionFocus, DiscussionFocusChangedEvent, Event, ModelSelection,
+    UsageTotalsSnapshot,
 };
 
 use crate::transport::OutChannel;
@@ -70,6 +71,22 @@ impl OperationGuard {
             }
         }
     }
+
+    /// Clears the abort handle installed by the task that just finished.
+    ///
+    /// A multi-round operation reuses one slot across several streamed provider
+    /// calls, and each call installs its own handle. Leaving a finished task's
+    /// handle behind lets a later hard-cancel target an already completed task
+    /// while the operation is in fact still working between rounds, so the slot
+    /// is emptied as soon as the streamed task resolves.
+    pub fn clear_abort_handle(&self) {
+        let mut slot = self.state.lock_active_operation();
+        if let Some(op) = slot.as_mut() {
+            if op.id == self.id {
+                op.abort_handle = None;
+            }
+        }
+    }
 }
 
 impl Drop for OperationGuard {
@@ -102,8 +119,18 @@ pub struct ConfigAndSelection {
 
 pub struct AppState {
     pub config: Mutex<ConfigAndSelection>,
-    pub context: tokio::sync::RwLock<ContextManager>,
-    pub history: Mutex<HistoryManager>,
+    /// Shared context manager behind a read/write lock.
+    ///
+    /// The lock lives in an `Arc` so a mutation can move its owned write guard
+    /// into the blocking pool and keep the whole read-modify-write sequence
+    /// exclusive, instead of cloning the manager and overwriting it afterwards.
+    pub context: Arc<tokio::sync::RwLock<ContextManager>>,
+    /// Shared interaction history behind a mutex.
+    ///
+    /// The lock lives in an `Arc` so a mutation can move its owned guard into
+    /// the blocking pool and keep the whole read-modify-write sequence
+    /// exclusive, instead of cloning the manager and overwriting it afterwards.
+    pub history: Arc<tokio::sync::Mutex<HistoryManager>>,
     pub session_lock: Mutex<()>,
     /// Single registration slot for the currently running operation.
     ///
@@ -113,12 +140,26 @@ pub struct AppState {
     /// non-awaiting critical sections.
     pub active_cancel: std::sync::Mutex<Option<ActiveOperation>>,
     pub total_cost: Mutex<f64>,
+    /// Authoritative token, cost, and duration totals for the session.
+    ///
+    /// Every operation kind — an interactive turn, a plan batch, a review run,
+    /// a locale synthesis — reports through [`crate::usage::UsageGuard`], so the
+    /// interface renders one consistent snapshot instead of re-deriving totals
+    /// from per-handler counters.
+    pub usage: Mutex<UsageTotalsSnapshot>,
     /// Active discussion focus anchor shared by REPL discussion turns.
     ///
     /// While a focus is set, every plain discussion prompt is enriched with the
     /// current state of the focused plan or review session, turning one-shot
     /// comments into a continuous multi-turn dialogue.
     pub discussion_focus: Mutex<DiscussionFocus>,
+    /// Identifier of the current REPL dialogue session.
+    ///
+    /// Every interactive turn binds its provider requests to this identifier so
+    /// the backend keeps its prompt-prefix cache warm across the rounds of one
+    /// dialogue. Clearing the history rotates the identifier, so the discarded
+    /// transcript can never warm the cache of the fresh dialogue.
+    pub session_uuid: Mutex<String>,
     pub history_sender: tokio::sync::mpsc::UnboundedSender<HistoryMutation>,
     pub out: OutChannel,
     /// Shared flag set while a git-backed apply policy holds an open
@@ -174,12 +215,14 @@ impl AppState {
                 config,
                 selection: default_selection,
             }),
-            context: tokio::sync::RwLock::new(ContextManager::new(repo_path)),
-            history: Mutex::new(initial_history_manager),
+            context: Arc::new(tokio::sync::RwLock::new(ContextManager::new(repo_path))),
+            history: Arc::new(Mutex::new(initial_history_manager)),
             session_lock: Mutex::new(()),
             active_cancel: std::sync::Mutex::new(None),
             total_cost: Mutex::new(0.0),
+            usage: Mutex::new(UsageTotalsSnapshot::default()),
             discussion_focus: Mutex::new(DiscussionFocus::None),
+            session_uuid: Mutex::new(tauqe_core::review::uuid::generate_uuid_v7()),
             history_sender,
             out,
             git_transaction_active: Arc::new(AtomicBool::new(false)),
@@ -208,7 +251,7 @@ impl AppState {
         if slot.is_some() {
             drop(slot);
             tracing::warn!(
-                code = "OPERATION_IN_PROGRESS",
+                code = tauqe_protocol::errors::OPERATION_IN_PROGRESS,
                 "Refused to register a new operation: a slot is already active",
             );
             return Err(());
@@ -346,6 +389,50 @@ impl AppState {
         self.context.read().await.repo_root().to_path_buf()
     }
 
+    /// Applies a mutation to the shared context atomically.
+    ///
+    /// The exclusive write guard is acquired before the blocking closure runs
+    /// and is moved into the blocking pool together with it, so the entire
+    /// read-modify-write sequence stays serialized. Cloning the manager under a
+    /// short read guard and overwriting the slot afterwards would let a
+    /// concurrent mutation be silently lost and would reset the monotonic
+    /// context revision.
+    pub async fn mutate_context<T, F>(self: &Arc<Self>, mutate: F) -> Result<T, String>
+    where
+        F: FnOnce(&mut ContextManager) -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        let guard = Arc::clone(&self.context).write_owned().await;
+        tokio::task::spawn_blocking(move || {
+            let mut guard = guard;
+            mutate(&mut guard)
+        })
+        .await
+        .map_err(|err| format!("blocking task failed: {}", err))
+    }
+
+    /// Applies a mutation to the shared interaction history atomically.
+    ///
+    /// History records are persisted with an `fsync` barrier, so the mutation
+    /// runs on the blocking pool. The exclusive guard is acquired first and
+    /// moved into the blocking task together with the closure, so the whole
+    /// read-modify-write sequence stays serialized: cloning the manager under a
+    /// short guard and overwriting the slot afterwards would drop concurrent
+    /// appends and compactions.
+    pub async fn mutate_history<T, F>(self: &Arc<Self>, mutate: F) -> Result<T, String>
+    where
+        F: FnOnce(&mut HistoryManager) -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        let guard = Arc::clone(&self.history).lock_owned().await;
+        tokio::task::spawn_blocking(move || {
+            let mut guard = guard;
+            mutate(&mut guard)
+        })
+        .await
+        .map_err(|err| format!("blocking task failed: {}", err))
+    }
+
     /// Returns the current discussion focus anchor.
     pub async fn discussion_focus(&self) -> DiscussionFocus {
         self.discussion_focus.lock().await.clone()
@@ -380,6 +467,31 @@ impl AppState {
         self.set_discussion_focus(DiscussionFocus::None).await
     }
 
+    /// Returns the identifier of the current REPL dialogue session.
+    pub async fn session_uuid(&self) -> String {
+        self.session_uuid.lock().await.clone()
+    }
+
+    /// Starts a fresh REPL dialogue session, returning its identifier.
+    ///
+    /// The identifier changes, so a provider-side prompt-prefix cache built
+    /// from the discarded transcript can never be reused by the new dialogue.
+    /// UUIDv7 is reused from the review subsystem so the workspace keeps a
+    /// single identifier generator.
+    pub async fn reset_session_uuid(&self) -> String {
+        let fresh = tauqe_core::review::uuid::generate_uuid_v7();
+        let previous = {
+            let mut guard = self.session_uuid.lock().await;
+            std::mem::replace(&mut *guard, fresh.clone())
+        };
+        tracing::info!(
+            previous_session = %previous,
+            session_id = %fresh,
+            "Rotated the dialogue session identifier",
+        );
+        fresh
+    }
+
     /// Returns the turn marker for the current turn, or `None` when markers are
     /// disabled.
     ///
@@ -406,4 +518,148 @@ static OP_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 pub fn next_operation_id() -> u64 {
     OP_COUNTER.fetch_add(1, Ordering::SeqCst)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tauqe_protocol::ContextAccess;
+
+    /// Concurrent context mutations must all survive: a clone-then-overwrite
+    /// sequence would drop the mutations that finished earlier and reset the
+    /// monotonic revision.
+    #[tokio::test]
+    async fn mutate_context_serializes_concurrent_mutations() {
+        let root = std::env::temp_dir()
+            .join(format!("tauqe-state-context-{}", next_operation_id()));
+        let _ = std::fs::create_dir_all(&root);
+
+        let (out, _rx) = OutChannel::new();
+        let (history_sender, _history_rx) = tokio::sync::mpsc::unbounded_channel();
+        let state = AppState::new(AppConfig::default(), root.clone(), history_sender, out);
+
+        let mut tasks = Vec::new();
+        for index in 0..8 {
+            let path = format!("file{}.rs", index);
+            std::fs::write(root.join(&path), "fn stub() {}\n").unwrap();
+            let state = Arc::clone(&state);
+            tasks.push(tokio::spawn(async move {
+                state
+                    .mutate_context(move |ctx| {
+                        ctx.add_auto_file(&path, ContextAccess::ReadOnly).map(|_| ())
+                    })
+                    .await
+            }));
+        }
+
+        for task in tasks {
+            let outcome = task.await.expect("mutation task joins");
+            let applied = outcome.expect("mutation runs on the blocking pool");
+            assert!(
+                applied.is_ok(),
+                "context mutation failed: {:?}",
+                applied.err()
+            );
+        }
+
+        let snapshot = state.context.read().await.get_state();
+        assert_eq!(
+            snapshot.items.len(),
+            8,
+            "every concurrent mutation must survive"
+        );
+        assert!(
+            snapshot.revision > 1,
+            "the context revision must stay monotonic"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Concurrent history mutations must all survive: a clone-then-overwrite
+    /// sequence would drop the records that finished earlier.
+    #[tokio::test]
+    async fn mutate_history_serializes_concurrent_mutations() {
+        let root =
+            std::env::temp_dir().join(format!("tauqe-state-history-{}", next_operation_id()));
+        let _ = std::fs::create_dir_all(&root);
+
+        let (out, _rx) = OutChannel::new();
+        let (history_sender, _history_rx) = tokio::sync::mpsc::unbounded_channel();
+        let state = AppState::new(AppConfig::default(), root.clone(), history_sender, out);
+
+        let mut tasks = Vec::new();
+        for index in 0..8 {
+            let prompt = format!("Task {}", index);
+            let state = Arc::clone(&state);
+            tasks.push(tokio::spawn(async move {
+                state
+                    .mutate_history(move |hm| hm.record_turn(prompt, Vec::new()).map(|_| ()))
+                    .await
+            }));
+        }
+
+        for task in tasks {
+            let outcome = task.await.expect("mutation task joins");
+            let applied = outcome.expect("mutation runs on the blocking pool");
+            assert!(
+                applied.is_ok(),
+                "history mutation failed: {:?}",
+                applied.err()
+            );
+        }
+
+        let entries = state
+            .history
+            .lock()
+            .await
+            .get_entries()
+            .expect("history reads back");
+        assert_eq!(
+            entries.len(),
+            8,
+            "every concurrent mutation must survive"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A finished streaming round must leave no abort handle behind, or a later
+    /// hard-cancel would abort a completed task instead of the work in flight.
+    #[tokio::test]
+    async fn clear_abort_handle_drops_the_installed_handle() {
+        let root =
+            std::env::temp_dir().join(format!("tauqe-state-abort-{}", next_operation_id()));
+        let _ = std::fs::create_dir_all(&root);
+
+        let (out, _rx) = OutChannel::new();
+        let (history_sender, _history_rx) = tokio::sync::mpsc::unbounded_channel();
+        let state = AppState::new(AppConfig::default(), root.clone(), history_sender, out);
+
+        let guard = state.try_begin_operation().expect("slot is free");
+        let task = tokio::spawn(async { std::future::pending::<()>().await });
+        guard.set_abort_handle(task.abort_handle());
+
+        let installed = {
+            let slot = state.lock_active_operation();
+            slot.as_ref()
+                .and_then(|op| op.abort_handle.as_ref())
+                .is_some()
+        };
+        assert!(installed, "the handle must be installed while streaming");
+
+        guard.clear_abort_handle();
+        let cleared = {
+            let slot = state.lock_active_operation();
+            slot.as_ref()
+                .and_then(|op| op.abort_handle.as_ref())
+                .is_none()
+        };
+        assert!(cleared, "the handle must be cleared once the task finished");
+
+        task.abort();
+        let _ = task.await;
+        drop(guard);
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }

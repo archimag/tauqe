@@ -10,6 +10,7 @@ use tauqe_protocol::{
 use crate::app::{AppState, ViewMode};
 use crate::command::CommandCategory::{Essential, Helpers, Interface};
 use crate::command::{CommandMap, CommandSpec, KeyChord};
+use crate::i18n::engine::active_t;
 use crate::input::InputResult;
 use crate::rpc::{send_request, RpcConnection};
 
@@ -44,209 +45,212 @@ pub enum ContextAction {
 /// Essential commands mutate the three context layers; Interface commands
 /// navigate and fold the section tree; Helpers copy paths, refresh state,
 /// remove a file, or clear a whole layer with modal confirmation. The map
-/// drives input resolution and the generated Help dialog.
+/// drives input resolution and the generated Help dialog. Chords are grouped by
+/// the canonical category order, and a whole-layer clear is reachable solely
+/// through its uppercase `Shift` chord, so declaration order never decides which
+/// action a key resolves to.
 pub static CONTEXT_COMMAND_MAP: CommandMap<ContextAction> = CommandMap::new(&[
-    // Destructive layer clearing: uppercase Shift chords with modal confirmation.
-    CommandSpec::new(
-        KeyChord::Bare(KeyCode::Char('C')),
-        ContextAction::ClearUser,
-        Helpers,
-        "Clear all persistent User files",
-    ),
-    CommandSpec::new(
-        KeyChord::Shift(KeyCode::Char('c')),
-        ContextAction::ClearUser,
-        Helpers,
-        "Clear all persistent User files",
-    ),
-    CommandSpec::new(
-        KeyChord::Bare(KeyCode::Char('A')),
-        ContextAction::ClearAuto,
-        Helpers,
-        "Clear all Auto-requested files",
-    ),
-    CommandSpec::new(
-        KeyChord::Shift(KeyCode::Char('a')),
-        ContextAction::ClearAuto,
-        Helpers,
-        "Clear all Auto-requested files",
-    ),
     // Helpers: clipboard copying, refresh, and single-file deletion.
     CommandSpec::new(
         KeyChord::Bare(KeyCode::Char('c')),
         ContextAction::Copy,
         Helpers,
-        "Copy file path to clipboard",
+        "cmd.context.copy",
     ),
     CommandSpec::new(
         KeyChord::Bare(KeyCode::Char('y')),
         ContextAction::Copy,
         Helpers,
-        "Copy file path to clipboard",
+        "cmd.context.copy",
     ),
     CommandSpec::new(
         KeyChord::Bare(KeyCode::Char('g')),
         ContextAction::Refresh,
         Helpers,
-        "Refresh context from the server",
+        "cmd.context.refresh",
     ),
     CommandSpec::new(
         KeyChord::Bare(KeyCode::Char('d')),
         ContextAction::Remove,
         Helpers,
-        "Remove the selected file from context",
+        "cmd.context.remove",
     ),
     CommandSpec::new(
         KeyChord::Bare(KeyCode::Delete),
         ContextAction::Remove,
         Helpers,
-        "Remove the selected file from context",
+        "cmd.context.remove",
+    ),
+    // Destructive layer clearing: uppercase Shift chords with modal confirmation.
+    CommandSpec::new(
+        KeyChord::Bare(KeyCode::Char('C')),
+        ContextAction::ClearUser,
+        Helpers,
+        "cmd.context.clear_user",
+    ),
+    CommandSpec::new(
+        KeyChord::Shift(KeyCode::Char('c')),
+        ContextAction::ClearUser,
+        Helpers,
+        "cmd.context.clear_user",
+    ),
+    CommandSpec::new(
+        KeyChord::Bare(KeyCode::Char('A')),
+        ContextAction::ClearAuto,
+        Helpers,
+        "cmd.context.clear_auto",
+    ),
+    CommandSpec::new(
+        KeyChord::Shift(KeyCode::Char('a')),
+        ContextAction::ClearAuto,
+        Helpers,
+        "cmd.context.clear_auto",
     ),
     // Essential: context layer mutations.
     CommandSpec::new(
         KeyChord::Bare(KeyCode::Char('e')),
         ContextAction::AddEditable,
         Essential,
-        "Add a file to context as editable",
+        "cmd.context.add_editable",
     ),
     CommandSpec::new(
         KeyChord::Bare(KeyCode::Char('r')),
         ContextAction::AddReadOnly,
         Essential,
-        "Add a file to context as read-only",
+        "cmd.context.add_readonly",
     ),
     CommandSpec::new(
         KeyChord::Bare(KeyCode::Char('t')),
         ContextAction::ToggleAccess,
         Essential,
-        "Toggle access between Editable and Read-Only",
+        "cmd.context.toggle_access",
     ),
     CommandSpec::new(
         KeyChord::Bare(KeyCode::Char('u')),
         ContextAction::PromoteToUser,
         Essential,
-        "Promote an Auto file to the persistent User layer",
+        "cmd.context.promote_user",
     ),
     CommandSpec::new(
         KeyChord::Bare(KeyCode::Enter),
         ContextAction::Activate,
         Essential,
-        "Promote an Auto file or fold / unfold the selected section",
+        "cmd.context.activate",
     ),
     // Interface: navigation, folding, and view switching.
     CommandSpec::new(
         KeyChord::Bare(KeyCode::Esc),
         ContextAction::Return,
         Interface,
-        "Return to the REPL",
+        "cmd.context.return",
     ),
     CommandSpec::new(
         KeyChord::Bare(KeyCode::Char('q')),
         ContextAction::Return,
         Interface,
-        "Return to the REPL",
+        "cmd.context.return",
     ),
     CommandSpec::new(
         KeyChord::Bare(KeyCode::Char('a')),
         ContextAction::FoldAll,
         Interface,
-        "Toggle fold or unfold for all context sections",
+        "cmd.context.fold_all",
     ),
     CommandSpec::new(
         KeyChord::Bare(KeyCode::Tab),
         ContextAction::FoldToggle,
         Interface,
-        "Fold or unfold the selected section",
+        "cmd.context.fold_toggle",
     ),
     CommandSpec::new(
         KeyChord::Bare(KeyCode::Char(' ')),
         ContextAction::FoldToggle,
         Interface,
-        "Fold or unfold the selected section",
+        "cmd.context.fold_toggle",
     ),
     CommandSpec::new(
         KeyChord::Bare(KeyCode::Up),
         ContextAction::NavPrev,
         Interface,
-        "Select the previous row",
+        "cmd.context.nav_prev",
     ),
     CommandSpec::new(
         KeyChord::Bare(KeyCode::Char('k')),
         ContextAction::NavPrev,
         Interface,
-        "Select the previous row",
+        "cmd.context.nav_prev",
     ),
     CommandSpec::new(
         KeyChord::Bare(KeyCode::Char('p')),
         ContextAction::NavPrev,
         Interface,
-        "Select the previous row",
+        "cmd.context.nav_prev",
     ),
     CommandSpec::new(
         KeyChord::Bare(KeyCode::Down),
         ContextAction::NavNext,
         Interface,
-        "Select the next row",
+        "cmd.context.nav_next",
     ),
     CommandSpec::new(
         KeyChord::Bare(KeyCode::Char('j')),
         ContextAction::NavNext,
         Interface,
-        "Select the next row",
+        "cmd.context.nav_next",
     ),
     CommandSpec::new(
         KeyChord::Bare(KeyCode::Char('n')),
         ContextAction::NavNext,
         Interface,
-        "Select the next row",
+        "cmd.context.nav_next",
     ),
     CommandSpec::new(
         KeyChord::Bare(KeyCode::Home),
         ContextAction::SelectFirst,
         Interface,
-        "Select the first row",
+        "cmd.context.select_first",
     ),
     CommandSpec::new(
         KeyChord::Meta(KeyCode::Char('<')),
         ContextAction::SelectFirst,
         Interface,
-        "Select the first row",
+        "cmd.context.select_first",
     ),
     CommandSpec::new(
         KeyChord::Ctrl(KeyCode::Home),
         ContextAction::SelectFirst,
         Interface,
-        "Select the first row",
+        "cmd.context.select_first",
     ),
     CommandSpec::new(
         KeyChord::Bare(KeyCode::End),
         ContextAction::SelectLast,
         Interface,
-        "Select the last row",
+        "cmd.context.select_last",
     ),
     CommandSpec::new(
         KeyChord::Meta(KeyCode::Char('>')),
         ContextAction::SelectLast,
         Interface,
-        "Select the last row",
+        "cmd.context.select_last",
     ),
     CommandSpec::new(
         KeyChord::Ctrl(KeyCode::End),
         ContextAction::SelectLast,
         Interface,
-        "Select the last row",
+        "cmd.context.select_last",
     ),
     CommandSpec::new(
         KeyChord::Bare(KeyCode::PageUp),
         ContextAction::PageUp,
         Interface,
-        "Scroll the context view up a page",
+        "cmd.context.page_up",
     ),
     CommandSpec::new(
         KeyChord::Bare(KeyCode::PageDown),
         ContextAction::PageDown,
         Interface,
-        "Scroll the context view down a page",
+        "cmd.context.page_down",
     ),
 ]);
 
@@ -445,7 +449,7 @@ pub async fn handle_context_key(
             Some(ContextRow::Item(ref item)) if item.layer == ContextLayer::Auto => {
                 let path = item.path.clone();
                 let access = item.access;
-                st.notify_info(format!("Promoting '{}' to User context...", path));
+                st.notify_info(active_t("notify.promoting_to_user").replace("{}", &path));
                 drop(st);
                 let params = ContextAddParams {
                     path,
@@ -466,7 +470,7 @@ pub async fn handle_context_key(
                 if item.layer == ContextLayer::Auto {
                     let path = item.path.clone();
                     let access = item.access;
-                    st.notify_info(format!("Promoting '{}' to User context...", path));
+                    st.notify_info(active_t("notify.promoting_to_user").replace("{}", &path));
                     drop(st);
                     let params = ContextAddParams {
                         path,
@@ -480,7 +484,7 @@ pub async fn handle_context_key(
                     )
                     .await?;
                 } else {
-                    st.notify_warning("Only Auto files can be promoted to User context");
+                    st.notify_warning(active_t("notify.only_auto_promotable"));
                 }
             }
         }
@@ -492,7 +496,7 @@ pub async fn handle_context_key(
                 .filter(|i| i.layer == ContextLayer::Auto)
                 .count();
             if count == 0 {
-                st.notify_info("No auto files to clear");
+                st.notify_info(active_t("notify.no_auto_files"));
             } else {
                 st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
                 st.context_view.confirm_clear_auto = true;
@@ -506,7 +510,7 @@ pub async fn handle_context_key(
                 .filter(|i| i.layer == ContextLayer::User)
                 .count();
             if count == 0 {
-                st.notify_info("No user files to clear");
+                st.notify_info(active_t("notify.no_user_files"));
             } else {
                 st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
                 st.context_view.confirm_clear_user = true;
@@ -538,17 +542,17 @@ pub async fn handle_context_key(
                 let mut st = state.lock().await;
                 match res {
                     crate::clipboard::CopyResult::Native => {
-                        st.notify_success("File path copied to clipboard");
+                        st.notify_success(active_t("notify.context_copied"));
                     }
                     crate::clipboard::CopyResult::Osc52Only => {
-                        st.notify_info("File path sent to terminal clipboard (OSC 52)");
+                        st.notify_info(active_t("notify.context_copied_osc52"));
                     }
                     crate::clipboard::CopyResult::Failed => {
-                        st.notify_error("Failed to copy to clipboard");
+                        st.notify_error(active_t("notify.copy_failed"));
                     }
                 }
             } else if let Some(ContextRow::Header(_)) = current_row {
-                st.notify_info("No files in section to copy");
+                st.notify_info(active_t("notify.context_no_files_copy"));
             }
         }
         ContextAction::Refresh => {
@@ -593,9 +597,7 @@ pub async fn handle_context_key(
         ContextAction::ToggleAccess => {
             if let Some(ContextRow::Item(ref item)) = current_row {
                 if item.layer == ContextLayer::Pinned {
-                    st.notify_warning(
-                        "Pinned files are read-only and cannot be changed",
-                    );
+                    st.notify_warning(active_t("notify.pinned_readonly"));
                 } else {
                     let path = item.path.clone();
                     let next_access = match item.access {
@@ -619,9 +621,7 @@ pub async fn handle_context_key(
         ContextAction::Remove => match current_row {
             Some(ContextRow::Item(ref item)) => {
                 if item.layer == ContextLayer::Pinned {
-                    st.notify_warning(
-                        "Pinned files are protected and cannot be removed",
-                    );
+                    st.notify_warning(active_t("notify.pinned_protected_remove"));
                 } else {
                     let path = item.path.clone();
                     if st.context_view.cursor_index > 0
@@ -647,16 +647,14 @@ pub async fn handle_context_key(
                     .filter(|i| i.layer == ContextLayer::Auto)
                     .count();
                 if auto_count == 0 {
-                    st.notify_info("No auto files to clear");
+                    st.notify_info(active_t("notify.no_auto_files"));
                 } else {
                     st.context_view.confirm_clear_auto = true;
                     st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
                 }
             }
             Some(ContextRow::Header(ContextLayer::Pinned)) => {
-                st.notify_warning(
-                    "Pinned section is protected and cannot be removed",
-                );
+                st.notify_warning(active_t("notify.pinned_protected_section"));
             }
             Some(ContextRow::Header(ContextLayer::User)) => {
                 let user_count = st
@@ -666,7 +664,7 @@ pub async fn handle_context_key(
                     .filter(|i| i.layer == ContextLayer::User)
                     .count();
                 if user_count == 0 {
-                    st.notify_info("No user files to clear");
+                    st.notify_info(active_t("notify.no_user_files"));
                 } else {
                     st.context_view.confirm_clear_user = true;
                     st.confirm_button = crate::app::ConfirmDialogButton::Cancel;

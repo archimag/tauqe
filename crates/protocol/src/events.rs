@@ -2,6 +2,7 @@ pub const MODEL_STARTED: &str = "model/started";
 pub const MODEL_REASONING_DELTA: &str = "model/reasoningDelta";
 pub const MODEL_TEXT_DELTA: &str = "model/textDelta";
 pub const MODEL_USAGE: &str = "model/usage";
+pub const MODEL_USAGE_TOTALS: &str = "model/usageTotals";
 pub const MODEL_RESULT: &str = "model/result";
 pub const MODEL_FINISHED: &str = "model/finished";
 pub const MODEL_CANCELLED: &str = "model/cancelled";

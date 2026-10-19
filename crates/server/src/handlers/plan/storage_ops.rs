@@ -4,9 +4,9 @@ use std::sync::Arc;
 
 use tauqe_core::plan::storage::PlanStorage;
 use tauqe_protocol::{
-    errors, events, PlanDeleteParams, PlanGetParams, PlanGetResult, PlanListChangedEvent,
-    PlanListResult, PlanSaveParams, PlanSetActiveParams, PlanUpdateItemParams, PlanUpdatedEvent,
-    Request, Response,
+    errors, events, PlanClearHorizonParams, PlanClearHorizonResult, PlanDeleteParams,
+    PlanGetParams, PlanGetResult, PlanListChangedEvent, PlanListResult, PlanSaveParams,
+    PlanSetActiveParams, PlanUpdateItemParams, PlanUpdatedEvent, Request, Response,
 };
 
 use crate::state::AppState;
@@ -112,7 +112,13 @@ pub async fn handle_plan_save(req: Request, state: &Arc<AppState>) -> Response {
 
     let params: PlanSaveParams = match req.params.and_then(|p| serde_json::from_value(p).ok()) {
         Some(p) => p,
-        None => return Response::err(req.id, errors::INVALID_PARAMS, "Missing or invalid plan payload"),
+        None => {
+            return Response::err(
+                req.id,
+                errors::INVALID_PARAMS,
+                "Missing or invalid plan payload",
+            )
+        }
     };
 
     if !is_valid_plan_id(&params.plan.id) {
@@ -178,9 +184,16 @@ pub async fn handle_plan_update_item(req: Request, state: &Arc<AppState>) -> Res
         return resp;
     }
 
-    let params: PlanUpdateItemParams = match req.params.and_then(|p| serde_json::from_value(p).ok()) {
+    let params: PlanUpdateItemParams = match req.params.and_then(|p| serde_json::from_value(p).ok())
+    {
         Some(p) => p,
-        None => return Response::err(req.id, errors::INVALID_PARAMS, "Missing or invalid update item params"),
+        None => {
+            return Response::err(
+                req.id,
+                errors::INVALID_PARAMS,
+                "Missing or invalid update item params",
+            )
+        }
     };
 
     let repo_root = state.context.read().await.repo_root().to_path_buf();
@@ -221,9 +234,79 @@ pub async fn handle_plan_update_item(req: Request, state: &Arc<AppState>) -> Res
         Ok(None) => Response::err(
             req.id,
             errors::NOT_FOUND,
-            format!("Item '{}' not found in plan '{}'", params.item_id, params.plan_id),
+            format!(
+                "Item '{}' not found in plan '{}'",
+                params.item_id, params.plan_id
+            ),
         ),
         Err(err) => Response::err(req.id, errors::PLAN_UPDATE_FAILED, err),
+    }
+}
+
+/// Discards the whole implementation horizon while preserving the concept.
+///
+/// Only the step list is cleared; the `concept` tree of requirements and
+/// invariants survives untouched. The `Done` immutability guard is intentionally
+/// bypassed here, so the client is responsible for demanding the strict
+/// two-tier confirmation before dispatching this request; the server never
+/// silently downgrades an authorized reset.
+pub async fn handle_plan_clear_horizon(req: Request, state: &Arc<AppState>) -> Response {
+    if let Some(resp) = crate::handlers::reject_if_operation_active(
+        &req.id,
+        state,
+        "Cannot clear a plan horizon while a model operation is in progress",
+    ) {
+        return resp;
+    }
+
+    let params: PlanClearHorizonParams =
+        match req.params.and_then(|p| serde_json::from_value(p).ok()) {
+            Some(p) => p,
+            None => {
+                return Response::err(
+                    req.id,
+                    errors::INVALID_PARAMS,
+                    "Missing or invalid clear horizon payload",
+                );
+            }
+        };
+
+    let repo_root = state.context.read().await.repo_root().to_path_buf();
+    let clear_root = repo_root.clone();
+    let plan_id = params.plan_id.clone();
+    match offload_plan(move || PlanStorage::clear_horizon(&clear_root, &plan_id)).await {
+        Ok(Some(plan)) => {
+            emit(
+                &state.out,
+                events::PLAN_UPDATED,
+                serde_json::to_value(PlanUpdatedEvent {
+                    plan: plan.clone(),
+                    is_save: false,
+                })
+                .ok(),
+            );
+            let list_root = repo_root.clone();
+            if let Ok((plans, active_id)) = offload_plan(move || {
+                let plans = PlanStorage::load_all(&list_root)?;
+                let active_id = PlanStorage::load_active_id(&list_root).ok().flatten();
+                Ok((plans, active_id))
+            })
+            .await
+            {
+                emit(
+                    &state.out,
+                    events::PLAN_LIST_CHANGED,
+                    serde_json::to_value(PlanListChangedEvent { plans, active_id }).ok(),
+                );
+            }
+            Response::ok_typed(req.id, &PlanClearHorizonResult { plan })
+        }
+        Ok(None) => Response::err(
+            req.id,
+            errors::NOT_FOUND,
+            format!("Plan '{}' not found", params.plan_id),
+        ),
+        Err(err) => Response::err(req.id, errors::PLAN_CLEAR_FAILED, err),
     }
 }
 
@@ -238,7 +321,9 @@ pub async fn handle_plan_delete(req: Request, state: &Arc<AppState>) -> Response
 
     let params: PlanDeleteParams = match req.params.and_then(|p| serde_json::from_value(p).ok()) {
         Some(p) => p,
-        None => return Response::err(req.id, errors::INVALID_PARAMS, "Missing or invalid plan ID"),
+        None => {
+            return Response::err(req.id, errors::INVALID_PARAMS, "Missing or invalid plan ID")
+        }
     };
 
     let repo_root = state.context.read().await.repo_root().to_path_buf();

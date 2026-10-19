@@ -26,6 +26,13 @@ fn is_sensitive_method(method: &str) -> bool {
     method == crate::methods::CREDENTIALS_SAVE || method.starts_with("credentials/")
 }
 
+fn is_token_metric_key(normalized: &str) -> bool {
+    normalized == "tokens"
+        || normalized.ends_with("tokens")
+        || normalized.ends_with("tokencount")
+        || normalized.ends_with("tokencounts")
+}
+
 /// Reports whether a JSON object key names a secret and must be redacted.
 ///
 /// Matching is tolerant of case and separator differences — `api_key`,
@@ -43,10 +50,15 @@ fn is_sensitive_key(key: &str) -> bool {
         .map(|c| c.to_ascii_lowercase())
         .collect();
 
+    if is_token_metric_key(&normalized) {
+        return false;
+    }
+
     normalized.ends_with("key")
         || normalized.contains("token")
         || normalized.contains("secret")
         || normalized.contains("password")
+        || normalized.contains("credential")
         || normalized.contains("authorization")
         || normalized.contains("bearer")
 }
@@ -58,7 +70,7 @@ fn redact_sensitive_json(value: &serde_json::Value, sensitive_context: bool) -> 
             for (k, v) in map {
                 if sensitive_context || is_sensitive_key(k) {
                     if v.is_object() || v.is_array() {
-                        sanitized.insert(k.clone(), redact_sensitive_json(v, sensitive_context));
+                        sanitized.insert(k.clone(), redact_sensitive_json(v, true));
                     } else {
                         sanitized.insert(
                             k.clone(),
@@ -78,9 +90,7 @@ fn redact_sensitive_json(value: &serde_json::Value, sensitive_context: bool) -> 
                 .map(|v| redact_sensitive_json(v, sensitive_context))
                 .collect(),
         ),
-        serde_json::Value::String(_) if sensitive_context => {
-            serde_json::Value::String("<redacted>".to_string())
-        }
+        _ if sensitive_context => serde_json::Value::String("<redacted>".to_string()),
         other => other.clone(),
     }
 }
@@ -604,18 +614,89 @@ mod tests {
             "client_secret",
             "password",
             "new_password",
+            "credential",
+            "credentials",
             "authorization",
             "bearer",
         ] {
             assert!(is_sensitive_key(key), "{key} must be treated as sensitive");
         }
 
-        for key in ["path", "method", "model", "name", "keyword", "count"] {
+        for key in [
+            "path",
+            "method",
+            "model",
+            "name",
+            "keyword",
+            "count",
+            "prompt_tokens",
+            "completion_tokens",
+            "total_tokens",
+            "reasoning_tokens",
+            "cached_tokens",
+            "estimated_tokens",
+            "added_tokens",
+            "tokens",
+        ] {
             assert!(
                 !is_sensitive_key(key),
                 "{key} must not be treated as sensitive"
             );
         }
+    }
+
+    #[test]
+    fn test_debug_redacts_nested_objects_and_arrays_under_sensitive_key() {
+        let req = Request {
+            id: RequestId::Number(10),
+            method: "custom/auth".to_string(),
+            params: Some(serde_json::json!({
+                "api_key": {
+                    "value": "sk-secret-nested",
+                    "backup": ["sk-secret-arr-1", "sk-secret-arr-2"]
+                },
+                "credentials": [
+                    {"token": "nested-token-1"},
+                    {"value": "nested-val-2"}
+                ]
+            })),
+        };
+
+        let rendered = format!("{req:?}");
+        assert!(!rendered.contains("sk-secret-nested"));
+        assert!(!rendered.contains("sk-secret-arr-1"));
+        assert!(!rendered.contains("sk-secret-arr-2"));
+        assert!(!rendered.contains("nested-token-1"));
+        assert!(!rendered.contains("nested-val-2"));
+        assert!(rendered.contains("<redacted>"));
+    }
+
+    #[test]
+    fn test_debug_preserves_token_metrics_in_response_and_event() {
+        let resp = Response::ok(
+            RequestId::Number(20),
+            serde_json::json!({
+                "estimated_tokens": 1500,
+                "status": "ok"
+            }),
+        );
+        let resp_rendered = format!("{resp:?}");
+        assert!(resp_rendered.contains("1500"));
+        assert!(resp_rendered.contains("estimated_tokens"));
+
+        let event = Event {
+            method: "model/usage".to_string(),
+            params: Some(serde_json::json!({
+                "prompt_tokens": 120,
+                "completion_tokens": 45,
+                "total_tokens": 165
+            })),
+        };
+        let event_rendered = format!("{event:?}");
+        assert!(event_rendered.contains("120"));
+        assert!(event_rendered.contains("45"));
+        assert!(event_rendered.contains("165"));
+        assert!(event_rendered.contains("prompt_tokens"));
     }
 
     #[test]

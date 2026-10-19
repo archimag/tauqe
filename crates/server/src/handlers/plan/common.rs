@@ -4,7 +4,6 @@ use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
 
-use tauqe_core::context::ContextManager;
 use tauqe_core::plan::storage::PlanStorage;
 use tauqe_protocol::{
     events, Event, ModelErrorEvent, Plan, PlanItem, PlanItemStatus, PlanListChangedEvent,
@@ -130,33 +129,12 @@ pub(super) async fn set_step_status(
     }
 }
 
-/// Runs a context mutation on the blocking pool without holding the async
-/// context guard across disk I/O.
+/// Runs a context mutation atomically under the exclusive context write lock.
 ///
-/// The context manager is cloned into a private snapshot under a short-lived
-/// read guard, mutated inside the blocking pool, and written back under a
-/// short-lived write guard. This keeps `state.context` free while `std::fs`
-/// metadata reads run, so the async worker is never blocked by the mutation
-/// (and never starves on the guard while a sibling task holds it).
-pub(super) async fn with_context_mutation<T, F>(state: &Arc<AppState>, f: F) -> Result<T, String>
-where
-    F: FnOnce(&mut ContextManager) -> T + Send + 'static,
-    T: Send + 'static,
-{
-    let snapshot = state.context.read().await.clone();
-    let (result, mutated) = crate::handlers::offload(move || {
-        let mut ctx = snapshot;
-        let result = f(&mut ctx);
-        (result, ctx)
-    })
-    .await?;
-
-    {
-        let mut guard = state.context.write().await;
-        *guard = mutated;
-    }
-    Ok(result)
-}
+/// The single implementation lives in `crate::handlers`; re-exporting it here
+/// keeps plan-side call sites unchanged while removing the duplicated body that
+/// cloned the manager and overwrote the shared state afterwards.
+pub(super) use crate::handlers::with_context_mutation;
 
 /// Clears the transient auto context layer so a retried attempt starts from a
 /// clean, deterministic basis, then notifies clients of the new snapshot.

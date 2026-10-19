@@ -349,8 +349,12 @@ pub fn copy_to_clipboard(text: &str) -> CopyResult {
     if should_send_osc52 && clean_text.len() <= MAX_OSC52_BYTES {
         let b64 = base64_encode(clean_text.as_bytes());
         let osc52 = format!("\x1b]52;c;{b64}\x07\x1b]52;p;{b64}\x07");
+        // Wrap in a DCS passthrough frame so `tmux` forwards the OSC 52 sequence
+        // to the host terminal; unwrapped, the multiplexer discards it and an
+        // SSH session loses its only clipboard mechanism.
+        let payload = crate::terminal::wrap_osc_payload(&osc52);
         let mut out = std::io::stdout();
-        if out.write_all(osc52.as_bytes()).is_ok() && out.flush().is_ok() {
+        if out.write_all(&payload).is_ok() && out.flush().is_ok() {
             osc52_ok = true;
         }
     }

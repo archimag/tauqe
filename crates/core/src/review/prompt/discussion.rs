@@ -5,11 +5,6 @@ use tauqe_protocol::PlanItem;
 
 pub const REVIEW_DISCUSSION_PREFIX: &str = "# Review Discussion:";
 
-/// Returns true if the prompt represents an explicit review discussion turn.
-pub fn is_review_discussion_prompt(prompt: &str) -> bool {
-    prompt.trim_start().starts_with(REVIEW_DISCUSSION_PREFIX)
-}
-
 /// Formats a targeted prompt for discussing and analyzing review findings in Structured Output mode.
 pub fn format_review_discussion_prompt(
     session: &ReviewSession,

@@ -2,7 +2,8 @@ use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 use tauqe_protocol::{
-    IssueStatus, Plan, PlanItem, ReviewIssue, ReviewItem, ReviewSession, ReviewSummary,
+    ArchitectTier, IssueStatus, Plan, PlanItem, ReviewIssue, ReviewItem, ReviewSession,
+    ReviewSummary,
 };
 
 pub struct ReviewStorage;
@@ -481,7 +482,11 @@ impl ReviewStorage {
         let updated_issue = if let Some(item) = session.items.iter_mut().find(|it| it.id == item_id) {
             let mut issue = ReviewIssue::from(item.clone());
             updater(&mut issue);
-            *item = ReviewItem::from(issue.clone());
+            let mut updated_item = ReviewItem::from(issue.clone());
+            // The issue view carries no Architect provenance, so it is carried
+            // over explicitly instead of being dropped by the round-trip.
+            updated_item.subplan_architect = item.subplan_architect.clone();
+            *item = updated_item;
             Some(issue)
         } else {
             None
@@ -513,10 +518,17 @@ impl ReviewStorage {
         review_id: &str,
         item_id: u32,
         new_subplan: Vec<PlanItem>,
+        architect: ArchitectTier,
     ) -> Result<Option<ReviewIssue>> {
         crate::blocking::run_blocking(|| {
             let _guard = Self::lock();
-            Self::replace_uncompleted_subplan_unlocked(repo_root, review_id, item_id, new_subplan)
+            Self::replace_uncompleted_subplan_unlocked(
+                repo_root,
+                review_id,
+                item_id,
+                new_subplan,
+                architect,
+            )
         })
     }
 
@@ -526,6 +538,7 @@ impl ReviewStorage {
         review_id: &str,
         item_id: u32,
         new_subplan: Vec<PlanItem>,
+        architect: ArchitectTier,
     ) -> Result<Option<ReviewIssue>> {
         let mut session = match Self::load_review_unlocked(repo_root, review_id)? {
             Some(s) => s,
@@ -533,20 +546,91 @@ impl ReviewStorage {
         };
 
         let updated_issue = if let Some(item) = session.items.iter_mut().find(|it| it.id == item_id) {
-            let merged = crate::plan::storage::merge_subplan(&item.subplan, new_subplan)?;
+            // Work on the canonical `ReviewIssue` model so the plan and status
+            // are read and mutated through their authoritative field names, then
+            // persist only the fields this primitive owns.
+            let mut issue = ReviewIssue::from(item.clone());
+            let merged = crate::plan::storage::merge_subplan(&issue.plan, new_subplan)?;
             let mut plan_wrapper = Plan {
                 items: merged,
                 ..Default::default()
             };
             plan_wrapper.normalize_leaf_files();
             plan_wrapper.refresh_parent_statuses();
-            item.subplan = plan_wrapper.items;
+            issue.plan = plan_wrapper.items;
 
-            if item.status == IssueStatus::Refine && !item.subplan.is_empty() {
-                item.status = IssueStatus::Todo;
+            // Planning settles the finding out of its planning status: `Refine`
+            // requested the decomposition and `InProgress` was published for the
+            // duration of the synthesis, so both resolve to `Todo` once the
+            // horizon is persisted.
+            if matches!(issue.status, IssueStatus::Refine | IssueStatus::InProgress)
+                && !issue.plan.is_empty()
+            {
+                issue.status = IssueStatus::Todo;
             }
 
-            let issue = ReviewIssue::from(item.clone());
+            item.status = issue.status;
+            item.subplan = issue.plan.clone();
+            // The finding records which Architect configuration produced the
+            // horizon, so a later replanning wave can reproduce or escalate it.
+            item.subplan_architect = Some(architect);
+            Some(issue)
+        } else {
+            None
+        };
+
+        if updated_issue.is_some() {
+            Self::save_session_unlocked(repo_root, &session)?;
+        }
+
+        Ok(updated_issue)
+    }
+
+    /// Atomically replaces the embedded subplan of a review item.
+    ///
+    /// The supplied subplan is the authoritative working horizon of the
+    /// finding, so it is normalized before it is persisted. Container steps
+    /// carry no authoritative status of their own: their status is a pure
+    /// function of their leaves. [`Plan::refresh_parent_statuses`] recomputes
+    /// that derived value, so a stored container can never disagree with the
+    /// children it aggregates. The whole read-modify-write cycle runs inside a
+    /// single acquisition of the process-global storage lock, so a concurrent
+    /// update cannot interleave between the load and the save.
+    pub fn update_subplan(
+        repo_root: &Path,
+        review_id: &str,
+        item_id: u32,
+        subplan: Vec<PlanItem>,
+    ) -> Result<Option<ReviewIssue>> {
+        crate::blocking::run_blocking(move || {
+            let _guard = Self::lock();
+            Self::update_subplan_unlocked(repo_root, review_id, item_id, subplan)
+        })
+    }
+
+    /// Lock-free core of [`Self::update_subplan`]; caller must hold storage lock.
+    fn update_subplan_unlocked(
+        repo_root: &Path,
+        review_id: &str,
+        item_id: u32,
+        subplan: Vec<PlanItem>,
+    ) -> Result<Option<ReviewIssue>> {
+        let mut session = match Self::load_review_unlocked(repo_root, review_id)? {
+            Some(s) => s,
+            None => return Ok(None),
+        };
+
+        let updated_issue = if let Some(item) = session.items.iter_mut().find(|it| it.id == item_id) {
+            // Normalize the derived container statuses and store the result
+            // through the canonical `ReviewIssue::plan` field.
+            let mut issue = ReviewIssue::from(item.clone());
+            let mut plan = Plan {
+                items: subplan,
+                ..Default::default()
+            };
+            plan.refresh_parent_statuses();
+            issue.plan = plan.items;
+            item.subplan = issue.plan.clone();
             Some(issue)
         } else {
             None
@@ -615,6 +699,11 @@ mod tests {
     use tauqe_protocol::{IssueType, ReviewSeverity};
     use tempfile::tempdir;
 
+    /// Architect provenance recorded by the synthesis primitive under test.
+    fn test_architect() -> ArchitectTier {
+        ArchitectTier::new(tauqe_protocol::ModelRef::openrouter("test/architect"), None)
+    }
+
     #[test]
     fn test_review_storage_crud_and_active() {
         let dir = tempdir().unwrap();
@@ -639,6 +728,7 @@ mod tests {
                 files: vec!["crates/core/src/lib.rs".to_string()],
                 readonly_files: vec![],
                 subplan: Vec::new(),
+                subplan_architect: None,
                 resolution_notes: None,
                 body: "Check input validation".to_string(),
             }],
@@ -731,6 +821,7 @@ mod tests {
                 files: vec![],
                 readonly_files: vec![],
                 subplan: Vec::new(),
+                subplan_architect: None,
                 resolution_notes: None,
                 body: "Check".to_string(),
             })
@@ -973,6 +1064,7 @@ mod tests {
                 files: vec![],
                 readonly_files: vec![],
                 subplan: Vec::new(),
+                subplan_architect: None,
                 resolution_notes: None,
                 body: String::new(),
             }],
@@ -1063,6 +1155,7 @@ mod tests {
                 files: vec![],
                 readonly_files: vec![],
                 subplan: Vec::new(),
+                subplan_architect: None,
                 resolution_notes: None,
                 body: "Body".to_string(),
             }],
@@ -1104,11 +1197,23 @@ mod tests {
                 status: tauqe_protocol::PlanItemStatus::Todo,
                 ..Default::default()
             }],
+            test_architect(),
         )
         .unwrap()
         .unwrap();
         assert_eq!(replaced.plan.len(), 1);
         assert_eq!(replaced.plan[0].id, "s-1");
+
+        // The issue view carries no Architect provenance, so the recorded
+        // configuration is verified on the finding that was persisted.
+        let stored = ReviewStorage::load_review(&root, "runtime-review")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored.items[0].subplan_architect,
+            Some(test_architect()),
+            "the Architect configuration that produced the subplan must be recorded"
+        );
 
         assert_eq!(ReviewStorage::load_all(&root).unwrap().len(), 1);
         assert_eq!(
@@ -1160,6 +1265,7 @@ mod tests {
                         ..Default::default()
                     },
                 ],
+                subplan_architect: None,
                 resolution_notes: None,
                 body: "Body".to_string(),
             }],
@@ -1179,6 +1285,7 @@ mod tests {
             "rev-subplan-1",
             1,
             new_subplan,
+            test_architect(),
         )
         .unwrap()
         .unwrap();
@@ -1189,9 +1296,97 @@ mod tests {
         assert_eq!(updated.plan[1].id, "s-3");
 
         let loaded = ReviewStorage::load_review(root, "rev-subplan-1").unwrap().unwrap();
-        assert_eq!(loaded.items[0].subplan.len(), 2);
-        assert_eq!(loaded.items[0].subplan[0].id, "s-1");
-        assert_eq!(loaded.items[0].subplan[1].id, "s-3");
+        let issues = loaded.issues();
+        let issue = &issues[0];
+        assert_eq!(issue.plan.len(), 2);
+        assert_eq!(issue.plan[0].id, "s-1");
+        assert_eq!(issue.plan[1].id, "s-3");
+    }
+
+    #[test]
+    fn test_update_subplan_normalizes_derived_container_statuses() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+
+        let session = ReviewSession {
+            id: "rev-update-subplan".to_string(),
+            title: "Subplan Update Audit".to_string(),
+            created_at: 100,
+            model: tauqe_protocol::ModelRef::openrouter("test-model"),
+            description: None,
+            user_prompt: None,
+            target_files: vec![],
+            items: vec![ReviewItem {
+                id: 1,
+                title: "Finding awaiting a subplan".to_string(),
+                model: None,
+                issue_type: IssueType::Architecture,
+                severity: ReviewSeverity::Warning,
+                status: IssueStatus::Todo,
+                recommendations: vec![],
+                files: vec![],
+                readonly_files: vec![],
+                subplan: Vec::new(),
+                subplan_architect: None,
+                resolution_notes: None,
+                body: "Body".to_string(),
+            }],
+            raw_markdown: String::new(),
+        };
+        ReviewStorage::save_session(root, &session).unwrap();
+
+        // The container arrives with a stale `Done` status while one of its
+        // leaves is still `Todo`; the persisted status must be recomputed.
+        let subplan = vec![PlanItem {
+            id: "phase-1".to_string(),
+            title: "Phase".to_string(),
+            status: tauqe_protocol::PlanItemStatus::Done,
+            children: vec![
+                PlanItem {
+                    id: "s-1".to_string(),
+                    title: "Finished step".to_string(),
+                    status: tauqe_protocol::PlanItemStatus::Done,
+                    ..Default::default()
+                },
+                PlanItem {
+                    id: "s-2".to_string(),
+                    title: "Pending step".to_string(),
+                    status: tauqe_protocol::PlanItemStatus::Todo,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        }];
+
+        let updated = ReviewStorage::update_subplan(root, "rev-update-subplan", 1, subplan)
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated.plan.len(), 1);
+        assert_eq!(
+            updated.plan[0].status,
+            tauqe_protocol::PlanItemStatus::InProgress
+        );
+
+        let loaded = ReviewStorage::load_review(root, "rev-update-subplan")
+            .unwrap()
+            .unwrap();
+        let issues = loaded.issues();
+        let issue = &issues[0];
+        assert_eq!(issue.plan.len(), 1);
+        assert_eq!(
+            issue.plan[0].status,
+            tauqe_protocol::PlanItemStatus::InProgress
+        );
+        assert_eq!(issue.plan[0].children.len(), 2);
+
+        // An unknown finding id resolves to nothing and never rewrites state.
+        let missing =
+            ReviewStorage::update_subplan(root, "rev-update-subplan", 99, Vec::new()).unwrap();
+        assert!(missing.is_none());
+        let unchanged = ReviewStorage::load_review(root, "rev-update-subplan")
+            .unwrap()
+            .unwrap();
+        assert_eq!(unchanged.issues()[0].plan.len(), 1);
     }
 
     #[test]
@@ -1218,6 +1413,7 @@ mod tests {
                 files: vec![],
                 readonly_files: vec![],
                 subplan: Vec::new(),
+                subplan_architect: None,
                 resolution_notes: None,
                 body: "Body".to_string(),
             }],
@@ -1237,6 +1433,7 @@ mod tests {
             "rev-refine-to-todo",
             1,
             new_subplan,
+            test_architect(),
         )
         .unwrap()
         .unwrap();
@@ -1245,6 +1442,68 @@ mod tests {
 
         let loaded = ReviewStorage::load_review(root, "rev-refine-to-todo").unwrap().unwrap();
         assert_eq!(loaded.items[0].status, IssueStatus::Todo);
+    }
+
+    /// A finding is published as `InProgress` while the Architect synthesizes its
+    /// horizon. Persisting that horizon must settle the finding on `Todo`, so a
+    /// successfully planned finding is executable instead of remaining stuck in
+    /// its planning status.
+    #[test]
+    fn test_replace_uncompleted_subplan_transitions_inprogress_to_todo() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+
+        let session = ReviewSession {
+            id: "rev-inprogress-to-todo".to_string(),
+            title: "Planning Status Audit".to_string(),
+            created_at: 100,
+            model: tauqe_protocol::ModelRef::openrouter("test-model"),
+            description: None,
+            user_prompt: None,
+            target_files: vec![],
+            items: vec![ReviewItem {
+                id: 1,
+                title: "Finding under planning".to_string(),
+                model: None,
+                issue_type: IssueType::Quality,
+                severity: ReviewSeverity::Suggestion,
+                status: IssueStatus::InProgress,
+                recommendations: vec![],
+                files: vec![],
+                readonly_files: vec![],
+                subplan: Vec::new(),
+                subplan_architect: None,
+                resolution_notes: None,
+                body: "Body".to_string(),
+            }],
+            raw_markdown: String::new(),
+        };
+        ReviewStorage::save_session(root, &session).unwrap();
+
+        let new_subplan = vec![PlanItem {
+            id: "step-1".to_string(),
+            title: "Implementation step".to_string(),
+            status: tauqe_protocol::PlanItemStatus::Todo,
+            ..Default::default()
+        }];
+
+        let updated = ReviewStorage::replace_uncompleted_subplan(
+            root,
+            "rev-inprogress-to-todo",
+            1,
+            new_subplan,
+            test_architect(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(updated.status, IssueStatus::Todo);
+        assert_eq!(updated.plan.len(), 1);
+
+        let loaded = ReviewStorage::load_review(root, "rev-inprogress-to-todo")
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.items[0].status, IssueStatus::Todo);
+        assert_eq!(loaded.issues()[0].plan.len(), 1);
     }
 
     #[test]
@@ -1271,6 +1530,7 @@ mod tests {
                 files: vec!["crates/core/src/state.rs".to_string()],
                 readonly_files: vec!["crates/protocol/src/lib.rs".to_string()],
                 subplan: Vec::new(),
+                subplan_architect: None,
                 resolution_notes: None,
                 body: "Root cause analysis".to_string(),
             }],
@@ -1336,6 +1596,7 @@ mod tests {
             files: vec![],
             readonly_files: vec![],
             subplan: Vec::new(),
+            subplan_architect: None,
             resolution_notes: None,
             body: String::new(),
         };

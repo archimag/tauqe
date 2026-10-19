@@ -46,6 +46,17 @@ pub fn canonical_catalog() -> Vec<LocaleCatalogItem> {
         item("footer.history_stats", "{} entries (~{} tokens)", "Footer history size indicator", None),
 
         // ------------------------------------------------------------------
+        // Footer usage summary labels (session total, last operation, and the
+        // in-flight operation slot) plus the token unit shown when no cost is
+        // known. They are unbounded because the whole usage field drops out of
+        // the footer as a unit once it no longer fits (c-4).
+        // ------------------------------------------------------------------
+        item("footer.usage.session", "session", "Footer usage label for the accumulated session total", None),
+        item("footer.usage.last", "last", "Footer usage label for the last completed operation", None),
+        item("footer.usage.now", "now", "Footer usage label for the operation currently in flight", None),
+        item("footer.usage.tok", "tok", "Footer usage unit suffix shown for token counts when no cost is known", None),
+
+        // ------------------------------------------------------------------
         // Bounded-turn phase pipeline (footer FSM telemetry).
         // ------------------------------------------------------------------
         item("phase.discovery", "Discovery", "Bounded-turn discovery phase label", Some(12)),
@@ -152,6 +163,7 @@ pub fn canonical_catalog() -> Vec<LocaleCatalogItem> {
         item("dialog.button.resolve_queue", "Resolve Queue", "Resolve a review findings queue button", Some(16)),
         item("dialog.button.execute", "Execute", "Execute a single plan step button", Some(12)),
         item("dialog.button.execute_scope", "Execute Scope", "Execute a plan scope queue button", Some(16)),
+        item("dialog.button.execute_pipeline", "Execute Pipeline", "Execute a multi-plan pipeline queue button", Some(18)),
         item("dialog.button.discard", "Discard", "Discard a squash message button", Some(12)),
         item("dialog.button.apply_squash", "Apply Squash", "Apply the squashed commit button", Some(14)),
         item("dialog.button.generate", "Generate via AI", "Generate a commit message with the model button", Some(18)),
@@ -217,6 +229,19 @@ pub fn canonical_catalog() -> Vec<LocaleCatalogItem> {
         item("dialog.execute_scope.queue_more", "   ... and {} more step(s)", "Execute-scope queue overflow line", None),
         item("dialog.execute_scope.note", "TAUQE will execute each step in an isolated turn with compiler verification gates.", "Execute-scope note about isolated turns", None),
         item("dialog.execute_scope.fail_fast", "Execution stops immediately if any step fails or is interrupted.", "Execute-scope stop-on-failure note", None),
+        item("dialog.execute_scope.title_jit", "Execute Concept Plan", "Title when executing a concept-only plan whose horizon is projected just-in-time", None),
+        item("dialog.execute_scope.heading_jit", "Project and execute the first implementation horizon autonomously?", "Execute-concept-plan dialog heading", None),
+        item("dialog.execute_scope.jit_note", "No implementation horizon has been synthesized yet; the Architect projects the first one before the first step runs.", "Execute-concept-plan note about just-in-time horizon synthesis", None),
+
+        item("dialog.execute_pipeline.title", "Execute Plan Pipeline", "Title for the multi-plan execution pipeline confirmation dialog", None),
+        item("dialog.execute_pipeline.heading", "Execute every ready plan as one sequential pipeline?", "Execute-pipeline dialog heading", None),
+        item("dialog.execute_pipeline.plans_label", " Plans: ", "Execute-pipeline plans field label", None),
+        item("dialog.execute_pipeline.plans_count", "{} plan(s)", "Execute-pipeline styled plan count", None),
+        item("dialog.execute_pipeline.steps_count", " ({} step(s) queued)", "Execute-pipeline queued step count", None),
+        item("dialog.execute_pipeline.queue_header", " Plans in the pipeline:", "Execute-pipeline queue header", None),
+        item("dialog.execute_pipeline.queue_more", "   ... and {} more plan(s)", "Execute-pipeline queue overflow line", None),
+        item("dialog.execute_pipeline.jit_note", " {} plan(s) carry only their architectural concept and are projected just-in-time before the queue starts.", "Execute-pipeline note about just-in-time horizon projection", None),
+        item("dialog.execute_pipeline.note", "TAUQE runs one plan at a time under a single operation and stops the queue if any plan fails.", "Execute-pipeline note about sequential execution", None),
 
         item("dialog.delete_plan.question", "Are you sure you want to delete this plan?", "Delete-plan dialog question line", None),
         item("dialog.delete_plan.plan_label", "Plan: ", "Delete-plan plan field label", None),
@@ -241,6 +266,23 @@ pub fn canonical_catalog() -> Vec<LocaleCatalogItem> {
         item("dialog.clear_history.question", "Are you sure you want to clear conversation history?", "Clear-history dialog question line", None),
         item("dialog.clear_history.erase_note", "This will permanently erase session history:", "Clear-history note about erasing history", None),
         item("dialog.clear_history.view_note", "and clear the current model view output.", "Clear-history note about clearing the view", None),
+
+        // ------------------------------------------------------------------
+        // Clear implementation horizon (two-tier confirmation, c-2). The
+        // concept tree survives the reset, so only the implementation steps
+        // are described as removed; the second tier warns that the reset is
+        // not a Git operation and cannot undo commits already recorded.
+        // ------------------------------------------------------------------
+        item("dialog.clear_horizon.title", "Clear Implementation Horizon", "Title for clearing implementation horizon confirmation dialog", None),
+        item("dialog.clear_horizon.question", "Clear the implementation horizon of this plan?", "Question in clear horizon confirmation dialog", None),
+        item("dialog.clear_horizon.note", "All implementation steps will be removed. The architectural concept tree will remain intact.", "Note in clear horizon confirmation dialog explaining concept is preserved", None),
+        item("dialog.clear_horizon_final.title", "Confirm Clearing Active Horizon", "Title for two-tier clear horizon confirmation dialog with active or done work", None),
+        item("dialog.clear_horizon_final.question", "Are you sure you want to clear completed or in-progress steps?", "Question in tier 2 clear horizon confirmation dialog", None),
+        item("dialog.clear_horizon_final.git_note", "Warning: Completed or in-progress steps have already been recorded in Git commits. Clearing the horizon does NOT undo Git commits and may cause desynchronization between Git history and the plan.", "Warning note about Git commits desync in tier 2 clear horizon dialog", None),
+        item("dialog.button.clear_horizon", "Clear Horizon", "Button to confirm clearing implementation horizon", Some(16)),
+        item("dialog.button.confirm_clear_horizon", "Confirm Clear", "Button to confirm tier 2 clearing of implementation horizon", Some(16)),
+        item("notify.plan_horizon_cleared", "Implementation horizon cleared; concept preserved", "Notification after successfully clearing plan horizon", None),
+        item("notify.plan_horizon_already_empty", "Plan has no implementation steps to clear", "Notification when clear horizon is invoked on plan with empty horizon", None),
 
         item("dialog.batch_cancel.question", "Cancel batch execution?", "Batch-cancel dialog question line", None),
         item("dialog.batch_cancel.continue_note", "Continue keeps the batch running.", "Batch-cancel continue action note", None),
@@ -314,7 +356,7 @@ pub fn canonical_catalog() -> Vec<LocaleCatalogItem> {
         // Plans view headers and empty state.
         // ------------------------------------------------------------------
         item("plans.empty_title", "No local engineering plans yet.", "Plans view empty-state heading", None),
-        item("plans.empty_hint", "Ask Tauqe AI in Develop (Ctrl+1) to formulate a multi-step task plan, or press 'r' to refresh.", "Plans view empty-state hint", None),
+        item("plans.empty_hint", "Ask Tauqe AI in Develop (Ctrl+1) to formulate a multi-step task plan, or press 'g' to refresh.", "Plans view empty-state hint", None),
         item("plans.refining", "[REFINING: AI Architect is analyzing codebase...]", "Plans view refinement-in-progress indicator", None),
         item("plans.plan_label", "Plan:", "Plans info line plan label", None),
         item("plans.concept_summary", "Concept: {} item(s) of architectural intent", "Plans info line concept section summary", None),
@@ -331,7 +373,7 @@ pub fn canonical_catalog() -> Vec<LocaleCatalogItem> {
         item("review.in_progress", "Review in progress...", "Review view running indicator", None),
         item("review.running_hint", "Streaming findings and summary in Develop view (Ctrl+1).", "Review view hint while a review streams", None),
         item("review.empty_title", "No code reviews yet.", "Review view empty-state heading", None),
-        item("review.empty_hint", "Add files to Context (Ctrl+2), then press 'r' to run a code review.", "Review view empty-state hint", None),
+        item("review.empty_hint", "Add files to Context (Ctrl+4), then press 'N' to run a code review.", "Review view empty-state hint", None),
         item("review.filter_open", "Filter: Open only", "Review view open-findings filter indicator", None),
 
         // ------------------------------------------------------------------
@@ -365,6 +407,28 @@ pub fn canonical_catalog() -> Vec<LocaleCatalogItem> {
         item("onboarding.step.ready_title", "Step 5: System is successfully configured and ready to use!", "Onboarding ready step heading", None),
 
         // ------------------------------------------------------------------
+        // Onboarding (Setup) chrome: the step badge that replaces the
+        // credentials step when the API key is missing, the per-step
+        // information panel, the status and error line prefixes, the ready
+        // summary values, and the custom langmap input hint.
+        // ------------------------------------------------------------------
+        item("onboarding.gatekeeper_badge", "Warning: API Key Missing", "Onboarding step badge replacing the credentials step when the API key is missing", Some(28)),
+        item("onboarding.info_title", "Information", "Onboarding information panel title", Some(16)),
+        item("onboarding.info.git", "Tauqe relies on Git for checkpoints, atomic step commits, and safe undo.", "Onboarding information line for the Git step", None),
+        item("onboarding.info.config", "Create default tauqe.toml or skip to use built-in defaults.", "Onboarding information line for the configuration step", None),
+        item("onboarding.info.credentials", "Secure credential storage: created with 0600 file permissions (owner-only read/write).", "Onboarding information line for the credentials step", None),
+        item("onboarding.info.workstation", "Workstation configuration: personal settings stored in ~/.config/tauqe/tui.toml.", "Onboarding information line for the workstation step", None),
+        item("onboarding.info.modifier", "Primary command modifier for text input: choose Ctrl (default) or Alt for legacy/macOS terminals.", "Onboarding information line for the command modifier step", None),
+        item("onboarding.info.gatekeeper", "OpenRouter API key is required for LLM calls. Select an action.", "Onboarding information line for the gatekeeper step", None),
+        item("onboarding.info.ready", "All parameters verified. Press Enter to start.", "Onboarding information line for the ready step", None),
+        item("onboarding.error_prefix", "Error: {}", "Onboarding error line prefix before the diagnostic message", None),
+        item("onboarding.status_prefix", "✓ {}", "Onboarding status line prefix before the confirmation message", None),
+        item("onboarding.ready.builtin_defaults", "Built-in defaults", "Onboarding ready summary value when no configuration file exists", None),
+        item("onboarding.ready.modifier_ctrl", "Ctrl (Default)", "Onboarding ready summary value for the Ctrl command modifier", Some(20)),
+        item("onboarding.ready.modifier_alt", "Alt", "Onboarding ready summary value for the Alt command modifier", Some(20)),
+        item("onboarding.input.langmap_hint", "  (Enter: Save, Esc: Cancel)", "Onboarding custom langmap input hint", None),
+
+        // ------------------------------------------------------------------
         // Command descriptions for the global command map.
         // ------------------------------------------------------------------
         item("cmd.global.cancel_generation", "Cancel the active generation", "Global command description", None),
@@ -377,6 +441,7 @@ pub fn canonical_catalog() -> Vec<LocaleCatalogItem> {
         item("cmd.global.select_model", "Select the active model", "Global command description", None),
         item("cmd.global.select_theme", "Select the color theme", "Global command description", None),
         item("cmd.global.select_locale", "Change the interface language (locale)", "Global command description", None),
+        item("cmd.global.open_usage_summary", "Open the session and operation usage breakdown", "Global command description", None),
         item("cmd.global.toggle_reasoning", "Fold or unfold the reasoning stream", "Global command description", None),
         item("cmd.global.open_help", "Open the Help dialog", "Global command description", None),
         item("cmd.global.reload_config", "Reload configuration from disk", "Global command description", None),
@@ -478,6 +543,7 @@ pub fn canonical_catalog() -> Vec<LocaleCatalogItem> {
         item("cmd.plans.page_down", "Scroll the plan view down a page", "Plans command description", None),
         item("cmd.plans.set_focus", "Set the discussion focus to the selection without leaving the view", "Plans command description", None),
         item("cmd.plans.copy_markdown", "Copy the plan as Markdown to the clipboard", "Plans command description", None),
+        item("cmd.plans.clear_horizon", "Clear the implementation horizon of the selected plan (with confirmation)", "Plans command description", None),
         item("cmd.plans.refresh", "Refresh plans from the server", "Plans command description", None),
         item("cmd.plans.delete", "Delete the plan", "Plans command description", None),
 
@@ -565,6 +631,9 @@ pub fn canonical_catalog() -> Vec<LocaleCatalogItem> {
         item("notify.pinned_readonly", "Pinned files are read-only and cannot be changed", "Context notification rejecting a Pinned access change", None),
         item("notify.pinned_protected_remove", "Pinned files are protected and cannot be removed", "Context notification rejecting a Pinned removal", None),
         item("notify.pinned_protected_section", "Pinned section is protected and cannot be removed", "Context notification rejecting a Pinned section removal", None),
+        item("notify.context_copied", "File path copied to clipboard", "Context notification after copying file path", None),
+        item("notify.context_copied_osc52", "File path sent to terminal clipboard (OSC 52)", "Context notification after copying file path via OSC 52", None),
+        item("notify.context_no_files_copy", "No files in section to copy", "Context notification when copying an empty section", None),
 
         // ------------------------------------------------------------------
         // Plans view notifications.
@@ -577,6 +646,7 @@ pub fn canonical_catalog() -> Vec<LocaleCatalogItem> {
         item("notify.plan_step_blocked", "Step is BLOCKED; resolve the blocker or press 'R' to replan horizon before executing.", "Plans notification for a blocked step", None),
         item("notify.plan_step_cancelled", "Step is CANCELLED; change status to TODO before executing.", "Plans notification for a cancelled step", None),
         item("notify.plan_item_not_found", "Target item not found in plan.", "Plans notification when a target item is missing", None),
+        item("notify.plan_pipeline_empty", "No plan has a ready step or a synthesized horizon to execute", "Plans notification when the pipeline queue is empty", None),
         item("notify.plan_concept_section_not_executable", "Concept section cannot be executed; execute implementation steps below.", "Plans notification rejecting concept-section execution", None),
         item("notify.plan_concept_item_not_executable", "Concept item cannot be executed directly; execute implementation steps or press 'd' to discuss.", "Plans notification rejecting concept-item execution", None),
         item("notify.plan_concept_no_status", "Concept items define architectural requirements and do not have task statuses. Press 'd' to discuss.", "Plans notification explaining concept items have no status", None),
@@ -607,7 +677,8 @@ pub fn canonical_catalog() -> Vec<LocaleCatalogItem> {
         item("notify.review_all_fixed", "All findings across all review sessions are already FIXED.", "Review notification when all sessions are complete", None),
         item("notify.review_no_todo_cross", "No TODO findings to execute across review sessions.", "Review notification when no cross-session TODO findings remain", None),
         item("notify.review_refining", "Decomposing finding with the Architect...", "Review notification while refining a finding", None),
-        item("notify.review_select_finding", "Select a finding to decompose into steps (R)", "Review notification prompting to select a finding", None),
+        item("notify.review_select_finding", "Select a finding to decompose into steps (r)", "Review notification prompting to select a finding", None),
+        item("notify.review_no_refine_needed", "No findings require architectural decomposition", "Review notification when no findings need refinement", None),
         item("notify.review_focus_set", "Discussion focus set to review '{}'", "Review notification confirming a session focus change", None),
         item("notify.review_focus_item_set", "Discussion focus set to {} in review '{}'", "Review notification confirming a finding focus change", None),
         item("notify.review_cannot_start_busy", "Cannot start a review while the model is generating", "Review notification rejecting a review while busy", None),
@@ -679,6 +750,26 @@ pub fn canonical_catalog() -> Vec<LocaleCatalogItem> {
         item("dialog.locale.footer_generating", "Esc cancel synthesis", "Locale dialog footer hint while synthesis runs", None),
         item("dialog.locale.footer_editor", "Enter synthesize • Tab controls • Esc dismiss", "Locale dialog footer hint while the language field has focus", None),
         item("dialog.locale.footer_actions", "← / → switch • Enter activate • Tab editor • Esc dismiss", "Locale dialog footer hint while the action bar has focus", None),
+
+        // ------------------------------------------------------------------
+        // Usage telemetry dialog: the full per-operation breakdown the compact
+        // footer deliberately omits (c-4). Every label is localized so a
+        // hot-swapped locale reaches the dialog body and its docked hint (c-5).
+        // ------------------------------------------------------------------
+        item("dialog.usage.title", "Usage Telemetry", "Title for the full usage breakdown dialog", None),
+        item("dialog.usage.session", "Session", "Usage dialog heading for the accumulated session totals", None),
+        item("dialog.usage.last", "Last Operation", "Usage dialog heading for the last completed operation", None),
+        item("dialog.usage.current", "Current Operation", "Usage dialog heading for the operation in flight", None),
+        item("dialog.usage.operations", "Operations", "Usage dialog row label for the completed operation count", None),
+        item("dialog.usage.prompt_tokens", "Prompt tokens", "Usage dialog row label for prompt tokens", None),
+        item("dialog.usage.completion_tokens", "Completion tokens", "Usage dialog row label for completion tokens", None),
+        item("dialog.usage.reasoning_tokens", "Reasoning tokens", "Usage dialog row label for reasoning tokens", None),
+        item("dialog.usage.cached_tokens", "Cached tokens", "Usage dialog row label for cached tokens", None),
+        item("dialog.usage.total_tokens", "Total tokens", "Usage dialog row label for total tokens", None),
+        item("dialog.usage.cost", "Cost", "Usage dialog row label for the monetary cost", None),
+        item("dialog.usage.duration", "Duration", "Usage dialog row label for the harness-measured duration", None),
+        item("dialog.usage.empty", "No usage recorded in this session yet.", "Usage dialog placeholder when no operation has completed", None),
+        item("dialog.usage.footer", "j / k or ↑ / ↓ scroll • PgUp / PgDn page • Home top • Esc close", "Usage dialog footer hint", None),
 
         // ------------------------------------------------------------------
         // Discussion prompt modal.
@@ -834,6 +925,119 @@ pub fn canonical_catalog() -> Vec<LocaleCatalogItem> {
         item("notify.review_completed_desktop_body", "Code review completed ({} findings)", "Desktop notification body for a completed review", None),
         item("notify.review_error_desktop_title", "TAUQE Review Error", "Desktop notification title for a failed review", None),
         item("notify.review_error_desktop_body", "Code review failed", "Desktop notification body for a failed review", None),
+
+        // ------------------------------------------------------------------
+        // REPL command descriptions continued: buffer boundaries and forward
+        // word-kill, bound to `M-<` / `C-Home`, `M->` / `C-End`, and `M-d`.
+        // ------------------------------------------------------------------
+        item("cmd.repl.move_buffer_start", "Move the cursor to the beginning of the buffer", "REPL command description", None),
+        item("cmd.repl.move_buffer_end", "Move the cursor to the end of the buffer", "REPL command description", None),
+        item("cmd.repl.kill_word_forward", "Kill the word after the cursor", "REPL command description", None),
+
+        // ------------------------------------------------------------------
+        // Onboarding (Setup) step bodies, prompts, and option labels. These are
+        // the visible copy of the setup workflow, declared here so a switched
+        // locale reaches every step without editing the renderer (c-1, c-2).
+        // ------------------------------------------------------------------
+        item("onboarding.git.body_not_repo", "The current working directory is not a Git repository.", "Onboarding Git step body: directory is not a repository", None),
+        item("onboarding.git.body_requires", "Tauqe strictly requires Git: isolated pre-edit checkpoints, atomic turn commits,", "Onboarding Git step body: first rationale line", None),
+        item("onboarding.git.body_rollback", "instant rollback (undo), and feature commit squashing.", "Onboarding Git step body: rationale completion line", None),
+        item("onboarding.git.select_prompt", "Select an action (arrows ↑/↓, then Enter):", "Onboarding action-selection prompt", None),
+        item("onboarding.git.option_init", "Initialize Git repository (git init)", "Onboarding Git option: init a repository", None),
+        item("onboarding.git.option_init_commit", "Initialize and create initial commit (git init && git commit)", "Onboarding Git option: init and first commit", None),
+        item("onboarding.git.option_exit", "Exit Tauqe", "Onboarding option: exit the application", None),
+        item("onboarding.config.body_not_found", "Configuration file not found in project root.", "Onboarding config step body: no config file", None),
+        item("onboarding.config.body_will_create", "It will be created at: {}", "Onboarding config step body: creation path", None),
+        item("onboarding.config.select_prompt", "Select configuration option (arrows ↑/↓, then Enter):", "Onboarding config selection prompt", None),
+        item("onboarding.config.option_create", "Create default tauqe.toml (recommended configuration)", "Onboarding config option: create default file", None),
+        item("onboarding.config.option_skip", "Skip (use built-in defaults without creating tauqe.toml)", "Onboarding config option: skip", None),
+        item("onboarding.credentials.body_not_detected", "OpenRouter API key was not detected in environment (OPENROUTER_API_KEY) or credentials files.", "Onboarding credentials body: key not detected", None),
+        item("onboarding.credentials.body_required", "An API key is required to query models (obtain at https://openrouter.ai/keys).", "Onboarding credentials body: key required", None),
+        item("onboarding.credentials.body_location", "Recommended secure file location: {}", "Onboarding credentials body: recommended path", None),
+        item("onboarding.credentials.select_prompt", "Select key setup method (arrows ↑/↓, then Enter):", "Onboarding credentials selection prompt", None),
+        item("onboarding.credentials.option_enter", "Enter API key now (save with 0600 permissions to {})", "Onboarding credentials option: enter key now", None),
+        item("onboarding.credentials.option_stub", "Create stub credentials.toml file (fill manually in editor)", "Onboarding credentials option: create stub", None),
+        item("onboarding.credentials.option_env", "Configured via OPENROUTER_API_KEY environment variable (Check again)", "Onboarding credentials option: environment variable", None),
+        item("onboarding.credentials.option_skip", "Skip", "Onboarding option: skip the current step", None),
+        item("onboarding.workstation.body_configure", "Configure shortcut key translation and navigation keys for your system layout.", "Onboarding workstation body: configure mapping", None),
+        item("onboarding.workstation.body_file", "Configuration file: {}", "Onboarding workstation body: tui config path", None),
+        item("onboarding.workstation.select_prompt", "Select keyboard layout option (arrows ↑/↓, then Enter):", "Onboarding workstation selection prompt", None),
+        item("onboarding.workstation.option_standard", "Standard (No translation, default QWERTY / layout-neutral)", "Onboarding workstation option: standard layout", None),
+        item("onboarding.workstation.option_jcuken", "Russian JCUKEN (Translate Cyrillic ЙЦУКЕН to QWERTY for shortcuts & navigation)", "Onboarding workstation option: Russian JCUKEN mapping", None),
+        item("onboarding.workstation.option_custom", "Custom Langmap (Input custom character mapping: e.g. Greek, Hebrew, etc.)", "Onboarding workstation option: custom langmap", None),
+        item("onboarding.workstation.option_skip", "Skip (Use defaults without creating tui.toml)", "Onboarding workstation option: skip", None),
+        item("onboarding.modifier.body_input", "In text input mode (prompt buffer, commit message editor), every regular key types text.", "Onboarding modifier body: text input mode", None),
+        item("onboarding.modifier.body_commands", "Functional commands (send prompt, undo, squash, model picker, tabs) use the primary modifier.", "Onboarding modifier body: command modifier", None),
+        item("onboarding.modifier.select_prompt", "Select primary command modifier (arrows ↑/↓, then Enter):", "Onboarding modifier selection prompt", None),
+        item("onboarding.modifier.option_ctrl", "Ctrl (Default — standard Emacs C- shortcuts: Ctrl+Enter, Ctrl+Z, Ctrl+S, Ctrl+M)", "Onboarding modifier option: Ctrl", None),
+        item("onboarding.modifier.option_alt", "Alt (Meta modifier — Alt+Enter, Alt+Z, Alt+S, Alt+M; robust on macOS and legacy terminals)", "Onboarding modifier option: Alt", None),
+        item("onboarding.gatekeeper.body_no_key", "Language model calls cannot proceed without an OpenRouter API key.", "Onboarding gatekeeper body: key required", None),
+        item("onboarding.gatekeeper.body_options", "You can input the key now, create credentials.toml, or export:", "Onboarding gatekeeper body: options intro", None),
+        item("onboarding.gatekeeper.body_export", "export OPENROUTER_API_KEY=\"sk-or-v1-...\"", "Onboarding gatekeeper body: export example", None),
+        item("onboarding.gatekeeper.option_go_back", "Go back and configure OpenRouter API key", "Onboarding gatekeeper option: go back", None),
+        item("onboarding.gatekeeper.option_recheck", "Check again (reload environment and credentials files)", "Onboarding gatekeeper option: recheck", None),
+        item("onboarding.gatekeeper.option_exit", "Exit Tauqe", "Onboarding option: exit the application", None),
+        item("onboarding.ready.model_label", "Model:", "Onboarding ready summary: model label", None),
+        item("onboarding.ready.config_label", "Configuration:", "Onboarding ready summary: configuration label", None),
+        item("onboarding.ready.key_label", "OpenRouter Key:", "Onboarding ready summary: key label", None),
+        item("onboarding.ready.modifier_label", "Command Modifier:", "Onboarding ready summary: modifier label", None),
+        item("onboarding.ready.key_configured", "[OK] Configured", "Onboarding ready summary: key configured badge", None),
+        item("onboarding.ready.press_enter", "Press Enter to open the development workspace.", "Onboarding ready: enter hint", None),
+        item("onboarding.ready.help_hint", "Press '?' at any time to view the hotkey reference.", "Onboarding ready: help hint", None),
+        item("onboarding.ready.start_session", "Start Session (Open Terminal)", "Onboarding ready: start session button", None),
+        item("onboarding.input.langmap_prompt", "Enter Custom Langmap (e.g. 'йцукен;qwerty' or 'йq,цw'):", "Onboarding input prompt for a custom langmap", None),
+        item("onboarding.input.api_key_prompt", "Enter OpenRouter API Key:", "Onboarding input prompt for the API key", None),
+        item("onboarding.input.key_hint_show", "({}R: Hide, {}V: Paste, Enter: Save, Esc: Cancel)", "Onboarding API key input hint while the key is shown", None),
+        item("onboarding.input.key_hint_hide", "({}R: Show, {}V: Paste, Enter: Save, Esc: Cancel)", "Onboarding API key input hint while the key is masked", None),
+
+        // ------------------------------------------------------------------
+        // View labels surfaced by the Develop, Plans, and Review render paths.
+        // ------------------------------------------------------------------
+        item("repl.proposed_edits", "Proposed Edits", "Develop header label for the staged file edits list", None),
+        item("repl.validation_error", "Validation Error:", "Develop label prefixing a failed file validation message", None),
+        item("repl.usage.tokens", "Tokens", "Develop usage line label preceding the token breakdown", None),
+        item("repl.usage.prompt", "prompt", "Develop usage line unit for prompt tokens", None),
+        item("repl.usage.completion", "completion", "Develop usage line unit for completion tokens", None),
+        item("repl.usage.reasoning", "reasoning", "Develop usage line unit for reasoning tokens", None),
+        item("repl.usage.cached", "cached", "Develop usage line unit for cached tokens", None),
+        item("repl.thinking", "Thinking...", "Develop reasoning block title while reasoning is shown", None),
+        item("repl.thinking_streaming", "Thinking (streaming)...", "Develop reasoning block title while reasoning streams", None),
+        item("repl.thinking_hidden", "Thinking (hidden)", "Develop reasoning block title while reasoning is folded", None),
+        item("repl.thinking_lines", "({} lines)", "Develop reasoning block line counter appended while reasoning streams", None),
+        item("plans.concept_title", "Concept", "Plans section title for architectural concept items", None),
+        item("plans.impl_title", "Implementation", "Plans section title for implementation items", None),
+        item("review.skip_reason_label", "Skip reason:", "Review detail label for a skipped finding rationale", None),
+        item("review.note_label", "Note:", "Review detail label for a finding note", None),
+
+        // ------------------------------------------------------------------
+        // Additional notifications declared alongside the localized view copy.
+        // ------------------------------------------------------------------
+        item("notify.comment_empty", "Comment cannot be empty", "Notification rejecting an empty discussion comment", None),
+        item("notify.squash_busy", "Cannot squash while the model is generating", "Notification rejecting a squash while the model is busy", None),
+        item("notify.onboarding_required", "Complete the initial setup before using this feature", "Notification requiring onboarding to finish first", None),
+        item("notify.config_reloading", "Reloading configuration...", "Notification while configuration reloads", None),
+        item("notify.mouse_shift_tip", "Hold Shift and drag to select text with the mouse", "Notification tip for mouse text selection", None),
+        item("notify.locale_generate_failed", "Failed to synthesize the interface language: {}", "Notification when locale synthesis fails", None),
+        item("notify.locale_generated", "Interface language '{}' synthesized", "Notification after a locale is synthesized", None),
+        item("notify.locale_empty_target", "Enter a target language (for example, Russian)", "Locale notification when target language is empty", None),
+        item("notify.locale_synthesizing", "Synthesizing the {} locale with Scribe...", "Locale notification when synthesis starts", None),
+        item("notify.locale_cancelled", "Locale generation cancelled", "Locale notification when synthesis is cancelled", None),
+        item("notify.locale_reset_english", "Interface language reset to English", "Locale notification when reset to English succeeds", None),
+        item("notify.locale_reset_unsaved", "Interface language reset to English, but the saved locale could not be removed: {}", "Locale notification when reset to English fails to delete file", None),
+        item("notify.config_reload_error", "{}; keeping previous TUI settings", "Notification when config reload encounters error", None),
+        item("notify.model_select_busy", "Cannot change model while model is generating", "Notification when model selection attempted while busy", None),
+        item("notify.quit_hint", "Press Ctrl+Q to quit TAUQE, or ? for help", "Notification hint for quitting tauqe or opening help", None),
+        item("dialog.squash.status_checking_base", "Checking base '{}'...", "Squash dialog status message when checking base commit", None),
+        item("dialog.squash.status_no_session_base", "Session base commit not available (no AI commits in session).", "Squash dialog status message when session base unavailable", None),
+        item("dialog.squash.status_no_upstream_base", "No upstream branch configured or detected.", "Squash dialog status message when upstream base unavailable", None),
+        item("dialog.squash.status_switching_base", "Switching base to '{}'...", "Squash dialog status message when switching base", None),
+        item("dialog.squash.status_generating_message", "Generating Conventional Commit message with AI...", "Squash dialog status message when generating commit message", None),
+        item("dialog.squash.status_applying", "Applying squash...", "Squash dialog status message when applying squash commit", None),
+        item("dialog.squash.status_loading_diff", "Diff is still loading, please wait...", "Squash dialog status message when diff is loading", None),
+        item("dialog.squash.status_message_generating", "Commit message is generating, please wait...", "Squash dialog status message when commit message is generating", None),
+        item("dialog.squash.status_invalid_base", "Invalid or empty base ref.", "Squash dialog status message when base ref is invalid", None),
+        item("dialog.squash.status_no_commits", "No commits ahead of base to squash.", "Squash dialog status message when no commits to squash", None),
+        item("dialog.squash.status_empty_message", "Commit message cannot be empty (Ctrl+G to generate, or type one).", "Squash dialog status message when commit message is empty", None),
     ]
 }
 

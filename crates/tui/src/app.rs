@@ -90,9 +90,14 @@ pub enum ActiveModal {
     ClearAuto,
     ClearUser,
     ConfirmDetachFocus,
+    /// First tier of the implementation-horizon clear confirmation.
+    ClearHorizon,
+    /// Second tier, raised when completed or in-progress work exists.
+    ClearHorizonFinal,
     DeletePlan,
     DeleteReview,
     ExecuteReview,
+    ExecutePipeline,
     ExecuteScope,
     RefineDialog,
     RefineBlocked,
@@ -102,6 +107,8 @@ pub enum ActiveModal {
     Status,
     Selection,
     ThemeSelector,
+    /// Full usage telemetry breakdown for the session and the operations.
+    UsageSummary,
     Help,
 }
 
@@ -420,6 +427,22 @@ pub struct ConfirmExecuteScopeState {
     pub steps: Vec<tauqe_protocol::PlanItem>,
 }
 
+/// Pending confirmation of a multi-plan execution pipeline.
+///
+/// A pipeline is a super-batch: every queued plan runs one after another under a
+/// single registered operation. The state keeps the display titles so the
+/// confirmation can name the whole queue, and records the plans that carry only
+/// their architectural concept so the dialog can announce the just-in-time
+/// horizon projection before any bounded turn spends tokens.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfirmExecutePipelineState {
+    pub plan_ids: Vec<String>,
+    pub plan_titles: Vec<String>,
+    pub steps: Vec<tauqe_protocol::PlanItem>,
+    /// Titles of the plans whose horizon the batch projects just-in-time.
+    pub pending_synthesis: Vec<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct ConfirmExecuteReviewState {
     pub review_id: Option<String>,
@@ -599,6 +622,16 @@ pub struct LocaleDialogState {
     pub button: LocaleDialogButton,
     /// Whether synthesis request is currently in flight.
     pub generating: bool,
+}
+
+/// State of the full usage breakdown dialog.
+///
+/// The daemon owns every counter (c-1), so the dialog stores nothing but its
+/// own scroll offset and renders the snapshot the footer mirrors (c-2, c-4).
+#[derive(Debug, Clone, Default)]
+pub struct UsageSummaryState {
+    /// Vertical scroll offset of the breakdown body.
+    pub scroll: u16,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1110,10 +1143,16 @@ pub struct AppState {
     /// Whether a running batch has been asked to stop after its current member.
     pub batch_stopping: bool,
     pub confirm_detach_focus: bool,
+    /// Plan awaiting the first-tier implementation-horizon clear confirmation.
+    pub confirm_clear_horizon: Option<String>,
+    /// Plan whose horizon clear escalated to the second tier because work was
+    /// already recorded in Git.
+    pub confirm_clear_horizon_final: Option<String>,
     pub confirm_clear_history: bool,
     pub confirm_delete_plan: Option<String>,
     pub confirm_delete_review: Option<String>,
     pub confirm_execute_scope: Option<ConfirmExecuteScopeState>,
+    pub confirm_execute_pipeline: Option<ConfirmExecutePipelineState>,
     pub confirm_execute_review: Option<ConfirmExecuteReviewState>,
     pub confirm_button: ConfirmDialogButton,
     pub selection_dialog: Option<SelectionDialogState>,
@@ -1147,6 +1186,8 @@ pub struct AppState {
     pub i18n: I18nEngine,
     /// Interface-language (locale) dialog, when open.
     pub locale_dialog: Option<LocaleDialogState>,
+    /// Full usage telemetry breakdown dialog, when open.
+    pub usage_summary: Option<UsageSummaryState>,
 }
 
 impl AppState {
@@ -1187,10 +1228,13 @@ impl AppState {
             batch_cancel_button: BatchCancelButton::Continue,
             batch_stopping: false,
             confirm_detach_focus: false,
+            confirm_clear_horizon: None,
+            confirm_clear_horizon_final: None,
             confirm_clear_history: false,
             confirm_delete_plan: None,
             confirm_delete_review: None,
             confirm_execute_scope: None,
+            confirm_execute_pipeline: None,
             confirm_execute_review: None,
             confirm_button: ConfirmDialogButton::Cancel,
             selection_dialog: None,
@@ -1214,6 +1258,7 @@ impl AppState {
             theme_selector: None,
             i18n: init.i18n,
             locale_dialog: None,
+            usage_summary: None,
         };
         // Publish the resolved catalog to the process-wide locale view so chrome
         // rendered without `&AppState` (modal footers) shares one source of
@@ -1383,6 +1428,14 @@ impl AppState {
         if self.confirm_detach_focus {
             return Some(ActiveModal::ConfirmDetachFocus);
         }
+        // The stricter second tier outranks the first tier, so a horizon that
+        // escalated to the dangerous confirmation always owns the keyboard.
+        if self.confirm_clear_horizon_final.is_some() {
+            return Some(ActiveModal::ClearHorizonFinal);
+        }
+        if self.confirm_clear_horizon.is_some() {
+            return Some(ActiveModal::ClearHorizon);
+        }
         if self.confirm_delete_plan.is_some() {
             return Some(ActiveModal::DeletePlan);
         }
@@ -1391,6 +1444,9 @@ impl AppState {
         }
         if self.confirm_execute_review.is_some() {
             return Some(ActiveModal::ExecuteReview);
+        }
+        if self.confirm_execute_pipeline.is_some() {
+            return Some(ActiveModal::ExecutePipeline);
         }
         if self.confirm_execute_scope.is_some() {
             return Some(ActiveModal::ExecuteScope);
@@ -1418,6 +1474,11 @@ impl AppState {
         }
         if self.theme_selector.is_some() {
             return Some(ActiveModal::ThemeSelector);
+        }
+        // The breakdown outranks Help but never displaces a confirmation, so a
+        // read-only telemetry surface can never swallow a pending decision.
+        if self.usage_summary.is_some() {
+            return Some(ActiveModal::UsageSummary);
         }
         if self.show_help {
             return Some(ActiveModal::Help);
@@ -1465,11 +1526,9 @@ impl AppState {
         self.model.markdown_lines.clear();
         self.model.error = None;
         self.model.result = None;
-        self.model.usage = None;
         self.model.scroll = 0;
         self.model.status = TurnStatus::Awaiting;
         self.model.auto_scroll = true;
-        self.model.current_cost = Some(0.0);
 
         self.model.edits_active = false;
         self.model.files.clear();
@@ -1526,6 +1585,15 @@ impl AppState {
     /// Opens the interactive theme preset selector, seeded on the active preset.
     pub fn open_theme_selector(&mut self) {
         self.theme_selector = Some(ThemeSelectorState::new(self.active_theme_preset));
+    }
+
+    /// Opens the full usage breakdown dialog at its top.
+    ///
+    /// Reading telemetry never spends tokens and never mutates domain state, so
+    /// the dialog opens regardless of a running turn and only mirrors the latest
+    /// daemon snapshot (c-4).
+    pub fn open_usage_summary(&mut self) {
+        self.usage_summary = Some(UsageSummaryState::default());
     }
 
     /// Opens the interface-language (locale) dialog.
@@ -1602,6 +1670,33 @@ mod tests {
         st.tui_config.theme.name = Some("catppuccin".to_string());
         st.sync_theme_mode();
         assert_eq!(st.active_theme_preset, ThemePreset::Catppuccin);
+    }
+
+    /// The full usage breakdown outranks Help but never displaces a
+    /// confirmation, and reopening always seeds a fresh scroll offset (c-4).
+    #[test]
+    fn test_usage_summary_owns_the_keyboard_above_help() {
+        let mut st = test_state();
+        assert!(st.usage_summary.is_none());
+
+        st.open_usage_summary();
+        assert_eq!(st.active_modal(), Some(ActiveModal::UsageSummary));
+        assert!(st.has_active_modal());
+
+        // Help is the lowest-priority surface and never displaces the breakdown.
+        st.show_help = true;
+        assert_eq!(st.active_modal(), Some(ActiveModal::UsageSummary));
+
+        st.usage_summary = None;
+        assert_eq!(st.active_modal(), Some(ActiveModal::Help));
+
+        st.show_help = false;
+        assert_eq!(st.active_modal(), None);
+
+        // A dialog left scrolled reopens at its top.
+        st.usage_summary = Some(UsageSummaryState { scroll: 42 });
+        st.open_usage_summary();
+        assert_eq!(st.usage_summary.as_ref().unwrap().scroll, 0);
     }
 
     #[test]
@@ -1943,6 +2038,26 @@ mod tests {
         // Help stays a lower-priority surface than the confirmation.
         st.show_help = true;
         assert_eq!(st.active_modal(), Some(ActiveModal::ClearUser));
+    }
+
+    #[test]
+    fn test_clear_horizon_modal_priority() {
+        let mut st = test_state();
+
+        st.confirm_clear_horizon = Some("plan-1".to_string());
+        assert_eq!(st.active_modal(), Some(ActiveModal::ClearHorizon));
+        assert!(st.has_active_modal());
+
+        // Both tiers armed at once: the stricter second (dangerous) tier wins
+        // so the riskier confirmation always owns the keyboard.
+        st.confirm_clear_horizon_final = Some("plan-1".to_string());
+        assert_eq!(st.active_modal(), Some(ActiveModal::ClearHorizonFinal));
+
+        st.confirm_clear_horizon = None;
+        assert_eq!(st.active_modal(), Some(ActiveModal::ClearHorizonFinal));
+
+        st.confirm_clear_horizon_final = None;
+        assert_eq!(st.active_modal(), None);
     }
 
     #[test]

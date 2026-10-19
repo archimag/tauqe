@@ -5,7 +5,8 @@ use tauqe_protocol::{
     EditFileRetryingEvent, EditFileStartedEvent, EditFinishedEvent, EditHunkEvent, Event,
     GitCommitCreatedEvent, GitSquashApplyResult, HistoryCompactedEvent,
     HistoryEntryAddedEvent, ModelDeltaEvent, ModelErrorEvent, ModelFinishedEvent, ModelResult,
-    ModelResultEvent, ModelStartedEvent, ModelUsageEvent, PlanBatchFinishedEvent, RepositoryState,
+    ModelResultEvent, ModelStartedEvent, ModelUsageTotalsEvent,
+    PlanBatchFinishedEvent, RepositoryState,
     ReviewBatchFinishedEvent, ReviewContentDeltaEvent, ReviewErrorEvent, ReviewFinishedEvent,
     ReviewReasoningDeltaEvent, ReviewStartedEvent,
 };
@@ -212,7 +213,6 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
                     st.model.is_batch = data.is_batch;
                     st.model.repomap_tokens = None;
                     st.model.auto_scroll = true;
-                    st.model.current_cost = Some(0.0);
                 }
             }
         }
@@ -434,14 +434,13 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
                 }
             }
         }
-        events::MODEL_USAGE => {
+        events::MODEL_USAGE_TOTALS => {
             if let Some(params) = ev.params {
-                if let Ok(data) = serde_json::from_value::<ModelUsageEvent>(params) {
-                    st.model.session_total_cost = data.session_total_cost;
-                    if let Some(curr) = data.current_cost {
-                        st.model.current_cost = Some(curr);
-                    }
-                    st.model.usage = Some(data);
+                if let Ok(data) = serde_json::from_value::<ModelUsageTotalsEvent>(params) {
+                    // The daemon owns accumulation: the reported snapshot
+                    // replaces the mirrored one, so the interface can never
+                    // double count an operation (c-1, c-2).
+                    st.model.usage_totals = data.snapshot;
                 }
             }
         }
@@ -481,21 +480,6 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
                         _ => {}
                     }
                     st.model.result = Some(data.result);
-                    if let Some(usage) = data.usage {
-                        let total_cost = data
-                            .session_total_cost
-                            .unwrap_or(st.model.session_total_cost);
-                        st.model.session_total_cost = total_cost;
-                        if let Some(curr) = data.current_cost {
-                            st.model.current_cost = Some(curr);
-                        }
-                        st.model.usage = Some(ModelUsageEvent {
-                            operation_id: data.operation_id.clone(),
-                            usage,
-                            session_total_cost: total_cost,
-                            current_cost: data.current_cost,
-                        });
-                    }
                     if st.model.auto_scroll {
                         let h = st.last_model_height;
                         st.model.scroll = st.model.max_scroll(h);
@@ -504,6 +488,14 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
             }
         }
         events::MODEL_FINISHED => {
+            // A batch member never settles the shared turn on its own: the
+            // supervisor's `plan/batch_finished` / `review/batch_finished`
+            // event is the single terminal signal for the whole queue, so the
+            // spinner, the status, and the notification stay untouched until
+            // the queue actually ends.
+            if st.model.is_batch {
+                return;
+            }
             *is_reasoning = false;
             st.model.reasoning.finalize();
             st.model.reasoning.show = false;
@@ -512,11 +504,7 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
             if let Some(started) = st.turn_started_at.take() {
                 let elapsed = started.elapsed().as_secs();
                 let focused = st.terminal_focused;
-                // Batch members stay silent: only the supervisor's final event
-                // raises a notification for the whole operation.
-                if !st.model.is_batch
-                    && st.tui_config.notifications.should_notify(elapsed, focused)
-                {
+                if st.tui_config.notifications.should_notify(elapsed, focused) {
                     let title = active_t("notify.turn_desktop_title");
                     let summary = st
                         .model
@@ -537,10 +525,7 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
                     st.model.toolchain = None;
                     st.model.turn_phase = None;
                     st.model.turn_phase_detail = None;
-                    if let Some(c) = st.model.current_cost {
-                        st.model.prev_cost = Some(c);
-                    }
-                    st.model.current_cost = None;
+                    st.model.end_in_flight_usage();
                     if st.model.last_commit_hash.is_some()
                         || st.model.edit_final_applied == Some(true)
                     {
@@ -581,17 +566,23 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
             st.model.toolchain = None;
             st.model.turn_phase = None;
             st.model.turn_phase_detail = None;
-            if let Some(c) = st.model.current_cost {
-                if c > 0.0 {
-                    st.model.prev_cost = Some(c);
-                }
-            }
-            st.model.current_cost = None;
+            st.model.end_in_flight_usage();
             fail_safe_reject_edits(&mut st.model, &active_t("notify.cancelled_before_edits"));
             let h = st.last_model_height;
             st.model.clamp_scroll(h);
         }
         events::MODEL_ERROR => {
+            // A batch member failure is aggregated into the supervisor's
+            // summary, so the member records its diagnostic without tearing
+            // down the turn the whole queue shares.
+            if st.model.is_batch {
+                if let Some(params) = ev.params {
+                    if let Ok(data) = serde_json::from_value::<ModelErrorEvent>(params) {
+                        st.model.error = Some(data.message);
+                    }
+                }
+                return;
+            }
             *is_reasoning = false;
             st.model.reasoning.finalize();
             st.model.reasoning.show = false;
@@ -600,10 +591,7 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
             if let Some(started) = st.turn_started_at.take() {
                 let elapsed = started.elapsed().as_secs();
                 let focused = st.terminal_focused;
-                // Batch member failures are aggregated into the batch summary.
-                if !st.model.is_batch
-                    && st.tui_config.notifications.should_notify(elapsed, focused)
-                {
+                if st.tui_config.notifications.should_notify(elapsed, focused) {
                     let title = active_t("notify.turn_error_desktop_title");
                     let body = active_t("notify.turn_error_desktop_body");
                     crate::terminal::trigger_turn_notification(
@@ -620,12 +608,7 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
             if let Some(params) = ev.params {
                 if let Ok(data) = serde_json::from_value::<ModelErrorEvent>(params) {
                     st.model.status = TurnStatus::Error;
-                    if let Some(c) = st.model.current_cost {
-                        if c > 0.0 {
-                            st.model.prev_cost = Some(c);
-                        }
-                    }
-                    st.model.current_cost = None;
+                    st.model.end_in_flight_usage();
                     fail_safe_reject_edits(&mut st.model, &active_t("notify.failed_before_edits"));
                     st.model.error = Some(data.message);
                     let h = st.last_model_height;
@@ -670,12 +653,6 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
             let mut findings_count = 0;
             if let Some(params) = ev.params {
                 if let Ok(data) = serde_json::from_value::<ReviewFinishedEvent>(params) {
-                    if let Some(total) = data.session_total_cost {
-                        st.model.session_total_cost = total;
-                    }
-                    if let Some(cost) = data.current_cost {
-                        st.model.prev_cost = Some(cost);
-                    }
                     findings_count = data.session.items.len();
                     st.review.set_session(data.session);
                 }
@@ -772,9 +749,11 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
             if let Some(params) = ev.params {
                 if let Ok(data) = serde_json::from_value::<PlanBatchFinishedEvent>(params) {
                     // The batch has terminated: clear the batch-scoped state so
-                    // a later interruption never targets a finished queue.
+                    // a later interruption never targets a finished queue, then
+                    // settle the turn the members deliberately left open.
                     st.batch_stopping = false;
                     st.model.is_batch = false;
+                    settle_batch_turn(&mut st, data.summary.status);
                     notify_batch_finished(&st, "Plan", &data.summary);
                 }
             }
@@ -782,8 +761,11 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
         events::REVIEW_BATCH_FINISHED => {
             if let Some(params) = ev.params {
                 if let Ok(data) = serde_json::from_value::<ReviewBatchFinishedEvent>(params) {
+                    // Mirror the plan supervisor: the terminal batch event is
+                    // the only point that settles the shared turn.
                     st.batch_stopping = false;
                     st.model.is_batch = false;
+                    settle_batch_turn(&mut st, data.summary.status);
                     notify_batch_finished(&st, "Review", &data.summary);
                 }
             }
@@ -824,7 +806,6 @@ fn begin_review_turn(model: &mut ReplView, data: &ReviewStartedEvent) {
     model.is_batch = false;
     model.repomap_tokens = None;
     model.auto_scroll = true;
-    model.current_cost = Some(0.0);
 }
 
 /// Streams a Reviewer reasoning delta into the REPL reasoning buffer.
@@ -868,6 +849,50 @@ fn end_review_turn(model: &mut ReplView, status: TurnStatus, error: Option<Strin
     if let Some(message) = error {
         model.error = Some(message);
     }
+}
+
+/// Settles the REPL buffer when a batch supervisor terminates.
+///
+/// Batch members leave the turn open (see the `MODEL_FINISHED` and
+/// `MODEL_ERROR` handlers): the queue owns one turn from its first member to
+/// its last. This is therefore the single point that stops the spinner, clears
+/// the phase telemetry, projects the aggregate outcome onto the turn status,
+/// and reconciles the streamed file edits, so the interface never stays stuck
+/// in a busy state after the queue ends.
+fn settle_batch_turn(st: &mut AppState, status: BatchFinishStatus) {
+    st.running_model = None;
+    st.turn_started_at = None;
+    st.confirm_cancel = false;
+
+    let applied =
+        st.model.edit_final_applied == Some(true) || st.model.last_commit_hash.is_some();
+    let height = st.last_model_height;
+
+    let model = &mut st.model;
+    model.reasoning.finalize();
+    model.reasoning.show = false;
+    model.status = match status {
+        BatchFinishStatus::Completed => TurnStatus::Done,
+        BatchFinishStatus::Failed | BatchFinishStatus::Blocked => TurnStatus::Error,
+        BatchFinishStatus::Cancelled | BatchFinishStatus::Stopped => TurnStatus::Cancelled,
+    };
+    model.toolchain = None;
+    model.turn_phase = None;
+    model.turn_round = None;
+    model.turn_max_rounds = None;
+    model.turn_phase_detail = None;
+    model.end_in_flight_usage();
+    if applied {
+        for file in model.files.iter_mut() {
+            file.status = FileEditStatus::Ok;
+            file.error = None;
+            file.retry_info = None;
+        }
+    } else {
+        fail_safe_reject_edits(model, &active_t("notify.edit_desync"));
+    }
+    model.update_markdown();
+    model.clamp_scroll(height);
 }
 
 /// Raises exactly one aggregate notification when a batch supervisor finishes.
@@ -1354,5 +1379,109 @@ mod tests {
             guard.plans_view.is_plan_expanded("plan-x"),
             "a saved plan must be expanded so its header is visible"
         );
+    }
+
+    #[tokio::test]
+    async fn test_model_finished_for_a_batch_member_keeps_the_turn_open() {
+        let mut st = crate::app::test_state();
+        st.model.is_batch = true;
+        st.model.status = TurnStatus::Responding;
+        st.model.reasoning.append_delta("drafting the step");
+        st.turn_started_at = Some(std::time::Instant::now());
+
+        let state = Arc::new(Mutex::new(st));
+        let mut is_reasoning = false;
+        let ev = Event {
+            method: events::MODEL_FINISHED.to_string(),
+            params: Some(
+                serde_json::to_value(ModelFinishedEvent {
+                    operation_id: "op-batch".to_string(),
+                    full_text: String::new(),
+                })
+                .unwrap(),
+            ),
+        };
+
+        handle_event(ev, &state, &mut is_reasoning).await;
+
+        let guard = state.lock().await;
+        assert_eq!(
+            guard.model.status,
+            TurnStatus::Responding,
+            "a batch member must not settle the turn"
+        );
+        assert!(
+            guard.turn_started_at.is_some(),
+            "the queue keeps owning the turn started timestamp"
+        );
+        assert!(guard.model.reasoning.is_streaming());
+        assert!(guard.active_notification().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_plan_batch_finished_settles_the_shared_turn() {
+        let mut st = crate::app::test_state();
+        st.model.is_batch = true;
+        st.model.status = TurnStatus::Responding;
+        st.model.edits_active = true;
+        st.model.edit_final_applied = Some(true);
+        st.model.toolchain = Some(ToolchainState::Running {
+            command: "cargo check".to_string(),
+        });
+        st.model.turn_phase = Some(tauqe_protocol::TurnPhase::Verification);
+        st.batch_stopping = true;
+        st.turn_started_at = Some(std::time::Instant::now());
+
+        let state = Arc::new(Mutex::new(st));
+        let mut is_reasoning = false;
+        let ev = Event {
+            method: events::PLAN_BATCH_FINISHED.to_string(),
+            params: Some(
+                serde_json::to_value(PlanBatchFinishedEvent {
+                    operation_id: "op-plan-batch".to_string(),
+                    summary: batch_summary(BatchFinishStatus::Completed, 2, 2, 30),
+                })
+                .unwrap(),
+            ),
+        };
+
+        handle_event(ev, &state, &mut is_reasoning).await;
+
+        let guard = state.lock().await;
+        assert_eq!(guard.model.status, TurnStatus::Done);
+        assert!(!guard.model.is_batch);
+        assert!(!guard.batch_stopping);
+        assert!(guard.model.toolchain.is_none());
+        assert!(guard.model.turn_phase.is_none());
+        assert!(
+            guard.turn_started_at.is_none(),
+            "the terminal batch event releases the turn timestamp"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_review_batch_finished_projects_a_failure_onto_the_turn() {
+        let mut st = crate::app::test_state();
+        st.model.is_batch = true;
+        st.model.status = TurnStatus::Verifying;
+
+        let state = Arc::new(Mutex::new(st));
+        let mut is_reasoning = false;
+        let ev = Event {
+            method: events::REVIEW_BATCH_FINISHED.to_string(),
+            params: Some(
+                serde_json::to_value(ReviewBatchFinishedEvent {
+                    operation_id: "op-review-batch".to_string(),
+                    summary: batch_summary(BatchFinishStatus::Failed, 1, 3, 90),
+                })
+                .unwrap(),
+            ),
+        };
+
+        handle_event(ev, &state, &mut is_reasoning).await;
+
+        let guard = state.lock().await;
+        assert_eq!(guard.model.status, TurnStatus::Error);
+        assert!(!guard.model.is_batch);
     }
 }

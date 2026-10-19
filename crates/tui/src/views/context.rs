@@ -53,29 +53,47 @@ impl Default for ContextViewState {
     }
 }
 
+/// Projects one context layer into rows ordered by path.
+///
+/// The context manager keeps files in insertion order so the prompt prefix
+/// stays stable between rounds of a turn. The interface still has to be
+/// predictable to browse, so alphabetical ordering is applied here only, at
+/// the projection step, and never in the domain layer.
+fn sorted_layer_items(items: &[ContextItem], layer: ContextLayer) -> Vec<&ContextItem> {
+    let mut layer_items: Vec<&ContextItem> = items.iter().filter(|i| i.layer == layer).collect();
+    layer_items.sort_by(|a, b| a.path.cmp(&b.path));
+    layer_items
+}
+
 impl ContextViewState {
     pub fn compute_rows(&self, items: &[ContextItem]) -> Vec<ContextRow> {
         let mut rows = Vec::new();
 
         rows.push(ContextRow::Header(ContextLayer::Pinned));
         if self.pinned_expanded {
-            for it in items.iter().filter(|i| i.layer == ContextLayer::Pinned) {
-                rows.push(ContextRow::Item(it.clone()));
-            }
+            rows.extend(
+                sorted_layer_items(items, ContextLayer::Pinned)
+                    .into_iter()
+                    .map(|it| ContextRow::Item(it.clone())),
+            );
         }
 
         rows.push(ContextRow::Header(ContextLayer::User));
         if self.user_expanded {
-            for it in items.iter().filter(|i| i.layer == ContextLayer::User) {
-                rows.push(ContextRow::Item(it.clone()));
-            }
+            rows.extend(
+                sorted_layer_items(items, ContextLayer::User)
+                    .into_iter()
+                    .map(|it| ContextRow::Item(it.clone())),
+            );
         }
 
         rows.push(ContextRow::Header(ContextLayer::Auto));
         if self.auto_expanded {
-            for it in items.iter().filter(|i| i.layer == ContextLayer::Auto) {
-                rows.push(ContextRow::Item(it.clone()));
-            }
+            rows.extend(
+                sorted_layer_items(items, ContextLayer::Auto)
+                    .into_iter()
+                    .map(|it| ContextRow::Item(it.clone())),
+            );
         }
 
         rows
@@ -185,5 +203,63 @@ impl ContextViewState {
         } else if self.selected_candidate_index >= self.filtered_candidates.len() {
             self.selected_candidate_index = self.filtered_candidates.len() - 1;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn item(path: &str, layer: ContextLayer) -> ContextItem {
+        ContextItem {
+            path: path.to_string(),
+            access: ContextAccess::ReadOnly,
+            size_bytes: 16,
+            estimated_tokens: 4,
+            layer,
+        }
+    }
+
+    fn rendered_paths(rows: &[ContextRow]) -> Vec<String> {
+        rows.iter()
+            .filter_map(|row| match row {
+                ContextRow::Item(it) => Some(it.path.clone()),
+                ContextRow::Header(_) => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_compute_rows_sorts_files_alphabetically_within_layer() {
+        let view = ContextViewState::default();
+        // Insertion order contradicts alphabetical order.
+        let items = vec![
+            item("zeta.rs", ContextLayer::User),
+            item("alpha.rs", ContextLayer::User),
+            item("mid.rs", ContextLayer::User),
+        ];
+
+        let rows = view.compute_rows(&items);
+        assert_eq!(rendered_paths(&rows), vec!["alpha.rs", "mid.rs", "zeta.rs"]);
+    }
+
+    #[test]
+    fn test_compute_rows_keeps_layer_sections_and_respects_folding() {
+        let mut view = ContextViewState::default();
+        let items = vec![
+            item("pinned.rs", ContextLayer::Pinned),
+            item("user.rs", ContextLayer::User),
+            item("auto.rs", ContextLayer::Auto),
+        ];
+
+        let rows = view.compute_rows(&items);
+        assert_eq!(
+            rendered_paths(&rows),
+            vec!["pinned.rs", "user.rs", "auto.rs"]
+        );
+
+        view.collapse_all();
+        let folded = view.compute_rows(&items);
+        assert!(rendered_paths(&folded).is_empty());
     }
 }

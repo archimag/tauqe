@@ -3,13 +3,13 @@ pub mod protocol;
 pub mod stream;
 pub mod xml;
 
-use crate::capabilities::CapabilityRegistry;
+use crate::capabilities::{CapabilityRegistry, ContractContext, PromptRenderContext};
 use crate::context::ContextFileContent;
 use crate::edits::stream::json::decode::first_json_object_str;
 use crate::prompt::protocol::PromptProtocol;
 use crate::providers::{ChatMessage, JsonSchemaDefinition, ResponseFormat};
 use tauqe_protocol::{
-    CapabilitySet, ContextAccess, LlmCapability, ModelRole, Plan, RepositoryState,
+    CapabilitySet, ContextAccess, ModelRole, Plan, RepositoryState, TurnIntent,
 };
 
 /// Default model role used for squash commit message synthesis.
@@ -198,39 +198,17 @@ pub fn estimate_tokens(text: &str) -> usize {
     estimate_tokens_from_bytes(text.len() as u64) as usize
 }
 
-/// Renders the operational-tag rule from the active capability set.
+/// Returns the declarative `access` attribute value of a context file.
 ///
-/// The tag list is derived from the capability registry, so a narrowed set never
-/// advertises a tag the model is unable to use. When the active protocol is bound
-/// to a turn marker, the marker suffix is applied to every listed tag.
-fn operational_tags_rule(capabilities: &CapabilitySet, marker: Option<&str>) -> String {
-    let tags: Vec<String> = CapabilityRegistry::global()
-        .operational_xml_tags(capabilities)
-        .into_iter()
-        .map(|tag| match marker {
-            Some(m) => format!("<{}_{}>", tag, m),
-            None => format!("<{}>", tag),
-        })
-        .collect();
-    let eg_tag = match marker {
-        Some(m) => format!("<context_request_{m} ...>"),
-        None => "<context_request ...>".to_string(),
-    };
-    format!(
-        "1a. Operational Protocol Tags: All operational protocol tags ({}) must be emitted strictly at the end of your response outside markdown code blocks. If you mention, quote, or discuss tags in conversational text, you MUST enclose them in backticks (e.g. `{}`) so they are treated as literal text and not operational commands.\n",
-        tags.join(", "),
-        eg_tag
-    )
-}
-
-/// Keeps only the capabilities present in both sets, preserving `set` order.
-fn intersect_capabilities(set: &CapabilitySet, allowed: &CapabilitySet) -> CapabilitySet {
-    let kept: Vec<LlmCapability> = set
-        .iter()
-        .copied()
-        .filter(|capability| allowed.contains(*capability))
-        .collect();
-    CapabilitySet::from_slice(&kept)
+/// The rendered context block annotates every file with this attribute instead
+/// of grouping files under separate read-only and editable sections, so
+/// promoting a file to editable rewrites only its own attribute and never moves
+/// it past its neighbors.
+fn access_attribute(access: ContextAccess) -> &'static str {
+    match access {
+        ContextAccess::ReadOnly => "read_only",
+        ContextAccess::Editable => "editable",
+    }
 }
 
 pub struct PromptAssembly {
@@ -243,8 +221,8 @@ pub struct PromptAssembly {
     pub repo_map: Option<String>,
     pub target_language: Option<String>,
     pub active_plan: Option<Plan>,
-    pub is_isolated_step: bool,
-    pub is_discussion: bool,
+    /// Declared intent of this turn, which decides the advertised capability set.
+    pub intent: TurnIntent,
     pub turn_scratchpad: Option<String>,
 }
 
@@ -268,14 +246,14 @@ impl PromptAssembly {
             repo_map,
             target_language: None,
             active_plan: None,
-            is_isolated_step: false,
-            is_discussion: false,
+            intent: TurnIntent::InteractiveRepl,
             turn_scratchpad: None,
         }
     }
 
-    pub fn with_isolated_step(mut self, is_isolated: bool) -> Self {
-        self.is_isolated_step = is_isolated;
+    /// Declares the intent that decides which capabilities this turn advertises.
+    pub fn with_intent(mut self, intent: TurnIntent) -> Self {
+        self.intent = intent;
         self
     }
 
@@ -284,114 +262,22 @@ impl PromptAssembly {
         self
     }
 
-    pub fn with_discussion(mut self, is_discussion: bool) -> Self {
-        self.is_discussion = is_discussion;
-        self
-    }
-
-    pub fn with_active_plan(mut self, plan: Option<Plan>) -> Self {
-        self.active_plan = plan;
-        self
-    }
-
-    pub fn with_target_language(mut self, target_language: Option<String>) -> Self {
-        self.target_language = target_language;
-        self
-    }
-
     pub fn build_system_prompt(&self, protocol: &dyn PromptProtocol) -> String {
         let capabilities = self.effective_capabilities(protocol);
         let effective_protocol = protocol.with_capability_set(capabilities.clone());
         let mut prompt = String::new();
-        prompt.push_str("You are Tauqe AI, an expert programming assistant operating inside TAUQE (The Answer to the Ultimate Question of Engineering), an AI-native engineering control environment built on the literal harness paradigm.\n\n");
-        let marker_suffix = effective_protocol
-            .turn_marker()
-            .map(|m| format!("_{}", m))
-            .unwrap_or_default();
-
+        prompt.push_str("You are Tauqe AI, an expert programming assistant operating inside TAUQE (The Answer to the Ultimate Question of Engineering), an AI-native engineering control environment built on the literal harness paradigm.\n");
+        prompt.push_str("TAUQE is the environment you operate within. Whenever the developer mentions TAUQE, they refer to this same control environment—its harness, workflows, context model, plans, and Git transactions—not to an external tool or framework.\n\n");
+        let render_ctx = PromptRenderContext::new(&[], effective_protocol.turn_marker());
+        let contract_ctx = ContractContext::new(self.intent, render_ctx)
+            .with_target_language(self.target_language.as_deref());
         prompt.push_str("## Core System Contract\n");
-        prompt.push_str("1. Authoritative Source: The files provided in <context> represent the authoritative current state of the project. Do not invent missing code.\n");
-        prompt.push_str(&operational_tags_rule(&capabilities, effective_protocol.turn_marker()));
+        prompt.push_str(
+            &CapabilityRegistry::global().compose_contract_rules(&capabilities, &contract_ctx),
+        );
+        prompt.push('\n');
 
-        if self.is_discussion {
-            prompt.push_str("2. Discussion Mode Scope: You are strictly in Discussion mode. Code modifications, file creations, file edits, and file deletions are strictly prohibited. Do NOT output XML edit blocks (<edit>, <create>, <replace>, <overwrite>, <delete>) or any code patch proposals.\n");
-            prompt.push_str(
-                "3. Read-Only Context Exploration: Files in <read_only_files> are strictly for reference and architectural understanding. If you need to inspect additional files from the repository map to answer the developer's questions, specify them in the `context_requests` array with `access: \"read_only\"`. To search across repository files, specify queries in `repo_searches`.\n",
-            );
-        } else {
-            prompt.push_str(
-                "2. Read-Only Scope: Files inside <read_only_files> are provided for reference, context, and structural comprehension. Prefer modifying files in <editable_files>. If completing the task requires editing a file present in <read_only_files>, you may propose edits to it directly without an extra discovery round — the environment will automatically promote it to editable upon applying the changes.\n"
-            );
-            prompt.push_str(&format!(
-                "3. Editable Scope: Files inside <editable_files> are permitted for modification. You may also create new files using <create{0} path=\"...\"> or move/rename files using <move{0} from=\"...\" to=\"...\" /> when required by the task.\n",
-                marker_suffix
-            ));
-        }
-        prompt.push_str("4. No Arbitrary Shell: You do not have shell execution capabilities. Work strictly through the context and actions provided.\n");
-        if !self.is_discussion && capabilities.contains(LlmCapability::FileEdits) {
-            prompt.push_str("5. Minimal Coherent Change: Prefer the smallest coherent modification necessary to complete the task.\n");
-            prompt.push_str("6. Always Explain Changes: Whenever you propose file edits, you MUST precede them with a concise conversational explanation (1-3 sentences) explaining what changes were made, why, and how they achieve the user's intent. Never output edits alone without an accompanying explanation.\n");
-        }
-        prompt.push_str("7. Reasoning in English: Always conduct internal reasoning, planning, and thinking strictly in English to preserve token budget and maximize reasoning quality.\n");
-
-        if capabilities.contains(LlmCapability::UserLanguage) {
-            if let Some(lang) = &self.target_language {
-                prompt.push_str(&format!(
-                    "8. Language Consistency: The user's language is {}. All conversational explanations, answers, and messages MUST be in {}. Do NOT switch to English for conversational responses unless requested.\n",
-                    lang, lang
-                ));
-            } else if self.is_discussion {
-                prompt.push_str(
-                    "8. Language Consistency: Always formulate conversational explanations and user-facing answers in `message` in the same language as the user's request. Identify the user's language in the `user_language` field (e.g. \"Russian\"). Do NOT switch to English for conversational responses unless requested.\n",
-                );
-            } else {
-                prompt.push_str(&format!(
-                    "8. Language Consistency: Always formulate conversational explanations and user-facing answers in the same language as the user's request. Identify the user's language using <user_language{}>language_name</user_language{}> (e.g. <user_language{}>Russian</user_language{}>). Do NOT switch to English for conversational responses unless requested.\n",
-                    marker_suffix, marker_suffix, marker_suffix, marker_suffix
-                ));
-            }
-        }
-        if self.is_isolated_step {
-            prompt.push_str(
-                "9. Code Verification: Verification on code modifications is handled automatically and deterministically by the harness at the end of each step. Do NOT emit verification tags (the harness runs toolchain verification and gating automatically).\n"
-            );
-        } else if capabilities.contains(LlmCapability::ToolchainVerify) {
-            prompt.push_str(&format!(
-                "9. Code Verification: Verification on code modifications is performed automatically and deterministically by the harness. Emit <verify{0} target=\"all|check|test|clippy\" on_success=\"silent|report\" /> ONLY when the user explicitly requests running verification, compiler checks, or tests to inspect codebase status. Always use on_success=\"silent\" unless the user explicitly asked to see raw command logs or test output. Do NOT emit <verify> on normal code edits, as the harness verifies them automatically.\n",
-                marker_suffix
-            ));
-        }
-        if capabilities.contains(LlmCapability::DocRequest) {
-            prompt.push_str(&format!(
-                "10. Self-Knowledge: When the user asks about your identity, capabilities, concepts, workflows, keyboard shortcuts, or configuration, do NOT guess. Request the authoritative documentation using <doc_request{} topic=\"{}\" /> and output nothing else except a short note. You will be called again with <system_documentation> blocks; base your answer strictly on them and formulate it in the user's language.\n",
-                marker_suffix,
-                crate::docs::topic_hint()
-            ));
-        }
-        if capabilities.contains(LlmCapability::Scratchpad) {
-            prompt.push_str(&format!(
-                "10a. Turn Scratchpad (Working Memory): To retain working hypotheses, verified findings, or focus across multi-round discovery and verification healing cycles, you may emit <scratchpad{0}>...</scratchpad{0}>. Keep scratchpad notes concise (bullet points of what is verified, current hypothesis, and purpose of requested files). Notes are preserved within the current turn in <scratchpad{0}> and isolated from persistent history.\n",
-                marker_suffix
-            ));
-        }
-        let plans_enabled = capabilities.contains(LlmCapability::PlanCreation)
-            || capabilities.contains(LlmCapability::PlanUpdate);
-        if self.is_isolated_step {
-            prompt.push_str("11. Step Execution Scope: You are executing a single isolated plan step. Plan creation, modification, status updates, or plan tags are strictly prohibited (step lifecycle and plan tracking are handled deterministically by the harness).\n\n");
-        } else if plans_enabled {
-            if self.is_discussion {
-                prompt.push_str(
-                    "11. Local Engineering Plans: When formulating or updating a task plan, populate the structured `plan_update` field in your response object with `action: \"save\"|\"update\"|\"delete\"`, plan `id`, `title`, `description`, `concept`, and `items`. Conceptual Foundation Invariant: Every plan in TAUQE is a two-section document and MUST have an architectural concept tree in `concept` defining requirements, design decisions, and system invariants ('What'). When creating a new plan (`action: \"save\"`), you MUST populate `concept` with at least one concept node. Creating a plan without a concept tree is strictly prohibited. Implementation steps in `items` ('How') are either outlined with `concept_refs` pointing to concept nodes, or left empty (`items: []`) to be synthesized subsequently by deep refinement (`plan_refine`). File Attributes Contract: `files` lists target files to create or modify (loaded as editable context), while `readonly_files` lists reference or contract files (loaded as read-only context and never modified). Leaf-Only Files Invariant: `files` and `readonly_files` must be specified exclusively for executable leaf steps without children; parent container items and task groups must have an empty `files: []` and `readonly_files: []` lists. Plan Action Semantics: Use `action: \"save\"` to create or completely overwrite/replace the entire plan; use `action: \"update\"` strictly to modify specific individual nodes or items in place by ID without touching unmentioned items; use `action: \"delete\"` to remove the plan. Reins Invariant: Never mutate the plan (leave `plan_update: null`) without an explicit user instruction to modify it. Questions, analysis, trade-off reviews, and critique must be answered strictly in conversational text in `message`. Planning Objective: Collaborative planning focuses on conceptual comprehension of the objective ('What'), aligning on key architectural decisions and trade-offs, and defining a cohesive concept tree without premature low-level code churn. Step Formulation Contract: Formulate each step around an engineering objective and operational invariants; define what state must be achieved and what invariants preserved. Always provide a clear `description` explaining the overall architecture, boundaries, and rationale. Language Consistency: Formulate plan title, description, concept titles/details, and step titles/details in the same language as the plan description and user's request. In <active_plan>, items marked with [FOCUSED] are focused by the user.\n\n",
-                );
-            } else {
-                prompt.push_str(&format!(
-                    "11. Local Engineering Plans: When formulating a task plan, wrap structured plan items in <plan{0} action=\"save\" id=\"plan-id\" title=\"Plan Title\">...</plan{0}>. In Develop mode, you may ONLY propose new plans (action=\"save\"). Updating plan statuses, closing steps, or modifying existing plans from Develop mode is strictly prohibited (step execution and completion occur strictly in isolated step turns, while plan modifications and re-scoping belong exclusively in Discussion mode). Conceptual Foundation Invariant: Every plan MUST contain an architectural concept tree in <concept{0}>...</concept{0}> defining the core requirements, design decisions, and system invariants ('What'). Inside <concept{0}>, define architectural nodes using structured <concept_item{0} id=\"c-...\" title=\"...\"><details{0}>...</details{0}></concept_item{0}> tags. Plan creation without <concept{0}> containing at least one <concept_item{0}> is strictly prohibited. Implementation steps in <item{0}> define 'How', may be included with concept_refs=\"c-...\", files=\"...\", and readonly=\"...\", or omitted if awaiting deep refinement. File Attributes Contract: the `files` attribute lists target files to create or modify (loaded as editable context), while the `readonly` attribute lists reference or contract files such as subsystem conventions, protocol types, and interfaces (loaded as read-only context and never modified). Leaf-Only Files Invariant: the `files` and `readonly` attributes must be specified exclusively for executable leaf steps without child items; parent container items and task groups must never have files. Planning Objective: Plan synthesis focuses on conceptual comprehension of the objective ('What'), aligning on key architectural decisions and trade-offs, and defining a cohesive concept tree without premature low-level code churn or deep file inspection. Step Formulation Contract: Formulate each step around an engineering objective and operational invariants rather than detailed procedural micro-instructions; define what state must be achieved and what invariants preserved. Always provide a clear <description{0}> explaining the overall architecture, boundaries, and rationale. Plan Creation Invariant: Whenever you propose a new plan, you MUST precede the tag with a concise conversational explanation of the proposed plan, and you MUST emit the structured <plan{0} action=\"save\" ...> tag in the same response containing both <concept{0}> (mandatory) and optional <item{0}> elements. Language Consistency: Formulate the plan title, description, concept nodes, step titles, and step details in the same language as the user's request.\nStructured Plan XML Format:\n<plan{0} action=\"save\" id=\"plan-id\" title=\"Plan Title\">\n  <description{0}>Overall architecture and rationale</description{0}>\n  <concept{0}>\n    <concept_item{0} id=\"c-1\" title=\"Core Invariant\">\n      <details{0}>Design rationale and invariants</details{0}>\n    </concept_item{0}>\n  </concept{0}>\n  <item{0} id=\"1\" title=\"Step Title\" concept_refs=\"c-1\" files=\"path/to/file.rs\" readonly=\"path/to/contract.rs\">\n    <details{0}>Engineering objective and verification criteria</details{0}>\n  </item{0}>\n</plan{0}>\n\n",
-                    marker_suffix
-                ));
-            }
-        }
-
-        if !self.is_discussion {
+        if !self.intent.is_readonly_discussion() {
             let editable_paths: Vec<String> = self
                 .context_files
                 .iter()
@@ -425,87 +311,53 @@ impl PromptAssembly {
         prompt
     }
 
-    /// Computes the capability set this turn actually advertises.
+    /// Computes the capability set this turn both advertises and accepts.
     ///
-    /// The protocol's own set is narrowed to the active mode: a discussion turn
-    /// is read-only, and an isolated step never advertises toolchain
-    /// verification because the harness verifies it deterministically.
-    fn effective_capabilities(&self, protocol: &dyn PromptProtocol) -> CapabilitySet {
-        let mut capabilities = protocol.capability_set();
-        if self.is_discussion {
-            capabilities = intersect_capabilities(&capabilities, &CapabilitySet::discussion());
-        }
-        if self.is_isolated_step {
-            capabilities =
-                intersect_capabilities(&capabilities, &CapabilitySet::isolated_step_xml());
-            capabilities = capabilities.without(LlmCapability::ToolchainVerify);
-        }
-        capabilities
+    /// The protocol's own set is narrowed by the declared turn intent, so the
+    /// rendered instructions, the structured response schema, the stream filter,
+    /// and the decoder all observe one surface: a capability can neither be
+    /// advertised without being decodable nor accepted without being advertised.
+    pub(crate) fn effective_capabilities(&self, protocol: &dyn PromptProtocol) -> CapabilitySet {
+        self.intent.narrow_capabilities(&protocol.capability_set())
     }
 
+    /// Renders the authoritative context block of a turn.
+    ///
+    /// The block opens with the constant `<context>` tag and lists every file in
+    /// context insertion order as `<file path="..." access="...">`. Nothing in
+    /// the block depends on the context revision counter or on the layer a file
+    /// came from: a newly discovered file appends an element at the end, and
+    /// promoting a file from read-only to editable rewrites only its own
+    /// attribute. A subsequent round therefore extends the previous context
+    /// block instead of rewriting it, which keeps the cached prompt prefix
+    /// intact.
     pub fn format_context_block(&self) -> Option<String> {
         if self.context_files.is_empty() {
             return None;
         }
 
+        // In discussion mode every file is rendered strictly as read-only,
+        // because code modification is prohibited in that mode.
+        let discussion = self.intent.is_readonly_discussion();
         let mut out = String::new();
-        out.push_str(&format!(
-            "<context revision=\"{}\">\n",
-            self.context_revision
-        ));
-
-        if self.is_discussion {
-            // In discussion mode, all context files are rendered strictly as read-only
-            out.push_str("  <read_only_files>\n");
-            for f in &self.context_files {
-                out.push_str(&format!("    <file path=\"{}\">\n", f.path));
-                out.push_str(&f.content);
-                if !f.content.ends_with('\n') {
-                    out.push('\n');
-                }
-                out.push_str("    </file>\n");
+        out.push_str("<context>\n");
+        for file in &self.context_files {
+            let access = if discussion {
+                ContextAccess::ReadOnly
+            } else {
+                file.access
+            };
+            out.push_str(&format!(
+                "    <file path=\"{}\" access=\"{}\">\n",
+                file.path,
+                access_attribute(access)
+            ));
+            out.push_str(&file.content);
+            if !file.content.ends_with('\n') {
+                out.push('\n');
             }
-            out.push_str("  </read_only_files>\n");
-        } else {
-            let ro_files: Vec<_> = self
-                .context_files
-                .iter()
-                .filter(|f| f.access == ContextAccess::ReadOnly)
-                .collect();
-
-            if !ro_files.is_empty() {
-                out.push_str("  <read_only_files>\n");
-                for f in ro_files {
-                    out.push_str(&format!("    <file path=\"{}\">\n", f.path));
-                    out.push_str(&f.content);
-                    if !f.content.ends_with('\n') {
-                        out.push('\n');
-                    }
-                    out.push_str("    </file>\n");
-                }
-                out.push_str("  </read_only_files>\n");
-            }
-
-            let ed_files: Vec<_> = self
-                .context_files
-                .iter()
-                .filter(|f| f.access == ContextAccess::Editable)
-                .collect();
-
-            if !ed_files.is_empty() {
-                out.push_str("  <editable_files>\n");
-                for f in ed_files {
-                    out.push_str(&format!("    <file path=\"{}\">\n", f.path));
-                    out.push_str(&f.content);
-                    if !f.content.ends_with('\n') {
-                        out.push('\n');
-                    }
-                    out.push_str("    </file>\n");
-                }
-                out.push_str("  </editable_files>\n");
-            }
+            out.push_str("    </file>\n");
         }
-
         out.push_str("</context>");
         Some(out)
     }
@@ -560,23 +412,16 @@ impl PromptAssembly {
     ) -> Vec<ChatMessage> {
         let mut messages = Vec::new();
 
-        // System prompt + Project metadata + Authoritative context + Repo map + Session history + Protocol instructions
+        // Stable prefix in caching order: the system contract, the frozen
+        // repository map, the session history, the context files in insertion
+        // order, and the active plan. Every block here is identical from one
+        // round of a bounded turn to the next, so the provider reuses the cached
+        // prefix instead of reprocessing it.
         let mut system_text = self.build_system_prompt(protocol);
-        if let Some(context_block) = self.format_context_block() {
-            system_text.push_str("## Project Context\n");
-            system_text.push_str(&context_block);
-            system_text.push_str("\n\n");
-        }
 
         if let Some(repo_map_block) = self.format_repo_map_block() {
             system_text.push_str("## Repository Map\n");
             system_text.push_str(&repo_map_block);
-            system_text.push_str("\n\n");
-        }
-
-        if let Some(scratchpad_block) = self.format_scratchpad_block() {
-            system_text.push_str("## Turn Scratchpad (Working Memory)\n");
-            system_text.push_str(&scratchpad_block);
             system_text.push_str("\n\n");
         }
 
@@ -586,7 +431,13 @@ impl PromptAssembly {
             system_text.push_str("\n\n");
         }
 
-        if !self.is_isolated_step {
+        if let Some(context_block) = self.format_context_block() {
+            system_text.push_str("## Project Context\n");
+            system_text.push_str(&context_block);
+            system_text.push_str("\n\n");
+        }
+
+        if !self.intent.is_isolated_step() {
             if let Some(plan) = &self.active_plan {
                 if let Some(plan_block) = crate::plan::format_active_plan_context(plan) {
                     system_text.push_str("## Active Task Plan Context\n");
@@ -596,11 +447,20 @@ impl PromptAssembly {
             }
         }
 
-    
         if let Some(target_lang) = &self.target_language {
             system_text.push_str("## Language Directive\n");
             system_text.push_str(&format!("- Target Response Language: {} (all conversational explanations, answers, messages, and plan items/titles/details MUST be in {})\n", target_lang, target_lang));
             system_text.push_str("- Reasoning / Thoughts: Strictly in English.\n\n");
+        }
+
+        // Volatile tail: the turn scratchpad is rewritten on every round, so it
+        // is appended after the whole stable prefix. Round-specific diagnostics
+        // (patch retry reports, verification failures) travel separately as
+        // append-only extensions of the user message.
+        if let Some(scratchpad_block) = self.format_scratchpad_block() {
+            system_text.push_str("## Turn Scratchpad (Working Memory)\n");
+            system_text.push_str(&scratchpad_block);
+            system_text.push_str("\n\n");
         }
 
         messages.push(ChatMessage::system(system_text));
@@ -610,7 +470,6 @@ impl PromptAssembly {
 
         messages
     }
-
 }
 
 #[cfg(test)]
@@ -700,7 +559,6 @@ mod tests {
         assert_eq!(messages[1], ChatMessage::user("Explain this code"));
     }
 
-    
     #[test]
     fn test_prompt_assembly_discussion_mode() {
         let files = vec![ContextFileContent {
@@ -709,16 +567,112 @@ mod tests {
             content: "fn main() {}\n".to_string(),
         }];
         let mut assembly = PromptAssembly::new(None, 1, files, "git", "xml", None, None);
-        assembly.is_discussion = true;
+        assembly.intent = TurnIntent::ReadonlyDiscussion;
         let proto = XmlPromptProtocol;
         let messages = assembly.assemble_chat_messages("Let's discuss architecture", &proto);
         let sys = &messages[0].content;
 
         assert!(sys.contains("Discussion Mode Scope"));
         assert!(sys.contains("Mode: Structured Discussion"));
+        assert!(sys.contains("<context>"));
+        assert!(sys.contains("access=\"read_only\""));
+        assert!(!sys.contains("access=\"editable\""));
         assert!(!sys.contains("<editable_files>"));
-        assert!(sys.contains("<read_only_files>"));
+        assert!(!sys.contains("<read_only_files>"));
         assert!(!sys.contains("Code Modification Protocol"));
+    }
+
+    #[test]
+    fn test_context_block_is_static_and_append_only() {
+        let file = |path: &str, access: ContextAccess| ContextFileContent {
+            path: path.to_string(),
+            access,
+            content: format!("// {path}\n"),
+        };
+
+        let mut assembly = PromptAssembly::new(
+            None,
+            7,
+            vec![file("src/a.rs", ContextAccess::ReadOnly)],
+            "git",
+            "xml",
+            None,
+            None,
+        );
+        let first = assembly.format_context_block().unwrap();
+        assert!(first.starts_with("<context>\n"));
+        assert!(!first.contains("revision"));
+        assert!(first.contains("path=\"src/a.rs\" access=\"read_only\""));
+
+        // A newly discovered file appends an element and leaves the previous
+        // block untouched, and the revision counter never enters the prefix.
+        assembly
+            .context_files
+            .push(file("src/b.rs", ContextAccess::Editable));
+        assembly.context_revision = 8;
+        let second = assembly.format_context_block().unwrap();
+        assert!(second.starts_with(&first[..first.len() - "</context>".len()]));
+        assert!(second.contains("path=\"src/b.rs\" access=\"editable\""));
+
+        // Promotion rewrites only the access attribute in place.
+        assembly.context_files[0].access = ContextAccess::Editable;
+        let promoted = assembly.format_context_block().unwrap();
+        assert_eq!(promoted.matches("path=\"src/a.rs\"").count(), 1);
+        assert!(promoted.contains("path=\"src/a.rs\" access=\"editable\""));
+        assert!(promoted.find("src/a.rs").unwrap() < promoted.find("src/b.rs").unwrap());
+    }
+
+    #[test]
+    fn test_stable_prefix_order_and_volatile_tail() {
+        let files = vec![ContextFileContent {
+            path: "src/main.rs".to_string(),
+            access: ContextAccess::Editable,
+            content: "fn main() {}\n".to_string(),
+        }];
+        let mut assembly = PromptAssembly::new(
+            None,
+            1,
+            files,
+            "git",
+            "xml",
+            Some("<history>\n</history>".to_string()),
+            Some("crate\n  fn main".to_string()),
+        );
+        assembly.turn_scratchpad = Some("- verified: prefix is stable".to_string());
+        assembly.active_plan = Some(Plan {
+            id: "prefix-plan".to_string(),
+            title: "Prefix Plan".to_string(),
+            description: None,
+            created_at: 0,
+            updated_at: 0,
+            architect: None,
+            concept: vec![],
+            items: vec![tauqe_protocol::PlanItem {
+                id: "1".to_string(),
+                title: "Step".to_string(),
+                ..Default::default()
+            }],
+        });
+
+        let messages = assembly.assemble_chat_messages("Do work", &XmlPromptProtocol);
+        let sys = &messages[0].content;
+
+        let repo_map = sys.find("## Repository Map").expect("repo map block");
+        let history = sys.find("## Session History").expect("history block");
+        let context = sys.find("## Project Context").expect("context block");
+        let plan = sys
+            .find("## Active Task Plan Context")
+            .expect("active plan block");
+        let scratchpad = sys
+            .find("## Turn Scratchpad (Working Memory)")
+            .expect("scratchpad block");
+
+        assert!(repo_map < history);
+        assert!(history < context);
+        assert!(context < plan);
+        assert!(plan < scratchpad);
+        assert!(sys.trim_end().ends_with("</scratchpad>"));
+        assert_eq!(messages[1].content, "Do work");
     }
 
     #[test]
@@ -745,20 +699,21 @@ mod tests {
             None,
             None,
         );
-        assembly.is_isolated_step = true;
+        assembly.intent = TurnIntent::IsolatedStep;
         assembly.active_plan = Some(Plan {
             id: "plan-test".to_string(),
             title: "Test Plan".to_string(),
             description: None,
             created_at: 0,
             updated_at: 0,
+            architect: None,
             concept: vec![],
             items: vec![],
         });
 
         let sys_prompt = assembly.build_system_prompt(&proto);
-        assert!(!sys_prompt.contains("11. Local Engineering Plans"));
-        assert!(sys_prompt.contains("11. Step Execution Scope"));
+        assert!(!sys_prompt.contains("Local Engineering Plans"));
+        assert!(sys_prompt.contains("Step Execution Scope"));
         assert!(!sys_prompt.contains("<plan"));
         assert!(!sys_prompt.contains("<verify"));
 
@@ -784,7 +739,7 @@ mod tests {
 
         // Discussion mode
         let mut disc_assembly = PromptAssembly::new(None, 1, vec![], "git", "xml", None, None);
-        disc_assembly.is_discussion = true;
+        disc_assembly.intent = TurnIntent::ReadonlyDiscussion;
         let disc_prompt = disc_assembly.build_system_prompt(&proto);
         assert!(disc_prompt.contains("Conceptual Foundation Invariant"));
         assert!(disc_prompt.contains("Leaf-Only Files Invariant"));
@@ -839,7 +794,7 @@ mod tests {
     #[test]
     fn test_narrowed_capabilities_hide_disabled_instructions() {
         use crate::prompt::protocol::PromptProtocol;
-        use tauqe_protocol::LlmCommand;
+        use tauqe_protocol::{LlmCapability, LlmCommand};
 
         let assembly = PromptAssembly::new(None, 1, vec![], "git", "xml", None, None);
         let narrowed = XmlPromptProtocol::with_capabilities(CapabilitySet::from_slice(&[
@@ -853,8 +808,8 @@ mod tests {
         assert!(!prompt.contains("<verify"));
         assert!(!prompt.contains("<scratchpad"));
         assert!(!prompt.contains("<success"));
-        assert!(!prompt.contains("10. Self-Knowledge"));
-        assert!(!prompt.contains("10a. Turn Scratchpad"));
+        assert!(!prompt.contains("Self-Knowledge"));
+        assert!(!prompt.contains("Turn Scratchpad"));
 
         // The same set narrows decoding, so a disabled capability never reaches
         // the execution pipeline.
@@ -921,6 +876,30 @@ mod tests {
     }
 
     #[test]
+    fn test_prompt_assembly_requires_an_explicit_request_for_code_changes() {
+        let proto = XmlPromptProtocol;
+
+        // Interactive develop turn: changes require an explicit user request or clear unambiguous task.
+        let assembly = PromptAssembly::new(None, 1, vec![], "git", "xml", None, None);
+        let prompt = assembly.build_system_prompt(&proto);
+        assert!(prompt.contains("Action Authorization"));
+        assert!(prompt.contains("When the required change is clear"));
+
+        // An isolated step turn is itself the explicit instruction, so the rule
+        // is deliberately omitted there instead of contradicting the step scope.
+        let mut isolated = PromptAssembly::new(None, 1, vec![], "git", "xml", None, None);
+        isolated.intent = TurnIntent::IsolatedStep;
+        let isolated_prompt = isolated.build_system_prompt(&proto);
+        assert!(!isolated_prompt.contains("Action Authorization"));
+
+        // Discussion mode is read-only and never edits files at all.
+        let mut discussion = PromptAssembly::new(None, 1, vec![], "git", "xml", None, None);
+        discussion.intent = TurnIntent::ReadonlyDiscussion;
+        let discussion_prompt = discussion.build_system_prompt(&proto);
+        assert!(!discussion_prompt.contains("Action Authorization"));
+    }
+
+    #[test]
     fn test_parse_structured_scribe_output_tolerates_fences_and_prose() {
         assert_eq!(
             parse_compaction_summary("{\"summary\":\"Done A and B\"}").as_deref(),
@@ -952,5 +931,88 @@ mod tests {
             parse_squash_commit_message(fenced).as_deref(),
             Some("feat: добавить функцию")
         );
+    }
+
+    /// Returns the `Core System Contract` section of a rendered prompt.
+    ///
+    /// The section ends at the first subsequent markdown heading, so the
+    /// numbering check never inspects edit-protocol or metadata sections.
+    fn contract_section(prompt: &str) -> &str {
+        let header = "## Core System Contract\n";
+        let start = match prompt.find(header) {
+            Some(idx) => idx + header.len(),
+            None => return "",
+        };
+        let rest = &prompt[start..];
+        let end = rest.find("\n#").unwrap_or(rest.len());
+        &rest[..end]
+    }
+
+    /// Collects the indices of densely numbered contract rule headers.
+    ///
+    /// A rule header is a line of the form `N. Title: body`, so only lines
+    /// whose prefix is all digits and whose title opens with an uppercase
+    /// letter are counted. Inline body content is ignored.
+    fn contract_rule_numbers(section: &str) -> Vec<usize> {
+        section
+            .lines()
+            .filter_map(|line| {
+                let (prefix, rest) = line.split_once(". ")?;
+                if prefix.is_empty() || !prefix.chars().all(|c| c.is_ascii_digit()) {
+                    return None;
+                }
+                let starts_title = rest
+                    .chars()
+                    .next()
+                    .map(|c| c.is_ascii_uppercase())
+                    .unwrap_or(false);
+                if !starts_title {
+                    return None;
+                }
+                prefix.parse::<usize>().ok()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_core_system_contract_is_numbered_monotonically() {
+        let proto = XmlPromptProtocol;
+        for intent in [
+            TurnIntent::InteractiveRepl,
+            TurnIntent::ReadonlyDiscussion,
+            TurnIntent::IsolatedStep,
+        ] {
+            let mut assembly = PromptAssembly::new(None, 1, vec![], "git", "xml", None, None);
+            assembly.intent = intent;
+            let prompt = assembly.build_system_prompt(&proto);
+            let section = contract_section(&prompt);
+            assert!(!section.is_empty(), "missing contract for {intent:?}");
+
+            let numbers = contract_rule_numbers(section);
+            assert!(!numbers.is_empty(), "no rules rendered for {intent:?}");
+            let expected: Vec<usize> = (1..=numbers.len()).collect();
+            assert_eq!(numbers, expected, "non-monotonic numbering for {intent:?}");
+        }
+    }
+
+    #[test]
+    fn test_core_system_contract_has_no_lettered_surrogates() {
+        let proto = XmlPromptProtocol;
+        for intent in [
+            TurnIntent::InteractiveRepl,
+            TurnIntent::ReadonlyDiscussion,
+            TurnIntent::IsolatedStep,
+        ] {
+            let mut assembly = PromptAssembly::new(None, 1, vec![], "git", "xml", None, None);
+            assembly.intent = intent;
+            let prompt = assembly.build_system_prompt(&proto);
+            let section = contract_section(&prompt);
+            for surrogate in ["1a.", "2a.", "4a.", "8a.", "10a.", "11a."] {
+                assert!(
+                    !section.contains(surrogate),
+                    "surrogate {surrogate} present for {intent:?}"
+                );
+            }
+        }
     }
 }

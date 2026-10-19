@@ -56,6 +56,22 @@ pub struct PlanSetActiveResult {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct PlanClearHorizonParams {
+    pub plan_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlanClearHorizonResult {
+    pub plan: Plan,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct PlanExecutePipelineParams {
+    #[serde(default)]
+    pub plan_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct PlanExecuteParams {
     pub plan_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]

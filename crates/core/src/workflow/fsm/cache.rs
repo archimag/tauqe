@@ -1,95 +1,71 @@
 //! Per-turn memoization of deterministic proposal inputs.
 //!
-//! The tracked-file list and the generated repo map are pure functions of the
-//! repository HEAD and the active context. Consecutive rounds that leave both
-//! unchanged (typical of patch retries) reuse the cached values instead of
-//! re-running `git ls-files` and a full Tree-sitter pass over the repository on
-//! every round. The retained extractor additionally reuses per-file symbols
-//! across regenerations within the turn.
+//! The repository map is the heaviest deterministic input of a proposal round:
+//! a full Tree-sitter pass over every tracked file outside the active context.
+//! It is generated once, on the first proposal round of a bounded turn, and
+//! frozen for the rest of that turn. Patch retries, verification healing, and
+//! discovery rounds that widened the context all receive the identical map
+//! string, so the repository map block of the prompt stays byte-identical and a
+//! provider's prefix cache keeps matching its tokens across rounds.
 
 use std::path::Path;
+use tauqe_protocol::TurnIntent;
 
+use crate::history::HistoryManager;
 use crate::repomap::TreeSitterExtractor;
 
 /// Per-turn memoization of deterministic proposal inputs.
 #[derive(Default)]
 pub(super) struct TurnInputCache {
-    files: Option<TrackedFiles>,
-    repo_map: Option<RepoMapCacheEntry>,
-    extractor: TreeSitterExtractor,
+    /// Repo map captured on the first proposal round of the turn.
+    ///
+    /// `Some` marks the map as generated, so an empty map is frozen as well
+    /// instead of being recomputed on every round.
+    repo_map: Option<FrozenRepoMap>,
+    /// History block captured on the first proposal round of the turn.
+    ///
+    /// `Some` marks the history as resolved, so an absent or empty history
+    /// block is frozen as well instead of re-reading history.jsonl on each round.
+    history_tag: Option<FrozenHistoryTag>,
 }
 
-/// Tracked-file list memoized at the repository HEAD it was read from.
-struct TrackedFiles {
-    head: String,
-    files: Vec<String>,
-}
-
-/// Repo map memoized against the inputs that determine it.
-///
-/// The map excludes every file in context, so the cached key stores the exact
-/// set of targetable paths alongside the repository HEAD and the token budget.
-struct RepoMapCacheEntry {
-    head: String,
-    targetable_paths: Vec<String>,
-    token_budget: usize,
+/// Repository map frozen for the remaining rounds of a bounded turn.
+struct FrozenRepoMap {
     map: Option<String>,
 }
 
-impl TurnInputCache {
-    /// Returns the repository's tracked file list, re-reading it only when the
-    /// repository HEAD has moved since the previous read.
-    async fn tracked_files(&mut self, repo_root: &Path, head: &str) -> Vec<String> {
-        let stale = self
-            .files
-            .as_ref()
-            .map(|cached| cached.head != head)
-            .unwrap_or(true);
-        if stale {
-            let root = repo_root.to_path_buf();
-            let files = crate::blocking::run_blocking_async(move || {
-                crate::git::list_repository_files(Some(&root)).unwrap_or_default()
-            })
-            .await
-            .unwrap_or_default();
-            self.files = Some(TrackedFiles {
-                head: head.to_string(),
-                files,
-            });
-        }
-        self.files
-            .as_ref()
-            .map(|cached| cached.files.clone())
-            .unwrap_or_default()
-    }
+/// Session history tag frozen for the remaining rounds of a bounded turn.
+struct FrozenHistoryTag {
+    tag: Option<String>,
+}
 
-    /// Returns the repo map for the given inputs, regenerating it only when the
-    /// HEAD, the targetable path set, or the token budget has changed.
+impl TurnInputCache {
+    /// Returns the repository map frozen at the start of the turn.
+    ///
+    /// The first call generates the map from the tracked files, the paths
+    /// already present in context, and the token budget, then freezes the
+    /// result. Every later call returns that exact string, even when a discovery
+    /// round added files to the context and thereby narrowed the set of paths the
+    /// map describes: dropping those nodes mid-turn would shorten the map block
+    /// and invalidate the prompt prefix the provider has already cached.
     pub(super) async fn repo_map(
         &mut self,
         repo_root: &Path,
-        head: &str,
         targetable_paths: &[String],
         token_budget: usize,
     ) -> Option<String> {
-        let cache_hit = self
-            .repo_map
-            .as_ref()
-            .map(|entry| {
-                entry.head == head
-                    && entry.token_budget == token_budget
-                    && entry.targetable_paths == targetable_paths
-            })
-            .unwrap_or(false);
-        if cache_hit {
-            return self.repo_map.as_ref().and_then(|entry| entry.map.clone());
+        if let Some(frozen) = &self.repo_map {
+            return frozen.map.clone();
         }
 
-        let available_files = self.tracked_files(repo_root, head).await;
         let root = repo_root.to_path_buf();
         let targetable = targetable_paths.to_vec();
-        let extractor = self.extractor.clone();
+        // The tracked-file listing and the Tree-sitter pass are blocking file
+        // and subprocess work, so they run off the async executor thread.
         let map = crate::blocking::run_blocking_async(move || {
+            let available_files =
+                crate::git::list_repository_files(Some(&root)).unwrap_or_default();
+            let extractor = TreeSitterExtractor::new();
             crate::repomap::generate_repo_map_with_extractor(
                 &root,
                 &available_files,
@@ -104,12 +80,177 @@ impl TurnInputCache {
         .ok()
         .flatten();
 
-        self.repo_map = Some(RepoMapCacheEntry {
-            head: head.to_string(),
-            targetable_paths: targetable_paths.to_vec(),
-            token_budget,
-            map: map.clone(),
-        });
+        self.repo_map = Some(FrozenRepoMap { map: map.clone() });
         map
+    }
+
+    /// Returns the session history block frozen at the start of the turn.
+    ///
+    /// An isolated step never injects history and freezes `None`. For regular
+    /// turns, the first call reads and formats session history off the executor
+    /// thread and freezes the result. Every subsequent round reuses that exact
+    /// string without hitting disk or re-parsing JSONL records, ensuring that
+    /// the session history block in the prompt prefix remains byte-identical.
+    pub(super) async fn history_tag(
+        &mut self,
+        history_manager: &HistoryManager,
+        intent: TurnIntent,
+    ) -> Option<String> {
+        if let Some(frozen) = &self.history_tag {
+            return frozen.tag.clone();
+        }
+
+        if intent.is_isolated_step() {
+            self.history_tag = Some(FrozenHistoryTag { tag: None });
+            return None;
+        }
+
+        let hm = history_manager.clone();
+        let tag = crate::blocking::run_blocking_async(move || {
+            hm.format_history_tag().ok().and_then(|tag| {
+                let trimmed = tag.trim();
+                if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(tag)
+                }
+            })
+        })
+        .await
+        .ok()
+        .flatten();
+
+        self.history_tag = Some(FrozenHistoryTag { tag: tag.clone() });
+        tag
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Creates a git repository with two tracked Rust files so the tracked-file
+    /// listing resolves them.
+    fn repo_with_two_files() -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        crate::git::init_repository(Some(&root), true).unwrap();
+        std::fs::write(root.join("a.rs"), "pub fn alpha() {}\n").unwrap();
+        std::fs::write(root.join("b.rs"), "pub fn beta() {}\n").unwrap();
+        let files = vec!["a.rs".to_string(), "b.rs".to_string()];
+        crate::git::cmd::stage_files(&root, &files).unwrap();
+        crate::git::cmd::commit_with_developer_author(&root, "Add fixtures", false).unwrap();
+        (dir, root)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn repo_map_stays_identical_when_discovery_widens_the_context() {
+        let (_dir, root) = repo_with_two_files();
+        let mut cache = TurnInputCache::default();
+
+        let opening_round: Vec<String> = Vec::new();
+        let first = cache
+            .repo_map(&root, &opening_round, 1000)
+            .await
+            .expect("the opening round generates the map");
+        assert!(first.contains("b.rs"));
+        assert!(first.contains("pub fn beta"));
+
+        // A discovery round pulls `b.rs` into the context, which would exclude
+        // it from a regenerated map. The frozen map keeps the node and stays
+        // byte-identical, so the prompt prefix of the previous round survives.
+        let later_round = vec!["b.rs".to_string()];
+        let second = cache
+            .repo_map(&root, &later_round, 1000)
+            .await
+            .expect("the frozen map is reused");
+        assert_eq!(second, first);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn empty_repo_map_is_frozen_instead_of_being_regenerated() {
+        let (_dir, root) = repo_with_two_files();
+        let mut cache = TurnInputCache::default();
+
+        let everything = crate::git::list_repository_files(Some(&root)).unwrap();
+        assert!(cache.repo_map(&root, &everything, 1000).await.is_none());
+
+        // A later round that would produce a non-empty map still observes the
+        // frozen empty result.
+        let narrowed = vec!["a.rs".to_string()];
+        assert!(cache.repo_map(&root, &narrowed, 1000).await.is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_new_turn_generates_its_own_map() {
+        let (_dir, root) = repo_with_two_files();
+
+        let mut first_turn = TurnInputCache::default();
+        let opening_round: Vec<String> = Vec::new();
+        let before = first_turn
+            .repo_map(&root, &opening_round, 1000)
+            .await
+            .expect("first turn map");
+        assert!(before.contains("b.rs"));
+
+        // A new turn starts with `b.rs` already in context and therefore gets a
+        // map without that node: the freeze is scoped to a single turn.
+        let mut second_turn = TurnInputCache::default();
+        let with_b = vec!["b.rs".to_string()];
+        let after = second_turn
+            .repo_map(&root, &with_b, 1000)
+            .await
+            .expect("second turn map");
+        assert!(!after.contains("b.rs"));
+        assert!(after.contains("a.rs"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn history_tag_is_frozen_across_rounds() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let mut history_manager = HistoryManager::new(root);
+        history_manager
+            .record_turn("Original prompt", vec!["a.rs".to_string()])
+            .unwrap();
+
+        let mut cache = TurnInputCache::default();
+        let first = cache
+            .history_tag(&history_manager, TurnIntent::InteractiveRepl)
+            .await
+            .expect("first round resolves history");
+        assert!(first.contains("Original prompt"));
+
+        // Simulate an external mutation or subsequent event added during the turn
+        history_manager
+            .record_turn("Subsequent prompt", vec!["b.rs".to_string()])
+            .unwrap();
+
+        let second = cache
+            .history_tag(&history_manager, TurnIntent::InteractiveRepl)
+            .await
+            .expect("second round reuses frozen history");
+        assert_eq!(second, first);
+        assert!(!second.contains("Subsequent prompt"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn isolated_step_freezes_none_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let mut history_manager = HistoryManager::new(root);
+        history_manager
+            .record_turn("Prompt", vec![])
+            .unwrap();
+
+        let mut cache = TurnInputCache::default();
+        assert!(cache
+            .history_tag(&history_manager, TurnIntent::IsolatedStep)
+            .await
+            .is_none());
+        assert!(cache
+            .history_tag(&history_manager, TurnIntent::IsolatedStep)
+            .await
+            .is_none());
     }
 }

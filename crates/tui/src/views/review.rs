@@ -3,11 +3,12 @@ use std::collections::{HashSet, VecDeque};
 use ratatui::style::{Style, Stylize};
 use ratatui::text::{Line, Span};
 use tauqe_protocol::{
-    DiscussionFocus, DiscussionTarget, IssueStatus, IssueType, ModelEntry, ModelRef,
-    ModelSelection, PlanItem, PlanItemStatus, ReviewIssue, ReviewItem, ReviewSession,
+    ArchitectTier, DiscussionFocus, DiscussionTarget, IssueStatus, IssueType, ModelEntry,
+    ModelRef, ModelSelection, PlanItem, PlanItemStatus, ReviewIssue, ReviewItem, ReviewSession,
 };
 
 use crate::components::model_selector::ModelSelector;
+use crate::views::plans::architect_badge;
 use crate::theme::engine::current_engine;
 use crate::ui::wrap_lines;
 
@@ -60,6 +61,9 @@ pub enum VisibleReviewRow {
         note: Option<String>,
         /// Embedded step plan decomposed by the Architect, rendered on expansion.
         plan: Vec<PlanItem>,
+        /// The Architect configuration that produced `plan`, rendered beside
+        /// the step progress so the decomposition's provenance stays visible.
+        subplan_architect: Option<ArchitectTier>,
         is_expanded: bool,
         /// Whether the active discussion focus anchors on this finding.
         focused: bool,
@@ -160,54 +164,6 @@ impl ReviewRefineDialogState {
         self.selector.selected_entry()
     }
 }
-
-/*
-#[derive(Debug, Clone, Default)]
-pub struct ReviewViewState {</search_6DFEFD4296DDA92B>
-</edit>
-<edit path="crates/tui/src/views/review.rs">
-<search>    /// Findings awaiting Architect decomposition, in dispatch order.
-    ///
-    /// The Architect decomposes one finding per bounded call, so a batch
-    /// refinement drains this queue one `review/refineItem` response at a time.
-    pub refine_queue: VecDeque<RefineTarget>,
-}</search>
-<replace>    /// Findings awaiting Architect decomposition, in dispatch order.
-    ///
-    /// The Architect decomposes one finding per bounded call, so a batch
-    /// refinement drains this queue one `review/refineItem` response at a time.
-    pub refine_queue: VecDeque<RefineTarget>,
-    /// Architect decomposition dialog for the selected finding, when open.
-    pub refine_dialog: Option<ReviewRefineDialogState>,
-}
-    pub running: bool,
-    /// Review id currently under Architect decomposition (`review/refineItem`),
-    /// if any. Drives the in-flight footer indicator and blocks re-entry.
-    pub refining: Option<String>,
-    pub sessions: Vec<ReviewSession>,
-    pub session: Option<ReviewSession>,
-    pub selected_index: usize,
-    pub scroll: u16,
-    pub collapsed_sessions: HashSet<String>,
-    pub collapsed_summaries: HashSet<String>,
-    pub expanded_items: HashSet<String>,
-    pub hide_closed: bool,
-    pub error: Option<String>,
-    pub view_height: u16,
-    pub content_width: usize,
-    pub rendered_lines: usize,
-    pub theme_mode: crate::config::ThemeMode,
-    /// Active discussion focus mirrored from the server, used to render the
-    /// `[FOCUS]` indicator. Synced from `AppState::discussion_focus` on render.
-    pub discussion_focus: DiscussionFocus,
-    /// Findings awaiting Architect decomposition, in dispatch order.
-    ///
-    /// The Architect decomposes one finding per bounded call, so a batch
-    /// refinement drains this queue one `review/refineItem` response at a time.
-    pub refine_queue: VecDeque<RefineTarget>,
-}
-
-*/
 
 #[derive(Debug, Clone, Default)]
 pub struct ReviewViewState {
@@ -607,7 +563,12 @@ impl ReviewViewState {
                 // description/recommendations, the protected readonly
                 // contracts, and the embedded plan through one explicit field
                 // mapping.
-                for issue in session.issues() {
+                for stored in &session.items {
+                    // The durable item carries the subplan's Architect
+                    // provenance, which the issue view drops, so the row reads
+                    // the stored item and projects it onto the view vocabulary
+                    // exactly once.
+                    let issue = ReviewIssue::from(stored.clone());
                     if self.hide_closed
                         && matches!(
                             issue.status,
@@ -631,6 +592,7 @@ impl ReviewViewState {
                         recommendations: issue.recommendations,
                         note: issue.note,
                         plan: issue.plan.clone(),
+                        subplan_architect: stored.subplan_architect.clone(),
                         is_expanded: item_expanded,
                         focused,
                     });
@@ -949,6 +911,50 @@ fn subplan_all_expanded(
     })
 }
 
+/// Indent step, in columns, of one nesting level of the Review tree.
+const REVIEW_INDENT_STEP: usize = 2;
+
+/// Nesting level of a session header row.
+const REVIEW_SESSION_LEVEL: usize = 0;
+
+/// Nesting level of the Executive Summary row of a session.
+const REVIEW_SUMMARY_LEVEL: usize = 1;
+
+/// Nesting level of a finding row.
+///
+/// A finding's own detail block and its top-level subplan steps both sit one
+/// level deeper, so the body never reads as deeper than the children.
+const REVIEW_ITEM_LEVEL: usize = 2;
+
+/// Leading indentation of a node rendered at `level`.
+///
+/// Every hierarchical row derives its leading indent from its numeric depth
+/// through this single helper, so a parent row, its body, and its children can
+/// never drift apart and no renderer needs a literal whitespace run
+/// (Conventions §4.8).
+fn review_indent(level: usize) -> String {
+    " ".repeat(REVIEW_INDENT_STEP * level)
+}
+
+/// Leading indentation of the detail block of a node rendered at `level`.
+///
+/// A summary row starts with a one-column selection gutter, while a detail
+/// block owns no gutter of its own. The gutter column is therefore reproduced
+/// as a leading space, so a node's body lines up exactly with the rows around
+/// it and the body never reads as shallower than its children.
+fn review_body_indent(level: usize) -> String {
+    format!(" {}", review_indent(level))
+}
+
+/// Nesting level of a subplan step lying `depth` levels below its finding.
+///
+/// `depth` keeps its established meaning (0 is the top-level step); the shift
+/// that places a step strictly deeper than its finding lives here, in the
+/// render scale, and never in the flatten logic.
+fn subplan_step_level(depth: usize) -> usize {
+    REVIEW_ITEM_LEVEL + 1 + depth
+}
+
 /// Short badge text for a classified problem type.
 ///
 /// The `quality` category maps to the domain `Style` variant, so it renders as
@@ -1199,7 +1205,7 @@ fn compute_unified_review_lines(
 
                 let mut spans = vec![
                     gutter,
-                    Span::raw(" "),
+                    Span::raw(review_indent(REVIEW_SESSION_LEVEL)),
                     Span::styled(fold_icon, engine.fg(palette.status_warning).bold()),
                     Span::styled(
                         format!("[{}] ", session_id),
@@ -1241,10 +1247,13 @@ fn compute_unified_review_lines(
                 let fold_icon = if *is_expanded { "▼ " } else { "▶ " };
                 let spans = vec![
                     gutter,
-                    Span::raw("  "),
+                    Span::raw(review_indent(REVIEW_SUMMARY_LEVEL)),
                     Span::styled(fold_icon, engine.fg(palette.status_warning).bold()),
                     Span::styled(
-                        "Executive Summary:",
+                        format!(
+                            "{}:",
+                            crate::i18n::active_t("review.executive_summary")
+                        ),
                         engine.fg(palette.status_success).bold(),
                     ),
                 ];
@@ -1258,25 +1267,23 @@ fn compute_unified_review_lines(
                 if *is_expanded {
                     let trimmed = description.trim();
                     if !trimmed.is_empty() {
+                        let body_prefix = Span::styled(
+                            format!("{}│ ", review_body_indent(REVIEW_SUMMARY_LEVEL + 1)),
+                            engine.fg(palette.text_muted),
+                        );
                         let mut theme =
                             crate::markdown::MarkdownTheme::answer_themed(theme_mode);
                         theme.text_style = engine.fg(palette.text_secondary);
                         theme.hard_breaks = true;
                         theme.compact = true;
-                        theme.line_prefix = Some(Span::styled(
-                            "    │ ",
-                            engine.fg(palette.text_muted),
-                        ));
+                        theme.line_prefix = Some(body_prefix.clone());
                         let md = crate::markdown::render_markdown(trimmed, &theme);
                         if !md.is_empty() {
                             row_lines.extend(md);
                         } else {
                             for line in trimmed.lines() {
                                 row_lines.push(Line::from(vec![
-                                    Span::styled(
-                                        "    │ ",
-                                        engine.fg(palette.text_muted),
-                                    ),
+                                    body_prefix.clone(),
                                     Span::styled(
                                         line.to_string(),
                                         engine.fg(palette.text_secondary),
@@ -1301,6 +1308,7 @@ fn compute_unified_review_lines(
                 recommendations,
                 note,
                 plan,
+                subplan_architect,
                 is_expanded,
                 focused,
                 ..
@@ -1324,7 +1332,7 @@ fn compute_unified_review_lines(
 
                 let mut spans = vec![
                     gutter,
-                    Span::raw("    "),
+                    Span::raw(review_indent(REVIEW_ITEM_LEVEL)),
                     Span::styled(fold_icon, engine.fg(palette.status_warning).bold()),
                     Span::styled(
                         format!(" {} ", issue_type_badge(*issue_type)),
@@ -1363,6 +1371,9 @@ fn compute_unified_review_lines(
                         ));
                     }
                 }
+                if let Some(tier) = subplan_architect {
+                    spans.push(architect_badge(tier));
+                }
                 if *focused {
                     spans.push(focus_badge());
                 }
@@ -1372,6 +1383,9 @@ fn compute_unified_review_lines(
                     item_line = pad_line_to_width(item_line, width, row_style);
                 }
                 let mut row_lines = vec![item_line];
+                // The finding's own detail block renders at the level of its
+                // children, never deeper (Conventions §4.8).
+                let body_indent = review_body_indent(REVIEW_ITEM_LEVEL + 1);
 
                 if *is_expanded {
                     let loc_str = location(files)
@@ -1381,7 +1395,7 @@ fn compute_unified_review_lines(
                         if !clean_loc.is_empty() {
                             row_lines.push(Line::from(vec![
                                 Span::styled(
-                                    "        Files: ",
+                                    format!("{body_indent}Files: "),
                                     engine.fg(palette.status_info).bold(),
                                 ),
                                 Span::styled(
@@ -1395,7 +1409,7 @@ fn compute_unified_review_lines(
                     if !readonly_files.is_empty() {
                         row_lines.push(Line::from(vec![
                             Span::styled(
-                                "        Readonly (do not modify): ",
+                                format!("{body_indent}Readonly (do not modify): "),
                                 engine.fg(palette.status_warning).bold(),
                             ),
                             Span::styled(
@@ -1409,9 +1423,15 @@ fn compute_unified_review_lines(
                         let clean_notes = notes.trim();
                         if !clean_notes.is_empty() {
                             let note_header = if *status == IssueStatus::Skipped {
-                                "        Skip Reason: "
+                                format!(
+                                    "{body_indent}{} ",
+                                    crate::i18n::active_t("review.skip_reason_label")
+                                )
                             } else {
-                                "        Note: "
+                                format!(
+                                    "{body_indent}{} ",
+                                    crate::i18n::active_t("review.note_label")
+                                )
                             };
                             let mut note_lines = clean_notes.lines();
                             if let Some(first) = note_lines.next() {
@@ -1428,7 +1448,7 @@ fn compute_unified_review_lines(
                                 for line in note_lines {
                                     row_lines.push(Line::from(vec![
                                         Span::styled(
-                                            "        │ ",
+                                            format!("{body_indent}│ "),
                                             engine.fg(palette.text_muted),
                                         ),
                                         Span::styled(
@@ -1443,7 +1463,7 @@ fn compute_unified_review_lines(
 
                     if !description.trim().is_empty() {
                         row_lines.push(Line::from(Span::styled(
-                            "        Description:",
+                            format!("{body_indent}Description:"),
                             engine.fg(palette.status_info).bold(),
                         )));
                         let mut theme =
@@ -1452,7 +1472,7 @@ fn compute_unified_review_lines(
                         theme.hard_breaks = true;
                         theme.compact = true;
                         theme.line_prefix = Some(Span::styled(
-                            "        │ ",
+                            format!("{body_indent}│ "),
                             engine.fg(palette.text_muted),
                         ));
                         let md = crate::markdown::render_markdown(description.trim(), &theme);
@@ -1463,13 +1483,13 @@ fn compute_unified_review_lines(
 
                     if !recommendations.is_empty() {
                         row_lines.push(Line::from(Span::styled(
-                            "        Recommendations:",
+                            format!("{body_indent}Recommendations:"),
                             engine.fg(palette.status_success).bold(),
                         )));
                         for rec in recommendations {
                             row_lines.push(Line::from(vec![
                                 Span::styled(
-                                    "        │ • ",
+                                    format!("{body_indent}│ • "),
                                     engine.fg(palette.text_muted),
                                 ),
                                 Span::styled(
@@ -1497,7 +1517,10 @@ fn compute_unified_review_lines(
                 is_expanded,
                 ..
             } => {
-                let indent = format!("    {}", "  ".repeat(*depth));
+                let row_level = subplan_step_level(*depth);
+                let indent = review_indent(row_level);
+                let body_indent = review_body_indent(row_level + 1);
+                let meta_prefix = format!("{body_indent}│ ");
                 let fold_icon = if *is_expandable {
                     if *is_expanded {
                         "▼ "
@@ -1561,7 +1584,6 @@ fn compute_unified_review_lines(
                 let mut row_lines = vec![row_line];
 
                 if *is_expanded {
-                    let meta_prefix = format!("{}    │ ", indent);
                     if !files.is_empty() {
                         row_lines.push(Line::from(vec![
                             Span::styled(meta_prefix.clone(), engine.fg(palette.text_muted)),
@@ -1744,8 +1766,10 @@ mod tests {
             compute_unified_review_lines(&rows, 0, 80, crate::config::ThemeMode::Dark);
         let texts: Vec<String> = lines.iter().map(|line| line.to_string()).collect();
 
+        let summary_label =
+            format!("{}:", crate::i18n::active_t("review.executive_summary"));
         assert!(
-            texts.iter().any(|t| t.contains("Executive Summary:")),
+            texts.iter().any(|t| t.contains(&summary_label)),
             "expected the Executive Summary header, got: {texts:?}"
         );
         assert!(
@@ -1771,8 +1795,10 @@ mod tests {
             compute_unified_review_lines(&rows, 0, 80, crate::config::ThemeMode::Dark);
         let texts: Vec<String> = lines.iter().map(|line| line.to_string()).collect();
 
+        let summary_label =
+            format!("{}:", crate::i18n::active_t("review.executive_summary"));
         assert!(
-            !texts.iter().any(|t| t.contains("Executive Summary:")),
+            !texts.iter().any(|t| t.contains(&summary_label)),
             "a collapsed session must not render the Executive Summary block, got: {texts:?}"
         );
     }
@@ -1802,7 +1828,9 @@ mod tests {
         let (lines, _) =
             compute_unified_review_lines(&rows, 0, 80, crate::config::ThemeMode::Dark);
         let texts: Vec<String> = lines.iter().map(|line| line.to_string()).collect();
-        assert!(texts.iter().any(|t| t.contains("Executive Summary:")));
+        let summary_label =
+            format!("{}:", crate::i18n::active_t("review.executive_summary"));
+        assert!(texts.iter().any(|t| t.contains(&summary_label)));
         assert!(texts.iter().any(|t| t.contains("The architecture is sound.")));
 
         // Folding the summary hides only its body; findings stay visible.
@@ -1820,7 +1848,7 @@ mod tests {
         let (lines, _) =
             compute_unified_review_lines(&rows, 0, 80, crate::config::ThemeMode::Dark);
         let texts: Vec<String> = lines.iter().map(|line| line.to_string()).collect();
-        assert!(texts.iter().any(|t| t.contains("Executive Summary:")));
+        assert!(texts.iter().any(|t| t.contains(&summary_label)));
         assert!(
             !texts.iter().any(|t| t.contains("The architecture is sound.")),
             "a folded summary must hide its body, got: {texts:?}"
@@ -1923,21 +1951,25 @@ mod tests {
             "expected compact SKIP status badge, got: {texts:?}"
         );
 
-        // 2. Multiline Skip Reason renders with vertical prefix for subsequent lines
+        // 2. Multiline skip reason renders with vertical prefix for subsequent lines
+        let skip_label = crate::i18n::active_t("review.skip_reason_label");
+        let note_label = crate::i18n::active_t("review.note_label");
         assert!(
-            texts.iter().any(|t| t.contains("Skip Reason: ")
+            texts.iter().any(|t| t.contains(&format!("{skip_label} "))
                 && t.contains("Already addressed in previous turn")),
-            "expected Skip Reason header and first line, got: {texts:?}"
+            "expected Skip reason header and first line, got: {texts:?}"
         );
         assert!(
             texts.iter().any(|t| t.contains("│ Verified no code change needed")),
             "expected indented subsequent line with vertical bar prefix, got: {texts:?}"
         );
 
-        // 3. Regular non-skipped item renders Note: header
+        // 3. Regular non-skipped item renders the note header
         assert!(
-            texts.iter().any(|t| t.contains("Note: Fixed race condition")),
-            "expected regular Note: header for fixed item, got: {texts:?}"
+            texts
+                .iter()
+                .any(|t| t.contains(&format!("{note_label} Fixed race condition"))),
+            "expected regular note header for fixed item, got: {texts:?}"
         );
     }
 
@@ -2225,6 +2257,40 @@ mod tests {
     }
 
     #[test]
+    fn test_review_item_renders_the_architect_provenance() {
+        let mut session = make_session("rev-arch", &[1]);
+        session.items[0] = ReviewItem::from(ReviewIssue {
+            plan: vec![subplan_step("1.1", "First step", PlanItemStatus::Todo)],
+            ..make_item(1)
+        });
+        session.items[0].subplan_architect = Some(tauqe_protocol::ArchitectTier::new(
+            tauqe_protocol::ModelRef::openrouter("planner/model"),
+            Some(tauqe_protocol::ReasoningEffort::XHigh),
+        ));
+        let view = ReviewViewState {
+            sessions: vec![session],
+            ..Default::default()
+        };
+
+        let rows = view.flatten_rows();
+        assert!(rows.iter().any(|row| matches!(
+            row,
+            VisibleReviewRow::ReviewItem {
+                subplan_architect: Some(_),
+                ..
+            }
+        )));
+
+        let (lines, _) =
+            compute_unified_review_lines(&rows, 1, 160, crate::config::ThemeMode::Dark);
+        let text = joined_text(&lines);
+        assert!(
+            text.contains("[ARC openrouter:planner/model xhigh]"),
+            "the finding must name the Architect model and depth: {text}"
+        );
+    }
+
+    #[test]
     fn test_accordion_navigation_walks_subplan_steps() {
         let mut session = make_session("rev-acc", &[1]);
         session.items[0] = ReviewItem::from(ReviewIssue {
@@ -2268,5 +2334,181 @@ mod tests {
             view.selected_row(),
             Some(VisibleReviewRow::SubplanItem { ref step_id, .. }) if step_id == "1.1"
         ));
+    }
+
+    /// Leading indent of a rendered line, counting the selection gutter.
+    ///
+    /// Every row carries a one-column gutter (`▌` when selected, a space
+    /// otherwise), so counting both characters yields indents that are
+    /// comparable no matter where the cursor rests.
+    fn leading_indent(line: &Line<'static>) -> usize {
+        line.spans
+            .iter()
+            .flat_map(|span| span.content.chars())
+            .take_while(|c| *c == ' ' || *c == '▌')
+            .count()
+    }
+
+    /// Full text of a rendered line, joined across all of its spans.
+    ///
+    /// A label and its value are rendered as separate spans, so a probe must
+    /// match the concatenated line rather than any single span.
+    fn line_text(line: &Line<'static>) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
+    }
+
+    fn find_line(lines: &[Line<'static>], needle: &str) -> usize {
+        lines
+            .iter()
+            .position(|line| line_text(line).contains(needle))
+            .unwrap_or_else(|| panic!("missing rendered line containing {needle}"))
+    }
+
+    #[test]
+    fn test_hierarchy_indent_strictly_increases_and_body_stays_within_children() {
+        let mut session = make_session_with_description("rev-indent", "Summary body.", &[1]);
+        session.items[0] = ReviewItem::from(ReviewIssue {
+            files: vec!["src/auth.rs".to_string()],
+            plan: vec![PlanItem {
+                children: vec![subplan_step("1.1", "Leaf step", PlanItemStatus::Todo)],
+                ..subplan_step("1", "Container step", PlanItemStatus::Todo)
+            }],
+            ..make_item(1)
+        });
+        let mut view = ReviewViewState {
+            sessions: vec![session],
+            ..Default::default()
+        };
+        view.toggle_item_expanded("rev-indent", 1);
+        view.toggle_subplan_item_expanded("rev-indent", 1, "1");
+
+        let rows = view.flatten_rows();
+        let (lines, _offsets) =
+            compute_unified_review_lines(&rows, 0, 160, crate::config::ThemeMode::Dark);
+
+        let header = leading_indent(&lines[find_line(&lines, "[rev-indent]")]);
+        let summary = leading_indent(&lines[find_line(&lines, "Executive Summary:")]);
+        let item = leading_indent(&lines[find_line(&lines, "#1 Finding 1")]);
+        let step = leading_indent(&lines[find_line(&lines, "#1 Container step")]);
+        let leaf = leading_indent(&lines[find_line(&lines, "#1.1 Leaf step")]);
+
+        // Every nested node renders strictly deeper than its visual parent.
+        assert!(
+            header < summary,
+            "the session summary must sit deeper than its session header: \
+             {header} >= {summary}"
+        );
+        assert!(
+            summary < item,
+            "a finding must sit deeper than the session summary: {summary} >= {item}"
+        );
+        assert!(
+            item < step,
+            "a top-level subplan step must sit strictly deeper than its finding: \
+             {item} >= {step}"
+        );
+        assert!(
+            step < leaf,
+            "a nested step must sit deeper than its container: {step} >= {leaf}"
+        );
+
+        // A node body occupies the level of its children, never a deeper one.
+        let finding_body = leading_indent(&lines[find_line(&lines, "Files: src/auth.rs")]);
+        assert_eq!(
+            finding_body, step,
+            "the finding detail block must sit at the level of its children"
+        );
+        let summary_body = leading_indent(&lines[find_line(&lines, "Summary body.")]);
+        assert!(
+            summary_body <= item,
+            "the session summary body must never sit deeper than its findings: \
+             {summary_body} > {item}"
+        );
+    }
+
+    /// Full text of every rendered line, joined for substring probes.
+    fn joined_text(lines: &[Line<'static>]) -> String {
+        lines.iter().map(line_text).collect::<Vec<_>>().join("\n")
+    }
+
+    #[test]
+    fn test_hierarchy_indent_covers_collapsed_and_expanded_states() {
+        let mut session = make_session_with_description("rev-state", "Summary body.", &[1]);
+        session.items[0] = ReviewItem::from(ReviewIssue {
+            files: vec!["src/auth.rs".to_string()],
+            plan: vec![PlanItem {
+                children: vec![subplan_step("1.1", "Leaf step", PlanItemStatus::Todo)],
+                ..subplan_step("1", "Container step", PlanItemStatus::Todo)
+            }],
+            ..make_item(1)
+        });
+        let mut view = ReviewViewState {
+            sessions: vec![session],
+            ..Default::default()
+        };
+
+        // A collapsed session exposes only its header, anchored at the root.
+        view.collapsed_sessions.insert("rev-state".to_string());
+        let rows = view.flatten_rows();
+        assert_eq!(rows.len(), 1, "a collapsed session exposes only its header");
+        let (lines, _) =
+            compute_unified_review_lines(&rows, usize::MAX, 160, crate::config::ThemeMode::Dark);
+        let header = leading_indent(&lines[find_line(&lines, "[rev-state]")]);
+        assert_eq!(header, 1, "the session header sits at the root level");
+        let rendered = joined_text(&lines);
+        assert!(
+            !rendered.contains("Summary body."),
+            "a collapsed session hides its summary: {rendered}"
+        );
+        assert!(
+            !rendered.contains("#1 Finding 1"),
+            "a collapsed session hides its findings: {rendered}"
+        );
+
+        // An expanded session with a collapsed finding shows the header, the
+        // summary, and the finding, but no subplan rows; each nested row is
+        // strictly deeper than its parent.
+        view.collapsed_sessions.clear();
+        let rows = view.flatten_rows();
+        let (lines, _) =
+            compute_unified_review_lines(&rows, usize::MAX, 160, crate::config::ThemeMode::Dark);
+        let header = leading_indent(&lines[find_line(&lines, "[rev-state]")]);
+        let summary = leading_indent(&lines[find_line(&lines, "Executive Summary:")]);
+        let item = leading_indent(&lines[find_line(&lines, "#1 Finding 1")]);
+        assert!(header < summary, "{header} >= {summary}");
+        assert!(summary < item, "{summary} >= {item}");
+        let rendered = joined_text(&lines);
+        assert!(
+            !rendered.contains("#1 Container step"),
+            "a collapsed finding hides its subplan: {rendered}"
+        );
+
+        // A fully expanded finding places its steps strictly deeper than the
+        // finding and keeps the finding body at the children level.
+        view.toggle_item_expanded("rev-state", 1);
+        view.toggle_subplan_item_expanded("rev-state", 1, "1");
+        let rows = view.flatten_rows();
+        let (lines, _) =
+            compute_unified_review_lines(&rows, usize::MAX, 160, crate::config::ThemeMode::Dark);
+        let item = leading_indent(&lines[find_line(&lines, "#1 Finding 1")]);
+        let step = leading_indent(&lines[find_line(&lines, "#1 Container step")]);
+        let leaf = leading_indent(&lines[find_line(&lines, "#1.1 Leaf step")]);
+        assert!(item < step, "{item} >= {step}");
+        assert!(step < leaf, "{step} >= {leaf}");
+
+        let finding_body = leading_indent(&lines[find_line(&lines, "Files: src/auth.rs")]);
+        assert_eq!(
+            finding_body, step,
+            "the finding detail block must sit at the level of its children"
+        );
+        let summary_body = leading_indent(&lines[find_line(&lines, "Summary body.")]);
+        assert!(
+            summary_body <= item,
+            "the session summary body must never sit deeper than its findings: \
+             {summary_body} > {item}"
+        );
     }
 }

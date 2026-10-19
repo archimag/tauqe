@@ -1,13 +1,14 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use tauqe_core::providers::{create_provider, ChatMessage, StreamEvent};
+use tauqe_core::providers::{create_provider, ChatMessage, LlmProvider, StreamEvent};
 use tauqe_protocol::{
     errors, events, Event, GitDiffParams, GitDiffResult, ModelRole, RepositoryListFilesResult,
     Request, Response,
 };
 
 use crate::state::AppState;
+use crate::usage::UsageGuard;
 
 /// Distinguishes a failure while reading the commit list from a failure while
 /// squashing, so each maps to the correct client error code.
@@ -51,38 +52,10 @@ pub async fn handle_repository_init(req: Request, state: &Arc<AppState>) -> Resp
 
     match init_result {
         Ok(Ok(repo_state)) => {
-            let repo_path = Path::new(&repo_state.root);
-            if !repo_path.as_os_str().is_empty() {
-                // A freshly initialized project may now carry its own
-                // `tauqe.toml`, so reload configuration for the new root and
-                // rebind the config, context, and history managers under
-                // separate short-lived guards, mirroring `initialize`. No guard
-                // is ever held across another subsystem's `.await`.
-                let loaded =
-                    super::config::reload_config_with_overrides(state, Some(repo_path)).await;
-                {
-                    let mut guard = state.config.lock().await;
-                    guard.selection = loaded.default_selection();
-                    guard.config = loaded;
-                }
-                let mut ctx_snapshot = state.context.read().await.clone();
-                let repo_buf = repo_path.to_path_buf();
-                if let Ok(updated_ctx) = super::offload(move || {
-                    ctx_snapshot.set_repo_root(repo_buf);
-                    ctx_snapshot
-                })
-                .await
-                {
-                    *state.context.write().await = updated_ctx;
-                }
-                let mut hm = tauqe_core::history::HistoryManager::new(repo_path.to_path_buf());
-                let sender = state.history_sender.clone();
-                hm.set_listener(move |mutation| {
-                    let _ = sender.send(mutation);
-                });
-                let mut history = state.history.lock().await;
-                *history = hm;
-            }
+            // A freshly initialized project may now carry its own `tauqe.toml`,
+            // so configuration, context, and history are rebound to the new
+            // root exactly as `client/initialize` does.
+            super::rebind_to_repository(state, Path::new(&repo_state.root)).await;
 
             state.out.send_event(&Event {
                 method: events::GIT_STATE_CHANGED.to_string(),
@@ -277,11 +250,11 @@ pub async fn handle_git_squash_generate_message(req: Request, state: &Arc<AppSta
     let (provider_res, model) = {
         let cfg = state.config.lock().await.config.clone();
         let m = cfg.resolve_role(ModelRole::Scribe);
-        let p = create_provider(m.provider, &cfg);
+        let p = resolve_squash_provider(state, &cfg, m.provider).await;
         (p, m)
     };
 
-    let (message, usage_info) = if let Ok(provider) = provider_res {
+    let (message, usage_snapshot) = if let Ok(provider) = provider_res {
         let operation = match state.try_begin_operation() {
             Ok(guard) => guard,
             Err(()) => {
@@ -292,6 +265,11 @@ pub async fn handle_git_squash_generate_message(req: Request, state: &Arc<AppSta
                 );
             }
         };
+        // The identifier and the usage window exist before the first streamed
+        // byte, so a cancellation delivered before the stream starts still
+        // closes exactly one accounted operation.
+        let op_id = format!("op-{}", crate::state::next_operation_id());
+        let usage_guard = state.begin_usage().await;
         let cancel_rx = operation.cancel_receiver();
         let (tx, mut rx) = tokio::sync::mpsc::channel(50);
         let msgs = vec![ChatMessage::user(&prompt)];
@@ -303,7 +281,6 @@ pub async fn handle_git_squash_generate_message(req: Request, state: &Arc<AppSta
                 .await
         });
         let mut full_text = String::new();
-        let mut usage: Option<tauqe_protocol::ModelUsageInfo> = None;
         let mut stream_error: Option<String> = None;
         let mut cancelled = false;
         while let Some(ev) = rx.recv().await {
@@ -311,8 +288,12 @@ pub async fn handle_git_squash_generate_message(req: Request, state: &Arc<AppSta
                 StreamEvent::TextDelta(delta) => {
                     full_text.push_str(&delta);
                 }
-                StreamEvent::Usage(u) => {
-                    usage = Some(u);
+                // Providers may report usage on intermediate chunks. It stays
+                // in the in-flight window and is folded into the session totals
+                // only by the single terminal flush below, so an intermediate
+                // report can never be counted twice.
+                StreamEvent::Usage(reported) => {
+                    usage_guard.observe(&reported).await;
                 }
                 StreamEvent::Error(msg) => {
                     stream_error = Some(msg);
@@ -328,6 +309,7 @@ pub async fn handle_git_squash_generate_message(req: Request, state: &Arc<AppSta
         }
 
         if cancelled {
+            close_squash_usage(state, usage_guard, &op_id).await;
             return Response::err(
                 req.id,
                 errors::CANCELLED,
@@ -338,14 +320,17 @@ pub async fn handle_git_squash_generate_message(req: Request, state: &Arc<AppSta
         // Surface both a streamed provider error and a failed streaming task so
         // a broken provider never masquerades as a successful fallback message.
         if let Some(msg) = stream_error {
+            close_squash_usage(state, usage_guard, &op_id).await;
             return Response::err(req.id, errors::INTERNAL_ERROR, msg);
         }
         match stream_task.await {
             Ok(Ok(())) => {}
             Ok(Err(err)) => {
+                close_squash_usage(state, usage_guard, &op_id).await;
                 return Response::err(req.id, errors::INTERNAL_ERROR, err.to_string());
             }
             Err(join_err) => {
+                close_squash_usage(state, usage_guard, &op_id).await;
                 return Response::err(
                     req.id,
                     errors::INTERNAL_ERROR,
@@ -359,8 +344,11 @@ pub async fn handle_git_squash_generate_message(req: Request, state: &Arc<AppSta
                 .map(|c| c.subject.clone())
                 .unwrap_or_else(|| "Squashed commits".to_string())
         });
-        (msg, usage)
+        let snapshot = close_squash_usage(state, usage_guard, &op_id).await;
+        (msg, Some(snapshot))
     } else {
+        // Without a provider no operation ever opens, so the zero operation
+        // neither reaches the session totals nor increments the operation count.
         (
             commits_ahead
                 .first()
@@ -370,33 +358,74 @@ pub async fn handle_git_squash_generate_message(req: Request, state: &Arc<AppSta
         )
     };
 
-    let usage = usage_info.unwrap_or_default();
-    let cost = usage.cost.unwrap_or(0.0);
-    let total_cost = {
-        let mut total = state.total_cost.lock().await;
-        *total += cost;
-        *total
+    // The legacy fields are projected from the authoritative snapshot — the
+    // last completed operation and the session total — instead of a locally
+    // re-summed counter, so both channels always agree.
+    let result = match usage_snapshot {
+        Some(snapshot) => {
+            let totals = snapshot.operation_totals().clone();
+            tauqe_protocol::GitSquashGenerateMessageResult {
+                message,
+                usage: Some(totals.to_usage_info()),
+                session_total_cost: Some(snapshot.session.cost),
+                current_cost: Some(totals.cost),
+            }
+        }
+        None => tauqe_protocol::GitSquashGenerateMessageResult {
+            message,
+            usage: None,
+            session_total_cost: None,
+            current_cost: None,
+        },
     };
+    Response::ok_typed(req.id, &result)
+}
 
-    let op_id = format!("op-{}", crate::state::next_operation_id());
+/// Resolves the LLM provider for a squash message.
+///
+/// Deterministic unit tests inject a scripted provider through the state's test
+/// seam; production builds construct a real network provider from configuration.
+async fn resolve_squash_provider(
+    _state: &Arc<AppState>,
+    config: &tauqe_core::config::AppConfig,
+    kind: tauqe_protocol::ProviderKind,
+) -> Result<Arc<dyn LlmProvider>, String> {
+    #[cfg(test)]
+    {
+        if let Some(provider) = _state.provider_override.lock().await.clone() {
+            return Ok(provider);
+        }
+    }
+    create_provider(kind, config)
+        .map(Arc::from)
+        .map_err(|err| err.to_string())
+}
+
+/// Closes the squash operation's usage window and publishes the snapshot.
+///
+/// The flush is the single point where the operation folds into the session
+/// totals, so the cancelled, failed, and successful paths all reach the
+/// accumulator exactly once. The legacy per-operation usage event is mirrored
+/// from the same snapshot.
+async fn close_squash_usage(
+    state: &Arc<AppState>,
+    guard: UsageGuard,
+    op_id: &str,
+) -> tauqe_protocol::UsageTotalsSnapshot {
+    guard.flush().await;
+    let snapshot = state.usage.lock().await.clone();
+    let totals = snapshot.operation_totals().clone();
     state.out.send_event(&Event {
         method: events::MODEL_USAGE.to_string(),
         params: serde_json::to_value(tauqe_protocol::ModelUsageEvent {
-            operation_id: op_id,
-            usage: usage.clone(),
-            session_total_cost: total_cost,
-            current_cost: Some(cost),
+            operation_id: op_id.to_string(),
+            usage: totals.to_usage_info(),
+            session_total_cost: snapshot.session.cost,
+            current_cost: Some(totals.cost),
         })
         .ok(),
     });
-
-    let result = tauqe_protocol::GitSquashGenerateMessageResult {
-        message,
-        usage: Some(usage),
-        session_total_cost: Some(total_cost),
-        current_cost: Some(cost),
-    };
-    Response::ok_typed(req.id, &result)
+    snapshot
 }
 
 pub async fn handle_git_squash_apply(req: Request, state: &Arc<AppState>) -> Response {
@@ -499,13 +528,23 @@ pub async fn handle_git_squash_apply(req: Request, state: &Arc<AppState>) -> Res
         commits_count, params.base_ref, squashed_hash
     );
 
-    {
-        let mut history = state.history.lock().await;
-        let _ = history.record_response(
+    // Recording the response appends to `history.jsonl` behind an `fsync`
+    // barrier, so the mutation runs on the blocking pool with the exclusive
+    // history guard held instead of stalling an async worker.
+    let response_commit = squashed_hash.clone();
+    let recorded = crate::handlers::with_history_mutation(state, move |history| {
+        history.record_response(
             &msg_text,
-            Some(squashed_hash.clone()),
+            Some(response_commit),
             Some(first_line),
             Vec::new(),
+        )
+    })
+    .await;
+    if let Err(err) = recorded {
+        tracing::warn!(
+            error = %err,
+            "Failed to record the squashed commit in the interaction history"
         );
     }
 
@@ -532,6 +571,7 @@ pub async fn handle_git_squash_apply(req: Request, state: &Arc<AppState>) -> Res
 mod tests {
     use super::*;
     use tauqe_core::config::AppConfig;
+    use tauqe_core::providers::mock::{MockLlmProvider, MockResponse};
     use tauqe_protocol::{methods, RepositoryInitParams, RequestId};
 
     /// Initialization must target the authoritative shared root and never the
@@ -570,7 +610,128 @@ mod tests {
         // The Git directory is created at the authoritative root, not the CWD.
         assert!(dir.join(".git").exists());
         assert_eq!(state.repo_root().await, dir);
+        // The history manager is rebuilt against the new root instead of being
+        // left anchored to the previous one.
+        assert_eq!(state.history.lock().await.repo_root(), dir.as_path());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Temporary git repository carrying one commit, so a squash request can
+    /// resolve its base revision.
+    struct SquashTestRepo(std::path::PathBuf);
+
+    impl SquashTestRepo {
+        fn new() -> Self {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+            let root = std::env::temp_dir().join(format!(
+                "tauqe-squash-usage-{}-{}",
+                std::process::id(),
+                COUNTER.fetch_add(1, Ordering::Relaxed)
+            ));
+            let _ = std::fs::create_dir_all(&root);
+            tauqe_core::git::init_repository(Some(&root), true).unwrap();
+            std::fs::write(root.join("README.md"), "# tauqe\n").unwrap();
+            tauqe_core::git::cmd::stage_files(&root, &["README.md".to_string()]).unwrap();
+            tauqe_core::git::cmd::commit_with_developer_author(&root, "Add readme", false)
+                .unwrap();
+            Self(root)
+        }
+
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl Drop for SquashTestRepo {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn squash_message_request() -> Request {
+        Request {
+            id: RequestId::Number(1),
+            method: methods::GIT_SQUASH_GENERATE_MESSAGE.to_string(),
+            params: Some(serde_json::json!({ "base_ref": "HEAD" })),
+        }
+    }
+
+    /// A generated squash message is one accounted operation: its usage folds
+    /// into the session totals exactly once, the window closes, and the legacy
+    /// result fields are projected from the same snapshot.
+    #[tokio::test]
+    async fn squash_message_generation_is_one_completed_operation() {
+        let repo = SquashTestRepo::new();
+        let root = repo.path().to_path_buf();
+
+        let usage = tauqe_protocol::ModelUsageInfo {
+            prompt_tokens: 30,
+            completion_tokens: 10,
+            total_tokens: 40,
+            cost: Some(0.25),
+            ..tauqe_protocol::ModelUsageInfo::default()
+        };
+        let provider: Arc<dyn LlmProvider> = Arc::new(MockLlmProvider::scripted([
+            MockResponse::text("squash the session history").with_usage(usage),
+        ]));
+
+        let (out, _rx) = crate::transport::OutChannel::new();
+        let (history_sender, _history_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut config = AppConfig::default();
+        config.models.scribe = Some(tauqe_protocol::ModelRef::openrouter("test/scribe"));
+        let state = AppState::new(config, root, history_sender, out);
+        *state.provider_override.lock().await = Some(provider);
+
+        let resp = handle_git_squash_generate_message(squash_message_request(), &state).await;
+        assert!(resp.error.is_none(), "unexpected error: {:?}", resp.error);
+
+        let result: tauqe_protocol::GitSquashGenerateMessageResult =
+            serde_json::from_value(resp.result.unwrap()).unwrap();
+        assert!(!result.message.is_empty(), "a message is always returned");
+        assert_eq!(result.usage.as_ref().map(|u| u.total_tokens), Some(40));
+        assert_eq!(result.session_total_cost, Some(0.25));
+        assert_eq!(result.current_cost, Some(0.25));
+
+        let snapshot = state.usage.lock().await.clone();
+        assert_eq!(snapshot.operations, 1, "one terminal flush per operation");
+        assert!(snapshot.cur.is_none(), "the flush closes the usage window");
+        assert_eq!(snapshot.session.total_tokens, 40);
+        assert_eq!(snapshot.prev.total_tokens, 40);
+        assert!((snapshot.session.cost - 0.25).abs() < f64::EPSILON);
+        assert!(
+            !state.is_operation_active(),
+            "the operation slot is released"
+        );
+    }
+
+    /// Without a provider no operation opens, so nothing reaches the session
+    /// totals, the operation count stays zero, and the response carries no
+    /// usage at all.
+    #[tokio::test]
+    async fn squash_message_without_provider_accounts_no_operation() {
+        let repo = SquashTestRepo::new();
+        let root = repo.path().to_path_buf();
+
+        let (out, _rx) = crate::transport::OutChannel::new();
+        let (history_sender, _history_rx) = tokio::sync::mpsc::unbounded_channel();
+        let state = AppState::new(AppConfig::default(), root, history_sender, out);
+
+        let resp = handle_git_squash_generate_message(squash_message_request(), &state).await;
+        assert!(resp.error.is_none(), "unexpected error: {:?}", resp.error);
+
+        let result: tauqe_protocol::GitSquashGenerateMessageResult =
+            serde_json::from_value(resp.result.unwrap()).unwrap();
+        assert!(result.usage.is_none());
+        assert!(result.session_total_cost.is_none());
+        assert!(result.current_cost.is_none());
+
+        let snapshot = state.usage.lock().await.clone();
+        assert_eq!(snapshot.operations, 0, "a zero operation never counts");
+        assert!(snapshot.session.is_empty());
+        assert!(snapshot.prev.is_empty());
+        assert!(snapshot.cur.is_none());
+        assert!(!state.is_operation_active());
     }
 }

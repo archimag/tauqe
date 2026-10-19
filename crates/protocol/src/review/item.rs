@@ -1,6 +1,6 @@
 use serde::{Deserialize, Deserializer, Serialize};
 
-use crate::model::ModelSelection;
+use crate::model::{ArchitectTier, ModelSelection};
 use crate::plan::{count_leaf_stats, PlanItem};
 
 /// Semantic category of a code review issue.
@@ -218,6 +218,13 @@ pub struct ReviewItem {
     pub readonly_files: Vec<String>,
     #[serde(default, alias = "plan", skip_serializing_if = "Vec::is_empty")]
     pub subplan: Vec<PlanItem>,
+    /// The Architect configuration that produced `subplan`.
+    ///
+    /// Planning is the *What* role's output, so the finding records which
+    /// Architect model, at which reasoning depth, decomposed it. A later
+    /// replanning wave reads this back instead of re-deriving a configuration.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subplan_architect: Option<ArchitectTier>,
     #[serde(default, alias = "note", skip_serializing_if = "Option::is_none")]
     pub resolution_notes: Option<String>,
     #[serde(default, rename = "body", alias = "description")]
@@ -249,6 +256,8 @@ struct ReviewItemWire {
     readonly_files: Vec<String>,
     #[serde(default, alias = "plan")]
     subplan: Vec<PlanItem>,
+    #[serde(default)]
+    subplan_architect: Option<ArchitectTier>,
     #[serde(default, alias = "note")]
     resolution_notes: Option<String>,
     #[serde(default, alias = "description")]
@@ -268,6 +277,7 @@ impl From<ReviewItemWire> for ReviewItem {
             files: wire.files,
             readonly_files: wire.readonly_files,
             subplan: wire.subplan,
+            subplan_architect: wire.subplan_architect,
             resolution_notes: wire.resolution_notes,
             body: wire.body,
         }
@@ -306,6 +316,10 @@ impl From<ReviewIssue> for ReviewItem {
             files: issue.files,
             readonly_files: issue.readonly_files,
             subplan: issue.plan,
+            // The issue view carries no Architect provenance, so a finding
+            // rebuilt from it starts without one and the caller records the
+            // configuration that actually produced the plan.
+            subplan_architect: None,
             resolution_notes: issue.note,
             body: issue.description,
         }

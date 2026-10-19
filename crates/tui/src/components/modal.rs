@@ -14,6 +14,7 @@ use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+use unicode_width::UnicodeWidthStr;
 
 use crate::app::{ConfirmDialogButton, ModalActionsState};
 use crate::command::dialog::{DialogCommand, DIALOG_COMMAND_MAP};
@@ -351,8 +352,8 @@ pub fn modal_action_buttons(area: Rect, confirm_label: &str, cancel_label: &str)
         .split(inner);
     let action_bar = chunks[1];
 
-    let confirm_w = (confirm_label.chars().count() as u16).saturating_add(6);
-    let cancel_w = (cancel_label.chars().count() as u16).saturating_add(6);
+    let confirm_w = (UnicodeWidthStr::width(confirm_label) as u16).saturating_add(6);
+    let cancel_w = (UnicodeWidthStr::width(cancel_label) as u16).saturating_add(6);
     let gap = 4u16;
     let total = confirm_w + gap + cancel_w;
     let start_x = action_bar.x + action_bar.width.saturating_sub(total) / 2;
@@ -400,5 +401,58 @@ mod tests {
                 " activate",
             ],
         );
+    }
+
+    /// Button hit rectangles must follow terminal display width, so a CJK label
+    /// (two columns per scalar) stays aligned with the drawn button
+    /// (Conventions §6, §9).
+    #[test]
+    fn modal_action_buttons_align_with_rendered_cjk_labels() {
+        use ratatui::backend::TestBackend;
+        use ratatui::layout::Rect;
+        use ratatui::Terminal;
+
+        use crate::app::ModalActionsState;
+
+        use super::{modal_action_buttons, render_modal_frame, ModalFrame, ModalTone};
+
+        let term = Rect::new(0, 0, 100, 30);
+        let area = crate::ui::centered_rect(60, 40, term);
+        let confirm_label = "确认";
+        let cancel_label = "取消";
+
+        let mut terminal = Terminal::new(TestBackend::new(term.width, term.height)).unwrap();
+        terminal
+            .draw(|f| {
+                render_modal_frame(
+                    f,
+                    ModalFrame {
+                        title: "Test",
+                        tone: ModalTone::Info,
+                        area,
+                        confirm_label,
+                        cancel_label,
+                        actions_state: ModalActionsState::default(),
+                        is_actions_focused: true,
+                        destructive: false,
+                        hint_text: Some(""),
+                    },
+                    |_frame, _body| {},
+                );
+            })
+            .unwrap();
+
+        let (confirm_btn, cancel_btn) = modal_action_buttons(area, confirm_label, cancel_label);
+        let buffer = terminal.backend().buffer();
+        let read = |rect: Rect| -> String {
+            (rect.x..rect.x + rect.width)
+                .map(|x| buffer[(x, rect.y)].symbol())
+                .collect()
+        };
+
+        let confirm_row = read(confirm_btn);
+        let cancel_row = read(cancel_btn);
+        assert!(confirm_row.contains('确'), "confirm row: {confirm_row:?}");
+        assert!(cancel_row.contains('取'), "cancel row: {cancel_row:?}");
     }
 }

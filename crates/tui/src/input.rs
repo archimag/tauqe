@@ -18,7 +18,7 @@ pub async fn open_squash_dialog(
     server_writer: &mut RpcConnection,
 ) -> anyhow::Result<()> {
     if st.model.is_busy() {
-        st.notify_warning("Cannot squash commits while model is generating");
+        st.notify_warning(crate::i18n::active_t("notify.squash_busy"));
     } else {
         st.squash_dialog = Some(crate::app::SquashDialogState::default());
         let params = GitSquashPreviewParams { base_ref: None };
@@ -40,7 +40,7 @@ pub async fn switch_view(
     server_writer: &mut RpcConnection,
 ) -> anyhow::Result<()> {
     if st.view_mode == ViewMode::Onboarding {
-        st.notify_warning("Please complete initial setup first");
+        st.notify_warning(crate::i18n::active_t("notify.onboarding_required"));
         return Ok(());
     }
 
@@ -119,6 +119,15 @@ pub fn is_text_input_active(st: &AppState) -> bool {
             .locale_dialog
             .as_ref()
             .is_some_and(|dialog| dialog.focus.is_editor()),
+        // Point execution of a single finding or subplan step exposes the
+        // multiline Coder directives editor, which must accept literal typing
+        // without layout translation (Conventions §5.1).
+        Some(ActiveModal::ExecuteReview) => st
+            .confirm_execute_review
+            .as_ref()
+            .is_some_and(|target| {
+                target.is_single_target() && target.focus.is_instructions_editor()
+            }),
         Some(_) => false,
         None => match st.view_mode {
             ViewMode::Repl => true,
@@ -217,6 +226,15 @@ pub fn handle_paste(st: &mut AppState, text: &str) {
             if let Some(dialog) = st.locale_dialog.as_mut() {
                 if dialog.focus.is_editor() {
                     dialog.language_editor.insert_paste_single_line(text);
+                }
+            }
+        }
+        // The single-target execution form owns a directives editor; pasted
+        // text lands there instead of being silently discarded.
+        Some(ActiveModal::ExecuteReview) => {
+            if let Some(target) = st.confirm_execute_review.as_mut() {
+                if target.is_single_target() && target.focus.is_instructions_editor() {
+                    target.instructions_editor.insert_paste(text);
                 }
             }
         }
@@ -378,10 +396,12 @@ async fn reload_configuration(
         Ok(cfg) => {
             st.tui_config = cfg;
             st.sync_theme_mode();
-            st.notify_info("Reloading configuration from disk...");
+            st.notify_info(crate::i18n::active_t("notify.config_reloading"));
         }
         Err(err) => {
-            st.notify_error(format!("{}; keeping previous TUI settings", err));
+            st.notify_error(
+                crate::i18n::active_t("notify.config_reload_error").replace("{}", &err.to_string()),
+            );
         }
     }
     send_request(server_writer, methods::CONFIG_RELOAD, serde_json::json!({})).await?;
@@ -455,7 +475,7 @@ async fn handle_global_shortcuts(
         }
         GlobalCommand::SelectModel => {
             if st.model.is_busy() {
-                st.notify_warning("Cannot change model while model is generating");
+                st.notify_warning(crate::i18n::active_t("notify.model_select_busy"));
             } else if !st.open_model_dialog() {
                 return Ok(None);
             }
@@ -472,8 +492,13 @@ async fn handle_global_shortcuts(
                 st.confirm_cancel = true;
                 st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
             } else {
-                st.notify_info("Press Ctrl+Q to quit TAUQE, or ? for help");
+                st.notify_info(crate::i18n::active_t("notify.quit_hint"));
             }
+        }
+        GlobalCommand::OpenUsageSummary => {
+            // Reading telemetry spends no tokens and mutates no domain state, so
+            // the breakdown opens regardless of a running turn (c-4).
+            st.open_usage_summary();
         }
         // Quit and keyboard-quit are consumed earlier in `handle_terminal_event`
         // (Ctrl+Q handling and the C-g normalization); the arms only satisfy the
@@ -817,7 +842,7 @@ mod tests {
         assert!(st.notification.is_some());
         let notif = st.notification.unwrap();
         assert_eq!(notif.level, NotificationLevel::Warning);
-        assert!(notif.text.contains("Please complete initial setup first"));
+        assert_eq!(notif.text, crate::i18n::active_t("notify.onboarding_required"));
     }
 
     #[tokio::test]
@@ -1059,6 +1084,41 @@ mod tests {
         assert!(state.lock().await.squash_dialog.is_some());
     }
 
+    /// The usage breakdown is read-only: its chord opens the dialog both while
+    /// navigating and while a prompt draft is being typed, because reading
+    /// telemetry spawns no turn and spends no tokens (c-4).
+    #[tokio::test]
+    async fn test_meta_u_opens_the_usage_breakdown() {
+        let state = Arc::new(Mutex::new(test_state()));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+
+        // M-U (Meta) from a navigation context.
+        let res = handle_global_shortcuts(
+            KeyEvent::new(KeyCode::Char('u'), KeyModifiers::ALT),
+            &state,
+            &mut conn,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(res, Some(InputResult::Continue));
+        assert!(state.lock().await.usage_summary.is_some());
+
+        let mut st = test_state();
+        st.input_editor.insert_str("draft being typed");
+        let state = Arc::new(Mutex::new(st));
+        let res = handle_global_shortcuts(
+            KeyEvent::new(KeyCode::Char('u'), KeyModifiers::ALT),
+            &state,
+            &mut conn,
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(res, Some(InputResult::Continue));
+        assert!(state.lock().await.usage_summary.is_some());
+    }
+
     #[tokio::test]
     async fn test_meta_l_opens_the_locale_dialog() {
         let state = Arc::new(Mutex::new(test_state()));
@@ -1129,6 +1189,78 @@ mod tests {
                 .instructions_editor
                 .get_text(),
             "split the finding into executable steps"
+        );
+        assert_eq!(st.input_editor.get_text(), "");
+    }
+
+    fn execute_review_dialog(
+        focus: crate::views::plans::RefineDialogFocus,
+    ) -> ConfirmExecuteReviewState {
+        let finding = tauqe_protocol::ReviewIssue {
+            id: 1,
+            title: "Missing auth guard".to_string(),
+            model: None,
+            issue_type: tauqe_protocol::IssueType::Bug,
+            status: tauqe_protocol::IssueStatus::Todo,
+            description: String::new(),
+            recommendations: Vec::new(),
+            files: Vec::new(),
+            readonly_files: Vec::new(),
+            plan: Vec::new(),
+            note: None,
+        };
+        let mut dialog = ConfirmExecuteReviewState::new(
+            Some("rev-1".to_string()),
+            "Session rev-1".to_string(),
+            "Finding 1".to_string(),
+            Some(1),
+            Some("step-1".to_string()),
+            vec![finding],
+            Vec::new(),
+        );
+        dialog.focus = focus;
+        dialog
+    }
+
+    #[test]
+    fn test_is_text_input_active_in_execute_review_dialog() {
+        let mut st = test_state();
+        st.view_mode = ViewMode::Review;
+        assert!(!is_text_input_active(&st));
+
+        st.confirm_execute_review = Some(execute_review_dialog(
+            crate::views::plans::RefineDialogFocus::ModelList,
+        ));
+        assert!(!is_text_input_active(&st));
+
+        st.confirm_execute_review = Some(execute_review_dialog(
+            crate::views::plans::RefineDialogFocus::InstructionsEditor,
+        ));
+        assert!(is_text_input_active(&st));
+
+        st.confirm_execute_review = Some(execute_review_dialog(
+            crate::views::plans::RefineDialogFocus::Actions,
+        ));
+        assert!(!is_text_input_active(&st));
+    }
+
+    #[test]
+    fn test_handle_paste_into_execute_review_instructions_editor() {
+        let mut st = test_state();
+        st.view_mode = ViewMode::Review;
+        st.confirm_execute_review = Some(execute_review_dialog(
+            crate::views::plans::RefineDialogFocus::InstructionsEditor,
+        ));
+
+        handle_paste(&mut st, "keep the patch minimal");
+
+        assert_eq!(
+            st.confirm_execute_review
+                .as_ref()
+                .expect("dialog stays open")
+                .instructions_editor
+                .get_text(),
+            "keep the patch minimal"
         );
         assert_eq!(st.input_editor.get_text(), "");
     }

@@ -23,6 +23,7 @@ Throughout this chapter, `Ctrl+<key>` denotes the abstract **Primary Command Mod
   - Contextual help: Press `Ctrl+H` / `Alt+H` from any view or `?` in navigation views to open the interactive help dialog.
   - Configuration reload: Press `Ctrl+O` to reload `tui.toml` settings without restarting TAUQE.
   - Theme selector: Press `Alt+T` (`M-T`) to open the interactive theme picker and preview built-in presets live (see section 5.10).
+  - Usage breakdown: Press `Alt+U` (`M-U`) to open the telemetry dialog with the full token, money, and time breakdown of the session, the last completed operation, and the operation in flight. The footer keeps only a three-value summary; the dialog shows the rest without spending tokens (see section 5.13).
 
 ### What Happens in REPL When You Submit a Prompt
 When you submit an engineering intent, TAUQE does not simply invoke a single-shot completion. Instead, it guides the model through an **autonomous, multi-round bounded turn**:
@@ -43,7 +44,8 @@ Reasoning output during an active turn is a progress indicator, not a document t
   - Workspace for managing tactical task hierarchies and execution roadmaps, split into an immutable Concept section (system invariants) and an Implementation section (executable steps).
   - Unified navigation: `n` / `p` (or `↑` / `↓`), `Home` / `Alt+<` for the first row, `End` / `Alt+>` for the last row, `PgUp` / `PgDn` to page, and `Ctrl+N` / `Ctrl+P` for accordion inspection of the next / previous item.
   - Interactive tree of tasks with explicit statuses: Discussion, Todo, InProgress, Done, Blocked, and Cancelled.
-  - Execution: `x` executes the selected step, group, or plan (with confirmation); `X` queues every unfinished leaf step of all ready plans as one batch execution (with confirmation); `Enter` executes a leaf step and folds/unfolds on groups and plan headers.
+  - Execution: `x` executes the selected step, group, or plan (with confirmation); on a concept-only plan (concept established, `items` empty) `x` transparently launches the Architect to synthesize the first horizon and runs the produced steps immediately. `X` starts a **plan pipeline** that runs every ready plan sequentially as one batch — each plan is projected on the freshly produced Git tail and RepoMap, and a failed, blocked, cancelled, or stopped plan halts the queue before the next plan starts (fail-fast). `Enter` executes a leaf step and folds/unfolds on groups and plan headers.
+  - Horizon reset: `Shift+C` clears the implementation horizon of the selected plan while preserving its concept tree; when the plan has already started (`Done`/`InProgress` leaves that may be captured by Git commits), a strict two-tier confirmation warns that the plan will diverge from existing repository history.
   - Discussion and refinement: `d` discusses the selected concept/step or the whole plan in REPL; `r` deep-refines the selected item with the Architect; `R` refines every item awaiting decomposition in one batch.
   - Intentional status assignment: Press `t` or `s` to open the status dialog (`1` Discussion, `2` Todo, `3` InProgress, `4` Done, `5` Blocked, `6` Cancelled).
   - Bulk folding (`a`), refresh of plan state from the daemon (`g`), deletion (`Delete`, with confirmation), and Markdown copy (`c` / `y`).
@@ -110,6 +112,7 @@ Modal dialogs follow a unified, three-tier layout standard designed for keyboard
 - **Semantic Hint Typography:** Hints are assembled from structured spans rather than a flat string: chords render in `text_primary` (emphasized), action verbs in `text_secondary`, and separators (`/`, `•`) in `text_muted`. This keeps keys scannable and legible at any color depth and follows the semantic design system of section 5.10.
 - **Hit-Testing Synchronization:** The geometry helpers that report clickable button rectangles derive their coordinates from the same `Layout` formula the render path uses, so shifting the action bar (or adding the docked panel below it) never desynchronizes mouse clicks from the drawn buttons: the buttons you see are always the buttons you can click.
 - **Destructive Action Safety:** Confirmation dialogs (Quit with draft, Undo AI commit, Git squash, Cancel generation, Delete plan, Clear history) default focus securely to `[ Cancel ]`.
+- **Two-Tier Dangerous Confirmation for Horizon Clearing:** Clearing the whole implementation horizon of a plan is a developer-authorized deletion of completed work, not a routine reset. When the plan has never started (every leaf `Todo`), a single confirmation dialog suffices. When any leaf is already `Done` or `InProgress` and may be captured by a Git commit, the dialog escalates into a strict two-tier modal: the first tier asks to clear the horizon, the second warns explicitly that the plan will diverge from the committed repository history. Both tiers default focus to `[ Cancel ]`, so a stray keypress never discards committed work.
 - **Button Navigation:** Switch focus between buttons using `Tab`, `Shift+Tab`, or arrow keys (`←`, `→`). Press `Enter` or `Space` to activate the focused button.
 - **Fast Accelerators:** In confirmation dialogs, pressing `y` / `Y` confirms immediately, while `n` / `N`, `q`, or `Esc` cancels.
 - **Intentional Status Dialogs:** In Plans and Review, task and finding statuses are selected through explicit modal dialogs rather than accidental cycling. Plans offer Discussion, Todo, InProgress, Done, Blocked, and Cancelled (`1`..`6`); Review offers Discussion, Todo, InProgress, Fixed, and Rejected (`1`..`5`). Choose a target status using direct numeric keys, or navigate with `n` / `p` and confirm with `Enter` / `Space`.
@@ -358,6 +361,11 @@ A chord names intent independently of the physical keyboard, so one specificatio
 - **Shift** combinations (`Shift+Tab`, `Shift+C`, `Shift+X`) carry reverse motion, destructive actions, and batch operations, kept separate from typed characters.
 - Raw `Ctrl` and `Alt` chords are used only where the physical key must never be remapped — the `Ctrl+G` keyboard-quit and the `Ctrl+C` cancel chord.
 - No function key (`F1`..`F12`) is ever bound.
+- A lowercase bare chord never matches a key event that carries `Shift`. Terminals report a shifted letter inconsistently — as `Char('C')` without the modifier, or as `Char('c')`/`Char('C')` with `Shift` — so only the explicit `Shift` binding may claim a shifted press, and the uppercase spelling accepts every delivery form. Declaration order therefore never decides which command a key resolves to.
+
+### 5.11.2.1 Collision Freedom Is Enforced by a Validator
+
+Comparing declared chord variants is not enough: two different `KeyChord` values can match the very same physical `KeyEvent`. Every static command map is therefore guarded by a collision validator in the test suite. It enumerates printable characters and navigation keys across the `None`, `Shift`, `Ctrl`, and `Alt` modifier sets and asserts that no single event resolves to two different actions inside the same map. Ambiguity is caught before it can reach a view, and it is caught independently of how the map is ordered.
 
 ### 5.11.3 Categorized Help
 
@@ -406,7 +414,18 @@ The scale is fixed before the letter. A batch command bound to a lowercase key t
 
 ### 5.12.3 Clipboard versus Destructive Clearing
 
-Copying is cheap, frequent, and safe; clearing an entire context layer or the whole session history is irreversible and rare. The two therefore never share a lowercase key. `c` and `y` copy in every navigation view, while bulk clearing requires `Shift+C` followed by an interactive confirmation dialog whose default focus is `Cancel` (section 5.4). If a stray `Shift` slips in, the dialog still stops the action, so the chord and the dialog guard the same decision from two sides.
+Copying is cheap, frequent, and safe; clearing an entire context layer, the whole session history, or a plan's implementation horizon is irreversible and rare. The two therefore never share a lowercase key. `c` and `y` copy in every navigation view, while bulk clearing requires `Shift+C` followed by an interactive confirmation dialog whose default focus is `Cancel` (section 5.4). A plan horizon that has already started (any `Done` or `InProgress` leaf) escalates to the strict two-tier modal described in section 5.4, because the plan may already be captured by a Git commit. If a stray `Shift` slips in, the dialog still stops the action, so the chord and the dialog guard the same decision from two sides.
+
+The same split holds in every view that keeps a collection, so the chord means the same thing wherever it is pressed:
+
+| View | `c` / `y` | `Shift+C` |
+| --- | --- | --- |
+| Plans | copy the plan as Markdown | clear the plan horizon |
+| History | copy the code block or the entry | clear the whole session history |
+| Context | copy the selected path or section | clear the user layer (`Shift+A` clears the auto layer) |
+| Review | copy the finding, session, or subplan step | unbound — Review has no mass-clear target |
+
+Review deliberately leaves `Shift+C` free. Its findings are not a clearing candidate, and leaving the chord unbound is preferable to binding it to a copy that would silently contradict the other three views. A view that has nothing to clear does not borrow the destructive chord.
 
 ### 5.12.4 Navigation Minimum and Canonical Refresh
 
@@ -428,8 +447,26 @@ The redundancy is intentional. `Alt+<` and `Alt+>` mirror Emacs `M-<` and `M->` 
 
 ### 5.12.5 Unified Batch Execution
 
-`X` is not a per-view loop; it feeds the single `BatchExecution` supervisor (section 5.6.2). In Plans the queue is assembled from every unfinished leaf step of the ready plans, the confirmation dialog states the total scope before anything runs, one progress view tracks the whole run, and interruption is governed by the three-way cancel dialog of section 5.4 (`Continue`, `Soft Stop`, `Hard Stop`). Review's `X` reuses the same supervisor over every open finding, so batch behavior, cancellation semantics, progress reporting, and the aggregated finish notification are identical in both views.
+`X` is not a per-view loop; it feeds the single `BatchExecution` supervisor (section 5.6.2). In Plans, `X` starts a **plan pipeline**: the queue is assembled from every ready plan and runs sequentially, and each plan is projected by the Architect on the freshly produced Git tail only after the previous plan has finished. A concept-only plan is queued like any other and its horizon is projected just-in-time. The confirmation dialog states the total scope before anything runs, one progress view tracks the whole run, and interruption is governed by the three-way cancel dialog of section 5.4 (`Continue`, `Soft Stop`, `Hard Stop`). A failed, blocked, cancelled, or stopped plan halts the queue before the next plan starts (fail-fast), so a downstream plan is never run against a codebase the earlier plan was supposed to produce. Review's `X` reuses the same supervisor over every open finding, so batch behavior, cancellation semantics, progress reporting, and the aggregated finish notification are identical in both views.
 
 ### 5.12.6 Declaration Through the Command Map
 
 Every command above is declared once as a `CommandSpec` in its view's command map (section 5.11), with its description living in the canonical i18n catalog. The dispatcher and the Help window read the same declarations, so the matrix described here and the keys the application intercepts cannot drift apart.
+
+---
+
+## 5.13 Usage Telemetry: Compact Footer and Full Breakdown
+
+A token, money, and time metric serves two audiences with opposite needs, and TAUQE refuses to compromise one for the other.
+
+The **footer** is a persistent band: it is read at a glance, on every turn, on whatever terminal width happens to be available. Putting a full per-operation breakdown there would push the turn lifecycle indicators off the row, so the footer shows only three compact values of the accumulated session usage — money when the provider reports it, total tokens otherwise, and the harness-measured session time.
+
+The **full breakdown** — prompt, completion, reasoning, and cached tokens, the monetary cost, the session time, and the number of completed operations, each rendered for the session total, the last completed operation, and the operation currently in flight — lives in a dedicated modal dialog opened with `Alt+U` (`M-U`), a client-only interface command that spends no tokens.
+
+Why the split:
+
+- **The footer never truncates a number.** Each of its three fields is rendered in full or dropped as a whole when the width runs out, so a value is never shown with missing digits. That discipline is what keeps the row narrow enough to survive beside the turn pipeline; a breakdown rich enough to need scrolling belongs in a surface with its own scroll offset, which the dialog provides.
+- **The dialog is a read-only mirror.** It renders strictly the snapshot the server daemon owns and publishes through `model/usageTotals`, so the two surfaces can never disagree about a number. It opens while a turn is running, because reading telemetry neither mutates domain state nor spends budget, and it never displaces a pending confirmation dialog.
+- **One formatter set serves both surfaces.** Tokens, money, and durations are formatted by a single shared module, so the footer and the dialog cannot render the same amount differently. Money keeps four decimal places because a two-place rendering would flatten cheap models to `$0.00`, and a duration under a minute keeps one decimal while a longer one switches to minutes and seconds.
+- **Time is the harness's measurement.** The session time is the sum of the durations of completed operations, not the wall-clock age of the session, so a pause between turns never inflates the metric. Retries, provider waiting, and verification are inside that window, because they are part of how long the operation held the developer's turn.
+- **Every label is localized.** The dialog headings, row labels, the footer's session, last, and in-flight markers, and both footers resolve through the locale catalog like every other surface, so a switched interface language reaches the telemetry without editing a renderer.

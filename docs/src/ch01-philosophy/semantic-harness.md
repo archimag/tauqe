@@ -21,6 +21,16 @@ TAUQE resolves this dilemma by holding the model in a firm grip:
 
 Autonomy exists only inside one bounded turn; the moment it concludes, control returns to the developer. This is what eliminates **agentic drift**: an unconstrained model, given an open-ended shell and an unbounded goal, tends to wander, repeat failed loops, and reach beyond its mandate.
 
+### Symlinks in the Repo Map
+
+A symbolic link is ambiguous material for a semantic outline. Inside a repository it usually mirrors a file the outline already describes, so parsing it duplicates declarations; outside the repository it can disclose content the developer never placed under version control. The repo map therefore classifies every tracked path with `lstat` (`symlink_metadata`) instead of dereferencing it:
+
+- **Never parsed.** A symlink is excluded from the Tree-sitter pool. An internal link cannot duplicate the target's symbols, and an escaping link cannot pull external files into the model's view.
+- **Always listed.** The link remains visible in the file section as `path -> target`, annotated with `(outside repository)` or `(broken)` when it leaves the repository or dangles. The model learns the entry exists and what it points to without reading through it.
+- **Budgeted like any entry.** Markers obey the same deduplication and greedy token-budget accounting as ordinary paths, so a large link farm cannot crowd out the symbol outline.
+
+The rationale is the harness invariant *never guess what is deterministically known*: the type of an entry is resolved by the filesystem, not inferred from its name, and the repo map reports exactly what lives on disk.
+
 ---
 
 ## 1.2 Model Roles: The "What" and the "How"

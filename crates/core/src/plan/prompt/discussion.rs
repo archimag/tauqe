@@ -12,11 +12,6 @@ fn join_escaped(items: &[String]) -> String {
         .join(", ")
 }
 
-/// Returns true if the prompt represents an explicit plan discussion turn.
-pub fn is_plan_discussion_prompt(prompt: &str) -> bool {
-    prompt.trim_start().starts_with(PLAN_DISCUSSION_PREFIX)
-}
-
 /// Formats a targeted prompt for discussing and refining a plan or specific marked items.
 ///
 /// Preserves session history and passes the targeted plan structure, focused items,

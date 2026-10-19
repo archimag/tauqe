@@ -2,6 +2,7 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::Stylize;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
+use unicode_width::UnicodeWidthStr;
 
 use crate::app::{
     compact_model_name, numbered_entry_label, SelectionDialogKind, SelectionItem,
@@ -82,9 +83,9 @@ pub fn selection_dialog_buttons(term: Rect, item_count: usize) -> (Rect, Rect) {
         .split(inner);
     let bar = chunks[2];
 
-    let select_w = select_button_label().chars().count() as u16;
-    let cancel_w = cancel_button_label().chars().count() as u16;
-    let gap_w = BUTTON_GAP.chars().count() as u16;
+    let select_w = UnicodeWidthStr::width(select_button_label().as_str()) as u16;
+    let cancel_w = UnicodeWidthStr::width(cancel_button_label().as_str()) as u16;
+    let gap_w = UnicodeWidthStr::width(BUTTON_GAP) as u16;
     let total = select_w + gap_w + cancel_w;
     let start_x = bar.x + bar.width.saturating_sub(total) / 2;
 

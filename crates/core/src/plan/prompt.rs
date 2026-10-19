@@ -11,8 +11,7 @@ pub mod refine;
 pub mod step;
 
 pub use discussion::{
-    format_active_plan_context, format_plan_discussion_prompt, is_plan_discussion_prompt,
-    PLAN_DISCUSSION_PREFIX,
+    format_active_plan_context, format_plan_discussion_prompt, PLAN_DISCUSSION_PREFIX,
 };
 pub use refine::{
     build_plan_horizon_system_prompt, build_plan_horizon_user_prompt,
@@ -21,9 +20,7 @@ pub use refine::{
     MAX_PLAN_REFINEMENT_DEPTH,
 };
 pub use step::{
-    extract_plan_step_execution_id, extract_plan_step_execution_target,
-    format_plan_step_execution_prompt, format_plan_step_retry_prompt,
-    is_plan_step_execution_prompt, PlanStepTarget, PLAN_STEP_EXECUTION_PREFIX,
+    format_plan_step_execution_prompt, format_plan_step_retry_prompt, PLAN_STEP_EXECUTION_PREFIX,
     PLAN_STEP_RETRY_PREFIX,
 };
 
@@ -40,6 +37,7 @@ mod tests {
             description: Some("Implement secure tokens".to_string()),
             created_at: 100,
             updated_at: 200,
+            architect: None,
             concept: vec![tauqe_protocol::ConceptItem {
                 id: "c-1".to_string(),
                 title: "Stateless JWT".to_string(),
@@ -100,13 +98,6 @@ mod tests {
         assert!(prompt.contains("- **Addressed Concept Nodes**: c-1"));
         assert!(prompt.contains("- **Prerequisite Steps (must be DONE)**: 1"));
 
-        assert!(is_plan_step_execution_prompt(&format!(" \n\t{}", prompt)));
-        let target = extract_plan_step_execution_target(&prompt).unwrap();
-        assert_eq!(target.plan_id.as_deref(), Some("jwt-auth"));
-        assert_eq!(target.step_id, "2");
-        let ws_target = extract_plan_step_execution_target(&format!("  \n  {}", prompt)).unwrap();
-        assert_eq!(ws_target.plan_id.as_deref(), Some("jwt-auth"));
-        assert_eq!(ws_target.step_id, "2");
         assert!(prompt.contains("- [x] #1 Models"));
         assert!(prompt.contains("- **ID**: `2`"));
         assert!(prompt.contains("<success_XYZ summary=\"...\" />"));
@@ -117,7 +108,6 @@ mod tests {
     fn test_format_plan_step_retry_prompt() {
         let prompt =
             format_plan_step_retry_prompt("I think we are done.", Some("No edits were applied"));
-        assert!(is_plan_step_execution_prompt(&prompt));
         assert!(prompt.contains("Correction Required"));
         assert!(prompt.contains("<previous_response>"));
         assert!(prompt.contains("I think we are done."));
@@ -292,7 +282,7 @@ mod tests {
     }
 
     #[test]
-    fn test_plan_discussion_prompt_detection_and_attribute_escaping() {
+    fn test_plan_discussion_prompt_attribute_escaping() {
         let plan = Plan {
             id: "auth-v2".to_string(),
             title: "OAuth & JWT".to_string(),
@@ -300,9 +290,6 @@ mod tests {
             ..Default::default()
         };
         let prompt = format_plan_discussion_prompt(&plan, &[], "Clarify signing");
-        assert!(is_plan_discussion_prompt(&prompt));
-        assert!(is_plan_discussion_prompt(&format!(" \n\t{}", prompt)));
-        assert!(!is_plan_discussion_prompt("regular message"));
         assert!(prompt.contains("<active_plan id=\"auth-v2\" title=\"OAuth &amp; JWT\""));
     }
 

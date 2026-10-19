@@ -19,13 +19,17 @@ mod scope;
 mod tests;
 
 pub use dto::{
-    PlanDeleteParams, PlanExecuteParams, PlanGetParams, PlanGetResult, PlanListChangedEvent,
-    PlanListResult, PlanRefineParams, PlanRefineResult, PlanReplanParams, PlanSaveParams,
-    PlanSetActiveParams, PlanSetActiveResult, PlanUpdateItemParams, PlanUpdateItemResult,
-    PlanUpdatedEvent,
+    PlanClearHorizonParams, PlanClearHorizonResult, PlanDeleteParams, PlanExecuteParams,
+    PlanExecutePipelineParams, PlanGetParams, PlanGetResult, PlanListChangedEvent, PlanListResult,
+    PlanRefineParams, PlanRefineResult, PlanReplanParams, PlanSaveParams, PlanSetActiveParams,
+    PlanSetActiveResult, PlanUpdateItemParams, PlanUpdateItemResult, PlanUpdatedEvent,
 };
 pub use item::{ConceptItem, PlanItem, PlanItemStatus};
-pub use node::{
-    compute_items_status, count_leaf_stats, Plan, PlanStats, PlanSummary, PlanValidationError,
-};
+pub use node::{compute_items_status, Plan, PlanStats, PlanSummary, PlanValidationError};
+
+// The leaf-progress counter is an internal building block shared by the plan
+// and review modules only. It stays crate-visible so a subplan and a full plan
+// keep one authoritative metric, and it is deliberately absent from the crate
+// root, so it never becomes part of the public wire surface.
+pub(crate) use node::count_leaf_stats;
 pub use scope::PlanScopeEvaluation;

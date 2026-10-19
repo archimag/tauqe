@@ -1,4 +1,5 @@
-use std::collections::{BTreeMap, BTreeSet};
+use indexmap::IndexMap;
+use std::collections::BTreeSet;
 use std::path::Path;
 
 use crate::prompt::estimate_tokens_from_bytes;
@@ -33,7 +34,7 @@ impl ContextManager {
         // `metadata()` inspections are all blocking filesystem work, so the
         // whole resolution runs off the async executor thread.
         crate::blocking::run_blocking(|| {
-            let mut new_pinned = BTreeMap::new();
+            let mut new_pinned = IndexMap::new();
 
             // 1. Root-level pinned files
             for pattern in &self.pinned_patterns {
@@ -76,7 +77,7 @@ impl ContextManager {
 
     fn insert_pinned_candidate(
         &self,
-        target_map: &mut BTreeMap<String, ContextItem>,
+        target_map: &mut IndexMap<String, ContextItem>,
         clean_path: String,
     ) {
         if target_map.contains_key(&clean_path) {

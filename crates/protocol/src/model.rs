@@ -24,7 +24,9 @@ pub use batch::{
     BatchFinishStatus, BatchFinishSummary, PlanBatchFinishedEvent, ReviewBatchFinishedEvent,
 };
 pub use effort::{ModelRolesEffort, ReasoningEffort};
-pub use entry::{CoderTier, ModelEntry, ModelRolesEntries, ModelRolesSummary};
+pub use entry::{
+    ArchitectTier, CoderTier, ModelEntry, ModelRolesEntries, ModelRolesSummary,
+};
 pub use reference::{deserialize_model_ref_lenient, ModelRef, ProviderKind};
 pub use role::ModelRole;
 pub use selection::{
@@ -36,4 +38,6 @@ pub use turn::{
     ModelTurnPlanContext, RepoMapInfoEvent, ToolchainFinishedEvent, ToolchainStartedEvent,
     TurnPhase, TurnPhaseEvent,
 };
-pub use usage::{ModelUsageEvent, ModelUsageInfo};
+pub use usage::{
+    ModelUsageEvent, ModelUsageInfo, ModelUsageTotalsEvent, UsageTotals, UsageTotalsSnapshot,
+};

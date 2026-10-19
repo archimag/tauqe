@@ -257,6 +257,7 @@ The embedded plan reuses the plan domain verbatim: each sub-step is a `PlanItem`
 - A schema-enforced structured response either yields a decomposed plan or reports a semantic `<blocked>` outcome.
 - The synthesized horizon is merged with the finding's existing **Done foundation**: every sub-step already marked `Done` is preserved verbatim, colliding identifiers are dropped deterministically, and the merged tree is validated before it reaches disk. A plan that would introduce a dependency cycle is rejected.
 - Decomposition alone writes no code; it produces the plan that makes the finding executable. The finding is then moved to `TODO` (see 6.4) and executed by the Coder.
+- **Recorded Architect Provenance and Replan Escalation.** Each decomposition records the Architect configuration that produced the subplan on the finding (`subplan_architect`: model plus optional reasoning depth) and renders it as a compact `[ARC model effort]` badge next to the title. When a sub-step later fails with a domain failure, the replanning round reads that record and asks the `architect` ladder for the next rung, so the reprojected horizon is synthesized by a stronger Architect than the one whose horizon already failed. The new rung is recorded in turn, escalation saturates on the last rung, and a configuration absent from `tauqe.toml` restarts from the base rung instead of guessing a position.
 
 ### Architect Context Discovery (Shared with Plan Refinement)
 

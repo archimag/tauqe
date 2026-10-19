@@ -32,18 +32,6 @@ fn refine_cancel_label() -> String {
 
 /// Height of the header block (plan label and description).
 const REFINE_HEADER_HEIGHT: u16 = 4;
-/// Height of the footer block: the action bar (2 rows) plus the docked hint
-/// strip (1 row).
-const REFINE_FOOTER_HEIGHT: u16 = 3;
-/// Minimum height kept for the instructions editor on short terminals.
-const REFINE_EDITOR_MIN_HEIGHT: u16 = 3;
-/// Maximum architect rows drawn before the list scrolls.
-const REFINE_MODEL_LIST_MAX_ROWS: u16 = 6;
-
-/// Number of architect rows drawn for `entry_count` entries, before borders.
-fn refine_model_list_rows(entry_count: usize) -> u16 {
-    (entry_count.max(1) as u16).min(REFINE_MODEL_LIST_MAX_ROWS)
-}
 
 /// Rectangles of the refine dialog, shared by the renderer and the mouse
 /// hit-tester so the surface that is drawn is the surface that is clicked
@@ -62,73 +50,25 @@ pub struct RefineDialogGeometry {
     pub cancel_button: Rect,
 }
 
-/// Insets a rectangle by a one-cell border on every side.
-fn inset(area: Rect) -> Rect {
-    Rect::new(
-        area.x + 1,
-        area.y + 1,
-        area.width.saturating_sub(2),
-        area.height.saturating_sub(2),
-    )
-}
-
-/// Splits the dialog interior into
-/// `[header, architect list, editor, buttons, footer]`.
-///
-/// The action bar, list, and header are sized first so the dialog stays usable
-/// on short terminals; the instructions editor absorbs whatever height remains.
-/// The footer block splits into the interactive action bar and a one-row docked
-/// hint strip pinned to the card's bottom edge.
-fn refine_dialog_chunks(area: Rect, entry_count: usize) -> [Rect; 5] {
-    let inner = inset(area);
-
-    let footer_h = REFINE_FOOTER_HEIGHT.min(inner.height);
-    let after_footer = inner.height - footer_h;
-
-    // The list never takes more than half of the room left after the footer, so
-    // the header and editor always keep space on short terminals.
-    let list_h = (refine_model_list_rows(entry_count) + 2).min(after_footer / 2);
-    let after_list = after_footer - list_h;
-
-    let header_h = REFINE_HEADER_HEIGHT.min(after_list.saturating_sub(REFINE_EDITOR_MIN_HEIGHT));
-    let editor_h = after_list - header_h;
-
-    let header = Rect::new(inner.x, inner.y, inner.width, header_h);
-    let list = Rect::new(inner.x, inner.y + header_h, inner.width, list_h);
-    let editor = Rect::new(inner.x, list.y + list_h, inner.width, editor_h);
-
-    // Split the footer into the action buttons and the docked hint strip so the
-    // hint reads as persistent chrome rather than a second row of buttons (c-1).
-    let docked_h = 1.min(footer_h);
-    let buttons_h = footer_h - docked_h;
-    let buttons = Rect::new(inner.x, editor.y + editor_h, inner.width, buttons_h);
-    let footer = Rect::new(inner.x, buttons.y + buttons_h, inner.width, docked_h);
-    [header, list, editor, buttons, footer]
-}
-
 /// Computes the dialog frame, the architect-row area, and the action buttons
 /// from the same layout the renderer uses.
 pub fn refine_dialog_geometry(term: Rect, entry_count: usize) -> RefineDialogGeometry {
     let area = centered_rect(REFINE_DIALOG_WIDTH, REFINE_DIALOG_HEIGHT, term);
-    let chunks = refine_dialog_chunks(area, entry_count);
-    let model_rows = inset(chunks[1]);
-    let editor_area = chunks[2];
+    let chunks = super::picker_dialog_chunks(area, entry_count, REFINE_HEADER_HEIGHT, 0);
+    let model_rows = super::inset(chunks.list);
 
-    let buttons = chunks[3];
-    // Button widths are measured from the same localized labels the renderer
-    // draws, so hit-testing never desynchronizes from the drawing.
-    let confirm_w = refine_confirm_label().chars().count() as u16;
-    let cancel_w = refine_cancel_label().chars().count() as u16;
-    let gap = 4u16;
-    let total = confirm_w + gap + cancel_w;
-    let start_x = buttons.x + (buttons.width.saturating_sub(total)) / 2;
-    let confirm_button = Rect::new(start_x, buttons.y, confirm_w, 1);
-    let cancel_button = Rect::new(start_x + confirm_w + gap, buttons.y, cancel_w, 1);
+    // The button geometry is measured from the same localized labels the
+    // renderer draws, so hit-testing never desynchronizes from the drawing.
+    let (confirm_button, cancel_button) = super::picker_button_rects(
+        chunks.buttons,
+        &refine_confirm_label(),
+        &refine_cancel_label(),
+    );
 
     RefineDialogGeometry {
         area,
         model_rows,
-        editor_area,
+        editor_area: chunks.editor,
         confirm_button,
         cancel_button,
     }
@@ -152,8 +92,14 @@ pub fn render_plan_refine_dialog(
         .style(Style::default().bg(engine.color(palette.surface)));
     frame.render_widget(outer_block, area);
 
-    let [header_area, list_area, editor_area, buttons_area, footer_area] =
-        refine_dialog_chunks(area, entry_count);
+    let super::PickerDialogChunks {
+        header: header_area,
+        list: list_area,
+        editor: editor_area,
+        buttons: buttons_area,
+        footer: footer_area,
+        ..
+    } = super::picker_dialog_chunks(area, entry_count, REFINE_HEADER_HEIGHT, 0);
 
     let dim = engine.fg(palette.text_muted);
 
@@ -314,8 +260,14 @@ pub fn render_review_refine_dialog(
         .style(Style::default().bg(engine.color(palette.surface)));
     frame.render_widget(outer_block, area);
 
-    let [header_area, list_area, editor_area, buttons_area, footer_area] =
-        refine_dialog_chunks(area, entry_count);
+    let super::PickerDialogChunks {
+        header: header_area,
+        list: list_area,
+        editor: editor_area,
+        buttons: buttons_area,
+        footer: footer_area,
+        ..
+    } = super::picker_dialog_chunks(area, entry_count, REFINE_HEADER_HEIGHT, 0);
 
     let dim = engine.fg(palette.text_muted);
 

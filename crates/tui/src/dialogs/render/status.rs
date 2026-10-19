@@ -2,6 +2,7 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
+use unicode_width::UnicodeWidthStr;
 
 use crate::components::modal::{render_dialog_footer, render_modal_container, ModalTone};
 use crate::i18n::active_t;
@@ -78,9 +79,9 @@ pub fn status_dialog_buttons(term: Rect, options_count: usize) -> (Rect, Rect) {
     let area = status_dialog_area(term, options_count);
     let bar = status_dialog_chunks(area, options_count)[2];
 
-    let apply_w = status_apply_label(options_count).chars().count() as u16;
-    let cancel_w = status_cancel_label().chars().count() as u16;
-    let gap_w = STATUS_BUTTON_GAP.chars().count() as u16;
+    let apply_w = UnicodeWidthStr::width(status_apply_label(options_count).as_str()) as u16;
+    let cancel_w = UnicodeWidthStr::width(status_cancel_label().as_str()) as u16;
+    let gap_w = UnicodeWidthStr::width(STATUS_BUTTON_GAP) as u16;
     let total = apply_w + gap_w + cancel_w;
     let start_x = bar.x + bar.width.saturating_sub(total) / 2;
 

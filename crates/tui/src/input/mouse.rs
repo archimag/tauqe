@@ -82,6 +82,12 @@ pub async fn handle_mouse_event(
                 dialog.selector.select_prev(visible_height);
                 return Ok(InputResult::Continue);
             }
+            // The breakdown outranks Help, so its wheel handling is consulted
+            // first and the renderer clamps whatever offset it produces (c-4).
+            if let Some(summary) = st.usage_summary.as_mut() {
+                summary.scroll = summary.scroll.saturating_sub(MOUSE_SCROLL_STEP as u16);
+                return Ok(InputResult::Continue);
+            }
             if st.show_help {
                 st.help_scroll = st.help_scroll.saturating_sub(MOUSE_SCROLL_STEP as u16);
                 return Ok(InputResult::Continue);
@@ -149,6 +155,10 @@ pub async fn handle_mouse_event(
                 let visible_height =
                     crate::dialogs::render::selection_dialog_visible_height(area);
                 dialog.selector.select_next(visible_height);
+                return Ok(InputResult::Continue);
+            }
+            if let Some(summary) = st.usage_summary.as_mut() {
+                summary.scroll = summary.scroll.saturating_add(MOUSE_SCROLL_STEP as u16);
                 return Ok(InputResult::Continue);
             }
             if st.show_help {
@@ -254,7 +264,7 @@ pub async fn handle_mouse_event(
                                             let base_ref = dialog.base_ref.clone();
                                             let message = dialog.message_editor.get_text().trim().to_string();
                                             dialog.applying = true;
-                                            dialog.status_message = Some("Applying squash...".to_string());
+                                            dialog.status_message = Some(crate::i18n::active_t("dialog.squash.status_applying"));
                                             drop(st);
                                             let params = tauqe_protocol::GitSquashApplyParams { base_ref, message };
                                             send_request(
@@ -562,6 +572,73 @@ pub async fn handle_mouse_event(
                         }
                     }
                 }
+                Some(ActiveModal::ClearHorizon) => {
+                    if let Some(plan_id) = st.confirm_clear_horizon.clone() {
+                        // Reuse the exact confirmation parameters the renderer
+                        // draws, so hit-testing never desynchronizes from the
+                        // rendered buttons (Conventions §6, §7).
+                        let geom = geometry_of(
+                            term_rect,
+                            &crate::dialogs::render::clear_horizon_params(&st, &plan_id),
+                        );
+                        match check_confirm_hit(&geom, mouse.column, mouse.row) {
+                            ModalHit::Confirm => {
+                                st.confirm_clear_horizon = None;
+                                st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
+                                // A horizon that already carries started or
+                                // completed steps has committed work in Git: the
+                                // reset escalates to the second tier instead of
+                                // dropping recorded history silently.
+                                let recorded = st
+                                    .plans_view
+                                    .plans
+                                    .iter()
+                                    .find(|p| p.id == plan_id)
+                                    .is_some_and(|p| p.has_started_or_completed_steps());
+                                if recorded {
+                                    st.confirm_clear_horizon_final = Some(plan_id);
+                                } else {
+                                    // The success notice is emitted once the
+                                    // server confirms the reset in the response
+                                    // handler, not on the click path.
+                                    drop(st);
+                                    crate::dialogs::input::clear_plan_horizon(
+                                        server_writer,
+                                        plan_id,
+                                    )
+                                    .await?;
+                                }
+                            }
+                            ModalHit::Cancel | ModalHit::Outside => {
+                                st.confirm_clear_horizon = None;
+                                st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
+                            }
+                            ModalHit::InsideBody => {}
+                        }
+                    }
+                }
+                Some(ActiveModal::ClearHorizonFinal) => {
+                    if let Some(plan_id) = st.confirm_clear_horizon_final.clone() {
+                        let geom = geometry_of(
+                            term_rect,
+                            &crate::dialogs::render::clear_horizon_final_params(&st, &plan_id),
+                        );
+                        match check_confirm_hit(&geom, mouse.column, mouse.row) {
+                            ModalHit::Confirm => {
+                                st.confirm_clear_horizon_final = None;
+                                st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
+                                drop(st);
+                                crate::dialogs::input::clear_plan_horizon(server_writer, plan_id)
+                                    .await?;
+                            }
+                            ModalHit::Cancel | ModalHit::Outside => {
+                                st.confirm_clear_horizon_final = None;
+                                st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
+                            }
+                            ModalHit::InsideBody => {}
+                        }
+                    }
+                }
                 Some(ActiveModal::DeletePlan) => {
                     if let Some(plan_id) = st.confirm_delete_plan.clone() {
                         let geom = geometry_of(
@@ -677,6 +754,36 @@ pub async fn handle_mouse_event(
                             }
                             ModalHit::Cancel | ModalHit::Outside => {
                                 st.confirm_execute_review = None;
+                                st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
+                            }
+                            ModalHit::InsideBody => {}
+                        }
+                    }
+                }
+                Some(ActiveModal::ExecutePipeline) => {
+                    // A pipeline is a super-batch over several plans, so the
+                    // confirmation is the binary confirm/cancel card whose
+                    // geometry is derived from the same parameters the renderer
+                    // draws (Conventions §6, §7).
+                    if let Some(target) = st.confirm_execute_pipeline.clone() {
+                        let geom = match crate::dialogs::render::execute_pipeline_params(&st) {
+                            Some(params) => geometry_of(term_rect, &params),
+                            None => return Ok(InputResult::Continue),
+                        };
+                        match check_confirm_hit(&geom, mouse.column, mouse.row) {
+                            ModalHit::Confirm => {
+                                st.confirm_execute_pipeline = None;
+                                st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
+                                crate::dialogs::input::confirm_execute_pipeline(
+                                    state,
+                                    st,
+                                    server_writer,
+                                    target,
+                                )
+                                .await?;
+                            }
+                            ModalHit::Cancel | ModalHit::Outside => {
+                                st.confirm_execute_pipeline = None;
                                 st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
                             }
                             ModalHit::InsideBody => {}
@@ -944,6 +1051,15 @@ pub async fn handle_mouse_event(
                         st.locale_dialog = None;
                     }
                 }
+                Some(ActiveModal::UsageSummary) => {
+                    // The breakdown exposes no controls: a click outside its
+                    // frame dismisses it and a click inside leaves it open for
+                    // the wheel and the keyboard (Conventions §6).
+                    let area = crate::dialogs::render::usage_summary_area(term_rect);
+                    if !rect_contains(area, mouse.column, mouse.row) {
+                        st.usage_summary = None;
+                    }
+                }
                 Some(ActiveModal::Help) => {
                     // A click on a header tab switches that tab; any other
                     // click dismisses the dialog, preserving the click-to-close
@@ -990,7 +1106,9 @@ pub async fn handle_mouse_event(
                             return Ok(InputResult::Continue);
                         } else if areas.model_select.1 > 0 && mouse.column >= areas.model_select.0 && mouse.column <= areas.model_select.1 {
                             if st.model.is_busy() {
-                                st.notify_warning("Cannot change model while model is generating");
+                                st.notify_warning(
+                                    crate::i18n::active_t("notify.model_select_busy"),
+                                );
                                 return Ok(InputResult::Continue);
                             }
                             if st.open_model_dialog() {
@@ -1030,21 +1148,27 @@ pub async fn handle_mouse_event(
                                         crate::clipboard::CopyResult::Native => {
                                             st.model.copy_flash = Some((block_id, std::time::Instant::now()));
                                             let lines_count = code_to_copy.lines().count().max(1);
-                                            st.notify_success(format!("Copied {} lines of code to clipboard", lines_count));
+                                            st.notify_success(
+                                                crate::i18n::active_t("notify.code_copied")
+                                                    .replace("{}", &lines_count.to_string()),
+                                            );
                                             st.model.update_markdown();
                                         }
                                         crate::clipboard::CopyResult::Osc52Only => {
                                             st.model.copy_flash = Some((block_id, std::time::Instant::now()));
                                             let lines_count = code_to_copy.lines().count().max(1);
-                                            st.notify_success(format!("Copied {} lines via terminal (OSC 52)", lines_count));
+                                            st.notify_success(
+                                                crate::i18n::active_t("notify.code_copied_osc52")
+                                                    .replace("{}", &lines_count.to_string()),
+                                            );
                                             st.model.update_markdown();
                                         }
                                         crate::clipboard::CopyResult::Failed => {
-                                            st.notify_error("Failed to copy code to clipboard");
+                                            st.notify_error(crate::i18n::active_t("notify.code_copy_failed"));
                                         }
                                     }
                                 } else if !st.shift_tip_shown {
-                                    st.notify_info("Tip: Hold Shift while dragging to select text with mouse");
+                                    st.notify_info(crate::i18n::active_t("notify.mouse_shift_tip"));
                                     st.shift_tip_shown = true;
                                 }
                             }
@@ -1075,20 +1199,26 @@ pub async fn handle_mouse_event(
                                             st.history_view.copy_flash =
                                                 Some(((block.item_id, block.block_id), std::time::Instant::now()));
                                             let lines_count = code_to_copy.lines().count().max(1);
-                                            st.notify_success(format!("Copied {} lines of code to clipboard", lines_count));
+                                            st.notify_success(
+                                                crate::i18n::active_t("notify.code_copied")
+                                                    .replace("{}", &lines_count.to_string()),
+                                            );
                                         }
                                         crate::clipboard::CopyResult::Osc52Only => {
                                             st.history_view.copy_flash =
                                                 Some(((block.item_id, block.block_id), std::time::Instant::now()));
                                             let lines_count = code_to_copy.lines().count().max(1);
-                                            st.notify_success(format!("Copied {} lines via terminal (OSC 52)", lines_count));
+                                            st.notify_success(
+                                                crate::i18n::active_t("notify.code_copied_osc52")
+                                                    .replace("{}", &lines_count.to_string()),
+                                            );
                                         }
                                         crate::clipboard::CopyResult::Failed => {
-                                            st.notify_error("Failed to copy code to clipboard");
+                                            st.notify_error(crate::i18n::active_t("notify.code_copy_failed"));
                                         }
                                     }
                                 } else if !st.shift_tip_shown {
-                                    st.notify_info("Tip: Hold Shift while dragging to select text with mouse");
+                                    st.notify_info(crate::i18n::active_t("notify.mouse_shift_tip"));
                                     st.shift_tip_shown = true;
                                 }
                             }
@@ -1173,6 +1303,7 @@ mod tests {
             description: None,
             created_at: 0,
             updated_at: 0,
+            architect: None,
             concept: vec![],
             items: vec![tauqe_protocol::PlanItem {
                 id: "1".to_string(),
@@ -1328,6 +1459,58 @@ mod tests {
 
         let st = state.lock().await;
         assert!(st.locale_dialog.is_none());
+    }
+
+    /// The usage breakdown dismisses on a click outside its frame and stays
+    /// open for a click inside (Conventions §6).
+    #[tokio::test]
+    async fn usage_summary_click_outside_closes_and_inside_keeps_it() {
+        let mut st = crate::app::test_state();
+        st.last_frame_area = Rect::new(0, 0, 100, 30);
+        st.open_usage_summary();
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+
+        let area = crate::dialogs::render::usage_summary_area(Rect::new(0, 0, 100, 30));
+        handle_mouse_event(left_click(area.x + 2, area.y + 2), &state, &mut conn)
+            .await
+            .unwrap();
+        assert!(state.lock().await.usage_summary.is_some());
+
+        handle_mouse_event(left_click(0, 0), &state, &mut conn)
+            .await
+            .unwrap();
+        assert!(state.lock().await.usage_summary.is_none());
+    }
+
+    /// The wheel scrolls the breakdown one step per notch, like every other
+    /// scrollable surface.
+    #[tokio::test]
+    async fn usage_summary_wheel_scrolls_the_breakdown() {
+        let mut st = crate::app::test_state();
+        st.last_frame_area = Rect::new(0, 0, 100, 30);
+        st.open_usage_summary();
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+
+        let down = MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 50,
+            row: 15,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        };
+        handle_mouse_event(down, &state, &mut conn).await.unwrap();
+        assert_eq!(
+            state.lock().await.usage_summary.as_ref().unwrap().scroll,
+            MOUSE_SCROLL_STEP as u16
+        );
+
+        let up = MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            ..down
+        };
+        handle_mouse_event(up, &state, &mut conn).await.unwrap();
+        assert_eq!(state.lock().await.usage_summary.as_ref().unwrap().scroll, 0);
     }
 
     fn architect_entry(name: &str) -> tauqe_protocol::ModelEntry {

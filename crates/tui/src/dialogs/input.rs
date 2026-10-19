@@ -43,11 +43,12 @@ fn begin_repl_turn(st: &mut AppState) {
     st.model.markdown_lines.clear();
     st.model.error = None;
     st.model.result = None;
-    st.model.usage = None;
+    // A freshly launched turn drops the in-flight usage window a cancelled or
+    // failed turn may have left open; the daemon owns the durable totals (c-1).
+    st.model.end_in_flight_usage();
     st.model.scroll = 0;
     st.model.status = TurnStatus::Awaiting;
     st.model.auto_scroll = true;
-    st.model.current_cost = Some(0.0);
     st.model.edits_active = false;
     st.model.files.clear();
     st.model.selected_file_index = 0;
@@ -69,7 +70,7 @@ fn begin_repl_turn(st: &mut AppState) {
 fn begin_review_execution_turn(st: &mut AppState) {
     begin_repl_turn(st);
     st.model.is_batch = true;
-    st.notify_info("Executing review finding(s): switched to REPL for coder execution");
+    st.notify_info(crate::i18n::active_t("notify.review_execution_started"));
 }
 
 /// Snapshot of the optimistic UI state applied when a turn is launched.
@@ -126,7 +127,9 @@ async fn start_turn(
     if let Err(err) = send_request(server_writer, method, params).await {
         let mut st = state.lock().await;
         snapshot.restore(&mut st);
-        st.notify_error(format!("Failed to start turn: {}", err));
+        st.notify_error(
+            crate::i18n::active_t("notify.turn_start_failed").replace("{}", &err.to_string()),
+        );
     }
 }
 
@@ -139,6 +142,45 @@ async fn start_turn(
 fn begin_scope_execution_turn(st: &mut AppState) {
     begin_repl_turn(st);
     st.model.is_batch = true;
+}
+
+/// Applies the shared start transition for a multi-plan execution pipeline.
+///
+/// It is the pipeline peer of [`begin_scope_execution_turn`]: the Coder role
+/// takes over the REPL and `is_batch` marks the queue as a batch, so the
+/// three-way batch-cancel dialog and the per-step notification suppression stay
+/// active for the whole queue.
+fn begin_pipeline_execution_turn(st: &mut AppState) {
+    begin_repl_turn(st);
+    st.model.is_batch = true;
+}
+
+/// Launches a multi-plan execution pipeline from a developer confirmation.
+///
+/// The queued plan identifiers travel as one typed `PlanExecutePipelineParams`,
+/// so the server schedules every plan under a single registered operation. Shared
+/// by the keyboard and mouse confirmation paths, and rolled back by
+/// [`start_turn`] when the request cannot be written.
+pub(crate) async fn confirm_execute_pipeline(
+    state: &Arc<Mutex<AppState>>,
+    st: MutexGuard<'_, AppState>,
+    server_writer: &mut RpcConnection,
+    target: crate::app::ConfirmExecutePipelineState,
+) -> anyhow::Result<()> {
+    let params = tauqe_protocol::PlanExecutePipelineParams {
+        plan_ids: target.plan_ids,
+    };
+    let params = serde_json::to_value(params)?;
+    start_turn(
+        state,
+        st,
+        server_writer,
+        methods::PLAN_EXECUTE_PIPELINE,
+        params,
+        begin_pipeline_execution_turn,
+    )
+    .await;
+    Ok(())
 }
 
 /// Applies the shared start transition for a plan-refinement turn.
@@ -255,18 +297,18 @@ pub(crate) async fn confirm_start_review(
 
 /// Clears the conversation history.
 ///
-/// Preserves the running session cost and re-syncs the theme so the reset model
-/// and history views keep the active theme mode. Shared by the keyboard and
-/// mouse confirmation paths.
+/// Usage totals describe the session rather than the conversation, so they
+/// survive the reset: the footer must never zero a counter the developer has
+/// already paid for. The theme is re-synced so the rebuilt model and history
+/// views keep the active theme mode. Shared by the keyboard and mouse
+/// confirmation paths.
 pub(crate) async fn confirm_clear_history(
     mut st: MutexGuard<'_, AppState>,
     server_writer: &mut RpcConnection,
 ) -> anyhow::Result<()> {
-    let cost = st.model.session_total_cost;
-    let prev_cost = st.model.prev_cost;
+    let usage_totals = std::mem::take(&mut st.model.usage_totals);
     st.model = ReplView {
-        session_total_cost: cost,
-        prev_cost,
+        usage_totals,
         ..Default::default()
     };
     st.history_view = HistoryViewState::default();
@@ -281,9 +323,36 @@ pub(crate) async fn confirm_clear_history(
     Ok(())
 }
 
+/// Clears the implementation horizon of a plan through the daemon.
+///
+/// The reset is a durable plan mutation, so the local plan cache is re-read from
+/// the server instead of being patched in place; the concept tree is preserved
+/// server-side, which is why the confirmation states it explicitly.
+pub(crate) async fn clear_plan_horizon(
+    server_writer: &mut RpcConnection,
+    plan_id: String,
+) -> anyhow::Result<()> {
+    // `plan/clearHorizon` expects `PlanClearHorizonParams { plan_id }`; the
+    // wire DTO has no `id` alias, so the typed payload is the single
+    // authoritative spelling of the request.
+    let params = tauqe_protocol::PlanClearHorizonParams { plan_id };
+    send_request(
+        server_writer,
+        methods::PLAN_CLEAR_HORIZON,
+        serde_json::to_value(params)?,
+    )
+    .await?;
+    send_request(server_writer, methods::PLAN_LIST, serde_json::json!({})).await?;
+    send_request(server_writer, methods::PLAN_GET, serde_json::json!({})).await?;
+    Ok(())
+}
+
 /// The plan view is refreshed from server responses, so nothing is cleared locally
 /// until the server confirms the deletion.
-pub(crate) async fn delete_plan(server_writer: &mut RpcConnection, plan_id: String) -> anyhow::Result<()> {
+pub(crate) async fn delete_plan(
+    server_writer: &mut RpcConnection,
+    plan_id: String,
+) -> anyhow::Result<()> {
     send_request(
         server_writer,
         methods::PLAN_DELETE,
@@ -295,7 +364,10 @@ pub(crate) async fn delete_plan(server_writer: &mut RpcConnection, plan_id: Stri
     Ok(())
 }
 
-pub(crate) async fn delete_review(server_writer: &mut RpcConnection, review_id: String) -> anyhow::Result<()> {
+pub(crate) async fn delete_review(
+    server_writer: &mut RpcConnection,
+    review_id: String,
+) -> anyhow::Result<()> {
     send_request(
         server_writer,
         methods::REVIEW_DELETE,
@@ -656,6 +728,55 @@ pub(crate) async fn handle_dialog_event(
             }
             return Ok(Some(InputResult::Continue));
         }
+        Some(ActiveModal::ClearHorizon) => {
+            if let Some(plan_id) = st.confirm_clear_horizon.take() {
+                match resolve_confirm(&mut st, key) {
+                    ConfirmOutcome::Toggled => st.confirm_clear_horizon = Some(plan_id),
+                    ConfirmOutcome::Dismissed => {
+                        st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
+                    }
+                    ConfirmOutcome::Accepted => {
+                        // A horizon that already carries started or completed
+                        // steps has committed work in Git: the reset escalates to
+                        // the second tier, which names the desynchronization risk
+                        // before the steps are dropped (Conventions §4.4).
+                        let recorded = st
+                            .plans_view
+                            .plans
+                            .iter()
+                            .find(|p| p.id == plan_id)
+                            .is_some_and(|p| p.has_started_or_completed_steps());
+                        if recorded {
+                            st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
+                            st.confirm_clear_horizon_final = Some(plan_id);
+                        } else {
+                            // The success notice is emitted once the server
+                            // confirms the reset in the response handler, so it
+                            // is not duplicated here.
+                            drop(st);
+                            clear_plan_horizon(server_writer, plan_id).await?;
+                        }
+                    }
+                }
+            }
+            return Ok(Some(InputResult::Continue));
+        }
+        Some(ActiveModal::ClearHorizonFinal) => {
+            if let Some(plan_id) = st.confirm_clear_horizon_final.take() {
+                match resolve_confirm(&mut st, key) {
+                    ConfirmOutcome::Toggled => st.confirm_clear_horizon_final = Some(plan_id),
+                    ConfirmOutcome::Dismissed => {
+                        st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
+                    }
+                    ConfirmOutcome::Accepted => {
+                        // The success notice is emitted by the response handler.
+                        drop(st);
+                        clear_plan_horizon(server_writer, plan_id).await?;
+                    }
+                }
+            }
+            return Ok(Some(InputResult::Continue));
+        }
         Some(ActiveModal::DeletePlan) => {
             if let Some(plan_id) = st.confirm_delete_plan.take() {
                 match resolve_confirm(&mut st, key) {
@@ -704,6 +825,18 @@ pub(crate) async fn handle_dialog_event(
                     ConfirmOutcome::Dismissed => {}
                     ConfirmOutcome::Accepted => {
                         confirm_execute_review(state, st, server_writer, target).await?;
+                    }
+                }
+            }
+            return Ok(Some(InputResult::Continue));
+        }
+        Some(ActiveModal::ExecutePipeline) => {
+            if let Some(target) = st.confirm_execute_pipeline.take() {
+                match resolve_confirm(&mut st, key) {
+                    ConfirmOutcome::Toggled => st.confirm_execute_pipeline = Some(target),
+                    ConfirmOutcome::Dismissed => {}
+                    ConfirmOutcome::Accepted => {
+                        confirm_execute_pipeline(state, st, server_writer, target).await?;
                     }
                 }
             }
@@ -849,6 +982,38 @@ pub(crate) async fn handle_dialog_event(
             }
             return Ok(Some(InputResult::Continue));
         }
+        Some(ActiveModal::UsageSummary) => {
+            // Read-only telemetry: navigation keys move the scroll offset and
+            // every dismissal chord closes the dialog without a request. `End`
+            // targets the last content line and the renderer clamps the offset
+            // to the body height, so the exact value here is free (c-4).
+            let close = matches!(
+                key.code,
+                KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') | KeyCode::Char('?')
+            );
+            if close {
+                st.usage_summary = None;
+            } else if let Some(summary) = st.usage_summary.as_mut() {
+                match key.code {
+                    KeyCode::Down | KeyCode::Char('j') | KeyCode::Char('n') => {
+                        summary.scroll = summary.scroll.saturating_add(1);
+                    }
+                    KeyCode::Up | KeyCode::Char('k') | KeyCode::Char('p') => {
+                        summary.scroll = summary.scroll.saturating_sub(1);
+                    }
+                    KeyCode::PageDown => {
+                        summary.scroll = summary.scroll.saturating_add(10);
+                    }
+                    KeyCode::PageUp => {
+                        summary.scroll = summary.scroll.saturating_sub(10);
+                    }
+                    KeyCode::Home => summary.scroll = 0,
+                    KeyCode::End => summary.scroll = u16::MAX,
+                    _ => {}
+                }
+            }
+            return Ok(Some(InputResult::Continue));
+        }
         // `server_disconnected` is handled before dialog dispatch, so it never
         // reaches here; `None` means no modal is active.
         Some(ActiveModal::ServerDisconnected) | None => {}
@@ -918,6 +1083,138 @@ mod tests {
             notification,
             guard.confirm_execute_review.is_some(),
         )
+    }
+
+    /// A horizon carrying recorded work must escalate to the second tier
+    /// instead of clearing immediately, and the safe `Cancel` must take focus.
+    #[tokio::test]
+    async fn clear_horizon_escalates_to_final_tier_when_work_recorded() {
+        let mut st = crate::app::test_state();
+        st.plans_view.plans = vec![tauqe_protocol::Plan {
+            id: "plan-h".to_string(),
+            title: "Horizon Plan".to_string(),
+            items: vec![tauqe_protocol::PlanItem {
+                id: "1".to_string(),
+                title: "Done step".to_string(),
+                status: tauqe_protocol::PlanItemStatus::Done,
+                ..Default::default()
+            }],
+            ..Default::default()
+        }];
+        st.confirm_clear_horizon = Some("plan-h".to_string());
+        st.confirm_button = ConfirmDialogButton::Confirm;
+
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+        handle_dialog_event(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &state,
+            &mut conn,
+        )
+        .await
+        .expect("in-memory dispatch never fails");
+
+        let guard = state.lock().await;
+        assert!(guard.confirm_clear_horizon.is_none());
+        assert_eq!(guard.confirm_clear_horizon_final.as_deref(), Some("plan-h"));
+        assert_eq!(guard.confirm_button, ConfirmDialogButton::Cancel);
+    }
+
+    /// Confirming the first tier on a horizon with no recorded work sends the
+    /// typed `plan/clearHorizon` request and closes the modal.
+    #[tokio::test]
+    async fn clear_horizon_confirm_without_recorded_work_clears_via_rpc() {
+        let mut st = crate::app::test_state();
+        st.plans_view.plans = vec![tauqe_protocol::Plan {
+            id: "plan-clear".to_string(),
+            title: "Clear Plan".to_string(),
+            items: vec![tauqe_protocol::PlanItem {
+                id: "1".to_string(),
+                title: "Todo step".to_string(),
+                status: tauqe_protocol::PlanItemStatus::Todo,
+                ..Default::default()
+            }],
+            ..Default::default()
+        }];
+        st.confirm_clear_horizon = Some("plan-clear".to_string());
+        st.confirm_button = ConfirmDialogButton::Confirm;
+
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+        handle_dialog_event(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &state,
+            &mut conn,
+        )
+        .await
+        .expect("in-memory dispatch never fails");
+
+        let payload = String::from_utf8(conn.written().to_vec()).expect("utf-8 payload");
+        assert!(payload.contains("plan/clearHorizon"), "{payload}");
+        assert!(payload.contains("plan_id"), "{payload}");
+
+        let guard = state.lock().await;
+        assert!(guard.confirm_clear_horizon.is_none());
+        assert!(guard.confirm_clear_horizon_final.is_none());
+    }
+
+    /// Confirming the second tier dispatches the same typed reset request.
+    #[tokio::test]
+    async fn clear_horizon_final_confirm_clears_via_rpc() {
+        let mut st = crate::app::test_state();
+        st.confirm_clear_horizon_final = Some("plan-final".to_string());
+        st.confirm_button = ConfirmDialogButton::Confirm;
+
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+        handle_dialog_event(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &state,
+            &mut conn,
+        )
+        .await
+        .expect("in-memory dispatch never fails");
+
+        let payload = String::from_utf8(conn.written().to_vec()).expect("utf-8 payload");
+        assert!(payload.contains("plan/clearHorizon"), "{payload}");
+        assert!(payload.contains("plan_id"), "{payload}");
+
+        let guard = state.lock().await;
+        assert!(guard.confirm_clear_horizon_final.is_none());
+    }
+
+    /// Confirming the pipeline modal dispatches the typed
+    /// `plan/executePipeline` request carrying every queued plan identifier.
+    #[tokio::test]
+    async fn execute_pipeline_confirm_sends_typed_request() {
+        let mut st = crate::app::test_state();
+        st.confirm_execute_pipeline = Some(crate::app::ConfirmExecutePipelineState {
+            plan_ids: vec!["plan-a".to_string(), "plan-b".to_string()],
+            plan_titles: vec!["A".to_string(), "B".to_string()],
+            steps: Vec::new(),
+            pending_synthesis: Vec::new(),
+        });
+        st.confirm_button = ConfirmDialogButton::Confirm;
+
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+        handle_dialog_event(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &state,
+            &mut conn,
+        )
+        .await
+        .expect("in-memory dispatch never fails");
+
+        let payload = String::from_utf8(conn.written().to_vec()).expect("utf-8 payload");
+        assert!(payload.contains("plan/executePipeline"), "{payload}");
+        assert!(payload.contains("plan-a"), "{payload}");
+        assert!(payload.contains("plan-b"), "{payload}");
+
+        let guard = state.lock().await;
+        assert!(guard.confirm_execute_pipeline.is_none());
+        assert_eq!(guard.view_mode, ViewMode::Repl);
+        assert!(guard.model.is_batch);
     }
 
     #[tokio::test]
@@ -1059,5 +1356,67 @@ mod tests {
         let dialog = guard.review_dialog.as_ref().expect("dialog stays open");
         assert_eq!(dialog.path_editor.get_text(), "x");
         assert!(dialog.prompt_editor.is_empty());
+    }
+
+    /// The usage breakdown is a read-only telemetry surface: navigation keys
+    /// move its scroll offset and every dismissal chord closes it without a
+    /// request (c-4).
+    #[tokio::test]
+    async fn usage_summary_scrolls_and_closes_without_a_request() {
+        let mut st = crate::app::test_state();
+        st.open_usage_summary();
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+
+        for (key, expected) in [
+            (KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE), 1u16),
+            (KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE), 11),
+            (KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE), 10),
+            (KeyEvent::new(KeyCode::Home, KeyModifiers::NONE), 0),
+        ] {
+            handle_dialog_event(key, &state, &mut conn)
+                .await
+                .expect("in-memory dispatch never fails");
+            let guard = state.lock().await;
+            assert_eq!(
+                guard
+                    .usage_summary
+                    .as_ref()
+                    .expect("dialog stays open")
+                    .scroll,
+                expected
+            );
+        }
+
+        // `End` jumps to the last content line; the renderer clamps the offset.
+        handle_dialog_event(
+            KeyEvent::new(KeyCode::End, KeyModifiers::NONE),
+            &state,
+            &mut conn,
+        )
+        .await
+        .expect("in-memory dispatch never fails");
+        assert_eq!(
+            state.lock().await.usage_summary.as_ref().unwrap().scroll,
+            u16::MAX
+        );
+
+        for key in [
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        ] {
+            state.lock().await.open_usage_summary();
+            handle_dialog_event(key, &state, &mut conn)
+                .await
+                .expect("in-memory dispatch never fails");
+            assert!(state.lock().await.usage_summary.is_none());
+        }
+
+        assert!(
+            conn.written().is_empty(),
+            "the dialog never talks to the server"
+        );
     }
 }

@@ -1,6 +1,24 @@
 use super::item::{ConceptItem, PlanItem, PlanItemStatus};
 use super::node::Plan;
 
+/// Joins plan metadata entries into a single markdown line body.
+///
+/// Every metadata key must occupy exactly one indented line. Entries that come
+/// from hand-edited or imported plan JSON may still carry surrounding
+/// whitespace, embedded line breaks, or be empty, and a raw `join` would either
+/// split the line or leave a dangling separator. Trimming, collapsing line
+/// breaks into spaces, and dropping empty entries keeps the rendered document
+/// structurally stable.
+fn inline_list(entries: &[String]) -> String {
+    entries
+        .iter()
+        .map(|entry| entry.replace(['\r', '\n'], " "))
+        .map(|entry| entry.trim().to_string())
+        .filter(|entry| !entry.is_empty())
+        .collect::<Vec<String>>()
+        .join(", ")
+}
+
 impl Plan {
     pub fn to_markdown(&self) -> String {
         let mut out = format!("# Plan: {}\n", self.title);
@@ -55,17 +73,23 @@ impl Plan {
                     "{}- {} {} #{}: {}\n",
                     indent, check, item.status, item.id, clean_title
                 ));
-                if !item.concept_refs.is_empty() {
-                    out.push_str(&format!("{}    ref: {}\n", indent, item.concept_refs.join(", ")));
+                // A key whose entries are all empty renders no line at all, so the
+                // emptiness check runs on the normalized body, not the raw list.
+                let refs = inline_list(&item.concept_refs);
+                if !refs.is_empty() {
+                    out.push_str(&format!("{indent}    ref: {refs}\n"));
                 }
-                if !item.files.is_empty() {
-                    out.push_str(&format!("{}    files: {}\n", indent, item.files.join(", ")));
+                let files = inline_list(&item.files);
+                if !files.is_empty() {
+                    out.push_str(&format!("{indent}    files: {files}\n"));
                 }
-                if !item.readonly_files.is_empty() {
-                    out.push_str(&format!("{}    readonly_files: {}\n", indent, item.readonly_files.join(", ")));
+                let readonly_files = inline_list(&item.readonly_files);
+                if !readonly_files.is_empty() {
+                    out.push_str(&format!("{indent}    readonly_files: {readonly_files}\n"));
                 }
-                if !item.depends_on.is_empty() {
-                    out.push_str(&format!("{}    depends_on: {}\n", indent, item.depends_on.join(", ")));
+                let depends_on = inline_list(&item.depends_on);
+                if !depends_on.is_empty() {
+                    out.push_str(&format!("{indent}    depends_on: {depends_on}\n"));
                 }
                 if let Some(details) = &item.details {
                     let trimmed = details.trim();

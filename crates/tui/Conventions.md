@@ -105,6 +105,12 @@ This document specifies mandatory architectural and UX invariants for the Tauqe 
 7. **Unified Batch Execution (`X`):**
    - A batch launch always reuses the single `BatchExecution` supervisor instead of a per-mode loop. The queue is assembled from every unfinished leaf step of the ready plans, the confirmation dialog states the total scope of work, one progress view tracks the run, and interruption is governed by the three-way `BatchCancel` dialog (§6.3).
 
+8. **Strictly Increasing Indentation Derived from Depth (All Hierarchical Views):**
+   - **Strictly Increasing Indent:** Every nested object renders strictly deeper than its visual parent. The indent step is fixed at 2 columns and accumulates with nesting depth, so a child row never shares its leading indent with the parent row. Rendering a child at the indent of its parent is forbidden.
+   - **A Node Body Is Never Deeper Than Its Children:** A node's own detail block — description, target files, read-only contracts, recommendations, and notes — renders at the level of its children, exactly one indent step deeper than the node's summary row, and never deeper. Otherwise the children read as if they sit above the parent's own body, which inverts the hierarchy.
+   - **Indent Is Computed, Never Written:** Leading indentation is derived from the numeric nesting depth through a single helper owned by the view. Literal whitespace runs inside a renderer are forbidden, so a parent row, its body, and its children can never drift apart and every hierarchical view shares one scale.
+   - **The Hierarchy Is Covered by a Regression Test:** Every hierarchical view carries a regression test asserting that a child's leading indent is strictly greater than its parent's, and that a node body is never indented deeper than its children. The test guards the invariant against a future return to a flat render.
+
 ---
 
 ## 5. Unified Emacs & Magit Paradigm: Direct Structural Navigation vs Readline Editing

@@ -272,13 +272,6 @@ pub async fn handle_response(
             }
             methods::GIT_SQUASH_GENERATE_MESSAGE => {
                 if let Ok(gen_res) = serde_json::from_value::<GitSquashGenerateMessageResult>(val) {
-                    if let Some(total) = gen_res.session_total_cost {
-                        st.model.session_total_cost = total;
-                    }
-                    if let Some(cost) = gen_res.current_cost {
-                        st.model.prev_cost = Some(cost);
-                    }
-                    st.model.current_cost = None;
                     if let Some(ref mut dialog) = st.squash_dialog {
                         dialog.generating_message = false;
                         dialog.message_editor.clear();
@@ -530,6 +523,26 @@ pub async fn handle_response(
                         st.plans_view.plans.push(res.plan);
                     }
                 }
+            }
+            methods::PLAN_CLEAR_HORIZON => {
+                // The server returns the concept-preserving plan after the
+                // reset; apply it to the local cache so the horizon empties
+                // immediately without a follow-up round trip.
+                if let Ok(res) =
+                    serde_json::from_value::<tauqe_protocol::PlanClearHorizonResult>(val)
+                {
+                    if let Some(pos) =
+                        st.plans_view.plans.iter().position(|p| p.id == res.plan.id)
+                    {
+                        st.plans_view.plans[pos] = res.plan;
+                    } else {
+                        st.plans_view.plans.push(res.plan);
+                    }
+                    st.plans_view.clamp_selection();
+                }
+                // One authoritative success notice once the daemon confirms the
+                // durable reset, shared by the keyboard and mouse paths.
+                st.notify_success(active_t("notify.plan_horizon_cleared"));
             }
             methods::PLAN_SAVE => {
                 // A save creates or fully replaces a plan. Its body and cursor

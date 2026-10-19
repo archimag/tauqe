@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use tokio::sync::{mpsc, watch};
-use tauqe_protocol::{EditOperation, EditOutcome, ModelRef, ModelResult};
+use tauqe_protocol::{EditOperation, EditOutcome, ModelRef, ModelResult, TurnIntent};
 
 use crate::context::ContextManager;
 use crate::edits::{EditError, StagedEditsState};
@@ -64,6 +64,14 @@ pub struct FsmTurnOutcome {
     /// replaced a plan. Propagated to the workflow result so the server can
     /// mark the emitted `plan/updated` event as a creation.
     pub plan_saved: bool,
+    /// The model's skip report when the turn ended with a semantic skip
+    /// signal.
+    ///
+    /// A skip is a validated outcome rather than a failed answer: the model
+    /// asserts the work is already satisfied. Carrying the report lets the
+    /// review supervisor mark the finding as skipped instead of treating the
+    /// empty turn as an unverified reply.
+    pub skip_reason: Option<String>,
 }
 
 impl FsmTurnOutcome {
@@ -74,45 +82,13 @@ impl FsmTurnOutcome {
     /// with coder-ladder escalation enabled the harness re-runs it on a
     /// stronger tier instead of accepting the empty answer.
     pub fn is_unverified_answer(&self) -> bool {
-        matches!(self.result, ModelResult::Answer { .. }) && !self.has_terminal_success
+        matches!(self.result, ModelResult::Answer { .. })
+            && !self.has_terminal_success
+            && self.skip_reason.is_none()
     }
 }
 
-/// Whether a prompt opens a typed focused dialogue turn rather than a plain
-/// develop turn.
-///
-/// Focused dialogue covers both plan discussions and review focus dialogues, so
-/// the REPL recognises a focused turn from its typed heading instead of
-/// re-deriving the mode from free-form text. Read-only routing is narrower and
-/// lives in [`is_readonly_discussion_prompt`]; the two are deliberately distinct
-/// because a review focus keeps code-editing capability.
-pub fn is_discussion_prompt(prompt: &str) -> bool {
-    crate::plan::prompt::is_plan_discussion_prompt(prompt)
-        || crate::review::prompt::is_review_discussion_prompt(prompt)
-}
 
-/// Whether a prompt opens a strictly read-only architectural discussion turn.
-///
-/// Only a plan discussion is read-only: the model reasons about and proposes
-/// plan structure but is barred from editing code, so the turn is routed through
-/// the text-only structured discussion protocol.
-///
-/// A review focus dialogue is deliberately excluded. It keeps dual capability
-/// (addressed concept c-3): the developer may reason about a finding and directly
-/// request a code fix, so the turn is routed through the configured edit protocol
-/// — carrying file edits and toolchain verification — and prompt assembly stays
-/// in develop mode. This predicate is the single source of truth consulted by
-/// prompt assembly, the plan-mutation mode, and the server-side protocol
-/// resolver.
-pub fn is_readonly_discussion_prompt(prompt: &str) -> bool {
-    crate::plan::prompt::is_plan_discussion_prompt(prompt)
-}
-
-/// Bookkeeping metadata returned when beginning a session turn.
-pub(super) struct SessionTurn {
-    pub is_isolated_step: bool,
-    pub turn_id: Option<u64>,
-}
 
 /// Shared, mutable state threaded through the FSM phase executors.
 ///
@@ -132,7 +108,7 @@ struct PhaseContext<'a> {
     cancel_rx: &'a watch::Receiver<bool>,
     options: &'a WorkflowOptions,
     repo_root: &'a Path,
-    is_isolated_step: bool,
+    intent: TurnIntent,
     plan_mode: PlanMutationMode,
     policy: &'a mut dyn ApplyPolicy,
     context_manager: &'a mut ContextManager,
@@ -160,7 +136,7 @@ async fn propose(
     options: &WorkflowOptions,
     input_cache: &mut TurnInputCache,
     state: &TurnState,
-    is_isolated_step: bool,
+    intent: TurnIntent,
     prompt: &str,
     staged: Option<&StagedEditsState>,
 ) -> anyhow::Result<ProposalStep> {
@@ -181,7 +157,7 @@ async fn propose(
         staged,
         language.as_deref(),
         scratchpad.as_deref(),
-        is_isolated_step,
+        intent,
     )
     .await
 }
@@ -199,6 +175,7 @@ async fn propose(
 #[allow(clippy::too_many_arguments)]
 pub async fn run_fsm_turn(
     prompt: &str,
+    intent: TurnIntent,
     provider: &dyn LlmProvider,
     model: &ModelRef,
     context_manager: &mut ContextManager,
@@ -210,11 +187,12 @@ pub async fn run_fsm_turn(
     cancel_rx: watch::Receiver<bool>,
     options: &WorkflowOptions,
 ) -> anyhow::Result<FsmTurnOutcome> {
-    let session_turn =
-        begin_session_turn(prompt, context_manager, history_manager, provider, &cancel_rx, options)
+    let turn_id =
+        begin_session_turn(prompt, intent, context_manager, history_manager, provider, &cancel_rx, options)
             .await;
     let turn_res = run_fsm_turn_body(
         prompt,
+        intent,
         provider,
         model,
         context_manager,
@@ -225,7 +203,6 @@ pub async fn run_fsm_turn(
         stream_tx,
         cancel_rx,
         options,
-        session_turn.is_isolated_step,
     )
     .await;
     let outcome = match turn_res {
@@ -238,14 +215,14 @@ pub async fn run_fsm_turn(
                 context_manager.clear_auto();
                 context_manager.prune_missing_files();
             });
-            if let Some(id) = session_turn.turn_id {
+            if let Some(id) = turn_id {
                 let _ = history_manager.rollback_entry(id);
             }
             return Err(err);
         }
     };
     if outcome.is_cancelled {
-        if let Some(id) = session_turn.turn_id {
+        if let Some(id) = turn_id {
             let _ = history_manager.rollback_entry(id);
         }
     } else {
@@ -258,21 +235,20 @@ pub async fn run_fsm_turn(
 ///
 /// Session bookkeeping runs once per bounded turn, independently of the number
 /// of proposal attempts, so retried turns never duplicate the user prompt or
-/// trigger redundant compaction passes. Returns whether the prompt is an
-/// isolated step execution, which suppresses history bookkeeping entirely.
+/// trigger redundant compaction passes. The turn declares its mode as a typed
+/// [`TurnIntent`], so an isolated step suppresses history bookkeeping entirely
+/// without being recognized from the shape of its prompt text.
 pub(super) async fn begin_session_turn(
     prompt: &str,
+    intent: TurnIntent,
     context_manager: &ContextManager,
     history_manager: &mut HistoryManager,
     provider: &dyn LlmProvider,
     cancel_rx: &watch::Receiver<bool>,
     options: &WorkflowOptions,
-) -> SessionTurn {
-    let is_isolated_step = crate::plan::prompt::is_plan_step_execution_prompt(prompt)
-        || crate::review::is_review_step_execution_prompt(prompt);
-
+) -> Option<u64> {
     let mut turn_id = None;
-    if !is_isolated_step {
+    if !intent.is_isolated_step() {
         let _ = compact_history_if_needed_with_budget(
             history_manager,
             provider,
@@ -299,10 +275,7 @@ pub(super) async fn begin_session_turn(
         }
     }
 
-    SessionTurn {
-        is_isolated_step,
-        turn_id,
-    }
+    turn_id
 }
 
 /// Records the completed turn outcome in session history.
@@ -340,6 +313,7 @@ fn isolated_step_capabilities(protocol: &dyn PromptProtocol) -> tauqe_protocol::
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn run_fsm_turn_body(
     prompt: &str,
+    intent: TurnIntent,
     provider: &dyn LlmProvider,
     model: &ModelRef,
     context_manager: &mut ContextManager,
@@ -350,20 +324,19 @@ pub(super) async fn run_fsm_turn_body(
     stream_tx: mpsc::Sender<StreamEvent>,
     cancel_rx: watch::Receiver<bool>,
     options: &WorkflowOptions,
-    is_isolated_step: bool,
 ) -> anyhow::Result<FsmTurnOutcome> {
     let repo_root = context_manager.repo_root().to_path_buf();
 
-    let plan_mode = if is_isolated_step {
+    let plan_mode = if intent.is_isolated_step() {
         PlanMutationMode::IsolatedStep
-    } else if is_readonly_discussion_prompt(prompt) {
+    } else if intent.is_readonly_discussion() {
         PlanMutationMode::Discussion
     } else {
         PlanMutationMode::Develop
     };
 
     let isolated_protocol;
-    let protocol: &dyn PromptProtocol = if is_isolated_step {
+    let protocol: &dyn PromptProtocol = if intent.is_isolated_step() {
         isolated_protocol = protocol.with_capability_set(isolated_step_capabilities(protocol));
         isolated_protocol.as_ref()
     } else {
@@ -373,7 +346,7 @@ pub(super) async fn run_fsm_turn_body(
     log_fsm_phase(
         workflow_name,
         model,
-        is_isolated_step,
+        intent.is_isolated_step(),
         tauqe_protocol::TurnPhase::Proposal,
         Some(1),
         None,
@@ -404,7 +377,7 @@ pub(super) async fn run_fsm_turn_body(
         None,
         None,
         None,
-        is_isolated_step,
+        intent,
     )
     .await?;
 
@@ -419,6 +392,7 @@ pub(super) async fn run_fsm_turn_body(
             blocked: None,
             has_terminal_success: false,
             plan_saved: false,
+            skip_reason: None,
         });
     }
 
@@ -450,7 +424,7 @@ pub(super) async fn run_fsm_turn_body(
         cancel_rx: &cancel_rx,
         options,
         repo_root: &repo_root,
-        is_isolated_step,
+        intent,
         plan_mode,
         policy,
         context_manager,
@@ -513,7 +487,7 @@ async fn finish_on_error_outcome(ctx: &mut PhaseContext<'_>) -> Option<FsmTurnOu
     tracing::error!(
         workflow = ctx.workflow_name,
         model = %ctx.model,
-        isolated_step = ctx.is_isolated_step,
+        isolated_step = ctx.intent.is_isolated_step(),
         error = %message,
         "bounded turn terminated by an error outcome"
     );
@@ -561,6 +535,12 @@ async fn finish_answer_without_edits(ctx: &mut PhaseContext<'_>) -> FsmTurnOutco
         ctx.state.terminal_outcome,
         Some(tauqe_protocol::LlmOutcome::Success { .. })
     );
+    // A semantic skip is a validated outcome, so its report rides on the turn
+    // and is exempt from coder-ladder escalation.
+    let skip_reason = match &ctx.state.terminal_outcome {
+        Some(tauqe_protocol::LlmOutcome::Skip { reason }) => Some(reason.clone()),
+        _ => None,
+    };
     let mut answer_text = std::mem::take(&mut ctx.accumulated_text);
     if let Some(request) = ctx.state.verify_request.clone() {
         let outcome = run_workflow_verification(
@@ -582,6 +562,7 @@ async fn finish_answer_without_edits(ctx: &mut PhaseContext<'_>) -> FsmTurnOutco
                 blocked: None,
                 has_terminal_success: false,
                 plan_saved: false,
+                skip_reason: None,
             };
         }
         if !outcome.report.trim().is_empty() {
@@ -595,7 +576,7 @@ async fn finish_answer_without_edits(ctx: &mut PhaseContext<'_>) -> FsmTurnOutco
     tracing::info!(
         workflow = ctx.workflow_name,
         model = %ctx.model,
-        isolated_step = ctx.is_isolated_step,
+        isolated_step = ctx.intent.is_isolated_step(),
         "bounded turn produced an answer without edits"
     );
     let _ = ctx.stream_tx.send(StreamEvent::Done).await;
@@ -611,6 +592,7 @@ async fn finish_answer_without_edits(ctx: &mut PhaseContext<'_>) -> FsmTurnOutco
     )
     .await;
     outcome.has_terminal_success = has_terminal_success;
+    outcome.skip_reason = skip_reason;
     outcome
 }
 
@@ -624,7 +606,7 @@ async fn finish_patch_failure(
     tracing::warn!(
         workflow = ctx.workflow_name,
         model = %ctx.model,
-        isolated_step = ctx.is_isolated_step,
+        isolated_step = ctx.intent.is_isolated_step(),
         max_retries = ctx.options.max_retries,
         failed_files = last_failed_errors.len(),
         protocol_errors = current_protocol_errors.len(),
@@ -675,7 +657,7 @@ async fn finish_no_edits(ctx: &mut PhaseContext<'_>) -> FsmTurnOutcome {
     tracing::warn!(
         workflow = ctx.workflow_name,
         model = %ctx.model,
-        isolated_step = ctx.is_isolated_step,
+        isolated_step = ctx.intent.is_isolated_step(),
         "no edits were successfully staged"
     );
     crate::blocking::run_blocking(|| {
@@ -763,6 +745,7 @@ mod tests {
 
         let outcome = run_fsm_turn(
             "Change compute to 42",
+            tauqe_protocol::TurnIntent::InteractiveRepl,
             &provider,
             &model,
             &mut context,
@@ -806,6 +789,7 @@ mod tests {
 
         let outcome = run_fsm_turn(
             "Explain a.rs",
+            tauqe_protocol::TurnIntent::InteractiveRepl,
             &provider,
             &model,
             &mut context,
@@ -850,6 +834,7 @@ mod tests {
 
         let outcome = run_fsm_turn(
             "Plan work",
+            tauqe_protocol::TurnIntent::InteractiveRepl,
             &provider,
             &model,
             &mut context,
@@ -892,6 +877,7 @@ mod tests {
 
         let outcome = run_fsm_turn(
             "Make the change",
+            tauqe_protocol::TurnIntent::InteractiveRepl,
             &provider,
             &model,
             &mut context,
@@ -941,6 +927,7 @@ mod tests {
 
         let outcome = run_fsm_turn(
             "Change compute to 42",
+            tauqe_protocol::TurnIntent::InteractiveRepl,
             &provider,
             &model,
             &mut context,
@@ -983,6 +970,7 @@ mod tests {
 
         let _outcome = run_fsm_turn(
             "Explain",
+            tauqe_protocol::TurnIntent::InteractiveRepl,
             &provider,
             &model,
             &mut context,
@@ -1012,6 +1000,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn forwards_configured_session_id_to_the_provider() {
+        let (_dir, root) = setup_repo(&[("a.rs", TARGET)]);
+        let mut context = context_with_target(&root);
+        let mut history = HistoryManager::new(root.clone());
+
+        let provider = MockLlmProvider::scripted([MockResponse::text("Ready.")]);
+        let model = ModelRef::openrouter("mock/model");
+        let protocol = XmlPromptProtocol;
+        let mut policy = DirectApplyPolicy::new();
+        let options = WorkflowOptions {
+            session_id: Some("tauqe-repl-session".to_string()),
+            ..WorkflowOptions::default()
+        };
+        let (stream_tx, rx) = mpsc::channel(256);
+        drop(rx);
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+
+        let _outcome = run_fsm_turn(
+            "Explain",
+            tauqe_protocol::TurnIntent::InteractiveRepl,
+            &provider,
+            &model,
+            &mut context,
+            &mut history,
+            &protocol,
+            &mut policy,
+            "git",
+            stream_tx,
+            cancel_rx,
+            &options,
+        )
+        .await
+        .unwrap();
+
+        let request = provider.last_request().expect("recorded request");
+        assert_eq!(request.session_id.as_deref(), Some("tauqe-repl-session"));
+    }
+
+    #[tokio::test]
     async fn stream_error_during_proposal_aborts_and_rolls_back() {
         let (_dir, root) = setup_repo(&[("a.rs", TARGET)]);
         let mut context = context_with_target(&root);
@@ -1028,6 +1055,7 @@ mod tests {
 
         let outcome_res = run_fsm_turn(
             "Change compute to 42",
+            tauqe_protocol::TurnIntent::InteractiveRepl,
             &provider,
             &model,
             &mut context,
@@ -1095,6 +1123,7 @@ mod tests {
         // Run isolated step execution
         let outcome = run_fsm_turn_body(
             "Execute step: isolated",
+            tauqe_protocol::TurnIntent::IsolatedStep,
             &provider,
             &model,
             &mut context,
@@ -1105,7 +1134,6 @@ mod tests {
             stream_tx,
             cancel_rx,
             &options,
-            true, // is_isolated_step
         )
         .await
         .unwrap();
@@ -1132,6 +1160,7 @@ mod tests {
             description: None,
             created_at: 1,
             updated_at: 1,
+            architect: None,
             concept: vec![],
             items: vec![tauqe_protocol::PlanItem {
                 id: "1".to_string(),
@@ -1160,6 +1189,7 @@ mod tests {
 
         let outcome = run_fsm_turn(
             "Update plan",
+            tauqe_protocol::TurnIntent::InteractiveRepl,
             &provider,
             &model,
             &mut context,

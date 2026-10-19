@@ -94,7 +94,7 @@ pub(super) async fn run_apply_and_verify_phase(
     })
     .await
     .unwrap_or_default();
-    let current_verify = if ctx.is_isolated_step {
+    let current_verify = if ctx.intent.is_isolated_step() {
         // In isolated step / batch execution, verification is strictly determined by project configuration.
         // The model has no capability or authority to configure or weaken toolchain verification.
         if toolchain_config.effective_auto_verify() {
@@ -136,7 +136,7 @@ pub(super) async fn run_apply_and_verify_phase(
         log_fsm_phase(
             ctx.workflow_name,
             ctx.model,
-            ctx.is_isolated_step,
+            ctx.intent.is_isolated_step(),
             TurnPhase::Verification,
             None,
             None,
@@ -173,6 +173,7 @@ pub(super) async fn run_apply_and_verify_phase(
                 blocked: None,
                 has_terminal_success: false,
                 plan_saved: false,
+                skip_reason: None,
             });
         }
         if !verify_outcome.success {
@@ -196,7 +197,7 @@ pub(super) async fn run_apply_and_verify_phase(
             log_fsm_phase(
                 ctx.workflow_name,
                 ctx.model,
-                ctx.is_isolated_step,
+                ctx.intent.is_isolated_step(),
                 TurnPhase::Healing,
                 Some(healing_attempt),
                 Some(ctx.options.max_retries),
@@ -249,7 +250,7 @@ pub(super) async fn run_apply_and_verify_phase(
                 ctx.options,
                 &mut *ctx.input_cache,
                 ctx.state,
-                ctx.is_isolated_step,
+                ctx.intent,
                 &retry_prompt,
                 None,
             )
@@ -285,6 +286,7 @@ pub(super) async fn run_apply_and_verify_phase(
                     blocked: None,
                     has_terminal_success: false,
                     plan_saved: false,
+                    skip_reason: None,
                 });
             }
             ctx.state.absorb(&step_out);
@@ -361,7 +363,7 @@ pub(super) async fn run_apply_and_verify_phase(
                             total_changed_files.push(file);
                         }
                     }
-                    if !ctx.is_isolated_step && !toolchain_config.effective_auto_verify() {
+                    if !ctx.intent.is_isolated_step() && !toolchain_config.effective_auto_verify() {
                         if let Some(new_request) = step_out.verify_request() {
                             verify_request = new_request.clone();
                         }
@@ -392,6 +394,7 @@ pub(super) async fn run_apply_and_verify_phase(
                             blocked: None,
                             has_terminal_success: false,
                             plan_saved: false,
+                            skip_reason: None,
                         });
                     }
                     if !verify_outcome.success {
@@ -423,7 +426,7 @@ pub(super) async fn run_apply_and_verify_phase(
             tracing::info!(
                 workflow = ctx.workflow_name,
                 model = %ctx.model,
-                isolated_step = ctx.is_isolated_step,
+                isolated_step = ctx.intent.is_isolated_step(),
                 changed_files = total_changed_files.len(),
                 committed = commit_hash.is_some(),
                 "bounded turn applied and verified edits"
@@ -462,7 +465,7 @@ pub(super) async fn run_apply_and_verify_phase(
         tracing::warn!(
             workflow = ctx.workflow_name,
             model = %ctx.model,
-            isolated_step = ctx.is_isolated_step,
+            isolated_step = ctx.intent.is_isolated_step(),
             "verification failed after healing attempts"
         );
         let _ = ctx.stream_tx.send(StreamEvent::Done).await;
@@ -495,7 +498,7 @@ pub(super) async fn run_apply_and_verify_phase(
     tracing::info!(
         workflow = ctx.workflow_name,
         model = %ctx.model,
-        isolated_step = ctx.is_isolated_step,
+        isolated_step = ctx.intent.is_isolated_step(),
         changed_files = total_changed_files.len(),
         committed = commit_hash.is_some(),
         "bounded turn finalized edits without verification"
@@ -640,6 +643,7 @@ mod tests {
 
         let outcome_result = run_fsm_turn(
             "Change compute",
+            tauqe_protocol::TurnIntent::InteractiveRepl,
             &provider,
             &model,
             &mut context,

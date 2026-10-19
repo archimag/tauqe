@@ -2,6 +2,7 @@ use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::Stylize;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
+use unicode_width::UnicodeWidthStr;
 
 use crate::app::{HelpTab, ViewMode};
 use crate::command::editor::EDITOR_COMMAND_MAP;
@@ -77,8 +78,8 @@ fn wrap_words(text: &str, width: usize) -> Vec<String> {
     let mut lines = Vec::new();
     let mut current = String::new();
     for word in text.split_whitespace() {
-        let current_len = current.chars().count();
-        let word_len = word.chars().count();
+        let current_len = UnicodeWidthStr::width(current.as_str());
+        let word_len = UnicodeWidthStr::width(word);
         if !current.is_empty() && current_len + 1 + word_len > width {
             lines.push(std::mem::take(&mut current));
         }
@@ -246,7 +247,7 @@ fn build_help_body(
     let key_w = sections
         .iter()
         .flat_map(|section| section.commands.iter())
-        .map(|command| command.key.chars().count())
+        .map(|command| UnicodeWidthStr::width(command.key.as_str()))
         .max()
         .unwrap_or(0);
     let col_w = key_w + 2;
@@ -337,9 +338,9 @@ pub fn help_tab_geometry(term: Rect) -> HelpTabGeometry {
         help_tab_title(HelpTab::TextEditor),
     ];
     let widths: [u16; 3] = [
-        titles[0].chars().count() as u16 + 2,
-        titles[1].chars().count() as u16 + 2,
-        titles[2].chars().count() as u16 + 2,
+        UnicodeWidthStr::width(titles[0].as_str()) as u16 + 2,
+        UnicodeWidthStr::width(titles[1].as_str()) as u16 + 2,
+        UnicodeWidthStr::width(titles[2].as_str()) as u16 + 2,
     ];
     let gap = 4u16;
     let total = widths[0] + widths[1] + widths[2] + gap * 2;
@@ -373,9 +374,29 @@ fn list_help_commands(
         .iter()
         .map(|command| HelpCommand {
             key: format_command_key(command.key, primary, meta),
-            description: command.description.to_string(),
+            description: onboarding_description(command.key)
+                .unwrap_or_else(|| command.description.to_string()),
         })
         .collect()
+}
+
+/// Resolves the localized description of a Setup (onboarding) command from the
+/// canonical catalog, keyed by the abstract chord declared in
+/// [`ONBOARDING_COMMANDS`]. The command list owns the chords and the catalog owns
+/// the text, so a hot-swapped locale reaches the Setup Help tab without
+/// duplicating either. An unmapped chord falls back to the static English
+/// description, so the tab never renders an empty row (c-1, c-5).
+fn onboarding_description(raw_key: &str) -> Option<String> {
+    let catalog_key = match raw_key {
+        "Enter" => "cmd.onboarding.execute",
+        "Esc" => "cmd.onboarding.exit_help",
+        "C-R" => "cmd.onboarding.toggle_key",
+        "C-V" => "cmd.onboarding.paste_key",
+        "C-U" => "cmd.onboarding.clear_key_input",
+        "C-O" => "cmd.onboarding.reload_config",
+        _ => return None,
+    };
+    Some(active_t(catalog_key))
 }
 
 /// Returns the heading and cognitive-ordered rows for the active mode.

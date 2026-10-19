@@ -11,9 +11,13 @@
 //! domain parsers and edit state, while the wire DTOs stay in `crates/protocol`.
 
 mod builtin;
+mod regime;
 mod registry;
 
-pub use registry::{CapabilityModule, CapabilityRegistry, PromptRenderContext};
+pub use registry::{
+    CapabilityModule, CapabilityRegistry, ContractContext, ContractRule, PromptRenderContext,
+    render_contract_rules,
+};
 
 // Protocol-to-command mapping helpers are owned by the capability modules that
 // define the corresponding capability. Re-exporting them keeps a single source

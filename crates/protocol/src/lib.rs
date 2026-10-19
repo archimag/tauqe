@@ -22,6 +22,7 @@ pub mod events;
 pub mod git;
 pub mod glob;
 pub mod history;
+pub mod intent;
 pub mod locale;
 pub mod message;
 pub mod methods;
@@ -66,7 +67,8 @@ pub use errors::{
     INVALID_PLAN_TREE, INVALID_PROTOCOL, INVALID_REQUEST, INVALID_WORKFLOW, ITEM_IN_DISCUSSION,
     ITEM_IN_REFINE, ITEM_REJECTED, LIST_FILES_FAILED, METHOD_NOT_FOUND, MODEL_ERROR,
     NEEDS_CONTEXT, NOT_FOUND, NOTHING_TO_EXECUTE, NOT_A_LEAF, NO_API_KEY, OPERATION_IN_PROGRESS,
-    PARSE_ERROR, PINNED_PROTECTED, PLAN_DELETE_FAILED, PLAN_GET_FAILED, PLAN_LIST_FAILED,
+    PARSE_ERROR, PINNED_PROTECTED, PLAN_CLEAR_FAILED, PLAN_DELETE_FAILED, PLAN_GET_FAILED,
+    PLAN_LIST_FAILED,
     PLAN_LOAD_FAILED, PLAN_SAVE_FAILED, PLAN_SET_ACTIVE_FAILED, PLAN_UPDATE_FAILED,
     PREFLIGHT_VERIFICATION_FAILED, REMOVE_FAILED, REPOSITORY_STATE_FAILED, REVIEW_DELETE_FAILED,
     REVIEW_GET_FAILED, REVIEW_LIST_FAILED, REVIEW_LOAD_FAILED, REVIEW_UPDATE_FAILED, SCHEMA_ERROR,
@@ -85,29 +87,32 @@ pub use history::{
     HistoryCompactedEvent, HistoryEntryAddedEvent, HistoryGetParams, HistoryGetResult,
     UiHistoryItem, UiHistoryKind,
 };
+pub use intent::TurnIntent;
 pub use locale::{LocaleCatalogItem, LocaleGenerateParams, LocaleGenerateResult};
 pub use message::{
     Event, InitializeParams, InitializeResult, Message, Request, RequestId, Response,
     ResponseError,
 };
 pub use model::{
-    BatchFinishStatus, BatchFinishSummary, CancelMode, CoderTier, deserialize_model_ref_lenient,
+    ArchitectTier, BatchFinishStatus, BatchFinishSummary, CancelMode, CoderTier,
+    deserialize_model_ref_lenient,
     ModelAskParams, ModelCancelParams, ModelChangedEvent, ModelCurrentResult, ModelDeltaEvent,
     ModelEntry,
     ModelErrorEvent,
     ModelFinishedEvent, ModelRef, ModelResult, ModelResultEvent, ModelResultProposal, ModelRole,
     ModelRolesEffort, ModelRolesEntries, ModelRolesSummary, ModelSelectParams, ModelSelectResult,
     ModelSelection, ModelStartedEvent, ModelTurnPlanContext, ModelUsageEvent, ModelUsageInfo,
-    PlanBatchFinishedEvent, ProviderKind, ReasoningEffort, RepoMapInfoEvent,
+    ModelUsageTotalsEvent, PlanBatchFinishedEvent, ProviderKind, ReasoningEffort, RepoMapInfoEvent,
     ReviewBatchFinishedEvent, ToolchainFinishedEvent, ToolchainStartedEvent, TurnPhase,
-    TurnPhaseEvent,
+    TurnPhaseEvent, UsageTotals, UsageTotalsSnapshot,
 };
 pub use plan::{
-    compute_items_status, ConceptItem, Plan, PlanDeleteParams, PlanExecuteParams, PlanGetParams,
-    PlanGetResult, PlanItem, PlanItemStatus, PlanListChangedEvent, PlanListResult,
-    PlanRefineParams, PlanRefineResult, PlanReplanParams, PlanSaveParams, PlanScopeEvaluation,
-    PlanSetActiveParams, PlanSetActiveResult, PlanStats, PlanSummary, PlanUpdateItemParams,
-    PlanUpdateItemResult, PlanUpdatedEvent, PlanValidationError,
+    compute_items_status, ConceptItem, Plan, PlanClearHorizonParams, PlanClearHorizonResult,
+    PlanDeleteParams, PlanExecuteParams, PlanExecutePipelineParams, PlanGetParams, PlanGetResult,
+    PlanItem, PlanItemStatus, PlanListChangedEvent, PlanListResult, PlanRefineParams,
+    PlanRefineResult, PlanReplanParams, PlanSaveParams, PlanScopeEvaluation, PlanSetActiveParams,
+    PlanSetActiveResult, PlanStats, PlanSummary, PlanUpdateItemParams, PlanUpdateItemResult,
+    PlanUpdatedEvent, PlanValidationError,
 };
 pub use review::{
     IssueStatus, IssueType, ReviewCancelParams, ReviewContentDeltaEvent, ReviewDeleteParams,

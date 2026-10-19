@@ -30,6 +30,7 @@ fn test_plan_refine_types_serde_and_helpers() {
         description: None,
         created_at: 10,
         updated_at: 20,
+        architect: None,
         concept: vec![],
         items: vec![],
     };
@@ -105,6 +106,7 @@ fn test_concept_item_and_two_section_plan_serde() {
         description: Some("Architecture & steps".to_string()),
         created_at: 100,
         updated_at: 200,
+        architect: None,
         concept,
         items: vec![step],
     };
@@ -187,6 +189,7 @@ fn test_plan_stats_and_summary() {
         description: Some("Replace session cookies".to_string()),
         created_at: 1700000000,
         updated_at: 1700000010,
+        architect: None,
         concept: vec![],
         items: vec![
             item(
@@ -221,6 +224,7 @@ fn test_count_stats_reports_only_leaves() {
         description: None,
         created_at: 1,
         updated_at: 1,
+        architect: None,
         concept: vec![],
         items: vec![
             item(
@@ -252,6 +256,7 @@ fn test_count_stats_excludes_cancelled_leaves_and_agrees_with_done_status() {
         description: None,
         created_at: 1,
         updated_at: 1,
+        architect: None,
         concept: vec![],
         items: vec![
             item("1", "Done step", PlanItemStatus::Done, vec![]),
@@ -279,6 +284,7 @@ fn test_count_stats_excludes_cancelled_leaves_in_mixed_plan() {
         description: None,
         created_at: 1,
         updated_at: 1,
+        architect: None,
         concept: vec![],
         items: vec![
             item("1", "Done step", PlanItemStatus::Done, vec![]),
@@ -302,6 +308,7 @@ fn test_count_stats_all_cancelled_reports_zero_and_cancelled_status() {
         description: None,
         created_at: 1,
         updated_at: 1,
+        architect: None,
         concept: vec![],
         items: vec![
             item("1", "Cancelled A", PlanItemStatus::Cancelled, vec![]),
@@ -324,6 +331,7 @@ fn test_evaluate_scope_reports_only_leaves_for_discussion() {
         description: None,
         created_at: 1,
         updated_at: 1,
+        architect: None,
         concept: vec![],
         items: vec![item(
             "1",
@@ -369,6 +377,7 @@ fn test_evaluate_scope_dependency_uses_derived_container_status() {
         description: None,
         created_at: 1,
         updated_at: 1,
+        architect: None,
         concept: vec![],
         items: vec![
             item(
@@ -401,6 +410,7 @@ fn test_plan_status_computation() {
         description: None,
         created_at: 1,
         updated_at: 1,
+        architect: None,
         concept: vec![],
         items: vec![
             item("1", "Step 1", PlanItemStatus::Todo, vec![]),
@@ -444,6 +454,7 @@ fn test_plan_item_leaf_and_refresh_parent_statuses() {
         description: None,
         created_at: 1,
         updated_at: 1,
+        architect: None,
         concept: vec![],
         items: vec![item(
             "parent",
@@ -503,6 +514,7 @@ fn test_plan_normalize_leaf_files() {
         description: None,
         created_at: 1,
         updated_at: 1,
+        architect: None,
         concept: vec![],
         items: vec![top, leaf],
     };
@@ -553,6 +565,7 @@ fn test_normalize_leaf_files_dedups_readonly_by_canonical_path() {
         description: None,
         created_at: 1,
         updated_at: 1,
+        architect: None,
         concept: vec![],
         items: vec![leaf],
     };
@@ -571,6 +584,7 @@ fn test_plan_evaluate_scope() {
         description: None,
         created_at: 1,
         updated_at: 1,
+        architect: None,
         concept: vec![],
         items: vec![
             item(
@@ -650,6 +664,7 @@ fn test_plan_evaluate_scope_dependencies() {
         description: None,
         created_at: 1,
         updated_at: 1,
+        architect: None,
         concept: vec![],
         items: vec![first, second, third],
     };
@@ -692,6 +707,7 @@ fn test_plan_evaluate_scope_surfaces_blocked_leaves() {
         description: None,
         created_at: 1,
         updated_at: 1,
+        architect: None,
         concept: vec![],
         items: vec![
             item("1", "Stuck A", PlanItemStatus::Blocked, vec![]),
@@ -715,6 +731,7 @@ fn test_plan_evaluate_scope_surfaces_blocked_leaves() {
         description: None,
         created_at: 1,
         updated_at: 1,
+        architect: None,
         concept: vec![],
         items: vec![
             item("1", "Ready", PlanItemStatus::Todo, vec![]),
@@ -736,6 +753,7 @@ fn test_plan_evaluate_scope_surfaces_blocked_leaves() {
         description: None,
         created_at: 1,
         updated_at: 1,
+        architect: None,
         concept: vec![],
         items: vec![item(
             "g",
@@ -764,6 +782,7 @@ fn test_plan_update_item_status_matches_ids_case_insensitively() {
         description: None,
         created_at: 1,
         updated_at: 1,
+        architect: None,
         concept: vec![],
         items: vec![item("Step-1", "Step", PlanItemStatus::Todo, vec![])],
     };
@@ -782,6 +801,7 @@ fn test_plan_update_item_status_rejects_container_targets() {
         description: None,
         created_at: 1,
         updated_at: 1,
+        architect: None,
         concept: vec![],
         items: vec![item(
             "g",
@@ -807,6 +827,83 @@ fn test_plan_update_item_status_rejects_container_targets() {
 }
 
 #[test]
+fn test_plan_has_started_or_completed_steps() {
+    fn plan_with(concept: Vec<ConceptItem>, items: Vec<PlanItem>) -> Plan {
+        Plan {
+            id: "started-steps".to_string(),
+            title: "Started Steps".to_string(),
+            description: None,
+            created_at: 1,
+            updated_at: 1,
+            architect: None,
+            concept,
+            items,
+        }
+    }
+
+    // A purely conceptual plan carries no implementation steps, so nothing is
+    // started or completed and a single confirmation is enough to clear it.
+    let conceptual = plan_with(
+        vec![ConceptItem {
+            id: "c-1".to_string(),
+            title: "Invariant".to_string(),
+            details: None,
+            children: vec![],
+        }],
+        vec![],
+    );
+    assert!(!conceptual.has_started_or_completed_steps());
+
+    // A single pending leaf records no progress.
+    let todo_only = plan_with(vec![], vec![item("1", "Pending", PlanItemStatus::Todo, vec![])]);
+    assert!(!todo_only.has_started_or_completed_steps());
+
+    // An in-progress leaf means implementation work is already underway.
+    let in_progress = plan_with(
+        vec![],
+        vec![item("1", "Active", PlanItemStatus::InProgress, vec![])],
+    );
+    assert!(in_progress.has_started_or_completed_steps());
+
+    // A finished leaf means progress may already be captured by a Git commit.
+    let done = plan_with(vec![], vec![item("1", "Finished", PlanItemStatus::Done, vec![])]);
+    assert!(done.has_started_or_completed_steps());
+
+    // A finished leaf counts at any depth, even beside pending siblings and
+    // with a stale container status.
+    let nested = plan_with(
+        vec![],
+        vec![item(
+            "1",
+            "Group",
+            PlanItemStatus::Todo,
+            vec![
+                item("1.1", "Pending", PlanItemStatus::Todo, vec![]),
+                item("1.2", "Finished", PlanItemStatus::Done, vec![]),
+            ],
+        )],
+    );
+    assert!(nested.has_started_or_completed_steps());
+
+    // A container whose leaves are all pending holds no progress of its own: the
+    // container status is derived from its children and is never inspected, so a
+    // stale `Done` on the container does not count as started work.
+    let pending_group = plan_with(
+        vec![],
+        vec![item(
+            "1",
+            "Group",
+            PlanItemStatus::Done,
+            vec![
+                item("1.1", "A", PlanItemStatus::Todo, vec![]),
+                item("1.2", "B", PlanItemStatus::Todo, vec![]),
+            ],
+        )],
+    );
+    assert!(!pending_group.has_started_or_completed_steps());
+}
+
+#[test]
 fn test_plan_to_markdown() {
     let mut models = item(
         "1",
@@ -824,6 +921,7 @@ fn test_plan_to_markdown() {
         description: Some("Replace session cookies".to_string()),
         created_at: 1700000000,
         updated_at: 1700000010,
+        architect: None,
         concept: vec![],
         items: vec![models, endpoint],
     };
@@ -1059,6 +1157,7 @@ fn test_identifier_normalization_is_consistent_across_validation_lookup_and_read
         description: None,
         created_at: 1,
         updated_at: 1,
+        architect: None,
         concept: vec![],
         items: vec![
             item(" 1 ", "Producer", PlanItemStatus::Done, vec![]),
@@ -1138,4 +1237,204 @@ fn test_plan_validate_detects_transitive_ancestor_deadlock() {
         }
         other => panic!("Expected a single CyclicDependency, got {:?}", other),
     }
+}
+
+#[test]
+fn test_plan_validate_detects_container_cycle_through_dependent_leaf() {
+    // The implicit container-to-leaf edge participates in cycle detection: the
+    // group can only finish once its child is Done, the child waits for the
+    // dependent step, and the dependent step waits for the group.
+    let mut child = item("1.1", "Child", PlanItemStatus::Todo, vec![]);
+    child.depends_on = vec!["2".to_string()];
+
+    let mut dependent = item("2", "Dependent", PlanItemStatus::Todo, vec![]);
+    dependent.depends_on = vec!["1".to_string()];
+
+    let plan = Plan {
+        id: "container-cycle".to_string(),
+        title: "Container Cycle".to_string(),
+        items: vec![
+            item("1", "Group", PlanItemStatus::Todo, vec![child]),
+            dependent,
+        ],
+        ..Default::default()
+    };
+
+    let errs = plan.validate().unwrap_err();
+    assert_eq!(errs.len(), 1);
+    match &errs[0] {
+        PlanValidationError::CyclicDependency(cycle) => {
+            for id in ["1", "1.1", "2"] {
+                assert!(
+                    cycle.contains(&id.to_string()),
+                    "cycle {cycle:?} misses step {id}"
+                );
+            }
+        }
+        other => panic!("Expected CyclicDependency, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_compute_direct_status_aggregation_edge_cases() {
+    use super::node::compute_direct_status;
+
+    // An empty set has no active member and defaults to Todo.
+    assert_eq!(
+        compute_direct_status(std::iter::empty::<PlanItemStatus>()),
+        PlanItemStatus::Todo
+    );
+    // Discussion dominates every other status.
+    assert_eq!(
+        compute_direct_status(vec![
+            PlanItemStatus::Done,
+            PlanItemStatus::Blocked,
+            PlanItemStatus::Discussion,
+            PlanItemStatus::InProgress,
+            PlanItemStatus::Todo,
+        ]),
+        PlanItemStatus::Discussion
+    );
+    // Blocked outranks InProgress.
+    assert_eq!(
+        compute_direct_status(vec![PlanItemStatus::InProgress, PlanItemStatus::Blocked]),
+        PlanItemStatus::Blocked
+    );
+    // InProgress outranks a partial Done/Todo mix.
+    assert_eq!(
+        compute_direct_status(vec![
+            PlanItemStatus::Done,
+            PlanItemStatus::Todo,
+            PlanItemStatus::InProgress,
+        ]),
+        PlanItemStatus::InProgress
+    );
+    // A Done/Todo mix is InProgress, never Done.
+    assert_eq!(
+        compute_direct_status(vec![PlanItemStatus::Done, PlanItemStatus::Todo]),
+        PlanItemStatus::InProgress
+    );
+    // A cancelled member does not prevent a finished set from being Done.
+    assert_eq!(
+        compute_direct_status(vec![PlanItemStatus::Done, PlanItemStatus::Cancelled]),
+        PlanItemStatus::Done
+    );
+    // A cancelled member does not disturb an all-Todo set.
+    assert_eq!(
+        compute_direct_status(vec![PlanItemStatus::Todo, PlanItemStatus::Cancelled]),
+        PlanItemStatus::Todo
+    );
+    // A set whose members are all cancelled is Cancelled.
+    assert_eq!(
+        compute_direct_status(vec![PlanItemStatus::Cancelled, PlanItemStatus::Cancelled]),
+        PlanItemStatus::Cancelled
+    );
+    // A single InProgress stays InProgress.
+    assert_eq!(
+        compute_direct_status(vec![PlanItemStatus::InProgress]),
+        PlanItemStatus::InProgress
+    );
+}
+
+#[test]
+fn test_refresh_parent_statuses_and_scope_on_deep_hierarchy() {
+    let mut plan = Plan {
+        id: "deep-hierarchy".to_string(),
+        title: "Deep Hierarchy".to_string(),
+        description: None,
+        created_at: 1,
+        updated_at: 1,
+        architect: None,
+        concept: vec![],
+        items: vec![item(
+            "1",
+            "Top",
+            PlanItemStatus::Todo,
+            vec![
+                item(
+                    "1.1",
+                    "Mid",
+                    PlanItemStatus::Todo,
+                    vec![
+                        item("1.1.1", "Finished", PlanItemStatus::Done, vec![]),
+                        item("1.1.2", "Pending", PlanItemStatus::Todo, vec![]),
+                    ],
+                ),
+                item("1.2", "Abandoned", PlanItemStatus::Cancelled, vec![]),
+            ],
+        )],
+    };
+
+    // Derived container statuses propagate through every nesting level: the
+    // partially finished group is InProgress and so is its parent.
+    plan.refresh_parent_statuses();
+    assert_eq!(
+        plan.find_item("1.1").unwrap().status,
+        PlanItemStatus::InProgress
+    );
+    assert_eq!(plan.find_item("1").unwrap().status, PlanItemStatus::InProgress);
+    assert_eq!(plan.status(), PlanItemStatus::InProgress);
+    // Only executable leaves count: the cancelled leaf stays out of the metric.
+    assert_eq!(plan.count_stats(), (2, 1));
+
+    // The readiness scan schedules exactly the pending leaf: the finished leaf is
+    // already satisfied and the cancelled leaf is skipped instead of stalling it.
+    match plan.evaluate_scope(None) {
+        PlanScopeEvaluation::Ready(leaves) => {
+            let ids: Vec<&str> = leaves.iter().map(|i| i.id.as_str()).collect();
+            assert_eq!(ids, vec!["1.1.2"]);
+        }
+        other => panic!("Expected Ready, got {:?}", other),
+    }
+
+    // A composite scope at the middle level reports the same single pending leaf.
+    match plan.evaluate_scope(Some("1.1")) {
+        PlanScopeEvaluation::Ready(leaves) => {
+            let ids: Vec<&str> = leaves.iter().map(|i| i.id.as_str()).collect();
+            assert_eq!(ids, vec!["1.1.2"]);
+        }
+        other => panic!("Expected Ready, got {:?}", other),
+    }
+
+    // Finishing the last executable leaf cascades to the top, and the cancelled
+    // sibling keeps the plan Done instead of blocking completion.
+    assert!(plan.update_item_status("1.1.2", PlanItemStatus::Done));
+    assert_eq!(plan.find_item("1.1").unwrap().status, PlanItemStatus::Done);
+    assert_eq!(plan.find_item("1").unwrap().status, PlanItemStatus::Done);
+    assert_eq!(plan.status(), PlanItemStatus::Done);
+    assert_eq!(plan.count_stats(), (2, 2));
+    assert_eq!(plan.evaluate_scope(None), PlanScopeEvaluation::AllCompleted);
+}
+
+#[test]
+fn test_plan_to_markdown_keeps_metadata_on_single_lines() {
+    let mut step = item("1", "Step", PlanItemStatus::Todo, vec![]);
+    // Hand-edited plan JSON can carry surrounding whitespace, embedded line
+    // breaks and empty entries. Each key must still render as exactly one
+    // indented line, and a key with no usable entry must render no line.
+    step.files = vec![
+        "  src/a.rs  ".to_string(),
+        String::new(),
+        "src/b\n.rs".to_string(),
+    ];
+    step.readonly_files = vec!["   ".to_string()];
+    step.depends_on = vec!["0\r".to_string()];
+
+    let plan = Plan {
+        id: "metadata-lines".to_string(),
+        title: "Metadata Lines".to_string(),
+        description: None,
+        created_at: 1,
+        updated_at: 1,
+        architect: None,
+        concept: vec![],
+        items: vec![step],
+    };
+
+    let md = plan.to_markdown();
+    assert!(md.contains("    files: src/a.rs, src/b .rs\n"));
+    assert!(!md.contains("readonly_files"));
+    assert!(md.contains("    depends_on: 0\n"));
+    // No carriage return survives into the rendered document.
+    assert!(!md.contains('\r'));
 }

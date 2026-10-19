@@ -9,9 +9,10 @@
 //! carries the aggregate status, finding counters, and elapsed time, so clients
 //! can raise a single notice for the whole batch.
 //!
-//! A finding in `Refine` (or a `Warning`-severity finding without a subplan) is
-//! decomposed by the Architect autonomously inside the executing step, so the
-//! batch queue never hands an undecomposed architecture finding to the Coder.
+//! A finding in `Refine`, or an `Architecture`-class finding without a subplan,
+//! is decomposed by the Architect autonomously inside the executing step, so
+//! the batch queue never hands an undecomposed architecture finding to the
+//! Coder.
 //! A caller may target a single leaf sub-step by `step_id` and supply a Coder
 //! model override plus developer directives.
 
@@ -25,8 +26,8 @@ use tauqe_core::workflow::batch::{
     BatchExecution, BatchStep, BatchStepExecutor, BatchStepOutcome, BatchStop,
 };
 use tauqe_protocol::{
-    errors, events, BatchFinishStatus, BatchFinishSummary, IssueStatus, ModelSelection, PlanItem,
-    PlanItemStatus, Request, Response, ResponseError, ReviewBatchFinishedEvent,
+    errors, events, BatchFinishStatus, BatchFinishSummary, IssueStatus, ModelSelection, Plan,
+    PlanScopeEvaluation, Request, Response, ResponseError, ReviewBatchFinishedEvent,
     ReviewExecuteParams, ReviewItem,
 };
 use tokio::sync::{mpsc, watch};
@@ -55,25 +56,15 @@ pub(super) enum BatchOutcome {
     },
 }
 
-/// Locates a leaf sub-step by identifier within a finding's embedded subplan.
-fn find_leaf_step<'a>(items: &'a [PlanItem], step_id: &str) -> Option<&'a PlanItem> {
-    fn walk<'a>(items: &'a [PlanItem], step_id: &str) -> Option<&'a PlanItem> {
-        for item in items {
-            if item.children.is_empty() {
-                if item.id.eq_ignore_ascii_case(step_id) {
-                    return Some(item);
-                }
-            } else if let Some(found) = walk(&item.children, step_id) {
-                return Some(found);
-            }
-        }
-        None
-    }
-    walk(items, step_id)
-}
-
-/// Validates that a targeted sub-step exists, is runnable, and has its internal
-/// dependencies satisfied before a batch is allowed to start.
+/// Validates that a targeted sub-step exists, is an executable leaf, and is
+/// ready to run before a batch is allowed to start.
+///
+/// The finding's embedded subplan is wrapped in a [`Plan`] so the readiness
+/// rules are never re-implemented here: `Plan::find_item` resolves the target,
+/// `PlanItem::is_leaf` rejects conceptual containers, and
+/// `Plan::evaluate_scope` decides `Done`/`Cancelled` immutability and dependency
+/// readiness, including a dependency satisfied by a `Done` container whose
+/// status is derived from its own leaves.
 fn validate_step_target(item: &ReviewItem, step_id: &str) -> Result<(), ResponseError> {
     if !item.has_subplan() {
         return Err(response_error(
@@ -84,7 +75,12 @@ fn validate_step_target(item: &ReviewItem, step_id: &str) -> Result<(), Response
             ),
         ));
     }
-    let step = find_leaf_step(&item.subplan, step_id).ok_or_else(|| {
+
+    let plan = Plan {
+        items: item.subplan.clone(),
+        ..Default::default()
+    };
+    let target = plan.find_item(step_id).ok_or_else(|| {
         response_error(
             errors::NOT_FOUND,
             format!(
@@ -93,48 +89,63 @@ fn validate_step_target(item: &ReviewItem, step_id: &str) -> Result<(), Response
             ),
         )
     })?;
-    if !step.children.is_empty() {
+    if !target.is_leaf() {
         return Err(response_error(
             errors::INVALID_PARAMS,
             format!(
                 "Sub-step '{}' is not a leaf item and cannot be executed directly",
-                step.id
+                target.id
             ),
         ));
     }
-    if step.status == PlanItemStatus::Done {
-        return Err(response_error(
+    let step_id = target.id.clone();
+
+    match plan.evaluate_scope(Some(step_id.as_str())) {
+        PlanScopeEvaluation::Ready(_) => Ok(()),
+        PlanScopeEvaluation::AllCompleted => Err(response_error(
             errors::NOTHING_TO_EXECUTE,
-            format!("Sub-step '{}' is already DONE", step.id),
-        ));
-    }
-    if step.status == PlanItemStatus::Cancelled {
-        return Err(response_error(
+            format!("Sub-step '{}' is already DONE", step_id),
+        )),
+        PlanScopeEvaluation::Cancelled => Err(response_error(
             errors::NOTHING_TO_EXECUTE,
-            format!("Sub-step '{}' is CANCELLED and cannot be executed", step.id),
-        ));
-    }
-    let unmet: Vec<String> = step
-        .depends_on
-        .iter()
-        .filter(|dep| {
-            find_leaf_step(&item.subplan, dep)
-                .map(|d| d.status != PlanItemStatus::Done && d.status != PlanItemStatus::Cancelled)
-                .unwrap_or(true)
-        })
-        .cloned()
-        .collect();
-    if !unmet.is_empty() {
-        return Err(response_error(
+            format!("Sub-step '{}' is CANCELLED and cannot be executed", step_id),
+        )),
+        PlanScopeEvaluation::StepBlocked => Err(response_error(
+            errors::STEP_BLOCKED,
+            format!("Sub-step '{}' is BLOCKED and cannot be executed", step_id),
+        )),
+        PlanScopeEvaluation::BlockedByDependencies(blocked) => Err(response_error(
             errors::STEP_BLOCKED_BY_DEPENDENCIES,
             format!(
                 "Sub-step '{}' depends on unfinished sub-step(s): {}",
-                step.id,
-                unmet.join(", ")
+                step_id,
+                blocked.join(", ")
             ),
-        ));
+        )),
+        PlanScopeEvaluation::BlockedByBlockers(blocked) => Err(response_error(
+            errors::STEP_BLOCKED,
+            format!(
+                "Sub-step '{}' cannot run while blocked sub-step(s) remain: {}",
+                step_id,
+                blocked.join(", ")
+            ),
+        )),
+        PlanScopeEvaluation::BlockedByDiscussion(discussion) => Err(response_error(
+            errors::STEP_IN_DISCUSSION,
+            format!(
+                "Sub-step '{}' is in DISCUSSION status and cannot be executed until reviewed: {}",
+                step_id,
+                discussion.join(", ")
+            ),
+        )),
+        PlanScopeEvaluation::NotFound => Err(response_error(
+            errors::NOT_FOUND,
+            format!(
+                "Sub-step '{}' not found in review item #{}",
+                step_id, item.id
+            ),
+        )),
     }
-    Ok(())
 }
 
 /// Builds a typed protocol error, mirroring `Response::err`.

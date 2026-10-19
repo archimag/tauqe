@@ -10,7 +10,7 @@
 use tokio::sync::{mpsc, watch};
 use tauqe_protocol::{
     ContextAccess, DocTopic, EditOperation, LlmCommand, LlmOutcome, ModelRef, RepoSearchRequest,
-    VerifyOnSuccess, VerifyTarget,
+    TurnIntent, VerifyOnSuccess, VerifyTarget,
 };
 
 use crate::context::{ContextFileContent, ContextManager};
@@ -26,7 +26,6 @@ use crate::providers::{LlmProvider, StreamEvent};
 use crate::workflow::WorkflowOptions;
 
 use super::cache::TurnInputCache;
-use super::is_readonly_discussion_prompt;
 
 /// Normalized proposal returned by a single model interaction.
 ///
@@ -128,20 +127,6 @@ impl ProposalStep {
         &self.commands
     }
 
-    /// Reports whether the proposal carries any command a registered Discovery
-    /// handler owns.
-    ///
-    /// The predicate consults the same handler registry the Discovery
-    /// dispatcher uses, so it can never advertise a capability the round would
-    /// not actually execute.
-    #[allow(dead_code)]
-    pub(super) fn has_discovery_commands(&self) -> bool {
-        let handlers = crate::workflow::discovery::discovery_handlers();
-        self.commands()
-            .iter()
-            .any(|command| handlers.iter().any(|handler| handler.handles(command)))
-    }
-
     /// File edit operations carried by the proposal.
     pub(super) fn edits(&self) -> &[EditOperation] {
         &self.edits
@@ -195,6 +180,17 @@ impl ProposalStep {
     /// Protocol syntax or structure errors encountered during decoding.
     pub(super) fn protocol_errors(&self) -> &[String] {
         &self.protocol_errors
+    }
+
+    /// Reports whether the proposal carries any discovery capability command.
+    ///
+    /// Reads the pre-partitioned buckets, so the healing phase can decide
+    /// whether to run the discovery dispatcher without rescanning the raw
+    /// command list.
+    pub(super) fn has_discovery_commands(&self) -> bool {
+        !self.context_requests.is_empty()
+            || !self.doc_requests.is_empty()
+            || !self.repo_searches.is_empty()
     }
 }
 
@@ -320,14 +316,19 @@ pub(super) async fn run_proposal_step(
     staged_state: Option<&StagedEditsState>,
     target_language: Option<&str>,
     turn_scratchpad: Option<&str>,
-    is_isolated_step: bool,
+    intent: TurnIntent,
 ) -> anyhow::Result<ProposalStep> {
     let repo_root = context_manager.repo_root().to_path_buf();
-    let repo_state = {
-        let root = repo_root.clone();
+
+    // Reading the repository state shells out to git; the call runs off the
+    // async executor thread. A repository that cannot be inspected degrades to
+    // an absent state block instead of failing the turn.
+    let root = repo_root.clone();
+    let repo_state =
         crate::blocking::run_blocking_async(move || crate::git::get_repository_state(Some(&root)))
-            .await?
-    };
+            .await
+            .ok();
+
     let ctx_state = context_manager.get_state();
     let root = repo_root.clone();
     let items = ctx_state.items.clone();
@@ -348,19 +349,26 @@ pub(super) async fn run_proposal_step(
     .await?;
 
     if let Some(staged) = staged_state {
+        // Staged content is merged in place: a file already present in context
+        // keeps its position, its neighbors keep their tokens, and the round
+        // extends the previous prompt instead of reshaping it. Files created
+        // during the turn are appended after the existing block in path order,
+        // which keeps the appended tail deterministic across rounds.
+        let mut appended = Vec::new();
         for (path, content) in &staged.staged_files {
             if let Some(file) = context_files.iter_mut().find(|file| &file.path == path) {
                 file.content = content.clone();
             } else {
-                context_files.push(ContextFileContent {
+                appended.push(ContextFileContent {
                     path: path.clone(),
                     access: ContextAccess::Editable,
                     content: content.clone(),
                 });
             }
         }
+        appended.sort_by(|a, b| a.path.cmp(&b.path));
+        context_files.extend(appended);
         context_files.retain(|file| !staged.deleted_paths.contains(&file.path));
-        context_files.sort_by(|a, b| a.path.cmp(&b.path));
     }
 
     let targetable_paths: Vec<String> = context_files
@@ -368,13 +376,10 @@ pub(super) async fn run_proposal_step(
         .map(|file| file.path.clone())
         .collect();
 
+    // The cache freezes the map on the first round of the turn, so later rounds
+    // receive the identical string even after discovery widened the context.
     let repo_map = cache
-        .repo_map(
-            &repo_root,
-            &repo_state.head,
-            &targetable_paths,
-            options.repomap_token_budget,
-        )
+        .repo_map(&repo_root, &targetable_paths, options.repomap_token_budget)
         .await;
 
     let repomap_tokens = repo_map
@@ -384,7 +389,7 @@ pub(super) async fn run_proposal_step(
     tracing::info!(
         workflow = workflow_name,
         model = %model,
-        isolated_step = is_isolated_step,
+        isolated_step = intent.is_isolated_step(),
         repo_map_tokens = repomap_tokens,
         "proposal round prepared"
     );
@@ -392,14 +397,10 @@ pub(super) async fn run_proposal_step(
         .send(StreamEvent::RepoMapTokens(repomap_tokens))
         .await;
 
-    let history_tag = if is_isolated_step {
-        None
-    } else {
-        history_manager.format_history_tag().ok()
-    };
+    let history_tag = cache.history_tag(history_manager, intent).await;
 
     let mut assembly = PromptAssembly::new(
-        Some(repo_state),
+        repo_state,
         ctx_state.revision,
         context_files,
         workflow_name,
@@ -408,19 +409,30 @@ pub(super) async fn run_proposal_step(
         repo_map,
     );
     assembly.target_language = target_language.map(|language| language.to_string());
-    assembly.is_isolated_step = is_isolated_step;
-    assembly.is_discussion = is_readonly_discussion_prompt(prompt);
+    assembly.intent = intent;
     assembly.turn_scratchpad = turn_scratchpad.map(|notes| notes.to_string());
+
+    // The declared turn intent narrows the protocol once, so the rendered
+    // instructions, the structured response schema, the stream filter, and the
+    // decoder all observe the same capability surface: nothing is advertised
+    // without being decodable, and nothing is accepted without being advertised.
+    let scoped_protocol = protocol.with_capability_set(assembly.effective_capabilities(protocol));
+    let protocol: &dyn PromptProtocol = scoped_protocol.as_ref();
 
     let messages = assembly.assemble_chat_messages(prompt, protocol);
     let response_format = protocol.response_format(&targetable_paths);
 
     let (llm_tx, mut llm_rx) = mpsc::channel::<StreamEvent>(100);
-    let client_call = provider.stream_chat_with_effort(
+    // A session identifier pins the proposal round to one provider backend and
+    // keeps its prompt-prefix cache warm across the discovery, patch-retry, and
+    // healing rounds of the same turn. Without one the provider serves the
+    // request statelessly.
+    let client_call = provider.stream_chat_with_session(
         &model.name,
         messages,
         response_format,
         options.reasoning_effort,
+        options.session_id.as_deref(),
         llm_tx,
         cancel_rx.clone(),
     );
@@ -472,16 +484,17 @@ pub(super) async fn run_proposal_step(
     });
 
     let client_result = client_call.await;
-    let (assistant_text, cancelled, stream_error, completed) = forward_task.await.map_err(|join_error| {
-        tracing::error!(
-            "Proposal streaming task terminated unexpectedly: {}",
-            join_error
-        );
-        anyhow::anyhow!(
-            "Proposal streaming task terminated unexpectedly: {}",
-            join_error
-        )
-    })?;
+    let (assistant_text, cancelled, stream_error, completed) =
+        forward_task.await.map_err(|join_error| {
+            tracing::error!(
+                "Proposal streaming task terminated unexpectedly: {}",
+                join_error
+            );
+            anyhow::anyhow!(
+                "Proposal streaming task terminated unexpectedly: {}",
+                join_error
+            )
+        })?;
     client_result?;
 
     if let Some(err) = stream_error {
@@ -532,29 +545,27 @@ mod tests {
     }
 
     #[test]
-    fn has_discovery_commands_detects_discovery_capabilities() {
-        let context_request = ProposalStep::from_commands(vec![LlmCommand::ContextRequest {
+    fn has_discovery_commands_detects_each_discovery_capability() {
+        let text_only = ProposalStep::from_commands(vec![LlmCommand::Text {
+            content: "hello".to_string(),
+        }]);
+        assert!(!text_only.has_discovery_commands());
+
+        let context = ProposalStep::from_commands(vec![LlmCommand::ContextRequest {
             path: "src/a.rs".to_string(),
             access: ContextAccess::ReadOnly,
         }]);
-        assert!(context_request.has_discovery_commands());
+        assert!(context.has_discovery_commands());
 
-        let doc_request = ProposalStep::from_commands(vec![LlmCommand::DocRequest {
-            topic: DocTopic::Workflow,
+        let search = ProposalStep::from_commands(vec![LlmCommand::RepoSearch {
+            path: "src".to_string(),
+            regex: "fn main".to_string(),
         }]);
-        assert!(doc_request.has_discovery_commands());
+        assert!(search.has_discovery_commands());
 
-        let repo_search = ProposalStep::from_commands(vec![LlmCommand::RepoSearch {
-            path: String::new(),
-            regex: "pub fn".to_string(),
+        let doc = ProposalStep::from_commands(vec![LlmCommand::DocRequest {
+            topic: DocTopic::Git,
         }]);
-        assert!(repo_search.has_discovery_commands());
-
-        let plain_answer = ProposalStep::from_commands(vec![LlmCommand::Text {
-            content: "just an answer".to_string(),
-        }]);
-        assert!(!plain_answer.has_discovery_commands());
-
-        assert!(!ProposalStep::default().has_discovery_commands());
+        assert!(doc.has_discovery_commands());
     }
 }

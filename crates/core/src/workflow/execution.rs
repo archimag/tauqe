@@ -13,7 +13,7 @@
 use async_trait::async_trait;
 use tokio::sync::mpsc;
 use tokio::sync::watch;
-use tauqe_protocol::{ModelEntry, ModelRef, ModelResult, ModelRole, ReasoningEffort};
+use tauqe_protocol::{ModelEntry, ModelRef, ModelResult, ModelRole, ReasoningEffort, TurnIntent};
 
 use crate::context::ContextManager;
 use crate::history::HistoryManager;
@@ -42,6 +42,13 @@ pub struct WorkflowOptions {
     /// semantic role. Updated on `auto_level_up` escalation so a
     /// Coder→Architect switch inherits the deeper Architect effort.
     pub reasoning_effort: Option<ReasoningEffort>,
+    /// Provider session identifier that binds this turn to a warm prompt-prefix
+    /// cache on the provider side.
+    ///
+    /// The caller owns the affinity scope: an interactive dialogue, a plan
+    /// execution, or a review audit each pass their own identifier. `None`
+    /// disables affinity and the provider serves every round statelessly.
+    pub session_id: Option<String>,
 }
 
 impl Default for WorkflowOptions {
@@ -59,6 +66,7 @@ impl Default for WorkflowOptions {
             initial_selection: None,
             app_config: None,
             reasoning_effort: None,
+            session_id: None,
         }
     }
 }
@@ -83,6 +91,7 @@ impl WorkflowOptions {
             initial_selection: None,
             app_config: Some(config.clone()),
             reasoning_effort: None,
+            session_id: None,
         }
     }
 }
@@ -125,6 +134,7 @@ pub trait ExecutionMode: Send + Sync {
         &self,
         policy: &mut dyn ApplyPolicy,
         prompt: &str,
+        intent: TurnIntent,
         provider: &dyn LlmProvider,
         model: &ModelRef,
         context_manager: &mut ContextManager,
@@ -159,6 +169,7 @@ impl ExecutionMode for SingleExecution {
         &self,
         policy: &mut dyn ApplyPolicy,
         prompt: &str,
+        intent: TurnIntent,
         provider: &dyn LlmProvider,
         model: &ModelRef,
         context_manager: &mut ContextManager,
@@ -171,8 +182,9 @@ impl ExecutionMode for SingleExecution {
         // escalation replays the turn body on a stronger tier, so recording the
         // prompt and response here, rather than inside every attempt, keeps a
         // retried turn from leaving duplicate history entries behind.
-        let session_turn = begin_session_turn(
+        let turn_id = begin_session_turn(
             prompt,
+            intent,
             context_manager,
             history_manager,
             provider,
@@ -199,6 +211,7 @@ impl ExecutionMode for SingleExecution {
 
             let turn_res = run_fsm_turn_body(
                 prompt,
+                intent,
                 active_provider,
                 &current_model,
                 context_manager,
@@ -209,7 +222,6 @@ impl ExecutionMode for SingleExecution {
                 stream_tx.clone(),
                 cancel_rx.clone(),
                 &turn_options,
-                session_turn.is_isolated_step,
             )
             .await;
 
@@ -223,7 +235,7 @@ impl ExecutionMode for SingleExecution {
                         context_manager.clear_auto();
                         context_manager.prune_missing_files();
                     });
-                    if let Some(id) = session_turn.turn_id {
+                    if let Some(id) = turn_id {
                         let _ = history_manager.rollback_entry(id);
                     }
                     return Err(err);
@@ -338,7 +350,7 @@ impl ExecutionMode for SingleExecution {
             }
 
             if turn.is_cancelled {
-                if let Some(id) = session_turn.turn_id {
+                if let Some(id) = turn_id {
                     let _ = history_manager.rollback_entry(id);
                 }
             } else {
@@ -348,10 +360,7 @@ impl ExecutionMode for SingleExecution {
                 result: turn.result,
                 assistant_text: turn.assistant_text,
                 blocked: turn.blocked,
-                // The FSM normalizes a semantic `<skip>` into an answer
-                // without edits and does not yet carry the skip report on the
-                // turn outcome, so the single-turn mode reports no skip here.
-                skip_reason: None,
+                skip_reason: turn.skip_reason,
                 plan_saved: turn.plan_saved,
             });
         }
@@ -478,6 +487,7 @@ coder = [
             .execute(
                 &mut policy,
                 "Set compute to return 42",
+                tauqe_protocol::TurnIntent::InteractiveRepl,
                 &provider,
                 &model,
                 &mut context,
@@ -568,6 +578,7 @@ coder = [
             .execute(
                 &mut policy,
                 "Set compute to return 42",
+                tauqe_protocol::TurnIntent::InteractiveRepl,
                 &provider,
                 &model,
                 &mut context,
@@ -627,6 +638,7 @@ coder = [
             .execute(
                 &mut policy,
                 "Confirm the step is satisfied",
+                tauqe_protocol::TurnIntent::InteractiveRepl,
                 &provider,
                 &model,
                 &mut context,

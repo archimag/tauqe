@@ -10,7 +10,7 @@
 
 use async_trait::async_trait;
 use tokio::sync::{mpsc, watch};
-use tauqe_protocol::ModelRef;
+use tauqe_protocol::{ModelRef, TurnIntent};
 
 use crate::context::ContextManager;
 use crate::prompt::protocol::PromptProtocol;
@@ -26,6 +26,11 @@ use crate::workflow::WorkflowOptions;
 /// collaborators grows and lets the pipeline stay decoupled from the task
 /// definitions.
 pub struct TaskEnv<'a> {
+    /// Semantic mode of the bounded turn, declared by the caller that starts it.
+    ///
+    /// The task never re-derives the mode from the prompt text: prompt
+    /// assembly, plan mutation, and verification gating all read this value.
+    pub intent: TurnIntent,
     /// Model transport used for every interaction of the task.
     pub provider: &'a dyn LlmProvider,
     /// Model reference resolved for the current turn.

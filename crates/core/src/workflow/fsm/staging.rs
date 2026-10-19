@@ -90,6 +90,7 @@ pub(super) async fn run_discovery_phase(
                 blocked: None,
                 has_terminal_success: false,
                 plan_saved: false,
+                skip_reason: None,
             })));
         }
 
@@ -101,7 +102,7 @@ pub(super) async fn run_discovery_phase(
         log_fsm_phase(
             ctx.workflow_name,
             ctx.model,
-            ctx.is_isolated_step,
+            ctx.intent.is_isolated_step(),
             TurnPhase::Discovery,
             Some(discovery_round),
             Some(ctx.options.max_discovery_rounds),
@@ -145,7 +146,7 @@ pub(super) async fn run_discovery_phase(
         log_fsm_phase(
             ctx.workflow_name,
             ctx.model,
-            ctx.is_isolated_step,
+            ctx.intent.is_isolated_step(),
             TurnPhase::Proposal,
             Some(discovery_round + 1),
             None,
@@ -172,7 +173,7 @@ pub(super) async fn run_discovery_phase(
             ctx.options,
             &mut *ctx.input_cache,
             ctx.state,
-            ctx.is_isolated_step,
+            ctx.intent,
             &round_prompt,
             None,
         )
@@ -189,6 +190,7 @@ pub(super) async fn run_discovery_phase(
                 blocked: None,
                 has_terminal_success: false,
                 plan_saved: false,
+                skip_reason: None,
             })));
         }
 
@@ -257,7 +259,7 @@ pub(super) async fn run_staging_phase(
     log_fsm_phase(
         ctx.workflow_name,
         ctx.model,
-        ctx.is_isolated_step,
+        ctx.intent.is_isolated_step(),
         TurnPhase::Staging,
         Some(1),
         Some(ctx.options.max_retries),
@@ -273,6 +275,11 @@ pub(super) async fn run_staging_phase(
         .await;
 
     let mut attempt = 0;
+    // Append-only repair log: every retry appends its diagnostics to the
+    // previous request instead of replacing it, so the round extends the
+    // provider-cached prompt prefix and the model keeps the full attempt
+    // history.
+    let mut retry_log = String::new();
     loop {
         if !current_edits.is_empty() {
             let stage_res = ctx
@@ -357,6 +364,10 @@ pub(super) async fn run_staging_phase(
             &current_protocol_errors,
             ctx.state.language.as_deref(),
         );
+        if !retry_log.is_empty() {
+            retry_log.push_str("\n\n---\n\n");
+        }
+        retry_log.push_str(&repair_prompt);
         let step_out = propose(
             ctx.provider,
             ctx.model,
@@ -369,8 +380,8 @@ pub(super) async fn run_staging_phase(
             ctx.options,
             &mut *ctx.input_cache,
             ctx.state,
-            ctx.is_isolated_step,
-            &repair_prompt,
+            ctx.intent,
+            &retry_log,
             staged_state.as_ref(),
         )
         .await?;
@@ -386,6 +397,7 @@ pub(super) async fn run_staging_phase(
                 blocked: None,
                 has_terminal_success: false,
                 plan_saved: false,
+                skip_reason: None,
             })));
         }
         ctx.state.absorb(&step_out);
@@ -441,7 +453,7 @@ pub(super) async fn run_staging_phase(
 
 #[cfg(test)]
 mod tests {
-    use super::super::run_fsm_turn;
+    use super::super::{run_fsm_turn as run_turn_with_intent, FsmTurnOutcome};
     use crate::context::ContextManager;
     use crate::history::HistoryManager;
     use crate::prompt::xml::XmlPromptProtocol;
@@ -449,10 +461,46 @@ mod tests {
     use crate::providers::StreamEvent;
     use crate::workflow::policy::DirectApplyPolicy;
     use crate::workflow::WorkflowOptions;
-    use tauqe_protocol::{ContextAccess, ModelRef, ModelResult};
+    use tauqe_protocol::{ContextAccess, ModelRef, ModelResult, TurnIntent};
     use tokio::sync::{mpsc, watch};
 
     const TARGET: &str = "pub fn compute() -> i32 { 0 }\n";
+
+    /// Runs an interactive develop turn through the FSM entry point.
+    ///
+    /// Every scenario in this module drives a free develop dialogue, so the
+    /// declared turn intent is pinned once here instead of being repeated at
+    /// every call site.
+    #[allow(clippy::too_many_arguments)]
+    async fn run_fsm_turn(
+        prompt: &str,
+        provider: &dyn crate::providers::LlmProvider,
+        model: &ModelRef,
+        context: &mut ContextManager,
+        history: &mut HistoryManager,
+        protocol: &dyn crate::prompt::protocol::PromptProtocol,
+        policy: &mut dyn crate::workflow::policy::ApplyPolicy,
+        workflow_name: &str,
+        stream_tx: mpsc::Sender<StreamEvent>,
+        cancel_rx: watch::Receiver<bool>,
+        options: &WorkflowOptions,
+    ) -> anyhow::Result<FsmTurnOutcome> {
+        run_turn_with_intent(
+            prompt,
+            TurnIntent::InteractiveRepl,
+            provider,
+            model,
+            context,
+            history,
+            protocol,
+            policy,
+            workflow_name,
+            stream_tx,
+            cancel_rx,
+            options,
+        )
+        .await
+    }
 
     fn setup_repo(files: &[(&str, &str)]) -> (tempfile::TempDir, std::path::PathBuf) {
         let dir = tempfile::tempdir().unwrap();

@@ -9,6 +9,7 @@ use tokio::sync::Mutex;
 use crate::app::{AppState, ReviewDialogState, ViewMode};
 use crate::command::CommandCategory::{Essential, Helpers, Interface};
 use crate::command::{CommandMap, CommandSpec, KeyChord};
+use crate::i18n::engine::active_t;
 use crate::input::InputResult;
 use crate::rpc::{send_request, RpcConnection};
 
@@ -56,19 +57,19 @@ pub static REVIEW_COMMAND_MAP: CommandMap<ReviewAction> = CommandMap::new(&[
         KeyChord::Bare(KeyCode::Char('X')),
         ReviewAction::ExecuteAll,
         Essential,
-        "Execute all Todo findings across all sessions (with confirmation)",
+        "cmd.review.execute_all",
     ),
     CommandSpec::new(
         KeyChord::Shift(KeyCode::Char('x')),
         ReviewAction::ExecuteAll,
         Essential,
-        "Execute all Todo findings across all sessions (with confirmation)",
+        "cmd.review.execute_all",
     ),
     CommandSpec::new(
         KeyChord::Bare(KeyCode::Char('x')),
         ReviewAction::Execute,
         Essential,
-        "Execute the selected finding or all Todo findings in the session",
+        "cmd.review.execute",
     ),
     // Case-differentiated decomposition chords, declared before the bare `r`.
     // Lowercase `r` decomposes the selection, uppercase `R` decomposes every
@@ -77,19 +78,19 @@ pub static REVIEW_COMMAND_MAP: CommandMap<ReviewAction> = CommandMap::new(&[
         KeyChord::Bare(KeyCode::Char('R')),
         ReviewAction::RefineAll,
         Essential,
-        "Decompose every finding awaiting architectural refinement",
+        "cmd.review.refine_all",
     ),
     CommandSpec::new(
         KeyChord::Shift(KeyCode::Char('r')),
         ReviewAction::RefineAll,
         Essential,
-        "Decompose every finding awaiting architectural refinement",
+        "cmd.review.refine_all",
     ),
     CommandSpec::new(
         KeyChord::Bare(KeyCode::Char('r')),
         ReviewAction::Refine,
         Essential,
-        "Decompose the selected finding into steps with the Architect",
+        "cmd.review.refine",
     ),
     // Starting a new review session is a creation verb, so it takes `N`; `r` and
     // `R` stay reserved for the Architect and refresh keeps the canonical `g`
@@ -98,251 +99,250 @@ pub static REVIEW_COMMAND_MAP: CommandMap<ReviewAction> = CommandMap::new(&[
         KeyChord::Bare(KeyCode::Char('N')),
         ReviewAction::RunReview,
         Essential,
-        "Run a code review on the current context",
+        "cmd.review.run",
     ),
     CommandSpec::new(
         KeyChord::Shift(KeyCode::Char('n')),
         ReviewAction::RunReview,
         Essential,
-        "Run a code review on the current context",
+        "cmd.review.run",
     ),
     // Case-differentiated filter chords, declared before the bare `f`.
     CommandSpec::new(
         KeyChord::Bare(KeyCode::Char('F')),
         ReviewAction::ToggleHideClosed,
         Interface,
-        "Toggle the filter between all findings and open findings only",
+        "cmd.review.toggle_hide_closed",
     ),
     CommandSpec::new(
         KeyChord::Shift(KeyCode::Char('f')),
         ReviewAction::ToggleHideClosed,
         Interface,
-        "Toggle the filter between all findings and open findings only",
+        "cmd.review.toggle_hide_closed",
     ),
     CommandSpec::new(
         KeyChord::Bare(KeyCode::Char('f')),
         ReviewAction::SetFocus,
         Interface,
-        "Set the discussion focus to the selection without leaving the view",
+        "cmd.review.set_focus",
     ),
     // Essential: review execution and the workflow cycle.
     CommandSpec::new(
         KeyChord::Bare(KeyCode::Enter),
         ReviewAction::Activate,
         Essential,
-        "Execute the selected finding; fold or unfold on session headers",
+        "cmd.review.activate",
     ),
     CommandSpec::new(
         KeyChord::Bare(KeyCode::Char('d')),
         ReviewAction::Discuss,
         Essential,
-        "Discuss the selected finding or the entire session in the REPL",
+        "cmd.review.discuss",
     ),
     CommandSpec::new(
         KeyChord::Bare(KeyCode::Char('D')),
         ReviewAction::Discuss,
         Essential,
-        "Discuss the selected finding or the entire session in the REPL",
+        "cmd.review.discuss",
     ),
     CommandSpec::new(
         KeyChord::Bare(KeyCode::Char('t')),
         ReviewAction::ChangeStatus,
         Essential,
-        "Change the finding status",
+        "cmd.review.change_status",
     ),
     CommandSpec::new(
         KeyChord::Bare(KeyCode::Char('T')),
         ReviewAction::ChangeStatus,
         Essential,
-        "Change the finding status",
+        "cmd.review.change_status",
     ),
     CommandSpec::new(
         KeyChord::Bare(KeyCode::Char('s')),
         ReviewAction::ChangeStatus,
         Essential,
-        "Change the finding status",
+        "cmd.review.change_status",
     ),
     CommandSpec::new(
         KeyChord::Bare(KeyCode::Char('S')),
         ReviewAction::ChangeStatus,
         Essential,
-        "Change the finding status",
+        "cmd.review.change_status",
     ),
     // Interface: navigation, accordion walk, folding, and scrolling.
     CommandSpec::new(
         KeyChord::Bare(KeyCode::Esc),
         ReviewAction::Return,
         Interface,
-        "Return to the REPL",
+        "cmd.review.return",
     ),
     CommandSpec::new(
         KeyChord::Bare(KeyCode::Char('q')),
         ReviewAction::Return,
         Interface,
-        "Return to the REPL",
+        "cmd.review.return",
     ),
     CommandSpec::new(
         KeyChord::Bare(KeyCode::Up),
         ReviewAction::NavPrev,
         Interface,
-        "Select the previous row",
+        "cmd.review.nav_prev",
     ),
     CommandSpec::new(
         KeyChord::Bare(KeyCode::Char('p')),
         ReviewAction::NavPrev,
         Interface,
-        "Select the previous row",
+        "cmd.review.nav_prev",
     ),
     CommandSpec::new(
         KeyChord::Bare(KeyCode::Down),
         ReviewAction::NavNext,
         Interface,
-        "Select the next row",
+        "cmd.review.nav_next",
     ),
     CommandSpec::new(
         KeyChord::Bare(KeyCode::Char('n')),
         ReviewAction::NavNext,
         Interface,
-        "Select the next row",
+        "cmd.review.nav_next",
     ),
     CommandSpec::new(
         KeyChord::Ctrl(KeyCode::Char('n')),
         ReviewAction::AccordionNext,
         Interface,
-        "Inspect the next finding (accordion walk)",
+        "cmd.review.accordion_next",
     ),
     CommandSpec::new(
         KeyChord::Primary(KeyCode::Char('n')),
         ReviewAction::AccordionNext,
         Interface,
-        "Inspect the next finding (accordion walk)",
+        "cmd.review.accordion_next",
     ),
     CommandSpec::new(
         KeyChord::Ctrl(KeyCode::Char('p')),
         ReviewAction::AccordionPrev,
         Interface,
-        "Inspect the previous finding (accordion walk)",
+        "cmd.review.accordion_prev",
     ),
     CommandSpec::new(
         KeyChord::Primary(KeyCode::Char('p')),
         ReviewAction::AccordionPrev,
         Interface,
-        "Inspect the previous finding (accordion walk)",
+        "cmd.review.accordion_prev",
     ),
     CommandSpec::new(
         KeyChord::Bare(KeyCode::Home),
         ReviewAction::SelectFirst,
         Interface,
-        "Select the first row",
+        "cmd.review.select_first",
     ),
     CommandSpec::new(
         KeyChord::Meta(KeyCode::Char('<')),
         ReviewAction::SelectFirst,
         Interface,
-        "Select the first row",
+        "cmd.review.select_first",
     ),
     CommandSpec::new(
         KeyChord::Ctrl(KeyCode::Home),
         ReviewAction::SelectFirst,
         Interface,
-        "Select the first row",
+        "cmd.review.select_first",
     ),
     CommandSpec::new(
         KeyChord::Bare(KeyCode::End),
         ReviewAction::SelectLast,
         Interface,
-        "Select the last row",
+        "cmd.review.select_last",
     ),
     CommandSpec::new(
         KeyChord::Meta(KeyCode::Char('>')),
         ReviewAction::SelectLast,
         Interface,
-        "Select the last row",
+        "cmd.review.select_last",
     ),
     CommandSpec::new(
         KeyChord::Ctrl(KeyCode::End),
         ReviewAction::SelectLast,
         Interface,
-        "Select the last row",
+        "cmd.review.select_last",
     ),
     CommandSpec::new(
         KeyChord::Bare(KeyCode::PageUp),
         ReviewAction::PageUp,
         Interface,
-        "Scroll the review view up one page",
+        "cmd.review.page_up",
     ),
     CommandSpec::new(
         KeyChord::Bare(KeyCode::PageDown),
         ReviewAction::PageDown,
         Interface,
-        "Scroll the review view down one page",
+        "cmd.review.page_down",
     ),
     CommandSpec::new(
         KeyChord::Bare(KeyCode::Tab),
         ReviewAction::FoldToggle,
         Interface,
-        "Fold or unfold the session, summary, or finding details",
+        "cmd.review.fold_toggle",
     ),
     CommandSpec::new(
         KeyChord::Bare(KeyCode::Char(' ')),
         ReviewAction::FoldToggle,
         Interface,
-        "Fold or unfold the session, summary, or finding details",
+        "cmd.review.fold_toggle",
     ),
     CommandSpec::new(
         KeyChord::Bare(KeyCode::Char('a')),
         ReviewAction::FoldAll,
         Interface,
-        "Toggle fold or unfold for all sessions and findings",
+        "cmd.review.fold_all",
     ),
     CommandSpec::new(
         KeyChord::Bare(KeyCode::Char('A')),
         ReviewAction::FoldAll,
         Interface,
-        "Toggle fold or unfold for all sessions and findings",
+        "cmd.review.fold_all",
     ),
     // Helpers: clipboard, refresh, and destructive operations.
+    //
+    // The clipboard is isolated from destructive clearing: lowercase `c` and `y`
+    // only place content into the clipboard, and the shifted `Shift+C` chord is
+    // deliberately left unbound here so Plans, Review, History, and Context all
+    // reserve the uppercase chord for a confirmed mass clear (Conventions §4.4).
     CommandSpec::new(
         KeyChord::Bare(KeyCode::Char('c')),
         ReviewAction::Copy,
         Helpers,
-        "Copy the selected finding or session to the clipboard",
-    ),
-    CommandSpec::new(
-        KeyChord::Bare(KeyCode::Char('C')),
-        ReviewAction::Copy,
-        Helpers,
-        "Copy the selected finding or session to the clipboard",
+        "cmd.review.copy",
     ),
     CommandSpec::new(
         KeyChord::Bare(KeyCode::Char('y')),
         ReviewAction::Copy,
         Helpers,
-        "Copy the selected finding or session to the clipboard",
+        "cmd.review.copy",
     ),
     CommandSpec::new(
         KeyChord::Bare(KeyCode::Char('Y')),
         ReviewAction::Copy,
         Helpers,
-        "Copy the selected finding or session to the clipboard",
+        "cmd.review.copy",
     ),
     CommandSpec::new(
         KeyChord::Bare(KeyCode::Delete),
         ReviewAction::DeleteReview,
         Helpers,
-        "Delete the review session (with confirmation)",
+        "cmd.review.delete",
     ),
     CommandSpec::new(
         KeyChord::Bare(KeyCode::Char('g')),
         ReviewAction::Refresh,
         Helpers,
-        "Refresh review sessions from the server",
+        "cmd.review.refresh",
     ),
     CommandSpec::new(
         KeyChord::Bare(KeyCode::Char('G')),
         ReviewAction::Refresh,
         Helpers,
-        "Refresh review sessions from the server",
+        "cmd.review.refresh",
     ),
 ]);
 
@@ -361,7 +361,7 @@ fn execute_review_scope_action(
     scope_title: &str,
 ) {
     if st.model.is_busy() {
-        st.notify_warning("Model is currently busy; wait for turn to finish or press Esc to cancel");
+        st.notify_warning(active_t("notify.model_busy_esc"));
         return;
     }
 
@@ -380,7 +380,7 @@ fn execute_review_scope_action(
         }) {
         Some(s) => s,
         None => {
-            st.notify_error(format!("Review session '{}' not found", session_id));
+            st.notify_error(active_t("notify.review_not_found").replace("{}", session_id));
             return;
         }
     };
@@ -395,7 +395,9 @@ fn execute_review_scope_action(
         let item = match session.find_item(item_id) {
             Some(i) => i.clone(),
             None => {
-                st.notify_error(format!("Review item #{} not found", item_id));
+                st.notify_error(
+                    active_t("notify.review_item_not_found").replace("{}", &item_id.to_string()),
+                );
                 return;
             }
         };
@@ -406,25 +408,28 @@ fn execute_review_scope_action(
         // (#c-1).
         match item.status {
             IssueStatus::Discussion => {
-                st.notify_warning(format!(
-                    "Finding #{} is in DISCUSSION status; approve or change status to TODO (t) before executing.",
-                    item.id
-                ));
+                st.notify_warning(
+                    active_t("notify.review_discussion_status")
+                        .replace("{}", &item.id.to_string()),
+                );
             }
             IssueStatus::Fixed => {
-                st.notify_info(format!("Finding #{} is already FIXED.", item.id));
+                st.notify_info(
+                    active_t("notify.review_already_fixed")
+                        .replace("{}", &item.id.to_string()),
+                );
             }
             IssueStatus::Skipped => {
-                st.notify_info(format!(
-                    "Finding #{} is SKIPPED; change status to TODO (t) before executing.",
-                    item.id
-                ));
+                st.notify_info(
+                    active_t("notify.review_skipped_status")
+                        .replace("{}", &item.id.to_string()),
+                );
             }
             IssueStatus::Rejected => {
-                st.notify_warning(format!(
-                    "Finding #{} is REJECTED; change status to TODO (t) before executing.",
-                    item.id
-                ));
+                st.notify_warning(
+                    active_t("notify.review_rejected_status")
+                        .replace("{}", &item.id.to_string()),
+                );
             }
             // A `REFINE` finding runs exactly like a planned one: the server
             // decomposes it with the Architect before the first Coder call, so a
@@ -465,9 +470,9 @@ fn execute_review_scope_action(
         if todo_items.is_empty() {
             let (total, fixed) = session.stats();
             if fixed == total && total > 0 {
-                st.notify_info("All findings in this review session are already FIXED.");
+                st.notify_info(active_t("notify.review_all_fixed_session"));
             } else {
-                st.notify_info("No TODO findings to execute in this review session.");
+                st.notify_info(active_t("notify.review_no_todo_session"));
             }
             return;
         }
@@ -490,13 +495,13 @@ fn execute_review_scope_action(
 
 pub(crate) fn execute_all_reviews_action(st: &mut AppState) {
     if st.model.is_busy() {
-        st.notify_warning("Model is currently busy; wait for turn to finish or press Esc to cancel");
+        st.notify_warning(active_t("notify.model_busy_esc"));
         return;
     }
 
     let sessions = st.review.effective_sessions();
     if sessions.is_empty() {
-        st.notify_info("No review sessions available.");
+        st.notify_info(active_t("notify.review_no_sessions"));
         return;
     }
 
@@ -509,7 +514,12 @@ pub(crate) fn execute_all_reviews_action(st: &mut AppState) {
         for item in &session.items {
             total_items += 1;
             match item.status {
-                IssueStatus::Todo | IssueStatus::InProgress => {
+                // A finding that still awaits architectural decomposition is
+                // executable: the server refines it with the Architect before
+                // the first Coder call (#c-1), exactly as single-session batch
+                // execution does. Omitting it here silently skipped work under
+                // the cross-session `X` verb.
+                IssueStatus::Refine | IssueStatus::Todo | IssueStatus::InProgress => {
                     todo_items.push(ReviewIssue::from(item.clone()));
                 }
                 IssueStatus::Discussion => {
@@ -525,15 +535,13 @@ pub(crate) fn execute_all_reviews_action(st: &mut AppState) {
 
     if todo_items.is_empty() {
         if total_items == 0 {
-            st.notify_info("No findings in review sessions.");
+            st.notify_info(active_t("notify.review_no_findings"));
         } else if discussion_count > 0 {
-            st.notify_warning(
-                "All remaining findings are in DISCUSSION status; approve or change status to TODO (t) before executing.",
-            );
+            st.notify_warning(active_t("notify.review_discussion_only"));
         } else if fixed_count == total_items {
-            st.notify_info("All findings across all review sessions are already FIXED.");
+            st.notify_info(active_t("notify.review_all_fixed"));
         } else {
-            st.notify_info("No TODO findings to execute across review sessions.");
+            st.notify_info(active_t("notify.review_no_todo_cross"));
         }
         return;
     }
@@ -623,7 +631,7 @@ async fn send_refine_request(
 /// on the model list for instant selection.
 fn open_refine_dialog(st: &mut AppState) {
     if st.model.is_busy() || st.review.running || st.review.refining.is_some() {
-        st.notify_warning("Model is currently busy; wait for operation to finish");
+        st.notify_warning(active_t("notify.model_busy"));
         return;
     }
 
@@ -635,7 +643,7 @@ fn open_refine_dialog(st: &mut AppState) {
             ..
         }) => (session_id, item_id, title),
         _ => {
-            st.notify_info("Select a finding to decompose into steps (r)");
+            st.notify_info(active_t("notify.review_select_finding"));
             return;
         }
     };
@@ -678,12 +686,12 @@ async fn refine_all_findings(
     let target = {
         let mut st = state.lock().await;
         if st.model.is_busy() || st.review.running || st.review.refining.is_some() {
-            st.notify_warning("Model is currently busy; wait for operation to finish");
+            st.notify_warning(active_t("notify.model_busy"));
             return Ok(());
         }
         let targets = st.review.pending_refine_targets();
         if targets.is_empty() {
-            st.notify_info("No findings require architectural decomposition");
+            st.notify_info(active_t("notify.review_no_refine_needed"));
             return Ok(());
         }
         st.review.begin_refine_batch(targets)
@@ -695,7 +703,7 @@ async fn refine_all_findings(
     state
         .lock()
         .await
-        .notify_info("Decomposing finding with the Architect...");
+        .notify_info(active_t("notify.review_refining"));
     Ok(())
 }
 
@@ -963,10 +971,10 @@ pub async fn handle_review_key(
                 st.discussion_focus = focus.clone();
                 let params = tauqe_protocol::DiscussionSetFocusParams { focus };
                 let message = match target_label {
-                    Some(label) => {
-                        format!("Discussion focus set to {} in review '{}'", label, review_title)
-                    }
-                    None => format!("Discussion focus set to review '{}'", review_title),
+                    Some(label) => active_t("notify.review_focus_item_set")
+                        .replacen("{}", &label, 1)
+                        .replace("{}", &review_title),
+                    None => active_t("notify.review_focus_set").replace("{}", &review_title),
                 };
                 drop(st);
                 send_request(
@@ -1086,25 +1094,22 @@ pub async fn handle_review_key(
                 let mut st = state.lock().await;
                 match res {
                     crate::clipboard::CopyResult::Native => {
-                        st.notify_success("Review findings copied to clipboard");
+                        st.notify_success(active_t("notify.review_copied"));
                     }
                     crate::clipboard::CopyResult::Osc52Only => {
-                        st.notify_info("Review findings sent to terminal clipboard (OSC 52)");
+                        st.notify_info(active_t("notify.review_copied_osc52"));
                     }
                     crate::clipboard::CopyResult::Failed => {
-                        st.notify_error("Failed to copy to clipboard");
+                        st.notify_error(active_t("notify.review_copy_failed"));
                     }
                 }
             }
         }
         ReviewAction::RunReview => {
             if st.model.is_busy() {
-                st.review.error =
-                    Some("Cannot start a review while the model is generating".to_string());
+                st.review.error = Some(active_t("notify.review_cannot_start_busy"));
             } else if st.context.items.is_empty() {
-                st.review.error = Some(
-                    "Context is empty: add files in the Context tab (Ctrl+2) first".to_string(),
-                );
+                st.review.error = Some(active_t("notify.review_context_empty"));
             } else {
                 let reviewer_entries = st
                     .model_choice
@@ -1504,6 +1509,33 @@ mod tests {
         assert!(st.confirm_execute_review.is_none());
         let notif = st.active_notification().expect("notification should be set");
         assert!(notif.text.contains("FIXED"));
+    }
+
+    #[test]
+    fn test_execute_all_reviews_action_includes_refine_findings() {
+        let mut st = crate::app::test_state();
+        // A finding awaiting decomposition is executable just like a TODO one:
+        // the server refines it before coding (#c-1).
+        st.review.sessions = vec![
+            session_with_status("rev-refine", 1, IssueStatus::Refine),
+            todo_session("rev-todo", 2),
+        ];
+
+        execute_all_reviews_action(&mut st);
+
+        let target = st
+            .confirm_execute_review
+            .as_ref()
+            .expect("modal confirmation must be armed");
+        assert_eq!(
+            target.items.len(),
+            2,
+            "must include both the Refine and the Todo finding"
+        );
+        assert_eq!(target.items[0].title, "Todo Finding");
+        assert_eq!(target.items[1].title, "Todo Finding");
+        assert_eq!(target.review_id, None);
+        assert_eq!(st.confirm_button, crate::app::ConfirmDialogButton::Cancel);
     }
 
     #[tokio::test]

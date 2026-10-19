@@ -13,18 +13,16 @@ pub mod step;
 
 pub use discussion::{
     build_review_system_prompt, build_review_user_prompt, format_review_discussion_prompt,
-    format_review_discussion_prompt_items, is_review_discussion_prompt,
-    REVIEW_DISCUSSION_PREFIX,
+    format_review_discussion_prompt_items, REVIEW_DISCUSSION_PREFIX,
 };
 pub use refine::{
     build_review_finding_refine_system_prompt, build_review_finding_refine_user_prompt,
     build_review_refine_system_prompt, build_review_refine_user_prompt, MAX_REVIEW_SUBPLAN_DEPTH,
 };
 pub use step::{
-    extract_review_step_execution_id, extract_review_step_execution_target,
     format_review_step_execution_prompt, format_review_step_failure_note,
-    format_review_step_retry_prompt, is_review_step_execution_prompt, ReviewStepFailure,
-    ReviewStepTarget, REVIEW_STEP_EXECUTION_PREFIX, REVIEW_STEP_RETRY_PREFIX,
+    format_review_step_retry_prompt, ReviewStepFailure, REVIEW_STEP_EXECUTION_PREFIX,
+    REVIEW_STEP_RETRY_PREFIX,
 };
 
 #[cfg(test)]
@@ -39,7 +37,6 @@ mod tests {
             "I inspected the file and it looks correct.",
             Some("No edits were applied"),
         );
-        assert!(is_review_step_execution_prompt(&prompt));
         assert!(prompt.contains("# Correction Required: Review Finding Turn Incomplete"));
         assert!(prompt.contains("<previous_response>"));
         assert!(prompt.contains("I inspected the file and it looks correct."));
@@ -88,6 +85,7 @@ mod tests {
                     depends_on: vec![],
                     children: vec![],
                 }],
+                subplan_architect: None,
                 resolution_notes: None,
                 body: "Break down large file".to_string(),
             }],
@@ -122,6 +120,7 @@ mod tests {
                 files: vec!["crates/core/src/lib.rs".to_string()],
                 readonly_files: vec![],
                 subplan: vec![],
+                subplan_architect: None,
                 resolution_notes: Some("Break into sub-steps".to_string()),
                 body: "Needs structural division".to_string(),
             }],
@@ -137,6 +136,7 @@ mod tests {
             &session.items[0],
             &[],
             Some("fn outline()"),
+            None,
             Some("Focus on safety"),
         );
         assert!(user.contains("# Review Finding Refinement: [rev-ref#42] Decompose this issue"));
@@ -168,6 +168,7 @@ mod tests {
                 files: vec!["crates/tui/src/view.rs".to_string()],
                 readonly_files: vec![],
                 subplan: Vec::new(),
+                subplan_architect: None,
                 resolution_notes: None,
                 body: "Replace clone with reference borrowing".to_string(),
             }],
@@ -175,17 +176,11 @@ mod tests {
         };
 
         let prompt = format_review_step_execution_prompt(&session, 3, "_TAG").unwrap();
-        assert!(is_review_step_execution_prompt(&prompt));
         assert!(prompt.contains(
             "# Target Review Step Execution: [rev-7:3] Excessive clone in hot path"
         ));
         assert!(prompt.contains("<success_TAG summary=\"...\" />"));
         assert!(prompt.contains("<error_TAG message=\"...\" />"));
-
-        let target = extract_review_step_execution_target(&prompt).unwrap();
-        assert_eq!(target.review_id.as_deref(), Some("rev-7"));
-        assert_eq!(target.item_id, 3);
-        assert_eq!(extract_review_step_execution_id(&prompt), Some(3));
     }
 
     #[test]
@@ -212,6 +207,7 @@ mod tests {
                 files: vec!["src/lib.rs".to_string()],
                 readonly_files: vec![],
                 subplan: Vec::new(),
+                subplan_architect: None,
                 resolution_notes: Some("Extend scope of mutex guard".to_string()),
                 body: "Lock is dropped prematurely.".to_string(),
             }],

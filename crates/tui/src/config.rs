@@ -1,5 +1,5 @@
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use serde::Deserialize;
 use toml_edit::{value, DocumentMut, Item, Table, Value};
 
@@ -459,7 +459,7 @@ pub fn save_tui_config_full(
         primary_modifier,
         meta_modifier,
     );
-    fs::write(&path, merged)?;
+    write_atomically(&path, &merged)?;
     Ok(path)
 }
 
@@ -475,8 +475,47 @@ pub fn save_theme_preset(name: &str) -> std::io::Result<PathBuf> {
     }
     let source = fs::read_to_string(&path).unwrap_or_else(|_| DEFAULT_TUI_TEMPLATE.to_string());
     let merged = merge_theme_name(&source, name);
-    fs::write(&path, merged)?;
+    write_atomically(&path, &merged)?;
     Ok(path)
+}
+
+/// Writes `content` into `path` atomically through a temporary sibling file and
+/// a final rename, so an interrupted or crashed write never leaves `tui.toml`
+/// truncated or partially updated.
+fn write_atomically(path: &Path, content: &str) -> std::io::Result<()> {
+    let temp_path = temp_sibling_path(path);
+    fs::write(&temp_path, content)?;
+    if let Err(err) = fs::rename(&temp_path, path) {
+        let _ = fs::remove_file(&temp_path);
+        return Err(err);
+    }
+    Ok(())
+}
+
+/// Builds a unique temporary sibling path next to `target`.
+///
+/// The process id is combined with the current timestamp so concurrent TAUQE
+/// processes, or a coarse system clock that repeats a timestamp, never share an
+/// intermediate file.
+fn temp_sibling_path(target: &Path) -> PathBuf {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let filename = format!(
+        ".{}.tmp.{}.{}",
+        target
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("tui"),
+        std::process::id(),
+        nanos
+    );
+    match target.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.join(filename),
+        _ => PathBuf::from(filename),
+    }
 }
 
 /// Merges a theme preset name into an existing document while preserving every
@@ -763,6 +802,29 @@ mode = "light"
         assert!(merged.contains("# Personal"));
         assert!(merged.contains("mode = \"dark\""));
         assert!(merged.contains("layout = \"none\""));
+    }
+
+    #[test]
+    fn test_write_atomically_replaces_content_without_leftover_temp_files() {
+        let dir = std::env::temp_dir().join(format!("tauqe_cfg_atomic_{}", std::process::id()));
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join("tui.toml");
+
+        write_atomically(&path, "[input]\nlayout = \"none\"\n").expect("first write");
+        write_atomically(&path, "[input]\nlayout = \"ru_jcuken\"\n").expect("second write");
+        assert_eq!(
+            fs::read_to_string(&path).expect("read back"),
+            "[input]\nlayout = \"ru_jcuken\"\n"
+        );
+
+        let leftovers = fs::read_dir(&dir)
+            .expect("read dir")
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_name() != std::ffi::OsStr::new("tui.toml"))
+            .count();
+        assert_eq!(leftovers, 0);
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

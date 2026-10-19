@@ -3,8 +3,8 @@ use std::collections::HashSet;
 use ratatui::style::{Style, Stylize};
 use ratatui::text::{Line, Span};
 use tauqe_protocol::{
-    ConceptItem, DiscussionFocus, DiscussionTarget, ModelEntry, ModelRole, Plan, PlanItem,
-    PlanItemStatus,
+    ArchitectTier, ConceptItem, DiscussionFocus, DiscussionTarget, ModelEntry, ModelRole, Plan,
+    PlanItem, PlanItemStatus,
 };
 
 use crate::app::AppState;
@@ -30,6 +30,10 @@ pub enum VisiblePlanRow {
         is_expanded: bool,
         /// Whether the active discussion focus anchors on the whole plan.
         focused: bool,
+        /// The Architect configuration that produced this plan's
+        /// decomposition, rendered so the *What* role's provenance stays
+        /// visible in the tree.
+        architect: Option<ArchitectTier>,
     },
     ConceptHeader {
         plan_id: String,
@@ -386,6 +390,7 @@ impl PlansViewState {
                 status,
                 is_expanded,
                 focused: self.is_plan_focused(&plan.id),
+                architect: plan.architect.clone(),
             });
 
             if is_expanded {
@@ -822,6 +827,38 @@ impl PlansViewState {
     }
 }
 
+/// Indent step, in columns, of one nesting level of the Plans tree.
+const PLAN_INDENT_STEP: usize = 2;
+
+/// Nesting level of a plan header row.
+const PLAN_HEADER_LEVEL: usize = 0;
+
+/// Nesting level of a section header (`CONCEPT`, `IMPLEMENTATION`) row.
+///
+/// A section header is a child of its plan header, so it sits exactly one level
+/// below the plan.
+const PLAN_SECTION_LEVEL: usize = 1;
+
+/// Leading indentation of a node rendered at `level`.
+///
+/// Every hierarchical row derives its leading indent from its numeric depth
+/// through this single helper, so a parent row, its body, and its children can
+/// never drift apart and no renderer needs a literal whitespace run
+/// (Conventions §4.8).
+fn plan_indent(level: usize) -> String {
+    " ".repeat(PLAN_INDENT_STEP * level)
+}
+
+/// Leading indentation of the detail block of a node rendered at `level`.
+///
+/// A summary row starts with a one-column selection gutter, while a detail
+/// block owns no gutter of its own. The gutter column is therefore reproduced
+/// as a leading space, so a node's body lines up exactly with the rows around
+/// it and the body never reads as shallower than its children.
+fn plan_body_indent(level: usize) -> String {
+    format!(" {}", plan_indent(level))
+}
+
 fn status_style(status: PlanItemStatus) -> Style {
     let engine = current_engine();
     let palette = engine.palette();
@@ -847,6 +884,25 @@ fn focus_badge() -> Span<'static> {
             .fg(engine.color(palette.text_inverse))
             .bold(),
     )
+}
+
+/// Compact badge naming the Architect configuration that produced a
+/// decomposition.
+///
+/// A plan and a review finding both record which Architect model, at which
+/// reasoning depth, decomposed them. The badge renders that provenance
+/// verbatim — model identifiers and effort names are technical artifacts, not
+/// localizable text — so the *What* role stays accountable for every
+/// decomposition in the tree (Vision.md §1.2). Plans and Review share this one
+/// helper so the two surfaces can never name the provenance differently.
+pub fn architect_badge(tier: &ArchitectTier) -> Span<'static> {
+    let engine = current_engine();
+    let palette = engine.palette();
+    let label = match tier.effort {
+        Some(effort) => format!(" [ARC {} {}]", tier.model, effort),
+        None => format!(" [ARC {}]", tier.model),
+    };
+    Span::styled(label, engine.fg(palette.status_error))
 }
 
 fn pad_line_to_width(mut line: Line<'static>, width: usize, fill_style: Style) -> Line<'static> {
@@ -935,6 +991,7 @@ fn compute_unified_plan_lines(
                 status,
                 is_expanded,
                 focused,
+                architect,
             } => {
                 if idx > 0 {
                     all_lines.push(Line::raw(""));
@@ -945,7 +1002,7 @@ fn compute_unified_plan_lines(
 
                 let mut spans = vec![
                     gutter,
-                    Span::raw(" "),
+                    Span::raw(plan_indent(PLAN_HEADER_LEVEL)),
                     Span::styled(fold_icon, engine.fg(palette.status_warning).bold()),
                     Span::styled(format!(" {} ", status), status_style(*status)),
                     Span::raw(" "),
@@ -966,6 +1023,9 @@ fn compute_unified_plan_lines(
                 if *focused {
                     spans.push(focus_badge());
                 }
+                if let Some(tier) = architect {
+                    spans.push(architect_badge(tier));
+                }
 
                 let mut header_line = Line::from(spans).style(row_style);
                 if is_selected {
@@ -977,26 +1037,26 @@ fn compute_unified_plan_lines(
                     if let Some(desc) = description {
                         let prepared = prepare_plan_markdown(desc);
                         if !prepared.is_empty() {
+                            // The plan body renders at the level of its
+                            // children, never deeper (Conventions §4.8).
+                            let body_prefix = Span::styled(
+                                format!("{}│ ", plan_body_indent(PLAN_HEADER_LEVEL + 1)),
+                                engine.fg(palette.text_muted),
+                            );
                             let mut desc_lines = Vec::new();
                             let mut theme =
                                 crate::markdown::MarkdownTheme::answer_themed(theme_mode);
                             theme.text_style = engine.fg(palette.text_secondary);
                             theme.hard_breaks = true;
                             theme.compact = true;
-                            theme.line_prefix = Some(Span::styled(
-                                "    │ ",
-                                engine.fg(palette.text_muted),
-                            ));
+                            theme.line_prefix = Some(body_prefix.clone());
                             let md = crate::markdown::render_markdown(&prepared, &theme);
                             if !md.is_empty() {
                                 desc_lines.extend(md);
                             } else {
                                 for line in prepared.lines() {
                                     desc_lines.push(Line::from(vec![
-                                        Span::styled(
-                                            "    │ ",
-                                            engine.fg(palette.text_muted),
-                                        ),
+                                        body_prefix.clone(),
                                         Span::styled(
                                             line.to_string(),
                                             engine.fg(palette.text_secondary),
@@ -1017,10 +1077,13 @@ fn compute_unified_plan_lines(
                 let fold_icon = if *is_expanded { "▼ " } else { "▶ " };
                 let spans = vec![
                     gutter,
-                    Span::raw("  "),
+                    Span::raw(plan_indent(PLAN_SECTION_LEVEL)),
                     Span::styled(fold_icon, engine.fg(palette.button_active_bg).bold()),
                     Span::styled(
-                        " CONCEPT ",
+                        format!(
+                            " {} ",
+                            crate::i18n::active_t("plans.concept_title").to_uppercase()
+                        ),
                         engine
                             .bg(palette.button_active_bg)
                             .fg(engine.color(palette.text_inverse))
@@ -1056,7 +1119,7 @@ fn compute_unified_plan_lines(
                 focused,
                 ..
             } => {
-                let indent = "  ".repeat(*depth);
+                let indent = plan_indent(*depth);
                 let fold_icon = if *is_expandable {
                     if *is_expanded { "▼ " } else { "▶ " }
                 } else if is_selected {
@@ -1103,7 +1166,7 @@ fn compute_unified_plan_lines(
                             theme.hard_breaks = true;
                             theme.compact = true;
                             theme.line_prefix = Some(Span::styled(
-                                format!("{}    │ ", indent),
+                                format!("{}│ ", plan_body_indent(*depth + 1)),
                                 engine.fg(palette.text_muted),
                             ));
                             let md = crate::markdown::render_markdown(&prepared, &theme);
@@ -1125,10 +1188,13 @@ fn compute_unified_plan_lines(
                 let stats_str = format!("{}/{} done", completed, total);
                 let spans = vec![
                     gutter,
-                    Span::raw("  "),
+                    Span::raw(plan_indent(PLAN_SECTION_LEVEL)),
                     Span::styled(fold_icon, engine.fg(palette.status_info).bold()),
                     Span::styled(
-                        " IMPLEMENTATION ",
+                        format!(
+                            " {} ",
+                            crate::i18n::active_t("plans.impl_title").to_uppercase()
+                        ),
                         engine
                             .bg(palette.status_info)
                             .fg(engine.color(palette.text_inverse))
@@ -1170,7 +1236,10 @@ fn compute_unified_plan_lines(
                 focused,
                 ..
             } => {
-                let indent = "  ".repeat(*depth);
+                let indent = plan_indent(*depth);
+                // The step body renders at the level of its children, never
+                // deeper (Conventions §4.8).
+                let body_prefix = format!("{}│ ", plan_body_indent(*depth + 1));
 
                 let fold_icon = if *is_expandable {
                     if *is_expanded { "▼ " } else { "▶ " }
@@ -1242,7 +1311,7 @@ fn compute_unified_plan_lines(
                     if !*has_children && !files.is_empty() {
                         row_lines.push(Line::from(vec![
                             Span::styled(
-                                format!("{}    │ ", indent),
+                                body_prefix.clone(),
                                 engine.fg(palette.text_muted),
                             ),
                             Span::styled("files: ", engine.fg(palette.text_muted)),
@@ -1252,7 +1321,7 @@ fn compute_unified_plan_lines(
                     if !*has_children && !readonly_files.is_empty() {
                         row_lines.push(Line::from(vec![
                             Span::styled(
-                                format!("{}    │ ", indent),
+                                body_prefix.clone(),
                                 engine.fg(palette.text_muted),
                             ),
                             Span::styled("ref: ", engine.fg(palette.text_muted)),
@@ -1265,7 +1334,7 @@ fn compute_unified_plan_lines(
                     if !concept_refs.is_empty() {
                         row_lines.push(Line::from(vec![
                             Span::styled(
-                                format!("{}    │ ", indent),
+                                body_prefix.clone(),
                                 engine.fg(palette.text_muted),
                             ),
                             Span::styled("concept: ", engine.fg(palette.text_muted)),
@@ -1284,7 +1353,7 @@ fn compute_unified_plan_lines(
                             theme.hard_breaks = true;
                             theme.compact = true;
                             theme.line_prefix = Some(Span::styled(
-                                format!("{}    │ ", indent),
+                                body_prefix.clone(),
                                 engine.fg(palette.text_muted),
                             ));
                             let md = crate::markdown::render_markdown(&prepared, &theme);
@@ -1347,6 +1416,7 @@ mod tests {
             description: None,
             created_at: 0,
             updated_at: 0,
+            architect: None,
             concept: vec![],
             items: vec![PlanItem {
                 id: "1".to_string(),
@@ -1394,6 +1464,7 @@ mod tests {
             description: None,
             created_at: 0,
             updated_at: 0,
+            architect: None,
             concept: vec![ConceptItem {
                 id: "c-1".to_string(),
                 title: "JWT Token Spec".to_string(),
@@ -1441,6 +1512,7 @@ mod tests {
             description: None,
             created_at: 0,
             updated_at: 0,
+            architect: None,
             concept: vec![],
             items: vec![PlanItem {
                 id: "1".to_string(),
@@ -1497,6 +1569,7 @@ mod tests {
             description: None,
             created_at: 0,
             updated_at: 0,
+            architect: None,
             concept: vec![],
             items: vec![PlanItem {
                 id: "1".to_string(),
@@ -1555,6 +1628,7 @@ mod tests {
             description: None,
             created_at: 0,
             updated_at: 0,
+            architect: None,
             concept: vec![ConceptItem {
                 id: "c-1".to_string(),
                 title: "Concept Root".to_string(),
@@ -1847,6 +1921,7 @@ mod tests {
             description: None,
             created_at: 0,
             updated_at: 0,
+            architect: None,
             concept: vec![],
             items: vec![PlanItem {
                 id: "1".to_string(),
@@ -1887,6 +1962,39 @@ mod tests {
     }
 
     #[test]
+    fn test_plan_header_renders_the_architect_provenance() {
+        let view = PlansViewState {
+            plans: vec![Plan {
+                id: "arch-plan".to_string(),
+                title: "Arch Plan".to_string(),
+                architect: Some(tauqe_protocol::ArchitectTier::new(
+                    tauqe_protocol::ModelRef::openrouter("planner/model"),
+                    Some(tauqe_protocol::ReasoningEffort::High),
+                )),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let rows = view.flatten_rows();
+        assert!(matches!(
+            &rows[0],
+            VisiblePlanRow::PlanHeader {
+                architect: Some(_),
+                ..
+            }
+        ));
+
+        let (lines, _) =
+            compute_unified_plan_lines(&rows, usize::MAX, 200, crate::config::ThemeMode::Auto);
+        let rendered = joined_text(&lines);
+        assert!(
+            rendered.contains("[ARC openrouter:planner/model high]"),
+            "the header must name the Architect model and depth: {rendered}"
+        );
+    }
+
+    #[test]
     fn test_focus_badge_marks_the_anchored_whole_plan() {
         let mut view = PlansViewState::default();
         let plan = Plan {
@@ -1895,6 +2003,7 @@ mod tests {
             description: None,
             created_at: 0,
             updated_at: 0,
+            architect: None,
             concept: vec![],
             items: vec![],
         };
@@ -1956,5 +2065,228 @@ mod tests {
         // Nothing changes: an unknown plan is ignored.
         assert!(view.is_plan_expanded("plan-a"));
         assert_eq!(view.selected_index, 0);
+    }
+
+    /// Leading indent of a rendered line, counting the selection gutter.
+    ///
+    /// Every row carries a one-column gutter (`▌` when selected, a space
+    /// otherwise), so counting that column yields indents that are comparable
+    /// no matter where the cursor rests.
+    fn leading_indent(line: &Line<'static>) -> usize {
+        line.spans
+            .iter()
+            .flat_map(|span| span.content.chars())
+            .take_while(|c| *c == ' ' || *c == '▌')
+            .count()
+    }
+
+    /// Index of the first rendered line whose concatenated text contains
+    /// `needle`.
+    ///
+    /// A label and its value are rendered as separate spans, so a probe must
+    /// match the joined line rather than any single span.
+    fn find_line(lines: &[Line<'static>], needle: &str) -> usize {
+        lines
+            .iter()
+            .position(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+                    .contains(needle)
+            })
+            .unwrap_or_else(|| panic!("missing rendered line containing {needle}"))
+    }
+
+    #[test]
+    fn test_hierarchy_indent_strictly_increases_and_body_stays_within_children() {
+        let mut parent = parent_item("1", "Parent Step", vec![leaf_item("1.1", "Leaf Step")]);
+        parent.details = Some("Parent details.".to_string());
+
+        let mut view = PlansViewState {
+            plans: vec![Plan {
+                id: "indent-plan".to_string(),
+                title: "Indent Plan".to_string(),
+                description: Some("Plan description.".to_string()),
+                concept: vec![ConceptItem {
+                    id: "c-1".to_string(),
+                    title: "Invariant".to_string(),
+                    details: Some("Tokens must be signed.".to_string()),
+                    children: vec![concept_leaf("c-1.1", "Nested Invariant")],
+                }],
+                items: vec![parent],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        view.expand_all();
+
+        let rows = view.flatten_rows();
+        let (lines, _) =
+            compute_unified_plan_lines(&rows, usize::MAX, 200, crate::config::ThemeMode::Auto);
+
+        let header = leading_indent(&lines[find_line(&lines, "[indent-plan]")]);
+        let concept_section = leading_indent(&lines[find_line(&lines, "Architectural Intent")]);
+        let impl_section = leading_indent(&lines[find_line(&lines, "Execution Blueprint")]);
+        let concept = leading_indent(&lines[find_line(&lines, "#c-1 Invariant")]);
+        let nested_concept = leading_indent(&lines[find_line(&lines, "#c-1.1 Nested Invariant")]);
+        let step = leading_indent(&lines[find_line(&lines, "#1 Parent Step")]);
+        let leaf = leading_indent(&lines[find_line(&lines, "#1.1 Leaf Step")]);
+
+        // Every nested node renders strictly deeper than its visual parent.
+        assert!(
+            header < concept_section,
+            "a section must sit deeper than the plan header: {header} >= {concept_section}"
+        );
+        assert!(
+            concept_section < concept,
+            "a concept must sit deeper than its section: {concept_section} >= {concept}"
+        );
+        assert!(
+            concept < nested_concept,
+            "a nested concept must sit deeper than its parent: {concept} >= {nested_concept}"
+        );
+        assert_eq!(
+            concept_section, impl_section,
+            "both sections are siblings and share one level"
+        );
+        assert!(
+            impl_section < step,
+            "a step must sit deeper than its section: {impl_section} >= {step}"
+        );
+        assert!(
+            step < leaf,
+            "a nested step must sit deeper than its parent: {step} >= {leaf}"
+        );
+
+        // A node body occupies the level of its children, never a deeper one.
+        let plan_body = leading_indent(&lines[find_line(&lines, "Plan description.")]);
+        assert_eq!(
+            plan_body, concept_section,
+            "the plan description must sit at the level of its sections"
+        );
+        let concept_body = leading_indent(&lines[find_line(&lines, "Tokens must be signed.")]);
+        assert_eq!(
+            concept_body, nested_concept,
+            "a concept body must sit at the level of its children"
+        );
+        let step_body = leading_indent(&lines[find_line(&lines, "Parent details.")]);
+        assert_eq!(
+            step_body, leaf,
+            "a step body must sit at the level of its children"
+        );
+    }
+
+    /// Full text of every rendered line, joined for substring probes.
+    fn joined_text(lines: &[Line<'static>]) -> String {
+        lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn test_hierarchy_indent_covers_collapsed_and_expanded_states() {
+        let mut parent = parent_item("1", "Parent Step", vec![leaf_item("1.1", "Leaf Step")]);
+        parent.details = Some("Parent details.".to_string());
+
+        let mut view = PlansViewState {
+            plans: vec![Plan {
+                id: "state-plan".to_string(),
+                title: "State Plan".to_string(),
+                description: Some("Plan description.".to_string()),
+                concept: vec![ConceptItem {
+                    id: "c-1".to_string(),
+                    title: "Invariant".to_string(),
+                    details: Some("Tokens must be signed.".to_string()),
+                    children: vec![concept_leaf("c-1.1", "Nested Invariant")],
+                }],
+                items: vec![parent],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        // A collapsed plan exposes only its header, anchored at the root level.
+        let rows = view.flatten_rows();
+        assert_eq!(rows.len(), 1, "a collapsed plan exposes only its header");
+        let (lines, _) =
+            compute_unified_plan_lines(&rows, usize::MAX, 200, crate::config::ThemeMode::Auto);
+        let rendered = joined_text(&lines);
+        assert!(
+            !rendered.contains("Invariant"),
+            "a collapsed plan hides its items: {rendered}"
+        );
+        let header = leading_indent(&lines[find_line(&lines, "[state-plan]")]);
+        assert_eq!(header, 1, "the plan header sits at the root level");
+
+        // Expanding the plan while folding both sections reveals the section
+        // headers only; every child stays hidden and strictly deeper than the
+        // plan header.
+        view.toggle_plan_expanded("state-plan");
+        view.toggle_concept_section_expanded("state-plan");
+        view.toggle_impl_section_expanded("state-plan");
+        let rows = view.flatten_rows();
+        let (lines, _) =
+            compute_unified_plan_lines(&rows, usize::MAX, 200, crate::config::ThemeMode::Auto);
+        let header = leading_indent(&lines[find_line(&lines, "[state-plan]")]);
+        let concept_section = leading_indent(&lines[find_line(&lines, "Architectural Intent")]);
+        let impl_section = leading_indent(&lines[find_line(&lines, "Execution Blueprint")]);
+        assert!(header < concept_section, "{header} >= {concept_section}");
+        assert_eq!(
+            concept_section, impl_section,
+            "both sections are siblings and share one level"
+        );
+        let rendered = joined_text(&lines);
+        assert!(
+            !rendered.contains("#c-1 "),
+            "a folded concept section hides its items: {rendered}"
+        );
+        assert!(
+            !rendered.contains("#1 "),
+            "a folded implementation section hides its steps: {rendered}"
+        );
+
+        // Fully expanding the tree keeps every child strictly deeper than its
+        // parent and every node body at the level of its children.
+        view.expand_all();
+        let rows = view.flatten_rows();
+        let (lines, _) =
+            compute_unified_plan_lines(&rows, usize::MAX, 200, crate::config::ThemeMode::Auto);
+        let header = leading_indent(&lines[find_line(&lines, "[state-plan]")]);
+        let concept_section = leading_indent(&lines[find_line(&lines, "Architectural Intent")]);
+        let concept = leading_indent(&lines[find_line(&lines, "#c-1 Invariant")]);
+        let nested_concept =
+            leading_indent(&lines[find_line(&lines, "#c-1.1 Nested Invariant")]);
+        let step = leading_indent(&lines[find_line(&lines, "#1 Parent Step")]);
+        let leaf = leading_indent(&lines[find_line(&lines, "#1.1 Leaf Step")]);
+
+        assert!(header < concept_section, "{header} >= {concept_section}");
+        assert!(concept_section < concept, "{concept_section} >= {concept}");
+        assert!(concept < nested_concept, "{concept} >= {nested_concept}");
+        assert!(concept_section < step, "{concept_section} >= {step}");
+        assert!(step < leaf, "{step} >= {leaf}");
+
+        let plan_body = leading_indent(&lines[find_line(&lines, "Plan description.")]);
+        assert_eq!(
+            plan_body, concept_section,
+            "the plan description must sit at the level of its sections"
+        );
+        let concept_body = leading_indent(&lines[find_line(&lines, "Tokens must be signed.")]);
+        assert_eq!(
+            concept_body, nested_concept,
+            "a concept body must sit at the level of its children"
+        );
+        let step_body = leading_indent(&lines[find_line(&lines, "Parent details.")]);
+        assert_eq!(
+            step_body, leaf,
+            "a step body must sit at the level of its children"
+        );
     }
 }

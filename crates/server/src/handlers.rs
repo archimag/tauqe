@@ -13,6 +13,7 @@ pub mod review;
 use std::path::Path;
 use std::sync::Arc;
 
+use tauqe_core::context::ContextManager;
 use tauqe_core::edits::protocol::VerifyTarget;
 use tauqe_core::edits::EditProtocolFactory;
 use tauqe_core::history::HistoryManager;
@@ -73,7 +74,9 @@ pub async fn handle_request(req: Request, state: &Arc<AppState>) -> Response {
         methods::PLAN_UPDATE_ITEM => plan::handle_plan_update_item(req, state).await,
         methods::PLAN_DELETE => plan::handle_plan_delete(req, state).await,
         methods::PLAN_SET_ACTIVE => plan::handle_plan_set_active(req, state).await,
+        methods::PLAN_CLEAR_HORIZON => plan::handle_plan_clear_horizon(req, state).await,
         methods::PLAN_EXECUTE => plan::handle_plan_execute(req, state).await,
+        methods::PLAN_EXECUTE_PIPELINE => plan::handle_plan_execute_pipeline(req, state).await,
         methods::PLAN_REFINE => plan::handle_plan_refine(req, state).await,
         methods::PLAN_REPLAN => plan::handle_plan_replan(req, state).await,
 
@@ -142,6 +145,41 @@ where
         .map_err(|err| format!("blocking task failed: {}", err))
 }
 
+/// Applies a mutation to the shared context atomically.
+///
+/// The mutation runs on the blocking pool because it touches the file system
+/// (metadata reads, path verification), but the exclusive context write guard
+/// is acquired first and moved into the blocking task with the closure, so the
+/// whole read-modify-write sequence stays serialized. Cloning the manager under
+/// a short read guard and overwriting the slot afterwards would let a
+/// concurrent mutation be lost and would reset the monotonic revision.
+pub(crate) async fn with_context_mutation<T, F>(
+    state: &Arc<AppState>,
+    mutate: F,
+) -> Result<T, String>
+where
+    F: FnOnce(&mut ContextManager) -> T + Send + 'static,
+    T: Send + 'static,
+{
+    state.mutate_context(mutate).await
+}
+
+/// Applies a mutation to the shared interaction history atomically.
+///
+/// History persistence is `fsync`-bounded, so the mutation runs on the blocking
+/// pool while the exclusive history guard stays held, keeping the whole
+/// read-modify-write sequence serialized the same way context mutations are.
+pub(crate) async fn with_history_mutation<T, F>(
+    state: &Arc<AppState>,
+    mutate: F,
+) -> Result<T, String>
+where
+    F: FnOnce(&mut HistoryManager) -> T + Send + 'static,
+    T: Send + 'static,
+{
+    state.mutate_history(mutate).await
+}
+
 pub(crate) async fn run_preflight_verification(repo_root: &Path) -> Result<(), String> {
     let (ok, results) =
         tauqe_core::toolchain::run_verification_pipeline(repo_root, &VerifyTarget::All, None).await;
@@ -161,6 +199,61 @@ pub(crate) async fn run_preflight_verification(repo_root: &Path) -> Result<(), S
         report = "Pre-flight verification failed without diagnostic output.".to_string();
     }
     Err(report)
+}
+
+/// Rebinds configuration, context, and history to a repository root.
+///
+/// `client/initialize` and `repository/init` both resolve the authoritative
+/// repository root and then must rebind every long-lived manager to it. The
+/// sequence lives here once so the two entry points cannot drift apart.
+///
+/// Each step takes its own short-lived guard: no guard is ever held across
+/// another subsystem's `.await`. Rebuilding the history manager rereads the
+/// journal, so it is constructed on the blocking pool instead of stalling an
+/// async worker thread; attaching the mutation listener stays here, where the
+/// client event channel lives.
+pub(crate) async fn rebind_to_repository(state: &Arc<AppState>, repo_path: &Path) {
+    if repo_path.as_os_str().is_empty() {
+        return;
+    }
+
+    let loaded = config::reload_config_with_overrides(state, Some(repo_path)).await;
+    {
+        let mut guard = state.config.lock().await;
+        guard.selection = loaded.default_selection();
+        guard.config = loaded;
+    }
+
+    let repo_buf = repo_path.to_path_buf();
+    if let Err(err) = state
+        .mutate_context(move |ctx| ctx.set_repo_root(repo_buf))
+        .await
+    {
+        tracing::warn!(
+            error = %err,
+            "Failed to rebind the context to the initialized repository"
+        );
+    }
+
+    let history_root = repo_path.to_path_buf();
+    let mut history_manager = match offload(move || HistoryManager::new(history_root)).await {
+        Ok(history_manager) => history_manager,
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                "Failed to rebuild the interaction history for the repository"
+            );
+            return;
+        }
+    };
+    let sender = state.history_sender.clone();
+    // Forward every history mutation so a compaction reaches the client as a
+    // structural rewrite rather than a trailing append.
+    history_manager.set_listener(move |mutation| {
+        let _ = sender.send(mutation);
+    });
+    let mut history = state.history.lock().await;
+    *history = history_manager;
 }
 
 async fn handle_client_initialize(req: Request, state: &Arc<AppState>) -> Response {
@@ -190,37 +283,7 @@ async fn handle_client_initialize(req: Request, state: &Arc<AppState>) -> Respon
             return Response::err(req.id, tauqe_protocol::errors::REPOSITORY_STATE_FAILED, err);
         }
     };
-    let repo_path = Path::new(&repo_state.root);
-
-    // Update configuration and the repo-bound managers under separate, short-lived
-    // guards: no guard is ever held across another subsystem's `.await`.
-    if !repo_path.as_os_str().is_empty() {
-        let loaded = config::reload_config_with_overrides(state, Some(repo_path)).await;
-        {
-            let mut guard = state.config.lock().await;
-            guard.selection = loaded.default_selection();
-            guard.config = loaded;
-        }
-        let mut ctx_snapshot = state.context.read().await.clone();
-        let repo_buf = repo_path.to_path_buf();
-        if let Ok(updated_ctx) = offload(move || {
-            ctx_snapshot.set_repo_root(repo_buf);
-            ctx_snapshot
-        })
-        .await
-        {
-            *state.context.write().await = updated_ctx;
-        }
-        let mut hm = HistoryManager::new(repo_path.to_path_buf());
-        let sender = state.history_sender.clone();
-        // Forward every history mutation so a compaction reaches the client as
-        // a structural rewrite rather than a trailing append.
-        hm.set_listener(move |mutation| {
-            let _ = sender.send(mutation);
-        });
-        let mut history = state.history.lock().await;
-        *history = hm;
-    }
+    rebind_to_repository(state, Path::new(&repo_state.root)).await;
 
     let (effective_model, workflow, edit_protocol, available_models) = {
         let guard = state.config.lock().await;

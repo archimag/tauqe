@@ -6,12 +6,12 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use tauqe_core::edits::protocol::ContextRequest;
 use tauqe_core::plan::storage::PlanStorage;
-use tauqe_core::providers::StreamEvent;
+use tauqe_core::providers::{format_session_id, SESSION_PREFIX_PLAN, StreamEvent};
 use tauqe_core::workflow::batch::{BatchStep, BatchStepExecutor, BatchStepOutcome};
 use tauqe_core::workflow::common::apply_context_requests_detailed;
 use tauqe_protocol::{
     events, ContextAccess, ModelSelection, ModelRole, ModelTurnPlanContext, PlanItem,
-    PlanItemStatus,
+    PlanItemStatus, TurnIntent,
 };
 use tokio::sync::{mpsc, watch};
 
@@ -149,6 +149,10 @@ async fn run_plan_step_inner(
     set_step_status(state, repo_root, plan_id, step_id, PlanItemStatus::InProgress).await;
     tracing::info!(plan_id = plan_id, step_id = step_id, "plan step started");
 
+    // Every step and retry of one plan extends the same provider prefix cache,
+    // so the session identifier is derived from the plan.
+    let session_id = Some(format_session_id(SESSION_PREFIX_PLAN, plan_id));
+
     // Generate the active turn marker before assembling prompts so the target
     // step prompt and the model turn share the same marker-bound protocol.
     let marker = state.next_turn_marker().await;
@@ -198,11 +202,13 @@ async fn run_plan_step_inner(
             prompt.clone(),
             policy,
             StepTurnOptions {
+                intent: TurnIntent::IsolatedStep,
                 custom_selection: Some(selection.clone()),
                 plan_context: Some(plan_context),
                 reasoning_effort,
                 marker: marker.clone(),
                 shared_operation: Some(Arc::clone(&operation)),
+                session_id: session_id.clone(),
             },
         )
         .await;

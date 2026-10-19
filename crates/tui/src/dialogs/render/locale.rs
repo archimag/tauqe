@@ -13,6 +13,7 @@ use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::Stylize;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
+use unicode_width::UnicodeWidthStr;
 
 use crate::app::{AppState, LocaleDialogButton, LocaleDialogState};
 use crate::components::modal::{render_dialog_footer, render_modal_container, ModalTone};
@@ -72,9 +73,9 @@ pub fn locale_dialog_geometry(term: Rect) -> LocaleDialogGeometry {
     // renderer draws, so hit-testing never desynchronizes from the drawing.
     let labels = locale_button_labels();
     let widths: [u16; 3] = [
-        labels[0].chars().count() as u16,
-        labels[1].chars().count() as u16,
-        labels[2].chars().count() as u16,
+        UnicodeWidthStr::width(labels[0].as_str()) as u16,
+        UnicodeWidthStr::width(labels[1].as_str()) as u16,
+        UnicodeWidthStr::width(labels[2].as_str()) as u16,
     ];
     let total = widths[0] + widths[1] + widths[2] + LOCALE_BUTTON_GAP * 2;
     let start = action_bar.x + action_bar.width.saturating_sub(total) / 2;

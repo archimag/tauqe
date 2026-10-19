@@ -150,7 +150,11 @@ pub struct ModelResultProposal {
     pub message: String,
     #[serde(default)]
     pub changes: Vec<StructuredChangeProposal>,
-    #[serde(default, deserialize_with = "deserialize_context_request_specs")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_context_request_specs",
+        skip_serializing_if = "Vec::is_empty"
+    )]
     pub context_requests: Vec<DiscussionContextRequest>,
     #[serde(
         default,
@@ -186,6 +190,9 @@ pub struct ModelResultProposal {
 /// forms are accepted so the model's requested access level is preserved in a
 /// single [`DiscussionContextRequest`] representation instead of being dropped
 /// into an ambiguous bare string.
+///
+/// A JSON `null` deserializes to an empty list, so a model that emits an
+/// explicit null never aborts the proposal parse.
 fn deserialize_context_request_specs<'de, D>(
     deserializer: D,
 ) -> Result<Vec<DiscussionContextRequest>, D::Error>
@@ -199,8 +206,9 @@ where
         Detailed(DiscussionContextRequest),
     }
 
-    let specs = Vec::<ContextRequestSpec>::deserialize(deserializer)?;
+    let specs = Option::<Vec<ContextRequestSpec>>::deserialize(deserializer)?;
     Ok(specs
+        .unwrap_or_default()
         .into_iter()
         .filter_map(|spec| match spec {
             ContextRequestSpec::Path(path) => DiscussionContextRequest::parse_spec(&path),
@@ -492,6 +500,7 @@ mod tests {
         let raw = r#"{
             "message": "Cannot proceed",
             "changes": [],
+            "context_requests": null,
             "doc_requests": null,
             "scratchpad": null,
             "outcome": null,
@@ -502,6 +511,7 @@ mod tests {
             }
         }"#;
         let proposal: ModelResultProposal = serde_json::from_str(raw).unwrap();
+        assert!(proposal.context_requests.is_empty());
         assert!(proposal.doc_requests.is_empty());
         assert!(proposal.scratchpad.is_none());
         assert!(proposal.outcome.is_none());
@@ -557,5 +567,23 @@ mod tests {
         assert_eq!(minimal.message, None);
         assert_eq!(minimal.reason, None);
         assert!(!minimal.is_skip());
+    }
+
+    #[test]
+    fn test_model_result_proposal_omits_empty_discovery_fields() {
+        // An empty discovery payload is omitted instead of serialized as an
+        // empty array, matching every sibling field of the proposal.
+        let proposal = ModelResultProposal {
+            message: "No context needed".to_string(),
+            ..ModelResultProposal::default()
+        };
+        let json = serde_json::to_string(&proposal).unwrap();
+        assert!(!json.contains("context_requests"));
+        assert!(!json.contains("repo_searches"));
+
+        // An omitted field and an explicit null stay equivalent on decode.
+        let decoded: ModelResultProposal =
+            serde_json::from_str(r#"{"message":"x","context_requests":null}"#).unwrap();
+        assert!(decoded.context_requests.is_empty());
     }
 }

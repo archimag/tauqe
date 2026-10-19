@@ -5,8 +5,17 @@ use tokio::sync::Mutex;
 use tauqe_protocol::methods;
 
 use crate::app::{AppState, OnboardingStep, ViewMode};
+use crate::i18n::active_t;
 use crate::input::InputResult;
 use crate::rpc::{send_request, RpcConnection};
+
+/// Fills the `{}` placeholders of a localized template in order.
+fn fill(template: &str, args: &[&str]) -> String {
+    args.iter()
+        .fold(template.to_string(), |acc, arg| {
+            acc.replacen("{}", arg, 1)
+        })
+}
 
 /// Persists the chosen workstation settings and reloads them, advancing to the
 /// Ready step only when both the write and the re-read succeed.
@@ -29,27 +38,30 @@ fn save_workstation_config(st: &mut AppState, modifier: crate::config::PrimaryMo
             Ok(cfg) => {
                 st.tui_config = cfg;
                 st.onboarding.has_tui_config = true;
-                st.onboarding.set_status(format!(
-                    "Workstation configuration saved to {} (Primary: {}, Meta: {})",
-                    path.display(),
-                    modifier.emacs_prefix(),
-                    meta.emacs_prefix()
+                st.onboarding.set_status(fill(
+                    &active_t("notify.onboarding_saved"),
+                    &[
+                        &path.display().to_string(),
+                        modifier.emacs_prefix(),
+                        meta.emacs_prefix(),
+                    ],
                 ));
                 st.onboarding.step = st.onboarding.next_step();
                 st.onboarding.selected_index = 0;
             }
             Err(err) => {
-                st.onboarding.set_error(format!(
-                    "Saved {}, but it cannot be loaded: {}",
-                    path.display(),
-                    err
+                st.onboarding.set_error(fill(
+                    &active_t("notify.onboarding_load_failed"),
+                    &[&path.display().to_string(), &err.to_string()],
                 ));
             }
         },
         Err(err) => {
             let target = st.onboarding.default_tui_config_path.clone();
-            st.onboarding
-                .set_error(format!("Failed to save {}: {}", target, err));
+            st.onboarding.set_error(fill(
+                &active_t("notify.onboarding_save_failed"),
+                &[&target.to_string(), &err.to_string()],
+            ));
         }
     }
 }
@@ -85,9 +97,8 @@ pub async fn handle_onboarding_key(
                             st.onboarding.input_buffer.insert_str(clip_text.trim());
                         }
                         None => {
-                            st.onboarding.set_error(
-                                "Clipboard is empty or unavailable. Use your terminal's paste instead.",
-                            );
+                            st.onboarding
+                                .set_error(active_t("notify.onboarding_clipboard_empty"));
                         }
                     }
                     return Ok(InputResult::Continue);
@@ -124,9 +135,8 @@ pub async fn handle_onboarding_key(
                 match st.onboarding.step {
                     OnboardingStep::Credentials => {
                         if input.is_empty() {
-                            st.onboarding.set_error(
-                                "API key cannot be empty. Please enter or paste a valid key, or press Esc to cancel.",
-                            );
+                            st.onboarding
+                                .set_error(active_t("notify.onboarding_key_empty"));
                             return Ok(InputResult::Continue);
                         }
                         st.onboarding.input_active = false;
@@ -254,9 +264,9 @@ pub async fn handle_onboarding_key(
                                     "{}V",
                                     st.tui_config.input.meta_modifier.prefix_str()
                                 );
-                                st.onboarding.set_status(format!(
-                                    "API key detected in clipboard. Press {} or {} to paste it.",
-                                    primary_chord, meta_chord
+                                st.onboarding.set_status(fill(
+                                    &active_t("notify.onboarding_key_detected"),
+                                    &[&primary_chord, &meta_chord],
                                 ));
                             }
                         }

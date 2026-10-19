@@ -13,6 +13,7 @@ use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
+use unicode_width::UnicodeWidthStr;
 
 use crate::app::{AppState, BatchCancelButton};
 use crate::i18n::active_t;
@@ -68,7 +69,11 @@ pub fn confirm_quit_params(state: &AppState) -> ConfirmModalParams<'_> {
         active_t("dialog.confirm_quit.activity_draft")
     } else if state.squash_dialog.as_ref().is_some_and(|d| d.applying) {
         active_t("dialog.confirm_quit.activity_squash_applying")
-    } else if state.squash_dialog.as_ref().is_some_and(|d| !d.message_editor.is_empty()) {
+    } else if state
+        .squash_dialog
+        .as_ref()
+        .is_some_and(|d| !d.message_editor.is_empty())
+    {
         active_t("dialog.confirm_quit.activity_squash_message")
     } else {
         active_t("dialog.confirm_quit.activity_default")
@@ -263,7 +268,15 @@ pub fn execute_review_params(state: &AppState) -> Option<ConfirmModalParams<'_>>
         for (i, item) in target.items.iter().take(4).enumerate() {
             body_lines.push(Line::from(vec![
                 Span::styled(format!("   {}. ", i + 1), engine.fg(palette.status_info)),
-                Span::styled(format!("[{}] #{} {}", item.issue_type, item.id, truncate_to_width(&item.title, 36)), engine.fg(palette.text_primary)),
+                Span::styled(
+                    format!(
+                        "[{}] #{} {}",
+                        item.issue_type,
+                        item.id,
+                        truncate_to_width(&item.title, 36)
+                    ),
+                    engine.fg(palette.text_primary),
+                ),
             ]));
         }
         if target.items.len() > 4 {
@@ -325,12 +338,6 @@ const EXECUTE_REVIEW_DIALOG_WIDTH: u16 = 68;
 const EXECUTE_REVIEW_DIALOG_HEIGHT: u16 = 56;
 /// Header rows: the review, the finding, an optional step, and target files.
 const EXECUTE_REVIEW_HEADER_HEIGHT: u16 = 4;
-/// Footer rows: the action bar (2) plus the docked hint strip (1).
-const EXECUTE_REVIEW_FOOTER_HEIGHT: u16 = 3;
-/// Minimum height kept for the directives editor on short terminals.
-const EXECUTE_REVIEW_EDITOR_MIN_HEIGHT: u16 = 3;
-/// Maximum Coder rows drawn before the list scrolls.
-const EXECUTE_REVIEW_MODEL_LIST_MAX_ROWS: u16 = 6;
 
 /// Full drawn confirm-button label, resolved from the runtime locale (c-1).
 fn execute_review_confirm_label() -> String {
@@ -340,21 +347,6 @@ fn execute_review_confirm_label() -> String {
 /// Full drawn cancel-button label, resolved from the runtime locale (c-1).
 fn execute_review_cancel_label() -> String {
     format!(" [ {} ] ", active_t("modal.cancel"))
-}
-
-/// Number of Coder rows drawn for `entry_count` entries, before borders.
-fn execute_review_model_list_rows(entry_count: usize) -> u16 {
-    (entry_count.max(1) as u16).min(EXECUTE_REVIEW_MODEL_LIST_MAX_ROWS)
-}
-
-/// Insets a rectangle by a one-cell border on every side.
-fn inset(area: Rect) -> Rect {
-    Rect::new(
-        area.x + 1,
-        area.y + 1,
-        area.width.saturating_sub(2),
-        area.height.saturating_sub(2),
-    )
 }
 
 /// Rectangles of the single-target execution dialog, shared by the renderer and
@@ -374,38 +366,9 @@ pub struct ExecuteReviewDialogGeometry {
     pub cancel_button: Rect,
 }
 
-/// Splits the dialog interior into
-/// `[header, coder list, editor, buttons, footer]`.
-///
-/// The footer, list, and header are sized first so the dialog stays usable on
-/// short terminals; the directives editor absorbs whatever height remains and
-/// the hint strip is pinned to the card's bottom edge.
-fn execute_review_dialog_chunks(area: Rect, entry_count: usize) -> [Rect; 5] {
-    let inner = inset(area);
-
-    let footer_h = EXECUTE_REVIEW_FOOTER_HEIGHT.min(inner.height);
-    let after_footer = inner.height - footer_h;
-
-    let list_h = (execute_review_model_list_rows(entry_count) + 2).min(after_footer / 2);
-    let after_list = after_footer - list_h;
-
-    let header_h = EXECUTE_REVIEW_HEADER_HEIGHT
-        .min(after_list.saturating_sub(EXECUTE_REVIEW_EDITOR_MIN_HEIGHT));
-    let editor_h = after_list - header_h;
-
-    let header = Rect::new(inner.x, inner.y, inner.width, header_h);
-    let list = Rect::new(inner.x, inner.y + header_h, inner.width, list_h);
-    let editor = Rect::new(inner.x, list.y + list_h, inner.width, editor_h);
-
-    let docked_h = 1.min(footer_h);
-    let buttons_h = footer_h - docked_h;
-    let buttons = Rect::new(inner.x, editor.y + editor_h, inner.width, buttons_h);
-    let footer = Rect::new(inner.x, buttons.y + buttons_h, inner.width, docked_h);
-    [header, list, editor, buttons, footer]
-}
-
 /// Computes the dialog frame, the Coder-row area, and the action buttons from
-/// the same layout the renderer uses (Conventions §6, §7).
+/// the shared picker layout the renderer uses, so the drawn buttons are always
+/// the clickable ones (Conventions §6, §7).
 pub fn execute_review_dialog_geometry(
     term: Rect,
     entry_count: usize,
@@ -415,25 +378,21 @@ pub fn execute_review_dialog_geometry(
         EXECUTE_REVIEW_DIALOG_HEIGHT,
         term,
     );
-    let chunks = execute_review_dialog_chunks(area, entry_count);
-    let model_rows = inset(chunks[1]);
-    let editor_area = chunks[2];
+    let chunks = super::picker_dialog_chunks(area, entry_count, EXECUTE_REVIEW_HEADER_HEIGHT, 0);
+    let model_rows = super::inset(chunks.list);
 
-    let buttons = chunks[3];
-    // Button widths are measured from the same localized labels the renderer
-    // draws, so hit-testing never desynchronizes from the drawing.
-    let confirm_w = execute_review_confirm_label().chars().count() as u16;
-    let cancel_w = execute_review_cancel_label().chars().count() as u16;
-    let gap = 4u16;
-    let total = confirm_w + gap + cancel_w;
-    let start_x = buttons.x + (buttons.width.saturating_sub(total)) / 2;
-    let confirm_button = Rect::new(start_x, buttons.y, confirm_w, 1);
-    let cancel_button = Rect::new(start_x + confirm_w + gap, buttons.y, cancel_w, 1);
+    // The button geometry is measured from the same localized labels the
+    // renderer draws, so hit-testing never desynchronizes from the drawing.
+    let (confirm_button, cancel_button) = super::picker_button_rects(
+        chunks.buttons,
+        &execute_review_confirm_label(),
+        &execute_review_cancel_label(),
+    );
 
     ExecuteReviewDialogGeometry {
         area,
         model_rows,
-        editor_area,
+        editor_area: chunks.editor,
         confirm_button,
         cancel_button,
     }
@@ -465,12 +424,18 @@ pub fn render_execute_review_dialog(frame: &mut ratatui::Frame, state: &AppState
     let outer_block = Block::default()
         .title(format!(" {} ", active_t("dialog.execute_review.title_point")))
         .borders(Borders::ALL)
-        .border_style(ModalTone::Info.border_style(&engine))
+        .border_style(engine.fg(palette.button_active_bg))
         .style(Style::default().bg(engine.color(palette.surface)));
     frame.render_widget(outer_block, area);
 
-    let [header_area, list_area, editor_area, buttons_area, footer_area] =
-        execute_review_dialog_chunks(area, entry_count);
+    let super::PickerDialogChunks {
+        header: header_area,
+        list: list_area,
+        editor: editor_area,
+        buttons: buttons_area,
+        footer: footer_area,
+        ..
+    } = super::picker_dialog_chunks(area, entry_count, EXECUTE_REVIEW_HEADER_HEIGHT, 0);
 
     // Header: which review, finding, and step are about to be resolved.
     let mut review_spans = vec![
@@ -658,14 +623,22 @@ pub fn execute_scope_params(state: &AppState) -> Option<ConfirmModalParams<'_>> 
     let palette = engine.palette();
 
     let is_single = target.steps.len() == 1;
+    // A scope without any scheduled leaf is a concept-only plan whose horizon
+    // the batch projects just-in-time, so the dialog states that explicitly
+    // instead of presenting an empty queue as a finished one (c-5).
+    let is_jit = target.steps.is_empty();
     let title = if is_single {
         active_t("dialog.execute_scope.title_single")
+    } else if is_jit {
+        active_t("dialog.execute_scope.title_jit")
     } else {
         active_t("dialog.execute_scope.title_scope")
     };
 
     let heading = if is_single {
         active_t("dialog.execute_scope.heading_single")
+    } else if is_jit {
+        active_t("dialog.execute_scope.heading_jit")
     } else {
         active_t("dialog.execute_scope.heading_scope")
     };
@@ -723,7 +696,10 @@ pub fn execute_scope_params(state: &AppState) -> Option<ConfirmModalParams<'_>> 
         for (i, step) in target.steps.iter().take(4).enumerate() {
             body_lines.push(Line::from(vec![
                 Span::styled(format!("   {}. ", i + 1), engine.fg(palette.status_info)),
-                Span::styled(format!("#{} {}", step.id, truncate_to_width(&step.title, 40)), engine.fg(palette.text_primary)),
+                Span::styled(
+                    format!("#{} {}", step.id, truncate_to_width(&step.title, 40)),
+                    engine.fg(palette.text_primary),
+                ),
             ]));
         }
         if target.steps.len() > 4 {
@@ -740,6 +716,12 @@ pub fn execute_scope_params(state: &AppState) -> Option<ConfirmModalParams<'_>> 
         active_t("dialog.execute_scope.note"),
         engine.fg(palette.text_muted),
     )));
+    if is_jit {
+        body_lines.push(Line::from(Span::styled(
+            active_t("dialog.execute_scope.jit_note"),
+            engine.fg(palette.text_secondary),
+        )));
+    }
     if !is_single {
         body_lines.push(Line::from(Span::styled(
             active_t("dialog.execute_scope.fail_fast"),
@@ -771,6 +753,96 @@ pub fn render_confirm_execute_scope_popup(frame: &mut ratatui::Frame, state: &Ap
     }
 }
 
+/// Presentation parameters for the multi-plan execution pipeline confirmation.
+///
+/// The confirmation names the whole queue and the total queued step count before
+/// any bounded turn spends tokens, because a pipeline keeps the operation slot
+/// for every plan it runs and stops the queue on the first failure
+/// (Conventions §5.4).
+pub fn execute_pipeline_params(state: &AppState) -> Option<ConfirmModalParams<'_>> {
+    let target = state.confirm_execute_pipeline.as_ref()?;
+    let engine = current_engine();
+    let palette = engine.palette();
+
+    let mut body_lines = vec![
+        Line::raw(""),
+        Line::from(Span::styled(
+            active_t("dialog.execute_pipeline.heading"),
+            engine.fg(palette.status_info).bold(),
+        )),
+        Line::raw(""),
+        Line::from(vec![
+            Span::styled(
+                active_t("dialog.execute_pipeline.plans_label"),
+                engine.fg(palette.text_muted),
+            ),
+            Span::styled(
+                active_t("dialog.execute_pipeline.plans_count")
+                    .replacen("{}", &target.plan_titles.len().to_string(), 1),
+                engine.fg(palette.status_warning).bold(),
+            ),
+            Span::styled(
+                active_t("dialog.execute_pipeline.steps_count")
+                    .replacen("{}", &target.steps.len().to_string(), 1),
+                engine.fg(palette.text_primary),
+            ),
+        ]),
+    ];
+
+    body_lines.push(Line::raw(""));
+    body_lines.push(Line::from(Span::styled(
+        active_t("dialog.execute_pipeline.queue_header"),
+        engine.fg(palette.text_muted),
+    )));
+    for (i, title) in target.plan_titles.iter().take(4).enumerate() {
+        body_lines.push(Line::from(vec![
+            Span::styled(format!("   {}. ", i + 1), engine.fg(palette.status_info)),
+            Span::styled(
+                truncate_to_width(title, 44),
+                engine.fg(palette.text_primary),
+            ),
+        ]));
+    }
+    if target.plan_titles.len() > 4 {
+        body_lines.push(Line::from(Span::styled(
+            active_t("dialog.execute_pipeline.queue_more")
+                .replacen("{}", &(target.plan_titles.len() - 4).to_string(), 1),
+            engine.fg(palette.text_muted).italic(),
+        )));
+    }
+
+    if !target.pending_synthesis.is_empty() {
+        body_lines.push(Line::from(Span::styled(
+            active_t("dialog.execute_pipeline.jit_note")
+                .replacen("{}", &target.pending_synthesis.len().to_string(), 1),
+            engine.fg(palette.text_secondary),
+        )));
+    }
+
+    body_lines.push(Line::raw(""));
+    body_lines.push(Line::from(Span::styled(
+        active_t("dialog.execute_pipeline.note"),
+        engine.fg(palette.text_muted),
+    )));
+
+    Some(ConfirmModalParams {
+        title: active_t("dialog.execute_pipeline.title"),
+        tone: ModalTone::Info,
+        body_lines,
+        confirm_label: active_t("dialog.button.execute_pipeline"),
+        cancel_label: active_t("modal.cancel"),
+        confirm_button: state.confirm_button,
+        destructive: false,
+        width: 68,
+    })
+}
+
+pub fn render_confirm_execute_pipeline_popup(frame: &mut ratatui::Frame, state: &AppState) {
+    if let Some(params) = execute_pipeline_params(state) {
+        render_modal_confirm(frame, params);
+    }
+}
+
 /// Presentation parameters for the plan-deletion confirmation.
 pub fn delete_plan_params<'a>(state: &'a AppState, plan_id: &str) -> ConfirmModalParams<'a> {
     let engine = current_engine();
@@ -792,7 +864,10 @@ pub fn delete_plan_params<'a>(state: &'a AppState, plan_id: &str) -> ConfirmModa
         Line::raw(""),
         Line::from(vec![
             Span::raw(active_t("dialog.delete_plan.plan_label")),
-            Span::styled(format!("{} ({})", plan_title, plan_id), engine.fg(palette.status_info).bold()),
+            Span::styled(
+                format!("{} ({})", plan_title, plan_id),
+                engine.fg(palette.status_info).bold(),
+            ),
         ]),
         Line::from(Span::styled(
             active_t("dialog.delete_plan.note"),
@@ -812,7 +887,11 @@ pub fn delete_plan_params<'a>(state: &'a AppState, plan_id: &str) -> ConfirmModa
     }
 }
 
-pub fn render_confirm_delete_plan_popup(frame: &mut ratatui::Frame, plan_id: &str, state: &AppState) {
+pub fn render_confirm_delete_plan_popup(
+    frame: &mut ratatui::Frame,
+    plan_id: &str,
+    state: &AppState,
+) {
     render_modal_confirm(frame, delete_plan_params(state, plan_id));
 }
 
@@ -826,7 +905,14 @@ pub fn delete_review_params<'a>(state: &'a AppState, session_id: &str) -> Confir
         .iter()
         .find(|s| s.id == session_id)
         .map(|s| s.title.clone())
-        .or_else(|| state.review.session.as_ref().filter(|s| s.id == session_id).map(|s| s.title.clone()))
+        .or_else(|| {
+            state
+                .review
+                .session
+                .as_ref()
+                .filter(|s| s.id == session_id)
+                .map(|s| s.title.clone())
+        })
         .unwrap_or_else(|| session_id.to_string());
 
     let body_lines = vec![
@@ -838,7 +924,10 @@ pub fn delete_review_params<'a>(state: &'a AppState, session_id: &str) -> Confir
         Line::raw(""),
         Line::from(vec![
             Span::raw(active_t("dialog.delete_review.review_label")),
-            Span::styled(format!("{} ({})", review_title, session_id), engine.fg(palette.status_info).bold()),
+            Span::styled(
+                format!("{} ({})", review_title, session_id),
+                engine.fg(palette.status_info).bold(),
+            ),
         ]),
         Line::from(Span::styled(
             active_t("dialog.delete_review.note"),
@@ -858,7 +947,11 @@ pub fn delete_review_params<'a>(state: &'a AppState, session_id: &str) -> Confir
     }
 }
 
-pub fn render_confirm_delete_review_popup(frame: &mut ratatui::Frame, session_id: &str, state: &AppState) {
+pub fn render_confirm_delete_review_popup(
+    frame: &mut ratatui::Frame,
+    session_id: &str,
+    state: &AppState,
+) {
     render_modal_confirm(frame, delete_review_params(state, session_id));
 }
 
@@ -883,7 +976,8 @@ pub fn clear_auto_params(state: &AppState) -> ConfirmModalParams<'_> {
         Line::from(vec![
             Span::raw(active_t("dialog.clear_auto.body_prefix")),
             Span::styled(
-                active_t("dialog.clear_auto.body_count").replacen("{}", &auto_count.to_string(), 1),
+                active_t("dialog.clear_auto.body_count")
+                    .replacen("{}", &auto_count.to_string(), 1),
                 engine.fg(palette.button_active_bg).bold(),
             ),
             Span::raw(active_t("dialog.clear_auto.body_suffix")),
@@ -933,7 +1027,8 @@ pub fn clear_user_params(state: &AppState) -> ConfirmModalParams<'_> {
         Line::from(vec![
             Span::raw(active_t("dialog.clear_user.body_prefix")),
             Span::styled(
-                active_t("dialog.clear_user.body_count").replacen("{}", &user_count.to_string(), 1),
+                active_t("dialog.clear_user.body_count")
+                    .replacen("{}", &user_count.to_string(), 1),
                 engine.fg(palette.button_active_bg).bold(),
             ),
             Span::raw(active_t("dialog.clear_user.body_suffix")),
@@ -996,6 +1091,124 @@ pub fn clear_history_params(state: &AppState) -> ConfirmModalParams<'_> {
 
 pub fn render_confirm_clear_history_popup(frame: &mut ratatui::Frame, state: &AppState) {
     render_modal_confirm(frame, clear_history_params(state));
+}
+
+/// Width of the single-tier clear-horizon confirmation.
+const CLEAR_HORIZON_WIDTH: u16 = 62;
+/// Width of the two-tier clear-horizon confirmation.
+const CLEAR_HORIZON_FINAL_WIDTH: u16 = 64;
+
+/// Title of the plan the confirmation targets, resolved from the loaded plans.
+///
+/// The lookup falls back to the raw identifier so the dialog always names its
+/// target even when the plan list has not been refreshed (c-2).
+fn plan_display_title(state: &AppState, plan_id: &str) -> String {
+    state
+        .plans_view
+        .plans
+        .iter()
+        .find(|p| p.id == plan_id)
+        .map(|p| p.title.clone())
+        .unwrap_or_else(|| plan_id.to_string())
+}
+
+/// Plan field of both clear-horizon confirmations: `Plan: <title> (<id>)`.
+fn clear_horizon_plan_line<'a>(state: &AppState, plan_id: &str) -> Line<'a> {
+    let engine = current_engine();
+    let palette = engine.palette();
+    Line::from(vec![
+        Span::raw(active_t("dialog.delete_plan.plan_label")),
+        Span::styled(
+            format!("{} ({})", plan_display_title(state, plan_id), plan_id),
+            engine.fg(palette.status_info).bold(),
+        ),
+    ])
+}
+
+/// Presentation parameters for the first tier of the clear-horizon confirmation.
+///
+/// The first tier states what survives the reset: only the implementation steps
+/// are dropped, while the `<concept>` tree of requirements and invariants stays
+/// untouched (c-2). The safe `Cancel` button holds the default focus.
+pub fn clear_horizon_params<'a>(state: &'a AppState, plan_id: &str) -> ConfirmModalParams<'a> {
+    let engine = current_engine();
+    let palette = engine.palette();
+
+    let body_lines = vec![
+        Line::raw(""),
+        Line::from(Span::styled(
+            active_t("dialog.clear_horizon.question"),
+            engine.fg(palette.status_warning).bold(),
+        )),
+        Line::raw(""),
+        clear_horizon_plan_line(state, plan_id),
+        Line::from(Span::styled(
+            active_t("dialog.clear_horizon.note"),
+            engine.fg(palette.text_secondary),
+        )),
+    ];
+
+    ConfirmModalParams {
+        title: active_t("dialog.clear_horizon.title"),
+        tone: ModalTone::Warning,
+        body_lines,
+        confirm_label: active_t("dialog.button.clear_horizon"),
+        cancel_label: active_t("modal.cancel"),
+        confirm_button: state.confirm_button,
+        destructive: true,
+        width: CLEAR_HORIZON_WIDTH,
+    }
+}
+
+/// Presentation parameters for the second tier of the clear-horizon confirmation.
+///
+/// A plan whose steps are already `InProgress` or `Done` has committed work in
+/// Git. Clearing its horizon does not rewrite that history, so the second tier
+/// raises the desynchronization risk explicitly before the reset runs (c-2).
+pub fn clear_horizon_final_params<'a>(state: &'a AppState, plan_id: &str) -> ConfirmModalParams<'a> {
+    let engine = current_engine();
+    let palette = engine.palette();
+
+    let body_lines = vec![
+        Line::raw(""),
+        Line::from(Span::styled(
+            active_t("dialog.clear_horizon_final.question"),
+            engine.fg(palette.status_error).bold(),
+        )),
+        Line::raw(""),
+        clear_horizon_plan_line(state, plan_id),
+        Line::from(Span::styled(
+            active_t("dialog.clear_horizon_final.git_note"),
+            engine.fg(palette.status_warning).bold(),
+        )),
+    ];
+
+    ConfirmModalParams {
+        title: active_t("dialog.clear_horizon_final.title"),
+        tone: ModalTone::Dangerous,
+        body_lines,
+        confirm_label: active_t("dialog.button.confirm_clear_horizon"),
+        cancel_label: active_t("modal.cancel"),
+        confirm_button: state.confirm_button,
+        destructive: true,
+        width: CLEAR_HORIZON_FINAL_WIDTH,
+    }
+}
+
+pub fn render_confirm_clear_horizon_popup(
+    frame: &mut ratatui::Frame,
+    plan_id: &str,
+    state: &AppState,
+) {
+    render_modal_confirm(frame, clear_horizon_params(state, plan_id));
+}
+
+pub fn render_confirm_clear_horizon_final_popup(
+    frame: &mut ratatui::Frame,
+    plan_id: &str,
+    state: &AppState,
+) {
+    render_modal_confirm(frame, clear_horizon_final_params(state, plan_id));
 }
 
 const BATCH_CANCEL_WIDTH: u16 = 64;
@@ -1076,9 +1289,9 @@ pub fn batch_cancel_modal_geometry(term: Rect) -> BatchCancelModalGeometry {
 
     let labels = batch_cancel_labels();
     let widths: [u16; 3] = [
-        labels[0].chars().count() as u16,
-        labels[1].chars().count() as u16,
-        labels[2].chars().count() as u16,
+        UnicodeWidthStr::width(labels[0].as_str()) as u16,
+        UnicodeWidthStr::width(labels[1].as_str()) as u16,
+        UnicodeWidthStr::width(labels[2].as_str()) as u16,
     ];
     let total = widths[0] + widths[1] + widths[2] + BATCH_CANCEL_GAP * 2;
     let start = action_bar.x + action_bar.width.saturating_sub(total) / 2;
@@ -1144,9 +1357,14 @@ pub fn render_confirm_batch_cancel_popup(frame: &mut ratatui::Frame, state: &App
     let focused = state.batch_cancel_button;
     let button_style = |button: BatchCancelButton| {
         if button == focused {
-            engine.bg(palette.button_active_bg).fg(engine.color(palette.text_inverse)).bold()
+            engine
+                .bg(palette.button_active_bg)
+                .fg(engine.color(palette.text_inverse))
+                .bold()
         } else {
-            engine.bg(palette.button_bg).fg(engine.color(palette.button_fg))
+            engine
+                .bg(palette.button_bg)
+                .fg(engine.color(palette.button_fg))
         }
     };
 
@@ -1188,9 +1406,7 @@ mod tests {
         let body_count = params.body_lines.len();
 
         let mut terminal = Terminal::new(TestBackend::new(term.width, term.height)).unwrap();
-        terminal
-            .draw(|f| render_modal_confirm(f, params))
-            .unwrap();
+        terminal.draw(|f| render_modal_confirm(f, params)).unwrap();
 
         let geom = crate::components::confirm::confirm_modal_geometry(
             term,
@@ -1201,7 +1417,8 @@ mod tests {
         );
         let buffer = terminal.backend().buffer();
 
-        let confirm_text: String = (geom.confirm_button.x..geom.confirm_button.x + geom.confirm_button.width)
+        let confirm_text: String = (geom.confirm_button.x
+            ..geom.confirm_button.x + geom.confirm_button.width)
             .map(|x| buffer[(x, geom.confirm_button.y)].symbol())
             .collect();
         assert!(
@@ -1209,7 +1426,8 @@ mod tests {
             "confirm row text: {confirm_text:?}"
         );
 
-        let cancel_text: String = (geom.cancel_button.x..geom.cancel_button.x + geom.cancel_button.width)
+        let cancel_text: String = (geom.cancel_button.x
+            ..geom.cancel_button.x + geom.cancel_button.width)
             .map(|x| buffer[(x, geom.cancel_button.y)].symbol())
             .collect();
         assert!(
@@ -1265,6 +1483,99 @@ mod tests {
         let texts: Vec<String> = params.body_lines.iter().map(|l| l.to_string()).collect();
         assert!(texts.iter().any(|t| t.contains("Review: All Review Sessions")));
         assert!(texts.iter().any(|t| t.contains("2 finding(s) to resolve")));
+    }
+
+    /// The first tier keeps the safe defaults: warning tone, `Cancel` focused,
+    /// and the concept-preservation note in the body.
+    #[test]
+    fn test_clear_horizon_params_are_warning_and_safe() {
+        let st = crate::app::test_state();
+        let params = clear_horizon_params(&st, "plan-1");
+
+        assert_eq!(params.title, "Clear Implementation Horizon");
+        assert_eq!(params.tone, ModalTone::Warning);
+        assert_eq!(params.confirm_label, "Clear Horizon");
+        assert_eq!(params.cancel_label, "Cancel");
+        assert_eq!(params.confirm_button, crate::app::ConfirmDialogButton::Cancel);
+        assert!(params.destructive);
+        assert_eq!(params.width, CLEAR_HORIZON_WIDTH);
+
+        let texts: Vec<String> = params.body_lines.iter().map(|l| l.to_string()).collect();
+        assert!(texts.iter().any(|t| t.contains("plan-1")));
+        assert!(texts
+            .iter()
+            .any(|t| t.contains("architectural concept tree will remain intact")));
+    }
+
+    /// The second tier escalates to the dangerous tone and names the Git
+    /// desynchronization risk before the reset can run.
+    #[test]
+    fn test_clear_horizon_final_params_are_dangerous() {
+        let st = crate::app::test_state();
+        let params = clear_horizon_final_params(&st, "plan-2");
+
+        assert_eq!(params.title, "Confirm Clearing Active Horizon");
+        assert_eq!(params.tone, ModalTone::Dangerous);
+        assert_eq!(params.confirm_label, "Confirm Clear");
+        assert_eq!(params.confirm_button, crate::app::ConfirmDialogButton::Cancel);
+        assert!(params.destructive);
+        assert_eq!(params.width, CLEAR_HORIZON_FINAL_WIDTH);
+
+        let texts: Vec<String> = params.body_lines.iter().map(|l| l.to_string()).collect();
+        assert!(texts.iter().any(|t| t.contains("plan-2")));
+        assert!(texts.iter().any(|t| t.contains("does NOT undo Git commits")));
+    }
+
+    /// Rendered buttons of both tiers must land exactly on the rectangles the
+    /// mouse hit-tester computes (Conventions §6, §7).
+    #[test]
+    fn clear_horizon_buttons_match_hit_geometry() {
+        let term = Rect::new(0, 0, 100, 40);
+        let st = crate::app::test_state();
+
+        let cases = [
+            (
+                clear_horizon_params(&st, "plan-3"),
+                "Clear Horizon",
+                CLEAR_HORIZON_WIDTH,
+            ),
+            (
+                clear_horizon_final_params(&st, "plan-4"),
+                "Confirm Clear",
+                CLEAR_HORIZON_FINAL_WIDTH,
+            ),
+        ];
+
+        for (params, confirm_label, width) in cases {
+            let body_count = params.body_lines.len();
+            let mut terminal = Terminal::new(TestBackend::new(term.width, term.height)).unwrap();
+            terminal.draw(|f| render_modal_confirm(f, params)).unwrap();
+
+            let geom = crate::components::confirm::confirm_modal_geometry(
+                term,
+                width,
+                body_count,
+                confirm_label,
+                "Cancel",
+            );
+            let buffer = terminal.backend().buffer();
+            let read = |rect: Rect| -> String {
+                (rect.x..rect.x + rect.width)
+                    .map(|x| buffer[(x, rect.y)].symbol())
+                    .collect()
+            };
+
+            let confirm_row = read(geom.confirm_button);
+            assert!(
+                confirm_row.contains("Clear"),
+                "confirm row for '{confirm_label}': {confirm_row:?}"
+            );
+            let cancel_row = read(geom.cancel_button);
+            assert!(
+                cancel_row.contains("Cancel"),
+                "cancel row for '{confirm_label}': {cancel_row:?}"
+            );
+        }
     }
 
     #[test]

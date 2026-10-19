@@ -3,6 +3,8 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
+use crate::model::ArchitectTier;
+
 use super::item::{ConceptItem, PlanItem, PlanItemStatus};
 
 /// Structured validation errors representing plan integrity violations.
@@ -77,6 +79,13 @@ pub struct Plan {
     pub description: Option<String>,
     pub created_at: u64,
     pub updated_at: u64,
+    /// The Architect configuration that produced this plan's decomposition.
+    ///
+    /// Recording the pair makes a later refinement reproducible with the same
+    /// Architect configuration instead of re-deriving one, and lets the harness
+    /// escalate along the architect ladder when a wave must be reprojected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub architect: Option<ArchitectTier>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub concept: Vec<ConceptItem>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -103,53 +112,101 @@ pub struct PlanStats {
     pub completed: usize,
 }
 
+/// Single-pass accumulator over a set of statuses used to derive an aggregate
+/// status without materializing an intermediate vector.
+///
+/// Each flag records whether at least one status of that kind was observed, and
+/// `total` records how many statuses were folded in so an empty set can be
+/// distinguished from an all-`Cancelled` one.
+#[derive(Default)]
+struct StatusSummary {
+    total: usize,
+    has_discussion: bool,
+    has_blocked: bool,
+    has_in_progress: bool,
+    has_done: bool,
+    has_todo: bool,
+    has_cancelled: bool,
+}
+
+impl StatusSummary {
+    fn push(&mut self, status: PlanItemStatus) {
+        self.total += 1;
+        match status {
+            PlanItemStatus::Discussion => self.has_discussion = true,
+            PlanItemStatus::Todo => self.has_todo = true,
+            PlanItemStatus::InProgress => self.has_in_progress = true,
+            PlanItemStatus::Done => self.has_done = true,
+            PlanItemStatus::Blocked => self.has_blocked = true,
+            PlanItemStatus::Cancelled => self.has_cancelled = true,
+        }
+    }
+
+    /// Collapses the accumulated flags into a single aggregate status.
+    ///
+    /// The precedence preserves the historical aggregation contract: any
+    /// `Discussion` dominates, then `Blocked`, then `InProgress`; a mix of
+    /// `Done` and `Todo` is still `InProgress`; otherwise a set whose active
+    /// (non-`Cancelled`) members are all `Done` is `Done`, a set whose active
+    /// members are all `Todo` is `Todo`, an all-`Cancelled` set is `Cancelled`,
+    /// and an empty set defaults to `Todo`.
+    fn into_status(self) -> PlanItemStatus {
+        if self.total == 0 {
+            return PlanItemStatus::Todo;
+        }
+        if self.has_discussion {
+            return PlanItemStatus::Discussion;
+        }
+        if self.has_blocked {
+            return PlanItemStatus::Blocked;
+        }
+        if self.has_in_progress {
+            return PlanItemStatus::InProgress;
+        }
+        if self.has_done && self.has_todo {
+            return PlanItemStatus::InProgress;
+        }
+        if self.has_done {
+            return PlanItemStatus::Done;
+        }
+        if self.has_todo {
+            return PlanItemStatus::Todo;
+        }
+        if self.has_cancelled {
+            return PlanItemStatus::Cancelled;
+        }
+        PlanItemStatus::InProgress
+    }
+}
+
+/// Computes the aggregate status of a set of already-resolved statuses.
+///
+/// This is the allocation-free primitive shared by a container's status refresh
+/// and the readiness scan. Callers pass whatever statuses they already hold —
+/// leaf statuses, freshly derived child statuses, or recursively computed
+/// subtree statuses — and receive the same aggregation that
+/// [`compute_items_status`] produces for a tree, without building an
+/// intermediate `Vec`.
+pub(super) fn compute_direct_status<I>(statuses: I) -> PlanItemStatus
+where
+    I: IntoIterator<Item = PlanItemStatus>,
+{
+    let mut summary = StatusSummary::default();
+    for status in statuses {
+        summary.push(status);
+    }
+    summary.into_status()
+}
+
 /// Recursively computes the aggregated status of a collection of plan items.
 pub fn compute_items_status(items: &[PlanItem]) -> PlanItemStatus {
-    if items.is_empty() {
-        return PlanItemStatus::Todo;
-    }
-    let statuses: Vec<PlanItemStatus> = items
-        .iter()
-        .map(|item| {
-            if item.is_leaf() {
-                item.status
-            } else {
-                compute_items_status(&item.children)
-            }
-        })
-        .collect();
-
-    if statuses.contains(&PlanItemStatus::Discussion) {
-        return PlanItemStatus::Discussion;
-    }
-    if statuses.contains(&PlanItemStatus::Blocked) {
-        return PlanItemStatus::Blocked;
-    }
-    if statuses.contains(&PlanItemStatus::InProgress) {
-        return PlanItemStatus::InProgress;
-    }
-    let has_done = statuses.contains(&PlanItemStatus::Done);
-    let has_todo = statuses.contains(&PlanItemStatus::Todo);
-    if has_done && has_todo {
-        return PlanItemStatus::InProgress;
-    }
-    if statuses.iter().all(|s| *s == PlanItemStatus::Done) {
-        return PlanItemStatus::Done;
-    }
-    if statuses.iter().all(|s| *s == PlanItemStatus::Cancelled) {
-        return PlanItemStatus::Cancelled;
-    }
-    if statuses.iter().all(|s| *s == PlanItemStatus::Todo) {
-        return PlanItemStatus::Todo;
-    }
-    let active: Vec<_> = statuses.iter().filter(|s| **s != PlanItemStatus::Cancelled).collect();
-    if !active.is_empty() && active.iter().all(|s| **s == PlanItemStatus::Done) {
-        return PlanItemStatus::Done;
-    }
-    if !active.is_empty() && active.iter().all(|s| **s == PlanItemStatus::Todo) {
-        return PlanItemStatus::Todo;
-    }
-    PlanItemStatus::InProgress
+    compute_direct_status(items.iter().map(|item| {
+        if item.is_leaf() {
+            item.status
+        } else {
+            compute_items_status(&item.children)
+        }
+    }))
 }
 
 /// Counts executable, non-cancelled leaf items and how many of them are `Done`.
@@ -162,7 +219,7 @@ pub fn compute_items_status(items: &[PlanItem]) -> PlanItemStatus {
 /// alongside the children it aggregates, and `Cancelled` leaves are excluded
 /// from `total` so a completed plan never reports a `completed/total` ratio
 /// below one.
-pub fn count_leaf_stats(items: &[PlanItem]) -> (usize, usize) {
+pub(crate) fn count_leaf_stats(items: &[PlanItem]) -> (usize, usize) {
     fn walk(items: &[PlanItem], total: &mut usize, completed: &mut usize) {
         for item in items {
             if item.is_leaf() {
@@ -218,6 +275,35 @@ impl Plan {
     /// semantics.
     pub fn count_stats(&self) -> (usize, usize) {
         count_leaf_stats(&self.items)
+    }
+
+    /// Reports whether implementation work has already started or finished.
+    ///
+    /// The client uses this to choose the confirmation strength when it clears
+    /// the implementation horizon: a plan whose leaves are all pending has no
+    /// progress recorded in Git commits yet, so a single confirmation suffices,
+    /// while any leaf that is `Done` or `InProgress` may already be captured by
+    /// a commit and therefore requires the strict two-tier confirmation.
+    ///
+    /// Only executable leaves are inspected. A container's status is derived
+    /// from its descendants, so it carries no independent progress and its
+    /// stored value is never trusted here; its children are still traversed.
+    /// The method is pure: no I/O, no mutation, and no allocation beyond the
+    /// recursion itself.
+    pub fn has_started_or_completed_steps(&self) -> bool {
+        fn walk(items: &[PlanItem]) -> bool {
+            items.iter().any(|item| {
+                if item.is_leaf() {
+                    matches!(
+                        item.status,
+                        PlanItemStatus::Done | PlanItemStatus::InProgress
+                    )
+                } else {
+                    walk(&item.children)
+                }
+            })
+        }
+        walk(&self.items)
     }
 
     pub fn find_concept_item(&self, item_id: &str) -> Option<&ConceptItem> {
@@ -282,7 +368,8 @@ impl Plan {
             for item in items.iter_mut() {
                 if !item.children.is_empty() {
                     walk(&mut item.children);
-                    item.status = compute_items_status(&item.children);
+                    item.status =
+                        compute_direct_status(item.children.iter().map(|child| child.status));
                 }
             }
         }
@@ -414,13 +501,20 @@ impl Plan {
 
         // 3. Validate concept_refs, depends_on existence, and self-dependency
         let mut dep_graph: HashMap<String, Vec<String>> = HashMap::new();
+        // Validates the reference and dependency edges of a subtree and returns
+        // the normalized keys of that subtree's leaves. A leaf reports its own
+        // key; a container reports the union of its children's keys. Returning
+        // them from the same recursion that validates the children means a
+        // container learns the leaves it implicitly depends on without a second
+        // descent over the subtree it just visited.
         fn walk_refs(
             items: &[PlanItem],
             seen_concepts: &HashSet<String>,
             seen_items: &HashSet<String>,
             dep_graph: &mut HashMap<String, Vec<String>>,
             errors: &mut Vec<PlanValidationError>,
-        ) {
+        ) -> Vec<String> {
+            let mut leaf_keys = Vec::new();
             for item in items {
                 let item_key = id_key(&item.id);
 
@@ -454,6 +548,9 @@ impl Plan {
                     }
                 }
 
+                let mut child_leaf_keys =
+                    walk_refs(&item.children, seen_concepts, seen_items, dep_graph, errors);
+
                 if !item_key.is_empty() {
                     // A container becomes `Done` exactly when all of its
                     // descendant leaves are `Done`, so it implicitly depends on
@@ -464,13 +561,20 @@ impl Plan {
                     // container is meaningful, so the implicit edges are added
                     // for non-leaf items only.
                     if !item.is_leaf() {
-                        collect_descendant_leaf_keys(item, &mut deps_for_item);
+                        deps_for_item.extend(child_leaf_keys.iter().cloned());
                     }
-                    dep_graph.insert(item_key, deps_for_item);
+                    dep_graph.insert(item_key.clone(), deps_for_item);
                 }
 
-                walk_refs(&item.children, seen_concepts, seen_items, dep_graph, errors);
+                if item.is_leaf() {
+                    if !item_key.is_empty() {
+                        leaf_keys.push(item_key);
+                    }
+                } else {
+                    leaf_keys.append(&mut child_leaf_keys);
+                }
             }
+            leaf_keys
         }
         walk_refs(&self.items, &seen_concept_ids, &seen_item_ids, &mut dep_graph, &mut errors);
 
@@ -483,24 +587,6 @@ impl Plan {
             Ok(())
         } else {
             Err(errors)
-        }
-    }
-}
-
-/// Collects the normalized keys of every leaf reachable beneath `item`.
-///
-/// A container's completion is defined by its descendant leaves, so these keys
-/// are the implicit dependencies that connect a container to the leaves whose
-/// `depends_on` may point back at it.
-fn collect_descendant_leaf_keys(item: &PlanItem, out: &mut Vec<String>) {
-    for child in &item.children {
-        if child.is_leaf() {
-            let key = id_key(&child.id);
-            if !key.is_empty() {
-                out.push(key);
-            }
-        } else {
-            collect_descendant_leaf_keys(child, out);
         }
     }
 }

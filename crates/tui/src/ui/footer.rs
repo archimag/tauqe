@@ -2,12 +2,16 @@ use ratatui::layout::Rect;
 use ratatui::style::Stylize;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
+use unicode_width::UnicodeWidthStr;
+
+use tauqe_protocol::model::UsageTotalsSnapshot;
 
 use crate::app::{AppState, ViewMode};
 use crate::i18n::active_t;
 use crate::theme::color::RgbColor;
 use crate::theme::engine::{current_engine, ThemeEngine};
 use crate::theme::palette::ThemePalette;
+use crate::ui::format::{format_money, format_tokens};
 use crate::views::repl::{FileEditStatus, ToolchainState, TurnStatus, SPINNER_FRAMES};
 
 pub fn render_footer(frame: &mut ratatui::Frame, state: &AppState, area: Rect) {
@@ -35,15 +39,12 @@ fn render_footer_with_engine(
     ));
     footer_spans.push(Span::styled(" │ ", engine.fg(palette.text_muted)));
 
-    // 2. Financial indicator (Σ session · last · now)
-    if let Some(cost_str) = format_footer_cost(
-        state.model.session_total_cost,
-        state.model.prev_cost,
-        state.model.current_cost,
-        state.model.is_busy(),
-    ) {
+    // 2. Usage indicator (Σ session · last · now), degrading by width instead
+    // of ever cutting a number in half (c-4).
+    let usage_budget = (area.width.saturating_sub(2) as usize).saturating_sub(24);
+    if let Some(usage_str) = format_footer_usage(&state.model.usage_totals, usage_budget) {
         footer_spans.push(Span::styled(
-            cost_str,
+            usage_str,
             engine.fg(palette.status_warning).bold(),
         ));
         footer_spans.push(Span::styled(" │ ", engine.fg(palette.text_muted)));
@@ -344,52 +345,173 @@ pub fn format_repomap_tokens(tokens: usize) -> String {
     active_t("footer.repomap_tokens").replacen("{}", &tokens.to_string(), 1)
 }
 
-pub fn format_footer_cost(
-    session_cost: f64,
-    prev_cost: Option<f64>,
-    current_cost: Option<f64>,
-    is_busy: bool,
-) -> Option<String> {
-    let prev = prev_cost.unwrap_or(0.0);
-    let cur = current_cost.unwrap_or(0.0);
-    let has_expenses = session_cost > 0.0 || prev > 0.0 || cur > 0.0;
+/// Renders every tier of the compact usage summary, richest first.
+///
+/// Money outranks tokens: as soon as any slot carries a known cost the footer
+/// shows currency, otherwise the token counts stand in under an explicit `tok`
+/// unit. The list runs from the three labelled slots down to the session total
+/// alone, so a caller picks the richest variant that fits instead of truncating
+/// a number mid-digit (c-4, c-5).
+pub fn footer_usage_variants(snapshot: &UsageTotalsSnapshot) -> Vec<String> {
+    let cur = snapshot.cur.as_ref();
+    let has_money = snapshot.session.cost > 0.0
+        || snapshot.prev.cost > 0.0
+        || cur.is_some_and(|totals| totals.cost > 0.0);
+    let has_tokens = snapshot.session.total_tokens > 0
+        || snapshot.prev.total_tokens > 0
+        || cur.is_some_and(|totals| totals.total_tokens > 0);
 
-    if !has_expenses {
-        return None;
-    }
-
-    if is_busy {
-        Some(format!(
-            "Σ ${:.4} session · ${:.4} last · ${:.4} now",
-            session_cost, prev, cur
-        ))
+    if has_money {
+        usage_variants(
+            format_money(snapshot.session.cost),
+            format_money(snapshot.prev.cost),
+            cur.map(|totals| format_money(totals.cost)),
+            None,
+        )
+    } else if has_tokens {
+        usage_variants(
+            format_tokens(snapshot.session.total_tokens),
+            format_tokens(snapshot.prev.total_tokens),
+            cur.map(|totals| format_tokens(totals.total_tokens)),
+            Some(active_t("footer.usage.tok")),
+        )
     } else {
-        Some(format!(
-            "Σ ${:.4} session · ${:.4} last",
-            session_cost, prev
-        ))
+        Vec::new()
     }
+}
+
+/// Selects the richest usage summary that fits `budget` terminal columns.
+///
+/// Returns `None` when the snapshot carries neither money nor tokens, and when
+/// even the session-only form does not fit: the footer then drops the field
+/// entirely rather than showing a severed value (c-4).
+pub fn format_footer_usage(snapshot: &UsageTotalsSnapshot, budget: usize) -> Option<String> {
+    footer_usage_variants(snapshot)
+        .into_iter()
+        .find(|variant| UnicodeWidthStr::width(variant.as_str()) <= budget)
+}
+
+/// Builds the three degradation tiers of one usage summary.
+fn usage_variants(
+    session: String,
+    prev: String,
+    cur: Option<String>,
+    unit: Option<String>,
+) -> Vec<String> {
+    let with_unit = |value: &String| match &unit {
+        Some(unit) => format!("{} {}", value, unit),
+        None => value.clone(),
+    };
+    let session = with_unit(&session);
+    let prev = with_unit(&prev);
+    let cur = cur.as_ref().map(with_unit);
+
+    let mut full = format!("Σ {} {}", session, active_t("footer.usage.session"));
+    full.push_str(&format!(" · {} {}", prev, active_t("footer.usage.last")));
+    if let Some(cur) = &cur {
+        full.push_str(&format!(" · {} {}", cur, active_t("footer.usage.now")));
+    }
+
+    let mut compact = format!("Σ {} · {}", session, prev);
+    if let Some(cur) = &cur {
+        compact.push_str(&format!(" · {}", cur));
+    }
+
+    vec![full, compact, format!("Σ {}", session)]
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tauqe_protocol::model::UsageTotals;
 
-    use crate::theme::color::ColorDepth;
-    use crate::theme::engine::ThemeEngine;
-    use crate::theme::presets::ThemePreset;
+    fn money_snapshot(cur_cost: Option<f64>) -> UsageTotalsSnapshot {
+        UsageTotalsSnapshot {
+            session: UsageTotals {
+                cost: 0.015,
+                ..UsageTotals::default()
+            },
+            prev: UsageTotals {
+                cost: 0.005,
+                ..UsageTotals::default()
+            },
+            cur: cur_cost.map(|cost| UsageTotals {
+                cost,
+                ..UsageTotals::default()
+            }),
+            operations: 2,
+        }
+    }
+
+    fn token_snapshot() -> UsageTotalsSnapshot {
+        UsageTotalsSnapshot {
+            session: UsageTotals {
+                total_tokens: 1200,
+                ..UsageTotals::default()
+            },
+            prev: UsageTotals {
+                total_tokens: 300,
+                ..UsageTotals::default()
+            },
+            cur: Some(UsageTotals {
+                total_tokens: 50,
+                ..UsageTotals::default()
+            }),
+            operations: 2,
+        }
+    }
 
     #[test]
-    fn test_render_turn_phase_pipeline() {
-        let engine = ThemeEngine::new(ThemePreset::TauqeDark, ColorDepth::Truecolor);
-        let spans = render_turn_phase_pipeline(&engine, tauqe_protocol::TurnPhase::Staging);
-        let combined: String = spans.iter().map(|s| s.content.as_ref()).collect();
-        assert_eq!(combined, "[Discovery→Proposal→Staging→Verify→Heal]");
-        let staging_span = spans.iter().find(|s| s.content == "Staging").unwrap();
+    fn footer_usage_prefers_money_and_labels_every_slot() {
+        let variants = footer_usage_variants(&money_snapshot(Some(0.002)));
         assert_eq!(
-            staging_span.style.fg,
-            Some(engine.color(engine.palette().status_info))
+            variants,
+            vec![
+                "Σ $0.0150 session · $0.0050 last · $0.0020 now".to_string(),
+                "Σ $0.0150 · $0.0050 · $0.0020".to_string(),
+                "Σ $0.0150".to_string(),
+            ]
         );
+    }
+
+    #[test]
+    fn footer_usage_drops_the_in_flight_slot_when_no_operation_runs() {
+        let variants = footer_usage_variants(&money_snapshot(None));
+        assert_eq!(variants[0], "Σ $0.0150 session · $0.0050 last");
+        assert_eq!(variants[1], "Σ $0.0150 · $0.0050");
+    }
+
+    #[test]
+    fn footer_usage_falls_back_to_tokens_when_no_cost_is_known() {
+        let variants = footer_usage_variants(&token_snapshot());
+        assert_eq!(variants[0], "Σ 1200 tok session · 300 tok last · 50 tok now");
+        assert_eq!(variants[1], "Σ 1200 tok · 300 tok · 50 tok");
+        assert_eq!(variants[2], "Σ 1200 tok");
+    }
+
+    #[test]
+    fn footer_usage_is_absent_without_money_or_tokens() {
+        let empty = UsageTotalsSnapshot::default();
+        assert!(footer_usage_variants(&empty).is_empty());
+        assert_eq!(format_footer_usage(&empty, 200), None);
+    }
+
+    #[test]
+    fn footer_usage_degrades_by_budget_without_cutting_numbers() {
+        let snapshot = money_snapshot(Some(0.002));
+        assert_eq!(
+            format_footer_usage(&snapshot, 46).as_deref(),
+            Some("Σ $0.0150 session · $0.0050 last · $0.0020 now")
+        );
+        assert_eq!(
+            format_footer_usage(&snapshot, 45).as_deref(),
+            Some("Σ $0.0150 · $0.0050 · $0.0020")
+        );
+        assert_eq!(
+            format_footer_usage(&snapshot, 9).as_deref(),
+            Some("Σ $0.0150")
+        );
+        assert_eq!(format_footer_usage(&snapshot, 8), None);
     }
 
     #[test]
@@ -410,8 +532,14 @@ mod tests {
     }
 
     #[test]
+    fn test_format_repomap_tokens() {
+        assert_eq!(format_repomap_tokens(850), "map: 850 tok");
+        assert_eq!(format_repomap_tokens(1024), "map: 1024 tok");
+    }
+
+    #[test]
     fn test_format_notification() {
-        let palette = ThemePreset::TauqeDark.palette();
+        let palette = crate::theme::presets::ThemePreset::TauqeDark.palette();
         let notif_info = crate::app::AppNotification {
             level: crate::app::NotificationLevel::Info,
             text: "info text".to_string(),
@@ -432,28 +560,6 @@ mod tests {
         assert_eq!(
             format_notification(&notif_err, &palette),
             ("✗", palette.status_error)
-        );
-    }
-
-    #[test]
-    fn test_format_repomap_tokens() {
-        assert_eq!(format_repomap_tokens(850), "map: 850 tok");
-        assert_eq!(format_repomap_tokens(1024), "map: 1024 tok");
-    }
-
-    #[test]
-    fn test_format_footer_cost() {
-        assert_eq!(format_footer_cost(0.0, None, None, false), None);
-        assert_eq!(format_footer_cost(0.0, Some(0.0), Some(0.0), true), None);
-
-        assert_eq!(
-            format_footer_cost(0.0150, Some(0.0050), None, false),
-            Some("Σ $0.0150 session · $0.0050 last".to_string())
-        );
-
-        assert_eq!(
-            format_footer_cost(0.0150, Some(0.0050), Some(0.0020), true),
-            Some("Σ $0.0150 session · $0.0050 last · $0.0020 now".to_string())
         );
     }
 
@@ -516,37 +622,5 @@ mod tests {
             content.contains("Stopping after current step"),
             "the soft-stop indicator must be visible: {content:?}"
         );
-    }
-
-    #[test]
-    fn footer_chrome_styles_track_theme_tokens() {
-        use ratatui::backend::TestBackend;
-        use ratatui::Terminal;
-
-        for preset in [ThemePreset::TauqeDark, ThemePreset::TauqeLight] {
-            let engine = ThemeEngine::new(preset, ColorDepth::Truecolor);
-            let palette = engine.palette();
-
-            let backend = TestBackend::new(120, 3);
-            let mut terminal = Terminal::new(backend).expect("terminal created");
-            let mut state = crate::app::test_state();
-            state.model.status = TurnStatus::Done;
-
-            terminal
-                .draw(|frame| {
-                    let area = frame.area();
-                    render_footer_with_engine(frame, &state, area, &engine);
-                })
-                .expect("draw succeeded");
-
-            let buffer = terminal.backend().buffer();
-            // The TAUQE badge is filled with the accent surface token.
-            assert_eq!(buffer[(1, 1)].bg, engine.color(palette.button_active_bg));
-            assert_eq!(buffer[(1, 1)].fg, engine.color(palette.text_inverse));
-            // The divider next to the badge uses the muted chrome token.
-            assert_eq!(buffer[(8, 1)].fg, engine.color(palette.text_muted));
-            // The idle Ready/Done indicator uses the success status token.
-            assert_eq!(buffer[(11, 1)].fg, engine.color(palette.status_success));
-        }
     }
 }

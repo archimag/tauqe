@@ -179,6 +179,7 @@ pub(super) async fn finish_turn(
         blocked: None,
         has_terminal_success: false,
         plan_saved,
+        skip_reason: None,
     }
 }
 

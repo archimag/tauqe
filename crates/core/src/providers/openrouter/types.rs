@@ -12,6 +12,10 @@ pub(crate) struct ChatCompletionRequest {
     pub(crate) model: String,
     pub(crate) messages: Vec<ChatMessage>,
     pub(crate) stream: bool,
+    /// Logical session identity used by OpenRouter for sticky provider routing
+    /// and prompt-prefix cache reuse.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) session_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) stream_options: Option<StreamOptions>,
     #[serde(skip_serializing_if = "Option::is_none")]

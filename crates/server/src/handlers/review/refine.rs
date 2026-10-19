@@ -8,20 +8,25 @@
 //! plan-tree manipulation happens in the server crate.
 //!
 //! The synthesis itself lives in [`refine_finding_with_architect`], a typed
-//! helper shared by the `review/refineItem` RPC handler and the autonomous
-//! decomposition that runs before coding a `Warning`-severity or `Refine`
-//! finding (see `step.rs`).
+//! helper shared by the `review/refineItem` RPC handler, the autonomous
+//! decomposition that runs before coding an `Architecture`-class or `Refine`
+//! finding, and the replanning cycle that reprojects the remaining horizon of a
+//! finding whose sub-step failed (see `step.rs`).
 
 use std::path::Path;
 use std::sync::Arc;
 
+use tauqe_core::config::AppConfig;
 use tauqe_core::context::ContextFileContent;
-use tauqe_core::providers::{JsonSchemaDefinition, ResponseFormat};
+use tauqe_core::providers::{
+    format_session_id, JsonSchemaDefinition, ResponseFormat, SESSION_PREFIX_REVIEW,
+};
+use tauqe_core::review::prompt::refine::ReviewRefineDiagnostics;
 use tauqe_core::review::ReviewStorage;
 use tauqe_protocol::{
-    errors, events, ModelDeltaEvent, ModelRole, ModelSelection, ModelStartedEvent, Request,
-    Response, ResponseError, ReviewIssue, ReviewItem, ReviewRefineItemParams,
-    ReviewRefineItemResult, ReviewSession,
+    errors, events, ArchitectTier, IssueStatus, ModelDeltaEvent, ModelRole, ModelSelection,
+    ModelStartedEvent, Request, Response, ResponseError, ReviewIssue, ReviewItem,
+    ReviewRefineItemParams, ReviewRefineItemResult, ReviewSession,
 };
 
 use crate::handlers::plan::{
@@ -32,6 +37,7 @@ use crate::state::{next_operation_id, AppState, OperationGuard};
 
 use super::common::{
     clear_auto_context, emit, offload_review, preload_refine_item_files, publish_review,
+    set_item_status,
 };
 
 /// Operation title used for finding decomposition telemetry and history.
@@ -124,6 +130,7 @@ pub async fn handle_review_refine_item(req: Request, state: &Arc<AppState>) -> R
         &item,
         params.model,
         params.instructions,
+        None,
         &operation,
     )
     .await
@@ -168,6 +175,20 @@ pub(super) enum RefineOutcome {
 /// the immutable `Done` foundation and promotes the finding from `Refine` to
 /// `Todo`. Session history is recorded strictly after the subplan is persisted,
 /// so a failed synthesis never poisons the audit trail.
+///
+/// `diagnostics` carries the failure of an already executed sub-step. Supplying
+/// it turns the same synthesis into horizon replanning: the Architect reprojects
+/// the remaining work around the failed approach, while the immutable `Done`
+/// foundation is preserved by the storage primitive exactly as it is during
+/// initial decomposition. A replanning round also escalates the Architect
+/// configuration recorded on the finding, so the reprojection runs on a stronger
+/// rung than the one whose horizon already failed.
+///
+/// Planning is a lifecycle state of the finding, not an invisible operation: it
+/// is published as `InProgress` for the whole synthesis, and a round that yields
+/// no horizon returns the finding to the status it held before planning started,
+/// so a failed or blocked round never leaves a stuck `InProgress`.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn refine_finding_with_architect(
     state: &Arc<AppState>,
     repo_root: &Path,
@@ -175,47 +196,168 @@ pub(super) async fn refine_finding_with_architect(
     item: &ReviewItem,
     custom_model: Option<ModelSelection>,
     instructions: Option<String>,
+    diagnostics: Option<ReviewRefineDiagnostics<'_>>,
+    operation: &OperationGuard,
+) -> Result<RefineOutcome, ResponseError> {
+    // Planning is visible in the finding lifecycle. Publishing `InProgress`
+    // before the first generation round lets the interface show planning
+    // instead of an idle finding, and a successful synthesis settles it on
+    // `Todo` inside `replace_uncompleted_subplan`.
+    let previous_status = item.status;
+    set_item_status(state, repo_root, &session.id, item.id, IssueStatus::InProgress).await;
+
+    let outcome = refine_finding_with_architect_inner(
+        state,
+        repo_root,
+        session,
+        item,
+        custom_model,
+        instructions,
+        diagnostics,
+        operation,
+    )
+    .await;
+
+    // A round that produced no horizon must not leave the finding stuck in
+    // `InProgress`, so it returns to the status it held before planning began.
+    if !matches!(&outcome, Ok(RefineOutcome::Success { .. })) {
+        let restored = status_after_failed_planning(previous_status);
+        tracing::info!(
+            review_id = %session.id,
+            item_id = item.id,
+            previous_status = %previous_status,
+            restored_status = %restored,
+            "review finding planning produced no horizon; status restored"
+        );
+        set_item_status(state, repo_root, &session.id, item.id, restored).await;
+    }
+
+    outcome
+}
+
+/// Status a finding returns to when a planning round yields no horizon.
+///
+/// The planning status must never outlive the planning round, so the finding
+/// returns to the status it held before planning started. A finding that was
+/// itself mid-planning is demoted to `Todo`, which keeps it executable and
+/// distinguishable from finished work.
+fn status_after_failed_planning(previous: IssueStatus) -> IssueStatus {
+    match previous {
+        IssueStatus::InProgress => IssueStatus::Todo,
+        other => other,
+    }
+}
+
+/// Renders an Architect configuration for user-facing banners.
+fn format_architect_tier(tier: &ArchitectTier) -> String {
+    match tier.effort {
+        Some(effort) => format!("{} ({})", tier.model, effort),
+        None => tier.model.to_string(),
+    }
+}
+
+/// Alias of the configured Architect entry backing a resolved rung, if any.
+///
+/// The alias is looked up by the rung's model and reasoning depth, so an
+/// escalated round shows the label of the configuration it actually runs on
+/// instead of the base entry's label.
+fn architect_alias(cfg: &AppConfig, tier: &ArchitectTier) -> Option<String> {
+    cfg.models
+        .role_entries(ModelRole::Architect)
+        .into_iter()
+        .find(|entry| entry.model == tier.model && entry.effort == tier.effort)
+        .and_then(|entry| entry.alias)
+}
+
+/// Resolves the Architect configuration for one finding decomposition round.
+///
+/// An explicit developer selection overrides the ladder. Otherwise a replanning
+/// round reads the configuration recorded on the finding and asks the ladder for
+/// the next rung, so a reprojected horizon is synthesized by a stronger Architect
+/// than the one that already failed; the initial decomposition of a finding
+/// starts from the base rung. The returned former configuration is `Some` only
+/// for a replanning round, and is `None` when no configuration was recorded.
+fn resolve_finding_architect_tier(
+    cfg: &AppConfig,
+    recorded: Option<&ArchitectTier>,
+    custom_model: Option<&ModelSelection>,
+    replanning: bool,
+) -> (ArchitectTier, Option<ArchitectTier>) {
+    match custom_model {
+        Some(selection) => (
+            ArchitectTier::new(
+                cfg.resolve_model(selection),
+                cfg.models.resolve_effort(ModelRole::Architect),
+            ),
+            None,
+        ),
+        None if replanning => (cfg.models.next_architect_tier(recorded), recorded.cloned()),
+        None => (cfg.models.architect_tier(0), None),
+    }
+}
+
+/// Runs the Architect synthesis of a finding horizon.
+///
+/// See [`refine_finding_with_architect`] for the lifecycle contract. This
+/// function performs the synthesis itself and never mutates the finding status.
+#[allow(clippy::too_many_arguments)]
+async fn refine_finding_with_architect_inner(
+    state: &Arc<AppState>,
+    repo_root: &Path,
+    session: &ReviewSession,
+    item: &ReviewItem,
+    custom_model: Option<ModelSelection>,
+    instructions: Option<String>,
+    diagnostics: Option<ReviewRefineDiagnostics<'_>>,
     operation: &OperationGuard,
 ) -> Result<RefineOutcome, ResponseError> {
     let (
         provider,
-        model,
-        reasoning_effort,
+        architect_tier,
         alias,
+        escalated_from,
         repomap_budget,
         max_discovery_rounds,
         files_token_budget,
     ) = {
         let cfg = state.config.lock().await.config.clone();
-        let architect_entry = cfg
-            .models
-            .role_entries(ModelRole::Architect)
-            .into_iter()
-            .next();
-        let model = match &custom_model {
-            Some(m) => cfg.resolve_model(m),
-            None => cfg.resolve_role(ModelRole::Architect),
-        };
-        let reasoning_effort = cfg.models.resolve_effort(ModelRole::Architect);
-        let alias = if custom_model.is_some() {
-            None
-        } else {
-            architect_entry.and_then(|entry| entry.alias)
-        };
-        let provider = match resolve_architect_provider(state, &cfg, model.provider).await {
-            Ok(p) => p,
-            Err(err) => return Err(refine_error(errors::NO_API_KEY, err)),
-        };
+        let (architect_tier, escalated_from) = resolve_finding_architect_tier(
+            &cfg,
+            item.subplan_architect.as_ref(),
+            custom_model.as_ref(),
+            diagnostics.is_some(),
+        );
+        let alias = architect_alias(&cfg, &architect_tier);
+        let provider =
+            match resolve_architect_provider(state, &cfg, architect_tier.model.provider).await {
+                Ok(p) => p,
+                Err(err) => return Err(refine_error(errors::NO_API_KEY, err)),
+            };
         (
             provider,
-            model,
-            reasoning_effort,
+            architect_tier,
             alias,
+            escalated_from,
             cfg.context.repomap_token_budget,
             cfg.context.max_discovery_rounds,
             cfg.context.files_token_budget,
         )
     };
+    let model = architect_tier.model.clone();
+    let reasoning_effort = architect_tier.effort;
+
+    // A replanning round runs on the escalated rung and records it with the
+    // reprojected horizon, so the next wave continues up the ladder instead of
+    // restarting from the configuration that already failed.
+    if diagnostics.is_some() {
+        tracing::warn!(
+            review_id = %session.id,
+            item_id = item.id,
+            from_tier = ?escalated_from,
+            to_tier = ?architect_tier,
+            "review finding architect level up"
+        );
+    }
 
     clear_auto_context(state).await;
 
@@ -241,10 +383,29 @@ pub(super) async fn refine_finding_with_architect(
         .ok(),
     );
 
-    let intro_header = format!(
-        "# {}: [{}#{}] {}\n*Analyzing codebase contours and decomposing the finding into executable sub-steps...*\n\n---\n\n",
-        OPERATION_TITLE, session.id, item.id, item.title
-    );
+    let level_up_note = if diagnostics.is_some() {
+        let from = escalated_from
+            .as_ref()
+            .map(format_architect_tier)
+            .unwrap_or_else(|| "not recorded".to_string());
+        format!(
+            "\n> Architect level up: {} → {}",
+            from,
+            format_architect_tier(&architect_tier)
+        )
+    } else {
+        String::new()
+    };
+    let intro_header = match &diagnostics {
+        Some(diag) => format!(
+            "# {}: [{}#{}] {}\n*Replanning the finding horizon around failed sub-step `{}`...*{}\n\n---\n\n",
+            OPERATION_TITLE, session.id, item.id, item.title, diag.failed_step_id, level_up_note
+        ),
+        None => format!(
+            "# {}: [{}#{}] {}\n*Analyzing codebase contours and decomposing the finding into executable sub-steps...*{}\n\n---\n\n",
+            OPERATION_TITLE, session.id, item.id, item.title, level_up_note
+        ),
+    };
     emit(
         &state.out,
         events::MODEL_TEXT_DELTA,
@@ -255,7 +416,12 @@ pub(super) async fn refine_finding_with_architect(
         .ok(),
     );
 
-    {
+    // The user turn and its response are recorded together once the decomposition
+    // reaches a terminal outcome, so a cancelled, failed, or rejected round
+    // leaves no orphaned user turn in the transcript. The prompt and context
+    // paths are captured here because they describe the state the Architect
+    // actually saw.
+    let (history_turn_prompt, history_context_paths) = {
         let ctx = state.context.read().await;
         let context_paths: Vec<String> =
             ctx.get_state().items.into_iter().map(|it| it.path).collect();
@@ -269,8 +435,8 @@ pub(super) async fn refine_finding_with_architect(
                 turn_prompt.push_str(&format!("\nDirectives: {}\n", trimmed));
             }
         }
-        let _ = state.history.lock().await.record_turn(turn_prompt, context_paths);
-    }
+        (turn_prompt, context_paths)
+    };
 
     let response_format = {
         let schema_val = tauqe_core::plan::prompt::plan_refine_response_schema_definition();
@@ -291,14 +457,22 @@ pub(super) async fn refine_finding_with_architect(
         repomap_budget,
         max_discovery_rounds,
         files_token_budget,
+        // Decomposition is an isolated design dialogue of one review session:
+        // its cache is keyed by the audit, never by the interactive REPL.
+        session_id: Some(format_session_id(SESSION_PREFIX_REVIEW, &session.id)),
     };
 
     let build_user_prompt = |context_files: &[ContextFileContent], repo_map: Option<&str>| {
+        let diagnostics_view = diagnostics.map(|d| ReviewRefineDiagnostics {
+            failed_step_id: d.failed_step_id,
+            failure_reason: d.failure_reason,
+        });
         tauqe_core::review::prompt::build_review_finding_refine_user_prompt(
             session,
             item,
             context_files,
             repo_map,
+            diagnostics_view,
             instructions.as_deref(),
         )
     };
@@ -322,18 +496,17 @@ pub(super) async fn refine_finding_with_architect(
             budget_exceeded: Some(warn_msg),
             ..
         }) => {
-            // Close the turn in session history: the user prompt was recorded on
-            // entry, so the blocking outcome must be recorded here too or the
-            // transcript keeps an unmatched user turn.
-            let _ = state.history.lock().await.record_response(
+            record_synthesis_history(
+                state,
+                history_turn_prompt,
+                history_context_paths,
                 warn_msg.clone(),
-                None,
                 Some(format!(
                     "{}: Token Budget Exceeded ({})",
                     OPERATION_TITLE, item.title
                 )),
-                Vec::new(),
-            );
+            )
+            .await;
             return Ok(RefineOutcome::Blocked { reason: warn_msg });
         }
         Err(ArchitectDiscoveryError::Cancelled) => {
@@ -359,12 +532,14 @@ pub(super) async fn refine_finding_with_architect(
             "Architect reported blockers for review finding [{}#{}]:\n\n{}",
             session.id, item.id, reason
         );
-        let _ = state.history.lock().await.record_response(
+        record_synthesis_history(
+            state,
+            history_turn_prompt,
+            history_context_paths,
             blocked_msg,
-            None,
             Some(format!("{}: Blocked ({})", OPERATION_TITLE, item.title)),
-            Vec::new(),
-        );
+        )
+        .await;
         return Ok(RefineOutcome::Blocked { reason });
     }
 
@@ -414,12 +589,14 @@ pub(super) async fn refine_finding_with_architect(
     let new_subplan = output.items;
     let save_root = repo_root.to_path_buf();
     let save_review_id = review_id.clone();
+    let subplan_architect = architect_tier;
     let updated = match offload_review(move || {
         ReviewStorage::replace_uncompleted_subplan(
             &save_root,
             &save_review_id,
             item_id,
             new_subplan,
+            subplan_architect,
         )
     })
     .await
@@ -449,12 +626,14 @@ pub(super) async fn refine_finding_with_architect(
         "Review finding [{}#{}] decomposed into {} sub-step(s).\n\n{}",
         review_id, item_id, subplan_total, explanation
     );
-    let _ = state.history.lock().await.record_response(
+    record_synthesis_history(
+        state,
+        history_turn_prompt,
+        history_context_paths,
         history_response,
-        None,
         Some(format!("{}: {}", OPERATION_TITLE, updated.title)),
-        Vec::new(),
-    );
+    )
+    .await;
 
     publish_review(state, repo_root, &review_id).await;
 
@@ -464,11 +643,89 @@ pub(super) async fn refine_finding_with_architect(
     })
 }
 
+/// Records an Architect decomposition interaction atomically once it reaches a
+/// terminal outcome.
+///
+/// The user turn and its response are written together under a single history
+/// mutation, only after the synthesis has produced a durable result. Recording
+/// the turn before the discovery loop would leave an orphaned user entry in the
+/// transcript whenever the round is cancelled, fails, or is rejected before a
+/// response exists. Persistence is `fsync`-bounded, so it runs on the blocking
+/// pool through `crate::handlers::with_history_mutation` instead of stalling an
+/// async worker thread.
+async fn record_synthesis_history(
+    state: &Arc<AppState>,
+    turn_prompt: String,
+    context_paths: Vec<String>,
+    response_message: String,
+    response_summary: Option<String>,
+) {
+    let _ = crate::handlers::with_history_mutation(state, move |history| {
+        let _ = history.record_turn(turn_prompt, context_paths);
+        let _ = history.record_response(response_message, None, response_summary, Vec::new());
+    })
+    .await;
+}
+
 /// Builds a typed error for the decomposition helper, mirroring `Response::err`.
 fn refine_error(code: &'static str, message: impl Into<String>) -> ResponseError {
     ResponseError {
         code: code.to_string(),
         message: message.into(),
         data: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tauqe_protocol::model::{ModelRef, ReasoningEffort};
+
+    #[test]
+    fn architect_tier_banner_renders_its_reasoning_depth() {
+        // Escalation is visible to the developer, so the banner must name the
+        // rung that actually runs, including its reasoning depth.
+        let tier = ArchitectTier::new(
+            ModelRef::openrouter("planner/model"),
+            Some(ReasoningEffort::High),
+        );
+        assert_eq!(
+            format_architect_tier(&tier),
+            format!("openrouter:planner/model ({})", ReasoningEffort::High)
+        );
+        // A rung without a reasoning depth renders as a bare model reference.
+        assert_eq!(
+            format_architect_tier(&ArchitectTier::from(ModelRef::openrouter("planner/model"))),
+            "openrouter:planner/model"
+        );
+    }
+
+    #[test]
+    fn failed_planning_restores_the_previous_status() {
+        // A finding the developer is still examining keeps its own status: a
+        // failed planning round must never silently queue it for execution.
+        assert_eq!(
+            status_after_failed_planning(IssueStatus::Discussion),
+            IssueStatus::Discussion
+        );
+        assert_eq!(
+            status_after_failed_planning(IssueStatus::Refine),
+            IssueStatus::Refine
+        );
+        // A finding left `Skipped` by an interrupted subplan keeps its
+        // interruption diagnostic instead of losing it to the planning round.
+        assert_eq!(
+            status_after_failed_planning(IssueStatus::Skipped),
+            IssueStatus::Skipped
+        );
+    }
+
+    #[test]
+    fn failed_planning_never_leaves_in_progress() {
+        // The planning status cannot outlive the round that published it.
+        assert_eq!(
+            status_after_failed_planning(IssueStatus::InProgress),
+            IssueStatus::Todo
+        );
     }
 }

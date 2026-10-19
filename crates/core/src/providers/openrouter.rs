@@ -112,12 +112,14 @@ impl OpenRouterProvider {
         Ok(None)
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn execute_stream(
         &self,
         model: &str,
         messages: Vec<ChatMessage>,
         response_format: Option<ResponseFormat>,
         reasoning_effort: Option<ReasoningEffort>,
+        session_id: Option<&str>,
         tx: mpsc::Sender<StreamEvent>,
         mut cancel_rx: watch::Receiver<bool>,
     ) -> Result<()> {
@@ -143,6 +145,7 @@ impl OpenRouterProvider {
         tracing::info!(
             model = %model,
             effort = ?reasoning_effort,
+            session_id = session_id.unwrap_or("none"),
             uses_json_schema,
             messages_count = messages.len(),
             "openrouter request dispatched"
@@ -152,6 +155,7 @@ impl OpenRouterProvider {
             model: model.to_string(),
             messages,
             stream: true,
+            session_id: session_id.map(str::to_string),
             stream_options: Some(StreamOptions {
                 include_usage: true,
             }),
@@ -411,7 +415,7 @@ impl LlmProvider for OpenRouterProvider {
         tx: mpsc::Sender<StreamEvent>,
         cancel_rx: watch::Receiver<bool>,
     ) -> Result<()> {
-        self.execute_stream(model, messages, response_format, None, tx, cancel_rx)
+        self.execute_stream(model, messages, response_format, None, None, tx, cancel_rx)
             .await
     }
 
@@ -429,6 +433,29 @@ impl LlmProvider for OpenRouterProvider {
             messages,
             response_format,
             reasoning_effort,
+            None,
+            tx,
+            cancel_rx,
+        )
+        .await
+    }
+
+    async fn stream_chat_with_session(
+        &self,
+        model: &str,
+        messages: Vec<ChatMessage>,
+        response_format: Option<ResponseFormat>,
+        reasoning_effort: Option<ReasoningEffort>,
+        session_id: Option<&str>,
+        tx: mpsc::Sender<StreamEvent>,
+        cancel_rx: watch::Receiver<bool>,
+    ) -> Result<()> {
+        self.execute_stream(
+            model,
+            messages,
+            response_format,
+            reasoning_effort,
+            session_id,
             tx,
             cancel_rx,
         )
@@ -438,10 +465,8 @@ impl LlmProvider for OpenRouterProvider {
 
 #[cfg(test)]
 mod tests {
+    use super::sse::{find_sse_event_boundary, truncate_response_body, RESPONSE_BODY_LOG_CHARS};
     use super::*;
-    use super::sse::{
-        find_sse_event_boundary, truncate_response_body, RESPONSE_BODY_LOG_CHARS,
-    };
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -599,13 +624,7 @@ mod tests {
 
         let provider_task = tokio::spawn(async move {
             provider
-                .stream_chat(
-                    "test-model",
-                    vec![],
-                    response_format,
-                    tx,
-                    cancel_rx,
-                )
+                .stream_chat("test-model", vec![], response_format, tx, cancel_rx)
                 .await
         });
 
@@ -682,6 +701,71 @@ mod tests {
         assert_eq!(req_json["reasoning"]["enabled"], true);
         assert_eq!(req_json["reasoning"]["effort"], "xhigh");
         assert_eq!(req_json["provider"]["require_parameters"], true);
+    }
+
+    async fn mount_stream_mock(mock_server: &MockServer) {
+        let sse_body = "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n";
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(sse_body, "text/event-stream"),
+            )
+            .mount(mock_server)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn test_stream_chat_serializes_session_id() {
+        let mock_server = MockServer::start().await;
+        mount_stream_mock(&mock_server).await;
+
+        let provider =
+            OpenRouterProvider::new("test-api-key".to_string()).with_base_url(mock_server.uri());
+
+        let (tx, mut rx) = mpsc::channel(10);
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+        provider
+            .stream_chat_with_session(
+                "test-model",
+                vec![],
+                None,
+                None,
+                Some("tauqe-plan-test-123"),
+                tx,
+                cancel_rx,
+            )
+            .await
+            .expect("session stream should succeed");
+        while rx.recv().await.is_some() {}
+
+        let requests = mock_server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(body["session_id"], "tauqe-plan-test-123");
+    }
+
+    #[tokio::test]
+    async fn test_stream_chat_omits_session_id_when_none() {
+        let mock_server = MockServer::start().await;
+        mount_stream_mock(&mock_server).await;
+
+        let provider =
+            OpenRouterProvider::new("test-api-key".to_string()).with_base_url(mock_server.uri());
+
+        let (tx, mut rx) = mpsc::channel(10);
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+        provider
+            .stream_text("test-model", vec![], tx, cancel_rx)
+            .await
+            .expect("plain stream should succeed");
+        while rx.recv().await.is_some() {}
+
+        let requests = mock_server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert!(body.get("session_id").is_none());
     }
 
     #[test]

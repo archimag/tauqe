@@ -9,6 +9,7 @@ use crate::app::AppState;
 use crate::command::CommandCategory::{Essential, Helpers, Interface};
 use crate::command::{CommandMap, CommandSpec, KeyChord};
 use crate::config::{InputConfig, MetaModifier, PrimaryModifier};
+use crate::i18n::engine::active_t;
 use crate::input::InputResult;
 use crate::rpc::{send_request, RpcConnection};
 use crate::views::repl::{ReplFocus, ReplView, TurnStatus};
@@ -22,423 +23,423 @@ pub static REPL_COMMAND_MAP: CommandMap<ReplAction> = CommandMap::new(&[
         KeyChord::Primary(KeyCode::Enter),
         ReplAction::SendPrompt,
         Essential,
-        "Send the prompt",
+        "cmd.repl.send",
     ),
     CommandSpec::new(
         KeyChord::Ctrl(KeyCode::Enter),
         ReplAction::SendPrompt,
         Essential,
-        "Send the prompt",
+        "cmd.repl.send",
     ),
     CommandSpec::new(
         KeyChord::Bare(KeyCode::Enter),
         ReplAction::SendPrompt,
         Essential,
-        "Send the prompt",
+        "cmd.repl.send",
     ),
     CommandSpec::new(
         KeyChord::PrimaryOrMeta(KeyCode::Char('s')),
         ReplAction::OpenSquashDialog,
         Essential,
-        "Open the squash AI commits dialog",
+        "cmd.repl.squash",
     ),
     // Interface: focus, folding, file navigation, scrolling, and editor navigation.
     CommandSpec::new(
         KeyChord::Shift(KeyCode::Tab),
         ReplAction::ToggleFocus,
         Interface,
-        "Switch focus between the prompt and the Viewport",
+        "cmd.repl.toggle_focus",
     ),
     CommandSpec::new(
         KeyChord::Shift(KeyCode::BackTab),
         ReplAction::ToggleFocus,
         Interface,
-        "Switch focus between the prompt and the Viewport",
+        "cmd.repl.toggle_focus",
     ),
     CommandSpec::new(
         KeyChord::Bare(KeyCode::BackTab),
         ReplAction::ToggleFocus,
         Interface,
-        "Switch focus between the prompt and the Viewport",
+        "cmd.repl.toggle_focus",
     ),
     CommandSpec::new(
         KeyChord::Primary(KeyCode::Char(' ')),
         ReplAction::ToggleFocus,
         Interface,
-        "Switch focus between the prompt and the Viewport",
+        "cmd.repl.toggle_focus",
     ),
     CommandSpec::new(
         KeyChord::Ctrl(KeyCode::Char(' ')),
         ReplAction::ToggleFocus,
         Interface,
-        "Switch focus between the prompt and the Viewport",
+        "cmd.repl.toggle_focus",
     ),
     CommandSpec::new(
         KeyChord::Alt(KeyCode::Char(' ')),
         ReplAction::ToggleSelectedFileFold,
         Interface,
-        "Fold or unfold the selected file diff",
+        "cmd.repl.toggle_file_fold",
     ),
     CommandSpec::new(
         KeyChord::Primary(KeyCode::Char('t')),
         ReplAction::ToggleSelectedFileFold,
         Interface,
-        "Fold or unfold the selected file diff",
+        "cmd.repl.toggle_file_fold",
     ),
     CommandSpec::new(
         KeyChord::Ctrl(KeyCode::Char('t')),
         ReplAction::ToggleSelectedFileFold,
         Interface,
-        "Fold or unfold the selected file diff",
+        "cmd.repl.toggle_file_fold",
     ),
     CommandSpec::new(
         KeyChord::Alt(KeyCode::Char('t')),
         ReplAction::ToggleSelectedFileFold,
         Interface,
-        "Fold or unfold the selected file diff",
+        "cmd.repl.toggle_file_fold",
     ),
     CommandSpec::new(
         KeyChord::Ctrl(KeyCode::Char('[')),
         ReplAction::PrevModifiedFile,
         Interface,
-        "Select the previous modified file",
+        "cmd.repl.prev_file",
     ),
     CommandSpec::new(
         KeyChord::Ctrl(KeyCode::Char(']')),
         ReplAction::NextModifiedFile,
         Interface,
-        "Select the next modified file",
+        "cmd.repl.next_file",
     ),
     CommandSpec::new(
         KeyChord::Alt(KeyCode::Char('[')),
         ReplAction::PrevModifiedFile,
         Interface,
-        "Select the previous modified file",
+        "cmd.repl.prev_file",
     ),
     CommandSpec::new(
         KeyChord::Alt(KeyCode::Char(']')),
         ReplAction::NextModifiedFile,
         Interface,
-        "Select the next modified file",
+        "cmd.repl.next_file",
     ),
     CommandSpec::new(
         KeyChord::Alt(KeyCode::Up),
         ReplAction::ScrollResponseUp,
         Interface,
-        "Scroll the response up",
+        "cmd.repl.scroll_up",
     ),
     CommandSpec::new(
         KeyChord::Alt(KeyCode::Down),
         ReplAction::ScrollResponseDown,
         Interface,
-        "Scroll the response down",
+        "cmd.repl.scroll_down",
     ),
     CommandSpec::new(
         KeyChord::Shift(KeyCode::Up),
         ReplAction::ScrollResponseUp,
         Interface,
-        "Scroll the response up",
+        "cmd.repl.scroll_up",
     ),
     CommandSpec::new(
         KeyChord::Shift(KeyCode::Down),
         ReplAction::ScrollResponseDown,
         Interface,
-        "Scroll the response down",
+        "cmd.repl.scroll_down",
     ),
     CommandSpec::new(
         KeyChord::Bare(KeyCode::PageUp),
         ReplAction::ScrollResponsePageUp,
         Interface,
-        "Scroll the response up one page",
+        "cmd.repl.page_up",
     ),
     CommandSpec::new(
         KeyChord::Bare(KeyCode::PageDown),
         ReplAction::ScrollResponsePageDown,
         Interface,
-        "Scroll the response down one page",
+        "cmd.repl.page_down",
     ),
     CommandSpec::new(
         KeyChord::Bare(KeyCode::Up),
         ReplAction::LineUpOrHistoryPrev,
         Interface,
-        "Move the cursor up one line; navigate history at the first line",
+        "cmd.repl.line_up_or_history_prev",
     ),
     CommandSpec::new(
         KeyChord::Bare(KeyCode::Down),
         ReplAction::LineDownOrHistoryNext,
         Interface,
-        "Move the cursor down one line; navigate history at the last line",
+        "cmd.repl.line_down_or_history_next",
     ),
     CommandSpec::new(
         KeyChord::Ctrl(KeyCode::Char('p')),
         ReplAction::MoveLineUp,
         Interface,
-        "Move the cursor up one line",
+        "cmd.repl.move_line_up",
     ),
     CommandSpec::new(
         KeyChord::Ctrl(KeyCode::Char('n')),
         ReplAction::MoveLineDown,
         Interface,
-        "Move the cursor down one line",
+        "cmd.repl.move_line_down",
     ),
     CommandSpec::new(
         KeyChord::Alt(KeyCode::Char('p')),
         ReplAction::HistoryPrev,
         Interface,
-        "Navigate the prompt history backward",
+        "cmd.repl.history_prev",
     ),
     CommandSpec::new(
         KeyChord::Alt(KeyCode::Char('n')),
         ReplAction::HistoryNext,
         Interface,
-        "Navigate the prompt history forward",
+        "cmd.repl.history_next",
     ),
     CommandSpec::new(
         KeyChord::Primary(KeyCode::Char('a')),
         ReplAction::MoveBeginningOfLine,
         Interface,
-        "Move the cursor to the beginning of the line",
+        "cmd.repl.move_beginning_of_line",
     ),
     CommandSpec::new(
         KeyChord::Ctrl(KeyCode::Char('a')),
         ReplAction::MoveBeginningOfLine,
         Interface,
-        "Move the cursor to the beginning of the line",
+        "cmd.repl.move_beginning_of_line",
     ),
     CommandSpec::new(
         KeyChord::Primary(KeyCode::Char('e')),
         ReplAction::MoveEndOfLine,
         Interface,
-        "Move the cursor to the end of the line",
+        "cmd.repl.move_end_of_line",
     ),
     CommandSpec::new(
         KeyChord::Ctrl(KeyCode::Char('e')),
         ReplAction::MoveEndOfLine,
         Interface,
-        "Move the cursor to the end of the line",
+        "cmd.repl.move_end_of_line",
     ),
     CommandSpec::new(
         KeyChord::Ctrl(KeyCode::Char('b')),
         ReplAction::MoveCharBackward,
         Interface,
-        "Move the cursor one character backward",
+        "cmd.repl.move_char_backward",
     ),
     CommandSpec::new(
         KeyChord::Ctrl(KeyCode::Char('f')),
         ReplAction::MoveCharForward,
         Interface,
-        "Move the cursor one character forward",
+        "cmd.repl.move_char_forward",
     ),
     CommandSpec::new(
         KeyChord::Alt(KeyCode::Char('b')),
         ReplAction::MoveWordBackward,
         Interface,
-        "Move the cursor one word backward",
+        "cmd.repl.move_word_backward",
     ),
     CommandSpec::new(
         KeyChord::Alt(KeyCode::Char('f')),
         ReplAction::MoveWordForward,
         Interface,
-        "Move the cursor one word forward",
+        "cmd.repl.move_word_forward",
     ),
     CommandSpec::new(
         KeyChord::Ctrl(KeyCode::Left),
         ReplAction::MoveWordBackward,
         Interface,
-        "Move the cursor one word backward",
+        "cmd.repl.move_word_backward",
     ),
     CommandSpec::new(
         KeyChord::Ctrl(KeyCode::Right),
         ReplAction::MoveWordForward,
         Interface,
-        "Move the cursor one word forward",
+        "cmd.repl.move_word_forward",
     ),
     CommandSpec::new(
         KeyChord::Alt(KeyCode::Left),
         ReplAction::MoveWordBackward,
         Interface,
-        "Move the cursor one word backward",
+        "cmd.repl.move_word_backward",
     ),
     CommandSpec::new(
         KeyChord::Alt(KeyCode::Right),
         ReplAction::MoveWordForward,
         Interface,
-        "Move the cursor one word forward",
+        "cmd.repl.move_word_forward",
     ),
     CommandSpec::new(
         KeyChord::Bare(KeyCode::Left),
         ReplAction::MoveCharBackward,
         Interface,
-        "Move the cursor one character backward",
+        "cmd.repl.move_char_backward",
     ),
     CommandSpec::new(
         KeyChord::Bare(KeyCode::Right),
         ReplAction::MoveCharForward,
         Interface,
-        "Move the cursor one character forward",
+        "cmd.repl.move_char_forward",
     ),
     CommandSpec::new(
         KeyChord::Bare(KeyCode::Home),
         ReplAction::MoveBeginningOfLine,
         Interface,
-        "Move the cursor to the beginning of the line",
+        "cmd.repl.move_beginning_of_line",
     ),
     CommandSpec::new(
         KeyChord::Bare(KeyCode::End),
         ReplAction::MoveEndOfLine,
         Interface,
-        "Move the cursor to the end of the line",
+        "cmd.repl.move_end_of_line",
     ),
     CommandSpec::new(
         KeyChord::Meta(KeyCode::Char('<')),
         ReplAction::MoveBufferStart,
         Interface,
-        "Move the cursor to the beginning of the buffer",
+        "cmd.repl.move_buffer_start",
     ),
     CommandSpec::new(
         KeyChord::Ctrl(KeyCode::Home),
         ReplAction::MoveBufferStart,
         Interface,
-        "Move the cursor to the beginning of the buffer",
+        "cmd.repl.move_buffer_start",
     ),
     CommandSpec::new(
         KeyChord::Meta(KeyCode::Char('>')),
         ReplAction::MoveBufferEnd,
         Interface,
-        "Move the cursor to the end of the buffer",
+        "cmd.repl.move_buffer_end",
     ),
     CommandSpec::new(
         KeyChord::Ctrl(KeyCode::End),
         ReplAction::MoveBufferEnd,
         Interface,
-        "Move the cursor to the end of the buffer",
+        "cmd.repl.move_buffer_end",
     ),
     // Helpers: editing and clipboard operations.
     CommandSpec::new(
         KeyChord::Bare(KeyCode::Tab),
         ReplAction::InsertSpaces,
         Helpers,
-        "Insert two spaces",
+        "cmd.repl.insert_spaces",
     ),
     CommandSpec::new(
         KeyChord::Shift(KeyCode::Enter),
         ReplAction::InsertNewline,
         Helpers,
-        "Insert a newline",
+        "cmd.repl.insert_newline",
     ),
     CommandSpec::new(
         KeyChord::Alt(KeyCode::Enter),
         ReplAction::InsertNewline,
         Helpers,
-        "Insert a newline",
+        "cmd.repl.insert_newline",
     ),
     CommandSpec::new(
         KeyChord::Ctrl(KeyCode::Char('j')),
         ReplAction::InsertNewline,
         Helpers,
-        "Insert a newline",
+        "cmd.repl.insert_newline",
     ),
     CommandSpec::new(
         KeyChord::Bare(KeyCode::Backspace),
         ReplAction::DeleteBackward,
         Helpers,
-        "Delete the character backward",
+        "cmd.repl.delete_backward",
     ),
     CommandSpec::new(
         KeyChord::Alt(KeyCode::Backspace),
         ReplAction::KillWordBackward,
         Helpers,
-        "Kill the word before the cursor",
+        "cmd.repl.kill_word_backward",
     ),
     CommandSpec::new(
         KeyChord::Ctrl(KeyCode::Char('d')),
         ReplAction::DeleteForward,
         Helpers,
-        "Delete the character forward",
+        "cmd.repl.delete_forward",
     ),
     CommandSpec::new(
         KeyChord::Bare(KeyCode::Delete),
         ReplAction::DeleteForward,
         Helpers,
-        "Delete the character forward",
+        "cmd.repl.delete_forward",
     ),
     CommandSpec::new(
         KeyChord::Primary(KeyCode::Char('k')),
         ReplAction::KillLine,
         Helpers,
-        "Kill to the end of the line",
+        "cmd.repl.kill_line",
     ),
     CommandSpec::new(
         KeyChord::Ctrl(KeyCode::Char('k')),
         ReplAction::KillLine,
         Helpers,
-        "Kill to the end of the line",
+        "cmd.repl.kill_line",
     ),
     CommandSpec::new(
         KeyChord::Ctrl(KeyCode::Char('u')),
         ReplAction::KillToBeginningOfLine,
         Helpers,
-        "Kill to the beginning of the line",
+        "cmd.repl.kill_to_beginning",
     ),
     CommandSpec::new(
         KeyChord::Primary(KeyCode::Char('w')),
         ReplAction::KillWordBackward,
         Helpers,
-        "Kill the word before the cursor",
+        "cmd.repl.kill_word_backward",
     ),
     CommandSpec::new(
         KeyChord::Ctrl(KeyCode::Char('w')),
         ReplAction::KillWordBackward,
         Helpers,
-        "Kill the word before the cursor",
+        "cmd.repl.kill_word_backward",
     ),
     CommandSpec::new(
         KeyChord::Alt(KeyCode::Char('d')),
         ReplAction::KillWordForward,
         Helpers,
-        "Kill the word after the cursor",
+        "cmd.repl.kill_word_forward",
     ),
     CommandSpec::new(
         KeyChord::Primary(KeyCode::Char('y')),
         ReplAction::Yank,
         Helpers,
-        "Yank from the kill ring or the clipboard",
+        "cmd.repl.yank",
     ),
     CommandSpec::new(
         KeyChord::Ctrl(KeyCode::Char('y')),
         ReplAction::Yank,
         Helpers,
-        "Yank from the kill ring or the clipboard",
+        "cmd.repl.yank",
     ),
     CommandSpec::new(
         KeyChord::Shift(KeyCode::Insert),
         ReplAction::Yank,
         Helpers,
-        "Yank from the kill ring or the clipboard",
+        "cmd.repl.yank",
     ),
     CommandSpec::new(
         KeyChord::Alt(KeyCode::Char('y')),
         ReplAction::CopyModelResponse,
         Helpers,
-        "Copy the model response to the clipboard",
+        "cmd.repl.copy_response",
     ),
     CommandSpec::new(
         KeyChord::Alt(KeyCode::Char('c')),
         ReplAction::CopyModelResponse,
         Helpers,
-        "Copy the model response to the clipboard",
+        "cmd.repl.copy_response",
     ),
     CommandSpec::new(
         KeyChord::Ctrl(KeyCode::Char('g')),
         ReplAction::ClearPromptSaving,
         Helpers,
-        "Interrupt, or clear the prompt (saving it to the kill ring)",
+        "cmd.repl.clear_prompt",
     ),
     CommandSpec::new(
         KeyChord::Bare(KeyCode::Esc),
         ReplAction::ClearPromptSaving,
         Helpers,
-        "Interrupt, or clear the prompt (saving it to the kill ring)",
+        "cmd.repl.clear_prompt",
     ),
 ]);
 
@@ -688,10 +689,10 @@ pub async fn handle_repl_key(
                 if armed {
                     st.model.esc_clear_armed = None;
                     st.input_editor.clear_saving();
-                    st.notify_info("Prompt cleared (C-Y to restore)");
+                    st.notify_info(active_t("notify.prompt_cleared"));
                 } else {
                     st.model.esc_clear_armed = Some(std::time::Instant::now());
-                    st.notify_info("Press Esc again to clear the prompt");
+                    st.notify_info(active_t("notify.prompt_clear_arm"));
                 }
             } else if st.discussion_focus.is_active() {
                 st.confirm_detach_focus = true;
@@ -710,7 +711,9 @@ pub async fn handle_repl_key(
                     st.input_editor.clear();
                     st.input_editor.insert_str(&prompt);
                     st.model.status = TurnStatus::Error;
-                    st.notify_error(format!("Failed to send prompt: {}", err));
+                    st.notify_error(
+                        active_t("notify.prompt_send_failed").replace("{}", &err.to_string()),
+                    );
                 }
             }
         }
@@ -719,9 +722,9 @@ pub async fn handle_repl_key(
         }
         ReplAction::CopyModelResponse => {
             if st.model.is_busy() {
-                st.notify_warning("Cannot copy while model is generating");
+                st.notify_warning(active_t("notify.copy_busy"));
             } else if st.model.text.trim().is_empty() {
-                st.notify_warning("No model response to copy");
+                st.notify_warning(active_t("notify.copy_no_response"));
             } else {
                 let text = st.model.text.clone();
                 drop(st);
@@ -729,13 +732,13 @@ pub async fn handle_repl_key(
                 let mut st = state.lock().await;
                 match res {
                     crate::clipboard::CopyResult::Native => {
-                        st.notify_success("Model response copied to clipboard");
+                        st.notify_success(active_t("notify.response_copied"));
                     }
                     crate::clipboard::CopyResult::Osc52Only => {
-                        st.notify_info("Model response sent to terminal clipboard (OSC 52)");
+                        st.notify_info(active_t("notify.response_copied_osc52"));
                     }
                     crate::clipboard::CopyResult::Failed => {
-                        st.notify_error("Failed to copy to clipboard");
+                        st.notify_error(active_t("notify.copy_failed"));
                     }
                 }
             }
