@@ -7,8 +7,8 @@ use super::{is_inside_markdown_code_with_fences, strip_tags, CodeFences};
 use crate::edits::protocol::xml::engine;
 use crate::edits::protocol::xml::{extract_attribute, find_base_tag_start};
 
-pub use item::ParsedPlanItem;
 use concept::parse_concept_items_with_diagnostics;
+pub use item::ParsedPlanItem;
 use item::{next_item_tag_bounds, parse_plan_items_with_diagnostics};
 
 /// Specification of the `<plan>` control tag from the XML tag registry.
@@ -55,7 +55,9 @@ fn find_closing_inner_tag(
                     && !suffix.starts_with("_item")
                     && !suffix.starts_with("-item")
                     && (suffix.starts_with('_') || suffix.starts_with('-'))
-                    && suffix.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'));
+                    && suffix
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'));
 
             if is_match {
                 let close_end = close_start + prefix.len() + gt + 1;
@@ -107,13 +109,18 @@ pub fn parse_plan_tags_with_diagnostics(text: &str) -> (Vec<ParsedPlanTag>, Vec<
         let mut idx = after_plan;
         if idx < bytes.len() && (bytes[idx] == b'_' || bytes[idx] == b'-') {
             idx += 1;
-            while idx < bytes.len() && (bytes[idx].is_ascii_alphanumeric() || bytes[idx] == b'_' || bytes[idx] == b'-') {
+            while idx < bytes.len()
+                && (bytes[idx].is_ascii_alphanumeric() || bytes[idx] == b'_' || bytes[idx] == b'-')
+            {
                 idx += 1;
             }
         }
         let tag_name = &text[tag_start + 1..idx];
         let rest = &text[idx..];
-        let boundary = rest.chars().next().is_some_and(|c| c.is_whitespace() || c == '>' || c == '/');
+        let boundary = rest
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_whitespace() || c == '>' || c == '/');
         if !boundary {
             pos = after_plan;
             continue;
@@ -137,7 +144,8 @@ pub fn parse_plan_tags_with_diagnostics(text: &str) -> (Vec<ParsedPlanTag>, Vec<
         let raw_id_opt = extract_attribute(header, "id");
         let raw_title_opt = extract_attribute(header, "title");
 
-        let has_plan_attributes = raw_action_opt.is_some() || raw_id_opt.is_some() || raw_title_opt.is_some();
+        let has_plan_attributes =
+            raw_action_opt.is_some() || raw_id_opt.is_some() || raw_title_opt.is_some();
 
         let (body, next_pos) = if is_self_closing {
             ("", header_end)
@@ -148,7 +156,9 @@ pub fn parse_plan_tags_with_diagnostics(text: &str) -> (Vec<ParsedPlanTag>, Vec<
                 (body_slice, header_end + close_offset + close_tag.len())
             } else {
                 if has_plan_attributes {
-                    errors.push(format!("Malformed <{tag_name}> tag: missing closing tag '{close_tag}'"));
+                    errors.push(format!(
+                        "Malformed <{tag_name}> tag: missing closing tag '{close_tag}'"
+                    ));
                 }
                 pos = header_end;
                 continue;
@@ -192,14 +202,13 @@ pub fn parse_plan_tags_with_diagnostics(text: &str) -> (Vec<ParsedPlanTag>, Vec<
             })
             .map(|s| s.trim().to_string());
 
-        let description = extract_attribute(header, "description")
-            .or_else(|| {
-                let (d, _) = extract_and_strip_inner_tag(&plan_meta, "description");
-                d.or_else(|| {
-                    let (s, _) = extract_and_strip_inner_tag(&plan_meta, "summary");
-                    s
-                })
-            });
+        let description = extract_attribute(header, "description").or_else(|| {
+            let (d, _) = extract_and_strip_inner_tag(&plan_meta, "description");
+            d.or_else(|| {
+                let (s, _) = extract_and_strip_inner_tag(&plan_meta, "summary");
+                s
+            })
+        });
 
         let (mut items, item_errors) = parse_plan_items_with_diagnostics(&body_without_concept);
         errors.extend(item_errors);
@@ -210,13 +219,23 @@ pub fn parse_plan_tags_with_diagnostics(text: &str) -> (Vec<ParsedPlanTag>, Vec<
                     item.title = item.id.clone();
                 }
             }
-        } else if action == "update" && items.is_empty() && title.is_none() && description.is_none() && has_plan_attributes {
-            errors.push(format!("Plan update for '{}' contains no items or fields to update", if id.is_empty() { tag_name } else { id.as_str() }));
+        } else if action == "update"
+            && items.is_empty()
+            && title.is_none()
+            && description.is_none()
+            && has_plan_attributes
+        {
+            errors.push(format!(
+                "Plan update for '{}' contains no items or fields to update",
+                if id.is_empty() { tag_name } else { id.as_str() }
+            ));
         }
 
         if id.is_empty() && items.is_empty() && concept.is_empty() {
             if has_plan_attributes {
-                errors.push(format!("Malformed <{tag_name}> tag: both 'id' and items are missing"));
+                errors.push(format!(
+                    "Malformed <{tag_name}> tag: both 'id' and items are missing"
+                ));
             }
         } else if action == "save" && concept.is_empty() {
             if concept_block.is_some() {
@@ -233,7 +252,11 @@ pub fn parse_plan_tags_with_diagnostics(text: &str) -> (Vec<ParsedPlanTag>, Vec<
         } else {
             plans.push(ParsedPlanTag {
                 action,
-                id: if id.is_empty() { "default".to_string() } else { id },
+                id: if id.is_empty() {
+                    "default".to_string()
+                } else {
+                    id
+                },
                 title,
                 description,
                 concept,
@@ -287,8 +310,14 @@ Here is our plan:
         assert_eq!(p.concept[0].id, "c-1");
         assert_eq!(p.items.len(), 2);
         assert_eq!(p.items[0].id, "1");
-        assert_eq!(p.items[0].status, Some(tauqe_protocol::PlanItemStatus::Done));
-        assert_eq!(p.items[0].details.as_deref(), Some("Define User and Claims"));
+        assert_eq!(
+            p.items[0].status,
+            Some(tauqe_protocol::PlanItemStatus::Done)
+        );
+        assert_eq!(
+            p.items[0].details.as_deref(),
+            Some("Define User and Claims")
+        );
         assert_eq!(p.items[1].children.len(), 1);
         assert_eq!(p.items[1].children[0].id, "2.1");
     }
@@ -307,8 +336,14 @@ Here is our plan:
         let parsed = parse_plan_tags(text);
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0].concept.len(), 1);
-        assert_eq!(parsed[0].items[0].details.as_deref(), Some("Attribute details here"));
-        assert_eq!(parsed[0].items[1].details.as_deref(), Some("Paired with attr"));
+        assert_eq!(
+            parsed[0].items[0].details.as_deref(),
+            Some("Attribute details here")
+        );
+        assert_eq!(
+            parsed[0].items[1].details.as_deref(),
+            Some("Paired with attr")
+        );
     }
 
     #[test]
@@ -319,7 +354,10 @@ Here is our plan:
 </plan>
 "#;
         let (plans, errors) = parse_plan_tags_with_diagnostics(text);
-        assert!(plans.is_empty(), "Plan without concept should not be accepted on save");
+        assert!(
+            plans.is_empty(),
+            "Plan without concept should not be accepted on save"
+        );
         assert_eq!(errors.len(), 1);
         assert!(errors[0].contains("must contain a <concept> section"));
     }
@@ -498,15 +536,25 @@ And outside markdown:
         let p = &parsed[0];
         assert_eq!(p.id, "plan-exec");
         assert_eq!(p.title.as_deref(), Some("Execution Engine"));
-        assert!(p.description.as_ref().unwrap().contains("Architectural plan"));
+        assert!(p
+            .description
+            .as_ref()
+            .unwrap()
+            .contains("Architectural plan"));
         assert_eq!(p.concept.len(), 1);
         assert_eq!(p.concept[0].id, "c-1");
         assert_eq!(p.items.len(), 2);
         assert_eq!(p.items[0].id, "1");
-        assert_eq!(p.items[0].status, Some(tauqe_protocol::PlanItemStatus::Done));
+        assert_eq!(
+            p.items[0].status,
+            Some(tauqe_protocol::PlanItemStatus::Done)
+        );
         assert_eq!(p.items[0].title, "Protocol tags");
         assert_eq!(p.items[1].id, "2");
-        assert_eq!(p.items[1].status, Some(tauqe_protocol::PlanItemStatus::Todo));
+        assert_eq!(
+            p.items[1].status,
+            Some(tauqe_protocol::PlanItemStatus::Todo)
+        );
     }
 
     #[test]
@@ -528,7 +576,10 @@ And outside markdown:
         let p = &parsed[0];
         assert_eq!(p.concept.len(), 1);
         assert_eq!(p.concept[0].id, "c-1");
-        assert_eq!(p.concept[0].details.as_deref(), Some("Core invariant details"));
+        assert_eq!(
+            p.concept[0].details.as_deref(),
+            Some("Core invariant details")
+        );
         assert_eq!(p.concept[0].children.len(), 1);
         assert_eq!(p.concept[0].children[0].id, "c-1.1");
         assert_eq!(p.items.len(), 1);
@@ -554,8 +605,14 @@ And outside markdown:
         let (parsed, errors) = parse_plan_tags_with_diagnostics(text);
         assert!(errors.is_empty(), "Errors: {:?}", errors);
         assert_eq!(parsed.len(), 1);
-        assert!(parsed[0].items[0].files.is_empty(), "Parent files must be cleared");
-        assert_eq!(parsed[0].items[0].children[0].files, vec!["crates/core/src/child.rs"]);
+        assert!(
+            parsed[0].items[0].files.is_empty(),
+            "Parent files must be cleared"
+        );
+        assert_eq!(
+            parsed[0].items[0].children[0].files,
+            vec!["crates/core/src/child.rs"]
+        );
     }
 
     #[test]
@@ -587,11 +644,20 @@ And outside markdown:
         assert_eq!(p.concept[0].id, "c-1");
         assert_eq!(p.items.len(), 2);
         assert_eq!(p.items[0].id, "1");
-        assert_eq!(p.items[0].title, "Create package manifest and binary entrypoint");
-        assert_eq!(p.items[0].details.as_deref(), Some("Setup Cargo.toml and src/main.rs entrypoint for the application"));
+        assert_eq!(
+            p.items[0].title,
+            "Create package manifest and binary entrypoint"
+        );
+        assert_eq!(
+            p.items[0].details.as_deref(),
+            Some("Setup Cargo.toml and src/main.rs entrypoint for the application")
+        );
         assert_eq!(p.items[1].id, "2");
         assert_eq!(p.items[1].title, "Compile and run");
-        assert_eq!(p.items[1].details.as_deref(), Some("Run cargo run to verify"));
+        assert_eq!(
+            p.items[1].details.as_deref(),
+            Some("Run cargo run to verify")
+        );
     }
 
     #[test]

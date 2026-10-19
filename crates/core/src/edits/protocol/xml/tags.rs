@@ -1,7 +1,11 @@
-//! Control tags of the XML edit protocol that are not code edits:
-//! `<context_request>`, `<doc_request>`, `<user_language>`, `<verify>` and `<plan>`.
+//! Control tags of the XML edit protocol that are not code edits: the
+//! discovery requests (`<context_request>`, `<repo_search>`, `<repo_dirs>`,
+//! `<repo_map>`, `<dir_list>`), documentation requests, verification, plan
+//! blocks, and the turn-scoped scratchpad.
 
 mod context;
+mod dir_list;
+mod dirs;
 mod docs;
 mod language;
 mod outcome;
@@ -13,35 +17,52 @@ mod verify;
 use super::engine;
 
 pub(crate) use context::parse_context_request_tags;
+pub(crate) use dir_list::parse_dir_list_tags;
+pub(crate) use dirs::parse_repo_dirs_tags;
 pub(crate) use docs::parse_doc_request_tags;
 pub(crate) use search::parse_repo_search_tags;
 
 pub use context::strip_context_request_tags;
+pub use dirs::strip_repo_dirs_tags;
 pub use docs::strip_doc_request_tags;
-pub use search::strip_repo_search_tags;
 pub use language::{extract_user_language, strip_user_language_tags};
 pub use outcome::{
     extract_blocked, extract_error, extract_skip, extract_success, extract_terminal_outcome,
     strip_blocked_tags, strip_error_tags, strip_skip_tags, strip_success_tags,
     strip_terminal_outcome_tags, TerminalOutcome,
 };
-pub use plan::{
-    parse_plan_tags_with_diagnostics, strip_plan_tags, ParsedPlanItem, ParsedPlanTag,
-};
+pub use plan::{parse_plan_tags_with_diagnostics, strip_plan_tags, ParsedPlanItem, ParsedPlanTag};
 pub use scratchpad::{extract_scratchpad, strip_scratchpad_tags};
+pub use search::strip_repo_search_tags;
 pub use verify::{
     extract_verify_request, strip_verify_tags, VerifyOnSuccess, VerifyRequest, VerifyTarget,
 };
 
-/// Locates the next complete tag named by `open` (for example `<verify`).
+/// Resolves the registry entry of the `<repo_map>` control tag.
+fn repo_map_spec() -> Option<&'static engine::XmlTagSpec> {
+    engine::tag_spec("repo_map")
+}
+
+/// Removes all targeted repository map tags from text.
+pub fn strip_repo_map_tags(text: &str) -> String {
+    match repo_map_spec() {
+        Some(spec) => engine::strip_tag_by_spec(text, spec),
+        None => text.to_string(),
+    }
+}
+
+/// Extracts targeted repository map requests (`<repo_map path="..." />`) in order.
 ///
-/// The close mode is declared by the tag's [`XmlTagSpec`], so every tag family
-/// shares one scanner: self-closing, closed directly after the header, or paired
-/// with a later closing tag. An optional turn-marker suffix is accepted, tags
-/// inside markdown code are ignored, and an incomplete tag yields `None`.
-fn next_tag_bounds(text: &str, open: &str) -> Option<(usize, usize)> {
-    let spec = engine::tag_spec(open.trim_start_matches('<'))?;
-    engine::find_next_tag_bounds(text, spec)
+/// A missing `path` attribute yields an empty string, which names the whole
+/// repository. Marked occurrences inside markdown code are ignored by the tag
+/// engine, so a quoted example never widens what the model can see.
+pub(crate) fn parse_repo_map_tags(text: &str) -> Vec<String> {
+    match repo_map_spec() {
+        Some(spec) => engine::iter_tags(text, spec)
+            .map(|tag| tag.attr("path").unwrap_or_default())
+            .collect(),
+        None => Vec::new(),
+    }
 }
 
 fn strip_tags(text: &str, next: fn(&str) -> Option<(usize, usize)>) -> String {
@@ -58,7 +79,9 @@ fn strip_tags(text: &str, next: fn(&str) -> Option<(usize, usize)>) -> String {
 /// Returns true if byte offset `target_pos` in `text` is inside an inline markdown code span (`...`).
 fn is_inside_inline_code(text: &str, target_pos: usize) -> bool {
     let line_start = text[..target_pos].rfind('\n').map_or(0, |i| i + 1);
-    let line_end = text[target_pos..].find('\n').map_or(text.len(), |i| target_pos + i);
+    let line_end = text[target_pos..]
+        .find('\n')
+        .map_or(text.len(), |i| target_pos + i);
     let line = &text[line_start..line_end];
     let rel_pos = target_pos - line_start;
 
@@ -200,8 +223,29 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_parse_and_strip_repo_map_tags() {
+        let text = "Outline needed.\n<repo_map path=\"crates/core\" />\n<repo_map />\nDone.";
+        assert_eq!(
+            parse_repo_map_tags(text),
+            vec!["crates/core".to_string(), String::new()]
+        );
+        assert_eq!(strip_repo_map_tags(text), "Outline needed.\n\n\nDone.");
+
+        // A marker-suffixed request is still the same control tag.
+        assert_eq!(
+            parse_repo_map_tags("<repo_map_AB12 path=\"src\" />"),
+            vec!["src".to_string()]
+        );
+
+        // A fenced example is documentation, not a command.
+        assert!(parse_repo_map_tags("```xml\n<repo_map path=\"src\" />\n```").is_empty());
+        assert!(!parse_repo_map_tags("no request here").iter().any(|_| true));
+    }
+
+    #[test]
     fn test_extract_and_strip_success_self_closing_with_summary() {
-        let text = "Changes applied.\n<success summary=\"Created models and passed checks\" />\nDone.";
+        let text =
+            "Changes applied.\n<success summary=\"Created models and passed checks\" />\nDone.";
         let outcome = extract_terminal_outcome(text).unwrap();
         assert_eq!(
             outcome,
@@ -209,7 +253,10 @@ mod tests {
                 summary: Some("Created models and passed checks".to_string()),
             }
         );
-        assert_eq!(extract_success(text), Some(Some("Created models and passed checks".to_string())));
+        assert_eq!(
+            extract_success(text),
+            Some(Some("Created models and passed checks".to_string()))
+        );
         assert_eq!(extract_error(text), None);
 
         let stripped = strip_terminal_outcome_tags(text);
@@ -308,7 +355,9 @@ mod tests {
         assert_eq!(
             outcome,
             TerminalOutcome::Error {
-                message: "Contradiction in architectural requirements: cannot ensure atomic commits.".to_string(),
+                message:
+                    "Contradiction in architectural requirements: cannot ensure atomic commits."
+                        .to_string(),
             }
         );
         let stripped = strip_terminal_outcome_tags(text);
@@ -440,7 +489,9 @@ Real outcome:
 
         assert!(is_inside_markdown_code_with_fences(text, 8, &fences));
         assert!(!fences.is_inside(8));
-        assert!(is_inside_markdown_code_with_fences(text, fenced_pos, &fences));
+        assert!(is_inside_markdown_code_with_fences(
+            text, fenced_pos, &fences
+        ));
         assert!(!is_inside_markdown_code_with_fences(text, 0, &fences));
     }
 }

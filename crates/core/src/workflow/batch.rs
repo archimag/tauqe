@@ -18,8 +18,8 @@
 //! concerns while still returning a single aggregate report.
 
 use async_trait::async_trait;
-use tokio::sync::{mpsc, watch};
 use tauqe_protocol::ModelUsageInfo;
+use tokio::sync::{mpsc, watch};
 
 use crate::providers::StreamEvent;
 
@@ -166,7 +166,9 @@ impl BatchUsage {
     /// degrades to `None`.
     pub fn accumulate(&mut self, usage: &ModelUsageInfo) {
         self.prompt_tokens = self.prompt_tokens.saturating_add(usage.prompt_tokens);
-        self.completion_tokens = self.completion_tokens.saturating_add(usage.completion_tokens);
+        self.completion_tokens = self
+            .completion_tokens
+            .saturating_add(usage.completion_tokens);
         self.total_tokens = self.total_tokens.saturating_add(usage.total_tokens);
         self.cost = match (self.cost, usage.cost) {
             (Some(total), Some(cost)) => Some(total + cost),

@@ -76,10 +76,7 @@ where
                 None => (content_slice, false),
             };
 
-        let delta = decode_json_string_body_incremental(
-            raw_body,
-            &mut self.raw_decoded_pos,
-        );
+        let delta = decode_json_string_body_incremental(raw_body, &mut self.raw_decoded_pos);
         if is_finished && self.raw_decoded_pos >= raw_body.len() {
             self.finished = true;
         }

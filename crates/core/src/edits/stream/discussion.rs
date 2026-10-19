@@ -216,9 +216,7 @@ impl DiscussionStreamFilter {
                 .get("repo_searches")
                 .or_else(|| val.get("search_requests"))
                 .filter(|v| !v.is_null())
-                .and_then(|v| {
-                    serde_json::from_value::<Vec<RepoSearchRequest>>(v.clone()).ok()
-                })
+                .and_then(|v| serde_json::from_value::<Vec<RepoSearchRequest>>(v.clone()).ok())
                 .unwrap_or_default();
 
             let user_language = val
@@ -226,13 +224,24 @@ impl DiscussionStreamFilter {
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string());
 
-            return DiscussionResponse {
+            let mut response = DiscussionResponse {
                 message,
                 plan_update,
                 context_requests,
                 repo_searches,
                 user_language,
+                ..Default::default()
             };
+            // Repository discovery requests survive the degraded decode through
+            // the same normalizing builder the typed schema path uses.
+            response.repo_dirs = val.get("repo_dirs").and_then(|field| field.as_bool());
+            if let Some(paths) = val
+                .get("repo_maps")
+                .and_then(|field| serde_json::from_value::<Vec<String>>(field.clone()).ok())
+            {
+                response = response.with_repo_maps(paths);
+            }
+            return response;
         }
 
         // Non-JSON plain text fallback

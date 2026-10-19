@@ -30,7 +30,8 @@ const SPLASH_TOTAL_DURATION: Duration = Duration::from_millis(2200);
 ///
 /// It is derived from the total budget so the two amounts can never drift
 /// apart, and it is zero-safe because the total always exceeds the assembly.
-const SPLASH_TYPING_BUDGET: Duration = SPLASH_TOTAL_DURATION.saturating_sub(SPLASH_ASSEMBLY_DURATION);
+const SPLASH_TYPING_BUDGET: Duration =
+    SPLASH_TOTAL_DURATION.saturating_sub(SPLASH_ASSEMBLY_DURATION);
 
 /// Normalizes `elapsed` against `budget` into a clamped `0.0..=1.0` fraction.
 ///
@@ -190,6 +191,22 @@ impl ToolchainState {
     }
 }
 
+/// Live reconnect telemetry reported by the daemon while it backs off between
+/// two provider attempts.
+///
+/// The daemon owns the countdown: every second of the pause is published as a
+/// fresh snapshot, so the view mirrors the reported remaining seconds instead of
+/// running its own timer and drifting away from the real deadline (c-4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetryingState {
+    /// The attempt that just failed, one-based.
+    pub attempt: u32,
+    /// Total attempts the transport is allowed to make for one request.
+    pub max_attempts: u32,
+    /// Whole seconds left before the next attempt starts.
+    pub delay_secs: u64,
+}
+
 /// Which pane of the REPL tab receives navigation keys.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ReplFocus {
@@ -229,6 +246,8 @@ pub struct ReplView {
     pub last_commit_hash: Option<String>,
     pub last_commit_summary: Option<String>,
     pub toolchain: Option<ToolchainState>,
+    /// Pending provider reconnect, mirrored from the daemon's countdown.
+    pub retrying: Option<RetryingState>,
     pub turn_phase: Option<tauqe_protocol::TurnPhase>,
     pub turn_round: Option<usize>,
     pub turn_max_rounds: Option<usize>,
@@ -279,6 +298,7 @@ impl Default for ReplView {
             last_commit_hash: None,
             last_commit_summary: None,
             toolchain: None,
+            retrying: None,
             turn_phase: None,
             turn_round: None,
             turn_max_rounds: None,
@@ -302,6 +322,43 @@ impl Default for ReplView {
 }
 
 impl ReplView {
+    /// Releases every per-turn buffer so a new turn starts from a clean slate.
+    ///
+    /// The interface is long-lived: without this reset the reasoning transcript,
+    /// the rendered answer, the streamed edits, and the rendered diff fragments
+    /// of every previous round would stay alive for the whole session, and a
+    /// batch of plan steps would accumulate them one step after another. Only
+    /// the per-turn payload is dropped; the turn identity (`operation_id`,
+    /// `model`, `status`, `plan_context`, `is_batch`), the scroll position, and
+    /// the accumulator-owned usage totals belong to the caller that opens the
+    /// turn and are set right after this reset (c-3).
+    pub fn reset_turn_buffers(&mut self) {
+        self.reasoning.clear();
+        self.text.clear();
+        self.markdown_lines.clear();
+        self.code_blocks.clear();
+        self.diff_cache = DiffRenderCache::default();
+        self.markdown_dirty = false;
+        self.last_markdown_render = None;
+        self.error = None;
+        self.result = None;
+        self.edits_active = false;
+        self.files.clear();
+        self.selected_file_index = 0;
+        self.edit_final_applied = None;
+        self.edit_final_error = None;
+        self.last_commit_hash = None;
+        self.last_commit_summary = None;
+        self.toolchain = None;
+        self.retrying = None;
+        self.turn_phase = None;
+        self.turn_round = None;
+        self.turn_max_rounds = None;
+        self.turn_phase_detail = None;
+        self.repomap_tokens = None;
+        self.copy_flash = None;
+    }
+
     /// Re-renders the answer markdown; while streaming, repeated calls within the
     /// throttle interval only mark the view dirty and are flushed later.
     pub fn update_markdown(&mut self) {
@@ -344,11 +401,8 @@ impl ReplView {
         if self.content_width > 0 {
             theme.max_width = Some(self.content_width);
         }
-        let (lines, blocks) = crate::markdown::render_markdown_with_blocks(
-            &self.text,
-            &theme,
-            flashing_id,
-        );
+        let (lines, blocks) =
+            crate::markdown::render_markdown_with_blocks(&self.text, &theme, flashing_id);
         self.markdown_lines = lines;
         self.code_blocks = blocks
             .into_iter()
@@ -434,7 +488,10 @@ impl ReplView {
     /// True when a turn or background operation is actively executing.
     pub fn background_active(&self) -> bool {
         self.is_busy()
-            || self.toolchain.as_ref().is_some_and(ToolchainState::is_running)
+            || self
+                .toolchain
+                .as_ref()
+                .is_some_and(ToolchainState::is_running)
             || (self.edits_active && self.edit_final_applied.is_none())
     }
 
@@ -554,6 +611,128 @@ impl ReplView {
     /// footer would keep presenting a finished operation as still running (c-1).
     pub fn end_in_flight_usage(&mut self) {
         self.usage_totals.cur = None;
+    }
+}
+
+#[cfg(test)]
+mod turn_reset_tests {
+    use super::*;
+
+    fn stale_view() -> ReplView {
+        let mut view = ReplView::default();
+        view.reasoning.append_delta("stale reasoning");
+        view.reasoning.toggle_fold();
+        view.text = "stale answer".to_string();
+        view.update_markdown();
+        view.code_blocks.push(ModelCodeBlock {
+            id: 0,
+            lang: "rust".to_string(),
+            code: "fn stale() {}".to_string(),
+            raw_start_line: 0,
+            raw_end_line: 1,
+            visual_start_line: 0,
+            visual_end_line: 1,
+        });
+        view.files.push(StreamingFileEdit {
+            path: "crates/tui/src/lib.rs".to_string(),
+            op_type: EditOp::Replace,
+            status: FileEditStatus::Ok,
+            error: None,
+            hunks: Vec::new(),
+            expanded: false,
+            retry_info: None,
+        });
+        view.edits_active = true;
+        view.edit_final_applied = Some(true);
+        view.edit_final_error = Some("stale".to_string());
+        view.last_commit_hash = Some("abc1234".to_string());
+        view.last_commit_summary = Some("feat: stale".to_string());
+        view.toolchain = Some(ToolchainState::Passed {
+            command: "cargo check".to_string(),
+        });
+        view.retrying = Some(RetryingState {
+            attempt: 1,
+            max_attempts: 3,
+            delay_secs: 2,
+        });
+        view.turn_phase = Some(tauqe_protocol::TurnPhase::Healing);
+        view.turn_round = Some(2);
+        view.turn_max_rounds = Some(4);
+        view.turn_phase_detail = Some("healing".to_string());
+        view.repomap_tokens = Some(4096);
+        view.error = Some("stale error".to_string());
+        view.copy_flash = Some((0, Instant::now()));
+        view
+    }
+
+    #[test]
+    fn reset_turn_buffers_releases_every_per_turn_buffer() {
+        let mut view = stale_view();
+        assert!(!view.reasoning.is_empty());
+        assert!(!view.markdown_lines.is_empty());
+
+        view.reset_turn_buffers();
+
+        assert!(view.reasoning.is_empty());
+        assert!(view.reasoning.show, "the reasoning block reopens folded");
+        assert!(!view.reasoning.is_streaming());
+        assert!(view.text.is_empty());
+        assert!(view.markdown_lines.is_empty());
+        assert!(view.code_blocks.is_empty());
+        assert!(view.files.is_empty());
+        assert!(!view.edits_active);
+        assert!(view.edit_final_applied.is_none());
+        assert!(view.edit_final_error.is_none());
+        assert!(view.last_commit_hash.is_none());
+        assert!(view.last_commit_summary.is_none());
+        assert!(view.toolchain.is_none());
+        assert!(view.retrying.is_none());
+        assert!(view.turn_phase.is_none());
+        assert!(view.turn_round.is_none());
+        assert!(view.turn_max_rounds.is_none());
+        assert!(view.turn_phase_detail.is_none());
+        assert!(view.repomap_tokens.is_none());
+        assert!(view.error.is_none());
+        assert!(view.result.is_none());
+        assert!(view.copy_flash.is_none());
+        assert!(!view.markdown_dirty);
+        assert!(
+            view.splash_visible(),
+            "a released turn returns the viewport to its opening state"
+        );
+    }
+
+    #[test]
+    fn reset_turn_buffers_preserves_turn_identity_and_usage() {
+        let mut view = stale_view();
+        view.operation_id = Some("op-7".to_string());
+        view.model = Some(tauqe_protocol::ModelRef::openrouter("coder"));
+        view.plan_context = Some(tauqe_protocol::ModelTurnPlanContext {
+            plan_id: "plan-1".to_string(),
+            step_id: "3".to_string(),
+            batch_step_ids: vec!["3".to_string(), "4".to_string()],
+        });
+        view.is_batch = true;
+        view.usage_totals.session.total_tokens = 128;
+
+        view.reset_turn_buffers();
+
+        assert_eq!(view.operation_id.as_deref(), Some("op-7"));
+        assert_eq!(
+            view.model,
+            Some(tauqe_protocol::ModelRef::openrouter("coder"))
+        );
+        assert_eq!(
+            view.plan_context
+                .as_ref()
+                .map(|context| context.step_id.as_str()),
+            Some("3")
+        );
+        assert!(view.is_batch);
+        assert_eq!(
+            view.usage_totals.session.total_tokens, 128,
+            "the accumulator-owned usage totals survive the reset"
+        );
     }
 }
 

@@ -38,7 +38,9 @@ pub(crate) fn effective_roles_summary(cfg: &AppConfig) -> ModelRolesSummary {
 }
 
 pub fn config_state(cfg: &AppConfig, selection: Option<&ModelSelection>) -> ConfigState {
-    let sel = selection.cloned().unwrap_or_else(|| cfg.default_selection());
+    let sel = selection
+        .cloned()
+        .unwrap_or_else(|| cfg.default_selection());
     let effective = cfg.resolve_model(&sel);
     let roles = effective_roles_summary(cfg);
     ConfigState {
@@ -217,7 +219,11 @@ pub async fn handle_config_set(req: Request, state: &Arc<AppState>) -> Response 
     let params: ConfigSetParams = match req.params.and_then(|p| serde_json::from_value(p).ok()) {
         Some(p) => p,
         None => {
-            return Response::err(req.id, errors::INVALID_PARAMS, "Missing or invalid parameters");
+            return Response::err(
+                req.id,
+                errors::INVALID_PARAMS,
+                "Missing or invalid parameters",
+            );
         }
     };
 
@@ -321,8 +327,14 @@ pub async fn handle_system_status(req: Request, state: &Arc<AppState>) -> Respon
 
     let has_git = repo_has_git(repo_opt).await;
     let guard = state.config.lock().await;
-    let status =
-        build_system_status(&guard.config, &guard.selection, repo_opt, has_git, None, None);
+    let status = build_system_status(
+        &guard.config,
+        &guard.selection,
+        repo_opt,
+        has_git,
+        None,
+        None,
+    );
 
     Response::ok_typed(req.id, &status)
 }
@@ -355,8 +367,7 @@ pub async fn handle_config_reload(req: Request, state: &Arc<AppState>) -> Respon
 
     let has_git = repo_has_git(repo_opt).await;
     let guard = state.config.lock().await;
-    let status =
-        build_system_status(&guard.config, &cur_sel_val, repo_opt, has_git, None, None);
+    let status = build_system_status(&guard.config, &cur_sel_val, repo_opt, has_git, None, None);
 
     Response::ok_typed(req.id, &status)
 }
@@ -374,19 +385,15 @@ pub async fn handle_config_create(req: Request, state: &Arc<AppState>) -> Respon
     let repo_opt = repo_root.as_deref();
 
     let (explicit_config, _) = explicit_cli_paths(state).await;
-    let target_path =
-        tauqe_core::config::default_config_path(repo_opt, explicit_config.as_deref());
+    let target_path = tauqe_core::config::default_config_path(repo_opt, explicit_config.as_deref());
     let write_path = target_path.clone();
-    let write_outcome = match super::offload(move || {
-        tauqe_core::config::write_default_config(&write_path)
-    })
-    .await
-    {
-        Ok(outcome) => outcome,
-        Err(err) => {
-            return Response::err(req.id, errors::CONFIG_CREATE_FAILED, err);
-        }
-    };
+    let write_outcome =
+        match super::offload(move || tauqe_core::config::write_default_config(&write_path)).await {
+            Ok(outcome) => outcome,
+            Err(err) => {
+                return Response::err(req.id, errors::CONFIG_CREATE_FAILED, err);
+            }
+        };
     if let Err(err) = write_outcome {
         return Response::err(
             req.id,
@@ -412,8 +419,14 @@ pub async fn handle_config_create(req: Request, state: &Arc<AppState>) -> Respon
     let has_git = repo_has_git(repo_opt).await;
     let guard = state.config.lock().await;
     let config_path = Some(target_path.to_string_lossy().to_string());
-    let status =
-        build_system_status(&guard.config, &cur_sel_val, repo_opt, has_git, config_path, None);
+    let status = build_system_status(
+        &guard.config,
+        &cur_sel_val,
+        repo_opt,
+        has_git,
+        config_path,
+        None,
+    );
 
     Response::ok_typed(req.id, &status)
 }
@@ -517,16 +530,14 @@ pub async fn handle_credentials_create_stub(req: Request, state: &Arc<AppState>)
     let target_path =
         tauqe_core::config::default_credentials_path(repo_opt, explicit_credentials.as_deref());
     let write_path = target_path.clone();
-    let write_outcome = match super::offload(move || {
-        tauqe_core::config::write_credentials_stub(&write_path)
-    })
-    .await
-    {
-        Ok(outcome) => outcome,
-        Err(err) => {
-            return Response::err(req.id, errors::CREDENTIALS_STUB_FAILED, err);
-        }
-    };
+    let write_outcome =
+        match super::offload(move || tauqe_core::config::write_credentials_stub(&write_path)).await
+        {
+            Ok(outcome) => outcome,
+            Err(err) => {
+                return Response::err(req.id, errors::CREDENTIALS_STUB_FAILED, err);
+            }
+        };
     if let Err(err) = write_outcome {
         return Response::err(
             req.id,
@@ -562,12 +573,16 @@ mod tests {
     async fn test_config_state_roles_and_scribe_history() {
         let mut cfg = AppConfig::default();
         cfg.models.scribe = Some(ModelRef::openrouter("anthropic/claude-3.5-haiku"));
-        cfg.models.coder = Some(vec![ModelRef::openrouter("anthropic/claude-3.7-sonnet").into()]);
-        cfg.models.architect =
-            Some(vec![ModelRef::openrouter("anthropic/claude-3.7-sonnet").into()]);
+        cfg.models.coder = Some(vec![
+            ModelRef::openrouter("anthropic/claude-3.7-sonnet").into()
+        ]);
+        cfg.models.architect = Some(vec![
+            ModelRef::openrouter("anthropic/claude-3.7-sonnet").into()
+        ]);
         cfg.models.primary = vec![ModelRef::openrouter("google/gemini-2.5-flash").into()];
-        cfg.models.reviewer =
-            Some(vec![ModelRef::openrouter("anthropic/claude-3.7-sonnet").into()]);
+        cfg.models.reviewer = Some(vec![
+            ModelRef::openrouter("anthropic/claude-3.7-sonnet").into()
+        ]);
 
         let st = config_state(&cfg, None);
         assert_eq!(
@@ -638,7 +653,12 @@ mod tests {
     async fn test_handle_config_set_workflow_and_protocol() {
         let (out, _rx) = crate::transport::OutChannel::new();
         let (history_sender, _hrx) = tokio::sync::mpsc::unbounded_channel();
-        let state = AppState::new(AppConfig::default(), std::env::temp_dir(), history_sender, out);
+        let state = AppState::new(
+            AppConfig::default(),
+            std::env::temp_dir(),
+            history_sender,
+            out,
+        );
 
         let req = Request {
             id: tauqe_protocol::RequestId::Number(2),
@@ -682,7 +702,12 @@ mod tests {
     async fn test_credentials_create_stub_rejected_while_operation_active() {
         let (out, _rx) = crate::transport::OutChannel::new();
         let (history_sender, _hrx) = tokio::sync::mpsc::unbounded_channel();
-        let state = AppState::new(AppConfig::default(), std::env::temp_dir(), history_sender, out);
+        let state = AppState::new(
+            AppConfig::default(),
+            std::env::temp_dir(),
+            history_sender,
+            out,
+        );
 
         let _guard = state
             .try_begin_operation()

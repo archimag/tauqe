@@ -63,13 +63,7 @@ const LOGO_WIDTH: usize = 43;
 /// bottom, so the five pieces visibly converge on the center. Downward travel is
 /// capped at one row: anything lower would collide with the motto line that owns
 /// the row directly beneath the blank spacer.
-const GLYPH_START_OFFSETS: [(i16, i16); 5] = [
-    (-16, -3),
-    (-8, 1),
-    (0, -3),
-    (8, 1),
-    (16, -3),
-];
+const GLYPH_START_OFFSETS: [(i16, i16); 5] = [(-16, -3), (-8, 1), (0, -3), (8, 1), (16, -3)];
 
 /// Rows occupied by the greeting while the glyphs assemble: the wordmark, the
 /// blank spacer, and the motto line.
@@ -277,7 +271,10 @@ fn glyph_start_col(glyph: usize) -> usize {
 /// (Conventions §4.2).
 fn glyph_slice(row: &str, glyph: usize) -> Vec<char> {
     let width = GLYPH_WIDTHS.get(glyph).copied().unwrap_or(0);
-    row.chars().skip(glyph_start_col(glyph)).take(width).collect()
+    row.chars()
+        .skip(glyph_start_col(glyph))
+        .take(width)
+        .collect()
 }
 
 /// Builds the quick-start hint row from the shared chord notation.
@@ -480,7 +477,11 @@ mod tests {
         // so the rendered row is a prefix-free, space-padded line no wider than
         // the viewport.
         for line in &lines {
-            let width: usize = line.spans.iter().map(|span| span.content.chars().count()).sum();
+            let width: usize = line
+                .spans
+                .iter()
+                .map(|span| span.content.chars().count())
+                .sum();
             assert!(width <= usize::from(area.width));
         }
     }

@@ -3,6 +3,7 @@ use ratatui::style::{Style, Stylize};
 use ratatui::text::{Line, Span};
 use unicode_width::UnicodeWidthStr;
 
+use crate::components::modal::modal_geometry;
 use crate::theme::engine::current_engine;
 
 pub(crate) use crate::components::confirm::{
@@ -24,11 +25,11 @@ pub(crate) mod status;
 pub(crate) mod usage;
 
 pub(crate) use confirm::{
-    batch_cancel_modal_geometry, clear_auto_params, clear_history_params, clear_horizon_final_params,
-    clear_horizon_params, clear_user_params, confirm_cancel_params, confirm_detach_focus_params,
-    confirm_quit_params, delete_plan_params, delete_review_params, execute_review_dialog_geometry,
-    execute_pipeline_params, execute_review_params, execute_scope_params,
-    render_confirm_batch_cancel_popup, render_confirm_cancel_popup,
+    batch_cancel_modal_geometry, clear_auto_params, clear_history_params,
+    clear_horizon_final_params, clear_horizon_params, clear_user_params, confirm_cancel_params,
+    confirm_detach_focus_params, confirm_quit_params, delete_plan_params, delete_review_params,
+    execute_pipeline_params, execute_review_dialog_geometry, execute_review_params,
+    execute_scope_params, render_confirm_batch_cancel_popup, render_confirm_cancel_popup,
     render_confirm_clear_auto_popup, render_confirm_clear_history_popup,
     render_confirm_clear_horizon_final_popup, render_confirm_clear_horizon_popup,
     render_confirm_clear_user_popup, render_confirm_delete_plan_popup,
@@ -85,12 +86,15 @@ pub(super) fn editor_lines(editor: &InputEditor, show_cursor: bool) -> Vec<Line<
 /// Shared chrome metrics of a model-list + instructions-editor dialog.
 ///
 /// Every picker dialog — Architect refinement, review launch, review execution —
-/// stacks the same sections, so the footer height, the minimum editor height,
-/// the model-row cap, and the optional target-field height live in one place and
-/// can never drift between the three surfaces (Conventions §1.3).
-const PICKER_DIALOG_FOOTER_HEIGHT: u16 = 3;
+/// stacks the same sections, so the minimum editor height, the model-row cap,
+/// the optional target-field height, and the inter-section spacing live in one
+/// place and can never drift between the three surfaces (Conventions §1.3).
 const PICKER_DIALOG_EDITOR_MIN_HEIGHT: u16 = 3;
 const PICKER_DIALOG_MODEL_LIST_MAX_ROWS: u16 = 6;
+/// One blank row separating two heterogeneous sections of a picker dialog, so
+/// the model list, the target field, and the editor never read as a single
+/// continuous block (Conventions §6.7).
+const PICKER_DIALOG_SPACER_HEIGHT: u16 = 1;
 /// Reserved height of the optional single-line target field that sits between
 /// the model list and the instructions editor.
 pub(super) const PICKER_DIALOG_PATH_HEIGHT: u16 = 3;
@@ -126,54 +130,86 @@ fn picker_model_list_rows(entry_count: usize) -> u16 {
     (entry_count.max(1) as u16).min(PICKER_DIALOG_MODEL_LIST_MAX_ROWS)
 }
 
-/// Splits a picker dialog interior into `[header, list, path, editor, buttons,
+/// Splits a picker dialog card into `[header, list, path, editor, buttons,
 /// footer]`.
 ///
-/// The footer, list, target field, and header are sized first so the dialog stays
-/// usable on short terminals; the instructions editor absorbs whatever height
-/// remains. The footer splits into the interactive action bar and a one-row docked
-/// hint strip pinned to the card's bottom edge.
+/// The whole card chrome — the one-row top inset under the border title, the
+/// one-column margin on each side, the pre-action spacer, and the docked hint
+/// strip — comes from the shared [`modal_geometry`] formula, so a picker breathes
+/// exactly like every other modal. Inside that air-aware body the sections are
+/// stacked in visual order and separated by one blank row each, so the model
+/// list, the target field, and the instructions editor read as three distinct
+/// zones instead of one continuous block (Conventions §6.7, §6.8).
+///
+/// The list, target field, and header are sized first so the dialog stays usable
+/// on short terminals; the instructions editor absorbs whatever height remains.
 pub(super) fn picker_dialog_chunks(
     area: Rect,
     entry_count: usize,
     header_height: u16,
     path_height: u16,
 ) -> PickerDialogChunks {
-    let inner = inset(area);
+    let geometry = modal_geometry(area);
+    let body = geometry.body;
 
-    let footer_h = PICKER_DIALOG_FOOTER_HEIGHT.min(inner.height);
-    let after_footer = inner.height - footer_h;
+    // The list never takes more than half of the body, so the header, the target
+    // field, and the editors always keep space on short terminals.
+    let list_h = (picker_model_list_rows(entry_count) + 2).min(body.height / 2);
 
-    // The list never takes more than half of the room left after the footer, so
-    // the header and editors always keep space on short terminals.
-    let list_h = (picker_model_list_rows(entry_count) + 2).min(after_footer / 2);
-    let after_list = after_footer - list_h;
+    let mut remaining = body.height;
+    let mut cursor = body.y;
 
-    let path_h = path_height.min(after_list.saturating_sub(PICKER_DIALOG_EDITOR_MIN_HEIGHT));
-    let after_path = after_list - path_h;
+    // Header block, capped so its spacer and the minimal editor always survive.
+    let header_h = header_height.min(
+        remaining.saturating_sub(PICKER_DIALOG_EDITOR_MIN_HEIGHT + PICKER_DIALOG_SPACER_HEIGHT),
+    );
+    let header = Rect::new(body.x, cursor, body.width, header_h);
+    cursor = cursor.saturating_add(header_h);
+    remaining = remaining.saturating_sub(header_h);
 
-    let header_h = header_height.min(after_path.saturating_sub(PICKER_DIALOG_EDITOR_MIN_HEIGHT));
-    let editor_h = after_path - header_h;
+    // Inter-section spacer under the header.
+    let header_gap = PICKER_DIALOG_SPACER_HEIGHT.min(remaining);
+    cursor = cursor.saturating_add(header_gap);
+    remaining = remaining.saturating_sub(header_gap);
 
-    let header = Rect::new(inner.x, inner.y, inner.width, header_h);
-    let list = Rect::new(inner.x, inner.y + header_h, inner.width, list_h);
-    let path = Rect::new(inner.x, list.y + list_h, inner.width, path_h);
-    let editor = Rect::new(inner.x, path.y + path_h, inner.width, editor_h);
+    let list_h = list_h.min(remaining);
+    let list = Rect::new(body.x, cursor, body.width, list_h);
+    cursor = cursor.saturating_add(list_h);
+    remaining = remaining.saturating_sub(list_h);
 
-    // Split the footer into the action buttons and the docked hint strip so the
-    // hint reads as persistent chrome rather than a second row of buttons.
-    let docked_h = 1.min(footer_h);
-    let buttons_h = footer_h - docked_h;
-    let buttons = Rect::new(inner.x, editor.y + editor_h, inner.width, buttons_h);
-    let footer = Rect::new(inner.x, buttons.y + buttons_h, inner.width, docked_h);
+    // The optional target field is reached through its own spacer, so a dialog
+    // without one never inherits a stray blank row above the editor.
+    let path_gap = if path_height == 0 {
+        0
+    } else {
+        PICKER_DIALOG_SPACER_HEIGHT.min(remaining)
+    };
+    cursor = cursor.saturating_add(path_gap);
+    remaining = remaining.saturating_sub(path_gap);
+
+    let path_h = if path_height == 0 {
+        0
+    } else {
+        path_height.min(remaining.saturating_sub(PICKER_DIALOG_EDITOR_MIN_HEIGHT))
+    };
+    let path = Rect::new(body.x, cursor, body.width, path_h);
+    cursor = cursor.saturating_add(path_h);
+    remaining = remaining.saturating_sub(path_h);
+
+    // Instructions editor, reached through its own spacer.
+    let editor_gap = PICKER_DIALOG_SPACER_HEIGHT.min(remaining);
+    cursor = cursor.saturating_add(editor_gap);
+    remaining = remaining.saturating_sub(editor_gap);
+
+    let editor = Rect::new(body.x, cursor, body.width, remaining);
 
     PickerDialogChunks {
         header,
         list,
         path,
         editor,
-        buttons,
-        footer,
+        buttons: geometry.action_bar,
+        footer: geometry.hint_row,
     }
 }
 

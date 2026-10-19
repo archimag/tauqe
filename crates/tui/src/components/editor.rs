@@ -906,7 +906,8 @@ impl TextEditor {
                                 let ch_str = ch.to_string();
                                 let ch_w = Span::raw(&ch_str).width();
                                 if current_width + ch_w > content_width && current_width > 3 {
-                                    visual_lines.push(Line::from(std::mem::take(&mut current_spans)));
+                                    visual_lines
+                                        .push(Line::from(std::mem::take(&mut current_spans)));
                                     current_spans.push(Span::styled("   ", prefix_style));
                                     current_width = 3;
                                 }
@@ -1047,7 +1048,10 @@ mod tests {
 
         assert_eq!(reloaded.history.len(), 3);
         assert_eq!(reloaded.history[0], "first simple prompt");
-        assert_eq!(reloaded.history[1], "multiline\nprompt with \"quotes\" and <tags>");
+        assert_eq!(
+            reloaded.history[1],
+            "multiline\nprompt with \"quotes\" and <tags>"
+        );
         assert_eq!(reloaded.history[2], "third prompt");
 
         let _ = std::fs::remove_file(history_file);
@@ -1166,10 +1170,7 @@ mod tests {
         editor.insert_str("first line\nsecond line");
 
         // `M-<` (Alt+Shift+,) jumps to the beginning of the buffer.
-        let meta_less = KeyEvent::new(
-            KeyCode::Char('<'),
-            KeyModifiers::ALT | KeyModifiers::SHIFT,
-        );
+        let meta_less = KeyEvent::new(KeyCode::Char('<'), KeyModifiers::ALT | KeyModifiers::SHIFT);
         assert!(editor.handle_key(meta_less, false));
         assert_eq!(editor.cursor, 0);
 

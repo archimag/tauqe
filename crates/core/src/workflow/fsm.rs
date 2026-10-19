@@ -16,8 +16,8 @@ mod staging;
 use std::collections::HashMap;
 use std::path::Path;
 
-use tokio::sync::{mpsc, watch};
 use tauqe_protocol::{EditOperation, EditOutcome, ModelRef, ModelResult, TurnIntent};
+use tokio::sync::{mpsc, watch};
 
 use crate::context::ContextManager;
 use crate::edits::{EditError, StagedEditsState};
@@ -33,10 +33,11 @@ use crate::workflow::WorkflowOptions;
 use cache::TurnInputCache;
 use guard::{finalize_blocked_turn, finish_turn, rollback_or_log};
 use healing::run_apply_and_verify_phase;
-use proposal::{
-    extract_error_message, log_fsm_phase, run_proposal_step, ProposalStep, TurnState,
+use proposal::{extract_error_message, log_fsm_phase, run_proposal_step, ProposalStep, TurnState};
+use staging::{
+    reask_after_empty_round, run_discovery_phase, run_staging_phase, DiscoveryPhase,
+    EmptyStepRetry, StagingPhase, EMPTY_STEP_REMINDER, MAX_EMPTY_STEP_RETRIES,
 };
-use staging::{run_discovery_phase, run_staging_phase, DiscoveryPhase, StagingPhase};
 
 /// Result of a single FSM turn executed by [`run_fsm_turn`].
 #[derive(Debug, Clone)]
@@ -87,8 +88,6 @@ impl FsmTurnOutcome {
             && self.skip_reason.is_none()
     }
 }
-
-
 
 /// Shared, mutable state threaded through the FSM phase executors.
 ///
@@ -187,9 +186,16 @@ pub async fn run_fsm_turn(
     cancel_rx: watch::Receiver<bool>,
     options: &WorkflowOptions,
 ) -> anyhow::Result<FsmTurnOutcome> {
-    let turn_id =
-        begin_session_turn(prompt, intent, context_manager, history_manager, provider, &cancel_rx, options)
-            .await;
+    let turn_id = begin_session_turn(
+        prompt,
+        intent,
+        context_manager,
+        history_manager,
+        provider,
+        &cancel_rx,
+        options,
+    )
+    .await;
     let turn_res = run_fsm_turn_body(
         prompt,
         intent,
@@ -286,7 +292,12 @@ pub(super) fn record_session_response(
     history_manager: &mut HistoryManager,
     outcome: &FsmTurnOutcome,
 ) {
-    record_workflow_response(history_manager, &outcome.result, &outcome.assistant_text, Vec::new());
+    record_workflow_response(
+        history_manager,
+        &outcome.result,
+        &outcome.assistant_text,
+        Vec::new(),
+    );
 }
 
 /// Returns the capability set of an isolated step, narrowed from `protocol`.
@@ -433,45 +444,63 @@ pub(super) async fn run_fsm_turn_body(
         accumulated_text,
     };
 
-    match run_discovery_phase(&mut ctx, step).await? {
-        DiscoveryPhase::Terminate(outcome) => Ok(*outcome),
-        DiscoveryPhase::Continue(step) => {
+    let mut pending = step;
+    let mut empty_retries = 0;
+    let mut retry_prompt = ctx.prompt.to_string();
+    let step = loop {
+        let step = match run_discovery_phase(&mut ctx, pending).await? {
+            DiscoveryPhase::Terminate(outcome) => return Ok(*outcome),
+            DiscoveryPhase::Continue(step) => *step,
+        };
+        if let Some(outcome) = finish_on_error_outcome(&mut ctx).await {
+            return Ok(outcome);
+        }
+        if !step.is_empty_step() {
+            break step;
+        }
+        // An empty round carries no text, no edits, and no command, so it can
+        // never be recorded as a validated answer. Re-ask with a corrective
+        // reminder and surface a failure only once the budget is spent.
+        if empty_retries >= MAX_EMPTY_STEP_RETRIES {
+            return Ok(finish_empty_step(&mut ctx).await);
+        }
+        empty_retries += 1;
+        retry_prompt.push_str(EMPTY_STEP_REMINDER);
+        pending = match reask_after_empty_round(&mut ctx, &retry_prompt, empty_retries).await? {
+            EmptyStepRetry::Proposed(step) => *step,
+            EmptyStepRetry::Terminate(outcome) => return Ok(*outcome),
+        };
+    };
+
+    let current_edits = step.edits();
+    let current_protocol_errors = step.protocol_errors();
+    if current_edits.is_empty() && current_protocol_errors.is_empty() {
+        return Ok(finish_answer_without_edits(&mut ctx).await);
+    }
+
+    match run_staging_phase(&mut ctx, &step).await? {
+        StagingPhase::Terminate(outcome) => Ok(*outcome),
+        StagingPhase::Ready(staging) => {
             if let Some(outcome) = finish_on_error_outcome(&mut ctx).await {
                 return Ok(outcome);
             }
-
-            let current_edits = step.edits();
-            let current_protocol_errors = step.protocol_errors();
-            if current_edits.is_empty() && current_protocol_errors.is_empty() {
-                return Ok(finish_answer_without_edits(&mut ctx).await);
+            let cumulative_edits = staging.cumulative_edits;
+            let last_failed_errors = staging.last_failed_errors;
+            let current_protocol_errors = staging.current_protocol_errors;
+            if !last_failed_errors.is_empty() || !current_protocol_errors.is_empty() {
+                return Ok(finish_patch_failure(
+                    &mut ctx,
+                    cumulative_edits,
+                    &last_failed_errors,
+                    &current_protocol_errors,
+                )
+                .await);
             }
-
-            match run_staging_phase(&mut ctx, &step).await? {
-                StagingPhase::Terminate(outcome) => Ok(*outcome),
-                StagingPhase::Ready(staging) => {
-                    if let Some(outcome) = finish_on_error_outcome(&mut ctx).await {
-                        return Ok(outcome);
-                    }
-                    let cumulative_edits = staging.cumulative_edits;
-                    let last_failed_errors = staging.last_failed_errors;
-                    let current_protocol_errors = staging.current_protocol_errors;
-                    if !last_failed_errors.is_empty() || !current_protocol_errors.is_empty() {
-                        return Ok(finish_patch_failure(
-                            &mut ctx,
-                            cumulative_edits,
-                            &last_failed_errors,
-                            &current_protocol_errors,
-                        )
-                        .await);
-                    }
-                    if cumulative_edits.is_empty() {
-                        return Ok(finish_no_edits(&mut ctx).await);
-                    }
-                    let current_verify = ctx.state.verify_request.clone();
-                    return run_apply_and_verify_phase(&mut ctx, cumulative_edits, current_verify)
-                        .await;
-                }
+            if cumulative_edits.is_empty() {
+                return Ok(finish_no_edits(&mut ctx).await);
             }
+            let current_verify = ctx.state.verify_request.clone();
+            run_apply_and_verify_phase(&mut ctx, cumulative_edits, current_verify).await
         }
     }
 }
@@ -499,7 +528,10 @@ async fn finish_on_error_outcome(ctx: &mut PhaseContext<'_>) -> Option<FsmTurnOu
         ctx.context_manager.prune_missing_files();
     });
     let ctx_state = ctx.context_manager.get_state();
-    let _ = ctx.stream_tx.send(StreamEvent::ContextChanged(ctx_state)).await;
+    let _ = ctx
+        .stream_tx
+        .send(StreamEvent::ContextChanged(ctx_state))
+        .await;
     let _ = ctx.stream_tx.send(StreamEvent::Done).await;
     let result = ModelResult::Edit {
         summary: "Execution blocked".to_string(),
@@ -686,6 +718,50 @@ async fn finish_no_edits(ctx: &mut PhaseContext<'_>) -> FsmTurnOutcome {
     .await
 }
 
+/// Finalizes the turn when the model kept generating an empty response.
+///
+/// A round without text, edits, or any protocol command is a transport-level
+/// non-answer: it cannot be recorded as a validated `ModelResult::Answer`. The
+/// turn surfaces it as a failed edit, which is what the coder ladder escalates
+/// and what the batch supervisor reports as a failed step, instead of accepting
+/// silence as a conclusion.
+async fn finish_empty_step(ctx: &mut PhaseContext<'_>) -> FsmTurnOutcome {
+    tracing::warn!(
+        workflow = ctx.workflow_name,
+        model = %ctx.model,
+        isolated_step = ctx.intent.is_isolated_step(),
+        retries = MAX_EMPTY_STEP_RETRIES,
+        "model produced an empty response after every retry"
+    );
+    crate::blocking::run_blocking(|| {
+        ctx.context_manager.clear_auto();
+        ctx.context_manager.prune_missing_files();
+    });
+    let _ = ctx.stream_tx.send(StreamEvent::Done).await;
+    let result = ModelResult::Edit {
+        summary: "Empty model response".to_string(),
+        edits: Vec::new(),
+        proposal: None,
+        outcome: EditOutcome {
+            applied: false,
+            error: Some(format!(
+                "The model returned an empty response after {} additional attempts: no text, no file edits, and no protocol command were produced.",
+                MAX_EMPTY_STEP_RETRIES
+            )),
+            changed_files: Vec::new(),
+            commit_hash: None,
+        },
+    };
+    finish_turn(
+        std::mem::take(&mut ctx.accumulated_text),
+        result,
+        ctx.repo_root,
+        &ctx.state.plans,
+        ctx.plan_mode,
+    )
+    .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -850,8 +926,7 @@ mod tests {
         .unwrap();
 
         assert!(matches!(outcome.result, ModelResult::Answer { .. }));
-        let loaded = crate::plan::storage::PlanStorage::load_plan(&root, "test-fsm-plan")
-            .unwrap();
+        let loaded = crate::plan::storage::PlanStorage::load_plan(&root, "test-fsm-plan").unwrap();
         assert!(loaded.is_some());
         let plan = loaded.unwrap();
         assert_eq!(plan.title, "FSM Plan");
@@ -943,7 +1018,9 @@ mod tests {
         .unwrap();
 
         match outcome.result {
-            ModelResult::Edit { outcome, summary, .. } => {
+            ModelResult::Edit {
+                outcome, summary, ..
+            } => {
                 assert!(outcome.applied);
                 assert_eq!(summary, "Custom squash summary");
             }
@@ -1044,7 +1121,8 @@ mod tests {
         let mut context = context_with_target(&root);
         let mut history = HistoryManager::new(root.clone());
 
-        let provider = MockLlmProvider::scripted([MockResponse::error("Connection terminated prematurely")]);
+        let provider =
+            MockLlmProvider::scripted([MockResponse::error("Connection terminated prematurely")]);
         let model = ModelRef::openrouter("mock/model");
         let protocol = XmlPromptProtocol;
         let mut policy = DirectApplyPolicy::new();
@@ -1082,7 +1160,8 @@ mod tests {
         assert!(!xml.contains(tauqe_protocol::LlmCapability::PlanUpdate));
         assert!(xml.contains(tauqe_protocol::LlmCapability::FileEdits));
 
-        let structured = isolated_step_capabilities(&crate::prompt::json::JsonPromptProtocol::edits());
+        let structured =
+            isolated_step_capabilities(&crate::prompt::json::JsonPromptProtocol::edits());
         assert_eq!(
             structured,
             tauqe_protocol::CapabilitySet::isolated_step_structured()
@@ -1143,8 +1222,12 @@ mod tests {
             ModelResult::Edit { outcome, .. } if outcome.applied
         ));
         // The code edit was applied, but the plan must NOT have been saved
-        let loaded = crate::plan::storage::PlanStorage::load_plan(&root, "isolated-turn-plan").unwrap();
-        assert!(loaded.is_none(), "isolated step must not persist plan mutations");
+        let loaded =
+            crate::plan::storage::PlanStorage::load_plan(&root, "isolated-turn-plan").unwrap();
+        assert!(
+            loaded.is_none(),
+            "isolated step must not persist plan mutations"
+        );
     }
 
     #[tokio::test]

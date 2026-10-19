@@ -92,6 +92,33 @@ pub struct ModelDeltaEvent {
     pub delta: String,
 }
 
+/// Telemetry of a pending provider reconnection.
+///
+/// Emitted once per second of the backoff pause so the client can render a
+/// live countdown next to the interruption hint. `attempt` is the attempt that
+/// already failed (`1` for the first retry), `max_attempts` bounds the ladder,
+/// and `delay_secs` is the time still remaining before the next attempt starts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelConnectionRetryingEvent {
+    pub operation_id: String,
+    pub attempt: u32,
+    pub max_attempts: u32,
+    pub delay_secs: u64,
+    pub reason: String,
+}
+
+/// Instruction to discard the partially streamed answer.
+///
+/// Sent when a connection broke after some deltas had already reached the
+/// client. Consumers drop everything accumulated for this turn before the
+/// retried stream restarts, so a restarted answer is never spliced onto the
+/// fragment of the aborted one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelStreamResetEvent {
+    pub operation_id: String,
+    pub reason: String,
+}
+
 /// Terminal outcome declared through a structured proposal.
 ///
 /// Structured output carries the terminal outcome as an explicit object field
@@ -432,8 +459,14 @@ mod tests {
     #[test]
     fn test_cancel_mode_and_model_cancel_params_serde() {
         assert_eq!(CancelMode::default(), CancelMode::Hard);
-        assert_eq!(serde_json::to_string(&CancelMode::Soft).unwrap(), "\"soft\"");
-        assert_eq!(serde_json::to_string(&CancelMode::Hard).unwrap(), "\"hard\"");
+        assert_eq!(
+            serde_json::to_string(&CancelMode::Soft).unwrap(),
+            "\"soft\""
+        );
+        assert_eq!(
+            serde_json::to_string(&CancelMode::Hard).unwrap(),
+            "\"hard\""
+        );
         assert_eq!(
             serde_json::from_str::<CancelMode>("\"soft\"").unwrap(),
             CancelMode::Soft

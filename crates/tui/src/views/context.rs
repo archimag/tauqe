@@ -131,11 +131,7 @@ impl ContextViewState {
         }
     }
 
-    pub fn update_filtered_candidates(
-        &mut self,
-        items: &[ContextItem],
-        all_repo_files: &[String],
-    ) {
+    pub fn update_filtered_candidates(&mut self, items: &[ContextItem], all_repo_files: &[String]) {
         let query = self.add_input.get_text().trim();
         let existing: std::collections::HashSet<&str> =
             items.iter().map(|it| it.path.as_str()).collect();

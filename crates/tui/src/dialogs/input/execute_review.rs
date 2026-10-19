@@ -60,8 +60,8 @@ pub(super) async fn handle_execute_review_dialog(
         return Ok(Some(InputResult::Continue));
     }
 
-    let is_ctrl_alt = key.modifiers.contains(KeyModifiers::CONTROL)
-        && key.modifiers.contains(KeyModifiers::ALT);
+    let is_ctrl_alt =
+        key.modifiers.contains(KeyModifiers::CONTROL) && key.modifiers.contains(KeyModifiers::ALT);
 
     // Alt+digit picks a Coder by position without leaving the editor.
     if target.focus.is_instructions_editor()
@@ -157,12 +157,7 @@ pub(super) async fn handle_execute_review_dialog(
         }
         _ => {
             if target.focus.is_instructions_editor() {
-                crate::input::handle_editor_key(
-                    &mut target.instructions_editor,
-                    key,
-                    is_cmd,
-                    true,
-                );
+                crate::input::handle_editor_key(&mut target.instructions_editor, key, is_cmd, true);
             }
             st.confirm_execute_review = Some(target);
             Ok(Some(InputResult::Continue))

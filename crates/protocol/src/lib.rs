@@ -23,6 +23,7 @@ pub mod git;
 pub mod glob;
 pub mod history;
 pub mod intent;
+pub mod lifecycle;
 pub mod locale;
 pub mod message;
 pub mod methods;
@@ -49,7 +50,8 @@ pub use context::{
     ContextSetAccessParams, ContextState,
 };
 pub use discussion::{
-    discussion_response_schema, discussion_response_schema_definition, DiscussionClearFocusParams,
+    discussion_response_schema, discussion_response_schema_definition, DirListRequest,
+    DiscussionClearFocusParams,
     DiscussionClearFocusResult, DiscussionContextRequest, DiscussionFocus,
     DiscussionFocusChangedEvent, DiscussionGetFocusParams, DiscussionGetFocusResult,
     DiscussionPlanAction, DiscussionPlanUpdate, DiscussionRequest, DiscussionResponse,
@@ -65,10 +67,9 @@ pub use errors::{
     CREDENTIALS_SAVE_FAILED, CREDENTIALS_STUB_FAILED, EMPTY_CONTEXT, EMPTY_ITEMS, GET_DIFF_FAILED,
     INIT_FAILED, INTERNAL_ERROR, INVALID_KEY, INVALID_MODEL, INVALID_PARAMS, INVALID_PLAN_ID,
     INVALID_PLAN_TREE, INVALID_PROTOCOL, INVALID_REQUEST, INVALID_WORKFLOW, ITEM_IN_DISCUSSION,
-    ITEM_IN_REFINE, ITEM_REJECTED, LIST_FILES_FAILED, METHOD_NOT_FOUND, MODEL_ERROR,
-    NEEDS_CONTEXT, NOT_FOUND, NOTHING_TO_EXECUTE, NOT_A_LEAF, NO_API_KEY, OPERATION_IN_PROGRESS,
-    PARSE_ERROR, PINNED_PROTECTED, PLAN_CLEAR_FAILED, PLAN_DELETE_FAILED, PLAN_GET_FAILED,
-    PLAN_LIST_FAILED,
+    ITEM_IN_REFINE, ITEM_REJECTED, LIST_FILES_FAILED, METHOD_NOT_FOUND, MODEL_ERROR, NEEDS_CONTEXT,
+    NOTHING_TO_EXECUTE, NOT_A_LEAF, NOT_FOUND, NO_API_KEY, OPERATION_IN_PROGRESS, PARSE_ERROR,
+    PINNED_PROTECTED, PLAN_CLEAR_FAILED, PLAN_DELETE_FAILED, PLAN_GET_FAILED, PLAN_LIST_FAILED,
     PLAN_LOAD_FAILED, PLAN_SAVE_FAILED, PLAN_SET_ACTIVE_FAILED, PLAN_UPDATE_FAILED,
     PREFLIGHT_VERIFICATION_FAILED, REMOVE_FAILED, REPOSITORY_STATE_FAILED, REVIEW_DELETE_FAILED,
     REVIEW_GET_FAILED, REVIEW_LIST_FAILED, REVIEW_LOAD_FAILED, REVIEW_UPDATE_FAILED, SCHEMA_ERROR,
@@ -88,20 +89,19 @@ pub use history::{
     UiHistoryItem, UiHistoryKind,
 };
 pub use intent::TurnIntent;
+pub use lifecycle::{CLIENT_SHUTDOWN_WAIT, SHUTDOWN_DRAIN_BUDGET};
 pub use locale::{LocaleCatalogItem, LocaleGenerateParams, LocaleGenerateResult};
 pub use message::{
-    Event, InitializeParams, InitializeResult, Message, Request, RequestId, Response,
-    ResponseError,
+    Event, InitializeParams, InitializeResult, Message, Request, RequestId, Response, ResponseError,
 };
 pub use model::{
-    ArchitectTier, BatchFinishStatus, BatchFinishSummary, CancelMode, CoderTier,
-    deserialize_model_ref_lenient,
-    ModelAskParams, ModelCancelParams, ModelChangedEvent, ModelCurrentResult, ModelDeltaEvent,
-    ModelEntry,
-    ModelErrorEvent,
-    ModelFinishedEvent, ModelRef, ModelResult, ModelResultEvent, ModelResultProposal, ModelRole,
-    ModelRolesEffort, ModelRolesEntries, ModelRolesSummary, ModelSelectParams, ModelSelectResult,
-    ModelSelection, ModelStartedEvent, ModelTurnPlanContext, ModelUsageEvent, ModelUsageInfo,
+    deserialize_model_ref_lenient, ArchitectTier, BatchFinishStatus, BatchFinishSummary,
+    CancelMode, CoderTier, ModelAskParams, ModelCancelParams, ModelChangedEvent,
+    ModelConnectionRetryingEvent, ModelCurrentResult, ModelDeltaEvent, ModelEntry,
+    ModelErrorEvent, ModelFinishedEvent, ModelRef, ModelResult, ModelResultEvent,
+    ModelResultProposal, ModelRole, ModelRolesEffort, ModelRolesEntries, ModelRolesSummary,
+    ModelSelectParams, ModelSelectResult, ModelSelection, ModelStartedEvent,
+    ModelStreamResetEvent, ModelTurnPlanContext, ModelUsageEvent, ModelUsageInfo,
     ModelUsageTotalsEvent, PlanBatchFinishedEvent, ProviderKind, ReasoningEffort, RepoMapInfoEvent,
     ReviewBatchFinishedEvent, ToolchainFinishedEvent, ToolchainStartedEvent, TurnPhase,
     TurnPhaseEvent, UsageTotals, UsageTotalsSnapshot,

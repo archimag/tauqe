@@ -116,15 +116,9 @@ pub fn format_review_step_execution_prompt(
     out.push_str("### Target Finding to Resolve:\n");
     out.push_str(&format!("- **ID**: `#{}`\n", issue.id));
     out.push_str(&format!("- **Type**: {}\n", issue.issue_type));
-    out.push_str(&format!(
-        "- **Title**: {}\n",
-        escape_xml_text(&issue.title)
-    ));
+    out.push_str(&format!("- **Title**: {}\n", escape_xml_text(&issue.title)));
     if !issue.files.is_empty() {
-        out.push_str(&format!(
-            "- **Files**: {}\n",
-            render_paths(&issue.files)
-        ));
+        out.push_str(&format!("- **Files**: {}\n", render_paths(&issue.files)));
     }
     if !issue.readonly_files.is_empty() {
         out.push_str(&format!(
@@ -164,7 +158,9 @@ pub fn format_review_step_execution_prompt(
         "1. Focus STRICTLY and EXCLUSIVELY on resolving review finding `#{}`.\n",
         issue.id
     ));
-    out.push_str("2. Do NOT touch unrelated code or address other findings outside of this scope.\n");
+    out.push_str(
+        "2. Do NOT touch unrelated code or address other findings outside of this scope.\n",
+    );
     out.push_str("3. Treat every file listed under Protected Contracts as immutable: rely on its interfaces and invariants, but NEVER modify it.\n");
     out.push_str("4. Keep changes minimal and coherent. Toolchain verification is handled automatically and deterministically by the harness; do NOT emit <verify> tags.\n");
     out.push_str(&format!(

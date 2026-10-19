@@ -13,8 +13,8 @@ use crate::edits::{
     apply_edit_proposal, stage_and_validate_edits, StageEditsResult, StagedEditsState,
 };
 use crate::git::{
-    create_ai_commit, create_checkpoint, create_step_commit, finalize_ai_commit, restore_checkpoint,
-    CheckpointInfo,
+    create_ai_commit, create_checkpoint, create_step_commit, finalize_ai_commit,
+    restore_checkpoint, CheckpointInfo,
 };
 
 /// Transactional apply policy that records every applied change set as a
@@ -91,7 +91,8 @@ impl ApplyPolicy for GitTransactionPolicy {
         // tree to its true pre-turn state.
         if self.checkpoint.is_none() {
             let root = repo_root.to_path_buf();
-            let checkpoint = crate::blocking::run_blocking_async(move || create_checkpoint(&root)).await??;
+            let checkpoint =
+                crate::blocking::run_blocking_async(move || create_checkpoint(&root)).await??;
             self.checkpoint = Some(checkpoint);
         }
         self.publish_transaction_state();
@@ -144,7 +145,8 @@ impl ApplyPolicy for GitTransactionPolicy {
         self.clear_transaction_state();
         if let Some(checkpoint) = self.checkpoint.take() {
             let root = repo_root.to_path_buf();
-            crate::blocking::run_blocking_async(move || restore_checkpoint(&root, &checkpoint)).await??;
+            crate::blocking::run_blocking_async(move || restore_checkpoint(&root, &checkpoint))
+                .await??;
             Ok(true)
         } else {
             Ok(false)
@@ -195,11 +197,17 @@ mod tests {
             summary: "update a.rs".to_string(),
             edits: edits.clone(),
         };
-        let changed = policy.apply_temporary(root, &mut cm, &proposal).await.unwrap();
+        let changed = policy
+            .apply_temporary(root, &mut cm, &proposal)
+            .await
+            .unwrap();
         assert_eq!(changed, vec!["a.rs".to_string()]);
         assert_eq!(std::fs::read_to_string(root.join("a.rs")).unwrap(), "two\n");
 
-        let commit = policy.apply_final(root, &changed, "update a.rs").await.unwrap();
+        let commit = policy
+            .apply_final(root, &changed, "update a.rs")
+            .await
+            .unwrap();
         assert!(commit.is_some());
         assert_eq!(std::fs::read_to_string(root.join("a.rs")).unwrap(), "two\n");
     }
@@ -217,7 +225,10 @@ mod tests {
             summary: "update a.rs".to_string(),
             edits: edits.clone(),
         };
-        let changed = policy.apply_temporary(root, &mut cm, &proposal).await.unwrap();
+        let changed = policy
+            .apply_temporary(root, &mut cm, &proposal)
+            .await
+            .unwrap();
         assert_eq!(changed, vec!["a.rs".to_string()]);
         assert_eq!(std::fs::read_to_string(root.join("a.rs")).unwrap(), "two\n");
 
@@ -268,8 +279,14 @@ mod tests {
                 new_text: "three\n".to_string(),
             }],
         };
-        policy.apply_temporary(root, &mut cm, &second).await.unwrap();
-        assert_eq!(std::fs::read_to_string(root.join("a.rs")).unwrap(), "three\n");
+        policy
+            .apply_temporary(root, &mut cm, &second)
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(root.join("a.rs")).unwrap(),
+            "three\n"
+        );
 
         // Rolling back after several temporary applications must return the
         // tree to its pristine pre-turn state and drop the whole transaction.
@@ -309,14 +326,23 @@ mod tests {
                 new_text: "three\n".to_string(),
             }],
         };
-        let changed = policy.apply_temporary(root, &mut cm, &second).await.unwrap();
+        let changed = policy
+            .apply_temporary(root, &mut cm, &second)
+            .await
+            .unwrap();
 
-        let commit = policy.apply_final(root, &changed, "update a.rs").await.unwrap();
+        let commit = policy
+            .apply_final(root, &changed, "update a.rs")
+            .await
+            .unwrap();
         assert!(commit.is_some());
 
         // Intermediate step commits must be squashed so exactly one new commit
         // carries the final summary on top of the initial commit.
-        assert_eq!(std::fs::read_to_string(root.join("a.rs")).unwrap(), "three\n");
+        assert_eq!(
+            std::fs::read_to_string(root.join("a.rs")).unwrap(),
+            "three\n"
+        );
         assert_eq!(head_subject(root), "update a.rs");
         // Exactly one permanent commit is added on top of the fixture's two
         // baseline commits, proving the healing step commits were squashed.
@@ -356,13 +382,25 @@ mod tests {
                 new_text: "three\n".to_string(),
             }],
         };
-        let changed = policy.apply_temporary(root, &mut cm, &second).await.unwrap();
+        let changed = policy
+            .apply_temporary(root, &mut cm, &second)
+            .await
+            .unwrap();
         assert_eq!(changed, vec!["a.rs".to_string()]);
-        assert_eq!(std::fs::read_to_string(root.join("a.rs")).unwrap(), "three\n");
+        assert_eq!(
+            std::fs::read_to_string(root.join("a.rs")).unwrap(),
+            "three\n"
+        );
 
-        let commit = policy.apply_final(root, &changed, "escalated attempt").await.unwrap();
+        let commit = policy
+            .apply_final(root, &changed, "escalated attempt")
+            .await
+            .unwrap();
         assert!(commit.is_some());
-        assert_eq!(std::fs::read_to_string(root.join("a.rs")).unwrap(), "three\n");
+        assert_eq!(
+            std::fs::read_to_string(root.join("a.rs")).unwrap(),
+            "three\n"
+        );
     }
 
     #[tokio::test]

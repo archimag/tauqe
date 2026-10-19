@@ -60,7 +60,10 @@ async fn direct_policy_rollback_and_finalize_are_noops() {
         summary: "update a.rs".to_string(),
         edits,
     };
-    let changed = policy.apply_temporary(root, &mut cm, &proposal).await.unwrap();
+    let changed = policy
+        .apply_temporary(root, &mut cm, &proposal)
+        .await
+        .unwrap();
     assert_eq!(changed, vec!["a.rs".to_string()]);
     assert_eq!(std::fs::read_to_string(root.join("a.rs")).unwrap(), "two\n");
 
@@ -92,10 +95,16 @@ async fn git_policy_finalize_creates_ai_commit() {
         summary: "update a.rs".to_string(),
         edits,
     };
-    let changed = policy.apply_temporary(root, &mut cm, &proposal).await.unwrap();
+    let changed = policy
+        .apply_temporary(root, &mut cm, &proposal)
+        .await
+        .unwrap();
     assert_eq!(changed, vec!["a.rs".to_string()]);
 
-    let commit = policy.apply_final(root, &changed, "update a.rs").await.unwrap();
+    let commit = policy
+        .apply_final(root, &changed, "update a.rs")
+        .await
+        .unwrap();
     assert!(commit.is_some());
 
     // Finalization squashes the temporary step commit into a single AI commit
@@ -119,7 +128,10 @@ async fn git_policy_rollback_restores_pre_edit_working_tree() {
         summary: "update a.rs".to_string(),
         edits,
     };
-    policy.apply_temporary(root, &mut cm, &proposal).await.unwrap();
+    policy
+        .apply_temporary(root, &mut cm, &proposal)
+        .await
+        .unwrap();
     assert_eq!(std::fs::read_to_string(root.join("a.rs")).unwrap(), "two\n");
 
     assert!(policy.rollback(root).await.unwrap());
@@ -148,7 +160,10 @@ async fn git_policy_rollback_preserves_uncommitted_developer_work() {
         summary: "update a.rs".to_string(),
         edits,
     };
-    policy.apply_temporary(root, &mut cm, &proposal).await.unwrap();
+    policy
+        .apply_temporary(root, &mut cm, &proposal)
+        .await
+        .unwrap();
     assert_eq!(std::fs::read_to_string(root.join("a.rs")).unwrap(), "two\n");
 
     assert!(policy.rollback(root).await.unwrap());

@@ -7,7 +7,8 @@
 use std::sync::OnceLock;
 
 use tauqe_protocol::{
-    DiscussionPlanAction, DiscussionPlanUpdate, LlmCapability, LlmCommand, LlmOutcome, ModelResult,
+    DiscussionPlanAction, DiscussionPlanUpdate, DocTopic, LlmCapability, LlmCommand, LlmOutcome,
+    ModelResult,
 };
 
 use crate::edits::protocol::xml::engine::XmlTagSpec;
@@ -148,16 +149,28 @@ impl CapabilityModule for DiscoveryModule {
     }
 
     fn xml_tag_specs(&self) -> &'static [&'static XmlTagSpec] {
-        resolve_specs(&DISCOVERY_SPECS, &["context_request", "repo_search"])
+        resolve_specs(
+            &DISCOVERY_SPECS,
+            &[
+                "context_request",
+                "repo_search",
+                "repo_dirs",
+                "repo_map",
+                "dir_list",
+            ],
+        )
     }
 
     fn render_contract_rule(&self, ctx: &ContractContext<'_>) -> Option<ContractRule> {
         let request = ctx.tag_name("context_request");
         let search = ctx.tag_name("repo_search");
+        let dirs = ctx.tag_name("repo_dirs");
+        let map = ctx.tag_name("repo_map");
+        let list = ctx.tag_name("dir_list");
         Some(ContractRule::new(
             "Discovery First",
             format!(
-                "Request missing files with <{request} path=\"...\" access=\"read_only|editable\" /> and locate symbols with <{search} path=\"...\" regex=\"...\" />; place these tags at the end of the response, outside markdown code."
+                "Explore codebase structure before loading files. Locate subsystems with <{dirs} />, list files in a directory with <{list} path=\"...\" recursive=\"true|false\" />, inspect symbol contours and type contracts with Tree-sitter <{map} path=\"...\" /> (extracts signatures, structs, and traits without function bodies to prevent context bloat), locate symbols with <{search} path=\"...\" regex=\"...\" />, and load full file contents with <{request} path=\"...\" access=\"read_only|editable\" /> only when editing or deep inspection is necessary. A discovery tag performs a request only when it appears verbatim at the very end of the response, outside markdown code: emitting the tag itself is the only way to run it, describing the intent in prose performs nothing, and the tag is never deferred to a later response. Batch every request of a round together."
             ),
         ))
     }
@@ -165,13 +178,16 @@ impl CapabilityModule for DiscoveryModule {
     fn render_xml_instruction(&self, ctx: &PromptRenderContext<'_>) -> Option<String> {
         let request = ctx.tag_name("context_request");
         let search = ctx.tag_name("repo_search");
+        let dirs = ctx.tag_name("repo_dirs");
+        let map = ctx.tag_name("repo_map");
+        let list = ctx.tag_name("dir_list");
         Some(format!(
-            "- Discovery: request missing files with <{request} path=\"...\" access=\"read_only|editable\" /> and locate symbols with <{search} path=\"...\" regex=\"...\" /> (use path=\"\" or \".\" for the repository root). Emit these tags at the end of the response, outside markdown code, and request several files in one round. Regex uses Rust / ripgrep syntax (\\b, \\w, \\d, (?:...), (?i)); lookaround assertions and backreferences are not supported. Files already present in <context> need no request."
+            "- Discovery: inspect symbol contours and API contracts with Tree-sitter <{map} path=\"...\" /> (returns function signatures, types, and traits without function bodies; prefer this over loading full files to avoid context bloat), request full files with <{request} path=\"...\" access=\"read_only|editable\" /> only when modifying or thoroughly inspecting them, and locate symbols with <{search} path=\"...\" regex=\"...\" /> (use path=\"\" or \".\" for the repository root). Render the compact directory tree with <{dirs} /> when subsystem locations are unknown, and list tracked files of a directory with <{list} path=\"...\" recursive=\"true|false\" />. Emit discovery tags at the end of the response, outside markdown code, and batch multiple requests in one round. A tag performs a request only when it appears verbatim at the very end of the response, outside markdown code: emitting the tag itself is the only way to run it, describing the intent in prose performs nothing, and the tag is never deferred to a later response. Regex uses Rust / ripgrep syntax (\\b, \\w, \\d, (?:...), (?i); no lookarounds or backreferences). Files already present in <context> need no request. A directory listing covers Git-tracked files only (shallow by default, `recursive=\"true\"` widens to all files under the prefix, truncated at entry limit)."
         ))
     }
 
     fn render_structured_instruction(&self, _ctx: &PromptRenderContext<'_>) -> Option<String> {
-        Some("- `context_requests`: files to add to context before editing (`path`, or `editable:<path>` for files you need to modify). Request missing files listed in <repo_map> first and never request files already in context.\n- `repo_searches`: repository search requests (`path`, `regex`) using Rust / ripgrep regex syntax (\\b, \\w, \\d, (?:...), (?i); no lookarounds or backreferences).".to_string())
+        Some("- `context_requests`: full files to load into context (`path`, or `editable:<path>` for files to modify); request only when modifying or deep inspection is necessary, never for files already in context.\n- `repo_maps`: targeted Tree-sitter symbol map requests for specific subsystems or files (`path`), returning signatures, types, and traits without function bodies; prefer this over full file requests to inspect APIs without context bloat.\n- `repo_searches`: repository search requests (`path`, `regex`) using Rust / ripgrep regex syntax (\\b, \\w, \\d, (?:...), (?i); no lookarounds or backreferences).\n- `repo_dirs`: set true to render the compact repository directory tree when the repository layout is still unknown, and false otherwise.\n- `dir_lists`: directory listing requests (`path`, `recursive`) to inspect tracked files under a prefix. Populate these arrays to run requests: describing the intent in prose performs nothing and triggers no discovery round.".to_string())
     }
 
     fn decode_xml(
@@ -193,6 +209,18 @@ impl CapabilityModule for DiscoveryModule {
             commands.push(LlmCommand::RepoSearch {
                 path: search.path,
                 regex: search.regex,
+            });
+        }
+        if parser.parse_repo_dirs(normalized_text) {
+            commands.push(LlmCommand::RepoDirs);
+        }
+        for path in parser.parse_repo_maps(normalized_text) {
+            commands.push(LlmCommand::RepoMap { path });
+        }
+        for request in parser.parse_dir_lists(normalized_text) {
+            commands.push(LlmCommand::DirList {
+                path: request.path,
+                recursive: request.recursive,
             });
         }
         commands
@@ -219,24 +247,32 @@ impl CapabilityModule for DocRequestModule {
 
     fn render_contract_rule(&self, ctx: &ContractContext<'_>) -> Option<ContractRule> {
         let doc = ctx.tag_name("doc_request");
+        let topics = crate::docs::topic_hint();
         Some(ContractRule::new(
             "Self-Knowledge",
             format!(
-                "Never guess answers about your identity, capabilities, concepts, workflows, keyboard shortcuts, or configuration. Request the authoritative documentation via <{doc} topic=\"{}\" /> and output nothing else except a short note; answer strictly from the returned <system_documentation> blocks in the user's language.",
-                crate::docs::topic_hint()
+                "Never guess answers about your identity, capabilities, concepts, workflows, keyboard shortcuts, or configuration. Environment behavior is declared in `tauqe.toml` at the repository root; questions about its parameters, defaults, budgets, or the recommended project layout are answered only from the authoritative documentation requested via <{doc} topic=\"{topics}\" />, where topic=\"config\" covers configuration and project preparation. Output nothing else except a short note, and answer strictly from the returned <system_documentation> blocks in the user's language."
             ),
         ))
     }
 
     fn render_xml_instruction(&self, ctx: &PromptRenderContext<'_>) -> Option<String> {
         let doc = ctx.tag_name("doc_request");
+        let topics = crate::docs::topic_hint();
         Some(format!(
-            "- Documentation: request authoritative system docs with <{doc} topic=\"overview|context|workflow|git|interface|review|plan|all\" />."
+            "- Documentation: request authoritative system docs with <{doc} topic=\"{topics}\" />."
         ))
     }
 
     fn render_structured_instruction(&self, _ctx: &PromptRenderContext<'_>) -> Option<String> {
-        Some("- `doc_requests`: array of system documentation topics (`overview`, `context`, `workflow`, `git`, `interface`, `review`, `plan`, `all`) to request before answering questions about identity, capabilities, concepts, or workflows; use an empty array when no documentation is needed.".to_string())
+        let topics = DocTopic::ALL
+            .iter()
+            .map(|topic| format!("`{}`", topic.as_str()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        Some(format!(
+            "- `doc_requests`: array of system documentation topics ({topics}) to request before answering questions about identity, capabilities, concepts, or workflows; use an empty array when no documentation is needed."
+        ))
     }
 
     fn decode_xml(
@@ -270,7 +306,9 @@ pub(crate) fn map_verify_target(target: VerifyTarget) -> tauqe_protocol::VerifyT
 }
 
 /// Maps the edit-protocol success policy onto the normalized command policy.
-pub(crate) fn map_verify_on_success(on_success: VerifyOnSuccess) -> tauqe_protocol::VerifyOnSuccess {
+pub(crate) fn map_verify_on_success(
+    on_success: VerifyOnSuccess,
+) -> tauqe_protocol::VerifyOnSuccess {
     match on_success {
         VerifyOnSuccess::Silent => tauqe_protocol::VerifyOnSuccess::Silent,
         VerifyOnSuccess::Report => tauqe_protocol::VerifyOnSuccess::Report,

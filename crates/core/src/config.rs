@@ -13,7 +13,8 @@ mod providers;
 mod toolchain;
 
 pub use context::{
-    ContextConfig, DEFAULT_FILES_TOKEN_BUDGET, DEFAULT_MAX_DISCOVERY_ROUNDS,
+    ContextConfig, DEFAULT_FILES_TOKEN_BUDGET, DEFAULT_INCLUDE_REPO_MAP,
+    DEFAULT_MAX_DISCOVERY_ROUNDS,
 };
 pub use credentials::default_credentials_path;
 pub use develop::{DevelopConfig, EditConfig};
@@ -33,7 +34,9 @@ pub use providers::{
     read_credentials_file, write_credentials_file, write_credentials_stub, Credentials,
     OpenRouterConfig, OpenRouterCredentials, ProvidersConfig,
 };
-pub use toolchain::{ToolchainConfig, DEFAULT_TOOLCHAIN_TIMEOUT_SECS};
+pub use toolchain::{
+    FormatterConfig, ToolchainConfig, ToolchainPhaseConfig, DEFAULT_TOOLCHAIN_TIMEOUT_SECS,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AppConfig {
@@ -114,6 +117,15 @@ impl AppConfig {
         }
     }
 
+    /// Resolves the reasoning effort for a model selection within the context of a specific role.
+    pub fn resolve_selection_effort(
+        &self,
+        role: ModelRole,
+        selection: &ModelSelection,
+    ) -> Option<tauqe_protocol::ReasoningEffort> {
+        self.models.resolve_selection_effort(role, selection)
+    }
+
     /// Summary of effective concrete models assigned to all semantic roles.
     pub fn roles_summary(&self) -> ModelRolesSummary {
         let fallback = self.configured_models().into_iter().next();
@@ -173,48 +185,57 @@ pub struct ConfigLoadOptions<'a> {
 }
 
 pub fn load_config_with_options(opts: ConfigLoadOptions) -> AppConfig {
-    let config_path = opts
-        .explicit_config
-        .map(PathBuf::from)
-        .or_else(|| find_config_file(opts.repo_root, opts.explicit_config));
+    // Discovery and reading of configuration files, plus credential
+    // resolution, are blocking filesystem work. Route them off the async
+    // executor thread.
+    crate::blocking::run_blocking(|| {
+        let config_path = opts
+            .explicit_config
+            .map(PathBuf::from)
+            .or_else(|| find_config_file(opts.repo_root, opts.explicit_config));
 
-    let mut config = AppConfig::default();
-    if let Some(p) = config_path.as_deref().filter(|p| !p.as_os_str().is_empty()) {
-        match std::fs::read_to_string(p) {
-            Ok(content) => match toml::from_str::<AppConfig>(&content) {
-                Ok(parsed) => {
-                    config = parsed;
-                    if let Err(err) = config.validate() {
-                        tracing::warn!("Configuration validation failed for {}: {}", p.display(), err);
-                        config.config_error =
-                            Some(format!("Invalid configuration in {}: {}", p.display(), err));
+        let mut config = AppConfig::default();
+        if let Some(p) = config_path.as_deref().filter(|p| !p.as_os_str().is_empty()) {
+            match std::fs::read_to_string(p) {
+                Ok(content) => match toml::from_str::<AppConfig>(&content) {
+                    Ok(parsed) => {
+                        config = parsed;
+                        if let Err(err) = config.validate() {
+                            tracing::warn!(
+                                "Configuration validation failed for {}: {}",
+                                p.display(),
+                                err
+                            );
+                            config.config_error =
+                                Some(format!("Invalid configuration in {}: {}", p.display(), err));
+                        }
                     }
-                }
+                    Err(err) => {
+                        tracing::warn!("Failed to parse config file {}: {}", p.display(), err);
+                        config.config_error =
+                            Some(format!("Failed to parse {}: {}", p.display(), err));
+                    }
+                },
                 Err(err) => {
-                    tracing::warn!("Failed to parse config file {}: {}", p.display(), err);
-                    config.config_error =
-                        Some(format!("Failed to parse {}: {}", p.display(), err));
+                    tracing::warn!("Failed to read config file {}: {}", p.display(), err);
+                    config.config_error = Some(format!("Failed to read {}: {}", p.display(), err));
                 }
-            },
-            Err(err) => {
-                tracing::warn!("Failed to read config file {}: {}", p.display(), err);
-                config.config_error = Some(format!("Failed to read {}: {}", p.display(), err));
             }
         }
-    }
 
-    credentials::apply_credentials(&mut config, opts.explicit_credentials, opts.repo_root);
+        credentials::apply_credentials(&mut config, opts.explicit_credentials, opts.repo_root);
 
-    config.explicit_config_path = opts
-        .explicit_config
-        .filter(|p| !p.as_os_str().is_empty())
-        .map(PathBuf::from);
-    config.explicit_credentials_path = opts
-        .explicit_credentials
-        .filter(|p| !p.as_os_str().is_empty())
-        .map(PathBuf::from);
+        config.explicit_config_path = opts
+            .explicit_config
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(PathBuf::from);
+        config.explicit_credentials_path = opts
+            .explicit_credentials
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(PathBuf::from);
 
-    config
+        config
+    })
 }
 
 /// Loads configuration for `repo_root` without any command-line overrides.
@@ -238,20 +259,24 @@ pub fn load_section<T: for<'de> Deserialize<'de> + Default>(
     repo_root: &Path,
     section_key: &str,
 ) -> T {
-    let Some(path) = find_config_file(Some(repo_root), None) else {
-        return T::default();
-    };
-    let Ok(content) = std::fs::read_to_string(&path) else {
-        return T::default();
-    };
-    let Ok(table) = toml::from_str::<toml::Table>(&content) else {
-        return T::default();
-    };
-    table
-        .get(section_key)
-        .cloned()
-        .and_then(|val| val.try_into::<T>().ok())
-        .unwrap_or_default()
+    // Locating and reading the configuration file is blocking filesystem work,
+    // so it runs off the async executor thread.
+    crate::blocking::run_blocking(|| {
+        let Some(path) = find_config_file(Some(repo_root), None) else {
+            return T::default();
+        };
+        let Ok(content) = std::fs::read_to_string(&path) else {
+            return T::default();
+        };
+        let Ok(table) = toml::from_str::<toml::Table>(&content) else {
+            return T::default();
+        };
+        table
+            .get(section_key)
+            .cloned()
+            .and_then(|val| val.try_into::<T>().ok())
+            .unwrap_or_default()
+    })
 }
 
 /// Resolves repository-local `[git]` integration settings for a repository root.
@@ -295,16 +320,40 @@ auto_level_up = true
         let config: AppConfig = toml::from_str(toml_str).expect("Failed to parse config");
         assert!(config.models.validate().is_ok());
         assert!(config.models.auto_level_up);
-        assert_eq!(config.active_model(), ModelRef::openrouter("google/gemini-flash-latest"));
-        assert_eq!(config.default_selection(), ModelSelection::Role(ModelRole::Primary));
-        assert_eq!(config.history_model(), ModelRef::openrouter("anthropic/claude-haiku-latest"));
+        assert_eq!(
+            config.active_model(),
+            ModelRef::openrouter("google/gemini-flash-latest")
+        );
+        assert_eq!(
+            config.default_selection(),
+            ModelSelection::Role(ModelRole::Primary)
+        );
+        assert_eq!(
+            config.history_model(),
+            ModelRef::openrouter("anthropic/claude-haiku-latest")
+        );
 
         let roles = config.roles_summary();
-        assert_eq!(roles.scribe, ModelRef::openrouter("anthropic/claude-haiku-latest"));
-        assert_eq!(roles.coder, ModelRef::openrouter("google/gemini-flash-latest"));
-        assert_eq!(roles.architect, ModelRef::openrouter("anthropic/claude-sonnet-latest"));
-        assert_eq!(roles.primary, ModelRef::openrouter("google/gemini-flash-latest"));
-        assert_eq!(roles.reviewer, ModelRef::openrouter("anthropic/claude-sonnet-latest"));
+        assert_eq!(
+            roles.scribe,
+            ModelRef::openrouter("anthropic/claude-haiku-latest")
+        );
+        assert_eq!(
+            roles.coder,
+            ModelRef::openrouter("google/gemini-flash-latest")
+        );
+        assert_eq!(
+            roles.architect,
+            ModelRef::openrouter("anthropic/claude-sonnet-latest")
+        );
+        assert_eq!(
+            roles.primary,
+            ModelRef::openrouter("google/gemini-flash-latest")
+        );
+        assert_eq!(
+            roles.reviewer,
+            ModelRef::openrouter("anthropic/claude-sonnet-latest")
+        );
 
         let models_summary = config.models.roles_summary();
         assert_eq!(models_summary.scribe, roles.scribe);
@@ -314,12 +363,30 @@ auto_level_up = true
         assert_eq!(models_summary.reviewer, roles.reviewer);
 
         let specific = ModelRef::openrouter("custom/model");
-        assert_eq!(config.resolve_model(&ModelSelection::Specific(specific.clone())), specific);
-        assert_eq!(config.resolve_model(&ModelSelection::Role(ModelRole::Scribe)), roles.scribe);
-        assert_eq!(config.resolve_model(&ModelSelection::Role(ModelRole::Coder)), roles.coder);
-        assert_eq!(config.resolve_model(&ModelSelection::Role(ModelRole::Architect)), roles.architect);
-        assert_eq!(config.resolve_model(&ModelSelection::Role(ModelRole::Primary)), roles.primary);
-        assert_eq!(config.resolve_model(&ModelSelection::Role(ModelRole::Reviewer)), roles.reviewer);
+        assert_eq!(
+            config.resolve_model(&ModelSelection::Specific(specific.clone())),
+            specific
+        );
+        assert_eq!(
+            config.resolve_model(&ModelSelection::Role(ModelRole::Scribe)),
+            roles.scribe
+        );
+        assert_eq!(
+            config.resolve_model(&ModelSelection::Role(ModelRole::Coder)),
+            roles.coder
+        );
+        assert_eq!(
+            config.resolve_model(&ModelSelection::Role(ModelRole::Architect)),
+            roles.architect
+        );
+        assert_eq!(
+            config.resolve_model(&ModelSelection::Role(ModelRole::Primary)),
+            roles.primary
+        );
+        assert_eq!(
+            config.resolve_model(&ModelSelection::Role(ModelRole::Reviewer)),
+            roles.reviewer
+        );
     }
 
     #[test]
@@ -502,6 +569,28 @@ repomap_token_budget = 6000
     }
 
     #[test]
+    fn test_include_repo_map_defaults_and_override() {
+        let default_cfg = ContextConfig::default();
+        assert_eq!(default_cfg.include_repo_map, DEFAULT_INCLUDE_REPO_MAP);
+        assert!(default_cfg.include_repo_map);
+
+        let absent: AppConfig =
+            toml::from_str("[context]\nrepomap_token_budget = 1000\n").expect("parse config");
+        assert!(
+            absent.context.include_repo_map,
+            "an omitted flag must keep the repository map enabled"
+        );
+
+        let disabled: AppConfig =
+            toml::from_str("[context]\ninclude_repo_map = false\n").expect("parse config");
+        assert!(!disabled.context.include_repo_map);
+
+        let enabled: AppConfig =
+            toml::from_str("[context]\ninclude_repo_map = true\n").expect("parse config");
+        assert!(enabled.context.include_repo_map);
+    }
+
+    #[test]
     fn test_context_discovery_config() {
         let toml_str = r#"
 [context]
@@ -665,7 +754,10 @@ models = ["deepseek/deepseek-chat", " ", "openai/gpt-4o"]
             config.config_error.is_some(),
             "an invalid models config must record a diagnostic"
         );
-        assert!(config.config_error.unwrap().contains("Invalid configuration"));
+        assert!(config
+            .config_error
+            .unwrap()
+            .contains("Invalid configuration"));
     }
 
     #[test]
@@ -678,7 +770,10 @@ models = ["deepseek/deepseek-chat", " ", "openai/gpt-4o"]
         .unwrap();
 
         let cfg = load_context_config(temp_dir.path());
-        assert_eq!(cfg.pinned, vec!["Conventions.md".to_string(), "README.md".to_string()]);
+        assert_eq!(
+            cfg.pinned,
+            vec!["Conventions.md".to_string(), "README.md".to_string()]
+        );
         assert_eq!(cfg.max_discovery_rounds, 9);
     }
 }

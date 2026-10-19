@@ -4,19 +4,18 @@ pub mod diff;
 pub mod state;
 
 pub use checkpoint::{
-    create_ai_commit, create_checkpoint, create_step_commit, finalize_ai_commit,
-    is_tauqe_commit, restore_checkpoint, undo_last_ai_commit, CheckpointInfo,
-    CHECKPOINT_PREFIX, STEP_PREFIX, TAUQE_CO_AUTHOR_TRAILER,
+    create_ai_commit, create_checkpoint, create_step_commit, finalize_ai_commit, is_tauqe_commit,
+    restore_checkpoint, undo_last_ai_commit, CheckpointInfo, CHECKPOINT_PREFIX, STEP_PREFIX,
+    TAUQE_CO_AUTHOR_TRAILER,
 };
 pub use cmd::run_git;
 pub use diff::{
-    find_last_non_ai_commit, get_commits_ahead, get_cumulative_diff,
-    get_cumulative_file_diffs, get_diff, get_diff_stat, squash_to_single_commit,
-    CommitSummary,
+    find_last_non_ai_commit, get_commits_ahead, get_cumulative_diff, get_cumulative_file_diffs,
+    get_diff, get_diff_stat, squash_to_single_commit, CommitSummary,
 };
 pub use state::{
-    detect_upstream_branch, get_repository_state, init_repository,
-    is_git_repository, list_repository_files,
+    detect_upstream_branch, get_repository_state, init_repository, is_git_repository,
+    list_repository_files,
 };
 
 #[cfg(test)]
@@ -115,7 +114,10 @@ mod tests {
         std::fs::write(root.join("init.txt"), "hello").unwrap();
         run_git(Some(root), &["add", "init.txt"]).unwrap();
         run_git(Some(root), &["commit", "-m", "chore: init"]).unwrap();
-        let init_hash = run_git(Some(root), &["rev-parse", "HEAD"]).unwrap().trim().to_string();
+        let init_hash = run_git(Some(root), &["rev-parse", "HEAD"])
+            .unwrap()
+            .trim()
+            .to_string();
 
         // No AI commits yet
         assert_eq!(find_last_non_ai_commit(root).unwrap(), None);
@@ -131,7 +133,11 @@ mod tests {
         // Check author and co-author on AI commit
         let author = run_git(Some(root), &["log", "-1", "--format=%an <%ae>"]).unwrap();
         assert_eq!(author.trim(), "Alice Developer <alice@dev.org>");
-        let trailers = run_git(Some(root), &["log", "-1", "--format=%(trailers:key=Co-authored-by)"]).unwrap();
+        let trailers = run_git(
+            Some(root),
+            &["log", "-1", "--format=%(trailers:key=Co-authored-by)"],
+        )
+        .unwrap();
         assert!(trailers.contains("Tauqe AI"));
 
         // Last non-AI commit should point to init_hash
@@ -151,13 +157,18 @@ mod tests {
         let ahead = get_commits_ahead(root, &init_hash).unwrap();
         assert_eq!(ahead.len(), 3);
 
-        let squashed_hash = squash_to_single_commit(root, &init_hash, "feat: complete feature").unwrap();
+        let squashed_hash =
+            squash_to_single_commit(root, &init_hash, "feat: complete feature").unwrap();
         assert!(!squashed_hash.is_empty());
 
         // Squashed commit has Alice as author and NO Co-authored-by trailer
         let squashed_author = run_git(Some(root), &["log", "-1", "--format=%an <%ae>"]).unwrap();
         assert_eq!(squashed_author.trim(), "Alice Developer <alice@dev.org>");
-        let squashed_trailers = run_git(Some(root), &["log", "-1", "--format=%(trailers:key=Co-authored-by)"]).unwrap();
+        let squashed_trailers = run_git(
+            Some(root),
+            &["log", "-1", "--format=%(trailers:key=Co-authored-by)"],
+        )
+        .unwrap();
         assert!(!squashed_trailers.contains("Tauqe AI"));
 
         // No more AI commits in history
@@ -265,8 +276,14 @@ mod tests {
 
         let subject = run_git(Some(root), &["log", "-1", "--format=%s"]).unwrap();
         assert_eq!(subject.trim(), "Squashed AI feature");
-        assert_eq!(std::fs::read_to_string(root.join("file1.txt")).unwrap(), "modified 1");
-        assert_eq!(std::fs::read_to_string(root.join("file2.txt")).unwrap(), "modified 2");
+        assert_eq!(
+            std::fs::read_to_string(root.join("file1.txt")).unwrap(),
+            "modified 1"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("file2.txt")).unwrap(),
+            "modified 2"
+        );
     }
 
     #[test]
@@ -294,8 +311,14 @@ mod tests {
         // Restore checkpoint on failure
         restore_checkpoint(root, &cp).unwrap();
 
-        assert_eq!(std::fs::read_to_string(root.join("file.txt")).unwrap(), "initial");
-        assert_eq!(std::fs::read_to_string(root.join("user.txt")).unwrap(), "user dirty");
+        assert_eq!(
+            std::fs::read_to_string(root.join("file.txt")).unwrap(),
+            "initial"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("user.txt")).unwrap(),
+            "user dirty"
+        );
 
         let log = run_git(Some(root), &["log", "--oneline"]).unwrap();
         assert!(!log.contains("tauqe-step:"));

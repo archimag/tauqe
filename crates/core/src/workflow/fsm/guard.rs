@@ -8,8 +8,8 @@
 
 use std::path::Path;
 
-use tokio::sync::mpsc;
 use tauqe_protocol::{EditOutcome, EditProposal, ModelResult};
+use tokio::sync::mpsc;
 
 use crate::context::ContextManager;
 use crate::providers::StreamEvent;
@@ -204,10 +204,7 @@ async fn apply_turn_plans(
                 tracing::warn!("Plan update rejected: {}", err);
             }
             for plan in outcome.applied {
-                let _ = crate::plan::storage::PlanStorage::save_active_id(
-                    &root,
-                    Some(&plan.id),
-                );
+                let _ = crate::plan::storage::PlanStorage::save_active_id(&root, Some(&plan.id));
             }
         }
     })

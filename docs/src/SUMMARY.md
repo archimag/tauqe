@@ -10,3 +10,4 @@
 - [5. Keyboard-First Interface](ch05-interface/tui-ux.md)
 - [6. Code Review](ch06-review/review.md)
 - [7. Local Plans](ch07-plans/plans.md)
+- [8. Configuration and Project Preparation](ch08-config/configuration.md)

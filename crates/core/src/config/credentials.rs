@@ -46,20 +46,37 @@ pub(crate) fn apply_credentials(
     explicit_credentials: Option<&Path>,
     repo_root: Option<&Path>,
 ) {
-    let creds = if let Some(explicit_path) =
-        explicit_credentials.filter(|p| !p.as_os_str().is_empty())
-    {
-        match std::fs::read_to_string(explicit_path) {
-            Ok(content) => match toml::from_str::<providers::Credentials>(&content) {
-                Ok(creds) => Some(creds),
+    let creds =
+        if let Some(explicit_path) = explicit_credentials.filter(|p| !p.as_os_str().is_empty()) {
+            match std::fs::read_to_string(explicit_path) {
+                Ok(content) => match toml::from_str::<providers::Credentials>(&content) {
+                    Ok(creds) => Some(creds),
+                    Err(err) => {
+                        tracing::warn!(
+                            "Failed to parse credentials file {}: {}",
+                            explicit_path.display(),
+                            err
+                        );
+                        let msg = format!(
+                            "Failed to parse credentials file {}: {}",
+                            explicit_path.display(),
+                            err
+                        );
+                        config.config_error = match config.config_error.take() {
+                            Some(prev) => Some(format!("{}; {}", prev, msg)),
+                            None => Some(msg),
+                        };
+                        None
+                    }
+                },
                 Err(err) => {
                     tracing::warn!(
-                        "Failed to parse credentials file {}: {}",
+                        "Failed to read credentials file {}: {}",
                         explicit_path.display(),
                         err
                     );
                     let msg = format!(
-                        "Failed to parse credentials file {}: {}",
+                        "Failed to read credentials file {}: {}",
                         explicit_path.display(),
                         err
                     );
@@ -69,28 +86,10 @@ pub(crate) fn apply_credentials(
                     };
                     None
                 }
-            },
-            Err(err) => {
-                tracing::warn!(
-                    "Failed to read credentials file {}: {}",
-                    explicit_path.display(),
-                    err
-                );
-                let msg = format!(
-                    "Failed to read credentials file {}: {}",
-                    explicit_path.display(),
-                    err
-                );
-                config.config_error = match config.config_error.take() {
-                    Some(prev) => Some(format!("{}; {}", prev, msg)),
-                    None => Some(msg),
-                };
-                None
             }
-        }
-    } else {
-        providers::load_credentials(repo_root, None)
-    };
+        } else {
+            providers::load_credentials(repo_root, None)
+        };
 
     if let Some(creds) = creds {
         if let Some(or_creds) = creds.openrouter {
@@ -168,7 +167,10 @@ mod tests {
         apply_credentials(&mut config, Some(&missing), Some(temp_dir.path()));
 
         assert!(config.config_error.is_some());
-        assert!(config.config_error.unwrap().contains("Failed to read credentials file"));
+        assert!(config
+            .config_error
+            .unwrap()
+            .contains("Failed to read credentials file"));
         assert!(config.providers.openrouter.is_none());
     }
 
@@ -182,7 +184,10 @@ mod tests {
         apply_credentials(&mut config, Some(&malformed), None);
 
         assert!(config.config_error.is_some());
-        assert!(config.config_error.unwrap().contains("Failed to parse credentials file"));
+        assert!(config
+            .config_error
+            .unwrap()
+            .contains("Failed to parse credentials file"));
         assert!(config.providers.openrouter.is_none());
     }
 }

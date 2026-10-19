@@ -336,7 +336,11 @@ mod tests {
         let chord = KeyChord::Bare(KeyCode::Char('n'));
 
         assert!(chord.matches(key(KeyCode::Char('n'), KeyModifiers::NONE), &input, false));
-        assert!(!chord.matches(key(KeyCode::Char('n'), KeyModifiers::CONTROL), &input, false));
+        assert!(!chord.matches(
+            key(KeyCode::Char('n'), KeyModifiers::CONTROL),
+            &input,
+            false
+        ));
         assert!(!chord.matches(key(KeyCode::Char('n'), KeyModifiers::ALT), &input, false));
         assert!(!chord.matches(key(KeyCode::Char('p'), KeyModifiers::NONE), &input, false));
     }
@@ -448,14 +452,26 @@ mod tests {
         let input = ctrl_primary();
         let compose = KeyModifiers::CONTROL | KeyModifiers::ALT;
 
-        assert!(!KeyChord::Primary(KeyCode::Char('2'))
-            .matches(key(KeyCode::Char('2'), compose), &input, true));
-        assert!(!KeyChord::Meta(KeyCode::Char('2'))
-            .matches(key(KeyCode::Char('2'), compose), &input, true));
-        assert!(!KeyChord::Ctrl(KeyCode::Char('2'))
-            .matches(key(KeyCode::Char('2'), compose), &input, true));
-        assert!(!KeyChord::Alt(KeyCode::Char('2'))
-            .matches(key(KeyCode::Char('2'), compose), &input, true));
+        assert!(!KeyChord::Primary(KeyCode::Char('2')).matches(
+            key(KeyCode::Char('2'), compose),
+            &input,
+            true
+        ));
+        assert!(!KeyChord::Meta(KeyCode::Char('2')).matches(
+            key(KeyCode::Char('2'), compose),
+            &input,
+            true
+        ));
+        assert!(!KeyChord::Ctrl(KeyCode::Char('2')).matches(
+            key(KeyCode::Char('2'), compose),
+            &input,
+            true
+        ));
+        assert!(!KeyChord::Alt(KeyCode::Char('2')).matches(
+            key(KeyCode::Char('2'), compose),
+            &input,
+            true
+        ));
     }
 
     #[test]
@@ -463,7 +479,10 @@ mod tests {
         let ctrl = ctrl_primary();
         let (p, m) = (ctrl.primary_modifier, ctrl.meta_modifier);
 
-        assert_eq!(KeyChord::Primary(KeyCode::Char('s')).display(p, m), "Ctrl+S");
+        assert_eq!(
+            KeyChord::Primary(KeyCode::Char('s')).display(p, m),
+            "Ctrl+S"
+        );
         assert_eq!(KeyChord::Meta(KeyCode::Char('s')).display(p, m), "Alt+S");
         assert_eq!(
             KeyChord::PrimaryOrMeta(KeyCode::Char('s')).display(p, m),
@@ -477,7 +496,10 @@ mod tests {
 
         let alt = alt_primary();
         let (ap, am) = (alt.primary_modifier, alt.meta_modifier);
-        assert_eq!(KeyChord::Primary(KeyCode::Char('s')).display(ap, am), "Alt+S");
+        assert_eq!(
+            KeyChord::Primary(KeyCode::Char('s')).display(ap, am),
+            "Alt+S"
+        );
         assert_eq!(KeyChord::Meta(KeyCode::Char('s')).display(ap, am), "Ctrl+S");
     }
 
@@ -588,7 +610,10 @@ mod tests {
     /// source of truth (c-1).
     fn assert_unique_chords<A: 'static>(map: &CommandMap<A>, label: &str) {
         let specs = map.specs();
-        assert!(!specs.is_empty(), "{label}: a command map must not be empty");
+        assert!(
+            !specs.is_empty(),
+            "{label}: a command map must not be empty"
+        );
         for (index, spec) in specs.iter().enumerate() {
             for other in specs.iter().skip(index + 1) {
                 assert_ne!(
@@ -721,11 +746,7 @@ mod tests {
             .map(|item| item.key)
             .collect();
 
-        fn assert_keys<A: 'static>(
-            map: &CommandMap<A>,
-            catalog: &HashSet<String>,
-            label: &str,
-        ) {
+        fn assert_keys<A: 'static>(map: &CommandMap<A>, catalog: &HashSet<String>, label: &str) {
             for spec in map.specs() {
                 assert!(
                     catalog.contains(spec.description_key),
@@ -808,29 +829,49 @@ mod tests {
         let input = ctrl_primary();
 
         assert_eq!(
-            resolve_action(&PLANS_COMMAND_MAP, key(KeyCode::Char('x'), KeyModifiers::NONE), &input),
+            resolve_action(
+                &PLANS_COMMAND_MAP,
+                key(KeyCode::Char('x'), KeyModifiers::NONE),
+                &input
+            ),
             Some(PlansAction::Execute),
             "x must execute the selected plan step"
         );
         assert_eq!(
-            resolve_action(&PLANS_COMMAND_MAP, key(KeyCode::Char('X'), KeyModifiers::NONE), &input),
+            resolve_action(
+                &PLANS_COMMAND_MAP,
+                key(KeyCode::Char('X'), KeyModifiers::NONE),
+                &input
+            ),
             Some(PlansAction::ExecuteAll),
             "X must execute the plan batch"
         );
 
         assert_eq!(
-            resolve_action(&REVIEW_COMMAND_MAP, key(KeyCode::Char('x'), KeyModifiers::NONE), &input),
+            resolve_action(
+                &REVIEW_COMMAND_MAP,
+                key(KeyCode::Char('x'), KeyModifiers::NONE),
+                &input
+            ),
             Some(ReviewAction::Execute),
             "x must execute the selected finding"
         );
         assert_eq!(
-            resolve_action(&REVIEW_COMMAND_MAP, key(KeyCode::Char('X'), KeyModifiers::NONE), &input),
+            resolve_action(
+                &REVIEW_COMMAND_MAP,
+                key(KeyCode::Char('X'), KeyModifiers::NONE),
+                &input
+            ),
             Some(ReviewAction::ExecuteAll),
             "X must execute the review batch"
         );
 
         assert_eq!(
-            resolve_action(&CONTEXT_COMMAND_MAP, key(KeyCode::Char('x'), KeyModifiers::NONE), &input),
+            resolve_action(
+                &CONTEXT_COMMAND_MAP,
+                key(KeyCode::Char('x'), KeyModifiers::NONE),
+                &input
+            ),
             None,
             "x must never be bound in the Context view"
         );
@@ -841,23 +882,39 @@ mod tests {
         let input = ctrl_primary();
 
         assert_eq!(
-            resolve_action(&PLANS_COMMAND_MAP, key(KeyCode::Char('r'), KeyModifiers::NONE), &input),
+            resolve_action(
+                &PLANS_COMMAND_MAP,
+                key(KeyCode::Char('r'), KeyModifiers::NONE),
+                &input
+            ),
             Some(PlansAction::Replan),
             "lowercase r must refine the selected plan horizon"
         );
         assert_eq!(
-            resolve_action(&PLANS_COMMAND_MAP, key(KeyCode::Char('R'), KeyModifiers::NONE), &input),
+            resolve_action(
+                &PLANS_COMMAND_MAP,
+                key(KeyCode::Char('R'), KeyModifiers::NONE),
+                &input
+            ),
             Some(PlansAction::ReplanAll),
             "uppercase R must replan every blocked step"
         );
 
         assert_eq!(
-            resolve_action(&REVIEW_COMMAND_MAP, key(KeyCode::Char('r'), KeyModifiers::NONE), &input),
+            resolve_action(
+                &REVIEW_COMMAND_MAP,
+                key(KeyCode::Char('r'), KeyModifiers::NONE),
+                &input
+            ),
             Some(ReviewAction::Refine),
             "lowercase r must decompose the selected finding"
         );
         assert_eq!(
-            resolve_action(&REVIEW_COMMAND_MAP, key(KeyCode::Char('R'), KeyModifiers::NONE), &input),
+            resolve_action(
+                &REVIEW_COMMAND_MAP,
+                key(KeyCode::Char('R'), KeyModifiers::NONE),
+                &input
+            ),
             Some(ReviewAction::RefineAll),
             "uppercase R must decompose every awaiting finding"
         );
@@ -867,7 +924,11 @@ mod tests {
     fn shift_n_starts_a_new_review_session() {
         let input = ctrl_primary();
         assert_eq!(
-            resolve_action(&REVIEW_COMMAND_MAP, key(KeyCode::Char('N'), KeyModifiers::NONE), &input),
+            resolve_action(
+                &REVIEW_COMMAND_MAP,
+                key(KeyCode::Char('N'), KeyModifiers::NONE),
+                &input
+            ),
             Some(ReviewAction::RunReview),
             "uppercase N must start a new review session"
         );
@@ -953,17 +1014,17 @@ mod tests {
     /// against every specification and fails when two specs with different
     /// actions both match, which is exactly the ambiguity that makes a command
     /// map order-dependent and lets one key silently shadow another (c-2).
-    fn assert_no_key_event_collisions<A>(
-        map: &CommandMap<A>,
-        input: &InputConfig,
-        label: &str,
-    ) where
+    fn assert_no_key_event_collisions<A>(map: &CommandMap<A>, input: &InputConfig, label: &str)
+    where
         A: Copy + PartialEq + std::fmt::Debug + 'static,
     {
         for (code, modifiers) in key_event_matrix() {
             let mut claimed: Option<&'static CommandSpec<A>> = None;
             for spec in map.specs() {
-                if !spec.chord.matches(KeyEvent::new(code, modifiers), input, false) {
+                if !spec
+                    .chord
+                    .matches(KeyEvent::new(code, modifiers), input, false)
+                {
                     continue;
                 }
                 match claimed {

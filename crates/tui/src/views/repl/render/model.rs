@@ -1,7 +1,7 @@
-use ratatui::style::{Style, Stylize};
-use ratatui::text::{Line, Span};
 use crate::theme::engine::current_engine;
 use crate::ui::format::format_tokens;
+use ratatui::style::{Style, Stylize};
+use ratatui::text::{Line, Span};
 
 use super::super::state::{EditOp, FileEditStatus, ReplView, ToolchainState};
 use super::indicator_style;
@@ -152,9 +152,7 @@ pub fn compute_model_lines(model: &mut ReplView) -> Vec<Line<'static>> {
                 EditOp::Create => ("[NEW] ", engine.fg(palette.status_success).bold()),
                 EditOp::Delete => ("[DEL] ", engine.fg(palette.status_error).bold()),
                 EditOp::Move => ("[MOVE] ", engine.fg(palette.status_info).bold()),
-                EditOp::Overwrite => {
-                    ("[OVERWRITE] ", engine.fg(palette.status_warning).bold())
-                }
+                EditOp::Overwrite => ("[OVERWRITE] ", engine.fg(palette.status_warning).bold()),
                 EditOp::Replace => ("[EDIT] ", engine.fg(palette.button_active_bg).bold()),
             };
 
@@ -197,10 +195,7 @@ pub fn compute_model_lines(model: &mut ReplView) -> Vec<Line<'static>> {
                 Span::styled(op_label, op_style),
                 Span::styled(file.path.clone(), Style::default().bold()),
                 Span::raw(" "),
-                Span::styled(
-                    format!("({})", hunk_label),
-                    engine.fg(palette.text_muted),
-                ),
+                Span::styled(format!("({})", hunk_label), engine.fg(palette.text_muted)),
                 Span::raw(" "),
                 Span::styled(status_icon, status_style),
             ];
@@ -291,7 +286,7 @@ pub fn compute_model_lines(model: &mut ReplView) -> Vec<Line<'static>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tauqe_protocol::model::UsageTotals;
+    use tauqe_protocol::model::{UsageTotals, UsageTotalsSnapshot};
 
     #[test]
     fn test_compute_model_lines_empty_when_splash_visible() {
@@ -313,11 +308,7 @@ mod tests {
         assert!(!model.splash_visible());
         let lines = compute_model_lines(&mut model);
         assert!(!lines.is_empty());
-        let rendered: String = lines[0]
-            .spans
-            .iter()
-            .map(|s| s.content.as_ref())
-            .collect();
+        let rendered: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(rendered, "Hello from model");
     }
 
@@ -330,9 +321,10 @@ mod tests {
         assert!(!model.splash_visible());
         let lines = compute_model_lines(&mut model);
         assert!(!lines.is_empty());
-        assert!(lines
+        assert!(lines.iter().any(|l| l
+            .spans
             .iter()
-            .any(|l| l.spans.iter().any(|s| s.content.contains("Failed to connect"))));
+            .any(|s| s.content.contains("Failed to connect"))));
     }
 
     #[test]
@@ -373,6 +365,7 @@ mod tests {
                 ..UsageTotals::default()
             }),
             operations: 1,
+            ..UsageTotalsSnapshot::default()
         };
 
         let lines = compute_model_lines(&mut model);

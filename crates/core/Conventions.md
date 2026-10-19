@@ -151,3 +151,52 @@ The interaction protocol between Tauqe and large language models is strictly div
      milliseconds. Running it inline on the executor thread freezes the bounded
      turn, provider streaming, and RPC handling. Offloading the call keeps the
      runtime responsive without introducing background state.
+
+---
+
+## 9. Prompt Architecture and Provider Prefix Caching Invariant
+
+1. **Single Static Prefix:**
+   - Every bounded turn assembles the system prompt as one monolithic static
+     prefix that is byte-for-byte identical from one round of the turn to the
+     next.
+   - Modern LLM providers cache the shared token prefix of consecutive
+     requests. Any byte that changes inside the prefix invalidates the whole
+     cached prefix and forces a full reprocessing pass, multiplying latency
+     and cost on every discovery and healing round.
+2. **Frozen Block Order:**
+   - The blocks of the stable prefix are rendered in a fixed order: the Core
+     System Contract, the repository outline (symbol map or directory tree,
+     never both), the session history, the context files in insertion order,
+     the active plan, and the language directive.
+   - A block never moves relative to its neighbors. When a caller must render
+     an additional block, it appends that block after the existing stable
+     blocks, never between them.
+3. **Deterministic Rendering:**
+   - The prefix carries no runtime-varying content: no timestamps, no dates,
+     no random or per-request identifiers, no context revision counters, no
+     counters or latencies, and no toolchain output.
+   - Every collection rendered into the prefix keeps a deterministic order
+     (context files in insertion order, symbols and directories in their
+     generated order), so identical state produces identical bytes.
+4. **Append-Only Context:**
+   - Discovery widens the context by appending newly discovered files at the
+     end of the existing `<context>` block. Previously rendered files keep
+     their exact bytes.
+   - Promoting a file from read-only to editable rewrites only that file's own
+     `access` attribute in place; it never relocates the file or reflows its
+     neighbors.
+5. **Isolated Volatile Tail:**
+   - All genuinely round-varying content is confined to the end of the message
+     sequence: the turn scratchpad is appended after the whole stable prefix,
+     and round-specific diagnostics (patch retry reports, verification
+     failures) travel as append-only extensions of the user message.
+   - Nothing volatile is ever injected into an earlier block, because an early
+     insertion invalidates every cached token that follows it.
+6. **Rationale (Why):**
+   - A bounded turn issues several requests per turn: discovery rounds, the
+     proposal, staging retries, and verification healing. Reusing the
+     provider's cached prefix across those requests removes the dominant
+     repeated cost and keeps multi-round turns economically viable.
+   - The invariant is only effective when it holds byte-for-byte, so any
+     dynamic content or reordering silently defeats it.

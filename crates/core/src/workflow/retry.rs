@@ -72,7 +72,9 @@ pub fn build_patch_retry_prompt(
     if failed_files.is_empty() {
         prompt.push_str("\nPlease provide corrected edit blocks strictly following the required protocol format.");
     } else {
-        prompt.push_str("\nPlease provide corrected edit blocks ONLY for the failed files listed above.");
+        prompt.push_str(
+            "\nPlease provide corrected edit blocks ONLY for the failed files listed above.",
+        );
     }
     if let Some(lang) = target_language {
         prompt.push_str(&format!(
@@ -96,12 +98,18 @@ pub fn retain_retried_failed_files(
             | EditOperation::Create { path, .. }
             | EditOperation::Delete { path }
             | EditOperation::Overwrite { path, .. } => {
-                let clean = context_manager.normalize_path(path).unwrap_or_else(|_| path.clone());
+                let clean = context_manager
+                    .normalize_path(path)
+                    .unwrap_or_else(|_| path.clone());
                 retried_paths.insert(clean);
             }
             EditOperation::Move { from, to } => {
-                let clean_from = context_manager.normalize_path(from).unwrap_or_else(|_| from.clone());
-                let clean_to = context_manager.normalize_path(to).unwrap_or_else(|_| to.clone());
+                let clean_from = context_manager
+                    .normalize_path(from)
+                    .unwrap_or_else(|_| from.clone());
+                let clean_to = context_manager
+                    .normalize_path(to)
+                    .unwrap_or_else(|_| to.clone());
                 retried_paths.insert(clean_from);
                 retried_paths.insert(clean_to);
             }
@@ -225,7 +233,12 @@ mod tests {
         let cm = ContextManager::new(dir.path().to_path_buf());
         let mut failed = HashMap::new();
         failed.insert("a.rs".to_string(), EditError::ReadOnly("a.rs".to_string()));
-        failed.insert("b.rs".to_string(), EditError::NoMatch { path: "b.rs".to_string() });
+        failed.insert(
+            "b.rs".to_string(),
+            EditError::NoMatch {
+                path: "b.rs".to_string(),
+            },
+        );
 
         let edits = vec![EditOperation::Replace {
             path: "b.rs".to_string(),

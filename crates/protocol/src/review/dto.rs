@@ -86,7 +86,11 @@ pub struct ReviewUpdateItemParams {
     ///
     /// Serialized as `note`; the legacy `resolution_notes` key is still
     /// accepted on read so older clients keep updating findings unchanged.
-    #[serde(default, alias = "resolution_notes", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        alias = "resolution_notes",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub note: Option<String>,
 }
 

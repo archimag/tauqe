@@ -429,7 +429,10 @@ mod tests {
         assert!(matches_glob_pattern("src/**/", "src/a/b.rs"));
         assert!(matches_glob_pattern("src/**/", "src/lib.rs"));
         assert!(!matches_glob_pattern("src/**/", "src"));
-        assert!(matches_glob_pattern("crates/*/", "crates/protocol/src/lib.rs"));
+        assert!(matches_glob_pattern(
+            "crates/*/",
+            "crates/protocol/src/lib.rs"
+        ));
         assert!(matches_glob_pattern("crates/*/", "crates/foo/Cargo.toml"));
         assert!(!matches_glob_pattern("crates/*/", "crates/foo"));
         assert!(!matches_glob_pattern("crates/*/", "crates"));
@@ -450,7 +453,13 @@ mod tests {
 
     #[test]
     fn test_compiled_pattern_matches_like_wrapper() {
-        let patterns = ["src/*.rs", "**/test.rs", "crates/*/", "build*", "src/lib.rs"];
+        let patterns = [
+            "src/*.rs",
+            "**/test.rs",
+            "crates/*/",
+            "build*",
+            "src/lib.rs",
+        ];
         let paths = [
             "src/lib.rs",
             "src/main.rs",

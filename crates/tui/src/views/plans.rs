@@ -166,11 +166,7 @@ pub struct PlanRefineDialogState {
 impl PlanRefineDialogState {
     /// Builds a plan refinement dialog selecting among the configured
     /// `architect_entries` for the Architect role.
-    pub fn new(
-        plan_id: String,
-        plan_title: String,
-        architect_entries: Vec<ModelEntry>,
-    ) -> Self {
+    pub fn new(plan_id: String, plan_title: String, architect_entries: Vec<ModelEntry>) -> Self {
         Self {
             plan_id,
             plan_title,
@@ -204,9 +200,7 @@ pub fn architect_entries(st: &AppState) -> Vec<ModelEntry> {
         .unwrap_or_else(|| {
             let fallback_model = st
                 .model_choice
-                .resolve(&tauqe_protocol::ModelSelection::Role(
-                    ModelRole::Architect,
-                ))
+                .resolve(&tauqe_protocol::ModelSelection::Role(ModelRole::Architect))
                 .unwrap_or_else(|| st.active_model.clone());
             let fallback_effort = st
                 .model_choice
@@ -259,7 +253,9 @@ impl PlansViewState {
     }
 
     pub fn is_concept_section_expanded(&self, plan_id: &str) -> bool {
-        !self.collapsed_sections.contains(&format!("concept:{}", plan_id))
+        !self
+            .collapsed_sections
+            .contains(&format!("concept:{}", plan_id))
     }
 
     pub fn toggle_concept_section_expanded(&mut self, plan_id: &str) {
@@ -270,7 +266,9 @@ impl PlansViewState {
     }
 
     pub fn is_impl_section_expanded(&self, plan_id: &str) -> bool {
-        !self.collapsed_sections.contains(&format!("impl:{}", plan_id))
+        !self
+            .collapsed_sections
+            .contains(&format!("impl:{}", plan_id))
     }
 
     pub fn toggle_impl_section_expanded(&mut self, plan_id: &str) {
@@ -281,7 +279,8 @@ impl PlansViewState {
     }
 
     pub fn is_concept_item_expanded(&self, plan_id: &str, item_id: &str) -> bool {
-        self.expanded_items.contains(&format!("c:{}:{}", plan_id, item_id))
+        self.expanded_items
+            .contains(&format!("c:{}:{}", plan_id, item_id))
     }
 
     pub fn toggle_concept_item_expanded(&mut self, plan_id: &str, item_id: &str) {
@@ -292,7 +291,8 @@ impl PlansViewState {
     }
 
     pub fn is_item_expanded(&self, plan_id: &str, item_id: &str) -> bool {
-        self.expanded_items.contains(&format!("{}:{}", plan_id, item_id))
+        self.expanded_items
+            .contains(&format!("{}:{}", plan_id, item_id))
     }
 
     pub fn toggle_item_expanded(&mut self, plan_id: &str, item_id: &str) {
@@ -304,7 +304,10 @@ impl PlansViewState {
 
     pub fn is_all_expanded(&self) -> bool {
         !self.plans.is_empty()
-            && self.plans.iter().all(|p| self.expanded_plans.contains(&p.id))
+            && self
+                .plans
+                .iter()
+                .all(|p| self.expanded_plans.contains(&p.id))
             && self.collapsed_sections.is_empty()
     }
 
@@ -367,9 +370,7 @@ impl PlansViewState {
             DiscussionFocus::Focused {
                 target: DiscussionTarget::Plan { id },
                 focused_items,
-            } if id.as_str() == plan_id => {
-                focused_items.iter().any(|fid| fid.as_str() == item_id)
-            }
+            } if id.as_str() == plan_id => focused_items.iter().any(|fid| fid.as_str() == item_id),
             _ => false,
         }
     }
@@ -437,7 +438,11 @@ impl PlansViewState {
         out: &mut Vec<VisiblePlanRow>,
     ) {
         let has_children = !item.children.is_empty();
-        let has_details = item.details.as_deref().map(|s| !s.trim().is_empty()).unwrap_or(false);
+        let has_details = item
+            .details
+            .as_deref()
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false);
         let is_expandable = has_children || has_details;
         let is_expanded = self.is_concept_item_expanded(plan_id, &item.id);
 
@@ -469,7 +474,11 @@ impl PlansViewState {
         out: &mut Vec<VisiblePlanRow>,
     ) {
         let has_children = !item.children.is_empty();
-        let has_details = item.details.as_deref().map(|s| !s.trim().is_empty()).unwrap_or(false);
+        let has_details = item
+            .details
+            .as_deref()
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false);
         let has_meta = !item.files.is_empty()
             || !item.readonly_files.is_empty()
             || !item.concept_refs.is_empty();
@@ -591,8 +600,11 @@ impl PlansViewState {
             out: &mut Vec<PlanNodeRef>,
         ) {
             if item.children.is_empty() {
-                let has_details =
-                    item.details.as_deref().map(|s| !s.trim().is_empty()).unwrap_or(false);
+                let has_details = item
+                    .details
+                    .as_deref()
+                    .map(|s| !s.trim().is_empty())
+                    .unwrap_or(false);
                 out.push(PlanNodeRef {
                     plan_id: plan_id.to_string(),
                     item_id: Some(item.id.clone()),
@@ -616,8 +628,11 @@ impl PlansViewState {
             out: &mut Vec<PlanNodeRef>,
         ) {
             if item.children.is_empty() {
-                let has_details =
-                    item.details.as_deref().map(|s| !s.trim().is_empty()).unwrap_or(false);
+                let has_details = item
+                    .details
+                    .as_deref()
+                    .map(|s| !s.trim().is_empty())
+                    .unwrap_or(false);
                 let has_meta = !item.files.is_empty()
                     || !item.readonly_files.is_empty()
                     || !item.concept_refs.is_empty();
@@ -675,12 +690,20 @@ impl PlansViewState {
 
         let sel_row = self.selected_row();
         let target_idx = match sel_row {
-            Some(VisiblePlanRow::ConceptItem { ref plan_id, ref item_id, .. }) => {
+            Some(VisiblePlanRow::ConceptItem {
+                ref plan_id,
+                ref item_id,
+                ..
+            }) => {
                 if let Some(pos) = leaves.iter().position(|l| {
                     l.plan_id == *plan_id && l.is_concept && l.item_id.as_deref() == Some(item_id)
                 }) {
                     if forward {
-                        if pos + 1 < leaves.len() { pos + 1 } else { return; }
+                        if pos + 1 < leaves.len() {
+                            pos + 1
+                        } else {
+                            return;
+                        }
                     } else if pos > 0 {
                         pos - 1
                     } else {
@@ -693,20 +716,36 @@ impl PlansViewState {
                             && l.ancestor_item_ids.iter().any(|a| a == item_id)
                     });
                     if forward {
-                        if let Some(first) = first_descendant { first } else { return; }
+                        if let Some(first) = first_descendant {
+                            first
+                        } else {
+                            return;
+                        }
                     } else if let Some(first) = first_descendant {
-                        if first > 0 { first - 1 } else { return; }
+                        if first > 0 {
+                            first - 1
+                        } else {
+                            return;
+                        }
                     } else {
                         return;
                     }
                 }
             }
-            Some(VisiblePlanRow::PlanItem { ref plan_id, ref item_id, .. }) => {
+            Some(VisiblePlanRow::PlanItem {
+                ref plan_id,
+                ref item_id,
+                ..
+            }) => {
                 if let Some(pos) = leaves.iter().position(|l| {
                     l.plan_id == *plan_id && !l.is_concept && l.item_id.as_deref() == Some(item_id)
                 }) {
                     if forward {
-                        if pos + 1 < leaves.len() { pos + 1 } else { return; }
+                        if pos + 1 < leaves.len() {
+                            pos + 1
+                        } else {
+                            return;
+                        }
                     } else if pos > 0 {
                         pos - 1
                     } else {
@@ -719,9 +758,17 @@ impl PlansViewState {
                             && l.ancestor_item_ids.iter().any(|a| a == item_id)
                     });
                     if forward {
-                        if let Some(first) = first_descendant { first } else { return; }
+                        if let Some(first) = first_descendant {
+                            first
+                        } else {
+                            return;
+                        }
                     } else if let Some(first) = first_descendant {
-                        if first > 0 { first - 1 } else { return; }
+                        if first > 0 {
+                            first - 1
+                        } else {
+                            return;
+                        }
                     } else {
                         return;
                     }
@@ -766,15 +813,27 @@ impl PlansViewState {
             Some(VisiblePlanRow::PlanHeader { ref plan_id, .. }) => {
                 let first_in_plan = leaves.iter().position(|l| l.plan_id == *plan_id);
                 if forward {
-                    if let Some(first) = first_in_plan { first } else { return; }
+                    if let Some(first) = first_in_plan {
+                        first
+                    } else {
+                        return;
+                    }
                 } else if let Some(first) = first_in_plan {
-                    if first > 0 { first - 1 } else { return; }
+                    if first > 0 {
+                        first - 1
+                    } else {
+                        return;
+                    }
                 } else {
                     return;
                 }
             }
             None => {
-                if forward { 0 } else { leaves.len().saturating_sub(1) }
+                if forward {
+                    0
+                } else {
+                    leaves.len().saturating_sub(1)
+                }
             }
         };
 
@@ -809,16 +868,27 @@ impl PlansViewState {
         }
 
         let rows = self.flatten_rows();
-        if let Some(pos) = rows.iter().position(|r| match (r, &target.item_id, target.is_concept) {
-            (VisiblePlanRow::PlanHeader { plan_id, .. }, None, _) => plan_id == &target.plan_id,
-            (VisiblePlanRow::ConceptItem { plan_id, item_id, .. }, Some(tid), true) => {
-                plan_id == &target.plan_id && item_id == tid
-            }
-            (VisiblePlanRow::PlanItem { plan_id, item_id, .. }, Some(tid), false) => {
-                plan_id == &target.plan_id && item_id == tid
-            }
-            _ => false,
-        }) {
+        if let Some(pos) = rows
+            .iter()
+            .position(|r| match (r, &target.item_id, target.is_concept) {
+                (VisiblePlanRow::PlanHeader { plan_id, .. }, None, _) => plan_id == &target.plan_id,
+                (
+                    VisiblePlanRow::ConceptItem {
+                        plan_id, item_id, ..
+                    },
+                    Some(tid),
+                    true,
+                ) => plan_id == &target.plan_id && item_id == tid,
+                (
+                    VisiblePlanRow::PlanItem {
+                        plan_id, item_id, ..
+                    },
+                    Some(tid),
+                    false,
+                ) => plan_id == &target.plan_id && item_id == tid,
+                _ => false,
+            })
+        {
             self.selected_index = pos;
         }
 
@@ -908,7 +978,8 @@ pub fn architect_badge(tier: &ArchitectTier) -> Span<'static> {
 fn pad_line_to_width(mut line: Line<'static>, width: usize, fill_style: Style) -> Line<'static> {
     let current_width: usize = line.spans.iter().map(|s| s.width()).sum();
     if current_width < width {
-        line.spans.push(Span::styled(" ".repeat(width - current_width), fill_style));
+        line.spans
+            .push(Span::styled(" ".repeat(width - current_width), fill_style));
     }
     line
 }
@@ -1070,9 +1141,7 @@ fn compute_unified_plan_lines(
                 }
             }
             VisiblePlanRow::ConceptHeader {
-                count,
-                is_expanded,
-                ..
+                count, is_expanded, ..
             } => {
                 let fold_icon = if *is_expanded { "▼ " } else { "▶ " };
                 let spans = vec![
@@ -1121,7 +1190,11 @@ fn compute_unified_plan_lines(
             } => {
                 let indent = plan_indent(*depth);
                 let fold_icon = if *is_expandable {
-                    if *is_expanded { "▼ " } else { "▶ " }
+                    if *is_expanded {
+                        "▼ "
+                    } else {
+                        "▶ "
+                    }
                 } else if is_selected {
                     "▶ "
                 } else {
@@ -1242,7 +1315,11 @@ fn compute_unified_plan_lines(
                 let body_prefix = format!("{}│ ", plan_body_indent(*depth + 1));
 
                 let fold_icon = if *is_expandable {
-                    if *is_expanded { "▼ " } else { "▶ " }
+                    if *is_expanded {
+                        "▼ "
+                    } else {
+                        "▶ "
+                    }
                 } else if is_selected {
                     "▶ "
                 } else if *status == PlanItemStatus::Discussion {
@@ -1310,33 +1387,21 @@ fn compute_unified_plan_lines(
                 if *is_expanded {
                     if !*has_children && !files.is_empty() {
                         row_lines.push(Line::from(vec![
-                            Span::styled(
-                                body_prefix.clone(),
-                                engine.fg(palette.text_muted),
-                            ),
+                            Span::styled(body_prefix.clone(), engine.fg(palette.text_muted)),
                             Span::styled("files: ", engine.fg(palette.text_muted)),
                             Span::styled(files.join(", "), engine.fg(palette.status_info)),
                         ]));
                     }
                     if !*has_children && !readonly_files.is_empty() {
                         row_lines.push(Line::from(vec![
-                            Span::styled(
-                                body_prefix.clone(),
-                                engine.fg(palette.text_muted),
-                            ),
+                            Span::styled(body_prefix.clone(), engine.fg(palette.text_muted)),
                             Span::styled("ref: ", engine.fg(palette.text_muted)),
-                            Span::styled(
-                                readonly_files.join(", "),
-                                engine.fg(palette.status_info),
-                            ),
+                            Span::styled(readonly_files.join(", "), engine.fg(palette.status_info)),
                         ]));
                     }
                     if !concept_refs.is_empty() {
                         row_lines.push(Line::from(vec![
-                            Span::styled(
-                                body_prefix.clone(),
-                                engine.fg(palette.text_muted),
-                            ),
+                            Span::styled(body_prefix.clone(), engine.fg(palette.text_muted)),
                             Span::styled("concept: ", engine.fg(palette.text_muted)),
                             Span::styled(
                                 concept_refs.join(", "),
@@ -1436,7 +1501,13 @@ mod tests {
         assert!(!view.is_plan_expanded("test-plan"));
         let rows = view.flatten_rows();
         assert_eq!(rows.len(), 1);
-        assert!(matches!(rows[0], VisiblePlanRow::PlanHeader { is_expanded: false, .. }));
+        assert!(matches!(
+            rows[0],
+            VisiblePlanRow::PlanHeader {
+                is_expanded: false,
+                ..
+            }
+        ));
 
         // Toggle expands the plan
         view.toggle_plan_expanded("test-plan");
@@ -1490,17 +1561,40 @@ mod tests {
         // PlanHeader, ConceptHeader, ConceptItem, ImplementationHeader, PlanItem
         assert_eq!(rows.len(), 5);
         assert!(matches!(rows[0], VisiblePlanRow::PlanHeader { .. }));
-        assert!(matches!(rows[1], VisiblePlanRow::ConceptHeader { count: 1, is_expanded: true, .. }));
-        assert!(matches!(rows[2], VisiblePlanRow::ConceptItem { ref item_id, .. } if item_id == "c-1"));
-        assert!(matches!(rows[3], VisiblePlanRow::ImplementationHeader { is_expanded: true, .. }));
-        assert!(matches!(rows[4], VisiblePlanRow::PlanItem { ref item_id, .. } if item_id == "s-1"));
+        assert!(matches!(
+            rows[1],
+            VisiblePlanRow::ConceptHeader {
+                count: 1,
+                is_expanded: true,
+                ..
+            }
+        ));
+        assert!(
+            matches!(rows[2], VisiblePlanRow::ConceptItem { ref item_id, .. } if item_id == "c-1")
+        );
+        assert!(matches!(
+            rows[3],
+            VisiblePlanRow::ImplementationHeader {
+                is_expanded: true,
+                ..
+            }
+        ));
+        assert!(
+            matches!(rows[4], VisiblePlanRow::PlanItem { ref item_id, .. } if item_id == "s-1")
+        );
 
         // Toggle collapse concept section
         view.toggle_concept_section_expanded("auth-feature");
         let rows_collapsed_concept = view.flatten_rows();
         // PlanHeader, ConceptHeader (collapsed), ImplementationHeader, PlanItem
         assert_eq!(rows_collapsed_concept.len(), 4);
-        assert!(matches!(rows_collapsed_concept[1], VisiblePlanRow::ConceptHeader { is_expanded: false, .. }));
+        assert!(matches!(
+            rows_collapsed_concept[1],
+            VisiblePlanRow::ConceptHeader {
+                is_expanded: false,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -1549,7 +1643,11 @@ mod tests {
             }
         }
 
-        assert!(text.contains("Leaf Task"), "leaf row should render: {}", text);
+        assert!(
+            text.contains("Leaf Task"),
+            "leaf row should render: {}",
+            text
+        );
         // Exactly one file badge: the leaf task. The parent phase carries a
         // non-empty `files` list in memory but must never render a badge.
         assert_eq!(
@@ -1577,7 +1675,10 @@ mod tests {
                 details: None,
                 status: PlanItemStatus::Todo,
                 files: vec!["src/auth.rs".to_string()],
-                readonly_files: vec!["contracts/api.md".to_string(), "contracts/types.rs".to_string()],
+                readonly_files: vec![
+                    "contracts/api.md".to_string(),
+                    "contracts/types.rs".to_string(),
+                ],
                 concept_refs: vec![],
                 depends_on: vec![],
                 children: vec![],
@@ -1601,7 +1702,11 @@ mod tests {
             "badge should count target and reference files: {}",
             text
         );
-        assert!(text.contains("files: src/auth.rs"), "target files line: {}", text);
+        assert!(
+            text.contains("files: src/auth.rs"),
+            "target files line: {}",
+            text
+        );
         assert!(
             text.contains("ref: contracts/api.md, contracts/types.rs"),
             "reference files line: {}",
@@ -1794,7 +1899,9 @@ mod tests {
         view.selected_index = view
             .flatten_rows()
             .iter()
-            .position(|r| matches!(r, VisiblePlanRow::ConceptItem { item_id, .. } if item_id == "c-1"))
+            .position(
+                |r| matches!(r, VisiblePlanRow::ConceptItem { item_id, .. } if item_id == "c-1"),
+            )
             .expect("concept leaf present");
         view.accordion_navigate(true);
         assert!(matches!(
@@ -1853,7 +1960,8 @@ mod tests {
     }
 
     #[test]
-    fn test_accordion_from_implementation_header_with_empty_implementation_reaches_last_concept_leaf() {
+    fn test_accordion_from_implementation_header_with_empty_implementation_reaches_last_concept_leaf(
+    ) {
         let mut view = PlansViewState::default();
         let plan = Plan {
             id: "concept-only".to_string(),
@@ -1958,7 +2066,11 @@ mod tests {
                 text.push_str(&span.content);
             }
         }
-        assert!(text.contains("[FOCUS]"), "focus badge should render: {}", text);
+        assert!(
+            text.contains("[FOCUS]"),
+            "focus badge should render: {}",
+            text
+        );
     }
 
     #[test]
@@ -2262,8 +2374,7 @@ mod tests {
         let header = leading_indent(&lines[find_line(&lines, "[state-plan]")]);
         let concept_section = leading_indent(&lines[find_line(&lines, "Architectural Intent")]);
         let concept = leading_indent(&lines[find_line(&lines, "#c-1 Invariant")]);
-        let nested_concept =
-            leading_indent(&lines[find_line(&lines, "#c-1.1 Nested Invariant")]);
+        let nested_concept = leading_indent(&lines[find_line(&lines, "#c-1.1 Nested Invariant")]);
         let step = leading_indent(&lines[find_line(&lines, "#1 Parent Step")]);
         let leaf = leading_indent(&lines[find_line(&lines, "#1.1 Leaf Step")]);
 

@@ -17,15 +17,33 @@ use crate::ui::centered_rect;
 /// Commands shown on the Setup (onboarding) tab.
 pub const ONBOARDING_COMMANDS: &[crate::app::KeyCommand] = &[
     // Core Actions: the primary work cycle.
-    crate::app::KeyCommand { key: "Enter", description: "Execute selected onboarding action" },
+    crate::app::KeyCommand {
+        key: "Enter",
+        description: "Execute selected onboarding action",
+    },
     // Navigation & Inspection.
-    crate::app::KeyCommand { key: "Esc", description: "Exit help dialog" },
-    crate::app::KeyCommand { key: "C-R", description: "Show / hide entered key" },
+    crate::app::KeyCommand {
+        key: "Esc",
+        description: "Exit help dialog",
+    },
+    crate::app::KeyCommand {
+        key: "C-R",
+        description: "Show / hide entered key",
+    },
     // Editing & Clipboard.
-    crate::app::KeyCommand { key: "C-V", description: "Paste API key from clipboard" },
-    crate::app::KeyCommand { key: "C-U", description: "Clear key input buffer" },
+    crate::app::KeyCommand {
+        key: "C-V",
+        description: "Paste API key from clipboard",
+    },
+    crate::app::KeyCommand {
+        key: "C-U",
+        description: "Clear key input buffer",
+    },
     // Auxiliary & Destructive.
-    crate::app::KeyCommand { key: "C-O", description: "Reload configuration from disk" },
+    crate::app::KeyCommand {
+        key: "C-O",
+        description: "Reload configuration from disk",
+    },
 ];
 
 /// One rendered help command: the projected chord label and its description.
@@ -278,7 +296,10 @@ fn render_help_tab_bar(
 ) {
     let palette = engine.palette();
     let mut spans: Vec<Span> = Vec::new();
-    for (index, tab) in [HelpTab::Global, HelpTab::CurrentMode, HelpTab::TextEditor].iter().enumerate() {
+    for (index, tab) in [HelpTab::Global, HelpTab::CurrentMode, HelpTab::TextEditor]
+        .iter()
+        .enumerate()
+    {
         if index > 0 {
             spans.push(Span::raw("    "));
         }
@@ -349,12 +370,7 @@ pub fn help_tab_geometry(term: Rect) -> HelpTabGeometry {
 
     let global_tab = Rect::new(start, y, widths[0], 1);
     let current_mode_tab = Rect::new(start + widths[0] + gap, y, widths[1], 1);
-    let text_editor_tab = Rect::new(
-        start + widths[0] + gap + widths[1] + gap,
-        y,
-        widths[2],
-        1,
-    );
+    let text_editor_tab = Rect::new(start + widths[0] + gap + widths[1] + gap, y, widths[2], 1);
 
     HelpTabGeometry {
         area,

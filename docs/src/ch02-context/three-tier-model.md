@@ -79,9 +79,33 @@ The Auto layer operates with pure append-only semantics throughout the active tu
 - Per-file cost is estimated from file size (roughly `size_bytes / 4`), and the assembled context reports an aggregate `total_estimated_tokens`.
 - `context.files_token_budget` bounds the total estimated tokens of all context files (default 300,000). If the model requests more context than fits within this budget, execution halts cleanly with a diagnostic asking to scope down or decompose the task.
 - `context.max_discovery_rounds` bounds discovery round-trips per turn (default 5), preventing unbounded exploration loops.
-- `context.repomap_token_budget` bounds the Tree-sitter Repo Map, keeping the architectural overview cheap.
+- `context.repomap_token_budget` bounds the Tree-sitter Repo Map, keeping the architectural overview cheap. It bounds both the eager global map and every targeted map rendered during a discovery round.
 
 Every budget is configurable through `tauqe.toml`; no operational limit is hardcoded.
+
+### 2.6.1 On-Demand Repository Map
+
+The repository outline is the largest deterministic block of the prompt, and in a large monorepository it can consume tens of thousands of tokens before the developer's task is even mentioned. `[context].include_repo_map` turns that block into a declared choice instead of a constant:
+
+- `include_repo_map = true` (the default) keeps the eager behavior: the Tree-sitter symbol map of the whole repository is rendered on every turn within `repomap_token_budget`.
+- `include_repo_map = false` removes the eager map from the prompt. The model is not left blind: the prompt carries a compact `<repo_dirs>` block instead — a folder tree rendered deterministically from the Git-tracked file list, sorted alphabetically, indented two spaces per level, with service directories (`.git`, `.tauqe`, `target`, `node_modules`) filtered out. It names where subsystems live without listing every file.
+  - **Repository root files are listed explicitly.** A model that cannot see `Cargo.toml`, `tauqe.toml`, or `README.md` cannot reason about the project at all, so the entries of the repository root are rendered by name ahead of the folder tree.
+  - **Pinned files are marked.** Every file resolved by the pinned context layer carries a `[pinned]` suffix, so the model knows that authoritative conventions already travelled with the prompt instead of searching for them again. Unpinned nested files stay hidden behind their folders.
+
+The two outlines are mutually exclusive by design. The assembled prompt renders the symbol map when it has one and the directory tree only when it does not, so the model reads either code contours or folder layout, never both. Keeping one of them small is the whole point: the prefix stays short and the model still knows the shape of the repository.
+
+The directory tree is deliberately not the whole story. While the eager map is off, symbol detail is requested on demand during Discovery via `<repo_map path="crates/core" />`, which returns the Tree-sitter outline of that subtree within the same token budget. Section 3.11 describes both navigation protocols, their path semantics, and their round guards.
+
+### 2.6.2 On-Demand Directory Listing (`dir_list`)
+
+A symbol outline says what is defined inside a subtree; it does not say which files exist there. `<dir_list path="crates/core" />` answers that question and obeys the same single source of truth as every other navigation surface: it is computed from the Git-tracked file list, never from a disk directory scan.
+
+- **Shallow by default.** Without a `recursive` flag the listing names only the direct files of the directory and the names of its direct subdirectories with a trailing slash, so one round describes a folder in a handful of lines.
+- **Recursive on request.** `recursive="true"` reports every tracked file underneath the prefix, for the rounds where the model genuinely needs the whole subtree.
+- **Capped and explicit.** A single listing is limited to `MAX_DIR_LIST_ENTRIES` (100) entries. When a tree exceeds the cap the block ends with a note naming how many entries were omitted, so truncation is never silent.
+- **Git-only and exclusion-aware.** An untracked directory answers with an empty result, and every path inside a service directory (`.git`, `.tauqe`, `target`, `node_modules`) is filtered out through the shared exclusion rule, so a listing can never advertise a file the model is not allowed to address.
+
+The listing arrives as round feedback rather than as a rewritten prompt head, so it preserves the cached prefix of the previous round (see 3.10.4).
 
 ---
 

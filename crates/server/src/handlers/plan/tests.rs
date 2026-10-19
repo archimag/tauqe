@@ -83,7 +83,11 @@ async fn test_plan_batch_fail_fast_resets_status() {
     let state = test_state(&dir);
 
     // Without an API key the first turn cannot start: the batch must stop at step 1.
-    let operation = Arc::new(state.try_begin_operation().expect("register batch operation"));
+    let operation = Arc::new(
+        state
+            .try_begin_operation()
+            .expect("register batch operation"),
+    );
     let outcome = run_plan_batch(
         &state,
         "batch",
@@ -101,8 +105,13 @@ async fn test_plan_batch_fail_fast_resets_status() {
         other => panic!("Expected Failed, got {:?}", other),
     }
 
-    let reloaded = PlanStorage::load_plan(dir.path(), "batch").unwrap().unwrap();
-    assert!(reloaded.items.iter().all(|i| i.status == PlanItemStatus::Todo));
+    let reloaded = PlanStorage::load_plan(dir.path(), "batch")
+        .unwrap()
+        .unwrap();
+    assert!(reloaded
+        .items
+        .iter()
+        .all(|i| i.status == PlanItemStatus::Todo));
     assert_eq!(
         PlanStorage::load_active_id(dir.path()).unwrap().as_deref(),
         Some("batch")
@@ -135,10 +144,18 @@ async fn test_plan_batch_emits_finished_event() {
     );
 
     // Without an API key the first turn cannot start: the batch fails at step 1.
-    let operation = Arc::new(state.try_begin_operation().expect("register batch operation"));
-    let outcome =
-        run_plan_batch(&state, "emit", vec!["1".to_string(), "2".to_string()], operation)
-            .await;
+    let operation = Arc::new(
+        state
+            .try_begin_operation()
+            .expect("register batch operation"),
+    );
+    let outcome = run_plan_batch(
+        &state,
+        "emit",
+        vec!["1".to_string(), "2".to_string()],
+        operation,
+    )
+    .await;
     assert!(matches!(outcome, BatchOutcome::Failed { .. }));
 
     // The supervisor publishes a single typed completion event for the whole
@@ -172,10 +189,18 @@ async fn test_plan_batch_skips_done_and_stops_on_discussion() {
     PlanStorage::save_plan(dir.path(), &plan).unwrap();
     let state = test_state(&dir);
 
-    let operation = Arc::new(state.try_begin_operation().expect("register batch operation"));
-    let outcome =
-        run_plan_batch(&state, "skip", vec!["1".to_string(), "2".to_string()], operation)
-            .await;
+    let operation = Arc::new(
+        state
+            .try_begin_operation()
+            .expect("register batch operation"),
+    );
+    let outcome = run_plan_batch(
+        &state,
+        "skip",
+        vec!["1".to_string(), "2".to_string()],
+        operation,
+    )
+    .await;
     match outcome {
         BatchOutcome::Failed {
             completed, step_id, ..
@@ -186,7 +211,10 @@ async fn test_plan_batch_skips_done_and_stops_on_discussion() {
         other => panic!("Expected Failed, got {:?}", other),
     }
     let reloaded = PlanStorage::load_plan(dir.path(), "skip").unwrap().unwrap();
-    assert_eq!(reloaded.find_item("2").unwrap().status, PlanItemStatus::Discussion);
+    assert_eq!(
+        reloaded.find_item("2").unwrap().status,
+        PlanItemStatus::Discussion
+    );
 }
 
 #[tokio::test]
@@ -207,7 +235,11 @@ async fn test_plan_batch_skips_done_and_stops_on_blocked() {
     PlanStorage::save_plan(dir.path(), &plan).unwrap();
     let state = test_state(&dir);
 
-    let operation = Arc::new(state.try_begin_operation().expect("register batch operation"));
+    let operation = Arc::new(
+        state
+            .try_begin_operation()
+            .expect("register batch operation"),
+    );
     let outcome = run_plan_batch(
         &state,
         "blocked-batch",
@@ -227,9 +259,17 @@ async fn test_plan_batch_skips_done_and_stops_on_blocked() {
         }
         other => panic!("Expected Failed on blocked step, got {:?}", other),
     }
-    let reloaded = PlanStorage::load_plan(dir.path(), "blocked-batch").unwrap().unwrap();
-    assert_eq!(reloaded.find_item("2").unwrap().status, PlanItemStatus::Blocked);
-    assert_eq!(reloaded.find_item("3").unwrap().status, PlanItemStatus::Todo);
+    let reloaded = PlanStorage::load_plan(dir.path(), "blocked-batch")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        reloaded.find_item("2").unwrap().status,
+        PlanItemStatus::Blocked
+    );
+    assert_eq!(
+        reloaded.find_item("3").unwrap().status,
+        PlanItemStatus::Todo
+    );
 }
 
 #[tokio::test]
@@ -301,10 +341,11 @@ async fn test_handle_plan_refine_defaults_to_architect_role() {
     PlanStorage::save_plan(dir.path(), &plan).unwrap();
 
     let mut config = tauqe_core::config::AppConfig::default();
-    config.models.architect =
-        Some(vec![tauqe_protocol::ModelRef::openrouter("test/architect-model").into()]);
-    config.models.primary =
-        vec![tauqe_protocol::ModelRef::openrouter("test/primary-model").into()];
+    config.models.architect = Some(vec![tauqe_protocol::ModelRef::openrouter(
+        "test/architect-model",
+    )
+    .into()]);
+    config.models.primary = vec![tauqe_protocol::ModelRef::openrouter("test/primary-model").into()];
 
     let (out, _rx) = OutChannel::new();
     let (hist_tx, _hist_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -383,9 +424,9 @@ async fn test_handle_plan_refine_clears_auto_context() {
             }
         ]
     });
-    let mock_provider = Arc::new(MockLlmProvider::scripted([
-        MockResponse::text(refine_output.to_string()),
-    ]));
+    let mock_provider = Arc::new(MockLlmProvider::scripted([MockResponse::text(
+        refine_output.to_string(),
+    )]));
 
     let config = tauqe_core::config::AppConfig::default();
     let state = test_state_with_provider(&dir, config, mock_provider).await;
@@ -449,7 +490,10 @@ async fn test_plan_execute_blocked_by_failed_preflight() {
     let reloaded = PlanStorage::load_plan(dir.path(), "preflight")
         .unwrap()
         .unwrap();
-    assert!(reloaded.items.iter().all(|i| i.status == PlanItemStatus::Todo));
+    assert!(reloaded
+        .items
+        .iter()
+        .all(|i| i.status == PlanItemStatus::Todo));
 }
 
 #[test]
@@ -521,11 +565,7 @@ fn test_unmet_dependencies_reports_prerequisites_not_done() {
     let done = test_item("1", PlanItemStatus::Done);
     let in_progress = test_item("2", PlanItemStatus::InProgress);
     let mut dependent = test_item("3", PlanItemStatus::Todo);
-    dependent.depends_on = vec![
-        "1".to_string(),
-        "2".to_string(),
-        "missing".to_string(),
-    ];
+    dependent.depends_on = vec!["1".to_string(), "2".to_string(), "missing".to_string()];
 
     let plan = Plan {
         id: "deps".to_string(),
@@ -666,9 +706,9 @@ async fn test_handle_plan_replan_with_mock_provider() {
             }
         ]
     });
-    let mock_provider = Arc::new(MockLlmProvider::scripted([
-        MockResponse::text(replan_output.to_string()),
-    ]));
+    let mock_provider = Arc::new(MockLlmProvider::scripted([MockResponse::text(
+        replan_output.to_string(),
+    )]));
 
     let config = tauqe_core::config::AppConfig::default();
     let state = test_state_with_provider(&dir, config, mock_provider).await;
@@ -685,9 +725,14 @@ async fn test_handle_plan_replan_with_mock_provider() {
     let res = handle_plan_replan(req, &state).await;
     assert!(res.error.is_none(), "replan failed: {:?}", res.error);
 
-    let reloaded = PlanStorage::load_plan(dir.path(), "replan-mock").unwrap().unwrap();
+    let reloaded = PlanStorage::load_plan(dir.path(), "replan-mock")
+        .unwrap()
+        .unwrap();
     // The Done foundation is preserved, the uncompleted horizon is replaced.
-    assert_eq!(reloaded.find_item("1").unwrap().status, PlanItemStatus::Done);
+    assert_eq!(
+        reloaded.find_item("1").unwrap().status,
+        PlanItemStatus::Done
+    );
     assert!(reloaded.find_item("2.1").is_some());
     assert!(reloaded.find_item("2").is_none());
 }
@@ -944,7 +989,11 @@ async fn test_plan_step_binds_the_plan_session() {
     config.models.auto_level_up = false;
     let state = test_state_with_provider(&dir, config, mock_provider.clone()).await;
 
-    let operation = Arc::new(state.try_begin_operation().expect("register batch operation"));
+    let operation = Arc::new(
+        state
+            .try_begin_operation()
+            .expect("register batch operation"),
+    );
     let outcome = run_plan_batch(&state, "plan-session", vec!["1".to_string()], operation).await;
     assert_eq!(outcome, BatchOutcome::Completed { steps: 1 });
 
@@ -1013,8 +1062,7 @@ async fn test_handle_plan_refine_preloads_all_existing_step_files() {
         ],
     )
     .unwrap();
-    tauqe_core::git::cmd::commit_with_developer_author(dir.path(), "Add files", false)
-        .unwrap();
+    tauqe_core::git::cmd::commit_with_developer_author(dir.path(), "Add files", false).unwrap();
 
     let mut step1 = test_item("1", PlanItemStatus::Todo);
     step1.files = vec!["src/a.rs".to_string()];
@@ -1112,9 +1160,9 @@ async fn test_plan_horizon_synthesis_history_transactionality() {
             }
         ]
     });
-    let mock_provider = Arc::new(MockLlmProvider::scripted([
-        MockResponse::text(cyclic_output.to_string()),
-    ]));
+    let mock_provider = Arc::new(MockLlmProvider::scripted([MockResponse::text(
+        cyclic_output.to_string(),
+    )]));
 
     let config = tauqe_core::config::AppConfig::default();
     let state = test_state_with_provider(&dir, config, mock_provider).await;
@@ -1137,7 +1185,10 @@ async fn test_plan_horizon_synthesis_history_transactionality() {
         .iter()
         .filter(|e| matches!(e, tauqe_core::history::HistoryEntry::Response { .. }))
         .count();
-    assert_eq!(responses, 0, "no response entry should be committed on persistence failure");
+    assert_eq!(
+        responses, 0,
+        "no response entry should be committed on persistence failure"
+    );
 }
 
 #[tokio::test]
@@ -1146,8 +1197,7 @@ async fn test_plan_step_execution_uses_turn_marker() {
     tauqe_core::git::init_repository(Some(dir.path()), true).unwrap();
     std::fs::write(dir.path().join("src.rs"), "pub fn compute() -> i32 { 0 }\n").unwrap();
     tauqe_core::git::cmd::stage_files(dir.path(), &["src.rs".to_string()]).unwrap();
-    tauqe_core::git::cmd::commit_with_developer_author(dir.path(), "Add src", false)
-        .unwrap();
+    tauqe_core::git::cmd::commit_with_developer_author(dir.path(), "Add src", false).unwrap();
 
     let mut item = test_item("1", PlanItemStatus::Todo);
     item.title = "Implement compute".to_string();
@@ -1177,7 +1227,11 @@ async fn test_plan_step_execution_uses_turn_marker() {
     let state = test_state_with_provider(&dir, config, provider.clone()).await;
     *state.marker_override.lock().await = Some(marker.to_string());
 
-    let operation = Arc::new(state.try_begin_operation().expect("register batch operation"));
+    let operation = Arc::new(
+        state
+            .try_begin_operation()
+            .expect("register batch operation"),
+    );
     let outcome = run_plan_batch(&state, "marker-plan", vec!["1".to_string()], operation).await;
     assert!(
         matches!(outcome, BatchOutcome::Completed { steps: 1 }),
@@ -1202,7 +1256,10 @@ async fn test_plan_step_execution_uses_turn_marker() {
     let reloaded = PlanStorage::load_plan(dir.path(), "marker-plan")
         .unwrap()
         .unwrap();
-    assert_eq!(reloaded.find_item("1").unwrap().status, PlanItemStatus::Done);
+    assert_eq!(
+        reloaded.find_item("1").unwrap().status,
+        PlanItemStatus::Done
+    );
 }
 
 #[tokio::test]
@@ -1270,14 +1327,23 @@ async fn test_plan_batch_automated_replanning_on_blocked_step() {
     let state = test_state_with_provider(&dir, config, provider).await;
     *state.marker_override.lock().await = Some(marker.to_string());
 
-    let operation = Arc::new(state.try_begin_operation().expect("register batch operation"));
+    let operation = Arc::new(
+        state
+            .try_begin_operation()
+            .expect("register batch operation"),
+    );
     let outcome = run_plan_batch(&state, "auto-replan", vec!["1".to_string()], operation).await;
 
     assert_eq!(outcome, BatchOutcome::Completed { steps: 1 });
 
-    let reloaded = PlanStorage::load_plan(dir.path(), "auto-replan").unwrap().unwrap();
+    let reloaded = PlanStorage::load_plan(dir.path(), "auto-replan")
+        .unwrap()
+        .unwrap();
     assert!(reloaded.find_item("1.1").is_some());
-    assert_eq!(reloaded.find_item("1.1").unwrap().status, PlanItemStatus::Done);
+    assert_eq!(
+        reloaded.find_item("1.1").unwrap().status,
+        PlanItemStatus::Done
+    );
     assert_eq!(
         std::fs::read_to_string(dir.path().join("src.rs")).unwrap(),
         "pub fn value() -> i32 { 100 }\n"
@@ -1344,7 +1410,11 @@ async fn test_plan_batch_automated_replanning_limit_exhausted() {
     let state = test_state_with_provider(&dir, config, provider).await;
     *state.marker_override.lock().await = Some(marker.to_string());
 
-    let operation = Arc::new(state.try_begin_operation().expect("register batch operation"));
+    let operation = Arc::new(
+        state
+            .try_begin_operation()
+            .expect("register batch operation"),
+    );
     let outcome = run_plan_batch(&state, "limit-replan", vec!["1".to_string()], operation).await;
 
     match outcome {
@@ -1362,11 +1432,19 @@ async fn test_plan_batch_automated_replanning_limit_exhausted() {
             );
             assert!(reason.contains("Manual developer intervention required"));
         }
-        other => panic!("Expected Blocked outcome with limit reached, got {:?}", other),
+        other => panic!(
+            "Expected Blocked outcome with limit reached, got {:?}",
+            other
+        ),
     }
 
-    let reloaded = PlanStorage::load_plan(dir.path(), "limit-replan").unwrap().unwrap();
-    assert_eq!(reloaded.find_item("1.1").unwrap().status, PlanItemStatus::Blocked);
+    let reloaded = PlanStorage::load_plan(dir.path(), "limit-replan")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        reloaded.find_item("1.1").unwrap().status,
+        PlanItemStatus::Blocked
+    );
 }
 
 #[tokio::test]
@@ -1394,7 +1472,11 @@ async fn test_plan_batch_stops_gracefully_on_soft_stop() {
         out,
     );
 
-    let operation = Arc::new(state.try_begin_operation().expect("register batch operation"));
+    let operation = Arc::new(
+        state
+            .try_begin_operation()
+            .expect("register batch operation"),
+    );
     // A soft stop requested before the batch starts stops the queue before
     // the first step runs.
     state.soft_stop_active_operation();
@@ -1410,8 +1492,13 @@ async fn test_plan_batch_stops_gracefully_on_soft_stop() {
     assert_eq!(outcome, BatchOutcome::Stopped { completed: 0 });
 
     // No step was started: every status stays TODO.
-    let reloaded = PlanStorage::load_plan(dir.path(), "soft-stop").unwrap().unwrap();
-    assert!(reloaded.items.iter().all(|i| i.status == PlanItemStatus::Todo));
+    let reloaded = PlanStorage::load_plan(dir.path(), "soft-stop")
+        .unwrap()
+        .unwrap();
+    assert!(reloaded
+        .items
+        .iter()
+        .all(|i| i.status == PlanItemStatus::Todo));
 
     // The supervisor publishes a single typed completion event carrying the
     // graceful "stopped" status.
@@ -1447,9 +1534,7 @@ impl tauqe_core::providers::LlmProvider for StreamCancellingProvider {
         tx: tokio::sync::mpsc::Sender<tauqe_core::providers::StreamEvent>,
         _cancel_rx: tokio::sync::watch::Receiver<bool>,
     ) -> anyhow::Result<()> {
-        let _ = tx
-            .send(tauqe_core::providers::StreamEvent::Cancelled)
-            .await;
+        let _ = tx.send(tauqe_core::providers::StreamEvent::Cancelled).await;
         Ok(())
     }
 }
@@ -1467,8 +1552,7 @@ async fn test_plan_refine_reports_cancellation_from_stream_event() {
     };
     PlanStorage::save_plan(dir.path(), &plan).unwrap();
 
-    let provider: Arc<dyn tauqe_core::providers::LlmProvider> =
-        Arc::new(StreamCancellingProvider);
+    let provider: Arc<dyn tauqe_core::providers::LlmProvider> = Arc::new(StreamCancellingProvider);
     let state =
         test_state_with_provider(&dir, tauqe_core::config::AppConfig::default(), provider).await;
 
@@ -1546,7 +1630,11 @@ async fn test_plan_batch_projects_conceptual_horizon_just_in_time() {
     let state = test_state_with_provider(&dir, config, provider).await;
     *state.marker_override.lock().await = Some(marker.to_string());
 
-    let operation = Arc::new(state.try_begin_operation().expect("register batch operation"));
+    let operation = Arc::new(
+        state
+            .try_begin_operation()
+            .expect("register batch operation"),
+    );
     let outcome = run_plan_batch(&state, "jit-horizon", Vec::new(), operation).await;
 
     // An empty scheduled scope is not a finished batch: the synthesized step is
@@ -1656,4 +1744,337 @@ async fn test_plan_pipeline_blocked_by_failed_preflight() {
         .items
         .iter()
         .all(|i| i.status == PlanItemStatus::Todo));
+}
+
+#[tokio::test]
+async fn test_handle_plan_refine_renders_targeted_repo_map_feedback() {
+    let dir = TestDir::new();
+    tauqe_core::git::init_repository(Some(dir.path()), true).unwrap();
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    std::fs::write(dir.path().join("src/target.rs"), "pub fn target() {}\n").unwrap();
+    tauqe_core::git::cmd::stage_files(dir.path(), &["src/target.rs".to_string()]).unwrap();
+    tauqe_core::git::cmd::commit_with_developer_author(dir.path(), "Add src", false).unwrap();
+
+    let plan = Plan {
+        id: "refine-repomap".to_string(),
+        title: "Refine RepoMap".to_string(),
+        created_at: 1,
+        updated_at: 1,
+        items: vec![test_item("1", PlanItemStatus::Todo)],
+        ..Default::default()
+    };
+    PlanStorage::save_plan(dir.path(), &plan).unwrap();
+
+    // Round 1: the architect requests the symbol contour of a subsystem it has
+    // not inspected yet. Round 2: it finalizes once it receives that contour.
+    let needs_context = serde_json::json!({
+        "status": "needs_context",
+        "explanation": "Outlining the src subsystem",
+        "reason": null,
+        "context_requests": [],
+        "repo_searches": [],
+        "repo_maps": ["src"],
+        "items": []
+    });
+    let success = serde_json::json!({
+        "status": "success",
+        "explanation": "Decomposed the subsystem",
+        "reason": null,
+        "context_requests": [],
+        "repo_searches": [],
+        "repo_maps": [],
+        "items": [
+            {
+                "id": "1.1",
+                "title": "Implement target",
+                "status": "todo",
+                "files": ["src/target.rs"],
+                "readonly_files": [],
+                "concept_refs": [],
+                "depends_on": [],
+                "children": []
+            }
+        ]
+    });
+    let mock_provider = Arc::new(MockLlmProvider::scripted([
+        MockResponse::text(needs_context.to_string()),
+        MockResponse::text(success.to_string()),
+    ]));
+    let state = test_state_with_provider(
+        &dir,
+        tauqe_core::config::AppConfig::default(),
+        mock_provider.clone(),
+    )
+    .await;
+
+    let req = Request {
+        id: tauqe_protocol::RequestId::Number(1),
+        method: tauqe_protocol::methods::PLAN_REFINE.to_string(),
+        params: Some(serde_json::json!({ "plan_id": "refine-repomap" })),
+    };
+    let res = handle_plan_refine(req, &state).await;
+    assert!(res.error.is_none(), "refine failed: {:?}", res.error);
+
+    // The rendered contour of the requested subsystem is fed back to the next
+    // architect round instead of being treated as a dead end.
+    let requests = mock_provider.requests();
+    assert_eq!(requests.len(), 2);
+    let feedback_prompt = &requests[1].messages[1].content;
+    assert!(feedback_prompt.contains("<repomap_feedback path=\"src\">"));
+    assert!(feedback_prompt.contains("pub fn target"));
+
+    let reloaded = PlanStorage::load_plan(dir.path(), "refine-repomap")
+        .unwrap()
+        .unwrap();
+    assert!(reloaded.find_item("1.1").is_some());
+}
+
+#[tokio::test]
+async fn test_handle_plan_refine_renders_directory_outline_when_repo_map_disabled() {
+    let dir = TestDir::new();
+    tauqe_core::git::init_repository(Some(dir.path()), true).unwrap();
+    std::fs::create_dir_all(dir.path().join("src/nested")).unwrap();
+    std::fs::write(
+        dir.path().join("src/nested/helper.rs"),
+        "pub fn helper() {}\n",
+    )
+    .unwrap();
+    tauqe_core::git::cmd::stage_files(dir.path(), &["src/nested/helper.rs".to_string()]).unwrap();
+    tauqe_core::git::cmd::commit_with_developer_author(dir.path(), "Add src", false).unwrap();
+
+    let plan = Plan {
+        id: "refine-dirs".to_string(),
+        title: "Refine Dirs".to_string(),
+        created_at: 1,
+        updated_at: 1,
+        items: vec![test_item("1", PlanItemStatus::Todo)],
+        ..Default::default()
+    };
+    PlanStorage::save_plan(dir.path(), &plan).unwrap();
+
+    let success = serde_json::json!({
+        "status": "success",
+        "explanation": "Decomposed the subsystem",
+        "reason": null,
+        "context_requests": [],
+        "repo_searches": [],
+        "repo_maps": [],
+        "items": [
+            {
+                "id": "2",
+                "title": "Implement helper",
+                "status": "todo",
+                "files": ["src/nested/helper.rs"],
+                "readonly_files": [],
+                "concept_refs": [],
+                "depends_on": [],
+                "children": []
+            }
+        ]
+    });
+    let mock_provider = Arc::new(MockLlmProvider::scripted([MockResponse::text(
+        success.to_string(),
+    )]));
+
+    let mut config = tauqe_core::config::AppConfig::default();
+    config.context.include_repo_map = false;
+    let state = test_state_with_provider(&dir, config, mock_provider.clone()).await;
+
+    let req = Request {
+        id: tauqe_protocol::RequestId::Number(1),
+        method: tauqe_protocol::methods::PLAN_REFINE.to_string(),
+        params: Some(serde_json::json!({ "plan_id": "refine-dirs" })),
+    };
+    let res = handle_plan_refine(req, &state).await;
+    assert!(res.error.is_none(), "refine failed: {:?}", res.error);
+
+    // With eager symbol maps disabled the architect still learns where the
+    // subsystems live from the compact directory tree, never from an absent
+    // contour section.
+    let requests = mock_provider.requests();
+    assert_eq!(requests.len(), 1);
+    let user_prompt = &requests[0].messages[1].content;
+    assert!(user_prompt.contains("## Repository Directories (<repo_dirs>):"));
+    assert!(user_prompt.contains("src\n  nested"));
+    assert!(!user_prompt.contains("## Codebase Symbol Contours"));
+}
+
+#[tokio::test]
+async fn test_plan_refine_regenerates_round_after_unparsable_response() {
+    let dir = TestDir::new();
+    let plan = Plan {
+        id: "parse-retry".to_string(),
+        title: "Parse Retry".to_string(),
+        created_at: 1,
+        updated_at: 1,
+        items: vec![test_item("1", PlanItemStatus::Todo)],
+        ..Default::default()
+    };
+    PlanStorage::save_plan(dir.path(), &plan).unwrap();
+
+    // The first round is cut off mid-JSON, the second one is complete.
+    let truncated = "{\"status\": \"success\", \"explanation\": \"Decomposed";
+    let complete = serde_json::json!({
+        "status": "success",
+        "explanation": "Decomposed after the regenerated round",
+        "reason": null,
+        "context_requests": [],
+        "repo_searches": [],
+        "repo_maps": [],
+        "items": [
+            {
+                "id": "1",
+                "title": "Refined step 1",
+                "status": "todo",
+                "files": [],
+                "readonly_files": [],
+                "concept_refs": [],
+                "depends_on": [],
+                "children": []
+            }
+        ]
+    });
+    let mock_provider = Arc::new(MockLlmProvider::scripted([
+        MockResponse::text(truncated),
+        MockResponse::text(complete.to_string()),
+    ]));
+
+    let mut config = tauqe_core::config::AppConfig::default();
+    config.develop.max_retries = 2;
+    let state = test_state_with_provider(&dir, config, mock_provider.clone()).await;
+
+    let req = Request {
+        id: tauqe_protocol::RequestId::Number(1),
+        method: tauqe_protocol::methods::PLAN_REFINE.to_string(),
+        params: Some(serde_json::json!({ "plan_id": "parse-retry" })),
+    };
+    let res = handle_plan_refine(req, &state).await;
+    assert!(res.error.is_none(), "refine failed: {:?}", res.error);
+
+    // An interrupted structured payload regenerates the round instead of
+    // aborting the whole synthesis on its first occurrence.
+    assert_eq!(mock_provider.requests().len(), 2);
+
+    let reloaded = PlanStorage::load_plan(dir.path(), "parse-retry")
+        .unwrap()
+        .unwrap();
+    assert_eq!(reloaded.find_item("1").unwrap().title, "Refined step 1");
+}
+
+#[tokio::test]
+async fn test_plan_refine_recovers_from_a_transport_break() {
+    let dir = TestDir::new();
+    let plan = Plan {
+        id: "stream-break".to_string(),
+        title: "Stream Break".to_string(),
+        created_at: 1,
+        updated_at: 1,
+        items: vec![test_item("1", PlanItemStatus::Todo)],
+        ..Default::default()
+    };
+    PlanStorage::save_plan(dir.path(), &plan).unwrap();
+
+    let refine_output = serde_json::json!({
+        "status": "success",
+        "explanation": "Decomposed after the interrupted round",
+        "reason": null,
+        "context_requests": [],
+        "repo_searches": [],
+        "repo_maps": [],
+        "items": [
+            {
+                "id": "1.1",
+                "title": "Survived the interruption",
+                "status": "todo",
+                "files": [],
+                "readonly_files": [],
+                "concept_refs": [],
+                "depends_on": [],
+                "children": []
+            }
+        ]
+    });
+
+    // The first attempt is cut off at the transport layer; the retry
+    // decorator re-issues the request and the second attempt answers with a
+    // complete structured horizon.
+    let mock = MockLlmProvider::scripted([
+        MockResponse::error("OpenRouter stream ended prematurely without [DONE] marker"),
+        MockResponse::text(refine_output.to_string()),
+    ]);
+    let provider: Arc<dyn tauqe_core::providers::LlmProvider> =
+        Arc::new(tauqe_core::providers::RetryingProvider::new(
+            Box::new(mock),
+            tauqe_core::providers::RetryConfig {
+                max_attempts: 3,
+                base_delay_ms: 1,
+                max_delay_ms: 1,
+            },
+        ));
+    let state =
+        test_state_with_provider(&dir, tauqe_core::config::AppConfig::default(), provider)
+            .await;
+
+    let req = Request {
+        id: tauqe_protocol::RequestId::Number(1),
+        method: tauqe_protocol::methods::PLAN_REFINE.to_string(),
+        params: Some(serde_json::json!({ "plan_id": "stream-break" })),
+    };
+    let res = handle_plan_refine(req, &state).await;
+    assert!(res.error.is_none(), "refine failed: {:?}", res.error);
+
+    // The interrupted round never poisons the synthesis: the retried round
+    // replaces the uncompleted horizon.
+    let reloaded = PlanStorage::load_plan(dir.path(), "stream-break")
+        .unwrap()
+        .unwrap();
+    assert!(reloaded.find_item("1.1").is_some());
+    assert!(reloaded.find_item("1").is_none());
+}
+
+#[tokio::test]
+async fn test_plan_refine_fails_after_parse_retries_are_exhausted() {
+    let dir = TestDir::new();
+    let plan = Plan {
+        id: "parse-exhausted".to_string(),
+        title: "Parse Exhausted".to_string(),
+        created_at: 1,
+        updated_at: 1,
+        items: vec![test_item("1", PlanItemStatus::Todo)],
+        ..Default::default()
+    };
+    PlanStorage::save_plan(dir.path(), &plan).unwrap();
+
+    // Both the round and its single retry answer with an empty payload.
+    let mock_provider = Arc::new(MockLlmProvider::scripted([
+        MockResponse::text(""),
+        MockResponse::text("   "),
+    ]));
+
+    let mut config = tauqe_core::config::AppConfig::default();
+    config.develop.max_retries = 1;
+    let state = test_state_with_provider(&dir, config, mock_provider.clone()).await;
+
+    let req = Request {
+        id: tauqe_protocol::RequestId::Number(1),
+        method: tauqe_protocol::methods::PLAN_REFINE.to_string(),
+        params: Some(serde_json::json!({ "plan_id": "parse-exhausted" })),
+    };
+    let res = handle_plan_refine(req, &state).await;
+
+    // The retry budget is bounded: an exhausted budget terminates the synthesis
+    // instead of looping forever.
+    let err = res.error.expect("an exhausted retry budget must fail");
+    assert_eq!(err.code, errors::PARSE_ERROR);
+    assert_eq!(mock_provider.requests().len(), 2);
+
+    // A failed synthesis leaves the stored plan untouched.
+    let reloaded = PlanStorage::load_plan(dir.path(), "parse-exhausted")
+        .unwrap()
+        .unwrap();
+    assert_eq!(reloaded.find_item("1").unwrap().title, "Step 1");
+    assert_eq!(
+        reloaded.find_item("1").unwrap().status,
+        PlanItemStatus::Todo
+    );
 }

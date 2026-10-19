@@ -71,7 +71,10 @@ fn test_plan_item_status_lifecycle() {
     assert_eq!(status.next().next(), PlanItemStatus::InProgress);
     assert_eq!(status.next().next().next(), PlanItemStatus::Done);
     assert_eq!(status.next().next().next().next(), PlanItemStatus::Blocked);
-    assert_eq!(status.next().next().next().next().next(), PlanItemStatus::Cancelled);
+    assert_eq!(
+        status.next().next().next().next().next(),
+        PlanItemStatus::Cancelled
+    );
     assert_eq!(
         status.next().next().next().next().next().next(),
         PlanItemStatus::Discussion
@@ -82,19 +85,17 @@ fn test_plan_item_status_lifecycle() {
 
 #[test]
 fn test_concept_item_and_two_section_plan_serde() {
-    let concept = vec![
-        ConceptItem {
-            id: "c-1".to_string(),
-            title: "Stateless Auth".to_string(),
-            details: Some("Tokens must be signed with ed25519".to_string()),
-            children: vec![ConceptItem {
-                id: "c-1.1".to_string(),
-                title: "Token Expiration Invariant".to_string(),
-                details: None,
-                children: vec![],
-            }],
-        },
-    ];
+    let concept = vec![ConceptItem {
+        id: "c-1".to_string(),
+        title: "Stateless Auth".to_string(),
+        details: Some("Tokens must be signed with ed25519".to_string()),
+        children: vec![ConceptItem {
+            id: "c-1.1".to_string(),
+            title: "Token Expiration Invariant".to_string(),
+            details: None,
+            children: vec![],
+        }],
+    }];
 
     let mut step = item("s-1", "Implement JWT signer", PlanItemStatus::Todo, vec![]);
     step.files = vec!["crates/core/src/auth.rs".to_string()];
@@ -113,7 +114,10 @@ fn test_concept_item_and_two_section_plan_serde() {
 
     // Concept navigation
     assert!(plan.find_concept_item("c-1").is_some());
-    assert_eq!(plan.find_concept_item("c-1.1").unwrap().title, "Token Expiration Invariant");
+    assert_eq!(
+        plan.find_concept_item("c-1.1").unwrap().title,
+        "Token Expiration Invariant"
+    );
     assert!(plan.find_concept_item("non-existent").is_none());
 
     // Serde roundtrip
@@ -139,7 +143,10 @@ fn test_concept_item_and_two_section_plan_serde() {
     if let Some(c) = plan.find_concept_item_mut("c-1.1") {
         c.title = "Updated Invariant".to_string();
     }
-    assert_eq!(plan.find_concept_item("c-1.1").unwrap().title, "Updated Invariant");
+    assert_eq!(
+        plan.find_concept_item("c-1.1").unwrap().title,
+        "Updated Invariant"
+    );
 }
 
 #[test]
@@ -176,7 +183,8 @@ fn test_plan_item_serde() {
 
 #[test]
 fn test_plan_item_ignores_legacy_model_field() {
-    let legacy: PlanItem = serde_json::from_str(r#"{"id":"2","title":"Old step","model":"junior"}"#).unwrap();
+    let legacy: PlanItem =
+        serde_json::from_str(r#"{"id":"2","title":"Old step","model":"junior"}"#).unwrap();
     assert_eq!(legacy.id, "2");
     assert_eq!(legacy.title, "Old step");
 }
@@ -347,7 +355,10 @@ fn test_evaluate_scope_reports_only_leaves_for_discussion() {
     // Refreshing propagates the Discussion child onto its container. Only the
     // offending leaf is reported, never the container as well.
     plan.refresh_parent_statuses();
-    assert_eq!(plan.find_item("1").unwrap().status, PlanItemStatus::Discussion);
+    assert_eq!(
+        plan.find_item("1").unwrap().status,
+        PlanItemStatus::Discussion
+    );
 
     match plan.evaluate_scope(None) {
         PlanScopeEvaluation::BlockedByDiscussion(items) => {
@@ -473,19 +484,31 @@ fn test_plan_item_leaf_and_refresh_parent_statuses() {
 
     // Update first sub-item to InProgress: parent becomes InProgress
     plan.update_item_status("sub-1", PlanItemStatus::InProgress);
-    assert_eq!(plan.find_item("parent").unwrap().status, PlanItemStatus::InProgress);
+    assert_eq!(
+        plan.find_item("parent").unwrap().status,
+        PlanItemStatus::InProgress
+    );
 
     // Update first sub-item to Discussion: parent becomes Discussion (highest attention priority)
     plan.update_item_status("sub-1", PlanItemStatus::Discussion);
-    assert_eq!(plan.find_item("parent").unwrap().status, PlanItemStatus::Discussion);
+    assert_eq!(
+        plan.find_item("parent").unwrap().status,
+        PlanItemStatus::Discussion
+    );
 
     // Update first sub-item to Done, second is still Todo: parent becomes InProgress
     plan.update_item_status("sub-1", PlanItemStatus::Done);
-    assert_eq!(plan.find_item("parent").unwrap().status, PlanItemStatus::InProgress);
+    assert_eq!(
+        plan.find_item("parent").unwrap().status,
+        PlanItemStatus::InProgress
+    );
 
     // Update second sub-item to done: parent automatically transitions to Done
     plan.update_item_status("sub-2", PlanItemStatus::Done);
-    assert_eq!(plan.find_item("parent").unwrap().status, PlanItemStatus::Done);
+    assert_eq!(
+        plan.find_item("parent").unwrap().status,
+        PlanItemStatus::Done
+    );
 }
 
 #[test]
@@ -538,7 +561,10 @@ fn test_plan_normalize_leaf_files() {
         vec!["src/ref.rs".to_string()]
     );
     assert_eq!(plan.items[1].files, vec!["src/leaf.rs".to_string()]);
-    assert_eq!(plan.items[1].readonly_files, vec!["src/leaf_ref.rs".to_string()]);
+    assert_eq!(
+        plan.items[1].readonly_files,
+        vec!["src/leaf_ref.rs".to_string()]
+    );
     assert_eq!(
         plan.items[0].children[0].children[0].depends_on,
         vec!["2".to_string()]
@@ -790,7 +816,10 @@ fn test_plan_update_item_status_matches_ids_case_insensitively() {
     // `find_item` and `update_item_status` must agree on the id matching rule.
     assert!(plan.find_item("step-1").is_some());
     assert!(plan.update_item_status("step-1", PlanItemStatus::Done));
-    assert_eq!(plan.find_item("STEP-1").unwrap().status, PlanItemStatus::Done);
+    assert_eq!(
+        plan.find_item("STEP-1").unwrap().status,
+        PlanItemStatus::Done
+    );
 }
 
 #[test]
@@ -855,7 +884,10 @@ fn test_plan_has_started_or_completed_steps() {
     assert!(!conceptual.has_started_or_completed_steps());
 
     // A single pending leaf records no progress.
-    let todo_only = plan_with(vec![], vec![item("1", "Pending", PlanItemStatus::Todo, vec![])]);
+    let todo_only = plan_with(
+        vec![],
+        vec![item("1", "Pending", PlanItemStatus::Todo, vec![])],
+    );
     assert!(!todo_only.has_started_or_completed_steps());
 
     // An in-progress leaf means implementation work is already underway.
@@ -866,7 +898,10 @@ fn test_plan_has_started_or_completed_steps() {
     assert!(in_progress.has_started_or_completed_steps());
 
     // A finished leaf means progress may already be captured by a Git commit.
-    let done = plan_with(vec![], vec![item("1", "Finished", PlanItemStatus::Done, vec![])]);
+    let done = plan_with(
+        vec![],
+        vec![item("1", "Finished", PlanItemStatus::Done, vec![])],
+    );
     assert!(done.has_started_or_completed_steps());
 
     // A finished leaf counts at any depth, even beside pending siblings and
@@ -972,7 +1007,10 @@ fn test_plan_validate_item_errors() {
         items: vec![item("  ", "Empty", PlanItemStatus::Todo, vec![])],
         ..Default::default()
     };
-    assert_eq!(empty_id.validate().unwrap_err(), vec![PlanValidationError::EmptyItemId]);
+    assert_eq!(
+        empty_id.validate().unwrap_err(),
+        vec![PlanValidationError::EmptyItemId]
+    );
 
     // 2. Duplicate item ID (case-insensitive)
     let dup_id = Plan {
@@ -1372,7 +1410,10 @@ fn test_refresh_parent_statuses_and_scope_on_deep_hierarchy() {
         plan.find_item("1.1").unwrap().status,
         PlanItemStatus::InProgress
     );
-    assert_eq!(plan.find_item("1").unwrap().status, PlanItemStatus::InProgress);
+    assert_eq!(
+        plan.find_item("1").unwrap().status,
+        PlanItemStatus::InProgress
+    );
     assert_eq!(plan.status(), PlanItemStatus::InProgress);
     // Only executable leaves count: the cancelled leaf stays out of the metric.
     assert_eq!(plan.count_stats(), (2, 1));

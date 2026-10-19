@@ -158,11 +158,13 @@ pub fn extract_symbols_from_str(path: &str, source: &str) -> Result<RepoFileSymb
     let support = language_for_path(path)
         .ok_or_else(|| anyhow::anyhow!("Unsupported source extension for path: {}", path))?;
     let mut parser = Parser::new();
-    let symbols = extract_symbols_with_support(&mut parser, support, path, source)
-        .unwrap_or_else(|| RepoFileSymbols {
-            path: path.to_string(),
-            symbols: Vec::new(),
-            line_count: source.lines().count(),
+    let symbols =
+        extract_symbols_with_support(&mut parser, support, path, source).unwrap_or_else(|| {
+            RepoFileSymbols {
+                path: path.to_string(),
+                symbols: Vec::new(),
+                line_count: source.lines().count(),
+            }
         });
     Ok(symbols)
 }
@@ -187,7 +189,7 @@ fn extract_symbols_with_support(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::repomap::SymbolKind;
+    use crate::repomap::{Symbol, SymbolKind};
 
     #[test]
     fn test_extract_symbols_from_source_contours() {
@@ -224,34 +226,74 @@ pub fn create_user(name: &str) -> User {
         assert_eq!(res.path, "src/user.rs");
         assert_eq!(res.line_count, code.lines().count());
 
-        let mod_sym = res.symbols.iter().find(|s| s.kind == SymbolKind::Mod).unwrap();
+        let mod_sym = res
+            .symbols
+            .iter()
+            .find(|s| s.kind == SymbolKind::Mod)
+            .unwrap();
         assert_eq!(mod_sym.name, "sub_module");
         assert!(mod_sym.is_public);
 
-        let struct_sym = res.symbols.iter().find(|s| s.kind == SymbolKind::Struct).unwrap();
+        let struct_sym = res
+            .symbols
+            .iter()
+            .find(|s| s.kind == SymbolKind::Struct)
+            .unwrap();
         assert_eq!(struct_sym.name, "User");
-        assert!(struct_sym.signature.as_ref().unwrap().contains("pub id: u64"));
-        assert!(struct_sym.signature.as_ref().unwrap().contains("secret: String"));
+        assert!(struct_sym
+            .signature
+            .as_ref()
+            .unwrap()
+            .contains("pub id: u64"));
+        assert!(struct_sym
+            .signature
+            .as_ref()
+            .unwrap()
+            .contains("secret: String"));
 
-        let enum_sym = res.symbols.iter().find(|s| s.kind == SymbolKind::Enum).unwrap();
+        let enum_sym = res
+            .symbols
+            .iter()
+            .find(|s| s.kind == SymbolKind::Enum)
+            .unwrap();
         assert_eq!(enum_sym.name, "Status");
         assert!(enum_sym.signature.as_ref().unwrap().contains("Active"));
-        assert!(enum_sym.signature.as_ref().unwrap().contains("Pending(u32)"));
+        assert!(enum_sym
+            .signature
+            .as_ref()
+            .unwrap()
+            .contains("Pending(u32)"));
 
-        let trait_sym = res.symbols.iter().find(|s| s.kind == SymbolKind::Trait).unwrap();
+        let trait_sym = res
+            .symbols
+            .iter()
+            .find(|s| s.kind == SymbolKind::Trait)
+            .unwrap();
         assert_eq!(trait_sym.name, "Greeter");
         assert_eq!(trait_sym.children.len(), 1);
         assert_eq!(trait_sym.children[0].name, "greet");
 
-        let impl_sym = res.symbols.iter().find(|s| s.kind == SymbolKind::Impl).unwrap();
+        let impl_sym = res
+            .symbols
+            .iter()
+            .find(|s| s.kind == SymbolKind::Impl)
+            .unwrap();
         assert!(impl_sym.name.contains("Greeter for User"));
         assert_eq!(impl_sym.children.len(), 1);
         assert_eq!(impl_sym.children[0].name, "greet");
         assert!(impl_sym.children[0].is_public);
 
-        let fn_sym = res.symbols.iter().find(|s| s.kind == SymbolKind::Function).unwrap();
+        let fn_sym = res
+            .symbols
+            .iter()
+            .find(|s| s.kind == SymbolKind::Function)
+            .unwrap();
         assert_eq!(fn_sym.name, "create_user");
-        assert!(fn_sym.signature.as_ref().unwrap().contains("pub fn create_user(name: &str) -> User"));
+        assert!(fn_sym
+            .signature
+            .as_ref()
+            .unwrap()
+            .contains("pub fn create_user(name: &str) -> User"));
     }
 
     #[test]
@@ -277,14 +319,419 @@ pub fn valid_after_error() -> bool {
     fn test_is_supported_path_registry() {
         assert!(is_supported_path("src/lib.rs"));
         assert!(is_supported_path("nested/dir/module.rs"));
-        assert!(!is_supported_path("src/index.ts"));
-        assert!(!is_supported_path("scripts/build.py"));
+        assert!(is_supported_path("src/index.ts"));
+        assert!(is_supported_path("scripts/build.py"));
+        assert!(is_supported_path("src/Main.java"));
+        assert!(is_supported_path("src/point.c"));
+        assert!(is_supported_path("include/point.h"));
+        assert!(is_supported_path("src/renderer.cpp"));
+        assert!(is_supported_path("include/renderer.hpp"));
+        assert!(is_supported_path("src/engine.cc"));
+        assert!(is_supported_path("src/engine.cxx"));
+        assert!(is_supported_path("src/Service.cs"));
+        assert!(is_supported_path("src/Service.php"));
+        assert!(!is_supported_path("src/app.rb"));
         assert!(!is_supported_path("Makefile"));
     }
 
     #[test]
     fn test_extract_symbols_from_str_rejects_unsupported_extension() {
-        assert!(extract_symbols_from_str("src/app.ts", "export const value = 1;\n").is_err());
+        assert!(extract_symbols_from_str("src/app.kt", "fun main() {}\n").is_err());
+    }
+
+    #[test]
+    fn test_extract_java_declarations() {
+        let code = r#"
+package com.example;
+
+public class Service implements Greeter {
+    private int retries;
+
+    public Service(int retries) {
+        this.retries = retries;
+    }
+
+    public String greet(String name) {
+        return name;
+    }
+}
+
+interface Greeter {
+    String greet(String name);
+}
+
+enum Status {
+    Active,
+    Pending
+}
+"#;
+        let file = extract_symbols_from_str("src/Service.java", code).unwrap();
+
+        let service = file
+            .symbols
+            .iter()
+            .find(|symbol| symbol.name == "Service")
+            .unwrap();
+        assert_eq!(service.kind, SymbolKind::Struct);
+        assert!(service.is_public);
+        assert!(service
+            .signature
+            .as_deref()
+            .unwrap()
+            .contains("implements Greeter"));
+        assert!(service
+            .children
+            .iter()
+            .any(|member| member.name == "Service" && member.kind == SymbolKind::Method));
+        assert!(service
+            .children
+            .iter()
+            .any(|member| member.name == "greet" && member.is_public));
+
+        let greeter = file
+            .symbols
+            .iter()
+            .find(|symbol| symbol.name == "Greeter")
+            .unwrap();
+        assert_eq!(greeter.kind, SymbolKind::Trait);
+        assert_eq!(greeter.children[0].name, "greet");
+        // Interface members are public by declaration, without a modifier.
+        assert!(greeter.children[0].is_public);
+
+        let status = file
+            .symbols
+            .iter()
+            .find(|symbol| symbol.name == "Status")
+            .unwrap();
+        assert_eq!(status.kind, SymbolKind::Enum);
+        assert!(status.signature.as_deref().unwrap().contains("Pending"));
+    }
+
+    #[test]
+    fn test_extract_c_declarations() {
+        let code = r#"
+#include <stdio.h>
+
+struct Point {
+    int x;
+    int y;
+};
+
+enum Color {
+    Red,
+    Green
+};
+
+int add(int a, int b);
+
+int add(int a, int b) {
+    return a + b;
+}
+"#;
+        let file = extract_symbols_from_str("src/point.c", code).unwrap();
+
+        let point = file
+            .symbols
+            .iter()
+            .find(|symbol| symbol.name == "Point")
+            .unwrap();
+        assert_eq!(point.kind, SymbolKind::Struct);
+        assert!(point.signature.as_deref().unwrap().contains("int x;"));
+
+        let color = file
+            .symbols
+            .iter()
+            .find(|symbol| symbol.name == "Color")
+            .unwrap();
+        assert_eq!(color.kind, SymbolKind::Enum);
+        assert!(color.signature.as_deref().unwrap().contains("Red"));
+
+        // A prototype and its definition are both announced.
+        let add: Vec<&Symbol> = file
+            .symbols
+            .iter()
+            .filter(|symbol| symbol.name == "add")
+            .collect();
+        assert_eq!(add.len(), 2);
+        assert!(add.iter().all(|symbol| symbol.kind == SymbolKind::Function));
+        assert!(add
+            .iter()
+            .all(|symbol| symbol.signature.as_deref().unwrap().contains("int a")));
+    }
+
+    #[test]
+    fn test_extract_cpp_declarations() {
+        let code = r#"
+namespace app {
+
+class Service : public Greeter {
+public:
+    explicit Service(int retries);
+    void greet(const std::string &name) override;
+    int retries() const { return retries_; }
+
+private:
+    int retries_;
+};
+
+}  // namespace app
+
+template <typename T>
+T identity(T value) {
+    return value;
+}
+"#;
+        let file = extract_symbols_from_str("src/service.cpp", code).unwrap();
+
+        let namespace = file
+            .symbols
+            .iter()
+            .find(|symbol| symbol.kind == SymbolKind::Mod)
+            .unwrap();
+        assert_eq!(namespace.name, "app");
+
+        let service = namespace
+            .children
+            .iter()
+            .find(|symbol| symbol.name == "Service")
+            .unwrap();
+        assert_eq!(service.kind, SymbolKind::Struct);
+        let members: Vec<&str> = service
+            .children
+            .iter()
+            .map(|member| member.name.as_str())
+            .collect();
+        assert!(members.contains(&"Service"));
+        assert!(members.contains(&"greet"));
+        assert!(members.contains(&"retries"));
+        assert!(service
+            .children
+            .iter()
+            .all(|member| member.kind == SymbolKind::Method));
+
+        let identity = file
+            .symbols
+            .iter()
+            .find(|symbol| symbol.name == "identity")
+            .unwrap();
+        assert_eq!(identity.kind, SymbolKind::Function);
+    }
+
+    #[test]
+    fn test_extract_c_sharp_declarations() {
+        let code = r#"
+namespace Sample
+{
+    public class Service : IGreeter
+    {
+        private int retries;
+
+        public Service(int retries)
+        {
+            this.retries = retries;
+        }
+
+        public string Greet(string name) => name;
+    }
+
+    public interface IGreeter
+    {
+        string Greet(string name);
+    }
+
+    public enum Status
+    {
+        Active,
+        Pending
+    }
+}
+"#;
+        let file = extract_symbols_from_str("src/Service.cs", code).unwrap();
+
+        let namespace = file
+            .symbols
+            .iter()
+            .find(|symbol| symbol.kind == SymbolKind::Mod)
+            .unwrap();
+        assert_eq!(namespace.name, "Sample");
+
+        let service = namespace
+            .children
+            .iter()
+            .find(|symbol| symbol.name == "Service")
+            .unwrap();
+        assert_eq!(service.kind, SymbolKind::Struct);
+        assert!(service.is_public);
+        assert!(service
+            .children
+            .iter()
+            .any(|member| member.name == "Greet" && member.is_public));
+
+        let greeter = namespace
+            .children
+            .iter()
+            .find(|symbol| symbol.name == "IGreeter")
+            .unwrap();
+        assert_eq!(greeter.kind, SymbolKind::Trait);
+        assert!(greeter.children[0].is_public);
+
+        let status = namespace
+            .children
+            .iter()
+            .find(|symbol| symbol.name == "Status")
+            .unwrap();
+        assert_eq!(status.kind, SymbolKind::Enum);
+        assert!(status.signature.as_deref().unwrap().contains("Pending"));
+    }
+
+    #[test]
+    fn test_extract_php_declarations() {
+        let code = r#"<?php
+
+namespace App;
+
+interface Greeter
+{
+    public function greet(string $name): string;
+}
+
+class Service implements Greeter
+{
+    private int $retries;
+
+    public function greet(string $name): string
+    {
+        return $name;
+    }
+
+    private function reset(): void
+    {
+    }
+}
+
+enum Status
+{
+    case Active;
+    case Pending;
+}
+
+function build_service(int $retries): Service
+{
+    return new Service($retries);
+}
+"#;
+        let file = extract_symbols_from_str("src/Service.php", code).unwrap();
+
+        let namespace = file
+            .symbols
+            .iter()
+            .find(|symbol| symbol.kind == SymbolKind::Mod)
+            .unwrap();
+        assert_eq!(namespace.name, "App");
+
+        let greeter = file
+            .symbols
+            .iter()
+            .find(|symbol| symbol.name == "Greeter")
+            .unwrap();
+        assert_eq!(greeter.kind, SymbolKind::Trait);
+        assert_eq!(greeter.children[0].name, "greet");
+        assert!(greeter.children[0].is_public);
+
+        let service = file
+            .symbols
+            .iter()
+            .find(|symbol| symbol.name == "Service")
+            .unwrap();
+        assert_eq!(service.kind, SymbolKind::Struct);
+        assert!(service
+            .children
+            .iter()
+            .any(|member| member.name == "greet" && member.kind == SymbolKind::Method));
+        assert!(service
+            .children
+            .iter()
+            .any(|member| member.name == "reset" && !member.is_public));
+
+        let status = file
+            .symbols
+            .iter()
+            .find(|symbol| symbol.name == "Status")
+            .unwrap();
+        assert_eq!(status.kind, SymbolKind::Enum);
+        assert!(status.signature.as_deref().unwrap().contains("Active"));
+
+        let build = file
+            .symbols
+            .iter()
+            .find(|symbol| symbol.name == "build_service")
+            .unwrap();
+        assert_eq!(build.kind, SymbolKind::Function);
+        assert!(build.is_public);
+    }
+
+    #[test]
+    fn test_extracts_declarations_preceding_syntax_errors_in_every_language() {
+        let cases: &[(&str, &str, &str)] = &[
+            (
+                "src/broken.rs",
+                "pub fn valid_after() -> bool {\n    true\n}\n\nfn broken_syntax( { let x = ; }\n",
+                "valid_after",
+            ),
+            (
+                "src/broken.ts",
+                "export function validAfter(): number {\n  return 1;\n}\n\nfunction broken( {\n",
+                "validAfter",
+            ),
+            (
+                "src/broken.js",
+                "export function validAfter() {\n  return 1;\n}\n\nconst broken = ;\n",
+                "validAfter",
+            ),
+            (
+                "src/broken.py",
+                "def valid_after():\n    return True\n\ndef broken(:\n",
+                "valid_after",
+            ),
+            (
+                "src/broken.go",
+                "package broken\n\nfunc ValidAfter() bool {\n\treturn true\n}\n\nfunc broken( {\n",
+                "ValidAfter",
+            ),
+            (
+                "src/Broken.java",
+                "public class ValidAfter {\n}\n\nclass Broken {\n    void broken( {\n}\n",
+                "ValidAfter",
+            ),
+            (
+                "src/broken.c",
+                "int valid_after(void) {\n    return 1;\n}\n\nint broken(void) {\n    return 1;\n",
+                "valid_after",
+            ),
+            (
+                "src/broken.cpp",
+                "int valid_after() {\n    return 1;\n}\n\nclass Broken {\n    void broken( {\n",
+                "valid_after",
+            ),
+            (
+                "src/Broken.cs",
+                "public class ValidAfter\n{\n}\n\npublic class Broken\n{\n    void broken( {\n}\n",
+                "ValidAfter",
+            ),
+            (
+                "src/broken.php",
+                "<?php\n\nfunction valid_after(): bool\n{\n    return true;\n}\n\nfunction broken( {\n",
+                "valid_after",
+            ),
+        ];
+
+        for (path, code, expected) in cases {
+            let file = extract_symbols_from_str(path, code).unwrap();
+            assert!(
+                file.symbols.iter().any(|symbol| symbol.name == *expected),
+                "{path} must still extract {expected}"
+            );
+        }
     }
 
     #[test]

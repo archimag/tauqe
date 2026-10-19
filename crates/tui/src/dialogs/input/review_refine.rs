@@ -53,8 +53,8 @@ pub(super) async fn handle_review_refine_dialog(
         return Ok(Some(InputResult::Continue));
     }
 
-    let is_ctrl_alt = key.modifiers.contains(KeyModifiers::CONTROL)
-        && key.modifiers.contains(KeyModifiers::ALT);
+    let is_ctrl_alt =
+        key.modifiers.contains(KeyModifiers::CONTROL) && key.modifiers.contains(KeyModifiers::ALT);
 
     // Alt+digit picks an architect by position without moving the cursor out of
     // the instructions editor.
@@ -132,12 +132,7 @@ pub(super) async fn handle_review_refine_dialog(
         }
         _ => {
             if dialog.focus.is_instructions_editor() {
-                crate::input::handle_editor_key(
-                    &mut dialog.instructions_editor,
-                    key,
-                    is_cmd,
-                    true,
-                );
+                crate::input::handle_editor_key(&mut dialog.instructions_editor, key, is_cmd, true);
             }
             st.review.refine_dialog = Some(dialog);
             Ok(Some(InputResult::Continue))
@@ -194,7 +189,9 @@ pub(crate) async fn submit_review_refine_dialog(
         let mut st = state.lock().await;
         st.review.refining = previous_refining;
         st.review.refine_queue.clear();
-        st.notify_error(crate::i18n::active_t("notify.turn_start_failed").replace("{}", &err.to_string()));
+        st.notify_error(
+            crate::i18n::active_t("notify.turn_start_failed").replace("{}", &err.to_string()),
+        );
     }
 
     Ok(Some(InputResult::Continue))
@@ -437,7 +434,9 @@ mod tests {
                 .as_mut()
                 .expect("dialog must be open");
             dialog.selector.select_index(1);
-            dialog.instructions_editor.insert_str("focus on the auth guard");
+            dialog
+                .instructions_editor
+                .insert_str("focus on the auth guard");
             dialog.focus = RefineDialogFocus::InstructionsEditor;
         }
 

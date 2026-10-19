@@ -253,10 +253,9 @@ pub(super) async fn run_review_batch_with_options(
     if owner_id != "all" {
         let save_root = repo_root.clone();
         let owner_owned = owner_id.to_string();
-        let _ = offload_review(move || {
-            ReviewStorage::save_active_id(&save_root, Some(&owner_owned))
-        })
-        .await;
+        let _ =
+            offload_review(move || ReviewStorage::save_active_id(&save_root, Some(&owner_owned)))
+                .await;
     }
     clear_auto_context(state).await;
 
@@ -270,7 +269,10 @@ pub(super) async fn run_review_batch_with_options(
                     "Fix sub-step '{}' of review finding #{} in session '{}'",
                     step, item_id, session_id
                 ),
-                None => format!("Fix review finding #{} in session '{}'", item_id, session_id),
+                None => format!(
+                    "Fix review finding #{} in session '{}'",
+                    item_id, session_id
+                ),
             };
             BatchStep::new(format!("{}:{}", session_id, item_id), label)
         })
@@ -391,9 +393,16 @@ pub(super) async fn run_review_batch(
 }
 
 pub async fn handle_review_execute(req: Request, state: &Arc<AppState>) -> Response {
-    let params: ReviewExecuteParams = match req.params.and_then(|p| serde_json::from_value(p).ok()) {
+    let params: ReviewExecuteParams = match req.params.and_then(|p| serde_json::from_value(p).ok())
+    {
         Some(p) => p,
-        None => return Response::err(req.id, errors::INVALID_PARAMS, "Missing or invalid review execute params"),
+        None => {
+            return Response::err(
+                req.id,
+                errors::INVALID_PARAMS,
+                "Missing or invalid review execute params",
+            )
+        }
     };
 
     let repo_root = state.context.read().await.repo_root().to_path_buf();
@@ -402,9 +411,19 @@ pub async fn handle_review_execute(req: Request, state: &Arc<AppState>) -> Respo
         Some(review_id) => {
             let load_root = repo_root.clone();
             let load_id = review_id.to_string();
-            let session = match offload_review(move || ReviewStorage::load_review(&load_root, &load_id)).await {
+            let session = match offload_review(move || {
+                ReviewStorage::load_review(&load_root, &load_id)
+            })
+            .await
+            {
                 Ok(Some(s)) => s,
-                Ok(None) => return Response::err(req.id, errors::NOT_FOUND, format!("Review session '{}' not found", review_id)),
+                Ok(None) => {
+                    return Response::err(
+                        req.id,
+                        errors::NOT_FOUND,
+                        format!("Review session '{}' not found", review_id),
+                    )
+                }
                 Err(err) => return Response::err(req.id, errors::REVIEW_LOAD_FAILED, err),
             };
 
@@ -413,9 +432,23 @@ pub async fn handle_review_execute(req: Request, state: &Arc<AppState>) -> Respo
                 Some(item_id) => {
                     let item = match session.find_item(item_id) {
                         Some(i) => i,
-                        None => return Response::err(req.id, errors::NOT_FOUND, format!("Review item #{} not found in session '{}'", item_id, review_id)),
+                        None => {
+                            return Response::err(
+                                req.id,
+                                errors::NOT_FOUND,
+                                format!(
+                                    "Review item #{} not found in session '{}'",
+                                    item_id, review_id
+                                ),
+                            )
+                        }
                     };
-                    match params.step_id.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                    match params
+                        .step_id
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                    {
                         Some(step) => {
                             if let Err(err) = validate_step_target(item, step) {
                                 return Response {
@@ -439,7 +472,10 @@ pub async fn handle_review_execute(req: Request, state: &Arc<AppState>) -> Respo
                                 return Response::err(
                                     req.id,
                                     errors::ITEM_REJECTED,
-                                    format!("Review item #{} is REJECTED and cannot be executed", item.id),
+                                    format!(
+                                        "Review item #{} is REJECTED and cannot be executed",
+                                        item.id
+                                    ),
                                 );
                             }
                             IssueStatus::Fixed => {
@@ -476,9 +512,7 @@ pub async fn handle_review_execute(req: Request, state: &Arc<AppState>) -> Respo
                         .filter(|i| {
                             matches!(
                                 i.status,
-                                IssueStatus::Todo
-                                    | IssueStatus::InProgress
-                                    | IssueStatus::Refine
+                                IssueStatus::Todo | IssueStatus::InProgress | IssueStatus::Refine
                             )
                         })
                         .map(|i| i.id)
@@ -493,7 +527,10 @@ pub async fn handle_review_execute(req: Request, state: &Arc<AppState>) -> Respo
                     ids
                 }
             };
-            let tasks: Vec<(String, u32)> = item_ids.into_iter().map(|id| (review_id.to_string(), id)).collect();
+            let tasks: Vec<(String, u32)> = item_ids
+                .into_iter()
+                .map(|id| (review_id.to_string(), id))
+                .collect();
             (review_id.to_string(), tasks, target_step)
         }
         None => {
@@ -579,7 +616,11 @@ pub async fn handle_review_execute(req: Request, state: &Arc<AppState>) -> Respo
         .await
         {
             BatchOutcome::Completed { items } => {
-                tracing::info!("Review batch '{}' completed: {} finding(s)", owner_id, items);
+                tracing::info!(
+                    "Review batch '{}' completed: {} finding(s)",
+                    owner_id,
+                    items
+                );
             }
             BatchOutcome::Failed {
                 completed,

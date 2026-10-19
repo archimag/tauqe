@@ -139,14 +139,7 @@ async fn run_review_step_inner(
             "autonomous architect decomposition before coding"
         );
         match refine_finding_with_architect(
-            state,
-            repo_root,
-            &session,
-            &item,
-            None,
-            None,
-            None,
-            &operation,
+            state, repo_root, &session, &item, None, None, None, &operation,
         )
         .await
         {
@@ -187,8 +180,19 @@ async fn run_review_step_inner(
     }
 
     preload_item_files(state, repo_root, &item.files).await;
-    set_item_status(state, repo_root, review_id, item_id, IssueStatus::InProgress).await;
-    tracing::info!(review_id = review_id, item_id = item_id, "review step started");
+    set_item_status(
+        state,
+        repo_root,
+        review_id,
+        item_id,
+        IssueStatus::InProgress,
+    )
+    .await;
+    tracing::info!(
+        review_id = review_id,
+        item_id = item_id,
+        "review step started"
+    );
 
     // Generate the active turn marker before assembling prompts so the target
     // finding prompt and the model turn share the same marker-bound protocol.
@@ -549,7 +553,14 @@ async fn run_review_subplan(
     // prefix cache across its sub-steps and their retries.
     let session_id = Some(format_session_id(SESSION_PREFIX_REVIEW, review_id));
     let item_id = item.id;
-    set_item_status(state, repo_root, review_id, item_id, IssueStatus::InProgress).await;
+    set_item_status(
+        state,
+        repo_root,
+        review_id,
+        item_id,
+        IssueStatus::InProgress,
+    )
+    .await;
 
     let marker = state.next_turn_marker().await;
     let marker_suffix = marker
@@ -582,7 +593,9 @@ async fn run_review_subplan(
     // evaluator, so dependency ordering and terminal states are derived exactly
     // as they are for a plan.
     let evaluation = match step_id {
-        Some(target) if plan.is_leaf_item(target) == Some(true) => plan.evaluate_scope(Some(target)),
+        Some(target) if plan.is_leaf_item(target) == Some(true) => {
+            plan.evaluate_scope(Some(target))
+        }
         Some(target) => {
             set_item_status(state, repo_root, review_id, item_id, IssueStatus::Todo).await;
             return Err(ReviewStepFailure::infrastructure(format!(

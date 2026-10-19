@@ -257,10 +257,9 @@ fn test_review_model_ref_lenient_is_total_and_keeps_precise_errors() {
 fn test_review_start_params_path_pattern_backward_compatible() {
     // A legacy client omits `path_pattern`; it stays absent and is never
     // serialized, preserving the old wire shape.
-    let legacy: ReviewStartParams = serde_json::from_str(
-        r#"{"model":{"provider":"openrouter","name":"openai/gpt-4o"}}"#,
-    )
-    .unwrap();
+    let legacy: ReviewStartParams =
+        serde_json::from_str(r#"{"model":{"provider":"openrouter","name":"openai/gpt-4o"}}"#)
+            .unwrap();
     assert!(legacy.path_pattern.is_none());
     assert_eq!(legacy.model, Some(ModelRef::openrouter("openai/gpt-4o")));
 
@@ -451,9 +450,18 @@ fn test_issue_status_lifecycle_and_refine() {
     assert_eq!(status.next().next(), IssueStatus::InProgress);
     assert_eq!(status.next().next().next(), IssueStatus::Refine);
     assert_eq!(status.next().next().next().next(), IssueStatus::Fixed);
-    assert_eq!(status.next().next().next().next().next(), IssueStatus::Skipped);
-    assert_eq!(status.next().next().next().next().next().next(), IssueStatus::Rejected);
-    assert_eq!(status.next().next().next().next().next().next().next(), IssueStatus::Discussion);
+    assert_eq!(
+        status.next().next().next().next().next(),
+        IssueStatus::Skipped
+    );
+    assert_eq!(
+        status.next().next().next().next().next().next(),
+        IssueStatus::Rejected
+    );
+    assert_eq!(
+        status.next().next().next().next().next().next().next(),
+        IssueStatus::Discussion
+    );
     assert_eq!(IssueStatus::Refine.to_string(), "REFINE");
     assert_eq!(
         serde_json::to_string(&IssueStatus::Refine).unwrap(),

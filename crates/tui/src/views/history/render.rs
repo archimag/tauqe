@@ -47,12 +47,7 @@ pub fn render_history_view(
     let total_lines = history_lines.len();
     state.history_view.rendered_lines_count = total_lines;
     state.history_view.code_blocks = code_blocks;
-    state.history_view.content_rect = (
-        inner.x,
-        inner.y,
-        inner.width,
-        content_height,
-    );
+    state.history_view.content_rect = (inner.x, inner.y, inner.width, content_height);
 
     let max_scroll = clamp_u16(total_lines).saturating_sub(content_height);
     if state.history_view.auto_scroll || state.history_view.scroll > max_scroll {
@@ -102,7 +97,7 @@ pub fn render_history_view(
             engine.fg(palette.status_info),
         ),
     ]);
-    let prompt_widget = Paragraph::new(info_line)
-        .block(Block::default().padding(Padding::horizontal(1)));
+    let prompt_widget =
+        Paragraph::new(info_line).block(Block::default().padding(Padding::horizontal(1)));
     frame.render_widget(prompt_widget, info_area);
 }

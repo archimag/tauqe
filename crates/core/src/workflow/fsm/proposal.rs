@@ -7,16 +7,16 @@
 //! the helpers that normalize commands into verification targets, terminal
 //! outcomes, and conversational text.
 
-use tokio::sync::{mpsc, watch};
 use tauqe_protocol::{
-    ContextAccess, DocTopic, EditOperation, LlmCommand, LlmOutcome, ModelRef, RepoSearchRequest,
-    TurnIntent, VerifyOnSuccess, VerifyTarget,
+    ContextAccess, DirListRequest, DocTopic, EditOperation, LlmCommand, LlmOutcome, ModelRef,
+    RepoSearchRequest, TurnIntent, VerifyOnSuccess, VerifyTarget,
 };
+use tokio::sync::{mpsc, watch};
 
 use crate::context::{ContextFileContent, ContextManager};
 use crate::edits::protocol::{
-    ContextRequest, VerifyOnSuccess as EditVerifyOnSuccess,
-    VerifyRequest as EditVerifyRequest, VerifyTarget as EditVerifyTarget,
+    ContextRequest, VerifyOnSuccess as EditVerifyOnSuccess, VerifyRequest as EditVerifyRequest,
+    VerifyTarget as EditVerifyTarget,
 };
 use crate::edits::StagedEditsState;
 use crate::history::HistoryManager;
@@ -41,6 +41,9 @@ pub(super) struct ProposalStep {
     context_requests: Vec<ContextRequest>,
     doc_requests: Vec<DocTopic>,
     repo_searches: Vec<RepoSearchRequest>,
+    repo_dirs: bool,
+    repo_map_requests: Vec<String>,
+    dir_list_requests: Vec<DirListRequest>,
     verify_request: Option<EditVerifyRequest>,
     terminal_outcome: Option<LlmOutcome>,
     blocked: Option<String>,
@@ -78,10 +81,21 @@ impl ProposalStep {
                     step.repo_searches
                         .push(RepoSearchRequest::new(path.clone(), regex.clone()));
                 }
+                LlmCommand::RepoDirs => step.repo_dirs = true,
+                LlmCommand::RepoMap { path } => step.repo_map_requests.push(path.clone()),
+                // The request is normalized during decoding, so a listing that
+                // names a location outside the repository is dropped here
+                // instead of reaching the discovery dispatcher.
+                LlmCommand::DirList { path, recursive } => {
+                    if let Some(request) =
+                        DirListRequest::new(path.clone(), *recursive).normalized()
+                    {
+                        step.dir_list_requests.push(request);
+                    }
+                }
                 LlmCommand::Verify { target, on_success } => {
                     if step.verify_request.is_none() {
-                        step.verify_request =
-                            Some(to_edit_verify_request(*target, *on_success));
+                        step.verify_request = Some(to_edit_verify_request(*target, *on_success));
                     }
                 }
                 LlmCommand::Outcome { outcome } => {
@@ -147,6 +161,26 @@ impl ProposalStep {
         &self.repo_searches
     }
 
+    /// Whether the proposal requested the compact repository directory tree.
+    pub(super) fn repo_dirs(&self) -> bool {
+        self.repo_dirs
+    }
+
+    /// Targeted repository map requests carried by the proposal.
+    pub(super) fn repo_maps(&self) -> &[String] {
+        &self.repo_map_requests
+    }
+
+    /// Directory listing requests carried by the proposal.
+    ///
+    /// Entries are normalized while decoding, so a listing that named a
+    /// location outside the repository never reaches this accessor. The
+    /// discovery loop reads it to recognize a round that only listed a
+    /// directory as progress instead of a dead end.
+    pub(super) fn dir_list_requests(&self) -> &[DirListRequest] {
+        &self.dir_list_requests
+    }
+
     /// Toolchain verification request carried by the proposal, if any.
     pub(super) fn verify_request(&self) -> Option<&EditVerifyRequest> {
         self.verify_request.as_ref()
@@ -191,6 +225,29 @@ impl ProposalStep {
         !self.context_requests.is_empty()
             || !self.doc_requests.is_empty()
             || !self.repo_searches.is_empty()
+            || !self.repo_maps().is_empty()
+            || !self.dir_list_requests.is_empty()
+            || self.repo_dirs
+    }
+
+    /// Reports whether the round carried nothing the harness can act upon.
+    ///
+    /// An empty round produced no conversational text, no file edits, no
+    /// protocol error, no discovery command, no plan mutation, no verification
+    /// request, and no terminal outcome. Such a round is a transport-level
+    /// non-answer rather than a validated reply, so the FSM re-asks the model
+    /// instead of recording it as an `ModelResult::Answer`. Ephemeral signals
+    /// that grant no capability — the scratchpad notes and the detected user
+    /// language — never make a round actionable on their own.
+    pub(super) fn is_empty_step(&self) -> bool {
+        self.text.trim().is_empty()
+            && self.edits.is_empty()
+            && self.protocol_errors.is_empty()
+            && self.plans.is_empty()
+            && self.verify_request.is_none()
+            && self.terminal_outcome.is_none()
+            && self.blocked.is_none()
+            && !self.has_discovery_commands()
     }
 }
 
@@ -324,10 +381,11 @@ pub(super) async fn run_proposal_step(
     // async executor thread. A repository that cannot be inspected degrades to
     // an absent state block instead of failing the turn.
     let root = repo_root.clone();
-    let repo_state =
-        crate::blocking::run_blocking_async(move || crate::git::get_repository_state(Some(&root)))
-            .await
-            .ok();
+    let repo_state = crate::blocking::run_blocking_async(move || {
+        crate::git::state::get_repository_state(Some(&root))
+    })
+    .await
+    .ok();
 
     let ctx_state = context_manager.get_state();
     let root = repo_root.clone();
@@ -371,19 +429,31 @@ pub(super) async fn run_proposal_step(
         context_files.retain(|file| !staged.deleted_paths.contains(&file.path));
     }
 
-    let targetable_paths: Vec<String> = context_files
-        .iter()
-        .map(|file| file.path.clone())
-        .collect();
+    let targetable_paths: Vec<String> =
+        context_files.iter().map(|file| file.path.clone()).collect();
 
     // The cache freezes the map on the first round of the turn, so later rounds
     // receive the identical string even after discovery widened the context.
-    let repo_map = cache
-        .repo_map(&repo_root, &targetable_paths, options.repomap_token_budget)
-        .await;
+    // The eager symbol map and the compact directory outline are mutually
+    // exclusive: the model reads either symbol contours or the folder layout,
+    // never both, so exactly one outline enters the prompt.
+    let (repo_map, repo_dirs) = if options.include_repo_map {
+        let map = cache
+            .repo_map(&repo_root, &targetable_paths, options.repomap_token_budget)
+            .await;
+        (map, None)
+    } else {
+        (
+            None,
+            cache
+                .repo_dirs(&repo_root, context_manager.pinned_patterns())
+                .await,
+        )
+    };
 
     let repomap_tokens = repo_map
         .as_deref()
+        .or(repo_dirs.as_deref())
         .map(crate::prompt::estimate_tokens)
         .unwrap_or(0);
     tracing::info!(
@@ -407,7 +477,8 @@ pub(super) async fn run_proposal_step(
         protocol.name(),
         history_tag,
         repo_map,
-    );
+    )
+    .with_repo_dirs(repo_dirs);
     assembly.target_language = target_language.map(|language| language.to_string());
     assembly.intent = intent;
     assembly.turn_scratchpad = turn_scratchpad.map(|notes| notes.to_string());
@@ -465,15 +536,30 @@ pub(super) async fn run_proposal_step(
                 }
                 StreamEvent::Error(ref err) => {
                     stream_error = Some(err.clone());
-                    let _ = forward_stream_tx.send(StreamEvent::Error(err.clone())).await;
+                    let _ = forward_stream_tx
+                        .send(StreamEvent::Error(err.clone()))
+                        .await;
+                }
+                // A retried attempt starts from a clean slate: the transport
+                // decorator discarded the fragments of the interrupted attempt
+                // and re-issued the request, so the text accumulated for
+                // decoding is discarded with them. Otherwise the partial output
+                // of a broken attempt would be decoded together with the
+                // complete answer of its retry.
+                StreamEvent::ResetStream => {
+                    assistant_text.clear();
+                    let _ = forward_stream_tx.send(StreamEvent::ResetStream).await;
                 }
                 StreamEvent::Done => {
                     completed = true;
                 }
+                // Events the view does not model are forwarded as-is. A client
+                // that stopped listening only silences the forwarding: the
+                // round keeps draining the provider, so its output is still
+                // decoded and the turn reaches a deterministic outcome instead
+                // of being reported as an interrupted stream.
                 other => {
-                    if forward_stream_tx.send(other).await.is_err() {
-                        break;
-                    }
+                    let _ = forward_stream_tx.send(other).await;
                 }
             }
         }
@@ -567,5 +653,76 @@ mod tests {
             topic: DocTopic::Git,
         }]);
         assert!(doc.has_discovery_commands());
+
+        let dirs = ProposalStep::from_commands(vec![LlmCommand::RepoDirs]);
+        assert!(dirs.repo_dirs());
+        assert!(dirs.has_discovery_commands());
+
+        let maps = ProposalStep::from_commands(vec![LlmCommand::RepoMap {
+            path: "crates/core".to_string(),
+        }]);
+        assert_eq!(maps.repo_maps().len(), 1);
+        assert_eq!(maps.repo_maps()[0], "crates/core");
+        assert!(maps.has_discovery_commands());
+
+        let dir_list = ProposalStep::from_commands(vec![LlmCommand::DirList {
+            path: "crates/core".to_string(),
+            recursive: false,
+        }]);
+        assert!(dir_list.has_discovery_commands());
+
+        // A listing that would escape the repository is dropped during
+        // decoding, so it never counts as discovery progress.
+        let escaping = ProposalStep::from_commands(vec![LlmCommand::DirList {
+            path: "../escape".to_string(),
+            recursive: true,
+        }]);
+        assert!(!escaping.has_discovery_commands());
+    }
+
+    #[test]
+    fn is_empty_step_rejects_rounds_without_actionable_output() {
+        use tauqe_protocol::{ContextAccess, LlmCommand, LlmOutcome};
+
+        let nothing = ProposalStep::from_commands(Vec::new());
+        assert!(nothing.is_empty_step());
+
+        let blank = ProposalStep::from_commands(vec![LlmCommand::Text {
+            content: "  \n\t ".to_string(),
+        }]);
+        assert!(blank.is_empty_step());
+
+        // Ephemeral channels grant no capability, so they cannot stand in for a
+        // concrete proposal on their own.
+        let ephemeral = ProposalStep::from_commands(vec![
+            LlmCommand::Scratchpad {
+                notes: "still thinking".to_string(),
+            },
+            LlmCommand::UserLanguage {
+                language: "Russian".to_string(),
+            },
+        ]);
+        assert!(ephemeral.is_empty_step());
+
+        let answer = ProposalStep::from_commands(vec![LlmCommand::Text {
+            content: "The function already returns 42.".to_string(),
+        }]);
+        assert!(!answer.is_empty_step());
+
+        let discovery = ProposalStep::from_commands(vec![LlmCommand::ContextRequest {
+            path: "src/a.rs".to_string(),
+            access: ContextAccess::ReadOnly,
+        }]);
+        assert!(!discovery.is_empty_step());
+
+        let malformed = ProposalStep::from_commands(vec![LlmCommand::ProtocolError {
+            message: "unclosed <edit>".to_string(),
+        }]);
+        assert!(!malformed.is_empty_step());
+
+        let terminal = ProposalStep::from_commands(vec![LlmCommand::Outcome {
+            outcome: LlmOutcome::Success { summary: None },
+        }]);
+        assert!(!terminal.is_empty_step());
     }
 }

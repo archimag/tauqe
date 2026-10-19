@@ -111,10 +111,7 @@ mod tests {
     #[test]
     fn test_narrowed_capability_set_omits_disabled_instructions() {
         let narrowed = system_instructions_for(
-            &CapabilitySet::from_slice(&[
-                LlmCapability::TextMessage,
-                LlmCapability::FileEdits,
-            ]),
+            &CapabilitySet::from_slice(&[LlmCapability::TextMessage, LlmCapability::FileEdits]),
             &[],
         );
         assert!(narrowed.contains("<tauqe_edits summary"));

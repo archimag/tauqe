@@ -175,7 +175,9 @@ pub fn render_onboarding_view(
                 active_t("onboarding.step.credentials_title"),
                 engine.fg(palette.status_warning).bold(),
             )));
-            lines.push(Line::from(active_t("onboarding.credentials.body_not_detected")));
+            lines.push(Line::from(active_t(
+                "onboarding.credentials.body_not_detected",
+            )));
             lines.push(Line::from(active_t("onboarding.credentials.body_required")));
             lines.push(Line::from(fill_one(
                 &active_t("onboarding.credentials.body_location"),
@@ -220,7 +222,9 @@ pub fn render_onboarding_view(
                 active_t("onboarding.step.workstation_title"),
                 engine.fg(palette.button_active_bg).bold(),
             )));
-            lines.push(Line::from(active_t("onboarding.workstation.body_configure")));
+            lines.push(Line::from(active_t(
+                "onboarding.workstation.body_configure",
+            )));
             lines.push(Line::from(fill_one(
                 &active_t("onboarding.workstation.body_file"),
                 &ob.default_tui_config_path.to_string(),
@@ -339,7 +343,10 @@ pub fn render_onboarding_view(
                     format!("• {} ", active_t("onboarding.ready.model_label")),
                     engine.fg(palette.text_primary).bold(),
                 ),
-                Span::styled(state.active_model.to_string(), engine.fg(palette.status_info)),
+                Span::styled(
+                    state.active_model.to_string(),
+                    engine.fg(palette.status_info),
+                ),
             ]));
 
             let config_value = ob
@@ -404,7 +411,10 @@ pub fn render_onboarding_view(
             let prompt = active_t("onboarding.input.langmap_prompt");
             lines.push(Line::from(vec![
                 Span::styled(prompt, engine.fg(palette.button_active_bg).bold()),
-                Span::styled(ob.input_buffer.get_text(), engine.fg(palette.text_primary).bold()),
+                Span::styled(
+                    ob.input_buffer.get_text(),
+                    engine.fg(palette.text_primary).bold(),
+                ),
                 Span::styled("█", engine.fg(palette.button_active_bg)),
                 Span::styled(
                     active_t("onboarding.input.langmap_hint"),

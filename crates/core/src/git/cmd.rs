@@ -65,12 +65,7 @@ pub fn commit_with_developer_author(dir: &Path, message: &str, allow_empty: bool
 
     let mut args = Vec::new();
     if !identity_resolved {
-        args.extend_from_slice(&[
-            "-c",
-            name_override.as_str(),
-            "-c",
-            email_override.as_str(),
-        ]);
+        args.extend_from_slice(&["-c", name_override.as_str(), "-c", email_override.as_str()]);
     }
     args.push("commit");
     if allow_empty {

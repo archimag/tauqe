@@ -99,7 +99,8 @@ pub(crate) fn normalize_marked_xml_incremental(
         output.push_str(&raw[pos..start]);
         let closing = raw[start..].starts_with("</");
         let name_start = start + if closing { 2 } else { 1 };
-        let name_len = raw[name_start..].bytes()
+        let name_len = raw[name_start..]
+            .bytes()
             .take_while(|b| b.is_ascii_alphanumeric() || *b == b'_' || *b == b'-')
             .count();
         let name_end = name_start + name_len;
@@ -122,7 +123,9 @@ pub(crate) fn normalize_marked_xml_incremental(
                 marked: false,
             });
         }
-        let boundary = raw[name_end..].chars().next()
+        let boundary = raw[name_end..]
+            .chars()
+            .next()
             .map(|c| c.is_whitespace() || c == '>' || c == '/')
             .unwrap_or(false);
         if let (true, Some(open)) = (boundary, active) {
@@ -132,7 +135,9 @@ pub(crate) fn normalize_marked_xml_incremental(
             let mut end = None;
             for (idx, ch) in raw[name_end..].char_indices() {
                 if let Some(q) = quote {
-                    if ch == q { quote = None; }
+                    if ch == q {
+                        quote = None;
+                    }
                 } else if ch == '\'' || ch == '"' {
                     quote = Some(ch);
                 } else if ch == '>' {
@@ -176,7 +181,9 @@ pub(crate) fn normalize_marked_xml_incremental(
             };
             if accepted {
                 output.push('<');
-                if closing { output.push('/'); }
+                if closing {
+                    output.push('/');
+                }
                 output.push_str(base);
                 output.push_str(&raw[name_end..end]);
                 if !closing && !raw[name_end..end].trim_end().ends_with("/>") {

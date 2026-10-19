@@ -14,10 +14,9 @@ pub use discussion::{
     format_active_plan_context, format_plan_discussion_prompt, PLAN_DISCUSSION_PREFIX,
 };
 pub use refine::{
-    build_plan_horizon_system_prompt, build_plan_horizon_user_prompt,
-    parse_plan_refinement_output, plan_refine_response_schema,
-    plan_refine_response_schema_definition, PlanHorizonDiagnostics, PlanRefinementOutput,
-    MAX_PLAN_REFINEMENT_DEPTH,
+    build_plan_horizon_system_prompt, build_plan_horizon_user_prompt, parse_plan_refinement_output,
+    plan_refine_response_schema, plan_refine_response_schema_definition, PlanHorizonDiagnostics,
+    PlanRefinementOutput, MAX_PLAN_REFINEMENT_DEPTH,
 };
 pub use step::{
     format_plan_step_execution_prompt, format_plan_step_retry_prompt, PLAN_STEP_EXECUTION_PREFIX,
@@ -143,6 +142,7 @@ mod tests {
             &ctx_files,
             Some("fn generate_token()"),
             None,
+            None,
             Some("Focus on EdDSA"),
         );
         assert!(user_prompt.contains("# Plan Horizon Synthesis: [jwt-auth] JWT Authentication"));
@@ -156,7 +156,10 @@ mod tests {
 
         let schema = plan_refine_response_schema();
         assert!(schema.get("properties").is_some());
-        assert!(!schema.to_string().contains("$ref"), "Schema must not contain recursive $ref");
+        assert!(
+            !schema.to_string().contains("$ref"),
+            "Schema must not contain recursive $ref"
+        );
         assert!(schema.to_string().contains("readonly_files"));
         assert!(schema.to_string().contains("depends_on"));
         assert!(schema.to_string().contains("New unfinished horizon"));
@@ -183,7 +186,10 @@ mod tests {
         assert_eq!(parsed.status, "success");
         assert_eq!(parsed.items.len(), 1);
         assert_eq!(parsed.items[0].id, "1");
-        assert_eq!(parsed.items[0].readonly_files, vec!["crates/core/src/contract.rs"]);
+        assert_eq!(
+            parsed.items[0].readonly_files,
+            vec!["crates/core/src/contract.rs"]
+        );
 
         let raw_blocked = r#"```json
         {
@@ -211,7 +217,10 @@ mod tests {
         }"#;
         let parsed_ctx = parse_plan_refinement_output(raw_needs_ctx).unwrap();
         assert_eq!(parsed_ctx.status, "needs_context");
-        assert_eq!(parsed_ctx.context_requests, vec!["crates/core/src/toolchain.rs"]);
+        assert_eq!(
+            parsed_ctx.context_requests,
+            vec!["crates/core/src/toolchain.rs"]
+        );
         assert!(parsed_ctx.items.is_empty());
 
         let raw_deep = r#"{
@@ -271,7 +280,8 @@ mod tests {
     fn test_format_plan_discussion_prompt() {
         let plan = sample_plan();
 
-        let prompt = format_plan_discussion_prompt(&plan, &["2".to_string()], "Should we use EdDSA?");
+        let prompt =
+            format_plan_discussion_prompt(&plan, &["2".to_string()], "Should we use EdDSA?");
         assert!(prompt.contains("# Plan Discussion: [jwt-auth] JWT Authentication"));
         assert!(prompt.contains("Implement secure tokens"));
         assert!(prompt.contains("<active_plan id=\"jwt-auth\""));
@@ -301,7 +311,8 @@ mod tests {
             blocked_reason: Some("Missing crypto dependency"),
             toolchain_status: Some("cargo check: 1 error"),
         };
-        let prompt = build_plan_horizon_user_prompt(&plan, &[], None, Some(diagnostics), None);
+        let prompt =
+            build_plan_horizon_user_prompt(&plan, &[], None, None, Some(diagnostics), None);
         assert!(prompt.contains("# Plan Horizon Synthesis: [jwt-auth] JWT Authentication"));
         assert!(prompt.contains("## Architectural Concept"));
         assert!(prompt.contains("## Completed Foundation"));
@@ -313,7 +324,7 @@ mod tests {
         assert!(prompt.contains("Architect Instructions"));
 
         // Without diagnostics the failure section is omitted entirely.
-        let plain = build_plan_horizon_user_prompt(&plan, &[], None, None, None);
+        let plain = build_plan_horizon_user_prompt(&plan, &[], None, None, None, None);
         assert!(!plain.contains("Blocked Step Diagnostics"));
 
         // A plan with no DONE steps reports an empty foundation.
@@ -321,7 +332,7 @@ mod tests {
         for item in &mut no_done.items {
             item.status = PlanItemStatus::Todo;
         }
-        let no_done_prompt = build_plan_horizon_user_prompt(&no_done, &[], None, None, None);
+        let no_done_prompt = build_plan_horizon_user_prompt(&no_done, &[], None, None, None, None);
         assert!(no_done_prompt.contains("*(No completed steps yet)*"));
     }
 }

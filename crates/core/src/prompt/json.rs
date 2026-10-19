@@ -165,6 +165,24 @@ impl PromptProtocol for JsonPromptProtocol {
             });
         }
 
+        // Repository outline: the compact directory tree and targeted symbol
+        // maps decoded from the structured `repo_dirs`/`repo_maps` fields.
+        if structured.parse_repo_dirs(raw_text) {
+            commands.push(LlmCommand::RepoDirs);
+        }
+        for path in structured.parse_repo_maps(raw_text) {
+            commands.push(LlmCommand::RepoMap { path });
+        }
+
+        // Directory content listings decoded from the structured `dir_lists`
+        // field, falling back to `<dir_list>` control tags.
+        for request in structured.parse_dir_lists(raw_text) {
+            commands.push(LlmCommand::DirList {
+                path: request.path,
+                recursive: request.recursive,
+            });
+        }
+
         // Toolchain verification decoded from the structured `verify` field.
         if let Some(request) = structured.parse_verify_request(raw_text) {
             commands.push(LlmCommand::Verify {
@@ -302,9 +320,9 @@ impl PromptProtocol for JsonPromptProtocol {
                 JsonStreamFilter::new(editable_paths, repo_root)
                     .with_staged_contents(staged_contents),
             ),
-            JsonPromptMode::Discussion { stream_field } => {
-                Box::new(DiscussionStreamFilter::with_target_field(stream_field.clone()))
-            }
+            JsonPromptMode::Discussion { stream_field } => Box::new(
+                DiscussionStreamFilter::with_target_field(stream_field.clone()),
+            ),
         }
     }
 }
@@ -423,6 +441,73 @@ mod tests {
     }
 
     #[test]
+    fn test_decode_repo_outline_requests() {
+        let protocol = JsonPromptProtocol::default();
+        let output = r#"{
+            "message":"Outlining",
+            "changes":[],
+            "repo_dirs":true,
+            "repo_maps":["./crates/core/","."],
+            "suggested_actions":[]
+        }"#;
+        let commands = protocol.decode(output);
+
+        assert!(commands.contains(&LlmCommand::RepoDirs));
+        assert!(commands.contains(&LlmCommand::RepoMap {
+            path: "crates/core".to_string(),
+        }));
+        assert!(commands.contains(&LlmCommand::RepoMap {
+            path: String::new(),
+        }));
+
+        // An idle outline request decodes into no outline command at all.
+        let idle = r#"{"message":"x","changes":[],"repo_dirs":false,"repo_maps":[]}"#;
+        let commands = protocol.decode(idle);
+        assert!(!commands
+            .iter()
+            .any(|command| matches!(command, LlmCommand::RepoDirs | LlmCommand::RepoMap { .. })));
+    }
+
+    #[test]
+    fn test_decode_dir_list_requests() {
+        let protocol = JsonPromptProtocol::default();
+        let output = r#"{
+            "message":"Listing",
+            "changes":[],
+            "dir_lists":[{"path":"./crates/core/","recursive":false},{"path":".","recursive":true}]
+        }"#;
+        let commands = protocol.decode(output);
+
+        assert!(commands.contains(&LlmCommand::DirList {
+            path: "crates/core".to_string(),
+            recursive: false,
+        }));
+        assert!(commands.contains(&LlmCommand::DirList {
+            path: String::new(),
+            recursive: true,
+        }));
+
+        // An idle listing request decodes into no directory command at all.
+        let idle = r#"{"message":"x","changes":[],"dir_lists":[]}"#;
+        assert!(!protocol
+            .decode(idle)
+            .iter()
+            .any(|command| matches!(command, LlmCommand::DirList { .. })));
+    }
+
+    #[test]
+    fn test_decode_dir_list_from_xml_fallback() {
+        let protocol = JsonPromptProtocol::default();
+        let output = "{\"message\":\"Working\",\"changes\":[]}\n\
+<dir_list path=\"crates/core\" recursive=\"true\" />";
+        let commands = protocol.decode(output);
+        assert!(commands.contains(&LlmCommand::DirList {
+            path: "crates/core".to_string(),
+            recursive: true,
+        }));
+    }
+
+    #[test]
     fn test_decode_discovery_requests() {
         let protocol = JsonPromptProtocol::default();
         let output = r#"{
@@ -480,10 +565,12 @@ mod tests {
 
     #[test]
     fn test_narrowed_capability_set_filters_decoded_commands() {
-        let protocol = JsonPromptProtocol::edits().with_capability_set(CapabilitySet::from_slice(
-            &[LlmCapability::TextMessage],
-        ));
-        assert_eq!(protocol.capability_set().as_slice(), &[LlmCapability::TextMessage]);
+        let protocol = JsonPromptProtocol::edits()
+            .with_capability_set(CapabilitySet::from_slice(&[LlmCapability::TextMessage]));
+        assert_eq!(
+            protocol.capability_set().as_slice(),
+            &[LlmCapability::TextMessage]
+        );
 
         let output = r#"{"message":"Need context","changes":[{"op":"create","path":"src/a.rs","to":"","old_text":"","new_text":"","content":"x"}],"context_requests":["src/b.rs"],"suggested_actions":[]}"#;
         let commands = protocol.decode(output);
@@ -549,9 +636,9 @@ mod tests {
         assert!(commands.contains(&LlmCommand::UserLanguage {
             language: "Russian".to_string(),
         }));
-        let has_plan = commands.iter().any(|c| {
-            matches!(c, LlmCommand::Plan { update } if update.id.as_deref() == Some("p-1"))
-        });
+        let has_plan = commands.iter().any(
+            |c| matches!(c, LlmCommand::Plan { update } if update.id.as_deref() == Some("p-1")),
+        );
         assert!(has_plan);
     }
 
@@ -654,9 +741,8 @@ mod tests {
 
     #[test]
     fn test_narrowed_capability_set_blocks_control_field_decoding() {
-        let protocol = JsonPromptProtocol::edits().with_capability_set(CapabilitySet::from_slice(
-            &[LlmCapability::TextMessage],
-        ));
+        let protocol = JsonPromptProtocol::edits()
+            .with_capability_set(CapabilitySet::from_slice(&[LlmCapability::TextMessage]));
         let output = r#"{
             "message": "Only text",
             "changes": [],
@@ -677,7 +763,10 @@ mod tests {
         let with_edits = JsonPromptProtocol::with_capabilities(CapabilitySet::develop_structured());
         assert_eq!(with_edits.name(), "structured");
         assert!(with_edits.supports(LlmCapability::FileEdits));
-        assert_eq!(with_edits.capability_set(), CapabilitySet::develop_structured());
+        assert_eq!(
+            with_edits.capability_set(),
+            CapabilitySet::develop_structured()
+        );
 
         let no_edits = JsonPromptProtocol::with_capabilities(CapabilitySet::from_slice(&[
             LlmCapability::TextMessage,
@@ -735,17 +824,22 @@ mod tests {
 
     #[test]
     fn test_capability_switch_filters_unadvertised_commands() {
-        let protocol = JsonPromptProtocol::edits().with_capability_set(CapabilitySet::from_slice(&[
-            LlmCapability::TextMessage,
-            LlmCapability::ToolchainVerify,
-        ]));
+        let protocol =
+            JsonPromptProtocol::edits().with_capability_set(CapabilitySet::from_slice(&[
+                LlmCapability::TextMessage,
+                LlmCapability::ToolchainVerify,
+            ]));
         let output = r#"{
             "message": "x",
             "changes": [{"op": "create", "path": "a.rs", "to": "", "old_text": "", "new_text": "", "content": "fn x() {}"}],
             "verify": {"target": "check", "on_success": "report"}
         }"#;
         let commands = protocol.decode(output);
-        assert!(commands.iter().any(|c| matches!(c, LlmCommand::Verify { .. })));
-        assert!(!commands.iter().any(|c| matches!(c, LlmCommand::Edit { .. })));
+        assert!(commands
+            .iter()
+            .any(|c| matches!(c, LlmCommand::Verify { .. })));
+        assert!(!commands
+            .iter()
+            .any(|c| matches!(c, LlmCommand::Edit { .. })));
     }
 }

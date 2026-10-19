@@ -10,8 +10,8 @@ use std::collections::VecDeque;
 use std::sync::Mutex;
 
 use async_trait::async_trait;
-use tokio::sync::{mpsc, watch};
 use tauqe_protocol::{ModelUsageInfo, ProviderKind};
+use tokio::sync::{mpsc, watch};
 
 use super::types::{ChatMessage, ReasoningEffort, ResponseFormat, StreamEvent};
 use super::LlmProvider;
@@ -186,7 +186,10 @@ impl MockLlmProvider {
 
         if let Some(reasoning) = response.reasoning {
             if !reasoning.is_empty()
-                && tx.send(StreamEvent::ReasoningDelta(reasoning)).await.is_err()
+                && tx
+                    .send(StreamEvent::ReasoningDelta(reasoning))
+                    .await
+                    .is_err()
             {
                 return Ok(());
             }
@@ -198,7 +201,10 @@ impl MockLlmProvider {
         }
 
         if !response.content.is_empty()
-            && tx.send(StreamEvent::TextDelta(response.content)).await.is_err()
+            && tx
+                .send(StreamEvent::TextDelta(response.content))
+                .await
+                .is_err()
         {
             return Ok(());
         }
@@ -332,7 +338,9 @@ mod tests {
         assert!(events
             .iter()
             .any(|event| matches!(event, StreamEvent::Error(message) if message == "boom")));
-        assert!(!events.iter().any(|event| matches!(event, StreamEvent::Done)));
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, StreamEvent::Done)));
     }
 
     #[tokio::test]
@@ -383,9 +391,7 @@ mod tests {
             tx,
             cancel_rx,
         );
-        let collect = async {
-            while rx.recv().await.is_some() {}
-        };
+        let collect = async { while rx.recv().await.is_some() {} };
         let (result, ()) = tokio::join!(stream, collect);
         result.expect("mock stream should succeed");
 
@@ -407,9 +413,7 @@ mod tests {
             tx,
             cancel_rx,
         );
-        let collect = async {
-            while rx.recv().await.is_some() {}
-        };
+        let collect = async { while rx.recv().await.is_some() {} };
         let (result, ()) = tokio::join!(stream, collect);
         result.expect("mock stream should succeed");
 

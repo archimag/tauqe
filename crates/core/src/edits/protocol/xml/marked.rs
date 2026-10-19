@@ -5,7 +5,7 @@
 //! reasoning models that drop the marker suffix by retrying unmarked tags.
 
 use crate::edits::protocol::ContextRequest;
-use tauqe_protocol::{DocTopic, EditOperation, ModelResult};
+use tauqe_protocol::{DirListRequest, DocTopic, EditOperation, ModelResult};
 
 use super::clean::extract_conversational_text;
 use super::engine::allows_unmarked_fallback;
@@ -37,7 +37,9 @@ impl MarkedXmlEditProtocol {
     /// [`with_turn_marker`](EditProtocol::with_turn_marker), which rejects a
     /// malformed marker by returning `None` instead of panicking.
     pub fn new(marker: &str) -> Self {
-        Self { marker: marker.to_string() }
+        Self {
+            marker: marker.to_string(),
+        }
     }
 
     /// Runs a marker-normalized parse and retries against the raw text when the
@@ -94,7 +96,10 @@ impl MarkedXmlEditProtocol {
     }
 
     /// Extracts repository search requests from pre-normalized text.
-    pub fn parse_repo_searches_normalized(&self, normalized: &str) -> Vec<tauqe_protocol::RepoSearchRequest> {
+    pub fn parse_repo_searches_normalized(
+        &self,
+        normalized: &str,
+    ) -> Vec<tauqe_protocol::RepoSearchRequest> {
         tags::parse_repo_search_tags(normalized)
     }
 
@@ -102,6 +107,48 @@ impl MarkedXmlEditProtocol {
     pub fn parse_repo_searches(&self, raw_text: &str) -> Vec<tauqe_protocol::RepoSearchRequest> {
         let normalized = normalize_marked_xml(raw_text, &self.marker, true);
         self.parse_repo_searches_normalized(&normalized)
+    }
+
+    /// Reports whether the model requested the directory tree from pre-normalized text.
+    pub fn parse_repo_dirs_normalized(&self, normalized: &str) -> bool {
+        tags::parse_repo_dirs_tags(normalized)
+    }
+
+    /// Reports whether the model requested the compact repository directory tree.
+    ///
+    /// The outline widens what the model can see, so the request must be bound to
+    /// the active turn marker like every other discovery command.
+    pub fn parse_repo_dirs(&self, raw_text: &str) -> bool {
+        let normalized = normalize_marked_xml(raw_text, &self.marker, true);
+        self.parse_repo_dirs_normalized(&normalized)
+    }
+
+    /// Extracts targeted repository map requests from pre-normalized text.
+    pub fn parse_repo_maps_normalized(&self, normalized: &str) -> Vec<String> {
+        tags::parse_repo_map_tags(normalized)
+    }
+
+    /// Extracts targeted repository map requests strictly bound to the active turn marker.
+    ///
+    /// The outline widens what the model can see, so the request must be bound to
+    /// the active turn marker like every other discovery command.
+    pub fn parse_repo_maps(&self, raw_text: &str) -> Vec<String> {
+        let normalized = normalize_marked_xml(raw_text, &self.marker, true);
+        self.parse_repo_maps_normalized(&normalized)
+    }
+
+    /// Extracts directory listing requests from pre-normalized text.
+    pub fn parse_dir_lists_normalized(&self, normalized: &str) -> Vec<DirListRequest> {
+        tags::parse_dir_list_tags(normalized)
+    }
+
+    /// Extracts directory listing requests strictly bound to the active turn marker.
+    ///
+    /// A listing widens what the model can see, so the request must be bound to
+    /// the active turn marker like every other discovery command.
+    pub fn parse_dir_lists(&self, raw_text: &str) -> Vec<DirListRequest> {
+        let normalized = normalize_marked_xml(raw_text, &self.marker, true);
+        self.parse_dir_lists_normalized(&normalized)
     }
 
     /// Extracts documentation topics from pre-normalized text.
@@ -116,27 +163,60 @@ impl MarkedXmlEditProtocol {
     }
 
     /// Extracts a verification request from pre-normalized text with unmarked fallback.
-    pub fn parse_verify_request_normalized(&self, normalized: &str, raw_text: &str) -> Option<VerifyRequest> {
-        self.tolerant_parse_normalized("verify", normalized, raw_text, tags::extract_verify_request, Option::is_none)
+    pub fn parse_verify_request_normalized(
+        &self,
+        normalized: &str,
+        raw_text: &str,
+    ) -> Option<VerifyRequest> {
+        self.tolerant_parse_normalized(
+            "verify",
+            normalized,
+            raw_text,
+            tags::extract_verify_request,
+            Option::is_none,
+        )
     }
 
     /// Extracts a verification request, tolerating an unmarked fallback.
     pub fn parse_verify_request(&self, raw_text: &str) -> Option<VerifyRequest> {
-        self.tolerant_parse("verify", raw_text, tags::extract_verify_request, Option::is_none)
+        self.tolerant_parse(
+            "verify",
+            raw_text,
+            tags::extract_verify_request,
+            Option::is_none,
+        )
     }
 
     /// Extracts the detected user language from pre-normalized text with unmarked fallback.
-    pub fn parse_user_language_normalized(&self, normalized: &str, raw_text: &str) -> Option<String> {
-        self.tolerant_parse_normalized("user_language", normalized, raw_text, tags::extract_user_language, Option::is_none)
+    pub fn parse_user_language_normalized(
+        &self,
+        normalized: &str,
+        raw_text: &str,
+    ) -> Option<String> {
+        self.tolerant_parse_normalized(
+            "user_language",
+            normalized,
+            raw_text,
+            tags::extract_user_language,
+            Option::is_none,
+        )
     }
 
     /// Extracts the detected user language, tolerating an unmarked fallback.
     pub fn parse_user_language(&self, raw_text: &str) -> Option<String> {
-        self.tolerant_parse("user_language", raw_text, tags::extract_user_language, Option::is_none)
+        self.tolerant_parse(
+            "user_language",
+            raw_text,
+            tags::extract_user_language,
+            Option::is_none,
+        )
     }
 
     /// Extracts plan tags from pre-normalized text.
-    pub fn parse_plan_tags_normalized(&self, normalized: &str) -> (Vec<tags::ParsedPlanTag>, Vec<String>) {
+    pub fn parse_plan_tags_normalized(
+        &self,
+        normalized: &str,
+    ) -> (Vec<tags::ParsedPlanTag>, Vec<String>) {
         tags::parse_plan_tags_with_diagnostics(normalized)
     }
 
@@ -235,18 +315,32 @@ impl MarkedXmlEditProtocol {
     /// conversation or source code are treated as literals, preventing injection
     /// or unintentional patch application.
     /// Parses pre-normalized model text into a `ModelResult`.
-    pub fn parse_output_normalized(&self, normalized: &str, editable_paths: &[String]) -> ModelResult {
+    pub fn parse_output_normalized(
+        &self,
+        normalized: &str,
+        editable_paths: &[String],
+    ) -> ModelResult {
         let mut result = XmlEditProtocol.parse_output(normalized, editable_paths);
         match &mut result {
             ModelResult::Answer { text } => *text = restore_xml_literals(text, &self.marker),
-            ModelResult::Edit { summary, edits, proposal, outcome, .. } => {
+            ModelResult::Edit {
+                summary,
+                edits,
+                proposal,
+                outcome,
+                ..
+            } => {
                 *summary = restore_xml_literals(summary, &self.marker);
                 if let Some(message) = &mut outcome.error {
                     *message = restore_xml_literals(message, &self.marker);
                 }
                 for edit in edits {
                     match edit {
-                        EditOperation::Replace { path, old_text, new_text } => {
+                        EditOperation::Replace {
+                            path,
+                            old_text,
+                            new_text,
+                        } => {
                             *path = restore_xml_literals(path, &self.marker);
                             *old_text = restore_xml_literals(old_text, &self.marker);
                             *new_text = restore_xml_literals(new_text, &self.marker);
@@ -287,8 +381,8 @@ impl MarkedXmlEditProtocol {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::tags::{VerifyOnSuccess, VerifyTarget};
+    use super::*;
     use tauqe_protocol::{EditOperation, ModelResult};
 
     #[test]
@@ -465,10 +559,7 @@ mod tests {
         );
         let cleaned_error = proto.clean_assistant_text(&error_output);
         assert!(!cleaned_error.contains("error"));
-        assert_eq!(
-            cleaned_error,
-            "Encountered blocker.\n\nExplanation text."
-        );
+        assert_eq!(cleaned_error, "Encountered blocker.\n\nExplanation text.");
     }
 
     #[test]
@@ -504,9 +595,12 @@ mod tests {
 
         let output = concat!(
             "Discussing outcomes:\n",
-            "<", "success summary=\"Example success\" />\n",
-            "<", "error message=\"Example blocker\" />\n",
-            "<", "blocked reason=\"Example reason\" />\n",
+            "<",
+            "success summary=\"Example success\" />\n",
+            "<",
+            "error message=\"Example blocker\" />\n",
+            "<",
+            "blocked reason=\"Example reason\" />\n",
             "Done.",
         );
         assert_eq!(proto.parse_terminal_outcome(output), None);
@@ -540,7 +634,9 @@ let s = \"clean\";\n\
             ModelResult::Edit { edits, .. } => {
                 assert_eq!(edits.len(), 1);
                 match &edits[0] {
-                    EditOperation::Replace { old_text, new_text, .. } => {
+                    EditOperation::Replace {
+                        old_text, new_text, ..
+                    } => {
                         assert!(old_text.contains("let s = \"</search>\";\n<replace>"));
                         assert!(new_text.contains("let s = \"clean\";"));
                     }
@@ -570,7 +666,8 @@ let s = \"clean\";\n\
         let proto = MarkedXmlEditProtocol::new(marker);
         let output = concat!(
             "Need context example:\n",
-            "<", "context_request path=\"src/a.rs\" access=\"editable\" />\n",
+            "<",
+            "context_request path=\"src/a.rs\" access=\"editable\" />\n",
             "Done.",
         );
         let requests = proto.parse_context_requests(output);
@@ -595,12 +692,51 @@ let s = \"clean\";\n\
         assert_eq!(searches[0].path, "crates/core");
         assert_eq!(searches[0].regex, "fn execute");
 
-        let unmarked_only = "Discussion with <repo_search path=\"crates/server\" regex=\"fn run\" /> alone.";
+        let unmarked_only =
+            "Discussion with <repo_search path=\"crates/server\" regex=\"fn run\" /> alone.";
         assert!(proto.parse_repo_searches(unmarked_only).is_empty());
 
         let cleaned = proto.clean_assistant_text(&output);
         assert!(cleaned.contains("`<repo_search path=\"crates/core\" regex=\"fn old\" />`"));
         assert!(!cleaned.contains("fn execute"));
+    }
+
+    #[test]
+    fn test_marked_xml_repo_dirs_requires_marker_and_ignores_unmarked() {
+        let marker = "M987655";
+        let proto = MarkedXmlEditProtocol::new(marker);
+
+        let output = format!(
+            "Outline example in discussion: `<repo_dirs />`.\n\
+            Real request:\n\
+            <repo_dirs_{m} />\n\
+            Done.",
+            m = marker
+        );
+        assert!(proto.parse_repo_dirs(&output));
+        assert!(!proto.parse_repo_dirs("no request here"));
+        assert!(!proto.parse_repo_dirs("Discussion with <repo_dirs /> alone."));
+    }
+
+    #[test]
+    fn test_marked_xml_dir_list_requires_marker_and_ignores_unmarked() {
+        let marker = "M987656";
+        let proto = MarkedXmlEditProtocol::new(marker);
+
+        let output = format!(
+            "Listing example in discussion: `<dir_list path=\"crates/core\" />`.\n\
+            Real request:\n\
+            <dir_list_{m} path=\"crates/core\" recursive=\"true\" />\n\
+            Done.",
+            m = marker
+        );
+        assert_eq!(
+            proto.parse_dir_lists(&output),
+            vec![DirListRequest::new("crates/core", true)]
+        );
+
+        let unmarked_only = "Discussion with <dir_list path=\"crates/server\" /> alone.";
+        assert!(proto.parse_dir_lists(unmarked_only).is_empty());
     }
 
     #[test]
@@ -620,12 +756,19 @@ let s = \"clean\";\n\
         let editable = vec!["src/lib.rs".to_string()];
         let output = concat!(
             "Fixing example:\n",
-            "<", "tauqe_edits summary=\"Fix\">\n",
-            "<", "edit path=\"src/lib.rs\">\n",
-            "<", "search>\nold();\n</search>\n",
-            "<", "replace>\nnew();\n<", "/replace>\n",
-            "<", "/edit>\n",
-            "<", "/tauqe_edits>\n",
+            "<",
+            "tauqe_edits summary=\"Fix\">\n",
+            "<",
+            "edit path=\"src/lib.rs\">\n",
+            "<",
+            "search>\nold();\n</search>\n",
+            "<",
+            "replace>\nnew();\n<",
+            "/replace>\n",
+            "<",
+            "/edit>\n",
+            "<",
+            "/tauqe_edits>\n",
         );
         match proto.parse_output(output, &editable) {
             ModelResult::Answer { text } => {

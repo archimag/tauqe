@@ -105,10 +105,7 @@ pub fn format_plan_step_execution_prompt(
 
     out.push_str("### Target Step to Implement:\n");
     out.push_str(&format!("- **ID**: `{}`\n", escape_xml_text(&step.id)));
-    out.push_str(&format!(
-        "- **Title**: {}\n",
-        escape_xml_text(&step.title)
-    ));
+    out.push_str(&format!("- **Title**: {}\n", escape_xml_text(&step.title)));
     if !step.concept_refs.is_empty() {
         out.push_str(&format!(
             "- **Addressed Concept Nodes**: {}\n",
@@ -136,10 +133,7 @@ pub fn format_plan_step_execution_prompt(
     if let Some(details) = &step.details {
         let trimmed = details.trim();
         if !trimmed.is_empty() {
-            out.push_str(&format!(
-                "- **Details**:\n{}\n",
-                escape_xml_text(trimmed)
-            ));
+            out.push_str(&format!("- **Details**:\n{}\n", escape_xml_text(trimmed)));
         }
     }
     out.push('\n');

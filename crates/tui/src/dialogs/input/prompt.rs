@@ -1,5 +1,7 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use tauqe_protocol::{methods, DiscussionFocus, DiscussionRequest, DiscussionTarget, ModelAskParams};
+use tauqe_protocol::{
+    methods, DiscussionFocus, DiscussionRequest, DiscussionTarget, ModelAskParams,
+};
 use tokio::sync::MutexGuard;
 
 use crate::app::{AppState, ModalFocus, PromptModalState, PromptModalTarget};
@@ -21,8 +23,8 @@ pub(super) async fn handle_prompt_modal(
     };
 
     let primary = st.tui_config.input.primary_modifier;
-    let is_ctrl_alt = key.modifiers.contains(KeyModifiers::CONTROL)
-        && key.modifiers.contains(KeyModifiers::ALT);
+    let is_ctrl_alt =
+        key.modifiers.contains(KeyModifiers::CONTROL) && key.modifiers.contains(KeyModifiers::ALT);
     let is_cmd = !is_ctrl_alt
         && (primary.matches(key.modifiers) || key.modifiers.contains(KeyModifiers::CONTROL));
 
@@ -62,9 +64,7 @@ pub(super) async fn handle_prompt_modal(
     }
 
     match key.code {
-        KeyCode::Esc => {
-            Ok(Some(InputResult::Continue))
-        }
+        KeyCode::Esc => Ok(Some(InputResult::Continue)),
         KeyCode::Tab | KeyCode::BackTab => {
             modal.focus = ModalFocus::Actions;
             modal.actions.reset_to_cancel();

@@ -91,10 +91,8 @@ pub fn handle_theme_selector_click(st: &mut AppState, col: u16, row: u16, term: 
     };
 
     let area = theme_selector_area(term);
-    let inside = col >= area.x
-        && col < area.x + area.width
-        && row >= area.y
-        && row < area.y + area.height;
+    let inside =
+        col >= area.x && col < area.x + area.width && row >= area.y && row < area.y + area.height;
     if !inside {
         let original = selector_state.original;
         st.apply_theme_preset(original);
@@ -102,10 +100,8 @@ pub fn handle_theme_selector_click(st: &mut AppState, col: u16, row: u16, term: 
     }
 
     let body = theme_selector_body_area(term);
-    let inside_body = col >= body.x
-        && col < body.x + body.width
-        && row >= body.y
-        && row < body.y + body.height;
+    let inside_body =
+        col >= body.x && col < body.x + body.width && row >= body.y && row < body.y + body.height;
     if inside_body {
         // The body's first row is the "Preview applies live." caption; preset
         // rows follow it. The visible window starts at the current scroll
@@ -298,7 +294,10 @@ mod tests {
 
         handle_theme_selector_key(key(KeyCode::Esc), &mut st, 5);
         assert_eq!(st.active_theme_preset, ThemePreset::TauqeDark);
-        assert!(st.theme_selector.is_none(), "cancellation closes the dialog");
+        assert!(
+            st.theme_selector.is_none(),
+            "cancellation closes the dialog"
+        );
     }
 
     #[test]

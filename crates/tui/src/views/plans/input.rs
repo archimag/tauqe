@@ -338,13 +338,24 @@ pub static PLANS_COMMAND_MAP: CommandMap<PlansAction> = CommandMap::new(&[
     ),
 ]);
 
-fn execute_scope_action(st: &mut AppState, plan_id: &str, scope_id: Option<&str>, scope_title: &str) {
+fn execute_scope_action(
+    st: &mut AppState,
+    plan_id: &str,
+    scope_id: Option<&str>,
+    scope_title: &str,
+) {
     if st.model.is_busy() || st.review.running {
         st.notify_warning(active_t("notify.model_busy_esc"));
         return;
     }
 
-    let plan = match st.plans_view.plans.iter().find(|p| p.id == plan_id).cloned() {
+    let plan = match st
+        .plans_view
+        .plans
+        .iter()
+        .find(|p| p.id == plan_id)
+        .cloned()
+    {
         Some(p) => p,
         None => {
             st.notify_error(active_t("notify.plan_not_found").replace("{}", plan_id));
@@ -497,8 +508,8 @@ pub async fn handle_plans_key(
         }
         PlansAction::PageDown => {
             let page = st.plans_view.view_height.saturating_sub(2).max(1);
-            let max = (st.plans_view.rendered_lines as u16)
-                .saturating_sub(st.plans_view.view_height);
+            let max =
+                (st.plans_view.rendered_lines as u16).saturating_sub(st.plans_view.view_height);
             st.plans_view.scroll = st.plans_view.scroll.saturating_add(page).min(max);
         }
         PlansAction::FoldToggle => {
@@ -515,9 +526,15 @@ pub async fn handle_plans_key(
                         st.plans_view.clamp_selection();
                         st.plans_view.scroll_to_selected();
                     }
-                    VisiblePlanRow::ConceptItem { plan_id, item_id, is_expandable, .. } => {
+                    VisiblePlanRow::ConceptItem {
+                        plan_id,
+                        item_id,
+                        is_expandable,
+                        ..
+                    } => {
                         if is_expandable {
-                            st.plans_view.toggle_concept_item_expanded(&plan_id, &item_id);
+                            st.plans_view
+                                .toggle_concept_item_expanded(&plan_id, &item_id);
                             st.plans_view.clamp_selection();
                             st.plans_view.scroll_to_selected();
                         }
@@ -527,7 +544,12 @@ pub async fn handle_plans_key(
                         st.plans_view.clamp_selection();
                         st.plans_view.scroll_to_selected();
                     }
-                    VisiblePlanRow::PlanItem { plan_id, item_id, is_expandable, .. } => {
+                    VisiblePlanRow::PlanItem {
+                        plan_id,
+                        item_id,
+                        is_expandable,
+                        ..
+                    } => {
                         if is_expandable {
                             st.plans_view.toggle_item_expanded(&plan_id, &item_id);
                             st.plans_view.clamp_selection();
@@ -558,7 +580,8 @@ pub async fn handle_plans_key(
                         ..
                     } => {
                         if is_expandable {
-                            st.plans_view.toggle_concept_item_expanded(&plan_id, &item_id);
+                            st.plans_view
+                                .toggle_concept_item_expanded(&plan_id, &item_id);
                             st.plans_view.clamp_selection();
                             st.plans_view.scroll_to_selected();
                         } else {
@@ -661,7 +684,13 @@ pub async fn handle_plans_key(
             let sel_row = st.plans_view.selected_row();
             if let Some(row) = sel_row {
                 let plan_id = row.plan_id().to_string();
-                if let Some(plan) = st.plans_view.plans.iter().find(|p| p.id == plan_id).cloned() {
+                if let Some(plan) = st
+                    .plans_view
+                    .plans
+                    .iter()
+                    .find(|p| p.id == plan_id)
+                    .cloned()
+                {
                     let mut focused = Vec::new();
                     match row {
                         VisiblePlanRow::ConceptItem { item_id, title, .. } => {
@@ -695,12 +724,14 @@ pub async fn handle_plans_key(
                     .map(|p| p.title.clone())
                     .unwrap_or_else(|| plan_id.clone());
                 let (focused, target_label) = match &row {
-                    VisiblePlanRow::ConceptItem { item_id, title, .. } => {
-                        (vec![item_id.clone()], Some(format!("concept {} '{}'", item_id, title)))
-                    }
-                    VisiblePlanRow::PlanItem { item_id, title, .. } => {
-                        (vec![item_id.clone()], Some(format!("step {} '{}'", item_id, title)))
-                    }
+                    VisiblePlanRow::ConceptItem { item_id, title, .. } => (
+                        vec![item_id.clone()],
+                        Some(format!("concept {} '{}'", item_id, title)),
+                    ),
+                    VisiblePlanRow::PlanItem { item_id, title, .. } => (
+                        vec![item_id.clone()],
+                        Some(format!("step {} '{}'", item_id, title)),
+                    ),
                     _ => (Vec::new(), None),
                 };
                 let focus = tauqe_protocol::DiscussionFocus::plan(plan_id, focused);
@@ -731,7 +762,13 @@ pub async fn handle_plans_key(
         PlansAction::ChangeStatus => {
             let sel_row = st.plans_view.selected_row();
             match sel_row {
-                Some(VisiblePlanRow::PlanItem { plan_id, item_id, title, status, .. }) => {
+                Some(VisiblePlanRow::PlanItem {
+                    plan_id,
+                    item_id,
+                    title,
+                    status,
+                    ..
+                }) => {
                     let cur_idx = match status {
                         tauqe_protocol::PlanItemStatus::Discussion => 0,
                         tauqe_protocol::PlanItemStatus::Todo => 1,
@@ -818,7 +855,13 @@ pub async fn handle_plans_key(
             }
             if let Some(row) = st.plans_view.selected_row() {
                 let plan_id = row.plan_id().to_string();
-                if let Some(plan) = st.plans_view.plans.iter().find(|p| p.id == plan_id).cloned() {
+                if let Some(plan) = st
+                    .plans_view
+                    .plans
+                    .iter()
+                    .find(|p| p.id == plan_id)
+                    .cloned()
+                {
                     // A blocked step under the cursor seeds the instruction with
                     // its own context so a single `r` replans the horizon around
                     // exactly that failure (c-3).
@@ -845,17 +888,23 @@ pub async fn handle_plans_key(
             }
             if let Some(row) = st.plans_view.selected_row() {
                 let plan_id = row.plan_id().to_string();
-                if let Some(plan) = st.plans_view.plans.iter().find(|p| p.id == plan_id).cloned() {
+                if let Some(plan) = st
+                    .plans_view
+                    .plans
+                    .iter()
+                    .find(|p| p.id == plan_id)
+                    .cloned()
+                {
                     // `R` addresses the whole blocked frontier of the plan at
                     // once, seeding the instruction with every blocked step the
                     // scope reports (c-1, c-3).
                     let seed = match plan.evaluate_scope(None) {
-                        tauqe_protocol::PlanScopeEvaluation::BlockedByBlockers(items) => Some(
-                            format!(
+                        tauqe_protocol::PlanScopeEvaluation::BlockedByBlockers(items) => {
+                            Some(format!(
                                 "Replan the uncompleted horizon addressing every blocked step:\n{}",
                                 items.join("\n")
-                            ),
-                        ),
+                            ))
+                        }
                         _ => Some("Replan the uncompleted horizon of this plan".to_string()),
                     };
                     open_refine_dialog(&mut st, plan, seed);
@@ -923,7 +972,11 @@ mod tests {
 
         assert!(matches!(res, InputResult::Continue));
         let guard = state.lock().await;
-        let dialog = guard.plans_view.refine_dialog.as_ref().expect("dialog opened");
+        let dialog = guard
+            .plans_view
+            .refine_dialog
+            .as_ref()
+            .expect("dialog opened");
         assert!(dialog
             .instructions_editor
             .get_text()
@@ -944,9 +997,16 @@ mod tests {
         .unwrap();
 
         let guard = state.lock().await;
-        let dialog = guard.plans_view.refine_dialog.as_ref().expect("dialog opened");
+        let dialog = guard
+            .plans_view
+            .refine_dialog
+            .as_ref()
+            .expect("dialog opened");
         let text = dialog.instructions_editor.get_text();
-        assert!(text.contains("addressing every blocked step"), "seed: {text}");
+        assert!(
+            text.contains("addressing every blocked step"),
+            "seed: {text}"
+        );
         assert!(text.contains("#1 Failing step"), "seed: {text}");
     }
 
@@ -1128,7 +1188,10 @@ mod tests {
 
         let guard = state.lock().await;
         assert_eq!(guard.confirm_clear_horizon.as_deref(), Some("plan-steps"));
-        assert_eq!(guard.confirm_button, crate::app::ConfirmDialogButton::Cancel);
+        assert_eq!(
+            guard.confirm_button,
+            crate::app::ConfirmDialogButton::Cancel
+        );
     }
 
     #[tokio::test]

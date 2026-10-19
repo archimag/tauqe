@@ -1,16 +1,18 @@
 #[cfg(any(test, feature = "test-support"))]
 pub mod mock;
 pub mod openrouter;
+pub mod retry;
 pub mod types;
 
 #[cfg(any(test, feature = "test-support"))]
 pub use mock::MockLlmProvider;
 pub use openrouter::OpenRouterProvider;
+pub use retry::{RetryConfig, RetryingProvider};
 pub use types::*;
 
 use async_trait::async_trait;
-use tokio::sync::{mpsc, watch};
 use tauqe_protocol::ProviderKind;
+use tokio::sync::{mpsc, watch};
 
 use crate::config::AppConfig;
 
@@ -96,8 +98,15 @@ pub trait LlmProvider: Send + Sync {
         tx: mpsc::Sender<StreamEvent>,
         cancel_rx: watch::Receiver<bool>,
     ) -> anyhow::Result<()> {
-        self.stream_chat_with_effort(model, messages, response_format, reasoning_effort, tx, cancel_rx)
-            .await
+        self.stream_chat_with_effort(
+            model,
+            messages,
+            response_format,
+            reasoning_effort,
+            tx,
+            cancel_rx,
+        )
+        .await
     }
 
     async fn stream_text(
@@ -111,7 +120,17 @@ pub trait LlmProvider: Send + Sync {
     }
 }
 
-pub fn create_provider(kind: ProviderKind, config: &AppConfig) -> anyhow::Result<Box<dyn LlmProvider>> {
+/// Builds the provider for `kind`, wrapped in the universal retry decorator.
+///
+/// Every provider reaches the harness through [`RetryingProvider`], so a
+/// transient transport failure — a dropped connection, an upstream `5xx`, a
+/// broken event stream — is retried uniformly without any caller knowing about
+/// the policy. Fatal failures, such as a rejected API key, are reported
+/// immediately.
+pub fn create_provider(
+    kind: ProviderKind,
+    config: &AppConfig,
+) -> anyhow::Result<Box<dyn LlmProvider>> {
     match kind {
         ProviderKind::OpenRouter => {
             let api_key = config
@@ -121,7 +140,11 @@ pub fn create_provider(kind: ProviderKind, config: &AppConfig) -> anyhow::Result
                 .and_then(|o| o.api_key.as_deref())
                 .filter(|k| !k.trim().is_empty())
                 .ok_or_else(|| anyhow::anyhow!("OpenRouter API key is not configured"))?;
-            Ok(Box::new(OpenRouterProvider::new(api_key.to_string())))
+            let provider = OpenRouterProvider::new(api_key.to_string());
+            Ok(Box::new(RetryingProvider::new(
+                Box::new(provider),
+                RetryConfig::default(),
+            )))
         }
     }
 }

@@ -49,8 +49,16 @@ impl PlanStorage {
                 );
             }
 
-            let old_details = done_item.details.as_deref().map(str::trim).filter(|s| !s.is_empty());
-            let new_details = updated_item.details.as_deref().map(str::trim).filter(|s| !s.is_empty());
+            let old_details = done_item
+                .details
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            let new_details = updated_item
+                .details
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
             if old_details != new_details {
                 anyhow::bail!(
                     "Cannot modify details of completed step '{}': completed steps are immutable",
@@ -178,25 +186,33 @@ mod tests {
         let mut regressed = plan.clone();
         regressed.items[0].status = PlanItemStatus::Todo;
         let err1 = PlanStorage::save_plan(root, &regressed).unwrap_err();
-        assert!(err1.to_string().contains("Cannot regress status of completed step '1'"));
+        assert!(err1
+            .to_string()
+            .contains("Cannot regress status of completed step '1'"));
 
         // 2. Title mutation
         let mut title_mutated = plan.clone();
         title_mutated.items[0].title = "Altered Title".to_string();
         let err2 = PlanStorage::save_plan(root, &title_mutated).unwrap_err();
-        assert!(err2.to_string().contains("Cannot modify title of completed step '1'"));
+        assert!(err2
+            .to_string()
+            .contains("Cannot modify title of completed step '1'"));
 
         // 3. Details mutation
         let mut details_mutated = plan.clone();
         details_mutated.items[0].details = Some("Altered Details".to_string());
         let err3 = PlanStorage::save_plan(root, &details_mutated).unwrap_err();
-        assert!(err3.to_string().contains("Cannot modify details of completed step '1'"));
+        assert!(err3
+            .to_string()
+            .contains("Cannot modify details of completed step '1'"));
 
         // 4. Target files mutation
         let mut files_mutated = plan.clone();
         files_mutated.items[0].files = vec!["src/other.rs".to_string()];
         let err4 = PlanStorage::save_plan(root, &files_mutated).unwrap_err();
-        assert!(err4.to_string().contains("Cannot modify target files of completed step '1'"));
+        assert!(err4
+            .to_string()
+            .contains("Cannot modify target files of completed step '1'"));
 
         // 5. Reference files mutation
         let mut readonly_mutated = plan.clone();

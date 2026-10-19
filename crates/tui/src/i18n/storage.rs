@@ -189,7 +189,8 @@ mod tests {
 
     #[test]
     fn test_load_corrupted_json_returns_none() {
-        let temp_file = std::env::temp_dir().join(format!("corrupt_locale_{}.json", std::process::id()));
+        let temp_file =
+            std::env::temp_dir().join(format!("corrupt_locale_{}.json", std::process::id()));
         fs::write(&temp_file, b"not valid json {{{").expect("write file");
 
         let loaded = load_custom_locale_from(&temp_file);
@@ -202,7 +203,10 @@ mod tests {
     fn test_temp_sibling_path_includes_process_id() {
         let target = Path::new("/tmp/custom_locale.json");
         let temp = temp_sibling_path(target);
-        let name = temp.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+        let name = temp
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default();
 
         assert!(name.starts_with(".custom_locale.json.tmp."));
         assert!(name.contains(&format!(".tmp.{}.", std::process::id())));

@@ -9,13 +9,13 @@ use tauqe_core::edits::protocol::ContextRequest;
 use tauqe_core::plan::storage::PlanStorage;
 use tauqe_core::providers::{
     create_provider, format_session_id, ChatMessage, JsonSchemaDefinition, LlmProvider,
-    ResponseFormat, SESSION_PREFIX_ARCHITECT, StreamEvent,
+    ResponseFormat, StreamEvent, SESSION_PREFIX_ARCHITECT,
 };
 use tauqe_core::workflow::common::apply_context_requests_detailed;
 use tauqe_protocol::{
-    errors, events, ArchitectTier, ContextAccess, Event, ModelDeltaEvent, ModelErrorEvent,
-    ModelFinishedEvent, ModelRole, ModelSelection, ModelStartedEvent, Plan, PlanItem,
-    PlanRefineResult, Response, TurnPhase, TurnPhaseEvent,
+    errors, events, ArchitectTier, ContextAccess, Event, LlmCommand, ModelDeltaEvent,
+    ModelErrorEvent, ModelFinishedEvent, ModelRole, ModelSelection, ModelStartedEvent, Plan,
+    PlanItem, PlanRefineResult, Response, TurnPhase, TurnPhaseEvent,
 };
 use tokio::sync::mpsc;
 
@@ -91,10 +91,11 @@ fn resolve_architect_tier(
     diagnostics: Option<&PlanHorizonDiagnosticsOwned>,
 ) -> (ArchitectTier, Option<String>, Option<ArchitectLevelUp>) {
     if let Some(selection) = custom_model {
-        let tier = ArchitectTier::new(
-            cfg.resolve_model(selection),
-            cfg.models.resolve_effort(ModelRole::Architect),
-        );
+        let model = cfg.resolve_model(selection);
+        let effort = cfg
+            .models
+            .resolve_selection_effort(ModelRole::Architect, selection);
+        let tier = ArchitectTier::new(model, effort);
         let alias = architect_alias(cfg, &tier);
         return (tier, alias, None);
     }
@@ -170,8 +171,7 @@ pub(crate) async fn run_architect_stream(
     let mut failure = None;
     let mut stream_cancelled = false;
     let mut passthrough: Option<bool> = None;
-    let mut explanation_cursor =
-        tauqe_core::edits::stream::json::decode::StringFieldCursor::new();
+    let mut explanation_cursor = tauqe_core::edits::stream::json::decode::StringFieldCursor::new();
     let mut streamed_explanation_bytes = 0usize;
 
     while let Some(event) = rx.recv().await {
@@ -325,8 +325,21 @@ pub(crate) struct ArchitectDiscoveryRequest<'a> {
     pub(crate) budget_hint: &'a str,
     pub(crate) response_format: ResponseFormat,
     pub(crate) repomap_budget: usize,
+    /// Whether the eager global symbol map is rendered for this synthesis.
+    ///
+    /// When eager map generation is disabled the loop renders the compact
+    /// directory outline instead, so the Architect still learns where the
+    /// subsystems live without a full Tree-sitter pass over the repository.
+    pub(crate) include_repo_map: bool,
     pub(crate) max_discovery_rounds: usize,
     pub(crate) files_token_budget: usize,
+    /// Retry budget for a generation round whose structured response could not
+    /// be parsed.
+    ///
+    /// A truncated or empty payload is a transport artifact as much as a
+    /// semantic failure, so the round is regenerated before the synthesis is
+    /// abandoned.
+    pub(crate) max_parse_retries: usize,
     /// Provider session the whole synthesis binds to, so the backend keeps one
     /// warm prompt-prefix cache across its discovery rounds.
     pub(crate) session_id: Option<String>,
@@ -374,7 +387,7 @@ pub(crate) async fn run_architect_discovery_loop<F>(
     operation: &OperationGuard,
 ) -> Result<ArchitectDiscoveryOutcome, ArchitectDiscoveryError>
 where
-    F: Fn(&[ContextFileContent], Option<&str>) -> String + Send,
+    F: Fn(&[ContextFileContent], Option<&str>, Option<&str>) -> String + Send,
 {
     // The whole synthesis is one accounted operation: every discovery round
     // reports into the same open window, and the window closes exactly once on
@@ -410,7 +423,7 @@ async fn run_architect_discovery_rounds<F>(
     usage: &UsageGuard,
 ) -> Result<ArchitectDiscoveryOutcome, ArchitectDiscoveryError>
 where
-    F: Fn(&[ContextFileContent], Option<&str>) -> String + Send,
+    F: Fn(&[ContextFileContent], Option<&str>, Option<&str>) -> String + Send,
 {
     let ArchitectDiscoveryRequest {
         repo_root,
@@ -421,8 +434,10 @@ where
         budget_hint,
         response_format,
         repomap_budget,
+        include_repo_map,
         max_discovery_rounds,
         files_token_budget,
+        max_parse_retries,
         session_id,
     } = request;
 
@@ -430,41 +445,59 @@ where
     // while discovery commands run stays visible to every later round.
     let cancel_rx = operation.cancel_receiver();
     let mut discovery_round = 0usize;
+    // Consecutive unparsable responses of the current generation round. An
+    // interrupted stream and an empty answer are the same failure: the provider
+    // never delivered a complete structured payload. Both are transient, so the
+    // round is regenerated instead of aborting the synthesis on the first
+    // occurrence. The counter resets as soon as a round parses.
+    let mut parse_failures = 0usize;
     // Append-only discovery feedback: each round extends the previous request
     // instead of rewriting it, so the model keeps the full history of search
     // results and documentation it already received.
     let mut feedback = String::new();
     let mut accumulated_full_text = intro_header.to_string();
 
-    // The repository map is deterministic for the whole loop, so it is
-    // generated once from the turn's opening context and reused by every round.
-    // A map regenerated after a discovery round added files to the context
+    // The repository outline is deterministic for the whole loop, so it is
+    // rendered once from the turn's opening context and reused by every round.
+    // An outline regenerated after a discovery round added files to the context
     // would drop those nodes and rewrite the middle of the prompt, discarding
-    // the prefix the provider has already cached.
-    let repo_map = {
-        let opening_context_paths: Vec<String> = {
-            let ctx = state.context.read().await;
-            ctx.get_state()
-                .items
-                .into_iter()
-                .map(|item| item.path)
-                .collect()
-        };
-        let root = repo_root.to_path_buf();
-        crate::handlers::offload(move || {
-            let all_files =
-                tauqe_core::git::list_repository_files(Some(&root)).unwrap_or_default();
-            tauqe_core::repomap::generate_repo_map(
-                &root,
+    // the prefix the provider has already cached. Exactly one outline is
+    // rendered: symbol contours when the eager map is enabled, the compact
+    // directory tree otherwise.
+    let opening_context_paths: Vec<String> = {
+        let ctx = state.context.read().await;
+        ctx.get_state()
+            .items
+            .into_iter()
+            .map(|item| item.path)
+            .collect()
+    };
+    let outline_root = repo_root.to_path_buf();
+    let (repo_map, repo_dirs) = crate::handlers::offload(move || {
+        let all_files =
+            tauqe_core::git::list_repository_files(Some(&outline_root)).unwrap_or_default();
+        if include_repo_map {
+            let map = tauqe_core::repomap::generate_repo_map(
+                &outline_root,
                 &all_files,
                 &opening_context_paths,
                 repomap_budget,
             )
             .ok()
-        })
-        .await
-        .unwrap_or(None)
-    };
+            .filter(|map| !map.trim().is_empty());
+            (map, None)
+        } else {
+            let tree = tauqe_core::repomap::dirs::generate_repo_dirs(&all_files);
+            let dirs = if tree.trim().is_empty() {
+                None
+            } else {
+                Some(tree)
+            };
+            (None, dirs)
+        }
+    })
+    .await
+    .unwrap_or((None, None));
 
     let output = loop {
         // Every round launches a fresh provider request, so the cancel signal is
@@ -499,7 +532,8 @@ where
             .await
             .unwrap_or_default();
 
-        let mut user_prompt = build_user_prompt(&context_files, repo_map.as_deref());
+        let mut user_prompt =
+            build_user_prompt(&context_files, repo_map.as_deref(), repo_dirs.as_deref());
 
         if !feedback.is_empty() {
             user_prompt.push_str("\n\n");
@@ -546,8 +580,44 @@ where
             streamed_explanation_bytes,
         } = stream_outcome;
 
-        let output = match tauqe_core::plan::prompt::parse_plan_refinement_output(&raw_text) {
-            Ok(out) => out,
+        let parsed = if raw_text.trim().is_empty() {
+            Err("model returned an empty structured response".to_string())
+        } else {
+            tauqe_core::plan::prompt::parse_plan_refinement_output(&raw_text)
+                .map_err(|err| err.to_string())
+        };
+
+        let output = match parsed {
+            Ok(out) => {
+                parse_failures = 0;
+                out
+            }
+            Err(err) if parse_failures < max_parse_retries => {
+                parse_failures += 1;
+                let retry_note = format!(
+                    "\n\n⚠️ Unparsable architect response ({}). Regenerating the round ({}/{}).\n\n",
+                    err, parse_failures, max_parse_retries
+                );
+                tracing::warn!(
+                    operation = operation_title,
+                    round = discovery_round + 1,
+                    attempt = parse_failures,
+                    max_attempts = max_parse_retries,
+                    error = %err,
+                    "architect structured response could not be parsed; regenerating the round"
+                );
+                accumulated_full_text.push_str(&retry_note);
+                emit(
+                    &state.out,
+                    events::MODEL_TEXT_DELTA,
+                    serde_json::to_value(ModelDeltaEvent {
+                        operation_id: op_id.to_string(),
+                        delta: retry_note,
+                    })
+                    .ok(),
+                );
+                continue;
+            }
             Err(err) => {
                 let err_msg = format!("Failed to parse architect refinement output: {err}");
                 emit(
@@ -589,6 +659,7 @@ where
                 .collect();
 
             let searches = output.repo_searches.clone();
+            let repo_map_requests = output.repo_maps.clone();
 
             let ctx_root = repo_root.to_path_buf();
             let (outcome, new_ctx_state) = match with_context_mutation(state, move |ctx| {
@@ -662,6 +733,39 @@ where
                 Vec::new()
             };
 
+            // Targeted contour requests run through the same Discovery handler
+            // as every other map request, so the loop never duplicates the
+            // rendering rules or the per-round request cap.
+            let map_outcome = if repo_map_requests.is_empty() {
+                tauqe_core::workflow::discovery::DiscoveryRoundOutcome::default()
+            } else {
+                let commands: Vec<LlmCommand> = repo_map_requests
+                    .iter()
+                    .map(|path| LlmCommand::RepoMap { path: path.clone() })
+                    .collect();
+                let m_root = repo_root.to_path_buf();
+                let map_budget = repomap_budget;
+                match with_context_mutation(state, move |ctx| {
+                    let available_files = tauqe_core::git::list_repository_files(Some(&m_root))
+                        .ok()
+                        .unwrap_or_default();
+                    tauqe_core::workflow::discovery::execute_discovery_commands_sync(
+                        ctx,
+                        &m_root,
+                        &available_files,
+                        &commands,
+                        usize::MAX,
+                        map_budget,
+                        false,
+                    )
+                })
+                .await
+                {
+                    Ok(outcome) => outcome,
+                    Err(err) => return Err(ArchitectDiscoveryError::ModelError(err)),
+                }
+            };
+
             if !outcome.added.is_empty() {
                 emit(
                     &state.out,
@@ -686,12 +790,14 @@ where
             // A round that only re-requests files already present in context is
             // not a dead end: the model still needs their feedback and another
             // analysis round, so the loop terminates only when a round adds
-            // nothing new, reports nothing missing, executes no searches, and leaves no requested file
-            // already satisfied.
+            // nothing new, reports nothing missing, executes no searches,
+            // renders no contours, and leaves no requested file already
+            // satisfied.
             if outcome.added.is_empty()
                 && outcome.missing.is_empty()
                 && outcome.already_satisfied.is_empty()
                 && search_results.is_empty()
+                && map_outcome.repo_maps_loaded == 0
             {
                 break output;
             }
@@ -732,13 +838,22 @@ where
                     search_results.len()
                 ));
             }
+            if map_outcome.repo_maps_loaded > 0 {
+                notes.push(format!(
+                    "Rendered {} targeted repository map(s)",
+                    map_outcome.repo_maps_loaded
+                ));
+            }
             if !outcome.missing.is_empty() {
                 notes.push(format!(
                     "Files not found in repository: {}",
                     outcome.missing.join(", ")
                 ));
             }
-            if !outcome.already_satisfied.is_empty() && outcome.added.is_empty() && search_results.is_empty() {
+            if !outcome.already_satisfied.is_empty()
+                && outcome.added.is_empty()
+                && search_results.is_empty()
+            {
                 notes.push(format!(
                     "Files already in context: {}",
                     outcome.already_satisfied.join(", ")
@@ -768,13 +883,21 @@ where
                 fb.push_str(&search_feedback);
                 fb.push('\n');
             }
+            let map_feedback = map_outcome.combined_feedback();
+            if !map_feedback.is_empty() {
+                fb.push_str(&map_feedback);
+                fb.push('\n');
+            }
             if !outcome.missing.is_empty() {
                 fb.push_str(&format!(
                     "<context_feedback>\nThe following requested files do not exist in the repository: [{}]\nPlease check <repo_map> for exact existing file paths.\n</context_feedback>\n",
                     outcome.missing.join(", ")
                 ));
             }
-            if !outcome.already_satisfied.is_empty() && outcome.added.is_empty() && search_results.is_empty() {
+            if !outcome.already_satisfied.is_empty()
+                && outcome.added.is_empty()
+                && search_results.is_empty()
+            {
                 fb.push_str(&format!(
                     "<context_feedback>\nThe following files are already loaded in context: [{}]\nYou may proceed with inspecting them and refining the plan.\n</context_feedback>\n",
                     outcome.already_satisfied.join(", ")
@@ -958,6 +1081,8 @@ pub(super) async fn execute_plan_horizon_synthesis(
         repomap_budget,
         max_discovery_rounds,
         files_token_budget,
+        max_parse_retries,
+        include_repo_map,
     ) = {
         let cfg = state.config.lock().await.config.clone();
         let (architect_tier, alias, level_up) =
@@ -975,6 +1100,8 @@ pub(super) async fn execute_plan_horizon_synthesis(
             cfg.context.repomap_token_budget,
             cfg.context.max_discovery_rounds,
             cfg.context.files_token_budget,
+            cfg.develop.max_retries,
+            cfg.context.include_repo_map,
         )
     };
     // The resolved rung is recorded with the synthesized horizon so a later
@@ -1089,7 +1216,9 @@ pub(super) async fn execute_plan_horizon_synthesis(
     let response_format = {
         let schema_val = tauqe_core::plan::prompt::plan_refine_response_schema_definition();
         match serde_json::from_value::<JsonSchemaDefinition>(schema_val) {
-            Ok(schema) => ResponseFormat::JsonSchema { json_schema: schema },
+            Ok(schema) => ResponseFormat::JsonSchema {
+                json_schema: schema,
+            },
             Err(err) => return Response::err(req_id, errors::SCHEMA_ERROR, err.to_string()),
         }
     };
@@ -1103,25 +1232,31 @@ pub(super) async fn execute_plan_horizon_synthesis(
         budget_hint: "The plan is too broad and should be manually decomposed or scoped down.",
         response_format,
         repomap_budget,
+        include_repo_map,
         max_discovery_rounds,
         files_token_budget,
+        max_parse_retries,
         // Horizon synthesis is an isolated design dialogue: its cache is keyed
         // by the plan, never by the interactive REPL session.
         session_id: Some(format_session_id(SESSION_PREFIX_ARCHITECT, &plan.id)),
     };
 
-    let build_user_prompt = |context_files: &[ContextFileContent], repo_map: Option<&str>| {
-        let diag_ref = diagnostics.as_ref().map(|d| {
-            tauqe_core::plan::prompt::PlanHorizonDiagnostics {
-                blocked_step_id: &d.blocked_step_id,
-                blocked_reason: d.blocked_reason.as_deref(),
-                toolchain_status: d.toolchain_status.as_deref(),
-            }
-        });
+    let build_user_prompt = |context_files: &[ContextFileContent],
+                             repo_map: Option<&str>,
+                             repo_dirs: Option<&str>| {
+        let diag_ref =
+            diagnostics
+                .as_ref()
+                .map(|d| tauqe_core::plan::prompt::PlanHorizonDiagnostics {
+                    blocked_step_id: &d.blocked_step_id,
+                    blocked_reason: d.blocked_reason.as_deref(),
+                    toolchain_status: d.toolchain_status.as_deref(),
+                });
         tauqe_core::plan::prompt::build_plan_horizon_user_prompt(
             &plan,
             context_files,
             repo_map,
+            repo_dirs,
             diag_ref,
             instructions.as_deref(),
         )
@@ -1184,8 +1319,10 @@ pub(super) async fn execute_plan_horizon_synthesis(
             reason = %reason,
             "architect reported blockers"
         );
-        let blocked_msg =
-            format!("Architect reported blockers for plan [{}]:\n\n{}", plan.id, reason);
+        let blocked_msg = format!(
+            "Architect reported blockers for plan [{}]:\n\n{}",
+            plan.id, reason
+        );
         record_synthesis_history(
             state,
             history_turn_prompt,
@@ -1315,4 +1452,71 @@ pub(super) async fn execute_plan_horizon_synthesis(
             explanation: Some(output.explanation),
         },
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tauqe_protocol::{ModelEntry, ModelRef, ReasoningEffort};
+
+    #[test]
+    fn test_resolve_architect_tier_custom_model_uses_its_own_effort() {
+        let cfg = tauqe_core::config::AppConfig {
+            models: tauqe_core::config::ModelsConfig {
+                primary: vec![ModelRef::openrouter("base/primary").into()],
+                architect: Some(vec![
+                    ModelEntry::new(
+                        ModelRef::openrouter("deepseek/deepseek-flash"),
+                        Some(ReasoningEffort::Max),
+                        None,
+                    ),
+                    ModelEntry::new(
+                        ModelRef::openrouter("google/gemini-flash"),
+                        Some(ReasoningEffort::High),
+                        None,
+                    ),
+                    ModelEntry::from(ModelRef::openrouter("google/gemini-argon")),
+                ]),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let plan = Plan {
+            id: "test-plan".to_string(),
+            title: "Test".to_string(),
+            ..Default::default()
+        };
+
+        // 1. None selects tier 0 (deepseek with max)
+        let (tier0, _, _) = resolve_architect_tier(&cfg, &plan, None, None);
+        assert_eq!(
+            tier0.model,
+            tauqe_protocol::ModelRef::openrouter("deepseek/deepseek-flash")
+        );
+        assert_eq!(tier0.effort, Some(ReasoningEffort::Max));
+
+        // 2. Custom selection of gemini-flash must use its OWN effort (high), NOT max from deepseek!
+        let selection = ModelSelection::Specific(tauqe_protocol::ModelRef::openrouter(
+            "google/gemini-flash",
+        ));
+        let (tier_custom, _, _) = resolve_architect_tier(&cfg, &plan, Some(&selection), None);
+        assert_eq!(
+            tier_custom.model,
+            tauqe_protocol::ModelRef::openrouter("google/gemini-flash")
+        );
+        assert_eq!(tier_custom.effort, Some(ReasoningEffort::High));
+
+        // 3. Custom selection of gemini-argon without effort returns None
+        let selection_argon = ModelSelection::Specific(tauqe_protocol::ModelRef::openrouter(
+            "google/gemini-argon",
+        ));
+        let (tier_argon, _, _) =
+            resolve_architect_tier(&cfg, &plan, Some(&selection_argon), None);
+        assert_eq!(
+            tier_argon.model,
+            tauqe_protocol::ModelRef::openrouter("google/gemini-argon")
+        );
+        assert_eq!(tier_argon.effort, None);
+    }
 }

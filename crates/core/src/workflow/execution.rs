@@ -11,14 +11,14 @@
 //! (`auto_level_up`) and cost accounting once per turn.
 
 use async_trait::async_trait;
+use tauqe_protocol::{ModelEntry, ModelRef, ModelResult, ModelRole, ReasoningEffort, TurnIntent};
 use tokio::sync::mpsc;
 use tokio::sync::watch;
-use tauqe_protocol::{ModelEntry, ModelRef, ModelResult, ModelRole, ReasoningEffort, TurnIntent};
 
 use crate::context::ContextManager;
 use crate::history::HistoryManager;
-use crate::providers::{LlmProvider, StreamEvent};
 use crate::prompt::protocol::PromptProtocol;
+use crate::providers::{LlmProvider, StreamEvent};
 use crate::workflow::policy::ApplyPolicy;
 
 use super::WorkflowExecutionResult;
@@ -33,6 +33,11 @@ pub struct WorkflowOptions {
     pub history_budget_tokens: u64,
     pub history_tail_turns: usize,
     pub repomap_token_budget: usize,
+    /// Whether the eager global symbol map is injected into every proposal.
+    ///
+    /// When disabled, the prompt carries the compact directory outline instead,
+    /// so the model still knows where subsystems live without a full map.
+    pub include_repo_map: bool,
     pub history_model: ModelRef,
     pub auto_level_up: bool,
     pub models_config: crate::config::ModelsConfig,
@@ -60,6 +65,7 @@ impl Default for WorkflowOptions {
             history_budget_tokens: crate::history::DEFAULT_HISTORY_BUDGET_TOKENS,
             history_tail_turns: crate::history::DEFAULT_TAIL_TURNS_COUNT,
             repomap_token_budget: crate::repomap::DEFAULT_REPOMAP_TOKEN_BUDGET,
+            include_repo_map: true,
             history_model: ModelRef::openrouter(crate::config::BUILTIN_DEFAULT_SCRIBE_MODEL),
             auto_level_up: false,
             models_config: crate::config::ModelsConfig::default(),
@@ -85,6 +91,7 @@ impl WorkflowOptions {
             history_budget_tokens: config.history.budget_tokens,
             history_tail_turns: config.history.tail_turns,
             repomap_token_budget: config.context.repomap_token_budget,
+            include_repo_map: config.context.include_repo_map,
             history_model: config.history_model(),
             auto_level_up: config.models.auto_level_up,
             models_config: config.models.clone(),
@@ -369,14 +376,14 @@ impl ExecutionMode for SingleExecution {
 
 #[cfg(test)]
 mod tests {
-    use tokio::sync::{mpsc, watch};
     use tauqe_protocol::{ContextAccess, ModelRef, ModelResult, ProviderKind, ReasoningEffort};
+    use tokio::sync::{mpsc, watch};
 
     use crate::context::ContextManager;
     use crate::history::HistoryManager;
+    use crate::prompt::protocol::PromptProtocol;
     use crate::providers::mock::{MockLlmProvider, MockResponse};
     use crate::providers::{ChatMessage, LlmProvider, ResponseFormat, StreamEvent};
-    use crate::prompt::protocol::PromptProtocol;
     use crate::workflow::policy::DirectApplyPolicy;
     use crate::workflow::WorkflowOptions;
 
@@ -450,7 +457,10 @@ coder = [
         assert_eq!(second.effort, Some(ReasoningEffort::XHigh));
 
         assert!(next_coder_tier(&config, 2).is_none(), "ladder saturates");
-        assert!(next_coder_tier(&config, 9).is_none(), "beyond the last rung saturates");
+        assert!(
+            next_coder_tier(&config, 9).is_none(),
+            "beyond the last rung saturates"
+        );
     }
 
     #[tokio::test]
@@ -458,8 +468,11 @@ coder = [
         let dir = tempfile::tempdir().unwrap();
         let repo_root = dir.path().to_path_buf();
         crate::git::init_repository(Some(&repo_root), true).unwrap();
-        std::fs::write(repo_root.join("target.rs"), "pub fn compute() -> i32 { 0 }\n")
-            .expect("write target fixture");
+        std::fs::write(
+            repo_root.join("target.rs"),
+            "pub fn compute() -> i32 { 0 }\n",
+        )
+        .expect("write target fixture");
         crate::git::cmd::stage_files(&repo_root, &["target.rs".to_string()]).unwrap();
         crate::git::cmd::commit_with_developer_author(&repo_root, "Initial commit", false).unwrap();
 
@@ -471,7 +484,7 @@ coder = [
 
         let protocol = crate::prompt::xml::XmlPromptProtocol;
         let protocol = protocol.with_turn_marker(MARKER).unwrap();
-        
+
         let chunk = format!(
             "<tauqe_edits_{MARKER} summary=\"Set compute to 42\">\n<edit_{MARKER} path=\"target.rs\">\n<search_{MARKER}>\npub fn compute() -> i32 {{ 0 }}\n</search_{MARKER}>\n<replace_{MARKER}>\npub fn compute() -> i32 {{ 42 }}\n</replace_{MARKER}>\n</edit_{MARKER}>\n</tauqe_edits_{MARKER}>"
         );
@@ -520,8 +533,11 @@ coder = [
         let dir = tempfile::tempdir().unwrap();
         let repo_root = dir.path().to_path_buf();
         crate::git::init_repository(Some(&repo_root), true).unwrap();
-        std::fs::write(repo_root.join("target.rs"), "pub fn compute() -> i32 { 0 }\n")
-            .expect("write target fixture");
+        std::fs::write(
+            repo_root.join("target.rs"),
+            "pub fn compute() -> i32 { 0 }\n",
+        )
+        .expect("write target fixture");
         crate::git::cmd::stage_files(&repo_root, &["target.rs".to_string()]).unwrap();
         crate::git::cmd::commit_with_developer_author(&repo_root, "Initial commit", false).unwrap();
         (dir, repo_root)
@@ -624,9 +640,8 @@ coder = [
         // marker, matching how the harness binds structural tags to the turn:
         // an unmarked tag would be treated as literal text and the reply as an
         // unverified answer.
-        let success = format!(
-            "The step is already satisfied.\n<success_{MARKER} summary=\"Verified\" />"
-        );
+        let success =
+            format!("The step is already satisfied.\n<success_{MARKER} summary=\"Verified\" />");
         let provider = MockLlmProvider::scripted([MockResponse::text(success)]);
         let model = ModelRef::openrouter("base/model");
         let (tx, _rx) = mpsc::channel(256);

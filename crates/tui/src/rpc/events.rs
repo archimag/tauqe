@@ -1,23 +1,22 @@
 use std::sync::Arc;
-use tokio::sync::Mutex;
 use tauqe_protocol::{
     events, BatchFinishStatus, BatchFinishSummary, ConfigState, ContextState, EditFileDoneEvent,
     EditFileRetryingEvent, EditFileStartedEvent, EditFinishedEvent, EditHunkEvent, Event,
-    GitCommitCreatedEvent, GitSquashApplyResult, HistoryCompactedEvent,
-    HistoryEntryAddedEvent, ModelDeltaEvent, ModelErrorEvent, ModelFinishedEvent, ModelResult,
-    ModelResultEvent, ModelStartedEvent, ModelUsageTotalsEvent,
-    PlanBatchFinishedEvent, RepositoryState,
+    GitCommitCreatedEvent, GitSquashApplyResult, HistoryCompactedEvent, HistoryEntryAddedEvent,
+    ModelDeltaEvent, ModelErrorEvent, ModelFinishedEvent, ModelResult, ModelResultEvent,
+    ModelStartedEvent, ModelUsageTotalsEvent, PlanBatchFinishedEvent, RepositoryState,
     ReviewBatchFinishedEvent, ReviewContentDeltaEvent, ReviewErrorEvent, ReviewFinishedEvent,
     ReviewReasoningDeltaEvent, ReviewStartedEvent,
 };
+use tokio::sync::Mutex;
 
+use super::responses::messages;
 use crate::app::{AppState, RunningModel, ViewMode};
 use crate::i18n::active_t;
 use crate::views::repl::{
-    EditOp, FileEditStatus, ReplView, StreamingFileEdit, StreamingHunk, ToolchainState,
-    TurnStatus,
+    EditOp, FileEditStatus, ReplView, RetryingState, StreamingFileEdit, StreamingHunk,
+    ToolchainState, TurnStatus,
 };
-use super::responses::messages;
 
 pub fn fail_safe_reject_edits(model: &mut ReplView, reason: &str) {
     if !model.edits_active || model.edit_final_applied.is_some() {
@@ -84,9 +83,9 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
         events::HISTORY_ENTRY_ADDED => {
             if let Some(params) = ev.params {
                 if let Ok(data) = serde_json::from_value::<HistoryEntryAddedEvent>(params) {
-                    let item_tokens = data.estimated_tokens.unwrap_or_else(|| {
-                        data.item.text.chars().count().div_ceil(4) as u64
-                    });
+                    let item_tokens = data
+                        .estimated_tokens
+                        .unwrap_or_else(|| data.item.text.chars().count().div_ceil(4) as u64);
                     if data.estimated_tokens.is_some() {
                         st.history_view.estimated_tokens = item_tokens;
                     } else {
@@ -96,7 +95,10 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
                     st.history_view.total_count += 1;
                     if st.history_view.auto_scroll {
                         let view_height = st.last_model_height;
-                        let total_lines = crate::views::history::compute_history_items_line_count(&st.history_view.items, None) as u16;
+                        let total_lines = crate::views::history::compute_history_items_line_count(
+                            &st.history_view.items,
+                            None,
+                        ) as u16;
                         st.history_view.scroll = total_lines.saturating_sub(view_height);
                         st.history_view.selected_item_index =
                             st.history_view.items.len().saturating_sub(1);
@@ -140,7 +142,9 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
         }
         events::MODEL_CHANGED => {
             if let Some(params) = ev.params {
-                if let Ok(data) = serde_json::from_value::<tauqe_protocol::ModelChangedEvent>(params) {
+                if let Ok(data) =
+                    serde_json::from_value::<tauqe_protocol::ModelChangedEvent>(params)
+                {
                     st.active_model = data.effective_model;
                     st.model_choice = crate::app::ModelChoice {
                         selection: data.selection,
@@ -178,7 +182,8 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
         }
         events::MODEL_STARTED => {
             *is_reasoning = false;
-            st.turn_started_at.get_or_insert_with(std::time::Instant::now);
+            st.turn_started_at
+                .get_or_insert_with(std::time::Instant::now);
             if let Some(params) = ev.params {
                 if let Ok(data) = serde_json::from_value::<ModelStartedEvent>(params) {
                     st.running_model = Some(RunningModel {
@@ -189,29 +194,15 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
                     });
                     st.model.operation_id = Some(data.operation_id);
                     st.model.model = Some(data.model);
-                    st.model.reasoning.clear();
-                    st.model.text.clear();
-                    st.model.markdown_lines.clear();
-                    st.model.error = None;
-                    st.model.result = None;
-                    st.model.code_blocks.clear();
+                    // One shared reset releases every per-turn buffer,
+                    // including the rendered diff cache, so a batch of
+                    // steps can never accumulate the payload of the
+                    // previous member.
+                    st.model.reset_turn_buffers();
                     st.model.scroll = 0;
                     st.model.status = TurnStatus::Awaiting;
-                    st.model.edits_active = false;
-                    st.model.files.clear();
-                    st.model.selected_file_index = 0;
-                    st.model.edit_final_applied = None;
-                    st.model.edit_final_error = None;
-                    st.model.last_commit_hash = None;
-                    st.model.last_commit_summary = None;
-                    st.model.toolchain = None;
-                    st.model.turn_phase = None;
-                    st.model.turn_round = None;
-                    st.model.turn_max_rounds = None;
-                    st.model.turn_phase_detail = None;
                     st.model.plan_context = data.plan_context;
                     st.model.is_batch = data.is_batch;
-                    st.model.repomap_tokens = None;
                     st.model.auto_scroll = true;
                 }
             }
@@ -241,14 +232,17 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
         }
         events::TURN_REPOMAP => {
             if let Some(params) = ev.params {
-                if let Ok(data) = serde_json::from_value::<tauqe_protocol::RepoMapInfoEvent>(params) {
+                if let Ok(data) = serde_json::from_value::<tauqe_protocol::RepoMapInfoEvent>(params)
+                {
                     st.model.repomap_tokens = Some(data.tokens);
                 }
             }
         }
         events::TOOLCHAIN_STARTED => {
             if let Some(params) = ev.params {
-                if let Ok(data) = serde_json::from_value::<tauqe_protocol::ToolchainStartedEvent>(params) {
+                if let Ok(data) =
+                    serde_json::from_value::<tauqe_protocol::ToolchainStartedEvent>(params)
+                {
                     st.model.toolchain = Some(ToolchainState::Running {
                         command: data.command,
                     });
@@ -258,7 +252,9 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
         }
         events::TOOLCHAIN_FINISHED => {
             if let Some(params) = ev.params {
-                if let Ok(data) = serde_json::from_value::<tauqe_protocol::ToolchainFinishedEvent>(params) {
+                if let Ok(data) =
+                    serde_json::from_value::<tauqe_protocol::ToolchainFinishedEvent>(params)
+                {
                     st.model.toolchain = Some(if data.success {
                         ToolchainState::Passed {
                             command: data.command,
@@ -277,10 +273,14 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
                 if let Ok(data) = serde_json::from_value::<ModelDeltaEvent>(params) {
                     if !data.delta.is_empty() {
                         st.model.status = TurnStatus::Thinking;
+                        // Real output means the pending retry already succeeded.
+                        st.model.retrying = None;
                         if !*is_reasoning {
                             *is_reasoning = true;
                             st.model.reasoning.show = true;
-                            if !st.model.reasoning.is_empty() && !st.model.reasoning.text.ends_with("\n\n") {
+                            if !st.model.reasoning.is_empty()
+                                && !st.model.reasoning.text.ends_with("\n\n")
+                            {
                                 st.model.reasoning.text.push_str("\n\n---\n\n");
                             }
                             let h = st.last_model_height;
@@ -304,6 +304,8 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
                         } else {
                             st.model.status = TurnStatus::Responding;
                         }
+                        // Real output means the pending retry already succeeded.
+                        st.model.retrying = None;
                         if *is_reasoning {
                             *is_reasoning = false;
                             st.model.reasoning.finalize();
@@ -318,6 +320,38 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
                         let h = st.last_model_height;
                         st.model.scroll = st.model.max_scroll(h);
                     }
+                }
+            }
+        }
+        events::MODEL_CONNECTION_RETRYING => {
+            if let Some(params) = ev.params {
+                if let Ok(data) =
+                    serde_json::from_value::<tauqe_protocol::ModelConnectionRetryingEvent>(params)
+                {
+                    // The daemon republishes the remaining seconds once per
+                    // second, so the view mirrors its countdown instead of
+                    // ticking a timer of its own (c-4).
+                    st.model.retrying = Some(RetryingState {
+                        attempt: data.attempt,
+                        max_attempts: data.max_attempts,
+                        delay_secs: data.delay_secs,
+                    });
+                }
+            }
+        }
+        events::MODEL_STREAM_RESET => {
+            if let Some(params) = ev.params {
+                if serde_json::from_value::<tauqe_protocol::ModelStreamResetEvent>(params).is_ok() {
+                    // The connection broke after partial delivery: every
+                    // fragment streamed so far belongs to the aborted attempt,
+                    // so the view drops them before the retry replays the
+                    // answer from its very beginning instead of stitching two
+                    // attempts together (c-3).
+                    *is_reasoning = false;
+                    st.model.text.clear();
+                    st.model.markdown_lines.clear();
+                    st.model.code_blocks.clear();
+                    st.model.reasoning.clear();
                 }
             }
         }
@@ -382,7 +416,10 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
             if let Some(params) = ev.params {
                 if let Ok(data) = serde_json::from_value::<EditFileRetryingEvent>(params) {
                     st.model.status = TurnStatus::Editing;
-                    let retry_msg = format!("{}/{} retrying: {}", data.attempt, data.max_retries, data.reason);
+                    let retry_msg = format!(
+                        "{}/{} retrying: {}",
+                        data.attempt, data.max_retries, data.reason
+                    );
                     if let Some(f) = st.model.files.iter_mut().find(|f| f.path == data.path) {
                         f.status = FileEditStatus::Retrying;
                         f.retry_info = Some(retry_msg);
@@ -417,12 +454,16 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
                             f.retry_info = None;
                         }
                     } else {
-                        let fallback_err = st.model.edit_final_error.clone().or_else(|| {
-                            Some(messages::EDIT_FAILED_FALLBACK.to_string())
-                        });
+                        let fallback_err = st
+                            .model
+                            .edit_final_error
+                            .clone()
+                            .or_else(|| Some(messages::EDIT_FAILED_FALLBACK.to_string()));
                         for f in st.model.files.iter_mut() {
-                            if matches!(f.status, FileEditStatus::Running | FileEditStatus::Retrying)
-                            {
+                            if matches!(
+                                f.status,
+                                FileEditStatus::Running | FileEditStatus::Retrying
+                            ) {
                                 f.status = FileEditStatus::Error;
                                 f.retry_info = None;
                                 if f.error.is_none() {
@@ -448,7 +489,9 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
             if let Some(params) = ev.params {
                 if let Ok(data) = serde_json::from_value::<ModelResultEvent>(params) {
                     match &data.result {
-                        ModelResult::Edit { outcome, summary, .. } if outcome.applied => {
+                        ModelResult::Edit {
+                            outcome, summary, ..
+                        } if outcome.applied => {
                             st.model.edit_final_applied = Some(true);
                             if let Some(hash) = &outcome.commit_hash {
                                 st.model.last_commit_hash = Some(hash.clone());
@@ -460,13 +503,17 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
                                 f.retry_info = None;
                             }
                         }
-                        ModelResult::Edit { outcome, summary, .. } if !outcome.applied => {
+                        ModelResult::Edit {
+                            outcome, summary, ..
+                        } if !outcome.applied => {
                             st.model.edit_final_applied = Some(false);
                             st.model.edit_final_error = outcome.error.clone();
                             st.model.last_commit_summary = Some(summary.clone());
                             for f in st.model.files.iter_mut() {
-                                if matches!(f.status, FileEditStatus::Running | FileEditStatus::Retrying)
-                                {
+                                if matches!(
+                                    f.status,
+                                    FileEditStatus::Running | FileEditStatus::Retrying
+                                ) {
                                     f.status = FileEditStatus::Error;
                                     f.retry_info = None;
                                     if f.error.is_none() {
@@ -523,6 +570,7 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
                 if let Ok(_data) = serde_json::from_value::<ModelFinishedEvent>(params) {
                     st.model.status = TurnStatus::Done;
                     st.model.toolchain = None;
+                    st.model.retrying = None;
                     st.model.turn_phase = None;
                     st.model.turn_phase_detail = None;
                     st.model.end_in_flight_usage();
@@ -564,6 +612,7 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
             st.turn_started_at = None;
             st.model.status = TurnStatus::Cancelled;
             st.model.toolchain = None;
+            st.model.retrying = None;
             st.model.turn_phase = None;
             st.model.turn_phase_detail = None;
             st.model.end_in_flight_usage();
@@ -603,6 +652,7 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
                 }
             }
             st.model.toolchain = None;
+            st.model.retrying = None;
             st.model.turn_phase = None;
             st.model.turn_phase_detail = None;
             if let Some(params) = ev.params {
@@ -663,8 +713,11 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
                 let focused = st.terminal_focused;
                 if st.tui_config.notifications.should_notify(elapsed, focused) {
                     let title = active_t("notify.review_desktop_title");
-                    let summary = active_t("notify.review_completed_desktop_body")
-                        .replacen("{}", &findings_count.to_string(), 1);
+                    let summary = active_t("notify.review_completed_desktop_body").replacen(
+                        "{}",
+                        &findings_count.to_string(),
+                        1,
+                    );
                     crate::terminal::trigger_turn_notification(
                         &title,
                         &summary,
@@ -705,7 +758,8 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
         }
         events::PLAN_UPDATED => {
             if let Some(params) = ev.params {
-                if let Ok(data) = serde_json::from_value::<tauqe_protocol::PlanUpdatedEvent>(params) {
+                if let Ok(data) = serde_json::from_value::<tauqe_protocol::PlanUpdatedEvent>(params)
+                {
                     let plan_id = data.plan.id.clone();
                     if let Some(pos) = st.plans_view.plans.iter().position(|p| p.id == plan_id) {
                         st.plans_view.plans[pos] = data.plan;
@@ -725,7 +779,9 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
         }
         events::PLAN_LIST_CHANGED => {
             if let Some(params) = ev.params {
-                if let Ok(data) = serde_json::from_value::<tauqe_protocol::PlanListChangedEvent>(params) {
+                if let Ok(data) =
+                    serde_json::from_value::<tauqe_protocol::PlanListChangedEvent>(params)
+                {
                     st.plans_view.plans = data.plans;
                     st.plans_view.clamp_selection();
                 }
@@ -733,14 +789,18 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
         }
         events::REVIEW_UPDATED => {
             if let Some(params) = ev.params {
-                if let Ok(data) = serde_json::from_value::<tauqe_protocol::ReviewUpdatedEvent>(params) {
+                if let Ok(data) =
+                    serde_json::from_value::<tauqe_protocol::ReviewUpdatedEvent>(params)
+                {
                     st.review.update_session(data.session);
                 }
             }
         }
         events::REVIEW_LIST_CHANGED => {
             if let Some(params) = ev.params {
-                if let Ok(data) = serde_json::from_value::<tauqe_protocol::ReviewListChangedEvent>(params) {
+                if let Ok(data) =
+                    serde_json::from_value::<tauqe_protocol::ReviewListChangedEvent>(params)
+                {
                     st.review.set_sessions(data.reviews, data.active_id);
                 }
             }
@@ -782,29 +842,11 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
 fn begin_review_turn(model: &mut ReplView, data: &ReviewStartedEvent) {
     model.operation_id = Some(data.operation_id.clone());
     model.model = Some(data.model.clone());
-    model.reasoning.clear();
-    model.text.clear();
-    model.markdown_lines.clear();
-    model.code_blocks.clear();
-    model.error = None;
-    model.result = None;
+    model.reset_turn_buffers();
     model.scroll = 0;
     model.status = TurnStatus::Responding;
-    model.edits_active = false;
-    model.files.clear();
-    model.selected_file_index = 0;
-    model.edit_final_applied = None;
-    model.edit_final_error = None;
-    model.last_commit_hash = None;
-    model.last_commit_summary = None;
-    model.toolchain = None;
-    model.turn_phase = None;
-    model.turn_round = None;
-    model.turn_max_rounds = None;
-    model.turn_phase_detail = None;
     model.plan_context = None;
     model.is_batch = false;
-    model.repomap_tokens = None;
     model.auto_scroll = true;
 }
 
@@ -864,8 +906,7 @@ fn settle_batch_turn(st: &mut AppState, status: BatchFinishStatus) {
     st.turn_started_at = None;
     st.confirm_cancel = false;
 
-    let applied =
-        st.model.edit_final_applied == Some(true) || st.model.last_commit_hash.is_some();
+    let applied = st.model.edit_final_applied == Some(true) || st.model.last_commit_hash.is_some();
     let height = st.last_model_height;
 
     let model = &mut st.model;
@@ -877,6 +918,7 @@ fn settle_batch_turn(st: &mut AppState, status: BatchFinishStatus) {
         BatchFinishStatus::Cancelled | BatchFinishStatus::Stopped => TurnStatus::Cancelled,
     };
     model.toolchain = None;
+    model.retrying = None;
     model.turn_phase = None;
     model.turn_round = None;
     model.turn_max_rounds = None;
@@ -1139,6 +1181,101 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_model_connection_retrying_records_the_countdown() {
+        let state = Arc::new(Mutex::new(crate::app::test_state()));
+        let mut is_reasoning = false;
+        let ev = Event {
+            method: events::MODEL_CONNECTION_RETRYING.to_string(),
+            params: Some(
+                serde_json::to_value(tauqe_protocol::ModelConnectionRetryingEvent {
+                    operation_id: "op-retry".to_string(),
+                    attempt: 2,
+                    max_attempts: 4,
+                    delay_secs: 3,
+                    reason: "stream ended prematurely".to_string(),
+                })
+                .unwrap(),
+            ),
+        };
+
+        handle_event(ev, &state, &mut is_reasoning).await;
+
+        let guard = state.lock().await;
+        let retrying = guard.model.retrying.expect("the countdown is recorded");
+        assert_eq!(retrying.attempt, 2);
+        assert_eq!(retrying.max_attempts, 4);
+        assert_eq!(retrying.delay_secs, 3);
+    }
+
+    #[tokio::test]
+    async fn test_model_stream_reset_discards_the_partial_answer() {
+        let mut st = crate::app::test_state();
+        st.model.text = "Hel".to_string();
+        st.model.update_markdown();
+        st.model.reasoning.append_delta("drafting the change");
+        assert!(!st.model.markdown_lines.is_empty());
+
+        let state = Arc::new(Mutex::new(st));
+        let mut is_reasoning = true;
+        let ev = Event {
+            method: events::MODEL_STREAM_RESET.to_string(),
+            params: Some(
+                serde_json::to_value(tauqe_protocol::ModelStreamResetEvent {
+                    operation_id: "op-reset".to_string(),
+                    reason: "connection interrupted mid-stream".to_string(),
+                })
+                .unwrap(),
+            ),
+        };
+
+        handle_event(ev, &state, &mut is_reasoning).await;
+
+        let guard = state.lock().await;
+        assert!(
+            guard.model.text.is_empty(),
+            "the aborted attempt's fragments must be dropped"
+        );
+        assert!(guard.model.markdown_lines.is_empty());
+        assert!(guard.model.code_blocks.is_empty());
+        assert!(
+            guard.model.reasoning.is_empty(),
+            "the aborted reasoning stream must be dropped as well"
+        );
+        assert!(!is_reasoning, "the reasoning phase ends with the reset");
+    }
+
+    #[tokio::test]
+    async fn test_model_text_delta_clears_the_reconnect_countdown() {
+        let mut st = crate::app::test_state();
+        st.model.retrying = Some(RetryingState {
+            attempt: 1,
+            max_attempts: 3,
+            delay_secs: 2,
+        });
+
+        let state = Arc::new(Mutex::new(st));
+        let mut is_reasoning = false;
+        let ev = Event {
+            method: events::MODEL_TEXT_DELTA.to_string(),
+            params: Some(
+                serde_json::to_value(ModelDeltaEvent {
+                    operation_id: "op-answer".to_string(),
+                    delta: "Answer".to_string(),
+                })
+                .unwrap(),
+            ),
+        };
+
+        handle_event(ev, &state, &mut is_reasoning).await;
+
+        let guard = state.lock().await;
+        assert!(
+            guard.model.retrying.is_none(),
+            "the countdown must not outlive the successful attempt"
+        );
+    }
+
+    #[tokio::test]
     async fn test_model_error_folds_reasoning_block() {
         let mut st = crate::app::test_state();
         st.model.reasoning.append_delta("Deep thoughts...");
@@ -1296,7 +1433,10 @@ mod tests {
             vec![3, 4, 5],
             "the compacted head is dropped and the tail follows"
         );
-        assert_eq!(guard.history_view.items[0].id, 3, "summary leads at index zero");
+        assert_eq!(
+            guard.history_view.items[0].id, 3,
+            "summary leads at index zero"
+        );
         assert_eq!(guard.history_view.items[0].kind, UiHistoryKind::System);
         assert_eq!(guard.history_view.total_count, 3);
         assert_eq!(guard.history_view.estimated_tokens, 256);

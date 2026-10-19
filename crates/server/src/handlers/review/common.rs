@@ -324,7 +324,10 @@ mod tests {
 
     #[test]
     fn skip_note_keeps_comment_and_reason() {
-        let note = build_skip_note("I could not patch the file safely.", "retry budget exhausted");
+        let note = build_skip_note(
+            "I could not patch the file safely.",
+            "retry budget exhausted",
+        );
         assert!(note.contains("retry budget exhausted"));
         assert!(note.contains("I could not patch the file safely."));
         assert!(note.contains("## Model Response:"));

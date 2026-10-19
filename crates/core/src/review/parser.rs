@@ -316,7 +316,10 @@ mod tests {
                 "crates/server/src/handlers/review.rs"
             ]
         );
-        assert_eq!(issues[0].readonly_files, vec!["crates/protocol/src/model.rs"]);
+        assert_eq!(
+            issues[0].readonly_files,
+            vec!["crates/protocol/src/model.rs"]
+        );
         assert_eq!(
             issues[0].recommendations,
             vec![
@@ -384,7 +387,10 @@ mod tests {
             "schema must not contain recursive $ref"
         );
         assert_eq!(schema["additionalProperties"], serde_json::json!(false));
-        assert_eq!(schema["required"], serde_json::json!(["summary", "title", "findings"]));
+        assert_eq!(
+            schema["required"],
+            serde_json::json!(["summary", "title", "findings"])
+        );
 
         let finding = &schema["properties"]["findings"]["items"];
         assert_eq!(finding["additionalProperties"], serde_json::json!(false));
@@ -455,7 +461,10 @@ mod tests {
         assert_eq!(issues[0].title, "Race condition");
         assert_eq!(issues[0].issue_type, IssueType::Bug);
         assert_eq!(issues[0].files, vec!["crates/server/src/state.rs"]);
-        assert_eq!(issues[0].recommendations, vec!["Enforce a single lock order"]);
+        assert_eq!(
+            issues[0].recommendations,
+            vec!["Enforce a single lock order"]
+        );
     }
 
     #[test]

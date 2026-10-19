@@ -222,8 +222,8 @@ mod tests {
     use std::sync::Mutex;
 
     use async_trait::async_trait;
-    use tokio::sync::{mpsc, watch};
     use tauqe_protocol::{ContextAccess, ModelRef, ModelResult, ProviderKind};
+    use tokio::sync::{mpsc, watch};
 
     use crate::context::ContextManager;
     use crate::history::HistoryManager;
@@ -280,7 +280,8 @@ mod tests {
             tx: mpsc::Sender<StreamEvent>,
             cancel_rx: watch::Receiver<bool>,
         ) -> anyhow::Result<()> {
-            self.stream_chat(model, messages, response_format, tx, cancel_rx).await
+            self.stream_chat(model, messages, response_format, tx, cancel_rx)
+                .await
         }
 
         async fn stream_text(
@@ -299,7 +300,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let repo_root = dir.path().to_path_buf();
         crate::git::init_repository(Some(&repo_root), true).unwrap();
-        std::fs::write(repo_root.join("target.rs"), "pub fn compute() -> i32 { 0 }\n").unwrap();
+        std::fs::write(
+            repo_root.join("target.rs"),
+            "pub fn compute() -> i32 { 0 }\n",
+        )
+        .unwrap();
         crate::git::cmd::stage_files(&repo_root, &["target.rs".to_string()]).unwrap();
         crate::git::cmd::commit_with_developer_author(&repo_root, "Initial commit", false).unwrap();
         (dir, repo_root)
@@ -318,7 +323,9 @@ mod tests {
     async fn test_answer_edit_loop_accepts_answer_without_edits() {
         let (_dir, repo_root) = init_repo_with_target();
         let mut context = ContextManager::new(repo_root.clone());
-        context.add_file("target.rs", ContextAccess::Editable).unwrap();
+        context
+            .add_file("target.rs", ContextAccess::Editable)
+            .unwrap();
         let mut history = HistoryManager::new(repo_root.clone());
         let protocol = crate::prompt::xml::XmlPromptProtocol;
         let protocol = protocol.with_turn_marker("MOCK").unwrap();
@@ -357,7 +364,9 @@ mod tests {
     async fn test_edit_loop_retries_until_edits_present() {
         let (_dir, repo_root) = init_repo_with_target();
         let mut context = ContextManager::new(repo_root.clone());
-        context.add_file("target.rs", ContextAccess::Editable).unwrap();
+        context
+            .add_file("target.rs", ContextAccess::Editable)
+            .unwrap();
         let mut history = HistoryManager::new(repo_root.clone());
         let protocol = crate::prompt::xml::XmlPromptProtocol;
         let protocol = protocol.with_turn_marker("MOCK").unwrap();
@@ -400,7 +409,9 @@ mod tests {
     async fn test_edit_loop_retry_records_single_turn_and_response() {
         let (_dir, repo_root) = init_repo_with_target();
         let mut context = ContextManager::new(repo_root.clone());
-        context.add_file("target.rs", ContextAccess::Editable).unwrap();
+        context
+            .add_file("target.rs", ContextAccess::Editable)
+            .unwrap();
         let mut history = HistoryManager::new(repo_root.clone());
         let protocol = crate::prompt::xml::XmlPromptProtocol;
         let protocol = protocol.with_turn_marker("MOCK").unwrap();
@@ -452,7 +463,9 @@ mod tests {
     async fn test_edit_loop_accepts_immediate_edits_without_retry() {
         let (_dir, repo_root) = init_repo_with_target();
         let mut context = ContextManager::new(repo_root.clone());
-        context.add_file("target.rs", ContextAccess::Editable).unwrap();
+        context
+            .add_file("target.rs", ContextAccess::Editable)
+            .unwrap();
         let mut history = HistoryManager::new(repo_root.clone());
         let protocol = crate::prompt::xml::XmlPromptProtocol;
         let protocol = protocol.with_turn_marker("MOCK").unwrap();

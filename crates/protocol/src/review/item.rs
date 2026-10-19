@@ -165,7 +165,11 @@ pub struct ReviewIssue {
     pub readonly_files: Vec<String>,
     #[serde(default, alias = "subplan", skip_serializing_if = "Vec::is_empty")]
     pub plan: Vec<PlanItem>,
-    #[serde(default, alias = "resolution_notes", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        alias = "resolution_notes",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub note: Option<String>,
 }
 

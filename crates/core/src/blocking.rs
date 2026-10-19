@@ -35,7 +35,7 @@ thread_local! {
 
 /// Runs `f`, moving it off the async worker pool when the caller is on a
 /// multi-threaded Tokio runtime.
-pub(crate) fn run_blocking<T>(f: impl FnOnce() -> T) -> T {
+pub fn run_blocking<T>(f: impl FnOnce() -> T) -> T {
     if IN_BLOCKING.with(Cell::get) {
         return f();
     }
@@ -65,13 +65,26 @@ pub(crate) fn run_blocking<T>(f: impl FnOnce() -> T) -> T {
 ///
 /// Returns `Ok(T)` on successful completion, or `Err(JoinError)` if the offloaded
 /// task panicked or was cancelled during runtime shutdown.
-pub(crate) async fn run_blocking_async<T, F>(f: F) -> Result<T, JoinError>
+pub async fn run_blocking_async<T, F>(f: F) -> Result<T, JoinError>
 where
     F: FnOnce() -> T + Send + 'static,
     T: Send + 'static,
 {
     match Handle::try_current() {
-        Ok(handle) => handle.spawn_blocking(f).await,
+        Ok(handle) => {
+            // Mark the offloaded thread as blocking before running `f`, so a
+            // nested `run_blocking` call inside the closure runs inline instead
+            // of attempting `block_in_place` on a blocking-pool thread (which
+            // would panic). The guard is cleared when the scope ends, including
+            // on panic, so the thread is never left marked.
+            handle
+                .spawn_blocking(move || {
+                    IN_BLOCKING.with(|flag| flag.set(true));
+                    let _reset = ResetBlockingFlag;
+                    f()
+                })
+                .await
+        }
         Err(_) => Ok(run_blocking(f)),
     }
 }

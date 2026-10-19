@@ -1,5 +1,7 @@
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
+
+use crate::atomic_write::write_atomic;
 use std::sync::{Mutex, MutexGuard};
 use std::time::SystemTime;
 use tauqe_protocol::{Plan, PlanItem, PlanItemStatus, PlanSummary};
@@ -237,7 +239,10 @@ impl PlanStorage {
     fn save_plan_unlocked(repo_root: &Path, plan: &Plan) -> Result<()> {
         let dir = Self::plans_dir(repo_root);
         std::fs::create_dir_all(&dir).with_context(|| {
-            format!("Failed to create plan storage directory at {}", dir.display())
+            format!(
+                "Failed to create plan storage directory at {}",
+                dir.display()
+            )
         })?;
 
         let safe_id = Self::sanitize_id(&plan.id);
@@ -257,10 +262,18 @@ impl PlanStorage {
             Self::find_plan_file_unlocked(repo_root, &plan.id).unwrap_or(default_target)
         };
         let existing = if target_file.is_file() {
-            let content = std::fs::read_to_string(&target_file)
-                .with_context(|| format!("Failed to read existing plan file at {}", target_file.display()))?;
-            Some(serde_json::from_str::<Plan>(&content)
-                .with_context(|| format!("Failed to parse existing plan JSON at {}", target_file.display()))?)
+            let content = std::fs::read_to_string(&target_file).with_context(|| {
+                format!(
+                    "Failed to read existing plan file at {}",
+                    target_file.display()
+                )
+            })?;
+            Some(serde_json::from_str::<Plan>(&content).with_context(|| {
+                format!(
+                    "Failed to parse existing plan JSON at {}",
+                    target_file.display()
+                )
+            })?)
         } else {
             None
         };
@@ -340,8 +353,12 @@ impl PlanStorage {
             return Ok(None);
         }
 
-        let content = std::fs::read_to_string(&active_file)
-            .with_context(|| format!("Failed to read active plan marker at {}", active_file.display()))?;
+        let content = std::fs::read_to_string(&active_file).with_context(|| {
+            format!(
+                "Failed to read active plan marker at {}",
+                active_file.display()
+            )
+        })?;
         let trimmed = content.trim();
         if trimmed.is_empty() {
             Ok(None)
@@ -364,7 +381,10 @@ impl PlanStorage {
     fn save_active_id_unlocked(repo_root: &Path, id: Option<&str>) -> Result<()> {
         let dir = Self::plans_dir(repo_root);
         std::fs::create_dir_all(&dir).with_context(|| {
-            format!("Failed to create plan storage directory at {}", dir.display())
+            format!(
+                "Failed to create plan storage directory at {}",
+                dir.display()
+            )
         })?;
 
         let active_file = dir.join("active");
@@ -503,45 +523,6 @@ impl PlanStorage {
     }
 }
 
-/// Atomically replaces `target` with `contents`.
-///
-/// The payload is staged into a uniquely named sibling temporary file, flushed,
-/// and `fsync`ed before the atomic rename. Without the `sync_all` barrier a crash
-/// immediately after the rename could leave a zero-length or truncated file on
-/// disk; the per-process suffix on the staging name also prevents a stale or
-/// concurrent write from colliding on a shared, fixed `<file>.json.tmp` path.
-fn write_atomic(target: &Path, contents: &[u8]) -> Result<()> {
-    // The temp-file creation, the write, the `fsync` barrier, and the atomic
-    // rename all run off the async executor thread, so a slow disk never stalls
-    // the bounded turn, provider streaming, or RPC handling. Nested inside
-    // another blocking scope the helper degrades to a direct call.
-    crate::blocking::run_blocking(move || -> Result<()> {
-        use std::io::Write;
-
-        let file_name = target.file_name().and_then(|f| f.to_str()).unwrap_or("file");
-        let temp_file = target.with_file_name(format!("{file_name}.tmp.{}", std::process::id()));
-
-        {
-            let mut file = std::fs::File::create(&temp_file)
-                .with_context(|| format!("Failed to create temp file at {}", temp_file.display()))?;
-            file.write_all(contents)
-                .with_context(|| format!("Failed to write temp file at {}", temp_file.display()))?;
-            file.flush()
-                .with_context(|| format!("Failed to flush temp file at {}", temp_file.display()))?;
-            file.sync_all()
-                .with_context(|| format!("Failed to sync temp file at {}", temp_file.display()))?;
-        }
-
-        std::fs::rename(&temp_file, target).with_context(|| {
-            format!(
-                "Failed to atomically rename {} to {}",
-                temp_file.display(),
-                target.display()
-            )
-        })
-    })
-}
-
 /// Result of applying plan operations from model output.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PlanApplicationOutcome {
@@ -619,14 +600,10 @@ mod tests {
         assert_eq!(loaded.title, "Authentication Flow");
 
         // 4. Update child item
-        let updated = PlanStorage::update_item(
-            root,
-            "auth-flow",
-            "1.1",
-            Some(PlanItemStatus::Done),
-        )
-        .unwrap()
-        .unwrap();
+        let updated =
+            PlanStorage::update_item(root, "auth-flow", "1.1", Some(PlanItemStatus::Done))
+                .unwrap()
+                .unwrap();
 
         assert_eq!(updated.items[0].children[0].status, PlanItemStatus::Done);
 
@@ -713,7 +690,10 @@ mod tests {
 
         let loaded = PlanStorage::load_plan(root, "leaf-only").unwrap().unwrap();
         assert!(loaded.items[0].files.is_empty());
-        assert_eq!(loaded.items[0].children[0].files, vec!["src/leaf.rs".to_string()]);
+        assert_eq!(
+            loaded.items[0].children[0].files,
+            vec!["src/leaf.rs".to_string()]
+        );
     }
 
     #[test]
@@ -902,7 +882,9 @@ mod tests {
             ..Default::default()
         };
         PlanStorage::save_plan(root, &first).unwrap();
-        assert!(PlanStorage::plans_dir(root).join("Tauqe-Server.json").is_file());
+        assert!(PlanStorage::plans_dir(root)
+            .join("Tauqe-Server.json")
+            .is_file());
 
         // A casing change yields a different sanitized file name; the existing file
         // must be reused instead of writing a second `tauqe-server.json`.
@@ -924,7 +906,9 @@ mod tests {
             "expected a single plan file, found {json_files:?}"
         );
 
-        let loaded = PlanStorage::load_plan(root, "tauqe-server").unwrap().unwrap();
+        let loaded = PlanStorage::load_plan(root, "tauqe-server")
+            .unwrap()
+            .unwrap();
         assert_eq!(loaded.title, "Second");
     }
 
@@ -1045,14 +1029,10 @@ mod tests {
         assert_eq!(loaded.items.len(), 1);
         assert_eq!(loaded.items[0].status, PlanItemStatus::Todo);
 
-        let updated = PlanStorage::update_item(
-            &root,
-            "runtime-plan",
-            "1",
-            Some(PlanItemStatus::Done),
-        )
-        .unwrap()
-        .unwrap();
+        let updated =
+            PlanStorage::update_item(&root, "runtime-plan", "1", Some(PlanItemStatus::Done))
+                .unwrap()
+                .unwrap();
         assert_eq!(updated.items[0].status, PlanItemStatus::Done);
 
         let refined = PlanStorage::update_concept_item(

@@ -140,7 +140,10 @@ mod tests {
 
     #[test]
     fn test_reasoning_effort_parse_display_and_serde() {
-        assert_eq!("low".parse::<ReasoningEffort>().unwrap(), ReasoningEffort::Low);
+        assert_eq!(
+            "low".parse::<ReasoningEffort>().unwrap(),
+            ReasoningEffort::Low
+        );
         assert_eq!(
             "  HIGH ".parse::<ReasoningEffort>().unwrap(),
             ReasoningEffort::High

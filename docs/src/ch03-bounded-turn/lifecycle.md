@@ -28,7 +28,7 @@ Instead of an unbounded background agent loop, TAUQE operates as a **finite-stat
 
 ---
 
-- **Discovery & Exploration Phase:** The model inspects the task, navigates the Tree-sitter repository map to locate missing symbols and type signatures, queries the codebase via typed `<repo_search path="..." regex="..." />` commands, or requests internal system documentation via `<doc_request topic="...">`. Search queries run in pure Rust without shell access and report matching file paths with hit counts in `<search_feedback>` blocks. If required files are missing from context, the system autonomously fetches them into the `auto` layer via `<context_request>` and proceeds to the next round. Throughout multi-round discovery, the model retains intermediate findings and working hypotheses in the ephemeral Turn Scratchpad. Code generation is deferred until the model has sufficient clarity to avoid blind speculation.
+- **Discovery & Exploration Phase:** The model inspects the task, navigates the Tree-sitter repository map to locate missing symbols and type signatures, queries the codebase via typed `<repo_search path="..." regex="..." />` commands, renders the repository directory tree with `<repo_dirs />`, outlines one subsystem with `<repo_map path="..." />`, lists the tracked files of one directory with `<dir_list path="..." />`, or requests internal system documentation via `<doc_request topic="...">`. Search queries run in pure Rust without shell access and report matching file paths with hit counts in `<search_feedback>` blocks. If required files are missing from context, the system autonomously fetches them into the `auto` layer via `<context_request>` and proceeds to the next round. Throughout multi-round discovery, the model retains intermediate findings and working hypotheses in the ephemeral Turn Scratchpad. Code generation is deferred until the model has sufficient clarity to avoid blind speculation.
 
 The five phases of the turn are surfaced to the interface as `TurnPhase` stream events (`Discovery`, `Proposal`, `Staging`, `Verification`, and `Healing`), so the footer pipeline can render which stage is currently active. `Discovery`, `Staging`, and `Healing` carry a `round` counter and a `max_rounds` bound because they may repeat, whereas `Proposal` is emitted for every model interaction and `Verification` runs once per applied proposal.
 
@@ -203,6 +203,8 @@ The `git` module remains a low-level facade over subprocess operations; `ApplyPo
 
 - **`OpenRouterProvider`** — real network transport.
 - **`MockLlmProvider`** — a scripted provider that replays predetermined responses. It enables deterministic multi-round scenarios (context request, compiler failure, successful healing patch, cancellation) to be exercised in the standard test runner in milliseconds and without any external network call.
+
+Neither implementation carries a retry policy itself: `create_provider` wraps every provider in `RetryingProvider`, which owns transient-failure recovery uniformly for all of them (§3.12).
 
 Cancellation is observed continuously, not only while the response body is streaming. The transport races the initial `send()` future against the cancellation watch channel with `tokio::select!`, so a turn aborts immediately even while the model is still reasoning and no body bytes have arrived. Without this race, the `Proposal` and `Awaiting` phases would stall until the provider finished generating, leaving cancellation effective only after the first token.
 
@@ -473,8 +475,9 @@ interface, which sorts rows for the developer.
 
 Round-specific data is appended behind the stable head:
 
-- **Discovery feedback** — search reports, documentation blocks, and missing-path
-  notes — is appended to the user message of the next round.
+- **Discovery feedback** — search reports, documentation blocks, directory
+  outlines, directory listings, targeted maps, and missing-path notes — is
+  appended to the user message of the next round.
 - **Patch-retry reports** accumulate in one append-only repair log, so retry `n`
   carries the full history of attempts `1..n` instead of replacing it.
 - **Verification diagnostics** and the healing instruction are appended to the
@@ -503,3 +506,297 @@ scratchpad rounds against a scripted provider and inspect the recorded requests:
 These tests are the regression guard. A change that reintroduces a moving value
 into the stable head fails them immediately, instead of silently paying for a
 cache miss on every round.
+
+---
+
+## 3.11 On-Demand Repository Navigation
+
+An eager global symbol map is cheap in a small crate and expensive in a
+monorepository. It costs a full Tree-sitter pass on every turn, it can consume a
+large part of the prompt before the task is even stated, and most of it is
+irrelevant to the single step at hand. Disabling it outright would be worse: a
+model without any sense of the repository's shape guesses paths instead of
+reading them.
+
+TAUQE therefore separates what a turn always knows from what it asks for:
+
+- **A deterministic outline is always present.** With `include_repo_map = true`
+  (the default) the turn renders the eager Tree-sitter map once and freezes it
+  for the whole turn (§3.10.2). With `include_repo_map = false` the prompt
+  instead carries the compact `<repo_dirs>` folder tree described in 2.6.1.
+- **Symbol detail is requested on demand.** The Discovery phase accepts
+  `<repo_map path="crates/core" />`, which renders the Tree-sitter outline of one
+  subsystem and returns it to the next round. The model spends tokens on the
+  subtree it is about to change, not on the whole repository.
+
+Each request is executed by its own `DiscoveryCapabilityHandler` among the other
+Discovery handlers (§3.7), so it owns its validation, disk scan, and feedback
+text like every other capability.
+
+### 3.11.1 Path Semantics
+
+The `path` argument of `<repo_map>` is a repository-relative prefix matched on
+whole path components, so `crates/core` covers `crates/core/src/lib.rs` but never
+a sibling such as `crates-core/lib.rs`. Naming a single file narrows the outline
+to that file, a cosmetic `./` prefix or a trailing slash names the same subtree,
+and an empty or missing argument outlines the whole repository. An unknown prefix
+answers with a note instead of a repository-wide map, so a typo cannot silently
+cost a full outline.
+
+Unlike the eager map, a targeted map never drops the files already in context.
+The request exists precisely to read the symbols of a subsystem the model is
+navigating, and hiding the parts of it already loaded would answer a different
+question.
+
+### 3.11.2 Round Guards
+
+Two deterministic guards keep one discovery round from turning into a re-index of
+the repository:
+
+- **Adaptive truncation.** A targeted outline passes through the same token
+  budget as the global map (`context.repomap_token_budget`). Detail is reduced
+  step by step — full signatures, then public symbols, then file outlines, then
+  top-level names — until the outline fits, so a large subtree degrades instead
+  of being rejected.
+- **Request cap.** A round renders at most `MAX_REPO_MAP_REQUESTS_PER_ROUND`
+  distinct targets. Repeated targets are deduplicated, and any further target is
+  logged and ignored, because each one costs a Tree-sitter pass.
+
+### 3.11.3 Feedback Block
+
+Every rendered outline returns to the next proposal round as
+`<repomap_feedback path="crates/core">...</repomap_feedback>`, appended to the
+volatile tail of the user message (§3.10.4). The outline arrives as round
+feedback rather than as a rewritten head of the system prompt, so the cached
+prefix of the previous round survives. A target that holds no tracked source
+files answers with a short note pointing the model at `<repo_dirs>`, so a wrong
+path is corrected in one round instead of being retried blindly.
+
+### 3.11.4 Directory Listing (`dir_list`)
+
+A symbol outline says what is defined inside a subtree; it does not say which
+files exist there. `<dir_list path="crates/core" />` answers that question from
+the same single source of truth as every other navigation surface: the
+Git-tracked file list, never a disk directory scan.
+
+- **Shallow by default.** Without a `recursive` flag the listing names only the
+  direct files of the directory and its direct subdirectories with a trailing
+  slash, so one round describes a folder in a handful of lines.
+- **Recursive on request.** `recursive="true"` reports every tracked file
+  underneath the prefix, for the rounds where the model genuinely needs the whole
+  subtree.
+- **Capped and explicit.** A single listing is limited to `MAX_DIR_LIST_ENTRIES`
+  (100) entries, and a longer result ends with a note naming how many entries
+  were omitted, so truncation is never silent.
+- **Git-only and exclusion-aware.** An untracked directory answers with an empty
+  result, and every path inside a service directory (`.git`, `.tauqe`, `target`,
+  `node_modules`) is filtered out through the shared exclusion rule, so a listing
+  can never advertise a file the model is not allowed to address.
+
+The listing arrives as
+`<dir_list_feedback path="crates/core" recursive="false">...</dir_list_feedback>`
+in the volatile tail of the next round, exactly like a search report. The compact
+folder tree stays reachable from inside a turn as well: `<repo_dirs />` renders it
+into the round as `<repo_dirs_feedback>`, so the folder layout is available even
+when the prompt already carries a symbol map.
+
+---
+
+## 3.12 Automatic Reconnection and Backoff
+
+A generation can fail on the transport layer alone: the connection times out
+before the response headers arrive, the provider answers `429 Too Many Requests`
+or a `5xx` status, or the server-sent event stream breaks before its terminator.
+None of these outcomes says anything about the request itself, so re-issuing it
+usually succeeds. TAUQE recovers from them automatically instead of failing the
+turn and making the developer repeat it.
+
+### 3.12.1 One Decorator for Every Provider
+
+`RetryingProvider` (`providers/retry.rs`) wraps any `Box<dyn LlmProvider>` and is
+applied once, in `create_provider`, so no caller and no provider implementation
+knows about the policy. The decorator also owns failure reporting end to end: an
+error raised by an attempt that will be retried never reaches the client, and the
+terminal failure is reported exactly once, after the retry budget is exhausted.
+
+### 3.12.2 Transient versus Fatal Failures
+
+The classifier separates conditions that say nothing about the request from
+conditions that will fail again immediately:
+
+| Class | Examples | Behaviour |
+|---|---|---|
+| Transient | timeouts, `connection reset`, `broken pipe`, `stream ended prematurely`, HTTP `408`, `425`, `429`, `500`, `502`, `503`, `504` | retried after a backoff pause |
+| Fatal | HTTP `400`, `401`, `403`, `404`, `413`, `422` (authentication, malformed request, context overflow) | reported at once, no attempt consumed |
+
+A retry is never blind. It re-sends the same request — same messages, same
+reasoning effort, same provider session — so the backend keeps its prompt-prefix
+cache warm across attempts and the developer sees one logical generation rather
+than a sequence of unrelated ones.
+
+### 3.12.3 Exponential Backoff with Jitter
+
+Pauses double per attempt up to a hard ceiling, and every pause carries equal
+jitter (half fixed, half random), so concurrent clients do not retry in lockstep
+against a struggling upstream. The defaults are four attempts in total, a
+`500 ms` pause before the second attempt, and an `8 s` ceiling on any single
+pause. Backoff is bounded in both directions, so a retry chain always terminates
+deterministically instead of degrading into an unbounded loop.
+
+### 3.12.4 Live Countdown and Instant Cancellation
+
+Every second of the pause is reported as `StreamEvent::RetryingConnection`, which
+the server forwards as the `model/connectionRetrying` RPC event carrying the
+attempt number, the maximum, and the remaining seconds. The TUI footer renders it
+as a live countdown together with a reminder that `C-g` interrupts the turn, and
+every user-facing string is localized through the i18n catalog.
+
+The pause itself races the turn cancellation signal with `tokio::select!`, so
+`C-g` aborts the wait at once: the decorator emits `StreamEvent::Cancelled`,
+returns cleanly, and never launches the next attempt. A long backoff therefore
+never leaves a dead pause the developer has to sit through, and a pending retry
+never overrides an explicit cancellation.
+
+### 3.12.5 Mid-Stream Reset
+
+The two failure positions have different consequences:
+
+- **Before any token** the retry is fully transparent: the failed attempt
+  produced nothing, so the client observes a pause and then the answer.
+- **After partial output** the fragments of the failed attempt are void. The
+  decorator emits `StreamEvent::ResetStream` (the `model/streamReset` RPC event)
+  before the retry, and the server and the TUI discard what they accumulated, so
+  fragments of two different attempts are never stitched into one answer.
+
+### 3.12.6 Diagnostics
+
+Each failed attempt is recorded in the server journal as a compact record with
+the model, the attempt number, the pause, and a truncated failure reason. Raw
+deltas, prompts, and diffs stay out of the journal (§3.8), so a reconnection
+storm is still readable through `grep` and `tail -f`.
+
+### 3.12.7 Runaway Output Ceiling
+
+A retry policy guards against a transport that fails. It does not guard against
+a transport that keeps working. A model caught in a reasoning loop streams
+deltas indefinitely: the relay forwards every event, the client keeps
+appending, and the process grows until the operating system kills it. No layer
+reports a failure while this happens, so waiting does not help.
+
+The decorator therefore meters the cumulative output of a single attempt. The
+answer text and the reasoning text count against one ceiling of two mebibytes,
+because either channel can grow without bound. Crossing the ceiling aborts the
+attempt, discards the partial output through `StreamEvent::ResetStream`, and
+reports the reason exactly once as a terminal error.
+
+The ceiling is deliberately not a retry class. Re-issuing the same request would
+only reproduce the same loop, so a runaway generation consumes no further
+attempt and never enters a backoff pause. Each attempt is measured on its own: a
+retry that follows an ordinary transport failure starts again from zero, because
+the output of the discarded attempt no longer occupies memory.
+
+### 3.12.8 What the Tests Enforce
+
+`crates/core/src/providers/retry.rs` covers the contract against a scripted
+provider. Both failure channels are exercised — an error returned by the provider
+call and an error reported on the stream channel — because a retry must work
+whichever layer observed the failure:
+
+- a transient failure before any token is retried transparently and the answer
+  arrives once;
+- a break in the middle of generation resets the accumulated output before the
+  retry and withholds the intermediate error from the client;
+- a fatal status is reported without consuming another attempt, and a queued
+  response stays untouched for a later turn;
+- exhausting the attempt budget reports the last failure exactly once;
+- a retry keeps the provider session and the reasoning effort;
+- cancellation interrupts a long pause promptly and launches no further attempt;
+- backoff pauses double with bounded jitter;
+- a runaway answer or reasoning stream is aborted at the ceiling, the delta that
+  crosses it is never forwarded, and the terminal error is reported once after
+  the stream reset.
+
+---
+
+## 3.13 Process Lifecycle: One Managed Death Channel
+
+A bounded turn ends inside the daemon, but the daemon itself is a child process of
+the client that owns it. The model is deliberately simple: the daemon lives
+exactly as long as the TUI that spawned it. It opens no socket, keeps no lock
+file, and registers no singleton; it reads requests from stdin and answers on
+stdout. Everything about how it stops follows from that one decision.
+
+### 3.13.1 Why the Daemon Must Be Process-Isolated
+
+Closing a terminal window destroys the pty master, and the kernel delivers
+`SIGHUP` to the whole foreground process group of the session. A daemon spawned
+naively inherits that group, so it would receive the signal at the very moment the
+TUI does and die before it ever reaches its own shutdown path: the active turn
+would not be cancelled and its Git transaction would not be rolled back.
+
+The client therefore spawns the daemon in its own process group
+(`process_group(0)` on Unix — the same technique the toolchain runner already uses
+for a child it must be able to isolate) and marks the handle `kill_on_drop`, so a
+forgotten handle can never leave an orphan writing into a dead stdout. With the
+process isolated, closing the window kills only the TUI: its descriptors close,
+the pipe yields EOF, and the daemon enters the ordinary drain.
+
+**EOF on stdin is the one managed death channel.** Every other termination cause
+is a fallback for the cases where a signal reaches the daemon on its own.
+
+### 3.13.2 Signals Converge on the Same Path
+
+The daemon converts `SIGHUP` and `SIGTERM` into the path EOF already takes:
+cancel the active operation, drain in-flight work within the shared budget, exit.
+No second, parallel implementation of shutdown appears — a signal changes only
+*why* the request loop ended, never *what* happens next.
+
+The cause is carried as typed data rather than inferred from surrounding text, and
+it is recorded in the journal before the drain begins, so `.tauqe/server.log`
+names `stdin-eof`, `stdin-read-error`, `SIGHUP`, or `SIGTERM` instead of showing an
+unexplained disappearance.
+
+**Boundary: `SIGINT` stays untouched.** The `Ctrl+C` / `C-g` chord belongs to the
+keyboard contour of the TUI (`crates/tui/Conventions.md` §5.5) and must never be
+implemented as a signal handler. Installing one in the daemon would break that
+invariant and change the terminal's standard behaviour for no gain.
+
+### 3.13.3 Why the Two Budgets Must Agree
+
+The client owns the spawned process and is the only side able to kill it, so its
+patience defines the real deadline. A client wait shorter than the daemon's drain
+budget does not merely time out: it guarantees a `SIGKILL` in the middle of the
+rollback the drain exists to protect, even on an otherwise careful quit.
+
+The contract is therefore stated once: one drain budget and one client wait,
+defined together in `tauqe_protocol::lifecycle` — a crate that by mandate performs
+no I/O and depends on nothing else — with the client wait strictly greater than
+the drain budget. Neither crate duplicates the numbers, and assertions next to
+the constants keep the relation true. The authoritative values live there; this
+chapter deliberately does not restate them.
+
+The client's wait also stays interruptible: it is a timeout around the wait for
+the child, so a daemon that already exited resolves immediately and an ordinary
+quit never pays the budget.
+
+### 3.13.4 Why Detach Is Deliberately Absent
+
+A long-lived daemon reachable over a Unix socket, guarded by a pid or lock file
+and protected by a singleton check, solves a different problem: surviving the
+client that started it. While the architecture remains "the daemon lives with the
+TUI", those mechanisms would be unused complexity and would introduce a second
+lifecycle to reconcile — two ways to be alive, two ways to stop, and one more
+state no turn depends on. When a detached lifetime becomes a real requirement it
+will be designed as its own lifecycle instead of being retrofitted onto this one.
+
+### 3.13.5 What the Tests Enforce
+
+- The relation between the two budgets is asserted where the constants are
+  declared, and the client repeats the comparison in its own tests, so a local
+  literal cannot reintroduce the race.
+- The signal surface is pinned as a closed set: only `SIGHUP` and `SIGTERM` reach
+  the shutdown path, and the watch never completes without a delivered signal, so
+  the daemon cannot abort itself.
+- The integration test in `crates/server/tests/shutdown_tests.rs` spawns the
+  compiled daemon the way a client does, closes stdin, and asserts a clean, prompt
+  exit together with a journal that names the cause.

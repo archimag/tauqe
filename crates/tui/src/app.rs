@@ -230,15 +230,13 @@ impl ModelChoice {
     pub fn resolve(&self, selection: &ModelSelection) -> Option<ModelRef> {
         match selection {
             ModelSelection::Specific(model) => Some(model.clone()),
-            ModelSelection::Role(role) => {
-                self.roles.as_ref().map(|roles| match role {
-                    ModelRole::Scribe => roles.scribe.clone(),
-                    ModelRole::Coder => roles.coder.clone(),
-                    ModelRole::Architect => roles.architect.clone(),
-                    ModelRole::Primary => roles.primary.clone(),
-                    ModelRole::Reviewer => roles.reviewer.clone(),
-                })
-            }
+            ModelSelection::Role(role) => self.roles.as_ref().map(|roles| match role {
+                ModelRole::Scribe => roles.scribe.clone(),
+                ModelRole::Coder => roles.coder.clone(),
+                ModelRole::Architect => roles.architect.clone(),
+                ModelRole::Primary => roles.primary.clone(),
+                ModelRole::Reviewer => roles.reviewer.clone(),
+            }),
         }
     }
 }
@@ -382,7 +380,11 @@ pub struct SelectionDialogState {
 }
 
 impl SelectionDialogState {
-    pub fn new(kind: SelectionDialogKind, items: Vec<SelectionItem>, selected_index: usize) -> Self {
+    pub fn new(
+        kind: SelectionDialogKind,
+        items: Vec<SelectionItem>,
+        selected_index: usize,
+    ) -> Self {
         let selector = ListSelector::new(items.len(), selected_index);
         Self {
             kind,
@@ -833,8 +835,16 @@ impl ReviewDialogState {
         let pattern = self.path_editor.get_text().trim().to_string();
         ReviewStartParams {
             model: self.selected_entry().map(|entry| entry.model.clone()),
-            user_prompt: if prompt.is_empty() { None } else { Some(prompt) },
-            path_pattern: if pattern.is_empty() { None } else { Some(pattern) },
+            user_prompt: if prompt.is_empty() {
+                None
+            } else {
+                Some(prompt)
+            },
+            path_pattern: if pattern.is_empty() {
+                None
+            } else {
+                Some(pattern)
+            },
         }
     }
 }
@@ -912,7 +922,9 @@ impl std::fmt::Debug for OnboardingState {
 impl Default for OnboardingState {
     fn default() -> Self {
         let has_tui = crate::config::find_tui_config_path().is_some();
-        let default_tui = crate::config::default_tui_config_path().display().to_string();
+        let default_tui = crate::config::default_tui_config_path()
+            .display()
+            .to_string();
         Self {
             step: OnboardingStep::Config,
             has_git: true,
@@ -1267,7 +1279,12 @@ impl AppState {
         state
     }
 
-    pub fn notify(&mut self, text: impl Into<String>, level: NotificationLevel, ttl: std::time::Duration) {
+    pub fn notify(
+        &mut self,
+        text: impl Into<String>,
+        level: NotificationLevel,
+        ttl: std::time::Duration,
+    ) {
         if let Some(ref current) = self.notification {
             if current.created_at.elapsed() < current.ttl
                 && level == NotificationLevel::Info
@@ -1285,19 +1302,35 @@ impl AppState {
     }
 
     pub fn notify_info(&mut self, text: impl Into<String>) {
-        self.notify(text, NotificationLevel::Info, std::time::Duration::from_secs(3));
+        self.notify(
+            text,
+            NotificationLevel::Info,
+            std::time::Duration::from_secs(3),
+        );
     }
 
     pub fn notify_success(&mut self, text: impl Into<String>) {
-        self.notify(text, NotificationLevel::Success, std::time::Duration::from_secs(4));
+        self.notify(
+            text,
+            NotificationLevel::Success,
+            std::time::Duration::from_secs(4),
+        );
     }
 
     pub fn notify_warning(&mut self, text: impl Into<String>) {
-        self.notify(text, NotificationLevel::Warning, std::time::Duration::from_secs(4));
+        self.notify(
+            text,
+            NotificationLevel::Warning,
+            std::time::Duration::from_secs(4),
+        );
     }
 
     pub fn notify_error(&mut self, text: impl Into<String>) {
-        self.notify(text, NotificationLevel::Error, std::time::Duration::from_secs(6));
+        self.notify(
+            text,
+            NotificationLevel::Error,
+            std::time::Duration::from_secs(6),
+        );
     }
 
     /// Opens the primary model picker presenting models configured under
@@ -1830,11 +1863,17 @@ mod tests {
         let mut state = test_state();
 
         state.notify_error("Critical failure");
-        assert_eq!(state.active_notification().unwrap().text, "Critical failure");
+        assert_eq!(
+            state.active_notification().unwrap().text,
+            "Critical failure"
+        );
 
         // Lower-priority info should not overwrite active error
         state.notify_info("Minor info");
-        assert_eq!(state.active_notification().unwrap().text, "Critical failure");
+        assert_eq!(
+            state.active_notification().unwrap().text,
+            "Critical failure"
+        );
 
         // Success feedback is never swallowed by an active error
         state.notify_success("Copied");
@@ -1842,7 +1881,10 @@ mod tests {
 
         // Equal or higher priority replaces it
         state.notify_error("New critical failure");
-        assert_eq!(state.active_notification().unwrap().text, "New critical failure");
+        assert_eq!(
+            state.active_notification().unwrap().text,
+            "New critical failure"
+        );
     }
 
     #[test]
@@ -1955,11 +1997,8 @@ mod tests {
     #[test]
     fn test_open_model_dialog_appends_catalog_escape_hatch() {
         let mut state = test_state();
-        let primary_entry = tauqe_protocol::ModelEntry::new(
-            ModelRef::openrouter("primary-model"),
-            None,
-            None,
-        );
+        let primary_entry =
+            tauqe_protocol::ModelEntry::new(ModelRef::openrouter("primary-model"), None, None);
         state.available_models = vec![ModelRef::openrouter("catalog-model")];
         state.model_choice = ModelChoice {
             selection: ModelSelection::Role(ModelRole::Primary),
@@ -2143,10 +2182,15 @@ mod tests {
         assert!(params.path_pattern.is_none());
         assert_eq!(serde_json::to_string(&params).unwrap(), "{}");
 
-        dialog.prompt_editor.insert_str("  focus on error handling  ");
+        dialog
+            .prompt_editor
+            .insert_str("  focus on error handling  ");
         dialog.path_editor.insert_str(" crates/core/src/**/*.rs ");
         let params = dialog.start_params();
-        assert_eq!(params.user_prompt.as_deref(), Some("focus on error handling"));
+        assert_eq!(
+            params.user_prompt.as_deref(),
+            Some("focus on error handling")
+        );
         assert_eq!(
             params.path_pattern.as_deref(),
             Some("crates/core/src/**/*.rs")

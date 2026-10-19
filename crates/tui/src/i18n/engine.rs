@@ -248,10 +248,7 @@ mod tests {
 
     #[test]
     fn missing_key_falls_back_to_english() {
-        let engine = I18nEngine::new(Some(custom(
-            "German",
-            &[("modal.confirm", "Bestätigen")],
-        )));
+        let engine = I18nEngine::new(Some(custom("German", &[("modal.confirm", "Bestätigen")])));
         assert_eq!(engine.t("modal.confirm"), "Bestätigen");
         assert_eq!(engine.t("tab.context"), "Context");
     }
@@ -266,10 +263,7 @@ mod tests {
     fn width_is_measured_in_terminal_cells_not_scalars() {
         // Six CJK scalars occupy twelve columns, exceeding the ten-column budget
         // of `status.done`, so the engine falls back to English.
-        let engine = I18nEngine::new(Some(custom(
-            "Japanese",
-            &[("status.done", "完了完了完了")],
-        )));
+        let engine = I18nEngine::new(Some(custom("Japanese", &[("status.done", "完了完了完了")])));
         assert_eq!(engine.t("status.done"), "Done");
 
         // Three CJK scalars occupy six columns, well within `modal.close`.

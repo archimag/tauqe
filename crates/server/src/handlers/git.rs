@@ -74,10 +74,9 @@ pub async fn handle_repository_init(req: Request, state: &Arc<AppState>) -> Resp
 
 pub async fn handle_repository_list_files(req: Request, state: &Arc<AppState>) -> Response {
     let repo_root = state.repo_root().await;
-    let files = super::offload(move || {
-        tauqe_core::git::list_repository_files(Some(repo_root.as_path()))
-    })
-    .await;
+    let files =
+        super::offload(move || tauqe_core::git::list_repository_files(Some(repo_root.as_path())))
+            .await;
 
     match files {
         Ok(Ok(files)) => Response::ok_typed(req.id, &RepositoryListFilesResult { files }),
@@ -188,11 +187,7 @@ pub async fn handle_git_squash_generate_message(req: Request, state: &Arc<AppSta
         match req.params.and_then(|p| serde_json::from_value(p).ok()) {
             Some(p) => p,
             None => {
-                return Response::err(
-                    req.id,
-                    errors::INVALID_PARAMS,
-                    "Missing base_ref parameter",
-                );
+                return Response::err(req.id, errors::INVALID_PARAMS, "Missing base_ref parameter");
             }
         };
 
@@ -213,7 +208,10 @@ pub async fn handle_git_squash_generate_message(req: Request, state: &Arc<AppSta
             return Response::err(
                 req.id,
                 errors::COMMITS_AHEAD_FAILED,
-                format!("Failed to get commits ahead of {}: {}", params.base_ref, err),
+                format!(
+                    "Failed to get commits ahead of {}: {}",
+                    params.base_ref, err
+                ),
             );
         }
         Err(err) => return Response::err(req.id, errors::COMMITS_AHEAD_FAILED, err),
@@ -338,12 +336,13 @@ pub async fn handle_git_squash_generate_message(req: Request, state: &Arc<AppSta
                 );
             }
         }
-        let msg = tauqe_core::prompt::parse_squash_commit_message(&full_text).unwrap_or_else(|| {
-            commits_ahead
-                .first()
-                .map(|c| c.subject.clone())
-                .unwrap_or_else(|| "Squashed commits".to_string())
-        });
+        let msg =
+            tauqe_core::prompt::parse_squash_commit_message(&full_text).unwrap_or_else(|| {
+                commits_ahead
+                    .first()
+                    .map(|c| c.subject.clone())
+                    .unwrap_or_else(|| "Squashed commits".to_string())
+            });
         let snapshot = close_squash_usage(state, usage_guard, &op_id).await;
         (msg, Some(snapshot))
     } else {
@@ -496,7 +495,10 @@ pub async fn handle_git_squash_apply(req: Request, state: &Arc<AppState>) -> Res
             return Response::err(
                 req.id,
                 errors::COMMITS_AHEAD_FAILED,
-                format!("Failed to get commits ahead of {}: {}", params.base_ref, err),
+                format!(
+                    "Failed to get commits ahead of {}: {}",
+                    params.base_ref, err
+                ),
             );
         }
         Ok(Err(SquashApplyError::Squash(err))) => {
@@ -634,8 +636,7 @@ mod tests {
             tauqe_core::git::init_repository(Some(&root), true).unwrap();
             std::fs::write(root.join("README.md"), "# tauqe\n").unwrap();
             tauqe_core::git::cmd::stage_files(&root, &["README.md".to_string()]).unwrap();
-            tauqe_core::git::cmd::commit_with_developer_author(&root, "Add readme", false)
-                .unwrap();
+            tauqe_core::git::cmd::commit_with_developer_author(&root, "Add readme", false).unwrap();
             Self(root)
         }
 
@@ -673,9 +674,11 @@ mod tests {
             cost: Some(0.25),
             ..tauqe_protocol::ModelUsageInfo::default()
         };
-        let provider: Arc<dyn LlmProvider> = Arc::new(MockLlmProvider::scripted([
-            MockResponse::text("squash the session history").with_usage(usage),
-        ]));
+        let provider: Arc<dyn LlmProvider> =
+            Arc::new(MockLlmProvider::scripted([MockResponse::text(
+                "squash the session history",
+            )
+            .with_usage(usage)]));
 
         let (out, _rx) = crate::transport::OutChannel::new();
         let (history_sender, _history_rx) = tokio::sync::mpsc::unbounded_channel();

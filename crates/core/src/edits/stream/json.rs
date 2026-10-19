@@ -11,9 +11,9 @@ use crate::providers::StreamEvent;
 pub mod decode;
 pub mod field;
 
+use decode::{extract_incomplete_change_op_and_path, StringFieldCursor};
 pub use decode::{extract_streamed_string_field, find_string_field_value_start};
 pub use field::JsonFieldStreamFilter;
-use decode::{extract_incomplete_change_op_and_path, StringFieldCursor};
 
 /// State-machine streaming parser for Structured Output JSON edits using struson.
 ///
@@ -78,7 +78,11 @@ impl JsonStreamFilter {
         if let Some(open_path) = self.open_file_path.take() {
             let hunks_count = self.file_hunk_counts.remove(&open_path).unwrap_or(0);
             let display = std::mem::take(&mut self.open_file_display);
-            let final_path = if display.is_empty() { open_path } else { display };
+            let final_path = if display.is_empty() {
+                open_path
+            } else {
+                display
+            };
             events.push(StreamEvent::EditFileDone {
                 path: final_path,
                 status: EditFileStatus::Ok,
@@ -246,7 +250,10 @@ impl JsonStreamFilter {
                     new_text: new_text.clone(),
                 });
 
-                match self.staging.apply_hunk(&resolved_path, &old_text, &new_text) {
+                match self
+                    .staging
+                    .apply_hunk(&resolved_path, &old_text, &new_text)
+                {
                     Ok(()) => {
                         self.file_hunk_counts.insert(resolved_path, hunk_index + 1);
                     }
@@ -305,11 +312,8 @@ impl EditStreamFilter for JsonStreamFilter {
 
         // 1. Stream message field deltas on the fly using incremental decoding.
         if !self.message_finished {
-            let (delta, finished) = extract_streamed_string_field(
-                &self.buffer,
-                "message",
-                &mut self.message_cursor,
-            );
+            let (delta, finished) =
+                extract_streamed_string_field(&self.buffer, "message", &mut self.message_cursor);
             if let Some(d) = delta {
                 events.push(StreamEvent::TextDelta(d));
             }
@@ -628,8 +632,7 @@ mod tests {
     fn test_backtick_plain_text_falls_back_to_passthrough() {
         let root = std::env::temp_dir();
         let mut filter = JsonStreamFilter::new(vec![], root);
-        let text =
-            "`foo` is a plain text reply that must not be swallowed by the JSON filter.";
+        let text = "`foo` is a plain text reply that must not be swallowed by the JSON filter.";
 
         let mut streamed = String::new();
         for ev in filter.push_chunk(text) {
@@ -669,8 +672,7 @@ mod tests {
     fn test_backtick_plain_text_streams_across_chunks() {
         let root = std::env::temp_dir();
         let mut filter = JsonStreamFilter::new(vec![], root);
-        let text =
-            "`cargo build` produced output that is a plain text answer, not JSON.";
+        let text = "`cargo build` produced output that is a plain text answer, not JSON.";
 
         let mut streamed = String::new();
         for c in text.chars() {
@@ -693,8 +695,8 @@ mod tests {
         let root = std::env::temp_dir();
         let input = r#"{"message":"Go","changes":[{"op":"replace","path":"a.rs","old_text":"x","new_text":"y"},{"op":"replace","path":"a.rs","old_text":"y","new_text":"z"}]}"#;
         let staged = HashMap::from([("a.rs".to_string(), "x".to_string())]);
-        let mut filter = JsonStreamFilter::new(vec!["a.rs".to_string()], root)
-            .with_staged_contents(staged);
+        let mut filter =
+            JsonStreamFilter::new(vec!["a.rs".to_string()], root).with_staged_contents(staged);
 
         let mut events = Vec::new();
         for c in input.chars() {

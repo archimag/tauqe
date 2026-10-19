@@ -6,12 +6,12 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tauqe_core::history::HistoryMutation;
 use tauqe_protocol::{
     errors, events, methods, Event, HistoryCompactedEvent, HistoryEntryAddedEvent, Request,
-    RequestId, Response,
+    RequestId, Response, SHUTDOWN_DRAIN_BUDGET,
 };
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 mod handlers;
 mod logging;
@@ -61,14 +61,14 @@ async fn main() -> anyhow::Result<()> {
         log_path = %log_path.display(),
         "Server daemon started",
     );
-    let config = tauqe_core::config::load_config_with_options(tauqe_core::config::ConfigLoadOptions {
-        repo_root: Some(&repo_path),
-        explicit_config: explicit_config.as_deref(),
-        explicit_credentials: explicit_credentials.as_deref(),
-    });
+    let config =
+        tauqe_core::config::load_config_with_options(tauqe_core::config::ConfigLoadOptions {
+            repo_root: Some(&repo_path),
+            explicit_config: explicit_config.as_deref(),
+            explicit_credentials: explicit_credentials.as_deref(),
+        });
 
-    let (history_tx, mut history_rx) =
-        tokio::sync::mpsc::unbounded_channel::<HistoryMutation>();
+    let (history_tx, mut history_rx) = tokio::sync::mpsc::unbounded_channel::<HistoryMutation>();
     let (out, mut out_rx) = OutChannel::new();
 
     let state = AppState::new(config, repo_path, history_tx, out);
@@ -135,6 +135,13 @@ async fn main() -> anyhow::Result<()> {
     let stdin = tokio::io::stdin();
     let mut reader = BufReader::new(stdin).lines();
 
+    // The signal watch is created before the read loop starts, so a signal
+    // delivered between two requests is never lost. It races the stdin reader
+    // and resolves to the same controlled exit instead of killing the process
+    // in the middle of a transaction.
+    let shutdown_watch = shutdown_signal();
+    tokio::pin!(shutdown_watch);
+
     // Requests whose handlers block on long-running work (LLM turns, the
     // deterministic pre-flight verification) are offloaded so the read loop
     // keeps draining stdin and can observe cancels and EOF. Every other request
@@ -142,17 +149,14 @@ async fn main() -> anyhow::Result<()> {
     // the client sent them and keeps responses ordered.
     let mut offloaded = tokio::task::JoinSet::new();
 
-    loop {
-        let line = match reader.next_line().await {
-            Ok(Some(line)) => line,
-            Ok(None) => {
-                tracing::info!("stdin reached EOF; beginning graceful shutdown");
-                break;
-            }
-            Err(err) => {
-                tracing::warn!(error = %err, "stdin read failed; beginning graceful shutdown");
-                break;
-            }
+    let shutdown_reason = loop {
+        let line = tokio::select! {
+            line = reader.next_line() => match line {
+                Ok(Some(line)) => line,
+                Ok(None) => break ShutdownReason::StdinEof,
+                Err(err) => break ShutdownReason::StdinFailed(err.to_string()),
+            },
+            reason = &mut shutdown_watch => break reason,
         };
         let line = line.trim();
         if line.is_empty() {
@@ -170,8 +174,7 @@ async fn main() -> anyhow::Result<()> {
                     code = errors::PARSE_ERROR,
                     "Rejected unparsable RPC request",
                 );
-                let err_resp =
-                    Response::err(RequestId::Null, errors::PARSE_ERROR, err.to_string());
+                let err_resp = Response::err(RequestId::Null, errors::PARSE_ERROR, err.to_string());
                 state.out.send_response(&err_resp);
                 continue;
             }
@@ -218,17 +221,139 @@ async fn main() -> anyhow::Result<()> {
             log_request_outcome(&request_id, &method, started.elapsed(), &response);
             state.out.send_response(&response);
         }
-    }
+    };
 
-    // stdin reached EOF (or failed): cancel the active operation and drain
-    // in-flight work so the process never exits mid-transaction.
+    shutdown_reason.record();
+
+    // The client closed the pipe or a signal asked the daemon to stop: cancel
+    // the active operation and drain in-flight work so the process never exits
+    // mid-transaction.
     drain_in_flight(&state, &mut offloaded).await;
 
     Ok(())
 }
 
-/// How long graceful shutdown waits for in-flight work before giving up.
-const SHUTDOWN_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// Why the daemon's request loop ended.
+///
+/// Every cause funnels into the same controlled exit: cancel the active
+/// operation, drain in-flight work, and return. The cause is carried as typed
+/// data, never inferred from surrounding text, so the journal entry and the
+/// shutdown path can never disagree.
+#[derive(Debug)]
+enum ShutdownReason {
+    /// The client closed its end of the stdin pipe.
+    StdinEof,
+    /// Reading stdin failed, which is a defect rather than a controlled end.
+    StdinFailed(String),
+    /// The operating system delivered a termination signal.
+    Signal(ShutdownSignal),
+}
+
+impl ShutdownReason {
+    /// Stable journal name of the cause.
+    ///
+    /// Each cause names itself, so `.tauqe/server.log` answers why the daemon
+    /// left on its own instead of showing an unexplained disappearance.
+    fn label(&self) -> &'static str {
+        match self {
+            Self::StdinEof => "stdin-eof",
+            Self::StdinFailed(_) => "stdin-read-error",
+            Self::Signal(signal) => signal.label(),
+        }
+    }
+
+    /// Records the cause in the journal before the drain begins.
+    ///
+    /// An expected end of the request stream is ordinary information, while a
+    /// failed read stays a warning carrying the underlying error.
+    fn record(&self) {
+        let reason = self.label();
+        match self {
+            Self::StdinFailed(error) => tracing::warn!(
+                reason = reason,
+                error = %error,
+                "beginning graceful shutdown",
+            ),
+            _ => tracing::info!(reason = reason, "beginning graceful shutdown"),
+        }
+    }
+}
+
+/// A termination signal the daemon converts into its own shutdown path.
+///
+/// `SIGINT` is deliberately absent: the `Ctrl+C` chord belongs to the keyboard
+/// contour of the TUI (`crates/tui/Conventions.md` §5.5) and must never be
+/// handled through a process signal handler.
+#[derive(Debug)]
+enum ShutdownSignal {
+    /// `SIGHUP`: the controlling terminal disappeared, usually because the TUI
+    /// window was closed.
+    Hangup,
+    /// `SIGTERM`: an operator or a supervisor asked the daemon to stop.
+    Terminate,
+}
+
+impl ShutdownSignal {
+    /// Signal name as it appears in the journal.
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Hangup => "SIGHUP",
+            Self::Terminate => "SIGTERM",
+        }
+    }
+
+    /// Platform signal this cause listens for.
+    #[cfg(unix)]
+    fn kind(&self) -> tokio::signal::unix::SignalKind {
+        use tokio::signal::unix::SignalKind;
+
+        match self {
+            Self::Hangup => SignalKind::hangup(),
+            Self::Terminate => SignalKind::terminate(),
+        }
+    }
+}
+
+/// Resolves when the operating system asks the daemon to terminate.
+///
+/// Neither signal may end the process on the spot, because an abrupt death
+/// skips the cancellation of the active turn and the rollback of its Git
+/// transaction. Both are therefore reported to the caller, which routes them
+/// into the same cancel, drain, and exit path as stdin EOF. The future is
+/// awaited alongside the stdin reader and never completes on its own.
+#[cfg(unix)]
+async fn shutdown_signal() -> ShutdownReason {
+    use tokio::signal::unix::signal;
+
+    match (
+        signal(ShutdownSignal::Hangup.kind()),
+        signal(ShutdownSignal::Terminate.kind()),
+    ) {
+        (Ok(mut hangup), Ok(mut terminate)) => {
+            tokio::select! {
+                _ = hangup.recv() => ShutdownReason::Signal(ShutdownSignal::Hangup),
+                _ = terminate.recv() => ShutdownReason::Signal(ShutdownSignal::Terminate),
+            }
+        }
+        (hangup, terminate) => {
+            // A handler that cannot be installed leaves the daemon on its
+            // pre-signal behaviour: it still stops on stdin EOF.
+            tracing::warn!(
+                hangup_error = ?hangup.as_ref().err(),
+                terminate_error = ?terminate.as_ref().err(),
+                "Failed to install shutdown signal handlers; relying on stdin EOF",
+            );
+            std::future::pending().await
+        }
+    }
+}
+
+/// On platforms without Unix signals stdin EOF remains the only controlled
+/// shutdown channel, and this future never completes.
+#[cfg(not(unix))]
+async fn shutdown_signal() -> ShutdownReason {
+    std::future::pending().await
+}
 
 /// Poll cadence while waiting for in-flight work to unwind during shutdown.
 const SHUTDOWN_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
@@ -264,12 +389,14 @@ fn is_long_running(method: &str) -> bool {
 /// A running turn holds the single operation slot for its whole duration and
 /// rolls its Git transaction back before releasing it, so an empty slot is a
 /// reliable "work finished" signal. Offloaded long-running handlers are drained
-/// as well. A bounded budget keeps a wedged provider from blocking shutdown
-/// forever; anything still running when it expires is aborted, and startup
-/// crash recovery covers any residue.
+/// as well. The deadline is the shared `SHUTDOWN_DRAIN_BUDGET` from the
+/// protocol contract, so a wedged provider cannot block shutdown forever while
+/// the client that spawned the daemon waits for that same budget; anything
+/// still running when it expires is aborted, and startup crash recovery covers
+/// any residue.
 async fn drain_in_flight(state: &Arc<AppState>, offloaded: &mut tokio::task::JoinSet<()>) {
     tracing::info!("Draining in-flight work before shutdown");
-    let deadline = tokio::time::Instant::now() + SHUTDOWN_DRAIN_TIMEOUT;
+    let deadline = tokio::time::Instant::now() + SHUTDOWN_DRAIN_BUDGET;
     loop {
         // Re-signal on every pass so an operation that registers while we wait
         // is cancelled too.
@@ -281,7 +408,7 @@ async fn drain_in_flight(state: &Arc<AppState>, offloaded: &mut tokio::task::Joi
         }
         if tokio::time::Instant::now() >= deadline {
             tracing::warn!(
-                timeout_secs = SHUTDOWN_DRAIN_TIMEOUT.as_secs(),
+                timeout_secs = SHUTDOWN_DRAIN_BUDGET.as_secs(),
                 "Shutdown drain timed out; aborting remaining work",
             );
             break;
@@ -371,5 +498,54 @@ mod tests {
         // request order.
         assert!(!is_long_running(methods::CONFIG_GET));
         assert!(!is_long_running(methods::HISTORY_GET));
+    }
+
+    /// Every termination cause carries its own stable journal name, so a look
+    /// at `.tauqe/server.log` answers why the daemon left on its own instead of
+    /// showing an unexplained disappearance.
+    #[test]
+    fn shutdown_causes_are_named_distinctly() {
+        let causes = [
+            ShutdownReason::StdinEof,
+            ShutdownReason::StdinFailed("broken pipe".to_string()),
+            ShutdownReason::Signal(ShutdownSignal::Hangup),
+            ShutdownReason::Signal(ShutdownSignal::Terminate),
+        ];
+
+        let mut labels: Vec<&str> = Vec::new();
+        for cause in &causes {
+            let label = cause.label();
+            assert!(!label.is_empty(), "a cause without a name cannot be logged");
+            assert!(
+                !labels.contains(&label),
+                "'{label}' names more than one cause"
+            );
+            labels.push(label);
+        }
+    }
+
+    /// `SIGHUP` and `SIGTERM` are the only signals the daemon converts into its
+    /// own shutdown path. `SIGINT` must stay untouched: the `Ctrl+C` chord
+    /// belongs to the keyboard contour of the TUI.
+    #[cfg(unix)]
+    #[test]
+    fn only_hangup_and_terminate_reach_the_shutdown_path() {
+        use tokio::signal::unix::SignalKind;
+
+        assert_eq!(ShutdownSignal::Hangup.kind(), SignalKind::hangup());
+        assert_eq!(ShutdownSignal::Terminate.kind(), SignalKind::terminate());
+        assert_ne!(ShutdownSignal::Hangup.kind(), SignalKind::terminate());
+        assert_ne!(ShutdownSignal::Hangup.kind(), SignalKind::interrupt());
+        assert_ne!(ShutdownSignal::Terminate.kind(), SignalKind::interrupt());
+    }
+
+    /// Without a delivered signal the watch never completes, on every platform:
+    /// a self-completing future would abort the daemon spuriously, and a
+    /// platform without Unix signals must poll it without panicking.
+    #[tokio::test]
+    async fn shutdown_watch_never_completes_on_its_own() {
+        let outcome =
+            tokio::time::timeout(std::time::Duration::from_millis(20), shutdown_signal()).await;
+        assert!(outcome.is_err(), "the shutdown watch fired without a signal");
     }
 }

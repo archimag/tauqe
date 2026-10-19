@@ -176,8 +176,14 @@ mod tests {
     fn test_translate_char_precedence() {
         // Custom langmap takes precedence over preset
         let custom = "й:z";
-        assert_eq!(translate_char('й', LayoutPreset::RuJcuken, Some(custom)), 'z');
+        assert_eq!(
+            translate_char('й', LayoutPreset::RuJcuken, Some(custom)),
+            'z'
+        );
         // Falls back to preset if not in custom langmap
-        assert_eq!(translate_char('ц', LayoutPreset::RuJcuken, Some(custom)), 'w');
+        assert_eq!(
+            translate_char('ц', LayoutPreset::RuJcuken, Some(custom)),
+            'w'
+        );
     }
 }

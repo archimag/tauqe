@@ -31,8 +31,8 @@ pub(super) async fn handle_locale_dialog(
         None => return Ok(None),
     };
 
-    let is_ctrl_alt = key.modifiers.contains(KeyModifiers::CONTROL)
-        && key.modifiers.contains(KeyModifiers::ALT);
+    let is_ctrl_alt =
+        key.modifiers.contains(KeyModifiers::CONTROL) && key.modifiers.contains(KeyModifiers::ALT);
     let is_cmd = !is_ctrl_alt
         && (st.tui_config.input.primary_modifier.matches(key.modifiers)
             || key.modifiers.contains(KeyModifiers::CONTROL));
@@ -272,7 +272,10 @@ mod tests {
         dispatch(&state, key(KeyCode::Enter)).await.unwrap();
 
         let st = state.lock().await;
-        let d = st.locale_dialog.as_ref().expect("dialog stays open while generating");
+        let d = st
+            .locale_dialog
+            .as_ref()
+            .expect("dialog stays open while generating");
         assert!(d.generating, "dialog transitions to generating state");
         let notif = st
             .active_notification()

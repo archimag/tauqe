@@ -10,7 +10,7 @@
 //! button styles are projected through [`crate::theme::engine`], so a modal
 //! keeps its meaning under any terminal palette (`#c-1`, `#c-2`).
 
-use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Alignment, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
@@ -241,6 +241,85 @@ pub fn render_modal_container(
     render_modal_container_styled(frame, area, title, tone.border_style(&engine))
 }
 
+/// Vertical bands of a standard modal card, with the air separators already
+/// applied.
+///
+/// Every dialog shares one vertical formula: a one-row top inset under the
+/// border title, the flexible body, a one-row pre-action spacer, the action bar,
+/// and the docked hint strip pinned to the bottom border. The body and the
+/// action bar are additionally padded one column off each vertical border, so
+/// content never presses against the card frame (Conventions §6.7, §6.8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ModalGeometry {
+    /// Content column, inset from the top border and padded off both vertical
+    /// borders.
+    pub body: Rect,
+    /// Row holding the confirm and cancel controls, padded like the body and
+    /// separated from the body by one blank row.
+    pub action_bar: Rect,
+    /// Docked, non-interactive hint strip on the bottom inner row.
+    pub hint_row: Rect,
+}
+
+/// Insets a rectangle by the one-cell card border.
+fn modal_inner_area(area: Rect) -> Rect {
+    Rect::new(
+        area.x.saturating_add(1),
+        area.y.saturating_add(1),
+        area.width.saturating_sub(2),
+        area.height.saturating_sub(2),
+    )
+}
+
+/// Keeps one column of horizontal air between content and each vertical border
+/// (Conventions §6.8).
+fn with_horizontal_padding(area: Rect) -> Rect {
+    Rect::new(
+        area.x.saturating_add(1),
+        area.y,
+        area.width.saturating_sub(2),
+        area.height,
+    )
+}
+
+/// Splits a modal card area into the shared air-aware vertical bands.
+///
+/// Dialogs render their content into [`ModalGeometry::body`] and never compute
+/// the top inset, the spacer, or the padding offsets by hand, so every card
+/// breathes the same way (Conventions §6.7, §6.8).
+pub fn modal_geometry(area: Rect) -> ModalGeometry {
+    modal_geometry_from_inner(modal_inner_area(area))
+}
+
+/// Splits the inner area returned by [`render_modal_container`] into the shared
+/// bands.
+fn modal_geometry_from_inner(inner: Rect) -> ModalGeometry {
+    let top_inset_h = inner.height.min(1);
+    let mut cursor = inner.y.saturating_add(top_inset_h);
+    let mut remaining = inner.height.saturating_sub(top_inset_h);
+
+    // The bottom chrome is reserved first, so a short card still shows its
+    // controls instead of clipping them behind an overgrown body.
+    let hint_h = remaining.min(1);
+    remaining = remaining.saturating_sub(hint_h);
+    let action_h = remaining.min(1);
+    remaining = remaining.saturating_sub(action_h);
+    let spacer_h = remaining.min(1);
+    let body_h = remaining.saturating_sub(spacer_h);
+
+    let body = with_horizontal_padding(Rect::new(inner.x, cursor, inner.width, body_h));
+    cursor = cursor.saturating_add(body_h).saturating_add(spacer_h);
+    let action_bar = with_horizontal_padding(Rect::new(inner.x, cursor, inner.width, action_h));
+    cursor = cursor.saturating_add(action_h);
+    let hint_row = Rect::new(inner.x, cursor, inner.width, hint_h);
+
+    ModalGeometry {
+        body,
+        action_bar,
+        hint_row,
+    }
+}
+
 /// Parameters for the standardized three-tier modal frame.
 pub struct ModalFrame<'a> {
     pub title: &'a str,
@@ -268,17 +347,13 @@ impl ModalFrame<'_> {
         let palette = engine.palette();
 
         let inner_area = render_modal_container(frame, self.area, self.title, self.tone);
+        // The frame owns the whole vertical formula: the top inset, the padded
+        // body, the pre-action spacer, the button row, and the docked hint
+        // strip, so a body can neither collide with the border title nor press
+        // the buttons against its own text (Conventions §6.7, §6.8).
+        let geometry = modal_geometry_from_inner(inner_area);
 
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Min(2),
-                Constraint::Length(2),
-                Constraint::Length(1),
-            ])
-            .split(inner_area);
-
-        render_body(frame, chunks[0]);
+        render_body(frame, geometry.body);
 
         let resting = button_style(&engine, palette.button_bg, palette.button_fg, false);
         let active = button_style(
@@ -305,7 +380,7 @@ impl ModalFrame<'_> {
             Span::styled(format!(" [ {} ] ", self.cancel_label), cancel_style),
         ]);
         let actions_widget = Paragraph::new(actions_line).alignment(Alignment::Center);
-        frame.render_widget(actions_widget, chunks[1]);
+        frame.render_widget(actions_widget, geometry.action_bar);
 
         // The navigation vocabulary is docked to the very bottom row as its own
         // strip, separated from the action buttons, so it reads as persistent
@@ -314,7 +389,7 @@ impl ModalFrame<'_> {
             Some(text) => text.to_string(),
             None => dialog_footer_hint(),
         };
-        render_dialog_footer(frame, chunks[2], &hint);
+        render_dialog_footer(frame, geometry.hint_row, &hint);
     }
 }
 
@@ -333,40 +408,42 @@ where
 /// Rendering and mouse hit-testing share this geometry, so the drawn
 /// confirm/cancel buttons are always the clickable ones (Conventions §6, §7).
 pub fn modal_action_buttons(area: Rect, confirm_label: &str, cancel_label: &str) -> (Rect, Rect) {
-    let inner = Rect::new(
-        area.x + 1,
-        area.y + 1,
-        area.width.saturating_sub(2),
-        area.height.saturating_sub(2),
-    );
-    // Mirror the frame's own split (flexible body, two-row button zone, one-row
-    // docked hint strip) so hit-testing lands on the row the buttons are drawn
-    // in and can never drift from the rendered layout (Conventions §6, §7).
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Min(2),
-            Constraint::Length(2),
-            Constraint::Length(1),
-        ])
-        .split(inner);
-    let action_bar = chunks[1];
+    modal_action_buttons_in(modal_geometry(area).action_bar, confirm_label, cancel_label)
+}
 
+/// Hit rectangles of the confirm and cancel buttons inside an action bar.
+///
+/// Dialogs that lay out their own action bar (pickers stacking a model list and
+/// an editor above the buttons) hand that row here instead of recomputing the
+/// centering, so the drawn buttons are always the clickable ones and every card
+/// keeps the same button geometry (Conventions §6.3, §6.6).
+pub fn modal_action_buttons_in(
+    action_bar: Rect,
+    confirm_label: &str,
+    cancel_label: &str,
+) -> (Rect, Rect) {
     let confirm_w = (UnicodeWidthStr::width(confirm_label) as u16).saturating_add(6);
     let cancel_w = (UnicodeWidthStr::width(cancel_label) as u16).saturating_add(6);
     let gap = 4u16;
-    let total = confirm_w + gap + cancel_w;
-    let start_x = action_bar.x + action_bar.width.saturating_sub(total) / 2;
+    let total = confirm_w.saturating_add(gap).saturating_add(cancel_w);
+    let start_x = action_bar
+        .x
+        .saturating_add(action_bar.width.saturating_sub(total) / 2);
 
     (
         Rect::new(start_x, action_bar.y, confirm_w, 1),
-        Rect::new(start_x + confirm_w + gap, action_bar.y, cancel_w, 1),
+        Rect::new(
+            start_x.saturating_add(confirm_w).saturating_add(gap),
+            action_bar.y,
+            cancel_w,
+            1,
+        ),
     )
 }
 
 #[cfg(test)]
 mod tests {
-    use super::hint_spans;
+    use super::{hint_spans, modal_action_buttons, modal_geometry};
     use crate::theme::engine::current_engine;
 
     fn contents(hint: &str) -> Vec<String> {
@@ -403,6 +480,53 @@ mod tests {
         );
     }
 
+    /// The body starts below the border and the one-row top inset, and stays one
+    /// column away from each vertical border (Conventions §6.7, §6.8).
+    #[test]
+    fn body_is_inset_from_the_top_and_padded_off_the_borders() {
+        let term = ratatui::layout::Rect::new(0, 0, 80, 24);
+        let area = crate::ui::centered_rect(60, 70, term);
+        let geometry = modal_geometry(area);
+
+        assert_eq!(geometry.body.y, area.y + 2, "border + top inset");
+        assert_eq!(geometry.body.x, area.x + 2, "border + horizontal padding");
+        assert_eq!(geometry.body.width, area.width - 4);
+    }
+
+    /// One blank row separates the body from the action bar, and the hint strip
+    /// sits on the bottom inner row (Conventions §6.7).
+    #[test]
+    fn action_bar_follows_one_blank_row_and_hint_row_is_docked() {
+        let term = ratatui::layout::Rect::new(0, 0, 80, 24);
+        let area = crate::ui::centered_rect(60, 70, term);
+        let geometry = modal_geometry(area);
+
+        assert_eq!(
+            geometry.action_bar.y,
+            geometry.body.y + geometry.body.height + 1,
+            "pre-action spacer"
+        );
+        assert_eq!(
+            geometry.hint_row.y + geometry.hint_row.height,
+            area.y + area.height - 1,
+            "hint strip is docked above the bottom border"
+        );
+    }
+
+    /// Hit-testing derives its row from the same formula the render path uses.
+    #[test]
+    fn buttons_land_on_the_rendered_action_bar() {
+        let term = ratatui::layout::Rect::new(0, 0, 80, 24);
+        let area = crate::ui::centered_rect(60, 70, term);
+        let (confirm, cancel) = modal_action_buttons(area, "Confirm", "Cancel");
+        let action_bar = modal_geometry(area).action_bar;
+
+        assert_eq!(confirm.y, action_bar.y);
+        assert_eq!(cancel.y, action_bar.y);
+        assert!(confirm.x >= action_bar.x);
+        assert!(cancel.x + cancel.width <= action_bar.x + action_bar.width);
+    }
+
     /// Button hit rectangles must follow terminal display width, so a CJK label
     /// (two columns per scalar) stays aligned with the drawn button
     /// (Conventions §6, §9).
@@ -414,7 +538,7 @@ mod tests {
 
         use crate::app::ModalActionsState;
 
-        use super::{modal_action_buttons, render_modal_frame, ModalFrame, ModalTone};
+        use super::{render_modal_frame, ModalFrame, ModalTone};
 
         let term = Rect::new(0, 0, 100, 30);
         let area = crate::ui::centered_rect(60, 40, term);
@@ -454,5 +578,64 @@ mod tests {
         let cancel_row = read(cancel_btn);
         assert!(confirm_row.contains('确'), "confirm row: {confirm_row:?}");
         assert!(cancel_row.contains('取'), "cancel row: {cancel_row:?}");
+    }
+
+    /// A body that fills its whole area must still leave the row above the
+    /// buttons empty, so text and controls never sit on adjacent rows
+    /// (Conventions §6.7).
+    #[test]
+    fn blank_separator_row_survives_a_body_that_fills_its_area() {
+        use ratatui::backend::TestBackend;
+        use ratatui::layout::Rect;
+        use ratatui::text::Line;
+        use ratatui::widgets::Paragraph;
+        use ratatui::Terminal;
+
+        use crate::app::ModalActionsState;
+
+        use super::{render_modal_frame, ModalFrame, ModalTone};
+
+        let term = Rect::new(0, 0, 80, 24);
+        let area = crate::ui::centered_rect(60, 70, term);
+        let confirm_label = "Confirm";
+        let cancel_label = "Cancel";
+
+        let mut terminal = Terminal::new(TestBackend::new(term.width, term.height)).unwrap();
+        terminal
+            .draw(|f| {
+                render_modal_frame(
+                    f,
+                    ModalFrame {
+                        title: "Test",
+                        tone: ModalTone::Info,
+                        area,
+                        confirm_label,
+                        cancel_label,
+                        actions_state: ModalActionsState::default(),
+                        is_actions_focused: true,
+                        destructive: false,
+                        hint_text: Some(""),
+                    },
+                    |frame, body| {
+                        let filler = "X".repeat(body.width as usize);
+                        let lines: Vec<Line> = (0..body.height)
+                            .map(|_| Line::from(filler.clone()))
+                            .collect();
+                        frame.render_widget(Paragraph::new(lines), body);
+                    },
+                );
+            })
+            .unwrap();
+
+        let (confirm_btn, _) = modal_action_buttons(area, confirm_label, cancel_label);
+        let buffer = terminal.backend().buffer();
+        let separator_y = confirm_btn.y.saturating_sub(1);
+        let separator: String = (area.x..area.x + area.width)
+            .map(|x| buffer[(x, separator_y)].symbol())
+            .collect();
+        assert!(
+            !separator.contains('X'),
+            "separator row must stay blank: {separator:?}"
+        );
     }
 }

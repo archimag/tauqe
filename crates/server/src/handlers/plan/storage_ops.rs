@@ -32,9 +32,7 @@ pub async fn handle_plan_list(req: Request, state: &Arc<AppState>) -> Response {
     })
     .await
     {
-        Ok((plans, active_id)) => {
-            Response::ok_typed(req.id, &PlanListResult { plans, active_id })
-        }
+        Ok((plans, active_id)) => Response::ok_typed(req.id, &PlanListResult { plans, active_id }),
         Err(err) => Response::err(req.id, errors::PLAN_LIST_FAILED, err),
     }
 }
@@ -85,7 +83,8 @@ pub async fn handle_plan_get(req: Request, state: &Arc<AppState>) -> Response {
     if target_id.is_none() && active_missing {
         if let Some(id) = plan_id.clone() {
             let root = repo_root.clone();
-            let _ = offload_plan(move || PlanStorage::save_active_id(&root, Some(id.as_str()))).await;
+            let _ =
+                offload_plan(move || PlanStorage::save_active_id(&root, Some(id.as_str()))).await;
         }
     }
 
@@ -132,7 +131,10 @@ pub async fn handle_plan_save(req: Request, state: &Arc<AppState>) -> Response {
         return Response::err(
             req.id,
             errors::INVALID_PLAN_TREE,
-            format!("Plan contains a duplicate or empty step ID: '{}'", duplicate),
+            format!(
+                "Plan contains a duplicate or empty step ID: '{}'",
+                duplicate
+            ),
         );
     }
 
@@ -143,7 +145,8 @@ pub async fn handle_plan_save(req: Request, state: &Arc<AppState>) -> Response {
     let repo_root = state.context.read().await.repo_root().to_path_buf();
     let save_root = repo_root.clone();
     let plan_to_save = plan.clone();
-    if let Err(err) = offload_plan(move || PlanStorage::save_plan(&save_root, &plan_to_save)).await {
+    if let Err(err) = offload_plan(move || PlanStorage::save_plan(&save_root, &plan_to_save)).await
+    {
         return Response::err(req.id, errors::PLAN_SAVE_FAILED, err);
     }
 
@@ -321,9 +324,7 @@ pub async fn handle_plan_delete(req: Request, state: &Arc<AppState>) -> Response
 
     let params: PlanDeleteParams = match req.params.and_then(|p| serde_json::from_value(p).ok()) {
         Some(p) => p,
-        None => {
-            return Response::err(req.id, errors::INVALID_PARAMS, "Missing or invalid plan ID")
-        }
+        None => return Response::err(req.id, errors::INVALID_PARAMS, "Missing or invalid plan ID"),
     };
 
     let repo_root = state.context.read().await.repo_root().to_path_buf();

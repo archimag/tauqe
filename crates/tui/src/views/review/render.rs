@@ -96,7 +96,9 @@ pub fn render_review_view(
         state.review.scroll = max_scroll;
     }
 
-    let tree_widget = Paragraph::new(lines).block(block).scroll((state.review.scroll, 0));
+    let tree_widget = Paragraph::new(lines)
+        .block(block)
+        .scroll((state.review.scroll, 0));
     frame.render_widget(tree_widget, main_area);
 
     let effective = state.review.effective_sessions();
@@ -104,16 +106,29 @@ pub fn render_review_view(
     let total_items: usize = effective.iter().map(|s| s.items.len()).sum();
     let fixed_items: usize = effective
         .iter()
-        .map(|s| s.items.iter().filter(|i| i.status == IssueStatus::Fixed).count())
+        .map(|s| {
+            s.items
+                .iter()
+                .filter(|i| i.status == IssueStatus::Fixed)
+                .count()
+        })
         .sum();
     let skipped_items: usize = effective
         .iter()
-        .map(|s| s.items.iter().filter(|i| i.status == IssueStatus::Skipped).count())
+        .map(|s| {
+            s.items
+                .iter()
+                .filter(|i| i.status == IssueStatus::Skipped)
+                .count()
+        })
         .sum();
 
     let mut status_spans = Vec::new();
     if let Some(err) = &state.review.error {
-        status_spans.push(Span::styled(format!(" {}", err), engine.fg(palette.status_error).bold()));
+        status_spans.push(Span::styled(
+            format!(" {}", err),
+            engine.fg(palette.status_error).bold(),
+        ));
     } else {
         if state.review.running {
             status_spans.push(Span::styled(
@@ -145,7 +160,11 @@ pub fn render_review_view(
         }
         if !rows.is_empty() {
             status_spans.push(Span::styled(
-                format!(" | [Row {}/{}]", state.review.selected_index + 1, rows.len()),
+                format!(
+                    " | [Row {}/{}]",
+                    state.review.selected_index + 1,
+                    rows.len()
+                ),
                 engine.fg(palette.text_secondary),
             ));
         }
@@ -190,10 +209,7 @@ fn describe_review_row(
                     format!(" {} {}", active_t("review.session_label"), title),
                     engine.fg(palette.text_primary).bold(),
                 ),
-                Span::styled(
-                    format!(" ({})", model),
-                    engine.fg(palette.text_muted),
-                ),
+                Span::styled(format!(" ({})", model), engine.fg(palette.text_muted)),
                 Span::styled(
                     format!("  {} ", format_created_at(*created_at)),
                     engine.fg(palette.text_muted),
@@ -247,10 +263,7 @@ fn describe_review_row(
             ..
         } => {
             let mut spans = vec![
-                Span::styled(
-                    format!(" #{} ", item_id),
-                    engine.fg(palette.text_secondary),
-                ),
+                Span::styled(format!(" #{} ", item_id), engine.fg(palette.text_secondary)),
                 Span::styled(
                     format!(" [{}] ", issue_type_badge(*issue_type)),
                     issue_type_style(*issue_type),
@@ -291,18 +304,12 @@ fn describe_review_row(
             ..
         } => {
             let mut spans = vec![
-                Span::styled(
-                    format!(" #{} ", item_id),
-                    engine.fg(palette.text_secondary),
-                ),
+                Span::styled(format!(" #{} ", item_id), engine.fg(palette.text_secondary)),
                 Span::styled(
                     format!(" step #{} ", step_id),
                     engine.fg(palette.text_secondary),
                 ),
-                Span::styled(
-                    format!(" {} ", status),
-                    plan_status_style(*status),
-                ),
+                Span::styled(format!(" {} ", status), plan_status_style(*status)),
                 Span::styled(title.clone(), engine.fg(palette.text_primary).bold()),
             ];
             if let Some(loc) = location(files) {
@@ -402,7 +409,9 @@ mod tests {
             "the Executive Summary block must remain visible after setting session, got: {texts:?}"
         );
         assert!(
-            texts.iter().any(|t| t.contains("The architecture is sound.")),
+            texts
+                .iter()
+                .any(|t| t.contains("The architecture is sound.")),
             "the summary body must render in the session header, got: {texts:?}"
         );
     }

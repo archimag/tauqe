@@ -83,8 +83,8 @@ fn handle_key(
         return handle_confirm(dialog, kind, key);
     }
 
-    let is_ctrl_alt = key.modifiers.contains(KeyModifiers::CONTROL)
-        && key.modifiers.contains(KeyModifiers::ALT);
+    let is_ctrl_alt =
+        key.modifiers.contains(KeyModifiers::CONTROL) && key.modifiers.contains(KeyModifiers::ALT);
     let is_cmd = !is_ctrl_alt
         && (primary.matches(key.modifiers) || key.modifiers.contains(KeyModifiers::CONTROL));
 
@@ -126,7 +126,11 @@ fn handle_confirm(
     }
 }
 
-fn handle_custom_input(dialog: &mut SquashDialogState, key: KeyEvent, is_cmd: bool) -> SquashAction {
+fn handle_custom_input(
+    dialog: &mut SquashDialogState,
+    key: KeyEvent,
+    is_cmd: bool,
+) -> SquashAction {
     match key.code {
         KeyCode::Esc => {
             dialog.custom_input_active = false;
@@ -141,8 +145,7 @@ fn handle_custom_input(dialog: &mut SquashDialogState, key: KeyEvent, is_cmd: bo
             dialog.pending_base = Some((SquashBaseMode::Custom, custom.clone()));
             dialog.loading = true;
             dialog.status_message = Some(
-                crate::i18n::active_t("dialog.squash.status_checking_base")
-                    .replace("{}", &custom),
+                crate::i18n::active_t("dialog.squash.status_checking_base").replace("{}", &custom),
             );
             SquashAction::Preview(custom)
         }
@@ -289,7 +292,9 @@ fn begin_generate(dialog: &mut SquashDialogState) -> SquashAction {
         return SquashAction::None;
     }
     dialog.generating_message = true;
-    dialog.status_message = Some(crate::i18n::active_t("dialog.squash.status_generating_message"));
+    dialog.status_message = Some(crate::i18n::active_t(
+        "dialog.squash.status_generating_message",
+    ));
     SquashAction::Generate(dialog.base_ref.clone())
 }
 
@@ -308,7 +313,9 @@ fn request_apply_confirm(dialog: &mut SquashDialogState) {
         return;
     }
     if dialog.generating_message {
-        dialog.status_message = Some(crate::i18n::active_t("dialog.squash.status_message_generating"));
+        dialog.status_message = Some(crate::i18n::active_t(
+            "dialog.squash.status_message_generating",
+        ));
         return;
     }
     if dialog.base_ref.trim().is_empty() {
@@ -320,8 +327,7 @@ fn request_apply_confirm(dialog: &mut SquashDialogState) {
         return;
     }
     if dialog.message_editor.get_text().trim().is_empty() {
-        dialog.status_message =
-            Some(crate::i18n::active_t("dialog.squash.status_empty_message"));
+        dialog.status_message = Some(crate::i18n::active_t("dialog.squash.status_empty_message"));
         dialog.focus = SquashDialogFocus::MessageEditor;
         return;
     }
@@ -329,7 +335,6 @@ fn request_apply_confirm(dialog: &mut SquashDialogState) {
     dialog.confirm_button = ConfirmDialogButton::Cancel;
 }
 
-    
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -374,19 +379,28 @@ mod tests {
     #[test]
     fn empty_message_closes_immediately() {
         let mut dialog = ready_dialog();
-        assert!(matches!(press(&mut dialog, KeyCode::Esc), SquashAction::Close));
+        assert!(matches!(
+            press(&mut dialog, KeyCode::Esc),
+            SquashAction::Close
+        ));
     }
 
     #[test]
     fn closing_with_message_requires_discard_confirmation() {
         let mut dialog = ready_dialog();
         dialog.message_editor.insert_str("feat: keep me");
-        assert!(matches!(press(&mut dialog, KeyCode::Esc), SquashAction::None));
+        assert!(matches!(
+            press(&mut dialog, KeyCode::Esc),
+            SquashAction::None
+        ));
         assert_eq!(dialog.confirm, Some(SquashConfirm::Discard));
         assert_eq!(dialog.confirm_button, ConfirmDialogButton::Cancel);
 
         // Enter on the default Cancel button keeps the dialog and the message.
-        assert!(matches!(press(&mut dialog, KeyCode::Enter), SquashAction::None));
+        assert!(matches!(
+            press(&mut dialog, KeyCode::Enter),
+            SquashAction::None
+        ));
         assert_eq!(dialog.confirm, None);
         assert_eq!(dialog.message_editor.get_text(), "feat: keep me");
     }
@@ -408,7 +422,10 @@ mod tests {
         assert_eq!(dialog.message_editor.get_text(), "feat: x");
 
         // Input is ignored until the server responds.
-        assert!(matches!(press(&mut dialog, KeyCode::Esc), SquashAction::None));
+        assert!(matches!(
+            press(&mut dialog, KeyCode::Esc),
+            SquashAction::None
+        ));
         assert_eq!(dialog.confirm, None);
     }
 
@@ -419,7 +436,10 @@ mod tests {
 
         // F6 is inert: the squash apply is reachable only through the C-S / M-S
         // chords, never through a hardware function key.
-        assert!(matches!(press(&mut dialog, KeyCode::F(6)), SquashAction::None));
+        assert!(matches!(
+            press(&mut dialog, KeyCode::F(6)),
+            SquashAction::None
+        ));
         assert!(dialog.status_message.is_none());
         assert_eq!(dialog.confirm, None);
     }

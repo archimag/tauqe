@@ -18,26 +18,40 @@ use super::{
 static SYNTAX_SET: LazyLock<SyntaxSet> = LazyLock::new(SyntaxSet::load_defaults_newlines);
 static THEME_SET: LazyLock<ThemeSet> = LazyLock::new(ThemeSet::load_defaults);
 
+/// Resolves the syntect grammar that highlights a fenced code block.
+///
+/// Every language Tauqe indexes with Tree-sitter is covered: Rust,
+/// TypeScript/TSX, JavaScript, Python, Go, Java, C, C++, C#, and PHP. SQL is
+/// highlighted as well, although it carries no Tree-sitter grammar. The
+/// default syntax set ships no TypeScript or TSX grammar, so both resolve to
+/// the JavaScript grammar that highlights their shared syntax. An unknown
+/// token degrades to plain text instead of losing the block.
 fn resolve_syntax(token: &str) -> &'static syntect::parsing::SyntaxReference {
     let token_trimmed = token.trim();
     let token_lower = token_trimmed.to_lowercase();
     let lookup_candidates: &[&str] = match token_lower.as_str() {
-        "ts" | "typescript" | "tsx" => &["JavaScript", "js", "ts"],
-        "js" | "javascript" | "jsx" | "node" => &["JavaScript", "js"],
         "rs" | "rust" => &["Rust", "rust", "rs"],
+        "ts" | "typescript" | "tsx" => &["JavaScript", "js", "ts"],
+        "js" | "javascript" | "jsx" | "mjs" | "cjs" | "node" => &["JavaScript", "js"],
         "py" | "python" | "python3" => &["Python", "python", "py"],
+        "go" | "golang" => &["Go", "go"],
+        "java" => &["Java", "java"],
+        // C headers resolve to C, C++ headers to C++.
+        "c" | "h" => &["C", "c"],
+        "cpp" | "c++" | "cc" | "cxx" | "hpp" | "hxx" => &["C++", "cpp", "c++"],
+        "cs" | "c#" | "csharp" => &["C#", "cs"],
+        "php" => &["PHP", "php"],
         "sh" | "bash" | "zsh" | "shell" => &["Bourne Again Shell (bash)", "bash", "sh"],
         "yml" | "yaml" => &["YAML", "yaml", "yml"],
         "json" => &["JSON", "json"],
         "toml" => &["TOML", "toml"],
         "md" | "markdown" => &["Markdown", "markdown", "md"],
-        "c" => &["C", "c"],
-        "cpp" | "c++" | "cc" | "cxx" => &["C++", "cpp", "c++"],
-        "cs" | "c#" | "csharp" => &["C#", "cs"],
-        "go" | "golang" => &["Go", "go"],
         "html" | "htm" => &["HTML", "html"],
         "css" => &["CSS", "css"],
-        "sql" => &["SQL", "sql"],
+        // Every SQL dialect shares one grammar in the default syntax set.
+        "sql" | "postgres" | "postgresql" | "psql" | "mysql" | "sqlite" | "plsql" => {
+            &["SQL", "sql"]
+        }
         "xml" => &["XML", "xml"],
         _ => &[],
     };
@@ -72,13 +86,22 @@ fn syntect_style_to_ratatui(style: SynStyle, fallback_bg: Color) -> Style {
         style.foreground.b,
     ));
     s = s.bg(fallback_bg);
-    if style.font_style.contains(syntect::highlighting::FontStyle::BOLD) {
+    if style
+        .font_style
+        .contains(syntect::highlighting::FontStyle::BOLD)
+    {
         s = s.add_modifier(Modifier::BOLD);
     }
-    if style.font_style.contains(syntect::highlighting::FontStyle::ITALIC) {
+    if style
+        .font_style
+        .contains(syntect::highlighting::FontStyle::ITALIC)
+    {
         s = s.add_modifier(Modifier::ITALIC);
     }
-    if style.font_style.contains(syntect::highlighting::FontStyle::UNDERLINE) {
+    if style
+        .font_style
+        .contains(syntect::highlighting::FontStyle::UNDERLINE)
+    {
         s = s.add_modifier(Modifier::UNDERLINED);
     }
     s
@@ -238,24 +261,47 @@ mod tests {
         let lines = render_markdown(ts_code, &theme);
         let default_code_fg = safe_rgb(220, 225, 235);
         let has_highlighting = lines.iter().any(|l| {
-            l.spans.iter().any(|s| {
-                s.style.fg.is_some_and(|fg| fg != default_code_fg)
-            })
+            l.spans
+                .iter()
+                .any(|s| s.style.fg.is_some_and(|fg| fg != default_code_fg))
         });
-        assert!(has_highlighting, "TypeScript code must have syntax highlighting");
+        assert!(
+            has_highlighting,
+            "TypeScript code must have syntax highlighting"
+        );
 
         let code_bg = theme.code_bg;
         // lines[0] is lang header ("typescript")
         // lines[1] is top padding
-        assert_eq!(lines[1].spans[0].style.bg, Some(code_bg), "Top padding must have code_bg");
+        assert_eq!(
+            lines[1].spans[0].style.bg,
+            Some(code_bg),
+            "Top padding must have code_bg"
+        );
         // lines[2] is const x: number = 42;
-        assert_eq!(lines[2].spans[0].style.bg, Some(code_bg), "Code line must have code_bg");
+        assert_eq!(
+            lines[2].spans[0].style.bg,
+            Some(code_bg),
+            "Code line must have code_bg"
+        );
         // lines[3] is the empty line inside the code block
-        assert_eq!(lines[3].spans[0].style.bg, Some(code_bg), "Empty line inside code block must have code_bg");
+        assert_eq!(
+            lines[3].spans[0].style.bg,
+            Some(code_bg),
+            "Empty line inside code block must have code_bg"
+        );
         // lines[4] is function test(): void {}
-        assert_eq!(lines[4].spans[0].style.bg, Some(code_bg), "Code line must have code_bg");
+        assert_eq!(
+            lines[4].spans[0].style.bg,
+            Some(code_bg),
+            "Code line must have code_bg"
+        );
         // lines[5] is bottom padding
-        assert_eq!(lines[5].spans[0].style.bg, Some(code_bg), "Bottom padding must have code_bg");
+        assert_eq!(
+            lines[5].spans[0].style.bg,
+            Some(code_bg),
+            "Bottom padding must have code_bg"
+        );
     }
 
     #[test]
@@ -280,7 +326,13 @@ mod tests {
 
         // Frame characters should not be present
         for text in [&lang_text, &top_text, &code_text, &bot_text] {
-            assert!(!text.contains('┌') && !text.contains('┐') && !text.contains('│') && !text.contains('└') && !text.contains('┘'));
+            assert!(
+                !text.contains('┌')
+                    && !text.contains('┐')
+                    && !text.contains('│')
+                    && !text.contains('└')
+                    && !text.contains('┘')
+            );
         }
 
         // Top, code, and bottom padding lines must have identical uniform block width
@@ -290,7 +342,147 @@ mod tests {
         // Background should be applied across the entire block
         assert_eq!(top_pad.spans[0].style.bg, Some(theme.code_bg));
         assert_eq!(code_line.spans[0].style.bg, Some(theme.code_bg));
-        assert_eq!(code_line.spans.last().unwrap().style.bg, Some(theme.code_bg));
+        assert_eq!(
+            code_line.spans.last().unwrap().style.bg,
+            Some(theme.code_bg)
+        );
         assert_eq!(bot_pad.spans[0].style.bg, Some(theme.code_bg));
+    }
+
+    /// Every supported language alias and the grammar it must resolve to.
+    const SYNTAX_ALIASES: &[(&str, &str)] = &[
+        ("rs", "Rust"),
+        ("rust", "Rust"),
+        ("ts", "JavaScript"),
+        ("typescript", "JavaScript"),
+        ("tsx", "JavaScript"),
+        ("js", "JavaScript"),
+        ("javascript", "JavaScript"),
+        ("jsx", "JavaScript"),
+        ("mjs", "JavaScript"),
+        ("cjs", "JavaScript"),
+        ("py", "Python"),
+        ("python", "Python"),
+        ("python3", "Python"),
+        ("go", "Go"),
+        ("golang", "Go"),
+        ("java", "Java"),
+        ("c", "C"),
+        ("h", "C"),
+        ("cpp", "C++"),
+        ("c++", "C++"),
+        ("cc", "C++"),
+        ("cxx", "C++"),
+        ("hpp", "C++"),
+        ("hxx", "C++"),
+        ("cs", "C#"),
+        ("c#", "C#"),
+        ("csharp", "C#"),
+        ("php", "PHP"),
+        ("sql", "SQL"),
+        ("postgresql", "SQL"),
+        ("psql", "SQL"),
+        ("mysql", "SQL"),
+        ("sqlite", "SQL"),
+    ];
+
+    /// One sample line per supported language tag, with a needle that locates
+    /// the rendered code line inside the surrounding block chrome.
+    const HIGHLIGHT_SAMPLES: &[(&str, &str, &str)] = &[
+        ("rust", "fn build(value: u32) -> u32 { value }", "fn build"),
+        (
+            "typescript",
+            "export function build(value: number): number { return value; }",
+            "export function",
+        ),
+        (
+            "tsx",
+            "export const View = () => <div>Hello</div>;",
+            "export const",
+        ),
+        (
+            "javascript",
+            "export function build(value) { return value; }",
+            "export function",
+        ),
+        ("python", "def build(value): return value", "def build"),
+        (
+            "go",
+            "func build(value int) int { return value }",
+            "func build",
+        ),
+        (
+            "java",
+            "public class Service { int build() { return 0; } }",
+            "public class",
+        ),
+        (
+            "c",
+            "static int build(int value) { return value; }",
+            "static int",
+        ),
+        ("cpp", "int build(int value) { return value; }", "int build"),
+        (
+            "cs",
+            "public int Build(int value) { return value; }",
+            "public int",
+        ),
+        (
+            "php",
+            "<?php function build($value) { return $value; }",
+            "function build",
+        ),
+        ("sql", "SELECT id FROM users WHERE active = 1;", "SELECT"),
+    ];
+
+    /// Counts the foreground-coloured spans of the rendered code line that
+    /// contains `needle`.
+    ///
+    /// A fenced block that degraded to plain text renders its whole line as a
+    /// single span, while a highlighted line is split into several coloured
+    /// tokens. Counting spans therefore proves highlighting without depending
+    /// on the active color depth.
+    fn coloured_spans(tag: &str, code: &str, needle: &str) -> usize {
+        let theme = MarkdownTheme::answer();
+        let markdown = format!("```{tag}\n{code}\n```");
+        let lines = render_markdown(&markdown, &theme);
+        let line = lines
+            .iter()
+            .find(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+                    .contains(needle)
+            })
+            .unwrap_or_else(|| panic!("`{tag}` block has no line containing `{needle}`"));
+        line.spans
+            .iter()
+            .filter(|span| span.style.fg.is_some())
+            .count()
+    }
+
+    #[test]
+    fn every_supported_language_alias_resolves_to_its_grammar() {
+        for (alias, expected) in SYNTAX_ALIASES {
+            let syntax = resolve_syntax(alias);
+            assert_eq!(
+                syntax.name.trim(),
+                *expected,
+                "alias `{alias}` must resolve to the {expected} grammar"
+            );
+        }
+    }
+
+    #[test]
+    fn every_supported_language_is_highlighted_instead_of_plain_text() {
+        for (tag, code, needle) in HIGHLIGHT_SAMPLES {
+            let highlighted = coloured_spans(tag, code, needle);
+            let plain = coloured_spans("text", code, needle);
+            assert!(
+                highlighted > plain,
+                "`{tag}` rendered {highlighted} coloured spans, plain text rendered {plain}"
+            );
+        }
     }
 }

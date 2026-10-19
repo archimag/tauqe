@@ -92,7 +92,12 @@ impl XmlStreamFilter {
                 | StreamEvent::EditFileDone { path, .. } => {
                     *path = self.restore_content(path);
                 }
-                StreamEvent::EditHunk { path, old_text, new_text, .. } => {
+                StreamEvent::EditHunk {
+                    path,
+                    old_text,
+                    new_text,
+                    ..
+                } => {
                     *path = self.restore_content(path);
                     *old_text = self.restore_content(old_text);
                     *new_text = self.restore_content(new_text);
@@ -166,7 +171,10 @@ impl XmlStreamFilter {
             if self.current_file.is_none() {
                 let next_file = find_file_tag_start(&self.buffer);
                 if let Some(close_wb) = self.buffer.find("</tauqe_edits>") {
-                    if next_file.as_ref().is_none_or(|(_, start)| close_wb < *start) {
+                    if next_file
+                        .as_ref()
+                        .is_none_or(|(_, start)| close_wb < *start)
+                    {
                         self.buffer.drain(..close_wb + "</tauqe_edits>".len());
                         self.in_edits_block = false;
                         continue;
@@ -183,7 +191,8 @@ impl XmlStreamFilter {
                                 .or_else(|| extract_attr(header, "path"));
                             let to_attr = extract_attr(header, "to");
                             if let (Some(from), Some(to)) = (from_attr, to_attr) {
-                                let resolved_from = resolve_path(&from, &self.editable_paths, false);
+                                let resolved_from =
+                                    resolve_path(&from, &self.editable_paths, false);
                                 let resolved_to = resolve_path(&to, &self.editable_paths, true);
                                 let display_path = format!("{} -> {}", resolved_from, resolved_to);
                                 events.push(StreamEvent::EditFileStarted {
@@ -207,7 +216,8 @@ impl XmlStreamFilter {
 
                         if let Some(path_attr) = extract_attr(header, "path") {
                             let is_create = tag_name == "create";
-                            let resolved = resolve_path(&path_attr, &self.editable_paths, is_create);
+                            let resolved =
+                                resolve_path(&path_attr, &self.editable_paths, is_create);
                             let op_type = match tag_name.as_str() {
                                 "create" => EditFileOp::Create,
                                 "overwrite" => EditFileOp::Overwrite,
@@ -357,7 +367,6 @@ impl XmlStreamFilter {
 
         events
     }
-
 }
 
 impl EditStreamFilter for XmlStreamFilter {
@@ -401,7 +410,8 @@ impl EditStreamFilter for XmlStreamFilter {
                 });
             }
             if !self.buffer.trim().is_empty() {
-                let cleaned = crate::edits::protocol::xml::extract_conversational_text(&self.buffer);
+                let cleaned =
+                    crate::edits::protocol::xml::extract_conversational_text(&self.buffer);
                 let cleaned = self.restore_content(&cleaned);
                 if !cleaned.trim().is_empty() {
                     events.push(StreamEvent::TextDelta(cleaned));
@@ -625,32 +635,40 @@ mod tests {
         let proto = crate::edits::protocol::MarkedXmlEditProtocol::new(marker);
         let parsed = proto.parse_output(input, &paths);
         let (expected_old, expected_new) = match parsed {
-            tauqe_protocol::ModelResult::Edit { edits, outcome, .. }
-                if outcome.error.is_none() =>
-            {
+            tauqe_protocol::ModelResult::Edit { edits, outcome, .. } if outcome.error.is_none() => {
                 match edits.into_iter().next().unwrap() {
-                    tauqe_protocol::EditOperation::Replace { old_text, new_text, .. } => {
-                        (old_text, new_text)
-                    }
+                    tauqe_protocol::EditOperation::Replace {
+                        old_text, new_text, ..
+                    } => (old_text, new_text),
                     _ => panic!("Expected replacement"),
                 }
             }
             _ => panic!("Expected valid edit"),
         };
 
-        for split in input.char_indices().map(|(idx, _)| idx).chain(std::iter::once(input.len())) {
+        for split in input
+            .char_indices()
+            .map(|(idx, _)| idx)
+            .chain(std::iter::once(input.len()))
+        {
             let mut filter = XmlStreamFilter::new(paths.clone(), std::env::temp_dir())
                 .with_marker(Some(marker.to_string()))
-                .with_staged_contents(HashMap::from([
-                    ("xml.rs".to_string(), expected_old.clone()),
-                ]));
+                .with_staged_contents(HashMap::from([(
+                    "xml.rs".to_string(),
+                    expected_old.clone(),
+                )]));
             let mut events = filter.push_chunk(&input[..split]);
             events.extend(filter.push_chunk(&input[split..]));
             events.extend(Box::new(filter).finish());
-            let hunks: Vec<_> = events.iter().filter_map(|event| match event {
-                StreamEvent::EditHunk { old_text, new_text, .. } => Some((old_text, new_text)),
-                _ => None,
-            }).collect();
+            let hunks: Vec<_> = events
+                .iter()
+                .filter_map(|event| match event {
+                    StreamEvent::EditHunk {
+                        old_text, new_text, ..
+                    } => Some((old_text, new_text)),
+                    _ => None,
+                })
+                .collect();
             assert_eq!(hunks, vec![(&expected_old, &expected_new)], "split {split}");
             assert!(events.iter().any(|event| matches!(event,
                 StreamEvent::EditFileDone { status, .. } if *status == EditFileStatus::Ok
@@ -658,10 +676,13 @@ mod tests {
             assert!(!events.iter().any(|event| matches!(event,
                 StreamEvent::EditFileDone { status, .. } if *status == EditFileStatus::Error
             )));
-            let text: String = events.iter().filter_map(|event| match event {
-                StreamEvent::TextDelta(delta) => Some(delta.as_str()),
-                _ => None,
-            }).collect();
+            let text: String = events
+                .iter()
+                .filter_map(|event| match event {
+                    StreamEvent::TextDelta(delta) => Some(delta.as_str()),
+                    _ => None,
+                })
+                .collect();
             assert_eq!(text, "Hi\n\nBye");
         }
     }
@@ -676,9 +697,13 @@ mod tests {
             events.extend(filter.push_chunk(&ch.to_string()));
         }
         events.extend(Box::new(filter).finish());
-        assert_eq!(events.iter().filter(|event| matches!(event,
-            StreamEvent::EditFileStarted { .. }
-        )).count(), 1);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, StreamEvent::EditFileStarted { .. }))
+                .count(),
+            1
+        );
         assert!(events.iter().any(|event| matches!(event,
             StreamEvent::EditHunk { new_text, .. }
                 if new_text == "literal <edit> and </search>\n"
@@ -698,22 +723,24 @@ mod tests {
             events.extend(filter.push_chunk(&ch.to_string()));
         }
         events.extend(Box::new(filter).finish());
-        assert!(!events.iter().any(|event| matches!(event,
-            StreamEvent::EditFileStarted { .. }
-        )));
-        let text: String = events.iter().filter_map(|event| match event {
-            StreamEvent::TextDelta(delta) => Some(delta.as_str()),
-            _ => None,
-        }).collect();
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, StreamEvent::EditFileStarted { .. })));
+        let text: String = events
+            .iter()
+            .filter_map(|event| match event {
+                StreamEvent::TextDelta(delta) => Some(delta.as_str()),
+                _ => None,
+            })
+            .collect();
         assert!(text.contains("tauqe_edits-k7q2zy"));
     }
 
     #[test]
     fn test_xml_without_marker_keeps_legacy_tags() {
         let mut filter = XmlStreamFilter::new(vec![], std::env::temp_dir());
-        let mut events = filter.push_chunk(
-            "<tauqe_edits><create path=\"new.rs\">hello</create></tauqe_edits>",
-        );
+        let mut events =
+            filter.push_chunk("<tauqe_edits><create path=\"new.rs\">hello</create></tauqe_edits>");
         events.extend(Box::new(filter).finish());
         assert!(events.iter().any(|event| matches!(event,
             StreamEvent::EditHunk { new_text, .. } if new_text == "hello"
@@ -750,12 +777,17 @@ mod tests {
             events.extend(filter.push_chunk(&ch.to_string()));
         }
         events.extend(Box::new(filter).finish());
-        let text: String = events.iter().filter_map(|event| match event {
-            StreamEvent::TextDelta(delta) => Some(delta.as_str()),
-            _ => None,
-        }).collect();
+        let text: String = events
+            .iter()
+            .filter_map(|event| match event {
+                StreamEvent::TextDelta(delta) => Some(delta.as_str()),
+                _ => None,
+            })
+            .collect();
         assert_eq!(text, input);
-        assert!(!events.iter().any(|event| matches!(event, StreamEvent::EditStarted)));
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, StreamEvent::EditStarted)));
     }
 
     #[test]

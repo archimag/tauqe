@@ -127,7 +127,10 @@ pub fn wrap_line(line: Line<'static>, max_width: usize) -> Vec<Line<'static>> {
                     current_width = 0;
                 }
             } else {
-                if current_spans.is_empty() && !wrapped_lines.is_empty() && !continuation_prefix.is_empty() {
+                if current_spans.is_empty()
+                    && !wrapped_lines.is_empty()
+                    && !continuation_prefix.is_empty()
+                {
                     push_continuation(&mut current_spans, &mut current_width);
                 }
 
@@ -176,7 +179,10 @@ pub fn wrap_line(line: Line<'static>, max_width: usize) -> Vec<Line<'static>> {
         let has_content = current_spans.len() > continuation_prefix.len()
             || current_spans.iter().any(|s| {
                 !s.content.trim().is_empty()
-                    && !s.content.chars().all(|c| c.is_whitespace() || c == '│' || c == '▌' || c == '|' || c == '║')
+                    && !s
+                        .content
+                        .chars()
+                        .all(|c| c.is_whitespace() || c == '│' || c == '▌' || c == '|' || c == '║')
             });
         if has_content || wrapped_lines.is_empty() {
             wrapped_lines.push(Line::from(current_spans));
@@ -246,9 +252,17 @@ mod tests {
         ]);
         let wrapped = wrap_line(line, 35);
         assert!(wrapped.len() > 1);
-        let first_line_text: String = wrapped[0].spans.iter().map(|s| s.content.as_ref()).collect();
+        let first_line_text: String = wrapped[0]
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
         assert!(first_line_text.starts_with("    │ • "));
-        let second_line_text: String = wrapped[1].spans.iter().map(|s| s.content.as_ref()).collect();
+        let second_line_text: String = wrapped[1]
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
         assert!(second_line_text.starts_with("    │   "));
     }
 }

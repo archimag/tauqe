@@ -79,10 +79,8 @@ pub(super) async fn handle_selection_dialog_key(
     // terminal size mid-event: it avoids an unnecessary syscall and keeps the
     // scroll viewport aligned with what is actually on screen (and with the
     // frame area customized by tests).
-    let area = crate::dialogs::render::selection_dialog_area(
-        st.last_frame_area,
-        dialog.items.len(),
-    );
+    let area =
+        crate::dialogs::render::selection_dialog_area(st.last_frame_area, dialog.items.len());
     let visible_height = crate::dialogs::render::selection_dialog_visible_height(area);
 
     if dialog.selector.handle_nav_key(key, visible_height) {

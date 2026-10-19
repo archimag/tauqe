@@ -55,7 +55,10 @@ pub(super) async fn run_discovery_phase(
     {
         let has_discovery = !step.context_requests().is_empty()
             || !step.doc_requests().is_empty()
-            || !step.repo_searches().is_empty();
+            || !step.repo_searches().is_empty()
+            || !step.repo_maps().is_empty()
+            || !step.dir_list_requests().is_empty()
+            || step.repo_dirs();
         if !has_discovery {
             break;
         }
@@ -65,6 +68,7 @@ pub(super) async fn run_discovery_phase(
             ctx.repo_root,
             step.commands(),
             ctx.options.files_token_budget,
+            ctx.options.repomap_token_budget,
             false,
         )
         .await;
@@ -133,7 +137,10 @@ pub(super) async fn run_discovery_phase(
         }
 
         let ctx_state = ctx.context_manager.get_state();
-        let _ = ctx.stream_tx.send(StreamEvent::ContextChanged(ctx_state)).await;
+        let _ = ctx
+            .stream_tx
+            .send(StreamEvent::ContextChanged(ctx_state))
+            .await;
 
         let banner_text = outcome.fsm_banner_summary();
 
@@ -142,7 +149,10 @@ pub(super) async fn run_discovery_phase(
             discovery_round + 1,
             banner_text
         );
-        let _ = ctx.stream_tx.send(StreamEvent::TextDelta(banner.clone())).await;
+        let _ = ctx
+            .stream_tx
+            .send(StreamEvent::TextDelta(banner.clone()))
+            .await;
         log_fsm_phase(
             ctx.workflow_name,
             ctx.model,
@@ -220,6 +230,134 @@ pub(super) async fn run_discovery_phase(
     }
 
     Ok(DiscoveryPhase::Continue(Box::new(step)))
+}
+
+/// Number of additional proposal attempts granted to a model that produced an
+/// empty round: no text, no edits, and no protocol command.
+pub(super) const MAX_EMPTY_STEP_RETRIES: usize = 2;
+
+/// Corrective suffix appended to the request after an empty proposal round.
+///
+/// The suffix extends the previous request instead of replacing it, so the
+/// corrective round keeps the provider-cached prompt prefix and the model keeps
+/// the original task statement in view.
+pub(super) const EMPTY_STEP_REMINDER: &str = "\n\nYour previous reply was empty: it carried no text, no file edits, and no protocol command, so nothing could be acted upon. Respond again with a concrete proposal: state your findings in plain text, emit the file edits, request the missing context, or declare an explicit terminal outcome.";
+
+/// Outcome of the corrective proposal round requested after an empty round.
+pub(super) enum EmptyStepRetry {
+    /// The model answered the corrective request; carries the new round.
+    Proposed(Box<ProposalStep>),
+    /// The turn must terminate immediately with the carried outcome.
+    Terminate(Box<FsmTurnOutcome>),
+}
+
+/// Re-asks the model after it produced a round with nothing actionable.
+///
+/// An empty generation is a transport-level non-answer, so decoding it as a
+/// validated `ModelResult::Answer` would record silence as a conclusion. The
+/// helper appends a corrective reminder to `prompt` and asks once more, folding
+/// the new round into the accumulated turn state and the accumulated text. A
+/// cancellation or a semantic block terminates the turn instead.
+pub(super) async fn reask_after_empty_round(
+    ctx: &mut PhaseContext<'_>,
+    prompt: &str,
+    attempt: usize,
+) -> anyhow::Result<EmptyStepRetry> {
+    tracing::warn!(
+        workflow = ctx.workflow_name,
+        model = %ctx.model,
+        attempt = attempt,
+        max_retries = MAX_EMPTY_STEP_RETRIES,
+        "empty proposal round; re-asking the model"
+    );
+
+    let detail = format!(
+        "Empty response retry {}/{}",
+        attempt, MAX_EMPTY_STEP_RETRIES
+    );
+    let banner = format!(
+        "\n\n---\n**[Empty Response {}/{}]** The previous reply carried nothing actionable; asking for a concrete proposal...\n\n",
+        attempt, MAX_EMPTY_STEP_RETRIES
+    );
+    let _ = ctx
+        .stream_tx
+        .send(StreamEvent::TextDelta(banner.clone()))
+        .await;
+    log_fsm_phase(
+        ctx.workflow_name,
+        ctx.model,
+        ctx.intent.is_isolated_step(),
+        TurnPhase::Proposal,
+        Some(attempt),
+        Some(MAX_EMPTY_STEP_RETRIES),
+    );
+    let _ = ctx
+        .stream_tx
+        .send(StreamEvent::TurnPhase {
+            phase: TurnPhase::Proposal,
+            round: Some(attempt),
+            max_rounds: Some(MAX_EMPTY_STEP_RETRIES),
+            detail: Some(detail),
+        })
+        .await;
+
+    let step = propose(
+        ctx.provider,
+        ctx.model,
+        ctx.protocol,
+        ctx.history_manager,
+        &*ctx.context_manager,
+        ctx.workflow_name,
+        ctx.stream_tx,
+        ctx.cancel_rx,
+        ctx.options,
+        &mut *ctx.input_cache,
+        ctx.state,
+        ctx.intent,
+        prompt,
+        None,
+    )
+    .await?;
+
+    if step.is_cancelled {
+        let _ = ctx.stream_tx.send(StreamEvent::Done).await;
+        return Ok(EmptyStepRetry::Terminate(Box::new(FsmTurnOutcome {
+            assistant_text: std::mem::take(&mut ctx.accumulated_text),
+            result: ModelResult::Answer {
+                text: String::new(),
+            },
+            is_cancelled: true,
+            blocked: None,
+            has_terminal_success: false,
+            plan_saved: false,
+            skip_reason: None,
+        })));
+    }
+
+    ctx.state.absorb(&step);
+    ctx.accumulated_text = merge_text(
+        std::mem::take(&mut ctx.accumulated_text),
+        &banner,
+        step.text(),
+    );
+
+    if let Some(reason) = ctx.state.blocked.clone() {
+        let accumulated = std::mem::take(&mut ctx.accumulated_text);
+        let outcome = finalize_blocked_turn(
+            ctx.policy,
+            ctx.context_manager,
+            ctx.stream_tx,
+            ctx.repo_root,
+            reason,
+            accumulated,
+            &ctx.state.plans,
+            ctx.plan_mode,
+        )
+        .await;
+        return Ok(EmptyStepRetry::Terminate(Box::new(outcome)));
+    }
+
+    Ok(EmptyStepRetry::Proposed(Box::new(step)))
 }
 
 /// Outcome of the FSM staging phase.
@@ -324,7 +462,10 @@ pub(super) async fn run_staging_phase(
                 phase: TurnPhase::Staging,
                 round: Some(attempt),
                 max_rounds: Some(ctx.options.max_retries),
-                detail: Some(format!("Patch retry {}/{}", attempt, ctx.options.max_retries)),
+                detail: Some(format!(
+                    "Patch retry {}/{}",
+                    attempt, ctx.options.max_retries
+                )),
             })
             .await;
         for (path, error) in &last_failed_errors {
@@ -453,12 +594,16 @@ pub(super) async fn run_staging_phase(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::super::{run_fsm_turn as run_turn_with_intent, FsmTurnOutcome};
     use crate::context::ContextManager;
     use crate::history::HistoryManager;
     use crate::prompt::xml::XmlPromptProtocol;
     use crate::providers::mock::{MockLlmProvider, MockResponse};
-    use crate::providers::StreamEvent;
+    use crate::providers::{
+        ChatMessage, ReasoningEffort, ResponseFormat, RetryConfig, RetryingProvider, StreamEvent,
+    };
     use crate::workflow::policy::DirectApplyPolicy;
     use crate::workflow::WorkflowOptions;
     use tauqe_protocol::{ContextAccess, ModelRef, ModelResult, TurnIntent};
@@ -529,6 +674,62 @@ mod tests {
         format!(
             "<tauqe_edits summary=\"Edit\">\n<edit path=\"a.rs\">\n<search>\n{search}\n</search>\n<replace>\n{replace}\n</replace>\n</edit>\n</tauqe_edits>"
         )
+    }
+
+    /// Retry policy whose backoff pauses are effectively instantaneous.
+    fn fast_retry_config() -> RetryConfig {
+        RetryConfig {
+            max_attempts: 3,
+            base_delay_ms: 1,
+            max_delay_ms: 1,
+        }
+    }
+
+    /// Adapter that lets the retry decorator wrap a scripted mock whose
+    /// recorded requests stay observable from the test.
+    struct RetryMock(Arc<MockLlmProvider>);
+
+    #[async_trait::async_trait]
+    impl crate::providers::LlmProvider for RetryMock {
+        fn kind(&self) -> tauqe_protocol::ProviderKind {
+            self.0.kind()
+        }
+
+        async fn stream_chat(
+            &self,
+            model: &str,
+            messages: Vec<ChatMessage>,
+            response_format: Option<ResponseFormat>,
+            tx: mpsc::Sender<StreamEvent>,
+            cancel_rx: watch::Receiver<bool>,
+        ) -> anyhow::Result<()> {
+            self.0
+                .stream_chat(model, messages, response_format, tx, cancel_rx)
+                .await
+        }
+
+        async fn stream_chat_with_session(
+            &self,
+            model: &str,
+            messages: Vec<ChatMessage>,
+            response_format: Option<ResponseFormat>,
+            reasoning_effort: Option<ReasoningEffort>,
+            session_id: Option<&str>,
+            tx: mpsc::Sender<StreamEvent>,
+            cancel_rx: watch::Receiver<bool>,
+        ) -> anyhow::Result<()> {
+            self.0
+                .stream_chat_with_session(
+                    model,
+                    messages,
+                    response_format,
+                    reasoning_effort,
+                    session_id,
+                    tx,
+                    cancel_rx,
+                )
+                .await
+        }
     }
 
     #[tokio::test]
@@ -732,9 +933,7 @@ mod tests {
         ));
         assert_eq!(provider.requests().len(), 3);
         let retry_request = &provider.requests()[2];
-        assert!(retry_request.messages[0]
-            .content
-            .contains("<scratchpad>"));
+        assert!(retry_request.messages[0].content.contains("<scratchpad>"));
         assert!(retry_request.messages[0]
             .content
             .contains("Hypothesis: helper.rs holds ANSWER"));
@@ -852,6 +1051,69 @@ mod tests {
         assert!(second_req.messages[1]
             .content
             .contains("src/helper.rs: 1 match"));
+    }
+
+    #[tokio::test]
+    async fn discovers_via_directory_listing_before_proposing_edits() {
+        let (_dir, root) = setup_repo(&[
+            ("a.rs", TARGET),
+            ("src/helper.rs", "pub const MAGIC_NUMBER: i32 = 42;\n"),
+        ]);
+        let mut context = context_with_target(&root);
+        let mut history = HistoryManager::new(root.clone());
+
+        let provider = MockLlmProvider::scripted([
+            MockResponse::text(
+                "Listing the subtree:\n<dir_list path=\"src\" recursive=\"true\" />",
+            ),
+            MockResponse::text(
+                "Requesting the helper:\n<context_request path=\"src/helper.rs\" access=\"read_only\" />",
+            ),
+            MockResponse::text(edit_block(
+                "pub fn compute() -> i32 { 0 }",
+                "pub fn compute() -> i32 { 42 }",
+            )),
+        ]);
+        let model = ModelRef::openrouter("mock/model");
+        let protocol = XmlPromptProtocol;
+        let mut policy = DirectApplyPolicy::new();
+        let options = WorkflowOptions::default();
+        let (stream_tx, rx) = mpsc::channel(256);
+        drop(rx);
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+
+        let outcome = run_fsm_turn(
+            "Use magic number from helper",
+            &provider,
+            &model,
+            &mut context,
+            &mut history,
+            &protocol,
+            &mut policy,
+            "git",
+            stream_tx,
+            cancel_rx,
+            &options,
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            outcome.result,
+            ModelResult::Edit { outcome, .. } if outcome.applied
+        ));
+        // A round that only listed a directory still widens what the model can
+        // see, so the turn continues instead of staging an empty proposal.
+        assert_eq!(provider.requests().len(), 3);
+        let listing_request = &provider.requests()[1];
+        assert!(listing_request
+            .messages
+            .iter()
+            .any(|m| m.content.contains("<dir_list_feedback path=\"src\"")));
+        assert!(listing_request
+            .messages
+            .iter()
+            .any(|m| m.content.contains("helper.rs")));
     }
 
     #[tokio::test]
@@ -1088,6 +1350,253 @@ mod tests {
         ));
         let loaded = crate::plan::storage::PlanStorage::load_plan(&root, "rollback-plan").unwrap();
         assert!(loaded.is_none(), "rolled back turn must not persist plan");
+    }
+
+    #[tokio::test]
+    async fn retries_empty_proposal_round_before_applying() {
+        let (_dir, root) = setup_repo(&[("a.rs", TARGET)]);
+        let mut context = context_with_target(&root);
+        let mut history = HistoryManager::new(root.clone());
+
+        let provider = MockLlmProvider::scripted([
+            MockResponse::text(""),
+            MockResponse::text(edit_block(
+                "pub fn compute() -> i32 { 0 }",
+                "pub fn compute() -> i32 { 42 }",
+            )),
+        ]);
+        let model = ModelRef::openrouter("mock/model");
+        let protocol = XmlPromptProtocol;
+        let mut policy = DirectApplyPolicy::new();
+        let options = WorkflowOptions::default();
+        let (stream_tx, rx) = mpsc::channel(256);
+        drop(rx);
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+
+        let outcome = run_fsm_turn(
+            "Change compute to 42",
+            &provider,
+            &model,
+            &mut context,
+            &mut history,
+            &protocol,
+            &mut policy,
+            "git",
+            stream_tx,
+            cancel_rx,
+            &options,
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            outcome.result,
+            ModelResult::Edit { outcome, .. } if outcome.applied
+        ));
+        assert!(outcome.assistant_text.contains("Empty Response"));
+        assert_eq!(provider.requests().len(), 2);
+        let retry_request = &provider.requests()[1];
+        assert!(retry_request
+            .messages
+            .iter()
+            .any(|m| m.content.contains("Your previous reply was empty")));
+    }
+
+    #[tokio::test]
+    async fn recovers_from_a_transport_break_and_an_empty_round() {
+        let (_dir, root) = setup_repo(&[("a.rs", TARGET)]);
+        let mut context = context_with_target(&root);
+        let mut history = HistoryManager::new(root.clone());
+
+        let mock = Arc::new(MockLlmProvider::scripted([
+            // The first attempt breaks before streaming anything.
+            MockResponse::error("OpenRouter stream ended prematurely without [DONE] marker"),
+            // The transparent retry completes but yields nothing actionable.
+            MockResponse::text(""),
+            // The corrective re-ask finally carries the edit.
+            MockResponse::text(edit_block(
+                "pub fn compute() -> i32 { 0 }",
+                "pub fn compute() -> i32 { 42 }",
+            )),
+        ]));
+        let provider =
+            RetryingProvider::new(Box::new(RetryMock(Arc::clone(&mock))), fast_retry_config());
+        let model = ModelRef::openrouter("mock/model");
+        let protocol = XmlPromptProtocol;
+        let mut policy = DirectApplyPolicy::new();
+        let options = WorkflowOptions::default();
+        let (stream_tx, rx) = mpsc::channel(256);
+        drop(rx);
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+
+        let outcome = run_fsm_turn(
+            "Change compute to 42",
+            &provider,
+            &model,
+            &mut context,
+            &mut history,
+            &protocol,
+            &mut policy,
+            "git",
+            stream_tx,
+            cancel_rx,
+            &options,
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            outcome.result,
+            ModelResult::Edit { outcome, .. } if outcome.applied
+        ));
+        assert!(outcome.assistant_text.contains("Empty Response"));
+        // One re-issued attempt for the interrupted stream and one corrective
+        // re-ask for the empty round that followed it.
+        assert_eq!(mock.requests().len(), 3);
+        assert_eq!(
+            std::fs::read_to_string(root.join("a.rs")).unwrap(),
+            "pub fn compute() -> i32 { 42 }\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn fails_the_turn_when_every_empty_retry_stays_empty() {
+        let (_dir, root) = setup_repo(&[("a.rs", TARGET)]);
+        let mut context = context_with_target(&root);
+        let mut history = HistoryManager::new(root.clone());
+
+        let provider = MockLlmProvider::scripted([
+            MockResponse::text(""),
+            MockResponse::text(""),
+            MockResponse::text(""),
+        ]);
+        let model = ModelRef::openrouter("mock/model");
+        let protocol = XmlPromptProtocol;
+        let mut policy = DirectApplyPolicy::new();
+        let options = WorkflowOptions::default();
+        let (stream_tx, rx) = mpsc::channel(256);
+        drop(rx);
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+
+        let outcome = run_fsm_turn(
+            "Change compute to 42",
+            &provider,
+            &model,
+            &mut context,
+            &mut history,
+            &protocol,
+            &mut policy,
+            "git",
+            stream_tx,
+            cancel_rx,
+            &options,
+        )
+        .await
+        .unwrap();
+
+        match outcome.result {
+            ModelResult::Edit { outcome, edits, .. } => {
+                assert!(!outcome.applied);
+                assert!(edits.is_empty());
+                assert!(outcome.error.unwrap().contains("empty response"));
+            }
+            other => panic!("expected an empty-step failure, got {other:?}"),
+        }
+        assert_eq!(provider.requests().len(), 3);
+        assert_eq!(std::fs::read_to_string(root.join("a.rs")).unwrap(), TARGET);
+    }
+
+    /// Provider that breaks its first attempt mid-stream after emitting a
+    /// partial edit block, then answers the re-issued request completely.
+    struct BreakAfterPartial {
+        attempts: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::providers::LlmProvider for BreakAfterPartial {
+        fn kind(&self) -> tauqe_protocol::ProviderKind {
+            tauqe_protocol::ProviderKind::OpenRouter
+        }
+
+        async fn stream_chat(
+            &self,
+            _model: &str,
+            _messages: Vec<ChatMessage>,
+            _response_format: Option<ResponseFormat>,
+            tx: mpsc::Sender<StreamEvent>,
+            _cancel_rx: watch::Receiver<bool>,
+        ) -> anyhow::Result<()> {
+            let attempt = self
+                .attempts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if attempt == 0 {
+                let partial = concat!(
+                    "<tauqe_edits summary=\"Edit\">\n",
+                    "<edit path=\"a.rs\">\n<search>\npub fn compute"
+                );
+                let _ = tx.send(StreamEvent::TextDelta(partial.to_string())).await;
+                return Err(anyhow::anyhow!(
+                    "OpenRouter stream read error: connection reset by peer"
+                ));
+            }
+            let _ = tx
+                .send(StreamEvent::TextDelta(edit_block(
+                    "pub fn compute() -> i32 { 0 }",
+                    "pub fn compute() -> i32 { 42 }",
+                )))
+                .await;
+            let _ = tx.send(StreamEvent::Done).await;
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn discards_the_fragments_of_an_interrupted_attempt() {
+        let (_dir, root) = setup_repo(&[("a.rs", TARGET)]);
+        let mut context = context_with_target(&root);
+        let mut history = HistoryManager::new(root.clone());
+
+        // The first attempt breaks mid-stream after emitting a partial edit
+        // block; the retry decorator re-issues the request and the second
+        // attempt answers with the complete edit.
+        let provider = RetryingProvider::new(
+            Box::new(BreakAfterPartial {
+                attempts: std::sync::atomic::AtomicUsize::new(0),
+            }),
+            fast_retry_config(),
+        );
+        let model = ModelRef::openrouter("mock/model");
+        let protocol = XmlPromptProtocol;
+        let mut policy = DirectApplyPolicy::new();
+        let options = WorkflowOptions::default();
+        let (stream_tx, rx) = mpsc::channel(256);
+        drop(rx);
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+
+        let outcome = run_fsm_turn(
+            "Change compute to 42",
+            &provider,
+            &model,
+            &mut context,
+            &mut history,
+            &protocol,
+            &mut policy,
+            "git",
+            stream_tx,
+            cancel_rx,
+            &options,
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            outcome.result,
+            ModelResult::Edit { outcome, .. } if outcome.applied
+        ));
+        assert_eq!(
+            std::fs::read_to_string(root.join("a.rs")).unwrap(),
+            "pub fn compute() -> i32 { 42 }\n"
+        );
     }
 
     #[allow(dead_code)]

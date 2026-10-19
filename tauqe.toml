@@ -22,8 +22,8 @@ models = [
 # replaces the raw model name in the model picker; `effort` sets the reasoning
 # depth ("low", "medium", "high", "xhigh", "max") for that entry.
 primary = [
-  { model = "~deepseek/deepseek-flash-latest", effort = "low" },
-  { model = "~google/gemini-flash-latest" },
+  "~google/gemini-flash-latest",
+  "~deepseek/deepseek-flash-latest"
 ]
 scribe = "~anthropic/claude-haiku-latest"    # history compaction, git squash commit messages, diff summarization
 # The coder list is the natural escalation ladder (level up): on verification
@@ -70,6 +70,43 @@ max_retries = 5
 # timeout_secs = 600   # wall-clock timeout in seconds for each verification command (default: 600)
 # auto_verify = true   # automatically run toolchain verification on turns with applied edits (default: true)
 # target = "all"       # default verification target when omitted: "all", "check", "clippy", "test" (default: "all")
+#
+# Verification is a pipeline of typed phases: `check`, then `lint`, then
+# `test`. Each phase resolves its command from its own section, then from the
+# legacy `check_command` field, and finally from deterministic project
+# auto-detection (Cargo.toml, package.json, go.mod). A phase that names no
+# command keeps auto-detection, so declaring a section never disables it.
+# [toolchain.check]
+# command = "cargo"
+# args = ["check", "--all-targets"]
+# timeout_secs = 600      # phase-local override of the global timeout
+# enabled = true          # set false to drop the phase without deleting it
+#
+# [toolchain.lint]
+# command = "cargo"
+# args = ["clippy", "--all-targets", "--", "-D", "warnings"]
+#
+# [toolchain.test]
+# command = "cargo"
+# args = ["test", "--workspace"]
+#
+# Formatters are a registry of named entries. Formatting is best-effort: it runs
+# strictly after a verified build and immediately before the Git commit, and a
+# formatter failure restores the verified content instead of interrupting the
+# turn. `extensions` is mandatory — an entry without it selects no file, so a
+# monorepo registers one formatter per language without touching the others.
+# Arguments are passed to the process literally (never through a shell), so a
+# path with spaces or metacharacters is safe.
+[toolchain.fmt.rustfmt]
+command = "rustfmt"
+extensions = ["rs"]
+timeout_secs = 60
+
+# Пример форматтера для веб-кода в монорепозиториях:
+# [toolchain.fmt.prettier]
+# command = "npx"
+# args = ["prettier", "--write"]
+# extensions = ["ts", "tsx", "js", "jsx", "mjs", "cjs"]
 
 [git]
 # upstream = "origin/master"  # base upstream branch for calculating diffs (auto-detected by default)
@@ -83,6 +120,7 @@ budget_tokens = 20000  # session history token budget before compaction is trigg
 max_discovery_rounds = 8  # maximum rounds for autonomous context discovery
 files_token_budget = 500000  # token budget for files in active context (default: 300000)
 repomap_token_budget = 40000  # token budget for the repository map (default: 4000)
+include_repo_map = true  # include the Tree-sitter repository map in turn prompts (default: true, false for on-demand)
 # max_pattern_batch = 150  # maximum files added per glob pattern request (default: 150)
 pinned = [
     "Conventions.md",

@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
 use crossterm::event::{KeyCode, KeyEvent};
-use tokio::sync::Mutex;
 use tauqe_protocol::methods;
+use tokio::sync::Mutex;
 
 use crate::app::{AppState, OnboardingStep, ViewMode};
 use crate::i18n::active_t;
@@ -12,9 +12,7 @@ use crate::rpc::{send_request, RpcConnection};
 /// Fills the `{}` placeholders of a localized template in order.
 fn fill(template: &str, args: &[&str]) -> String {
     args.iter()
-        .fold(template.to_string(), |acc, arg| {
-            acc.replacen("{}", arg, 1)
-        })
+        .fold(template.to_string(), |acc, arg| acc.replacen("{}", arg, 1))
 }
 
 /// Persists the chosen workstation settings and reloads them, advancing to the
@@ -260,10 +258,8 @@ pub async fn handle_onboarding_key(
                                     "{}V",
                                     st.tui_config.input.primary_modifier.prefix_str()
                                 );
-                                let meta_chord = format!(
-                                    "{}V",
-                                    st.tui_config.input.meta_modifier.prefix_str()
-                                );
+                                let meta_chord =
+                                    format!("{}V", st.tui_config.input.meta_modifier.prefix_str());
                                 st.onboarding.set_status(fill(
                                     &active_t("notify.onboarding_key_detected"),
                                     &[&primary_chord, &meta_chord],

@@ -9,12 +9,12 @@
 //! stay declarative.
 
 use async_trait::async_trait;
-use tokio::sync::{mpsc, watch};
 use tauqe_protocol::{ModelRef, TurnIntent};
+use tokio::sync::{mpsc, watch};
 
 use crate::context::ContextManager;
-use crate::prompt::protocol::PromptProtocol;
 use crate::history::HistoryManager;
+use crate::prompt::protocol::PromptProtocol;
 use crate::providers::{LlmProvider, StreamEvent};
 use crate::workflow::fsm::FsmTurnOutcome;
 use crate::workflow::policy::ApplyPolicy;

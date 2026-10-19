@@ -176,7 +176,9 @@ where
         return fallback;
     }
 
-    reply_rx.recv_timeout(NATIVE_CLIPBOARD_TIMEOUT).unwrap_or(fallback)
+    reply_rx
+        .recv_timeout(NATIVE_CLIPBOARD_TIMEOUT)
+        .unwrap_or(fallback)
 }
 
 /// Reads plain text for a paste operation, detecting the most recently updated
@@ -298,7 +300,12 @@ fn read_standard_clipboard_now(clipboard: &mut ClipboardHandle) -> Option<String
 
 /// Reads text from the X11/Wayland Primary Selection buffer on platforms that
 /// expose one, returning `None` everywhere else.
-#[cfg(all(unix, not(target_os = "macos"), not(target_os = "android"), not(target_os = "emscripten")))]
+#[cfg(all(
+    unix,
+    not(target_os = "macos"),
+    not(target_os = "android"),
+    not(target_os = "emscripten")
+))]
 fn read_primary_selection_now(clipboard: &mut ClipboardHandle) -> Option<String> {
     use arboard::GetExtLinux;
 
@@ -320,7 +327,12 @@ fn read_primary_selection_now(clipboard: &mut ClipboardHandle) -> Option<String>
 
 /// Reads text from the X11/Wayland Primary Selection buffer on platforms that
 /// expose one, returning `None` everywhere else.
-#[cfg(not(all(unix, not(target_os = "macos"), not(target_os = "android"), not(target_os = "emscripten"))))]
+#[cfg(not(all(
+    unix,
+    not(target_os = "macos"),
+    not(target_os = "android"),
+    not(target_os = "emscripten")
+)))]
 fn read_primary_selection_now(_clipboard: &mut ClipboardHandle) -> Option<String> {
     None
 }
@@ -420,7 +432,12 @@ fn write_native_clipboard(clipboard: &mut ClipboardHandle, text: &str) -> bool {
 
 /// Mirrors `text` into the X11/Wayland Primary Selection on Linux so that a
 /// middle-click paste stays consistent with the standard clipboard.
-#[cfg(all(unix, not(target_os = "macos"), not(target_os = "android"), not(target_os = "emscripten")))]
+#[cfg(all(
+    unix,
+    not(target_os = "macos"),
+    not(target_os = "android"),
+    not(target_os = "emscripten")
+))]
 fn mirror_into_primary(clipboard: &mut arboard::Clipboard, text: &str) {
     use arboard::SetExtLinux;
     let _ = clipboard
@@ -430,7 +447,12 @@ fn mirror_into_primary(clipboard: &mut arboard::Clipboard, text: &str) {
 }
 
 /// No-op on platforms without an X11/Wayland Primary Selection.
-#[cfg(not(all(unix, not(target_os = "macos"), not(target_os = "android"), not(target_os = "emscripten"))))]
+#[cfg(not(all(
+    unix,
+    not(target_os = "macos"),
+    not(target_os = "android"),
+    not(target_os = "emscripten")
+)))]
 fn mirror_into_primary(_clipboard: &mut arboard::Clipboard, _text: &str) {}
 
 fn base64_encode(data: &[u8]) -> String {
@@ -480,21 +502,37 @@ mod tests {
         };
 
         // Initial state: both present and different -> Primary preferred as active mouse selection
-        let got = resolve_best_clipboard_inner(&mut tr, Some("std1".to_string()), Some("prim1".to_string()));
+        let got = resolve_best_clipboard_inner(
+            &mut tr,
+            Some("std1".to_string()),
+            Some("prim1".to_string()),
+        );
         assert_eq!(got, Some("prim1".to_string()));
         assert_eq!(tr.last_active, ActiveBuffer::Primary);
 
         // Immediate repeat: neither changed -> returns last active (prim1)
-        let got = resolve_best_clipboard_inner(&mut tr, Some("std1".to_string()), Some("prim1".to_string()));
+        let got = resolve_best_clipboard_inner(
+            &mut tr,
+            Some("std1".to_string()),
+            Some("prim1".to_string()),
+        );
         assert_eq!(got, Some("prim1".to_string()));
 
         // Standard clipboard changes (Ctrl+C in another window) -> returns new standard
-        let got = resolve_best_clipboard_inner(&mut tr, Some("std2".to_string()), Some("prim1".to_string()));
+        let got = resolve_best_clipboard_inner(
+            &mut tr,
+            Some("std2".to_string()),
+            Some("prim1".to_string()),
+        );
         assert_eq!(got, Some("std2".to_string()));
         assert_eq!(tr.last_active, ActiveBuffer::Standard);
 
         // Primary selection changes (mouse selection in another window) -> returns new primary
-        let got = resolve_best_clipboard_inner(&mut tr, Some("std2".to_string()), Some("prim2".to_string()));
+        let got = resolve_best_clipboard_inner(
+            &mut tr,
+            Some("std2".to_string()),
+            Some("prim2".to_string()),
+        );
         assert_eq!(got, Some("prim2".to_string()));
         assert_eq!(tr.last_active, ActiveBuffer::Primary);
 

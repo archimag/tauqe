@@ -35,12 +35,7 @@ impl PlanStorage {
         parsed: Vec<ParsedPlanTag>,
         errors: Vec<String>,
     ) -> PlanApplicationOutcome {
-        Self::apply_parsed_plans_with_mode(
-            repo_root,
-            parsed,
-            errors,
-            PlanMutationMode::Discussion,
-        )
+        Self::apply_parsed_plans_with_mode(repo_root, parsed, errors, PlanMutationMode::Discussion)
     }
 
     /// Applies pre-parsed plan tags and diagnostics to local storage under a specific [`PlanMutationMode`].
@@ -118,8 +113,11 @@ impl PlanStorage {
                         ));
                         continue;
                     }
-                    let already_exists = crate::plan::matcher::resolve_plan_id_exact(&tag.id, &all_plans).is_some()
-                        || applied.iter().any(|p: &Plan| p.id.eq_ignore_ascii_case(&tag.id));
+                    let already_exists =
+                        crate::plan::matcher::resolve_plan_id_exact(&tag.id, &all_plans).is_some()
+                            || applied
+                                .iter()
+                                .any(|p: &Plan| p.id.eq_ignore_ascii_case(&tag.id));
                     if already_exists {
                         errors.push(format!(
                             "Cannot modify existing plan '{}' in Develop mode: modifying existing plans belongs exclusively in Discussion mode",
@@ -140,7 +138,8 @@ impl PlanStorage {
                         ));
                         continue;
                     }
-                    let matched_plan = crate::plan::matcher::resolve_plan_id_exact(&tag.id, &all_plans).cloned();
+                    let matched_plan =
+                        crate::plan::matcher::resolve_plan_id_exact(&tag.id, &all_plans).cloned();
                     let mut plan = matched_plan.unwrap_or_else(|| Plan {
                         id: tag.id.clone(),
                         title: tag.title.clone().unwrap_or_else(|| tag.id.clone()),
@@ -193,21 +192,23 @@ impl PlanStorage {
                     }
                 }
                 "update" => {
-                    let matched_plan = match crate::plan::matcher::resolve_plan(&tag.id, &all_plans, None) {
-                        crate::plan::matcher::PlanResolution::Found(p) => Some(p.clone()),
-                        crate::plan::matcher::PlanResolution::Ambiguous(candidates) => {
-                            let candidate_ids: Vec<String> = candidates.iter().map(|p| format!("'{}'", p.id)).collect();
-                            errors.push(format!(
-                                "Cannot update plan '{}': ambiguous match, candidates: {}",
-                                tag.id,
-                                candidate_ids.join(", ")
-                            ));
-                            continue;
-                        }
-                        crate::plan::matcher::PlanResolution::NotFound => {
-                            Self::load_plan_unlocked(repo_root, &tag.id).ok().flatten()
-                        }
-                    };
+                    let matched_plan =
+                        match crate::plan::matcher::resolve_plan(&tag.id, &all_plans, None) {
+                            crate::plan::matcher::PlanResolution::Found(p) => Some(p.clone()),
+                            crate::plan::matcher::PlanResolution::Ambiguous(candidates) => {
+                                let candidate_ids: Vec<String> =
+                                    candidates.iter().map(|p| format!("'{}'", p.id)).collect();
+                                errors.push(format!(
+                                    "Cannot update plan '{}': ambiguous match, candidates: {}",
+                                    tag.id,
+                                    candidate_ids.join(", ")
+                                ));
+                                continue;
+                            }
+                            crate::plan::matcher::PlanResolution::NotFound => {
+                                Self::load_plan_unlocked(repo_root, &tag.id).ok().flatten()
+                            }
+                        };
 
                     if let Some(mut plan) = matched_plan {
                         if let Some(t) = tag.title {
@@ -287,7 +288,11 @@ impl PlanStorage {
                         if !missing_items.is_empty() {
                             errors.push(format!(
                                 "Item(s) {} not found in plan '{}'",
-                                missing_items.iter().map(|id| format!("'{id}'")).collect::<Vec<_>>().join(", "),
+                                missing_items
+                                    .iter()
+                                    .map(|id| format!("'{id}'"))
+                                    .collect::<Vec<_>>()
+                                    .join(", "),
                                 plan.id
                             ));
                         }
@@ -299,11 +304,15 @@ impl PlanStorage {
                                 applied.push(plan);
                             }
                             Err(err) => {
-                                errors.push(format!("Failed to save updated plan '{}': {:#}", plan.id, err));
+                                errors.push(format!(
+                                    "Failed to save updated plan '{}': {:#}",
+                                    plan.id, err
+                                ));
                             }
                         }
                     } else {
-                        let available: Vec<String> = all_plans.iter().map(|p| p.id.clone()).collect();
+                        let available: Vec<String> =
+                            all_plans.iter().map(|p| p.id.clone()).collect();
                         let hint = if available.is_empty() {
                             "no plans exist in storage".to_string()
                         } else {
@@ -316,9 +325,10 @@ impl PlanStorage {
                     }
                 }
                 "delete" => {
-                    let target_id = crate::plan::matcher::resolve_plan_id_exact(&tag.id, &all_plans)
-                        .map(|p| p.id.as_str())
-                        .unwrap_or(&tag.id);
+                    let target_id =
+                        crate::plan::matcher::resolve_plan_id_exact(&tag.id, &all_plans)
+                            .map(|p| p.id.as_str())
+                            .unwrap_or(&tag.id);
                     match Self::delete_plan_unlocked(repo_root, target_id) {
                         Ok(true) => {}
                         Ok(false) => {
@@ -330,7 +340,9 @@ impl PlanStorage {
                     }
                 }
                 other => {
-                    errors.push(format!("Unsupported plan action '{other}' (expected save, update, or delete)"));
+                    errors.push(format!(
+                        "Unsupported plan action '{other}' (expected save, update, or delete)"
+                    ));
                 }
             }
         }
@@ -382,7 +394,10 @@ impl PlanStorage {
 
             let action = if update.action == DiscussionPlanAction::Update
                 && all_plans.is_empty()
-                && Self::load_plan_unlocked(repo_root, &plan_id).ok().flatten().is_none()
+                && Self::load_plan_unlocked(repo_root, &plan_id)
+                    .ok()
+                    .flatten()
+                    .is_none()
             {
                 "save".to_string()
             } else {
@@ -426,7 +441,8 @@ impl PlanStorage {
         text: &str,
         mode: PlanMutationMode,
     ) -> PlanApplicationOutcome {
-        let (parsed, errors) = crate::edits::protocol::xml::tags::parse_plan_tags_with_diagnostics(text);
+        let (parsed, errors) =
+            crate::edits::protocol::xml::tags::parse_plan_tags_with_diagnostics(text);
         Self::apply_parsed_plans_with_mode(repo_root, parsed, errors, mode)
     }
 
@@ -465,7 +481,10 @@ I have prepared the plan:
         assert_eq!(affected.applied[0].id, "jwt-auth");
         assert_eq!(affected.applied[0].concept.len(), 1);
         assert_eq!(affected.applied[0].items.len(), 2);
-        assert_eq!(PlanStorage::load_active_id(root).unwrap(), Some("jwt-auth".to_string()));
+        assert_eq!(
+            PlanStorage::load_active_id(root).unwrap(),
+            Some("jwt-auth".to_string())
+        );
 
         let update_text = r#"
 Step 1 is done:
@@ -476,8 +495,14 @@ Step 1 is done:
         let affected_update = PlanStorage::apply_plan_tags(root, update_text);
         assert_eq!(affected_update.applied.len(), 1);
         assert!(affected_update.errors.is_empty());
-        assert_eq!(affected_update.applied[0].items[0].status, PlanItemStatus::Done);
-        assert_eq!(affected_update.applied[0].items[1].status, PlanItemStatus::Todo);
+        assert_eq!(
+            affected_update.applied[0].items[0].status,
+            PlanItemStatus::Done
+        );
+        assert_eq!(
+            affected_update.applied[0].items[1].status,
+            PlanItemStatus::Todo
+        );
     }
 
     #[test]
@@ -493,7 +518,8 @@ Step 1 is done:
         assert!(res.errors[0].contains("missing closing tag"));
 
         // 2. Non-existent plan on update
-        let update_missing = "<plan action=\"update\" id=\"non-existent\"><item id=\"1\" status=\"done\" /></plan>";
+        let update_missing =
+            "<plan action=\"update\" id=\"non-existent\"><item id=\"1\" status=\"done\" /></plan>";
         let res_missing = PlanStorage::apply_plan_tags(root, update_missing);
         assert!(res_missing.applied.is_empty());
         assert_eq!(res_missing.errors.len(), 1);
@@ -522,7 +548,8 @@ Step 1 is done:
         };
         PlanStorage::save_plan(root, &valid_plan).unwrap();
 
-        let update_item_missing = "<plan action=\"update\" id=\"my-plan\"><item id=\"99\" status=\"done\" /></plan>";
+        let update_item_missing =
+            "<plan action=\"update\" id=\"my-plan\"><item id=\"99\" status=\"done\" /></plan>";
         let res_item = PlanStorage::apply_plan_tags(root, update_item_missing);
         assert_eq!(res_item.applied.len(), 1);
         assert_eq!(res_item.errors.len(), 1);
@@ -562,7 +589,10 @@ Step 1 is done:
         assert!(outcome.errors.is_empty());
         assert_eq!(outcome.applied.len(), 1);
         assert_eq!(outcome.applied[0].id, "structured-auth");
-        assert_eq!(PlanStorage::load_active_id(root).unwrap(), Some("structured-auth".to_string()));
+        assert_eq!(
+            PlanStorage::load_active_id(root).unwrap(),
+            Some("structured-auth".to_string())
+        );
 
         let update2 = DiscussionPlanUpdate {
             action: DiscussionPlanAction::Update,
@@ -585,7 +615,10 @@ Step 1 is done:
 
         let outcome2 = PlanStorage::apply_discussion_plan_update(root, &update2);
         assert!(outcome2.errors.is_empty());
-        assert_eq!(outcome2.applied[0].items[0].details.as_deref(), Some("Updated details"));
+        assert_eq!(
+            outcome2.applied[0].items[0].details.as_deref(),
+            Some("Updated details")
+        );
     }
 
     #[test]
@@ -608,7 +641,14 @@ Step 1 is done:
             }],
         };
         PlanStorage::save_plan(root, &plan).unwrap();
-        assert_eq!(PlanStorage::load_plan(root, "test-plan").unwrap().unwrap().items.len(), 1);
+        assert_eq!(
+            PlanStorage::load_plan(root, "test-plan")
+                .unwrap()
+                .unwrap()
+                .items
+                .len(),
+            1
+        );
 
         let update = DiscussionPlanUpdate {
             action: DiscussionPlanAction::Save,
@@ -630,7 +670,10 @@ Step 1 is done:
 
         let reloaded = PlanStorage::load_plan(root, "test-plan").unwrap().unwrap();
         assert_eq!(reloaded.items.len(), 0);
-        assert_eq!(reloaded.description.as_deref(), Some("Updated Desc without items"));
+        assert_eq!(
+            reloaded.description.as_deref(),
+            Some("Updated Desc without items")
+        );
     }
 
     #[test]
@@ -677,8 +720,12 @@ Step 1 is done:
         assert!(outcome.errors[0].contains("'feature-beta'"));
 
         // Neither plan was modified
-        let p1_reloaded = PlanStorage::load_plan(root, "feature-alpha").unwrap().unwrap();
-        let p2_reloaded = PlanStorage::load_plan(root, "feature-beta").unwrap().unwrap();
+        let p1_reloaded = PlanStorage::load_plan(root, "feature-alpha")
+            .unwrap()
+            .unwrap();
+        let p2_reloaded = PlanStorage::load_plan(root, "feature-beta")
+            .unwrap()
+            .unwrap();
         assert_eq!(p1_reloaded.items[0].status, PlanItemStatus::Todo);
         assert_eq!(p2_reloaded.items[0].status, PlanItemStatus::Todo);
     }
@@ -711,7 +758,11 @@ Step 1 is done:
 </plan>
 "#;
         let refreshed = PlanStorage::apply_plan_tags(root, concept_only);
-        assert!(refreshed.errors.is_empty(), "Errors: {:?}", refreshed.errors);
+        assert!(
+            refreshed.errors.is_empty(),
+            "Errors: {:?}",
+            refreshed.errors
+        );
         assert_eq!(refreshed.applied.len(), 1);
         assert_eq!(refreshed.applied[0].items.len(), 2);
         assert_eq!(
@@ -719,7 +770,9 @@ Step 1 is done:
             PlanItemStatus::InProgress
         );
 
-        let reloaded = PlanStorage::load_plan(root, "guarded-save").unwrap().unwrap();
+        let reloaded = PlanStorage::load_plan(root, "guarded-save")
+            .unwrap()
+            .unwrap();
         assert_eq!(reloaded.items.len(), 2);
         assert_eq!(reloaded.concept[0].title, "Refined concept");
     }
@@ -782,11 +835,8 @@ Step 1 is done:
         assert!(res_isolated.errors[0].contains("isolated step execution"));
 
         // 2. Develop mode permits saving a new plan
-        let res_develop_save = PlanStorage::apply_plan_tags_with_mode(
-            root,
-            initial_plan,
-            PlanMutationMode::Develop,
-        );
+        let res_develop_save =
+            PlanStorage::apply_plan_tags_with_mode(root, initial_plan, PlanMutationMode::Develop);
         assert_eq!(res_develop_save.applied.len(), 1);
         assert!(res_develop_save.errors.is_empty());
 
@@ -796,22 +846,16 @@ Step 1 is done:
   <item id="1" status="done" />
 </plan>
 "#;
-        let res_develop_update = PlanStorage::apply_plan_tags_with_mode(
-            root,
-            update_text,
-            PlanMutationMode::Develop,
-        );
+        let res_develop_update =
+            PlanStorage::apply_plan_tags_with_mode(root, update_text, PlanMutationMode::Develop);
         assert!(res_develop_update.applied.is_empty());
         assert_eq!(res_develop_update.errors.len(), 1);
         assert!(res_develop_update.errors[0].contains("in Develop mode: only 'save' is permitted"));
 
         // 4. Develop mode forbids deleting a plan
         let delete_text = r#"<plan action="delete" id="plan-mode-test" />"#;
-        let res_develop_delete = PlanStorage::apply_plan_tags_with_mode(
-            root,
-            delete_text,
-            PlanMutationMode::Develop,
-        );
+        let res_develop_delete =
+            PlanStorage::apply_plan_tags_with_mode(root, delete_text, PlanMutationMode::Develop);
         assert!(res_develop_delete.applied.is_empty());
         assert_eq!(res_develop_delete.errors.len(), 1);
         assert!(res_develop_delete.errors[0].contains("in Develop mode: only 'save' is permitted"));
@@ -824,24 +868,22 @@ Step 1 is done:
   </concept>
 </plan>
 "#;
-        let res_develop_overwrite = PlanStorage::apply_plan_tags_with_mode(
-            root,
-            overwrite_text,
-            PlanMutationMode::Develop,
-        );
+        let res_develop_overwrite =
+            PlanStorage::apply_plan_tags_with_mode(root, overwrite_text, PlanMutationMode::Develop);
         assert!(res_develop_overwrite.applied.is_empty());
         assert_eq!(res_develop_overwrite.errors.len(), 1);
-        assert!(res_develop_overwrite.errors[0].contains("Cannot modify existing plan 'plan-mode-test' in Develop mode"));
+        assert!(res_develop_overwrite.errors[0]
+            .contains("Cannot modify existing plan 'plan-mode-test' in Develop mode"));
 
         // 6. Discussion mode permits update
-        let res_disc_update = PlanStorage::apply_plan_tags_with_mode(
-            root,
-            update_text,
-            PlanMutationMode::Discussion,
-        );
+        let res_disc_update =
+            PlanStorage::apply_plan_tags_with_mode(root, update_text, PlanMutationMode::Discussion);
         assert_eq!(res_disc_update.applied.len(), 1);
         assert!(res_disc_update.errors.is_empty());
-        assert_eq!(res_disc_update.applied[0].items[0].status, PlanItemStatus::Done);
+        assert_eq!(
+            res_disc_update.applied[0].items[0].status,
+            PlanItemStatus::Done
+        );
     }
 
     #[test]
@@ -888,7 +930,9 @@ Step 1 is done:
         assert!(outcome.errors.is_empty(), "Errors: {:?}", outcome.errors);
         assert_eq!(outcome.applied.len(), 1);
 
-        let plan = PlanStorage::load_plan(root, "status-preserve").unwrap().unwrap();
+        let plan = PlanStorage::load_plan(root, "status-preserve")
+            .unwrap()
+            .unwrap();
         assert_eq!(plan.items[0].title, "Step 1 Updated");
         assert_eq!(plan.items[0].status, PlanItemStatus::InProgress);
         assert_eq!(plan.items[0].readonly_files, vec!["crates/core/src/lib.rs"]);
@@ -904,9 +948,14 @@ Step 1 is done:
         let outcome2 = PlanStorage::apply_plan_tags(root, update_with_deps);
         assert!(outcome2.errors.is_empty(), "Errors: {:?}", outcome2.errors);
 
-        let plan2 = PlanStorage::load_plan(root, "status-preserve").unwrap().unwrap();
+        let plan2 = PlanStorage::load_plan(root, "status-preserve")
+            .unwrap()
+            .unwrap();
         assert_eq!(plan2.items[0].status, PlanItemStatus::InProgress);
-        assert_eq!(plan2.items[0].readonly_files, vec!["crates/protocol/src/lib.rs"]);
+        assert_eq!(
+            plan2.items[0].readonly_files,
+            vec!["crates/protocol/src/lib.rs"]
+        );
         assert_eq!(plan2.items[0].depends_on, vec!["2"]);
     }
 }

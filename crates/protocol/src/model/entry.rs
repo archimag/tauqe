@@ -409,7 +409,10 @@ mod tests {
             r#"{"model":"openrouter:anthropic/claude-sonnet","effort":"high","alias":"Sonnet High"}"#,
         )
         .unwrap();
-        assert_eq!(entry_table.model, ModelRef::openrouter("anthropic/claude-sonnet"));
+        assert_eq!(
+            entry_table.model,
+            ModelRef::openrouter("anthropic/claude-sonnet")
+        );
         assert_eq!(entry_table.effort, Some(ReasoningEffort::High));
         assert_eq!(entry_table.alias, Some("Sonnet High".to_string()));
         assert_eq!(entry_table.display_label(), "Sonnet High");
@@ -469,8 +472,7 @@ mod tests {
 
     #[test]
     fn test_architect_tier_shares_entry_spec_parsing() {
-        let tier_str: ArchitectTier =
-            serde_json::from_str("\"openrouter:planner/model\"").unwrap();
+        let tier_str: ArchitectTier = serde_json::from_str("\"openrouter:planner/model\"").unwrap();
         assert_eq!(
             tier_str,
             ArchitectTier::new(ModelRef::openrouter("planner/model"), None)
@@ -556,10 +558,9 @@ mod tests {
     fn test_model_entry_tolerates_null_alias() {
         // An explicit `null` alias means "no alias", mirroring an absent field,
         // so a null-tolerant producer never makes the entry unreadable.
-        let entry: ModelEntry = serde_json::from_str(
-            r#"{"model":"openrouter:anthropic/claude-sonnet","alias":null}"#,
-        )
-        .unwrap();
+        let entry: ModelEntry =
+            serde_json::from_str(r#"{"model":"openrouter:anthropic/claude-sonnet","alias":null}"#)
+                .unwrap();
         assert_eq!(entry.model, ModelRef::openrouter("anthropic/claude-sonnet"));
         assert_eq!(entry.alias, None);
     }

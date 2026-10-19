@@ -1,6 +1,7 @@
+use tauqe_protocol::discussion::normalize_repo_map_path;
 use tauqe_protocol::{
-    CapabilitySet, DocTopic, EditFileOp, EditOperation, EditOutcome, LlmCapability, ModelResult,
-    ModelResultProposal,
+    CapabilitySet, DirListRequest, DocTopic, EditFileOp, EditOperation, EditOutcome, LlmCapability,
+    ModelResult, ModelResultProposal,
 };
 
 use crate::capabilities::{CapabilityRegistry, PromptRenderContext};
@@ -25,7 +26,13 @@ impl StructuredEditProtocol {
         (LlmCapability::FileEdits, &["changes"]),
         (
             LlmCapability::Discovery,
-            &["context_requests", "repo_searches"],
+            &[
+                "context_requests",
+                "repo_searches",
+                "repo_dirs",
+                "repo_maps",
+                "dir_lists",
+            ],
         ),
         (LlmCapability::DocRequest, &["doc_requests"]),
         (LlmCapability::ToolchainVerify, &["verify"]),
@@ -85,6 +92,7 @@ impl StructuredEditProtocol {
 
     /// Complete edit-mode schema before capability pruning.
     fn full_schema(_editable_paths: &[String]) -> serde_json::Value {
+        let doc_topics: Vec<&str> = DocTopic::ALL.iter().map(DocTopic::as_str).collect();
         serde_json::json!({
             "type": "object",
             "properties": {
@@ -154,12 +162,42 @@ impl StructuredEditProtocol {
                         "additionalProperties": false
                     }
                 },
+                "repo_dirs": {
+                    "type": "boolean",
+                    "description": "Whether the compact repository directory tree is requested; set true only when the repository layout is still unknown"
+                },
+                "repo_maps": {
+                    "type": "array",
+                    "description": "Targeted symbol map requests for specific subsystems; each entry is a repository-relative directory or file prefix, and an empty string or '.' requests the whole repository",
+                    "items": {
+                        "type": "string"
+                    }
+                },
+                "dir_lists": {
+                    "type": "array",
+                    "description": "Directory content listing requests over the tracked repository files; each entry names a repository-relative directory prefix, and an empty string or '.' requests the repository root. The listing is shallow unless 'recursive' is true",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "path": {
+                                "type": "string",
+                                "description": "Repository-relative directory path, or an empty string for the repository root"
+                            },
+                            "recursive": {
+                                "type": "boolean",
+                                "description": "List every tracked file underneath the directory instead of only its direct children"
+                            }
+                        },
+                        "required": ["path", "recursive"],
+                        "additionalProperties": false
+                    }
+                },
                 "doc_requests": {
                     "type": "array",
                     "description": "System documentation topics to request before answering questions about identity, capabilities, concepts, or workflows",
                     "items": {
                         "type": "string",
-                        "enum": ["overview", "context", "workflow", "git", "interface", "review", "plan", "all"]
+                        "enum": doc_topics
                     }
                 },
                 "scratchpad": {
@@ -243,6 +281,7 @@ impl StructuredEditProtocol {
             },
             "required": [
                 "message", "changes", "context_requests", "repo_searches",
+                "repo_dirs", "repo_maps", "dir_lists",
                 "doc_requests", "scratchpad", "outcome", "blocked",
                 "verify", "user_language", "suggested_actions"
             ],
@@ -265,27 +304,25 @@ impl StructuredEditProtocol {
 
         for change in &proposal.changes {
             let is_create = change.op == EditFileOp::Create;
-            let target_path = match resolve_target_path_for_op(&change.path, editable_paths, is_create) {
-                Ok(p) => p,
-                Err(ambiguity_err) => {
-                    return ModelResult::Edit {
-                        summary: "Ambiguous file path".to_string(),
-                        edits: Vec::new(),
-                        proposal: Some(proposal),
-                        outcome: EditOutcome {
-                            applied: false,
-                            error: Some(ambiguity_err),
-                            changed_files: Vec::new(),
-                            commit_hash: None,
-                        },
-                    };
-                }
-            };
+            let target_path =
+                match resolve_target_path_for_op(&change.path, editable_paths, is_create) {
+                    Ok(p) => p,
+                    Err(ambiguity_err) => {
+                        return ModelResult::Edit {
+                            summary: "Ambiguous file path".to_string(),
+                            edits: Vec::new(),
+                            proposal: Some(proposal),
+                            outcome: EditOutcome {
+                                applied: false,
+                                error: Some(ambiguity_err),
+                                changed_files: Vec::new(),
+                                commit_hash: None,
+                            },
+                        };
+                    }
+                };
 
-            if !editable_paths.is_empty()
-                && !is_create
-                && !editable_paths.contains(&target_path)
-            {
+            if !editable_paths.is_empty() && !is_create && !editable_paths.contains(&target_path) {
                 return ModelResult::Edit {
                     summary: format!("File '{}' is not in context", target_path),
                     edits: Vec::new(),
@@ -430,7 +467,8 @@ impl StructuredEditProtocol {
         if capabilities.contains(LlmCapability::Discovery) {
             prompt.push_str("A file absent from <context> is reached through `context_requests` or created with `op: 'create'`.\n\n");
         } else {
-            prompt.push_str("A file absent from <context> must be created with `op: 'create'`.\n\n");
+            prompt
+                .push_str("A file absent from <context> must be created with `op: 'create'`.\n\n");
         }
 
         prompt.push_str("CRITICAL INVARIANTS:\n");
@@ -488,6 +526,76 @@ impl StructuredEditProtocol {
             }
         }
         super::xml::tags::parse_repo_search_tags(raw_text)
+    }
+
+    /// Extracts targeted repository map requests from a structured proposal,
+    /// falling back to XML control tags when the JSON field is absent.
+    ///
+    /// Every entry is normalized through the shared `normalize_repo_map_path`
+    /// rule, so an empty string or `.` names the whole repository while a
+    /// traversal path is dropped instead of escaping it.
+    pub fn parse_repo_maps(&self, raw_text: &str) -> Vec<String> {
+        if let Some(value) = parse_json_object(raw_text) {
+            if let Some(entries) = value.get("repo_maps").and_then(|field| field.as_array()) {
+                let maps: Vec<String> = entries
+                    .iter()
+                    .filter_map(|entry| entry.as_str())
+                    .filter_map(normalize_repo_map_path)
+                    .collect();
+                if !maps.is_empty() {
+                    return maps;
+                }
+            }
+        }
+        super::xml::tags::parse_repo_map_tags(raw_text)
+            .iter()
+            .filter_map(|path| normalize_repo_map_path(path))
+            .collect()
+    }
+
+    /// Reports whether the model requested the compact repository directory
+    /// tree, falling back to XML control tags when the JSON field is absent or
+    /// reports no request.
+    pub fn parse_repo_dirs(&self, raw_text: &str) -> bool {
+        if let Some(value) = parse_json_object(raw_text) {
+            if let Some(requested) = value.get("repo_dirs").and_then(|field| field.as_bool()) {
+                if requested {
+                    return true;
+                }
+            }
+        }
+        super::xml::tags::parse_repo_dirs_tags(raw_text)
+    }
+
+    /// Extracts directory content listing requests from the structured
+    /// `dir_lists` field, falling back to `<dir_list>` control tags when the
+    /// JSON field is absent or empty.
+    ///
+    /// Every entry is normalized through [`DirListRequest::normalized`], so `.`
+    /// and `./` collapse to the repository root while a path that escapes the
+    /// repository is dropped instead of resolved. A missing `recursive` flag
+    /// keeps the listing shallow, so a malformed entry narrows the result
+    /// rather than failing it.
+    pub fn parse_dir_lists(&self, raw_text: &str) -> Vec<DirListRequest> {
+        if let Some(value) = parse_json_object(raw_text) {
+            if let Some(entries) = value.get("dir_lists").and_then(|field| field.as_array()) {
+                let requests: Vec<DirListRequest> = entries
+                    .iter()
+                    .filter_map(|entry| {
+                        let path = entry.get("path").and_then(|field| field.as_str())?;
+                        let recursive = entry
+                            .get("recursive")
+                            .and_then(|field| field.as_bool())
+                            .unwrap_or(false);
+                        DirListRequest::new(path, recursive).normalized()
+                    })
+                    .collect();
+                if !requests.is_empty() {
+                    return requests;
+                }
+            }
+        }
+        super::xml::tags::parse_dir_list_tags(raw_text)
     }
 
     /// Extracts requested documentation topics from a structured proposal,
@@ -645,9 +753,9 @@ impl StructuredEditProtocol {
     pub fn parse_plan_updates(&self, raw_text: &str) -> Vec<tauqe_protocol::DiscussionPlanUpdate> {
         if let Some(value) = parse_json_object(raw_text) {
             if let Some(plan_update) = value.get("plan_update") {
-                if let Ok(update) =
-                    serde_json::from_value::<tauqe_protocol::DiscussionPlanUpdate>(plan_update.clone())
-                {
+                if let Ok(update) = serde_json::from_value::<tauqe_protocol::DiscussionPlanUpdate>(
+                    plan_update.clone(),
+                ) {
                     return vec![update];
                 }
             }
@@ -778,6 +886,9 @@ pub fn extract_json_messages(raw: &str) -> Vec<String> {
                         && (val.get("changes").is_some()
                             || val.get("context_requests").is_some()
                             || val.get("repo_searches").is_some()
+                            || val.get("repo_dirs").is_some()
+                            || val.get("repo_maps").is_some()
+                            || val.get("dir_lists").is_some()
                             || val.get("doc_requests").is_some()
                             || val.get("scratchpad").is_some()
                             || val.get("outcome").is_some()
@@ -819,6 +930,87 @@ mod tests {
         assert_eq!(searches.len(), 1);
         assert_eq!(searches[0].path, "crates/core");
         assert_eq!(searches[0].regex, "fn execute");
+    }
+
+    #[test]
+    fn test_structured_protocol_repo_dirs_and_repo_maps() {
+        let proto = StructuredEditProtocol;
+        let json = r#"{
+            "message": "Map the subsystem first",
+            "changes": [],
+            "repo_dirs": true,
+            "repo_maps": [".", "./crates/core/", "../escape.rs", "crates/protocol/"]
+        }"#;
+        assert!(proto.parse_repo_dirs(json));
+        // `.` names the whole repository, `./` prefixes collapse, and the
+        // traversal entry is dropped instead of escaping the repository.
+        assert_eq!(
+            proto.parse_repo_maps(json),
+            vec![
+                String::new(),
+                "crates/core".to_string(),
+                "crates/protocol".to_string()
+            ]
+        );
+
+        let idle = r#"{"message":"x","changes":[],"repo_dirs":false,"repo_maps":[]}"#;
+        assert!(!proto.parse_repo_dirs(idle));
+        assert!(proto.parse_repo_maps(idle).is_empty());
+    }
+
+    #[test]
+    fn test_structured_protocol_repo_requests_fall_back_to_xml_tags() {
+        let proto = StructuredEditProtocol;
+        let raw = "{\"message\":\"Working\",\"changes\":[]}\n\
+<repo_dirs />\n\
+<repo_map path=\"crates/core\" />\n\
+<repo_map />";
+        assert!(proto.parse_repo_dirs(raw));
+        assert_eq!(
+            proto.parse_repo_maps(raw),
+            vec!["crates/core".to_string(), String::new()]
+        );
+    }
+
+    #[test]
+    fn test_structured_protocol_dir_lists() {
+        let proto = StructuredEditProtocol;
+        let json = r#"{
+            "message": "List the subsystem",
+            "changes": [],
+            "dir_lists": [
+                {"path": "./crates/core/", "recursive": false},
+                {"path": ".", "recursive": true},
+                {"path": "../escape", "recursive": true}
+            ]
+        }"#;
+        // `./` collapses, `.` names the repository root, and the traversal
+        // entry is dropped instead of escaping the repository.
+        assert_eq!(
+            proto.parse_dir_lists(json),
+            vec![
+                DirListRequest::new("crates/core", false),
+                DirListRequest::new("", true),
+            ]
+        );
+
+        let idle = r#"{"message":"x","changes":[],"dir_lists":[]}"#;
+        assert!(proto.parse_dir_lists(idle).is_empty());
+    }
+
+    #[test]
+    fn test_structured_protocol_dir_lists_fall_back_to_xml_tags() {
+        let proto = StructuredEditProtocol;
+        let raw = "{\"message\":\"Working\",\"changes\":[]}\n\
+<dir_list path=\"crates/core\" />\n\
+<dir_list path=\"crates/protocol\" recursive=\"true\" />";
+        assert_eq!(
+            proto.parse_dir_lists(raw),
+            vec![
+                DirListRequest::new("crates/core", false),
+                DirListRequest::new("crates/protocol", true),
+            ]
+        );
     }
 
     #[test]
@@ -1031,7 +1223,9 @@ mod tests {
                 assert_eq!(summary, "Всё отлично! ✨");
                 assert_eq!(edits.len(), 1);
                 match &edits[0] {
-                    EditOperation::Replace { old_text, new_text, .. } => {
+                    EditOperation::Replace {
+                        old_text, new_text, ..
+                    } => {
                         assert_eq!(old_text, "старый");
                         assert_eq!(new_text, "новый");
                     }
@@ -1313,7 +1507,8 @@ mod tests {
         assert_eq!(req.target, VerifyTarget::Test);
         assert_eq!(req.on_success, VerifyOnSuccess::Silent);
 
-        let none = r#"{"message":"x","changes":[],"verify":{"target":"none","on_success":"silent"}}"#;
+        let none =
+            r#"{"message":"x","changes":[],"verify":{"target":"none","on_success":"silent"}}"#;
         assert!(proto.parse_verify_request(none).is_none());
     }
 
@@ -1337,13 +1532,19 @@ mod tests {
         let updates = proto.parse_plan_updates(json);
         assert_eq!(updates.len(), 1);
         assert_eq!(updates[0].id.as_deref(), Some("p-1"));
-        assert_eq!(updates[0].action, tauqe_protocol::DiscussionPlanAction::Update);
+        assert_eq!(
+            updates[0].action,
+            tauqe_protocol::DiscussionPlanAction::Update
+        );
 
         let xml = "Working\n<plan action=\"save\" id=\"p-2\" title=\"P2\"><concept><concept_item id=\"c-1\" title=\"C\" /></concept><item id=\"1\" title=\"Step\" /></plan>";
         let updates = proto.parse_plan_updates(xml);
         assert_eq!(updates.len(), 1);
         assert_eq!(updates[0].id.as_deref(), Some("p-2"));
-        assert_eq!(updates[0].action, tauqe_protocol::DiscussionPlanAction::Save);
+        assert_eq!(
+            updates[0].action,
+            tauqe_protocol::DiscussionPlanAction::Save
+        );
     }
 
     #[test]
@@ -1364,10 +1565,7 @@ mod tests {
         for target in ["none", "all", "check", "test", "clippy"] {
             assert!(targets.iter().any(|value| value == target));
         }
-        assert_eq!(
-            schema["properties"]["user_language"]["type"],
-            "string"
-        );
+        assert_eq!(schema["properties"]["user_language"]["type"], "string");
         assert!(!schema.to_string().contains("\"null\""));
     }
 
@@ -1380,6 +1578,9 @@ mod tests {
             "changes",
             "context_requests",
             "repo_searches",
+            "repo_dirs",
+            "repo_maps",
+            "dir_lists",
             "doc_requests",
             "scratchpad",
             "outcome",
@@ -1411,6 +1612,9 @@ mod tests {
         for field in [
             "context_requests",
             "repo_searches",
+            "repo_dirs",
+            "repo_maps",
+            "dir_lists",
             "doc_requests",
             "scratchpad",
             "outcome",

@@ -349,7 +349,10 @@ mod tests {
 
     #[test]
     fn rfc3339_timestamp_has_millisecond_precision_in_utc() {
-        assert_eq!(format_rfc3339_millis(UNIX_EPOCH), "1970-01-01T00:00:00.000Z");
+        assert_eq!(
+            format_rfc3339_millis(UNIX_EPOCH),
+            "1970-01-01T00:00:00.000Z"
+        );
 
         let sample = UNIX_EPOCH + Duration::from_millis(1_609_459_200_123);
         assert_eq!(format_rfc3339_millis(sample), "2021-01-01T00:00:00.123Z");

@@ -161,7 +161,10 @@ mod tests {
             assert_eq!(value.len(), UUID_TEXT_LEN);
             let bytes = value.as_bytes();
             for position in [8, 13, 18, 23] {
-                assert_eq!(bytes[position], b'-', "missing hyphen at {position}: {value}");
+                assert_eq!(
+                    bytes[position], b'-',
+                    "missing hyphen at {position}: {value}"
+                );
             }
             assert_eq!(value.chars().filter(|c| *c == '-').count(), 4);
             assert!(value.chars().all(|c| c == '-' || c.is_ascii_hexdigit()));

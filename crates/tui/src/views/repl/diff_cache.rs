@@ -119,28 +119,19 @@ fn render_expanded_diff_lines(file: &StreamingFileEdit) -> Vec<Line<'static>> {
                         similar::ChangeTag::Delete => {
                             lines.push(Line::from(vec![
                                 Span::styled("  - ", engine.fg(palette.diff_removed).bold()),
-                                Span::styled(
-                                    line_str.to_string(),
-                                    engine.fg(palette.diff_removed),
-                                ),
+                                Span::styled(line_str.to_string(), engine.fg(palette.diff_removed)),
                             ]));
                         }
                         similar::ChangeTag::Insert => {
                             lines.push(Line::from(vec![
                                 Span::styled("  + ", engine.fg(palette.diff_added).bold()),
-                                Span::styled(
-                                    line_str.to_string(),
-                                    engine.fg(palette.diff_added),
-                                ),
+                                Span::styled(line_str.to_string(), engine.fg(palette.diff_added)),
                             ]));
                         }
                         similar::ChangeTag::Equal => {
                             lines.push(Line::from(vec![
                                 Span::styled("    ", engine.fg(palette.diff_context)),
-                                Span::styled(
-                                    line_str.to_string(),
-                                    engine.fg(palette.diff_context),
-                                ),
+                                Span::styled(line_str.to_string(), engine.fg(palette.diff_context)),
                             ]));
                         }
                     }

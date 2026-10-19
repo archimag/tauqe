@@ -136,6 +136,39 @@ pub fn discussion_response_schema() -> serde_json::Value {
                             "additionalProperties": false
                         }
                     },
+                    "repo_dirs": {
+                        "anyOf": [
+                            { "type": "boolean" },
+                            { "type": "null" }
+                        ],
+                        "description": "Request the compact repository directory tree when the repository layout is still unknown; use null or false when the provided contours are sufficient"
+                    },
+                    "repo_maps": {
+                        "type": "array",
+                        "description": "Targeted symbol map requests for specific subsystems; each entry is a repository-relative directory or file prefix, and an empty string or '.' requests the whole repository",
+                        "items": {
+                            "type": "string"
+                        }
+                    },
+                    "dir_lists": {
+                        "type": "array",
+                        "description": "Directory content listing requests over the tracked repository files; each entry names a repository-relative directory prefix, and an empty string or '.' requests the repository root. The listing is shallow unless 'recursive' is true.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "path": {
+                                    "type": "string",
+                                    "description": "Repository-relative directory path, or an empty string for the repository root"
+                                },
+                                "recursive": {
+                                    "type": "boolean",
+                                    "description": "List every tracked file underneath the directory instead of only its direct children"
+                                }
+                            },
+                            "required": ["path", "recursive"],
+                            "additionalProperties": false
+                        }
+                    },
                     "user_language": {
                         "anyOf": [
                             { "type": "string" },
@@ -144,7 +177,7 @@ pub fn discussion_response_schema() -> serde_json::Value {
                         "description": "Detected primary natural language of the user prompt"
                     }
                 },
-                "required": ["message", "plan_update", "context_requests", "repo_searches", "user_language"],
+                "required": ["message", "plan_update", "context_requests", "repo_searches", "repo_dirs", "repo_maps", "dir_lists", "user_language"],
                 "additionalProperties": false,
                 "$defs": {
                     "ConceptItem": {
@@ -261,8 +294,8 @@ mod tests {
     use super::{discussion_response_schema, discussion_response_schema_definition};
     use crate::context::ContextAccess;
     use crate::discussion::{
-        DiscussionContextRequest, DiscussionPlanAction, DiscussionPlanUpdate, DiscussionResponse,
-        RepoSearchRequest,
+        DirListRequest, DiscussionContextRequest, DiscussionPlanAction, DiscussionPlanUpdate,
+        DiscussionResponse, RepoSearchRequest,
     };
     use crate::plan::{ConceptItem, PlanItem, PlanItemStatus};
 
@@ -275,19 +308,36 @@ mod tests {
             .expect("properties object must exist");
 
         let first_key = properties.keys().next().expect("first property must exist");
-        assert_eq!(first_key, "message", "message MUST be the first property for streaming");
+        assert_eq!(
+            first_key, "message",
+            "message MUST be the first property for streaming"
+        );
 
         let schema_str = serde_json::to_string(&schema).unwrap();
         let msg_idx = schema_str.find("\"message\"").expect("message found");
-        let plan_idx = schema_str.find("\"plan_update\"").expect("plan_update found");
-        let ctx_idx = schema_str.find("\"context_requests\"").expect("context_requests found");
-        let search_idx = schema_str.find("\"repo_searches\"").expect("repo_searches found");
-        let lang_idx = schema_str.find("\"user_language\"").expect("user_language found");
+        let plan_idx = schema_str
+            .find("\"plan_update\"")
+            .expect("plan_update found");
+        let ctx_idx = schema_str
+            .find("\"context_requests\"")
+            .expect("context_requests found");
+        let search_idx = schema_str
+            .find("\"repo_searches\"")
+            .expect("repo_searches found");
+        let dirs_idx = schema_str.find("\"repo_dirs\"").expect("repo_dirs found");
+        let maps_idx = schema_str.find("\"repo_maps\"").expect("repo_maps found");
+        let lists_idx = schema_str.find("\"dir_lists\"").expect("dir_lists found");
+        let lang_idx = schema_str
+            .find("\"user_language\"")
+            .expect("user_language found");
 
         assert!(msg_idx < plan_idx);
         assert!(plan_idx < ctx_idx);
         assert!(ctx_idx < search_idx);
-        assert!(search_idx < lang_idx);
+        assert!(search_idx < dirs_idx);
+        assert!(dirs_idx < maps_idx);
+        assert!(maps_idx < lists_idx);
+        assert!(lists_idx < lang_idx);
     }
 
     #[test]
@@ -319,7 +369,11 @@ mod tests {
             let props = keys(&node["properties"]);
             let required: BTreeSet<String> = node["required"]
                 .as_array()
-                .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
                 .unwrap_or_default();
             (props, required)
         }
@@ -338,6 +392,9 @@ mod tests {
             })
             .with_context_requests(vec![DiscussionContextRequest::read_only("a.rs")])
             .with_repo_searches(vec![RepoSearchRequest::new("crates/core", "regex")])
+            .with_repo_dirs(true)
+            .with_repo_maps(vec!["crates/core".to_string()])
+            .with_dir_lists(vec![DirListRequest::new("crates/core", true)])
             .with_user_language("English");
         let (props, required) = field_sets(&schema);
         assert_eq!(props, keys(&serde_json::to_value(&response).unwrap()));
@@ -370,6 +427,23 @@ mod tests {
         );
         assert_eq!(required, props);
 
+        // 3b. repo_dirs is a nullable boolean and repo_maps is a path array.
+        let dir_variants = schema["properties"]["repo_dirs"]["anyOf"]
+            .as_array()
+            .expect("repo_dirs anyOf array");
+        assert!(dir_variants.iter().any(|v| v["type"] == "boolean"));
+        assert!(dir_variants.iter().any(|v| v["type"] == "null"));
+        assert_eq!(schema["properties"]["repo_maps"]["type"], "array");
+        assert_eq!(schema["properties"]["repo_maps"]["items"]["type"], "string");
+
+        // 3c. dir_lists item object.
+        let (props, required) = field_sets(&schema["properties"]["dir_lists"]["items"]);
+        assert_eq!(
+            props,
+            keys(&serde_json::to_value(DirListRequest::new("crates/core", true)).unwrap())
+        );
+        assert_eq!(required, props);
+
         // 4. ConceptItem definition.
         let concept = ConceptItem {
             id: "c-1".to_string(),
@@ -398,11 +472,15 @@ mod tests {
         assert_eq!(required, props);
 
         // 6. Every PlanItemStatus variant must be expressible in the status enum.
-        let status_enum: BTreeSet<String> =
-            schema["$defs"]["PlanItem"]["properties"]["status"]["enum"]
-                .as_array()
-                .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
-                .unwrap_or_default();
+        let status_enum: BTreeSet<String> = schema["$defs"]["PlanItem"]["properties"]["status"]
+            ["enum"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
         for status in [
             PlanItemStatus::Discussion,
             PlanItemStatus::Todo,
@@ -421,11 +499,15 @@ mod tests {
 
         // 7. Every DiscussionPlanAction variant must be expressible in the
         //    plan_update.action enum.
-        let action_enum: BTreeSet<String> =
-            schema["properties"]["plan_update"]["anyOf"][0]["properties"]["action"]["enum"]
-                .as_array()
-                .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
-                .unwrap_or_default();
+        let action_enum: BTreeSet<String> = schema["properties"]["plan_update"]["anyOf"][0]
+            ["properties"]["action"]["enum"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
         for action in [
             DiscussionPlanAction::Update,
             DiscussionPlanAction::Save,
@@ -441,11 +523,15 @@ mod tests {
 
         // 8. Every ContextAccess variant must be expressible in the
         //    context_requests.access enum.
-        let access_enum: BTreeSet<String> =
-            schema["properties"]["context_requests"]["items"]["properties"]["access"]["enum"]
-                .as_array()
-                .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
-                .unwrap_or_default();
+        let access_enum: BTreeSet<String> = schema["properties"]["context_requests"]["items"]
+            ["properties"]["access"]["enum"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
         for access in [ContextAccess::ReadOnly, ContextAccess::Editable] {
             let wire = serde_json::to_value(access).unwrap();
             let wire = wire.as_str().unwrap();

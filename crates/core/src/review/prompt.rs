@@ -94,7 +94,9 @@ mod tests {
 
         let prompt = format_review_step_execution_prompt(&session, 1, "_TAG").unwrap();
         assert!(prompt.contains("Decomposed Subplan Steps:"));
-        assert!(prompt.contains("- [DONE] #1.1 Split module (files: crates/core/src/sub.rs): Create submodules"));
+        assert!(prompt.contains(
+            "- [DONE] #1.1 Split module (files: crates/core/src/sub.rs): Create submodules"
+        ));
     }
 
     #[test]
@@ -137,6 +139,7 @@ mod tests {
             &[],
             Some("fn outline()"),
             None,
+            None,
             Some("Focus on safety"),
         );
         assert!(user.contains("# Review Finding Refinement: [rev-ref#42] Decompose this issue"));
@@ -176,9 +179,8 @@ mod tests {
         };
 
         let prompt = format_review_step_execution_prompt(&session, 3, "_TAG").unwrap();
-        assert!(prompt.contains(
-            "# Target Review Step Execution: [rev-7:3] Excessive clone in hot path"
-        ));
+        assert!(prompt
+            .contains("# Target Review Step Execution: [rev-7:3] Excessive clone in hot path"));
         assert!(prompt.contains("<success_TAG summary=\"...\" />"));
         assert!(prompt.contains("<error_TAG message=\"...\" />"));
     }
@@ -214,19 +216,19 @@ mod tests {
             raw_markdown: String::new(),
         };
 
-        let prompt =
-            format_review_discussion_prompt(&session, Some(1), "Is this really possible?");
+        let prompt = format_review_discussion_prompt(&session, Some(1), "Is this really possible?");
         assert!(prompt.contains("# Review Discussion: [rev-42] Security Audit"));
         assert!(prompt.contains("Race condition in cache"));
         assert!(prompt.contains("Resolution Note: Extend scope of mutex guard"));
         assert!(prompt.contains("Is this really possible?"));
-        assert!(prompt.contains("explain the proposed modifications clearly in conversational text"));
+        assert!(
+            prompt.contains("explain the proposed modifications clearly in conversational text")
+        );
         // A focused review discussion must let the model either reason about
         // the finding or apply the requested fix directly.
         assert!(!prompt.contains("Do NOT emit file edits"));
-        assert!(prompt.contains(
-            "apply the required code changes directly instead of only describing them"
-        ));
+        assert!(prompt
+            .contains("apply the required code changes directly instead of only describing them"));
     }
 
     #[test]

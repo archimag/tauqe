@@ -24,19 +24,17 @@ pub use batch::{
     BatchFinishStatus, BatchFinishSummary, PlanBatchFinishedEvent, ReviewBatchFinishedEvent,
 };
 pub use effort::{ModelRolesEffort, ReasoningEffort};
-pub use entry::{
-    ArchitectTier, CoderTier, ModelEntry, ModelRolesEntries, ModelRolesSummary,
-};
+pub use entry::{ArchitectTier, CoderTier, ModelEntry, ModelRolesEntries, ModelRolesSummary};
 pub use reference::{deserialize_model_ref_lenient, ModelRef, ProviderKind};
 pub use role::ModelRole;
 pub use selection::{
     ModelChangedEvent, ModelCurrentResult, ModelSelectParams, ModelSelectResult, ModelSelection,
 };
 pub use turn::{
-    CancelMode, ModelAskParams, ModelCancelParams, ModelDeltaEvent, ModelErrorEvent,
-    ModelFinishedEvent, ModelResult, ModelResultEvent, ModelResultProposal, ModelStartedEvent,
-    ModelTurnPlanContext, RepoMapInfoEvent, ToolchainFinishedEvent, ToolchainStartedEvent,
-    TurnPhase, TurnPhaseEvent,
+    CancelMode, ModelAskParams, ModelCancelParams, ModelConnectionRetryingEvent, ModelDeltaEvent,
+    ModelErrorEvent, ModelFinishedEvent, ModelResult, ModelResultEvent, ModelResultProposal,
+    ModelStartedEvent, ModelStreamResetEvent, ModelTurnPlanContext, RepoMapInfoEvent,
+    ToolchainFinishedEvent, ToolchainStartedEvent, TurnPhase, TurnPhaseEvent,
 };
 pub use usage::{
     ModelUsageEvent, ModelUsageInfo, ModelUsageTotalsEvent, UsageTotals, UsageTotalsSnapshot,

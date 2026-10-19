@@ -15,8 +15,8 @@ mod regime;
 mod registry;
 
 pub use registry::{
-    CapabilityModule, CapabilityRegistry, ContractContext, ContractRule, PromptRenderContext,
-    render_contract_rules,
+    render_contract_rules, CapabilityModule, CapabilityRegistry, ContractContext, ContractRule,
+    PromptRenderContext,
 };
 
 // Protocol-to-command mapping helpers are owned by the capability modules that

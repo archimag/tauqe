@@ -588,9 +588,13 @@ mod tests {
     #[test]
     fn test_replace_uncompleted_horizon_missing_plan_errors() {
         let dir = tempdir().unwrap();
-        let err =
-            PlanStorage::replace_uncompleted_horizon(dir.path(), "ghost", Vec::new(), test_architect())
-                .unwrap_err();
+        let err = PlanStorage::replace_uncompleted_horizon(
+            dir.path(),
+            "ghost",
+            Vec::new(),
+            test_architect(),
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("not found"));
     }
 

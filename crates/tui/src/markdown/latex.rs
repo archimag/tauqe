@@ -619,10 +619,10 @@ fn replace_scripts(mut text: &str) -> String {
                 }
             } else if let Some(first_char) = after.chars().next() {
                 if let Some(sc) = if is_super {
-                            to_superscript(first_char)
-                        } else {
-                            to_subscript(first_char)
-                        } {
+                    to_superscript(first_char)
+                } else {
+                    to_subscript(first_char)
+                } {
                     out.push(sc);
                     text = &after[first_char.len_utf8()..];
                     continue;
@@ -824,20 +824,14 @@ fn render_inline_math_or_plain(
         // Not valid math block, push up to $ and continue
         let chunk = &remainder[..open_idx + 1];
         let cleaned = clean_latex_in_plain_text(chunk);
-        spans.push(Span::styled(
-            cleaned,
-            style_mod.to_style(base_style, theme),
-        ));
+        spans.push(Span::styled(cleaned, style_mod.to_style(base_style, theme)));
         remainder = after_open;
     }
 
     if !remainder.is_empty() {
         // Even plain text might contain standalone arrows/macros like \longrightarrow or \to
         let cleaned = clean_latex_in_plain_text(remainder);
-        spans.push(Span::styled(
-            cleaned,
-            style_mod.to_style(base_style, theme),
-        ));
+        spans.push(Span::styled(cleaned, style_mod.to_style(base_style, theme)));
     }
 
     spans
@@ -868,7 +862,9 @@ fn is_likely_math(s: &str) -> bool {
     }
 
     // Reject pure currency strings: e.g. "50", "100.00"
-    if s.chars().all(|c| c.is_ascii_digit() || c == '.' || c == ',') {
+    if s.chars()
+        .all(|c| c.is_ascii_digit() || c == '.' || c == ',')
+    {
         return false;
     }
 

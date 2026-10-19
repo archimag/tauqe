@@ -6,8 +6,8 @@ pub mod fsm;
 pub mod git_policy;
 pub mod loops;
 pub mod policy;
-pub mod task;
 pub(crate) mod retry;
+pub mod task;
 pub(crate) mod verification;
 
 #[cfg(test)]

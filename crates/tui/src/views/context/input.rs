@@ -1,11 +1,11 @@
 use std::sync::Arc;
 
 use crossterm::event::{KeyCode, KeyEvent};
-use tokio::sync::Mutex;
 use tauqe_protocol::{
     methods, ContextAccess, ContextAddParams, ContextAddPatternParams, ContextLayer,
     ContextRemoveParams, ContextSetAccessParams,
 };
+use tokio::sync::Mutex;
 
 use crate::app::{AppState, ViewMode};
 use crate::command::CommandCategory::{Essential, Helpers, Interface};
@@ -305,14 +305,13 @@ pub async fn handle_context_key(
                     .get(st.context_view.selected_candidate_index)
                     .cloned();
 
-                let is_pattern_entry = selected_candidate.as_ref().is_some_and(|c| {
-                    c.starts_with("[+] Add all matching '")
-                });
+                let is_pattern_entry = selected_candidate
+                    .as_ref()
+                    .is_some_and(|c| c.starts_with("[+] Add all matching '"));
 
                 let raw_input = st.context_view.add_input.get_text().trim().to_string();
-                let is_glob_direct = raw_input.contains('*')
-                    || raw_input.contains('?')
-                    || raw_input.ends_with('/');
+                let is_glob_direct =
+                    raw_input.contains('*') || raw_input.contains('?') || raw_input.ends_with('/');
 
                 let access = st.context_view.add_access;
                 if is_pattern_entry || is_glob_direct {
@@ -557,12 +556,7 @@ pub async fn handle_context_key(
         }
         ContextAction::Refresh => {
             drop(st);
-            send_request(
-                server_writer,
-                methods::CONTEXT_GET,
-                serde_json::json!({}),
-            )
-            .await?;
+            send_request(server_writer, methods::CONTEXT_GET, serde_json::json!({})).await?;
         }
         ContextAction::AddEditable => {
             st.context_view.adding_file = true;
@@ -696,7 +690,9 @@ mod tests {
     async fn test_shift_c_opens_clear_user_confirmation() {
         let mut st = test_state();
         st.view_mode = ViewMode::Context;
-        st.context.items.push(item("src/lib.rs", ContextLayer::User));
+        st.context
+            .items
+            .push(item("src/lib.rs", ContextLayer::User));
         let state = Arc::new(Mutex::new(st));
         let mut conn = RpcConnection::new(Vec::<u8>::new());
 
@@ -728,7 +724,9 @@ mod tests {
     async fn test_lowercase_c_copies_and_does_not_clear() {
         let mut st = test_state();
         st.view_mode = ViewMode::Context;
-        st.context.items.push(item("src/lib.rs", ContextLayer::User));
+        st.context
+            .items
+            .push(item("src/lib.rs", ContextLayer::User));
         st.context.items.push(item("auto.rs", ContextLayer::Auto));
         // Select an item
         st.context_view.cursor_index = 2; // User file item
@@ -747,7 +745,9 @@ mod tests {
     async fn test_x_does_not_remove_file() {
         let mut st = test_state();
         st.view_mode = ViewMode::Context;
-        st.context.items.push(item("src/lib.rs", ContextLayer::User));
+        st.context
+            .items
+            .push(item("src/lib.rs", ContextLayer::User));
         st.context_view.cursor_index = 2; // User file item
         let state = Arc::new(Mutex::new(st));
         let mut conn = RpcConnection::new(Vec::<u8>::new());

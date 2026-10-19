@@ -1,6 +1,6 @@
+use serde::Deserialize;
 use std::fs;
 use std::path::{Path, PathBuf};
-use serde::Deserialize;
 use toml_edit::{value, DocumentMut, Item, Table, Value};
 
 use crossterm::event::KeyModifiers;
@@ -505,10 +505,7 @@ fn temp_sibling_path(target: &Path) -> PathBuf {
         .unwrap_or(0);
     let filename = format!(
         ".{}.tmp.{}.{}",
-        target
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("tui"),
+        target.file_name().and_then(|n| n.to_str()).unwrap_or("tui"),
         std::process::id(),
         nanos
     );
@@ -550,7 +547,11 @@ fn merge_workstation_settings(
 
     if let Some(input) = doc.get_mut("input").and_then(|item| item.as_table_mut()) {
         set_input_value(input, "layout", layout_str(layout));
-        set_input_value(input, "primary_modifier", primary_modifier_str(primary_modifier));
+        set_input_value(
+            input,
+            "primary_modifier",
+            primary_modifier_str(primary_modifier),
+        );
         set_input_value(input, "meta_modifier", meta_modifier_str(meta_modifier));
         match langmap.map(str::trim).filter(|s| !s.is_empty()) {
             Some(lm) => set_input_value(input, "langmap", lm),
@@ -795,8 +796,7 @@ mode = "light"
 
     #[test]
     fn test_merge_theme_name_preserves_unrelated_keys() {
-        let source =
-            "# Personal\n[theme]\nmode = \"dark\"\n\n[input]\nlayout = \"none\"\n";
+        let source = "# Personal\n[theme]\nmode = \"dark\"\n\n[input]\nlayout = \"none\"\n";
         let merged = merge_theme_name(source, "gruvbox");
         assert!(merged.contains("name = \"gruvbox\""));
         assert!(merged.contains("# Personal"));

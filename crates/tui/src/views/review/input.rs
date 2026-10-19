@@ -409,26 +409,22 @@ fn execute_review_scope_action(
         match item.status {
             IssueStatus::Discussion => {
                 st.notify_warning(
-                    active_t("notify.review_discussion_status")
-                        .replace("{}", &item.id.to_string()),
+                    active_t("notify.review_discussion_status").replace("{}", &item.id.to_string()),
                 );
             }
             IssueStatus::Fixed => {
                 st.notify_info(
-                    active_t("notify.review_already_fixed")
-                        .replace("{}", &item.id.to_string()),
+                    active_t("notify.review_already_fixed").replace("{}", &item.id.to_string()),
                 );
             }
             IssueStatus::Skipped => {
                 st.notify_info(
-                    active_t("notify.review_skipped_status")
-                        .replace("{}", &item.id.to_string()),
+                    active_t("notify.review_skipped_status").replace("{}", &item.id.to_string()),
                 );
             }
             IssueStatus::Rejected => {
                 st.notify_warning(
-                    active_t("notify.review_rejected_status")
-                        .replace("{}", &item.id.to_string()),
+                    active_t("notify.review_rejected_status").replace("{}", &item.id.to_string()),
                 );
             }
             // A `REFINE` finding runs exactly like a planned one: the server
@@ -763,8 +759,7 @@ pub async fn handle_review_key(
             st.review.scroll = st.review.scroll.saturating_sub(page);
         }
         ReviewAction::PageDown => {
-            let max = (st.review.rendered_lines as u16)
-                .saturating_sub(st.review.view_height);
+            let max = (st.review.rendered_lines as u16).saturating_sub(st.review.view_height);
             st.review.scroll = st.review.scroll.saturating_add(page).min(max);
         }
         ReviewAction::FoldToggle => {
@@ -860,17 +855,13 @@ pub async fn handle_review_key(
             let sel_row = st.review.selected_row();
             if let Some(row) = sel_row {
                 match row {
-                    VisibleReviewRow::SessionHeader { session_id, title, .. } => {
+                    VisibleReviewRow::SessionHeader {
+                        session_id, title, ..
+                    } => {
                         execute_review_scope_action(&mut st, &session_id, None, None, &title);
                     }
                     VisibleReviewRow::SessionSummary { session_id, .. } => {
-                        execute_review_scope_action(
-                            &mut st,
-                            &session_id,
-                            None,
-                            None,
-                            &session_id,
-                        );
+                        execute_review_scope_action(&mut st, &session_id, None, None, &session_id);
                     }
                     VisibleReviewRow::ReviewItem {
                         session_id,
@@ -924,12 +915,7 @@ pub async fn handle_review_key(
 
                 if let Some(session) = session_opt {
                     let mut focused = Vec::new();
-                    if let VisibleReviewRow::ReviewItem {
-                        item_id,
-                        title,
-                        ..
-                    } = row
-                    {
+                    if let VisibleReviewRow::ReviewItem { item_id, title, .. } = row {
                         focused.push((item_id, title));
                     }
                     st.prompt_modal = Some(crate::app::PromptModalState::new(
@@ -1054,7 +1040,12 @@ pub async fn handle_review_key(
                         .map(|item| format_item_for_clipboard(&ReviewIssue::from(item.clone())))
                 }
                 Some(VisibleReviewRow::SessionHeader { session_id, .. }) => {
-                    let s_opt = st.review.sessions.iter().find(|s| s.id == session_id).or(st.review.session.as_ref());
+                    let s_opt = st
+                        .review
+                        .sessions
+                        .iter()
+                        .find(|s| s.id == session_id)
+                        .or(st.review.session.as_ref());
                     s_opt.map(|s| s.raw_markdown.clone())
                 }
                 Some(VisibleReviewRow::SessionSummary { description, .. }) => Some(description),
@@ -1163,12 +1154,7 @@ pub async fn handle_review_key(
         // Refresh review sessions from the server.
         ReviewAction::Refresh => {
             drop(st);
-            send_request(
-                server_writer,
-                methods::REVIEW_LIST,
-                serde_json::json!({}),
-            )
-            .await?;
+            send_request(server_writer, methods::REVIEW_LIST, serde_json::json!({})).await?;
         }
     }
 
@@ -1507,7 +1493,9 @@ mod tests {
         execute_all_reviews_action(&mut st);
 
         assert!(st.confirm_execute_review.is_none());
-        let notif = st.active_notification().expect("notification should be set");
+        let notif = st
+            .active_notification()
+            .expect("notification should be set");
         assert!(notif.text.contains("FIXED"));
     }
 

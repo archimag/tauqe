@@ -41,7 +41,11 @@ fn transaction_marker_path(dir: &Path) -> PathBuf {
 /// Reports whether the recorded transaction base is still part of the history of
 /// the commit currently checked out.
 fn is_ancestor_of_head(dir: &Path, ancestor: &str) -> bool {
-    run_git(Some(dir), &["merge-base", "--is-ancestor", ancestor, "HEAD"]).is_ok()
+    run_git(
+        Some(dir),
+        &["merge-base", "--is-ancestor", ancestor, "HEAD"],
+    )
+    .is_ok()
 }
 
 /// Persists the checkpoint of an open transaction so crash recovery can tell a
@@ -51,7 +55,10 @@ fn write_transaction_marker(dir: &Path, checkpoint: &CheckpointInfo) -> Result<(
     let path = transaction_marker_path(dir);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).with_context(|| {
-            format!("Failed to create transaction marker directory: {:?}", parent)
+            format!(
+                "Failed to create transaction marker directory: {:?}",
+                parent
+            )
         })?;
     }
     let json =
@@ -207,7 +214,12 @@ pub fn recover_interrupted_workflow(dir: &Path) -> Result<Option<String>> {
     for commit in &commits {
         let trailers = run_git(
             Some(dir),
-            &["log", "-1", "--format=%(trailers:key=Co-authored-by)", commit],
+            &[
+                "log",
+                "-1",
+                "--format=%(trailers:key=Co-authored-by)",
+                commit,
+            ],
         )
         .unwrap_or_default();
         if !trailers.contains("Tauqe AI") {
@@ -495,7 +507,11 @@ pub fn create_step_commit(dir: &Path, changed_files: &[String], step_name: &str)
 
     stage_files(dir, changed_files)?;
 
-    let commit_message = format!("tauqe-step: {}\n\n{}", step_name.trim(), TAUQE_CO_AUTHOR_TRAILER);
+    let commit_message = format!(
+        "tauqe-step: {}\n\n{}",
+        step_name.trim(),
+        TAUQE_CO_AUTHOR_TRAILER
+    );
     commit_with_developer_author(dir, &commit_message, false)?;
 
     let short_hash = run_git(Some(dir), &["rev-parse", "--short", "HEAD"])?
@@ -680,7 +696,10 @@ mod tests {
 
         assert!(!tmp_file.exists());
         assert!(!existing_bak.exists());
-        assert_eq!(fs::read_to_string(&existing_orig).unwrap(), "existing content");
+        assert_eq!(
+            fs::read_to_string(&existing_orig).unwrap(),
+            "existing content"
+        );
         assert!(!missing_bak.exists());
         assert_eq!(
             fs::read_to_string(path.join("missing.rs")).unwrap(),
@@ -701,7 +720,9 @@ mod tests {
 
         let recovery = recover_interrupted_workflow(path).unwrap();
         assert!(recovery.is_some());
-        assert!(recovery.unwrap().contains("Cleaned up 1 orphaned staging artifact(s)"));
+        assert!(recovery
+            .unwrap()
+            .contains("Cleaned up 1 orphaned staging artifact(s)"));
         assert!(!tmp_file.exists());
     }
 
@@ -828,7 +849,10 @@ mod tests {
 
         // User uncommitted work must be intact in the working tree
         assert!(user_file.exists());
-        assert_eq!(fs::read_to_string(&user_file).unwrap(), "original uncommitted work");
+        assert_eq!(
+            fs::read_to_string(&user_file).unwrap(),
+            "original uncommitted work"
+        );
         // Intermediate step modification should be removed
         assert!(!ai_file.exists());
     }

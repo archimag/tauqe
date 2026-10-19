@@ -19,13 +19,13 @@ mod tests;
 pub(crate) use common::find_duplicate_item_ids;
 pub(crate) use engine::resolve_architect_provider;
 // Re-exported for the review subsystem's shared architect discovery loop.
+pub use batch::{
+    handle_plan_execute, handle_plan_execute_pipeline, handle_plan_refine, handle_plan_replan,
+};
 #[allow(unused_imports)]
 pub(crate) use engine::{
     run_architect_discovery_loop, ArchitectDiscoveryError, ArchitectDiscoveryOutcome,
     ArchitectDiscoveryRequest,
-};
-pub use batch::{
-    handle_plan_execute, handle_plan_execute_pipeline, handle_plan_refine, handle_plan_replan,
 };
 pub(crate) use step::preload_step_files;
 pub use storage_ops::{

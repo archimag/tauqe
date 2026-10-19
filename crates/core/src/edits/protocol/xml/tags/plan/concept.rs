@@ -21,11 +21,16 @@ fn next_concept_item_bounds(text: &str) -> Option<(usize, usize)> {
         let after = start + open_len;
         let bytes = text.as_bytes();
         let mut idx = after;
-        while idx < bytes.len() && (bytes[idx].is_ascii_alphanumeric() || bytes[idx] == b'_' || bytes[idx] == b'-') {
+        while idx < bytes.len()
+            && (bytes[idx].is_ascii_alphanumeric() || bytes[idx] == b'_' || bytes[idx] == b'-')
+        {
             idx += 1;
         }
         let rest = &text[idx..];
-        let boundary = rest.chars().next().is_some_and(|c| c.is_whitespace() || c == '>' || c == '/');
+        let boundary = rest
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_whitespace() || c == '>' || c == '/');
         if !boundary {
             from = after;
             continue;
@@ -123,11 +128,16 @@ fn parse_concept_items_inner(content: &str) -> (Vec<tauqe_protocol::ConceptItem>
         let after = start + open_len;
         let bytes = &content.as_bytes()[after..];
         let mut idx = 0;
-        while idx < bytes.len() && (bytes[idx] == b'_' || bytes[idx] == b'-' || bytes[idx].is_ascii_alphanumeric()) {
+        while idx < bytes.len()
+            && (bytes[idx] == b'_' || bytes[idx] == b'-' || bytes[idx].is_ascii_alphanumeric())
+        {
             idx += 1;
         }
         let rest = &content[after + idx..];
-        let boundary = rest.chars().next().is_some_and(|c| c.is_whitespace() || c == '>' || c == '/');
+        let boundary = rest
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_whitespace() || c == '>' || c == '/');
         if !boundary {
             pos = after;
             continue;
@@ -139,8 +149,14 @@ fn parse_concept_items_inner(content: &str) -> (Vec<tauqe_protocol::ConceptItem>
         };
         let header_end = after + idx + gt + 1;
         let header = &content[start..header_end];
-        let id = extract_attribute(header, "id").unwrap_or_default().trim().to_string();
-        let raw_title = extract_attribute(header, "title").unwrap_or_default().trim().to_string();
+        let id = extract_attribute(header, "id")
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        let raw_title = extract_attribute(header, "title")
+            .unwrap_or_default()
+            .trim()
+            .to_string();
         let attr_details = extract_attribute(header, "details")
             .or_else(|| extract_attribute(header, "description"))
             .map(|s| s.trim().to_string())
@@ -149,7 +165,11 @@ fn parse_concept_items_inner(content: &str) -> (Vec<tauqe_protocol::ConceptItem>
         if rest[..gt].trim_end().ends_with('/') {
             if !id.is_empty() || !raw_title.is_empty() {
                 items.push(tauqe_protocol::ConceptItem {
-                    id: if id.is_empty() { format!("c-{}", items.len() + 1) } else { id },
+                    id: if id.is_empty() {
+                        format!("c-{}", items.len() + 1)
+                    } else {
+                        id
+                    },
                     title: raw_title,
                     details: attr_details,
                     children: Vec::new(),
@@ -209,7 +229,8 @@ fn parse_concept_items_inner(content: &str) -> (Vec<tauqe_protocol::ConceptItem>
                 errors.extend(child_errors);
                 let text_only = strip_tags(body, next_concept_item_bounds);
 
-                let (inner_title, text_without_title) = extract_and_strip_inner_tag(&text_only, "title");
+                let (inner_title, text_without_title) =
+                    extract_and_strip_inner_tag(&text_only, "title");
                 let mut title = raw_title;
                 if title.is_empty() {
                     if let Some(it) = inner_title {
@@ -251,7 +272,11 @@ fn parse_concept_items_inner(content: &str) -> (Vec<tauqe_protocol::ConceptItem>
 
                 if !id.is_empty() || !title.is_empty() {
                     items.push(tauqe_protocol::ConceptItem {
-                        id: if id.is_empty() { format!("c-{}", items.len() + 1) } else { id.clone() },
+                        id: if id.is_empty() {
+                            format!("c-{}", items.len() + 1)
+                        } else {
+                            id.clone()
+                        },
                         title: if title.is_empty() { id } else { title },
                         details,
                         children,
@@ -259,7 +284,9 @@ fn parse_concept_items_inner(content: &str) -> (Vec<tauqe_protocol::ConceptItem>
                 }
                 pos = cend_full;
             } else {
-                errors.push(format!("Malformed concept item tag: missing closing tag </{tag_name}>"));
+                errors.push(format!(
+                    "Malformed concept item tag: missing closing tag </{tag_name}>"
+                ));
                 pos = header_end;
             }
         }
@@ -268,7 +295,10 @@ fn parse_concept_items_inner(content: &str) -> (Vec<tauqe_protocol::ConceptItem>
     (items, errors)
 }
 
-fn parse_fallback_item_header(text: &str, fallback_index: usize) -> (String, String, Option<String>) {
+fn parse_fallback_item_header(
+    text: &str,
+    fallback_index: usize,
+) -> (String, String, Option<String>) {
     let raw = text.trim();
     let mut words = raw.split_whitespace();
     let first_word = words.next().unwrap_or("");
@@ -276,17 +306,36 @@ fn parse_fallback_item_header(text: &str, fallback_index: usize) -> (String, Str
 
     let (id, remainder) = if clean_first.starts_with("#c-") || clean_first.starts_with("#c_") {
         let id_val = clean_first.trim_start_matches('#');
-        let rem = raw.strip_prefix(first_word).unwrap_or(raw).trim().trim_start_matches(':').trim();
+        let rem = raw
+            .strip_prefix(first_word)
+            .unwrap_or(raw)
+            .trim()
+            .trim_start_matches(':')
+            .trim();
         (id_val.to_string(), rem)
     } else if clean_first.starts_with("c-") || clean_first.starts_with("c_") {
-        let rem = raw.strip_prefix(first_word).unwrap_or(raw).trim().trim_start_matches(':').trim();
+        let rem = raw
+            .strip_prefix(first_word)
+            .unwrap_or(raw)
+            .trim()
+            .trim_start_matches(':')
+            .trim();
         (clean_first.to_string(), rem)
     } else if clean_first.starts_with('#')
-        && clean_first.strip_prefix('#').unwrap_or("").chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
+        && clean_first
+            .strip_prefix('#')
+            .unwrap_or("")
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
         && clean_first.len() > 1
     {
         let id_val = clean_first.trim_start_matches('#');
-        let rem = raw.strip_prefix(first_word).unwrap_or(raw).trim().trim_start_matches(':').trim();
+        let rem = raw
+            .strip_prefix(first_word)
+            .unwrap_or(raw)
+            .trim()
+            .trim_start_matches(':')
+            .trim();
         let formatted_id = if id_val.starts_with("c-") {
             id_val.to_string()
         } else {
@@ -334,7 +383,9 @@ fn parse_concept_items_fallback(content: &str) -> Vec<tauqe_protocol::ConceptIte
             Some(rest.trim())
         } else if let Some(rest) = trimmed.strip_prefix(|c: char| c.is_ascii_digit()) {
             let after_digits = rest.trim_start_matches(|c: char| c.is_ascii_digit());
-            after_digits.strip_prefix(". ").map(|after_dot| after_dot.trim())
+            after_digits
+                .strip_prefix(". ")
+                .map(|after_dot| after_dot.trim())
         } else if trimmed.starts_with("#c-")
             || trimmed.starts_with("c-")
             || trimmed.starts_with("#c_")

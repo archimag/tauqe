@@ -10,10 +10,10 @@ use ratatui::style::{Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
+use super::{editor_lines, render_modal_confirm, ConfirmModalParams, ModalTone};
 use crate::i18n::active_t;
 use crate::theme::engine::current_engine;
 use crate::ui::header::truncate_to_width;
-use super::{editor_lines, render_modal_confirm, ConfirmModalParams, ModalTone};
 
 /// Squash dialog uses almost the whole terminal so that all panes stay readable.
 pub fn squash_dialog_area(term: Rect) -> Rect {
@@ -72,7 +72,10 @@ pub fn squash_discard_params(dialog: &crate::app::SquashDialogState) -> ConfirmM
     }
 }
 
-pub fn render_squash_discard_popup(frame: &mut ratatui::Frame, dialog: &crate::app::SquashDialogState) {
+pub fn render_squash_discard_popup(
+    frame: &mut ratatui::Frame,
+    dialog: &crate::app::SquashDialogState,
+) {
     render_modal_confirm(frame, squash_discard_params(dialog));
 }
 
@@ -118,25 +121,40 @@ pub fn render_squash_popup(frame: &mut ratatui::Frame, dialog: &mut crate::app::
     let upstream_available = dialog.upstream_base.is_some();
 
     let style_s = if dialog.base_mode == crate::app::SquashBaseMode::Session {
-        engine.bg(palette.button_active_bg).fg(engine.color(palette.text_inverse)).bold()
+        engine
+            .bg(palette.button_active_bg)
+            .fg(engine.color(palette.text_inverse))
+            .bold()
     } else if session_available {
-        engine.bg(palette.button_bg).fg(engine.color(palette.button_fg))
+        engine
+            .bg(palette.button_bg)
+            .fg(engine.color(palette.button_fg))
     } else {
         engine.fg(palette.text_muted)
     };
 
     let style_u = if dialog.base_mode == crate::app::SquashBaseMode::Upstream {
-        engine.bg(palette.button_active_bg).fg(engine.color(palette.text_inverse)).bold()
+        engine
+            .bg(palette.button_active_bg)
+            .fg(engine.color(palette.text_inverse))
+            .bold()
     } else if upstream_available {
-        engine.bg(palette.button_bg).fg(engine.color(palette.button_fg))
+        engine
+            .bg(palette.button_bg)
+            .fg(engine.color(palette.button_fg))
     } else {
         engine.fg(palette.text_muted)
     };
 
     let style_c = if dialog.base_mode == crate::app::SquashBaseMode::Custom {
-        engine.bg(palette.button_active_bg).fg(engine.color(palette.text_inverse)).bold()
+        engine
+            .bg(palette.button_active_bg)
+            .fg(engine.color(palette.text_inverse))
+            .bold()
     } else {
-        engine.bg(palette.button_bg).fg(engine.color(palette.button_fg))
+        engine
+            .bg(palette.button_bg)
+            .fg(engine.color(palette.button_fg))
     };
 
     let mut header_lines = Vec::new();
@@ -173,10 +191,16 @@ pub fn render_squash_popup(frame: &mut ratatui::Frame, dialog: &mut crate::app::
         ));
         header_lines.push(Line::from(custom_line));
     } else if let Some(status) = &dialog.status_message {
-        header_lines.push(Line::from(Span::styled(status, engine.fg(palette.status_warning))));
+        header_lines.push(Line::from(Span::styled(
+            status,
+            engine.fg(palette.status_warning),
+        )));
     } else {
         header_lines.push(Line::from(vec![
-            Span::styled(active_t("dialog.squash.stats_label"), engine.fg(palette.text_muted).bold()),
+            Span::styled(
+                active_t("dialog.squash.stats_label"),
+                engine.fg(palette.text_muted).bold(),
+            ),
             Span::styled(&dialog.diff_stat, engine.fg(palette.diff_added)),
             Span::styled(
                 active_t("dialog.squash.stats_note"),
@@ -219,7 +243,10 @@ pub fn render_squash_popup(frame: &mut ratatui::Frame, dialog: &mut crate::app::
             let fold_icon = if f.expanded { "▼ " } else { "▶ " };
             let prefix = if is_sel { "● " } else { "  " };
             let style = if is_sel {
-                engine.bg(palette.overlay).fg(engine.color(palette.text_primary)).bold()
+                engine
+                    .bg(palette.overlay)
+                    .fg(engine.color(palette.text_primary))
+                    .bold()
             } else {
                 engine.fg(palette.text_primary)
             };
@@ -238,12 +265,17 @@ pub fn render_squash_popup(frame: &mut ratatui::Frame, dialog: &mut crate::app::
     let file_list_widget = Paragraph::new(file_lines)
         .block(
             Block::default()
-                .title(
-                    active_t("dialog.squash.files_title")
-                        .replacen("{}", &dialog.files.len().to_string(), 1),
-                )
+                .title(active_t("dialog.squash.files_title").replacen(
+                    "{}",
+                    &dialog.files.len().to_string(),
+                    1,
+                ))
                 .borders(Borders::ALL)
-                .border_style(if is_files_focus { engine.fg(palette.status_info) } else { engine.fg(palette.border) })
+                .border_style(if is_files_focus {
+                    engine.fg(palette.status_info)
+                } else {
+                    engine.fg(palette.border)
+                })
                 .style(Style::default().bg(engine.color(palette.surface))),
         )
         .scroll((files_offset as u16, 0));
@@ -264,7 +296,10 @@ pub fn render_squash_popup(frame: &mut ratatui::Frame, dialog: &mut crate::app::
                 } else if l.starts_with('-') && !l.starts_with("---") {
                     diff_lines.push(Line::from(Span::styled(l, engine.fg(palette.diff_removed))));
                 } else if l.starts_with("@@") {
-                    diff_lines.push(Line::from(Span::styled(l, engine.fg(palette.status_info).bold())));
+                    diff_lines.push(Line::from(Span::styled(
+                        l,
+                        engine.fg(palette.status_info).bold(),
+                    )));
                 } else {
                     diff_lines.push(Line::from(Span::styled(l, engine.fg(palette.diff_context))));
                 }
@@ -290,7 +325,11 @@ pub fn render_squash_popup(frame: &mut ratatui::Frame, dialog: &mut crate::app::
             Block::default()
                 .title(format!(" {} ", active_t("dialog.squash.diff_title")))
                 .borders(Borders::ALL)
-                .border_style(if is_diff_focus { engine.fg(palette.status_info) } else { engine.fg(palette.border) })
+                .border_style(if is_diff_focus {
+                    engine.fg(palette.status_info)
+                } else {
+                    engine.fg(palette.border)
+                })
                 .style(Style::default().bg(engine.color(palette.surface))),
         )
         .scroll((dialog.diff_scroll, 0));
@@ -335,7 +374,11 @@ pub fn render_squash_popup(frame: &mut ratatui::Frame, dialog: &mut crate::app::
             Block::default()
                 .title(msg_title)
                 .borders(Borders::ALL)
-                .border_style(if is_msg_focus { engine.fg(palette.status_success) } else { engine.fg(palette.border) })
+                .border_style(if is_msg_focus {
+                    engine.fg(palette.status_success)
+                } else {
+                    engine.fg(palette.border)
+                })
                 .style(Style::default().bg(engine.color(palette.surface))),
         )
         .scroll((msg_scroll, 0));
@@ -344,28 +387,88 @@ pub fn render_squash_popup(frame: &mut ratatui::Frame, dialog: &mut crate::app::
     // Footer actions (contextual: letter keys are literal text while the editor has focus)
     let footer_line = if is_msg_focus {
         Line::from(vec![
-            Span::styled(" Ctrl+G ", engine.bg(palette.status_warning).fg(engine.color(palette.text_inverse)).bold()),
+            Span::styled(
+                " Ctrl+G ",
+                engine
+                    .bg(palette.status_warning)
+                    .fg(engine.color(palette.text_inverse))
+                    .bold(),
+            ),
             Span::raw(format!(" {}  ", active_t("dialog.squash.footer.generate"))),
-            Span::styled(" Ctrl+Enter / Ctrl+S ", engine.bg(palette.status_success).fg(engine.color(palette.text_inverse)).bold()),
+            Span::styled(
+                " Ctrl+Enter / Ctrl+S ",
+                engine
+                    .bg(palette.status_success)
+                    .fg(engine.color(palette.text_inverse))
+                    .bold(),
+            ),
             Span::raw(format!(" {}  ", active_t("dialog.squash.footer.apply"))),
-            Span::styled(" Tab / Esc ", engine.bg(palette.button_bg).fg(engine.color(palette.button_fg)).bold()),
+            Span::styled(
+                " Tab / Esc ",
+                engine
+                    .bg(palette.button_bg)
+                    .fg(engine.color(palette.button_fg))
+                    .bold(),
+            ),
             Span::raw(format!(" {}", active_t("dialog.squash.footer.file_list"))),
         ])
     } else {
         Line::from(vec![
-            Span::styled(" 1/2/3 ", engine.bg(palette.button_bg).fg(engine.color(palette.button_fg)).bold()),
+            Span::styled(
+                " 1/2/3 ",
+                engine
+                    .bg(palette.button_bg)
+                    .fg(engine.color(palette.button_fg))
+                    .bold(),
+            ),
             Span::raw(format!(" {}  ", active_t("dialog.squash.footer.base"))),
-            Span::styled(" Space/Enter ", engine.bg(palette.button_bg).fg(engine.color(palette.button_fg)).bold()),
+            Span::styled(
+                " Space/Enter ",
+                engine
+                    .bg(palette.button_bg)
+                    .fg(engine.color(palette.button_fg))
+                    .bold(),
+            ),
             Span::raw(format!(" {}  ", active_t("dialog.squash.footer.fold"))),
-            Span::styled(" Tab ", engine.bg(palette.button_bg).fg(engine.color(palette.button_fg)).bold()),
+            Span::styled(
+                " Tab ",
+                engine
+                    .bg(palette.button_bg)
+                    .fg(engine.color(palette.button_fg))
+                    .bold(),
+            ),
             Span::raw(format!(" {}  ", active_t("dialog.squash.footer.focus"))),
-            Span::styled(" g ", engine.bg(palette.status_warning).fg(engine.color(palette.text_inverse)).bold()),
+            Span::styled(
+                " g ",
+                engine
+                    .bg(palette.status_warning)
+                    .fg(engine.color(palette.text_inverse))
+                    .bold(),
+            ),
             Span::raw(format!(" {}  ", active_t("dialog.squash.footer.generate"))),
-            Span::styled(" e ", engine.bg(palette.button_bg).fg(engine.color(palette.button_fg)).bold()),
+            Span::styled(
+                " e ",
+                engine
+                    .bg(palette.button_bg)
+                    .fg(engine.color(palette.button_fg))
+                    .bold(),
+            ),
             Span::raw(format!(" {}  ", active_t("dialog.squash.footer.edit"))),
-            Span::styled(" Ctrl+Enter / Ctrl+S ", engine.bg(palette.status_success).fg(engine.color(palette.text_inverse)).bold()),
+            Span::styled(
+                " Ctrl+Enter / Ctrl+S ",
+                engine
+                    .bg(palette.status_success)
+                    .fg(engine.color(palette.text_inverse))
+                    .bold(),
+            ),
             Span::raw(format!(" {}  ", active_t("dialog.squash.footer.apply"))),
-            Span::styled(" Esc ", engine.bg(palette.button_bg).fg(engine.color(palette.button_fg)).bold()),
+            Span::styled(
+                " Esc ",
+                engine
+                    .bg(palette.button_bg)
+                    .fg(engine.color(palette.button_fg))
+                    .bold(),
+            ),
             Span::raw(format!(" {}", active_t("dialog.squash.footer.close"))),
         ])
     };
@@ -389,7 +492,13 @@ pub fn render_squash_popup(frame: &mut ratatui::Frame, dialog: &mut crate::app::
 pub fn squash_apply_params(dialog: &crate::app::SquashDialogState) -> ConfirmModalParams<'_> {
     let engine = current_engine();
     let palette = engine.palette();
-    let first_line = dialog.message_editor.get_text().lines().next().unwrap_or("").trim();
+    let first_line = dialog
+        .message_editor
+        .get_text()
+        .lines()
+        .next()
+        .unwrap_or("")
+        .trim();
     let msg_preview = if first_line.is_empty() {
         active_t("dialog.squash_confirm.no_message")
     } else {
@@ -406,16 +515,25 @@ pub fn squash_apply_params(dialog: &crate::app::SquashDialogState) -> ConfirmMod
         Line::from(vec![
             Span::raw(active_t("dialog.squash_confirm.squashing_label")),
             Span::styled(
-                active_t("dialog.squash_confirm.commit_count")
-                    .replacen("{}", &dialog.commits.len().to_string(), 1),
+                active_t("dialog.squash_confirm.commit_count").replacen(
+                    "{}",
+                    &dialog.commits.len().to_string(),
+                    1,
+                ),
                 engine.fg(palette.status_info).bold(),
             ),
             Span::raw(active_t("dialog.squash_confirm.squash_tail")),
-            Span::styled(dialog.base_ref.clone(), engine.fg(palette.status_success).bold()),
+            Span::styled(
+                dialog.base_ref.clone(),
+                engine.fg(palette.status_success).bold(),
+            ),
         ]),
         Line::from(vec![
             Span::raw(active_t("dialog.squash_confirm.message_label")),
-            Span::styled(format!("\"{}\"", msg_preview), engine.fg(palette.text_primary)),
+            Span::styled(
+                format!("\"{}\"", msg_preview),
+                engine.fg(palette.text_primary),
+            ),
         ]),
         Line::from(Span::styled(
             active_t("dialog.squash_confirm.note"),
@@ -435,6 +553,9 @@ pub fn squash_apply_params(dialog: &crate::app::SquashDialogState) -> ConfirmMod
     }
 }
 
-pub fn render_squash_confirm_popup(frame: &mut ratatui::Frame, dialog: &crate::app::SquashDialogState) {
+pub fn render_squash_confirm_popup(
+    frame: &mut ratatui::Frame,
+    dialog: &crate::app::SquashDialogState,
+) {
     render_modal_confirm(frame, squash_apply_params(dialog));
 }

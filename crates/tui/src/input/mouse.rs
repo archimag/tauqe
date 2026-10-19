@@ -2,8 +2,8 @@ use std::sync::Arc;
 
 use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
-use tokio::sync::Mutex;
 use tauqe_protocol::{methods, DiscussionFocus};
+use tokio::sync::Mutex;
 
 use crate::app::{ActiveModal, AppState, HelpTab, LocaleDialogButton, ViewMode};
 use crate::input::InputResult;
@@ -67,18 +67,16 @@ pub async fn handle_mouse_event(
             let term_rect = st.last_frame_area;
             if let Some(ref mut dialog) = st.status_dialog {
                 let count = dialog.target.options_count();
-                let visible =
-                    crate::dialogs::render::status_dialog_options_area(term_rect, count)
-                        .height
-                        .max(1) as usize;
+                let visible = crate::dialogs::render::status_dialog_options_area(term_rect, count)
+                    .height
+                    .max(1) as usize;
                 dialog.selector.select_prev(visible);
                 return Ok(InputResult::Continue);
             }
             if let Some(ref mut dialog) = st.selection_dialog {
                 let area =
                     crate::dialogs::render::selection_dialog_area(term_rect, dialog.items.len());
-                let visible_height =
-                    crate::dialogs::render::selection_dialog_visible_height(area);
+                let visible_height = crate::dialogs::render::selection_dialog_visible_height(area);
                 dialog.selector.select_prev(visible_height);
                 return Ok(InputResult::Continue);
             }
@@ -103,7 +101,8 @@ pub async fn handle_mouse_event(
                             dialog.diff_scroll = 0;
                         }
                     } else {
-                        dialog.diff_scroll = dialog.diff_scroll.saturating_sub(MOUSE_SCROLL_STEP as u16);
+                        dialog.diff_scroll =
+                            dialog.diff_scroll.saturating_sub(MOUSE_SCROLL_STEP as u16);
                     }
                     return Ok(InputResult::Continue);
                 }
@@ -119,20 +118,28 @@ pub async fn handle_mouse_event(
                 }
                 ViewMode::History => {
                     st.history_view.auto_scroll = false;
-                    st.history_view.scroll = st.history_view.scroll.saturating_sub(MOUSE_SCROLL_STEP as u16);
+                    st.history_view.scroll = st
+                        .history_view
+                        .scroll
+                        .saturating_sub(MOUSE_SCROLL_STEP as u16);
                     let h = st.last_model_height;
                     let w = st.history_view.content_width;
                     st.history_view.update_selected_item_from_scroll(h, Some(w));
                 }
                 ViewMode::Context => {
-                    st.context_view.cursor_index =
-                        st.context_view.cursor_index.saturating_sub(MOUSE_SCROLL_STEP);
+                    st.context_view.cursor_index = st
+                        .context_view
+                        .cursor_index
+                        .saturating_sub(MOUSE_SCROLL_STEP);
                 }
                 ViewMode::Review => {
                     st.review.scroll = st.review.scroll.saturating_sub(MOUSE_SCROLL_STEP as u16);
                 }
                 ViewMode::Plans => {
-                    st.plans_view.scroll = st.plans_view.scroll.saturating_sub(MOUSE_SCROLL_STEP as u16);
+                    st.plans_view.scroll = st
+                        .plans_view
+                        .scroll
+                        .saturating_sub(MOUSE_SCROLL_STEP as u16);
                 }
                 ViewMode::Onboarding => {}
             }
@@ -142,18 +149,16 @@ pub async fn handle_mouse_event(
             let term_rect = st.last_frame_area;
             if let Some(ref mut dialog) = st.status_dialog {
                 let count = dialog.target.options_count();
-                let visible =
-                    crate::dialogs::render::status_dialog_options_area(term_rect, count)
-                        .height
-                        .max(1) as usize;
+                let visible = crate::dialogs::render::status_dialog_options_area(term_rect, count)
+                    .height
+                    .max(1) as usize;
                 dialog.selector.select_next(visible);
                 return Ok(InputResult::Continue);
             }
             if let Some(ref mut dialog) = st.selection_dialog {
                 let area =
                     crate::dialogs::render::selection_dialog_area(term_rect, dialog.items.len());
-                let visible_height =
-                    crate::dialogs::render::selection_dialog_visible_height(area);
+                let visible_height = crate::dialogs::render::selection_dialog_visible_height(area);
                 dialog.selector.select_next(visible_height);
                 return Ok(InputResult::Continue);
             }
@@ -171,12 +176,15 @@ pub async fn handle_mouse_event(
                     let (_area, files_rect, _diff_rect) =
                         crate::dialogs::render::squash_dialog_chunks(term_rect);
                     if rect_contains(files_rect, mouse.column, mouse.row) {
-                        if !dialog.files.is_empty() && dialog.selected_file_index + 1 < dialog.files.len() {
+                        if !dialog.files.is_empty()
+                            && dialog.selected_file_index + 1 < dialog.files.len()
+                        {
                             dialog.selected_file_index += 1;
                             dialog.diff_scroll = 0;
                         }
                     } else {
-                        dialog.diff_scroll = dialog.diff_scroll.saturating_add(MOUSE_SCROLL_STEP as u16);
+                        dialog.diff_scroll =
+                            dialog.diff_scroll.saturating_add(MOUSE_SCROLL_STEP as u16);
                     }
                     return Ok(InputResult::Continue);
                 }
@@ -189,7 +197,8 @@ pub async fn handle_mouse_event(
                 ViewMode::Repl => {
                     let view_height = st.last_model_height;
                     let max = st.model.max_scroll(view_height);
-                    st.model.scroll = (st.model.scroll.saturating_add(MOUSE_SCROLL_STEP as u16)).min(max);
+                    st.model.scroll =
+                        (st.model.scroll.saturating_add(MOUSE_SCROLL_STEP as u16)).min(max);
                     if st.model.scroll >= max {
                         st.model.auto_scroll = true;
                     }
@@ -198,9 +207,14 @@ pub async fn handle_mouse_event(
                     let view_height = st.last_model_height;
                     let total = st.history_view.rendered_lines_count as u16;
                     let max = total.saturating_sub(view_height);
-                    st.history_view.scroll = (st.history_view.scroll.saturating_add(MOUSE_SCROLL_STEP as u16)).min(max);
+                    st.history_view.scroll = (st
+                        .history_view
+                        .scroll
+                        .saturating_add(MOUSE_SCROLL_STEP as u16))
+                    .min(max);
                     let w = st.history_view.content_width;
-                    st.history_view.update_selected_item_from_scroll(view_height, Some(w));
+                    st.history_view
+                        .update_selected_item_from_scroll(view_height, Some(w));
                     if st.history_view.scroll >= max {
                         st.history_view.auto_scroll = true;
                     }
@@ -213,12 +227,22 @@ pub async fn handle_mouse_event(
                     }
                 }
                 ViewMode::Review => {
-                    let max = (st.review.rendered_lines as u16).saturating_sub(st.review.view_height);
-                    st.review.scroll = st.review.scroll.saturating_add(MOUSE_SCROLL_STEP as u16).min(max);
+                    let max =
+                        (st.review.rendered_lines as u16).saturating_sub(st.review.view_height);
+                    st.review.scroll = st
+                        .review
+                        .scroll
+                        .saturating_add(MOUSE_SCROLL_STEP as u16)
+                        .min(max);
                 }
                 ViewMode::Plans => {
-                    let max = (st.plans_view.rendered_lines as u16).saturating_sub(st.plans_view.view_height);
-                    st.plans_view.scroll = st.plans_view.scroll.saturating_add(MOUSE_SCROLL_STEP as u16).min(max);
+                    let max = (st.plans_view.rendered_lines as u16)
+                        .saturating_sub(st.plans_view.view_height);
+                    st.plans_view.scroll = st
+                        .plans_view
+                        .scroll
+                        .saturating_add(MOUSE_SCROLL_STEP as u16)
+                        .min(max);
                 }
                 ViewMode::Onboarding => {}
             }
@@ -262,11 +286,17 @@ pub async fn handle_mouse_event(
                                     match kind {
                                         crate::app::SquashConfirm::Apply => {
                                             let base_ref = dialog.base_ref.clone();
-                                            let message = dialog.message_editor.get_text().trim().to_string();
+                                            let message =
+                                                dialog.message_editor.get_text().trim().to_string();
                                             dialog.applying = true;
-                                            dialog.status_message = Some(crate::i18n::active_t("dialog.squash.status_applying"));
+                                            dialog.status_message = Some(crate::i18n::active_t(
+                                                "dialog.squash.status_applying",
+                                            ));
                                             drop(st);
-                                            let params = tauqe_protocol::GitSquashApplyParams { base_ref, message };
+                                            let params = tauqe_protocol::GitSquashApplyParams {
+                                                base_ref,
+                                                message,
+                                            };
                                             send_request(
                                                 server_writer,
                                                 methods::GIT_SQUASH_APPLY,
@@ -302,12 +332,14 @@ pub async fn handle_mouse_event(
 
                         if rect_contains(files_rect, mouse.column, mouse.row) {
                             let files_visible = files_rect.height.saturating_sub(2) as usize;
-                            let files_offset = (dialog.selected_file_index + 1).saturating_sub(files_visible);
+                            let files_offset =
+                                (dialog.selected_file_index + 1).saturating_sub(files_visible);
                             let clicked_row = (mouse.row.saturating_sub(files_rect.y + 1)) as usize;
                             let clicked_idx = files_offset + clicked_row;
                             if clicked_idx < dialog.files.len() {
                                 if clicked_idx == dialog.selected_file_index {
-                                    dialog.files[clicked_idx].expanded = !dialog.files[clicked_idx].expanded;
+                                    dialog.files[clicked_idx].expanded =
+                                        !dialog.files[clicked_idx].expanded;
                                 } else {
                                     dialog.selected_file_index = clicked_idx;
                                     dialog.diff_scroll = 0;
@@ -425,10 +457,20 @@ pub async fn handle_mouse_event(
                                 let cancel_model = st.model.is_busy();
                                 drop(st);
                                 if cancel_review {
-                                    send_request(server_writer, methods::REVIEW_CANCEL, serde_json::json!({})).await?;
+                                    send_request(
+                                        server_writer,
+                                        methods::REVIEW_CANCEL,
+                                        serde_json::json!({}),
+                                    )
+                                    .await?;
                                 }
                                 if cancel_model || !cancel_review {
-                                    send_request(server_writer, methods::MODEL_CANCEL, serde_json::json!({})).await?;
+                                    send_request(
+                                        server_writer,
+                                        methods::MODEL_CANCEL,
+                                        serde_json::json!({}),
+                                    )
+                                    .await?;
                                 }
                             }
                             ModalHit::Cancel | ModalHit::Outside => {
@@ -489,10 +531,8 @@ pub async fn handle_mouse_event(
                 }
                 Some(ActiveModal::ClearAuto) => {
                     if st.context_view.confirm_clear_auto {
-                        let geom = geometry_of(
-                            term_rect,
-                            &crate::dialogs::render::clear_auto_params(&st),
-                        );
+                        let geom =
+                            geometry_of(term_rect, &crate::dialogs::render::clear_auto_params(&st));
                         match check_confirm_hit(&geom, mouse.column, mouse.row) {
                             ModalHit::Confirm => {
                                 st.context_view.confirm_clear_auto = false;
@@ -518,10 +558,8 @@ pub async fn handle_mouse_event(
                 }
                 Some(ActiveModal::ClearUser) => {
                     if st.context_view.confirm_clear_user {
-                        let geom = geometry_of(
-                            term_rect,
-                            &crate::dialogs::render::clear_user_params(&st),
-                        );
+                        let geom =
+                            geometry_of(term_rect, &crate::dialogs::render::clear_user_params(&st));
                         match check_confirm_hit(&geom, mouse.column, mouse.row) {
                             ModalHit::Confirm => {
                                 st.context_view.confirm_clear_user = false;
@@ -671,7 +709,8 @@ pub async fn handle_mouse_event(
                                 st.confirm_delete_review = None;
                                 st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
                                 drop(st);
-                                crate::dialogs::input::delete_review(server_writer, review_id).await?;
+                                crate::dialogs::input::delete_review(server_writer, review_id)
+                                    .await?;
                             }
                             ModalHit::Cancel | ModalHit::Outside => {
                                 st.confirm_delete_review = None;
@@ -724,8 +763,7 @@ pub async fn handle_mouse_event(
                                 if index < target.selector.len() {
                                     target.selector.select_index(index);
                                 }
-                                target.focus =
-                                    crate::views::plans::RefineDialogFocus::ModelList;
+                                target.focus = crate::views::plans::RefineDialogFocus::ModelList;
                             } else if rect_contains(geo.editor_area, mouse.column, mouse.row) {
                                 target.focus =
                                     crate::views::plans::RefineDialogFocus::InstructionsEditor;
@@ -963,7 +1001,12 @@ pub async fn handle_mouse_event(
                         // Apply can never fall through to the dismiss path.
                         if rect_contains(apply_btn, mouse.column, mouse.row) {
                             let chosen = dialog.selector.selected_index();
-                            crate::dialogs::input::apply_status_dialog(&mut st, chosen, server_writer).await?;
+                            crate::dialogs::input::apply_status_dialog(
+                                &mut st,
+                                chosen,
+                                server_writer,
+                            )
+                            .await?;
                         } else if rect_contains(cancel_btn, mouse.column, mouse.row) {
                             st.status_dialog = None;
                         } else if rect_contains(options_area, mouse.column, mouse.row) {
@@ -975,7 +1018,12 @@ pub async fn handle_mouse_event(
                             let clicked_row = dialog.selector.scroll_offset()
                                 + (mouse.row - options_area.y) as usize;
                             if clicked_row < options_count {
-                                crate::dialogs::input::apply_status_dialog(&mut st, clicked_row, server_writer).await?;
+                                crate::dialogs::input::apply_status_dialog(
+                                    &mut st,
+                                    clicked_row,
+                                    server_writer,
+                                )
+                                .await?;
                             }
                         } else if !rect_contains(area, mouse.column, mouse.row) {
                             st.status_dialog = None;
@@ -989,16 +1037,20 @@ pub async fn handle_mouse_event(
                             crate::dialogs::render::selection_dialog_area(term_rect, item_count);
                         let (select_btn, cancel_btn) =
                             crate::dialogs::render::selection::selection_dialog_buttons(
-                                term_rect,
-                                item_count,
+                                term_rect, item_count,
                             );
 
                         // Action footer: Select activates the highlighted row, Cancel dismisses.
                         if rect_contains(select_btn, mouse.column, mouse.row) {
-                            let selected = dialog.items.get(dialog.selector.selected_index()).cloned();
+                            let selected =
+                                dialog.items.get(dialog.selector.selected_index()).cloned();
                             if let Some(item) = selected {
-                                crate::dialogs::input::activate_selection_item(st, item, server_writer)
-                                    .await?;
+                                crate::dialogs::input::activate_selection_item(
+                                    st,
+                                    item,
+                                    server_writer,
+                                )
+                                .await?;
                             }
                             return Ok(InputResult::Continue);
                         }
@@ -1012,16 +1064,25 @@ pub async fn handle_mouse_event(
                             return Ok(InputResult::Continue);
                         }
 
-                        let inner_height = crate::dialogs::render::selection_dialog_visible_height(area);
-                        let scroll_offset = dialog.selector.scroll_offset();
-                        let start_y = area.y + 2;
-                        if mouse.row >= start_y && (mouse.row as usize) < start_y as usize + inner_height {
-                            let clicked_visible = (mouse.row - start_y) as usize;
-                            let clicked_idx = scroll_offset + clicked_visible;
+                        // Rows resolve through the same list rectangle the
+                        // renderer draws, so the air above the first row and
+                        // below the last one never activates an item
+                        // (Conventions §6.6, §6.7, c-3).
+                        let list_area =
+                            crate::dialogs::render::selection::selection_dialog_list_area(
+                                term_rect, item_count,
+                            );
+                        if rect_contains(list_area, mouse.column, mouse.row) {
+                            let clicked_visible = (mouse.row - list_area.y) as usize;
+                            let clicked_idx = dialog.selector.scroll_offset() + clicked_visible;
                             let clicked = dialog.items.get(clicked_idx).cloned();
                             if let Some(item) = clicked {
-                                crate::dialogs::input::activate_selection_item(st, item, server_writer)
-                                    .await?;
+                                crate::dialogs::input::activate_selection_item(
+                                    st,
+                                    item,
+                                    server_writer,
+                                )
+                                .await?;
                             }
                         }
                     }
@@ -1089,35 +1150,64 @@ pub async fn handle_mouse_event(
 
                     if st.header_clicks.row > 0 && mouse.row == st.header_clicks.row {
                         let areas = st.header_clicks;
-                        if areas.repl_tab.1 > 0 && mouse.column >= areas.repl_tab.0 && mouse.column <= areas.repl_tab.1 {
-                            crate::input::switch_view(&mut st, ViewMode::Repl, server_writer).await?;
+                        if areas.repl_tab.1 > 0
+                            && mouse.column >= areas.repl_tab.0
+                            && mouse.column <= areas.repl_tab.1
+                        {
+                            crate::input::switch_view(&mut st, ViewMode::Repl, server_writer)
+                                .await?;
                             return Ok(InputResult::Continue);
-                        } else if areas.plans_tab.1 > 0 && mouse.column >= areas.plans_tab.0 && mouse.column <= areas.plans_tab.1 {
-                            crate::input::switch_view(&mut st, ViewMode::Plans, server_writer).await?;
+                        } else if areas.plans_tab.1 > 0
+                            && mouse.column >= areas.plans_tab.0
+                            && mouse.column <= areas.plans_tab.1
+                        {
+                            crate::input::switch_view(&mut st, ViewMode::Plans, server_writer)
+                                .await?;
                             return Ok(InputResult::Continue);
-                        } else if areas.review_tab.1 > 0 && mouse.column >= areas.review_tab.0 && mouse.column <= areas.review_tab.1 {
-                            crate::input::switch_view(&mut st, ViewMode::Review, server_writer).await?;
+                        } else if areas.review_tab.1 > 0
+                            && mouse.column >= areas.review_tab.0
+                            && mouse.column <= areas.review_tab.1
+                        {
+                            crate::input::switch_view(&mut st, ViewMode::Review, server_writer)
+                                .await?;
                             return Ok(InputResult::Continue);
-                        } else if areas.context_tab.1 > 0 && mouse.column >= areas.context_tab.0 && mouse.column <= areas.context_tab.1 {
-                            crate::input::switch_view(&mut st, ViewMode::Context, server_writer).await?;
+                        } else if areas.context_tab.1 > 0
+                            && mouse.column >= areas.context_tab.0
+                            && mouse.column <= areas.context_tab.1
+                        {
+                            crate::input::switch_view(&mut st, ViewMode::Context, server_writer)
+                                .await?;
                             return Ok(InputResult::Continue);
-                        } else if areas.history_tab.1 > 0 && mouse.column >= areas.history_tab.0 && mouse.column <= areas.history_tab.1 {
-                            crate::input::switch_view(&mut st, ViewMode::History, server_writer).await?;
+                        } else if areas.history_tab.1 > 0
+                            && mouse.column >= areas.history_tab.0
+                            && mouse.column <= areas.history_tab.1
+                        {
+                            crate::input::switch_view(&mut st, ViewMode::History, server_writer)
+                                .await?;
                             return Ok(InputResult::Continue);
-                        } else if areas.model_select.1 > 0 && mouse.column >= areas.model_select.0 && mouse.column <= areas.model_select.1 {
+                        } else if areas.model_select.1 > 0
+                            && mouse.column >= areas.model_select.0
+                            && mouse.column <= areas.model_select.1
+                        {
                             if st.model.is_busy() {
-                                st.notify_warning(
-                                    crate::i18n::active_t("notify.model_select_busy"),
-                                );
+                                st.notify_warning(crate::i18n::active_t(
+                                    "notify.model_select_busy",
+                                ));
                                 return Ok(InputResult::Continue);
                             }
                             if st.open_model_dialog() {
                                 return Ok(InputResult::Continue);
                             }
-                        } else if areas.squash_button.1 > 0 && mouse.column >= areas.squash_button.0 && mouse.column <= areas.squash_button.1 {
+                        } else if areas.squash_button.1 > 0
+                            && mouse.column >= areas.squash_button.0
+                            && mouse.column <= areas.squash_button.1
+                        {
                             crate::input::open_squash_dialog(&mut st, server_writer).await?;
                             return Ok(InputResult::Continue);
-                        } else if areas.help_button.1 > 0 && mouse.column >= areas.help_button.0 && mouse.column <= areas.help_button.1 {
+                        } else if areas.help_button.1 > 0
+                            && mouse.column >= areas.help_button.0
+                            && mouse.column <= areas.help_button.1
+                        {
                             st.show_help = !st.show_help;
                             return Ok(InputResult::Continue);
                         }
@@ -1125,19 +1215,30 @@ pub async fn handle_mouse_event(
 
                     if st.view_mode == ViewMode::Repl {
                         let (cx, cy, cw, ch) = st.model.content_rect;
-                        if mouse.column >= cx && mouse.column < cx + cw && mouse.row >= cy && mouse.row < cy + ch {
+                        if mouse.column >= cx
+                            && mouse.column < cx + cw
+                            && mouse.row >= cy
+                            && mouse.row < cy + ch
+                        {
                             let relative_row = (mouse.row - cy) as usize;
                             let clicked_visual_line = st.model.scroll as usize + relative_row;
 
-                            if let Some(block) = st.model.code_blocks.iter().find(|b| {
-                                clicked_visual_line >= b.visual_start_line
-                                    && clicked_visual_line <= b.visual_end_line
-                            }).cloned() {
+                            if let Some(block) = st
+                                .model
+                                .code_blocks
+                                .iter()
+                                .find(|b| {
+                                    clicked_visual_line >= b.visual_start_line
+                                        && clicked_visual_line <= b.visual_end_line
+                                })
+                                .cloned()
+                            {
                                 let (btn_rel_start, btn_rel_end) =
                                     crate::markdown::copy_button_span(&block.lang);
                                 let btn_start = cx + btn_rel_start;
                                 let btn_end = cx + btn_rel_end;
-                                let is_button_clicked = clicked_visual_line == block.visual_start_line
+                                let is_button_clicked = clicked_visual_line
+                                    == block.visual_start_line
                                     && mouse.column >= btn_start
                                     && mouse.column <= btn_end;
 
@@ -1146,7 +1247,8 @@ pub async fn handle_mouse_event(
                                     let block_id = block.id;
                                     match crate::clipboard::copy_to_clipboard(&code_to_copy) {
                                         crate::clipboard::CopyResult::Native => {
-                                            st.model.copy_flash = Some((block_id, std::time::Instant::now()));
+                                            st.model.copy_flash =
+                                                Some((block_id, std::time::Instant::now()));
                                             let lines_count = code_to_copy.lines().count().max(1);
                                             st.notify_success(
                                                 crate::i18n::active_t("notify.code_copied")
@@ -1155,7 +1257,8 @@ pub async fn handle_mouse_event(
                                             st.model.update_markdown();
                                         }
                                         crate::clipboard::CopyResult::Osc52Only => {
-                                            st.model.copy_flash = Some((block_id, std::time::Instant::now()));
+                                            st.model.copy_flash =
+                                                Some((block_id, std::time::Instant::now()));
                                             let lines_count = code_to_copy.lines().count().max(1);
                                             st.notify_success(
                                                 crate::i18n::active_t("notify.code_copied_osc52")
@@ -1164,7 +1267,9 @@ pub async fn handle_mouse_event(
                                             st.model.update_markdown();
                                         }
                                         crate::clipboard::CopyResult::Failed => {
-                                            st.notify_error(crate::i18n::active_t("notify.code_copy_failed"));
+                                            st.notify_error(crate::i18n::active_t(
+                                                "notify.code_copy_failed",
+                                            ));
                                         }
                                     }
                                 } else if !st.shift_tip_shown {
@@ -1175,20 +1280,32 @@ pub async fn handle_mouse_event(
                         }
                     } else if st.view_mode == ViewMode::History {
                         let (cx, cy, cw, ch) = st.history_view.content_rect;
-                        if mouse.column >= cx && mouse.column < cx + cw && mouse.row >= cy && mouse.row < cy + ch {
+                        if mouse.column >= cx
+                            && mouse.column < cx + cw
+                            && mouse.row >= cy
+                            && mouse.row < cy + ch
+                        {
                             let relative_row = (mouse.row - cy) as usize;
-                            let clicked_visual_line = st.history_view.scroll as usize + relative_row;
+                            let clicked_visual_line =
+                                st.history_view.scroll as usize + relative_row;
 
-                            if let Some(block) = st.history_view.code_blocks.iter().find(|b| {
-                                clicked_visual_line >= b.visual_start_line
-                                    && clicked_visual_line <= b.visual_end_line
-                            }).cloned() {
+                            if let Some(block) = st
+                                .history_view
+                                .code_blocks
+                                .iter()
+                                .find(|b| {
+                                    clicked_visual_line >= b.visual_start_line
+                                        && clicked_visual_line <= b.visual_end_line
+                                })
+                                .cloned()
+                            {
                                 let (btn_rel_start, btn_rel_end) =
                                     crate::markdown::copy_button_span(&block.lang);
                                 // History bodies render with a two-column line prefix.
                                 let btn_start = cx + 2 + btn_rel_start;
                                 let btn_end = cx + 2 + btn_rel_end;
-                                let is_button_clicked = clicked_visual_line == block.visual_start_line
+                                let is_button_clicked = clicked_visual_line
+                                    == block.visual_start_line
                                     && mouse.column >= btn_start
                                     && mouse.column <= btn_end;
 
@@ -1196,8 +1313,10 @@ pub async fn handle_mouse_event(
                                     let code_to_copy = block.code.clone();
                                     match crate::clipboard::copy_to_clipboard(&code_to_copy) {
                                         crate::clipboard::CopyResult::Native => {
-                                            st.history_view.copy_flash =
-                                                Some(((block.item_id, block.block_id), std::time::Instant::now()));
+                                            st.history_view.copy_flash = Some((
+                                                (block.item_id, block.block_id),
+                                                std::time::Instant::now(),
+                                            ));
                                             let lines_count = code_to_copy.lines().count().max(1);
                                             st.notify_success(
                                                 crate::i18n::active_t("notify.code_copied")
@@ -1205,8 +1324,10 @@ pub async fn handle_mouse_event(
                                             );
                                         }
                                         crate::clipboard::CopyResult::Osc52Only => {
-                                            st.history_view.copy_flash =
-                                                Some(((block.item_id, block.block_id), std::time::Instant::now()));
+                                            st.history_view.copy_flash = Some((
+                                                (block.item_id, block.block_id),
+                                                std::time::Instant::now(),
+                                            ));
                                             let lines_count = code_to_copy.lines().count().max(1);
                                             st.notify_success(
                                                 crate::i18n::active_t("notify.code_copied_osc52")
@@ -1214,7 +1335,9 @@ pub async fn handle_mouse_event(
                                             );
                                         }
                                         crate::clipboard::CopyResult::Failed => {
-                                            st.notify_error(crate::i18n::active_t("notify.code_copy_failed"));
+                                            st.notify_error(crate::i18n::active_t(
+                                                "notify.code_copy_failed",
+                                            ));
                                         }
                                     }
                                 } else if !st.shift_tip_shown {
@@ -1244,13 +1367,20 @@ pub async fn handle_mouse_event(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::backend::TestBackend;
     use ratatui::layout::Rect;
+    use ratatui::Terminal;
 
     #[test]
     fn test_rect_contains_and_check_confirm_hit() {
         let term = Rect::new(0, 0, 100, 30);
-        let geom =
-            crate::dialogs::render::confirm_modal_geometry(term, 58, 5, "Interrupt (Y)", "Cancel (Esc)");
+        let geom = crate::dialogs::render::confirm_modal_geometry(
+            term,
+            58,
+            5,
+            "Interrupt (Y)",
+            "Cancel (Esc)",
+        );
 
         assert!(geom.area.width > 0 && geom.area.height > 0);
         assert!(geom.confirm_button.width > 0 && geom.cancel_button.width > 0);
@@ -1328,8 +1458,7 @@ mod tests {
         ));
 
         let term = st.last_frame_area;
-        let (apply_btn, _cancel_btn) =
-            crate::dialogs::render::status_dialog_buttons(term, 6);
+        let (apply_btn, _cancel_btn) = crate::dialogs::render::status_dialog_buttons(term, 6);
         let mouse = MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
             column: apply_btn.x + 2,
@@ -1630,5 +1759,354 @@ mod tests {
             crate::views::plans::RefineDialogFocus::InstructionsEditor
         );
         assert!(conn.written().is_empty());
+    }
+
+    /// Builds a Plans state holding one `Todo` step and an open status dialog,
+    /// so a click test can assert both the applied status and the request.
+    fn state_with_plan_status_dialog() -> crate::app::AppState {
+        let mut st = crate::app::test_state();
+        st.view_mode = ViewMode::Plans;
+        st.last_frame_area = Rect::new(0, 0, 100, 30);
+        st.plans_view.plans = vec![tauqe_protocol::Plan {
+            id: "plan-1".to_string(),
+            title: "Test Plan".to_string(),
+            description: None,
+            created_at: 0,
+            updated_at: 0,
+            architect: None,
+            concept: vec![],
+            items: vec![tauqe_protocol::PlanItem {
+                id: "1".to_string(),
+                title: "Step".to_string(),
+                details: None,
+                status: tauqe_protocol::PlanItemStatus::Todo,
+                files: vec![],
+                readonly_files: vec![],
+                concept_refs: vec![],
+                depends_on: vec![],
+                children: vec![],
+            }],
+        }];
+        st.status_dialog = Some(crate::app::StatusDialogState::new(
+            crate::app::StatusDialogTarget::PlanItem {
+                plan_id: "plan-1".to_string(),
+                item_id: "1".to_string(),
+                item_title: "Step".to_string(),
+                current_status: tauqe_protocol::PlanItemStatus::Todo,
+            },
+            1,
+        ));
+        st
+    }
+
+    /// A click on a status option must apply the status drawn on that very row.
+    ///
+    /// The option list starts below the card's top inset and one inter-section
+    /// spacer, so the test first renders the dialog, locates the row the
+    /// renderer drew for `IN_PROGRESS`, and only then clicks it: the vertical air
+    /// must move rendering and hit-testing together (Conventions §6.7, §6.8,
+    /// c-1, c-3).
+    #[tokio::test]
+    async fn status_option_row_click_applies_the_drawn_status() {
+        let st = state_with_plan_status_dialog();
+        let term = st.last_frame_area;
+        let options_count = st
+            .status_dialog
+            .as_ref()
+            .map(|dialog| dialog.target.options_count())
+            .unwrap_or(0);
+        let options_area = crate::dialogs::render::status_dialog_options_area(term, options_count);
+
+        let mut terminal = Terminal::new(TestBackend::new(term.width, term.height)).unwrap();
+        terminal
+            .draw(|frame| {
+                if let Some(dialog) = st.status_dialog.as_ref() {
+                    crate::dialogs::render::render_status_dialog(frame, dialog);
+                }
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let drawn_row = (options_area.y..options_area.y + options_area.height)
+            .find(|row| {
+                (options_area.x..options_area.x + options_area.width)
+                    .map(|column| buffer[(column, *row)].symbol())
+                    .collect::<String>()
+                    .contains("IN_PROGRESS")
+            })
+            .expect("the IN_PROGRESS option must be drawn inside the options area");
+
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+        handle_mouse_event(left_click(options_area.x + 4, drawn_row), &state, &mut conn)
+            .await
+            .unwrap();
+
+        let payload = String::from_utf8(conn.written().to_vec()).expect("utf-8 payload");
+        assert!(payload.contains(methods::PLAN_UPDATE_ITEM), "{payload}");
+
+        let guard = state.lock().await;
+        assert!(guard.status_dialog.is_none(), "the dialog must be consumed");
+        let item = guard
+            .plans_view
+            .plans
+            .iter()
+            .find(|plan| plan.id == "plan-1")
+            .and_then(|plan| plan.find_item("1"))
+            .expect("the plan step must exist");
+        assert_eq!(item.status, tauqe_protocol::PlanItemStatus::InProgress);
+    }
+
+    /// The reserved air rows of the status dialog are not phantom targets: a
+    /// click on the top inset or on the inter-section spacer neither applies a
+    /// status nor dismisses the card (Conventions §6.7, c-1).
+    #[tokio::test]
+    async fn status_air_rows_never_resolve_to_an_option() {
+        let st = state_with_plan_status_dialog();
+        let term = st.last_frame_area;
+        let area = crate::dialogs::render::status_dialog_area(term, 6);
+        let options_area = crate::dialogs::render::status_dialog_options_area(term, 6);
+
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+        for row in [area.y + 1, options_area.y - 1] {
+            handle_mouse_event(left_click(options_area.x + 4, row), &state, &mut conn)
+                .await
+                .unwrap();
+        }
+
+        let guard = state.lock().await;
+        assert!(
+            guard.status_dialog.is_some(),
+            "an air row keeps the dialog open"
+        );
+        let item = guard
+            .plans_view
+            .plans
+            .iter()
+            .find(|plan| plan.id == "plan-1")
+            .and_then(|plan| plan.find_item("1"))
+            .expect("the plan step must exist");
+        assert_eq!(item.status, tauqe_protocol::PlanItemStatus::Todo);
+        assert!(conn.written().is_empty());
+    }
+
+    /// The status dialog `Cancel` button dismisses the card without applying the
+    /// highlighted status, at the rectangle the shared action bar draws
+    /// (Conventions §6.6, c-3).
+    #[tokio::test]
+    async fn status_cancel_click_dismisses_without_applying() {
+        let st = state_with_plan_status_dialog();
+        let term = st.last_frame_area;
+        let options_count = st
+            .status_dialog
+            .as_ref()
+            .map(|dialog| dialog.target.options_count())
+            .unwrap_or(0);
+        let (_apply_button, cancel_button) =
+            crate::dialogs::render::status_dialog_buttons(term, options_count);
+
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+        handle_mouse_event(left_click(cancel_button.x + 1, cancel_button.y), &state, &mut conn)
+            .await
+            .unwrap();
+
+        assert!(conn.written().is_empty());
+        let guard = state.lock().await;
+        assert!(guard.status_dialog.is_none());
+        let item = guard
+            .plans_view
+            .plans
+            .iter()
+            .find(|plan| plan.id == "plan-1")
+            .and_then(|plan| plan.find_item("1"))
+            .expect("the plan step must exist");
+        assert_eq!(item.status, tauqe_protocol::PlanItemStatus::Todo);
+    }
+
+    /// Builds a state with an open model picker listing two catalog models.
+    fn state_with_selection_dialog() -> crate::app::AppState {
+        let mut st = crate::app::test_state();
+        st.last_frame_area = Rect::new(0, 0, 100, 30);
+        st.selection_dialog = Some(crate::app::SelectionDialogState::new(
+            crate::app::SelectionDialogKind::ModelCatalog,
+            vec![
+                crate::app::SelectionItem::Model(tauqe_protocol::ModelRef::openrouter(
+                    "alpha-unique",
+                )),
+                crate::app::SelectionItem::Model(tauqe_protocol::ModelRef::openrouter(
+                    "beta-unique",
+                )),
+            ],
+            0,
+        ));
+        st
+    }
+
+    /// Item count of the open picker, read without cloning the dialog.
+    fn selection_item_count(st: &crate::app::AppState) -> usize {
+        st.selection_dialog
+            .as_ref()
+            .map(|dialog| dialog.items.len())
+            .unwrap_or(0)
+    }
+
+    /// A click on the second picker row selects the second model, which proves
+    /// the hit-tested list starts exactly where the renderer draws its first
+    /// row: the intro line and its spacer sit above the list and are skipped
+    /// (Conventions §6.6–§6.8, c-3).
+    #[tokio::test]
+    async fn selection_list_row_click_activates_the_drawn_row() {
+        let st = state_with_selection_dialog();
+        let term = st.last_frame_area;
+        let list_area = crate::dialogs::render::selection::selection_dialog_list_area(
+            term,
+            selection_item_count(&st),
+        );
+
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+        handle_mouse_event(
+            left_click(list_area.x + 3, list_area.y + 1),
+            &state,
+            &mut conn,
+        )
+        .await
+        .unwrap();
+
+        let payload = String::from_utf8(conn.written().to_vec()).expect("utf-8 payload");
+        assert!(payload.contains(methods::MODEL_SELECT), "{payload}");
+        assert!(payload.contains("beta-unique"), "{payload}");
+        assert!(state.lock().await.selection_dialog.is_none());
+    }
+
+    /// The picker `Select` button activates the highlighted row at the rectangle
+    /// the shared action bar draws (Conventions §6.6, c-3).
+    #[tokio::test]
+    async fn selection_select_click_activates_the_highlighted_row() {
+        let st = state_with_selection_dialog();
+        let term = st.last_frame_area;
+        let (select_button, _cancel_button) =
+            crate::dialogs::render::selection::selection_dialog_buttons(
+                term,
+                selection_item_count(&st),
+            );
+
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+        handle_mouse_event(
+            left_click(select_button.x + 2, select_button.y),
+            &state,
+            &mut conn,
+        )
+        .await
+        .unwrap();
+
+        let payload = String::from_utf8(conn.written().to_vec()).expect("utf-8 payload");
+        assert!(payload.contains(methods::MODEL_SELECT), "{payload}");
+        assert!(payload.contains("alpha-unique"), "{payload}");
+        assert!(state.lock().await.selection_dialog.is_none());
+    }
+
+    /// The picker `Cancel` button dismisses the dialog without a request.
+    #[tokio::test]
+    async fn selection_cancel_click_dismisses_without_a_request() {
+        let st = state_with_selection_dialog();
+        let term = st.last_frame_area;
+        let (_select_button, cancel_button) =
+            crate::dialogs::render::selection::selection_dialog_buttons(
+                term,
+                selection_item_count(&st),
+            );
+
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+        handle_mouse_event(left_click(cancel_button.x + 2, cancel_button.y), &state, &mut conn)
+            .await
+            .unwrap();
+
+        assert!(conn.written().is_empty());
+        assert!(state.lock().await.selection_dialog.is_none());
+    }
+
+    /// The intro line above the picker list is not a row: clicking it keeps the
+    /// dialog open and starts no model switch (Conventions §6.7, c-1).
+    #[tokio::test]
+    async fn selection_intro_click_keeps_the_dialog_open() {
+        let st = state_with_selection_dialog();
+        let term = st.last_frame_area;
+        let area = crate::dialogs::render::selection_dialog_area(term, selection_item_count(&st));
+
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+        // One row under the top inset: the intro line, above its own spacer.
+        handle_mouse_event(left_click(area.x + 3, area.y + 2), &state, &mut conn)
+            .await
+            .unwrap();
+
+        assert!(conn.written().is_empty());
+        assert!(state.lock().await.selection_dialog.is_some());
+    }
+
+    /// The first item the picker draws sits exactly on the top row of the
+    /// hit-tested list, and the spacer above it is drawn blank, so the vertical
+    /// air can never turn into an activatable row (Conventions §6.7, §6.8, c-1).
+    #[test]
+    fn selection_drawn_rows_align_with_the_hit_tested_list() {
+        let st = state_with_selection_dialog();
+        let term = st.last_frame_area;
+        let item_count = selection_item_count(&st);
+        let area = crate::dialogs::render::selection_dialog_area(term, item_count);
+        let list_area = crate::dialogs::render::selection::selection_dialog_list_area(term, item_count);
+
+        let mut terminal = Terminal::new(TestBackend::new(term.width, term.height)).unwrap();
+        terminal
+            .draw(|frame| {
+                if let Some(dialog) = st.selection_dialog.as_ref() {
+                    crate::dialogs::render::render_selection_dialog(frame, dialog);
+                }
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let interior = |row: u16| -> String {
+            (area.x + 1..area.x + area.width - 1)
+                .map(|column| buffer[(column, row)].symbol())
+                .collect()
+        };
+
+        assert!(
+            list_area.y > area.y + 2,
+            "the list starts below the border, the top inset, and the intro"
+        );
+        assert!(
+            interior(list_area.y - 1).trim().is_empty(),
+            "the inter-section spacer must stay blank: {:?}",
+            interior(list_area.y - 1)
+        );
+        assert!(
+            !interior(list_area.y).trim().is_empty(),
+            "the first item must be drawn at the top of the hit-tested list"
+        );
+    }
+
+    /// The spacer between the refinement list and its editor is inert: a click
+    /// there submits nothing and keeps the dialog open (Conventions §6.7, c-1).
+    #[tokio::test]
+    async fn review_refine_spacer_click_keeps_the_dialog_untouched() {
+        let st = state_with_review_refine_dialog();
+        let geo = crate::dialogs::render::refine::refine_dialog_geometry(st.last_frame_area, 2);
+
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+        handle_mouse_event(
+            left_click(geo.editor_area.x + 2, geo.editor_area.y - 1),
+            &state,
+            &mut conn,
+        )
+        .await
+        .unwrap();
+
+        assert!(conn.written().is_empty());
+        assert!(state.lock().await.review.refine_dialog.is_some());
     }
 }

@@ -9,8 +9,8 @@
 use std::sync::OnceLock;
 
 use tauqe_protocol::{
-    CapabilityPhase, CapabilitySet, DocTopic, LlmCapability, LlmCommand, ModelResult,
-    RepoSearchRequest, TurnIntent,
+    CapabilityPhase, CapabilitySet, DirListRequest, DocTopic, LlmCapability, LlmCommand,
+    ModelResult, RepoSearchRequest, TurnIntent,
 };
 
 use crate::edits::protocol::xml::engine::{self, XmlTagSpec};
@@ -234,6 +234,27 @@ impl XmlParser {
         }
     }
 
+    pub(crate) fn parse_repo_dirs(&self, normalized: &str) -> bool {
+        match self {
+            Self::Unmarked(protocol) => protocol.parse_repo_dirs(normalized),
+            Self::Marked(protocol) => protocol.parse_repo_dirs_normalized(normalized),
+        }
+    }
+
+    pub(crate) fn parse_repo_maps(&self, normalized: &str) -> Vec<String> {
+        match self {
+            Self::Unmarked(protocol) => protocol.parse_repo_maps(normalized),
+            Self::Marked(protocol) => protocol.parse_repo_maps_normalized(normalized),
+        }
+    }
+
+    pub(crate) fn parse_dir_lists(&self, normalized: &str) -> Vec<DirListRequest> {
+        match self {
+            Self::Unmarked(protocol) => protocol.parse_dir_lists(normalized),
+            Self::Marked(protocol) => protocol.parse_dir_lists_normalized(normalized),
+        }
+    }
+
     pub(crate) fn parse_doc_requests(&self, normalized: &str) -> Vec<DocTopic> {
         match self {
             Self::Unmarked(protocol) => protocol.parse_doc_requests(normalized),
@@ -255,7 +276,9 @@ impl XmlParser {
     ) -> Option<VerifyRequest> {
         match self {
             Self::Unmarked(protocol) => protocol.parse_verify_request(normalized),
-            Self::Marked(protocol) => protocol.parse_verify_request_normalized(normalized, raw_text),
+            Self::Marked(protocol) => {
+                protocol.parse_verify_request_normalized(normalized, raw_text)
+            }
         }
     }
 
@@ -287,7 +310,12 @@ pub(crate) fn resolve_specs(
     bases: &[&'static str],
 ) -> &'static [&'static XmlTagSpec] {
     cache
-        .get_or_init(|| bases.iter().filter_map(|base| engine::tag_spec(base)).collect())
+        .get_or_init(|| {
+            bases
+                .iter()
+                .filter_map(|base| engine::tag_spec(base))
+                .collect()
+        })
         .as_slice()
 }
 
@@ -345,7 +373,9 @@ impl CapabilityRegistry {
         for module in self.enabled(set) {
             for spec in module.xml_tag_specs() {
                 if spec.is_control()
-                    && !tags.iter().any(|existing| existing.as_str() == spec.base_name)
+                    && !tags
+                        .iter()
+                        .any(|existing| existing.as_str() == spec.base_name)
                 {
                     tags.push(spec.base_name.to_string());
                 }
@@ -545,6 +575,9 @@ mod tests {
             vec![
                 "context_request".to_string(),
                 "repo_search".to_string(),
+                "repo_dirs".to_string(),
+                "repo_map".to_string(),
+                "dir_list".to_string(),
                 "doc_request".to_string(),
                 "verify".to_string(),
                 "plan".to_string(),
@@ -595,10 +628,8 @@ mod tests {
     #[test]
     fn contract_rules_keep_dense_numbering_for_narrowed_sets() {
         let registry = CapabilityRegistry::global();
-        let narrowed = CapabilitySet::from_slice(&[
-            LlmCapability::TextMessage,
-            LlmCapability::FileEdits,
-        ]);
+        let narrowed =
+            CapabilitySet::from_slice(&[LlmCapability::TextMessage, LlmCapability::FileEdits]);
         let rendered = registry.compose_contract_rules(&narrowed, &plain_context());
 
         // File-edit tags are not control tags, so the operational rule is
@@ -727,6 +758,7 @@ mod tests {
         let raw = concat!(
             "Applying the plan.\n",
             "<context_request_AB path=\"src/a.rs\" access=\"editable\" />\n",
+            "<dir_list_AB path=\"crates/core\" recursive=\"true\" />\n",
             "<plan_AB action=\"save\" id=\"p1\" title=\"Plan\">",
             "<concept_AB><concept_item_AB id=\"c-1\" title=\"Concept\" /></concept_AB>",
             "<item id=\"1\" title=\"Step\" status=\"todo\" />",
@@ -741,6 +773,11 @@ mod tests {
         assert!(develop
             .iter()
             .any(|command| matches!(command, LlmCommand::ContextRequest { .. })));
+        assert!(develop.iter().any(|command| matches!(
+            command,
+            LlmCommand::DirList { path, recursive }
+                if path == "crates/core" && *recursive
+        )));
         assert!(develop
             .iter()
             .any(|command| matches!(command, LlmCommand::Text { .. })));
@@ -753,14 +790,18 @@ mod tests {
         assert!(isolated
             .iter()
             .any(|command| matches!(command, LlmCommand::ContextRequest { .. })));
+        assert!(isolated
+            .iter()
+            .any(|command| matches!(command, LlmCommand::DirList { .. })));
     }
 
     #[test]
     fn clean_text_removes_enabled_capability_tags() {
         let registry = CapabilityRegistry::global();
-        let raw = "Context gathered.\n<context_request path=\"src/a.rs\" />\n<scratchpad>\nnotes\n</scratchpad>\nDone.";
+        let raw = "Context gathered.\n<context_request path=\"src/a.rs\" />\n<dir_list path=\"crates/core\" />\n<scratchpad>\nnotes\n</scratchpad>\nDone.";
         let cleaned = registry.clean_text(&CapabilitySet::develop_xml(), raw, None);
         assert!(!cleaned.contains("context_request"));
+        assert!(!cleaned.contains("dir_list"));
         assert!(!cleaned.contains("<scratchpad"));
         assert!(cleaned.contains("Context gathered."));
         assert!(cleaned.contains("Done."));

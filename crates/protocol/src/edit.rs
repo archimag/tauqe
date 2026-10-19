@@ -193,9 +193,7 @@ impl StructuredChangeProposal {
                     .content
                     .clone()
                     .or_else(|| self.new_text.clone())
-                    .ok_or_else(|| {
-                        "Change 'create' requires a 'content' field".to_string()
-                    })?;
+                    .ok_or_else(|| "Change 'create' requires a 'content' field".to_string())?;
                 Ok(EditOperation::Create { path, content })
             }
             EditFileOp::Overwrite => {
@@ -203,16 +201,15 @@ impl StructuredChangeProposal {
                     .content
                     .clone()
                     .or_else(|| self.new_text.clone())
-                    .ok_or_else(|| {
-                        "Change 'overwrite' requires a 'content' field".to_string()
-                    })?;
+                    .ok_or_else(|| "Change 'overwrite' requires a 'content' field".to_string())?;
                 Ok(EditOperation::Overwrite { path, content })
             }
             EditFileOp::Delete => Ok(EditOperation::Delete { path }),
             EditFileOp::Move => {
-                let to = self.to.as_deref().ok_or_else(|| {
-                    "Change 'move' requires a 'to' field".to_string()
-                })?;
+                let to = self
+                    .to
+                    .as_deref()
+                    .ok_or_else(|| "Change 'move' requires a 'to' field".to_string())?;
                 let to = normalize_repo_path(to)?;
                 Ok(EditOperation::Move { from: path, to })
             }
@@ -519,8 +516,7 @@ mod tests {
         assert_eq!(unknown.op, EditFileOp::Replace);
 
         // An absent operation uses the same default.
-        let absent: StructuredChangeProposal =
-            serde_json::from_str(r#"{"path":"a.txt"}"#).unwrap();
+        let absent: StructuredChangeProposal = serde_json::from_str(r#"{"path":"a.txt"}"#).unwrap();
         assert_eq!(absent.op, EditFileOp::Replace);
 
         // An explicit `null` operation is tolerated exactly like an absent one,
@@ -539,14 +535,7 @@ mod tests {
         // Traversal in both separators, absolute paths, drive paths, NUL
         // bytes, and empty results are rejected.
         for raw in [
-            "a/../b",
-            "a\\..\\b",
-            "..",
-            ".",
-            "/abs",
-            "\\abs",
-            "C:\\abs",
-            "a\0b",
+            "a/../b", "a\\..\\b", "..", ".", "/abs", "\\abs", "C:\\abs", "a\0b",
         ] {
             assert!(
                 normalize_repo_path(raw).is_err(),

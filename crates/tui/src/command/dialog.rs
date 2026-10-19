@@ -158,7 +158,10 @@ mod tests {
             &input,
             false,
         );
-        assert_eq!(dismiss.map(|spec| spec.action), Some(DialogCommand::Dismiss));
+        assert_eq!(
+            dismiss.map(|spec| spec.action),
+            Some(DialogCommand::Dismiss)
+        );
 
         let next = DIALOG_COMMAND_MAP.resolve(
             KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),

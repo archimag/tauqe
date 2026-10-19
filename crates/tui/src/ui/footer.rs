@@ -105,6 +105,25 @@ fn render_footer_with_engine(
             engine.fg(status_color).bold(),
         ));
 
+        // A reconnect pause is in flight: the daemon publishes the remaining
+        // seconds, so the footer mirrors that countdown and names the chord
+        // that aborts the pause instead of waiting it out (c-4).
+        if let Some(retrying) = &state.model.retrying {
+            footer_spans.push(Span::raw(" "));
+            footer_spans.push(Span::styled(
+                active_t("footer.retrying")
+                    .replacen("{}", &retrying.attempt.to_string(), 1)
+                    .replacen("{}", &retrying.max_attempts.to_string(), 1)
+                    .replacen("{}", &retrying.delay_secs.to_string(), 1),
+                engine.fg(palette.status_warning).bold(),
+            ));
+            footer_spans.push(Span::raw(" "));
+            footer_spans.push(Span::styled(
+                format!("({})", active_t("footer.retrying_cancel")),
+                engine.fg(palette.status_warning),
+            ));
+        }
+
         // A graceful batch stop is in flight: the current member finishes and
         // the queue halts before the next one, so the developer sees exactly
         // which stop is pending.
@@ -204,15 +223,18 @@ fn render_footer_with_engine(
         ));
     } else {
         let (status_lbl, status_style) = match state.model.status {
-            TurnStatus::Done => {
-                (active_t("footer.done"), engine.fg(palette.status_success).bold())
-            }
-            TurnStatus::Cancelled => {
-                (active_t("footer.cancelled"), engine.fg(palette.status_error).bold())
-            }
-            TurnStatus::Error => {
-                (active_t("footer.error"), engine.fg(palette.status_error).bold())
-            }
+            TurnStatus::Done => (
+                active_t("footer.done"),
+                engine.fg(palette.status_success).bold(),
+            ),
+            TurnStatus::Cancelled => (
+                active_t("footer.cancelled"),
+                engine.fg(palette.status_error).bold(),
+            ),
+            TurnStatus::Error => (
+                active_t("footer.error"),
+                engine.fg(palette.status_error).bold(),
+            ),
             _ => (active_t("footer.ready"), engine.fg(palette.status_success)),
         };
         footer_spans.push(Span::styled(status_lbl, status_style));
@@ -220,22 +242,10 @@ fn render_footer_with_engine(
 
     let inner_width = area.width.saturating_sub(2) as usize;
 
+    // The repository map cost is telemetry, not a turn indicator: it lives in
+    // the usage dialog (Alt+U), so the status line never spends columns on it
+    // and stays free for turn phases and the active file (c-4).
     let mut right_spans: Vec<Span<'static>> = Vec::new();
-
-    if let Some(tokens) = state.model.repomap_tokens {
-        if tokens > 0 {
-            let (color, bold) = if state.model.is_busy() {
-                (palette.status_info, true)
-            } else {
-                (palette.text_muted, false)
-            };
-            let mut style = engine.fg(color);
-            if bold {
-                style = style.bold();
-            }
-            right_spans.push(Span::styled(format_repomap_tokens(tokens), style));
-        }
-    }
 
     if state.view_mode == ViewMode::History {
         if !right_spans.is_empty() {
@@ -304,7 +314,10 @@ pub fn render_turn_phase_pipeline(
         (tauqe_protocol::TurnPhase::Discovery, "phase.discovery"),
         (tauqe_protocol::TurnPhase::Proposal, "phase.proposal"),
         (tauqe_protocol::TurnPhase::Staging, "phase.staging"),
-        (tauqe_protocol::TurnPhase::Verification, "phase.verification"),
+        (
+            tauqe_protocol::TurnPhase::Verification,
+            "phase.verification",
+        ),
         (tauqe_protocol::TurnPhase::Healing, "phase.healing"),
     ];
 
@@ -339,10 +352,6 @@ pub fn extract_current_round(text: &str) -> Option<String> {
 
 fn extract_bracketed(slice: &str) -> Option<String> {
     slice.find(']').map(|end| slice[1..end].to_string())
-}
-
-pub fn format_repomap_tokens(tokens: usize) -> String {
-    active_t("footer.repomap_tokens").replacen("{}", &tokens.to_string(), 1)
 }
 
 /// Renders every tier of the compact usage summary, richest first.
@@ -440,6 +449,7 @@ mod tests {
                 ..UsageTotals::default()
             }),
             operations: 2,
+            ..UsageTotalsSnapshot::default()
         }
     }
 
@@ -458,6 +468,7 @@ mod tests {
                 ..UsageTotals::default()
             }),
             operations: 2,
+            ..UsageTotalsSnapshot::default()
         }
     }
 
@@ -484,7 +495,10 @@ mod tests {
     #[test]
     fn footer_usage_falls_back_to_tokens_when_no_cost_is_known() {
         let variants = footer_usage_variants(&token_snapshot());
-        assert_eq!(variants[0], "Σ 1200 tok session · 300 tok last · 50 tok now");
+        assert_eq!(
+            variants[0],
+            "Σ 1200 tok session · 300 tok last · 50 tok now"
+        );
         assert_eq!(variants[1], "Σ 1200 tok · 300 tok · 50 tok");
         assert_eq!(variants[2], "Σ 1200 tok");
     }
@@ -532,9 +546,32 @@ mod tests {
     }
 
     #[test]
-    fn test_format_repomap_tokens() {
-        assert_eq!(format_repomap_tokens(850), "map: 850 tok");
-        assert_eq!(format_repomap_tokens(1024), "map: 1024 tok");
+    fn footer_never_renders_the_repository_map_cost() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let backend = TestBackend::new(140, 3);
+        let mut terminal = Terminal::new(backend).expect("terminal created");
+        let mut state = crate::app::test_state();
+        state.model.repomap_tokens = Some(1234);
+
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                render_footer(frame, &state, area);
+            })
+            .expect("draw succeeded");
+
+        let buffer = terminal.backend().buffer();
+        let content: String = buffer.content().iter().map(|cell| cell.symbol()).collect();
+
+        // The map cost is telemetry confined to the usage dialog (c-4) ...
+        assert!(
+            !content.contains("1234") && !content.contains("map:"),
+            "the footer must not spend columns on the map cost: {content:?}"
+        );
+        // ... while the regular status line stays intact.
+        assert!(content.contains("Ready"), "{content:?}");
     }
 
     #[test]
@@ -594,6 +631,40 @@ mod tests {
         assert!(
             content.contains("Patch applied"),
             "notification must remain visible next to the telemetry: {content:?}"
+        );
+    }
+
+    #[test]
+    fn busy_footer_shows_the_reconnect_countdown() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let backend = TestBackend::new(140, 3);
+        let mut terminal = Terminal::new(backend).expect("terminal created");
+        let mut state = crate::app::test_state();
+        state.model.status = TurnStatus::Awaiting;
+        state.model.retrying = Some(crate::views::repl::RetryingState {
+            attempt: 2,
+            max_attempts: 4,
+            delay_secs: 3,
+        });
+
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                render_footer(frame, &state, area);
+            })
+            .expect("draw succeeded");
+
+        let buffer = terminal.backend().buffer();
+        let content: String = buffer.content().iter().map(|cell| cell.symbol()).collect();
+        assert!(
+            content.contains("Reconnecting 2/4 in 3s"),
+            "the countdown must name the attempt and the remaining seconds: {content:?}"
+        );
+        assert!(
+            content.contains("C-g to cancel"),
+            "the indicator must name the chord that aborts the pause: {content:?}"
         );
     }
 

@@ -188,10 +188,8 @@ pub(super) async fn run_plan_batch_with(
             // scope.
             let load_root = repo_root.clone();
             let load_plan_id = plan_id.to_string();
-            let plan = match offload_plan(move || {
-                PlanStorage::load_plan(&load_root, &load_plan_id)
-            })
-            .await
+            let plan = match offload_plan(move || PlanStorage::load_plan(&load_root, &load_plan_id))
+                .await
             {
                 Ok(Some(plan)) => plan,
                 Ok(None) => {
@@ -275,13 +273,7 @@ pub(super) async fn run_plan_batch_with(
                             let msg =
                                 format!("Just-in-time horizon cannot be executed: {:?}", other);
                             clear_auto_context(state).await;
-                            return reject_batch(
-                                state,
-                                plan_id,
-                                started_at,
-                                total_scheduled,
-                                msg,
-                            );
+                            return reject_batch(state, plan_id, started_at, total_scheduled, msg);
                         }
                     },
                     Some(PlanRefineResult::Blocked { reason }) => {
@@ -407,12 +399,18 @@ pub(super) async fn run_plan_batch_with(
                         Ok(None) => {
                             let err_msg = format!("Plan '{}' not found", plan_id);
                             last_error = Some(err_msg.clone());
-                            final_stop = BatchStop::Blocked { step_id, reason: err_msg };
+                            final_stop = BatchStop::Blocked {
+                                step_id,
+                                reason: err_msg,
+                            };
                             break;
                         }
                         Err(err) => {
                             last_error = Some(err.clone());
-                            final_stop = BatchStop::Blocked { step_id, reason: err };
+                            final_stop = BatchStop::Blocked {
+                                step_id,
+                                reason: err,
+                            };
                             break;
                         }
                     };
@@ -463,70 +461,84 @@ pub(super) async fn run_plan_batch_with(
                         .and_then(|v| serde_json::from_value::<PlanRefineResult>(v).ok());
 
                     match refine_res {
-                        Some(PlanRefineResult::Success { plan: updated_plan, .. }) => {
-                            match updated_plan.evaluate_scope(None) {
-                                PlanScopeEvaluation::Ready(new_steps) => {
-                                    current_step_ids =
-                                        new_steps.into_iter().map(|s| s.id).collect();
-                                    total_scheduled = total_completed + current_step_ids.len();
-                                    tracing::info!(
-                                        plan_id = plan_id,
-                                        new_horizon_steps = current_step_ids.len(),
-                                        replan_round = replans_count,
-                                        architect = ?updated_plan.architect,
-                                        "automated replanning produced a new horizon"
-                                    );
-                                    continue;
-                                }
-                                PlanScopeEvaluation::AllCompleted => {
-                                    final_stop = BatchStop::Completed;
-                                    break;
-                                }
-                                PlanScopeEvaluation::BlockedByDiscussion(items) => {
-                                    let msg = format!(
+                        Some(PlanRefineResult::Success {
+                            plan: updated_plan, ..
+                        }) => match updated_plan.evaluate_scope(None) {
+                            PlanScopeEvaluation::Ready(new_steps) => {
+                                current_step_ids = new_steps.into_iter().map(|s| s.id).collect();
+                                total_scheduled = total_completed + current_step_ids.len();
+                                tracing::info!(
+                                    plan_id = plan_id,
+                                    new_horizon_steps = current_step_ids.len(),
+                                    replan_round = replans_count,
+                                    architect = ?updated_plan.architect,
+                                    "automated replanning produced a new horizon"
+                                );
+                                continue;
+                            }
+                            PlanScopeEvaluation::AllCompleted => {
+                                final_stop = BatchStop::Completed;
+                                break;
+                            }
+                            PlanScopeEvaluation::BlockedByDiscussion(items) => {
+                                let msg = format!(
                                         "Scope contains item(s) in DISCUSSION status: {}. Review them first",
                                         items.join(", ")
                                     );
-                                    last_error = Some(msg.clone());
-                                    final_stop = BatchStop::Blocked { step_id, reason: msg };
-                                    break;
-                                }
-                                PlanScopeEvaluation::BlockedByBlockers(items) => {
-                                    let msg = format!(
+                                last_error = Some(msg.clone());
+                                final_stop = BatchStop::Blocked {
+                                    step_id,
+                                    reason: msg,
+                                };
+                                break;
+                            }
+                            PlanScopeEvaluation::BlockedByBlockers(items) => {
+                                let msg = format!(
                                         "Scope contains step(s) in BLOCKED status: {}. Manual intervention required",
                                         items.join(", ")
                                     );
-                                    last_error = Some(msg.clone());
-                                    final_stop = BatchStop::Blocked { step_id, reason: msg };
-                                    break;
-                                }
-                                PlanScopeEvaluation::BlockedByDependencies(items) => {
-                                    let msg = format!(
-                                        "Scope contains step(s) whose prerequisites are not DONE: {}",
-                                        items.join(", ")
-                                    );
-                                    last_error = Some(msg.clone());
-                                    final_stop = BatchStop::Blocked { step_id, reason: msg };
-                                    break;
-                                }
-                                other => {
-                                    let msg = format!(
-                                        "Replanned scope cannot be executed: {:?}",
-                                        other
-                                    );
-                                    last_error = Some(msg.clone());
-                                    final_stop = BatchStop::Blocked { step_id, reason: msg };
-                                    break;
-                                }
+                                last_error = Some(msg.clone());
+                                final_stop = BatchStop::Blocked {
+                                    step_id,
+                                    reason: msg,
+                                };
+                                break;
                             }
-                        }
-                        Some(PlanRefineResult::Blocked { reason: architect_reason }) => {
+                            PlanScopeEvaluation::BlockedByDependencies(items) => {
+                                let msg = format!(
+                                    "Scope contains step(s) whose prerequisites are not DONE: {}",
+                                    items.join(", ")
+                                );
+                                last_error = Some(msg.clone());
+                                final_stop = BatchStop::Blocked {
+                                    step_id,
+                                    reason: msg,
+                                };
+                                break;
+                            }
+                            other => {
+                                let msg =
+                                    format!("Replanned scope cannot be executed: {:?}", other);
+                                last_error = Some(msg.clone());
+                                final_stop = BatchStop::Blocked {
+                                    step_id,
+                                    reason: msg,
+                                };
+                                break;
+                            }
+                        },
+                        Some(PlanRefineResult::Blocked {
+                            reason: architect_reason,
+                        }) => {
                             let msg = format!(
                                 "Architect reported blockers during automated replanning for step '{}': {}",
                                 step_id, architect_reason
                             );
                             last_error = Some(msg.clone());
-                            final_stop = BatchStop::Blocked { step_id, reason: msg };
+                            final_stop = BatchStop::Blocked {
+                                step_id,
+                                reason: msg,
+                            };
                             break;
                         }
                         None => {
@@ -535,7 +547,10 @@ pub(super) async fn run_plan_batch_with(
                                 step_id
                             );
                             last_error = Some(msg.clone());
-                            final_stop = BatchStop::Blocked { step_id, reason: msg };
+                            final_stop = BatchStop::Blocked {
+                                step_id,
+                                reason: msg,
+                            };
                             break;
                         }
                     }
@@ -594,13 +609,11 @@ pub(super) async fn run_plan_batch_with(
                 reason,
             }
         }
-        BatchStop::Blocked { step_id, reason } => {
-            BatchOutcome::Blocked {
-                completed: total_completed,
-                step_id,
-                reason,
-            }
-        }
+        BatchStop::Blocked { step_id, reason } => BatchOutcome::Blocked {
+            completed: total_completed,
+            step_id,
+            reason,
+        },
     };
 
     clear_auto_context(state).await;
@@ -621,7 +634,13 @@ pub(super) async fn run_plan_batch_with(
 pub async fn handle_plan_execute(req: Request, state: &Arc<AppState>) -> Response {
     let params: PlanExecuteParams = match req.params.and_then(|p| serde_json::from_value(p).ok()) {
         Some(p) => p,
-        None => return Response::err(req.id, errors::INVALID_PARAMS, "Missing or invalid plan execute params"),
+        None => {
+            return Response::err(
+                req.id,
+                errors::INVALID_PARAMS,
+                "Missing or invalid plan execute params",
+            )
+        }
     };
 
     let repo_root = state.context.read().await.repo_root().to_path_buf();
@@ -686,11 +705,19 @@ pub async fn handle_plan_execute(req: Request, state: &Arc<AppState>) -> Respons
             if plan.items.is_empty() && !plan.concept.is_empty() {
                 Vec::<tauqe_protocol::PlanItem>::new()
             } else {
-                return Response::err(req.id, errors::NOTHING_TO_EXECUTE, "All steps in this scope are already completed");
+                return Response::err(
+                    req.id,
+                    errors::NOTHING_TO_EXECUTE,
+                    "All steps in this scope are already completed",
+                );
             }
         }
         PlanScopeEvaluation::Cancelled => {
-            return Response::err(req.id, errors::STEP_CANCELLED, "Step is CANCELLED and cannot be executed");
+            return Response::err(
+                req.id,
+                errors::STEP_CANCELLED,
+                "Step is CANCELLED and cannot be executed",
+            );
         }
         PlanScopeEvaluation::NotFound => {
             return Response::err(req.id, errors::NOT_FOUND, "Target item not found in plan");
@@ -909,10 +936,8 @@ pub async fn handle_plan_replan(req: Request, state: &Arc<AppState>) -> Response
                         .and_then(|v| v.as_str())
                         .unwrap_or_default()
                         .to_string();
-                    let blocked_reason = obj
-                        .get("reason")
-                        .and_then(|v| v.as_str())
-                        .map(String::from);
+                    let blocked_reason =
+                        obj.get("reason").and_then(|v| v.as_str()).map(String::from);
                     let custom_model = obj
                         .get("model")
                         .and_then(|v| serde_json::from_value(v.clone()).ok());
@@ -960,7 +985,11 @@ pub async fn handle_plan_replan(req: Request, state: &Arc<AppState>) -> Response
         );
     }
     if step_id.trim().is_empty() {
-        return Response::err(req.id, errors::INVALID_PARAMS, "Missing blocked step ID to replan");
+        return Response::err(
+            req.id,
+            errors::INVALID_PARAMS,
+            "Missing blocked step ID to replan",
+        );
     }
 
     let load_root = repo_root.clone();
@@ -983,7 +1012,10 @@ pub async fn handle_plan_replan(req: Request, state: &Arc<AppState>) -> Response
             return Response::err(
                 req.id,
                 errors::NOT_FOUND,
-                format!("Step '{}' not found in plan '{}'", step_id, effective_plan_id),
+                format!(
+                    "Step '{}' not found in plan '{}'",
+                    step_id, effective_plan_id
+                ),
             );
         }
     };

@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
 use crossterm::event::{KeyCode, KeyEvent};
-use tokio::sync::Mutex;
 use tauqe_protocol::{methods, HistoryGetParams};
+use tokio::sync::Mutex;
 
 use crate::app::{AppState, ViewMode};
 use crate::command::CommandCategory::{Essential, Helpers, Interface};
@@ -299,20 +299,27 @@ pub async fn handle_history_key(
             st.view_mode = ViewMode::Repl;
         }
         HistoryAction::FoldToggle => {
-            if let Some(item) = st.history_view.items.get(st.history_view.selected_item_index) {
+            if let Some(item) = st
+                .history_view
+                .items
+                .get(st.history_view.selected_item_index)
+            {
                 let id = item.id;
                 st.history_view.toggle_expanded(id);
-                st.history_view.scroll_to_selected_item(view_height, Some(content_width));
+                st.history_view
+                    .scroll_to_selected_item(view_height, Some(content_width));
             }
         }
         HistoryAction::Recenter => {
-            st.history_view.recenter_selected_item(view_height, Some(content_width));
+            st.history_view
+                .recenter_selected_item(view_height, Some(content_width));
         }
         HistoryAction::NavPrev => {
             if !st.history_view.items.is_empty() {
                 if st.history_view.selected_item_index > 0 {
                     st.history_view.selected_item_index -= 1;
-                    st.history_view.scroll_to_selected_item(view_height, Some(content_width));
+                    st.history_view
+                        .scroll_to_selected_item(view_height, Some(content_width));
                 } else {
                     request_older_history(&mut st, server_writer, true).await?;
                 }
@@ -323,7 +330,8 @@ pub async fn handle_history_key(
                 && st.history_view.selected_item_index + 1 < st.history_view.items.len()
             {
                 st.history_view.selected_item_index += 1;
-                st.history_view.scroll_to_selected_item(view_height, Some(content_width));
+                st.history_view
+                    .scroll_to_selected_item(view_height, Some(content_width));
                 if st.history_view.selected_item_index + 1 >= st.history_view.items.len() {
                     st.history_view.auto_scroll = true;
                 }
@@ -396,8 +404,7 @@ pub async fn handle_history_key(
                     }
                 } else {
                     st.notify_warning(
-                        active_t("notify.history_item_empty")
-                            .replace("{}", &item_id.to_string()),
+                        active_t("notify.history_item_empty").replace("{}", &item_id.to_string()),
                     );
                 }
             }
@@ -433,8 +440,7 @@ pub async fn handle_history_key(
                     }
                 } else {
                     st.notify_warning(
-                        active_t("notify.history_item_empty")
-                            .replace("{}", &item_id.to_string()),
+                        active_t("notify.history_item_empty").replace("{}", &item_id.to_string()),
                     );
                 }
             }
@@ -443,7 +449,8 @@ pub async fn handle_history_key(
             st.history_view.auto_scroll = false;
             if st.history_view.scroll > 0 {
                 st.history_view.scroll = st.history_view.scroll.saturating_sub(1);
-                st.history_view.update_selected_item_from_scroll(view_height, Some(content_width));
+                st.history_view
+                    .update_selected_item_from_scroll(view_height, Some(content_width));
             } else {
                 request_older_history(&mut st, server_writer, false).await?;
             }
@@ -453,7 +460,8 @@ pub async fn handle_history_key(
             st.history_view.auto_scroll = false;
             if st.history_view.scroll > 0 {
                 st.history_view.scroll = st.history_view.scroll.saturating_sub(page);
-                st.history_view.update_selected_item_from_scroll(view_height, Some(content_width));
+                st.history_view
+                    .update_selected_item_from_scroll(view_height, Some(content_width));
             } else {
                 request_older_history(&mut st, server_writer, false).await?;
             }
@@ -461,7 +469,8 @@ pub async fn handle_history_key(
         HistoryAction::ScrollDown => {
             if st.history_view.scroll < max_scroll {
                 st.history_view.scroll = st.history_view.scroll.saturating_add(1);
-                st.history_view.update_selected_item_from_scroll(view_height, Some(content_width));
+                st.history_view
+                    .update_selected_item_from_scroll(view_height, Some(content_width));
             }
             if st.history_view.scroll >= max_scroll {
                 st.history_view.auto_scroll = true;
@@ -470,7 +479,8 @@ pub async fn handle_history_key(
         HistoryAction::PageDown => {
             let page = view_height.saturating_sub(2).max(1);
             st.history_view.scroll = (st.history_view.scroll.saturating_add(page)).min(max_scroll);
-            st.history_view.update_selected_item_from_scroll(view_height, Some(content_width));
+            st.history_view
+                .update_selected_item_from_scroll(view_height, Some(content_width));
             if st.history_view.scroll >= max_scroll {
                 st.history_view.auto_scroll = true;
             }
@@ -478,13 +488,15 @@ pub async fn handle_history_key(
         HistoryAction::SelectFirst => {
             st.history_view.auto_scroll = false;
             st.history_view.scroll = 0;
-            st.history_view.update_selected_item_from_scroll(view_height, Some(content_width));
+            st.history_view
+                .update_selected_item_from_scroll(view_height, Some(content_width));
             request_older_history(&mut st, server_writer, false).await?;
         }
         HistoryAction::SelectLast => {
             st.history_view.auto_scroll = true;
             st.history_view.scroll = max_scroll;
-            st.history_view.update_selected_item_from_scroll(view_height, Some(content_width));
+            st.history_view
+                .update_selected_item_from_scroll(view_height, Some(content_width));
         }
     }
 

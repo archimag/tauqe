@@ -109,32 +109,26 @@ pub async fn handle_context_add_pattern(req: Request, state: &Arc<AppState>) -> 
     };
 
     let repo_root = state.repo_root().await;
-    let available_files = super::offload(move || {
-        tauqe_core::git::list_repository_files(Some(repo_root.as_path()))
-    })
-    .await
-    .map(|result| result.unwrap_or_default())
-    .unwrap_or_default();
+    let available_files =
+        super::offload(move || tauqe_core::git::list_repository_files(Some(repo_root.as_path())))
+            .await
+            .map(|result| result.unwrap_or_default())
+            .unwrap_or_default();
 
     // The batch reads metadata of up to `max_pattern_batch` files from disk, so
     // the whole application runs inside the blocking closure.
     let outcome = super::with_context_mutation(state, move |ctx| {
-        ctx.add_files_by_pattern(
-            &params.pattern,
-            params.access,
-            &available_files,
-            max_batch,
-        )
-        .map(|outcome| {
-            let state = ctx.get_state();
-            (
-                outcome.added_items.len(),
-                outcome.added_tokens,
-                outcome.truncated,
-                state,
-            )
-        })
-        .map_err(|err| err.to_string())
+        ctx.add_files_by_pattern(&params.pattern, params.access, &available_files, max_batch)
+            .map(|outcome| {
+                let state = ctx.get_state();
+                (
+                    outcome.added_items.len(),
+                    outcome.added_tokens,
+                    outcome.truncated,
+                    state,
+                )
+            })
+            .map_err(|err| err.to_string())
     })
     .await;
 
@@ -204,7 +198,11 @@ pub async fn handle_context_set_access(req: Request, state: &Arc<AppState>) -> R
         match req.params.and_then(|p| serde_json::from_value(p).ok()) {
             Some(p) => p,
             None => {
-                return Response::err(req.id, errors::INVALID_PARAMS, "Missing or invalid parameters");
+                return Response::err(
+                    req.id,
+                    errors::INVALID_PARAMS,
+                    "Missing or invalid parameters",
+                );
             }
         };
 
@@ -454,8 +452,7 @@ mod tests {
         .ok();
         let res = handle_context_add_pattern(make_req(3, pat_params), &state).await;
         assert!(res.error.is_none());
-        let result: ContextAddPatternResult =
-            serde_json::from_value(res.result.unwrap()).unwrap();
+        let result: ContextAddPatternResult = serde_json::from_value(res.result.unwrap()).unwrap();
         assert_eq!(result.added_count, 2);
         assert!(!result.truncated);
         assert_eq!(result.state.items.len(), 2);
@@ -673,18 +670,17 @@ mod tests {
             access: ContextAccess::ReadOnly,
         })
         .ok();
-        let res = handle_context_add_pattern(
-            make_req(methods::CONTEXT_ADD_PATTERN, pat_params),
-            &state,
-        )
-        .await;
+        let res =
+            handle_context_add_pattern(make_req(methods::CONTEXT_ADD_PATTERN, pat_params), &state)
+                .await;
         assert_eq!(res.error.unwrap().code, errors::OPERATION_IN_PROGRESS);
 
         let rem_params = serde_json::to_value(ContextRemoveParams {
             path: "foo.rs".to_string(),
         })
         .ok();
-        let res = handle_context_remove(make_req(methods::CONTEXT_REMOVE, rem_params), &state).await;
+        let res =
+            handle_context_remove(make_req(methods::CONTEXT_REMOVE, rem_params), &state).await;
         assert_eq!(res.error.unwrap().code, errors::OPERATION_IN_PROGRESS);
 
         let set_params = serde_json::to_value(ContextSetAccessParams {

@@ -85,7 +85,10 @@ mod tests {
 
     #[test]
     fn test_resolve_target_path_for_op_ambiguity_returns_err() {
-        let editable = vec!["crates/a/src/lib.rs".to_string(), "crates/b/src/lib.rs".to_string()];
+        let editable = vec![
+            "crates/a/src/lib.rs".to_string(),
+            "crates/b/src/lib.rs".to_string(),
+        ];
         let res = resolve_target_path_for_op("lib.rs", &editable, false);
         assert!(res.is_err());
     }

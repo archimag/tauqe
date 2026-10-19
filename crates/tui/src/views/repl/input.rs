@@ -2,8 +2,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crossterm::event::{KeyCode, KeyEvent};
-use tokio::sync::Mutex;
 use tauqe_protocol::{methods, ModelAskParams};
+use tokio::sync::Mutex;
 
 use crate::app::AppState;
 use crate::command::CommandCategory::{Essential, Helpers, Interface};
@@ -540,12 +540,12 @@ pub fn resolve_viewport_action(
         {
             ReplAction::ToggleSelectedFileFold
         }
-        ReplAction::HistoryPrev
-        | ReplAction::LineUpOrHistoryPrev
-        | ReplAction::MoveLineUp => ReplAction::ViewportPrev,
-        ReplAction::HistoryNext
-        | ReplAction::LineDownOrHistoryNext
-        | ReplAction::MoveLineDown => ReplAction::ViewportNext,
+        ReplAction::HistoryPrev | ReplAction::LineUpOrHistoryPrev | ReplAction::MoveLineUp => {
+            ReplAction::ViewportPrev
+        }
+        ReplAction::HistoryNext | ReplAction::LineDownOrHistoryNext | ReplAction::MoveLineDown => {
+            ReplAction::ViewportNext
+        }
         ReplAction::InsertSpaces => ReplAction::ToggleSelectedFileFold,
         ReplAction::MoveBeginningOfLine if key.code == KeyCode::Home => {
             ReplAction::ScrollResponseHome
@@ -706,7 +706,13 @@ pub async fn handle_repl_key(
                 let params = ModelAskParams::Prompt {
                     text: prompt.clone(),
                 };
-                if let Err(err) = send_request(server_writer, methods::MODEL_ASK, serde_json::to_value(params)?).await {
+                if let Err(err) = send_request(
+                    server_writer,
+                    methods::MODEL_ASK,
+                    serde_json::to_value(params)?,
+                )
+                .await
+                {
                     let mut st = state.lock().await;
                     st.input_editor.clear();
                     st.input_editor.insert_str(&prompt);
@@ -750,7 +756,8 @@ pub async fn handle_repl_key(
             }
         }
         ReplAction::NextModifiedFile => {
-            if !st.model.files.is_empty() && st.model.selected_file_index + 1 < st.model.files.len() {
+            if !st.model.files.is_empty() && st.model.selected_file_index + 1 < st.model.files.len()
+            {
                 st.model.selected_file_index += 1;
                 st.model.scroll_to_selected_file(view_height);
             }
@@ -1149,10 +1156,12 @@ mod tests {
         );
 
         // Typing (including Space) is an editor action that returns focus to the prompt
-        let typed = resolve_viewport_action(key(KeyCode::Char('x'), KeyModifiers::NONE), p).unwrap();
+        let typed =
+            resolve_viewport_action(key(KeyCode::Char('x'), KeyModifiers::NONE), p).unwrap();
         assert_eq!(typed, ReplAction::InsertChar('x'));
         assert!(is_editor_action(typed));
-        let space = resolve_viewport_action(key(KeyCode::Char(' '), KeyModifiers::NONE), p).unwrap();
+        let space =
+            resolve_viewport_action(key(KeyCode::Char(' '), KeyModifiers::NONE), p).unwrap();
         assert_eq!(space, ReplAction::InsertChar(' '));
         assert!(is_editor_action(space));
     }
@@ -1229,9 +1238,18 @@ mod tests {
         handle_repl_key(key, &state, &mut conn).await.unwrap();
 
         let guard = state.lock().await;
-        assert!(guard.confirm_batch_cancel, "Esc during batch must open three-way batch cancel dialog");
-        assert!(!guard.confirm_cancel, "Esc during batch must not open binary hard cancel dialog");
-        assert_eq!(guard.batch_cancel_button, crate::app::BatchCancelButton::Continue);
+        assert!(
+            guard.confirm_batch_cancel,
+            "Esc during batch must open three-way batch cancel dialog"
+        );
+        assert!(
+            !guard.confirm_cancel,
+            "Esc during batch must not open binary hard cancel dialog"
+        );
+        assert_eq!(
+            guard.batch_cancel_button,
+            crate::app::BatchCancelButton::Continue
+        );
     }
 
     #[tokio::test]
@@ -1248,7 +1266,10 @@ mod tests {
         let guard = state.lock().await;
         assert!(!guard.confirm_batch_cancel);
         assert!(guard.confirm_cancel);
-        assert_eq!(guard.confirm_button, crate::app::ConfirmDialogButton::Cancel);
+        assert_eq!(
+            guard.confirm_button,
+            crate::app::ConfirmDialogButton::Cancel
+        );
     }
 
     #[tokio::test]

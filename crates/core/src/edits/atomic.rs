@@ -282,8 +282,13 @@ mod tests {
             summary: "multi".into(),
             edits: vec![
                 replace("a.rs", "one", "alpha"),
-                EditOperation::Create { path: "c.rs".into(), content: "gamma".into() },
-                EditOperation::Delete { path: "b.rs".into() },
+                EditOperation::Create {
+                    path: "c.rs".into(),
+                    content: "gamma".into(),
+                },
+                EditOperation::Delete {
+                    path: "b.rs".into(),
+                },
             ],
         };
         let changed = apply_edit_proposal(root, &mut cm, &proposal).unwrap();
@@ -325,14 +330,13 @@ mod tests {
             path: "sym_dir/hacked.txt".into(),
             content: "payload".into(),
         };
-        let result = stage_and_validate_edits(
-            repo_root,
-            &cm,
-            std::slice::from_ref(&create_op),
-            None,
-        );
+        let result =
+            stage_and_validate_edits(repo_root, &cm, std::slice::from_ref(&create_op), None);
         assert!(!result.is_success());
-        assert!(matches!(&result.failed_files[0].error, EditError::InvalidPath(_, _)));
+        assert!(matches!(
+            &result.failed_files[0].error,
+            EditError::InvalidPath(_, _)
+        ));
         assert!(!outside_root.join("hacked.txt").exists());
 
         let proposal = EditProposal {

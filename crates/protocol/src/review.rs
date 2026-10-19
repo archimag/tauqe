@@ -26,7 +26,5 @@ pub use events::{
     ReviewContentDeltaEvent, ReviewErrorEvent, ReviewFinishedEvent, ReviewListChangedEvent,
     ReviewReasoningDeltaEvent, ReviewStartedEvent, ReviewUpdatedEvent,
 };
-pub use item::{
-    IssueStatus, IssueType, ReviewIssue, ReviewItem, ReviewItemStatus, ReviewSeverity,
-};
+pub use item::{IssueStatus, IssueType, ReviewIssue, ReviewItem, ReviewItemStatus, ReviewSeverity};
 pub use session::{ReviewSession, ReviewSummary};

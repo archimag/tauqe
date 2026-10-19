@@ -142,8 +142,11 @@ fn build_env<'a>(
 #[tokio::test]
 async fn answer_edit_loop_stages_matching_edits() {
     let (_dir, repo_root) = init_repo();
-    std::fs::write(repo_root.join("target.rs"), "pub fn compute() -> i32 { 0 }\n")
-        .expect("write target fixture");
+    std::fs::write(
+        repo_root.join("target.rs"),
+        "pub fn compute() -> i32 { 0 }\n",
+    )
+    .expect("write target fixture");
     commit_fixture(&repo_root, &["target.rs"]);
 
     let mut context = ContextManager::new(repo_root.clone());
@@ -186,7 +189,11 @@ async fn answer_edit_loop_stages_matching_edits() {
 
     match &output.result {
         ModelResult::Edit { edits, outcome, .. } => {
-            assert!(outcome.error.is_none(), "unexpected error: {:?}", outcome.error);
+            assert!(
+                outcome.error.is_none(),
+                "unexpected error: {:?}",
+                outcome.error
+            );
             assert_eq!(edits.len(), 1);
         }
         other => panic!("expected staged edits, got {other:?}"),
@@ -197,8 +204,11 @@ async fn answer_edit_loop_stages_matching_edits() {
 #[tokio::test]
 async fn answer_edit_loop_accepts_answer_without_edits() {
     let (_dir, repo_root) = init_repo();
-    std::fs::write(repo_root.join("target.rs"), "pub fn compute() -> i32 { 0 }\n")
-        .expect("write target fixture");
+    std::fs::write(
+        repo_root.join("target.rs"),
+        "pub fn compute() -> i32 { 0 }\n",
+    )
+    .expect("write target fixture");
     commit_fixture(&repo_root, &["target.rs"]);
 
     let mut context = ContextManager::new(repo_root.clone());
@@ -242,11 +252,17 @@ async fn answer_edit_loop_accepts_answer_without_edits() {
 #[tokio::test]
 async fn answer_edit_loop_discovers_context_via_repo_search() {
     let (_dir, repo_root) = init_repo();
-    std::fs::write(repo_root.join("target.rs"), "pub fn compute() -> i32 { 0 }\n")
-        .expect("write target fixture");
+    std::fs::write(
+        repo_root.join("target.rs"),
+        "pub fn compute() -> i32 { 0 }\n",
+    )
+    .expect("write target fixture");
     std::fs::create_dir_all(repo_root.join("src")).expect("create src dir");
-    std::fs::write(repo_root.join("src/helper.rs"), "pub const ANSWER: i32 = 42;\n")
-        .expect("write helper fixture");
+    std::fs::write(
+        repo_root.join("src/helper.rs"),
+        "pub const ANSWER: i32 = 42;\n",
+    )
+    .expect("write helper fixture");
     commit_fixture(&repo_root, &["target.rs", "src/helper.rs"]);
 
     let mut context = ContextManager::new(repo_root.clone());
@@ -317,8 +333,11 @@ async fn answer_edit_loop_discovers_context_via_repo_search() {
 #[tokio::test]
 async fn answer_edit_loop_discovers_requested_context() {
     let (_dir, repo_root) = init_repo();
-    std::fs::write(repo_root.join("target.rs"), "pub fn compute() -> i32 { 0 }\n")
-        .expect("write target fixture");
+    std::fs::write(
+        repo_root.join("target.rs"),
+        "pub fn compute() -> i32 { 0 }\n",
+    )
+    .expect("write target fixture");
     std::fs::write(repo_root.join("helper.rs"), "pub const ANSWER: i32 = 42;\n")
         .expect("write helper fixture");
     commit_fixture(&repo_root, &["target.rs", "helper.rs"]);
@@ -376,10 +395,215 @@ async fn answer_edit_loop_discovers_requested_context() {
 }
 
 #[tokio::test]
+async fn answer_edit_loop_discovers_the_directory_outline() {
+    let (_dir, repo_root) = init_repo();
+    std::fs::write(
+        repo_root.join("target.rs"),
+        "pub fn compute() -> i32 { 0 }\n",
+    )
+    .expect("write target fixture");
+    std::fs::create_dir_all(repo_root.join("src/nested")).expect("create nested directory");
+    std::fs::write(
+        repo_root.join("src/nested/helper.rs"),
+        "pub const ANSWER: i32 = 42;\n",
+    )
+    .expect("write helper fixture");
+    commit_fixture(&repo_root, &["target.rs", "src/nested/helper.rs"]);
+
+    let mut context = ContextManager::new(repo_root.clone());
+    context
+        .add_file("target.rs", ContextAccess::Editable)
+        .expect("add target to context");
+    let mut history = HistoryManager::new(repo_root.clone());
+
+    let discovery = format!("I need the repository layout.\n<repo_dirs_{MARKER} />");
+    let edit = edit_block(
+        "Use the helper constant",
+        "target.rs",
+        "pub fn compute() -> i32 { 0 }",
+        "pub fn compute() -> i32 { 42 }",
+    );
+    let provider =
+        MockLlmProvider::scripted([MockResponse::text(discovery), MockResponse::text(edit)]);
+    let model = ModelRef::openrouter("mock/model");
+    let protocol = tauqe_core::prompt::xml::XmlPromptProtocol;
+    let protocol = protocol.with_turn_marker(MARKER).unwrap();
+    let mut policy = tauqe_core::workflow::policy::DirectApplyPolicy::new();
+    let options = WorkflowOptions::default();
+    let (stream_tx, cancel_rx) = event_channel();
+
+    let output = {
+        let mut env = build_env(
+            &provider,
+            &model,
+            &mut context,
+            &mut history,
+            protocol.as_ref(),
+            &mut policy,
+            stream_tx,
+            cancel_rx,
+            &options,
+        );
+        AnswerEditLoop::new("Use the helper constant")
+            .execute(&mut env)
+            .await
+            .expect("answer/edit loop executes")
+    };
+
+    assert!(matches!(&output.result, ModelResult::Edit { edits, .. } if !edits.is_empty()));
+    assert_eq!(provider.requests().len(), 2);
+    let follow_up = &provider.requests()[1];
+    assert!(follow_up.messages[1]
+        .content
+        .contains("<repo_dirs_feedback>"));
+    assert!(follow_up.messages[1].content.contains("src\n  nested"));
+}
+
+#[tokio::test]
+async fn answer_edit_loop_discovers_a_targeted_repo_map() {
+    let (_dir, repo_root) = init_repo();
+    std::fs::write(
+        repo_root.join("target.rs"),
+        "pub fn compute() -> i32 { 0 }\n",
+    )
+    .expect("write target fixture");
+    std::fs::create_dir_all(repo_root.join("src")).expect("create src directory");
+    std::fs::write(repo_root.join("src/alpha.rs"), "pub fn alpha() {}\n")
+        .expect("write alpha fixture");
+    commit_fixture(&repo_root, &["target.rs", "src/alpha.rs"]);
+
+    let mut context = ContextManager::new(repo_root.clone());
+    context
+        .add_file("target.rs", ContextAccess::Editable)
+        .expect("add target to context");
+    let mut history = HistoryManager::new(repo_root.clone());
+
+    let discovery = format!("Outlining the subsystem.\n<repo_map_{MARKER} path=\"src\" />");
+    let edit = edit_block(
+        "Use the helper constant",
+        "target.rs",
+        "pub fn compute() -> i32 { 0 }",
+        "pub fn compute() -> i32 { 42 }",
+    );
+    let provider =
+        MockLlmProvider::scripted([MockResponse::text(discovery), MockResponse::text(edit)]);
+    let model = ModelRef::openrouter("mock/model");
+    let protocol = tauqe_core::prompt::xml::XmlPromptProtocol;
+    let protocol = protocol.with_turn_marker(MARKER).unwrap();
+    let mut policy = tauqe_core::workflow::policy::DirectApplyPolicy::new();
+    let options = WorkflowOptions::default();
+    let (stream_tx, cancel_rx) = event_channel();
+
+    let output = {
+        let mut env = build_env(
+            &provider,
+            &model,
+            &mut context,
+            &mut history,
+            protocol.as_ref(),
+            &mut policy,
+            stream_tx,
+            cancel_rx,
+            &options,
+        );
+        AnswerEditLoop::new("Use the helper constant")
+            .execute(&mut env)
+            .await
+            .expect("answer/edit loop executes")
+    };
+
+    assert!(matches!(&output.result, ModelResult::Edit { edits, .. } if !edits.is_empty()));
+    assert_eq!(provider.requests().len(), 2);
+    let follow_up = &provider.requests()[1];
+    assert!(follow_up.messages[1]
+        .content
+        .contains("<repomap_feedback path=\"src\">"));
+    assert!(follow_up.messages[1].content.contains("pub fn alpha"));
+}
+
+#[tokio::test]
+async fn structured_turn_discovers_a_targeted_repo_map() {
+    let (_dir, repo_root) = init_repo();
+    std::fs::write(
+        repo_root.join("target.rs"),
+        "pub fn compute() -> i32 { 0 }\n",
+    )
+    .expect("write target fixture");
+    std::fs::create_dir_all(repo_root.join("src")).expect("create src directory");
+    std::fs::write(repo_root.join("src/alpha.rs"), "pub fn alpha() {}\n")
+        .expect("write alpha fixture");
+    commit_fixture(&repo_root, &["target.rs", "src/alpha.rs"]);
+
+    let mut context = ContextManager::new(repo_root.clone());
+    context
+        .add_file("target.rs", ContextAccess::Editable)
+        .expect("add target to context");
+    let mut history = HistoryManager::new(repo_root.clone());
+
+    let discovery = serde_json::json!({
+        "message": "Outlining the subsystem.",
+        "changes": [],
+        "context_requests": [],
+        "repo_maps": ["src"],
+    })
+    .to_string();
+    let edit = serde_json::json!({
+        "message": "Use the helper constant.",
+        "changes": [{
+            "op": "replace",
+            "path": "target.rs",
+            "to": "",
+            "old_text": "pub fn compute() -> i32 { 0 }",
+            "new_text": "pub fn compute() -> i32 { 42 }",
+            "content": ""
+        }],
+        "context_requests": [],
+        "outcome": { "status": "success", "summary": "Constant applied", "message": "" },
+    })
+    .to_string();
+
+    let provider =
+        MockLlmProvider::scripted([MockResponse::text(discovery), MockResponse::text(edit)]);
+    let model = ModelRef::openrouter("mock/model");
+    let protocol = tauqe_core::prompt::json::JsonPromptProtocol::edits();
+    let mut policy = tauqe_core::workflow::policy::DirectApplyPolicy::new();
+    let options = WorkflowOptions::default();
+    let (stream_tx, cancel_rx) = event_channel();
+
+    let output = {
+        let mut env = build_env(
+            &provider,
+            &model,
+            &mut context,
+            &mut history,
+            &protocol,
+            &mut policy,
+            stream_tx,
+            cancel_rx,
+            &options,
+        );
+        AnswerEditLoop::new("Use the helper constant")
+            .execute(&mut env)
+            .await
+            .expect("structured turn executes")
+    };
+
+    assert!(matches!(&output.result, ModelResult::Edit { edits, .. } if !edits.is_empty()));
+    assert_eq!(provider.requests().len(), 2);
+    let follow_up = &provider.requests()[1];
+    assert!(follow_up.messages[1]
+        .content
+        .contains("<repomap_feedback path=\"src\">"));
+}
+
+#[tokio::test]
 async fn answer_edit_loop_heals_failed_patch_application() {
     let (_dir, repo_root) = init_repo();
-    std::fs::write(repo_root.join("target.rs"), "pub fn compute() -> i32 { 0 }\n")
-        .expect("write target fixture");
+    std::fs::write(
+        repo_root.join("target.rs"),
+        "pub fn compute() -> i32 { 0 }\n",
+    )
+    .expect("write target fixture");
     commit_fixture(&repo_root, &["target.rs"]);
 
     let mut context = ContextManager::new(repo_root.clone());
@@ -436,8 +660,11 @@ async fn answer_edit_loop_heals_failed_patch_application() {
 #[tokio::test]
 async fn edit_loop_retries_until_edits_are_produced() {
     let (_dir, repo_root) = init_repo();
-    std::fs::write(repo_root.join("target.rs"), "pub fn compute() -> i32 { 0 }\n")
-        .expect("write target fixture");
+    std::fs::write(
+        repo_root.join("target.rs"),
+        "pub fn compute() -> i32 { 0 }\n",
+    )
+    .expect("write target fixture");
     commit_fixture(&repo_root, &["target.rs"]);
 
     let mut context = ContextManager::new(repo_root.clone());
@@ -544,13 +771,21 @@ async fn git_workflow_heals_compiler_failure() {
 
     match execution.result {
         ModelResult::Edit { outcome, .. } => {
-            assert!(outcome.error.is_none(), "unexpected error: {:?}", outcome.error);
-            assert!(outcome.applied, "healing should apply and commit the repaired edits");
+            assert!(
+                outcome.error.is_none(),
+                "unexpected error: {:?}",
+                outcome.error
+            );
+            assert!(
+                outcome.applied,
+                "healing should apply and commit the repaired edits"
+            );
         }
         other => panic!("expected applied edits, got {other:?}"),
     }
 
-    let healed = std::fs::read_to_string(repo_root.join("src/lib.rs")).expect("read healed library");
+    let healed =
+        std::fs::read_to_string(repo_root.join("src/lib.rs")).expect("read healed library");
     assert!(healed.contains("pub fn alpha() -> i32 { 1 }"));
     assert!(healed.contains("pub fn beta() -> i32 { 2 }"));
     assert_eq!(provider.requests().len(), 2);
@@ -615,13 +850,21 @@ async fn git_workflow_verifies_and_heals_when_verify_tag_omitted_by_model() {
 
     match execution.result {
         ModelResult::Edit { outcome, .. } => {
-            assert!(outcome.error.is_none(), "unexpected error: {:?}", outcome.error);
-            assert!(outcome.applied, "auto-verification should heal and apply edits");
+            assert!(
+                outcome.error.is_none(),
+                "unexpected error: {:?}",
+                outcome.error
+            );
+            assert!(
+                outcome.applied,
+                "auto-verification should heal and apply edits"
+            );
         }
         other => panic!("expected applied edits, got {other:?}"),
     }
 
-    let healed = std::fs::read_to_string(repo_root.join("src/lib.rs")).expect("read healed library");
+    let healed =
+        std::fs::read_to_string(repo_root.join("src/lib.rs")).expect("read healed library");
     assert!(healed.contains("pub fn alpha() -> i32 { 1 }"));
     assert!(healed.contains("pub fn beta() -> i32 { 2 }"));
     assert_eq!(
@@ -722,7 +965,8 @@ async fn git_workflow_heals_when_verification_response_has_text_only() {
         ),
     );
     // The first verification retry response gives only text explanation without any edits.
-    let text_only_retry = "I see that beta also has a mismatched return type. Let me fix it.".to_string();
+    let text_only_retry =
+        "I see that beta also has a mismatched return type. Let me fix it.".to_string();
     let fix_beta = format!(
         "{edits}\n<verify_{MARKER} target=\"check\" on_success=\"silent\" />",
         edits = edit_block(
@@ -762,7 +1006,11 @@ async fn git_workflow_heals_when_verification_response_has_text_only() {
 
     match execution.result {
         ModelResult::Edit { outcome, .. } => {
-            assert!(outcome.error.is_none(), "unexpected error: {:?}", outcome.error);
+            assert!(
+                outcome.error.is_none(),
+                "unexpected error: {:?}",
+                outcome.error
+            );
             assert!(
                 outcome.applied,
                 "healing should survive text-only retry and apply the repaired edits"
@@ -771,7 +1019,8 @@ async fn git_workflow_heals_when_verification_response_has_text_only() {
         other => panic!("expected applied edits, got {other:?}"),
     }
 
-    let healed = std::fs::read_to_string(repo_root.join("src/lib.rs")).expect("read healed library");
+    let healed =
+        std::fs::read_to_string(repo_root.join("src/lib.rs")).expect("read healed library");
     assert!(healed.contains("pub fn alpha() -> i32 { 1 }"));
     assert!(healed.contains("pub fn beta() -> i32 { 2 }"));
     assert_eq!(provider.requests().len(), 3);
@@ -852,9 +1101,7 @@ async fn scratchpad_from_discovery_reaches_verification_healing() {
     ));
     assert_eq!(provider.requests().len(), 3);
     let healing_request = &provider.requests()[2];
-    assert!(healing_request.messages[0]
-        .content
-        .contains("<scratchpad>"));
+    assert!(healing_request.messages[0].content.contains("<scratchpad>"));
     assert!(healing_request.messages[0]
         .content
         .contains("Hypothesis: repair both return types"));
@@ -863,8 +1110,11 @@ async fn scratchpad_from_discovery_reaches_verification_healing() {
 #[tokio::test]
 async fn fsm_turn_respects_cancellation() {
     let (_dir, repo_root) = init_repo();
-    std::fs::write(repo_root.join("target.rs"), "pub fn compute() -> i32 { 0 }\n")
-        .expect("write target fixture");
+    std::fs::write(
+        repo_root.join("target.rs"),
+        "pub fn compute() -> i32 { 0 }\n",
+    )
+    .expect("write target fixture");
     commit_fixture(&repo_root, &["target.rs"]);
 
     let mut context = ContextManager::new(repo_root.clone());
@@ -927,8 +1177,11 @@ async fn fsm_turn_respects_cancellation() {
 #[tokio::test]
 async fn fsm_turn_saves_and_activates_plan() {
     let (_dir, repo_root) = init_repo();
-    std::fs::write(repo_root.join("target.rs"), "pub fn compute() -> i32 { 0 }\n")
-        .expect("write target fixture");
+    std::fs::write(
+        repo_root.join("target.rs"),
+        "pub fn compute() -> i32 { 0 }\n",
+    )
+    .expect("write target fixture");
     commit_fixture(&repo_root, &["target.rs"]);
 
     let mut context = ContextManager::new(repo_root.clone());
@@ -990,8 +1243,11 @@ async fn fsm_turn_saves_and_activates_plan() {
 #[tokio::test]
 async fn scratchpad_persists_between_proposal_rounds() {
     let (_dir, repo_root) = init_repo();
-    std::fs::write(repo_root.join("target.rs"), "pub fn compute() -> i32 { 0 }\n")
-        .expect("write target fixture");
+    std::fs::write(
+        repo_root.join("target.rs"),
+        "pub fn compute() -> i32 { 0 }\n",
+    )
+    .expect("write target fixture");
     std::fs::write(repo_root.join("helper.rs"), "pub const ANSWER: i32 = 42;\n")
         .expect("write helper fixture");
     commit_fixture(&repo_root, &["target.rs", "helper.rs"]);
@@ -1063,7 +1319,11 @@ fn event_channel_with_rx() -> (
 #[tokio::test]
 async fn answer_discussing_protocol_tags_never_starts_edits() {
     let (_dir, repo_root) = init_repo();
-    std::fs::write(repo_root.join("target.rs"), "pub fn compute() -> i32 { 0 }\n").unwrap();
+    std::fs::write(
+        repo_root.join("target.rs"),
+        "pub fn compute() -> i32 { 0 }\n",
+    )
+    .unwrap();
     commit_fixture(&repo_root, &["target.rs"]);
 
     let mut context = ContextManager::new(repo_root.clone());
@@ -1101,11 +1361,17 @@ async fn answer_discussing_protocol_tags_never_starts_edits() {
 
     let mut saw_edit_started = false;
     while let Ok(ev) = stream_rx.try_recv() {
-        if matches!(ev, StreamEvent::EditStarted | StreamEvent::EditFileStarted { .. }) {
+        if matches!(
+            ev,
+            StreamEvent::EditStarted | StreamEvent::EditFileStarted { .. }
+        ) {
             saw_edit_started = true;
         }
     }
-    assert!(!saw_edit_started, "Conversational text discussing tags should not emit edit events");
+    assert!(
+        !saw_edit_started,
+        "Conversational text discussing tags should not emit edit events"
+    );
 }
 
 #[tokio::test]
@@ -1153,11 +1419,17 @@ async fn terminal_error_outcome_blocks_without_applying_edits() {
 #[tokio::test]
 async fn terminal_success_outcome_labels_applied_edits() {
     let (_dir, repo_root) = init_repo();
-    std::fs::write(repo_root.join("target.rs"), "pub fn compute() -> i32 { 0 }\n").unwrap();
+    std::fs::write(
+        repo_root.join("target.rs"),
+        "pub fn compute() -> i32 { 0 }\n",
+    )
+    .unwrap();
     commit_fixture(&repo_root, &["target.rs"]);
 
     let mut context = ContextManager::new(repo_root.clone());
-    context.add_file("target.rs", ContextAccess::Editable).unwrap();
+    context
+        .add_file("target.rs", ContextAccess::Editable)
+        .unwrap();
     let mut history = HistoryManager::new(repo_root.clone());
 
     let edits = edit_block(
@@ -1206,8 +1478,11 @@ async fn terminal_success_outcome_labels_applied_edits() {
 #[tokio::test]
 async fn fsm_turn_semantic_blocked_outcome_aborts_and_rolls_back() {
     let (_dir, repo_root) = init_repo();
-    std::fs::write(repo_root.join("target.rs"), "pub fn compute() -> i32 { 0 }\n")
-        .expect("write target fixture");
+    std::fs::write(
+        repo_root.join("target.rs"),
+        "pub fn compute() -> i32 { 0 }\n",
+    )
+    .expect("write target fixture");
     commit_fixture(&repo_root, &["target.rs"]);
 
     let mut context = ContextManager::new(repo_root.clone());
@@ -1295,7 +1570,11 @@ async fn plan_semantic_recovery_lifecycle_end_to_end() {
         created_at: 10,
         updated_at: 10,
         concept: vec![],
-        items: vec![foundation.clone(), blocked_step.clone(), dependent_step.clone()],
+        items: vec![
+            foundation.clone(),
+            blocked_step.clone(),
+            dependent_step.clone(),
+        ],
         ..Default::default()
     };
 
@@ -1425,8 +1704,11 @@ async fn plan_semantic_recovery_lifecycle_end_to_end() {
 #[tokio::test]
 async fn discussion_turn_streams_clean_markdown_without_json_leakage() {
     let (_dir, repo_root) = init_repo();
-    std::fs::write(repo_root.join("target.rs"), "pub fn compute() -> i32 { 0 }\n")
-        .expect("write target fixture");
+    std::fs::write(
+        repo_root.join("target.rs"),
+        "pub fn compute() -> i32 { 0 }\n",
+    )
+    .expect("write target fixture");
     commit_fixture(&repo_root, &["target.rs"]);
 
     let mut context = ContextManager::new(repo_root.clone());
@@ -1493,7 +1775,12 @@ async fn discussion_turn_streams_clean_markdown_without_json_leakage() {
             "protocol JSON scaffolding must never leak into the REPL stream: {streamed:?}"
         );
     }
-    for forbidden in ["message", "plan_update", "context_requests", "user_language"] {
+    for forbidden in [
+        "message",
+        "plan_update",
+        "context_requests",
+        "user_language",
+    ] {
         assert!(
             !streamed.contains(forbidden),
             "control metadata must never leak into the REPL stream: {streamed:?}"
@@ -1633,8 +1920,11 @@ fn readonly_discussion_intent_selects_structured_discussion_protocol() {
 #[tokio::test]
 async fn structured_turn_persists_scratchpad_between_proposal_rounds() {
     let (_dir, repo_root) = init_repo();
-    std::fs::write(repo_root.join("target.rs"), "pub fn compute() -> i32 { 0 }\n")
-        .expect("write target fixture");
+    std::fs::write(
+        repo_root.join("target.rs"),
+        "pub fn compute() -> i32 { 0 }\n",
+    )
+    .expect("write target fixture");
     std::fs::write(repo_root.join("helper.rs"), "pub const ANSWER: i32 = 42;\n")
         .expect("write helper fixture");
     commit_fixture(&repo_root, &["target.rs", "helper.rs"]);
@@ -1824,8 +2114,11 @@ async fn run_parity_turn(
     response: String,
 ) -> (ModelResult, usize, String) {
     let (_dir, repo_root) = init_repo();
-    std::fs::write(repo_root.join("target.rs"), "pub fn compute() -> i32 { 0 }\n")
-        .expect("write target fixture");
+    std::fs::write(
+        repo_root.join("target.rs"),
+        "pub fn compute() -> i32 { 0 }\n",
+    )
+    .expect("write target fixture");
     commit_fixture(&repo_root, &["target.rs"]);
 
     let mut context = ContextManager::new(repo_root.clone());
@@ -1928,8 +2221,11 @@ async fn xml_and_structured_protocols_are_interchangeable_peers() {
 #[tokio::test]
 async fn discovery_round_extends_the_stable_prompt_prefix() {
     let (_dir, repo_root) = init_repo();
-    std::fs::write(repo_root.join("target.rs"), "pub fn compute() -> i32 { 0 }\n")
-        .expect("write target fixture");
+    std::fs::write(
+        repo_root.join("target.rs"),
+        "pub fn compute() -> i32 { 0 }\n",
+    )
+    .expect("write target fixture");
     std::fs::write(repo_root.join("helper.rs"), "pub const ANSWER: i32 = 42;\n")
         .expect("write helper fixture");
     commit_fixture(&repo_root, &["target.rs", "helper.rs"]);
@@ -2025,8 +2321,11 @@ async fn discovery_round_extends_the_stable_prompt_prefix() {
 #[tokio::test]
 async fn scratchpad_renders_in_the_volatile_tail() {
     let (_dir, repo_root) = init_repo();
-    std::fs::write(repo_root.join("target.rs"), "pub fn compute() -> i32 { 0 }\n")
-        .expect("write target fixture");
+    std::fs::write(
+        repo_root.join("target.rs"),
+        "pub fn compute() -> i32 { 0 }\n",
+    )
+    .expect("write target fixture");
     std::fs::write(repo_root.join("helper.rs"), "pub const ANSWER: i32 = 42;\n")
         .expect("write helper fixture");
     commit_fixture(&repo_root, &["target.rs", "helper.rs"]);
@@ -2111,8 +2410,11 @@ async fn scratchpad_renders_in_the_volatile_tail() {
 #[tokio::test]
 async fn patch_retry_appends_diagnostics_without_reshaping_the_system_prompt() {
     let (_dir, repo_root) = init_repo();
-    std::fs::write(repo_root.join("target.rs"), "pub fn compute() -> i32 { 0 }\n")
-        .expect("write target fixture");
+    std::fs::write(
+        repo_root.join("target.rs"),
+        "pub fn compute() -> i32 { 0 }\n",
+    )
+    .expect("write target fixture");
     commit_fixture(&repo_root, &["target.rs"]);
 
     let mut context = ContextManager::new(repo_root.clone());
@@ -2168,7 +2470,8 @@ async fn patch_retry_appends_diagnostics_without_reshaping_the_system_prompt() {
     assert_eq!(provider.requests().len(), 2);
 
     assert_eq!(
-        provider.requests()[1].messages[0].content, provider.requests()[0].messages[0].content,
+        provider.requests()[1].messages[0].content,
+        provider.requests()[0].messages[0].content,
         "a patch retry must not reshape the cached system prompt"
     );
     assert!(provider.requests()[1].messages[1]
@@ -2177,4 +2480,717 @@ async fn patch_retry_appends_diagnostics_without_reshaping_the_system_prompt() {
     assert!(!provider.requests()[0].messages[1]
         .content
         .contains("Failed files and errors:"));
+}
+
+/// Manifest of a self-contained Cargo fixture used by the formatting tests.
+const FORMAT_MANIFEST: &str = "\
+[package]
+name = \"tauqe-fsm-format-fixture\"
+version = \"0.0.0\"
+edition = \"2021\"
+
+[workspace]
+";
+
+/// Broken fixture source whose mismatched return type the scripted turn repairs.
+const FORMAT_LIB: &str = "pub fn compute() -> i32 { \"compute\" }\n";
+
+/// Search text of the scripted repair.
+const FORMAT_SEARCH: &str = "pub fn compute() -> i32 { \"compute\" }";
+
+/// Replacement text of the scripted repair.
+const FORMAT_REPLACE: &str = "pub fn compute() -> i32 { 7 }";
+
+/// Builds the repository fixture shared by the formatting tests.
+#[cfg(unix)]
+fn format_fixture(formatter: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+    let (_dir, repo_root) = init_repo();
+    std::fs::write(repo_root.join("Cargo.toml"), FORMAT_MANIFEST).expect("write manifest");
+    std::fs::create_dir_all(repo_root.join("src")).expect("create src directory");
+    std::fs::write(repo_root.join("src/lib.rs"), FORMAT_LIB).expect("write broken library");
+    std::fs::write(repo_root.join("tauqe.toml"), formatter).expect("write formatter registry");
+    commit_fixture(&repo_root, &["Cargo.toml", "src/lib.rs", "tauqe.toml"]);
+    (_dir, repo_root)
+}
+
+/// Runs one verified repair turn over the formatting fixture.
+#[cfg(unix)]
+async fn run_format_turn(repo_root: &std::path::Path) -> (ModelResult, usize) {
+    let mut context = ContextManager::new(repo_root.to_path_buf());
+    context
+        .add_file("src/lib.rs", ContextAccess::Editable)
+        .expect("add library to context");
+    let mut history = HistoryManager::new(repo_root.to_path_buf());
+
+    let repair = format!(
+        "{edits}\n<verify_{MARKER} target=\"check\" on_success=\"silent\" />",
+        edits = edit_block(
+            "Repair compute return type",
+            "src/lib.rs",
+            FORMAT_SEARCH,
+            FORMAT_REPLACE
+        ),
+    );
+    let provider = MockLlmProvider::scripted([MockResponse::text(repair)]);
+    let model = ModelRef::openrouter("mock/model");
+    let protocol = tauqe_core::prompt::xml::XmlPromptProtocol
+        .with_turn_marker(MARKER)
+        .expect("marker-bound protocol");
+    let (stream_tx, cancel_rx) = event_channel();
+
+    let mut policy = GitTransactionPolicy::new();
+    let exec = SingleExecution::new(WorkflowOptions::default());
+    let execution = exec
+        .execute(
+            &mut policy,
+            "Repair the mismatched return type in src/lib.rs",
+            tauqe_protocol::TurnIntent::InteractiveRepl,
+            &provider,
+            &model,
+            &mut context,
+            &mut history,
+            protocol.as_ref(),
+            stream_tx,
+            cancel_rx,
+        )
+        .await
+        .expect("workflow execution succeeds");
+
+    (execution.result, provider.requests().len())
+}
+
+/// A formatter that fails must leave the verified working tree untouched: its
+/// output is discarded, the failure stays out of the model loop, and the
+/// verified code is committed.
+#[cfg(unix)]
+#[tokio::test]
+async fn git_workflow_discards_formatter_failure_and_commits_verified_code() {
+    let (_dir, repo_root) = format_fixture(
+        r#"
+[toolchain.fmt.corruptor]
+command = "sh"
+args = ['-c', 'printf "garbage\n" > "$0"; exit 1']
+extensions = ["rs"]
+"#,
+    );
+
+    let (result, requests) = run_format_turn(&repo_root).await;
+
+    match result {
+        ModelResult::Edit { outcome, .. } => {
+            assert!(
+                outcome.error.is_none(),
+                "unexpected error: {:?}",
+                outcome.error
+            );
+            assert!(
+                outcome.applied,
+                "verified code must be committed even when a formatter fails"
+            );
+        }
+        other => panic!("expected applied edits, got {other:?}"),
+    }
+    assert_eq!(
+        requests, 1,
+        "a formatter failure must never re-prompt the model"
+    );
+
+    let restored = std::fs::read_to_string(repo_root.join("src/lib.rs")).expect("read library");
+    assert!(
+        restored.contains(FORMAT_REPLACE),
+        "the verified repair must survive the formatting failure: {restored:?}"
+    );
+    assert!(
+        !restored.contains("garbage"),
+        "the failed formatter output must be discarded: {restored:?}"
+    );
+}
+
+/// A formatter that succeeds rewrites the changed file, and its output reaches
+/// the Git commit.
+#[cfg(unix)]
+#[tokio::test]
+async fn git_workflow_commits_successful_formatter_output() {
+    let (_dir, repo_root) = format_fixture(
+        r#"
+[toolchain.fmt.appender]
+command = "sh"
+args = ['-c', 'printf "// formatted\n" >> "$0"']
+extensions = ["rs"]
+"#,
+    );
+
+    let (result, requests) = run_format_turn(&repo_root).await;
+
+    match result {
+        ModelResult::Edit { outcome, .. } => {
+            assert!(
+                outcome.error.is_none(),
+                "unexpected error: {:?}",
+                outcome.error
+            );
+            assert!(outcome.applied, "a formatted turn must still commit");
+        }
+        other => panic!("expected applied edits, got {other:?}"),
+    }
+    assert_eq!(requests, 1);
+
+    let formatted = std::fs::read_to_string(repo_root.join("src/lib.rs")).expect("read library");
+    assert!(
+        formatted.contains(FORMAT_REPLACE),
+        "the verified repair must be preserved by formatting: {formatted:?}"
+    );
+    assert!(
+        formatted.trim_end().ends_with("// formatted"),
+        "the formatter output must be committed: {formatted:?}"
+    );
+}
+
+/// Discovery navigation is Git-only and exclusion-aware: a search and a listing
+/// that address a service directory report nothing, so vendored or generated
+/// files never reach the prompt.
+#[tokio::test]
+async fn discovery_ignores_excluded_paths() {
+    let (_dir, repo_root) = init_repo();
+    std::fs::create_dir_all(repo_root.join("node_modules/pkg")).expect("create node_modules dir");
+    std::fs::write(
+        repo_root.join("node_modules/pkg/index.js"),
+        "module.exports = 42;\n",
+    )
+    .expect("write vendored module");
+    std::fs::write(
+        repo_root.join("target.rs"),
+        "pub fn compute() -> i32 { 0 }\n",
+    )
+    .expect("write target fixture");
+    commit_fixture(&repo_root, &["node_modules/pkg/index.js", "target.rs"]);
+
+    let mut context = ContextManager::new(repo_root.clone());
+    context
+        .add_file("target.rs", ContextAccess::Editable)
+        .expect("add target to context");
+    let mut history = HistoryManager::new(repo_root.clone());
+
+    let discovery = format!(
+        "Inspecting the vendored tree.\n\
+        <repo_search_{MARKER} path=\"node_modules\" regex=\"module\\.exports\" />\n\
+        <dir_list_{MARKER} path=\"node_modules\" recursive=\"true\" />"
+    );
+    let edit = edit_block(
+        "Change compute to 42",
+        "target.rs",
+        "pub fn compute() -> i32 { 0 }",
+        "pub fn compute() -> i32 { 42 }",
+    );
+    let provider =
+        MockLlmProvider::scripted([MockResponse::text(discovery), MockResponse::text(edit)]);
+    let model = ModelRef::openrouter("mock/model");
+    let protocol = tauqe_core::prompt::xml::XmlPromptProtocol
+        .with_turn_marker(MARKER)
+        .expect("marker-bound protocol");
+    let mut policy = tauqe_core::workflow::policy::DirectApplyPolicy::new();
+    let options = WorkflowOptions::default();
+    let (stream_tx, cancel_rx) = event_channel();
+
+    let output = {
+        let mut env = build_env(
+            &provider,
+            &model,
+            &mut context,
+            &mut history,
+            protocol.as_ref(),
+            &mut policy,
+            stream_tx,
+            cancel_rx,
+            &options,
+        );
+        AnswerEditLoop::new("Change compute to return 42")
+            .execute(&mut env)
+            .await
+            .expect("answer/edit loop executes")
+    };
+
+    assert!(matches!(
+        &output.result,
+        ModelResult::Edit { edits, .. } if !edits.is_empty()
+    ));
+    assert_eq!(provider.requests().len(), 2);
+
+    let feedback = &provider.requests()[1].messages[1].content;
+    assert!(feedback.contains("<search_feedback path=\"node_modules\""));
+    assert!(
+        feedback.contains("No matches found."),
+        "excluded directories must never be searched: {feedback}"
+    );
+    assert!(feedback.contains("<dir_list_feedback path=\"node_modules\""));
+    assert!(
+        feedback.contains("No tracked files under `node_modules`"),
+        "excluded directories must never be listed: {feedback}"
+    );
+    assert!(!feedback.contains("index.js"));
+}
+
+/// A shallow listing describes one folder, while a recursive listing of the same
+/// prefix reports every tracked file underneath it.
+#[tokio::test]
+async fn dir_list_reports_shallow_children_then_recursive_files() {
+    let (_dir, repo_root) = init_repo();
+    std::fs::write(
+        repo_root.join("target.rs"),
+        "pub fn compute() -> i32 { 0 }\n",
+    )
+    .expect("write target fixture");
+    std::fs::create_dir_all(repo_root.join("src/nested")).expect("create nested directory");
+    std::fs::write(repo_root.join("src/main.rs"), "pub fn main() {}\n").expect("write main");
+    std::fs::write(repo_root.join("src/nested/module.rs"), "pub fn module() {}\n")
+        .expect("write module");
+    commit_fixture(
+        &repo_root,
+        &["target.rs", "src/main.rs", "src/nested/module.rs"],
+    );
+
+    let mut context = ContextManager::new(repo_root.clone());
+    context
+        .add_file("target.rs", ContextAccess::Editable)
+        .expect("add target to context");
+    let mut history = HistoryManager::new(repo_root.clone());
+
+    let shallow = format!("Listing the folder.\n<dir_list_{MARKER} path=\"src\" />");
+    let recursive =
+        format!("Listing the subtree.\n<dir_list_{MARKER} path=\"src\" recursive=\"true\" />");
+    let edit = edit_block(
+        "Change compute to 42",
+        "target.rs",
+        "pub fn compute() -> i32 { 0 }",
+        "pub fn compute() -> i32 { 42 }",
+    );
+    let provider = MockLlmProvider::scripted([
+        MockResponse::text(shallow),
+        MockResponse::text(recursive),
+        MockResponse::text(edit),
+    ]);
+    let model = ModelRef::openrouter("mock/model");
+    let protocol = tauqe_core::prompt::xml::XmlPromptProtocol
+        .with_turn_marker(MARKER)
+        .expect("marker-bound protocol");
+    let mut policy = tauqe_core::workflow::policy::DirectApplyPolicy::new();
+    let options = WorkflowOptions::default();
+    let (stream_tx, cancel_rx) = event_channel();
+
+    let output = {
+        let mut env = build_env(
+            &provider,
+            &model,
+            &mut context,
+            &mut history,
+            protocol.as_ref(),
+            &mut policy,
+            stream_tx,
+            cancel_rx,
+            &options,
+        );
+        AnswerEditLoop::new("Change compute to return 42")
+            .execute(&mut env)
+            .await
+            .expect("answer/edit loop executes")
+    };
+
+    assert!(matches!(
+        &output.result,
+        ModelResult::Edit { edits, .. } if !edits.is_empty()
+    ));
+    assert_eq!(provider.requests().len(), 3, "each listing costs one round");
+
+    let shallow_feedback = &provider.requests()[1].messages[1].content;
+    assert!(shallow_feedback.contains("<dir_list_feedback path=\"src\" recursive=\"false\">"));
+    assert!(shallow_feedback.contains("main.rs"));
+    assert!(shallow_feedback.contains("nested/"));
+    assert!(
+        !shallow_feedback.contains("module.rs"),
+        "a shallow listing must not enumerate nested files: {shallow_feedback}"
+    );
+
+    let recursive_feedback = &provider.requests()[2].messages[1].content;
+    assert!(recursive_feedback.contains("<dir_list_feedback path=\"src\" recursive=\"true\">"));
+    assert!(
+        recursive_feedback.contains("nested/module.rs"),
+        "a recursive listing must report nested files: {recursive_feedback}"
+    );
+}
+
+/// A wide listing degrades into a capped summary and names the omitted entries
+/// instead of flooding the context budget in silence.
+#[tokio::test]
+async fn dir_list_truncates_at_the_entry_cap() {
+    let (_dir, repo_root) = init_repo();
+    std::fs::create_dir_all(repo_root.join("many")).expect("create many directory");
+    let mut staged: Vec<String> = Vec::new();
+    for index in 0..105 {
+        let path = format!("many/file_{index:03}.txt");
+        std::fs::write(repo_root.join(&path), format!("entry {index}\n")).expect("write entry");
+        staged.push(path);
+    }
+    std::fs::write(
+        repo_root.join("target.rs"),
+        "pub fn compute() -> i32 { 0 }\n",
+    )
+    .expect("write target fixture");
+    staged.push("target.rs".to_string());
+    let paths: Vec<&str> = staged.iter().map(|path| path.as_str()).collect();
+    commit_fixture(&repo_root, &paths);
+
+    let mut context = ContextManager::new(repo_root.clone());
+    context
+        .add_file("target.rs", ContextAccess::Editable)
+        .expect("add target to context");
+    let mut history = HistoryManager::new(repo_root.clone());
+
+    let discovery =
+        format!("Listing the wide folder.\n<dir_list_{MARKER} path=\"many\" recursive=\"true\" />");
+    let edit = edit_block(
+        "Change compute to 42",
+        "target.rs",
+        "pub fn compute() -> i32 { 0 }",
+        "pub fn compute() -> i32 { 42 }",
+    );
+    let provider =
+        MockLlmProvider::scripted([MockResponse::text(discovery), MockResponse::text(edit)]);
+    let model = ModelRef::openrouter("mock/model");
+    let protocol = tauqe_core::prompt::xml::XmlPromptProtocol
+        .with_turn_marker(MARKER)
+        .expect("marker-bound protocol");
+    let mut policy = tauqe_core::workflow::policy::DirectApplyPolicy::new();
+    let options = WorkflowOptions::default();
+    let (stream_tx, cancel_rx) = event_channel();
+
+    let output = {
+        let mut env = build_env(
+            &provider,
+            &model,
+            &mut context,
+            &mut history,
+            protocol.as_ref(),
+            &mut policy,
+            stream_tx,
+            cancel_rx,
+            &options,
+        );
+        AnswerEditLoop::new("Change compute to return 42")
+            .execute(&mut env)
+            .await
+            .expect("answer/edit loop executes")
+    };
+
+    assert!(matches!(
+        &output.result,
+        ModelResult::Edit { edits, .. } if !edits.is_empty()
+    ));
+
+    let feedback = &provider.requests()[1].messages[1].content;
+    assert!(
+        feedback.contains("file_099.txt"),
+        "a listing names entries relative to the requested prefix: {feedback}"
+    );
+    assert!(
+        !feedback.contains("file_100.txt"),
+        "the listing must stop at the entry cap: {feedback}"
+    );
+    assert!(
+        feedback.contains("[5 more entries omitted"),
+        "truncation must be reported explicitly: {feedback}"
+    );
+}
+
+/// The compact outline names the repository root files and marks every file the
+/// pinned context layer anchored, so conventions are visible without searching.
+#[tokio::test]
+async fn repo_dirs_lists_root_files_and_marks_pinned_conventions() {
+    let (_dir, repo_root) = init_repo();
+    std::fs::write(repo_root.join("README.md"), "# Fixture\n").expect("write readme");
+    std::fs::write(repo_root.join("LICENSE"), "Fixture license\n").expect("write license");
+    std::fs::write(repo_root.join("Conventions.md"), "# Conventions\n").expect("write conventions");
+    std::fs::create_dir_all(repo_root.join("src")).expect("create src directory");
+    std::fs::write(repo_root.join("src/main.rs"), "pub fn main() {}\n").expect("write main");
+    std::fs::write(
+        repo_root.join("target.rs"),
+        "pub fn compute() -> i32 { 0 }\n",
+    )
+    .expect("write target fixture");
+    std::fs::write(
+        repo_root.join("tauqe.toml"),
+        "[context]\npinned = [\"Conventions.md\"]\n",
+    )
+    .expect("write project configuration");
+    commit_fixture(
+        &repo_root,
+        &[
+            "README.md",
+            "LICENSE",
+            "Conventions.md",
+            "src/main.rs",
+            "target.rs",
+            "tauqe.toml",
+        ],
+    );
+
+    let mut context = ContextManager::new(repo_root.clone());
+    assert_eq!(
+        context.pinned_patterns(),
+        &["Conventions.md".to_string()],
+        "the pinned pattern must come from the project configuration"
+    );
+    context
+        .add_file("target.rs", ContextAccess::Editable)
+        .expect("add target to context");
+    let mut history = HistoryManager::new(repo_root.clone());
+
+    let discovery = format!("Outlining the repository.\n<repo_dirs_{MARKER} />");
+    let edit = edit_block(
+        "Change compute to 42",
+        "target.rs",
+        "pub fn compute() -> i32 { 0 }",
+        "pub fn compute() -> i32 { 42 }",
+    );
+    let provider =
+        MockLlmProvider::scripted([MockResponse::text(discovery), MockResponse::text(edit)]);
+    let model = ModelRef::openrouter("mock/model");
+    let protocol = tauqe_core::prompt::xml::XmlPromptProtocol
+        .with_turn_marker(MARKER)
+        .expect("marker-bound protocol");
+    let mut policy = tauqe_core::workflow::policy::DirectApplyPolicy::new();
+    let options = WorkflowOptions::default();
+    let (stream_tx, cancel_rx) = event_channel();
+
+    let output = {
+        let mut env = build_env(
+            &provider,
+            &model,
+            &mut context,
+            &mut history,
+            protocol.as_ref(),
+            &mut policy,
+            stream_tx,
+            cancel_rx,
+            &options,
+        );
+        AnswerEditLoop::new("Change compute to return 42")
+            .execute(&mut env)
+            .await
+            .expect("answer/edit loop executes")
+    };
+
+    assert!(matches!(
+        &output.result,
+        ModelResult::Edit { edits, .. } if !edits.is_empty()
+    ));
+
+    let feedback = &provider.requests()[1].messages[1].content;
+    assert!(feedback.contains("<repo_dirs_feedback>"));
+    assert!(
+        feedback.contains("README.md"),
+        "root files must be listed explicitly: {feedback}"
+    );
+    assert!(
+        feedback.contains("LICENSE"),
+        "root files must be listed explicitly: {feedback}"
+    );
+    assert!(
+        feedback.contains("Conventions.md [pinned]"),
+        "pinned files must be marked: {feedback}"
+    );
+    assert!(
+        feedback.contains("\nsrc\n"),
+        "the folder tree must name the subsystem folder: {feedback}"
+    );
+    assert!(
+        !feedback.contains("main.rs"),
+        "an unpinned nested file stays hidden behind its folder: {feedback}"
+    );
+}
+
+/// The authoritative configuration chapter travels through a `doc_request`
+/// round as volatile feedback, so the model answers configuration questions
+/// from documentation instead of inferring an answer from partial source
+/// memory, and the cached prefix stays untouched.
+#[tokio::test]
+async fn doc_request_config_returns_authoritative_configuration_documentation() {
+    let (_dir, repo_root) = init_repo();
+    std::fs::write(
+        repo_root.join("target.rs"),
+        "pub fn compute() -> i32 { 0 }\n",
+    )
+    .expect("write target fixture");
+    commit_fixture(&repo_root, &["target.rs"]);
+
+    let mut context = ContextManager::new(repo_root.clone());
+    context
+        .add_file("target.rs", ContextAccess::Editable)
+        .expect("add target to context");
+    let mut history = HistoryManager::new(repo_root.clone());
+
+    let discovery = format!(
+        "Checking the authoritative configuration reference.\n\
+        <doc_request_{MARKER} topic=\"config\" />"
+    );
+    let edit = edit_block(
+        "Change compute to 42",
+        "target.rs",
+        "pub fn compute() -> i32 { 0 }",
+        "pub fn compute() -> i32 { 42 }",
+    );
+    let provider =
+        MockLlmProvider::scripted([MockResponse::text(discovery), MockResponse::text(edit)]);
+    let model = ModelRef::openrouter("mock/model");
+    let protocol = tauqe_core::prompt::xml::XmlPromptProtocol
+        .with_turn_marker(MARKER)
+        .expect("marker-bound protocol");
+    let mut policy = tauqe_core::workflow::policy::DirectApplyPolicy::new();
+    let options = WorkflowOptions::default();
+    let (stream_tx, cancel_rx) = event_channel();
+
+    let output = {
+        let mut env = build_env(
+            &provider,
+            &model,
+            &mut context,
+            &mut history,
+            protocol.as_ref(),
+            &mut policy,
+            stream_tx,
+            cancel_rx,
+            &options,
+        );
+        AnswerEditLoop::new("Where is the context budget declared?")
+            .execute(&mut env)
+            .await
+            .expect("answer/edit loop executes")
+    };
+
+    assert!(matches!(
+        &output.result,
+        ModelResult::Edit { edits, .. } if !edits.is_empty()
+    ));
+    assert_eq!(
+        provider.requests().len(),
+        2,
+        "one documentation round must be enough"
+    );
+
+    let first_system = &provider.requests()[0].messages[0].content;
+    let second_system = &provider.requests()[1].messages[0].content;
+    let feedback = &provider.requests()[1].messages[1].content;
+
+    // The chapter itself reaches the model as a documentation block.
+    assert!(feedback.contains("<system_documentation>"));
+    assert!(feedback.contains("Configuration and Project Preparation"));
+    assert!(feedback.contains("files_token_budget"));
+    assert!(feedback.contains("Why credentials are never a project setting"));
+
+    // The documentation is volatile tail content: it never widens the cached
+    // system prefix, and the head of that prefix stays byte-identical.
+    const CHAPTER_ONLY: &str = "Why credentials are never a project setting";
+    assert!(!first_system.contains(CHAPTER_ONLY));
+    assert!(!second_system.contains(CHAPTER_ONLY));
+    assert_eq!(
+        stable_system_prefix(second_system),
+        stable_system_prefix(first_system),
+        "a documentation round must not reshape the cached prefix"
+    );
+}
+
+/// The static anchor that makes `tauqe.toml` authoritative is rendered in the
+/// head of the system message, before the context block, and it keeps its
+/// exact bytes from one round of a turn to the next.
+#[tokio::test]
+async fn tauqe_toml_anchor_renders_in_the_stable_prefix_before_the_context_block() {
+    let (_dir, repo_root) = init_repo();
+    std::fs::write(
+        repo_root.join("target.rs"),
+        "pub fn compute() -> i32 { 0 }\n",
+    )
+    .expect("write target fixture");
+    std::fs::write(repo_root.join("helper.rs"), "pub const ANSWER: i32 = 42;\n")
+        .expect("write helper fixture");
+    commit_fixture(&repo_root, &["target.rs", "helper.rs"]);
+
+    let mut context = ContextManager::new(repo_root.clone());
+    context
+        .add_file("target.rs", ContextAccess::Editable)
+        .expect("add target to context");
+    let mut history = HistoryManager::new(repo_root.clone());
+
+    let discovery = format!(
+        "I need the constant definitions.\n<context_request_{MARKER} path=\"helper.rs\" access=\"read_only\" />"
+    );
+    let edit = edit_block(
+        "Use the helper constant",
+        "target.rs",
+        "pub fn compute() -> i32 { 0 }",
+        "pub fn compute() -> i32 { 42 }",
+    );
+    let provider =
+        MockLlmProvider::scripted([MockResponse::text(discovery), MockResponse::text(edit)]);
+    let model = ModelRef::openrouter("mock/model");
+    let protocol = tauqe_core::prompt::xml::XmlPromptProtocol
+        .with_turn_marker(MARKER)
+        .expect("marker-bound protocol");
+    let mut policy = tauqe_core::workflow::policy::DirectApplyPolicy::new();
+    let options = WorkflowOptions::default();
+    let (stream_tx, cancel_rx) = event_channel();
+
+    let output = {
+        let mut env = build_env(
+            &provider,
+            &model,
+            &mut context,
+            &mut history,
+            protocol.as_ref(),
+            &mut policy,
+            stream_tx,
+            cancel_rx,
+            &options,
+        );
+        AnswerEditLoop::new("Use the helper constant")
+            .execute(&mut env)
+            .await
+            .expect("answer/edit loop executes")
+    };
+
+    assert!(matches!(
+        &output.result,
+        ModelResult::Edit { edits, .. } if !edits.is_empty()
+    ));
+    assert_eq!(provider.requests().len(), 2);
+
+    let first_system = &provider.requests()[0].messages[0].content;
+    let second_system = &provider.requests()[1].messages[0].content;
+
+    const ANCHOR: &str = "Environment behavior is declared in `tauqe.toml` at the repository root";
+    for system in [first_system, second_system] {
+        let anchor = system
+            .find(ANCHOR)
+            .expect("the system prompt must anchor the project configuration file");
+        let context_block = system
+            .find("## Project Context")
+            .expect("the context block must be rendered");
+        assert!(
+            anchor < context_block,
+            "the configuration anchor belongs to the static head"
+        );
+        assert!(
+            system.contains("Self-Knowledge"),
+            "the anchor must route configuration questions to the documentation request"
+        );
+    }
+
+    assert_eq!(
+        stable_system_prefix(second_system),
+        stable_system_prefix(first_system),
+        "the anchored head must stay byte-identical across rounds"
+    );
+    assert_eq!(
+        repo_map_block(second_system),
+        repo_map_block(first_system),
+        "the frozen repository outline must keep the earlier bytes"
+    );
 }

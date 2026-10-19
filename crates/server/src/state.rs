@@ -2,7 +2,6 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
-use tokio::sync::{watch, Mutex};
 use tauqe_core::config::AppConfig;
 use tauqe_core::context::ContextManager;
 use tauqe_core::history::{HistoryManager, HistoryMutation};
@@ -10,20 +9,19 @@ use tauqe_protocol::{
     events, DiscussionFocus, DiscussionFocusChangedEvent, Event, ModelSelection,
     UsageTotalsSnapshot,
 };
+use tokio::sync::{watch, Mutex};
 
 use crate::transport::OutChannel;
 
 /// Poll cadence while the last-resort hard-cancel abort waits for an in-flight
 /// git transaction to close.
-const HARD_CANCEL_POLL_INTERVAL: std::time::Duration =
-    std::time::Duration::from_millis(100);
+const HARD_CANCEL_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// Maximum time the last-resort hard-cancel abort is deferred while a git
 /// transaction stays open before the stalled workflow task is force-aborted
 /// anyway. A transaction open this long means the turn is wedged; core startup
 /// crash recovery unwinds any residue on the next launch.
-const HARD_CANCEL_TRANSACTION_DEFER_LIMIT: std::time::Duration =
-    std::time::Duration::from_secs(60);
+const HARD_CANCEL_TRANSACTION_DEFER_LIMIT: std::time::Duration = std::time::Duration::from_secs(60);
 
 pub struct ActiveOperation {
     pub id: u64,
@@ -101,7 +99,10 @@ impl Drop for OperationGuard {
             }
         };
         if released {
-            tracing::info!(operation_slot_id = self.id, "Released active operation slot");
+            tracing::info!(
+                operation_slot_id = self.id,
+                "Released active operation slot"
+            );
         }
     }
 }
@@ -145,7 +146,9 @@ pub struct AppState {
     /// Every operation kind — an interactive turn, a plan batch, a review run,
     /// a locale synthesis — reports through [`crate::usage::UsageGuard`], so the
     /// interface renders one consistent snapshot instead of re-deriving totals
-    /// from per-handler counters.
+    /// from per-handler counters. The project lifetime scope is loaded from
+    /// `<repo_root>/.tauqe/usage.json` at construction, so the counters survive
+    /// a daemon restart.
     pub usage: Mutex<UsageTotalsSnapshot>,
     /// Active discussion focus anchor shared by REPL discussion turns.
     ///
@@ -201,6 +204,10 @@ impl AppState {
         tauqe_core::review::ReviewStorage::migrate_legacy_if_needed(&repo_path);
 
         let default_selection = config.default_selection();
+        // The project lifetime totals outlive the process, so they are read
+        // from `.tauqe/usage.json` before the repository root moves into the
+        // context manager.
+        let initial_usage = crate::usage::load_initial_snapshot(&repo_path);
         let history_sender_init = history_sender.clone();
         let mut initial_history_manager = HistoryManager::new(repo_path.clone());
         // Forward every history mutation — appends and structural compactions —
@@ -220,7 +227,7 @@ impl AppState {
             session_lock: Mutex::new(()),
             active_cancel: std::sync::Mutex::new(None),
             total_cost: Mutex::new(0.0),
-            usage: Mutex::new(UsageTotalsSnapshot::default()),
+            usage: Mutex::new(initial_usage),
             discussion_focus: Mutex::new(DiscussionFocus::None),
             session_uuid: Mutex::new(tauqe_core::review::uuid::generate_uuid_v7()),
             history_sender,
@@ -530,8 +537,8 @@ mod tests {
     /// monotonic revision.
     #[tokio::test]
     async fn mutate_context_serializes_concurrent_mutations() {
-        let root = std::env::temp_dir()
-            .join(format!("tauqe-state-context-{}", next_operation_id()));
+        let root =
+            std::env::temp_dir().join(format!("tauqe-state-context-{}", next_operation_id()));
         let _ = std::fs::create_dir_all(&root);
 
         let (out, _rx) = OutChannel::new();
@@ -546,7 +553,8 @@ mod tests {
             tasks.push(tokio::spawn(async move {
                 state
                     .mutate_context(move |ctx| {
-                        ctx.add_auto_file(&path, ContextAccess::ReadOnly).map(|_| ())
+                        ctx.add_auto_file(&path, ContextAccess::ReadOnly)
+                            .map(|_| ())
                     })
                     .await
             }));
@@ -615,11 +623,7 @@ mod tests {
             .await
             .get_entries()
             .expect("history reads back");
-        assert_eq!(
-            entries.len(),
-            8,
-            "every concurrent mutation must survive"
-        );
+        assert_eq!(entries.len(), 8, "every concurrent mutation must survive");
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -628,8 +632,7 @@ mod tests {
     /// hard-cancel would abort a completed task instead of the work in flight.
     #[tokio::test]
     async fn clear_abort_handle_drops_the_installed_handle() {
-        let root =
-            std::env::temp_dir().join(format!("tauqe-state-abort-{}", next_operation_id()));
+        let root = std::env::temp_dir().join(format!("tauqe-state-abort-{}", next_operation_id()));
         let _ = std::fs::create_dir_all(&root);
 
         let (out, _rx) = OutChannel::new();

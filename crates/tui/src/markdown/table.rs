@@ -548,7 +548,10 @@ mod tests {
         fit_col_widths(&mut widths, &minimum, 40);
         let total: usize = widths.iter().sum();
         assert!(total + widths.len() < 40, "total {} too wide", total);
-        assert!(widths.iter().all(|&w| w >= 5), "columns shrank below minimum");
+        assert!(
+            widths.iter().all(|&w| w >= 5),
+            "columns shrank below minimum"
+        );
     }
 
     #[test]
@@ -613,7 +616,10 @@ mod tests {
 
     /// Flattens a rendered line back into its raw text.
     fn line_text(line: &Line<'static>) -> String {
-        line.spans.iter().map(|span| span.content.as_ref()).collect()
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
     }
 
     /// Collects the character positions of every vertical border (`│`) on a

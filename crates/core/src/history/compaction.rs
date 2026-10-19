@@ -83,15 +83,58 @@ mod tests {
     #[test]
     fn test_partition_head_tail() {
         let entries = vec![
-            HistoryEntry::Summary { id: None, text: "Previous work".to_string() },
-            HistoryEntry::Turn { id: None, prompt: "turn 1".to_string(), context: vec![] },
-            HistoryEntry::Response { id: None, message: "resp 1".to_string(), commit: None, summary: None, files: vec![] },
-            HistoryEntry::Turn { id: None, prompt: "turn 2".to_string(), context: vec![] },
-            HistoryEntry::Response { id: None, message: "resp 2".to_string(), commit: None, summary: None, files: vec![] },
-            HistoryEntry::Turn { id: None, prompt: "turn 3".to_string(), context: vec![] },
-            HistoryEntry::Response { id: None, message: "resp 3".to_string(), commit: None, summary: None, files: vec![] },
-            HistoryEntry::Turn { id: None, prompt: "turn 4".to_string(), context: vec![] },
-            HistoryEntry::Response { id: None, message: "resp 4".to_string(), commit: None, summary: None, files: vec![] },
+            HistoryEntry::Summary {
+                id: None,
+                text: "Previous work".to_string(),
+            },
+            HistoryEntry::Turn {
+                id: None,
+                prompt: "turn 1".to_string(),
+                context: vec![],
+            },
+            HistoryEntry::Response {
+                id: None,
+                message: "resp 1".to_string(),
+                commit: None,
+                summary: None,
+                files: vec![],
+            },
+            HistoryEntry::Turn {
+                id: None,
+                prompt: "turn 2".to_string(),
+                context: vec![],
+            },
+            HistoryEntry::Response {
+                id: None,
+                message: "resp 2".to_string(),
+                commit: None,
+                summary: None,
+                files: vec![],
+            },
+            HistoryEntry::Turn {
+                id: None,
+                prompt: "turn 3".to_string(),
+                context: vec![],
+            },
+            HistoryEntry::Response {
+                id: None,
+                message: "resp 3".to_string(),
+                commit: None,
+                summary: None,
+                files: vec![],
+            },
+            HistoryEntry::Turn {
+                id: None,
+                prompt: "turn 4".to_string(),
+                context: vec![],
+            },
+            HistoryEntry::Response {
+                id: None,
+                message: "resp 4".to_string(),
+                commit: None,
+                summary: None,
+                files: vec![],
+            },
         ];
 
         // Keep last 2 turns: turns 3 and 4 should be in tail
@@ -108,12 +151,20 @@ mod tests {
 
     #[test]
     fn test_build_compacted_history() {
-        let tail = vec![
-            HistoryEntry::Turn { id: Some(5), prompt: "latest".to_string(), context: vec![] },
-        ];
+        let tail = vec![HistoryEntry::Turn {
+            id: Some(5),
+            prompt: "latest".to_string(),
+            context: vec![],
+        }];
         let compacted = build_compacted_history(Some(1), "Summary text".to_string(), tail.clone());
         assert_eq!(compacted.len(), 2);
-        assert_eq!(compacted[0], HistoryEntry::Summary { id: Some(1), text: "Summary text".to_string() });
+        assert_eq!(
+            compacted[0],
+            HistoryEntry::Summary {
+                id: Some(1),
+                text: "Summary text".to_string()
+            }
+        );
         assert_eq!(compacted[1], tail[0]);
     }
 }

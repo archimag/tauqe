@@ -122,6 +122,11 @@ async fn start_turn(
 ) {
     let snapshot = TurnLaunchSnapshot::capture(&st);
     begin(&mut st);
+    // Executing code hands control to the Coder role on every launch path, so
+    // no discussion anchor may survive into the turn. Applying it here covers
+    // plan, review, pipeline, and refine launches at once, and the rollback
+    // below still restores the launch state if the request cannot be written.
+    st.discussion_focus = DiscussionFocus::None;
     drop(st);
 
     if let Err(err) = send_request(server_writer, method, params).await {
@@ -627,20 +632,12 @@ pub(crate) async fn handle_dialog_event(
                     let cancel_model = st.model.is_busy();
                     drop(st);
                     if cancel_review {
-                        send_request(
-                            server_writer,
-                            methods::REVIEW_CANCEL,
-                            serde_json::json!({}),
-                        )
-                        .await?;
+                        send_request(server_writer, methods::REVIEW_CANCEL, serde_json::json!({}))
+                            .await?;
                     }
                     if cancel_model || !cancel_review {
-                        send_request(
-                            server_writer,
-                            methods::MODEL_CANCEL,
-                            serde_json::json!({}),
-                        )
-                        .await?;
+                        send_request(server_writer, methods::MODEL_CANCEL, serde_json::json!({}))
+                            .await?;
                     }
                 }
             }
@@ -811,13 +808,8 @@ pub(crate) async fn handle_dialog_event(
                 .as_ref()
                 .is_some_and(|target| target.is_single_target());
             if single_target {
-                return execute_review::handle_execute_review_dialog(
-                    key,
-                    state,
-                    st,
-                    server_writer,
-                )
-                .await;
+                return execute_review::handle_execute_review_dialog(key, state, st, server_writer)
+                    .await;
             }
             if let Some(target) = st.confirm_execute_review.take() {
                 match resolve_confirm(&mut st, key) {
@@ -920,8 +912,7 @@ pub(crate) async fn handle_dialog_event(
             return selection::handle_selection_dialog_key(key, st, server_writer).await;
         }
         Some(ActiveModal::ThemeSelector) => {
-            let visible =
-                crate::theme::selector::theme_selector_visible_height(st.last_frame_area);
+            let visible = crate::theme::selector::theme_selector_visible_height(st.last_frame_area);
             crate::theme::selector::handle_theme_selector_key(key, &mut st, visible);
             return Ok(Some(InputResult::Continue));
         }

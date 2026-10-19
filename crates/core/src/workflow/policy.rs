@@ -124,11 +124,17 @@ mod tests {
             summary: "update a.rs".to_string(),
             edits: edits.clone(),
         };
-        let changed = policy.apply_temporary(root, &mut cm, &proposal).await.unwrap();
+        let changed = policy
+            .apply_temporary(root, &mut cm, &proposal)
+            .await
+            .unwrap();
         assert_eq!(changed, vec!["a.rs".to_string()]);
         assert_eq!(std::fs::read_to_string(root.join("a.rs")).unwrap(), "two\n");
 
-        let commit = policy.apply_final(root, &changed, "update a.rs").await.unwrap();
+        let commit = policy
+            .apply_final(root, &changed, "update a.rs")
+            .await
+            .unwrap();
         assert!(commit.is_none());
         assert!(!policy.rollback(root).await.unwrap());
         assert_eq!(std::fs::read_to_string(root.join("a.rs")).unwrap(), "two\n");

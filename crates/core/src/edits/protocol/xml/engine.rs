@@ -153,6 +153,24 @@ pub(crate) const XML_TAG_SPECS: &[XmlTagSpec] = &[
         MarkerPolicy::Strict,
     ),
     control_spec(
+        "repo_dirs",
+        LlmCapability::Discovery,
+        TagCloseMode::Simple,
+        MarkerPolicy::Strict,
+    ),
+    control_spec(
+        "repo_map",
+        LlmCapability::Discovery,
+        TagCloseMode::Simple,
+        MarkerPolicy::Strict,
+    ),
+    control_spec(
+        "dir_list",
+        LlmCapability::Discovery,
+        TagCloseMode::Simple,
+        MarkerPolicy::Strict,
+    ),
+    control_spec(
         "doc_request",
         LlmCapability::DocRequest,
         TagCloseMode::Simple,
@@ -194,10 +212,9 @@ pub(crate) const XML_TAG_SPECS: &[XmlTagSpec] = &[
         TagCloseMode::Control,
         MarkerPolicy::Strict,
     ),
-    // Parse-only outcome tag. `<skip>` is deliberately not a capability
-    // control tag: the review contour reads it back from the cleaned assistant
-    // text to record why a finding was skipped, so `strip_all_control_tags`
-    // must never remove it.
+    // Parse-only outcome tag. The review contour reads it back from the
+    // cleaned assistant text to record why a finding was skipped, so
+    // `strip_all_control_tags` must never remove it.
     spec("skip", TagCloseMode::Control, false),
     XmlTagSpec {
         base_name: "plan",
@@ -255,7 +272,7 @@ pub(crate) fn tag_bases() -> impl Iterator<Item = &'static str> {
 ///
 /// A frame remembers whether its opening tag carried the turn marker. That bit
 /// lets normalization keep a literal unmarked closing tag, such as a `</search>`
-/// quoted inside a marked `<search>` body, from closing a marker-bound block.
+/// quoted inside a marked search body, from closing a marker-bound block.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct OpenTag {
     /// Base name of the open tag.
@@ -348,6 +365,7 @@ pub(crate) fn find_next_tag_bounds_with_fences(
     None
 }
 
+#[cfg(test)]
 pub(crate) fn find_next_tag_bounds(text: &str, spec: &XmlTagSpec) -> Option<(usize, usize)> {
     find_next_tag_bounds_with_fences(text, spec, 0, &CodeFences::find(text))
 }
@@ -631,13 +649,33 @@ mod tests {
         assert!(allows_unmarked_fallback("verify"));
         assert!(allows_unmarked_fallback("user_language"));
         assert!(allows_unmarked_fallback("scratchpad"));
+        assert_eq!(
+            spec_of("repo_dirs").capability,
+            Some(LlmCapability::Discovery)
+        );
+        assert_eq!(
+            spec_of("repo_map").capability,
+            Some(LlmCapability::Discovery)
+        );
+        assert_eq!(spec_of("repo_map").close_mode, TagCloseMode::Simple);
+        assert!(spec_of("repo_map").is_control());
         assert!(!allows_unmarked_fallback("context_request"));
+        assert!(!allows_unmarked_fallback("repo_dirs"));
+        assert!(!allows_unmarked_fallback("repo_map"));
+        assert!(!allows_unmarked_fallback("dir_list"));
         assert!(!allows_unmarked_fallback("success"));
+
+        assert_eq!(
+            spec_of("dir_list").capability,
+            Some(LlmCapability::Discovery)
+        );
+        assert_eq!(spec_of("dir_list").close_mode, TagCloseMode::Simple);
+        assert!(spec_of("dir_list").is_control());
     }
 
     #[test]
     fn registry_declares_skip_as_a_parse_only_outcome_tag() {
-        // The review contour reads `<skip>` back from the cleaned assistant
+        // The review contour reads the skip tag back from the cleaned assistant
         // text, so the tag stays parseable but is never stripped as a control
         // tag.
         let spec = spec_of("skip");
@@ -677,6 +715,13 @@ mod tests {
         let suffixed = "<context_request_AB12 path=\"a.rs\" />";
         assert!(find_next_tag_bounds(suffixed, spec_of("context_request")).is_some());
 
+        let map = "<repo_map_AB12 path=\"crates/core\" />";
+        let (start, end) = match find_next_tag_bounds(map, spec_of("repo_map")) {
+            Some(bounds) => bounds,
+            None => panic!("targeted map tag not found"),
+        };
+        assert_eq!(&map[start..end], map);
+
         assert!(find_next_tag_bounds("<verify", spec_of("verify")).is_none());
         assert!(find_next_tag_bounds("<verif", spec_of("verify")).is_none());
     }
@@ -700,7 +745,10 @@ mod tests {
         };
         assert_eq!(found.attr("note"), None);
         assert_eq!(found.body, Some("unused body"));
-        assert_eq!(found.attr_or_body(&["note"]).as_deref(), Some("unused body"));
+        assert_eq!(
+            found.attr_or_body(&["note"]).as_deref(),
+            Some("unused body")
+        );
 
         let attributed = "<scratchpad note=\"from attribute\">body</scratchpad>";
         let found = match find_next_tag(attributed, spec_of("scratchpad")) {
@@ -711,7 +759,10 @@ mod tests {
             found.attr_any(&["note", "message"]).as_deref(),
             Some("from attribute")
         );
-        assert_eq!(found.attr_or_body(&["note"]).as_deref(), Some("from attribute"));
+        assert_eq!(
+            found.attr_or_body(&["note"]).as_deref(),
+            Some("from attribute")
+        );
     }
 
     #[test]
@@ -723,7 +774,7 @@ mod tests {
         let edits = "<create path=\"a.rs\">x</create>";
         assert_eq!(strip_all_control_tags(edits), edits);
 
-        // `<skip>` is parse-only: the review contour reads it back from the
+        // The skip tag is parse-only: the review contour reads it back from the
         // cleaned assistant text, so it survives conversational cleaning.
         let skip = "<skip reason=\"False positive\">already handled</skip>";
         assert_eq!(strip_all_control_tags(skip), skip);
@@ -799,7 +850,13 @@ Real outcome:
         let text = "First <verify target=\"check\" /> inside\n```\n<verify target=\"test\" />\n```\nand second <verify target=\"all\" />";
         let matches: Vec<_> = iter_tags(text, spec_of("verify")).collect();
         assert_eq!(matches.len(), 2);
-        assert_eq!(&text[matches[0].start..matches[0].end], "<verify target=\"check\" />");
-        assert_eq!(&text[matches[1].start..matches[1].end], "<verify target=\"all\" />");
+        assert_eq!(
+            &text[matches[0].start..matches[0].end],
+            "<verify target=\"check\" />"
+        );
+        assert_eq!(
+            &text[matches[1].start..matches[1].end],
+            "<verify target=\"all\" />"
+        );
     }
 }

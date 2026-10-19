@@ -1,5 +1,7 @@
 use anyhow::{Context, Result};
 use std::fs::{create_dir_all, File, OpenOptions};
+
+use crate::atomic_write::write_atomic;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 
@@ -13,9 +15,7 @@ pub struct SessionStorage {
 
 impl SessionStorage {
     pub fn new(repo_root: PathBuf) -> Self {
-        Self {
-            repo_root,
-        }
+        Self { repo_root }
     }
 
     pub fn repo_root(&self) -> &Path {
@@ -121,43 +121,16 @@ impl SessionStorage {
 
         let dir = self.tauqe_dir();
         let target_path = self.history_path();
-        let temp_filename = format!(
-            "{}.tmp.{}",
-            target_path.file_name().and_then(|f| f.to_str()).unwrap_or("history.jsonl"),
-            std::process::id()
-        );
-        let temp_path = dir.join(temp_filename);
 
-        // The write, flush, and `fsync` barrier, plus the atomic rename, run
-        // off the async executor thread so a slow disk never stalls the turn.
+        // Directory creation runs off the async executor thread for the same
+        // reason the write does: history compaction happens inside the bounded
+        // turn, never on a bare Tokio worker thread. The replacement itself
+        // stages, syncs, and renames through the shared writer, which keeps
+        // concurrent rewrites from colliding on one staging name.
         crate::blocking::run_blocking(move || -> Result<()> {
             create_dir_all(&dir)
                 .with_context(|| format!("Failed to create .tauqe directory: {:?}", dir))?;
-
-            {
-                let mut temp_file = File::create(&temp_path).with_context(|| {
-                    format!("Failed to create temp history file: {:?}", temp_path)
-                })?;
-
-                temp_file.write_all(payload.as_bytes()).with_context(|| {
-                    format!("Failed to write to temp history file: {:?}", temp_path)
-                })?;
-                temp_file.flush().with_context(|| {
-                    format!("Failed to flush temp history file: {:?}", temp_path)
-                })?;
-                temp_file.sync_all().with_context(|| {
-                    format!("Failed to sync temp history file: {:?}", temp_path)
-                })?;
-            }
-
-            std::fs::rename(&temp_path, &target_path).with_context(|| {
-                format!(
-                    "Failed to atomically replace history file from {:?} to {:?}",
-                    temp_path, target_path
-                )
-            })?;
-
-            Ok(())
+            write_atomic(&target_path, payload.as_bytes())
         })
     }
 
@@ -216,7 +189,9 @@ mod tests {
             id: Some(1),
             text: "Compacted auth task".to_string(),
         };
-        storage.rewrite_entries(&[entry_summary.clone(), entry2.clone()]).unwrap();
+        storage
+            .rewrite_entries(&[entry_summary.clone(), entry2.clone()])
+            .unwrap();
         let rewritten = storage.read_entries().unwrap();
         assert_eq!(rewritten, vec![entry_summary, entry2]);
 

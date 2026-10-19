@@ -14,10 +14,16 @@ pub enum PlanValidationError {
     EmptyConceptId,
     DuplicateItemId(String),
     DuplicateConceptId(String),
-    MissingDependency { item_id: String, depends_on: String },
+    MissingDependency {
+        item_id: String,
+        depends_on: String,
+    },
     SelfDependency(String),
     CyclicDependency(Vec<String>),
-    MissingConceptRef { item_id: String, concept_ref: String },
+    MissingConceptRef {
+        item_id: String,
+        concept_ref: String,
+    },
 }
 
 impl fmt::Display for PlanValidationError {
@@ -27,8 +33,14 @@ impl fmt::Display for PlanValidationError {
             Self::EmptyConceptId => write!(f, "Concept ID cannot be empty"),
             Self::DuplicateItemId(id) => write!(f, "Duplicate step ID: '{id}'"),
             Self::DuplicateConceptId(id) => write!(f, "Duplicate concept ID: '{id}'"),
-            Self::MissingDependency { item_id, depends_on } => {
-                write!(f, "Step '{item_id}' references non-existent dependency '{depends_on}'")
+            Self::MissingDependency {
+                item_id,
+                depends_on,
+            } => {
+                write!(
+                    f,
+                    "Step '{item_id}' references non-existent dependency '{depends_on}'"
+                )
             }
             Self::SelfDependency(id) => {
                 write!(f, "Step '{id}' cannot depend on itself")
@@ -36,8 +48,14 @@ impl fmt::Display for PlanValidationError {
             Self::CyclicDependency(cycle) => {
                 write!(f, "Cyclic dependency detected: {}", cycle.join(" -> "))
             }
-            Self::MissingConceptRef { item_id, concept_ref } => {
-                write!(f, "Step '{item_id}' references non-existent concept '{concept_ref}'")
+            Self::MissingConceptRef {
+                item_id,
+                concept_ref,
+            } => {
+                write!(
+                    f,
+                    "Step '{item_id}' references non-existent concept '{concept_ref}'"
+                )
             }
         }
     }
@@ -497,7 +515,12 @@ impl Plan {
                 walk_items(&item.children, seen, id_display, errors);
             }
         }
-        walk_items(&self.items, &mut seen_item_ids, &mut id_display, &mut errors);
+        walk_items(
+            &self.items,
+            &mut seen_item_ids,
+            &mut id_display,
+            &mut errors,
+        );
 
         // 3. Validate concept_refs, depends_on existence, and self-dependency
         let mut dep_graph: HashMap<String, Vec<String>> = HashMap::new();
@@ -576,7 +599,13 @@ impl Plan {
             }
             leaf_keys
         }
-        walk_refs(&self.items, &seen_concept_ids, &seen_item_ids, &mut dep_graph, &mut errors);
+        walk_refs(
+            &self.items,
+            &seen_concept_ids,
+            &seen_item_ids,
+            &mut dep_graph,
+            &mut errors,
+        );
 
         // 4. Validate acyclicity of depends_on
         if let Some(cycle) = detect_dependency_cycle(&dep_graph, &id_display) {
@@ -634,8 +663,7 @@ fn detect_dependency_cycle(
                 stack.push((node.clone(), index + 1));
                 match marks.get(&neighbor) {
                     Some(Mark::Visiting) => {
-                        let cycle_start =
-                            path.iter().position(|n| n == &neighbor).unwrap_or(0);
+                        let cycle_start = path.iter().position(|n| n == &neighbor).unwrap_or(0);
                         let mut cycle: Vec<String> = path[cycle_start..]
                             .iter()
                             .map(|k| id_display.get(k).cloned().unwrap_or_else(|| k.clone()))

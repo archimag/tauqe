@@ -253,7 +253,10 @@ mod tests {
 
     #[test]
     fn test_workflow_kind_serde_and_aliases() {
-        assert_eq!(serde_json::to_string(&WorkflowKind::Git).unwrap(), "\"git\"");
+        assert_eq!(
+            serde_json::to_string(&WorkflowKind::Git).unwrap(),
+            "\"git\""
+        );
         assert_eq!(
             serde_json::to_string(&WorkflowKind::Naive).unwrap(),
             "\"naive\""

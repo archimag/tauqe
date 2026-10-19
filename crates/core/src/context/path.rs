@@ -178,12 +178,16 @@ mod tests {
 
         // File symlink escapes repo
         assert!(cm.normalize_path("sym_file.txt").is_err());
-        assert!(cm.add_file("sym_file.txt", ContextAccess::ReadOnly).is_err());
+        assert!(cm
+            .add_file("sym_file.txt", ContextAccess::ReadOnly)
+            .is_err());
 
         // Directory symlink escapes repo (both existing and non-existing files under it)
         assert!(cm.normalize_path("sym_dir/secret.txt").is_err());
         assert!(cm.normalize_path("sym_dir/new_file.txt").is_err());
-        assert!(cm.add_file("sym_dir/secret.txt", ContextAccess::ReadOnly).is_err());
+        assert!(cm
+            .add_file("sym_dir/secret.txt", ContextAccess::ReadOnly)
+            .is_err());
 
         // Symlink pointing inside repo is allowed
         let internal_dir = repo_root.join("src");

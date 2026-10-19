@@ -92,7 +92,12 @@ pub fn detect_upstream_branch(dir: &Path, configured_upstream: Option<&str>) -> 
     // Check tracked upstream branch
     if let Ok(upstream) = run_git(
         Some(dir),
-        &["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"],
+        &[
+            "rev-parse",
+            "--abbrev-ref",
+            "--symbolic-full-name",
+            "@{upstream}",
+        ],
     ) {
         let trimmed = upstream.trim();
         if !trimmed.is_empty() && trimmed != "@{upstream}" {

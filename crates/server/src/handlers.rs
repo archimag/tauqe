@@ -52,6 +52,7 @@ pub async fn handle_request(req: Request, state: &Arc<AppState>) -> Response {
         methods::MODEL_CLEAR_HISTORY => model::handle_model_clear_history(req, state).await,
         methods::MODEL_SELECT => model::handle_model_select(req, state).await,
         methods::MODEL_CURRENT => model::handle_model_current(req, state).await,
+        methods::MODEL_USAGE_RESET => model::handle_usage_reset(req, state).await,
 
         methods::DISCUSSION_SET_FOCUS => model::handle_discussion_set_focus(req, state).await,
         methods::DISCUSSION_GET_FOCUS => model::handle_discussion_get_focus(req, state).await,

@@ -204,7 +204,14 @@ pub(super) async fn refine_finding_with_architect(
     // instead of an idle finding, and a successful synthesis settles it on
     // `Todo` inside `replace_uncompleted_subplan`.
     let previous_status = item.status;
-    set_item_status(state, repo_root, &session.id, item.id, IssueStatus::InProgress).await;
+    set_item_status(
+        state,
+        repo_root,
+        &session.id,
+        item.id,
+        IssueStatus::InProgress,
+    )
+    .await;
 
     let outcome = refine_finding_with_architect_inner(
         state,
@@ -284,13 +291,13 @@ fn resolve_finding_architect_tier(
     replanning: bool,
 ) -> (ArchitectTier, Option<ArchitectTier>) {
     match custom_model {
-        Some(selection) => (
-            ArchitectTier::new(
-                cfg.resolve_model(selection),
-                cfg.models.resolve_effort(ModelRole::Architect),
-            ),
-            None,
-        ),
+        Some(selection) => {
+            let model = cfg.resolve_model(selection);
+            let effort = cfg
+                .models
+                .resolve_selection_effort(ModelRole::Architect, selection);
+            (ArchitectTier::new(model, effort), None)
+        }
         None if replanning => (cfg.models.next_architect_tier(recorded), recorded.cloned()),
         None => (cfg.models.architect_tier(0), None),
     }
@@ -319,6 +326,8 @@ async fn refine_finding_with_architect_inner(
         repomap_budget,
         max_discovery_rounds,
         files_token_budget,
+        max_parse_retries,
+        include_repo_map,
     ) = {
         let cfg = state.config.lock().await.config.clone();
         let (architect_tier, escalated_from) = resolve_finding_architect_tier(
@@ -341,6 +350,8 @@ async fn refine_finding_with_architect_inner(
             cfg.context.repomap_token_budget,
             cfg.context.max_discovery_rounds,
             cfg.context.files_token_budget,
+            cfg.develop.max_retries,
+            cfg.context.include_repo_map,
         )
     };
     let model = architect_tier.model.clone();
@@ -423,8 +434,12 @@ async fn refine_finding_with_architect_inner(
     // actually saw.
     let (history_turn_prompt, history_context_paths) = {
         let ctx = state.context.read().await;
-        let context_paths: Vec<String> =
-            ctx.get_state().items.into_iter().map(|it| it.path).collect();
+        let context_paths: Vec<String> = ctx
+            .get_state()
+            .items
+            .into_iter()
+            .map(|it| it.path)
+            .collect();
         let mut turn_prompt = format!(
             "# {}: [{}#{}] {}\n",
             OPERATION_TITLE, session.id, item.id, item.title
@@ -441,7 +456,9 @@ async fn refine_finding_with_architect_inner(
     let response_format = {
         let schema_val = tauqe_core::plan::prompt::plan_refine_response_schema_definition();
         match serde_json::from_value::<JsonSchemaDefinition>(schema_val) {
-            Ok(schema) => ResponseFormat::JsonSchema { json_schema: schema },
+            Ok(schema) => ResponseFormat::JsonSchema {
+                json_schema: schema,
+            },
             Err(err) => return Err(refine_error(errors::SCHEMA_ERROR, err.to_string())),
         }
     };
@@ -455,14 +472,18 @@ async fn refine_finding_with_architect_inner(
         budget_hint: "The finding decomposition is too broad and should be scoped down.",
         response_format,
         repomap_budget,
+        include_repo_map,
         max_discovery_rounds,
         files_token_budget,
+        max_parse_retries,
         // Decomposition is an isolated design dialogue of one review session:
         // its cache is keyed by the audit, never by the interactive REPL.
         session_id: Some(format_session_id(SESSION_PREFIX_REVIEW, &session.id)),
     };
 
-    let build_user_prompt = |context_files: &[ContextFileContent], repo_map: Option<&str>| {
+    let build_user_prompt = |context_files: &[ContextFileContent],
+                             repo_map: Option<&str>,
+                             repo_dirs: Option<&str>| {
         let diagnostics_view = diagnostics.map(|d| ReviewRefineDiagnostics {
             failed_step_id: d.failed_step_id,
             failure_reason: d.failure_reason,
@@ -472,6 +493,7 @@ async fn refine_finding_with_architect_inner(
             item,
             context_files,
             repo_map,
+            repo_dirs,
             diagnostics_view,
             instructions.as_deref(),
         )
@@ -679,7 +701,7 @@ fn refine_error(code: &'static str, message: impl Into<String>) -> ResponseError
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tauqe_protocol::model::{ModelRef, ReasoningEffort};
+    use tauqe_protocol::model::{ModelEntry, ModelRef, ReasoningEffort};
 
     #[test]
     fn architect_tier_banner_renders_its_reasoning_depth() {
@@ -727,5 +749,33 @@ mod tests {
             status_after_failed_planning(IssueStatus::InProgress),
             IssueStatus::Todo
         );
+    }
+
+    #[test]
+    fn test_resolve_finding_architect_tier_custom_model_uses_its_own_effort() {
+        let cfg = AppConfig {
+            models: tauqe_core::config::ModelsConfig {
+                primary: vec![ModelRef::openrouter("base/primary").into()],
+                architect: Some(vec![
+                    ModelEntry::new(
+                        ModelRef::openrouter("deepseek/deepseek-flash"),
+                        Some(ReasoningEffort::Max),
+                        None,
+                    ),
+                    ModelEntry::new(
+                        ModelRef::openrouter("google/gemini-flash"),
+                        Some(ReasoningEffort::High),
+                        None,
+                    ),
+                ]),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let selection = ModelSelection::Specific(ModelRef::openrouter("google/gemini-flash"));
+        let (tier, _) = resolve_finding_architect_tier(&cfg, None, Some(&selection), false);
+        assert_eq!(tier.model, ModelRef::openrouter("google/gemini-flash"));
+        assert_eq!(tier.effort, Some(ReasoningEffort::High));
     }
 }

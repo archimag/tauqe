@@ -84,8 +84,10 @@ impl TurnIntent {
         match self {
             Self::InteractiveRepl => capabilities.clone(),
             Self::ReadonlyDiscussion => Self::intersect(capabilities, &CapabilitySet::discussion()),
-            Self::IsolatedStep => Self::intersect(capabilities, &CapabilitySet::isolated_step_xml())
-                .without(LlmCapability::ToolchainVerify),
+            Self::IsolatedStep => {
+                Self::intersect(capabilities, &CapabilitySet::isolated_step_xml())
+                    .without(LlmCapability::ToolchainVerify)
+            }
         }
     }
 
@@ -175,8 +177,7 @@ mod tests {
 
     #[test]
     fn test_narrow_capabilities_isolated_step_drops_plan_and_verification() {
-        let narrowed =
-            TurnIntent::IsolatedStep.narrow_capabilities(&CapabilitySet::develop_xml());
+        let narrowed = TurnIntent::IsolatedStep.narrow_capabilities(&CapabilitySet::develop_xml());
 
         assert!(narrowed.contains(LlmCapability::FileEdits));
         assert!(narrowed.contains(LlmCapability::Discovery));

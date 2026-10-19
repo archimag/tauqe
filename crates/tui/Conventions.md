@@ -180,7 +180,7 @@ This document specifies mandatory architectural and UX invariants for the Tauqe 
    - Every modal dialog must follow a consistent three-tier layout:
      - **Header / Title:** Border title (`Block::bordered().title(...)`) indicating operation context and status (e.g. ` Confirm Cancellation `, ` Select Model `, ` Squash AI Commits (Applying...) `).
      - **Body:** Central functional area (formatted text/alert for confirmations, virtual scrollable list for selectors, or structured input/diff pane).
-     - **Actions Footer:** Dedicated bottom action bar separated by visual hierarchy or divider, presenting explicit action buttons (`[ Confirm ]`, `[ Cancel ]`, etc.).
+     - **Actions Footer:** Dedicated bottom action bar presenting explicit action buttons (`[ Confirm ]`, `[ Cancel ]`, etc.). It is always separated from the body by a blank row (see §6.7), never by a rule drawn through the middle of the card.
      - **Docked Help Panel:** Immediately below the action bar, a non-interactive hint strip docked to the bottom border and rendered as a `palette.overlay`-filled row (see §6.4). It is chrome, not a fourth content tier.
 
 2. **Standardized Command Navigation:**
@@ -212,6 +212,23 @@ This document specifies mandatory architectural and UX invariants for the Tauqe 
 6. **Mouse Hit-Testing Synchronization Invariant:**
    - Every geometry helper that reports clickable button rectangles (for example `modal_action_buttons`) must compute its coordinates from the exact same `Layout` formula the render path uses. Shifting the action bar, or inserting the docked help panel below it, must therefore never desynchronize the click targets from the drawn buttons.
    - Rendering and hit-testing share a single geometry source of truth, so the confirm/cancel buttons that are drawn are always the buttons that are clickable.
+
+7. **Mandatory Vertical Breathing Room (Dialog Air):**
+   - A modal dialog is never a dense block of text pressed against its own borders, title, or buttons. The card reserves three fixed spacers, and every band of the card is separated from its neighbour by them.
+   - **Top Inset:** exactly one empty row between the top border (its title included) and the first rendered line of the body. The body never collides with the border title.
+   - **Inter-Section Spacer:** exactly one empty row between logical blocks inside the body (a summary and an item list, a heading and its details, two stacked forms). It belongs to the body renderer, which knows where its own sections begin and end.
+   - **Pre-Action Spacer:** exactly one empty row between the body and the interactive action bar, followed by the button row and the docked hint row. It belongs to the shared frame, not to the body renderer.
+   - The shared frame therefore expresses a fixed vertical formula: top inset, flexible body, pre-action spacer, button row, docked hint row. A dialog cannot opt out of the top inset or the pre-action spacer.
+   - A body renderer draws strictly inside its own area. Painting into the top inset, the pre-action spacer, the button row, or the hint strip is a layout defect, and reclaiming space by deleting a spacer is forbidden.
+   - Because all three spacers are part of the shared formula, they are also part of the hit-testing helper (§6.6): spacing and click geometry are corrected in one place and cannot drift apart.
+   - Rationale: a dense dialog forces the eye to re-parse where reading ends and acting begins, and on a short terminal the buttons visually merge with the text above them. One empty row is the cheapest possible separation and keeps high information density legible.
+
+8. **Mandatory Horizontal Margin (Dialog Frame Inset):**
+   - Text pressed against a vertical border reads as clipped: the border glyph merges with the first character of every line and the card loses its frame.
+   - Every modal card keeps its content off the left and right borders by one column of inner horizontal padding on each side. The body, the action bar, and the docked help panel share that same padding, so text, buttons, and hints start on one left margin.
+   - Content is laid out strictly inside the padded column. Renderers never draw on the border column, and they never compensate for a narrow card by shrinking the padding below one column.
+   - The padding is part of the same shared geometry as the vertical spacers (§6.6, §6.7), so mouse hit-testing and rendering stay aligned when the card is resized.
+   - Rationale: one column of margin is the smallest possible inset that visually separates content from chrome, and it keeps the border readable on every terminal width.
 
 ---
 

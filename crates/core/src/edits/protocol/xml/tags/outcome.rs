@@ -5,10 +5,19 @@ use crate::edits::protocol::xml::engine::{self, XmlTagMatch, XmlTagSpec};
 /// Universal terminal outcome emitted by the model at the conclusion of a turn.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TerminalOutcome {
-    Success { summary: Option<String> },
-    Error { message: String },
-    Blocked { reason: String, details: Option<String> },
-    Skip { reason: String },
+    Success {
+        summary: Option<String>,
+    },
+    Error {
+        message: String,
+    },
+    Blocked {
+        reason: String,
+        details: Option<String>,
+    },
+    Skip {
+        reason: String,
+    },
 }
 
 impl TerminalOutcome {

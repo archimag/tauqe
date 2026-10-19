@@ -240,10 +240,7 @@ mod tests {
         let input = InputConfig::default();
 
         let meta_less = EDITOR_COMMAND_MAP.resolve(
-            KeyEvent::new(
-                KeyCode::Char('<'),
-                KeyModifiers::ALT | KeyModifiers::SHIFT,
-            ),
+            KeyEvent::new(KeyCode::Char('<'), KeyModifiers::ALT | KeyModifiers::SHIFT),
             &input,
             true,
         );

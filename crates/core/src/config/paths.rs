@@ -218,12 +218,8 @@ mod tests {
     #[test]
     fn test_cli_config_precedence() {
         let explicit = Path::new("/explicit/path/tauqe.toml");
-        let candidates = config_candidates_internal(
-            Some(Path::new("/repo")),
-            None,
-            None,
-            Some(explicit),
-        );
+        let candidates =
+            config_candidates_internal(Some(Path::new("/repo")), None, None, Some(explicit));
         assert_eq!(candidates, vec![explicit.to_path_buf()]);
     }
 

@@ -69,6 +69,44 @@ impl RepoSearchRequest {
     }
 }
 
+/// Declarative directory content listing request emitted during discovery.
+///
+/// The request addresses a repository-relative directory prefix; an empty path
+/// names the repository root. `recursive` widens the listing from the direct
+/// children to every tracked file underneath, so the default request stays
+/// shallow and never floods the context budget.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DirListRequest {
+    pub path: String,
+    #[serde(default)]
+    pub recursive: bool,
+}
+
+impl DirListRequest {
+    pub fn new(path: impl Into<String>, recursive: bool) -> Self {
+        Self {
+            path: path.into(),
+            recursive,
+        }
+    }
+
+    /// Normalizes the requested directory path through the shared repository
+    /// path rules.
+    ///
+    /// An empty path, `.`, or `./` names the whole repository and normalizes to
+    /// an empty string. Any other path is validated through
+    /// [`normalize_repo_map_path`], so a directory listing can never address a
+    /// location outside the repository; such a path yields `None` and the
+    /// request is dropped instead of being allowed to escape. The `recursive`
+    /// flag is preserved.
+    pub fn normalized(self) -> Option<Self> {
+        normalize_repo_map_path(&self.path).map(|path| Self {
+            path,
+            recursive: self.recursive,
+        })
+    }
+}
+
 /// Structured file context request emitted during discussion turns.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DiscussionContextRequest {
@@ -160,7 +198,9 @@ impl DiscussionFocus {
 
     pub fn review(review_id: impl Into<String>, focused_items: Vec<String>) -> Self {
         Self::from_target(
-            DiscussionTarget::Review { id: review_id.into() },
+            DiscussionTarget::Review {
+                id: review_id.into(),
+            },
             focused_items,
         )
     }
@@ -291,6 +331,20 @@ pub struct DiscussionResponse {
     )]
     pub repo_searches: Vec<RepoSearchRequest>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo_dirs: Option<bool>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_repo_map_paths",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub repo_maps: Vec<String>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_dir_list_requests",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub dir_lists: Vec<DirListRequest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_language: Option<String>,
 }
 
@@ -301,6 +355,9 @@ impl DiscussionResponse {
             plan_update: None,
             context_requests: Vec::new(),
             repo_searches: Vec::new(),
+            repo_dirs: None,
+            repo_maps: Vec::new(),
+            dir_lists: Vec::new(),
             user_language: None,
         }
     }
@@ -320,6 +377,27 @@ impl DiscussionResponse {
         self
     }
 
+    pub fn with_repo_dirs(mut self, request: bool) -> Self {
+        self.repo_dirs = Some(request);
+        self
+    }
+
+    pub fn with_repo_maps(mut self, paths: Vec<String>) -> Self {
+        self.repo_maps = paths
+            .iter()
+            .filter_map(|path| normalize_repo_map_path(path))
+            .collect();
+        self
+    }
+
+    pub fn with_dir_lists(mut self, requests: Vec<DirListRequest>) -> Self {
+        self.dir_lists = requests
+            .into_iter()
+            .filter_map(DirListRequest::normalized)
+            .collect();
+        self
+    }
+
     pub fn with_user_language(mut self, language: impl Into<String>) -> Self {
         self.user_language = Some(language.into());
         self
@@ -333,6 +411,58 @@ where
 {
     let opt = Option::<T>::deserialize(deserializer)?;
     Ok(opt.unwrap_or_default())
+}
+
+/// Normalizes a single targeted repository map request.
+///
+/// An empty path, `.`, or `./` names the whole repository and normalizes to an
+/// empty string. Any other path is validated through [`normalize_repo_path`],
+/// so a request can never address a location outside the repository; such a
+/// path yields `None` and the request is dropped. This is the crate's single
+/// shared normalizer for map requests, so every wire boundary applies the same
+/// rules.
+pub fn normalize_repo_map_path(raw: &str) -> Option<String> {
+    let trimmed = raw.trim().trim_matches('`').trim();
+    if trimmed.is_empty() || trimmed == "." || trimmed == "./" {
+        return Some(String::new());
+    }
+    normalize_repo_path(trimmed).ok()
+}
+
+/// Deserializes the `repo_maps` field of [`DiscussionResponse`].
+///
+/// A `null` payload yields an empty list, and every entry is normalized through
+/// [`normalize_repo_map_path`], so a directly decoded response can no longer
+/// carry an unvalidated or escaping path.
+fn deserialize_repo_map_paths<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let paths = Option::<Vec<String>>::deserialize(deserializer)?;
+    Ok(paths
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|path| normalize_repo_map_path(path))
+        .collect())
+}
+
+/// Deserializes the `dir_lists` field of [`DiscussionResponse`].
+///
+/// A `null` payload yields an empty list, and every entry is normalized through
+/// [`DirListRequest::normalized`], so a directly decoded response can no longer
+/// carry an unvalidated or escaping directory path.
+fn deserialize_dir_list_requests<'de, D>(
+    deserializer: D,
+) -> Result<Vec<DirListRequest>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let requests = Option::<Vec<DirListRequest>>::deserialize(deserializer)?;
+    Ok(requests
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(DirListRequest::normalized)
+        .collect())
 }
 
 /// Deserializes the `context_requests` field of [`DiscussionResponse`],
@@ -529,10 +659,7 @@ mod tests {
     fn test_repo_search_request_serde() {
         let req = RepoSearchRequest::new("crates/protocol", r"pub fn \w+");
         let json = serde_json::to_string(&req).unwrap();
-        assert_eq!(
-            json,
-            r#"{"path":"crates/protocol","regex":"pub fn \\w+"}"#
-        );
+        assert_eq!(json, r#"{"path":"crates/protocol","regex":"pub fn \\w+"}"#);
         let de: RepoSearchRequest = serde_json::from_str(&json).unwrap();
         assert_eq!(de, req);
     }
@@ -545,6 +672,9 @@ mod tests {
         assert!(resp.plan_update.is_none());
         assert!(resp.context_requests.is_empty());
         assert!(resp.repo_searches.is_empty());
+        assert!(resp.repo_dirs.is_none());
+        assert!(resp.repo_maps.is_empty());
+        assert!(resp.dir_lists.is_empty());
         assert!(resp.user_language.is_none());
     }
 
@@ -555,6 +685,9 @@ mod tests {
             "plan_update": null,
             "context_requests": null,
             "repo_searches": null,
+            "repo_dirs": null,
+            "repo_maps": null,
+            "dir_lists": null,
             "user_language": null
         }"#;
         let resp: DiscussionResponse = serde_json::from_str(raw).unwrap();
@@ -562,6 +695,9 @@ mod tests {
         assert!(resp.plan_update.is_none());
         assert!(resp.context_requests.is_empty());
         assert!(resp.repo_searches.is_empty());
+        assert!(resp.repo_dirs.is_none());
+        assert!(resp.repo_maps.is_empty());
+        assert!(resp.dir_lists.is_empty());
         assert!(resp.user_language.is_none());
     }
 
@@ -580,9 +716,97 @@ mod tests {
     }
 
     #[test]
+    fn test_discussion_response_repo_dirs_and_repo_maps() {
+        let raw = r#"{
+            "message": "Map the subsystem first",
+            "repo_dirs": true,
+            "repo_maps": [".", "./crates/core/", "../escape.rs", "crates/protocol/"]
+        }"#;
+        let resp: DiscussionResponse = serde_json::from_str(raw).unwrap();
+        assert_eq!(resp.repo_dirs, Some(true));
+        // `.` names the whole repository, `./` prefixes collapse, and the
+        // traversal entry is dropped instead of escaping the repository.
+        assert_eq!(
+            resp.repo_maps,
+            vec![
+                String::new(),
+                "crates/core".to_string(),
+                "crates/protocol".to_string()
+            ]
+        );
+
+        // Both fields stay absent by default and survive a serde round-trip.
+        let minimal: DiscussionResponse = serde_json::from_str(r#"{"message":"x"}"#).unwrap();
+        assert!(minimal.repo_dirs.is_none());
+        assert!(minimal.repo_maps.is_empty());
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("\"repo_dirs\":true"));
+        assert!(json.contains("\"repo_maps\":[\"\",\"crates/core\",\"crates/protocol\"]"));
+        assert_eq!(
+            serde_json::from_str::<DiscussionResponse>(&json).unwrap(),
+            resp
+        );
+
+        // The builder applies the same normalization as the decoder.
+        let built = DiscussionResponse::new("x")
+            .with_repo_dirs(false)
+            .with_repo_maps(vec!["./crates/core/".to_string(), "../escape.rs".to_string()]);
+        assert_eq!(built.repo_dirs, Some(false));
+        assert_eq!(built.repo_maps, vec!["crates/core".to_string()]);
+
+        assert_eq!(normalize_repo_map_path(""), Some(String::new()));
+        assert_eq!(normalize_repo_map_path("  .  "), Some(String::new()));
+        assert_eq!(
+            normalize_repo_map_path("`crates/core`"),
+            Some("crates/core".to_string())
+        );
+        assert_eq!(normalize_repo_map_path("/etc"), None);
+        assert_eq!(normalize_repo_map_path("a/../b"), None);
+    }
+
+    #[test]
+    fn test_discussion_dir_list_requests_normalize_paths() {
+        let raw = r#"{
+            "message": "List the subsystem",
+            "dir_lists": [
+                {"path": "./crates/core/", "recursive": false},
+                {"path": ".", "recursive": true},
+                {"path": "../escape", "recursive": true}
+            ]
+        }"#;
+        let resp: DiscussionResponse = serde_json::from_str(raw).unwrap();
+        // `./` collapses, `.` names the repository root, and the traversal
+        // entry is dropped instead of escaping the repository.
+        assert_eq!(resp.dir_lists.len(), 2);
+        assert_eq!(resp.dir_lists[0].path, "crates/core");
+        assert!(!resp.dir_lists[0].recursive);
+        assert_eq!(resp.dir_lists[1].path, "");
+        assert!(resp.dir_lists[1].recursive);
+
+        // The builder applies the same normalization as the decoder.
+        let built = DiscussionResponse::new("x").with_dir_lists(vec![
+            DirListRequest::new("./crates/protocol/", true),
+            DirListRequest::new("../escape", false),
+        ]);
+        assert_eq!(
+            built.dir_lists,
+            vec![DirListRequest::new("crates/protocol", true)]
+        );
+
+        // `recursive` defaults to false on the wire and an empty listing stays
+        // absent from the encoded payload.
+        let shallow: DirListRequest = serde_json::from_str(r#"{"path":"src"}"#).unwrap();
+        assert_eq!(shallow, DirListRequest::new("src", false));
+        let json = serde_json::to_string(&DiscussionResponse::new("x")).unwrap();
+        assert!(!json.contains("dir_lists"));
+    }
+
+    #[test]
     fn test_discussion_response_full_roundtrip() {
-        let resp = DiscussionResponse::new("Let's proceed with architecture update")
-            .with_user_language("Russian")
+        let resp = DiscussionResponse::new("Proceed with the protocol update")
+            .with_repo_dirs(true)
+            .with_repo_maps(vec!["./crates/core/".to_string()])
+            .with_dir_lists(vec![DirListRequest::new("./crates/core/", true)])
             .with_context_requests(vec![
                 DiscussionContextRequest::read_only("crates/core/src/lib.rs"),
                 DiscussionContextRequest::editable("crates/protocol/src/lib.rs"),
@@ -596,19 +820,25 @@ mod tests {
                 id: Some("structured-output".to_string()),
                 title: Some("Structured Output".to_string()),
                 description: Some("Implement JSON schema protocol".to_string()),
-                concept: vec![],
+                concept: vec![ConceptItem {
+                    id: "c-1".to_string(),
+                    title: "One wire contract".to_string(),
+                    details: Some("Schemas mirror the Rust data model".to_string()),
+                    children: vec![],
+                }],
                 items: vec![PlanItem {
                     id: "1".to_string(),
                     title: "Protocol types".to_string(),
                     details: Some("Add discussion schemas".to_string()),
                     status: PlanItemStatus::Done,
-                    files: vec![],
+                    files: vec!["crates/protocol/src/discussion.rs".to_string()],
                     readonly_files: vec![],
-                    concept_refs: vec![],
+                    concept_refs: vec!["c-1".to_string()],
                     depends_on: vec![],
                     children: vec![],
                 }],
-            });
+            })
+            .with_user_language("Russian");
 
         let json = serde_json::to_string_pretty(&resp).unwrap();
         let de: DiscussionResponse = serde_json::from_str(&json).unwrap();

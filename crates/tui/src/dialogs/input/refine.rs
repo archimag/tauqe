@@ -27,12 +27,10 @@ pub(super) async fn handle_refine_dialog(
 
     let primary = st.tui_config.input.primary_modifier;
     let meta = st.tui_config.input.meta_modifier;
-    let visible_rows = crate::dialogs::render::refine_dialog_geometry(
-        st.last_frame_area,
-        dialog.selector.len(),
-    )
-    .model_rows
-    .height as usize;
+    let visible_rows =
+        crate::dialogs::render::refine_dialog_geometry(st.last_frame_area, dialog.selector.len())
+            .model_rows
+            .height as usize;
 
     // The C-M / M-M chord always switches the architect; the arrows browse the
     // list only while the list owns focus, so list navigation and text editing
@@ -52,8 +50,8 @@ pub(super) async fn handle_refine_dialog(
         return Ok(Some(InputResult::Continue));
     }
 
-    let is_ctrl_alt = key.modifiers.contains(KeyModifiers::CONTROL)
-        && key.modifiers.contains(KeyModifiers::ALT);
+    let is_ctrl_alt =
+        key.modifiers.contains(KeyModifiers::CONTROL) && key.modifiers.contains(KeyModifiers::ALT);
 
     // Alt+digit picks an architect by position without moving the cursor out of
     // the instructions editor (c-magit-key-navigation).
@@ -131,12 +129,7 @@ pub(super) async fn handle_refine_dialog(
         }
         _ => {
             if dialog.focus.is_instructions_editor() {
-                crate::input::handle_editor_key(
-                    &mut dialog.instructions_editor,
-                    key,
-                    is_cmd,
-                    true,
-                );
+                crate::input::handle_editor_key(&mut dialog.instructions_editor, key, is_cmd, true);
             }
             st.plans_view.refine_dialog = Some(dialog);
             Ok(Some(InputResult::Continue))

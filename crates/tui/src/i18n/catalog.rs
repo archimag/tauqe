@@ -42,7 +42,8 @@ pub fn canonical_catalog() -> Vec<LocaleCatalogItem> {
         item("footer.error", "Error", "Footer indicator for a failed turn", Some(10)),
         item("footer.reviewing", "Reviewing", "Footer indicator while a code review runs", Some(12)),
         item("footer.stopping", "[Stopping after current step]", "Footer badge while a soft batch stop is pending", None),
-        item("footer.repomap_tokens", "map: {} tok", "Footer repository map token counter", None),
+        item("footer.retrying", "⟳ Reconnecting {}/{} in {}s", "Footer indicator counting down the seconds until the next provider attempt", None),
+        item("footer.retrying_cancel", "C-g to cancel", "Footer hint naming the chord that aborts a reconnect pause", None),
         item("footer.history_stats", "{} entries (~{} tokens)", "Footer history size indicator", None),
 
         // ------------------------------------------------------------------
@@ -288,6 +289,22 @@ pub fn canonical_catalog() -> Vec<LocaleCatalogItem> {
         item("dialog.batch_cancel.continue_note", "Continue keeps the batch running.", "Batch-cancel continue action note", None),
         item("dialog.batch_cancel.soft_stop_note", "Soft Stop finishes the current step, then stops the queue.", "Batch-cancel soft-stop action note", None),
         item("dialog.batch_cancel.hard_stop_note", "Hard Stop aborts the current step immediately.", "Batch-cancel hard-stop action note", None),
+
+        // ------------------------------------------------------------------
+        // Multi-round continuation dialog (raised between bounded batch rounds,
+        // c-4). It reuses the three-way Continue / Soft Stop / Hard Stop
+        // vocabulary of the batch-cancel dialog, so a developer who stops a
+        // multi-round run makes the same explicit choice as one who interrupts
+        // a single round.
+        // ------------------------------------------------------------------
+        item("dialog.batch_round.title", "Continue Multi-Round Execution", "Title for the dialog offering the next bounded batch round", None),
+        item("dialog.batch_round.question", "Start the next bounded round?", "Question in the multi-round continuation dialog", None),
+        item("dialog.batch_round.progress", "Rounds completed: {} of {} ({} available)", "Progress line naming the completed, total, and available rounds", None),
+        item("dialog.batch_round.continue_note", "Continue launches the next round over the remaining work.", "Multi-round continue action note", None),
+        item("dialog.batch_round.soft_stop_note", "Soft Stop keeps every result and ends the loop here.", "Multi-round soft-stop action note", None),
+        item("dialog.batch_round.hard_stop_note", "Hard Stop ends the loop without discarding committed work.", "Multi-round hard-stop action note", None),
+        item("notify.batch_round_launched", "Round {} launched", "Notification when the next bounded round is launched", None),
+        item("notify.batch_round_stopped", "Multi-round execution stopped after {} round(s)", "Notification when the multi-round loop ends", None),
 
         item("dialog.server_disconnected.terminated", "Connection to tauqe-server was terminated", "Server-disconnected card heading", None),
         item("dialog.server_disconnected.footer", "q / Esc / Ctrl+Q quit", "Server-disconnected footer hint", None),
@@ -760,6 +777,8 @@ pub fn canonical_catalog() -> Vec<LocaleCatalogItem> {
         item("dialog.usage.session", "Session", "Usage dialog heading for the accumulated session totals", None),
         item("dialog.usage.last", "Last Operation", "Usage dialog heading for the last completed operation", None),
         item("dialog.usage.current", "Current Operation", "Usage dialog heading for the operation in flight", None),
+        item("dialog.usage.lifetime", "Project Lifetime", "Usage dialog heading for the project-wide totals accumulated across process restarts", None),
+        item("dialog.usage.metric", "Metric", "Usage dialog table column header for the metric name", Some(16)),
         item("dialog.usage.operations", "Operations", "Usage dialog row label for the completed operation count", None),
         item("dialog.usage.prompt_tokens", "Prompt tokens", "Usage dialog row label for prompt tokens", None),
         item("dialog.usage.completion_tokens", "Completion tokens", "Usage dialog row label for completion tokens", None),
@@ -768,8 +787,10 @@ pub fn canonical_catalog() -> Vec<LocaleCatalogItem> {
         item("dialog.usage.total_tokens", "Total tokens", "Usage dialog row label for total tokens", None),
         item("dialog.usage.cost", "Cost", "Usage dialog row label for the monetary cost", None),
         item("dialog.usage.duration", "Duration", "Usage dialog row label for the harness-measured duration", None),
+        item("dialog.usage.map", "Repository Map", "Usage dialog heading for the tokens the repository map consumed", None),
+        item("dialog.usage.repomap_tokens", "Map tokens", "Usage dialog row label for the tokens spent on the repository map", None),
         item("dialog.usage.empty", "No usage recorded in this session yet.", "Usage dialog placeholder when no operation has completed", None),
-        item("dialog.usage.footer", "j / k or ↑ / ↓ scroll • PgUp / PgDn page • Home top • Esc close", "Usage dialog footer hint", None),
+        item("dialog.usage.footer", "j / k or ↑ / ↓ scroll • PgUp / PgDn page • Home top • Shift+C reset • Esc close", "Usage dialog footer hint including the project telemetry reset chord", None),
 
         // ------------------------------------------------------------------
         // Discussion prompt modal.
@@ -1004,6 +1025,7 @@ pub fn canonical_catalog() -> Vec<LocaleCatalogItem> {
         item("repl.thinking_streaming", "Thinking (streaming)...", "Develop reasoning block title while reasoning streams", None),
         item("repl.thinking_hidden", "Thinking (hidden)", "Develop reasoning block title while reasoning is folded", None),
         item("repl.thinking_lines", "({} lines)", "Develop reasoning block line counter appended while reasoning streams", None),
+        item("repl.thinking_truncated", "({} earlier lines dropped)", "Develop reasoning block marker stating how many earliest reasoning lines fell out of the bounded transcript window", None),
         item("plans.concept_title", "Concept", "Plans section title for architectural concept items", None),
         item("plans.impl_title", "Implementation", "Plans section title for implementation items", None),
         item("review.skip_reason_label", "Skip reason:", "Review detail label for a skipped finding rationale", None),
@@ -1109,6 +1131,8 @@ mod tests {
         // Footer telemetry and bounded-turn phases.
         assert!(keys.contains("footer.ready"));
         assert!(keys.contains("footer.stopping"));
+        assert!(keys.contains("footer.retrying"));
+        assert!(keys.contains("footer.retrying_cancel"));
         assert!(keys.contains("phase.discovery"));
         assert!(keys.contains("phase.healing"));
 
@@ -1130,6 +1154,10 @@ mod tests {
         assert!(keys.contains("cmd.plans.execute"));
         assert!(keys.contains("cmd.review.refine"));
         assert!(keys.contains("cmd.repl.send"));
+
+        // Usage telemetry headings, including the project-wide lifetime block.
+        assert!(keys.contains("dialog.usage.session"));
+        assert!(keys.contains("dialog.usage.lifetime"));
 
         // System notifications.
         assert!(keys.contains("notify.turn_completed"));
@@ -1173,8 +1201,7 @@ mod tests {
                 item.key
             );
             assert!(
-                item
-                    .key
+                item.key
                     .chars()
                     .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '.' || c == '_'),
                 "catalog key '{}' must be lowercase dot notation",

@@ -49,7 +49,10 @@ mod tests {
 
     #[test]
     fn escape_xml_text_keeps_quotes_and_escapes_markup() {
-        assert_eq!(escape_xml_text("a & b \"c\" <d>"), "a &amp; b \"c\" &lt;d&gt;");
+        assert_eq!(
+            escape_xml_text("a & b \"c\" <d>"),
+            "a &amp; b \"c\" &lt;d&gt;"
+        );
     }
 
     #[test]

@@ -121,9 +121,17 @@ mod tests {
         std::fs::write(root.join("Conventions.md"), "# Root Conventions").unwrap();
         std::fs::create_dir_all(root.join("crates/tui/src/views")).unwrap();
         std::fs::write(root.join("crates/tui/Conventions.md"), "# TUI Conventions").unwrap();
-        std::fs::write(root.join("crates/tui/src/views/develop.rs"), "pub fn view() {}").unwrap();
+        std::fs::write(
+            root.join("crates/tui/src/views/develop.rs"),
+            "pub fn view() {}",
+        )
+        .unwrap();
         std::fs::create_dir_all(root.join("crates/core/src")).unwrap();
-        std::fs::write(root.join("crates/core/Conventions.md"), "# Core Conventions").unwrap();
+        std::fs::write(
+            root.join("crates/core/Conventions.md"),
+            "# Core Conventions",
+        )
+        .unwrap();
         std::fs::write(root.join("crates/core/src/lib.rs"), "pub fn core() {}").unwrap();
 
         let mut cm = ContextManager::new(root);
@@ -135,13 +143,15 @@ mod tests {
         assert!(!cm.contains("crates/core/Conventions.md").unwrap());
 
         // Adding a file in crates/tui automatically includes crates/tui/Conventions.md in pinned
-        cm.add_file("crates/tui/src/views/develop.rs", ContextAccess::Editable).unwrap();
+        cm.add_file("crates/tui/src/views/develop.rs", ContextAccess::Editable)
+            .unwrap();
         assert!(cm.contains("crates/tui/Conventions.md").unwrap());
         assert!(!cm.is_editable("crates/tui/Conventions.md").unwrap());
         assert!(!cm.contains("crates/core/Conventions.md").unwrap());
 
         // Adding a file in crates/core to auto layer automatically includes crates/core/Conventions.md
-        cm.add_auto_file("crates/core/src/lib.rs", ContextAccess::ReadOnly).unwrap();
+        cm.add_auto_file("crates/core/src/lib.rs", ContextAccess::ReadOnly)
+            .unwrap();
         assert!(cm.contains("crates/core/Conventions.md").unwrap());
 
         // Clearing auto removes crates/core/Conventions.md, but retains crates/tui/Conventions.md
@@ -186,7 +196,8 @@ mod tests {
         cm.load_pinned(&["pinned.rs".to_string()]);
         assert!(!cm.is_editable("pinned.rs").unwrap());
 
-        cm.add_auto_file("pinned.rs", ContextAccess::Editable).unwrap();
+        cm.add_auto_file("pinned.rs", ContextAccess::Editable)
+            .unwrap();
         assert!(cm.is_editable("pinned.rs").unwrap());
     }
 
@@ -201,7 +212,8 @@ mod tests {
         assert!(!cm.is_editable("pinned.rs").unwrap());
 
         // The model requests the already-pinned file as editable.
-        cm.add_auto_file("pinned.rs", ContextAccess::Editable).unwrap();
+        cm.add_auto_file("pinned.rs", ContextAccess::Editable)
+            .unwrap();
 
         // Access is upgraded without duplicating the pinned file into auto.
         assert!(cm.is_editable("pinned.rs").unwrap());
@@ -209,7 +221,8 @@ mod tests {
 
         // A read-only re-request stays a no-op for pinned files.
         let rev_before = cm.get_state().revision;
-        cm.add_auto_file("pinned.rs", ContextAccess::ReadOnly).unwrap();
+        cm.add_auto_file("pinned.rs", ContextAccess::ReadOnly)
+            .unwrap();
         assert_eq!(cm.get_state().revision, rev_before);
         assert!(cm.auto_files().is_empty());
 
@@ -236,7 +249,9 @@ mod tests {
         assert!(!primary.is_editable("pinned.rs").unwrap());
 
         let mut turn_snapshot = primary.clone();
-        turn_snapshot.add_auto_file("pinned.rs", ContextAccess::Editable).unwrap();
+        turn_snapshot
+            .add_auto_file("pinned.rs", ContextAccess::Editable)
+            .unwrap();
         assert!(turn_snapshot.is_editable("pinned.rs").unwrap());
 
         primary.merge_turn_context(&turn_snapshot);
@@ -249,11 +264,16 @@ mod tests {
         let root = dir.path().to_path_buf();
         std::fs::write(root.join("Conventions.md"), "# Root Conventions").unwrap();
         std::fs::create_dir_all(root.join("crates/core/src")).unwrap();
-        std::fs::write(root.join("crates/core/Conventions.md"), "# Core Conventions").unwrap();
+        std::fs::write(
+            root.join("crates/core/Conventions.md"),
+            "# Core Conventions",
+        )
+        .unwrap();
         std::fs::write(root.join("crates/core/src/lib.rs"), "pub fn core() {}").unwrap();
 
         let mut cm = ContextManager::with_pinned(root, &["Conventions.md".to_string()]);
-        cm.add_file("crates/core/src/lib.rs", ContextAccess::Editable).unwrap();
+        cm.add_file("crates/core/src/lib.rs", ContextAccess::Editable)
+            .unwrap();
         assert!(cm.contains("crates/core/Conventions.md").unwrap());
 
         cm.clear_user();

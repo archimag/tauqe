@@ -364,7 +364,10 @@ mod tests {
             ThemePreset::from_name("SOLARIZED-DARK"),
             Some(ThemePreset::SolarizedDark)
         );
-        assert_eq!(ThemePreset::from_name("gruvbox"), Some(ThemePreset::Gruvbox));
+        assert_eq!(
+            ThemePreset::from_name("gruvbox"),
+            Some(ThemePreset::Gruvbox)
+        );
         assert_eq!(ThemePreset::from_name("nope"), None);
     }
 

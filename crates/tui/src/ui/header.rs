@@ -93,8 +93,9 @@ fn model_selector_label(state: &AppState, max_model_len: usize) -> String {
 
             if let Some(entry) = role_entry {
                 truncate_to_width(&crate::app::compact_entry_label(entry), max_model_len)
-            } else if let Some(model_ref) =
-                state.model_choice.resolve(&tauqe_protocol::ModelSelection::Role(*role))
+            } else if let Some(model_ref) = state
+                .model_choice
+                .resolve(&tauqe_protocol::ModelSelection::Role(*role))
             {
                 truncate_to_width(crate::app::compact_model_name(&model_ref), max_model_len)
             } else {
@@ -220,7 +221,10 @@ fn render_header_with_engine(
     let help_hint = crate::app::help_open_hint(state.tui_config.input.primary_modifier);
     // The squash button advertises the portable C-S / M-S chord, following the
     // configured primary modifier instead of the former F6 hardware key.
-    let squash_hint = format!("{}S", state.tui_config.input.primary_modifier.emacs_prefix());
+    let squash_hint = format!(
+        "{}S",
+        state.tui_config.input.primary_modifier.emacs_prefix()
+    );
     // Button labels resolve through the locale catalog, so a hot-swapped
     // language relabels the header actions instead of leaving the English
     // literals behind (Conventions §9, c-1).
@@ -240,9 +244,17 @@ fn render_header_with_engine(
                 format!(" [{}] {} ", help_hint, help_label),
             )
         } else if inner_header_width >= 75 {
-            (8, format!(" [{}] ", squash_hint), format!(" [{}] {} ", help_hint, help_label))
+            (
+                8,
+                format!(" [{}] ", squash_hint),
+                format!(" [{}] {} ", help_hint, help_label),
+            )
         } else {
-            (6, format!(" [{}] ", squash_hint), format!(" [{}] ", help_hint))
+            (
+                6,
+                format!(" [{}] ", squash_hint),
+                format!(" [{}] ", help_hint),
+            )
         };
 
     let palette = engine.palette();
@@ -254,9 +266,12 @@ fn render_header_with_engine(
     let right_chrome_width = div_width * 2
         + Span::raw(squash_text.as_str()).width()
         + Span::raw(help_text.as_str()).width();
-    let mut right_width =
-        Span::raw(format!(" 🧠 {} ", model_selector_label(state, max_model_len))).width()
-            + right_chrome_width;
+    let mut right_width = Span::raw(format!(
+        " 🧠 {} ",
+        model_selector_label(state, max_model_len)
+    ))
+    .width()
+        + right_chrome_width;
 
     let avail_for_left = inner_header_width.saturating_sub(right_width + 1);
 
@@ -298,16 +313,15 @@ fn render_header_with_engine(
             .sum();
         w += tabs.len().saturating_sub(1);
         if active_mode == ViewMode::Onboarding {
-            w += 1
-                + display_width(&tab_label(
-                    tier,
-                    ViewMode::Onboarding,
-                    active_mode,
-                    ctx_count,
-                    review_count,
-                    plans_count,
-                    i18n,
-                ));
+            w += 1 + display_width(&tab_label(
+                tier,
+                ViewMode::Onboarding,
+                active_mode,
+                ctx_count,
+                review_count,
+                plans_count,
+                i18n,
+            ));
         }
         w
     };
@@ -391,14 +405,20 @@ fn render_header_with_engine(
     if avail_proj_w >= 8 {
         let max_name = avail_proj_w.saturating_sub(7).clamp(1, 20);
         let proj_name = truncate_to_width(&raw_project_name, max_name);
-        left_items.push((Span::styled(" 📁 ", engine.fg(palette.text_secondary)), None));
+        left_items.push((
+            Span::styled(" 📁 ", engine.fg(palette.text_secondary)),
+            None,
+        ));
         left_items.push((
             Span::styled(proj_name, engine.fg(palette.status_info).bold()),
             None,
         ));
         left_items.push((Span::styled(" │ ", engine.fg(palette.text_muted)), None));
     } else if avail_proj_w >= 4 {
-        left_items.push((Span::styled(" 📁 ", engine.fg(palette.text_secondary)), None));
+        left_items.push((
+            Span::styled(" 📁 ", engine.fg(palette.text_secondary)),
+            None,
+        ));
     }
 
     // Add tabs
@@ -594,14 +614,13 @@ mod tests {
     #[test]
     fn test_tab_label_review_count() {
         let i18n = I18nEngine::english();
-        let label = |tier: HeaderTier,
-                     mode: ViewMode,
-                     active: ViewMode,
-                     ctx: usize,
-                     review: usize,
-                     plans: usize| {
-            tab_label(tier, mode, active, ctx, review, plans, &i18n)
-        };
+        let label =
+            |tier: HeaderTier,
+             mode: ViewMode,
+             active: ViewMode,
+             ctx: usize,
+             review: usize,
+             plans: usize| { tab_label(tier, mode, active, ctx, review, plans, &i18n) };
 
         assert_eq!(
             label(HeaderTier::Full, ViewMode::Repl, ViewMode::Repl, 0, 0, 0),
@@ -616,7 +635,14 @@ mod tests {
             " 1: REPL "
         );
         assert_eq!(
-            label(HeaderTier::Compact, ViewMode::Repl, ViewMode::Context, 0, 0, 0),
+            label(
+                HeaderTier::Compact,
+                ViewMode::Repl,
+                ViewMode::Context,
+                0,
+                0,
+                0
+            ),
             " 1 "
         );
         assert_eq!(
@@ -636,15 +662,36 @@ mod tests {
             " 3: Review (2) "
         );
         assert_eq!(
-            label(HeaderTier::Medium, ViewMode::Review, ViewMode::Repl, 0, 3, 0),
+            label(
+                HeaderTier::Medium,
+                ViewMode::Review,
+                ViewMode::Repl,
+                0,
+                3,
+                0
+            ),
             " 3: Review "
         );
         assert_eq!(
-            label(HeaderTier::Compact, ViewMode::Review, ViewMode::Review, 0, 1, 0),
+            label(
+                HeaderTier::Compact,
+                ViewMode::Review,
+                ViewMode::Review,
+                0,
+                1,
+                0
+            ),
             " 3: Review "
         );
         assert_eq!(
-            label(HeaderTier::Compact, ViewMode::Review, ViewMode::Repl, 0, 1, 0),
+            label(
+                HeaderTier::Compact,
+                ViewMode::Review,
+                ViewMode::Repl,
+                0,
+                1,
+                0
+            ),
             " 3 "
         );
     }
@@ -690,7 +737,10 @@ mod tests {
                 if range == (0, 0) {
                     continue;
                 }
-                assert!(range.0 <= range.1, "malformed range {range:?} at width {width}");
+                assert!(
+                    range.0 <= range.1,
+                    "malformed range {range:?} at width {width}"
+                );
                 assert!(range.1 < max_col, "range {range:?} overflows width {width}");
                 if let Some(prev) = last_end {
                     assert!(
@@ -758,8 +808,14 @@ mod tests {
             .expect("localized draw succeeded");
 
         let row = header_row_text(&terminal, state.header_clicks.row);
-        assert!(row.contains("Сквиш"), "squash label must be localized: {row}");
-        assert!(row.contains("Справка"), "help label must be localized: {row}");
+        assert!(
+            row.contains("Сквиш"),
+            "squash label must be localized: {row}"
+        );
+        assert!(
+            row.contains("Справка"),
+            "help label must be localized: {row}"
+        );
         assert!(
             row.contains("нет репозитория"),
             "repository placeholder must be localized: {row}"
@@ -833,10 +889,24 @@ mod tests {
 
             // Click ranges must be valid and within the terminal bounds
             let max_col = w - 1;
-            assert!(clicks.help_button.1 < max_col, "Help button exceeds width {} ({:?})", w, clicks.help_button);
-            assert!(clicks.squash_button.1 < clicks.help_button.0, "Squash and help button overlap");
-            assert!(clicks.model_select.1 < clicks.squash_button.0, "Model and squash button overlap");
-            assert!(clicks.repl_tab.1 < clicks.plans_tab.0, "REPL and plans tab overlap");
+            assert!(
+                clicks.help_button.1 < max_col,
+                "Help button exceeds width {} ({:?})",
+                w,
+                clicks.help_button
+            );
+            assert!(
+                clicks.squash_button.1 < clicks.help_button.0,
+                "Squash and help button overlap"
+            );
+            assert!(
+                clicks.model_select.1 < clicks.squash_button.0,
+                "Model and squash button overlap"
+            );
+            assert!(
+                clicks.repl_tab.1 < clicks.plans_tab.0,
+                "REPL and plans tab overlap"
+            );
 
             assert!(
                 header_row_text(&terminal, clicks.row).contains("C-S"),

@@ -74,10 +74,7 @@ pub(super) fn parse_xml_edits(
 
                     let (search_content, after_search) = find_tag(&body[inner_pos..], "search")
                         .ok_or_else(|| {
-                            format!(
-                                "Malformed <search> tag in file '{}'",
-                                target_path
-                            )
+                            format!("Malformed <search> tag in file '{}'", target_path)
                         })?;
                     let search_abs_end = inner_pos + after_search;
                     let remaining_inner = &body[search_abs_end..];
@@ -180,7 +177,12 @@ pub(super) fn parse_xml_edits(
                 let header = &tag_slice[..open_tag_end];
                 let from_attr = extract_attribute(header, "from")
                     .or_else(|| extract_attribute(header, "path"))
-                    .ok_or_else(|| format!("Missing 'from' or 'path' attribute in <move> tag: {}", header))?;
+                    .ok_or_else(|| {
+                        format!(
+                            "Missing 'from' or 'path' attribute in <move> tag: {}",
+                            header
+                        )
+                    })?;
                 let to_attr = extract_attribute(header, "to")
                     .ok_or_else(|| format!("Missing 'to' attribute in <move> tag: {}", header))?;
 

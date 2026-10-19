@@ -195,9 +195,11 @@ async fn build_discussion_prompt(
                 .iter()
                 .filter_map(|raw| raw.trim().parse::<u32>().ok())
                 .collect();
-            Ok(tauqe_core::review::prompt::format_review_discussion_prompt_items(
-                &session, &focused, comment,
-            ))
+            Ok(
+                tauqe_core::review::prompt::format_review_discussion_prompt_items(
+                    &session, &focused, comment,
+                ),
+            )
         }
     }
 }
@@ -227,16 +229,17 @@ pub async fn handle_model_select(req: Request, state: &Arc<AppState>) -> Respons
         );
     }
 
-    let params: tauqe_protocol::ModelSelectParams = match req.params.and_then(|p| serde_json::from_value(p).ok()) {
-        Some(p) => p,
-        None => {
-            return Response::err(
-                req.id,
-                tauqe_protocol::errors::INVALID_PARAMS,
-                "Missing or invalid model selection",
-            );
-        }
-    };
+    let params: tauqe_protocol::ModelSelectParams =
+        match req.params.and_then(|p| serde_json::from_value(p).ok()) {
+            Some(p) => p,
+            None => {
+                return Response::err(
+                    req.id,
+                    tauqe_protocol::errors::INVALID_PARAMS,
+                    "Missing or invalid model selection",
+                );
+            }
+        };
 
     let (selection, effective_model, roles) = {
         let mut guard = state.config.lock().await;
@@ -303,19 +306,39 @@ pub async fn handle_model_current(req: Request, state: &Arc<AppState>) -> Respon
     )
 }
 
+/// Clears the persisted project lifetime usage totals.
+///
+/// Only the project scope is cleared: the session counters keep describing what
+/// the running process has already spent, so a reset never makes the current
+/// session appear free. The request is refused while an operation is active,
+/// because the running turn flushes its own window on completion and would
+/// immediately re-accumulate into the freshly cleared total.
+pub async fn handle_usage_reset(req: Request, state: &Arc<AppState>) -> Response {
+    if let Some(resp) = crate::handlers::reject_if_operation_active(
+        &req.id,
+        state,
+        "Cannot reset usage while a model operation is in progress",
+    ) {
+        return resp;
+    }
+
+    let snapshot = state.reset_lifetime_usage().await;
+    Response::ok_typed(req.id, &snapshot)
+}
+
 /// Sets the active discussion focus anchor and broadcasts the change.
 pub async fn handle_discussion_set_focus(req: Request, state: &Arc<AppState>) -> Response {
-    let params: DiscussionSetFocusParams = match req.params.and_then(|p| serde_json::from_value(p).ok())
-    {
-        Some(p) => p,
-        None => {
-            return Response::err(
-                req.id,
-                tauqe_protocol::errors::INVALID_PARAMS,
-                "Missing or invalid discussion focus",
-            );
-        }
-    };
+    let params: DiscussionSetFocusParams =
+        match req.params.and_then(|p| serde_json::from_value(p).ok()) {
+            Some(p) => p,
+            None => {
+                return Response::err(
+                    req.id,
+                    tauqe_protocol::errors::INVALID_PARAMS,
+                    "Missing or invalid discussion focus",
+                );
+            }
+        };
     let focus = state.set_discussion_focus(params.focus).await;
     Response::ok_typed(req.id, &DiscussionSetFocusResult { focus })
 }
@@ -400,15 +423,14 @@ fn build_configured_provider(
     config: &tauqe_core::config::AppConfig,
     kind: tauqe_protocol::ProviderKind,
 ) -> Result<Arc<dyn LlmProvider>, ResponseError> {
-    create_provider(kind, config).map(Arc::from).map_err(|err| {
-        ResponseError::new(tauqe_protocol::errors::NO_API_KEY, err.to_string())
-    })
+    create_provider(kind, config)
+        .map(Arc::from)
+        .map_err(|err| ResponseError::new(tauqe_protocol::errors::NO_API_KEY, err.to_string()))
 }
 
 /// Grace period granted to a workflow task to unwind cooperatively after a
 /// cancellation or stream error before a supervisor force-aborts it.
-pub(crate) const CANCEL_UNWIND_GRACE: std::time::Duration =
-    std::time::Duration::from_secs(30);
+pub(crate) const CANCEL_UNWIND_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Builds the apply policy for a turn, wiring the shared git-transaction guard
 /// into the Git-backed policy so a supervisor never force-aborts a workflow
@@ -421,11 +443,11 @@ pub(crate) fn build_apply_policy(
         tauqe_protocol::WorkflowKind::Naive => {
             Box::new(tauqe_core::workflow::policy::DirectApplyPolicy::new())
         }
-        tauqe_protocol::WorkflowKind::Git => {
-            Box::new(tauqe_core::workflow::git_policy::GitTransactionPolicy::with_guard(
-                Arc::clone(&state.git_transaction_active),
-            ))
-        }
+        tauqe_protocol::WorkflowKind::Git => Box::new(
+            tauqe_core::workflow::git_policy::GitTransactionPolicy::with_guard(Arc::clone(
+                &state.git_transaction_active,
+            )),
+        ),
     }
 }
 
@@ -572,22 +594,16 @@ fn resolve_turn_protocol(
         Box::new(JsonPromptProtocol::discussion())
     } else if intent.is_isolated_step() {
         match develop_protocol {
-            tauqe_protocol::EditProtocolKind::Structured => {
-                JsonPromptProtocol::with_capabilities(
-                    tauqe_protocol::CapabilitySet::isolated_step_structured(),
-                )
-            }
-            tauqe_protocol::EditProtocolKind::Xml => {
-                XmlPromptProtocol::with_capabilities(
-                    tauqe_protocol::CapabilitySet::isolated_step_xml(),
-                )
-            }
+            tauqe_protocol::EditProtocolKind::Structured => JsonPromptProtocol::with_capabilities(
+                tauqe_protocol::CapabilitySet::isolated_step_structured(),
+            ),
+            tauqe_protocol::EditProtocolKind::Xml => XmlPromptProtocol::with_capabilities(
+                tauqe_protocol::CapabilitySet::isolated_step_xml(),
+            ),
         }
     } else {
         match develop_protocol {
-            tauqe_protocol::EditProtocolKind::Structured => {
-                Box::new(JsonPromptProtocol::default())
-            }
+            tauqe_protocol::EditProtocolKind::Structured => Box::new(JsonPromptProtocol::default()),
             tauqe_protocol::EditProtocolKind::Xml => Box::new(XmlPromptProtocol),
         }
     };
@@ -638,8 +654,7 @@ async fn run_prepared_turn(
 
     let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamEvent>(100);
 
-    let protocol =
-        resolve_turn_protocol(intent, app_config.develop.protocol, marker.as_deref());
+    let protocol = resolve_turn_protocol(intent, app_config.develop.protocol, marker.as_deref());
 
     let mut workflow_opts = tauqe_core::workflow::WorkflowOptions::from_app_config(&app_config);
     workflow_opts.reasoning_effort = reasoning_effort.or_else(|| match &selection {
@@ -860,6 +875,38 @@ async fn run_prepared_turn(
                 }
                 emit_legacy_usage_event(state, &op_id).await;
             }
+            StreamEvent::RetryingConnection {
+                attempt,
+                max_attempts,
+                delay_secs,
+                reason,
+            } => {
+                state.out.send_event(&Event {
+                    method: events::MODEL_CONNECTION_RETRYING.to_string(),
+                    params: serde_json::to_value(tauqe_protocol::ModelConnectionRetryingEvent {
+                        operation_id: op_id.clone(),
+                        attempt,
+                        max_attempts,
+                        delay_secs,
+                        reason,
+                    })
+                    .ok(),
+                });
+            }
+            StreamEvent::ResetStream => {
+                // The provider broke after partial output: everything streamed
+                // so far belongs to the aborted attempt, so the client discards
+                // it and this turn stops carrying it as assistant text.
+                raw_streamed_text.clear();
+                state.out.send_event(&Event {
+                    method: events::MODEL_STREAM_RESET.to_string(),
+                    params: serde_json::to_value(tauqe_protocol::ModelStreamResetEvent {
+                        operation_id: op_id.clone(),
+                        reason: "connection interrupted mid-stream".to_string(),
+                    })
+                    .ok(),
+                });
+            }
             StreamEvent::Done => {}
             StreamEvent::Cancelled => {
                 if edit_events_sent && !edit_finished_sent {
@@ -1062,7 +1109,8 @@ async fn run_prepared_turn(
                 });
             }
 
-            if should_report_aborted_edits(edit_events_sent, edit_finished_sent, &wf_result.result) {
+            if should_report_aborted_edits(edit_events_sent, edit_finished_sent, &wf_result.result)
+            {
                 send_edit_aborted(
                     &state.out,
                     &op_id,
@@ -1090,12 +1138,9 @@ async fn run_prepared_turn(
             });
 
             let has_terminal_success =
-                tauqe_core::edits::protocol::xml::extract_success(&raw_streamed_text)
-                    .is_some()
-                    || tauqe_core::edits::protocol::xml::extract_success(
-                        &wf_result.assistant_text,
-                    )
-                    .is_some();
+                tauqe_core::edits::protocol::xml::extract_success(&raw_streamed_text).is_some()
+                    || tauqe_core::edits::protocol::xml::extract_success(&wf_result.assistant_text)
+                        .is_some();
 
             let turn_error = match &wf_result.result {
                 tauqe_protocol::ModelResult::Edit { outcome, .. } if !outcome.applied => {
@@ -1121,11 +1166,7 @@ async fn run_prepared_turn(
             let snapshot = flush_usage(state, &mut usage_guard).await;
             emit_legacy_usage_event(state, &op_id).await;
             if edit_events_sent && !edit_finished_sent {
-                send_edit_aborted(
-                    &state.out,
-                    &op_id,
-                    format!("Workflow failed: {}", err),
-                );
+                send_edit_aborted(&state.out, &op_id, format!("Workflow failed: {}", err));
             }
             state.out.send_event(&Event {
                 method: events::MODEL_ERROR.to_string(),
@@ -1447,10 +1488,7 @@ fn log_turn_finished(
 /// this once, so the tokens and time the turn already consumed are folded into
 /// the session totals instead of being dropped. Ownership moves out of the
 /// `Option`, which makes a second flush of the same window impossible.
-async fn flush_usage(
-    state: &Arc<AppState>,
-    guard: &mut Option<UsageGuard>,
-) -> UsageTotalsSnapshot {
+async fn flush_usage(state: &Arc<AppState>, guard: &mut Option<UsageGuard>) -> UsageTotalsSnapshot {
     if let Some(guard) = guard.take() {
         guard.flush().await;
     }
@@ -1508,7 +1546,9 @@ fn send_edit_aborted(out: &OutChannel, op_id: &str, error: String) {
 mod tests {
     use super::*;
 
+    use async_trait::async_trait;
     use tauqe_core::providers::mock::{MockLlmProvider, MockResponse};
+    use tauqe_core::providers::{ChatMessage, ResponseFormat, RetryConfig, RetryingProvider};
 
     #[test]
     fn test_model_turn_result_success_evaluation() {
@@ -1621,7 +1661,9 @@ mod tests {
 
     #[test]
     fn test_should_report_aborted_edits() {
-        let answer = tauqe_protocol::ModelResult::Answer { text: "text".to_string() };
+        let answer = tauqe_protocol::ModelResult::Answer {
+            text: "text".to_string(),
+        };
         let edit = tauqe_protocol::ModelResult::Edit {
             summary: "sum".to_string(),
             edits: vec![],
@@ -1653,13 +1695,17 @@ mod tests {
         let (hist_tx, _hist_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut config = tauqe_core::config::AppConfig::default();
         config.models.scribe = Some(tauqe_protocol::ModelRef::openrouter("test/scribe"));
-        config.models.coder =
-            Some(vec![tauqe_protocol::ModelRef::openrouter("test/coder").into()]);
+        config.models.coder = Some(vec![
+            tauqe_protocol::ModelRef::openrouter("test/coder").into()
+        ]);
         config.models.architect =
-            Some(vec![tauqe_protocol::ModelRef::openrouter("test/architect").into()]);
+            Some(vec![
+                tauqe_protocol::ModelRef::openrouter("test/architect").into()
+            ]);
         config.models.primary = vec![tauqe_protocol::ModelRef::openrouter("test/primary").into()];
-        config.models.reviewer =
-            Some(vec![tauqe_protocol::ModelRef::openrouter("test/reviewer").into()]);
+        config.models.reviewer = Some(vec![
+            tauqe_protocol::ModelRef::openrouter("test/reviewer").into()
+        ]);
 
         let state = AppState::new(
             config,
@@ -1683,11 +1729,26 @@ mod tests {
             tauqe_protocol::ModelSelection::Role(tauqe_protocol::ModelRole::Primary)
         );
         let roles = current_val.roles.unwrap();
-        assert_eq!(roles.scribe, tauqe_protocol::ModelRef::openrouter("test/scribe"));
-        assert_eq!(roles.coder, tauqe_protocol::ModelRef::openrouter("test/coder"));
-        assert_eq!(roles.architect, tauqe_protocol::ModelRef::openrouter("test/architect"));
-        assert_eq!(roles.primary, tauqe_protocol::ModelRef::openrouter("test/primary"));
-        assert_eq!(roles.reviewer, tauqe_protocol::ModelRef::openrouter("test/reviewer"));
+        assert_eq!(
+            roles.scribe,
+            tauqe_protocol::ModelRef::openrouter("test/scribe")
+        );
+        assert_eq!(
+            roles.coder,
+            tauqe_protocol::ModelRef::openrouter("test/coder")
+        );
+        assert_eq!(
+            roles.architect,
+            tauqe_protocol::ModelRef::openrouter("test/architect")
+        );
+        assert_eq!(
+            roles.primary,
+            tauqe_protocol::ModelRef::openrouter("test/primary")
+        );
+        assert_eq!(
+            roles.reviewer,
+            tauqe_protocol::ModelRef::openrouter("test/reviewer")
+        );
 
         // 2. Select Coder role
         let req_select = Request {
@@ -1710,7 +1771,10 @@ mod tests {
             tauqe_protocol::ModelRef::openrouter("test/coder")
         );
         let selected_roles = select_val.roles.unwrap();
-        assert_eq!(selected_roles.primary, tauqe_protocol::ModelRef::openrouter("test/primary"));
+        assert_eq!(
+            selected_roles.primary,
+            tauqe_protocol::ModelRef::openrouter("test/primary")
+        );
     }
 
     #[tokio::test]
@@ -1763,8 +1827,7 @@ mod tests {
             id: "p-1".to_string(),
         });
         assert!(intent.is_readonly_discussion());
-        let protocol =
-            resolve_turn_protocol(intent, tauqe_protocol::EditProtocolKind::Xml, None);
+        let protocol = resolve_turn_protocol(intent, tauqe_protocol::EditProtocolKind::Xml, None);
 
         // The discussion protocol carries plan capabilities while hiding file
         // editing and toolchain verification from the model.
@@ -1851,6 +1914,53 @@ mod tests {
         assert!(structured_proto.supports(tauqe_protocol::LlmCapability::FileEdits));
         assert!(!structured_proto.supports(tauqe_protocol::LlmCapability::PlanCreation));
         assert!(!structured_proto.supports(tauqe_protocol::LlmCapability::PlanUpdate));
+    }
+
+    #[tokio::test]
+    async fn test_handle_usage_reset_clears_only_the_project_lifetime() {
+        let (out, _rx) = crate::transport::OutChannel::new();
+        let (hist_tx, _hist_rx) = tokio::sync::mpsc::unbounded_channel();
+        let root = std::env::temp_dir().join(format!(
+            "tauqe-model-usage-reset-{}",
+            next_operation_id()
+        ));
+        let _ = std::fs::create_dir_all(&root);
+        let state = AppState::new(
+            tauqe_core::config::AppConfig::default(),
+            root.clone(),
+            hist_tx,
+            out,
+        );
+
+        let guard = state.begin_usage().await;
+        guard
+            .observe(&tauqe_protocol::ModelUsageInfo {
+                prompt_tokens: 6,
+                completion_tokens: 4,
+                total_tokens: 10,
+                cost: Some(0.5),
+                ..tauqe_protocol::ModelUsageInfo::default()
+            })
+            .await;
+        guard.flush().await;
+
+        let req = Request {
+            id: tauqe_protocol::RequestId::Number(1),
+            method: tauqe_protocol::methods::MODEL_USAGE_RESET.to_string(),
+            params: None,
+        };
+        let res = handle_usage_reset(req, &state).await;
+        assert!(res.error.is_none());
+        let snapshot: UsageTotalsSnapshot = serde_json::from_value(res.result.unwrap()).unwrap();
+
+        assert!(snapshot.lifetime.is_empty(), "the project scope is cleared");
+        assert_eq!(snapshot.lifetime_operations, 0);
+        assert_eq!(
+            snapshot.session.total_tokens, 10,
+            "the session scope keeps describing the running process"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[tokio::test]
@@ -2011,6 +2121,153 @@ mod tests {
         );
     }
 
+    /// One event of a scripted transport attempt.
+    enum ScriptEvent {
+        Text(&'static str),
+        Error(&'static str),
+        Done,
+    }
+
+    /// Scripted transport double able to fail after partial delivery.
+    ///
+    /// The stock [`MockLlmProvider`] answers either with content or with an
+    /// error, while a mid-stream interruption needs both inside one attempt.
+    /// This double replays an explicit event script per provider call, so the
+    /// retry decorator observes a genuine partial delivery followed by a
+    /// transient stream failure and exercises the server's reset path.
+    struct ScriptedTransportProvider {
+        script: std::sync::Mutex<std::collections::VecDeque<Vec<ScriptEvent>>>,
+    }
+
+    impl ScriptedTransportProvider {
+        fn new(attempts: Vec<Vec<ScriptEvent>>) -> Self {
+            Self {
+                script: std::sync::Mutex::new(attempts.into()),
+            }
+        }
+
+        async fn replay(
+            &self,
+            tx: tokio::sync::mpsc::Sender<StreamEvent>,
+        ) -> anyhow::Result<()> {
+            let scripted = self
+                .script
+                .lock()
+                .expect("script lock")
+                .pop_front()
+                .unwrap_or_default();
+            for event in scripted {
+                let sent = match event {
+                    ScriptEvent::Text(text) => {
+                        tx.send(StreamEvent::TextDelta(text.to_string())).await
+                    }
+                    ScriptEvent::Error(message) => {
+                        tx.send(StreamEvent::Error(message.to_string())).await
+                    }
+                    ScriptEvent::Done => tx.send(StreamEvent::Done).await,
+                };
+                if sent.is_err() {
+                    return Ok(());
+                }
+            }
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl LlmProvider for ScriptedTransportProvider {
+        fn kind(&self) -> tauqe_protocol::ProviderKind {
+            tauqe_protocol::ProviderKind::OpenRouter
+        }
+
+        async fn stream_chat(
+            &self,
+            _model: &str,
+            _messages: Vec<ChatMessage>,
+            _response_format: Option<ResponseFormat>,
+            tx: tokio::sync::mpsc::Sender<StreamEvent>,
+            _cancel_rx: tokio::sync::watch::Receiver<bool>,
+        ) -> anyhow::Result<()> {
+            self.replay(tx).await
+        }
+    }
+
+    /// A mid-stream break must reach the client as a countdown followed by a
+    /// stream reset, never as a turn error or a spliced answer.
+    #[tokio::test]
+    async fn test_turn_broadcasts_reconnect_countdown_and_stream_reset() {
+        let repo = FocusTestRepo::new();
+
+        // The first attempt delivers a fragment and then dies mid-stream; the
+        // retry replays the whole answer from scratch.
+        let provider: Arc<dyn LlmProvider> = Arc::new(RetryingProvider::new(
+            Box::new(ScriptedTransportProvider::new(vec![
+                vec![
+                    ScriptEvent::Text("Hel"),
+                    ScriptEvent::Error(
+                        "OpenRouter stream ended prematurely without [DONE] marker",
+                    ),
+                ],
+                vec![ScriptEvent::Text("Hello"), ScriptEvent::Done],
+            ])),
+            RetryConfig {
+                max_attempts: 2,
+                base_delay_ms: 1,
+                max_delay_ms: 1,
+            },
+        ));
+
+        let (out, mut rx) = crate::transport::OutChannel::new();
+        let (hist_tx, _hist_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut config = tauqe_core::config::AppConfig::default();
+        config.develop.workflow = tauqe_protocol::WorkflowKind::Naive;
+        config.develop.protocol = tauqe_protocol::EditProtocolKind::Xml;
+        config.models.auto_level_up = false;
+        let state = AppState::new(config, repo.path().to_path_buf(), hist_tx, out);
+        *state.provider_override.lock().await = Some(provider);
+
+        let policy = build_apply_policy(&state, tauqe_protocol::WorkflowKind::Naive);
+        let turn = execute_model_turn(
+            &state,
+            "Report the current state".to_string(),
+            policy,
+            StepTurnOptions {
+                intent: TurnIntent::IsolatedStep,
+                custom_selection: None,
+                plan_context: None,
+                reasoning_effort: None,
+                marker: None,
+                session_id: None,
+                shared_operation: None,
+            },
+        )
+        .await
+        .expect("turn executes");
+        assert!(
+            turn.error.is_none(),
+            "a recovered transport failure must not fail the turn: {:?}",
+            turn.error
+        );
+
+        let wire: Vec<String> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert!(
+            wire.iter()
+                .any(|line| line.contains(events::MODEL_CONNECTION_RETRYING)),
+            "the reconnect countdown must reach the client: {wire:?}"
+        );
+        assert!(
+            wire.iter()
+                .any(|line| line.contains(events::MODEL_STREAM_RESET)),
+            "a mid-stream break must reset the accumulated client stream: {wire:?}"
+        );
+        assert!(
+            !wire
+                .iter()
+                .any(|line| line.contains(events::MODEL_ERROR)),
+            "a retried attempt must never surface as a turn error: {wire:?}"
+        );
+    }
+
     /// Temporary git repository hosting a single committed source file.
     struct FocusTestRepo(std::path::PathBuf);
 
@@ -2027,8 +2284,7 @@ mod tests {
             tauqe_core::git::init_repository(Some(&root), true).unwrap();
             std::fs::write(root.join("src/target.rs"), "pub fn target() {}\n").unwrap();
             tauqe_core::git::cmd::stage_files(&root, &["src/target.rs".to_string()]).unwrap();
-            tauqe_core::git::cmd::commit_with_developer_author(&root, "Add target", false)
-                .unwrap();
+            tauqe_core::git::cmd::commit_with_developer_author(&root, "Add target", false).unwrap();
             Self(root)
         }
 
@@ -2181,9 +2437,11 @@ mod tests {
             cost: Some(0.5),
             ..tauqe_protocol::ModelUsageInfo::default()
         };
-        let provider: Arc<dyn LlmProvider> = Arc::new(MockLlmProvider::scripted([
-            MockResponse::text("Nothing to change.").with_usage(usage),
-        ]));
+        let provider: Arc<dyn LlmProvider> =
+            Arc::new(MockLlmProvider::scripted([MockResponse::text(
+                "Nothing to change.",
+            )
+            .with_usage(usage)]));
         let state = usage_state(repo.path(), provider).await;
 
         let policy = build_apply_policy(&state, tauqe_protocol::WorkflowKind::Naive);
@@ -2204,11 +2462,18 @@ mod tests {
         .await
         .expect("turn executes");
         assert!(!turn.is_cancelled);
-        assert!(turn.error.is_none(), "unexpected turn error: {:?}", turn.error);
+        assert!(
+            turn.error.is_none(),
+            "unexpected turn error: {:?}",
+            turn.error
+        );
 
         let snapshot = state.usage.lock().await.clone();
         assert_eq!(snapshot.operations, 1, "one terminal flush per turn");
-        assert!(snapshot.cur.is_none(), "the terminal flush closes the window");
+        assert!(
+            snapshot.cur.is_none(),
+            "the terminal flush closes the window"
+        );
         assert_eq!(snapshot.session.total_tokens, 20);
         assert_eq!(snapshot.prev.total_tokens, 20);
         assert!((snapshot.session.cost - 0.5).abs() < f64::EPSILON);

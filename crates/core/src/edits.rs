@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use thiserror::Error;
 use tauqe_protocol::{EditOperation, EditProposal};
+use thiserror::Error;
 
 use crate::context::ContextManager;
 
@@ -136,8 +136,7 @@ fn stage_and_validate_edits_inner(
                 if !res.successful_paths.contains(&path) {
                     res.successful_paths.push(path);
                 }
-                res.successful_edits
-                    .extend(operations.into_iter().cloned());
+                res.successful_edits.extend(operations.into_iter().cloned());
             }
         }
     };
@@ -172,7 +171,10 @@ fn stage_and_validate_edits_inner(
                 if clean_from == clean_to {
                     result.failed_files.push(FailedFileEdit {
                         path: clean_to.clone(),
-                        error: EditError::InvalidPath(clean_to, "Source and destination are identical".to_string()),
+                        error: EditError::InvalidPath(
+                            clean_to,
+                            "Source and destination are identical".to_string(),
+                        ),
                     });
                     continue;
                 }
@@ -225,7 +227,10 @@ fn stage_and_validate_edits_inner(
 
                 result.staged_state.staged_files.remove(&clean_from);
                 result.staged_state.deleted_paths.insert(clean_from.clone());
-                result.staged_state.staged_files.insert(clean_to.clone(), content);
+                result
+                    .staged_state
+                    .staged_files
+                    .insert(clean_to.clone(), content);
                 result.staged_state.deleted_paths.remove(&clean_to);
 
                 if !result.successful_paths.contains(&clean_from) {
@@ -239,24 +244,22 @@ fn stage_and_validate_edits_inner(
             EditOperation::Replace { path, .. }
             | EditOperation::Create { path, .. }
             | EditOperation::Delete { path }
-            | EditOperation::Overwrite { path, .. } => {
-                match context_manager.normalize_path(path) {
-                    Ok(clean_path) => {
-                        if !grouped.contains_key(&clean_path) {
-                            file_order.push(clean_path.clone());
-                        }
-                        grouped.entry(clean_path).or_default().push(edit);
+            | EditOperation::Overwrite { path, .. } => match context_manager.normalize_path(path) {
+                Ok(clean_path) => {
+                    if !grouped.contains_key(&clean_path) {
+                        file_order.push(clean_path.clone());
                     }
-                    Err(err) => {
-                        if invalid_paths.insert(path.clone()) {
-                            result.failed_files.push(FailedFileEdit {
-                                path: path.clone(),
-                                error: EditError::InvalidPath(path.clone(), err.to_string()),
-                            });
-                        }
+                    grouped.entry(clean_path).or_default().push(edit);
+                }
+                Err(err) => {
+                    if invalid_paths.insert(path.clone()) {
+                        result.failed_files.push(FailedFileEdit {
+                            path: path.clone(),
+                            error: EditError::InvalidPath(path.clone(), err.to_string()),
+                        });
                     }
                 }
-            }
+            },
         }
     }
 
@@ -273,7 +276,8 @@ fn stage_file_edits(
     edits: &[&EditOperation],
     initial_staged: &StagedEditsState,
 ) -> Result<Option<String>, EditError> {
-    let invalid_path = |err: anyhow::Error| EditError::InvalidPath(path.to_string(), err.to_string());
+    let invalid_path =
+        |err: anyhow::Error| EditError::InvalidPath(path.to_string(), err.to_string());
     crate::context::verify_path_within_repo(repo_root, path).map_err(invalid_path)?;
     let in_context = context_manager.contains(path).map_err(invalid_path)?;
     let full_path = repo_root.join(path);
@@ -296,26 +300,37 @@ fn stage_file_edits(
         }
 
         match edit {
-            EditOperation::Replace { old_text, new_text, .. } => {
+            EditOperation::Replace {
+                old_text, new_text, ..
+            } => {
                 if !loaded {
                     if !full_path.is_file() {
                         return Err(EditError::FileNotFound(path.to_string()));
                     }
-                    content = Some(std::fs::read_to_string(&full_path)
-                        .map_err(|err| EditError::Io(path.to_string(), err))?);
+                    content = Some(
+                        std::fs::read_to_string(&full_path)
+                            .map_err(|err| EditError::Io(path.to_string(), err))?,
+                    );
                     loaded = true;
                 }
-                let current = content.as_ref()
+                let current = content
+                    .as_ref()
                     .ok_or_else(|| EditError::FileNotFound(path.to_string()))?;
                 let updated = apply_replace(current, old_text, new_text, path)?;
                 content = Some(updated);
             }
-            EditOperation::Create { content: new_content, .. } => {
+            EditOperation::Create {
+                content: new_content,
+                ..
+            } => {
                 content = Some(new_content.clone());
                 loaded = true;
                 newly_created = !full_path.exists();
             }
-            EditOperation::Overwrite { content: new_content, .. } => {
+            EditOperation::Overwrite {
+                content: new_content,
+                ..
+            } => {
                 // Full replacement requires an existing (on disk or staged) file.
                 if content.is_none() && (loaded || !full_path.is_file()) {
                     return Err(EditError::FileNotFound(path.to_string()));
@@ -401,8 +416,8 @@ fn apply_edit_proposal_inner(
 #[cfg(test)]
 mod staging_tests {
     use super::*;
-    use tempfile::tempdir;
     use tauqe_protocol::{ContextAccess, ContextLayer};
+    use tempfile::tempdir;
 
     fn replace(path: &str, old_text: &str, new_text: &str) -> EditOperation {
         EditOperation::Replace {
@@ -434,12 +449,18 @@ mod staging_tests {
         assert!(!result.staged_state.staged_files.contains_key("a.rs"));
         assert_eq!(result.failed_files.len(), 1);
         assert_eq!(result.failed_files[0].path, "a.rs");
-        assert!(matches!(&result.failed_files[0].error, EditError::NoMatch { .. }));
+        assert!(matches!(
+            &result.failed_files[0].error,
+            EditError::NoMatch { .. }
+        ));
         assert_eq!(cm.get_state().revision, before);
         assert_eq!(std::fs::read_to_string(root.join("a.rs")).unwrap(), "one");
         assert_eq!(std::fs::read_to_string(root.join("b.rs")).unwrap(), "two");
 
-        let proposal = EditProposal { summary: "test".into(), edits };
+        let proposal = EditProposal {
+            summary: "test".into(),
+            edits,
+        };
         assert!(apply_edit_proposal(root, &mut cm, &proposal).is_err());
         assert_eq!(std::fs::read_to_string(root.join("b.rs")).unwrap(), "two");
     }
@@ -453,12 +474,18 @@ mod staging_tests {
         cm.add_file("a.rs", ContextAccess::Editable).unwrap();
         let first = stage_and_validate_edits(root, &cm, &[replace("a.rs", "one", "two")], None);
         let second = stage_and_validate_edits(
-            root, &cm, &[replace("a.rs", "two", "three")], Some(&first.staged_state),
+            root,
+            &cm,
+            &[replace("a.rs", "two", "three")],
+            Some(&first.staged_state),
         );
         assert!(second.is_success());
         assert_eq!(second.staged_state.staged_files["a.rs"], "three");
         let failed = stage_and_validate_edits(
-            root, &cm, &[replace("a.rs", "missing", "four")], Some(&second.staged_state),
+            root,
+            &cm,
+            &[replace("a.rs", "missing", "four")],
+            Some(&second.staged_state),
         );
         assert!(!failed.is_success());
         assert_eq!(failed.staged_state, second.staged_state);
@@ -471,16 +498,27 @@ mod staging_tests {
         let dir = tempdir().unwrap();
         let root = dir.path();
         let mut cm = ContextManager::new(root.to_path_buf());
-        let create = EditOperation::Create { path: "new.rs".into(), content: "one".into() };
-        let delete = EditOperation::Delete { path: "new.rs".into() };
+        let create = EditOperation::Create {
+            path: "new.rs".into(),
+            content: "one".into(),
+        };
+        let delete = EditOperation::Delete {
+            path: "new.rs".into(),
+        };
         let first = stage_and_validate_edits(root, &cm, std::slice::from_ref(&create), None);
         let second = stage_and_validate_edits(
-            root, &cm, &[replace("new.rs", "one", "two")], Some(&first.staged_state),
+            root,
+            &cm,
+            &[replace("new.rs", "one", "two")],
+            Some(&first.staged_state),
         );
         assert!(second.is_success());
         assert_eq!(second.staged_state.staged_files["new.rs"], "two");
         let deleted = stage_and_validate_edits(
-            root, &cm, std::slice::from_ref(&delete), Some(&second.staged_state),
+            root,
+            &cm,
+            std::slice::from_ref(&delete),
+            Some(&second.staged_state),
         );
         assert!(deleted.is_success());
         assert!(deleted.staged_state.deleted_paths.contains("new.rs"));
@@ -489,17 +527,30 @@ mod staging_tests {
 
         let proposal = EditProposal {
             summary: "create".into(),
-            edits: vec![create.clone(), delete, create, replace("new.rs", "one", "final")],
+            edits: vec![
+                create.clone(),
+                delete,
+                create,
+                replace("new.rs", "one", "final"),
+            ],
         };
-        assert_eq!(apply_edit_proposal(root, &mut cm, &proposal).unwrap(), vec!["new.rs"]);
-        assert_eq!(std::fs::read_to_string(root.join("new.rs")).unwrap(), "final");
+        assert_eq!(
+            apply_edit_proposal(root, &mut cm, &proposal).unwrap(),
+            vec!["new.rs"]
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("new.rs")).unwrap(),
+            "final"
+        );
         assert!(cm.is_editable("new.rs").unwrap());
         let state = cm.get_state();
         let new_item = state.items.iter().find(|i| i.path == "new.rs").unwrap();
         assert_eq!(new_item.layer, ContextLayer::User);
         let deletion = EditProposal {
             summary: "delete".into(),
-            edits: vec![EditOperation::Delete { path: "new.rs".into() }],
+            edits: vec![EditOperation::Delete {
+                path: "new.rs".into(),
+            }],
         };
         apply_edit_proposal(root, &mut cm, &deletion).unwrap();
         assert!(!root.join("new.rs").exists());
@@ -514,23 +565,44 @@ mod staging_tests {
         std::fs::write(root.join("ambiguous.rs"), "one one").unwrap();
         std::fs::write(root.join("missing.rs"), "one").unwrap();
         let mut cm = ContextManager::new(root.to_path_buf());
-        cm.add_file("ambiguous.rs", ContextAccess::Editable).unwrap();
+        cm.add_file("ambiguous.rs", ContextAccess::Editable)
+            .unwrap();
         cm.add_file("missing.rs", ContextAccess::Editable).unwrap();
         std::fs::remove_file(root.join("missing.rs")).unwrap();
         for edit in [
             replace("outside.rs", "one", "two"),
-            EditOperation::Create { path: "outside.rs".into(), content: "two".into() },
-            EditOperation::Delete { path: "outside.rs".into() },
+            EditOperation::Create {
+                path: "outside.rs".into(),
+                content: "two".into(),
+            },
+            EditOperation::Delete {
+                path: "outside.rs".into(),
+            },
         ] {
             let result = stage_and_validate_edits(root, &cm, &[edit], None);
-            assert!(matches!(&result.failed_files[0].error, EditError::NotInContext(_)));
+            assert!(matches!(
+                &result.failed_files[0].error,
+                EditError::NotInContext(_)
+            ));
         }
-        let ambiguous = stage_and_validate_edits(root, &cm, &[replace("ambiguous.rs", "one", "two")], None);
-        assert!(matches!(&ambiguous.failed_files[0].error, EditError::AmbiguousMatch { count: 2, .. }));
-        let missing = stage_and_validate_edits(root, &cm, &[replace("missing.rs", "one", "two")], None);
-        assert!(matches!(&missing.failed_files[0].error, EditError::FileNotFound(_)));
-        let invalid = stage_and_validate_edits(root, &cm, &[replace("../escape.rs", "one", "two")], None);
-        assert!(matches!(&invalid.failed_files[0].error, EditError::InvalidPath(_, _)));
+        let ambiguous =
+            stage_and_validate_edits(root, &cm, &[replace("ambiguous.rs", "one", "two")], None);
+        assert!(matches!(
+            &ambiguous.failed_files[0].error,
+            EditError::AmbiguousMatch { count: 2, .. }
+        ));
+        let missing =
+            stage_and_validate_edits(root, &cm, &[replace("missing.rs", "one", "two")], None);
+        assert!(matches!(
+            &missing.failed_files[0].error,
+            EditError::FileNotFound(_)
+        ));
+        let invalid =
+            stage_and_validate_edits(root, &cm, &[replace("../escape.rs", "one", "two")], None);
+        assert!(matches!(
+            &invalid.failed_files[0].error,
+            EditError::InvalidPath(_, _)
+        ));
     }
 
     #[test]
@@ -545,7 +617,10 @@ mod staging_tests {
         let edit = replace("ref.rs", "fn original() {}", "fn updated() {}");
         let stage_res = stage_and_validate_edits(root, &cm, std::slice::from_ref(&edit), None);
         assert!(stage_res.is_success());
-        assert_eq!(stage_res.staged_state.staged_files["ref.rs"], "fn updated() {}");
+        assert_eq!(
+            stage_res.staged_state.staged_files["ref.rs"],
+            "fn updated() {}"
+        );
 
         let proposal = EditProposal {
             summary: "Update read-only file".into(),
@@ -553,7 +628,10 @@ mod staging_tests {
         };
         let changed = apply_edit_proposal(root, &mut cm, &proposal).unwrap();
         assert_eq!(changed, vec!["ref.rs"]);
-        assert_eq!(std::fs::read_to_string(root.join("ref.rs")).unwrap(), "fn updated() {}");
+        assert_eq!(
+            std::fs::read_to_string(root.join("ref.rs")).unwrap(),
+            "fn updated() {}"
+        );
         assert!(cm.is_editable("ref.rs").unwrap());
     }
 
@@ -565,19 +643,34 @@ mod staging_tests {
         let mut cm = ContextManager::new(root.to_path_buf());
         cm.add_file("a.rs", ContextAccess::Editable).unwrap();
 
-        let op = EditOperation::Overwrite { path: "a.rs".into(), content: "all new".into() };
+        let op = EditOperation::Overwrite {
+            path: "a.rs".into(),
+            content: "all new".into(),
+        };
         let result = stage_and_validate_edits(root, &cm, std::slice::from_ref(&op), None);
         assert!(result.is_success());
         assert_eq!(result.staged_state.staged_files["a.rs"], "all new");
         assert_eq!(std::fs::read_to_string(root.join("a.rs")).unwrap(), "one");
 
-        let missing = EditOperation::Overwrite { path: "missing.rs".into(), content: "x".into() };
+        let missing = EditOperation::Overwrite {
+            path: "missing.rs".into(),
+            content: "x".into(),
+        };
         let result = stage_and_validate_edits(root, &cm, &[missing], None);
-        assert!(matches!(&result.failed_files[0].error, EditError::NotInContext(_)));
+        assert!(matches!(
+            &result.failed_files[0].error,
+            EditError::NotInContext(_)
+        ));
 
-        let proposal = EditProposal { summary: "overwrite".into(), edits: vec![op] };
+        let proposal = EditProposal {
+            summary: "overwrite".into(),
+            edits: vec![op],
+        };
         apply_edit_proposal(root, &mut cm, &proposal).unwrap();
-        assert_eq!(std::fs::read_to_string(root.join("a.rs")).unwrap(), "all new");
+        assert_eq!(
+            std::fs::read_to_string(root.join("a.rs")).unwrap(),
+            "all new"
+        );
     }
 
     #[test]
@@ -604,7 +697,10 @@ mod staging_tests {
         };
         apply_edit_proposal(root, &mut cm, &proposal).unwrap();
         assert!(!root.join("old.rs").exists());
-        assert_eq!(std::fs::read_to_string(root.join("new.rs")).unwrap(), "fn hello() {}");
+        assert_eq!(
+            std::fs::read_to_string(root.join("new.rs")).unwrap(),
+            "fn hello() {}"
+        );
         assert!(cm.is_editable("new.rs").unwrap());
         assert!(!cm.contains("old.rs").unwrap());
     }
@@ -685,7 +781,8 @@ mod staging_tests {
         std::fs::write(root.join("a.rs"), "one\r\n").unwrap();
         let mut cm = ContextManager::new(root.to_path_buf());
         cm.add_file("a.rs", ContextAccess::Editable).unwrap();
-        let result = stage_and_validate_edits(root, &cm, &[replace("a.rs", "one\n", "two\n")], None);
+        let result =
+            stage_and_validate_edits(root, &cm, &[replace("a.rs", "one\n", "two\n")], None);
         assert!(result.is_success());
         assert_eq!(result.staged_state.staged_files["a.rs"], "two\r\n");
         let empty = stage_and_validate_edits(root, &cm, &[], Some(&result.staged_state));

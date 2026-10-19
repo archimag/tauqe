@@ -147,7 +147,9 @@ pub fn format_review_discussion_prompt_items(
     out.push_str("\n\n");
 
     out.push_str("## Instructions for Model:\n");
-    out.push_str("1. Address the developer's question or feedback regarding the code review findings.\n");
+    out.push_str(
+        "1. Address the developer's question or feedback regarding the code review findings.\n",
+    );
     out.push_str("2. Select the response mode that the developer's request calls for. When the developer is reasoning about the findings, analyze the problem, its edge cases, and potential solutions conceptually. When the developer asks you to resolve a finding, apply the required code changes directly instead of only describing them, while preserving the surrounding review context.\n");
     out.push_str("3. If the review findings or their statuses should be updated based on this discussion, explain the proposed modifications clearly in conversational text in `message`; the developer applies status changes through the review interface.\n");
     out.push_str("4. Treat every file listed as a protected contract as immutable: rely on its interfaces and invariants, but never modify it.\n");
@@ -212,7 +214,9 @@ pub fn build_review_system_prompt() -> String {
     prompt.push_str("When a finding is a complex architectural defect that cannot be resolved by a single localized change, its `recommendations` MUST begin by instructing that the finding be decomposed through architectural refinement before any implementation begins, so the engineer decomposes the defect into executable steps first.\n\n");
 
     prompt.push_str("If there are no issues, respond with an empty `findings` array.\n");
-    prompt.push_str("Do NOT output markdown headers, diffs, or XML edit tags; this is an audit-only review.\n");
+    prompt.push_str(
+        "Do NOT output markdown headers, diffs, or XML edit tags; this is an audit-only review.\n",
+    );
 
     prompt
 }

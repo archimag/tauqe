@@ -5,7 +5,8 @@
 
 pub use tauqe_protocol as protocol;
 
-pub(crate) mod blocking;
+pub mod atomic_write;
+pub mod blocking;
 pub mod capabilities;
 pub mod config;
 pub mod context;

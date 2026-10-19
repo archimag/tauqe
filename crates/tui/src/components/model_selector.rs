@@ -171,8 +171,7 @@ impl ModelSelector {
                 true
             }
             KeyCode::PageUp => {
-                self.selected_index =
-                    self.selected_index.saturating_sub(visible_height.max(1));
+                self.selected_index = self.selected_index.saturating_sub(visible_height.max(1));
                 true
             }
             KeyCode::PageDown => {
@@ -499,7 +498,10 @@ mod tests {
     fn test_ctrl_alt_compose_is_not_the_chord() {
         let mut selector = ModelSelector::new(ModelRole::Reviewer, three_entries(), 0);
 
-        let compose = key(KeyCode::Char('m'), KeyModifiers::CONTROL | KeyModifiers::ALT);
+        let compose = key(
+            KeyCode::Char('m'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+        );
         assert!(!selector.handle_key(compose, PrimaryModifier::Ctrl, MetaModifier::Alt, true));
         assert_eq!(selector.selected_index(), 0);
     }
@@ -714,7 +716,11 @@ mod tests {
     fn test_numbered_row_label_includes_effort_for_aliased_entries() {
         let selector = ModelSelector::new(
             ModelRole::Reviewer,
-            vec![entry("x/a", Some(ReasoningEffort::High), Some("Claude Auditor"))],
+            vec![entry(
+                "x/a",
+                Some(ReasoningEffort::High),
+                Some("Claude Auditor"),
+            )],
             0,
         );
         let rows = selector.render_list_lines(5);

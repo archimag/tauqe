@@ -133,10 +133,8 @@ mod tests {
             translations: BTreeMap::new(),
         };
         assert_eq!(
-            serde_json::from_str::<LocaleGenerateResult>(
-                &serde_json::to_string(&empty).unwrap()
-            )
-            .unwrap(),
+            serde_json::from_str::<LocaleGenerateResult>(&serde_json::to_string(&empty).unwrap())
+                .unwrap(),
             empty
         );
     }

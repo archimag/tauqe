@@ -184,9 +184,7 @@ impl MarkdownTheme {
         let accent = engine.fg(palette.status_info);
         Self {
             text_style: body,
-            bold_style: engine
-                .fg(palette.text_primary)
-                .add_modifier(Modifier::BOLD),
+            bold_style: engine.fg(palette.text_primary).add_modifier(Modifier::BOLD),
             italic_style: body.add_modifier(Modifier::ITALIC),
             h1: accent.add_modifier(Modifier::BOLD),
             h2: accent.add_modifier(Modifier::BOLD),
@@ -362,10 +360,6 @@ fn ensure_line_prefix(
         }
     }
 }
-
-
-
-
 
 pub fn render_markdown(text: &str, theme: &MarkdownTheme) -> Vec<Line<'static>> {
     render_markdown_with_blocks(text, theme, None).0
@@ -770,7 +764,10 @@ mod tests {
                     .collect()
             })
             .collect();
-        assert_eq!(text, vec!["Первая строка", "Вторая строка", "Третья строка"]);
+        assert_eq!(
+            text,
+            vec!["Первая строка", "Вторая строка", "Третья строка"]
+        );
     }
 
     #[test]

@@ -1,4 +1,5 @@
 use std::io::{stdout, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use crate::config::{DesktopNotificationProtocol, NotificationConfig};
@@ -8,6 +9,7 @@ use crossterm::event::{
     EnableFocusChange, EnableMouseCapture, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
     PushKeyboardEnhancementFlags,
 };
+use crossterm::cursor::Show;
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -16,30 +18,87 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use tokio::sync::mpsc;
 
-pub struct TerminalGuard {
-    enhancement_active: bool,
-}
+/// Whether [`init_terminal`] pushed the keyboard enhancement flags.
+///
+/// The flag outlives the guard: the panic hook and the termination handler
+/// restore the terminal without ever holding it.
+static KEYBOARD_ENHANCEMENT_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+pub struct TerminalGuard;
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
-        reset_terminal_background();
-        let _ = execute!(
-            stdout(),
-            DisableFocusChange,
-            DisableBracketedPaste,
-            DisableMouseCapture,
-        );
-        if self.enhancement_active {
-            let _ = execute!(stdout(), PopKeyboardEnhancementFlags);
-        }
-        let _ = execute!(stdout(), LeaveAlternateScreen);
-        let _ = disable_raw_mode();
+        restore_terminal();
     }
 }
 
-pub fn init_terminal() -> anyhow::Result<(Terminal<CrosstermBackend<std::io::Stdout>>, TerminalGuard)> {
+/// Undoes every change [`init_terminal`] made to the terminal.
+///
+/// A run ends either through the guard, through the panic hook, or through the
+/// termination handler, and all three must leave the same terminal behind. The
+/// steps therefore live here once and in one order; a copy per exit path lets
+/// one of them silently miss a step the others undo and strand the developer in
+/// a raw alternate screen. The routine is idempotent, because more than one
+/// path can fire for a single run.
+pub fn restore_terminal() {
+    reset_terminal_background();
+    let _ = execute!(
+        stdout(),
+        DisableFocusChange,
+        DisableBracketedPaste,
+        DisableMouseCapture,
+        Show,
+    );
+    if KEYBOARD_ENHANCEMENT_ACTIVE.swap(false, Ordering::SeqCst) {
+        let _ = execute!(stdout(), PopKeyboardEnhancementFlags);
+    }
+    let _ = execute!(stdout(), LeaveAlternateScreen);
+    let _ = disable_raw_mode();
+}
+
+/// Restores the terminal and exits when the process is asked to terminate.
+///
+/// A termination signal unwinds the process without dropping the guard, so an
+/// external `SIGTERM` from a supervisor or a closed session would leave the
+/// developer's terminal in raw mode and inside the alternate screen. The
+/// handler only restores the terminal; it never interprets the signal as a TUI
+/// command. The keyboard's `Ctrl+C` does not reach it either: raw mode disables
+/// signal generation and the input layer normalizes the chord itself.
+pub fn install_termination_restore() {
+    tokio::spawn(async {
+        wait_for_termination().await;
+        restore_terminal();
+        std::process::exit(130);
+    });
+}
+
+async fn wait_for_termination() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        match signal(SignalKind::terminate()) {
+            Ok(mut terminate) => {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = terminate.recv() => {}
+                }
+            }
+            Err(_) => {
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+pub fn init_terminal(
+) -> anyhow::Result<(Terminal<CrosstermBackend<std::io::Stdout>>, TerminalGuard)> {
     enable_raw_mode()?;
-    let enhancement_supported = crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false);
+    let enhancement_supported =
+        crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false);
 
     execute!(
         stdout(),
@@ -49,7 +108,6 @@ pub fn init_terminal() -> anyhow::Result<(Terminal<CrosstermBackend<std::io::Std
         EnableFocusChange,
     )?;
 
-    let mut enhancement_active = false;
     if enhancement_supported
         && execute!(
             stdout(),
@@ -57,10 +115,10 @@ pub fn init_terminal() -> anyhow::Result<(Terminal<CrosstermBackend<std::io::Std
         )
         .is_ok()
     {
-        enhancement_active = true;
+        KEYBOARD_ENHANCEMENT_ACTIVE.store(true, Ordering::SeqCst);
     }
 
-    let guard = TerminalGuard { enhancement_active };
+    let guard = TerminalGuard;
     let backend = CrosstermBackend::new(stdout());
     let terminal = Terminal::new(backend)?;
     Ok((terminal, guard))
@@ -278,21 +336,28 @@ mod tests {
         // Compare against `wrap_osc_payload` so the assertion holds whether or
         // not the test process itself runs inside `tmux`.
         let osc9 = format_desktop_notification("Title", "Body", DesktopNotificationProtocol::Osc9);
-        assert_eq!(
-            osc9,
-            wrap_osc_payload("\x1b]9;Title: Body\x1b\\")
-        );
+        assert_eq!(osc9, wrap_osc_payload("\x1b]9;Title: Body\x1b\\"));
 
-        let osc777 = format_desktop_notification("Title", "Body", DesktopNotificationProtocol::Osc777);
-        assert_eq!(
-            osc777,
-            wrap_osc_payload("\x1b]777;notify;Title;Body\x1b\\")
-        );
+        let osc777 =
+            format_desktop_notification("Title", "Body", DesktopNotificationProtocol::Osc777);
+        assert_eq!(osc777, wrap_osc_payload("\x1b]777;notify;Title;Body\x1b\\"));
 
         let both = format_desktop_notification("Title", "Body", DesktopNotificationProtocol::Both);
         assert_eq!(
             both,
             wrap_osc_payload("\x1b]777;notify;Title;Body\x1b\\\x1b]9;Title: Body\x1b\\")
         );
+    }
+
+    /// The guard, the panic hook, and the termination handler can all fire for
+    /// one run, so a repeated restore must not pop a keyboard enhancement the
+    /// process never pushed.
+    #[test]
+    fn test_restore_terminal_is_idempotent() {
+        KEYBOARD_ENHANCEMENT_ACTIVE.store(true, Ordering::SeqCst);
+        restore_terminal();
+        assert!(!KEYBOARD_ENHANCEMENT_ACTIVE.load(Ordering::SeqCst));
+        restore_terminal();
+        assert!(!KEYBOARD_ENHANCEMENT_ACTIVE.load(Ordering::SeqCst));
     }
 }

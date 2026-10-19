@@ -45,12 +45,8 @@ async fn main() -> anyhow::Result<()> {
 
     let repo_state = handshake.repository;
     let protocol_version = handshake.protocol_version.clone();
-    let workflow = handshake
-        .workflow
-        .unwrap_or_default();
-    let edit_protocol = handshake
-        .edit_protocol
-        .unwrap_or_default();
+    let workflow = handshake.workflow.unwrap_or_default();
+    let edit_protocol = handshake.edit_protocol.unwrap_or_default();
     let available_workflows = if handshake.available_workflows.is_empty() {
         vec![
             tauqe_protocol::WorkflowKind::Git,
@@ -140,17 +136,15 @@ async fn main() -> anyhow::Result<()> {
     rpc::send_request(&mut conn, methods::PLAN_LIST, serde_json::json!({})).await?;
     rpc::send_request(&mut conn, methods::PLAN_GET, serde_json::json!({})).await?;
 
-    // Safety net: restore the terminal before reporting any unexpected panic
+    // Safety net: restore the terminal before reporting an abnormal exit. The
+    // panic hook and the termination handler run the same routine as the
+    // terminal guard, so every exit path undoes exactly the same changes.
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |panic_info| {
-        let _ = crossterm::terminal::disable_raw_mode();
-        let _ = crossterm::execute!(
-            std::io::stdout(),
-            crossterm::terminal::LeaveAlternateScreen,
-            crossterm::cursor::Show
-        );
+        crate::terminal::restore_terminal();
         original_hook(panic_info);
     }));
+    terminal::install_termination_restore();
 
     let mut msg_rx = rpc::spawn_message_reader(server_reader);
     let (mut terminal, _guard) = terminal::init_terminal()?;
@@ -270,8 +264,13 @@ async fn main() -> anyhow::Result<()> {
     }
 
     drop(conn);
-    let shutdown_timeout = Duration::from_millis(1500);
-    if tokio::time::timeout(shutdown_timeout, server_child.wait())
+    // Dropping the connection closes the daemon's stdin, which is what asks it
+    // to stop. It answers by cancelling the active turn and rolling its Git
+    // transaction back, so the wait is the shared protocol budget instead of a
+    // local literal: the client must never kill the daemon inside the cleanup
+    // the drain exists to protect. A daemon that already exited resolves `wait`
+    // immediately, so an ordinary quit never pays the budget.
+    if tokio::time::timeout(tauqe_protocol::CLIENT_SHUTDOWN_WAIT, server_child.wait())
         .await
         .is_err()
     {
@@ -300,5 +299,21 @@ async fn dispatch_server_message(
             rpc::handle_response(resp, state, conn).await;
         }
         Message::Request(_) => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// The client owns the spawned daemon and is the only side that can kill
+    /// it, so its wait must outlast the daemon's own drain budget: a shorter
+    /// wait would terminate the process while it still cancels the active turn
+    /// and rolls its Git transaction back. Reading the shared contract keeps a
+    /// local literal from silently reintroducing that race.
+    #[test]
+    fn client_shutdown_wait_outlasts_the_server_drain_budget() {
+        assert!(
+            tauqe_protocol::CLIENT_SHUTDOWN_WAIT > tauqe_protocol::SHUTDOWN_DRAIN_BUDGET,
+            "the client would kill the daemon before its drain completes"
+        );
     }
 }

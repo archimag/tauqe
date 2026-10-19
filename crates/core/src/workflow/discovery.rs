@@ -1,8 +1,11 @@
 pub mod search;
 
+use std::collections::BTreeSet;
 use std::path::Path;
 
-use tauqe_protocol::{ContextAccess, DocTopic, LlmCapability, LlmCommand, RepoSearchRequest};
+use tauqe_protocol::{
+    ContextAccess, DirListRequest, DocTopic, LlmCapability, LlmCommand, RepoSearchRequest,
+};
 
 use crate::blocking::{run_blocking, run_blocking_async};
 use crate::context::ContextManager;
@@ -147,7 +150,13 @@ pub fn apply_context_requests(
     available_files: &[String],
     files_token_budget: usize,
 ) -> Vec<String> {
-    apply_context_requests_detailed(context_manager, requests, available_files, files_token_budget).added
+    apply_context_requests_detailed(
+        context_manager,
+        requests,
+        available_files,
+        files_token_budget,
+    )
+    .added
 }
 
 /// Immutable inputs shared by every Discovery capability handler.
@@ -162,6 +171,8 @@ pub struct DiscoveryRoundContext<'a> {
     pub available_files: &'a [String],
     /// Hard token budget for context file additions.
     pub files_token_budget: usize,
+    /// Token budget for a targeted repository map rendered this round.
+    pub repomap_token_budget: usize,
     /// Whether a request already satisfied by the context counts as progress.
     pub allow_already_satisfied_feedback: bool,
 }
@@ -185,6 +196,12 @@ pub struct DiscoveryRoundOutcome {
     pub searches_executed: Vec<RepoSearchResult>,
     /// Documentation topics loaded this round.
     pub doc_topics_loaded: Vec<DocTopic>,
+    /// Repository directory trees rendered this round.
+    pub dir_trees_loaded: usize,
+    /// Directory listings rendered this round.
+    pub dir_lists_loaded: usize,
+    /// Targeted repository maps rendered this round.
+    pub repo_maps_loaded: usize,
     /// Feedback blocks to inject into the next proposal round.
     pub feedback_blocks: Vec<String>,
 }
@@ -201,6 +218,9 @@ impl DiscoveryRoundOutcome {
         !self.added_files.is_empty()
             || !self.missing_files.is_empty()
             || !self.searches_executed.is_empty()
+            || self.dir_trees_loaded > 0
+            || self.dir_lists_loaded > 0
+            || self.repo_maps_loaded > 0
             || !self.doc_topics_loaded.is_empty()
             || (allow_already_satisfied && !self.already_satisfied_files.is_empty())
     }
@@ -222,10 +242,34 @@ impl DiscoveryRoundOutcome {
             parts.push(format!("{} file(s) added", self.added_files.len()));
         }
         if !self.searches_executed.is_empty() {
-            parts.push(format!("{} search(es) executed", self.searches_executed.len()));
+            parts.push(format!(
+                "{} search(es) executed",
+                self.searches_executed.len()
+            ));
+        }
+        if self.dir_trees_loaded > 0 {
+            parts.push(format!(
+                "{} directory tree(s) rendered",
+                self.dir_trees_loaded
+            ));
+        }
+        if self.dir_lists_loaded > 0 {
+            parts.push(format!(
+                "{} directory listing(s) rendered",
+                self.dir_lists_loaded
+            ));
+        }
+        if self.repo_maps_loaded > 0 {
+            parts.push(format!(
+                "{} targeted map(s) rendered",
+                self.repo_maps_loaded
+            ));
         }
         if !self.doc_topics_loaded.is_empty() {
-            parts.push(format!("{} doc topic(s) loaded", self.doc_topics_loaded.len()));
+            parts.push(format!(
+                "{} doc topic(s) loaded",
+                self.doc_topics_loaded.len()
+            ));
         }
         if parts.is_empty() {
             format!("{} file(s) added.", self.added_files.len())
@@ -248,6 +292,21 @@ impl DiscoveryRoundOutcome {
             notes.push(format!(
                 "Executed {} repository search(es)",
                 self.searches_executed.len()
+            ));
+        }
+        if self.dir_trees_loaded > 0 {
+            notes.push("Rendered the repository directory tree".to_string());
+        }
+        if self.dir_lists_loaded > 0 {
+            notes.push(format!(
+                "Rendered {} directory listing(s)",
+                self.dir_lists_loaded
+            ));
+        }
+        if self.repo_maps_loaded > 0 {
+            notes.push(format!(
+                "Rendered {} targeted repository map(s)",
+                self.repo_maps_loaded
             ));
         }
         if !self.missing_files.is_empty() {
@@ -380,10 +439,265 @@ impl DiscoveryCapabilityHandler for RepoSearchHandler {
 
         let results = execute_repo_searches(round.repo_root, &queries, round.available_files);
         if !results.is_empty() {
-            outcome.feedback_blocks.push(format_search_feedback(&results));
+            outcome
+                .feedback_blocks
+                .push(format_search_feedback(&results));
         }
         outcome.searches_executed.extend(results);
     }
+}
+
+/// Renders the compact repository directory tree on demand.
+struct RepoDirsHandler;
+
+impl DiscoveryCapabilityHandler for RepoDirsHandler {
+    fn capability(&self) -> LlmCapability {
+        LlmCapability::Discovery
+    }
+
+    fn handles(&self, command: &LlmCommand) -> bool {
+        matches!(command, LlmCommand::RepoDirs)
+    }
+
+    fn execute(
+        &self,
+        round: &DiscoveryRoundContext<'_>,
+        commands: &[LlmCommand],
+        context_manager: &mut ContextManager,
+        outcome: &mut DiscoveryRoundOutcome,
+    ) {
+        if !commands
+            .iter()
+            .any(|command| matches!(command, LlmCommand::RepoDirs))
+        {
+            return;
+        }
+
+        // The outline is derived deterministically from the tracked file list,
+        // so the model reads the repository layout instead of guessing it. Files
+        // anchored by the pinned context layer are marked, so the model knows
+        // that authoritative conventions already travelled with the prompt.
+        let tree = crate::repomap::dirs::generate_repo_dirs_with_pinned(
+            round.available_files,
+            context_manager.pinned_patterns(),
+        );
+        let body = if tree.trim().is_empty() {
+            "The repository contains no subdirectories.".to_string()
+        } else {
+            tree.trim_end().to_string()
+        };
+        outcome
+            .feedback_blocks
+            .push(format!("<repo_dirs_feedback>\n{}\n</repo_dirs_feedback>", body));
+        outcome.dir_trees_loaded += 1;
+    }
+}
+
+/// Maximum number of entries rendered by a single directory listing.
+///
+/// A listing is a navigation aid, not a file dump: a recursive request over a
+/// wide tree can name thousands of files and consume the whole context budget.
+pub const MAX_DIR_LIST_ENTRIES: usize = 100;
+
+/// Maximum number of distinct targeted map requests honored in one round.
+///
+/// A targeted outline costs a Tree-sitter pass over the requested subtree, so an
+/// unbounded set of requests would turn one discovery round into a full
+/// repository re-index.
+pub const MAX_REPO_MAP_REQUESTS_PER_ROUND: usize = 3;
+
+/// Renders the targeted symbol map of a requested subdirectory.
+struct RepoMapRequestHandler;
+
+impl DiscoveryCapabilityHandler for RepoMapRequestHandler {
+    fn capability(&self) -> LlmCapability {
+        LlmCapability::Discovery
+    }
+
+    fn handles(&self, command: &LlmCommand) -> bool {
+        matches!(command, LlmCommand::RepoMap { .. })
+    }
+
+    fn execute(
+        &self,
+        round: &DiscoveryRoundContext<'_>,
+        commands: &[LlmCommand],
+        _context_manager: &mut ContextManager,
+        outcome: &mut DiscoveryRoundOutcome,
+    ) {
+        let mut requested: Vec<String> = Vec::new();
+        for command in commands {
+            let LlmCommand::RepoMap { path } = command else {
+                continue;
+            };
+            let target = path.trim().to_string();
+            if requested.contains(&target) {
+                continue;
+            }
+            if requested.len() >= MAX_REPO_MAP_REQUESTS_PER_ROUND {
+                tracing::warn!(
+                    limit = MAX_REPO_MAP_REQUESTS_PER_ROUND,
+                    "targeted repository map request limit reached; ignoring the rest"
+                );
+                break;
+            }
+            requested.push(target);
+        }
+
+        for target in requested {
+            let display_path = if target.is_empty() {
+                ".".to_string()
+            } else {
+                target.clone()
+            };
+            // The outline is derived deterministically from the tracked file list
+            // and the Tree-sitter symbols under the requested prefix, so the model
+            // reads the subsystem's real contour instead of guessing it.
+            let map = match crate::repomap::generate_targeted_repo_map(
+                round.repo_root,
+                round.available_files,
+                &target,
+                round.repomap_token_budget,
+            ) {
+                Ok(map) => map,
+                Err(err) => {
+                    tracing::warn!(
+                        path = display_path.as_str(),
+                        error = %err,
+                        "targeted repository map generation failed"
+                    );
+                    String::new()
+                }
+            };
+            let body = if map.trim().is_empty() {
+                format!(
+                    "No tracked source files under `{}`. Check <repo_dirs> for existing paths.",
+                    display_path
+                )
+            } else {
+                map.trim_end().to_string()
+            };
+            outcome.feedback_blocks.push(format!(
+                "<repomap_feedback path=\"{}\">\n{}\n</repomap_feedback>",
+                display_path, body
+            ));
+            outcome.repo_maps_loaded += 1;
+        }
+    }
+}
+
+/// Lists the tracked files of a requested directory.
+struct DirListHandler;
+
+impl DiscoveryCapabilityHandler for DirListHandler {
+    fn capability(&self) -> LlmCapability {
+        LlmCapability::Discovery
+    }
+
+    fn handles(&self, command: &LlmCommand) -> bool {
+        matches!(command, LlmCommand::DirList { .. })
+    }
+
+    fn execute(
+        &self,
+        round: &DiscoveryRoundContext<'_>,
+        commands: &[LlmCommand],
+        _context_manager: &mut ContextManager,
+        outcome: &mut DiscoveryRoundOutcome,
+    ) {
+        let mut requested: Vec<DirListRequest> = Vec::new();
+        for command in commands {
+            let LlmCommand::DirList { path, recursive } = command else {
+                continue;
+            };
+            let Some(request) = DirListRequest::new(path.clone(), *recursive).normalized() else {
+                tracing::warn!(
+                    path = path.as_str(),
+                    "invalid directory listing request ignored"
+                );
+                continue;
+            };
+            if requested
+                .iter()
+                .any(|existing| existing.path == request.path)
+            {
+                continue;
+            }
+            requested.push(request);
+        }
+
+        for request in requested {
+            let display_path = if request.path.is_empty() {
+                ".".to_string()
+            } else {
+                request.path.clone()
+            };
+            // The listing is derived deterministically from the tracked file
+            // set, so the model reads the directory contents instead of
+            // guessing which files exist.
+            let mut entries =
+                render_dir_listing(round.available_files, &request.path, request.recursive);
+            // A listing is a navigation aid, not a file dump: a recursive
+            // request over a wide tree would otherwise consume the whole context
+            // budget, so the cap is applied and reported explicitly.
+            let omitted = entries.len().saturating_sub(MAX_DIR_LIST_ENTRIES);
+            if omitted > 0 {
+                entries.truncate(MAX_DIR_LIST_ENTRIES);
+            }
+            let mut body = if entries.is_empty() {
+                format!(
+                    "No tracked files under `{}`. Check <repo_dirs> for existing paths.",
+                    display_path
+                )
+            } else {
+                entries.join("\n")
+            };
+            if omitted > 0 {
+                body.push_str(&format!(
+                    "\n[{} more entries omitted: a listing is capped at {} entries]",
+                    omitted, MAX_DIR_LIST_ENTRIES
+                ));
+            }
+            outcome.feedback_blocks.push(format!(
+                "<dir_list_feedback path=\"{}\" recursive=\"{}\">\n{}\n</dir_list_feedback>",
+                display_path, request.recursive, body
+            ));
+            outcome.dir_lists_loaded += 1;
+        }
+    }
+}
+
+/// Renders the tracked files under a directory prefix.
+///
+/// A shallow listing reports the direct children of the directory and marks
+/// subdirectories with a trailing slash; a recursive listing reports every
+/// tracked file underneath. Entries are sorted and deduplicated, so the same
+/// request always produces the same block.
+fn render_dir_listing(available_files: &[String], target: &str, recursive: bool) -> Vec<String> {
+    let prefix = if target.is_empty() {
+        String::new()
+    } else {
+        format!("{}/", target)
+    };
+    let mut entries = BTreeSet::new();
+    for file in available_files {
+        // Excluded paths never appear in a listing, exactly as they never
+        // appear in search results or in the directory tree.
+        if search::is_excluded_path(file) {
+            continue;
+        }
+        let Some(remainder) = file.strip_prefix(prefix.as_str()) else {
+            continue;
+        };
+        if recursive {
+            entries.insert(remainder.to_string());
+        } else if let Some((subdirectory, _)) = remainder.split_once('/') {
+            entries.insert(format!("{}/", subdirectory));
+        } else {
+            entries.insert(remainder.to_string());
+        }
+    }
+    entries.into_iter().collect()
 }
 
 /// Loads authoritative documentation chapters for requested topics.
@@ -432,8 +746,14 @@ impl DiscoveryCapabilityHandler for DocRequestHandler {
 }
 
 /// Registered Discovery handlers, in dispatch order.
-static DISCOVERY_HANDLERS: &[&dyn DiscoveryCapabilityHandler] =
-    &[&ContextRequestHandler, &RepoSearchHandler, &DocRequestHandler];
+static DISCOVERY_HANDLERS: &[&dyn DiscoveryCapabilityHandler] = &[
+    &ContextRequestHandler,
+    &RepoSearchHandler,
+    &RepoDirsHandler,
+    &RepoMapRequestHandler,
+    &DirListHandler,
+    &DocRequestHandler,
+];
 
 /// Returns the registered Discovery capability handlers in dispatch order.
 pub fn discovery_handlers() -> &'static [&'static dyn DiscoveryCapabilityHandler] {
@@ -452,12 +772,14 @@ pub fn execute_discovery_commands_sync(
     available_files: &[String],
     commands: &[LlmCommand],
     files_token_budget: usize,
+    repomap_token_budget: usize,
     allow_already_satisfied_feedback: bool,
 ) -> DiscoveryRoundOutcome {
     let round = DiscoveryRoundContext {
         repo_root,
         available_files,
         files_token_budget,
+        repomap_token_budget,
         allow_already_satisfied_feedback,
     };
     let mut outcome = DiscoveryRoundOutcome::default();
@@ -501,6 +823,7 @@ pub async fn execute_discovery_commands(
     repo_root: &Path,
     commands: &[LlmCommand],
     files_token_budget: usize,
+    repomap_token_budget: usize,
     allow_already_satisfied_feedback: bool,
 ) -> DiscoveryRoundOutcome {
     if commands.is_empty() {
@@ -510,7 +833,11 @@ pub async fn execute_discovery_commands(
     let needs_file_list = commands.iter().any(|command| {
         matches!(
             command,
-            LlmCommand::ContextRequest { .. } | LlmCommand::RepoSearch { .. }
+            LlmCommand::ContextRequest { .. }
+                | LlmCommand::RepoSearch { .. }
+                | LlmCommand::RepoDirs
+                | LlmCommand::RepoMap { .. }
+                | LlmCommand::DirList { .. }
         )
     });
     let available_files = if needs_file_list {
@@ -531,6 +858,7 @@ pub async fn execute_discovery_commands(
             &available_files,
             commands,
             files_token_budget,
+            repomap_token_budget,
             allow_already_satisfied_feedback,
         )
     })
@@ -574,12 +902,10 @@ mod tests {
         std::fs::write(dir.path().join("a.rs"), "fn a() { let x = 12345; }").unwrap();
         let mut cm = ContextManager::new(dir.path().to_path_buf());
         let available = vec!["a.rs".to_string()];
-        let requests = vec![
-            ContextRequest {
-                path: "a.rs".to_string(),
-                access: ContextAccess::ReadOnly,
-            },
-        ];
+        let requests = vec![ContextRequest {
+            path: "a.rs".to_string(),
+            access: ContextAccess::ReadOnly,
+        }];
 
         // Budget is only 2 tokens; file content is ~7 tokens.
         let outcome = apply_context_requests_detailed(&mut cm, &requests, &available, 2);
@@ -677,7 +1003,10 @@ mod tests {
             "Files already in context: a.rs"
         );
         satisfied.added_files.push("b.rs".to_string());
-        assert_eq!(satisfied.architect_banner_summary(), "Added 1 file(s) to context: b.rs");
+        assert_eq!(
+            satisfied.architect_banner_summary(),
+            "Added 1 file(s) to context: b.rs"
+        );
     }
 
     #[test]
@@ -706,8 +1035,15 @@ mod tests {
             },
         ];
 
-        let outcome =
-            execute_discovery_commands_sync(&mut cm, dir.path(), &available, &commands, 300_000, false);
+        let outcome = execute_discovery_commands_sync(
+            &mut cm,
+            dir.path(),
+            &available,
+            &commands,
+            300_000,
+            300_000,
+            false,
+        );
 
         assert_eq!(outcome.added_files, vec!["a.rs".to_string()]);
         assert_eq!(outcome.missing_files, vec!["missing.rs".to_string()]);
@@ -744,7 +1080,15 @@ mod tests {
             },
         ];
 
-        let outcome = execute_discovery_commands_sync(&mut cm, dir.path(), &available, &commands, 1, false);
+        let outcome = execute_discovery_commands_sync(
+            &mut cm,
+            dir.path(),
+            &available,
+            &commands,
+            1,
+            300_000,
+            false,
+        );
 
         let limit = outcome
             .limit_exceeded
@@ -769,16 +1113,118 @@ mod tests {
             access: ContextAccess::ReadOnly,
         }];
 
-        let outcome =
-            execute_discovery_commands_sync(&mut cm, dir.path(), &available, &commands, 300_000, false);
+        let outcome = execute_discovery_commands_sync(
+            &mut cm,
+            dir.path(),
+            &available,
+            &commands,
+            300_000,
+            300_000,
+            false,
+        );
         assert_eq!(outcome.already_satisfied_files, vec!["a.rs".to_string()]);
         assert!(!outcome.has_progress(false));
         assert!(outcome.combined_feedback().is_empty());
 
-        let outcome =
-            execute_discovery_commands_sync(&mut cm, dir.path(), &available, &commands, 300_000, true);
+        let outcome = execute_discovery_commands_sync(
+            &mut cm,
+            dir.path(),
+            &available,
+            &commands,
+            300_000,
+            300_000,
+            true,
+        );
         assert!(outcome.has_progress(true));
-        assert!(outcome.combined_feedback().contains("already loaded in context"));
+        assert!(outcome
+            .combined_feedback()
+            .contains("already loaded in context"));
+    }
+
+    #[test]
+    fn test_execute_discovery_commands_renders_the_directory_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src/nested")).unwrap();
+        let mut cm = ContextManager::new(dir.path().to_path_buf());
+        let available = vec![
+            "src/main.rs".to_string(),
+            "src/nested/module.rs".to_string(),
+        ];
+
+        let commands = vec![LlmCommand::RepoDirs];
+        let outcome = execute_discovery_commands_sync(
+            &mut cm,
+            dir.path(),
+            &available,
+            &commands,
+            300_000,
+            300_000,
+            false,
+        );
+
+        assert_eq!(outcome.dir_trees_loaded, 1);
+        assert!(outcome.has_progress(false));
+        assert_eq!(outcome.fsm_banner_summary(), "1 directory tree(s) rendered.");
+        let feedback = outcome.combined_feedback();
+        assert!(feedback.contains("<repo_dirs_feedback>"));
+        assert!(feedback.contains("src\n  nested"));
+    }
+
+    #[test]
+    fn test_execute_discovery_commands_lists_a_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src/nested")).unwrap();
+        let mut cm = ContextManager::new(dir.path().to_path_buf());
+        let available = vec![
+            "src/main.rs".to_string(),
+            "src/nested/module.rs".to_string(),
+            "README.md".to_string(),
+        ];
+
+        // A shallow listing reports the direct children of the directory.
+        let commands = vec![LlmCommand::DirList {
+            path: "src".to_string(),
+            recursive: false,
+        }];
+        let outcome = execute_discovery_commands_sync(
+            &mut cm,
+            dir.path(),
+            &available,
+            &commands,
+            300_000,
+            300_000,
+            false,
+        );
+        assert_eq!(outcome.dir_lists_loaded, 1);
+        assert!(outcome.has_progress(false));
+        assert_eq!(
+            outcome.fsm_banner_summary(),
+            "1 directory listing(s) rendered."
+        );
+        let feedback = outcome.combined_feedback();
+        assert!(feedback.contains("<dir_list_feedback path=\"src\" recursive=\"false\">"));
+        assert!(feedback.contains("main.rs"));
+        assert!(feedback.contains("nested/"));
+        assert!(!feedback.contains("README.md"));
+
+        // A recursive listing reports every tracked file underneath.
+        let commands = vec![LlmCommand::DirList {
+            path: "src".to_string(),
+            recursive: true,
+        }];
+        let outcome = execute_discovery_commands_sync(
+            &mut cm,
+            dir.path(),
+            &available,
+            &commands,
+            300_000,
+            300_000,
+            false,
+        );
+        let feedback = outcome.combined_feedback();
+        assert!(feedback.contains("<dir_list_feedback path=\"src\" recursive=\"true\">"));
+        assert!(feedback.contains("main.rs"));
+        assert!(feedback.contains("nested/module.rs"));
     }
 
     #[test]
@@ -789,9 +1235,101 @@ mod tests {
         let commands = vec![LlmCommand::Text {
             content: "no discovery work".to_string(),
         }];
-        let outcome = execute_discovery_commands_sync(&mut cm, dir.path(), &[], &commands, 300_000, true);
+        let outcome = execute_discovery_commands_sync(
+            &mut cm,
+            dir.path(),
+            &[],
+            &commands,
+            300_000,
+            300_000,
+            true,
+        );
 
         assert_eq!(outcome, DiscoveryRoundOutcome::default());
         assert!(!outcome.has_progress(true));
+    }
+
+    #[test]
+    fn test_execute_discovery_commands_renders_a_targeted_repo_map() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src/nested")).unwrap();
+        std::fs::create_dir_all(dir.path().join("other")).unwrap();
+        std::fs::write(dir.path().join("src/alpha.rs"), "pub fn alpha() {}\n").unwrap();
+        std::fs::write(
+            dir.path().join("src/nested/beta.rs"),
+            "pub fn beta() {}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("other/gamma.rs"),
+            "pub fn gamma() {}\n",
+        )
+        .unwrap();
+        let mut cm = ContextManager::new(dir.path().to_path_buf());
+        let available = vec![
+            "src/alpha.rs".to_string(),
+            "src/nested/beta.rs".to_string(),
+            "other/gamma.rs".to_string(),
+        ];
+
+        // The same target requested twice renders exactly one block.
+        let commands = vec![
+            LlmCommand::RepoMap {
+                path: "src".to_string(),
+            },
+            LlmCommand::RepoMap {
+                path: "src".to_string(),
+            },
+        ];
+        let outcome = execute_discovery_commands_sync(
+            &mut cm,
+            dir.path(),
+            &available,
+            &commands,
+            300_000,
+            300_000,
+            false,
+        );
+
+        assert_eq!(outcome.repo_maps_loaded, 1);
+        assert!(outcome.has_progress(false));
+        assert_eq!(outcome.fsm_banner_summary(), "1 targeted map(s) rendered.");
+
+        let feedback = outcome.combined_feedback();
+        assert_eq!(
+            feedback.matches("<repomap_feedback path=\"src\">").count(),
+            1
+        );
+        assert!(feedback.contains("pub fn alpha"));
+        assert!(feedback.contains("pub fn beta"));
+        assert!(!feedback.contains("other/gamma.rs"));
+        assert!(!feedback.contains("pub fn gamma"));
+    }
+
+    #[test]
+    fn test_execute_discovery_commands_reports_an_empty_targeted_map() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/alpha.rs"), "pub fn alpha() {}\n").unwrap();
+        let mut cm = ContextManager::new(dir.path().to_path_buf());
+        let available = vec!["src/alpha.rs".to_string()];
+
+        let commands = vec![LlmCommand::RepoMap {
+            path: "docs".to_string(),
+        }];
+        let outcome = execute_discovery_commands_sync(
+            &mut cm,
+            dir.path(),
+            &available,
+            &commands,
+            300_000,
+            300_000,
+            false,
+        );
+
+        assert_eq!(outcome.repo_maps_loaded, 1);
+        let feedback = outcome.combined_feedback();
+        assert!(feedback.contains("<repomap_feedback path=\"docs\">"));
+        assert!(feedback.contains("No tracked source files under `docs`"));
     }
 }

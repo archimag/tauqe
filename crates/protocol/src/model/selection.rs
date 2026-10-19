@@ -70,10 +70,16 @@ mod tests {
         let role = ModelRole::Coder;
         let role_json = serde_json::to_string(&role).unwrap();
         assert_eq!(role_json, "\"coder\"");
-        assert_eq!(serde_json::from_str::<ModelRole>("\"coder\"").unwrap(), ModelRole::Coder);
+        assert_eq!(
+            serde_json::from_str::<ModelRole>("\"coder\"").unwrap(),
+            ModelRole::Coder
+        );
         // serde routes through FromStr, so wire parsing matches configuration
         // parsing: trimmed and case-insensitive.
-        assert_eq!(serde_json::from_str::<ModelRole>("\"Coder\"").unwrap(), ModelRole::Coder);
+        assert_eq!(
+            serde_json::from_str::<ModelRole>("\"Coder\"").unwrap(),
+            ModelRole::Coder
+        );
         assert_eq!(
             serde_json::from_str::<ModelSelection>("\"Architect\"").unwrap(),
             ModelSelection::Role(ModelRole::Architect)
@@ -83,13 +89,19 @@ mod tests {
         let sel_role = ModelSelection::Role(ModelRole::Primary);
         let sel_role_json = serde_json::to_string(&sel_role).unwrap();
         assert_eq!(sel_role_json, "\"primary\"");
-        assert_eq!(serde_json::from_str::<ModelSelection>("\"primary\"").unwrap(), sel_role);
+        assert_eq!(
+            serde_json::from_str::<ModelSelection>("\"primary\"").unwrap(),
+            sel_role
+        );
 
         let specific = ModelRef::openrouter("anthropic/claude-3.5-sonnet");
         let sel_spec = ModelSelection::Specific(specific.clone());
         let sel_spec_json = serde_json::to_string(&sel_spec).unwrap();
         assert!(sel_spec_json.contains("\"provider\":\"openrouter\""));
-        assert_eq!(serde_json::from_str::<ModelSelection>(&sel_spec_json).unwrap(), sel_spec);
+        assert_eq!(
+            serde_json::from_str::<ModelSelection>(&sel_spec_json).unwrap(),
+            sel_spec
+        );
 
         let roles_summary = ModelRolesSummary {
             scribe: ModelRef::openrouter("s"),

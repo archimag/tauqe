@@ -82,9 +82,7 @@ mod tests {
         assert!(matches!(&first[..], [StreamEvent::TextDelta(t)] if t == "Hello "));
 
         let second = filter.push_chunk("<edit path=\"a.rs\">");
-        assert!(
-            matches!(&second[..], [StreamEvent::TextDelta(t)] if t == "<edit path=\"a.rs\">")
-        );
+        assert!(matches!(&second[..], [StreamEvent::TextDelta(t)] if t == "<edit path=\"a.rs\">"));
 
         assert_eq!(filter.raw_text(), "Hello <edit path=\"a.rs\">");
 

@@ -245,7 +245,10 @@ mod tests {
     #[test]
     fn tab_toggles_then_enter_confirms() {
         let mut dialog = ConfirmDialog::new();
-        assert_eq!(dialog.handle_key(key(KeyCode::Tab)), ConfirmOutcome::Toggled);
+        assert_eq!(
+            dialog.handle_key(key(KeyCode::Tab)),
+            ConfirmOutcome::Toggled
+        );
         assert!(dialog.is_confirm());
         assert_eq!(
             dialog.handle_key(key(KeyCode::Enter)),

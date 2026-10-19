@@ -11,8 +11,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use tauqe_core::edits::stream::json::JsonFieldStreamFilter;
 use tauqe_core::providers::{
-    create_provider, format_session_id, ChatMessage, LlmProvider, SESSION_PREFIX_REVIEW,
-    StreamEvent,
+    create_provider, format_session_id, ChatMessage, LlmProvider, StreamEvent,
+    SESSION_PREFIX_REVIEW,
 };
 use tauqe_core::review::parser::ReviewFindingsOutput;
 use tauqe_core::review::{
@@ -21,8 +21,8 @@ use tauqe_core::review::{
 };
 use tauqe_protocol::{
     errors, events, ContextAccess, ModelRole, ModelUsageEvent, ModelUsageInfo, Request, Response,
-    ReviewCancelParams, ReviewContentDeltaEvent, ReviewFinishedEvent, ReviewListChangedEvent,
-    ReviewItem, ReviewReasoningDeltaEvent, ReviewSession, ReviewStartParams,
+    ReviewCancelParams, ReviewContentDeltaEvent, ReviewFinishedEvent, ReviewItem,
+    ReviewListChangedEvent, ReviewReasoningDeltaEvent, ReviewSession, ReviewStartParams,
     ReviewStartedEvent, ReviewUpdatedEvent,
 };
 use tokio::sync::mpsc;
@@ -104,9 +104,13 @@ pub async fn handle_review_start(req: Request, state: &Arc<AppState>) -> Respons
         }
     };
 
-    if let Some(pattern) = params.path_pattern.as_deref().map(str::trim).filter(|p| !p.is_empty()) {
-        let existing_paths: HashSet<String> =
-            files.iter().map(|f| f.path.clone()).collect();
+    if let Some(pattern) = params
+        .path_pattern
+        .as_deref()
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+    {
+        let existing_paths: HashSet<String> = files.iter().map(|f| f.path.clone()).collect();
         let pattern = pattern.to_string();
         let root = repo_root.clone();
         // Listing the repository and reading every matched file is blocking git
@@ -323,7 +327,11 @@ pub async fn handle_review_start(req: Request, state: &Arc<AppState>) -> Respons
         // fallback parser and the persisted `raw_markdown`.
         let raw_buffer = filter.buffer().to_string();
         if raw_buffer.trim().is_empty() {
-            emit_error(&state.out, &op_id, "Model returned an empty review".to_string());
+            emit_error(
+                &state.out,
+                &op_id,
+                "Model returned an empty review".to_string(),
+            );
             return;
         }
 

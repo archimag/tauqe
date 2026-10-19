@@ -11,6 +11,7 @@ const GIT_SAFETY: &str = include_str!("../../../docs/src/ch04-git-safety/checkpo
 const INTERFACE: &str = include_str!("../../../docs/src/ch05-interface/tui-ux.md");
 const REVIEW: &str = include_str!("../../../docs/src/ch06-review/review.md");
 const PLANS: &str = include_str!("../../../docs/src/ch07-plans/plans.md");
+const CONFIG: &str = include_str!("../../../docs/src/ch08-config/configuration.md");
 
 /// Renders the authoritative documentation topics advertised in the system
 /// prompt, derived from [`DocTopic::ALL`] so the hint keeps a single source of
@@ -33,8 +34,9 @@ pub(crate) fn get_documentation(topic: DocTopic) -> String {
         DocTopic::Interface => &[INTERFACE],
         DocTopic::Review => &[REVIEW],
         DocTopic::Plan => &[PLANS],
+        DocTopic::Config => &[CONFIG],
         DocTopic::All => &[
-            INTRO, PHILOSOPHY, CONTEXT, LIFECYCLE, GIT_SAFETY, INTERFACE, REVIEW, PLANS,
+            INTRO, PHILOSOPHY, CONTEXT, LIFECYCLE, GIT_SAFETY, INTERFACE, REVIEW, PLANS, CONFIG,
         ],
     };
     sections
@@ -52,10 +54,14 @@ mod tests {
     fn test_get_documentation_topics() {
         assert!(get_documentation(DocTopic::Interface).contains("Ctrl+1"));
         assert!(get_documentation(DocTopic::Plan).contains("Local Plans"));
+        assert!(
+            get_documentation(DocTopic::Config).contains("Configuration and Project Preparation")
+        );
         let all = get_documentation(DocTopic::All);
         assert!(all.contains("Semantic Harness"));
         assert!(all.contains("Ctrl+1"));
         assert!(all.contains("Local Plans"));
+        assert!(all.contains("Configuration and Project Preparation"));
     }
 
     #[test]

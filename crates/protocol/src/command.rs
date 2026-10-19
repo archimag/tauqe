@@ -349,6 +349,8 @@ pub enum DocTopic {
     Review,
     /// Local plans.
     Plan,
+    /// Project and user configuration reference.
+    Config,
     /// Every documentation chapter aggregated (default).
     #[default]
     All,
@@ -376,6 +378,7 @@ impl DocTopic {
         Self::Interface,
         Self::Review,
         Self::Plan,
+        Self::Config,
         Self::All,
     ];
 
@@ -389,6 +392,7 @@ impl DocTopic {
             Self::Interface => "interface",
             Self::Review => "review",
             Self::Plan => "plan",
+            Self::Config => "config",
             Self::All => "all",
         }
     }
@@ -421,6 +425,7 @@ impl FromStr for DocTopic {
             // output parsing; scheduled for removal in 0.2.0 and tracked by the
             // wire-contract test in `lib.rs`.
             "plan" | "plans" => Ok(Self::Plan),
+            "config" => Ok(Self::Config),
             "all" => Ok(Self::All),
             other => Err(format!(
                 "Unknown documentation topic '{}'. Expected one of: {}",
@@ -451,6 +456,20 @@ pub enum LlmCommand {
     ContextRequest { path: String, access: ContextAccess },
     /// A search request across repository files using Rust/ripgrep regex.
     RepoSearch { path: String, regex: String },
+    /// A request for the compact repository directory tree.
+    RepoDirs,
+    /// A request for the targeted symbol map of one subdirectory.
+    ///
+    /// The path is a repository-relative prefix matching whole path components;
+    /// an empty path names the whole repository.
+    RepoMap { path: String },
+    /// A request for the tracked-file listing of one directory.
+    ///
+    /// The path is a repository-relative directory prefix matching whole path
+    /// components; an empty path names the repository root. `recursive` widens
+    /// the listing from the direct children to every tracked file underneath,
+    /// keeping the default request shallow.
+    DirList { path: String, recursive: bool },
     /// A request for system documentation by topic.
     DocRequest { topic: DocTopic },
     /// A request to run deterministic toolchain verification.
@@ -483,9 +502,11 @@ impl LlmCommand {
         match self {
             Self::Text { .. } => Some(LlmCapability::TextMessage),
             Self::Edit { .. } => Some(LlmCapability::FileEdits),
-            Self::ContextRequest { .. } | Self::RepoSearch { .. } => {
-                Some(LlmCapability::Discovery)
-            }
+            Self::ContextRequest { .. }
+            | Self::RepoSearch { .. }
+            | Self::RepoDirs
+            | Self::RepoMap { .. }
+            | Self::DirList { .. } => Some(LlmCapability::Discovery),
             Self::DocRequest { .. } => Some(LlmCapability::DocRequest),
             Self::Verify { .. } => Some(LlmCapability::ToolchainVerify),
             Self::Plan { update } => Some(match update.action {
@@ -621,6 +642,29 @@ mod tests {
         let json = serde_json::to_string(&doc).unwrap();
         assert!(json.contains("\"type\":\"doc_request\""));
         assert_eq!(serde_json::from_str::<LlmCommand>(&json).unwrap(), doc);
+
+        let dirs = LlmCommand::RepoDirs;
+        let json = serde_json::to_string(&dirs).unwrap();
+        assert!(json.contains("\"type\":\"repo_dirs\""));
+        assert_eq!(serde_json::from_str::<LlmCommand>(&json).unwrap(), dirs);
+
+        let map = LlmCommand::RepoMap {
+            path: "crates/core".to_string(),
+        };
+        let json = serde_json::to_string(&map).unwrap();
+        assert!(json.contains("\"type\":\"repo_map\""));
+        assert!(json.contains("\"path\":\"crates/core\""));
+        assert_eq!(serde_json::from_str::<LlmCommand>(&json).unwrap(), map);
+
+        let dir_list = LlmCommand::DirList {
+            path: "crates/core".to_string(),
+            recursive: true,
+        };
+        let json = serde_json::to_string(&dir_list).unwrap();
+        assert!(json.contains("\"type\":\"dir_list\""));
+        assert!(json.contains("\"path\":\"crates/core\""));
+        assert!(json.contains("\"recursive\":true"));
+        assert_eq!(serde_json::from_str::<LlmCommand>(&json).unwrap(), dir_list);
     }
 
     #[test]
@@ -650,12 +694,35 @@ mod tests {
         assert_eq!(DocTopic::parse_lossy("  Interface "), DocTopic::Interface);
         assert_eq!(DocTopic::Interface.to_string(), "interface");
         assert_eq!("GIT".parse::<DocTopic>().unwrap(), DocTopic::Git);
+
+        assert_eq!(
+            serde_json::to_string(&DocTopic::Config).unwrap(),
+            "\"config\""
+        );
+        assert_eq!(
+            serde_json::from_str::<DocTopic>("\"config\"").unwrap(),
+            DocTopic::Config
+        );
+        assert_eq!(DocTopic::Config.to_string(), "config");
+        assert_eq!("config".parse::<DocTopic>().unwrap(), DocTopic::Config);
         assert!("bogus".parse::<DocTopic>().is_err());
 
         // Unknown doc topic inside an LlmCommand does not fail deserialization.
         let raw = r#"{"type":"doc_request","topic":"nonexistent_topic"}"#;
         let command: LlmCommand = serde_json::from_str(raw).unwrap();
-        assert_eq!(command, LlmCommand::DocRequest { topic: DocTopic::All });
+        assert_eq!(
+            command,
+            LlmCommand::DocRequest {
+                topic: DocTopic::All
+            }
+        );
+    }
+
+    #[test]
+    fn test_doc_topic_all_roundtrips_through_wire_names() {
+        for topic in DocTopic::ALL {
+            assert_eq!(topic.as_str().parse::<DocTopic>().unwrap(), *topic);
+        }
     }
 
     #[test]
@@ -670,7 +737,10 @@ mod tests {
         assert!(json.contains("\"on_success\":\"silent\""));
         assert_eq!(serde_json::from_str::<LlmCommand>(&json).unwrap(), verify);
 
-        assert_eq!(serde_json::to_string(&VerifyTarget::All).unwrap(), "\"all\"");
+        assert_eq!(
+            serde_json::to_string(&VerifyTarget::All).unwrap(),
+            "\"all\""
+        );
         assert_eq!(
             serde_json::to_string(&VerifyOnSuccess::Report).unwrap(),
             "\"report\""
@@ -691,7 +761,10 @@ mod tests {
         };
         let json = serde_json::to_string(&scratchpad).unwrap();
         assert!(json.contains("\"type\":\"scratchpad\""));
-        assert_eq!(serde_json::from_str::<LlmCommand>(&json).unwrap(), scratchpad);
+        assert_eq!(
+            serde_json::from_str::<LlmCommand>(&json).unwrap(),
+            scratchpad
+        );
 
         let language = LlmCommand::UserLanguage {
             language: "Russian".to_string(),
@@ -706,7 +779,10 @@ mod tests {
         let json = serde_json::to_string(&proto_err).unwrap();
         assert!(json.contains("\"type\":\"protocol_error\""));
         assert!(json.contains("\"message\":\"Malformed XML edit block: Unclosed tag\""));
-        assert_eq!(serde_json::from_str::<LlmCommand>(&json).unwrap(), proto_err);
+        assert_eq!(
+            serde_json::from_str::<LlmCommand>(&json).unwrap(),
+            proto_err
+        );
     }
 
     #[test]
@@ -803,7 +879,10 @@ mod tests {
             (LlmCapability::PlanUpdate, CapabilityPhase::Execution),
             (LlmCapability::Scratchpad, CapabilityPhase::Execution),
             (LlmCapability::UserLanguage, CapabilityPhase::Execution),
-            (LlmCapability::ToolchainVerify, CapabilityPhase::Verification),
+            (
+                LlmCapability::ToolchainVerify,
+                CapabilityPhase::Verification,
+            ),
             (LlmCapability::Outcome, CapabilityPhase::Outcome),
             (LlmCapability::Blocked, CapabilityPhase::Outcome),
         ];
@@ -936,6 +1015,23 @@ mod tests {
             regex: "fn main".to_string(),
         };
         assert_eq!(search.capability(), Some(LlmCapability::Discovery));
+
+        let dirs = LlmCommand::RepoDirs;
+        assert_eq!(dirs.capability(), Some(LlmCapability::Discovery));
+        assert_eq!(dirs.phase(), Some(CapabilityPhase::Discovery));
+
+        let map = LlmCommand::RepoMap {
+            path: "crates/core".to_string(),
+        };
+        assert_eq!(map.capability(), Some(LlmCapability::Discovery));
+        assert_eq!(map.phase(), Some(CapabilityPhase::Discovery));
+
+        let dir_list = LlmCommand::DirList {
+            path: "crates/core".to_string(),
+            recursive: false,
+        };
+        assert_eq!(dir_list.capability(), Some(LlmCapability::Discovery));
+        assert_eq!(dir_list.phase(), Some(CapabilityPhase::Discovery));
 
         let doc = LlmCommand::DocRequest {
             topic: DocTopic::Workflow,

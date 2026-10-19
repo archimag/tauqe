@@ -1,15 +1,15 @@
 use std::sync::Arc;
-use tokio::sync::Mutex;
 use tauqe_protocol::{
     methods, ConfigState, ContextState, GitSquashApplyResult, GitSquashGenerateMessageResult,
-    GitSquashPreviewResult, HistoryGetResult, RepositoryListFilesResult, RequestId,
-    Response, ReviewGetResult, ReviewUpdateItemResult, SystemStatusResult,
+    GitSquashPreviewResult, HistoryGetResult, RepositoryListFilesResult, RequestId, Response,
+    ReviewGetResult, ReviewUpdateItemResult, SystemStatusResult,
 };
+use tokio::sync::Mutex;
 
+use super::transport::{OptimisticRollback, RpcConnection};
 use crate::app::{AppState, ViewMode};
 use crate::i18n::active_t;
 use crate::views::repl::TurnStatus;
-use super::transport::{OptimisticRollback, RpcConnection};
 
 /// RPC error code returned by the server when the pre-flight toolchain
 /// verification blocks a plan or review batch before any step starts.
@@ -17,7 +17,10 @@ const PREFLIGHT_VERIFICATION_FAILED: &str = "PREFLIGHT_VERIFICATION_FAILED";
 
 pub mod messages {
     pub fn stub_credentials_created(path: &str) -> String {
-        format!("Stub credentials file created at '{}'. Edit it and select 'Check again'.", path)
+        format!(
+            "Stub credentials file created at '{}'. Edit it and select 'Check again'.",
+            path
+        )
     }
     pub const CONFIG_CREATED: &str = "tauqe.toml created successfully.";
     pub const API_KEY_SAVED: &str = "OpenRouter API key saved successfully.";
@@ -68,12 +71,14 @@ pub(crate) fn apply_system_status_response(
             ));
         }
         SystemStatusAction::Created => {
-            st.onboarding.set_status(messages::CONFIG_CREATED.to_string());
+            st.onboarding
+                .set_status(messages::CONFIG_CREATED.to_string());
             st.onboarding.step = st.onboarding.next_step();
             st.onboarding.selected_index = 0;
         }
         SystemStatusAction::Saved => {
-            st.onboarding.set_status(messages::API_KEY_SAVED.to_string());
+            st.onboarding
+                .set_status(messages::API_KEY_SAVED.to_string());
             st.onboarding.step = st.onboarding.next_step();
             st.onboarding.selected_index = 0;
         }
@@ -116,16 +121,28 @@ pub async fn handle_response(
         if let RequestId::Number(id) = resp.id {
             if let Some(rollback) = conn.take_optimistic_rollback(id) {
                 match rollback {
-                    OptimisticRollback::ReviewIssueStatus { review_id, item_id, prev_status } => {
+                    OptimisticRollback::ReviewIssueStatus {
+                        review_id,
+                        item_id,
+                        prev_status,
+                    } => {
                         st.review
                             .set_item_status(review_id.as_deref(), item_id, prev_status);
                     }
-                    OptimisticRollback::PlanItemStatus { plan_id, item_id, prev_status } => {
-                        if let Some(plan) = st.plans_view.plans.iter_mut().find(|p| p.id == plan_id) {
+                    OptimisticRollback::PlanItemStatus {
+                        plan_id,
+                        item_id,
+                        prev_status,
+                    } => {
+                        if let Some(plan) = st.plans_view.plans.iter_mut().find(|p| p.id == plan_id)
+                        {
                             plan.update_item_status(&item_id, prev_status);
                         }
                     }
-                    OptimisticRollback::ActiveModel { prev_model, prev_selection } => {
+                    OptimisticRollback::ActiveModel {
+                        prev_model,
+                        prev_selection,
+                    } => {
                         st.active_model = prev_model;
                         st.model_choice.selection = prev_selection;
                     }
@@ -311,8 +328,10 @@ pub async fn handle_response(
                             let w = st.history_view.content_width;
                             st.history_view.scroll_to_selected_item(h, Some(w));
                         } else {
-                            st.history_view.selected_item_index =
-                                st.history_view.selected_item_index.saturating_add(fetched_count);
+                            st.history_view.selected_item_index = st
+                                .history_view
+                                .selected_item_index
+                                .saturating_add(fetched_count);
                         }
                     } else {
                         st.history_view.items = history_res.items;
@@ -366,16 +385,18 @@ pub async fn handle_response(
                     let items_removed = items_before.saturating_sub(st.context.items.len());
                     match method_name {
                         methods::CONTEXT_REMOVE => {
-                            st.notify_info(
-                                active_t("notify.context_removed")
-                                    .replacen("{}", &items_removed.to_string(), 1),
-                            );
+                            st.notify_info(active_t("notify.context_removed").replacen(
+                                "{}",
+                                &items_removed.to_string(),
+                                1,
+                            ));
                         }
                         methods::CONTEXT_CLEAR => {
-                            st.notify_success(
-                                active_t("notify.context_cleared")
-                                    .replacen("{}", &items_removed.to_string(), 1),
-                            );
+                            st.notify_success(active_t("notify.context_cleared").replacen(
+                                "{}",
+                                &items_removed.to_string(),
+                                1,
+                            ));
                         }
                         _ => {}
                     }
@@ -453,8 +474,7 @@ pub async fn handle_response(
             }
             methods::REVIEW_UPDATE_ITEM => {
                 if let Ok(res) = serde_json::from_value::<ReviewUpdateItemResult>(val) {
-                    st.review
-                        .apply_item(updated_review_id.as_deref(), res.item);
+                    st.review.apply_item(updated_review_id.as_deref(), res.item);
                 }
             }
             methods::REVIEW_LIST => {
@@ -475,7 +495,9 @@ pub async fn handle_response(
                                 .clone()
                                 .or_else(|| st.review.session.as_ref().map(|s| s.id.clone()));
                             if let Some(ref rid) = target_review_id {
-                                st.review.expanded_items.insert(format!("{}:{}", rid, item_id));
+                                st.review
+                                    .expanded_items
+                                    .insert(format!("{}:{}", rid, item_id));
                                 st.review.collapsed_sessions.remove(rid);
                             }
                             st.review.apply_item(review_id.as_deref(), item);
@@ -508,16 +530,22 @@ pub async fn handle_response(
                 }
             }
             methods::PLAN_GET | methods::PLAN_UPDATE_ITEM => {
-                if let Ok(res) = serde_json::from_value::<tauqe_protocol::PlanGetResult>(val.clone()) {
+                if let Ok(res) =
+                    serde_json::from_value::<tauqe_protocol::PlanGetResult>(val.clone())
+                {
                     if let Some(plan) = res.plan {
-                        if let Some(pos) = st.plans_view.plans.iter().position(|p| p.id == plan.id) {
+                        if let Some(pos) = st.plans_view.plans.iter().position(|p| p.id == plan.id)
+                        {
                             st.plans_view.plans[pos] = plan;
                         } else {
                             st.plans_view.plans.push(plan);
                         }
                     }
-                } else if let Ok(res) = serde_json::from_value::<tauqe_protocol::PlanUpdateItemResult>(val) {
-                    if let Some(pos) = st.plans_view.plans.iter().position(|p| p.id == res.plan.id) {
+                } else if let Ok(res) =
+                    serde_json::from_value::<tauqe_protocol::PlanUpdateItemResult>(val)
+                {
+                    if let Some(pos) = st.plans_view.plans.iter().position(|p| p.id == res.plan.id)
+                    {
                         st.plans_view.plans[pos] = res.plan;
                     } else {
                         st.plans_view.plans.push(res.plan);
@@ -531,8 +559,7 @@ pub async fn handle_response(
                 if let Ok(res) =
                     serde_json::from_value::<tauqe_protocol::PlanClearHorizonResult>(val)
                 {
-                    if let Some(pos) =
-                        st.plans_view.plans.iter().position(|p| p.id == res.plan.id)
+                    if let Some(pos) = st.plans_view.plans.iter().position(|p| p.id == res.plan.id)
                     {
                         st.plans_view.plans[pos] = res.plan;
                     } else {
@@ -555,19 +582,25 @@ pub async fn handle_response(
             methods::PLAN_REFINE | methods::PLAN_REPLAN => {
                 st.plans_view.refining = false;
                 let refining_plan_id = st.plans_view.refining_plan_id.take();
-                if let Ok(refine_res) = serde_json::from_value::<tauqe_protocol::PlanRefineResult>(val) {
+                if let Ok(refine_res) =
+                    serde_json::from_value::<tauqe_protocol::PlanRefineResult>(val)
+                {
                     match refine_res {
                         tauqe_protocol::PlanRefineResult::Success { plan, explanation } => {
                             let plan_title = plan.title.clone();
                             let plan_id = plan.id.clone();
                             let (total_items, completed_items) = plan.count_stats();
-                            if let Some(pos) = st.plans_view.plans.iter().position(|p| p.id == plan.id) {
+                            if let Some(pos) =
+                                st.plans_view.plans.iter().position(|p| p.id == plan.id)
+                            {
                                 st.plans_view.plans[pos] = plan;
                             } else {
                                 st.plans_view.plans.push(plan);
                             }
                             st.plans_view.expanded_plans.insert(plan_id.clone());
-                            st.plans_view.collapsed_sections.remove(&format!("impl:{}", plan_id));
+                            st.plans_view
+                                .collapsed_sections
+                                .remove(&format!("impl:{}", plan_id));
                             st.plans_view.clamp_selection();
                             st.plans_view.scroll_to_selected();
                             let msg = match explanation {
@@ -587,18 +620,25 @@ pub async fn handle_response(
                         }
                         tauqe_protocol::PlanRefineResult::Blocked { reason } => {
                             let target_plan_id = refining_plan_id.unwrap_or_else(|| {
-                                st.plans_view.selected_row().map(|r| r.plan_id().to_string()).unwrap_or_default()
+                                st.plans_view
+                                    .selected_row()
+                                    .map(|r| r.plan_id().to_string())
+                                    .unwrap_or_default()
                             });
-                            let plan_title = st.plans_view.plans.iter()
+                            let plan_title = st
+                                .plans_view
+                                .plans
+                                .iter()
                                 .find(|p| p.id == target_plan_id)
                                 .map(|p| p.title.clone())
                                 .unwrap_or_else(|| "Plan".to_string());
                             st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
-                            st.plans_view.refine_blocked = Some(crate::views::plans::PlanRefineBlockedState {
-                                plan_id: target_plan_id,
-                                plan_title,
-                                reason,
-                            });
+                            st.plans_view.refine_blocked =
+                                Some(crate::views::plans::PlanRefineBlockedState {
+                                    plan_id: target_plan_id,
+                                    plan_title,
+                                    reason,
+                                });
                             st.view_mode = ViewMode::Plans;
                             st.notify_warning(active_t("notify.plan_horizon_blocked"));
                         }
@@ -664,8 +704,8 @@ pub async fn handle_response(
                 instructions: None,
             };
             if let Ok(value) = serde_json::to_value(&params) {
-                let _ = super::transport::send_request(conn, methods::REVIEW_REFINE_ITEM, value)
-                    .await;
+                let _ =
+                    super::transport::send_request(conn, methods::REVIEW_REFINE_ITEM, value).await;
             }
         }
     }
@@ -814,7 +854,11 @@ mod tests {
         let st = state.lock().await;
         assert!(!st.plans_view.refining);
         assert_eq!(st.view_mode, ViewMode::Plans);
-        let blocked = st.plans_view.refine_blocked.as_ref().expect("refine_blocked expected");
+        let blocked = st
+            .plans_view
+            .refine_blocked
+            .as_ref()
+            .expect("refine_blocked expected");
         assert_eq!(blocked.plan_id, "p1");
         assert_eq!(blocked.reason, "Contradiction found");
     }
@@ -895,7 +939,10 @@ mod tests {
             st.review.sessions[0].items[0].status,
             ReviewItemStatus::InProgress
         );
-        assert_eq!(st.review.sessions[1].items[0].status, ReviewItemStatus::Todo);
+        assert_eq!(
+            st.review.sessions[1].items[0].status,
+            ReviewItemStatus::Todo
+        );
         assert_eq!(
             st.review.session.as_ref().map(|s| s.items[0].status),
             Some(ReviewItemStatus::InProgress)
@@ -949,8 +996,14 @@ mod tests {
 
         let st = state.lock().await;
         // The server's authoritative item lands in rev-2 only.
-        assert_eq!(st.review.sessions[0].items[0].status, ReviewItemStatus::Todo);
-        assert_eq!(st.review.sessions[1].items[0].status, ReviewItemStatus::Fixed);
+        assert_eq!(
+            st.review.sessions[0].items[0].status,
+            ReviewItemStatus::Todo
+        );
+        assert_eq!(
+            st.review.sessions[1].items[0].status,
+            ReviewItemStatus::Fixed
+        );
         assert_eq!(
             st.review.session.as_ref().map(|s| s.items[0].status),
             Some(ReviewItemStatus::Todo)

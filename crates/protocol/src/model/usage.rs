@@ -65,7 +65,9 @@ impl UsageTotals {
     /// the duration saturates as well.
     pub fn accumulate(&mut self, other: &UsageTotals) {
         self.prompt_tokens = self.prompt_tokens.saturating_add(other.prompt_tokens);
-        self.completion_tokens = self.completion_tokens.saturating_add(other.completion_tokens);
+        self.completion_tokens = self
+            .completion_tokens
+            .saturating_add(other.completion_tokens);
         self.total_tokens = self.total_tokens.saturating_add(other.total_tokens);
         self.reasoning_tokens = add_optional_tokens(self.reasoning_tokens, other.reasoning_tokens);
         self.cached_tokens = add_optional_tokens(self.cached_tokens, other.cached_tokens);
@@ -101,7 +103,11 @@ impl UsageTotals {
             total_tokens: self.total_tokens,
             reasoning_tokens: self.reasoning_tokens,
             cached_tokens: self.cached_tokens,
-            cost: if self.cost > 0.0 { Some(self.cost) } else { None },
+            cost: if self.cost > 0.0 {
+                Some(self.cost)
+            } else {
+                None
+            },
         }
     }
 }
@@ -113,11 +119,18 @@ fn add_optional_tokens(current: Option<u32>, incoming: Option<u32>) -> Option<u3
     }
 }
 
-/// Full three-slot usage snapshot.
+/// Full usage snapshot across every telemetry scope.
 ///
-/// `session` is the sum of completed operations, `prev` is the last completed
-/// operation, and `cur` is the in-flight operation that only exists while a
-/// turn is running. `operations` counts the completed operations.
+/// `session` is the sum of the completed operations of the running process,
+/// `prev` is the last completed operation, and `cur` is the in-flight operation
+/// that only exists while a turn is running. `operations` counts the completed
+/// operations of the session.
+///
+/// `lifetime` and `lifetime_operations` carry the project total, which
+/// accumulates across process restarts and is persisted separately from the
+/// session counters. Both lifetime fields are `serde`-defaultable, so a
+/// snapshot written before the project scope existed still deserializes and
+/// simply starts from zero instead of failing the read.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct UsageTotalsSnapshot {
     #[serde(default)]
@@ -128,6 +141,10 @@ pub struct UsageTotalsSnapshot {
     pub cur: Option<UsageTotals>,
     #[serde(default)]
     pub operations: u64,
+    #[serde(default)]
+    pub lifetime: UsageTotals,
+    #[serde(default)]
+    pub lifetime_operations: u64,
 }
 
 impl UsageTotalsSnapshot {
@@ -224,11 +241,47 @@ mod tests {
             },
             cur: None,
             operations: 1,
+            lifetime: UsageTotals {
+                total_tokens: 9_000,
+                cost: 0.5,
+                duration_ms: 60_000,
+                ..UsageTotals::default()
+            },
+            lifetime_operations: 42,
         };
         let json = serde_json::to_string(&snapshot).unwrap();
         assert!(!json.contains("\"cur\""), "cur must be omitted when None");
+        assert!(
+            json.contains("\"lifetime\""),
+            "the project scope must always be serialized"
+        );
         let de: UsageTotalsSnapshot = serde_json::from_str(&json).unwrap();
         assert_eq!(de, snapshot);
+    }
+
+    /// Guards wire compatibility with snapshots written before the project
+    /// scope existed. Every optional and lifetime field must backfill from the
+    /// serde defaults instead of failing the read.
+    #[test]
+    fn usage_totals_snapshot_backfills_missing_lifetime_fields() {
+        let legacy = r#"{
+            "session": {
+                "prompt_tokens": 120,
+                "completion_tokens": 30,
+                "total_tokens": 150,
+                "cost": 0.02,
+                "duration_ms": 1500
+            },
+            "operations": 3
+        }"#;
+        let snapshot: UsageTotalsSnapshot = serde_json::from_str(legacy).unwrap();
+        assert_eq!(snapshot.operations, 3);
+        assert_eq!(snapshot.session.total_tokens, 150);
+        assert!(snapshot.cur.is_none());
+        assert_eq!(snapshot.prev, UsageTotals::default());
+        assert_eq!(snapshot.lifetime, UsageTotals::default());
+        assert_eq!(snapshot.lifetime_operations, 0);
+        assert!(snapshot.lifetime.is_empty());
     }
 
     #[test]

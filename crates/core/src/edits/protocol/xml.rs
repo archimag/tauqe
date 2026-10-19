@@ -12,8 +12,8 @@ use super::ContextRequest;
 
 mod clean;
 pub(crate) mod engine;
-mod marker;
 mod marked;
+mod marker;
 mod parser;
 mod prompt;
 pub(crate) mod tags;
@@ -23,22 +23,23 @@ use parser::{extract_summary_from_xml, parse_xml_edits};
 use tags::{parse_context_request_tags, parse_doc_request_tags, parse_repo_search_tags};
 
 pub use clean::extract_conversational_text;
-pub use marker::generate_turn_marker;
+pub(crate) use marked::is_valid_turn_marker;
 pub use marked::MarkedXmlEditProtocol;
-pub use parser::has_xml_edit_tags;
+pub use marker::generate_turn_marker;
 pub(crate) use marker::{
     normalize_marked_xml, normalize_marked_xml_incremental, restore_xml_literals,
 };
-pub(crate) use marked::is_valid_turn_marker;
+pub use parser::has_xml_edit_tags;
 pub(crate) use parser::{extract_attribute, find_base_tag_start};
 pub use tags::{
     extract_blocked, extract_error, extract_scratchpad, extract_skip, extract_success,
-    extract_terminal_outcome, extract_user_language, extract_verify_request,
-    strip_blocked_tags, strip_context_request_tags, strip_doc_request_tags,
-    strip_error_tags, strip_plan_tags, strip_repo_search_tags, strip_scratchpad_tags,
+    extract_terminal_outcome, extract_user_language, extract_verify_request, strip_blocked_tags,
+    strip_context_request_tags, strip_doc_request_tags, strip_error_tags, strip_plan_tags,
+    strip_repo_dirs_tags, strip_repo_map_tags, strip_repo_search_tags, strip_scratchpad_tags,
     strip_skip_tags, strip_success_tags, strip_terminal_outcome_tags, strip_user_language_tags,
     strip_verify_tags, TerminalOutcome, VerifyOnSuccess, VerifyRequest, VerifyTarget,
 };
+
 /// XML-based code edit protocol
 #[derive(Debug, Default, Clone)]
 pub struct XmlEditProtocol;
@@ -52,6 +53,21 @@ impl XmlEditProtocol {
     /// Extracts repository search requests (`<repo_search path="..." regex="..." />`).
     pub fn parse_repo_searches(&self, raw_text: &str) -> Vec<tauqe_protocol::RepoSearchRequest> {
         parse_repo_search_tags(raw_text)
+    }
+
+    /// Reports whether the model requested the compact directory tree (`<repo_dirs />`).
+    pub fn parse_repo_dirs(&self, raw_text: &str) -> bool {
+        tags::parse_repo_dirs_tags(raw_text)
+    }
+
+    /// Extracts targeted repository map requests (`<repo_map path="..." />`).
+    pub fn parse_repo_maps(&self, raw_text: &str) -> Vec<String> {
+        tags::parse_repo_map_tags(raw_text)
+    }
+
+    /// Extracts directory listing requests (`<dir_list path="..." recursive="true|false" />`).
+    pub fn parse_dir_lists(&self, raw_text: &str) -> Vec<tauqe_protocol::DirListRequest> {
+        tags::parse_dir_list_tags(raw_text)
     }
 
     /// Extracts requested documentation topics (`All` when unspecified).
@@ -215,7 +231,8 @@ pub fn new_fn() {}
 
     #[test]
     fn test_extract_and_strip_skip_request() {
-        let text = "Not applicable here.\n<skip reason=\"Finding does not apply to this crate\" />\nDone.";
+        let text =
+            "Not applicable here.\n<skip reason=\"Finding does not apply to this crate\" />\nDone.";
         assert_eq!(
             XmlEditProtocol.parse_skip(text),
             Some("Finding does not apply to this crate".to_string())
@@ -230,8 +247,32 @@ pub fn new_fn() {}
     }
 
     #[test]
+    fn test_extract_and_strip_repo_dirs_request() {
+        let text = "Need the outline.\n<repo_dirs />\nDone.";
+        assert!(XmlEditProtocol.parse_repo_dirs(text));
+        assert_eq!(
+            strip_repo_dirs_tags(text).trim(),
+            "Need the outline.\n\nDone."
+        );
+    }
+
+    #[test]
+    fn test_extract_and_strip_dir_list_requests() {
+        let text = "Listing needed.\n<dir_list path=\"crates/core\" recursive=\"true\" />\nDone.";
+        assert_eq!(
+            XmlEditProtocol.parse_dir_lists(text),
+            vec![tauqe_protocol::DirListRequest::new("crates/core", true)]
+        );
+        assert_eq!(
+            XmlEditProtocol.clean_assistant_text(text),
+            "Listing needed.\n\nDone."
+        );
+    }
+
+    #[test]
     fn test_extract_and_strip_verify_request() {
-        let text = "Here are changes.\n<verify target=\"clippy\" on_success=\"silent\" />\nAll done.";
+        let text =
+            "Here are changes.\n<verify target=\"clippy\" on_success=\"silent\" />\nAll done.";
         let req = extract_verify_request(text).unwrap();
         assert_eq!(req.target, VerifyTarget::Clippy);
         assert_eq!(req.on_success, VerifyOnSuccess::Silent);
@@ -296,7 +337,9 @@ let s = "clean </edit>";
             ModelResult::Edit { edits, .. } => {
                 assert_eq!(edits.len(), 1);
                 match &edits[0] {
-                    EditOperation::Replace { old_text, new_text, .. } => {
+                    EditOperation::Replace {
+                        old_text, new_text, ..
+                    } => {
                         assert!(old_text.contains("let s = \"</edit>\";"));
                         assert!(new_text.contains("let s = \"clean </edit>\";"));
                     }

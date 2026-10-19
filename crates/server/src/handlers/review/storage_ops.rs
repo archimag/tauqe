@@ -81,9 +81,8 @@ pub async fn handle_review_get(req: Request, state: &Arc<AppState>) -> Response 
     if target_id.is_none() && active_missing {
         if let Some(id) = review_id.clone() {
             let root = repo_root.clone();
-            let _ =
-                offload_review(move || ReviewStorage::save_active_id(&root, Some(id.as_str())))
-                    .await;
+            let _ = offload_review(move || ReviewStorage::save_active_id(&root, Some(id.as_str())))
+                .await;
         }
     }
 
@@ -110,7 +109,13 @@ pub async fn handle_review_delete(req: Request, state: &Arc<AppState>) -> Respon
 
     let params: ReviewDeleteParams = match req.params.and_then(|p| serde_json::from_value(p).ok()) {
         Some(p) => p,
-        None => return Response::err(req.id, errors::INVALID_PARAMS, "Missing or invalid review ID"),
+        None => {
+            return Response::err(
+                req.id,
+                errors::INVALID_PARAMS,
+                "Missing or invalid review ID",
+            )
+        }
     };
 
     let repo_root = state.context.read().await.repo_root().to_path_buf();

@@ -9,10 +9,10 @@
 
 use std::path::Path;
 
-use tokio::sync::mpsc;
 use tauqe_protocol::{
     ContextAccess, EditOperation, EditOutcome, EditProposal, ModelResult, TurnPhase, VerifyTarget,
 };
+use tokio::sync::{mpsc, watch};
 
 use crate::context::ContextManager;
 use crate::edits::protocol::{
@@ -62,7 +62,10 @@ pub(super) async fn run_apply_and_verify_phase(
         Err(error) => {
             guard.rollback().await;
             let ctx_state = guard.context_manager.get_state();
-            let _ = ctx.stream_tx.send(StreamEvent::ContextChanged(ctx_state)).await;
+            let _ = ctx
+                .stream_tx
+                .send(StreamEvent::ContextChanged(ctx_state))
+                .await;
             let _ = ctx.stream_tx.send(StreamEvent::Done).await;
             let result = ModelResult::Edit {
                 summary,
@@ -124,10 +127,7 @@ pub(super) async fn run_apply_and_verify_phase(
             .as_ref()
             .map(|r| r.on_success)
             .unwrap_or(EditVerifyOnSuccess::Silent);
-        Some(EditVerifyRequest {
-            target,
-            on_success,
-        })
+        Some(EditVerifyRequest { target, on_success })
     } else {
         verify_request
     };
@@ -161,7 +161,10 @@ pub(super) async fn run_apply_and_verify_phase(
         if verify_outcome.is_cancelled {
             if guard.rollback().await {
                 let ctx_state = guard.context_manager.get_state();
-                let _ = ctx.stream_tx.send(StreamEvent::ContextChanged(ctx_state)).await;
+                let _ = ctx
+                    .stream_tx
+                    .send(StreamEvent::ContextChanged(ctx_state))
+                    .await;
             }
             let _ = ctx.stream_tx.send(StreamEvent::Done).await;
             return Ok(FsmTurnOutcome {
@@ -265,7 +268,10 @@ pub(super) async fn run_apply_and_verify_phase(
                 Err(err) => {
                     if guard.rollback().await {
                         let ctx_state = guard.context_manager.get_state();
-                        let _ = ctx.stream_tx.send(StreamEvent::ContextChanged(ctx_state)).await;
+                        let _ = ctx
+                            .stream_tx
+                            .send(StreamEvent::ContextChanged(ctx_state))
+                            .await;
                     }
                     return Err(err);
                 }
@@ -274,7 +280,10 @@ pub(super) async fn run_apply_and_verify_phase(
             if step_out.is_cancelled {
                 if guard.rollback().await {
                     let ctx_state = guard.context_manager.get_state();
-                    let _ = ctx.stream_tx.send(StreamEvent::ContextChanged(ctx_state)).await;
+                    let _ = ctx
+                        .stream_tx
+                        .send(StreamEvent::ContextChanged(ctx_state))
+                        .await;
                 }
                 let _ = ctx.stream_tx.send(StreamEvent::Done).await;
                 return Ok(FsmTurnOutcome {
@@ -300,7 +309,10 @@ pub(super) async fn run_apply_and_verify_phase(
             if let Some(reason) = ctx.state.blocked.clone() {
                 guard.rollback().await;
                 let ctx_state = guard.context_manager.get_state();
-                let _ = ctx.stream_tx.send(StreamEvent::ContextChanged(ctx_state)).await;
+                let _ = ctx
+                    .stream_tx
+                    .send(StreamEvent::ContextChanged(ctx_state))
+                    .await;
                 let _ = ctx.stream_tx.send(StreamEvent::Done).await;
                 let result = ModelResult::Edit {
                     summary: "Execution blocked".to_string(),
@@ -335,12 +347,16 @@ pub(super) async fn run_apply_and_verify_phase(
                     ctx.repo_root,
                     step_out.commands(),
                     ctx.options.files_token_budget,
+                    ctx.options.repomap_token_budget,
                     false,
                 )
                 .await;
                 if !discovery_outcome.added_files.is_empty() {
                     let ctx_state = guard.context_manager.get_state();
-                    let _ = ctx.stream_tx.send(StreamEvent::ContextChanged(ctx_state)).await;
+                    let _ = ctx
+                        .stream_tx
+                        .send(StreamEvent::ContextChanged(ctx_state))
+                        .await;
                 }
             }
 
@@ -421,8 +437,35 @@ pub(super) async fn run_apply_and_verify_phase(
             if let Some(text) = extract_success_summary(ctx.state.terminal_outcome.as_ref()) {
                 summary = text;
             }
-            let (commit_hash, commit_error) =
-                guard.finalize(&total_changed_files, &summary).await;
+            // Formatting is the last step before the Git commit: it runs only on
+            // a verified working tree and never invalidates the build. An
+            // interrupted run rolls the turn back instead of committing a
+            // partially formatted tree.
+            if !toolchain_config.fmt.is_empty()
+                && run_best_effort_formatters(ctx.repo_root, &total_changed_files, ctx.cancel_rx)
+                    .await
+            {
+                if guard.rollback().await {
+                    let ctx_state = guard.context_manager.get_state();
+                    let _ = ctx
+                        .stream_tx
+                        .send(StreamEvent::ContextChanged(ctx_state))
+                        .await;
+                }
+                let _ = ctx.stream_tx.send(StreamEvent::Done).await;
+                return Ok(FsmTurnOutcome {
+                    assistant_text: std::mem::take(&mut ctx.accumulated_text),
+                    result: ModelResult::Answer {
+                        text: String::new(),
+                    },
+                    is_cancelled: true,
+                    blocked: None,
+                    has_terminal_success: false,
+                    plan_saved: false,
+                    skip_reason: None,
+                });
+            }
+            let (commit_hash, commit_error) = guard.finalize(&total_changed_files, &summary).await;
             tracing::info!(
                 workflow = ctx.workflow_name,
                 model = %ctx.model,
@@ -432,7 +475,10 @@ pub(super) async fn run_apply_and_verify_phase(
                 "bounded turn applied and verified edits"
             );
             let ctx_state = guard.context_manager.get_state();
-            let _ = ctx.stream_tx.send(StreamEvent::ContextChanged(ctx_state)).await;
+            let _ = ctx
+                .stream_tx
+                .send(StreamEvent::ContextChanged(ctx_state))
+                .await;
             let _ = ctx.stream_tx.send(StreamEvent::Done).await;
             let result = ModelResult::Edit {
                 summary,
@@ -457,7 +503,10 @@ pub(super) async fn run_apply_and_verify_phase(
 
         let changed_files = if guard.rollback().await {
             let ctx_state = guard.context_manager.get_state();
-            let _ = ctx.stream_tx.send(StreamEvent::ContextChanged(ctx_state)).await;
+            let _ = ctx
+                .stream_tx
+                .send(StreamEvent::ContextChanged(ctx_state))
+                .await;
             Vec::new()
         } else {
             total_changed_files
@@ -475,7 +524,10 @@ pub(super) async fn run_apply_and_verify_phase(
             proposal: None,
             outcome: EditOutcome {
                 applied: false,
-                error: Some(format!("Code verification failed:\n{}", verify_outcome.report)),
+                error: Some(format!(
+                    "Code verification failed:\n{}",
+                    verify_outcome.report
+                )),
                 changed_files,
                 commit_hash: None,
             },
@@ -494,6 +546,29 @@ pub(super) async fn run_apply_and_verify_phase(
     if let Some(text) = extract_success_summary(ctx.state.terminal_outcome.as_ref()) {
         summary = text;
     }
+    if !toolchain_config.fmt.is_empty()
+        && run_best_effort_formatters(ctx.repo_root, &total_changed_files, ctx.cancel_rx).await
+    {
+        if guard.rollback().await {
+            let ctx_state = guard.context_manager.get_state();
+            let _ = ctx
+                .stream_tx
+                .send(StreamEvent::ContextChanged(ctx_state))
+                .await;
+        }
+        let _ = ctx.stream_tx.send(StreamEvent::Done).await;
+        return Ok(FsmTurnOutcome {
+            assistant_text: std::mem::take(&mut ctx.accumulated_text),
+            result: ModelResult::Answer {
+                text: String::new(),
+            },
+            is_cancelled: true,
+            blocked: None,
+            has_terminal_success: false,
+            plan_saved: false,
+            skip_reason: None,
+        });
+    }
     let (commit_hash, commit_error) = guard.finalize(&total_changed_files, &summary).await;
     tracing::info!(
         workflow = ctx.workflow_name,
@@ -504,7 +579,10 @@ pub(super) async fn run_apply_and_verify_phase(
         "bounded turn finalized edits without verification"
     );
     let ctx_state = guard.context_manager.get_state();
-    let _ = ctx.stream_tx.send(StreamEvent::ContextChanged(ctx_state)).await;
+    let _ = ctx
+        .stream_tx
+        .send(StreamEvent::ContextChanged(ctx_state))
+        .await;
     let _ = ctx.stream_tx.send(StreamEvent::Done).await;
     let result = ModelResult::Edit {
         summary,
@@ -525,6 +603,161 @@ pub(super) async fn run_apply_and_verify_phase(
         ctx.plan_mode,
     )
     .await)
+}
+
+/// Working-tree content of every changed file a formatter may rewrite.
+type ChangedFilesSnapshot = Vec<(String, Option<Vec<u8>>)>;
+
+/// Runs the configured formatters over the changed files as a best-effort step.
+///
+/// Formatting happens strictly after the build and tests verified the working
+/// tree and immediately before the Git commit. The content of the changed files
+/// is snapshotted first, so a formatter that fails or exits non-zero has the
+/// files it claimed restored: the failure is logged, the verified code is
+/// committed untouched, and the model is never asked to repair a formatter.
+///
+/// The turn cancellation signal is forwarded to every invocation, so a
+/// developer interrupt stops formatting immediately rather than after the last
+/// configured formatter finished. An interrupted formatter is handled like a
+/// failed one — the verified content is restored — and the `true` return value
+/// tells the caller to roll the turn back instead of committing.
+async fn run_best_effort_formatters(
+    repo_root: &Path,
+    changed_files: &[String],
+    cancel_rx: &watch::Receiver<bool>,
+) -> bool {
+    if changed_files.is_empty() {
+        return false;
+    }
+    let is_git = crate::blocking::run_blocking(|| {
+        crate::git::state::is_git_repository(Some(repo_root))
+    });
+    let dirty_before = if is_git {
+        crate::blocking::run_blocking(|| collect_porcelain_status_files(repo_root))
+    } else {
+        Vec::new()
+    };
+
+    let snapshot =
+        crate::blocking::run_blocking(|| snapshot_changed_files(repo_root, changed_files));
+    let results = crate::toolchain::run_formatters(repo_root, changed_files, Some(cancel_rx)).await;
+    let mut cancelled = false;
+    for result in results.iter() {
+        if result.is_cancelled {
+            cancelled = true;
+        }
+        if result.success {
+            continue;
+        }
+        tracing::warn!(
+            formatter = %result.formatter,
+            command = %result.command,
+            files = result.files.len(),
+            cancelled = result.is_cancelled,
+            "formatter failed; restoring the verified content"
+        );
+        let files = result.files.as_slice();
+        crate::blocking::run_blocking(|| restore_changed_files(repo_root, &snapshot, files));
+    }
+
+    if is_git && !cancelled {
+        crate::blocking::run_blocking(|| {
+            revert_foreign_formatter_modifications(repo_root, &dirty_before, changed_files);
+        });
+    }
+
+    cancelled
+}
+
+/// Collects repository-relative paths of modified or untracked files via Git status.
+fn collect_porcelain_status_files(repo_root: &Path) -> Vec<String> {
+    let output = match crate::git::cmd::run_git(Some(repo_root), &["status", "--porcelain"]) {
+        Ok(out) => out,
+        Err(_) => return Vec::new(),
+    };
+    parse_porcelain_paths(&output)
+}
+
+fn parse_porcelain_paths(output: &str) -> Vec<String> {
+    let mut paths = Vec::new();
+    for line in output.lines() {
+        if line.len() < 4 {
+            continue;
+        }
+        let file_part = &line[3..];
+        let path = if let Some((_, to)) = file_part.split_once(" -> ") {
+            to.trim()
+        } else {
+            file_part.trim()
+        };
+        let cleaned = path.trim_matches('"');
+        if !cleaned.is_empty() {
+            paths.push(cleaned.to_string());
+        }
+    }
+    paths
+}
+
+/// Reverts any files modified, deleted, or created by formatters that are not part
+/// of the turn's intentional `changed_files`.
+fn revert_foreign_formatter_modifications(
+    repo_root: &Path,
+    dirty_before: &[String],
+    changed_files: &[String],
+) {
+    let dirty_after = collect_porcelain_status_files(repo_root);
+    for path_str in dirty_after {
+        let is_foreign = !dirty_before.iter().any(|d| Path::new(d) == Path::new(&path_str))
+            && !changed_files.iter().any(|c| Path::new(c) == Path::new(&path_str));
+        if !is_foreign {
+            continue;
+        }
+
+        tracing::warn!(
+            file = %path_str,
+            "reverting unauthorized modification made by formatter outside changed files"
+        );
+
+        let checkout_res =
+            crate::git::cmd::run_git(Some(repo_root), &["checkout", "HEAD", "--", &path_str]);
+        if checkout_res.is_err() {
+            let full_path = repo_root.join(&path_str);
+            if full_path.is_file() || full_path.is_symlink() {
+                let _ = std::fs::remove_file(&full_path);
+            } else if full_path.is_dir() {
+                let _ = std::fs::remove_dir_all(&full_path);
+            }
+        }
+    }
+}
+
+/// Reads the current working-tree content of the changed files.
+fn snapshot_changed_files(repo_root: &Path, changed_files: &[String]) -> ChangedFilesSnapshot {
+    changed_files
+        .iter()
+        .map(|file| (file.clone(), std::fs::read(repo_root.join(file)).ok()))
+        .collect()
+}
+
+/// Restores the snapshotted content of the files a failed formatter claimed.
+fn restore_changed_files(repo_root: &Path, snapshot: &ChangedFilesSnapshot, files: &[String]) {
+    for (path, content) in snapshot {
+        if !files.iter().any(|file| file == path) {
+            continue;
+        }
+        let full = repo_root.join(path);
+        let restored = match content {
+            Some(bytes) => std::fs::write(&full, bytes),
+            None => std::fs::remove_file(&full),
+        };
+        if let Err(err) = restored {
+            tracing::error!(
+                file = %path,
+                error = %err,
+                "failed to restore a file after a formatter failure"
+            );
+        }
+    }
 }
 
 /// Registers files referenced by a verification failure into editable context.
@@ -576,6 +809,7 @@ async fn auto_register_error_files(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use super::super::run_fsm_turn;
     use crate::context::ContextManager;
     use crate::history::HistoryManager;
@@ -657,11 +891,47 @@ mod tests {
         )
         .await;
 
-        assert!(outcome_result.is_err(), "turn must propagate provider error");
+        assert!(
+            outcome_result.is_err(),
+            "turn must propagate provider error"
+        );
         // Verify working tree has been rolled back to pristine pre-turn state.
         assert_eq!(
             std::fs::read_to_string(root.join("a.rs")).unwrap(),
             "pub fn compute() -> i32 { 0 }\n"
         );
+    }
+
+    #[test]
+    fn test_revert_foreign_formatter_modifications() {
+        let (_dir, root) = setup_repo(&[
+            ("a.rs", "pub fn a() {}\n"),
+            ("b.rs", "pub fn b() {}\n"),
+        ]);
+
+        let dirty_before = collect_porcelain_status_files(&root);
+        assert!(dirty_before.is_empty());
+
+        // Simulate a formatter modifying both the intentional file (a.rs)
+        // and a foreign file (b.rs), as well as creating an untracked artifact.
+        std::fs::write(root.join("a.rs"), "pub fn a() { /* formatted */ }\n").unwrap();
+        std::fs::write(root.join("b.rs"), "pub fn b() { /* foreign edit */ }\n").unwrap();
+        std::fs::write(root.join("untracked.tmp"), "stray formatter artifact\n").unwrap();
+
+        // Revert foreign modifications; only a.rs was intentionally changed.
+        revert_foreign_formatter_modifications(&root, &dirty_before, &["a.rs".to_string()]);
+
+        // a.rs retains its modification
+        assert_eq!(
+            std::fs::read_to_string(root.join("a.rs")).unwrap(),
+            "pub fn a() { /* formatted */ }\n"
+        );
+        // b.rs is reverted to original content from HEAD
+        assert_eq!(
+            std::fs::read_to_string(root.join("b.rs")).unwrap(),
+            "pub fn b() {}\n"
+        );
+        // untracked artifact is removed
+        assert!(!root.join("untracked.tmp").exists());
     }
 }

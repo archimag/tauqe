@@ -33,7 +33,9 @@ where
             if trimmed.is_empty() {
                 Ok(None)
             } else {
-                parse_model_ref(trimmed).map(Some).map_err(serde::de::Error::custom)
+                parse_model_ref(trimmed)
+                    .map(Some)
+                    .map_err(serde::de::Error::custom)
             }
         }
         Some(ModelRefRaw::Struct(m)) => Ok(Some(m)),
@@ -122,8 +124,14 @@ impl ModelsConfig {
         match role {
             ModelRole::Primary => self.primary.clone(),
             ModelRole::Coder => self.coder.clone().unwrap_or_else(|| self.primary.clone()),
-            ModelRole::Architect => self.architect.clone().unwrap_or_else(|| self.primary.clone()),
-            ModelRole::Reviewer => self.reviewer.clone().unwrap_or_else(|| self.primary.clone()),
+            ModelRole::Architect => self
+                .architect
+                .clone()
+                .unwrap_or_else(|| self.primary.clone()),
+            ModelRole::Reviewer => self
+                .reviewer
+                .clone()
+                .unwrap_or_else(|| self.primary.clone()),
             ModelRole::Scribe => match &self.scribe {
                 Some(model) => vec![ModelEntry::from(model.clone())],
                 None => self.primary.clone(),
@@ -165,7 +173,40 @@ impl ModelsConfig {
     /// the role starts on; deeper ladder rungs may carry their own effort and are
     /// applied during escalation instead.
     pub fn resolve_effort(&self, role: ModelRole) -> Option<ReasoningEffort> {
-        self.role_entries(role).first().and_then(|entry| entry.effort)
+        self.role_entries(role)
+            .first()
+            .and_then(|entry| entry.effort)
+    }
+
+    /// Resolves the reasoning effort for a model selection within the context of a specific role.
+    ///
+    /// If the selection specifies a role, returns the base effort of that role.
+    /// If the selection specifies a concrete model, looks for that model among the
+    /// entries configured for `role` first, then falls back to `primary`, returning
+    /// that entry's configured effort. If the model is not in either list or has no
+    /// effort specified, returns `None`.
+    pub fn resolve_selection_effort(
+        &self,
+        role: ModelRole,
+        selection: &ModelSelection,
+    ) -> Option<ReasoningEffort> {
+        match selection {
+            ModelSelection::Role(r) => self.resolve_effort(*r),
+            ModelSelection::Specific(model) => self
+                .role_entries(role)
+                .into_iter()
+                .find(|entry| &entry.model == model)
+                .or_else(|| {
+                    if role != ModelRole::Primary {
+                        self.role_entries(ModelRole::Primary)
+                            .into_iter()
+                            .find(|entry| &entry.model == model)
+                    } else {
+                        None
+                    }
+                })
+                .and_then(|entry| entry.effort),
+        }
     }
 
     /// Resolves a [`ModelSelection`] to a concrete [`ModelRef`].
@@ -251,9 +292,11 @@ impl ModelsConfig {
     /// configuration changed between waves, so its position cannot be trusted.
     pub fn architect_tier_index(&self, recorded: Option<&ArchitectTier>) -> Option<usize> {
         let recorded = recorded?;
-        self.architect_ladder()
+        let ladder = self.architect_ladder();
+        ladder
             .iter()
             .position(|tier| tier == recorded)
+            .or_else(|| ladder.iter().position(|tier| tier.model == recorded.model))
     }
 
     /// Returns the rung that follows a recorded Architect configuration.
@@ -377,7 +420,10 @@ coder = [{ model = "openrouter:deepseek/deepseek-chat", effort = "high" }]
         .expect("parse coder table");
         let ladder = config.coder_ladder();
         assert_eq!(ladder.len(), 1);
-        assert_eq!(ladder[0].model, ModelRef::openrouter("deepseek/deepseek-chat"));
+        assert_eq!(
+            ladder[0].model,
+            ModelRef::openrouter("deepseek/deepseek-chat")
+        );
         assert_eq!(ladder[0].effort, Some(ReasoningEffort::High));
         assert_eq!(config.resolve_role(ModelRole::Coder), ladder[0].model);
         assert_eq!(
@@ -490,6 +536,86 @@ architect = ["openrouter:planner/one"]
         assert_eq!(
             config.next_architect_tier(Some(&unknown)),
             ArchitectTier::new(ModelRef::openrouter("planner/one"), None)
+        );
+    }
+
+    #[test]
+    fn test_resolve_selection_effort_picks_matching_model_entry() {
+        let config: ModelsConfig = toml::from_str(
+            r#"
+primary = ["openrouter:base/primary"]
+architect = [
+    { model = "openrouter:deepseek/flash", effort = "max" },
+    { model = "openrouter:google/gemini-flash", effort = "high" },
+    "openrouter:google/gemini-argon",
+]
+"#,
+        )
+        .expect("parse models config");
+
+        // Role selection returns base effort (max)
+        assert_eq!(
+            config.resolve_selection_effort(
+                ModelRole::Architect,
+                &ModelSelection::Role(ModelRole::Architect)
+            ),
+            Some(ReasoningEffort::Max)
+        );
+
+        // Specific gemini-flash returns high, NOT max from deepseek
+        assert_eq!(
+            config.resolve_selection_effort(
+                ModelRole::Architect,
+                &ModelSelection::Specific(ModelRef::openrouter("google/gemini-flash"))
+            ),
+            Some(ReasoningEffort::High)
+        );
+
+        // Specific gemini-argon without effort returns None
+        assert_eq!(
+            config.resolve_selection_effort(
+                ModelRole::Architect,
+                &ModelSelection::Specific(ModelRef::openrouter("google/gemini-argon"))
+            ),
+            None
+        );
+
+        // Model not in list returns None
+        assert_eq!(
+            config.resolve_selection_effort(
+                ModelRole::Architect,
+                &ModelSelection::Specific(ModelRef::openrouter("unknown/model"))
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn test_architect_tier_index_falls_back_to_model_matching_on_effort_discrepancy() {
+        let config: ModelsConfig = toml::from_str(
+            r#"
+primary = ["openrouter:base/primary"]
+architect = [
+    { model = "openrouter:deepseek/flash", effort = "max" },
+    { model = "openrouter:google/gemini-flash", effort = "high" },
+    "openrouter:google/gemini-argon",
+]
+"#,
+        )
+        .expect("parse models config");
+
+        // Recorded tier has mismatched effort (Max instead of High)
+        let mismatched = ArchitectTier::new(
+            ModelRef::openrouter("google/gemini-flash"),
+            Some(ReasoningEffort::Max),
+        );
+
+        // Falls back to model match and finds index 1 instead of returning None
+        assert_eq!(config.architect_tier_index(Some(&mismatched)), Some(1));
+        // Escalation proceeds to index 2 (gemini-argon) instead of resetting to tier 0
+        assert_eq!(
+            config.next_architect_tier(Some(&mismatched)),
+            ArchitectTier::new(ModelRef::openrouter("google/gemini-argon"), None)
         );
     }
 

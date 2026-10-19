@@ -1,4 +1,5 @@
 use crate::app::AppState;
+use crate::dialogs::render::status::{PLAN_STATUS_ORDER, REVIEW_STATUS_ORDER};
 use crate::rpc::RpcConnection;
 use tauqe_protocol::methods;
 
@@ -21,15 +22,10 @@ pub(crate) async fn apply_status_dialog(
             current_status,
             ..
         } => {
-            let statuses = [
-                tauqe_protocol::PlanItemStatus::Discussion,
-                tauqe_protocol::PlanItemStatus::Todo,
-                tauqe_protocol::PlanItemStatus::InProgress,
-                tauqe_protocol::PlanItemStatus::Done,
-                tauqe_protocol::PlanItemStatus::Blocked,
-                tauqe_protocol::PlanItemStatus::Cancelled,
-            ];
-            let new_status = match statuses.get(chosen_idx).copied() {
+            // The chosen index is the position of the status in the list the
+            // dialog draws, so rendering and fast-select share one source of
+            // truth and can never disagree about which status a digit applies.
+            let new_status = match PLAN_STATUS_ORDER.get(chosen_idx).copied() {
                 Some(s) => s,
                 None => return Ok(()),
             };
@@ -67,19 +63,10 @@ pub(crate) async fn apply_status_dialog(
             current_status,
             ..
         } => {
-            // The review lifecycle carries seven statuses: `Refine` sits between
-            // `InProgress` and `Fixed`, matching the option order rendered by
-            // `render/status.rs` and the fast-select range advertised there.
-            let statuses = [
-                tauqe_protocol::ReviewItemStatus::Discussion,
-                tauqe_protocol::ReviewItemStatus::Todo,
-                tauqe_protocol::ReviewItemStatus::InProgress,
-                tauqe_protocol::ReviewItemStatus::Refine,
-                tauqe_protocol::ReviewItemStatus::Fixed,
-                tauqe_protocol::ReviewItemStatus::Skipped,
-                tauqe_protocol::ReviewItemStatus::Rejected,
-            ];
-            let new_status = match statuses.get(chosen_idx).copied() {
+            // The review lifecycle carries seven statuses and is read from the
+            // same ordered list the dialog renders, so `Refine` keeps sitting
+            // between `InProgress` and `Fixed` for both the rows and the digits.
+            let new_status = match REVIEW_STATUS_ORDER.get(chosen_idx).copied() {
                 Some(s) => s,
                 None => return Ok(()),
             };
@@ -89,8 +76,8 @@ pub(crate) async fn apply_status_dialog(
                 // update, the optimistic rollback, and the request, so a
                 // finding id shared across sessions never mutates the wrong
                 // session's finding.
-                let target_review_id = review_id
-                    .or_else(|| st.review.session.as_ref().map(|s| s.id.clone()));
+                let target_review_id =
+                    review_id.or_else(|| st.review.session.as_ref().map(|s| s.id.clone()));
                 st.review
                     .set_item_status(target_review_id.as_deref(), item_id, new_status);
                 if st.review.hide_closed {
@@ -185,7 +172,10 @@ mod tests {
 
         // rev-2's finding moves to InProgress; rev-1's identically numbered
         // finding, and the active session mirror, stay untouched.
-        assert_eq!(st.review.sessions[0].items[0].status, ReviewItemStatus::Todo);
+        assert_eq!(
+            st.review.sessions[0].items[0].status,
+            ReviewItemStatus::Todo
+        );
         assert_eq!(
             st.review.sessions[1].items[0].status,
             ReviewItemStatus::InProgress
@@ -218,7 +208,10 @@ mod tests {
         let mut conn = RpcConnection::new(Vec::<u8>::new());
         apply_status_dialog(&mut st, 3, &mut conn).await.unwrap();
 
-        assert_eq!(st.review.sessions[0].items[0].status, ReviewItemStatus::Refine);
+        assert_eq!(
+            st.review.sessions[0].items[0].status,
+            ReviewItemStatus::Refine
+        );
         assert_eq!(st.status_dialog, None, "the dialog must be consumed");
     }
 }

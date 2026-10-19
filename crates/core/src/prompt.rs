@@ -8,9 +8,7 @@ use crate::context::ContextFileContent;
 use crate::edits::stream::json::decode::first_json_object_str;
 use crate::prompt::protocol::PromptProtocol;
 use crate::providers::{ChatMessage, JsonSchemaDefinition, ResponseFormat};
-use tauqe_protocol::{
-    CapabilitySet, ContextAccess, ModelRole, Plan, RepositoryState, TurnIntent,
-};
+use tauqe_protocol::{CapabilitySet, ContextAccess, ModelRole, Plan, RepositoryState, TurnIntent};
 
 /// Default model role used for squash commit message synthesis.
 pub const SQUASH_COMMIT_ROLE: ModelRole = ModelRole::Scribe;
@@ -28,7 +26,9 @@ pub fn build_squash_commit_prompt(
 
     if !pinned_files.is_empty() {
         prompt.push_str("## Project Guidelines & Context\n");
-        prompt.push_str("Follow any commit message conventions, scopes, and guidelines specified below:\n");
+        prompt.push_str(
+            "Follow any commit message conventions, scopes, and guidelines specified below:\n",
+        );
         for file in pinned_files {
             prompt.push_str(&format!(
                 "<file path=\"{}\">\n{}\n</file>\n",
@@ -211,6 +211,26 @@ fn access_attribute(access: ContextAccess) -> &'static str {
     }
 }
 
+/// Renders the repository outline section of an Architect prompt.
+///
+/// The eager symbol map and the compact directory tree are mutually exclusive
+/// alternatives: the model reads symbol contours whenever a map is available
+/// and falls back to the folder layout only when eager map generation is
+/// disabled or the rendered map is empty. The returned section ends with a
+/// blank line, so a caller appends it as a single block.
+pub(crate) fn format_repository_outline_section(
+    repo_map: Option<&str>,
+    repo_dirs: Option<&str>,
+) -> Option<String> {
+    if let Some(contours) = repo_map.map(str::trim).filter(|text| !text.is_empty()) {
+        return Some(format!(
+            "## Codebase Symbol Contours (<repo_map>):\n{contours}\n\n"
+        ));
+    }
+    let dirs = repo_dirs.map(str::trim).filter(|text| !text.is_empty());
+    dirs.map(|tree| format!("## Repository Directories (<repo_dirs>):\n{tree}\n\n"))
+}
+
 pub struct PromptAssembly {
     pub repo_state: Option<RepositoryState>,
     pub context_revision: u64,
@@ -219,6 +239,11 @@ pub struct PromptAssembly {
     pub edit_protocol: String,
     pub history_tag: Option<String>,
     pub repo_map: Option<String>,
+    /// Compact directory-tree outline of the repository.
+    ///
+    /// Rendered only when the eager global symbol map is disabled, so the model
+    /// still learns where subsystems live without a full outline pass.
+    pub repo_dirs: Option<String>,
     pub target_language: Option<String>,
     pub active_plan: Option<Plan>,
     /// Declared intent of this turn, which decides the advertised capability set.
@@ -244,6 +269,7 @@ impl PromptAssembly {
             edit_protocol: edit_protocol.into(),
             history_tag,
             repo_map,
+            repo_dirs: None,
             target_language: None,
             active_plan: None,
             intent: TurnIntent::InteractiveRepl,
@@ -262,12 +288,19 @@ impl PromptAssembly {
         self
     }
 
+    /// Attaches the compact directory outline rendered for this turn.
+    pub fn with_repo_dirs(mut self, repo_dirs: Option<String>) -> Self {
+        self.repo_dirs = repo_dirs;
+        self
+    }
+
     pub fn build_system_prompt(&self, protocol: &dyn PromptProtocol) -> String {
         let capabilities = self.effective_capabilities(protocol);
         let effective_protocol = protocol.with_capability_set(capabilities.clone());
         let mut prompt = String::new();
         prompt.push_str("You are Tauqe AI, an expert programming assistant operating inside TAUQE (The Answer to the Ultimate Question of Engineering), an AI-native engineering control environment built on the literal harness paradigm.\n");
-        prompt.push_str("TAUQE is the environment you operate within. Whenever the developer mentions TAUQE, they refer to this same control environment—its harness, workflows, context model, plans, and Git transactions—not to an external tool or framework.\n\n");
+        prompt.push_str("TAUQE is the environment you operate within. Whenever the developer mentions TAUQE, they refer to this same control environment—its harness, workflows, context model, plans, and Git transactions—not to an external tool or framework.\n");
+        prompt.push_str("Environment behavior is declared in `tauqe.toml` at the repository root: model roles, toolchain verification phases, context and repo-map budgets, pinned files, and workflow policy all come from that file. Treat it as the authoritative project configuration surface, and never infer a documented parameter, budget, or project convention from partial source memory.\n\n");
         let render_ctx = PromptRenderContext::new(&[], effective_protocol.turn_marker());
         let contract_ctx = ContractContext::new(self.intent, render_ctx)
             .with_target_language(self.target_language.as_deref());
@@ -384,6 +417,17 @@ impl PromptAssembly {
         })
     }
 
+    pub fn format_repo_dirs_block(&self) -> Option<String> {
+        self.repo_dirs.as_ref().and_then(|dirs| {
+            let trimmed = dirs.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(format!("<repo_dirs>\n{}\n</repo_dirs>", trimmed))
+            }
+        })
+    }
+
     pub fn format_scratchpad_block(&self) -> Option<String> {
         self.turn_scratchpad.as_ref().and_then(|pad| {
             let trimmed = pad.trim();
@@ -391,12 +435,8 @@ impl PromptAssembly {
                 None
             } else {
                 let text = if trimmed.chars().count() > MAX_SCRATCHPAD_CHARS {
-                    let truncated: String =
-                        trimmed.chars().take(MAX_SCRATCHPAD_CHARS).collect();
-                    format!(
-                        "{}\n... [scratchpad truncated for length] ...",
-                        truncated
-                    )
+                    let truncated: String = trimmed.chars().take(MAX_SCRATCHPAD_CHARS).collect();
+                    format!("{}\n... [scratchpad truncated for length] ...", truncated)
                 } else {
                     trimmed.to_string()
                 };
@@ -419,9 +459,16 @@ impl PromptAssembly {
         // prefix instead of reprocessing it.
         let mut system_text = self.build_system_prompt(protocol);
 
+        // The eager symbol map and the compact directory outline are mutually
+        // exclusive: the model reads either symbol contours or the folder
+        // layout, never both, so the prefix stays as small as one of them.
         if let Some(repo_map_block) = self.format_repo_map_block() {
             system_text.push_str("## Repository Map\n");
             system_text.push_str(&repo_map_block);
+            system_text.push_str("\n\n");
+        } else if let Some(repo_dirs_block) = self.format_repo_dirs_block() {
+            system_text.push_str("## Repository Directories\n");
+            system_text.push_str(&repo_dirs_block);
             system_text.push_str("\n\n");
         }
 
@@ -528,8 +575,12 @@ mod tests {
         let proto = XmlPromptProtocol;
         let messages = assembly.assemble_chat_messages("Привет", &proto);
         assert!(messages[0].content.contains("## Language Directive"));
-        assert!(messages[0].content.contains("Target Response Language: Russian"));
-        assert!(messages[0].content.contains("Reasoning / Thoughts: Strictly in English."));
+        assert!(messages[0]
+            .content
+            .contains("Target Response Language: Russian"));
+        assert!(messages[0]
+            .content
+            .contains("Reasoning / Thoughts: Strictly in English."));
     }
 
     #[test]
@@ -539,7 +590,8 @@ mod tests {
             access: ContextAccess::Editable,
             content: "fn main() {}\n".to_string(),
         }];
-        let history = Some("<history>\n{\"type\":\"summary\",\"text\":\"Initial\"}\n</history>".to_string());
+        let history =
+            Some("<history>\n{\"type\":\"summary\",\"text\":\"Initial\"}\n</history>".to_string());
         let repo_map = Some("crates/core/src/git.rs\n  pub fn get_repository_state()".to_string());
         let assembly = PromptAssembly::new(None, 1, files, "git", "xml", history, repo_map);
         let proto = XmlPromptProtocol;
@@ -555,7 +607,9 @@ mod tests {
         assert!(messages[0].content.contains("crates/core/src/git.rs"));
         assert!(messages[0].content.contains("## Session History"));
         assert!(messages[0].content.contains("<history>"));
-        assert!(messages[0].content.contains("{\"type\":\"summary\",\"text\":\"Initial\"}"));
+        assert!(messages[0]
+            .content
+            .contains("{\"type\":\"summary\",\"text\":\"Initial\"}"));
         assert_eq!(messages[1], ChatMessage::user("Explain this code"));
     }
 
@@ -676,6 +730,44 @@ mod tests {
     }
 
     #[test]
+    fn test_repository_outline_is_map_or_directories_never_both() {
+        let base = || PromptAssembly::new(None, 1, vec![], "git", "xml", None, None);
+
+        // The rendered outline block, as opposed to the bare `<repo_dirs>` tag
+        // name that the protocol instructions advertise in every turn.
+        const DIRS_BLOCK: &str = "<repo_dirs>\ncrate\n  src\n</repo_dirs>";
+
+        // An eager symbol map wins and suppresses the directory outline, even
+        // though an outline is available to render.
+        let mut with_map = base().with_repo_dirs(Some("crate\n  src".to_string()));
+        with_map.repo_map = Some("crate\n  pub fn main".to_string());
+        assert!(with_map.format_repo_dirs_block().is_some());
+        let messages = with_map.assemble_chat_messages("Go", &XmlPromptProtocol);
+        let sys = &messages[0].content;
+        assert!(sys.contains("## Repository Map"));
+        assert!(!sys.contains("## Repository Directories"));
+        assert!(!sys.contains(DIRS_BLOCK));
+
+        // Without a map the compact outline answers where subsystems live.
+        let with_dirs = base().with_repo_dirs(Some("crate\n  src".to_string()));
+        let messages = with_dirs.assemble_chat_messages("Go", &XmlPromptProtocol);
+        let sys = &messages[0].content;
+        assert!(!sys.contains("## Repository Map"));
+        assert!(sys.contains("## Repository Directories"));
+        assert!(sys.contains(DIRS_BLOCK));
+
+        // A blank outline renders no block at all.
+        let blank = base().with_repo_dirs(Some("   ".to_string()));
+        assert!(blank.format_repo_dirs_block().is_none());
+
+        // With neither input the prefix carries no repository outline.
+        let messages = base().assemble_chat_messages("Go", &XmlPromptProtocol);
+        let sys = &messages[0].content;
+        assert!(!sys.contains("## Repository Map"));
+        assert!(!sys.contains("## Repository Directories"));
+    }
+
+    #[test]
     fn test_estimate_tokens() {
         assert_eq!(estimate_tokens(""), 0);
         assert_eq!(estimate_tokens("abcd"), 1);
@@ -690,15 +782,7 @@ mod tests {
     #[test]
     fn test_prompt_assembly_isolated_step() {
         let proto = XmlPromptProtocol;
-        let mut assembly = PromptAssembly::new(
-            None,
-            1,
-            vec![],
-            "git",
-            "xml",
-            None,
-            None,
-        );
+        let mut assembly = PromptAssembly::new(None, 1, vec![], "git", "xml", None, None);
         assembly.intent = TurnIntent::IsolatedStep;
         assembly.active_plan = Some(Plan {
             id: "plan-test".to_string(),
@@ -758,6 +842,40 @@ mod tests {
         assert!(!prompt.contains("Snapshot Strategy"));
         assert!(prompt.contains("<context_request"));
         assert!(prompt.contains("<repo_search"));
+        // A tag runs a request only when it is emitted verbatim at the very end
+        // of the response, outside markdown code; prose that merely describes
+        // an intent performs nothing.
+        assert!(prompt.contains("describing the intent in prose performs nothing"));
+    }
+
+    #[test]
+    fn test_system_prompt_anchors_project_configuration() {
+        use tauqe_protocol::LlmCapability;
+
+        let assembly = PromptAssembly::new(None, 1, vec![], "git", "xml", None, None);
+        let full = assembly.build_system_prompt(&XmlPromptProtocol);
+
+        // The configuration anchor belongs to the static introduction, and the
+        // self-knowledge rule routes configuration questions to that topic.
+        assert!(full.contains("tauqe.toml"));
+        assert!(full.contains("Self-Knowledge"));
+        assert!(full.contains("topic=\"config\""));
+
+        // With documentation requests disabled the anchor survives as prose,
+        // because it advertises no control tag the decoder would reject.
+        let text_only = XmlPromptProtocol::with_capabilities(CapabilitySet::from_slice(&[
+            LlmCapability::TextMessage,
+        ]));
+        let narrowed = assembly.build_system_prompt(&*text_only);
+        assert!(narrowed.contains("tauqe.toml"));
+        assert!(!narrowed.contains("Self-Knowledge"));
+        assert!(!narrowed.contains("<doc_request"));
+
+        // Discussion mode renders the same authoritative anchor.
+        let mut discussion = PromptAssembly::new(None, 1, vec![], "git", "xml", None, None);
+        discussion.intent = TurnIntent::ReadonlyDiscussion;
+        let prompt = discussion.build_system_prompt(&XmlPromptProtocol);
+        assert!(prompt.contains("tauqe.toml"));
     }
 
     #[test]
@@ -769,14 +887,17 @@ mod tests {
         assembly.turn_scratchpad = Some("   ".to_string());
         assert!(assembly.format_scratchpad_block().is_none());
 
-        assembly.turn_scratchpad = Some("- Hypothesis: Foo needs Bar\n- Status: Inspecting bar.rs".to_string());
+        assembly.turn_scratchpad =
+            Some("- Hypothesis: Foo needs Bar\n- Status: Inspecting bar.rs".to_string());
         let block = assembly.format_scratchpad_block().unwrap();
         assert!(block.contains("<scratchpad>"));
         assert!(block.contains("- Hypothesis: Foo needs Bar"));
         assert!(block.contains("</scratchpad>"));
 
         let messages = assembly.assemble_chat_messages("Continue", &proto);
-        assert!(messages[0].content.contains("## Turn Scratchpad (Working Memory)"));
+        assert!(messages[0]
+            .content
+            .contains("## Turn Scratchpad (Working Memory)"));
         assert!(messages[0].content.contains("- Hypothesis: Foo needs Bar"));
     }
 

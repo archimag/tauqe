@@ -1,5 +1,5 @@
-use anyhow::{bail, Result};
 use crate::prompt::estimate_tokens_from_bytes;
+use anyhow::{bail, Result};
 use indexmap::IndexMap;
 use std::path::{Path, PathBuf};
 pub use tauqe_protocol::matches_glob_pattern;
@@ -224,71 +224,76 @@ impl ContextManager {
         layer: ContextLayer,
         recompute: bool,
     ) -> Result<ContextItem> {
-        let clean_path = self.normalize_path(relative_path)?;
-        verify_path_within_repo(&self.repo_root, &clean_path)?;
-        let full_path = self.repo_root.join(&clean_path);
+        // Symlink verification, existence checks, and metadata reads are
+        // blocking filesystem work, so the whole operation runs off the async
+        // executor thread. The nested pinned recomputation stays inline.
+        crate::blocking::run_blocking(|| {
+            let clean_path = self.normalize_path(relative_path)?;
+            verify_path_within_repo(&self.repo_root, &clean_path)?;
+            let full_path = self.repo_root.join(&clean_path);
 
-        if !full_path.is_file() {
-            bail!("File not found or is a directory: {}", clean_path);
-        }
-
-        let metadata = std::fs::metadata(&full_path)?;
-        let size_bytes = metadata.len();
-        let estimated_tokens = estimate_tokens_from_bytes(size_bytes);
-
-        let item = ContextItem {
-            path: clean_path.clone(),
-            access,
-            size_bytes,
-            estimated_tokens,
-            layer,
-        };
-
-        let changed = match layer {
-            ContextLayer::Pinned => store_item(&mut self.pinned, item.clone()),
-            ContextLayer::User => {
-                // Adding to the user layer promotes the path out of auto, so
-                // the eviction is itself a change.
-                let evicted = self.auto.shift_remove(&clean_path).is_some();
-                store_item(&mut self.user, item.clone()) || evicted
+            if !full_path.is_file() {
+                bail!("File not found or is a directory: {}", clean_path);
             }
-            ContextLayer::Auto => {
-                if let Some(user_item) = self.user.get_mut(&clean_path) {
-                    upgrade_access(user_item, access)
-                } else if let Some(pinned_item) = self.pinned.get(&clean_path).cloned() {
-                    // A pinned entry is owned by configuration and is always
-                    // present in context, so it must never be duplicated into
-                    // the auto layer. An editable request is persisted as a
-                    // user-layer override (mirroring set_access); a read-only
-                    // request matches the pinned base access and is a no-op.
-                    if access == ContextAccess::Editable
-                        && pinned_item.access != ContextAccess::Editable
-                    {
-                        let override_item = ContextItem {
-                            access: ContextAccess::Editable,
-                            layer: ContextLayer::User,
-                            ..pinned_item
-                        };
-                        store_item(&mut self.user, override_item)
-                    } else {
-                        false
-                    }
-                } else {
-                    store_item(&mut self.auto, item.clone())
+
+            let metadata = std::fs::metadata(&full_path)?;
+            let size_bytes = metadata.len();
+            let estimated_tokens = estimate_tokens_from_bytes(size_bytes);
+
+            let item = ContextItem {
+                path: clean_path.clone(),
+                access,
+                size_bytes,
+                estimated_tokens,
+                layer,
+            };
+
+            let changed = match layer {
+                ContextLayer::Pinned => store_item(&mut self.pinned, item.clone()),
+                ContextLayer::User => {
+                    // Adding to the user layer promotes the path out of auto, so
+                    // the eviction is itself a change.
+                    let evicted = self.auto.shift_remove(&clean_path).is_some();
+                    store_item(&mut self.user, item.clone()) || evicted
                 }
+                ContextLayer::Auto => {
+                    if let Some(user_item) = self.user.get_mut(&clean_path) {
+                        upgrade_access(user_item, access)
+                    } else if let Some(pinned_item) = self.pinned.get(&clean_path).cloned() {
+                        // A pinned entry is owned by configuration and is always
+                        // present in context, so it must never be duplicated into
+                        // the auto layer. An editable request is persisted as a
+                        // user-layer override (mirroring set_access); a read-only
+                        // request matches the pinned base access and is a no-op.
+                        if access == ContextAccess::Editable
+                            && pinned_item.access != ContextAccess::Editable
+                        {
+                            let override_item = ContextItem {
+                                access: ContextAccess::Editable,
+                                layer: ContextLayer::User,
+                                ..pinned_item
+                            };
+                            store_item(&mut self.user, override_item)
+                        } else {
+                            false
+                        }
+                    } else {
+                        store_item(&mut self.auto, item.clone())
+                    }
+                }
+            };
+
+            let pinned_changed = if recompute {
+                self.recompute_pinned()
+            } else {
+                false
+            };
+
+            if changed || pinned_changed {
+                self.revision += 1;
             }
-        };
-
-        let pinned_changed = if recompute {
-            self.recompute_pinned()
-        } else {
-            false
-        };
-
-        if changed || pinned_changed {
-            self.revision += 1;
-        }
-        Ok(item)
+            Ok(item)
+        })
     }
 
     pub fn add_auto_file(
@@ -417,24 +422,28 @@ impl ContextManager {
     }
 
     pub fn update_file_metadata(&mut self, relative_path: &str) -> Result<()> {
-        let clean_path = self.normalize_path(relative_path)?;
-        let full_path = self.repo_root.join(&clean_path);
-        let mut updated = false;
-        if let Ok(metadata) = std::fs::metadata(&full_path) {
-            let size = metadata.len();
-            let tokens = estimate_tokens_from_bytes(size);
-            for layer in [&mut self.pinned, &mut self.user, &mut self.auto] {
-                if let Some(item) = layer.get_mut(&clean_path) {
-                    item.size_bytes = size;
-                    item.estimated_tokens = tokens;
-                    updated = true;
+        // The metadata read is blocking filesystem work, so it runs off the
+        // async executor thread.
+        crate::blocking::run_blocking(|| {
+            let clean_path = self.normalize_path(relative_path)?;
+            let full_path = self.repo_root.join(&clean_path);
+            let mut updated = false;
+            if let Ok(metadata) = std::fs::metadata(&full_path) {
+                let size = metadata.len();
+                let tokens = estimate_tokens_from_bytes(size);
+                for layer in [&mut self.pinned, &mut self.user, &mut self.auto] {
+                    if let Some(item) = layer.get_mut(&clean_path) {
+                        item.size_bytes = size;
+                        item.estimated_tokens = tokens;
+                        updated = true;
+                    }
                 }
             }
-        }
-        if updated {
-            self.revision += 1;
-        }
-        Ok(())
+            if updated {
+                self.revision += 1;
+            }
+            Ok(())
+        })
     }
 
     /// Removes a path from the mutable context layers.
@@ -458,46 +467,50 @@ impl ContextManager {
 
     /// Renames a file in context, preserving its layer, access level, and metadata.
     pub fn rename_file(&mut self, from_relative: &str, to_relative: &str) -> Result<()> {
-        let clean_from = self.normalize_path(from_relative)?;
-        let clean_to = self.normalize_path(to_relative)?;
-        if clean_from == clean_to {
-            bail!("Source and destination paths are identical: {}", clean_from);
-        }
-
-        let mut found_item = None;
-        let mut found_layer = None;
-
-        if let Some(item) = self.user.shift_remove(&clean_from) {
-            found_item = Some(item);
-            found_layer = Some(ContextLayer::User);
-        } else if let Some(item) = self.auto.shift_remove(&clean_from) {
-            found_item = Some(item);
-            found_layer = Some(ContextLayer::Auto);
-        } else if self.pinned.contains_key(&clean_from) {
-            bail!("Pinned file '{}' cannot be renamed or moved", clean_from);
-        }
-
-        if let (Some(mut item), Some(layer)) = (found_item, found_layer) {
-            item.path = clean_to.clone();
-            let full_to = self.repo_root.join(&clean_to);
-            if let Ok(meta) = std::fs::metadata(&full_to) {
-                item.size_bytes = meta.len();
-                item.estimated_tokens = estimate_tokens_from_bytes(item.size_bytes);
+        // The destination metadata read is blocking filesystem work, so it runs
+        // off the async executor thread.
+        crate::blocking::run_blocking(|| {
+            let clean_from = self.normalize_path(from_relative)?;
+            let clean_to = self.normalize_path(to_relative)?;
+            if clean_from == clean_to {
+                bail!("Source and destination paths are identical: {}", clean_from);
             }
-            match layer {
-                ContextLayer::User => {
-                    self.user.insert(clean_to, item);
-                }
-                ContextLayer::Auto => {
-                    self.auto.insert(clean_to, item);
-                }
-                ContextLayer::Pinned => {}
-            }
-            self.recompute_pinned();
-            self.revision += 1;
-        }
 
-        Ok(())
+            let mut found_item = None;
+            let mut found_layer = None;
+
+            if let Some(item) = self.user.shift_remove(&clean_from) {
+                found_item = Some(item);
+                found_layer = Some(ContextLayer::User);
+            } else if let Some(item) = self.auto.shift_remove(&clean_from) {
+                found_item = Some(item);
+                found_layer = Some(ContextLayer::Auto);
+            } else if self.pinned.contains_key(&clean_from) {
+                bail!("Pinned file '{}' cannot be renamed or moved", clean_from);
+            }
+
+            if let (Some(mut item), Some(layer)) = (found_item, found_layer) {
+                item.path = clean_to.clone();
+                let full_to = self.repo_root.join(&clean_to);
+                if let Ok(meta) = std::fs::metadata(&full_to) {
+                    item.size_bytes = meta.len();
+                    item.estimated_tokens = estimate_tokens_from_bytes(item.size_bytes);
+                }
+                match layer {
+                    ContextLayer::User => {
+                        self.user.insert(clean_to, item);
+                    }
+                    ContextLayer::Auto => {
+                        self.auto.insert(clean_to, item);
+                    }
+                    ContextLayer::Pinned => {}
+                }
+                self.recompute_pinned();
+                self.revision += 1;
+            }
+
+            Ok(())
+        })
     }
 
     pub fn set_access(&mut self, relative_path: &str, access: ContextAccess) -> Result<bool> {
@@ -540,92 +553,101 @@ impl ContextManager {
 
     /// Prunes files from context that no longer exist on disk (e.g. after undoing AI creation).
     pub fn prune_missing_files(&mut self) -> Vec<String> {
-        let mut removed = Vec::new();
-        let prune_layer = |layer: &mut IndexMap<String, ContextItem>, root: &Path| -> Vec<String> {
-            let to_remove: Vec<String> = layer
-                .keys()
-                .filter(|p| !root.join(p).is_file())
-                .cloned()
-                .collect();
-            for p in &to_remove {
-                layer.shift_remove(p);
+        // Existence checks against every context path are blocking filesystem
+        // work, so the prune runs off the async executor thread.
+        crate::blocking::run_blocking(|| {
+            let mut removed = Vec::new();
+            let prune_layer =
+                |layer: &mut IndexMap<String, ContextItem>, root: &Path| -> Vec<String> {
+                    let to_remove: Vec<String> = layer
+                        .keys()
+                        .filter(|p| !root.join(p).is_file())
+                        .cloned()
+                        .collect();
+                    for p in &to_remove {
+                        layer.shift_remove(p);
+                    }
+                    to_remove
+                };
+
+            removed.extend(prune_layer(&mut self.pinned, &self.repo_root));
+            removed.extend(prune_layer(&mut self.user, &self.repo_root));
+            removed.extend(prune_layer(&mut self.auto, &self.repo_root));
+
+            let pinned_changed = self.recompute_pinned();
+
+            if !removed.is_empty() || pinned_changed {
+                self.revision += 1;
             }
-            to_remove
-        };
 
-        removed.extend(prune_layer(&mut self.pinned, &self.repo_root));
-        removed.extend(prune_layer(&mut self.user, &self.repo_root));
-        removed.extend(prune_layer(&mut self.auto, &self.repo_root));
-
-        let pinned_changed = self.recompute_pinned();
-
-        if !removed.is_empty() || pinned_changed {
-            self.revision += 1;
-        }
-
-        removed
+            removed
+        })
     }
 
     /// Merges updates produced by a workflow run into the current context manager.
     /// Preserves user layer changes made concurrently. Updates the auto layer,
     /// syncs file renames/removals, and refreshes metadata.
     pub fn merge_turn_context(&mut self, turn_context: &ContextManager) {
-        let mut changed = false;
+        // The prune and the metadata refresh both touch the filesystem, so the
+        // whole merge runs off the async executor thread.
+        crate::blocking::run_blocking(|| {
+            let mut changed = false;
 
-        // 1. Sync auto layer: replace with turn_context.auto (excluding any path
-        // already in the user layer).
-        let previous_auto = std::mem::take(&mut self.auto);
-        for (path, item) in &turn_context.auto {
-            if !self.user.contains_key(path) {
-                self.auto.insert(path.clone(), item.clone());
+            // 1. Sync auto layer: replace with turn_context.auto (excluding any path
+            // already in the user layer).
+            let previous_auto = std::mem::take(&mut self.auto);
+            for (path, item) in &turn_context.auto {
+                if !self.user.contains_key(path) {
+                    self.auto.insert(path.clone(), item.clone());
+                }
             }
-        }
-        changed |= previous_auto != self.auto;
+            changed |= previous_auto != self.auto;
 
-        // 2. Remove files that no longer exist on disk (prunes deleted files).
-        // The prune advances the revision itself when it drops anything, so its
-        // outcome is not counted again here.
-        self.prune_missing_files();
+            // 2. Remove files that no longer exist on disk (prunes deleted files).
+            // The prune advances the revision itself when it drops anything, so its
+            // outcome is not counted again here.
+            self.prune_missing_files();
 
-        // 3. Mirror any file renamed/moved into the user layer by the turn and
-        // sync access upgrades from the turn. The pinned layer is configuration
-        // owned and is never upgraded at runtime, so it needs no sync here.
-        for (path, item) in &turn_context.user {
-            if let Some(existing) = self.user.get_mut(path) {
-                if existing.access == ContextAccess::ReadOnly
-                    && item.access == ContextAccess::Editable
-                {
-                    existing.access = ContextAccess::Editable;
+            // 3. Mirror any file renamed/moved into the user layer by the turn and
+            // sync access upgrades from the turn. The pinned layer is configuration
+            // owned and is never upgraded at runtime, so it needs no sync here.
+            for (path, item) in &turn_context.user {
+                if let Some(existing) = self.user.get_mut(path) {
+                    if existing.access == ContextAccess::ReadOnly
+                        && item.access == ContextAccess::Editable
+                    {
+                        existing.access = ContextAccess::Editable;
+                        changed = true;
+                    }
+                } else if self.repo_root.join(path).is_file() {
+                    self.user.insert(path.clone(), item.clone());
                     changed = true;
                 }
-            } else if self.repo_root.join(path).is_file() {
-                self.user.insert(path.clone(), item.clone());
-                changed = true;
             }
-        }
 
-        // Recompute hierarchical pinned files after merging user and auto layers.
-        changed |= self.recompute_pinned();
+            // Recompute hierarchical pinned files after merging user and auto layers.
+            changed |= self.recompute_pinned();
 
-        // 4. Refresh metadata for all files in context.
-        for layer in [&mut self.pinned, &mut self.user, &mut self.auto] {
-            for (path, item) in layer.iter_mut() {
-                let full_path = self.repo_root.join(path);
-                if let Ok(meta) = std::fs::metadata(&full_path) {
-                    let size = meta.len();
-                    let tokens = estimate_tokens_from_bytes(size);
-                    if item.size_bytes != size || item.estimated_tokens != tokens {
-                        item.size_bytes = size;
-                        item.estimated_tokens = tokens;
-                        changed = true;
+            // 4. Refresh metadata for all files in context.
+            for layer in [&mut self.pinned, &mut self.user, &mut self.auto] {
+                for (path, item) in layer.iter_mut() {
+                    let full_path = self.repo_root.join(path);
+                    if let Ok(meta) = std::fs::metadata(&full_path) {
+                        let size = meta.len();
+                        let tokens = estimate_tokens_from_bytes(size);
+                        if item.size_bytes != size || item.estimated_tokens != tokens {
+                            item.size_bytes = size;
+                            item.estimated_tokens = tokens;
+                            changed = true;
+                        }
                     }
                 }
             }
-        }
 
-        if changed {
-            self.revision += 1;
-        }
+            if changed {
+                self.revision += 1;
+            }
+        })
     }
 }
 
@@ -708,7 +730,8 @@ mod tests {
 
         let mut cm = ContextManager::new(root.clone());
         cm.load_pinned(&["pinned.rs".to_string()]);
-        cm.add_auto_file("auto.rs", ContextAccess::ReadOnly).unwrap();
+        cm.add_auto_file("auto.rs", ContextAccess::ReadOnly)
+            .unwrap();
 
         // Pinned is read-only
         assert!(!cm.is_editable("pinned.rs").unwrap());
@@ -736,7 +759,9 @@ mod tests {
         std::fs::write(root.join("user_added.rs"), "fn user_added() {}").unwrap();
 
         let mut primary = ContextManager::new(root.clone());
-        primary.add_file("base.rs", ContextAccess::Editable).unwrap();
+        primary
+            .add_file("base.rs", ContextAccess::Editable)
+            .unwrap();
 
         // Turn starts with a snapshot
         let mut turn_snapshot = primary.clone();
@@ -790,7 +815,8 @@ mod tests {
         cm.add_file("file.rs", ContextAccess::ReadOnly).unwrap();
         assert!(!cm.is_editable("file.rs").unwrap());
 
-        cm.add_auto_file("file.rs", ContextAccess::Editable).unwrap();
+        cm.add_auto_file("file.rs", ContextAccess::Editable)
+            .unwrap();
         assert!(cm.is_editable("file.rs").unwrap());
     }
 
@@ -801,7 +827,9 @@ mod tests {
         std::fs::write(root.join("file.rs"), "fn test() {}").unwrap();
 
         let mut primary = ContextManager::new(root);
-        primary.add_file("file.rs", ContextAccess::ReadOnly).unwrap();
+        primary
+            .add_file("file.rs", ContextAccess::ReadOnly)
+            .unwrap();
 
         let mut turn_snapshot = primary.clone();
         turn_snapshot
@@ -824,7 +852,8 @@ mod tests {
         let mut cm = ContextManager::new(root);
         cm.load_pinned(&["pinned.rs".to_string()]);
         cm.add_file("user.rs", ContextAccess::ReadOnly).unwrap();
-        cm.add_auto_file("auto.rs", ContextAccess::ReadOnly).unwrap();
+        cm.add_auto_file("auto.rs", ContextAccess::ReadOnly)
+            .unwrap();
 
         assert_eq!(cm.auto_files(), vec!["auto.rs".to_string()]);
 
@@ -848,7 +877,8 @@ mod tests {
         std::fs::write(root.join("auto.rs"), "fn auto() {}").unwrap();
 
         let mut cm = ContextManager::new(root);
-        cm.add_auto_file("auto.rs", ContextAccess::ReadOnly).unwrap();
+        cm.add_auto_file("auto.rs", ContextAccess::ReadOnly)
+            .unwrap();
         let rev_before = cm.get_state().revision;
 
         // Dropping non-existent path doesn't change revision
@@ -872,7 +902,9 @@ mod tests {
 
         let mut primary = ContextManager::new(root.clone());
         primary.load_pinned(&["pinned.rs".to_string()]);
-        primary.add_file("user.rs", ContextAccess::ReadOnly).unwrap();
+        primary
+            .add_file("user.rs", ContextAccess::ReadOnly)
+            .unwrap();
         primary
             .add_auto_file("auto1.rs", ContextAccess::ReadOnly)
             .unwrap();
@@ -880,7 +912,8 @@ mod tests {
         let mut turn = primary.clone();
         // During turn, auto1 is dropped/evicted, auto2 is added
         turn.drop_auto_file("auto1.rs").unwrap();
-        turn.add_auto_file("auto2.rs", ContextAccess::ReadOnly).unwrap();
+        turn.add_auto_file("auto2.rs", ContextAccess::ReadOnly)
+            .unwrap();
 
         primary.merge_turn_context(&turn);
 
@@ -904,7 +937,8 @@ mod tests {
         let mut cm = ContextManager::new(root);
         cm.load_pinned(&["pinned.rs".to_string()]);
         cm.add_file("user.rs", ContextAccess::Editable).unwrap();
-        cm.add_auto_file("auto.rs", ContextAccess::ReadOnly).unwrap();
+        cm.add_auto_file("auto.rs", ContextAccess::ReadOnly)
+            .unwrap();
 
         let rev_before = cm.get_state().revision;
         cm.clear_user();
@@ -922,7 +956,8 @@ mod tests {
         std::fs::write(root.join("auto.rs"), "fn auto() {}").unwrap();
 
         let mut cm = ContextManager::new(root);
-        cm.add_auto_file("auto.rs", ContextAccess::ReadOnly).unwrap();
+        cm.add_auto_file("auto.rs", ContextAccess::ReadOnly)
+            .unwrap();
         let rev_before = cm.get_state().revision;
 
         cm.clear_user();
@@ -944,8 +979,10 @@ mod tests {
         // Insertion order deliberately contradicts alphabetical order.
         cm.add_file("zeta.rs", ContextAccess::ReadOnly).unwrap();
         cm.add_file("alpha.rs", ContextAccess::ReadOnly).unwrap();
-        cm.add_auto_file("beta.rs", ContextAccess::ReadOnly).unwrap();
-        cm.add_auto_file("gamma.rs", ContextAccess::ReadOnly).unwrap();
+        cm.add_auto_file("beta.rs", ContextAccess::ReadOnly)
+            .unwrap();
+        cm.add_auto_file("gamma.rs", ContextAccess::ReadOnly)
+            .unwrap();
 
         let state = cm.get_state();
         let paths: Vec<&str> = state.items.iter().map(|i| i.path.as_str()).collect();

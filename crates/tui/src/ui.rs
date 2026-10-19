@@ -10,6 +10,7 @@ pub mod footer;
 pub mod format;
 pub mod geometry;
 pub mod header;
+pub mod table;
 pub mod wrap;
 
 use crate::dialogs::render::{
@@ -109,7 +110,9 @@ pub fn render_ui(frame: &mut ratatui::Frame, state: &mut AppState) {
     let (prompt_lines, cursor_visual_line, bottom_height) = if state.view_mode == ViewMode::Repl {
         let max_input_height = (term_height * 4 / 10).clamp(6, 16);
         let inner_input_width = (term_width.saturating_sub(2)) as usize;
-        let (lines, cursor) = state.input_editor.build_prompt_lines(inner_input_width, is_busy);
+        let (lines, cursor) = state
+            .input_editor
+            .build_prompt_lines(inner_input_width, is_busy);
         let height = (lines.len() as u16 + 2).max(3).min(max_input_height);
         (lines, cursor, height)
     } else if compact {
@@ -259,7 +262,12 @@ pub fn render_ui(frame: &mut ratatui::Frame, state: &mut AppState) {
         }
         Some(ActiveModal::UsageSummary) => {
             if let Some(summary) = state.usage_summary.as_mut() {
-                render_usage_summary(frame, &state.model.usage_totals, &mut summary.scroll);
+                render_usage_summary(
+                    frame,
+                    &state.model.usage_totals,
+                    state.model.repomap_tokens,
+                    &mut summary.scroll,
+                );
             }
         }
         Some(ActiveModal::Help) => {

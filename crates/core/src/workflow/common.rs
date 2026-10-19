@@ -1,5 +1,5 @@
-use tokio::sync::{mpsc, watch};
 use tauqe_protocol::{EditOperation, ModelResult};
+use tokio::sync::{mpsc, watch};
 
 use tauqe_protocol::ModelRef;
 
@@ -209,12 +209,9 @@ pub fn record_workflow_response(
                 None
             };
 
-            if let Err(err) = history_manager.record_response(
-                &msg,
-                commit,
-                Some(summary.clone()),
-                files,
-            ) {
+            if let Err(err) =
+                history_manager.record_response(&msg, commit, Some(summary.clone()), files)
+            {
                 tracing::warn!(
                     "Failed to record the assistant response in session history: {}",
                     err
@@ -234,9 +231,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut hm = HistoryManager::new(dir.path().to_path_buf());
         hm.record_turn("Prompt 1", vec![]).unwrap();
-        hm.record_response("Resp 1".to_string(), None, None, vec![]).unwrap();
+        hm.record_response("Resp 1".to_string(), None, None, vec![])
+            .unwrap();
         hm.record_turn("Prompt 2", vec![]).unwrap();
-        hm.record_response("Resp 2".to_string(), None, None, vec![]).unwrap();
+        hm.record_response("Resp 2".to_string(), None, None, vec![])
+            .unwrap();
 
         let provider = crate::providers::mock::MockLlmProvider::scripted([
             crate::providers::mock::MockResponse::error("Connection reset"),
@@ -244,12 +243,17 @@ mod tests {
         let model = ModelRef::openrouter("mock/model");
         let (_cancel_tx, cancel_rx) = watch::channel(false);
 
-        let res = compact_history_if_needed_with_budget(&mut hm, &provider, &model, cancel_rx, 1, 1).await;
+        let res =
+            compact_history_if_needed_with_budget(&mut hm, &provider, &model, cancel_rx, 1, 1)
+                .await;
         assert!(res.is_ok());
 
         let entries = hm.get_entries().unwrap();
         assert_eq!(entries.len(), 4);
-        assert!(!matches!(entries[0], crate::history::entry::HistoryEntry::Summary { .. }));
+        assert!(!matches!(
+            entries[0],
+            crate::history::entry::HistoryEntry::Summary { .. }
+        ));
     }
 
     #[tokio::test]
@@ -257,9 +261,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut hm = HistoryManager::new(dir.path().to_path_buf());
         hm.record_turn("Prompt 1", vec![]).unwrap();
-        hm.record_response("Resp 1".to_string(), None, None, vec![]).unwrap();
+        hm.record_response("Resp 1".to_string(), None, None, vec![])
+            .unwrap();
         hm.record_turn("Prompt 2", vec![]).unwrap();
-        hm.record_response("Resp 2".to_string(), None, None, vec![]).unwrap();
+        hm.record_response("Resp 2".to_string(), None, None, vec![])
+            .unwrap();
 
         let provider = crate::providers::mock::MockLlmProvider::scripted([
             crate::providers::mock::MockResponse::text("Partial summary that was cut off"),
@@ -267,12 +273,17 @@ mod tests {
         let model = ModelRef::openrouter("mock/model");
         let (_cancel_tx, cancel_rx) = watch::channel(true);
 
-        let res = compact_history_if_needed_with_budget(&mut hm, &provider, &model, cancel_rx, 1, 1).await;
+        let res =
+            compact_history_if_needed_with_budget(&mut hm, &provider, &model, cancel_rx, 1, 1)
+                .await;
         assert!(res.is_ok());
 
         let entries = hm.get_entries().unwrap();
         assert_eq!(entries.len(), 4);
-        assert!(!matches!(entries[0], crate::history::entry::HistoryEntry::Summary { .. }));
+        assert!(!matches!(
+            entries[0],
+            crate::history::entry::HistoryEntry::Summary { .. }
+        ));
     }
 
     #[test]
@@ -358,11 +369,7 @@ mod tests {
         let entries = hm.get_entries().unwrap();
         assert_eq!(entries.len(), 1);
         match &entries[0] {
-            crate::history::entry::HistoryEntry::Response {
-                message,
-                files,
-                ..
-            } => {
+            crate::history::entry::HistoryEntry::Response { message, files, .. } => {
                 assert_eq!(message, "Need file a.rs\n\nUpdated file a.rs");
                 assert_eq!(files, &vec!["[EDIT] a.rs"]);
                 assert!(!message.contains("changes"));

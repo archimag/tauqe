@@ -3,17 +3,22 @@ use ratatui::style::{Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 
+use super::editor_lines;
 use crate::components::modal::render_dialog_footer;
 use crate::config::PrimaryModifier;
 use crate::i18n::active_t;
 use crate::theme::engine::current_engine;
 use crate::ui::centered_rect;
-use super::editor_lines;
 
 /// Width of the review launch dialog, as a percentage of the terminal width.
 pub const REVIEW_DIALOG_WIDTH: u16 = 64;
 /// Height of the review launch dialog, as a percentage of the terminal height.
-pub const REVIEW_DIALOG_HEIGHT: u16 = 54;
+///
+/// The card stacks five heterogeneous zones — header, reviewer list, target
+/// field, instructions editor — with one blank row between each of them, plus
+/// the action bar and its docked hint strip. It is therefore taller than a plain
+/// form dialog so the air never costs a section (Conventions §6.7).
+pub const REVIEW_DIALOG_HEIGHT: u16 = 70;
 /// Full drawn confirm-button label, resolved from the runtime locale.
 ///
 /// Rendering and mouse hit-testing both measure this label, so the clickable
@@ -172,7 +177,9 @@ pub fn render_review_dialog(
             list_inner,
         );
     } else {
-        let rows = dialog.selector.render_list_lines(list_inner.height as usize);
+        let rows = dialog
+            .selector
+            .render_list_lines(list_inner.height as usize);
         frame.render_widget(Paragraph::new(rows), list_inner);
     }
 
@@ -256,19 +263,33 @@ pub fn render_review_dialog(
     let (confirm_style, cancel_style) = if in_actions {
         if confirm_selected {
             (
-                engine.bg(palette.status_success).fg(engine.color(palette.text_inverse)).bold(),
-                engine.bg(palette.button_bg).fg(engine.color(palette.button_fg)),
+                engine
+                    .bg(palette.status_success)
+                    .fg(engine.color(palette.text_inverse))
+                    .bold(),
+                engine
+                    .bg(palette.button_bg)
+                    .fg(engine.color(palette.button_fg)),
             )
         } else {
             (
-                engine.bg(palette.button_bg).fg(engine.color(palette.button_fg)),
-                engine.bg(palette.button_active_bg).fg(engine.color(palette.text_inverse)).bold(),
+                engine
+                    .bg(palette.button_bg)
+                    .fg(engine.color(palette.button_fg)),
+                engine
+                    .bg(palette.button_active_bg)
+                    .fg(engine.color(palette.text_inverse))
+                    .bold(),
             )
         }
     } else {
         (
-            engine.bg(palette.button_bg).fg(engine.color(palette.button_fg)),
-            engine.bg(palette.button_bg).fg(engine.color(palette.button_fg)),
+            engine
+                .bg(palette.button_bg)
+                .fg(engine.color(palette.button_fg)),
+            engine
+                .bg(palette.button_bg)
+                .fg(engine.color(palette.button_fg)),
         )
     };
     let nav_hint = if dialog.focus.is_actions() {
@@ -322,9 +343,12 @@ mod tests {
         assert!(geo.editor_area.bottom() <= geo.area.bottom());
     }
 
+    /// The reserved single-line path field is fully visible on a normal terminal,
+    /// and every neighbouring section is separated by exactly one blank row
+    /// inside the card's air-aware body (Conventions §6.7, §6.8).
     #[test]
-    fn test_review_dialog_chunks_reserve_path_field_between_list_and_editor() {
-        let term = Rect::new(0, 0, 120, 40);
+    fn test_review_dialog_chunks_keep_air_between_sections() {
+        let term = Rect::new(0, 0, 120, 50);
         let area = centered_rect(REVIEW_DIALOG_WIDTH, REVIEW_DIALOG_HEIGHT, term);
         let super::super::PickerDialogChunks {
             header,
@@ -340,19 +364,25 @@ mod tests {
             super::super::PICKER_DIALOG_PATH_HEIGHT,
         );
 
-        // The reserved single-line path field is fully visible on a normal terminal.
         assert_eq!(path.height, super::super::PICKER_DIALOG_PATH_HEIGHT);
 
-        // The interior stacks top-to-bottom without gaps or overlap, and the
-        // footer block ends in a one-row docked hint strip.
-        assert_eq!(header.y, area.y + 1);
-        assert_eq!(list.y, header.y + header.height);
-        assert_eq!(path.y, list.y + list.height);
-        assert_eq!(editor.y, path.y + path.height);
-        assert_eq!(buttons.y, editor.y + editor.height);
+        // One blank row under the border title and one column of margin on each
+        // side, so no section presses against the card frame.
+        assert_eq!(header.y, area.y + 2, "border + top inset");
+        assert_eq!(header.x, area.x + 2, "border + horizontal padding");
+        assert_eq!(header.width, area.width - 4);
+
+        // Header, list, path field, and editor are four separate zones.
+        assert_eq!(list.y, header.y + header.height + 1);
+        assert_eq!(path.y, list.y + list.height + 1);
+        assert_eq!(editor.y, path.y + path.height + 1);
+        assert!(editor.height > 0);
+
+        // The action bar never touches the editor, and the hint strip is docked
+        // to the bottom inner row.
+        assert_eq!(buttons.y, editor.y + editor.height + 1, "pre-action spacer");
         assert_eq!(footer.y, buttons.y + buttons.height);
-        assert!(footer.y + footer.height <= area.bottom());
-        assert!(path.width > 0 && editor.height > 0);
         assert_eq!(footer.height, 1, "docked hint strip is one row");
+        assert_eq!(footer.y + footer.height, area.bottom() - 1);
     }
 }

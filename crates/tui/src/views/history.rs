@@ -205,7 +205,9 @@ impl HistoryViewState {
         // Fold state and cached bodies of the removed head entries are stale.
         let live: HashSet<u64> = self.items.iter().map(|it| it.id).collect();
         self.expanded_items.retain(|id| live.contains(id));
-        self.body_cache.entries.retain(|(id, _), _| live.contains(id));
+        self.body_cache
+            .entries
+            .retain(|(id, _), _| live.contains(id));
 
         // Recompute geometry against the new item set and re-anchor the viewport.
         let max_width = Some(self.content_width);
@@ -248,7 +250,9 @@ impl HistoryViewState {
         if self.items.is_empty() || view_height == 0 {
             return;
         }
-        let sel = self.selected_item_index.min(self.items.len().saturating_sub(1));
+        let sel = self
+            .selected_item_index
+            .min(self.items.len().saturating_sub(1));
         self.selected_item_index = sel;
         let (total_lines, offsets) = self.layout_offsets(max_width, Some(sel));
         let max_scroll = clamp_u16(total_lines).saturating_sub(view_height);
@@ -282,7 +286,9 @@ impl HistoryViewState {
         if self.items.is_empty() || view_height == 0 {
             return;
         }
-        let sel = self.selected_item_index.min(self.items.len().saturating_sub(1));
+        let sel = self
+            .selected_item_index
+            .min(self.items.len().saturating_sub(1));
         self.selected_item_index = sel;
         let (total_lines, offsets) = self.layout_offsets(max_width, Some(sel));
         let max_scroll = clamp_u16(total_lines).saturating_sub(view_height);
@@ -304,7 +310,8 @@ impl HistoryViewState {
                     // Center in window
                     let center_scroll = (start_offset as isize + (item_height as isize / 2)
                         - (view_height as isize / 2))
-                        .clamp(0, max_scroll as isize) as u16;
+                        .clamp(0, max_scroll as isize)
+                        as u16;
                     self.scroll = center_scroll;
                 }
                 1 => {
@@ -314,18 +321,15 @@ impl HistoryViewState {
                 _ => {
                     // Align to bottom
                     let bottom_scroll = (next_offset as isize - view_height as isize)
-                        .clamp(0, max_scroll as isize) as u16;
+                        .clamp(0, max_scroll as isize)
+                        as u16;
                     self.scroll = bottom_scroll;
                 }
             }
         }
     }
 
-    pub fn update_selected_item_from_scroll(
-        &mut self,
-        view_height: u16,
-        max_width: Option<usize>,
-    ) {
+    pub fn update_selected_item_from_scroll(&mut self, view_height: u16, max_width: Option<usize>) {
         if self.items.is_empty() {
             return;
         }
@@ -348,7 +352,10 @@ impl HistoryViewState {
     }
 }
 
-pub fn compute_history_items_line_count(items: &[UiHistoryItem], max_width: Option<usize>) -> usize {
+pub fn compute_history_items_line_count(
+    items: &[UiHistoryItem],
+    max_width: Option<usize>,
+) -> usize {
     compute_history_lines(items, max_width, None, None).len()
 }
 
@@ -358,7 +365,8 @@ pub fn compute_history_lines(
     selected_index: Option<usize>,
     expanded_items: Option<&HashSet<u64>>,
 ) -> Vec<Line<'static>> {
-    let (lines, _) = compute_history_lines_with_offsets(items, max_width, selected_index, expanded_items);
+    let (lines, _) =
+        compute_history_lines_with_offsets(items, max_width, selected_index, expanded_items);
     lines
 }
 
@@ -536,19 +544,24 @@ fn build_item_body(
                     ),
                 ]));
                 for file_entry in &item.files {
-                    let (op_label, op_style, path) = if let Some(p) = file_entry.strip_prefix("[NEW] ") {
-                        ("[NEW] ", engine.fg(palette.status_success).bold(), p)
-                    } else if let Some(p) = file_entry.strip_prefix("[DEL] ") {
-                        ("[DEL] ", engine.fg(palette.status_error).bold(), p)
-                    } else if let Some(p) = file_entry.strip_prefix("[OVERWRITE] ") {
-                        ("[OVERWRITE] ", engine.fg(palette.status_warning).bold(), p)
-                    } else if let Some(p) = file_entry.strip_prefix("[MOVE] ") {
-                        ("[MOVE] ", engine.fg(palette.status_info).bold(), p)
-                    } else if let Some(p) = file_entry.strip_prefix("[EDIT] ") {
-                        ("[EDIT] ", engine.fg(palette.button_active_bg).bold(), p)
-                    } else {
-                        ("• ", engine.fg(palette.status_warning).bold(), file_entry.as_str())
-                    };
+                    let (op_label, op_style, path) =
+                        if let Some(p) = file_entry.strip_prefix("[NEW] ") {
+                            ("[NEW] ", engine.fg(palette.status_success).bold(), p)
+                        } else if let Some(p) = file_entry.strip_prefix("[DEL] ") {
+                            ("[DEL] ", engine.fg(palette.status_error).bold(), p)
+                        } else if let Some(p) = file_entry.strip_prefix("[OVERWRITE] ") {
+                            ("[OVERWRITE] ", engine.fg(palette.status_warning).bold(), p)
+                        } else if let Some(p) = file_entry.strip_prefix("[MOVE] ") {
+                            ("[MOVE] ", engine.fg(palette.status_info).bold(), p)
+                        } else if let Some(p) = file_entry.strip_prefix("[EDIT] ") {
+                            ("[EDIT] ", engine.fg(palette.button_active_bg).bold(), p)
+                        } else {
+                            (
+                                "• ",
+                                engine.fg(palette.status_warning).bold(),
+                                file_entry.as_str(),
+                            )
+                        };
 
                     raw_lines.push(Line::from(vec![
                         Span::raw("    "),
@@ -573,7 +586,10 @@ fn build_item_body(
         let preview_slice = &all_raw_lines[..total_text_lines.min(COLLAPSED_PREVIEW_LINES)];
 
         for line in preview_slice {
-            raw_lines.push(Line::from(Span::styled(format!("    {}", line), text_style)));
+            raw_lines.push(Line::from(Span::styled(
+                format!("    {}", line),
+                text_style,
+            )));
         }
 
         let extra_lines = total_text_lines.saturating_sub(COLLAPSED_PREVIEW_LINES);
@@ -608,7 +624,8 @@ fn build_item_body(
     for block in extracted_blocks {
         let raw_start = md_start_idx + block.start_line;
         let raw_end = md_start_idx + block.end_line;
-        if let (Some(start), Some(end)) = (raw_to_visual.get(raw_start), raw_to_visual.get(raw_end)) {
+        if let (Some(start), Some(end)) = (raw_to_visual.get(raw_start), raw_to_visual.get(raw_end))
+        {
             blocks.push(CachedCodeBlock {
                 block_id: block.id,
                 lang: block.lang,
@@ -657,19 +674,23 @@ fn layout_history(
         offsets.push(all_lines.len());
 
         let is_selected = selected_index == Some(idx);
-        let is_expanded = expanded_items.map(|set| set.contains(&item.id)).unwrap_or(false);
+        let is_expanded = expanded_items
+            .map(|set| set.contains(&item.id))
+            .unwrap_or(false);
         all_lines.extend(wrap_one(
             build_item_header(item, is_selected, is_expanded, theme_mode),
             max_width,
         ));
 
-        let flash_id = flashing_block.and_then(|(i_id, b_id)| {
-            if i_id == item.id {
-                Some(b_id)
-            } else {
-                None
-            }
-        });
+        let flash_id = flashing_block.and_then(
+            |(i_id, b_id)| {
+                if i_id == item.id {
+                    Some(b_id)
+                } else {
+                    None
+                }
+            },
+        );
 
         // Items with an active copy flash are rendered fresh so the cache never stores flash styling.
         let uncached;
@@ -730,14 +751,28 @@ mod tests {
             })
             .collect();
 
-        assert!(rendered.iter().any(|line| line.contains("[COMMIT: abcdef1]")));
+        assert!(rendered
+            .iter()
+            .any(|line| line.contains("[COMMIT: abcdef1]")));
         assert!(rendered.iter().any(|line| line.contains("Refactoring")));
-        assert!(rendered.iter().any(|line| line.contains("Updated codebase")));
-        assert!(rendered.iter().any(|line| line.contains("Modified files (4):")));
-        assert!(rendered.iter().any(|line| line.contains("[EDIT] ") && line.contains("src/main.rs")));
-        assert!(rendered.iter().any(|line| line.contains("[NEW] ") && line.contains("src/util.rs")));
-        assert!(rendered.iter().any(|line| line.contains("[DEL] ") && line.contains("src/old.rs")));
-        assert!(rendered.iter().any(|line| line.contains("[MOVE] ") && line.contains("src/prev.rs -> src/next.rs")));
+        assert!(rendered
+            .iter()
+            .any(|line| line.contains("Updated codebase")));
+        assert!(rendered
+            .iter()
+            .any(|line| line.contains("Modified files (4):")));
+        assert!(rendered
+            .iter()
+            .any(|line| line.contains("[EDIT] ") && line.contains("src/main.rs")));
+        assert!(rendered
+            .iter()
+            .any(|line| line.contains("[NEW] ") && line.contains("src/util.rs")));
+        assert!(rendered
+            .iter()
+            .any(|line| line.contains("[DEL] ") && line.contains("src/old.rs")));
+        assert!(rendered
+            .iter()
+            .any(|line| line.contains("[MOVE] ") && line.contains("src/prev.rs -> src/next.rs")));
     }
 
     #[test]
@@ -763,12 +798,16 @@ mod tests {
             })
             .collect();
 
-        assert!(rendered.iter().any(|line| line.contains("▶ ") && line.contains("[ASSISTANT]")));
+        assert!(rendered
+            .iter()
+            .any(|line| line.contains("▶ ") && line.contains("[ASSISTANT]")));
         assert!(rendered.iter().any(|line| line.contains("Line 1")));
         assert!(rendered.iter().any(|line| line.contains("Line 2")));
         assert!(rendered.iter().any(|line| line.contains("Line 3")));
         assert!(!rendered.iter().any(|line| line.contains("Line 5")));
-        assert!(rendered.iter().any(|line| line.contains("[+2 more lines, 1 modified files]")));
+        assert!(rendered
+            .iter()
+            .any(|line| line.contains("[+2 more lines, 1 modified files]")));
     }
 
     #[test]
@@ -788,7 +827,11 @@ mod tests {
 
         assert!(wrapped.len() > unwrapped.len());
         for line in &wrapped {
-            assert!(line.width() <= 40, "Line width {} exceeds max_width 40", line.width());
+            assert!(
+                line.width() <= 40,
+                "Line width {} exceeds max_width 40",
+                line.width()
+            );
         }
     }
 
@@ -944,7 +987,10 @@ mod tests {
         assert_eq!(st.items[0].kind, UiHistoryKind::System);
         assert_eq!(st.total_count, 3);
         assert_eq!(st.estimated_tokens, 256);
-        assert!(!st.expanded_items.contains(&2), "head fold state is dropped");
+        assert!(
+            !st.expanded_items.contains(&2),
+            "head fold state is dropped"
+        );
         assert!(st.expanded_items.contains(&4), "tail fold state survives");
         assert!(
             !st.body_cache.entries.keys().any(|(id, _)| *id == 2),

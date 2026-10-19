@@ -200,10 +200,16 @@ pub fn execute_review_params(state: &AppState) -> Option<ConfirmModalParams<'_>>
                 active_t("dialog.execute_review.scope_label"),
                 engine.fg(palette.text_muted),
             ),
-            Span::styled(&target.scope_title, engine.fg(palette.status_warning).bold()),
             Span::styled(
-                active_t("dialog.execute_review.scope_count")
-                    .replacen("{}", &target.items.len().to_string(), 1),
+                &target.scope_title,
+                engine.fg(palette.status_warning).bold(),
+            ),
+            Span::styled(
+                active_t("dialog.execute_review.scope_count").replacen(
+                    "{}",
+                    &target.items.len().to_string(),
+                    1,
+                ),
                 engine.fg(palette.text_primary),
             ),
         ]),
@@ -281,8 +287,11 @@ pub fn execute_review_params(state: &AppState) -> Option<ConfirmModalParams<'_>>
         }
         if target.items.len() > 4 {
             body_lines.push(Line::from(Span::styled(
-                active_t("dialog.execute_review.queue_more")
-                    .replacen("{}", &(target.items.len() - 4).to_string(), 1),
+                active_t("dialog.execute_review.queue_more").replacen(
+                    "{}",
+                    &(target.items.len() - 4).to_string(),
+                    1,
+                ),
                 engine.fg(palette.text_muted).italic(),
             )));
         }
@@ -422,7 +431,10 @@ pub fn render_execute_review_dialog(frame: &mut ratatui::Frame, state: &AppState
     frame.render_widget(Clear, area);
 
     let outer_block = Block::default()
-        .title(format!(" {} ", active_t("dialog.execute_review.title_point")))
+        .title(format!(
+            " {} ",
+            active_t("dialog.execute_review.title_point")
+        ))
         .borders(Borders::ALL)
         .border_style(engine.fg(palette.button_active_bg))
         .style(Style::default().bg(engine.color(palette.surface)));
@@ -509,7 +521,9 @@ pub fn render_execute_review_dialog(frame: &mut ratatui::Frame, state: &AppState
             list_inner,
         );
     } else {
-        let rows = target.selector.render_list_lines(list_inner.height as usize);
+        let rows = target
+            .selector
+            .render_list_lines(list_inner.height as usize);
         frame.render_widget(Paragraph::new(rows), list_inner);
     }
 
@@ -653,17 +667,26 @@ pub fn execute_scope_params(state: &AppState) -> Option<ConfirmModalParams<'_>> 
                 engine.fg(palette.text_muted),
             ),
             Span::styled(&target.plan_title, engine.fg(palette.text_primary).bold()),
-            Span::styled(format!(" [{}]", target.plan_id), engine.fg(palette.text_muted)),
+            Span::styled(
+                format!(" [{}]", target.plan_id),
+                engine.fg(palette.text_muted),
+            ),
         ]),
         Line::from(vec![
             Span::styled(
                 active_t("dialog.execute_scope.scope_label"),
                 engine.fg(palette.text_muted),
             ),
-            Span::styled(&target.scope_title, engine.fg(palette.status_warning).bold()),
             Span::styled(
-                active_t("dialog.execute_scope.scope_count")
-                    .replacen("{}", &target.steps.len().to_string(), 1),
+                &target.scope_title,
+                engine.fg(palette.status_warning).bold(),
+            ),
+            Span::styled(
+                active_t("dialog.execute_scope.scope_count").replacen(
+                    "{}",
+                    &target.steps.len().to_string(),
+                    1,
+                ),
                 engine.fg(palette.text_primary),
             ),
         ]),
@@ -704,8 +727,11 @@ pub fn execute_scope_params(state: &AppState) -> Option<ConfirmModalParams<'_>> 
         }
         if target.steps.len() > 4 {
             body_lines.push(Line::from(Span::styled(
-                active_t("dialog.execute_scope.queue_more")
-                    .replacen("{}", &(target.steps.len() - 4).to_string(), 1),
+                active_t("dialog.execute_scope.queue_more").replacen(
+                    "{}",
+                    &(target.steps.len() - 4).to_string(),
+                    1,
+                ),
                 engine.fg(palette.text_muted).italic(),
             )));
         }
@@ -777,13 +803,19 @@ pub fn execute_pipeline_params(state: &AppState) -> Option<ConfirmModalParams<'_
                 engine.fg(palette.text_muted),
             ),
             Span::styled(
-                active_t("dialog.execute_pipeline.plans_count")
-                    .replacen("{}", &target.plan_titles.len().to_string(), 1),
+                active_t("dialog.execute_pipeline.plans_count").replacen(
+                    "{}",
+                    &target.plan_titles.len().to_string(),
+                    1,
+                ),
                 engine.fg(palette.status_warning).bold(),
             ),
             Span::styled(
-                active_t("dialog.execute_pipeline.steps_count")
-                    .replacen("{}", &target.steps.len().to_string(), 1),
+                active_t("dialog.execute_pipeline.steps_count").replacen(
+                    "{}",
+                    &target.steps.len().to_string(),
+                    1,
+                ),
                 engine.fg(palette.text_primary),
             ),
         ]),
@@ -805,16 +837,22 @@ pub fn execute_pipeline_params(state: &AppState) -> Option<ConfirmModalParams<'_
     }
     if target.plan_titles.len() > 4 {
         body_lines.push(Line::from(Span::styled(
-            active_t("dialog.execute_pipeline.queue_more")
-                .replacen("{}", &(target.plan_titles.len() - 4).to_string(), 1),
+            active_t("dialog.execute_pipeline.queue_more").replacen(
+                "{}",
+                &(target.plan_titles.len() - 4).to_string(),
+                1,
+            ),
             engine.fg(palette.text_muted).italic(),
         )));
     }
 
     if !target.pending_synthesis.is_empty() {
         body_lines.push(Line::from(Span::styled(
-            active_t("dialog.execute_pipeline.jit_note")
-                .replacen("{}", &target.pending_synthesis.len().to_string(), 1),
+            active_t("dialog.execute_pipeline.jit_note").replacen(
+                "{}",
+                &target.pending_synthesis.len().to_string(),
+                1,
+            ),
             engine.fg(palette.text_secondary),
         )));
     }
@@ -976,8 +1014,7 @@ pub fn clear_auto_params(state: &AppState) -> ConfirmModalParams<'_> {
         Line::from(vec![
             Span::raw(active_t("dialog.clear_auto.body_prefix")),
             Span::styled(
-                active_t("dialog.clear_auto.body_count")
-                    .replacen("{}", &auto_count.to_string(), 1),
+                active_t("dialog.clear_auto.body_count").replacen("{}", &auto_count.to_string(), 1),
                 engine.fg(palette.button_active_bg).bold(),
             ),
             Span::raw(active_t("dialog.clear_auto.body_suffix")),
@@ -1027,8 +1064,7 @@ pub fn clear_user_params(state: &AppState) -> ConfirmModalParams<'_> {
         Line::from(vec![
             Span::raw(active_t("dialog.clear_user.body_prefix")),
             Span::styled(
-                active_t("dialog.clear_user.body_count")
-                    .replacen("{}", &user_count.to_string(), 1),
+                active_t("dialog.clear_user.body_count").replacen("{}", &user_count.to_string(), 1),
                 engine.fg(palette.button_active_bg).bold(),
             ),
             Span::raw(active_t("dialog.clear_user.body_suffix")),
@@ -1165,7 +1201,10 @@ pub fn clear_horizon_params<'a>(state: &'a AppState, plan_id: &str) -> ConfirmMo
 /// A plan whose steps are already `InProgress` or `Done` has committed work in
 /// Git. Clearing its horizon does not rewrite that history, so the second tier
 /// raises the desynchronization risk explicitly before the reset runs (c-2).
-pub fn clear_horizon_final_params<'a>(state: &'a AppState, plan_id: &str) -> ConfirmModalParams<'a> {
+pub fn clear_horizon_final_params<'a>(
+    state: &'a AppState,
+    plan_id: &str,
+) -> ConfirmModalParams<'a> {
     let engine = current_engine();
     let palette = engine.palette();
 
@@ -1478,10 +1517,15 @@ mod tests {
 
         let params = execute_review_params(&st).expect("params should be generated");
         assert_eq!(params.title, "Execute All Review Sessions");
-        assert_eq!(params.confirm_button, crate::app::ConfirmDialogButton::Cancel);
+        assert_eq!(
+            params.confirm_button,
+            crate::app::ConfirmDialogButton::Cancel
+        );
         assert!(!params.destructive);
         let texts: Vec<String> = params.body_lines.iter().map(|l| l.to_string()).collect();
-        assert!(texts.iter().any(|t| t.contains("Review: All Review Sessions")));
+        assert!(texts
+            .iter()
+            .any(|t| t.contains("Review: All Review Sessions")));
         assert!(texts.iter().any(|t| t.contains("2 finding(s) to resolve")));
     }
 
@@ -1496,7 +1540,10 @@ mod tests {
         assert_eq!(params.tone, ModalTone::Warning);
         assert_eq!(params.confirm_label, "Clear Horizon");
         assert_eq!(params.cancel_label, "Cancel");
-        assert_eq!(params.confirm_button, crate::app::ConfirmDialogButton::Cancel);
+        assert_eq!(
+            params.confirm_button,
+            crate::app::ConfirmDialogButton::Cancel
+        );
         assert!(params.destructive);
         assert_eq!(params.width, CLEAR_HORIZON_WIDTH);
 
@@ -1517,13 +1564,18 @@ mod tests {
         assert_eq!(params.title, "Confirm Clearing Active Horizon");
         assert_eq!(params.tone, ModalTone::Dangerous);
         assert_eq!(params.confirm_label, "Confirm Clear");
-        assert_eq!(params.confirm_button, crate::app::ConfirmDialogButton::Cancel);
+        assert_eq!(
+            params.confirm_button,
+            crate::app::ConfirmDialogButton::Cancel
+        );
         assert!(params.destructive);
         assert_eq!(params.width, CLEAR_HORIZON_FINAL_WIDTH);
 
         let texts: Vec<String> = params.body_lines.iter().map(|l| l.to_string()).collect();
         assert!(texts.iter().any(|t| t.contains("plan-2")));
-        assert!(texts.iter().any(|t| t.contains("does NOT undo Git commits")));
+        assert!(texts
+            .iter()
+            .any(|t| t.contains("does NOT undo Git commits")));
     }
 
     /// Rendered buttons of both tiers must land exactly on the rectangles the

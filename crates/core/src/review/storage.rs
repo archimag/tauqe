@@ -1,5 +1,7 @@
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
+
+use crate::atomic_write::write_atomic;
 use std::sync::{Mutex, MutexGuard};
 use tauqe_protocol::{
     ArchitectTier, IssueStatus, Plan, PlanItem, ReviewIssue, ReviewItem, ReviewSession,
@@ -299,17 +301,16 @@ impl ReviewStorage {
     /// Lock-free core of [`Self::save_session`]; caller must hold storage lock.
     fn save_session_unlocked(repo_root: &Path, session: &ReviewSession) -> Result<()> {
         let dir = Self::reviews_dir(repo_root);
-        std::fs::create_dir_all(&dir).with_context(|| {
-            format!("Failed to create reviews directory at {}", dir.display())
-        })?;
+        std::fs::create_dir_all(&dir)
+            .with_context(|| format!("Failed to create reviews directory at {}", dir.display()))?;
 
         let safe_id = Self::sanitize_id(&session.id);
         let default_target = dir.join(format!("{safe_id}.json"));
 
         // Reuse the file that already stores this session even when its name differs
         // from the sanitized id, so saving never spawns a duplicate session file.
-        let target_file = Self::find_session_file_unlocked(repo_root, &session.id)
-            .unwrap_or(default_target);
+        let target_file =
+            Self::find_session_file_unlocked(repo_root, &session.id).unwrap_or(default_target);
 
         // Refuse to overwrite a file that already stores a different review session
         // whose sanitized storage name collides with this one (for example
@@ -317,10 +318,16 @@ impl ReviewStorage {
         // never silently replaces an unrelated session.
         if target_file.is_file() {
             let content = std::fs::read_to_string(&target_file).with_context(|| {
-                format!("Failed to read existing review file at {}", target_file.display())
+                format!(
+                    "Failed to read existing review file at {}",
+                    target_file.display()
+                )
             })?;
             let existing: ReviewSession = serde_json::from_str(&content).with_context(|| {
-                format!("Failed to parse existing review JSON at {}", target_file.display())
+                format!(
+                    "Failed to parse existing review JSON at {}",
+                    target_file.display()
+                )
             })?;
             if !existing.id.eq_ignore_ascii_case(&session.id) {
                 anyhow::bail!(
@@ -379,8 +386,9 @@ impl ReviewStorage {
             }
         };
 
-        std::fs::remove_file(&target_file)
-            .with_context(|| format!("Failed to remove review file at {}", target_file.display()))?;
+        std::fs::remove_file(&target_file).with_context(|| {
+            format!("Failed to remove review file at {}", target_file.display())
+        })?;
 
         if let Ok(Some(active)) = Self::load_active_id_unlocked(repo_root) {
             if active.eq_ignore_ascii_case(id) || active.eq_ignore_ascii_case(&safe_id) {
@@ -405,8 +413,12 @@ impl ReviewStorage {
             return Ok(None);
         }
 
-        let content = std::fs::read_to_string(&active_file)
-            .with_context(|| format!("Failed to read active review marker at {}", active_file.display()))?;
+        let content = std::fs::read_to_string(&active_file).with_context(|| {
+            format!(
+                "Failed to read active review marker at {}",
+                active_file.display()
+            )
+        })?;
         let trimmed = content.trim();
         if trimmed.is_empty() {
             Ok(None)
@@ -426,9 +438,8 @@ impl ReviewStorage {
     /// Lock-free core of [`Self::save_active_id`]; caller must hold storage lock.
     fn save_active_id_unlocked(repo_root: &Path, id: Option<&str>) -> Result<()> {
         let dir = Self::reviews_dir(repo_root);
-        std::fs::create_dir_all(&dir).with_context(|| {
-            format!("Failed to create reviews directory at {}", dir.display())
-        })?;
+        std::fs::create_dir_all(&dir)
+            .with_context(|| format!("Failed to create reviews directory at {}", dir.display()))?;
 
         let active_file = dir.join("active");
         match id {
@@ -479,7 +490,8 @@ impl ReviewStorage {
             None => return Ok(None),
         };
 
-        let updated_issue = if let Some(item) = session.items.iter_mut().find(|it| it.id == item_id) {
+        let updated_issue = if let Some(item) = session.items.iter_mut().find(|it| it.id == item_id)
+        {
             let mut issue = ReviewIssue::from(item.clone());
             updater(&mut issue);
             let mut updated_item = ReviewItem::from(issue.clone());
@@ -545,7 +557,8 @@ impl ReviewStorage {
             None => return Ok(None),
         };
 
-        let updated_issue = if let Some(item) = session.items.iter_mut().find(|it| it.id == item_id) {
+        let updated_issue = if let Some(item) = session.items.iter_mut().find(|it| it.id == item_id)
+        {
             // Work on the canonical `ReviewIssue` model so the plan and status
             // are read and mutated through their authoritative field names, then
             // persist only the fields this primitive owns.
@@ -620,7 +633,8 @@ impl ReviewStorage {
             None => return Ok(None),
         };
 
-        let updated_issue = if let Some(item) = session.items.iter_mut().find(|it| it.id == item_id) {
+        let updated_issue = if let Some(item) = session.items.iter_mut().find(|it| it.id == item_id)
+        {
             // Normalize the derived container statuses and store the result
             // through the canonical `ReviewIssue::plan` field.
             let mut issue = ReviewIssue::from(item.clone());
@@ -642,45 +656,6 @@ impl ReviewStorage {
 
         Ok(updated_issue)
     }
-}
-
-/// Atomically replaces `target` with `contents`.
-///
-/// The payload is staged into a uniquely named sibling temporary file, flushed,
-/// and `fsync`ed before the atomic rename. Without the `sync_all` barrier a crash
-/// immediately after the rename could leave a zero-length or truncated file on
-/// disk; the per-process suffix on the staging name also prevents a stale or
-/// concurrent write from colliding on a shared, fixed `<file>.json.tmp` path.
-fn write_atomic(target: &Path, contents: &[u8]) -> Result<()> {
-    // The temp-file creation, the write, the `fsync` barrier, and the atomic
-    // rename all run off the async executor thread, so a slow disk never stalls
-    // the bounded turn, provider streaming, or RPC handling. Nested inside
-    // another blocking scope the helper degrades to a direct call.
-    crate::blocking::run_blocking(move || -> Result<()> {
-        use std::io::Write;
-
-        let file_name = target.file_name().and_then(|f| f.to_str()).unwrap_or("file");
-        let temp_file = target.with_file_name(format!("{file_name}.tmp.{}", std::process::id()));
-
-        {
-            let mut file = std::fs::File::create(&temp_file)
-                .with_context(|| format!("Failed to create temp file at {}", temp_file.display()))?;
-            file.write_all(contents)
-                .with_context(|| format!("Failed to write temp file at {}", temp_file.display()))?;
-            file.flush()
-                .with_context(|| format!("Failed to flush temp file at {}", temp_file.display()))?;
-            file.sync_all()
-                .with_context(|| format!("Failed to sync temp file at {}", temp_file.display()))?;
-        }
-
-        std::fs::rename(&temp_file, target).with_context(|| {
-            format!(
-                "Failed to atomically rename {} to {}",
-                temp_file.display(),
-                target.display()
-            )
-        })
-    })
 }
 
 /// Extracts the UUIDv7 millisecond timestamp embedded in a session id.
@@ -744,7 +719,9 @@ mod tests {
         assert_eq!(list[0].id, "rev-sec-1");
 
         // 3. Load by ID and Load Latest
-        let loaded = ReviewStorage::load_review(root, "rev-sec-1").unwrap().unwrap();
+        let loaded = ReviewStorage::load_review(root, "rev-sec-1")
+            .unwrap()
+            .unwrap();
         assert_eq!(loaded.title, "Security Audit");
         // Persisting and reloading a finding keeps its exact category instead
         // of collapsing it into the coarse severity class.
@@ -755,18 +732,17 @@ mod tests {
         assert_eq!(latest.id, "rev-sec-1");
 
         // 4. Update item status to Fixed
-        let updated = ReviewStorage::update_session_item_status(
-            root,
-            "rev-sec-1",
-            1,
-            IssueStatus::Fixed,
-        )
-        .unwrap()
-        .unwrap();
+        let updated =
+            ReviewStorage::update_session_item_status(root, "rev-sec-1", 1, IssueStatus::Fixed)
+                .unwrap()
+                .unwrap();
         assert_eq!(updated.status, IssueStatus::Fixed);
 
         // 5. Active marker
-        assert_eq!(ReviewStorage::load_active_id(root).unwrap(), Some("rev-sec-1".to_string()));
+        assert_eq!(
+            ReviewStorage::load_active_id(root).unwrap(),
+            Some("rev-sec-1".to_string())
+        );
         ReviewStorage::save_active_id(root, None).unwrap();
         assert_eq!(ReviewStorage::load_active_id(root).unwrap(), None);
 
@@ -912,7 +888,9 @@ mod tests {
             raw_markdown: String::new(),
         };
         ReviewStorage::save_session(root, &first).unwrap();
-        assert!(ReviewStorage::reviews_dir(root).join("Review-One.json").is_file());
+        assert!(ReviewStorage::reviews_dir(root)
+            .join("Review-One.json")
+            .is_file());
 
         // A casing change yields a different sanitized file name; the existing file
         // must be reused instead of writing a second `review-one.json`.
@@ -940,7 +918,9 @@ mod tests {
             "expected a single review file, found {json_files:?}"
         );
 
-        let loaded = ReviewStorage::load_review(root, "review one").unwrap().unwrap();
+        let loaded = ReviewStorage::load_review(root, "review one")
+            .unwrap()
+            .unwrap();
         assert_eq!(loaded.created_at, 2);
     }
 
@@ -1005,7 +985,9 @@ mod tests {
             .contains("already used by review session 'team/auth'"));
 
         // The original session is preserved unchanged.
-        let loaded = ReviewStorage::load_review(root, "team/auth").unwrap().unwrap();
+        let loaded = ReviewStorage::load_review(root, "team/auth")
+            .unwrap()
+            .unwrap();
         assert_eq!(loaded.id, "team/auth");
         assert_eq!(loaded.title, "Team Auth");
     }
@@ -1295,7 +1277,9 @@ mod tests {
         assert_eq!(updated.plan[0].status, tauqe_protocol::PlanItemStatus::Done);
         assert_eq!(updated.plan[1].id, "s-3");
 
-        let loaded = ReviewStorage::load_review(root, "rev-subplan-1").unwrap().unwrap();
+        let loaded = ReviewStorage::load_review(root, "rev-subplan-1")
+            .unwrap()
+            .unwrap();
         let issues = loaded.issues();
         let issue = &issues[0];
         assert_eq!(issue.plan.len(), 2);
@@ -1440,7 +1424,9 @@ mod tests {
 
         assert_eq!(updated.status, IssueStatus::Todo);
 
-        let loaded = ReviewStorage::load_review(root, "rev-refine-to-todo").unwrap().unwrap();
+        let loaded = ReviewStorage::load_review(root, "rev-refine-to-todo")
+            .unwrap()
+            .unwrap();
         assert_eq!(loaded.items[0].status, IssueStatus::Todo);
     }
 
@@ -1541,8 +1527,12 @@ mod tests {
 
         let updated = ReviewStorage::update_session_item(root, "rev-ext-1", 1, |issue| {
             issue.status = IssueStatus::Fixed;
-            issue.recommendations.push("Step 2: add regression test".to_string());
-            issue.readonly_files.push("crates/core/src/config.rs".to_string());
+            issue
+                .recommendations
+                .push("Step 2: add regression test".to_string());
+            issue
+                .readonly_files
+                .push("crates/core/src/config.rs".to_string());
             issue.note = Some("Resolved in PR #42".to_string());
         })
         .unwrap()
@@ -1559,7 +1549,9 @@ mod tests {
         );
         assert_eq!(updated.note.as_deref(), Some("Resolved in PR #42"));
 
-        let loaded = ReviewStorage::load_review(root, "rev-ext-1").unwrap().unwrap();
+        let loaded = ReviewStorage::load_review(root, "rev-ext-1")
+            .unwrap()
+            .unwrap();
         let issues = loaded.issues();
         assert_eq!(issues.len(), 1);
         assert_eq!(issues[0].status, IssueStatus::Fixed);
@@ -1617,21 +1609,31 @@ mod tests {
         };
         ReviewStorage::save_session(root, &session).unwrap();
 
-        let updated = ReviewStorage::update_session_item(root, "rev-category-fidelity", 1, |issue| {
-            issue.status = IssueStatus::Fixed;
-        })
-        .unwrap()
-        .unwrap();
+        let updated =
+            ReviewStorage::update_session_item(root, "rev-category-fidelity", 1, |issue| {
+                issue.status = IssueStatus::Fixed;
+            })
+            .unwrap()
+            .unwrap();
         assert_eq!(updated.issue_type, IssueType::Security);
 
         let loaded = ReviewStorage::load_review(root, "rev-category-fidelity")
             .unwrap()
             .unwrap();
         assert_eq!(loaded.find_item(1).unwrap().issue_type, IssueType::Security);
-        assert_eq!(loaded.find_item(2).unwrap().issue_type, IssueType::Performance);
+        assert_eq!(
+            loaded.find_item(2).unwrap().issue_type,
+            IssueType::Performance
+        );
         // The presentation severity is derived from the stored category.
-        assert_eq!(loaded.find_item(1).unwrap().severity, ReviewSeverity::Critical);
-        assert_eq!(loaded.find_item(2).unwrap().severity, ReviewSeverity::Warning);
+        assert_eq!(
+            loaded.find_item(1).unwrap().severity,
+            ReviewSeverity::Critical
+        );
+        assert_eq!(
+            loaded.find_item(2).unwrap().severity,
+            ReviewSeverity::Warning
+        );
 
         let issues = loaded.issues();
         assert_eq!(issues[0].issue_type, IssueType::Security);

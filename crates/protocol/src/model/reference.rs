@@ -229,11 +229,19 @@ mod tests {
         let m1: ModelRef = "openrouter:anthropic/claude-3.7-sonnet".parse().unwrap();
         assert_eq!(m1, ModelRef::openrouter("anthropic/claude-3.7-sonnet"));
 
-        let m2: ModelRef = "openrouter:meta-llama/llama-3.3-70b-instruct:free".parse().unwrap();
-        assert_eq!(m2, ModelRef::openrouter("meta-llama/llama-3.3-70b-instruct:free"));
+        let m2: ModelRef = "openrouter:meta-llama/llama-3.3-70b-instruct:free"
+            .parse()
+            .unwrap();
+        assert_eq!(
+            m2,
+            ModelRef::openrouter("meta-llama/llama-3.3-70b-instruct:free")
+        );
 
         let m3: ModelRef = "meta-llama/llama-3.3-70b-instruct:free".parse().unwrap();
-        assert_eq!(m3, ModelRef::openrouter("meta-llama/llama-3.3-70b-instruct:free"));
+        assert_eq!(
+            m3,
+            ModelRef::openrouter("meta-llama/llama-3.3-70b-instruct:free")
+        );
 
         let m4: ModelRef = "anthropic/claude-3.7-sonnet".parse().unwrap();
         assert_eq!(m4, ModelRef::openrouter("anthropic/claude-3.7-sonnet"));

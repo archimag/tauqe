@@ -1,6 +1,8 @@
 pub const MODEL_STARTED: &str = "model/started";
 pub const MODEL_REASONING_DELTA: &str = "model/reasoningDelta";
 pub const MODEL_TEXT_DELTA: &str = "model/textDelta";
+pub const MODEL_CONNECTION_RETRYING: &str = "model/connectionRetrying";
+pub const MODEL_STREAM_RESET: &str = "model/streamReset";
 pub const MODEL_USAGE: &str = "model/usage";
 pub const MODEL_USAGE_TOTALS: &str = "model/usageTotals";
 pub const MODEL_RESULT: &str = "model/result";

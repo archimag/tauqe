@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use classify::{classify_repo_path, RepoPathKind, SymlinkStatus, SymlinkTarget};
 
 pub mod classify;
+pub mod dirs;
 pub mod treesitter;
 
 pub use treesitter::TreeSitterExtractor;
@@ -184,6 +185,67 @@ fn format_map_symlink(path: &str, link: &SymlinkTarget) -> String {
     }
 }
 
+/// Generates a symbol outline restricted to the files under `target_path`.
+///
+/// The target is a repository-relative prefix matched on whole path components,
+/// so `crates/core` covers `crates/core/src/lib.rs` but never
+/// `crates/core-utils/lib.rs`; naming a single file narrows the outline to that
+/// file. An empty prefix covers the whole repository.
+///
+/// Unlike the eager global map, a targeted map never drops files that are
+/// already in context: the request exists precisely to read the symbols of the
+/// subsystem the model is about to navigate. The outline is rendered through the
+/// same adaptive token budget as the global map, and an unknown prefix yields an
+/// empty string instead of a repository-wide outline.
+pub fn generate_targeted_repo_map(
+    repo_root: &Path,
+    available_files: &[String],
+    target_path: &str,
+    token_budget: usize,
+) -> Result<String> {
+    let prefix = normalize_target_prefix(target_path);
+    let targeted: Vec<String> = available_files
+        .iter()
+        .filter(|path| path_is_under_prefix(path, &prefix))
+        .cloned()
+        .collect();
+    if targeted.is_empty() {
+        return Ok(String::new());
+    }
+    generate_repo_map(repo_root, &targeted, &[], token_budget)
+}
+
+/// Normalizes a requested map path into a repository-relative prefix.
+///
+/// Leading `./` markers and `/` separators are stripped and a trailing `/` is
+/// dropped, so `./crates/core/` and `crates/core` name the same subtree. An
+/// empty result names the whole repository.
+fn normalize_target_prefix(target_path: &str) -> String {
+    let trimmed = target_path
+        .trim()
+        .trim_start_matches("./")
+        .trim_start_matches('/')
+        .trim_end_matches('/');
+    match trimmed {
+        "" | "." => String::new(),
+        other => other.to_string(),
+    }
+}
+
+/// Reports whether a repository-relative file path lies under `prefix`.
+///
+/// The comparison is component-wise, so a sibling directory that merely shares a
+/// textual stem is never included. An empty prefix matches every path.
+fn path_is_under_prefix(path: &str, prefix: &str) -> bool {
+    if prefix.is_empty() {
+        return true;
+    }
+    match path.strip_prefix(prefix) {
+        Some(rest) => rest.is_empty() || rest.starts_with('/'),
+        None => false,
+    }
+}
+
 /// Formats repository symbols into an outline, reducing detail level if `token_budget` is exceeded.
 pub fn format_symbols_with_budget(files: &[RepoFileSymbols], token_budget: usize) -> String {
     format_repo_map_with_budget(files, &[], token_budget)
@@ -317,7 +379,11 @@ fn format_all_files(files: &[RepoFileSymbols], level: DetailLevel) -> String {
 fn format_file_symbols(file: &RepoFileSymbols, level: DetailLevel) -> String {
     let mut lines = Vec::new();
     if file.line_count > 0 {
-        let suffix = if file.line_count == 1 { "line" } else { "lines" };
+        let suffix = if file.line_count == 1 {
+            "line"
+        } else {
+            "lines"
+        };
         lines.push(format!("{} ({} {})", file.path, file.line_count, suffix));
     } else {
         lines.push(file.path.clone());
@@ -421,11 +487,7 @@ fn format_symbol_into_lines(
             }
         }
         SymbolKind::Function | SymbolKind::Method => {
-            lines.push(format!(
-                "{}{}",
-                indent,
-                format_func_signature(sym, false)
-            ));
+            lines.push(format!("{}{}", indent, format_func_signature(sym, false)));
         }
         SymbolKind::Mod => {
             let header = sym.signature.as_deref().unwrap_or(&sym.name);
@@ -519,7 +581,10 @@ mod tests {
                 Symbol {
                     name: "PublicStruct".to_string(),
                     kind: SymbolKind::Struct,
-                    signature: Some("pub struct PublicStruct {\n    pub id: u64,\n    pub name: String,\n}".to_string()),
+                    signature: Some(
+                        "pub struct PublicStruct {\n    pub id: u64,\n    pub name: String,\n}"
+                            .to_string(),
+                    ),
                     is_public: true,
                     line: 1,
                     children: Vec::new(),
@@ -654,7 +719,9 @@ mod tests {
             symbols: vec![Symbol {
                 name: "Status".to_string(),
                 kind: SymbolKind::Enum,
-                signature: Some("pub enum Status {\n    Ready,\n    Running(u32),\n    Done,\n}".to_string()),
+                signature: Some(
+                    "pub enum Status {\n    Ready,\n    Running(u32),\n    Done,\n}".to_string(),
+                ),
                 is_public: true,
                 line: 1,
                 children: Vec::new(),
@@ -680,6 +747,79 @@ mod tests {
         assert!(outline.contains("tauqe.toml"));
     }
 
+    #[test]
+    fn test_generate_targeted_repo_map_filters_by_component_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("crates/core/src")).unwrap();
+        std::fs::create_dir_all(root.join("crates/protocol/src")).unwrap();
+        std::fs::create_dir_all(root.join("crates/core-utils/src")).unwrap();
+        std::fs::write(root.join("crates/core/src/lib.rs"), "pub fn core_fn() {}\n").unwrap();
+        std::fs::write(
+            root.join("crates/protocol/src/lib.rs"),
+            "pub fn protocol_fn() {}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("crates/core-utils/src/lib.rs"),
+            "pub fn utils_fn() {}\n",
+        )
+        .unwrap();
+
+        let available = vec![
+            "crates/core/src/lib.rs".to_string(),
+            "crates/protocol/src/lib.rs".to_string(),
+            "crates/core-utils/src/lib.rs".to_string(),
+        ];
+
+        let map = generate_targeted_repo_map(root, &available, "crates/core", 1000).unwrap();
+        assert!(map.contains("crates/core/src/lib.rs"));
+        assert!(map.contains("pub fn core_fn"));
+        // A sibling directory sharing only a textual stem is excluded.
+        assert!(!map.contains("crates/protocol"));
+        assert!(!map.contains("crates/core-utils"));
+        assert!(!map.contains("pub fn utils_fn"));
+
+        // A cosmetic `./` prefix and a trailing slash name the same subtree.
+        let dotted = generate_targeted_repo_map(root, &available, "./crates/core/", 1000).unwrap();
+        assert_eq!(dotted, map);
+
+        // Naming a single file narrows the outline to that file.
+        let single =
+            generate_targeted_repo_map(root, &available, "crates/core/src/lib.rs", 1000).unwrap();
+        assert!(single.contains("pub fn core_fn"));
+        assert!(!single.contains("crates/protocol"));
+
+        // An unknown prefix yields an empty outline instead of a full map.
+        assert!(
+            generate_targeted_repo_map(root, &available, "missing", 1000)
+                .unwrap()
+                .is_empty()
+        );
+
+        // An empty prefix covers the whole repository.
+        let whole = generate_targeted_repo_map(root, &available, "", 1000).unwrap();
+        assert!(whole.contains("pub fn core_fn"));
+        assert!(whole.contains("pub fn protocol_fn"));
+    }
+
+    #[test]
+    fn test_generate_targeted_repo_map_honors_the_token_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/a.rs"), "pub fn alpha() {}\n").unwrap();
+        std::fs::write(root.join("src/b.rs"), "pub fn beta() {}\n").unwrap();
+        let available = vec!["src/a.rs".to_string(), "src/b.rs".to_string()];
+
+        let generous = generate_targeted_repo_map(root, &available, "src", 1000).unwrap();
+        assert!(generous.contains("src/a.rs"));
+        assert!(generous.contains("src/b.rs"));
+
+        let tight = generate_targeted_repo_map(root, &available, "src", 2).unwrap();
+        assert!(crate::prompt::estimate_tokens(&tight) <= 2);
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_generate_repo_map_on_multi_thread_runtime() {
         let dir = tempfile::tempdir().unwrap();
@@ -688,9 +828,10 @@ mod tests {
         let available = vec!["main.rs".to_string()];
         let context = vec![];
 
-        let handle = tokio::spawn(async move {
-            generate_repo_map(&root, &available, &context, 1000).unwrap()
-        });
+        let handle =
+            tokio::spawn(
+                async move { generate_repo_map(&root, &available, &context, 1000).unwrap() },
+            );
 
         let map = handle.await.unwrap();
         assert!(map.contains("main.rs"));
@@ -855,7 +996,8 @@ mod tests {
         let all_files = vec!["src/a.rs".to_string(), "alias.rs -> lib.rs".to_string()];
 
         // Budget admits the symbol block but not the additional marker entry.
-        let symbol_only = format_repo_map_with_budget(std::slice::from_ref(&symbols_outline), &[], 500);
+        let symbol_only =
+            format_repo_map_with_budget(std::slice::from_ref(&symbols_outline), &[], 500);
         let budget = crate::prompt::estimate_tokens(&symbol_only) + 2;
         let truncated = format_repo_map_with_budget(&[symbols_outline], &all_files, budget);
 

@@ -11,11 +11,16 @@ pub(super) fn next_item_tag_bounds(text: &str) -> Option<(usize, usize)> {
         let after = start + "<item".len();
         let bytes = text.as_bytes();
         let mut idx = after;
-        while idx < bytes.len() && (bytes[idx].is_ascii_alphanumeric() || bytes[idx] == b'_' || bytes[idx] == b'-') {
+        while idx < bytes.len()
+            && (bytes[idx].is_ascii_alphanumeric() || bytes[idx] == b'_' || bytes[idx] == b'-')
+        {
             idx += 1;
         }
         let rest = &text[idx..];
-        let boundary = rest.chars().next().is_some_and(|c| c.is_whitespace() || c == '>' || c == '/');
+        let boundary = rest
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_whitespace() || c == '>' || c == '/');
         if !boundary {
             from = after;
             continue;
@@ -118,7 +123,9 @@ impl From<tauqe_protocol::PlanItem> for ParsedPlanItem {
     }
 }
 
-pub(super) fn parse_plan_items_with_diagnostics(content: &str) -> (Vec<ParsedPlanItem>, Vec<String>) {
+pub(super) fn parse_plan_items_with_diagnostics(
+    content: &str,
+) -> (Vec<ParsedPlanItem>, Vec<String>) {
     let mut items = Vec::new();
     let mut errors = Vec::new();
     let mut pos = 0;
@@ -128,11 +135,16 @@ pub(super) fn parse_plan_items_with_diagnostics(content: &str) -> (Vec<ParsedPla
         let after = start + "<item".len();
         let bytes = &content.as_bytes()[after..];
         let mut idx = 0;
-        while idx < bytes.len() && (bytes[idx].is_ascii_alphanumeric() || bytes[idx] == b'_' || bytes[idx] == b'-') {
+        while idx < bytes.len()
+            && (bytes[idx].is_ascii_alphanumeric() || bytes[idx] == b'_' || bytes[idx] == b'-')
+        {
             idx += 1;
         }
         let rest = &content[after + idx..];
-        let boundary = rest.chars().next().is_some_and(|c| c.is_whitespace() || c == '>' || c == '/');
+        let boundary = rest
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_whitespace() || c == '>' || c == '/');
         if !boundary {
             pos = after;
             continue;
@@ -144,18 +156,29 @@ pub(super) fn parse_plan_items_with_diagnostics(content: &str) -> (Vec<ParsedPla
         };
         let header_end = after + idx + gt + 1;
         let header = &content[start..header_end];
-        let id = extract_attribute(header, "id").unwrap_or_default().trim().to_string();
-        let raw_title = extract_attribute(header, "title").unwrap_or_default().trim().to_string();
+        let id = extract_attribute(header, "id")
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        let raw_title = extract_attribute(header, "title")
+            .unwrap_or_default()
+            .trim()
+            .to_string();
         let status_str = extract_attribute(header, "status");
         let status = status_str.map(|s| match s.trim().to_lowercase().as_str() {
-            "discussion" | "discuss" | "question" | "?" => tauqe_protocol::PlanItemStatus::Discussion,
+            "discussion" | "discuss" | "question" | "?" => {
+                tauqe_protocol::PlanItemStatus::Discussion
+            }
             "in_progress" | "inprogress" | "doing" => tauqe_protocol::PlanItemStatus::InProgress,
             "done" | "completed" | "finished" => tauqe_protocol::PlanItemStatus::Done,
             "blocked" | "block" => tauqe_protocol::PlanItemStatus::Blocked,
             "cancelled" | "canceled" => tauqe_protocol::PlanItemStatus::Cancelled,
             "todo" | "pending" | "" => tauqe_protocol::PlanItemStatus::Todo,
             other => {
-                errors.push(format!("Unrecognized status '{other}' for item '{}', defaulting to 'todo'", if id.is_empty() { &raw_title } else { &id }));
+                errors.push(format!(
+                    "Unrecognized status '{other}' for item '{}', defaulting to 'todo'",
+                    if id.is_empty() { &raw_title } else { &id }
+                ));
                 tauqe_protocol::PlanItemStatus::Todo
             }
         });
@@ -233,7 +256,11 @@ pub(super) fn parse_plan_items_with_diagnostics(content: &str) -> (Vec<ParsedPla
             // Self-closing item
             if !id.is_empty() || !raw_title.is_empty() {
                 items.push(ParsedPlanItem {
-                    id: if id.is_empty() { format!("{}", items.len() + 1) } else { id.clone() },
+                    id: if id.is_empty() {
+                        format!("{}", items.len() + 1)
+                    } else {
+                        id.clone()
+                    },
                     title: raw_title,
                     details: attr_details,
                     status,
@@ -293,7 +320,8 @@ pub(super) fn parse_plan_items_with_diagnostics(content: &str) -> (Vec<ParsedPla
                 errors.extend(child_errors);
                 let text_only = strip_tags(body, next_item_tag_bounds);
 
-                let (inner_title, text_without_title) = extract_and_strip_inner_tag(&text_only, "title");
+                let (inner_title, text_without_title) =
+                    extract_and_strip_inner_tag(&text_only, "title");
                 let mut title = raw_title;
                 if title.is_empty() {
                     if let Some(it) = inner_title {
@@ -310,16 +338,14 @@ pub(super) fn parse_plan_items_with_diagnostics(content: &str) -> (Vec<ParsedPla
                     }
                 };
 
-                let mut details = inner_details
-                    .or(attr_details)
-                    .or_else(|| {
-                        let trimmed = text_without_details.trim();
-                        if trimmed.is_empty() {
-                            None
-                        } else {
-                            Some(trimmed.to_string())
-                        }
-                    });
+                let mut details = inner_details.or(attr_details).or_else(|| {
+                    let trimmed = text_without_details.trim();
+                    if trimmed.is_empty() {
+                        None
+                    } else {
+                        Some(trimmed.to_string())
+                    }
+                });
 
                 if title.is_empty() {
                     if let Some(d) = details.take() {
@@ -337,20 +363,39 @@ pub(super) fn parse_plan_items_with_diagnostics(content: &str) -> (Vec<ParsedPla
 
                 if !id.is_empty() || !title.is_empty() {
                     items.push(ParsedPlanItem {
-                        id: if id.is_empty() { format!("{}", items.len() + 1) } else { id.clone() },
+                        id: if id.is_empty() {
+                            format!("{}", items.len() + 1)
+                        } else {
+                            id.clone()
+                        },
                         title: if title.is_empty() { id } else { title },
                         details,
                         status,
-                        files: if children.is_empty() { files } else { Vec::new() },
-                        readonly_files: if children.is_empty() { readonly_files } else { Vec::new() },
+                        files: if children.is_empty() {
+                            files
+                        } else {
+                            Vec::new()
+                        },
+                        readonly_files: if children.is_empty() {
+                            readonly_files
+                        } else {
+                            Vec::new()
+                        },
                         concept_refs,
-                        depends_on: if children.is_empty() { depends_on } else { Vec::new() },
+                        depends_on: if children.is_empty() {
+                            depends_on
+                        } else {
+                            Vec::new()
+                        },
                         children,
                     });
                 }
                 pos = cend_full;
             } else {
-                errors.push(format!("Malformed <item> tag: missing closing tag </item> for item '{}'", if id.is_empty() { &raw_title } else { &id }));
+                errors.push(format!(
+                    "Malformed <item> tag: missing closing tag </item> for item '{}'",
+                    if id.is_empty() { &raw_title } else { &id }
+                ));
                 pos = header_end;
             }
         }

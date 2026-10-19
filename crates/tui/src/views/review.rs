@@ -3,14 +3,14 @@ use std::collections::{HashSet, VecDeque};
 use ratatui::style::{Style, Stylize};
 use ratatui::text::{Line, Span};
 use tauqe_protocol::{
-    ArchitectTier, DiscussionFocus, DiscussionTarget, IssueStatus, IssueType, ModelEntry,
-    ModelRef, ModelSelection, PlanItem, PlanItemStatus, ReviewIssue, ReviewItem, ReviewSession,
+    ArchitectTier, DiscussionFocus, DiscussionTarget, IssueStatus, IssueType, ModelEntry, ModelRef,
+    ModelSelection, PlanItem, PlanItemStatus, ReviewIssue, ReviewItem, ReviewSession,
 };
 
 use crate::components::model_selector::ModelSelector;
-use crate::views::plans::architect_badge;
 use crate::theme::engine::current_engine;
 use crate::ui::wrap_lines;
+use crate::views::plans::architect_badge;
 
 pub mod input;
 pub mod render;
@@ -325,22 +325,12 @@ impl ReviewViewState {
     ///
     /// A leaf step reveals its details and file lists; a container step reveals
     /// its nested child steps.
-    pub fn is_subplan_item_expanded(
-        &self,
-        session_id: &str,
-        item_id: u32,
-        step_id: &str,
-    ) -> bool {
+    pub fn is_subplan_item_expanded(&self, session_id: &str, item_id: u32, step_id: &str) -> bool {
         self.expanded_items
             .contains(&subplan_key(session_id, item_id, step_id))
     }
 
-    pub fn toggle_subplan_item_expanded(
-        &mut self,
-        session_id: &str,
-        item_id: u32,
-        step_id: &str,
-    ) {
+    pub fn toggle_subplan_item_expanded(&mut self, session_id: &str, item_id: u32, step_id: &str) {
         let key = subplan_key(session_id, item_id, step_id);
         if !self.expanded_items.remove(&key) {
             self.expanded_items.insert(key);
@@ -385,12 +375,7 @@ impl ReviewViewState {
                 && s.issues().iter().all(|issue| {
                     self.expanded_items
                         .contains(&format!("{}:{}", s.id, issue.id))
-                        && subplan_all_expanded(
-                            &self.expanded_items,
-                            &s.id,
-                            issue.id,
-                            &issue.plan,
-                        )
+                        && subplan_all_expanded(&self.expanded_items, &s.id, issue.id, &issue.plan)
                 })
         })
     }
@@ -601,13 +586,7 @@ impl ReviewViewState {
                     // first-class interactive rows, so the cursor can rest on a
                     // single step and fold its own details (Conventions §4.4).
                     if item_expanded {
-                        self.flatten_subplan_rows(
-                            &session.id,
-                            issue.id,
-                            &issue.plan,
-                            0,
-                            &mut rows,
-                        );
+                        self.flatten_subplan_rows(&session.id, issue.id, &issue.plan, 0, &mut rows);
                     }
                 }
             }
@@ -779,7 +758,11 @@ impl ReviewViewState {
                 .iter()
                 .position(|n| n.session_id == session_id && n.item_id.is_none())
                 .unwrap_or(0),
-            Some(VisibleReviewRow::ReviewItem { session_id, item_id, .. }) => all_nodes
+            Some(VisibleReviewRow::ReviewItem {
+                session_id,
+                item_id,
+                ..
+            }) => all_nodes
                 .iter()
                 .position(|n| {
                     n.session_id == session_id && n.item_id == Some(item_id) && n.step_id.is_none()
@@ -828,18 +811,12 @@ impl ReviewViewState {
             self.expanded_items
                 .insert(format!("{}:{}", target.session_id, item_id));
             for ancestor in &target.ancestor_steps {
-                self.expanded_items.insert(subplan_key(
-                    &target.session_id,
-                    item_id,
-                    ancestor,
-                ));
+                self.expanded_items
+                    .insert(subplan_key(&target.session_id, item_id, ancestor));
             }
             if let Some(step_id) = target.step_id.as_deref() {
-                self.expanded_items.insert(subplan_key(
-                    &target.session_id,
-                    item_id,
-                    step_id,
-                ));
+                self.expanded_items
+                    .insert(subplan_key(&target.session_id, item_id, step_id));
             }
         }
 
@@ -853,9 +830,15 @@ impl ReviewViewState {
                 (VisibleReviewRow::SessionSummary { session_id, .. }, None, None) => {
                     session_id == &target.session_id
                 }
-                (VisibleReviewRow::ReviewItem { session_id, item_id, .. }, Some(tid), None) => {
-                    session_id == &target.session_id && *item_id == tid
-                }
+                (
+                    VisibleReviewRow::ReviewItem {
+                        session_id,
+                        item_id,
+                        ..
+                    },
+                    Some(tid),
+                    None,
+                ) => session_id == &target.session_id && *item_id == tid,
                 (
                     VisibleReviewRow::SubplanItem {
                         session_id,
@@ -1133,7 +1116,11 @@ fn split_title_and_file_path(title: &str) -> (&str, Option<&str>) {
     if let Some(idx) = trimmed.rfind(" (") {
         if trimmed.ends_with(')') {
             let inside = &trimmed[idx + 2..trimmed.len() - 1];
-            if inside.contains('/') || inside.contains('\\') || inside.contains(':') || inside.contains('.') {
+            if inside.contains('/')
+                || inside.contains('\\')
+                || inside.contains(':')
+                || inside.contains('.')
+            {
                 return (trimmed[..idx].trim(), Some(inside));
             }
         }
@@ -1144,7 +1131,8 @@ fn split_title_and_file_path(title: &str) -> (&str, Option<&str>) {
 fn pad_line_to_width(mut line: Line<'static>, width: usize, fill_style: Style) -> Line<'static> {
     let current_width: usize = line.spans.iter().map(|s| s.width()).sum();
     if current_width < width {
-        line.spans.push(Span::styled(" ".repeat(width - current_width), fill_style));
+        line.spans
+            .push(Span::styled(" ".repeat(width - current_width), fill_style));
     }
     line
 }
@@ -1212,10 +1200,7 @@ fn compute_unified_review_lines(
                         engine.fg(palette.status_info).bold(),
                     ),
                     Span::styled(title.clone(), engine.fg(palette.text_primary).bold()),
-                    Span::styled(
-                        format!(" ({}) ", model),
-                        engine.fg(palette.text_muted),
-                    ),
+                    Span::styled(format!(" ({}) ", model), engine.fg(palette.text_muted)),
                     Span::styled(
                         format!("{}  ", format_created_at(*created_at)),
                         engine.fg(palette.text_muted),
@@ -1250,10 +1235,7 @@ fn compute_unified_review_lines(
                     Span::raw(review_indent(REVIEW_SUMMARY_LEVEL)),
                     Span::styled(fold_icon, engine.fg(palette.status_warning).bold()),
                     Span::styled(
-                        format!(
-                            "{}:",
-                            crate::i18n::active_t("review.executive_summary")
-                        ),
+                        format!("{}:", crate::i18n::active_t("review.executive_summary")),
                         engine.fg(palette.status_success).bold(),
                     ),
                 ];
@@ -1271,8 +1253,7 @@ fn compute_unified_review_lines(
                             format!("{}│ ", review_body_indent(REVIEW_SUMMARY_LEVEL + 1)),
                             engine.fg(palette.text_muted),
                         );
-                        let mut theme =
-                            crate::markdown::MarkdownTheme::answer_themed(theme_mode);
+                        let mut theme = crate::markdown::MarkdownTheme::answer_themed(theme_mode);
                         theme.text_style = engine.fg(palette.text_secondary);
                         theme.hard_breaks = true;
                         theme.compact = true;
@@ -1388,8 +1369,7 @@ fn compute_unified_review_lines(
                 let body_indent = review_body_indent(REVIEW_ITEM_LEVEL + 1);
 
                 if *is_expanded {
-                    let loc_str = location(files)
-                        .or_else(|| extra_path.map(|s| s.to_string()));
+                    let loc_str = location(files).or_else(|| extra_path.map(|s| s.to_string()));
                     if let Some(loc) = loc_str {
                         let clean_loc = loc.trim();
                         if !clean_loc.is_empty() {
@@ -1466,8 +1446,7 @@ fn compute_unified_review_lines(
                             format!("{body_indent}Description:"),
                             engine.fg(palette.status_info).bold(),
                         )));
-                        let mut theme =
-                            crate::markdown::MarkdownTheme::answer_themed(theme_mode);
+                        let mut theme = crate::markdown::MarkdownTheme::answer_themed(theme_mode);
                         theme.text_style = engine.fg(palette.text_secondary);
                         theme.hard_breaks = true;
                         theme.compact = true;
@@ -1492,14 +1471,10 @@ fn compute_unified_review_lines(
                                     format!("{body_indent}│ • "),
                                     engine.fg(palette.text_muted),
                                 ),
-                                Span::styled(
-                                    rec.clone(),
-                                    engine.fg(palette.text_primary),
-                                ),
+                                Span::styled(rec.clone(), engine.fg(palette.text_primary)),
                             ]));
                         }
                     }
-
                 }
 
                 all_lines.extend(wrap_lines(row_lines, width));
@@ -1541,9 +1516,7 @@ fn compute_unified_review_lines(
                 };
                 let title_style = if is_selected {
                     engine.fg(palette.text_primary).bold()
-                } else if *status == PlanItemStatus::Done
-                    || *status == PlanItemStatus::Cancelled
-                {
+                } else if *status == PlanItemStatus::Done || *status == PlanItemStatus::Cancelled {
                     engine.fg(palette.text_secondary)
                 } else {
                     Style::default().bold()
@@ -1595,10 +1568,7 @@ fn compute_unified_review_lines(
                         row_lines.push(Line::from(vec![
                             Span::styled(meta_prefix.clone(), engine.fg(palette.text_muted)),
                             Span::styled("ref: ", engine.fg(palette.text_muted)),
-                            Span::styled(
-                                readonly_files.join(", "),
-                                engine.fg(palette.status_info),
-                            ),
+                            Span::styled(readonly_files.join(", "), engine.fg(palette.status_info)),
                         ]));
                     }
                     if !depends_on.is_empty() {
@@ -1766,14 +1736,15 @@ mod tests {
             compute_unified_review_lines(&rows, 0, 80, crate::config::ThemeMode::Dark);
         let texts: Vec<String> = lines.iter().map(|line| line.to_string()).collect();
 
-        let summary_label =
-            format!("{}:", crate::i18n::active_t("review.executive_summary"));
+        let summary_label = format!("{}:", crate::i18n::active_t("review.executive_summary"));
         assert!(
             texts.iter().any(|t| t.contains(&summary_label)),
             "expected the Executive Summary header, got: {texts:?}"
         );
         assert!(
-            texts.iter().any(|t| t.contains("The architecture is sound.")),
+            texts
+                .iter()
+                .any(|t| t.contains("The architecture is sound.")),
             "expected the rendered summary body, got: {texts:?}"
         );
     }
@@ -1795,8 +1766,7 @@ mod tests {
             compute_unified_review_lines(&rows, 0, 80, crate::config::ThemeMode::Dark);
         let texts: Vec<String> = lines.iter().map(|line| line.to_string()).collect();
 
-        let summary_label =
-            format!("{}:", crate::i18n::active_t("review.executive_summary"));
+        let summary_label = format!("{}:", crate::i18n::active_t("review.executive_summary"));
         assert!(
             !texts.iter().any(|t| t.contains(&summary_label)),
             "a collapsed session must not render the Executive Summary block, got: {texts:?}"
@@ -1825,13 +1795,13 @@ mod tests {
             })
         ));
 
-        let (lines, _) =
-            compute_unified_review_lines(&rows, 0, 80, crate::config::ThemeMode::Dark);
+        let (lines, _) = compute_unified_review_lines(&rows, 0, 80, crate::config::ThemeMode::Dark);
         let texts: Vec<String> = lines.iter().map(|line| line.to_string()).collect();
-        let summary_label =
-            format!("{}:", crate::i18n::active_t("review.executive_summary"));
+        let summary_label = format!("{}:", crate::i18n::active_t("review.executive_summary"));
         assert!(texts.iter().any(|t| t.contains(&summary_label)));
-        assert!(texts.iter().any(|t| t.contains("The architecture is sound.")));
+        assert!(texts
+            .iter()
+            .any(|t| t.contains("The architecture is sound.")));
 
         // Folding the summary hides only its body; findings stay visible.
         view.toggle_summary_expanded("rev-summary");
@@ -1845,12 +1815,13 @@ mod tests {
                 ..
             })
         ));
-        let (lines, _) =
-            compute_unified_review_lines(&rows, 0, 80, crate::config::ThemeMode::Dark);
+        let (lines, _) = compute_unified_review_lines(&rows, 0, 80, crate::config::ThemeMode::Dark);
         let texts: Vec<String> = lines.iter().map(|line| line.to_string()).collect();
         assert!(texts.iter().any(|t| t.contains(&summary_label)));
         assert!(
-            !texts.iter().any(|t| t.contains("The architecture is sound.")),
+            !texts
+                .iter()
+                .any(|t| t.contains("The architecture is sound.")),
             "a folded summary must hide its body, got: {texts:?}"
         );
         assert!(
@@ -1960,7 +1931,9 @@ mod tests {
             "expected Skip reason header and first line, got: {texts:?}"
         );
         assert!(
-            texts.iter().any(|t| t.contains("│ Verified no code change needed")),
+            texts
+                .iter()
+                .any(|t| t.contains("│ Verified no code change needed")),
             "expected indented subsequent line with vertical bar prefix, got: {texts:?}"
         );
 
@@ -2073,7 +2046,10 @@ mod tests {
         let text: String = lines.iter().map(|line| line.to_string()).collect();
 
         // The authoritative category drives the badge directly.
-        assert!(text.contains(" BUG "), "expected the issue-type badge: {text}");
+        assert!(
+            text.contains(" BUG "),
+            "expected the issue-type badge: {text}"
+        );
     }
 
     #[test]
@@ -2127,9 +2103,18 @@ mod tests {
             }
         }
         assert!(text.contains("[FOCUS]"), "focus badge expected: {text}");
-        assert!(text.contains("[1/2 steps]"), "subplan badge expected: {text}");
-        assert!(text.contains("#1.1 First subtask"), "subtask expected: {text}");
-        assert!(text.contains("#1.2 Second subtask"), "subtask expected: {text}");
+        assert!(
+            text.contains("[1/2 steps]"),
+            "subplan badge expected: {text}"
+        );
+        assert!(
+            text.contains("#1.1 First subtask"),
+            "subtask expected: {text}"
+        );
+        assert!(
+            text.contains("#1.2 Second subtask"),
+            "subtask expected: {text}"
+        );
     }
 
     fn subplan_step(id: &str, title: &str, status: PlanItemStatus) -> PlanItem {
@@ -2176,10 +2161,7 @@ mod tests {
         // An expanded finding exposes its top-level step only; children stay
         // folded until the container step is expanded.
         view.toggle_item_expanded("rev-sub", 1);
-        assert_eq!(
-            step_rows(&view.flatten_rows()),
-            vec![("1".to_string(), 0)]
-        );
+        assert_eq!(step_rows(&view.flatten_rows()), vec![("1".to_string(), 0)]);
 
         view.toggle_subplan_item_expanded("rev-sub", 1, "1");
         assert_eq!(

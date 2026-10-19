@@ -353,9 +353,10 @@ mod tests {
 
     #[tokio::test]
     async fn refuses_when_an_operation_is_already_active() {
-        let state =
-            state_with_provider(Arc::new(MockLlmProvider::scripted([MockResponse::text("{}")])))
-                .await;
+        let state = state_with_provider(Arc::new(MockLlmProvider::scripted([MockResponse::text(
+            "{}",
+        )])))
+        .await;
         let _guard = state.try_begin_operation().expect("register operation");
 
         let catalog = params(vec![item("a", "A", None)]);
@@ -365,10 +366,11 @@ mod tests {
 
     #[tokio::test]
     async fn surfaces_a_provider_stream_error() {
-        let state = state_with_provider(Arc::new(MockLlmProvider::scripted([
-            MockResponse::error("boom"),
-        ])))
-        .await;
+        let state =
+            state_with_provider(Arc::new(MockLlmProvider::scripted([MockResponse::error(
+                "boom",
+            )])))
+            .await;
 
         let catalog = params(vec![item("a", "A", None)]);
         let response = handle_locale_generate(request(&catalog), &state).await;

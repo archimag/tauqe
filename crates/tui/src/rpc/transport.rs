@@ -4,10 +4,10 @@ use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::Context;
+use tauqe_protocol::{Message, ModelRef, Request, RequestId};
 use tokio::io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader, Lines};
 use tokio::process::{Child, ChildStdin, ChildStdout};
 use tokio::sync::mpsc;
-use tauqe_protocol::{Message, ModelRef, Request, RequestId};
 
 static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(10);
 
@@ -167,7 +167,8 @@ fn resolve_repo_root() -> PathBuf {
     }
 }
 
-pub async fn start_server() -> anyhow::Result<(Child, ChildStdin, Lines<BufReader<ChildStdout>>, PathBuf)> {
+pub async fn start_server(
+) -> anyhow::Result<(Child, ChildStdin, Lines<BufReader<ChildStdout>>, PathBuf)> {
     let server_path = find_server_binary();
     // The server owns its journal: it opens `.tauqe/server.log` through the
     // rotating file appender in `logging`. The client only derives the same
@@ -176,17 +177,29 @@ pub async fn start_server() -> anyhow::Result<(Child, ChildStdin, Lines<BufReade
     // rotation.
     let log_path = resolve_repo_root().join(".tauqe").join("server.log");
 
-    let mut server_child = tokio::process::Command::new(&server_path)
-        .stdin(Stdio::piped())
+    let mut cmd = tokio::process::Command::new(&server_path);
+    cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
-        .spawn()
-        .with_context(|| {
-            format!(
-                "Failed to spawn tauqe-server at '{}'. Make sure to run 'cargo build' first.",
-                server_path.display()
-            )
-        })?;
+        .kill_on_drop(true);
+
+    // Put the daemon in its own process group on Unix so that a signal sent to
+    // the TUI's foreground group (Ctrl+C, SIGHUP, or a closed terminal) never
+    // reaches the server and leaves it running as an orphan. The server is torn
+    // down explicitly on exit, or implicitly through `kill_on_drop` when the
+    // child handle is dropped.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.as_std_mut().process_group(0);
+    }
+
+    let mut server_child = cmd.spawn().with_context(|| {
+        format!(
+            "Failed to spawn tauqe-server at '{}'. Make sure to run 'cargo build' first.",
+            server_path.display()
+        )
+    })?;
 
     let child_stdin = server_child
         .stdin
@@ -299,5 +312,56 @@ mod tests {
         );
         assert!(a.take_optimistic_rollback(1).is_some());
         assert!(b.take_optimistic_rollback(1).is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dropping_the_child_handle_kills_the_spawned_process() {
+        use std::os::unix::process::CommandExt;
+
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_nanos())
+            .unwrap_or(0);
+        let heartbeat = std::env::temp_dir().join(format!(
+            "tauqe-spawn-probe-{}-{}.log",
+            std::process::id(),
+            unique
+        ));
+
+        // The probe appends a heartbeat every 50ms until it is terminated.
+        let script = format!(
+            "while true; do echo tick >> '{}'; sleep 0.05; done",
+            heartbeat.display()
+        );
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.arg("-c")
+            .arg(script)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        cmd.as_std_mut().process_group(0);
+
+        let child = cmd.spawn().expect("spawn probe process");
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        // Dropping the handle must terminate the process so it stops writing.
+        drop(child);
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let size_at_drop = std::fs::metadata(&heartbeat)
+            .map(|meta| meta.len())
+            .unwrap_or(0);
+
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let size_later = std::fs::metadata(&heartbeat)
+            .map(|meta| meta.len())
+            .unwrap_or(0);
+
+        let _ = std::fs::remove_file(&heartbeat);
+        assert_eq!(
+            size_at_drop, size_later,
+            "the spawned process kept running after its handle was dropped"
+        );
     }
 }

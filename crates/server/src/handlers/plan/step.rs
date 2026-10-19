@@ -6,11 +6,11 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use tauqe_core::edits::protocol::ContextRequest;
 use tauqe_core::plan::storage::PlanStorage;
-use tauqe_core::providers::{format_session_id, SESSION_PREFIX_PLAN, StreamEvent};
+use tauqe_core::providers::{format_session_id, StreamEvent, SESSION_PREFIX_PLAN};
 use tauqe_core::workflow::batch::{BatchStep, BatchStepExecutor, BatchStepOutcome};
 use tauqe_core::workflow::common::apply_context_requests_detailed;
 use tauqe_protocol::{
-    events, ContextAccess, ModelSelection, ModelRole, ModelTurnPlanContext, PlanItem,
+    events, ContextAccess, ModelRole, ModelSelection, ModelTurnPlanContext, PlanItem,
     PlanItemStatus, TurnIntent,
 };
 use tokio::sync::{mpsc, watch};
@@ -77,8 +77,15 @@ async fn run_plan_step(
     batch_step_ids: &[String],
     operation: Arc<OperationGuard>,
 ) -> BatchStepOutcome {
-    let outcome =
-        run_plan_step_inner(state, repo_root, plan_id, step_id, batch_step_ids, operation).await;
+    let outcome = run_plan_step_inner(
+        state,
+        repo_root,
+        plan_id,
+        step_id,
+        batch_step_ids,
+        operation,
+    )
+    .await;
     clear_auto_context(state).await;
     outcome
 }
@@ -146,7 +153,14 @@ async fn run_plan_step_inner(
     }
 
     preload_step_files(state, repo_root, &item).await;
-    set_step_status(state, repo_root, plan_id, step_id, PlanItemStatus::InProgress).await;
+    set_step_status(
+        state,
+        repo_root,
+        plan_id,
+        step_id,
+        PlanItemStatus::InProgress,
+    )
+    .await;
     tracing::info!(plan_id = plan_id, step_id = step_id, "plan step started");
 
     // Every step and retry of one plan extends the same provider prefix cache,

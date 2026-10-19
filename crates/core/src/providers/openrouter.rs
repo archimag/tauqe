@@ -2,13 +2,16 @@ use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
-use tokio::sync::{mpsc, watch};
 use tauqe_protocol::{ModelUsageInfo, ProviderKind};
+use tokio::sync::{mpsc, watch};
 
+use super::retry::JSON_TRUNCATION_MARKER;
 use super::types::{ChatMessage, ReasoningEffort, ResponseFormat, StreamEvent};
 use super::LlmProvider;
 
-use self::sse::{find_sse_event_boundary, log_stream_completion, truncate_response_body};
+use self::sse::{
+    find_sse_event_boundary, log_stream_completion, truncate_response_body, MAX_SSE_EVENT_BYTES,
+};
 use self::types::{
     ChatCompletionRequest, GenerationResponse, ProviderPreferences, ReasoningOption, StreamOptions,
     StreamingChunk,
@@ -140,6 +143,12 @@ impl OpenRouterProvider {
             return Ok(());
         }
 
+        // A structured response is one JSON document, so a generation stopped at
+        // the token limit leaves it unparseable.
+        let expects_json = matches!(
+            &response_format,
+            Some(ResponseFormat::JsonObject | ResponseFormat::JsonSchema { .. })
+        );
         let uses_json_schema = matches!(&response_format, Some(ResponseFormat::JsonSchema { .. }));
 
         tracing::info!(
@@ -235,11 +244,37 @@ impl OpenRouterProvider {
                 chunk_res = byte_stream.next() => {
                     match chunk_res {
                         Some(Ok(chunk)) => {
+                            let pending = buffer.len();
+                            if pending + chunk.len() > MAX_SSE_EVENT_BYTES {
+                                let msg = format!(
+                                    "OpenRouter SSE event exceeded {} bytes without an event terminator",
+                                    MAX_SSE_EVENT_BYTES
+                                );
+                                tracing::error!(
+                                    pending_bytes = pending,
+                                    chunk_bytes = chunk.len(),
+                                    limit_bytes = MAX_SSE_EVENT_BYTES,
+                                    "openrouter sse buffer cap exceeded"
+                                );
+                                let _ = tx.send(StreamEvent::Error(msg.clone())).await;
+                                bail!("{}", msg);
+                            }
+
                             buffer.extend_from_slice(&chunk);
 
-                            while let Some((pos, delim_len)) = find_sse_event_boundary(&buffer) {
+                            // Resume scanning at the chunk seam. The longest
+                            // delimiter is `\r\n\r\n` (4 bytes), so reaching
+                            // back 3 bytes is enough to catch a boundary split
+                            // across two chunks.
+                            let mut search_from = pending.saturating_sub(3);
+
+                            while let Some((pos, delim_len)) =
+                                find_sse_event_boundary(&buffer, search_from)
+                            {
                                 let event_bytes = buffer[..pos].to_vec();
                                 buffer.drain(..pos + delim_len);
+                                search_from = 0;
+
                                 let event_block = String::from_utf8_lossy(&event_bytes);
 
                                 for line in event_block.lines() {
@@ -323,6 +358,22 @@ impl OpenRouterProvider {
                                                         .send(StreamEvent::Error(msg.clone()))
                                                         .await;
                                                     bail!("OpenRouter error: {}", msg);
+                                                }
+                                                if choice.finish_reason.as_deref() == Some("length")
+                                                    && expects_json
+                                                {
+                                                    tracing::error!(
+                                                        finish_reason = "length",
+                                                        "openrouter structured output truncated"
+                                                    );
+                                                    let msg = format!(
+                                                        "OpenRouter structured JSON response {}",
+                                                        JSON_TRUNCATION_MARKER
+                                                    );
+                                                    let _ = tx
+                                                        .send(StreamEvent::Error(msg.clone()))
+                                                        .await;
+                                                    bail!("{}", msg);
                                                 }
 
                                                 if let Some(delta) = choice.delta {
@@ -465,7 +516,10 @@ impl LlmProvider for OpenRouterProvider {
 
 #[cfg(test)]
 mod tests {
-    use super::sse::{find_sse_event_boundary, truncate_response_body, RESPONSE_BODY_LOG_CHARS};
+    use super::sse::{
+        find_sse_event_boundary, truncate_response_body, MAX_SSE_EVENT_BYTES,
+        RESPONSE_BODY_LOG_CHARS,
+    };
     use super::*;
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -770,12 +824,15 @@ mod tests {
 
     #[test]
     fn test_find_sse_event_boundary() {
-        assert_eq!(find_sse_event_boundary(b""), None);
-        assert_eq!(find_sse_event_boundary(b"abc"), None);
-        assert_eq!(find_sse_event_boundary(b"abc\n\ndef"), Some((3, 2)));
-        assert_eq!(find_sse_event_boundary(b"abc\r\n\r\ndef"), Some((3, 4)));
-        assert_eq!(find_sse_event_boundary(b"abc\r\n\r\ndef\n\n"), Some((3, 4)));
-        assert_eq!(find_sse_event_boundary(b"abc\n\ndef\r\n\r\n"), Some((3, 2)));
+        assert_eq!(find_sse_event_boundary(b"", 0), None);
+        assert_eq!(find_sse_event_boundary(b"abc", 0), None);
+        assert_eq!(find_sse_event_boundary(b"abc\n\ndef", 0), Some((3, 2)));
+        assert_eq!(find_sse_event_boundary(b"abc\r\n\r\ndef", 0), Some((3, 4)));
+        assert_eq!(find_sse_event_boundary(b"abc\r\n\r\ndef\n\n", 0), Some((3, 4)));
+        assert_eq!(find_sse_event_boundary(b"abc\n\ndef\r\n\r\n", 0), Some((3, 2)));
+        assert_eq!(find_sse_event_boundary(b"abc\n\ndef", 1), Some((3, 2)));
+        assert_eq!(find_sse_event_boundary(b"abc\n\ndef", 4), None);
+        assert_eq!(find_sse_event_boundary(b"abc\n\ndef", 99), None);
     }
 
     #[test]
@@ -785,9 +842,10 @@ mod tests {
         let bytes = text.as_bytes();
         let mid = bytes.len() / 2;
         buffer.extend_from_slice(&bytes[..mid]);
-        assert_eq!(find_sse_event_boundary(&buffer), None);
+        assert_eq!(find_sse_event_boundary(&buffer, 0), None);
         buffer.extend_from_slice(&bytes[mid..]);
-        let (pos, len) = find_sse_event_boundary(&buffer).expect("found boundary");
+        let resume_from = mid.saturating_sub(3);
+        let (pos, len) = find_sse_event_boundary(&buffer, resume_from).expect("found boundary");
         assert_eq!(pos, bytes.len() - 2);
         assert_eq!(len, 2);
         let event_str = String::from_utf8(buffer[..pos].to_vec()).expect("valid utf-8");
@@ -905,7 +963,10 @@ mod tests {
             .await;
 
         assert!(res.is_err());
-        assert!(res.unwrap_err().to_string().contains("without [DONE] marker"));
+        assert!(res
+            .unwrap_err()
+            .to_string()
+            .contains("without [DONE] marker"));
 
         let mut saw_error_event = false;
         while let Some(event) = rx.recv().await {
@@ -1054,6 +1115,104 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_structured_output_truncated_by_length_is_transient() {
+        use super::super::types::JsonSchemaDefinition;
+
+        let mock_server = MockServer::start().await;
+
+        let sse_body = "data: {\"choices\":[{\"delta\":{\"content\":\"{\\\"message\\\":\\\"par\"},\"finish_reason\":\"length\"}]}\n\n";
+
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(sse_body, "text/event-stream"),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let provider =
+            OpenRouterProvider::new("test-api-key".to_string()).with_base_url(mock_server.uri());
+
+        let (tx, mut rx) = mpsc::channel(10);
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+
+        let response_format = Some(ResponseFormat::JsonSchema {
+            json_schema: JsonSchemaDefinition {
+                name: "model_result".to_string(),
+                description: None,
+                schema: serde_json::json!({"type": "object"}),
+                strict: Some(true),
+            },
+        });
+
+        let res = provider
+            .stream_chat("test-model", vec![], response_format, tx, cancel_rx)
+            .await;
+
+        assert!(res.is_err());
+        let message = res.unwrap_err().to_string();
+        assert!(
+            message.contains(JSON_TRUNCATION_MARKER),
+            "unexpected error: {message}"
+        );
+
+        let mut saw_error = false;
+        while let Some(event) = rx.recv().await {
+            if let StreamEvent::Error(error) = event {
+                assert!(error.contains(JSON_TRUNCATION_MARKER));
+                saw_error = true;
+            }
+        }
+        assert!(saw_error, "the truncation must surface as a stream error");
+    }
+
+    #[tokio::test]
+    async fn test_plain_text_length_finish_reason_is_not_an_error() {
+        let mock_server = MockServer::start().await;
+
+        let sse_body = "data: {\"choices\":[{\"delta\":{\"content\":\"truncated answer\"},\"finish_reason\":\"length\"}]}\n\n\
+                        data: [DONE]\n\n";
+
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(sse_body, "text/event-stream"),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let provider =
+            OpenRouterProvider::new("test-api-key".to_string()).with_base_url(mock_server.uri());
+
+        let (tx, mut rx) = mpsc::channel(10);
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+
+        provider
+            .stream_text("test-model", vec![], tx, cancel_rx)
+            .await
+            .expect("a text answer may legitimately end at the token limit");
+
+        let mut text = String::new();
+        let mut got_done = false;
+        let mut errors = Vec::new();
+        while let Some(event) = rx.recv().await {
+            match event {
+                StreamEvent::TextDelta(delta) => text.push_str(&delta),
+                StreamEvent::Done => got_done = true,
+                StreamEvent::Error(error) => errors.push(error),
+                _ => {}
+            }
+        }
+        assert_eq!(text, "truncated answer");
+        assert!(got_done);
+        assert!(errors.is_empty(), "unexpected stream errors: {errors:?}");
+    }
+
+    #[tokio::test]
     async fn test_stream_chat_finish_reason_error_returns_err() {
         let mock_server = MockServer::start().await;
 
@@ -1120,6 +1279,49 @@ mod tests {
         let err_msg = res.unwrap_err().to_string();
         assert!(err_msg.contains("429"));
         assert!(err_msg.contains("Too Many Requests"));
+    }
+
+    #[tokio::test]
+    async fn test_stream_chat_aborts_oversized_unterminated_event() {
+        let mock_server = MockServer::start().await;
+
+        let payload = "x".repeat(MAX_SSE_EVENT_BYTES + 1);
+        let sse_body = format!("data: {}", payload);
+
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(sse_body.into_bytes(), "text/event-stream"),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let provider =
+            OpenRouterProvider::new("test-api-key".to_string()).with_base_url(mock_server.uri());
+
+        let (tx, mut rx) = mpsc::channel(10);
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+
+        let res = provider
+            .stream_text("test-model", vec![], tx, cancel_rx)
+            .await;
+
+        assert!(res.is_err());
+        assert!(res.unwrap_err().to_string().contains("terminator"));
+
+        let mut saw_error_event = false;
+        while let Some(event) = rx.recv().await {
+            if let StreamEvent::Error(msg) = event {
+                assert!(msg.contains("terminator"));
+                saw_error_event = true;
+            }
+        }
+        assert!(
+            saw_error_event,
+            "oversized unterminated event must surface a stream error"
+        );
     }
 
     #[test]

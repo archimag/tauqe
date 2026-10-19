@@ -86,9 +86,9 @@ impl Plan {
 
                 if target.is_leaf() {
                     match target.status {
-                        PlanItemStatus::Discussion => PlanScopeEvaluation::BlockedByDiscussion(vec![
-                            format!("#{} {}", target.id, target.title),
-                        ]),
+                        PlanItemStatus::Discussion => PlanScopeEvaluation::BlockedByDiscussion(
+                            vec![format!("#{} {}", target.id, target.title)],
+                        ),
                         PlanItemStatus::Blocked => PlanScopeEvaluation::StepBlocked,
                         PlanItemStatus::Cancelled => PlanScopeEvaluation::Cancelled,
                         PlanItemStatus::Done => PlanScopeEvaluation::AllCompleted,
@@ -101,7 +101,12 @@ impl Plan {
                     let mut blocked = Vec::new();
                     let mut candidates = Vec::new();
 
-                    walk_candidate_leaves(&target.children, &mut discussion, &mut blocked, &mut candidates);
+                    walk_candidate_leaves(
+                        &target.children,
+                        &mut discussion,
+                        &mut blocked,
+                        &mut candidates,
+                    );
 
                     if !discussion.is_empty() {
                         return PlanScopeEvaluation::BlockedByDiscussion(discussion);
@@ -133,7 +138,10 @@ impl Plan {
     ///
     /// Returns the ordered ready leaves together with the descriptions of the
     /// leaves that remain blocked by unmet dependencies.
-    fn resolve_dependency_readiness(&self, candidates: Vec<PlanItem>) -> (Vec<PlanItem>, Vec<String>) {
+    fn resolve_dependency_readiness(
+        &self,
+        candidates: Vec<PlanItem>,
+    ) -> (Vec<PlanItem>, Vec<String>) {
         let mut satisfied: HashSet<String> = HashSet::new();
         // An item satisfies a dependency when it is effectively `Done`: a leaf
         // carries its own authoritative status, while a container is `Done`
@@ -148,9 +156,7 @@ impl Plan {
                 let status = if item.is_leaf() {
                     item.status
                 } else {
-                    compute_direct_status(
-                        item.children.iter().map(|child| walk(child, satisfied)),
-                    )
+                    compute_direct_status(item.children.iter().map(|child| walk(child, satisfied)))
                 };
                 if status == PlanItemStatus::Done {
                     satisfied.insert(id_key(&item.id));

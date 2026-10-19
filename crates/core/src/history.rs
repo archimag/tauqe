@@ -27,7 +27,10 @@ pub enum HistoryMutation {
     /// A new interaction record was appended to the end of the session.
     Appended { item: UiHistoryItem },
     /// The summarized prefix was replaced by `summary`, preserving `tail_ids`.
-    Compacted { summary: UiHistoryItem, tail_ids: Vec<u64> },
+    Compacted {
+        summary: UiHistoryItem,
+        tail_ids: Vec<u64>,
+    },
 }
 
 #[derive(Clone)]
@@ -87,7 +90,9 @@ impl HistoryManager {
                 commit_hash: None,
                 files: Vec::new(),
             },
-            HistoryEntry::Turn { prompt, context, .. } => UiHistoryItem {
+            HistoryEntry::Turn {
+                prompt, context, ..
+            } => UiHistoryItem {
                 id: final_id,
                 kind: UiHistoryKind::User,
                 text: prompt.clone(),
@@ -315,7 +320,10 @@ impl HistoryManager {
         summary_text: impl Into<String>,
         tail: Vec<HistoryEntry>,
     ) -> Result<()> {
-        let summary_id = tail.first().and_then(|e| e.id()).map(|id| id.saturating_sub(1));
+        let summary_id = tail
+            .first()
+            .and_then(|e| e.id())
+            .map(|id| id.saturating_sub(1));
         let tail_ids: Vec<u64> = tail.iter().filter_map(|entry| entry.id()).collect();
         let compacted = build_compacted_history(summary_id, summary_text.into(), tail);
         self.storage.rewrite_entries(&compacted)?;
@@ -365,20 +373,24 @@ mod tests {
 
         assert_eq!(hm.format_history_tag().unwrap(), "");
 
-        hm.record_turn("Check git status", vec!["src/git.rs".to_string()]).unwrap();
+        hm.record_turn("Check git status", vec!["src/git.rs".to_string()])
+            .unwrap();
         hm.record_response(
             "Checked git status",
             Some("f1a2b3c".to_string()),
             Some("Fix status check".to_string()),
             vec!["src/git.rs".to_string()],
-        ).unwrap();
+        )
+        .unwrap();
         let entries = hm.get_entries().unwrap();
         assert_eq!(entries.len(), 2);
 
         let tag = hm.format_history_tag().unwrap();
         assert!(tag.starts_with("<history>\n"));
         assert!(tag.ends_with("\n</history>"));
-        assert!(tag.contains(r#"{"type":"turn","id":1,"prompt":"Check git status","context":["src/git.rs"]}"#));
+        assert!(tag.contains(
+            r#"{"type":"turn","id":1,"prompt":"Check git status","context":["src/git.rs"]}"#
+        ));
 
         // Clear
         hm.clear().unwrap();
@@ -393,14 +405,16 @@ mod tests {
 
         for i in 1..=4 {
             hm.record_turn(format!("Task {}", i), vec![]).unwrap();
-            hm.record_response(format!("Done {}", i), None, None, vec![]).unwrap();
+            hm.record_response(format!("Done {}", i), None, None, vec![])
+                .unwrap();
         }
 
         let (head, tail) = hm.prepare_compaction(2).unwrap().unwrap();
         assert_eq!(head.len(), 4);
         assert_eq!(tail.len(), 4);
 
-        hm.apply_compaction("Tasks 1 and 2 completed successfully.", tail).unwrap();
+        hm.apply_compaction("Tasks 1 and 2 completed successfully.", tail)
+            .unwrap();
 
         let compacted_entries = hm.get_entries().unwrap();
         assert_eq!(compacted_entries.len(), 5); // 1 summary + 4 tail entries
@@ -467,7 +481,10 @@ mod tests {
 
     #[test]
     fn test_entry_to_ui_item() {
-        let entry1 = HistoryEntry::Summary { id: Some(1), text: "Summary text".to_string() };
+        let entry1 = HistoryEntry::Summary {
+            id: Some(1),
+            text: "Summary text".to_string(),
+        };
         let item1 = HistoryManager::entry_to_ui_item(1, &entry1);
         assert_eq!(item1.id, 1);
         assert_eq!(item1.kind, UiHistoryKind::System);
@@ -572,7 +589,10 @@ mod tests {
 
         storage.append_entry(&entry1).unwrap();
         let history_file = storage.history_path();
-        let mut file = std::fs::OpenOptions::new().append(true).open(&history_file).unwrap();
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&history_file)
+            .unwrap();
         writeln!(file, "not valid jsonl").unwrap();
         file.flush().unwrap();
         storage.append_entry(&entry2).unwrap();
@@ -605,7 +625,8 @@ mod tests {
 
         for i in 1..=4 {
             hm.record_turn(format!("Task {}", i), vec![]).unwrap();
-            hm.record_response(format!("Done {}", i), None, None, vec![]).unwrap();
+            hm.record_response(format!("Done {}", i), None, None, vec![])
+                .unwrap();
         }
 
         // Compaction must be reported as a structural mutation carrying the
@@ -613,7 +634,8 @@ mod tests {
         let (_, tail) = hm.prepare_compaction(2).unwrap().unwrap();
         let expected_tail_ids: Vec<u64> = tail.iter().filter_map(|entry| entry.id()).collect();
         assert_eq!(expected_tail_ids, vec![5, 6, 7, 8]);
-        hm.apply_compaction("Earlier tasks summarized.", tail).unwrap();
+        hm.apply_compaction("Earlier tasks summarized.", tail)
+            .unwrap();
 
         let mutations = received.lock().unwrap();
         // Eight appends (four turns, four responses), then one compaction.

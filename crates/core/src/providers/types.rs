@@ -128,6 +128,16 @@ pub enum StreamEvent {
         message: Option<String>,
     },
 
+    /// A transient connection failure is being retried after a backoff pause.
+    RetryingConnection {
+        attempt: u32,
+        max_attempts: u32,
+        delay_secs: u64,
+        reason: String,
+    },
+    /// The stream broke after partial output, so accumulated deltas are void.
+    ResetStream,
+
     Usage(ModelUsageInfo),
     Done,
     Cancelled,

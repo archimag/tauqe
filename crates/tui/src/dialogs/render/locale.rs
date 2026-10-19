@@ -147,8 +147,11 @@ fn render_locale_body(
 
     if dialog.generating {
         lines.push(Line::from(Span::styled(
-            active_t("dialog.locale.generating")
-                .replacen("{}", dialog.language_editor.get_text().trim(), 1),
+            active_t("dialog.locale.generating").replacen(
+                "{}",
+                dialog.language_editor.get_text().trim(),
+                1,
+            ),
             engine.fg(palette.status_warning).bold(),
         )));
     } else if dialog.language_editor.is_empty() {
@@ -161,7 +164,10 @@ fn render_locale_body(
             ),
         ]));
     } else {
-        lines.extend(super::editor_lines(&dialog.language_editor, is_editor_focused));
+        lines.extend(super::editor_lines(
+            &dialog.language_editor,
+            is_editor_focused,
+        ));
     }
 
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
@@ -179,7 +185,9 @@ fn render_locale_actions(frame: &mut ratatui::Frame, area: Rect, dialog: &Locale
                 .fg(engine.color(palette.text_inverse))
                 .bold()
         } else {
-            engine.bg(palette.button_bg).fg(engine.color(palette.button_fg))
+            engine
+                .bg(palette.button_bg)
+                .fg(engine.color(palette.button_fg))
         }
     };
 
@@ -192,7 +200,10 @@ fn render_locale_actions(frame: &mut ratatui::Frame, area: Rect, dialog: &Locale
     let actions = Line::from(vec![
         Span::styled(synthesize_label, style_for(LocaleDialogButton::Synthesize)),
         Span::raw("  "),
-        Span::styled(labels[1].clone(), style_for(LocaleDialogButton::ResetEnglish)),
+        Span::styled(
+            labels[1].clone(),
+            style_for(LocaleDialogButton::ResetEnglish),
+        ),
         Span::raw("  "),
         Span::styled(labels[2].clone(), style_for(LocaleDialogButton::Cancel)),
     ]);

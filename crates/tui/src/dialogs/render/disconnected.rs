@@ -106,7 +106,11 @@ pub fn render_disconnected_popup(frame: &mut ratatui::Frame, message: &str) {
     let actions = Paragraph::new(quit_line).alignment(Alignment::Center);
     frame.render_widget(actions, chunks[1]);
 
-    render_dialog_footer(frame, chunks[2], &active_t("dialog.server_disconnected.footer"));
+    render_dialog_footer(
+        frame,
+        chunks[2],
+        &active_t("dialog.server_disconnected.footer"),
+    );
 }
 
 #[cfg(test)]

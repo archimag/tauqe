@@ -172,7 +172,9 @@ fn decode_with_capabilities(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tauqe_protocol::{ContextAccess, DocTopic, EditOperation, LlmOutcome, VerifyOnSuccess, VerifyTarget};
+    use tauqe_protocol::{
+        ContextAccess, DocTopic, EditOperation, LlmOutcome, VerifyOnSuccess, VerifyTarget,
+    };
 
     #[test]
     fn test_name_and_capabilities() {
@@ -221,7 +223,8 @@ mod tests {
         assert_eq!(narrowed.capabilities(), &[LlmCapability::TextMessage]);
         assert!(!narrowed.supports(LlmCapability::FileEdits));
 
-        let raw = "Working.\n<context_request path=\"src/a.rs\" />\n<scratchpad>notes</scratchpad>\n";
+        let raw =
+            "Working.\n<context_request path=\"src/a.rs\" />\n<scratchpad>notes</scratchpad>\n";
         let commands = narrowed.decode(raw);
         assert!(!commands
             .iter()
@@ -348,7 +351,10 @@ mod tests {
         let has_error = commands
             .iter()
             .any(|cmd| matches!(cmd, LlmCommand::ProtocolError { .. }));
-        assert!(has_error, "Malformed XML should produce ProtocolError command");
+        assert!(
+            has_error,
+            "Malformed XML should produce ProtocolError command"
+        );
     }
 
     #[test]

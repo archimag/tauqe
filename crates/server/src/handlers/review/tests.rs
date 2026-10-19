@@ -121,10 +121,11 @@ async fn test_handle_review_start_defaults_to_reviewer_role() {
     std::fs::write(&target_file, "fn foo() {}\n").unwrap();
 
     let mut config = tauqe_core::config::AppConfig::default();
-    config.models.reviewer =
-        Some(vec![tauqe_protocol::ModelRef::openrouter("test/reviewer-model").into()]);
-    config.models.primary =
-        vec![tauqe_protocol::ModelRef::openrouter("test/primary-model").into()];
+    config.models.reviewer = Some(vec![tauqe_protocol::ModelRef::openrouter(
+        "test/reviewer-model",
+    )
+    .into()]);
+    config.models.primary = vec![tauqe_protocol::ModelRef::openrouter("test/primary-model").into()];
 
     let (out, _rx) = OutChannel::new();
     let (hist_tx, _hist_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -187,8 +188,8 @@ async fn test_review_start_streams_clean_summary_without_json_leakage() {
     while let Ok(Some(line)) =
         tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv()).await
     {
-        let terminal = line.contains(events::REVIEW_FINISHED)
-            || line.contains(events::REVIEW_ERROR);
+        let terminal =
+            line.contains(events::REVIEW_FINISHED) || line.contains(events::REVIEW_ERROR);
         lines.push(line);
         if terminal {
             break;
@@ -200,8 +201,7 @@ async fn test_review_start_streams_clean_summary_without_json_leakage() {
     let mut streamed = String::new();
     for line in &lines {
         if let Ok(val) = serde_json::from_str::<serde_json::Value>(line) {
-            if val.get("method").and_then(|m| m.as_str()) == Some(events::REVIEW_CONTENT_DELTA)
-            {
+            if val.get("method").and_then(|m| m.as_str()) == Some(events::REVIEW_CONTENT_DELTA) {
                 if let Some(delta) = val
                     .get("params")
                     .and_then(|p| p.get("delta"))
@@ -246,7 +246,10 @@ async fn test_handle_review_execute_validations() {
     assert_eq!(res.error.unwrap().code, "INVALID_PARAMS");
 
     let res = handle_review_execute(
-        make_req(2, Some(serde_json::json!({ "review_id": "non-existent", "item_id": 1 }))),
+        make_req(
+            2,
+            Some(serde_json::json!({ "review_id": "non-existent", "item_id": 1 })),
+        ),
         &state,
     )
     .await;
@@ -377,7 +380,11 @@ async fn test_review_batch_cross_session_skips_and_continues() {
     let state = AppState::new(config, dir.path().to_path_buf(), hist_tx, out);
     *state.provider_override.lock().await = Some(provider);
 
-    let operation = Arc::new(state.try_begin_operation().expect("register batch operation"));
+    let operation = Arc::new(
+        state
+            .try_begin_operation()
+            .expect("register batch operation"),
+    );
     let tasks = vec![
         ("rev-cross-skip-1".to_string(), 1),
         ("rev-cross-skip-2".to_string(), 2),
@@ -391,10 +398,14 @@ async fn test_review_batch_cross_session_skips_and_continues() {
 
     // A domain failure skips the finding in its own session without aborting
     // the queue or leaking into the other session.
-    let reloaded1 = ReviewStorage::load_review(dir.path(), "rev-cross-skip-1").unwrap().unwrap();
+    let reloaded1 = ReviewStorage::load_review(dir.path(), "rev-cross-skip-1")
+        .unwrap()
+        .unwrap();
     assert_eq!(reloaded1.find_item(1).unwrap().status, IssueStatus::Skipped);
 
-    let reloaded2 = ReviewStorage::load_review(dir.path(), "rev-cross-skip-2").unwrap().unwrap();
+    let reloaded2 = ReviewStorage::load_review(dir.path(), "rev-cross-skip-2")
+        .unwrap()
+        .unwrap();
     assert_eq!(reloaded2.find_item(2).unwrap().status, IssueStatus::Skipped);
 
     // Event review/batch_finished emitted with owner_id "all".
@@ -446,7 +457,11 @@ async fn test_review_batch_cross_session_success_and_active_id_tracking() {
     let state = test_state_with_provider(&dir, config, provider).await;
     *state.marker_override.lock().await = Some(marker.to_string());
 
-    let operation = Arc::new(state.try_begin_operation().expect("register batch operation"));
+    let operation = Arc::new(
+        state
+            .try_begin_operation()
+            .expect("register batch operation"),
+    );
     let tasks = vec![
         ("rev-cross-ok-1".to_string(), 1),
         ("rev-cross-ok-2".to_string(), 2),
@@ -459,10 +474,14 @@ async fn test_review_batch_cross_session_success_and_active_id_tracking() {
         outcome
     );
 
-    let reloaded1 = ReviewStorage::load_review(dir.path(), "rev-cross-ok-1").unwrap().unwrap();
+    let reloaded1 = ReviewStorage::load_review(dir.path(), "rev-cross-ok-1")
+        .unwrap()
+        .unwrap();
     assert_eq!(reloaded1.find_item(1).unwrap().status, IssueStatus::Skipped);
 
-    let reloaded2 = ReviewStorage::load_review(dir.path(), "rev-cross-ok-2").unwrap().unwrap();
+    let reloaded2 = ReviewStorage::load_review(dir.path(), "rev-cross-ok-2")
+        .unwrap()
+        .unwrap();
     assert_eq!(reloaded2.find_item(2).unwrap().status, IssueStatus::Skipped);
 
     // Active session ID tracks the latest executed session.
@@ -500,8 +519,18 @@ async fn test_review_batch_fail_fast_resets_status_and_preloads_file() {
     clear_auto_context(&state).await;
 
     // Without an API key the first turn cannot start: the batch must stop at finding 1.
-    let operation = Arc::new(state.try_begin_operation().expect("register batch operation"));
-    let outcome = run_review_batch(&state, "rev-exec-1", make_tasks("rev-exec-1", &[1, 2]), operation).await;
+    let operation = Arc::new(
+        state
+            .try_begin_operation()
+            .expect("register batch operation"),
+    );
+    let outcome = run_review_batch(
+        &state,
+        "rev-exec-1",
+        make_tasks("rev-exec-1", &[1, 2]),
+        operation,
+    )
+    .await;
     match outcome {
         BatchOutcome::Failed {
             completed, item_id, ..
@@ -541,8 +570,18 @@ async fn test_review_batch_skips_fixed_and_stops_on_rejected() {
     ReviewStorage::save_session(dir.path(), &session).unwrap();
     let state = test_state(&dir);
 
-    let operation = Arc::new(state.try_begin_operation().expect("register batch operation"));
-    let outcome = run_review_batch(&state, "rev-skip", make_tasks("rev-skip", &[1, 2]), operation).await;
+    let operation = Arc::new(
+        state
+            .try_begin_operation()
+            .expect("register batch operation"),
+    );
+    let outcome = run_review_batch(
+        &state,
+        "rev-skip",
+        make_tasks("rev-skip", &[1, 2]),
+        operation,
+    )
+    .await;
     match outcome {
         BatchOutcome::Failed {
             completed, item_id, ..
@@ -576,8 +615,18 @@ async fn test_review_batch_emits_finished_event() {
     );
 
     // Without an API key the first turn cannot start: the batch fails at finding 1.
-    let operation = Arc::new(state.try_begin_operation().expect("register batch operation"));
-    let outcome = run_review_batch(&state, "rev-emit", make_tasks("rev-emit", &[1, 2]), operation).await;
+    let operation = Arc::new(
+        state
+            .try_begin_operation()
+            .expect("register batch operation"),
+    );
+    let outcome = run_review_batch(
+        &state,
+        "rev-emit",
+        make_tasks("rev-emit", &[1, 2]),
+        operation,
+    )
+    .await;
     assert!(matches!(outcome, BatchOutcome::Failed { .. }));
 
     let mut raw_events = Vec::new();
@@ -714,8 +763,18 @@ async fn test_review_retry_exhaustion_skips_item_and_continues() {
     config.develop.max_retries = 1;
     let state = test_state_with_provider(&dir, config, provider.clone()).await;
 
-    let operation = Arc::new(state.try_begin_operation().expect("register batch operation"));
-    let outcome = run_review_batch(&state, "rev-retry-exhaust", make_tasks("rev-retry-exhaust", &[1]), operation).await;
+    let operation = Arc::new(
+        state
+            .try_begin_operation()
+            .expect("register batch operation"),
+    );
+    let outcome = run_review_batch(
+        &state,
+        "rev-retry-exhaust",
+        make_tasks("rev-retry-exhaust", &[1]),
+        operation,
+    )
+    .await;
     assert!(
         matches!(outcome, BatchOutcome::Completed { items: 1 }),
         "expected the exhausted finding to be skipped and the batch to complete, got {outcome:?}"
@@ -729,7 +788,10 @@ async fn test_review_retry_exhaustion_skips_item_and_continues() {
     let issue = ReviewIssue::from(updated.find_item(1).unwrap().clone());
     assert_eq!(issue.status, IssueStatus::Skipped);
     let notes = issue.note.as_deref().unwrap_or("");
-    assert!(notes.contains("Skipped after execution failure"), "notes: {notes}");
+    assert!(
+        notes.contains("Skipped after execution failure"),
+        "notes: {notes}"
+    );
     assert!(notes.contains("no code changes"), "notes: {notes}");
 
     // The retry loop is bounded: one initial attempt plus `max_retries`.
@@ -761,8 +823,18 @@ async fn test_review_batch_skips_no_change_findings_without_hanging() {
     config.develop.max_retries = 1;
     let state = test_state_with_provider(&dir, config, provider.clone()).await;
 
-    let operation = Arc::new(state.try_begin_operation().expect("register batch operation"));
-    let outcome = run_review_batch(&state, "rev-no-change", make_tasks("rev-no-change", &[1, 2]), operation).await;
+    let operation = Arc::new(
+        state
+            .try_begin_operation()
+            .expect("register batch operation"),
+    );
+    let outcome = run_review_batch(
+        &state,
+        "rev-no-change",
+        make_tasks("rev-no-change", &[1, 2]),
+        operation,
+    )
+    .await;
     assert!(
         matches!(outcome, BatchOutcome::Completed { items: 2 }),
         "expected the batch to skip both findings and complete, got {outcome:?}"
@@ -796,8 +868,18 @@ async fn test_review_semantic_block_skips_finding_without_retry() {
 
     let state = test_state_with_provider(&dir, test_config(), provider.clone()).await;
 
-    let operation = Arc::new(state.try_begin_operation().expect("register batch operation"));
-    let outcome = run_review_batch(&state, "rev-blocked", make_tasks("rev-blocked", &[1]), operation).await;
+    let operation = Arc::new(
+        state
+            .try_begin_operation()
+            .expect("register batch operation"),
+    );
+    let outcome = run_review_batch(
+        &state,
+        "rev-blocked",
+        make_tasks("rev-blocked", &[1]),
+        operation,
+    )
+    .await;
     assert!(
         matches!(outcome, BatchOutcome::Completed { items: 1 }),
         "expected the blocked finding to be skipped and the batch to complete, got {outcome:?}"
@@ -822,9 +904,9 @@ async fn test_review_explicit_model_disables_ladder_escalation() {
     init_repo_with_file(&dir, "src/target.rs");
 
     let mut item = test_item(1, IssueStatus::Todo, "src/target.rs");
-    item.model = Some(ModelSelection::Specific(tauqe_protocol::ModelRef::openrouter(
-        "explicit/model",
-    )));
+    item.model = Some(ModelSelection::Specific(
+        tauqe_protocol::ModelRef::openrouter("explicit/model"),
+    ));
 
     let session = test_session("rev-explicit", vec![item]);
     ReviewStorage::save_session(dir.path(), &session).unwrap();
@@ -841,8 +923,18 @@ async fn test_review_explicit_model_disables_ladder_escalation() {
     config.models.auto_level_up = true;
     let state = test_state_with_provider(&dir, config, provider.clone()).await;
 
-    let operation = Arc::new(state.try_begin_operation().expect("register batch operation"));
-    let outcome = run_review_batch(&state, "rev-explicit", make_tasks("rev-explicit", &[1]), operation).await;
+    let operation = Arc::new(
+        state
+            .try_begin_operation()
+            .expect("register batch operation"),
+    );
+    let outcome = run_review_batch(
+        &state,
+        "rev-explicit",
+        make_tasks("rev-explicit", &[1]),
+        operation,
+    )
+    .await;
     assert!(matches!(outcome, BatchOutcome::Completed { items: 1 }));
 
     let requests = provider.requests();
@@ -877,8 +969,18 @@ async fn test_review_step_execution_uses_turn_marker() {
     let state = test_state_with_provider(&dir, config, provider.clone()).await;
     *state.marker_override.lock().await = Some(marker.to_string());
 
-    let operation = Arc::new(state.try_begin_operation().expect("register batch operation"));
-    let outcome = run_review_batch(&state, "rev-marker", make_tasks("rev-marker", &[1]), operation).await;
+    let operation = Arc::new(
+        state
+            .try_begin_operation()
+            .expect("register batch operation"),
+    );
+    let outcome = run_review_batch(
+        &state,
+        "rev-marker",
+        make_tasks("rev-marker", &[1]),
+        operation,
+    )
+    .await;
     assert!(
         matches!(outcome, BatchOutcome::Completed { items: 1 }),
         "expected a completed batch, got {:?}",
@@ -925,8 +1027,18 @@ async fn test_review_step_execution_with_skip_tag_marks_skipped_and_saves_notes(
     let state = test_state_with_provider(&dir, config, provider).await;
     *state.marker_override.lock().await = Some(marker.to_string());
 
-    let operation = Arc::new(state.try_begin_operation().expect("register batch operation"));
-    let outcome = run_review_batch(&state, "rev-skip-single", make_tasks("rev-skip-single", &[1]), operation).await;
+    let operation = Arc::new(
+        state
+            .try_begin_operation()
+            .expect("register batch operation"),
+    );
+    let outcome = run_review_batch(
+        &state,
+        "rev-skip-single",
+        make_tasks("rev-skip-single", &[1]),
+        operation,
+    )
+    .await;
     assert!(
         matches!(outcome, BatchOutcome::Completed { items: 1 }),
         "expected batch completed, got {:?}",
@@ -978,8 +1090,18 @@ async fn test_review_batch_continues_after_skipped_item() {
     let state = test_state_with_provider(&dir, config, provider).await;
     *state.marker_override.lock().await = Some(marker.to_string());
 
-    let operation = Arc::new(state.try_begin_operation().expect("register batch operation"));
-    let outcome = run_review_batch(&state, "rev-skip-continue", make_tasks("rev-skip-continue", &[1, 2]), operation).await;
+    let operation = Arc::new(
+        state
+            .try_begin_operation()
+            .expect("register batch operation"),
+    );
+    let outcome = run_review_batch(
+        &state,
+        "rev-skip-continue",
+        make_tasks("rev-skip-continue", &[1, 2]),
+        operation,
+    )
+    .await;
     assert!(
         matches!(outcome, BatchOutcome::Completed { items: 2 }),
         "expected batch to execute both items, got {:?}",
@@ -1044,7 +1166,9 @@ async fn test_review_batch_preloads_multiple_files() {
         "<skip_{m} reason=\"Validated\">Files were verified to be in sync</skip_{m}>",
         m = marker
     );
-    let provider = Arc::new(MockLlmProvider::scripted([MockResponse::text(skip_response)]));
+    let provider = Arc::new(MockLlmProvider::scripted([MockResponse::text(
+        skip_response,
+    )]));
 
     let mut config = test_config();
     config.develop.workflow = tauqe_protocol::WorkflowKind::Naive;
@@ -1073,8 +1197,18 @@ async fn test_review_batch_preloads_multiple_files() {
     }
     clear_auto_context(&state).await;
 
-    let operation = Arc::new(state.try_begin_operation().expect("register batch operation"));
-    let outcome = run_review_batch(&state, "rev-preload-multi", make_tasks("rev-preload-multi", &[1]), operation).await;
+    let operation = Arc::new(
+        state
+            .try_begin_operation()
+            .expect("register batch operation"),
+    );
+    let outcome = run_review_batch(
+        &state,
+        "rev-preload-multi",
+        make_tasks("rev-preload-multi", &[1]),
+        operation,
+    )
+    .await;
     assert!(matches!(outcome, BatchOutcome::Completed { items: 1 }));
 
     // After batch execution, auto context is cleaned up so preloaded files do not leak
@@ -1112,7 +1246,9 @@ async fn test_handle_review_update_item_clears_and_updates_notes() {
         .unwrap()
         .unwrap();
     assert_eq!(
-        ReviewIssue::from(reloaded.find_item(1).unwrap().clone()).note.as_deref(),
+        ReviewIssue::from(reloaded.find_item(1).unwrap().clone())
+            .note
+            .as_deref(),
         Some("Updated note")
     );
 
@@ -1143,10 +1279,7 @@ async fn test_handle_review_update_item_requires_explicit_review_id() {
     let dir = TestDir::new();
     let state = test_state(&dir);
 
-    let session = test_session(
-        "rev-iso-1",
-        vec![test_item(1, IssueStatus::Todo, "foo.rs")],
-    );
+    let session = test_session("rev-iso-1", vec![test_item(1, IssueStatus::Todo, "foo.rs")]);
     ReviewStorage::save_session(dir.path(), &session).unwrap();
     ReviewStorage::save_active_id(dir.path(), Some("rev-iso-1")).unwrap();
 
@@ -1219,7 +1352,11 @@ async fn test_review_batch_stops_gracefully_on_soft_stop() {
         out,
     );
 
-    let operation = Arc::new(state.try_begin_operation().expect("register batch operation"));
+    let operation = Arc::new(
+        state
+            .try_begin_operation()
+            .expect("register batch operation"),
+    );
     // A soft stop requested before the batch starts stops the queue before
     // the first finding runs.
     state.soft_stop_active_operation();
@@ -1275,12 +1412,7 @@ async fn test_review_start_with_path_pattern_preserves_user_context() {
 
     let (out, mut rx) = OutChannel::new();
     let (hist_tx, _hist_rx) = tokio::sync::mpsc::unbounded_channel();
-    let state = AppState::new(
-        test_config(),
-        dir.path().to_path_buf(),
-        hist_tx,
-        out,
-    );
+    let state = AppState::new(test_config(), dir.path().to_path_buf(), hist_tx, out);
     *state.provider_override.lock().await = Some(provider);
 
     state
@@ -1301,7 +1433,11 @@ async fn test_review_start_with_path_pattern_preserves_user_context() {
         })),
     };
     let res = handle_review_start(req, &state).await;
-    assert!(res.error.is_none(), "review start must succeed: {:?}", res.error);
+    assert!(
+        res.error.is_none(),
+        "review start must succeed: {:?}",
+        res.error
+    );
 
     while let Ok(Some(line)) =
         tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv()).await
@@ -1349,8 +1485,18 @@ async fn test_review_step_execution_records_resolution_notes_on_fixed() {
     let state = test_state_with_provider(&dir, config, provider.clone()).await;
     *state.marker_override.lock().await = Some(marker.to_string());
 
-    let operation = Arc::new(state.try_begin_operation().expect("register batch operation"));
-    let outcome = run_review_batch(&state, "rev-fixed-notes", make_tasks("rev-fixed-notes", &[1]), operation).await;
+    let operation = Arc::new(
+        state
+            .try_begin_operation()
+            .expect("register batch operation"),
+    );
+    let outcome = run_review_batch(
+        &state,
+        "rev-fixed-notes",
+        make_tasks("rev-fixed-notes", &[1]),
+        operation,
+    )
+    .await;
     assert!(
         matches!(outcome, BatchOutcome::Completed { items: 1 }),
         "expected a completed batch, got {:?}",
@@ -1568,8 +1714,18 @@ async fn test_review_subplan_execution_marks_fixed_when_all_steps_succeed() {
 
     let mut item = test_item(1, IssueStatus::Todo, "src/target.rs");
     item.plan = vec![
-        subplan_item("1.1", "First step", PlanItemStatus::Todo, vec!["src/target.rs"]),
-        subplan_item("1.2", "Second step", PlanItemStatus::Todo, vec!["src/target.rs"]),
+        subplan_item(
+            "1.1",
+            "First step",
+            PlanItemStatus::Todo,
+            vec!["src/target.rs"],
+        ),
+        subplan_item(
+            "1.2",
+            "Second step",
+            PlanItemStatus::Todo,
+            vec!["src/target.rs"],
+        ),
     ];
     let session = test_session("rev-subplan-ok", vec![item]);
     ReviewStorage::save_session(dir.path(), &session).unwrap();
@@ -1593,7 +1749,11 @@ async fn test_review_subplan_execution_marks_fixed_when_all_steps_succeed() {
     let state = test_state_with_provider(&dir, config, provider).await;
     *state.marker_override.lock().await = Some(marker.to_string());
 
-    let operation = Arc::new(state.try_begin_operation().expect("register batch operation"));
+    let operation = Arc::new(
+        state
+            .try_begin_operation()
+            .expect("register batch operation"),
+    );
     let outcome = run_review_batch(
         &state,
         "rev-subplan-ok",
@@ -1627,8 +1787,18 @@ async fn test_review_subplan_interruption_preserves_done_and_marks_skipped() {
 
     let mut item = test_item(1, IssueStatus::Todo, "src/target.rs");
     item.plan = vec![
-        subplan_item("1.1", "First step", PlanItemStatus::Todo, vec!["src/target.rs"]),
-        subplan_item("1.2", "Second step", PlanItemStatus::Todo, vec!["src/target.rs"]),
+        subplan_item(
+            "1.1",
+            "First step",
+            PlanItemStatus::Todo,
+            vec!["src/target.rs"],
+        ),
+        subplan_item(
+            "1.2",
+            "Second step",
+            PlanItemStatus::Todo,
+            vec!["src/target.rs"],
+        ),
     ];
     let session = test_session("rev-subplan-stop", vec![item]);
     ReviewStorage::save_session(dir.path(), &session).unwrap();
@@ -1654,7 +1824,11 @@ async fn test_review_subplan_interruption_preserves_done_and_marks_skipped() {
     let state = test_state_with_provider(&dir, config, provider).await;
     *state.marker_override.lock().await = Some(marker.to_string());
 
-    let operation = Arc::new(state.try_begin_operation().expect("register batch operation"));
+    let operation = Arc::new(
+        state
+            .try_begin_operation()
+            .expect("register batch operation"),
+    );
     let outcome = run_review_batch(
         &state,
         "rev-subplan-stop",
@@ -1688,8 +1862,18 @@ async fn test_review_subplan_replans_remaining_horizon_after_failed_step() {
 
     let mut item = test_item(1, IssueStatus::Todo, "src/target.rs");
     item.plan = vec![
-        subplan_item("1.1", "First step", PlanItemStatus::Todo, vec!["src/target.rs"]),
-        subplan_item("1.2", "Second step", PlanItemStatus::Todo, vec!["src/target.rs"]),
+        subplan_item(
+            "1.1",
+            "First step",
+            PlanItemStatus::Todo,
+            vec!["src/target.rs"],
+        ),
+        subplan_item(
+            "1.2",
+            "Second step",
+            PlanItemStatus::Todo,
+            vec!["src/target.rs"],
+        ),
     ];
     let session = test_session("rev-subplan-replan", vec![item]);
     ReviewStorage::save_session(dir.path(), &session).unwrap();
@@ -1735,7 +1919,11 @@ async fn test_review_subplan_replans_remaining_horizon_after_failed_step() {
     let state = test_state_with_provider(&dir, config, provider.clone()).await;
     *state.marker_override.lock().await = Some(marker.to_string());
 
-    let operation = Arc::new(state.try_begin_operation().expect("register batch operation"));
+    let operation = Arc::new(
+        state
+            .try_begin_operation()
+            .expect("register batch operation"),
+    );
     let outcome = run_review_batch(
         &state,
         "rev-subplan-replan",
@@ -1813,7 +2001,11 @@ async fn test_review_batch_skips_finding_on_verification_failure_and_continues()
     config.develop.max_retries = 0;
     let state = test_state_with_provider(&dir, config, provider.clone()).await;
 
-    let operation = Arc::new(state.try_begin_operation().expect("register batch operation"));
+    let operation = Arc::new(
+        state
+            .try_begin_operation()
+            .expect("register batch operation"),
+    );
     let outcome = run_review_batch(
         &state,
         "rev-verify-skip",
@@ -1842,7 +2034,10 @@ async fn test_review_batch_skips_finding_on_verification_failure_and_continues()
             notes.contains("Skipped after execution failure"),
             "finding {id} notes: {notes}"
         );
-        assert!(notes.contains("verification"), "finding {id} notes: {notes}");
+        assert!(
+            notes.contains("verification"),
+            "finding {id} notes: {notes}"
+        );
     }
 
     // Each failed turn rolled back cleanly, so the source is left unmodified.
@@ -1875,7 +2070,11 @@ async fn test_review_batch_stops_on_provider_error() {
 
     let state = test_state_with_provider(&dir, test_config(), provider.clone()).await;
 
-    let operation = Arc::new(state.try_begin_operation().expect("register batch operation"));
+    let operation = Arc::new(
+        state
+            .try_begin_operation()
+            .expect("register batch operation"),
+    );
     let outcome = run_review_batch(
         &state,
         "rev-provider-abort",
@@ -1914,14 +2113,8 @@ async fn test_parallel_review_updates_are_isolated_by_review_id() {
     let dir = TestDir::new();
     let state = test_state(&dir);
 
-    let session_a = test_session(
-        "rev-par-a",
-        vec![test_item(1, IssueStatus::Todo, "foo.rs")],
-    );
-    let session_b = test_session(
-        "rev-par-b",
-        vec![test_item(1, IssueStatus::Todo, "foo.rs")],
-    );
+    let session_a = test_session("rev-par-a", vec![test_item(1, IssueStatus::Todo, "foo.rs")]);
+    let session_b = test_session("rev-par-b", vec![test_item(1, IssueStatus::Todo, "foo.rs")]);
     ReviewStorage::save_session(dir.path(), &session_a).unwrap();
     ReviewStorage::save_session(dir.path(), &session_b).unwrap();
     // The process-global active marker points at session A only; it must never
@@ -1942,8 +2135,16 @@ async fn test_parallel_review_updates_are_isolated_by_review_id() {
         handle_review_update_item(make_req(1, "rev-par-a", "fixed"), &state),
         handle_review_update_item(make_req(2, "rev-par-b", "rejected"), &state),
     );
-    assert!(res_a.error.is_none(), "session A update failed: {:?}", res_a.error);
-    assert!(res_b.error.is_none(), "session B update failed: {:?}", res_b.error);
+    assert!(
+        res_a.error.is_none(),
+        "session A update failed: {:?}",
+        res_a.error
+    );
+    assert!(
+        res_b.error.is_none(),
+        "session B update failed: {:?}",
+        res_b.error
+    );
 
     // Each update is scoped to the session it names: the two findings sharing
     // id #1 keep their own, independent status.
@@ -2090,7 +2291,11 @@ async fn test_review_autonomous_architecture_decomposition_before_coding() {
     let state = test_state_with_provider(&dir, config, provider.clone()).await;
     *state.marker_override.lock().await = Some(marker.to_string());
 
-    let operation = Arc::new(state.try_begin_operation().expect("register batch operation"));
+    let operation = Arc::new(
+        state
+            .try_begin_operation()
+            .expect("register batch operation"),
+    );
     let outcome = run_review_batch(
         &state,
         "rev-auto-arch",
@@ -2154,7 +2359,11 @@ async fn test_review_refine_status_autonomous_decomposition() {
     let state = test_state_with_provider(&dir, config, provider.clone()).await;
     *state.marker_override.lock().await = Some(marker.to_string());
 
-    let operation = Arc::new(state.try_begin_operation().expect("register batch operation"));
+    let operation = Arc::new(
+        state
+            .try_begin_operation()
+            .expect("register batch operation"),
+    );
     let outcome = run_review_batch(
         &state,
         "rev-auto-refine",
@@ -2198,7 +2407,11 @@ async fn test_review_autonomous_decomposition_blocked_skips_finding() {
 
     let state = test_state_with_provider(&dir, test_config(), provider.clone()).await;
 
-    let operation = Arc::new(state.try_begin_operation().expect("register batch operation"));
+    let operation = Arc::new(
+        state
+            .try_begin_operation()
+            .expect("register batch operation"),
+    );
     let outcome = run_review_batch(
         &state,
         "rev-auto-blocked",
@@ -2250,8 +2463,18 @@ async fn test_review_subplan_emits_in_progress_updates() {
     *state.provider_override.lock().await = Some(provider);
     *state.marker_override.lock().await = Some(marker.to_string());
 
-    let operation = Arc::new(state.try_begin_operation().expect("register batch operation"));
-    let _ = run_review_batch(&state, "rev-inprog", make_tasks("rev-inprog", &[1]), operation).await;
+    let operation = Arc::new(
+        state
+            .try_begin_operation()
+            .expect("register batch operation"),
+    );
+    let _ = run_review_batch(
+        &state,
+        "rev-inprog",
+        make_tasks("rev-inprog", &[1]),
+        operation,
+    )
+    .await;
 
     let mut saw_substep_in_progress = false;
     while let Ok(line) = rx.try_recv() {
@@ -2303,8 +2526,8 @@ async fn test_handle_review_execute_validates_step_target() {
     };
 
     // step_id requires review_id and item_id.
-    let res = handle_review_execute(make_req(1, serde_json::json!({ "step_id": "1.1" })), &state)
-        .await;
+    let res =
+        handle_review_execute(make_req(1, serde_json::json!({ "step_id": "1.1" })), &state).await;
     assert_eq!(res.error.unwrap().code, "INVALID_PARAMS");
 
     // An unknown sub-step is rejected.
@@ -2370,7 +2593,11 @@ async fn test_review_subplan_targeted_step_execution() {
     let state = test_state_with_provider(&dir, config, provider.clone()).await;
     *state.marker_override.lock().await = Some(marker.to_string());
 
-    let operation = Arc::new(state.try_begin_operation().expect("register batch operation"));
+    let operation = Arc::new(
+        state
+            .try_begin_operation()
+            .expect("register batch operation"),
+    );
     let outcome = run_review_batch_with_options(
         &state,
         "rev-target-step",
@@ -2422,7 +2649,11 @@ async fn test_review_subplan_targeted_step_model_and_instructions() {
     *state.marker_override.lock().await = Some(marker.to_string());
 
     let model = ModelSelection::Specific(tauqe_protocol::ModelRef::openrouter("custom/coder"));
-    let operation = Arc::new(state.try_begin_operation().expect("register batch operation"));
+    let operation = Arc::new(
+        state
+            .try_begin_operation()
+            .expect("register batch operation"),
+    );
     let outcome = run_review_batch_with_options(
         &state,
         "rev-step-opts",
@@ -2476,11 +2707,7 @@ fn subplan_container(
 }
 
 /// Builds a leaf sub-step that declares the given dependencies.
-fn dependent_subplan_item(
-    id: &str,
-    title: &str,
-    deps: &[&str],
-) -> tauqe_protocol::PlanItem {
+fn dependent_subplan_item(id: &str, title: &str, deps: &[&str]) -> tauqe_protocol::PlanItem {
     tauqe_protocol::PlanItem {
         id: id.to_string(),
         title: title.to_string(),
@@ -2500,7 +2727,11 @@ fn save_subplan_session(dir: &TestDir, review_id: &str, subplan: Vec<tauqe_proto
 }
 
 /// Sends a `review/execute` request targeting a single sub-step.
-async fn execute_substep(state: &Arc<AppState>, review_id: &str, step_id: &str) -> tauqe_protocol::Response {
+async fn execute_substep(
+    state: &Arc<AppState>,
+    review_id: &str,
+    step_id: &str,
+) -> tauqe_protocol::Response {
     let req = Request {
         id: tauqe_protocol::RequestId::Number(1),
         method: tauqe_protocol::methods::REVIEW_EXECUTE.to_string(),
@@ -2524,7 +2755,12 @@ async fn test_validate_step_target_rejects_cancelled_dependency() {
         &dir,
         "rev-cancelled-dep",
         vec![
-            subplan_item("1.1", "First", PlanItemStatus::Cancelled, vec!["src/target.rs"]),
+            subplan_item(
+                "1.1",
+                "First",
+                PlanItemStatus::Cancelled,
+                vec!["src/target.rs"],
+            ),
             dependent_subplan_item("1.2", "Second", &["1.1"]),
         ],
     );
@@ -2552,8 +2788,18 @@ async fn test_validate_step_target_resolves_composite_container_dependency_when_
                 "1.2",
                 "Composite prerequisite",
                 vec![
-                    subplan_item("1.2.1", "Child one", PlanItemStatus::Done, vec!["src/target.rs"]),
-                    subplan_item("1.2.2", "Child two", PlanItemStatus::Done, vec!["src/target.rs"]),
+                    subplan_item(
+                        "1.2.1",
+                        "Child one",
+                        PlanItemStatus::Done,
+                        vec!["src/target.rs"],
+                    ),
+                    subplan_item(
+                        "1.2.2",
+                        "Child two",
+                        PlanItemStatus::Done,
+                        vec!["src/target.rs"],
+                    ),
                 ],
             ),
             dependent_subplan_item("1.3", "Third", &["1.2"]),
@@ -2585,8 +2831,18 @@ async fn test_validate_step_target_blocks_composite_container_dependency_when_un
                 "1.2",
                 "Composite prerequisite",
                 vec![
-                    subplan_item("1.2.1", "Child one", PlanItemStatus::Done, vec!["src/target.rs"]),
-                    subplan_item("1.2.2", "Child two", PlanItemStatus::Todo, vec!["src/target.rs"]),
+                    subplan_item(
+                        "1.2.1",
+                        "Child one",
+                        PlanItemStatus::Done,
+                        vec!["src/target.rs"],
+                    ),
+                    subplan_item(
+                        "1.2.2",
+                        "Child two",
+                        PlanItemStatus::Todo,
+                        vec!["src/target.rs"],
+                    ),
                 ],
             ),
             dependent_subplan_item("1.3", "Third", &["1.2"]),

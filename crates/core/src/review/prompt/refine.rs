@@ -1,5 +1,6 @@
 use crate::context::ContextFileContent;
 use crate::escape::single_line;
+use crate::prompt::format_repository_outline_section;
 use tauqe_protocol::review::{ReviewIssue, ReviewItem, ReviewSession};
 use tauqe_protocol::PlanItem;
 
@@ -51,8 +52,10 @@ pub fn build_review_finding_refine_system_prompt() -> String {
 
     out.push_str("6. Architect Discovery Protocol (Mandatory Contract Verification):\n");
     out.push_str("   - You have access to symbol contours in `<repo_map>` and already loaded files in `Active Context Files`.\n");
+    out.push_str("   - Eager contour generation may be disabled, so `<repo_map>` can cover only part of the codebase. A module absent from the contours is never evidence that it is empty: request its contours via `repo_maps` before designing a step that touches it.\n");
     out.push_str("   - RepoMap contours are blinkers, not contracts: they reveal only the shape of the codebase (names, kinds, and rough signatures), never exact type definitions, field layouts, trait bounds, error semantics, lifetimes, or crate boundaries.\n");
-    out.push_str("   - Whenever a leaf step you synthesize must interact with an existing interface, struct, enum, function, trait, module, or external crate, you MUST NOT infer its contract from contours alone. You MUST set `status: \"needs_context\"`, request the concrete source files in `context_requests: [...]` or execute searches via `repo_searches: [...]`, and leave `items: []`.\n");
+    out.push_str("   - Whenever a leaf step you synthesize must interact with an existing interface, struct, enum, function, trait, module, or external crate, you MUST NOT infer its contract from contours alone. You MUST set `status: \"needs_context\"`, request the concrete source files in `context_requests: [...]`, execute searches via `repo_searches: [...]`, or request Tree-sitter symbol contours of a specific subsystem via `repo_maps: [\"crates/core/src/review\"]`, and leave `items: []`.\n");
+    out.push_str("   - Contour requests (`repo_maps`) accept a repository-relative directory or file prefix; an empty string or `.` names the whole repository. They reveal module shape only, so an exact contract still has to be verified through `context_requests` or `repo_searches`.\n");
     out.push_str("   - Repository Search Syntax: searches use Rust / ripgrep regular expressions (lookaround assertions and backreferences are not supported).\n");
     out.push_str("   - Never emit speculative field names, argument types, return types, generic parameters, or method signatures derived from a contour line. A guessed contract is a hard contract violation.\n");
     out.push_str("   - Do not re-request files already present in `Active Context Files`; treat them as verified context.\n\n");
@@ -100,6 +103,7 @@ pub fn build_review_finding_refine_user_prompt(
     item: &ReviewItem,
     context_files: &[ContextFileContent],
     repo_map: Option<&str>,
+    repo_dirs: Option<&str>,
     diagnostics: Option<ReviewRefineDiagnostics<'_>>,
     instructions: Option<&str>,
 ) -> String {
@@ -204,19 +208,20 @@ pub fn build_review_finding_refine_user_prompt(
         out.push('\n');
     }
 
-    if let Some(rm) = repo_map {
-        let trimmed = rm.trim();
-        if !trimmed.is_empty() {
-            out.push_str("## Codebase Symbol Contours (<repo_map>):\n");
-            out.push_str(trimmed);
-            out.push_str("\n\n");
-        }
+    // The eager symbol map and the compact directory tree are mutually
+    // exclusive: the Architect reads either symbol contours or the folder
+    // layout, never both.
+    if let Some(outline) = format_repository_outline_section(repo_map, repo_dirs) {
+        out.push_str(&outline);
     }
 
     if !context_files.is_empty() {
         out.push_str("## Active Context Files:\n");
         for file in context_files {
-            out.push_str(&format!("### File: `{}`\n```\n{}\n```\n\n", file.path, file.content));
+            out.push_str(&format!(
+                "### File: `{}`\n```\n{}\n```\n\n",
+                file.path, file.content
+            ));
         }
     }
 
@@ -234,7 +239,7 @@ pub fn build_review_finding_refine_user_prompt(
     out.push_str("2. Synthesize a decomposed, dependency-ordered subplan of leaf steps with `status: \"todo\"`.\n");
     out.push_str("3. For each leaf step, declare `files`, `readonly_files`, and `depends_on`. Ensure each step leaves the codebase in a compiling state.\n");
     out.push_str("4. If the finding is blocked or cannot be implemented, report `status: \"blocked\"` with `reason`.\n");
-    out.push_str("5. Follow the Architect Discovery Protocol: before designing any step that interacts with an existing interface, type, trait, module, or crate, verify its real contract by reporting `status: \"needs_context\"` with the required `context_requests` or `repo_searches`. Never infer contracts from RepoMap contours alone.\n");
+    out.push_str("5. Follow the Architect Discovery Protocol: before designing any step that interacts with an existing interface, type, trait, module, or crate, verify its real contract by reporting `status: \"needs_context\"` with the required `context_requests`, `repo_searches`, or `repo_maps`. Never infer contracts from RepoMap contours alone.\n");
     out.push_str("6. Language Directive: Formulate all titles, details, explanations, and reasons strictly in the same natural language as the finding.\n");
 
     out
@@ -246,6 +251,7 @@ pub fn build_review_refine_user_prompt(
     item: &ReviewItem,
     context_files: &[ContextFileContent],
     repo_map: Option<&str>,
+    repo_dirs: Option<&str>,
     instructions: Option<&str>,
 ) -> String {
     build_review_finding_refine_user_prompt(
@@ -253,6 +259,7 @@ pub fn build_review_refine_user_prompt(
         item,
         context_files,
         repo_map,
+        repo_dirs,
         None,
         instructions,
     )
@@ -293,46 +300,38 @@ mod tests {
     }
 
     #[test]
-    fn test_review_refine_system_prompt_mandates_contract_discovery() {
-        let sys = build_review_finding_refine_system_prompt();
-        assert!(sys.contains("Architect Discovery Protocol"));
-        assert!(sys.contains("needs_context"));
-        assert!(sys.contains("<repo_map>"));
-        assert!(sys.contains("hard contract violation"));
-        assert!(!sys.contains("Codebase Exploration & Discovery Contract"));
-    }
-
-    #[test]
-    fn test_review_refine_user_prompt_mandates_contract_discovery() {
+    fn test_review_refine_outline_is_map_or_directories_never_both() {
         let session = sample_session();
-        let user = build_review_finding_refine_user_prompt(
+        let item = &session.items[0];
+
+        // Symbol contours win whenever the eager map is available, so the
+        // directory tree never dilutes an existing outline.
+        let with_map = build_review_finding_refine_user_prompt(
             &session,
-            &session.items[0],
+            item,
             &[],
-            None,
+            Some("crate\n  pub fn main"),
+            Some("crate\n  src"),
             None,
             None,
         );
-        assert!(user.contains("Architect Discovery Protocol"));
-        assert!(user.contains("needs_context"));
-    }
+        assert!(with_map.contains("## Codebase Symbol Contours (<repo_map>):"));
+        assert!(with_map.contains("crate\n  pub fn main"));
+        assert!(!with_map.contains("## Repository Directories"));
 
-    #[test]
-    fn test_review_refine_user_prompt_renders_failed_step_diagnostics() {
-        let session = sample_session();
-        let user = build_review_finding_refine_user_prompt(
+        // Without a map the compact tree still tells the Architect where
+        // subsystems live instead of leaving it blind.
+        let with_dirs = build_review_finding_refine_user_prompt(
             &session,
-            &session.items[0],
+            item,
             &[],
             None,
-            Some(ReviewRefineDiagnostics {
-                failed_step_id: "42",
-                failure_reason: Some("sub-step finished without applying any code changes"),
-            }),
+            Some("crate\n  src"),
+            None,
             None,
         );
-        assert!(user.contains("## Failed Sub-step Diagnostics:"));
-        assert!(user.contains("sub-step finished without applying any code changes"));
-        assert!(user.contains("MUST NOT be restated"));
+        assert!(with_dirs.contains("## Repository Directories (<repo_dirs>):"));
+        assert!(with_dirs.contains("crate\n  src"));
+        assert!(!with_dirs.contains("## Codebase Symbol Contours"));
     }
 }

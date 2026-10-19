@@ -155,8 +155,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn reads_files_and_moves_without_stalling_the_runtime() {
         let repo_root = unique_test_dir();
-        std::fs::write(repo_root.join("source.txt"), "hello world")
-            .expect("write source file");
+        std::fs::write(repo_root.join("source.txt"), "hello world").expect("write source file");
 
         let mut simulator = StagingSimulator::new(HashMap::new(), repo_root.clone());
 

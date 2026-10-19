@@ -92,8 +92,18 @@ pub fn render_plans_view(
             status_spans.extend(describe_plan_row(&row, &engine));
         }
         let plans_count = state.plans_view.plans.len();
-        let total_items: usize = state.plans_view.plans.iter().map(|p| p.count_stats().0).sum();
-        let total_completed: usize = state.plans_view.plans.iter().map(|p| p.count_stats().1).sum();
+        let total_items: usize = state
+            .plans_view
+            .plans
+            .iter()
+            .map(|p| p.count_stats().0)
+            .sum();
+        let total_completed: usize = state
+            .plans_view
+            .plans
+            .iter()
+            .map(|p| p.count_stats().1)
+            .sum();
         status_spans.push(Span::styled(
             format!(
                 "  |  {} plan(s), {} item(s) ({} done)",
@@ -103,7 +113,11 @@ pub fn render_plans_view(
         ));
         if !rows.is_empty() {
             status_spans.push(Span::styled(
-                format!(" | [Row {}/{}]", state.plans_view.selected_index + 1, rows.len()),
+                format!(
+                    " | [Row {}/{}]",
+                    state.plans_view.selected_index + 1,
+                    rows.len()
+                ),
                 engine.fg(palette.text_muted),
             ));
         }
@@ -116,8 +130,8 @@ pub fn render_plans_view(
     }
     let status_line = Line::from(status_spans);
 
-    let info_widget = Paragraph::new(vec![status_line])
-        .block(Block::default().padding(Padding::horizontal(1)));
+    let info_widget =
+        Paragraph::new(vec![status_line]).block(Block::default().padding(Padding::horizontal(1)));
     frame.render_widget(info_widget, info_area);
 }
 
@@ -193,9 +207,7 @@ fn describe_plan_row(
             spans
         }
         VisiblePlanRow::ImplementationHeader {
-            total,
-            completed,
-            ..
+            total, completed, ..
         } => vec![Span::styled(
             format!(
                 " {}",
@@ -235,7 +247,11 @@ fn describe_plan_row(
             }
             if !readonly_files.is_empty() {
                 spans.push(Span::styled(
-                    format!("  {} {}", active_t("plans.ref_prefix"), readonly_files.join(", ")),
+                    format!(
+                        "  {} {}",
+                        active_t("plans.ref_prefix"),
+                        readonly_files.join(", ")
+                    ),
                     engine.fg(palette.text_secondary),
                 ));
             }

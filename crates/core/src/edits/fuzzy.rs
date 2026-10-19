@@ -33,10 +33,18 @@ fn scan_lines(text: &str) -> Vec<LineSpan> {
             } else {
                 i
             };
-            lines.push(LineSpan { start, content_end, end });
+            lines.push(LineSpan {
+                start,
+                content_end,
+                end,
+            });
             start = end;
         } else {
-            lines.push(LineSpan { start, content_end: len, end: len });
+            lines.push(LineSpan {
+                start,
+                content_end: len,
+                end: len,
+            });
             break;
         }
     }
@@ -229,7 +237,12 @@ fn try_fuzzy_replace(
             continue;
         }
 
-        if let Some(shift) = compute_indent_shift(current, effective_old, &file_lines[i..i + p_len], &pattern_lines) {
+        if let Some(shift) = compute_indent_shift(
+            current,
+            effective_old,
+            &file_lines[i..i + p_len],
+            &pattern_lines,
+        ) {
             indent_matches.push((i, shift));
         }
     }
@@ -269,14 +282,19 @@ pub(crate) fn apply_replace(
     new_text: &str,
     path: &str,
 ) -> Result<String, EditError> {
-    let (effective_old, effective_new) =
-        if current.contains("\r\n") && !old_text.contains("\r\n") {
-            (old_text.replace('\n', "\r\n"), new_text.replace('\n', "\r\n"))
-        } else if !current.contains("\r\n") && old_text.contains("\r\n") {
-            (old_text.replace("\r\n", "\n"), new_text.replace("\r\n", "\n"))
-        } else {
-            (old_text.to_string(), new_text.to_string())
-        };
+    let (effective_old, effective_new) = if current.contains("\r\n") && !old_text.contains("\r\n") {
+        (
+            old_text.replace('\n', "\r\n"),
+            new_text.replace('\n', "\r\n"),
+        )
+    } else if !current.contains("\r\n") && old_text.contains("\r\n") {
+        (
+            old_text.replace("\r\n", "\n"),
+            new_text.replace("\r\n", "\n"),
+        )
+    } else {
+        (old_text.to_string(), new_text.to_string())
+    };
 
     // 1. Exact match (fast path)
     let matches: Vec<(usize, &str)> = current.match_indices(&effective_old).collect();
@@ -336,6 +354,9 @@ mod tests {
     fn fuzzy_replace_rejects_ambiguous_matches() {
         let current = "fn a() {\n    foo();\n}\nfn b() {\n    foo();\n}\n";
         let result = apply_replace(current, "    foo();  \n", "    bar();\n", "dup.rs");
-        assert!(matches!(result, Err(EditError::AmbiguousMatch { count: 2, .. })));
+        assert!(matches!(
+            result,
+            Err(EditError::AmbiguousMatch { count: 2, .. })
+        ));
     }
 }

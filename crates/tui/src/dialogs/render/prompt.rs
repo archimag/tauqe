@@ -3,11 +3,11 @@ use ratatui::style::{Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
+use super::{editor_lines, render_modal_frame, ModalFrameParams, ModalTone};
 use crate::i18n::active_t;
 use crate::theme::engine::current_engine;
 use crate::ui::centered_rect;
 use crate::ui::header::truncate_to_width;
-use super::{editor_lines, render_modal_frame, ModalFrameParams, ModalTone};
 
 /// Geometry of the discussion prompt modal, shared by rendering and mouse
 /// hit-testing so the drawn buttons are always the clickable ones
@@ -25,15 +25,16 @@ pub fn prompt_modal_buttons(term: Rect) -> (Rect, Rect) {
     )
 }
 
-pub fn render_prompt_modal(
-    frame: &mut ratatui::Frame,
-    modal: &crate::app::PromptModalState,
-) {
+pub fn render_prompt_modal(frame: &mut ratatui::Frame, modal: &crate::app::PromptModalState) {
     let engine = current_engine();
     let palette = engine.palette();
     let area = prompt_modal_area(frame.area());
     let (dialog_title, tone, header_lines) = match &modal.target {
-        crate::app::PromptModalTarget::Review { review_id, review_title, focused_items } => {
+        crate::app::PromptModalTarget::Review {
+            review_id,
+            review_title,
+            focused_items,
+        } => {
             let title = if let Some((item_id, _)) = focused_items.first() {
                 active_t("dialog.prompt.title_finding")
                     .replacen("{}", review_id, 1)
@@ -41,22 +42,35 @@ pub fn render_prompt_modal(
             } else {
                 active_t("dialog.prompt.title_review").replacen("{}", review_id, 1)
             };
-            let mut lines = vec![
-                Line::from(vec![
-                    Span::styled(active_t("dialog.prompt.review_label"), engine.fg(palette.text_muted)),
-                    Span::styled(review_title, engine.fg(palette.text_primary).bold()),
-                ]),
-            ];
+            let mut lines = vec![Line::from(vec![
+                Span::styled(
+                    active_t("dialog.prompt.review_label"),
+                    engine.fg(palette.text_muted),
+                ),
+                Span::styled(review_title, engine.fg(palette.text_primary).bold()),
+            ])];
             if focused_items.is_empty() {
                 lines.push(Line::from(vec![
-                    Span::styled(active_t("dialog.prompt.scope_label"), engine.fg(palette.text_muted)),
-                    Span::styled(active_t("dialog.prompt.scope_review"), engine.fg(palette.status_warning).bold()),
-                    Span::styled(active_t("dialog.prompt.scope_review_note"), engine.fg(palette.text_muted)),
+                    Span::styled(
+                        active_t("dialog.prompt.scope_label"),
+                        engine.fg(palette.text_muted),
+                    ),
+                    Span::styled(
+                        active_t("dialog.prompt.scope_review"),
+                        engine.fg(palette.status_warning).bold(),
+                    ),
+                    Span::styled(
+                        active_t("dialog.prompt.scope_review_note"),
+                        engine.fg(palette.text_muted),
+                    ),
                 ]));
             } else if let Some((id, title)) = focused_items.first() {
                 let max_w = area.width.saturating_sub(22) as usize;
                 lines.push(Line::from(vec![
-                    Span::styled(active_t("dialog.prompt.target_finding_label"), engine.fg(palette.text_muted)),
+                    Span::styled(
+                        active_t("dialog.prompt.target_finding_label"),
+                        engine.fg(palette.text_muted),
+                    ),
                     Span::styled(
                         truncate_to_width(&format!("#{} {}", id, title), max_w),
                         engine.fg(palette.status_success).bold(),
@@ -65,7 +79,11 @@ pub fn render_prompt_modal(
             }
             (title, ModalTone::Accent, lines)
         }
-        crate::app::PromptModalTarget::Plan { plan_id, plan_title, focused_items } => {
+        crate::app::PromptModalTarget::Plan {
+            plan_id,
+            plan_title,
+            focused_items,
+        } => {
             let title = if let Some((step_id, _)) = focused_items.first() {
                 active_t("dialog.prompt.title_step")
                     .replacen("{}", plan_id, 1)
@@ -73,22 +91,35 @@ pub fn render_prompt_modal(
             } else {
                 active_t("dialog.prompt.title_plan").replacen("{}", plan_id, 1)
             };
-            let mut lines = vec![
-                Line::from(vec![
-                    Span::styled(active_t("dialog.prompt.plan_label"), engine.fg(palette.text_muted)),
-                    Span::styled(plan_title, engine.fg(palette.text_primary).bold()),
-                ]),
-            ];
+            let mut lines = vec![Line::from(vec![
+                Span::styled(
+                    active_t("dialog.prompt.plan_label"),
+                    engine.fg(palette.text_muted),
+                ),
+                Span::styled(plan_title, engine.fg(palette.text_primary).bold()),
+            ])];
             if focused_items.is_empty() {
                 lines.push(Line::from(vec![
-                    Span::styled(active_t("dialog.prompt.scope_label"), engine.fg(palette.text_muted)),
-                    Span::styled(active_t("dialog.prompt.scope_plan"), engine.fg(palette.status_warning).bold()),
-                    Span::styled(active_t("dialog.prompt.scope_plan_note"), engine.fg(palette.text_muted)),
+                    Span::styled(
+                        active_t("dialog.prompt.scope_label"),
+                        engine.fg(palette.text_muted),
+                    ),
+                    Span::styled(
+                        active_t("dialog.prompt.scope_plan"),
+                        engine.fg(palette.status_warning).bold(),
+                    ),
+                    Span::styled(
+                        active_t("dialog.prompt.scope_plan_note"),
+                        engine.fg(palette.text_muted),
+                    ),
                 ]));
             } else if let Some((id, title)) = focused_items.first() {
                 let max_w = area.width.saturating_sub(22) as usize;
                 lines.push(Line::from(vec![
-                    Span::styled(active_t("dialog.prompt.target_step_label"), engine.fg(palette.text_muted)),
+                    Span::styled(
+                        active_t("dialog.prompt.target_step_label"),
+                        engine.fg(palette.text_muted),
+                    ),
                     Span::styled(
                         truncate_to_width(&format!("#{} {}", id, title), max_w),
                         engine.fg(palette.status_success).bold(),

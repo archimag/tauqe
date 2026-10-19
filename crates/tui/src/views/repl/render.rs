@@ -49,15 +49,14 @@ pub fn render_repl_view(
     // the prompt for its status banner. The banner is a pure indicator, so it is
     // carved out of the response area rather than the prompt itself
     // (c-visual-anchor).
-    let (model_area, focus_banner_area) = if state.discussion_focus.is_active()
-        && model_area.height > 1
-    {
-        let chunks =
-            Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(model_area);
-        (chunks[0], Some(chunks[1]))
-    } else {
-        (model_area, None)
-    };
+    let (model_area, focus_banner_area) =
+        if state.discussion_focus.is_active() && model_area.height > 1 {
+            let chunks =
+                Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(model_area);
+            (chunks[0], Some(chunks[1]))
+        } else {
+            (model_area, None)
+        };
 
     if let Some(lines) = plan_stepper_lines(state) {
         let body = u16::try_from(lines.len()).unwrap_or(u16::MAX);
@@ -66,11 +65,8 @@ pub fn render_repl_view(
         let stepper_height = desired.min(max_allowed);
 
         if stepper_height >= 3 {
-            let chunks = Layout::vertical([
-                Constraint::Length(stepper_height),
-                Constraint::Min(0),
-            ])
-            .split(model_area);
+            let chunks = Layout::vertical([Constraint::Length(stepper_height), Constraint::Min(0)])
+                .split(model_area);
             render_plan_stepper(frame, lines, chunks[0]);
             render_model_pane(frame, state, chunks[1]);
         } else {
@@ -229,10 +225,7 @@ fn plan_stepper_lines(state: &AppState) -> Option<Vec<Line<'static>>> {
             ),
             Span::styled(badge.to_string(), badge_style),
             Span::raw(" "),
-            Span::styled(
-                format!("#{} ", item.id),
-                engine.fg(palette.text_muted),
-            ),
+            Span::styled(format!("#{} ", item.id), engine.fg(palette.text_muted)),
             Span::styled(item.title.clone(), title_style),
         ]));
     }
@@ -244,16 +237,12 @@ fn plan_status_badge(status: tauqe_protocol::PlanItemStatus) -> (&'static str, S
     let engine = current_engine();
     let palette = engine.palette();
     match status {
-        tauqe_protocol::PlanItemStatus::Done => {
-            ("✓", engine.fg(palette.status_success).bold())
-        }
+        tauqe_protocol::PlanItemStatus::Done => ("✓", engine.fg(palette.status_success).bold()),
         tauqe_protocol::PlanItemStatus::InProgress => {
             ("▶", engine.fg(palette.status_warning).bold())
         }
         tauqe_protocol::PlanItemStatus::Todo => ("○", engine.fg(palette.text_muted)),
-        tauqe_protocol::PlanItemStatus::Blocked => {
-            ("!", engine.fg(palette.status_error).bold())
-        }
+        tauqe_protocol::PlanItemStatus::Blocked => ("!", engine.fg(palette.status_error).bold()),
         tauqe_protocol::PlanItemStatus::Cancelled => ("✗", engine.fg(palette.status_error)),
         tauqe_protocol::PlanItemStatus::Discussion => {
             ("?", engine.fg(palette.button_active_bg).bold())
@@ -278,20 +267,16 @@ fn render_model_pane(frame: &mut ratatui::Frame, state: &mut AppState, area: Rec
     let content_height = inner.height;
     let content_width = (inner.width as usize).max(10);
     state.last_model_height = content_height;
-    state.model.content_rect = (
-        inner.x,
-        inner.y,
-        inner.width,
-        content_height,
-    );
+    state.model.content_rect = (inner.x, inner.y, inner.width, content_height);
 
     if state.model.content_width != content_width {
         state.model.content_width = content_width;
         state.model.reasoning.max_width = Some(content_width);
         state.model.render_markdown_now();
-        if !state.model.reasoning.is_empty() {
-            state.model.reasoning.update_markdown();
-        }
+        // The reasoning block is a lazy surface: this re-parses only while the
+        // transcript is expanded and settled, and releases the rendered lines
+        // otherwise (c-2).
+        state.model.reasoning.update_markdown();
     }
 
     if let Some((_, inst)) = state.model.copy_flash {
@@ -311,8 +296,8 @@ fn render_model_pane(frame: &mut ratatui::Frame, state: &mut AppState, area: Rec
 
     let raw_lines = compute_model_lines(&mut state.model);
 
-    let prefix_count = (state.model.error.is_some() as usize)
-        + (state.model.toolchain.is_some() as usize);
+    let prefix_count =
+        (state.model.error.is_some() as usize) + (state.model.toolchain.is_some() as usize);
 
     let mut raw_to_visual_start = Vec::with_capacity(raw_lines.len());
     let mut raw_to_visual_end = Vec::with_capacity(raw_lines.len());

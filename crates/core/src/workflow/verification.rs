@@ -69,7 +69,8 @@ pub async fn run_workflow_verification(
         crate::toolchain::run_verification_pipeline(repo_root, &verify_req.target, cancel_rx).await;
 
     if results.is_empty() {
-        let note = "⚠️ No build/test toolchain detected in repository for verification.\n".to_string();
+        let note =
+            "⚠️ No build/test toolchain detected in repository for verification.\n".to_string();
         let _ = stream_tx
             .send(StreamEvent::ToolchainFinished {
                 command: target_str.to_string(),
@@ -129,13 +130,19 @@ pub async fn run_workflow_verification(
     if ok {
         let success_msg = format!("✅ Code verification (`{}`) passed.\n", target_str);
         if stream_output || verify_req.on_success == VerifyOnSuccess::Report {
-            let _ = stream_tx.send(StreamEvent::TextDelta(success_msg.clone())).await;
+            let _ = stream_tx
+                .send(StreamEvent::TextDelta(success_msg.clone()))
+                .await;
         }
 
         if verify_req.on_success == VerifyOnSuccess::Report {
             for r in &results {
                 if !r.combined_output.trim().is_empty() {
-                    report.push_str(&format!("`{}` output:\n```\n{}\n```\n\n", r.command, r.combined_output.trim()));
+                    report.push_str(&format!(
+                        "`{}` output:\n```\n{}\n```\n\n",
+                        r.command,
+                        r.combined_output.trim()
+                    ));
                 }
             }
             if report.is_empty() {
@@ -145,9 +152,16 @@ pub async fn run_workflow_verification(
             }
         }
     } else {
-        report.push_str(&format!("❌ Code verification (`{}`) failed:\n\n", target_str));
+        report.push_str(&format!(
+            "❌ Code verification (`{}`) failed:\n\n",
+            target_str
+        ));
         for r in results.iter().filter(|r| !r.success) {
-            report.push_str(&format!("Command `{}` failed:\n```\n{}\n```\n\n", r.command, r.combined_output.trim()));
+            report.push_str(&format!(
+                "Command `{}` failed:\n```\n{}\n```\n\n",
+                r.command,
+                r.combined_output.trim()
+            ));
         }
         if stream_output {
             let _ = stream_tx.send(StreamEvent::TextDelta(report.clone())).await;
@@ -183,10 +197,7 @@ mod verification_outcome_tests {
         let mut saw_finished = false;
         while let Ok(event) = rx.try_recv() {
             if let StreamEvent::ToolchainFinished { message, .. } = event {
-                assert_eq!(
-                    message.as_deref(),
-                    Some("No build/test toolchain detected")
-                );
+                assert_eq!(message.as_deref(), Some("No build/test toolchain detected"));
                 saw_finished = true;
             }
         }
@@ -204,7 +215,10 @@ pub fn extract_error_paths(report: &str, available_files: &[String]) -> Vec<Stri
     for line in report.lines() {
         for word in line.split_whitespace() {
             let trimmed = word.trim_matches(|c: char| {
-                matches!(c, '`' | '\'' | '"' | '(' | ')' | '[' | ']' | ',' | ';' | '<' | '>')
+                matches!(
+                    c,
+                    '`' | '\'' | '"' | '(' | ')' | '[' | ']' | ',' | ';' | '<' | '>'
+                )
             });
             let candidate = trimmed.strip_prefix("./").unwrap_or(trimmed);
             let path_part = candidate.split(':').next().unwrap_or("");
@@ -220,10 +234,7 @@ pub fn extract_error_paths(report: &str, available_files: &[String]) -> Vec<Stri
 }
 
 /// Constructs a prompt asking the model to fix compiler, clippy, or test failures.
-pub fn build_verification_retry_prompt(
-    report: &str,
-    target_language: Option<&str>,
-) -> String {
+pub fn build_verification_retry_prompt(report: &str, target_language: Option<&str>) -> String {
     let mut prompt = String::new();
     prompt.push_str("Code verification failed with the following errors:\n\n```\n");
     prompt.push_str(report.trim());
@@ -259,7 +270,8 @@ pub fn build_verification_missing_edits_prompt(
 mod tests {
     #[test]
     fn test_build_verification_missing_edits_prompt() {
-        let prompt = build_verification_missing_edits_prompt("error: mismatched types", Some("Russian"));
+        let prompt =
+            build_verification_missing_edits_prompt("error: mismatched types", Some("Russian"));
         assert!(prompt.contains("did not include any code edits"));
         assert!(prompt.contains("error: mismatched types"));
         assert!(prompt.contains("Russian"));

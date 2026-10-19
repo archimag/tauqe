@@ -14,8 +14,8 @@ pub use transport::{
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::views::repl::{EditOp, FileEditStatus, ReplView, StreamingFileEdit};
     use tauqe_protocol::ModelRef;
-    use crate::views::repl::{ReplView, EditOp, FileEditStatus, StreamingFileEdit};
 
     #[test]
     fn test_optimistic_rollback_storage() {
@@ -29,7 +29,10 @@ mod tests {
             },
         );
         let rollback = conn.take_optimistic_rollback(req_id);
-        assert!(matches!(rollback, Some(OptimisticRollback::ActiveModel { .. })));
+        assert!(matches!(
+            rollback,
+            Some(OptimisticRollback::ActiveModel { .. })
+        ));
         assert!(conn.take_optimistic_rollback(req_id).is_none());
     }
 
@@ -40,10 +43,19 @@ mod tests {
             "Stub credentials file created at 'credentials.toml'. Edit it and select 'Check again'."
         );
         assert_eq!(messages::CONFIG_CREATED, "tauqe.toml created successfully.");
-        assert_eq!(messages::API_KEY_SAVED, "OpenRouter API key saved successfully.");
-        assert_eq!(messages::CONFIG_RELOADED_OK, "Configuration reloaded. All checks passed!");
+        assert_eq!(
+            messages::API_KEY_SAVED,
+            "OpenRouter API key saved successfully."
+        );
+        assert_eq!(
+            messages::CONFIG_RELOADED_OK,
+            "Configuration reloaded. All checks passed!"
+        );
         assert!(messages::API_KEY_NOT_FOUND.starts_with("API key still not found"));
-        assert_eq!(messages::GIT_INIT_OK, "Git repository initialized successfully.");
+        assert_eq!(
+            messages::GIT_INIT_OK,
+            "Git repository initialized successfully."
+        );
     }
 
     #[test]

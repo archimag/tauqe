@@ -6,12 +6,12 @@ use ratatui::style::{Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 
+use super::{editor_lines, render_modal_confirm, ConfirmModalParams, ModalTone};
 use crate::components::modal::render_dialog_footer;
 use crate::config::PrimaryModifier;
 use crate::i18n::active_t;
 use crate::theme::engine::current_engine;
 use crate::ui::centered_rect;
-use super::{editor_lines, render_modal_confirm, ConfirmModalParams, ModalTone};
 
 /// Width of the refine dialog, as a percentage of the terminal width.
 pub const REFINE_DIALOG_WIDTH: u16 = 68;
@@ -146,7 +146,9 @@ pub fn render_plan_refine_dialog(
             list_inner,
         );
     } else {
-        let rows = dialog.selector.render_list_lines(list_inner.height as usize);
+        let rows = dialog
+            .selector
+            .render_list_lines(list_inner.height as usize);
         frame.render_widget(Paragraph::new(rows), list_inner);
     }
 
@@ -193,19 +195,33 @@ pub fn render_plan_refine_dialog(
     let (confirm_style, cancel_style) = if in_actions {
         if confirm_selected {
             (
-                engine.bg(palette.status_success).fg(engine.color(palette.text_inverse)).bold(),
-                engine.bg(palette.button_bg).fg(engine.color(palette.button_fg)),
+                engine
+                    .bg(palette.status_success)
+                    .fg(engine.color(palette.text_inverse))
+                    .bold(),
+                engine
+                    .bg(palette.button_bg)
+                    .fg(engine.color(palette.button_fg)),
             )
         } else {
             (
-                engine.bg(palette.button_bg).fg(engine.color(palette.button_fg)),
-                engine.bg(palette.button_active_bg).fg(engine.color(palette.text_inverse)).bold(),
+                engine
+                    .bg(palette.button_bg)
+                    .fg(engine.color(palette.button_fg)),
+                engine
+                    .bg(palette.button_active_bg)
+                    .fg(engine.color(palette.text_inverse))
+                    .bold(),
             )
         }
     } else {
         (
-            engine.bg(palette.button_bg).fg(engine.color(palette.button_fg)),
-            engine.bg(palette.button_bg).fg(engine.color(palette.button_fg)),
+            engine
+                .bg(palette.button_bg)
+                .fg(engine.color(palette.button_fg)),
+            engine
+                .bg(palette.button_bg)
+                .fg(engine.color(palette.button_fg)),
         )
     };
     let nav_hint = if dialog.focus.is_actions() {
@@ -326,7 +342,9 @@ pub fn render_review_refine_dialog(
             list_inner,
         );
     } else {
-        let rows = dialog.selector.render_list_lines(list_inner.height as usize);
+        let rows = dialog
+            .selector
+            .render_list_lines(list_inner.height as usize);
         frame.render_widget(Paragraph::new(rows), list_inner);
     }
 
@@ -373,19 +391,33 @@ pub fn render_review_refine_dialog(
     let (confirm_style, cancel_style) = if in_actions {
         if confirm_selected {
             (
-                engine.bg(palette.status_success).fg(engine.color(palette.text_inverse)).bold(),
-                engine.bg(palette.button_bg).fg(engine.color(palette.button_fg)),
+                engine
+                    .bg(palette.status_success)
+                    .fg(engine.color(palette.text_inverse))
+                    .bold(),
+                engine
+                    .bg(palette.button_bg)
+                    .fg(engine.color(palette.button_fg)),
             )
         } else {
             (
-                engine.bg(palette.button_bg).fg(engine.color(palette.button_fg)),
-                engine.bg(palette.button_active_bg).fg(engine.color(palette.text_inverse)).bold(),
+                engine
+                    .bg(palette.button_bg)
+                    .fg(engine.color(palette.button_fg)),
+                engine
+                    .bg(palette.button_active_bg)
+                    .fg(engine.color(palette.text_inverse))
+                    .bold(),
             )
         }
     } else {
         (
-            engine.bg(palette.button_bg).fg(engine.color(palette.button_fg)),
-            engine.bg(palette.button_bg).fg(engine.color(palette.button_fg)),
+            engine
+                .bg(palette.button_bg)
+                .fg(engine.color(palette.button_fg)),
+            engine
+                .bg(palette.button_bg)
+                .fg(engine.color(palette.button_fg)),
         )
     };
     let nav_hint = if dialog.focus.is_actions() {
@@ -431,7 +463,10 @@ pub fn refine_blocked_params<'a>(
         )),
         Line::raw(""),
         Line::from(vec![
-            Span::styled(active_t("dialog.refine_blocked.plan_label"), engine.fg(palette.text_muted)),
+            Span::styled(
+                active_t("dialog.refine_blocked.plan_label"),
+                engine.fg(palette.text_muted),
+            ),
             Span::styled(
                 format!("{} [{}]", blocked.plan_title, blocked.plan_id),
                 engine.fg(palette.text_primary).bold(),
@@ -498,5 +533,35 @@ mod tests {
 
         assert!(geo.editor_area.y >= geo.model_rows.bottom());
         assert!(geo.editor_area.bottom() <= geo.area.bottom());
+    }
+
+    /// The architect list and the instructions editor are distinct zones: a
+    /// blank row sits under the header, between the list and the editor, and
+    /// above the action bar (Conventions §6.7, §6.8).
+    #[test]
+    fn refine_dialog_sections_are_separated_by_blank_rows() {
+        let term = Rect::new(0, 0, 120, 50);
+        let area = centered_rect(REFINE_DIALOG_WIDTH, REFINE_DIALOG_HEIGHT, term);
+        let chunks = super::super::picker_dialog_chunks(area, 3, REFINE_HEADER_HEIGHT, 0);
+
+        assert_eq!(chunks.header.y, area.y + 2, "border + top inset");
+        assert_eq!(chunks.header.x, area.x + 2, "border + horizontal padding");
+        assert_eq!(chunks.header.width, area.width - 4);
+
+        assert_eq!(chunks.list.y, chunks.header.y + chunks.header.height + 1);
+        assert_eq!(chunks.path.height, 0, "this dialog has no target field");
+        assert_eq!(chunks.editor.y, chunks.list.y + chunks.list.height + 1);
+        assert!(chunks.editor.height > 0);
+
+        assert_eq!(
+            chunks.buttons.y,
+            chunks.editor.y + chunks.editor.height + 1,
+            "pre-action spacer"
+        );
+        assert_eq!(
+            chunks.footer.y + chunks.footer.height,
+            area.bottom() - 1,
+            "hint strip is docked above the bottom border"
+        );
     }
 }

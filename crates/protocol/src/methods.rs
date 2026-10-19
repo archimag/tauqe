@@ -7,6 +7,7 @@ pub const MODEL_CANCEL: &str = "model/cancel";
 pub const MODEL_CLEAR_HISTORY: &str = "model/clearHistory";
 pub const MODEL_SELECT: &str = "model/select";
 pub const MODEL_CURRENT: &str = "model/current";
+pub const MODEL_USAGE_RESET: &str = "model/usageReset";
 
 pub const CONTEXT_GET: &str = "context/get";
 pub const CONTEXT_ADD: &str = "context/add";
@@ -79,6 +80,7 @@ mod tests {
             MODEL_CLEAR_HISTORY,
             MODEL_SELECT,
             MODEL_CURRENT,
+            MODEL_USAGE_RESET,
             CONTEXT_GET,
             CONTEXT_ADD,
             CONTEXT_ADD_PATTERN,
@@ -128,7 +130,10 @@ mod tests {
     fn test_method_names_are_unique_and_namespaced_camel_case() {
         let mut seen = HashSet::new();
         for method in all_methods() {
-            assert!(seen.insert(method), "duplicate method wire name: '{method}'");
+            assert!(
+                seen.insert(method),
+                "duplicate method wire name: '{method}'"
+            );
 
             let (namespace, verb) = method
                 .split_once('/')

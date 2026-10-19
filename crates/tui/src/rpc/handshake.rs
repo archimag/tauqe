@@ -1,10 +1,10 @@
 use anyhow::Context;
-use tokio::io::{BufReader, Lines};
-use tokio::process::ChildStdout;
 use tauqe_protocol::{
     methods, ContextState, Event, InitializeParams, InitializeResult, Message,
     RepositoryListFilesResult, Request, RequestId, Response, SystemStatusResult, PROTOCOL_VERSION,
 };
+use tokio::io::{BufReader, Lines};
+use tokio::process::ChildStdout;
 
 use super::transport::RpcConnection;
 use crate::app::{OnboardingState, ViewMode};
@@ -119,7 +119,8 @@ pub async fn initialize_connection(
         method: methods::SYSTEM_STATUS.to_string(),
         params: None,
     };
-    conn.write_line(&serde_json::to_string(&status_req)?).await?;
+    conn.write_line(&serde_json::to_string(&status_req)?)
+        .await?;
 
     if let Ok(resp) = read_response_for_id(reader, 4, &mut buffered_events).await {
         if let Some(val) = resp.result {

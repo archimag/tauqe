@@ -20,9 +20,24 @@ pub fn render_context_view(
     let palette = engine.palette();
     let mut context_lines: Vec<Line> = Vec::new();
 
-    let pinned_count = state.context.items.iter().filter(|i| i.layer == ContextLayer::Pinned).count();
-    let user_count = state.context.items.iter().filter(|i| i.layer == ContextLayer::User).count();
-    let auto_count = state.context.items.iter().filter(|i| i.layer == ContextLayer::Auto).count();
+    let pinned_count = state
+        .context
+        .items
+        .iter()
+        .filter(|i| i.layer == ContextLayer::Pinned)
+        .count();
+    let user_count = state
+        .context
+        .items
+        .iter()
+        .filter(|i| i.layer == ContextLayer::User)
+        .count();
+    let auto_count = state
+        .context
+        .items
+        .iter()
+        .filter(|i| i.layer == ContextLayer::Auto)
+        .count();
 
     context_lines.push(Line::from(vec![
         Span::raw(format!("{} ", active_t("context.total_size"))),
@@ -50,28 +65,70 @@ pub fn render_context_view(
             ContextRow::Header(layer) => {
                 let (arrow, name, count, tokens, role, hint) = match layer {
                     ContextLayer::Pinned => {
-                        let arrow = if state.context_view.pinned_expanded { "▼" } else { "▶" };
-                        let tokens: u64 = state.context.items.iter()
+                        let arrow = if state.context_view.pinned_expanded {
+                            "▼"
+                        } else {
+                            "▶"
+                        };
+                        let tokens: u64 = state
+                            .context
+                            .items
+                            .iter()
                             .filter(|i| i.layer == ContextLayer::Pinned)
                             .map(|i| i.estimated_tokens)
                             .sum();
-                        (arrow, active_t("context.section.pinned"), pinned_count, tokens, palette.status_info, active_t("context.section.pinned_hint"))
+                        (
+                            arrow,
+                            active_t("context.section.pinned"),
+                            pinned_count,
+                            tokens,
+                            palette.status_info,
+                            active_t("context.section.pinned_hint"),
+                        )
                     }
                     ContextLayer::User => {
-                        let arrow = if state.context_view.user_expanded { "▼" } else { "▶" };
-                        let tokens: u64 = state.context.items.iter()
+                        let arrow = if state.context_view.user_expanded {
+                            "▼"
+                        } else {
+                            "▶"
+                        };
+                        let tokens: u64 = state
+                            .context
+                            .items
+                            .iter()
                             .filter(|i| i.layer == ContextLayer::User)
                             .map(|i| i.estimated_tokens)
                             .sum();
-                        (arrow, active_t("context.section.user"), user_count, tokens, palette.status_warning, active_t("context.section.user_hint"))
+                        (
+                            arrow,
+                            active_t("context.section.user"),
+                            user_count,
+                            tokens,
+                            palette.status_warning,
+                            active_t("context.section.user_hint"),
+                        )
                     }
                     ContextLayer::Auto => {
-                        let arrow = if state.context_view.auto_expanded { "▼" } else { "▶" };
-                        let tokens: u64 = state.context.items.iter()
+                        let arrow = if state.context_view.auto_expanded {
+                            "▼"
+                        } else {
+                            "▶"
+                        };
+                        let tokens: u64 = state
+                            .context
+                            .items
+                            .iter()
                             .filter(|i| i.layer == ContextLayer::Auto)
                             .map(|i| i.estimated_tokens)
                             .sum();
-                        (arrow, active_t("context.section.auto"), auto_count, tokens, palette.button_active_bg, active_t("context.section.auto_hint"))
+                        (
+                            arrow,
+                            active_t("context.section.auto"),
+                            auto_count,
+                            tokens,
+                            palette.button_active_bg,
+                            active_t("context.section.auto_hint"),
+                        )
                     }
                 };
 
@@ -90,7 +147,8 @@ pub fn render_context_view(
                         engine.fg(palette.text_primary).bold(),
                     ),
                     Span::styled(hint, engine.fg(palette.text_muted)),
-                ]).style(line_style);
+                ])
+                .style(line_style);
 
                 context_lines.push(header_line);
             }
@@ -168,15 +226,24 @@ pub fn render_context_view(
         )),
         Some(ContextRow::Item(ref it)) => match it.layer {
             ContextLayer::Pinned => Line::from(Span::styled(
-                format!("Pinned document: {} (protected, ~{} tokens)", it.path, it.estimated_tokens),
+                format!(
+                    "Pinned document: {} (protected, ~{} tokens)",
+                    it.path, it.estimated_tokens
+                ),
                 engine.fg(palette.status_info),
             )),
             ContextLayer::User => Line::from(Span::styled(
-                format!("User file: {} [{:?}], ~{} tokens", it.path, it.access, it.estimated_tokens),
+                format!(
+                    "User file: {} [{:?}], ~{} tokens",
+                    it.path, it.access, it.estimated_tokens
+                ),
                 engine.fg(palette.text_primary),
             )),
             ContextLayer::Auto => Line::from(Span::styled(
-                format!("Auto-discovered file: {} [{:?}], ~{} tokens", it.path, it.access, it.estimated_tokens),
+                format!(
+                    "Auto-discovered file: {} [{:?}], ~{} tokens",
+                    it.path, it.access, it.estimated_tokens
+                ),
                 engine.fg(palette.button_active_bg),
             )),
         },
@@ -185,8 +252,8 @@ pub fn render_context_view(
             engine.fg(palette.text_muted),
         )),
     };
-    let prompt_widget = Paragraph::new(info_line)
-        .block(Block::default().padding(Padding::horizontal(1)));
+    let prompt_widget =
+        Paragraph::new(info_line).block(Block::default().padding(Padding::horizontal(1)));
     frame.render_widget(prompt_widget, info_area);
 
     if state.context_view.adding_file {

@@ -27,6 +27,11 @@ pub(super) struct TurnInputCache {
     /// `Some` marks the history as resolved, so an absent or empty history
     /// block is frozen as well instead of re-reading history.jsonl on each round.
     history_tag: Option<FrozenHistoryTag>,
+    /// Directory outline captured on the first proposal round of the turn.
+    ///
+    /// `Some` marks the outline as rendered, so an empty tree is frozen as well
+    /// instead of re-walking the tracked file list on every round.
+    repo_dirs: Option<FrozenRepoDirs>,
 }
 
 /// Repository map frozen for the remaining rounds of a bounded turn.
@@ -37,6 +42,11 @@ struct FrozenRepoMap {
 /// Session history tag frozen for the remaining rounds of a bounded turn.
 struct FrozenHistoryTag {
     tag: Option<String>,
+}
+
+/// Compact directory outline frozen for the remaining rounds of a bounded turn.
+struct FrozenRepoDirs {
+    tree: Option<String>,
 }
 
 impl TurnInputCache {
@@ -122,6 +132,45 @@ impl TurnInputCache {
 
         self.history_tag = Some(FrozenHistoryTag { tag: tag.clone() });
         tag
+    }
+
+    /// Returns the compact directory outline frozen at the start of the turn.
+    ///
+    /// The tree is derived only from the tracked file list, so it is rendered
+    /// once and reused verbatim by every later round: the outline block stays
+    /// byte-identical and the provider keeps matching its cached prefix. Files
+    /// anchored by the pinned context layer are marked, so the model never
+    /// searches for conventions that already travelled with the prompt.
+    pub(super) async fn repo_dirs(
+        &mut self,
+        repo_root: &Path,
+        pinned_patterns: &[String],
+    ) -> Option<String> {
+        if let Some(frozen) = &self.repo_dirs {
+            return frozen.tree.clone();
+        }
+
+        let root = repo_root.to_path_buf();
+        let pinned = pinned_patterns.to_vec();
+        // Listing the tracked files is blocking subprocess work, so it runs off
+        // the async executor thread.
+        let tree = crate::blocking::run_blocking_async(move || {
+            let available_files =
+                crate::git::list_repository_files(Some(&root)).unwrap_or_default();
+            let tree =
+                crate::repomap::dirs::generate_repo_dirs_with_pinned(&available_files, &pinned);
+            if tree.trim().is_empty() {
+                None
+            } else {
+                Some(tree)
+            }
+        })
+        .await
+        .ok()
+        .flatten();
+
+        self.repo_dirs = Some(FrozenRepoDirs { tree: tree.clone() });
+        tree
     }
 }
 
@@ -235,13 +284,43 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn directory_outline_is_frozen_across_rounds() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        crate::git::init_repository(Some(&root), true).unwrap();
+        std::fs::create_dir_all(root.join("src/nested")).unwrap();
+        std::fs::write(root.join("src/main.rs"), "pub fn main() {}\n").unwrap();
+        std::fs::write(root.join("src/nested/deep.rs"), "pub fn deep() {}\n").unwrap();
+        let files = vec!["src/main.rs".to_string(), "src/nested/deep.rs".to_string()];
+        crate::git::cmd::stage_files(&root, &files).unwrap();
+        crate::git::cmd::commit_with_developer_author(&root, "Add fixtures", false).unwrap();
+
+        let mut cache = TurnInputCache::default();
+        let first = cache
+            .repo_dirs(&root, &[])
+            .await
+            .expect("outline rendered");
+        assert_eq!(first, "src\n  nested\n");
+
+        // A folder tracked later would appear in a regenerated outline; the
+        // frozen one keeps the prompt prefix byte-identical.
+        std::fs::create_dir_all(root.join("extra")).unwrap();
+        std::fs::write(root.join("extra/mod.rs"), "pub fn extra() {}\n").unwrap();
+        crate::git::cmd::stage_files(&root, &["extra/mod.rs".to_string()]).unwrap();
+        crate::git::cmd::commit_with_developer_author(&root, "Add extra", false).unwrap();
+
+        assert_eq!(
+            cache.repo_dirs(&root, &[]).await.as_deref(),
+            Some(first.as_str())
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn isolated_step_freezes_none_history() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().to_path_buf();
         let mut history_manager = HistoryManager::new(root);
-        history_manager
-            .record_turn("Prompt", vec![])
-            .unwrap();
+        history_manager.record_turn("Prompt", vec![]).unwrap();
 
         let mut cache = TurnInputCache::default();
         assert!(cache

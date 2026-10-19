@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use tokio::sync::Mutex;
 use tauqe_protocol::{methods, GitSquashPreviewParams};
+use tokio::sync::Mutex;
 
 use crate::app::{ActiveModal, AppState, SquashDialogFocus, ViewMode};
 use crate::command::global::{GlobalCommand, GLOBAL_COMMAND_MAP};
@@ -52,8 +52,7 @@ pub async fn switch_view(
         st.view_mode = ViewMode::History;
         st.history_view.auto_scroll = true;
         if !st.history_view.items.is_empty() {
-            st.history_view.selected_item_index =
-                st.history_view.items.len().saturating_sub(1);
+            st.history_view.selected_item_index = st.history_view.items.len().saturating_sub(1);
         } else if !st.history_view.loading {
             st.history_view.loading = true;
             let params = tauqe_protocol::HistoryGetParams {
@@ -70,12 +69,7 @@ pub async fn switch_view(
     } else if target_mode == ViewMode::Review {
         st.view_mode = ViewMode::Review;
         if st.review.sessions.is_empty() {
-            send_request(
-                server_writer,
-                methods::REVIEW_LIST,
-                serde_json::json!({}),
-            )
-            .await?;
+            send_request(server_writer, methods::REVIEW_LIST, serde_json::json!({})).await?;
         }
     } else {
         st.view_mode = target_mode;
@@ -100,16 +94,19 @@ pub fn is_text_input_active(st: &AppState) -> bool {
                 && !dialog.applying
                 && (dialog.custom_input_active || dialog.focus == SquashDialogFocus::MessageEditor)
         }),
-        Some(ActiveModal::Prompt) => {
-            st.prompt_modal.as_ref().is_some_and(|modal| modal.focus.is_editor())
-        }
+        Some(ActiveModal::Prompt) => st
+            .prompt_modal
+            .as_ref()
+            .is_some_and(|modal| modal.focus.is_editor()),
         Some(ActiveModal::Review) => st
             .review_dialog
             .as_ref()
             .is_some_and(|d| d.focus.is_prompt_editor() || d.focus.is_path_editor()),
-        Some(ActiveModal::RefineDialog) => {
-            st.plans_view.refine_dialog.as_ref().is_some_and(|d| d.focus.is_instructions_editor())
-        }
+        Some(ActiveModal::RefineDialog) => st
+            .plans_view
+            .refine_dialog
+            .as_ref()
+            .is_some_and(|d| d.focus.is_instructions_editor()),
         Some(ActiveModal::ReviewRefine) => st
             .review
             .refine_dialog
@@ -122,12 +119,11 @@ pub fn is_text_input_active(st: &AppState) -> bool {
         // Point execution of a single finding or subplan step exposes the
         // multiline Coder directives editor, which must accept literal typing
         // without layout translation (Conventions §5.1).
-        Some(ActiveModal::ExecuteReview) => st
-            .confirm_execute_review
-            .as_ref()
-            .is_some_and(|target| {
+        Some(ActiveModal::ExecuteReview) => {
+            st.confirm_execute_review.as_ref().is_some_and(|target| {
                 target.is_single_target() && target.focus.is_instructions_editor()
-            }),
+            })
+        }
         Some(_) => false,
         None => match st.view_mode {
             ViewMode::Repl => true,
@@ -306,8 +302,8 @@ pub async fn handle_terminal_event(
             let is_ctrl_alt = key.modifiers.contains(KeyModifiers::CONTROL)
                 && key.modifiers.contains(KeyModifiers::ALT);
             let is_primary_mod = !is_ctrl_alt && primary_modifier.matches(key.modifiers);
-            let has_layout_mapping = layout_preset != crate::config::LayoutPreset::None
-                || custom_langmap.is_some();
+            let has_layout_mapping =
+                layout_preset != crate::config::LayoutPreset::None || custom_langmap.is_some();
             if has_layout_mapping
                 && (!text_input_active
                     || (!is_char_typing(key.modifiers)
@@ -340,9 +336,10 @@ pub async fn handle_terminal_event(
                 let has_unsaved_work = st.model.is_busy()
                     || st.review.running
                     || !st.input_editor.is_empty()
-                    || st.squash_dialog.as_ref().is_some_and(|d| {
-                        d.applying || !d.message_editor.is_empty()
-                    });
+                    || st
+                        .squash_dialog
+                        .as_ref()
+                        .is_some_and(|d| d.applying || !d.message_editor.is_empty());
                 if has_unsaved_work {
                     st.confirm_quit = true;
                     st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
@@ -359,7 +356,9 @@ pub async fn handle_terminal_event(
             }
 
             // 1. Modals & Dialogs (Squash, Confirmations, Model Picker, Help)
-            if let Some(res) = crate::dialogs::input::handle_dialog_event(key, state, server_writer).await? {
+            if let Some(res) =
+                crate::dialogs::input::handle_dialog_event(key, state, server_writer).await?
+            {
                 return Ok(res);
             }
 
@@ -375,7 +374,9 @@ pub async fn handle_terminal_event(
             match mode {
                 ViewMode::Repl => repl::handle_repl_key(key, state, server_writer).await,
                 ViewMode::Context => context::handle_context_key(key, state, server_writer).await,
-                ViewMode::Onboarding => onboarding::handle_onboarding_key(key, state, server_writer).await,
+                ViewMode::Onboarding => {
+                    onboarding::handle_onboarding_key(key, state, server_writer).await
+                }
                 ViewMode::Review => review::handle_review_key(key, state, server_writer).await,
                 ViewMode::Plans => plans::handle_plans_key(key, state, server_writer).await,
                 ViewMode::History => history::handle_history_key(key, state, server_writer).await,
@@ -443,7 +444,10 @@ async fn handle_global_shortcuts(
     // request with no repository. Only Help and configuration reload stay
     // available, because the onboarding footer advertises them.
     if st.view_mode == ViewMode::Onboarding
-        && !matches!(command, GlobalCommand::OpenHelp | GlobalCommand::ReloadConfig)
+        && !matches!(
+            command,
+            GlobalCommand::OpenHelp | GlobalCommand::ReloadConfig
+        )
     {
         return Ok(None);
     }
@@ -768,7 +772,10 @@ mod tests {
         st.context_view.adding_file = true;
         st.all_repo_files = vec!["crates/core/src/lib.rs".to_string()];
         handle_paste(&mut st, " crates/core/src/lib.rs ");
-        assert_eq!(st.context_view.add_input.get_text(), "crates/core/src/lib.rs");
+        assert_eq!(
+            st.context_view.add_input.get_text(),
+            "crates/core/src/lib.rs"
+        );
         assert_eq!(st.context_view.selected_candidate_index, 0);
     }
 
@@ -778,7 +785,9 @@ mod tests {
         let mut conn = RpcConnection::new(Vec::<u8>::new());
 
         let key = KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE);
-        let res = handle_global_shortcuts(key, &state, &mut conn, true).await.unwrap();
+        let res = handle_global_shortcuts(key, &state, &mut conn, true)
+            .await
+            .unwrap();
         assert_eq!(res, None);
         assert!(!state.lock().await.show_help);
     }
@@ -791,7 +800,9 @@ mod tests {
         let mut conn = RpcConnection::new(Vec::<u8>::new());
 
         let key = KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE);
-        let res = handle_global_shortcuts(key, &state, &mut conn, false).await.unwrap();
+        let res = handle_global_shortcuts(key, &state, &mut conn, false)
+            .await
+            .unwrap();
         assert_eq!(res, Some(InputResult::Continue));
         assert!(state.lock().await.show_help);
     }
@@ -802,7 +813,9 @@ mod tests {
         let mut conn = RpcConnection::new(Vec::<u8>::new());
 
         let key = KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL);
-        let res = handle_global_shortcuts(key, &state, &mut conn, true).await.unwrap();
+        let res = handle_global_shortcuts(key, &state, &mut conn, true)
+            .await
+            .unwrap();
         assert_eq!(res, Some(InputResult::Continue));
         assert!(state.lock().await.show_help);
     }
@@ -837,12 +850,17 @@ mod tests {
         st.view_mode = ViewMode::Onboarding;
         let mut conn = RpcConnection::new(Vec::<u8>::new());
 
-        switch_view(&mut st, ViewMode::Repl, &mut conn).await.unwrap();
+        switch_view(&mut st, ViewMode::Repl, &mut conn)
+            .await
+            .unwrap();
         assert_eq!(st.view_mode, ViewMode::Onboarding);
         assert!(st.notification.is_some());
         let notif = st.notification.unwrap();
         assert_eq!(notif.level, NotificationLevel::Warning);
-        assert_eq!(notif.text, crate::i18n::active_t("notify.onboarding_required"));
+        assert_eq!(
+            notif.text,
+            crate::i18n::active_t("notify.onboarding_required")
+        );
     }
 
     #[tokio::test]
@@ -853,7 +871,9 @@ mod tests {
         // AltGr on Windows/X11: CONTROL | ALT
         let altgr = KeyModifiers::CONTROL | KeyModifiers::ALT;
         let key = KeyEvent::new(KeyCode::Char('2'), altgr);
-        let res = handle_global_shortcuts(key, &state, &mut conn, true).await.unwrap();
+        let res = handle_global_shortcuts(key, &state, &mut conn, true)
+            .await
+            .unwrap();
         assert_eq!(res, None);
         assert_eq!(state.lock().await.view_mode, ViewMode::Repl);
     }
@@ -902,10 +922,15 @@ mod tests {
         // Cancel shortcut (Ctrl+C) when busy arms the confirmation and resets
         // the focused button to the safe Cancel.
         let key_ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
-        let res = handle_global_shortcuts(key_ctrl_c, &state, &mut conn, true).await.unwrap();
+        let res = handle_global_shortcuts(key_ctrl_c, &state, &mut conn, true)
+            .await
+            .unwrap();
         assert_eq!(res, Some(InputResult::Continue));
         assert!(state.lock().await.confirm_cancel);
-        assert_eq!(state.lock().await.confirm_button, ConfirmDialogButton::Cancel);
+        assert_eq!(
+            state.lock().await.confirm_button,
+            ConfirmDialogButton::Cancel
+        );
     }
 
     #[tokio::test]
@@ -925,7 +950,10 @@ mod tests {
         let guard = state.lock().await;
         assert!(guard.confirm_batch_cancel);
         assert!(!guard.confirm_cancel);
-        assert_eq!(guard.batch_cancel_button, crate::app::BatchCancelButton::Continue);
+        assert_eq!(
+            guard.batch_cancel_button,
+            crate::app::BatchCancelButton::Continue
+        );
         assert!(!guard.batch_stopping);
     }
 
@@ -938,7 +966,9 @@ mod tests {
 
         let altgr = KeyModifiers::CONTROL | KeyModifiers::ALT;
         let key = KeyEvent::new(KeyCode::Char('2'), altgr);
-        let res = handle_global_shortcuts(key, &state, &mut conn, false).await.unwrap();
+        let res = handle_global_shortcuts(key, &state, &mut conn, false)
+            .await
+            .unwrap();
         assert_eq!(res, None);
         assert_eq!(state.lock().await.view_mode, ViewMode::Plans);
     }

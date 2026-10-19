@@ -1,12 +1,6 @@
 //! Parser for the `<scratchpad>` control tag.
 
-use super::{next_tag_bounds, strip_tags};
 use crate::edits::protocol::xml::engine;
-
-/// Locates the next complete `<scratchpad ...>...</scratchpad>` or `<scratchpad .../>` tag.
-pub(crate) fn next_scratchpad_tag(text: &str) -> Option<(usize, usize)> {
-    next_tag_bounds(text, "<scratchpad")
-}
 
 /// Extracts ephemeral scratchpad content from model output if present.
 pub fn extract_scratchpad(text: &str) -> Option<String> {
@@ -25,7 +19,10 @@ pub fn extract_scratchpad(text: &str) -> Option<String> {
 
 /// Removes all scratchpad tags and enclosed content from text.
 pub fn strip_scratchpad_tags(text: &str) -> String {
-    strip_tags(text, next_scratchpad_tag)
+    match engine::tag_spec("scratchpad") {
+        Some(spec) => engine::strip_tag_by_spec(text, spec),
+        None => text.to_string(),
+    }
 }
 
 #[cfg(test)]
