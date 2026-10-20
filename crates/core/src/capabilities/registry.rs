@@ -36,15 +36,30 @@ pub struct PromptRenderContext<'a> {
     pub editable_paths: &'a [String],
     /// Active turn-marker suffix, when the protocol is marker-bound.
     pub marker: Option<&'a str>,
+    /// Whether an eager repository symbol map is already rendered this turn.
+    ///
+    /// A module conditioned on this flag never advertises an on-demand map
+    /// request for contours the prompt already carries.
+    pub has_eager_repo_map: bool,
 }
 
 impl<'a> PromptRenderContext<'a> {
     /// Creates a render context for the given editable paths and marker.
+    ///
+    /// The eager-map flag defaults to `false`; a caller that already rendered a
+    /// symbol map declares it through [`PromptRenderContext::with_eager_repo_map`].
     pub fn new(editable_paths: &'a [String], marker: Option<&'a str>) -> Self {
         Self {
             editable_paths,
             marker,
+            has_eager_repo_map: false,
         }
+    }
+
+    /// Declares whether an eager repository symbol map is already rendered.
+    pub fn with_eager_repo_map(mut self, has_eager_repo_map: bool) -> Self {
+        self.has_eager_repo_map = has_eager_repo_map;
+        self
     }
 
     /// Returns a tag name with the active turn-marker suffix applied.
@@ -104,16 +119,37 @@ pub struct ContractContext<'a> {
     pub intent: TurnIntent,
     /// Concrete response language, when the caller already resolved it.
     pub target_language: Option<&'a str>,
+    /// Whether an eager repository symbol map is already rendered this turn.
+    ///
+    /// Mirrors [`PromptRenderContext::has_eager_repo_map`]; contract rules read
+    /// this field directly instead of reaching into the render context.
+    pub has_eager_repo_map: bool,
 }
 
 impl<'a> ContractContext<'a> {
     /// Creates a contract context for the given intent and render context.
+    ///
+    /// The eager-map flag is inherited from the render context, so a contract
+    /// rule and a protocol instruction composed for the same turn observe one
+    /// value.
     pub fn new(intent: TurnIntent, render: PromptRenderContext<'a>) -> Self {
+        let has_eager_repo_map = render.has_eager_repo_map;
         Self {
             render,
             intent,
             target_language: None,
+            has_eager_repo_map,
         }
+    }
+
+    /// Declares whether an eager repository symbol map is already rendered.
+    ///
+    /// The flag is written to both contexts so a contract rule and its matching
+    /// protocol instruction can never disagree.
+    pub fn with_eager_repo_map(mut self, has_eager_repo_map: bool) -> Self {
+        self.has_eager_repo_map = has_eager_repo_map;
+        self.render.has_eager_repo_map = has_eager_repo_map;
+        self
     }
 
     /// Sets the concrete target language, when the caller already resolved it.
@@ -424,7 +460,10 @@ impl CapabilityRegistry {
             .map(|tag| format!("<{}>", ctx.tag_name(tag)))
             .collect::<Vec<_>>()
             .join(", ");
-        let example = format!("<{} ...>", ctx.tag_name("context_request"));
+        let example = tags
+            .first()
+            .map(|tag| format!("<{} ...>", ctx.tag_name(tag)))
+            .unwrap_or_default();
         Some(ContractRule::new(
             "Operational Protocol Tags",
             format!(
@@ -539,6 +578,30 @@ mod tests {
             TurnIntent::InteractiveRepl,
             PromptRenderContext::new(&[], None),
         )
+    }
+
+    #[test]
+    fn render_context_eager_repo_map_defaults_off_and_propagates() {
+        let render = PromptRenderContext::new(&[], None);
+        assert!(!render.has_eager_repo_map);
+
+        let eager = render.with_eager_repo_map(true);
+        assert!(eager.has_eager_repo_map);
+
+        // The contract context inherits the flag from the render context, so a
+        // contract rule and a protocol instruction never disagree.
+        let ctx = ContractContext::new(TurnIntent::InteractiveRepl, eager);
+        assert!(ctx.has_eager_repo_map);
+        assert!(ctx.render.has_eager_repo_map);
+
+        // The builder keeps both contexts in sync on later changes.
+        let reset = ctx.with_eager_repo_map(false);
+        assert!(!reset.has_eager_repo_map);
+        assert!(!reset.render.has_eager_repo_map);
+
+        let declared = plain_context().with_eager_repo_map(true);
+        assert!(declared.has_eager_repo_map);
+        assert!(declared.render.has_eager_repo_map);
     }
 
     #[test]
@@ -685,6 +748,18 @@ mod tests {
         let rendered = registry.compose_contract_rules(&CapabilitySet::discussion(), &discussion);
         assert!(rendered.contains("Language Consistency: Always formulate"));
         assert!(rendered.contains("`user_language` field"));
+    }
+
+    #[test]
+    fn operational_tag_rule_stays_within_the_enabled_set() {
+        let registry = CapabilityRegistry::global();
+        let narrowed =
+            CapabilitySet::from_slice(&[LlmCapability::ToolchainVerify, LlmCapability::Outcome]);
+        let rendered = registry.compose_contract_rules(&narrowed, &plain_context());
+
+        assert!(rendered.contains("Operational Protocol Tags"));
+        assert!(rendered.contains("`<verify ...>`"));
+        assert!(!rendered.contains("context_request"));
     }
 
     #[test]

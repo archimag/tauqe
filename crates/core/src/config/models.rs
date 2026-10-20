@@ -114,6 +114,34 @@ impl ModelsConfig {
         Ok(())
     }
 
+    /// Borrowed model list backing a functional role.
+    ///
+    /// A specialized role without its own list borrows the entire `primary`
+    /// list, so read-only callers never clone the configured entries. `scribe` is
+    /// the single exception: it is a derived one-element role rather than a stored
+    /// list, so it yields `None` and its entry is resolved on demand instead.
+    fn role_slice(&self, role: ModelRole) -> Option<&[ModelEntry]> {
+        match role {
+            ModelRole::Primary => Some(&self.primary),
+            ModelRole::Coder => Some(self.coder.as_deref().unwrap_or(&self.primary)),
+            ModelRole::Architect => Some(self.architect.as_deref().unwrap_or(&self.primary)),
+            ModelRole::Reviewer => Some(self.reviewer.as_deref().unwrap_or(&self.primary)),
+            ModelRole::Scribe => None,
+        }
+    }
+
+    /// Base (first) entry of a role list, without cloning the list.
+    fn base_entry(&self, role: ModelRole) -> Option<&ModelEntry> {
+        self.role_slice(role)?.first()
+    }
+
+    /// Entry of a role list matching a concrete model, without cloning the list.
+    fn entry_for_model(&self, role: ModelRole, model: &ModelRef) -> Option<&ModelEntry> {
+        self.role_slice(role)?
+            .iter()
+            .find(|entry| &entry.model == model)
+    }
+
     /// Ordered model list backing a functional role.
     ///
     /// A specialized role without its own list inherits the entire `primary`
@@ -121,21 +149,13 @@ impl ModelsConfig {
     /// `primary` entry; it is reported as a one-element list so callers can treat
     /// every role uniformly.
     pub fn role_entries(&self, role: ModelRole) -> Vec<ModelEntry> {
-        match role {
-            ModelRole::Primary => self.primary.clone(),
-            ModelRole::Coder => self.coder.clone().unwrap_or_else(|| self.primary.clone()),
-            ModelRole::Architect => self
-                .architect
-                .clone()
-                .unwrap_or_else(|| self.primary.clone()),
-            ModelRole::Reviewer => self
-                .reviewer
-                .clone()
-                .unwrap_or_else(|| self.primary.clone()),
-            ModelRole::Scribe => match &self.scribe {
-                Some(model) => vec![ModelEntry::from(model.clone())],
-                None => self.primary.clone(),
-            },
+        if let Some(entries) = self.role_slice(role) {
+            return entries.to_vec();
+        }
+
+        match &self.scribe {
+            Some(model) => vec![ModelEntry::from(model.clone())],
+            None => self.primary.clone(),
         }
     }
 
@@ -160,8 +180,7 @@ impl ModelsConfig {
                 .unwrap_or_else(|| ModelRef::openrouter(BUILTIN_DEFAULT_SCRIBE_MODEL));
         }
 
-        self.role_entries(role)
-            .first()
+        self.base_entry(role)
             .map(|entry| entry.model.clone())
             .or(fallback)
             .unwrap_or_else(|| ModelRef::openrouter(default_model_for_role(role)))
@@ -173,9 +192,7 @@ impl ModelsConfig {
     /// the role starts on; deeper ladder rungs may carry their own effort and are
     /// applied during escalation instead.
     pub fn resolve_effort(&self, role: ModelRole) -> Option<ReasoningEffort> {
-        self.role_entries(role)
-            .first()
-            .and_then(|entry| entry.effort)
+        self.base_entry(role).and_then(|entry| entry.effort)
     }
 
     /// Resolves the reasoning effort for a model selection within the context of a specific role.
@@ -193,14 +210,10 @@ impl ModelsConfig {
         match selection {
             ModelSelection::Role(r) => self.resolve_effort(*r),
             ModelSelection::Specific(model) => self
-                .role_entries(role)
-                .into_iter()
-                .find(|entry| &entry.model == model)
+                .entry_for_model(role, model)
                 .or_else(|| {
                     if role != ModelRole::Primary {
-                        self.role_entries(ModelRole::Primary)
-                            .into_iter()
-                            .find(|entry| &entry.model == model)
+                        self.entry_for_model(ModelRole::Primary, model)
                     } else {
                         None
                     }
@@ -223,11 +236,9 @@ impl ModelsConfig {
     /// `primary` list. When even that is empty it degrades to a single rung
     /// resolved through the role chain, so escalation always has a base.
     pub fn coder_ladder(&self) -> Vec<ModelEntry> {
-        let ladder = self.role_entries(ModelRole::Coder);
-        if ladder.is_empty() {
-            vec![self.fallback_coder_tier()]
-        } else {
-            ladder
+        match self.role_slice(ModelRole::Coder) {
+            Some(entries) if !entries.is_empty() => entries.to_vec(),
+            _ => vec![self.fallback_coder_tier()],
         }
     }
 
@@ -257,9 +268,10 @@ impl ModelsConfig {
     /// resolved through the role chain, so escalation always has a base.
     pub fn architect_ladder(&self) -> Vec<ArchitectTier> {
         let ladder: Vec<ArchitectTier> = self
-            .role_entries(ModelRole::Architect)
-            .into_iter()
-            .map(|entry| ArchitectTier::new(entry.model, entry.effort))
+            .role_slice(ModelRole::Architect)
+            .unwrap_or(&[])
+            .iter()
+            .map(|entry| ArchitectTier::new(entry.model.clone(), entry.effort))
             .collect();
         if ladder.is_empty() {
             vec![self.fallback_architect_tier()]
@@ -638,5 +650,32 @@ coder = [
         assert_eq!(ladder[1].model, ModelRef::openrouter("aliased/model"));
         assert_eq!(ladder[1].effort, Some(ReasoningEffort::High));
         assert_eq!(ladder[1].alias, Some("Fast Coder".to_string()));
+    }
+
+    #[test]
+    fn test_role_slice_mirrors_role_entries_for_stored_roles() {
+        let config: ModelsConfig = toml::from_str(
+            r#"
+primary = ["openrouter:base/primary", "openrouter:second/primary"]
+coder = ["openrouter:only/coder"]
+architect = [{ model = "openrouter:only/architect", effort = "high" }]
+"#,
+        )
+        .expect("parse models config");
+
+        for role in [
+            ModelRole::Primary,
+            ModelRole::Coder,
+            ModelRole::Architect,
+            ModelRole::Reviewer,
+        ] {
+            let slice = config
+                .role_slice(role)
+                .expect("stored role exposes a borrowed slice");
+            assert_eq!(slice, config.role_entries(role).as_slice());
+        }
+
+        // Scribe is a derived single-entry role and never exposes a stored list.
+        assert!(config.role_slice(ModelRole::Scribe).is_none());
     }
 }

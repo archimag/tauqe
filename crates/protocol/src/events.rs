@@ -10,6 +10,7 @@ pub const MODEL_FINISHED: &str = "model/finished";
 pub const MODEL_CANCELLED: &str = "model/cancelled";
 pub const MODEL_ERROR: &str = "model/error";
 pub const MODEL_CHANGED: &str = "model/changed";
+pub const MODEL_ESCALATED: &str = "model/escalated";
 
 pub const CONTEXT_CHANGED: &str = "context/changed";
 

@@ -444,6 +444,20 @@ pub(crate) async fn apply_batch_cancel(
     Ok(())
 }
 
+/// Reports whether the key is the `Shift+C` mass-clearing chord.
+///
+/// `Shift+C` is the canonical mass-clearing chord, deliberately uppercase so it
+/// never collides with the lowercase `c` copy verb. Both encodings reach it: a
+/// terminal may report the shifted letter as an uppercase code point, or as a
+/// lowercase code point carrying the `Shift` modifier.
+fn is_mass_clear_chord(key: KeyEvent) -> bool {
+    match key.code {
+        KeyCode::Char('C') => true,
+        KeyCode::Char('c') => key.modifiers.contains(KeyModifiers::SHIFT),
+        _ => false,
+    }
+}
+
 pub(crate) async fn handle_dialog_event(
     key: KeyEvent,
     state: &Arc<Mutex<AppState>>,
@@ -974,16 +988,35 @@ pub(crate) async fn handle_dialog_event(
             return Ok(Some(InputResult::Continue));
         }
         Some(ActiveModal::UsageSummary) => {
-            // Read-only telemetry: navigation keys move the scroll offset and
-            // every dismissal chord closes the dialog without a request. `End`
-            // targets the last content line and the renderer clamps the offset
-            // to the body height, so the exact value here is free (c-4).
+            // Navigation keys move the scroll offset and every dismissal chord
+            // closes the dialog without a request. `End` targets the last
+            // content line and the renderer clamps the offset to the body
+            // height, so the exact value here is free (c-4). The single mutating
+            // chord is the `Shift+C` reset the footer advertises.
             let close = matches!(
                 key.code,
                 KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') | KeyCode::Char('?')
             );
             if close {
                 st.usage_summary = None;
+            } else if is_mass_clear_chord(key) {
+                // The reset is a daemon-owned mutation, so it is dispatched
+                // rather than patched locally. The cleared snapshot arrives
+                // through `model/usageTotals`, so the dialog re-renders the
+                // reset totals, and the state lock is released before the
+                // transport write so the interface never blocks on it.
+                drop(st);
+                send_request(
+                    server_writer,
+                    methods::MODEL_USAGE_RESET,
+                    serde_json::json!({}),
+                )
+                .await?;
+                state
+                    .lock()
+                    .await
+                    .notify_success(crate::i18n::active_t("notify.usage_reset"));
+                return Ok(Some(InputResult::Continue));
             } else if let Some(summary) = st.usage_summary.as_mut() {
                 match key.code {
                     KeyCode::Down | KeyCode::Char('j') | KeyCode::Char('n') => {
@@ -1409,5 +1442,64 @@ mod tests {
             conn.written().is_empty(),
             "the dialog never talks to the server"
         );
+    }
+
+    /// The footer advertises `Shift+C` as the telemetry reset chord, so that
+    /// chord must dispatch the daemon-owned reset instead of being swallowed by
+    /// the read-only navigation arm.
+    #[tokio::test]
+    async fn usage_summary_shift_c_resets_the_project_telemetry() {
+        for key in [
+            KeyEvent::new(KeyCode::Char('C'), KeyModifiers::SHIFT),
+            // A terminal that reports the shifted letter as a lowercase code
+            // point with the `Shift` modifier reaches the same chord.
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::SHIFT),
+        ] {
+            let mut st = crate::app::test_state();
+            st.open_usage_summary();
+            let state = Arc::new(Mutex::new(st));
+            let mut conn = RpcConnection::new(Vec::<u8>::new());
+
+            handle_dialog_event(key, &state, &mut conn)
+                .await
+                .expect("in-memory dispatch never fails");
+
+            let payload = String::from_utf8(conn.written().to_vec()).expect("utf-8 payload");
+            assert!(payload.contains("model/usageReset"), "{payload}");
+
+            let guard = state.lock().await;
+            assert!(
+                guard.usage_summary.is_some(),
+                "the telemetry dialog stays open after the reset"
+            );
+            assert_eq!(
+                guard.active_notification().map(|n| n.level),
+                Some(crate::app::NotificationLevel::Success)
+            );
+        }
+    }
+
+    /// A plain lowercase `c` is not a mass-clearing chord: the reset stays
+    /// reachable only through the advertised uppercase chord.
+    #[tokio::test]
+    async fn usage_summary_lowercase_c_does_not_reset_the_telemetry() {
+        let mut st = crate::app::test_state();
+        st.open_usage_summary();
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+
+        handle_dialog_event(
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE),
+            &state,
+            &mut conn,
+        )
+        .await
+        .expect("in-memory dispatch never fails");
+
+        assert!(
+            conn.written().is_empty(),
+            "a bare lowercase key never reaches the server"
+        );
+        assert!(state.lock().await.usage_summary.is_some());
     }
 }

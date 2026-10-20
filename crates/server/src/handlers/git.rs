@@ -269,6 +269,10 @@ pub async fn handle_git_squash_generate_message(req: Request, state: &Arc<AppSta
         let op_id = format!("op-{}", crate::state::next_operation_id());
         let usage_guard = state.begin_usage().await;
         let cancel_rx = operation.cancel_receiver();
+        // The signal is also observed after the event loop, so a provider that
+        // stops streaming on cancellation without reporting it is still
+        // recognized as a cancelled turn.
+        let cancel_observer = cancel_rx.clone();
         let (tx, mut rx) = tokio::sync::mpsc::channel(50);
         let msgs = vec![ChatMessage::user(&prompt)];
         let model_name = model.name.clone();
@@ -278,6 +282,9 @@ pub async fn handle_git_squash_generate_message(req: Request, state: &Arc<AppSta
                 .stream_chat(&model_name, msgs, Some(response_format), tx, cancel_rx)
                 .await
         });
+        // The handle lets the last-resort watchdog interrupt a provider request
+        // that never observes the cancellation signal.
+        operation.set_abort_handle(stream_task.abort_handle());
         let mut full_text = String::new();
         let mut stream_error: Option<String> = None;
         let mut cancelled = false;
@@ -295,33 +302,50 @@ pub async fn handle_git_squash_generate_message(req: Request, state: &Arc<AppSta
                 }
                 StreamEvent::Error(msg) => {
                     stream_error = Some(msg);
+                    break;
                 }
                 // An explicit provider cancellation is reported as `CANCELLED`
                 // instead of being swallowed by the catch-all arm and surfacing
                 // later as a generic internal failure.
                 StreamEvent::Cancelled => {
                     cancelled = true;
+                    break;
                 }
                 _ => {}
             }
         }
 
-        if cancelled {
+        // The signal itself is authoritative: a provider may end the stream on
+        // cancellation without ever reporting a cancellation event.
+        let cancelled = cancelled || *cancel_observer.borrow();
+
+        // Surface both a cancelled turn and a streamed provider error so a
+        // broken or interrupted provider never masquerades as a successful
+        // fallback message. The abandoned request is interrupted and awaited
+        // before the outcome is reported, so no provider call outlives the
+        // response.
+        if cancelled || stream_error.is_some() {
+            stream_task.abort();
+            let _ = stream_task.await;
+            operation.clear_abort_handle();
             close_squash_usage(state, usage_guard, &op_id).await;
-            return Response::err(
-                req.id,
-                errors::CANCELLED,
-                "Squash message generation was cancelled",
-            );
+            let (code, message) = if cancelled {
+                (
+                    errors::CANCELLED,
+                    "Squash message generation was cancelled".to_string(),
+                )
+            } else {
+                (
+                    errors::INTERNAL_ERROR,
+                    stream_error.unwrap_or_else(|| "Squash message stream failed".to_string()),
+                )
+            };
+            return Response::err(req.id, code, message);
         }
 
-        // Surface both a streamed provider error and a failed streaming task so
-        // a broken provider never masquerades as a successful fallback message.
-        if let Some(msg) = stream_error {
-            close_squash_usage(state, usage_guard, &op_id).await;
-            return Response::err(req.id, errors::INTERNAL_ERROR, msg);
-        }
-        match stream_task.await {
+        let stream_result = stream_task.await;
+        operation.clear_abort_handle();
+        match stream_result {
             Ok(Ok(())) => {}
             Ok(Err(err)) => {
                 close_squash_usage(state, usage_guard, &op_id).await;

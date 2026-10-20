@@ -9,6 +9,12 @@
 //! zero-length or truncated file after a crash, so the staged payload is
 //! flushed and synced before the rename.
 //!
+//! A rename is recorded in the parent directory, not in the renamed file, so
+//! the file's own `sync_all` does not make it durable either. On Unix the
+//! parent directory is opened and synced after the rename. Filesystems that
+//! reject directory syncing keep the weaker durability they offer; a genuine
+//! sync failure is reported instead of being hidden.
+//!
 //! The staging name carries both the process id and a process-wide monotonic
 //! sequence number. A fixed `<file>.tmp.<pid>` name would let two writers of
 //! one process truncate each other's staging file and publish a corrupted
@@ -32,7 +38,10 @@ static STAGING_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 /// The payload is staged into a process-unique sibling temporary file, flushed,
 /// and `fsync`ed before the atomic rename. A failure before the rename removes
 /// the staging file, so a rejected write never leaves an orphaned artifact
-/// behind and never disturbs the existing target.
+/// behind and never disturbs the existing target. On Unix the parent directory
+/// is synced after the rename, so the new directory entry survives a crash; a
+/// failure at that point is reported because the durability of the replacement
+/// is then unknown.
 pub fn write_atomic(target: &Path, contents: &[u8]) -> Result<()> {
     // The staging file, the write, the `fsync` barrier, and the atomic rename
     // all run off the async executor thread, so a slow disk never stalls the
@@ -55,7 +64,8 @@ pub fn write_atomic(target: &Path, contents: &[u8]) -> Result<()> {
     })
 }
 
-/// Stages `contents` into `staging`, syncs it, and renames it over `target`.
+/// Stages `contents` into `staging`, syncs it, renames it over `target`, and
+/// syncs the directory that holds the result.
 fn stage_and_rename(staging: &Path, target: &Path, contents: &[u8]) -> Result<()> {
     {
         let mut file = std::fs::File::create(staging)
@@ -74,12 +84,81 @@ fn stage_and_rename(staging: &Path, target: &Path, contents: &[u8]) -> Result<()
             staging.display(),
             target.display()
         )
-    })
+    })?;
+
+    // The file's own `sync_all` covers its data and inode, not the directory
+    // entry that now points at it. Syncing the parent directory makes the
+    // rename itself durable, so a power loss cannot roll it back.
+    sync_parent_directory(target)
+}
+
+/// The directory that holds `target`.
+///
+/// A bare file name reports an empty parent that cannot be opened; the current
+/// directory holds it instead.
+#[cfg(unix)]
+fn parent_directory(target: &Path) -> &Path {
+    match target.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    }
+}
+
+/// Opens the directory that holds `target` and syncs it.
+///
+/// A rename is recorded in the parent directory, so the file's own `sync_all`
+/// does not make it durable. A rejection is ignored so writes keep working on
+/// filesystems that do not sync directories; they simply retain their weaker
+/// durability level. A genuine I/O failure is reported, because the durability
+/// of the rename is then unknown.
+#[cfg(unix)]
+fn sync_parent_directory(target: &Path) -> Result<()> {
+    let parent = parent_directory(target);
+
+    let directory = match std::fs::File::open(parent) {
+        Ok(directory) => directory,
+        Err(error) if rejects_directory_sync(&error) => return Ok(()),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("Failed to open directory {} for sync", parent.display()))
+        }
+    };
+
+    match directory.sync_all() {
+        Ok(()) => Ok(()),
+        Err(error) if rejects_directory_sync(&error) => Ok(()),
+        Err(error) => Err(error).with_context(|| {
+            format!(
+                "Failed to sync directory {} after renaming into it",
+                parent.display()
+            )
+        }),
+    }
+}
+
+/// Whether `error` reports a filesystem that does not sync directories.
+#[cfg(unix)]
+fn rejects_directory_sync(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::InvalidInput
+            | std::io::ErrorKind::PermissionDenied
+            | std::io::ErrorKind::Unsupported
+    )
+}
+
+/// Directory syncing is a POSIX durability step with no portable equivalent.
+#[cfg(not(unix))]
+fn sync_parent_directory(_target: &Path) -> Result<()> {
+    Ok(())
 }
 
 /// Builds a staging path for `target` that is unique within this process.
 fn staging_path(target: &Path) -> PathBuf {
-    let file_name = target.file_name().and_then(|f| f.to_str()).unwrap_or("file");
+    let file_name = target
+        .file_name()
+        .and_then(|f| f.to_str())
+        .unwrap_or("file");
     let sequence = STAGING_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     target.with_file_name(format!("{file_name}.tmp.{}.{sequence}", std::process::id()))
 }
@@ -169,6 +248,18 @@ mod tests {
         assert!(
             staging_leftovers(dir.path()).is_empty(),
             "a failed write must not leave a staging file behind"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_bare_file_name_resolves_to_the_current_directory() {
+        use super::parent_directory;
+
+        assert_eq!(parent_directory(Path::new("document.json")), Path::new("."));
+        assert_eq!(
+            parent_directory(Path::new("/tmp/document.json")),
+            Path::new("/tmp")
         );
     }
 }

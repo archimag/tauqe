@@ -1089,7 +1089,7 @@ impl Default for SquashDialogState {
             selected_file_index: 0,
             diff_scroll: 0,
             message_editor: InputEditor::default(),
-            status_message: Some("Inspecting repository history...".to_string()),
+            status_message: Some(active_t("dialog.squash.status_inspecting")),
             focus: SquashDialogFocus::FileList,
             confirm: None,
             confirm_button: ConfirmDialogButton::Cancel,

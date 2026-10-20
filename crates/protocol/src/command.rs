@@ -239,6 +239,12 @@ impl CapabilitySet {
     /// Plan creation and modification are excluded: while an isolated step
     /// runs the plan is immutable and progress is recorded deterministically
     /// by the harness, never by the model.
+    ///
+    /// Toolchain verification stays advertised here because this profile
+    /// removes plan authoring from the development set and nothing else. The
+    /// harness owns verification for a step, so `TurnIntent::IsolatedStep`
+    /// strips it inside `TurnIntent::narrow_capabilities`; removing it here as
+    /// well would duplicate that decision in two places.
     pub fn isolated_step_xml() -> Self {
         Self::from_slice(&[
             LlmCapability::TextMessage,

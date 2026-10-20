@@ -4,6 +4,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
 use crate::app::{ActiveModal, AppState, ViewMode};
+use crate::i18n::active_t;
 use crate::theme::engine::current_engine;
 
 pub mod footer;
@@ -61,16 +62,19 @@ impl ratatui::widgets::Widget for CanvasBackground {
 fn render_terminal_too_small(frame: &mut ratatui::Frame) {
     let engine = current_engine();
     let area = frame.area();
+    let current_size = active_t("ui.terminal_current")
+        .replacen("{}", &area.width.to_string(), 1)
+        .replacen("{}", &area.height.to_string(), 1);
+    let required_size = active_t("ui.terminal_required")
+        .replacen("{}", &MIN_TERM_WIDTH.to_string(), 1)
+        .replacen("{}", &MIN_TERM_HEIGHT.to_string(), 1);
     let lines = vec![
         Line::from(Span::styled(
-            "Terminal too small",
+            active_t("ui.terminal_too_small"),
             engine.fg(engine.palette().status_warning).bold(),
         )),
-        Line::from(format!("Current: {}x{}", area.width, area.height)),
-        Line::from(format!(
-            "Required: {}x{} (Ctrl+Q to exit)",
-            MIN_TERM_WIDTH, MIN_TERM_HEIGHT
-        )),
+        Line::from(current_size),
+        Line::from(required_size),
     ];
     let height = area.height.min(3);
     let rect = Rect::new(

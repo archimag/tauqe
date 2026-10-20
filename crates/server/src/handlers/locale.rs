@@ -12,11 +12,10 @@
 use std::sync::Arc;
 
 use tauqe_core::providers::{create_provider, ChatMessage, LlmProvider, StreamEvent};
-use tauqe_protocol::{
-    errors, events, Event, LocaleGenerateParams, ModelRole, ProviderKind, Request, Response,
-};
+use tauqe_protocol::{errors, LocaleGenerateParams, ModelRole, ProviderKind, Request, Response};
 
 use crate::state::AppState;
+use crate::usage::UsageGuard;
 
 /// Handles `locale/generate`: validates the request, runs a single structured
 /// provider call, and returns a sanitized catalog.
@@ -74,6 +73,7 @@ pub async fn handle_locale_generate(req: Request, state: &Arc<AppState>) -> Resp
     // Open the shared usage ledger: this call reports both the tokens the
     // provider returned and the duration the harness measured, so every
     // operation kind feeds one consistent snapshot.
+    let op_id = format!("op-{}", crate::state::next_operation_id());
     let usage_guard = state.begin_usage().await;
 
     // Locale synthesis never produces code changes, so it is a Structured
@@ -95,13 +95,15 @@ pub async fn handle_locale_generate(req: Request, state: &Arc<AppState>) -> Resp
     });
 
     let mut raw_text = String::new();
-    let mut usage = None;
     let mut stream_error = None;
     let mut cancelled = false;
     while let Some(event) = rx.recv().await {
         match event {
             StreamEvent::TextDelta(delta) => raw_text.push_str(&delta),
-            StreamEvent::Usage(reported) => usage = Some(reported),
+            // Usage is folded into the in-flight window as it arrives, so a
+            // cancelled or failed call is charged for whatever it already
+            // spent instead of losing the report when the loop breaks early.
+            StreamEvent::Usage(reported) => usage_guard.observe(&reported).await,
             StreamEvent::Cancelled => {
                 cancelled = true;
                 break;
@@ -117,15 +119,21 @@ pub async fn handle_locale_generate(req: Request, state: &Arc<AppState>) -> Resp
     if cancelled {
         stream_task.abort();
         let _ = stream_task.await;
+        close_locale_usage(state, usage_guard, &op_id).await;
         return Response::err(req.id, errors::CANCELLED, "Locale generation was cancelled");
     }
     if let Some(message) = stream_error {
+        close_locale_usage(state, usage_guard, &op_id).await;
         return Response::err(req.id, errors::MODEL_ERROR, message);
     }
     match stream_task.await {
         Ok(Ok(())) => {}
-        Ok(Err(err)) => return Response::err(req.id, errors::MODEL_ERROR, err.to_string()),
+        Ok(Err(err)) => {
+            close_locale_usage(state, usage_guard, &op_id).await;
+            return Response::err(req.id, errors::MODEL_ERROR, err.to_string());
+        }
         Err(join_err) => {
+            close_locale_usage(state, usage_guard, &op_id).await;
             return Response::err(
                 req.id,
                 errors::MODEL_ERROR,
@@ -134,28 +142,12 @@ pub async fn handle_locale_generate(req: Request, state: &Arc<AppState>) -> Resp
         }
     }
 
-    // Account for the provider cost and duration of this one-shot call through
-    // the shared usage ledger before the legacy per-operation channel reports
-    // the monetary counter.
-    let usage = usage.unwrap_or_default();
-    usage_guard.observe(&usage).await;
-    usage_guard.flush().await;
-    let cost = usage.cost.unwrap_or(0.0);
-    let total_cost = {
-        let mut total = state.total_cost.lock().await;
-        *total += cost;
-        *total
-    };
-    state.out.send_event(&Event {
-        method: events::MODEL_USAGE.to_string(),
-        params: serde_json::to_value(tauqe_protocol::ModelUsageEvent {
-            operation_id: format!("op-{}", crate::state::next_operation_id()),
-            usage: usage.clone(),
-            session_total_cost: total_cost,
-            current_cost: Some(cost),
-        })
-        .ok(),
-    });
+    // The terminal flush folds the reported usage and the measured duration of
+    // this one-shot call into the session totals, then mirrors the authoritative
+    // numbers onto the legacy per-operation channel. The legacy fields are
+    // projected from that snapshot, never from a separately maintained counter,
+    // so the aggregate and legacy views can never disagree.
+    close_locale_usage(state, usage_guard, &op_id).await;
 
     // Deterministic geometry validation and graceful English fallback live in
     // `core`: the daemon never trusts the model's own width arithmetic, so an
@@ -166,6 +158,18 @@ pub async fn handle_locale_generate(req: Request, state: &Arc<AppState>) -> Resp
         &tauqe_core::locale::parse_locale_output(&raw_text),
     );
     Response::ok_typed(req.id, &result)
+}
+
+/// Closes the locale call's usage window exactly once.
+///
+/// Every terminal path — success, cancellation, and provider failure — reaches
+/// this, so the tokens and the time the call already consumed are folded into
+/// the session totals instead of leaving a window open for the next operation to
+/// discard. The legacy per-operation usage channel is then mirrored from the
+/// same authoritative snapshot.
+async fn close_locale_usage(state: &Arc<AppState>, guard: UsageGuard, op_id: &str) {
+    guard.flush().await;
+    crate::handlers::model::emit_legacy_usage_event(state, op_id).await;
 }
 
 /// Resolves the LLM provider for a locale call.
@@ -191,10 +195,11 @@ async fn resolve_locale_provider(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
     use crate::transport::OutChannel;
     use tauqe_core::providers::mock::{MockLlmProvider, MockResponse};
     use tauqe_core::providers::ResponseFormat;
-    use tauqe_protocol::{LocaleCatalogItem, LocaleGenerateResult, RequestId};
+    use tauqe_protocol::{events, LocaleCatalogItem, LocaleGenerateResult, RequestId};
 
     fn item(key: &str, english: &str, max_width: Option<u16>) -> LocaleCatalogItem {
         LocaleCatalogItem {
@@ -235,6 +240,50 @@ mod tests {
         let state = bare_state();
         *state.provider_override.lock().await = Some(provider);
         state
+    }
+
+    /// Builds a state together with its wire channel, so a test can inspect the
+    /// events the handler publishes.
+    fn state_with_wire() -> (Arc<AppState>, tokio::sync::mpsc::UnboundedReceiver<String>) {
+        let (out, rx) = OutChannel::new();
+        let (hist_tx, _hist_rx) = tokio::sync::mpsc::unbounded_channel();
+        let state = AppState::new(
+            tauqe_core::config::AppConfig::default(),
+            std::path::PathBuf::from("/nonexistent"),
+            hist_tx,
+            out,
+        );
+        (state, rx)
+    }
+
+    /// Builds a state whose provider is a double, keeping the wire channel open
+    /// for assertion.
+    async fn state_with_provider_on_wire(
+        provider: Arc<dyn LlmProvider>,
+    ) -> (Arc<AppState>, tokio::sync::mpsc::UnboundedReceiver<String>) {
+        let (state, rx) = state_with_wire();
+        *state.provider_override.lock().await = Some(provider);
+        (state, rx)
+    }
+
+    /// Drains every line the handler already wrote to the wire.
+    fn drain_wire(rx: &mut tokio::sync::mpsc::UnboundedReceiver<String>) -> Vec<String> {
+        std::iter::from_fn(|| rx.try_recv().ok()).collect()
+    }
+
+    /// Counts the legacy per-operation usage events on the wire.
+    ///
+    /// The lines are parsed instead of substring-matched, because the legacy
+    /// method name is a prefix of the aggregate one.
+    fn count_legacy_usage_events(lines: &[String]) -> usize {
+        lines
+            .iter()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(|event| {
+                event.get("method").and_then(|method| method.as_str())
+                    == Some(events::MODEL_USAGE)
+            })
+            .count()
     }
 
     fn parse_result(response: Response) -> LocaleGenerateResult {
@@ -377,5 +426,134 @@ mod tests {
         let err = response.error.expect("provider error must surface");
         assert_eq!(err.code, errors::MODEL_ERROR);
         assert!(err.message.contains("boom"));
+
+        // A failed call still closes its window exactly once, so the next
+        // operation starts from a clean ledger instead of inheriting an
+        // abandoned in-flight window.
+        let snapshot = state.usage.lock().await.clone();
+        assert_eq!(snapshot.operations, 1);
+        assert!(snapshot.cur.is_none());
+        assert!(!state.is_operation_active(), "the slot is released");
+    }
+
+    /// Provider double that reports usage and then terminates the stream with an
+    /// explicit cancellation, so the cancelled terminal path is exercised
+    /// instead of the ordinary success path.
+    struct CancellingProvider {
+        usage: tauqe_protocol::ModelUsageInfo,
+    }
+
+    #[async_trait]
+    impl LlmProvider for CancellingProvider {
+        fn kind(&self) -> tauqe_protocol::ProviderKind {
+            tauqe_protocol::ProviderKind::OpenRouter
+        }
+
+        async fn stream_chat(
+            &self,
+            _model: &str,
+            _messages: Vec<ChatMessage>,
+            _response_format: Option<ResponseFormat>,
+            tx: tokio::sync::mpsc::Sender<StreamEvent>,
+            _cancel_rx: tokio::sync::watch::Receiver<bool>,
+        ) -> anyhow::Result<()> {
+            let _ = tx.send(StreamEvent::Usage(self.usage.clone())).await;
+            let _ = tx.send(StreamEvent::Cancelled).await;
+            Ok(())
+        }
+    }
+
+    /// A successful translation is one accounted operation: its usage folds into
+    /// the session totals exactly once and is mirrored onto the legacy channel
+    /// from the same authoritative snapshot.
+    #[tokio::test]
+    async fn accounts_the_translation_and_mirrors_the_usage_event() {
+        let raw = serde_json::json!({
+            "translations": [{"key": "tab.review", "translation": "Обзор"}]
+        })
+        .to_string();
+        let usage = tauqe_protocol::ModelUsageInfo {
+            prompt_tokens: 20,
+            completion_tokens: 8,
+            total_tokens: 28,
+            cost: Some(0.4),
+            ..tauqe_protocol::ModelUsageInfo::default()
+        };
+        let provider: Arc<dyn LlmProvider> =
+            Arc::new(MockLlmProvider::scripted([MockResponse::text(raw).with_usage(usage)]));
+        let (state, mut rx) = state_with_provider_on_wire(provider).await;
+
+        let catalog = params(vec![item("tab.review", "Review", None)]);
+        let response = handle_locale_generate(request(&catalog), &state).await;
+        assert!(
+            response.error.is_none(),
+            "unexpected error: {:?}",
+            response.error
+        );
+        let result = parse_result(response);
+        assert_eq!(result.translations["tab.review"], "Обзор");
+
+        let snapshot = state.usage.lock().await.clone();
+        assert_eq!(snapshot.operations, 1, "one terminal flush per call");
+        assert!(snapshot.cur.is_none(), "the flush closes the window");
+        assert_eq!(snapshot.session.total_tokens, 28);
+        assert!((snapshot.session.cost - 0.4).abs() < f64::EPSILON);
+
+        let lines = drain_wire(&mut rx);
+        assert_eq!(
+            count_legacy_usage_events(&lines),
+            1,
+            "exactly one legacy usage event per call"
+        );
+        let reported = lines
+            .iter()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .find(|event| {
+                event.get("method").and_then(|method| method.as_str())
+                    == Some(events::MODEL_USAGE)
+            })
+            .expect("legacy usage event");
+        assert_eq!(
+            reported["params"]["usage"]["total_tokens"].as_u64(),
+            Some(28)
+        );
+        assert_eq!(reported["params"]["session_total_cost"].as_f64(), Some(0.4));
+        assert!(!state.is_operation_active());
+    }
+
+    /// A cancelled call is charged for what it already spent and leaves no open
+    /// window behind.
+    #[tokio::test]
+    async fn cancellation_still_charges_the_operation_once() {
+        let usage = tauqe_protocol::ModelUsageInfo {
+            prompt_tokens: 5,
+            completion_tokens: 1,
+            total_tokens: 6,
+            cost: Some(0.1),
+            ..tauqe_protocol::ModelUsageInfo::default()
+        };
+        let provider: Arc<dyn LlmProvider> = Arc::new(CancellingProvider { usage });
+        let (state, mut rx) = state_with_provider_on_wire(provider).await;
+
+        let catalog = params(vec![item("tab.review", "Review", None)]);
+        let response = handle_locale_generate(request(&catalog), &state).await;
+        assert_eq!(
+            response.error.expect("cancellation must surface").code,
+            errors::CANCELLED
+        );
+
+        let snapshot = state.usage.lock().await.clone();
+        assert_eq!(snapshot.operations, 1, "a cancelled call flushes once");
+        assert!(snapshot.cur.is_none(), "cancellation closes the window");
+        assert_eq!(snapshot.session.total_tokens, 6);
+        assert!((snapshot.session.cost - 0.1).abs() < f64::EPSILON);
+        assert!(!state.is_operation_active(), "the operation slot is released");
+
+        let lines = drain_wire(&mut rx);
+        assert_eq!(
+            count_legacy_usage_events(&lines),
+            1,
+            "a cancelled call reports its usage exactly once"
+        );
     }
 }

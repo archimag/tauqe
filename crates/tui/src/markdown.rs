@@ -1,6 +1,7 @@
 use pulldown_cmark::{Alignment, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
+use unicode_width::UnicodeWidthStr;
 
 use crate::theme::color::RgbColor;
 
@@ -37,17 +38,13 @@ pub fn rgb_to_ansi256(r: u8, g: u8, b: u8) -> u8 {
 
 /// Projects a raw RGB color onto the active terminal color depth.
 ///
-/// Truecolor terminals receive the exact RGB value, 256-color terminals the
-/// nearest protected-cube index, and the 16-color fallback degrades to the
-/// default foreground so text stays legible.
+/// The projection is delegated to the theme engine, so raw syntax-highlighting
+/// colors follow the same single path as the semantic palette
+/// (`crates/tui/Conventions.md` §8): truecolor terminals receive the exact RGB
+/// value, 256-color terminals the nearest protected-cube index, and the
+/// 16-color fallback degrades to the default foreground.
 pub fn safe_rgb(r: u8, g: u8, b: u8) -> Color {
-    if supports_truecolor() {
-        Color::Rgb(r, g, b)
-    } else if crate::theme::engine::current_depth() == crate::theme::color::ColorDepth::Ansi16 {
-        Color::Reset
-    } else {
-        Color::Indexed(rgb_to_ansi256(r, g, b))
-    }
+    crate::theme::engine::current_engine().color(RgbColor::new(r, g, b))
 }
 
 /// Clickable label of the code-block copy button.
@@ -66,10 +63,10 @@ pub fn copy_button_span(lang: &str) -> (u16, u16) {
     let lang_width = if lang.trim().is_empty() {
         4
     } else {
-        lang.trim().chars().count()
+        lang.trim().width()
     };
     let start = (2 + lang_width + 1) as u16;
-    let end = start + (COPY_BUTTON_LABEL.len() + 1) as u16;
+    let end = start + (COPY_BUTTON_LABEL.width() + 1) as u16;
     (start, end)
 }
 
@@ -798,5 +795,10 @@ mod tests {
         let (start, end) = copy_button_span("   ");
         assert_eq!(start, 2 + 4 + 1);
         assert_eq!(end, start + 9);
+
+        // A wide (CJK) label shifts the button by its display width, not by
+        // its scalar count, so hit-testing follows what is actually painted.
+        let (start, _) = copy_button_span("日本語");
+        assert_eq!(start, 2 + 6 + 1);
     }
 }

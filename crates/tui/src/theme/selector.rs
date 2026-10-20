@@ -10,12 +10,15 @@
 //! surface where the palettes are offered to the developer.
 
 use crossterm::event::{KeyCode, KeyEvent};
-use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
+use ratatui::layout::Rect;
 use ratatui::style::Stylize;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+use ratatui::widgets::Paragraph;
 
 use crate::app::AppState;
+use crate::components::modal::{
+    modal_geometry, render_dialog_footer, render_modal_container, ModalTone,
+};
 use crate::components::ListSelector;
 use crate::i18n::active_t;
 use crate::theme::engine::current_engine;
@@ -58,25 +61,27 @@ pub fn theme_selector_area(term: Rect) -> Rect {
 }
 
 /// Number of preset rows visible in the selector body.
+///
+/// The live-preview caption occupies the first body row, so only the rows below
+/// it carry presets.
 pub fn theme_selector_visible_height(term: Rect) -> usize {
-    (theme_selector_area(term).height.saturating_sub(5) as usize).max(1)
+    selector_visible_rows(theme_selector_body_area(term))
+}
+
+/// Preset rows that fit under the live-preview caption of a body band.
+fn selector_visible_rows(body: Rect) -> usize {
+    (body.height.saturating_sub(1) as usize).max(1)
 }
 
 /// Body area (the scrollable preset rows) of the selector, shared by rendering
 /// and mouse hit-testing.
+///
+/// The band is taken from the shared modal frame, so the selector inherits the
+/// same top inset, horizontal padding, and pre-action spacer as every other
+/// dialog instead of computing its own inner rectangle (`#c-4`,
+/// Conventions §6.7, §6.8).
 pub fn theme_selector_body_area(term: Rect) -> Rect {
-    let area = theme_selector_area(term);
-    let inner = Rect::new(
-        area.x + 1,
-        area.y + 1,
-        area.width.saturating_sub(2),
-        area.height.saturating_sub(2),
-    );
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(2), Constraint::Length(1)])
-        .split(inner);
-    chunks[0]
+    modal_geometry(theme_selector_area(term)).body
 }
 
 /// Resolves a left-click inside the theme selector.
@@ -166,29 +171,25 @@ fn preset_row(preset: ThemePreset, is_selected: bool, is_active: bool) -> Line<'
 }
 
 /// Renders the theme selector dialog using the active semantic palette.
+///
+/// The shared modal frame owns the card chrome: clearing the area, filling the
+/// `surface` background, the border tone, the top inset, the horizontal margin,
+/// the pre-action spacer, and the docked hint row. This renderer only draws the
+/// preset list into its own padded body band (`#c-1`, `#c-2`, Conventions §6.7,
+/// §6.8).
 pub fn render_theme_selector(frame: &mut ratatui::Frame, state: &ThemeSelectorState) {
     let engine = current_engine();
     let palette = engine.palette();
     let area = theme_selector_area(frame.area());
-    frame.render_widget(Clear, area);
+    let title = active_t("dialog.theme_select.title");
+    render_modal_container(frame, area, &title, ModalTone::Info);
 
-    let block = Block::default()
-        .title(format!(" {} ", active_t("dialog.theme_select.title")))
-        .borders(Borders::ALL)
-        .border_style(engine.fg(palette.status_info))
-        .style(ratatui::style::Style::default().bg(engine.color(palette.surface)));
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(2), Constraint::Length(1)])
-        .split(inner);
+    let geometry = modal_geometry(area);
 
     let active = engine.preset();
     // Render only the visible window of presets so the drawn rows always match
     // the rows the click and keyboard navigation address (`#c-4`).
-    let visible = theme_selector_visible_height(frame.area());
+    let visible = selector_visible_rows(geometry.body);
     let start = state.selector.scroll_offset();
     let mut body: Vec<Line<'static>> = Vec::with_capacity(visible + 1);
     body.push(Line::from(Span::styled(
@@ -207,14 +208,15 @@ pub fn render_theme_selector(frame: &mut ratatui::Frame, state: &ThemeSelectorSt
             *preset == active,
         ));
     }
-    frame.render_widget(Paragraph::new(body), chunks[0]);
+    frame.render_widget(Paragraph::new(body), geometry.body);
 
-    let footer = Paragraph::new(Span::styled(
-        active_t("dialog.theme_select.footer"),
-        engine.fg(palette.text_muted),
-    ))
-    .alignment(Alignment::Center);
-    frame.render_widget(footer, chunks[1]);
+    // The hint vocabulary is docked to the bottom inner row as its own filled
+    // strip, separated from the preset list by the action band.
+    render_dialog_footer(
+        frame,
+        geometry.hint_row,
+        &active_t("dialog.theme_select.footer"),
+    );
 }
 
 /// Commits a preset: records it in configuration, applies it live, and persists
@@ -224,8 +226,14 @@ fn commit_preset(st: &mut AppState, preset: ThemePreset) {
     st.tui_config.theme.name = Some(preset.as_str().to_string());
     st.apply_theme_preset(preset);
     match crate::config::save_theme_preset(preset.as_str()) {
-        Ok(_) => st.notify_success(format!("Theme saved: {}", preset.as_str())),
-        Err(err) => st.notify_error(format!("Failed to save theme: {}", err)),
+        Ok(_) => {
+            st.notify_success(active_t("notify.theme_saved").replacen("{}", preset.as_str(), 1))
+        }
+        Err(err) => st.notify_error(active_t("notify.theme_save_failed").replacen(
+            "{}",
+            &err.to_string(),
+            1,
+        )),
     }
 }
 
@@ -315,5 +323,83 @@ mod tests {
     fn handler_is_inert_without_an_open_dialog() {
         let mut st = test_state();
         assert!(!handle_theme_selector_key(key(KeyCode::Enter), &mut st, 5));
+    }
+
+    /// The body band keeps one row of air below the border title and one column
+    /// of margin off each vertical border (Conventions §6.7, §6.8).
+    #[test]
+    fn body_area_keeps_the_top_inset_and_the_horizontal_margin() {
+        let term = Rect::new(0, 0, 80, 24);
+        let area = theme_selector_area(term);
+        let body = theme_selector_body_area(term);
+
+        assert_eq!(body.y, area.y + 2, "border + top inset");
+        assert_eq!(body.x, area.x + 2, "border + horizontal padding");
+        assert_eq!(body.width, area.width - 4, "both vertical margins");
+    }
+
+    /// The hint strip is docked to the bottom inner row of the card, so it never
+    /// floats loose between the presets and the border (Conventions §6.4).
+    #[test]
+    fn hint_row_is_docked_above_the_bottom_border() {
+        let term = Rect::new(0, 0, 80, 24);
+        let area = theme_selector_area(term);
+        let geometry = modal_geometry(area);
+
+        assert_eq!(
+            geometry.hint_row.y + geometry.hint_row.height,
+            area.y + area.height - 1,
+            "hint strip is docked above the bottom border"
+        );
+        assert_eq!(geometry.hint_row.height, 1);
+    }
+
+    /// Clicking a preset row selects exactly the preset painted on that row, so
+    /// the drawn list and the hit-tested list can never drift apart
+    /// (`#c-4`, Conventions §6.6).
+    #[test]
+    fn clicking_a_rendered_preset_row_selects_the_preset_drawn_on_it() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let term = Rect::new(0, 0, 80, 24);
+        let mut st = test_state();
+        // Seed the cursor on the first preset so the clicked row is not the
+        // already-highlighted one, which would commit instead of selecting.
+        st.active_theme_preset = ThemePreset::TauqeDark;
+        st.open_theme_selector();
+        let selector_state = st.theme_selector.clone().expect("selector opens");
+
+        let mut terminal = Terminal::new(TestBackend::new(term.width, term.height)).unwrap();
+        terminal
+            .draw(|frame| render_theme_selector(frame, &selector_state))
+            .unwrap();
+
+        let body = theme_selector_body_area(term);
+        // Row 0 of the body is the live-preview caption; preset rows follow it,
+        // so body row 3 carries preset index 2 at zero scroll offset.
+        let target_row = body.y + 3;
+        let expected = ThemePreset::ALL[2];
+        let drawn: String = (body.x..body.x + body.width)
+            .map(|x| terminal.backend().buffer()[(x, target_row)].symbol())
+            .collect();
+        assert!(
+            drawn.contains(expected.as_str()),
+            "row {target_row} draws {drawn:?}, expected {}",
+            expected.as_str()
+        );
+
+        assert!(handle_theme_selector_click(
+            &mut st,
+            body.x + 5,
+            target_row,
+            term
+        ));
+        let selected = st
+            .theme_selector
+            .expect("selection keeps the dialog open")
+            .selected_preset();
+        assert_eq!(selected, expected);
+        assert_eq!(st.active_theme_preset, expected);
     }
 }

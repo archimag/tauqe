@@ -301,7 +301,9 @@ impl PromptAssembly {
         prompt.push_str("You are Tauqe AI, an expert programming assistant operating inside TAUQE (The Answer to the Ultimate Question of Engineering), an AI-native engineering control environment built on the literal harness paradigm.\n");
         prompt.push_str("TAUQE is the environment you operate within. Whenever the developer mentions TAUQE, they refer to this same control environment—its harness, workflows, context model, plans, and Git transactions—not to an external tool or framework.\n");
         prompt.push_str("Environment behavior is declared in `tauqe.toml` at the repository root: model roles, toolchain verification phases, context and repo-map budgets, pinned files, and workflow policy all come from that file. Treat it as the authoritative project configuration surface, and never infer a documented parameter, budget, or project convention from partial source memory.\n\n");
-        let render_ctx = PromptRenderContext::new(&[], effective_protocol.turn_marker());
+        let has_eager_repo_map = self.has_eager_repo_map();
+        let render_ctx = PromptRenderContext::new(&[], effective_protocol.turn_marker())
+            .with_eager_repo_map(has_eager_repo_map);
         let contract_ctx = ContractContext::new(self.intent, render_ctx)
             .with_target_language(self.target_language.as_deref());
         prompt.push_str("## Core System Contract\n");
@@ -319,7 +321,9 @@ impl PromptAssembly {
                 .collect();
 
             // Delegate edit protocol specific instructions
-            prompt.push_str(&effective_protocol.system_instructions(&editable_paths));
+            prompt.push_str(
+                &effective_protocol.system_instructions(&editable_paths, has_eager_repo_map),
+            );
         } else {
             prompt.push_str("## Mode: Structured Discussion\n");
             prompt.push_str("You are participating in an architectural discussion. Code modifications are strictly prohibited. You cannot edit, create, or delete code files. Focus on conceptual comprehension of the objective ('What'), clarifying requirements, evaluating trade-offs, establishing key design decisions, and formulating or refining plans via structured fields.\n");
@@ -404,6 +408,16 @@ impl PromptAssembly {
                 Some(trimmed.to_string())
             }
         })
+    }
+
+    /// Reports whether an eager repository symbol map is rendered this turn.
+    ///
+    /// The predicate matches [`PromptAssembly::format_repo_map_block`] exactly,
+    /// so a map that renders no block never claims to be present.
+    fn has_eager_repo_map(&self) -> bool {
+        self.repo_map
+            .as_deref()
+            .is_some_and(|map| !map.trim().is_empty())
     }
 
     pub fn format_repo_map_block(&self) -> Option<String> {
@@ -765,6 +779,66 @@ mod tests {
         let sys = &messages[0].content;
         assert!(!sys.contains("## Repository Map"));
         assert!(!sys.contains("## Repository Directories"));
+    }
+
+    #[test]
+    fn test_eager_repo_map_flag_tracks_the_rendered_block() {
+        let mut assembly = PromptAssembly::new(None, 1, vec![], "git", "xml", None, None);
+        assert!(!assembly.has_eager_repo_map());
+        assert!(assembly.format_repo_map_block().is_none());
+
+        // A blank map renders no block, so it must not claim an eager mode.
+        assembly.repo_map = Some("   ".to_string());
+        assert!(!assembly.has_eager_repo_map());
+        assert!(assembly.format_repo_map_block().is_none());
+
+        assembly.repo_map = Some("crate\n  pub fn main".to_string());
+        assert!(assembly.has_eager_repo_map());
+        assert!(assembly.format_repo_map_block().is_some());
+    }
+
+    #[test]
+    fn test_eager_repo_map_suppresses_on_demand_map_instructions() {
+        let assembly = PromptAssembly::new(
+            None,
+            1,
+            vec![],
+            "git",
+            "xml",
+            None,
+            Some("crates/core/src/prompt.rs\n  pub fn estimate_tokens".to_string()),
+        );
+        assert!(assembly.has_eager_repo_map());
+
+        let messages = assembly.assemble_chat_messages("Go", &XmlPromptProtocol);
+        let system = &messages[0].content;
+
+        // The static symbol contours already answer where symbols live, so no
+        // rendered instruction may advertise an on-demand map request.
+        assert!(system.contains("## Repository Map"));
+        assert!(!system.contains("repo_map path="));
+        assert!(system.contains("repository symbol map is already rendered"));
+
+        // Discovery still routes through targeted search, directory listings,
+        // and full-file loading.
+        assert!(system.contains("<repo_search"));
+        assert!(system.contains("<dir_list"));
+        assert!(system.contains("<context_request"));
+    }
+
+    #[test]
+    fn test_on_demand_repo_map_instructions_carry_an_explicit_example() {
+        let assembly = PromptAssembly::new(None, 1, vec![], "git", "xml", None, None);
+        assert!(!assembly.has_eager_repo_map());
+
+        let messages = assembly.assemble_chat_messages("Go", &XmlPromptProtocol);
+        let system = &messages[0].content;
+
+        // Without the rendered outline the model needs an unambiguous tag
+        // invocation example, so it requests symbol contours instead of loading
+        // whole files.
+        assert!(!system.contains("## Repository Map"));
+        assert!(system.contains("<repo_map path=\"path/to/file.rs\" />"));
     }
 
     #[test]

@@ -3,10 +3,10 @@ use tauqe_protocol::{
     events, BatchFinishStatus, BatchFinishSummary, ConfigState, ContextState, EditFileDoneEvent,
     EditFileRetryingEvent, EditFileStartedEvent, EditFinishedEvent, EditHunkEvent, Event,
     GitCommitCreatedEvent, GitSquashApplyResult, HistoryCompactedEvent, HistoryEntryAddedEvent,
-    ModelDeltaEvent, ModelErrorEvent, ModelFinishedEvent, ModelResult, ModelResultEvent,
-    ModelStartedEvent, ModelUsageTotalsEvent, PlanBatchFinishedEvent, RepositoryState,
-    ReviewBatchFinishedEvent, ReviewContentDeltaEvent, ReviewErrorEvent, ReviewFinishedEvent,
-    ReviewReasoningDeltaEvent, ReviewStartedEvent,
+    ModelDeltaEvent, ModelErrorEvent, ModelEscalatedEvent, ModelFinishedEvent, ModelResult,
+    ModelResultEvent, ModelStartedEvent, ModelUsageTotalsEvent, PlanBatchFinishedEvent,
+    RepositoryState, ReviewBatchFinishedEvent, ReviewContentDeltaEvent, ReviewErrorEvent,
+    ReviewFinishedEvent, ReviewReasoningDeltaEvent, ReviewStartedEvent,
 };
 use tokio::sync::Mutex;
 
@@ -204,6 +204,22 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
                     st.model.plan_context = data.plan_context;
                     st.model.is_batch = data.is_batch;
                     st.model.auto_scroll = true;
+                }
+            }
+        }
+        events::MODEL_ESCALATED => {
+            if let Some(params) = ev.params {
+                if let Ok(data) = serde_json::from_value::<ModelEscalatedEvent>(params) {
+                    // Escalation promotes the turn inside the same role, so
+                    // only the tier coordinates change: the header swaps the
+                    // running model in place instead of waiting for the turn
+                    // to settle.
+                    st.running_model = Some(RunningModel {
+                        model: data.model,
+                        role: data.role,
+                        alias: data.alias,
+                        effort: data.effort,
+                    });
                 }
             }
         }
@@ -1019,7 +1035,7 @@ fn format_elapsed(seconds: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tauqe_protocol::{ModelRef, UiHistoryItem, UiHistoryKind};
+    use tauqe_protocol::{ModelRef, ModelRole, ReasoningEffort, UiHistoryItem, UiHistoryKind};
 
     fn batch_summary(
         status: BatchFinishStatus,
@@ -1242,6 +1258,37 @@ mod tests {
             "the aborted reasoning stream must be dropped as well"
         );
         assert!(!is_reasoning, "the reasoning phase ends with the reset");
+    }
+
+    #[tokio::test]
+    async fn test_model_escalated_updates_the_running_model() {
+        let state = Arc::new(Mutex::new(crate::app::test_state()));
+        let mut is_reasoning = false;
+        let ev = Event {
+            method: events::MODEL_ESCALATED.to_string(),
+            params: Some(
+                serde_json::to_value(ModelEscalatedEvent {
+                    operation_id: "op-escalate".to_string(),
+                    model: ModelRef::openrouter("stronger-coder"),
+                    role: Some(ModelRole::Coder),
+                    alias: Some("deep".to_string()),
+                    effort: Some(ReasoningEffort::High),
+                    tier: 1,
+                })
+                .unwrap(),
+            ),
+        };
+
+        handle_event(ev, &state, &mut is_reasoning).await;
+
+        let guard = state.lock().await;
+        let running = guard
+            .running_model
+            .as_ref()
+            .expect("the escalated model stays current until the turn settles");
+        assert_eq!(running.model, ModelRef::openrouter("stronger-coder"));
+        assert!(matches!(running.role, Some(ModelRole::Coder)));
+        assert_eq!(running.label(), "deep");
     }
 
     #[tokio::test]

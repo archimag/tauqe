@@ -9,14 +9,16 @@
 //! (`crate::i18n::active_t`), so a hot-swapped locale reaches the dialog without
 //! touching the renderer (Conventions §9, c-1).
 
-use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Alignment, Rect};
 use ratatui::style::Stylize;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
 use unicode_width::UnicodeWidthStr;
 
 use crate::app::{AppState, LocaleDialogButton, LocaleDialogState};
-use crate::components::modal::{render_dialog_footer, render_modal_container, ModalTone};
+use crate::components::modal::{
+    modal_geometry, render_dialog_footer, render_modal_container, ModalTone,
+};
 use crate::i18n::active_t;
 use crate::theme::engine::current_engine;
 
@@ -33,8 +35,21 @@ fn locale_button_labels() -> [String; 3] {
 }
 
 const LOCALE_DIALOG_WIDTH: u16 = 66;
-const LOCALE_DIALOG_HEIGHT_PERCENT: u16 = 44;
 const LOCALE_BUTTON_GAP: u16 = 2;
+/// Fixed body rows the locale card always renders: a leading blank, the active
+/// language line, a blank, the intro line, a blank, and the language field.
+const LOCALE_BODY_LINES: u16 = 6;
+
+/// Height percentage that lets the shared frame show the whole body.
+///
+/// The frame reserves six chrome rows — two borders, the top inset, the
+/// pre-action spacer, the action row, and the docked hint strip — so the card is
+/// sized from its body instead of a fixed percentage that would clip the
+/// language field on a short terminal (Conventions §6.7).
+fn locale_dialog_height_percent(term: Rect) -> u16 {
+    let needed_height = LOCALE_BODY_LINES.saturating_add(8).max(10);
+    (needed_height * 100 / term.height.max(1)).clamp(25, 90)
+}
 
 /// Exact geometry and action-button bounds of the locale dialog.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,26 +63,17 @@ pub struct LocaleDialogGeometry {
 /// Computes the geometry and button bounds of the locale dialog so rendering and
 /// mouse hit-testing agree on the same layout.
 pub fn locale_dialog_geometry(term: Rect) -> LocaleDialogGeometry {
-    let area = crate::ui::centered_rect(LOCALE_DIALOG_WIDTH, LOCALE_DIALOG_HEIGHT_PERCENT, term);
-
-    // Mirror the renderer's own split (flexible body, two-row action zone,
-    // one-row docked hint strip) so hit-testing lands on the row the buttons
-    // are drawn in and can never drift from the rendered layout (Conventions §6).
-    let inner = Rect::new(
-        area.x + 1,
-        area.y + 1,
-        area.width.saturating_sub(2),
-        area.height.saturating_sub(2),
+    let area = crate::ui::centered_rect(
+        LOCALE_DIALOG_WIDTH,
+        locale_dialog_height_percent(term),
+        term,
     );
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Min(2),
-            Constraint::Length(2),
-            Constraint::Length(1),
-        ])
-        .split(inner);
-    let action_bar = chunks[1];
+
+    // The shared modal formula owns the top inset, the horizontal margins, the
+    // pre-action spacer, and the docked hint row, so the buttons are placed on
+    // the padded action bar the renderer draws into and hit-testing can never
+    // drift from the rendered layout (Conventions §6.7, §6.8).
+    let action_bar = modal_geometry(area).action_bar;
 
     // The labels are measured in characters, matching the localized chips the
     // renderer draws, so hit-testing never desynchronizes from the drawing.
@@ -103,19 +109,16 @@ pub fn render_locale_dialog(frame: &mut ratatui::Frame, state: &AppState) {
     let geom = locale_dialog_geometry(frame.area());
 
     let title = active_t("dialog.locale.title");
-    let inner = render_modal_container(frame, geom.area, &title, ModalTone::Accent);
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Min(2),
-            Constraint::Length(2),
-            Constraint::Length(1),
-        ])
-        .split(inner);
+    render_modal_container(frame, geom.area, &title, ModalTone::Accent);
 
-    render_locale_body(frame, chunks[0], dialog, state);
-    render_locale_actions(frame, chunks[1], dialog);
-    render_dialog_footer(frame, chunks[2], &locale_footer_hint(dialog));
+    // The container is drawn from the shared frame, so the body, the action bar,
+    // and the docked hint strip are read from the same air-aware formula the
+    // button hit-testing uses (Conventions §6.6–§6.8).
+    let geometry = modal_geometry(geom.area);
+
+    render_locale_body(frame, geometry.body, dialog, state);
+    render_locale_actions(frame, geometry.action_bar, dialog);
+    render_dialog_footer(frame, geometry.hint_row, &locale_footer_hint(dialog));
 }
 
 /// Renders the body: the active language and the target-language field.
@@ -239,6 +242,28 @@ mod tests {
         terminal.draw(|f| render_locale_dialog(f, &state)).unwrap();
 
         let geom = locale_dialog_geometry(term);
+        let geometry = modal_geometry(geom.area);
+
+        assert_eq!(geom.synthesize_button.y, geometry.action_bar.y);
+        assert_eq!(geom.reset_button.y, geometry.action_bar.y);
+        assert_eq!(geom.cancel_button.y, geometry.action_bar.y);
+        assert!(geom.synthesize_button.x >= geometry.action_bar.x);
+        assert!(
+            geom.cancel_button.x + geom.cancel_button.width
+                <= geometry.action_bar.x + geometry.action_bar.width
+        );
+        assert_eq!(geometry.body.y, geom.area.y + 2, "border + top inset");
+        assert_eq!(
+            geometry.body.x,
+            geom.area.x + 2,
+            "border + horizontal margin"
+        );
+        assert_eq!(
+            geometry.hint_row.y + geometry.hint_row.height,
+            geom.area.y + geom.area.height - 1,
+            "hint strip is docked above the bottom border"
+        );
+
         let buffer = terminal.backend().buffer();
         let read = |rect: Rect| -> String {
             (rect.x..rect.x + rect.width)

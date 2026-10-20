@@ -61,8 +61,13 @@ impl PromptProtocol for XmlPromptProtocol {
         decode_with_capabilities(raw_text, None, &self.capability_set())
     }
 
-    fn system_instructions(&self, editable_paths: &[String]) -> String {
-        XmlEditProtocol.system_instructions_for(&self.capability_set(), editable_paths, None)
+    fn system_instructions(&self, editable_paths: &[String], has_eager_repo_map: bool) -> String {
+        XmlEditProtocol.system_instructions_for(
+            &self.capability_set(),
+            editable_paths,
+            None,
+            has_eager_repo_map,
+        )
     }
 
     fn with_turn_marker(&self, marker: &str) -> Option<Box<dyn PromptProtocol>> {
@@ -127,11 +132,12 @@ impl PromptProtocol for ScopedXmlPromptProtocol {
         decode_with_capabilities(raw_text, self.marker.as_deref(), &self.capabilities)
     }
 
-    fn system_instructions(&self, editable_paths: &[String]) -> String {
+    fn system_instructions(&self, editable_paths: &[String], has_eager_repo_map: bool) -> String {
         XmlEditProtocol.system_instructions_for(
             &self.capabilities,
             editable_paths,
             self.marker.as_deref(),
+            has_eager_repo_map,
         )
     }
 

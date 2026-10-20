@@ -250,9 +250,11 @@ impl PromptProtocol for JsonPromptProtocol {
         commands
     }
 
-    fn system_instructions(&self, editable_paths: &[String]) -> String {
+    fn system_instructions(&self, editable_paths: &[String], _has_eager_repo_map: bool) -> String {
         match &self.mode {
             JsonPromptMode::Edits => {
+                // Structured Output always exposes the `repo_maps` schema field,
+                // so its reference describes the field regardless of the outline.
                 StructuredEditProtocol.system_instructions_for(&self.capabilities, editable_paths)
             }
             JsonPromptMode::Discussion { stream_field } => {

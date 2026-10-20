@@ -6,20 +6,16 @@ use std::sync::Arc;
 
 use tauqe_core::plan::storage::PlanStorage;
 use tauqe_protocol::{
-    events, Event, ModelErrorEvent, Plan, PlanItem, PlanItemStatus, PlanListChangedEvent,
+    events, ModelErrorEvent, Plan, PlanItem, PlanItemStatus, PlanListChangedEvent,
     PlanUpdatedEvent,
 };
 
 use crate::state::AppState;
-use crate::transport::OutChannel;
 
-/// Emits a server event with an optional serialized parameter payload.
-pub(super) fn emit(out: &OutChannel, method: &str, params: Option<serde_json::Value>) {
-    out.send_event(&Event {
-        method: method.to_string(),
-        params,
-    });
-}
+/// Event emission, auto-context clearing, and turn-outcome inspection are shared
+/// with every other handler subsystem, so they are re-exported here instead of
+/// being duplicated per subsystem.
+pub(super) use crate::handlers::common::{clear_auto_context, emit, turn_applied_edits};
 
 /// Runs a blocking plan-storage operation on the Tokio blocking pool.
 ///
@@ -136,36 +132,7 @@ pub(super) async fn set_step_status(
 /// cloned the manager and overwrote the shared state afterwards.
 pub(super) use crate::handlers::with_context_mutation;
 
-/// Clears the transient auto context layer so a retried attempt starts from a
-/// clean, deterministic basis, then notifies clients of the new snapshot.
-pub(super) async fn clear_auto_context(state: &Arc<AppState>) {
-    let cleared = with_context_mutation(state, |ctx| {
-        ctx.clear_auto();
-        ctx.get_state()
-    })
-    .await;
 
-    if let Ok(new_ctx_state) = cleared {
-        emit(
-            &state.out,
-            events::CONTEXT_CHANGED,
-            Some(serde_json::json!({ "state": new_ctx_state })),
-        );
-    }
-}
-
-/// Whether a completed turn actually applied code edits to disk.
-///
-/// Plan steps ask the model to modify code: explanatory text alone, even when
-/// accompanied by a terminal success tag, must not satisfy the step contract.
-pub(super) fn turn_applied_edits(turn: &crate::handlers::model::ModelTurnResult) -> bool {
-    match &turn.result {
-        Some(tauqe_protocol::ModelResult::Edit { outcome, .. }) => {
-            outcome.applied && outcome.error.is_none()
-        }
-        _ => false,
-    }
-}
 
 /// Returns the declared dependencies of a step that are not yet DONE.
 ///

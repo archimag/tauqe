@@ -54,8 +54,11 @@ pub trait PromptProtocol: Send + Sync {
     /// Renders protocol-specific instructions appended to the system prompt.
     ///
     /// The active protocol renders its own guidance directly, so prompt assembly
-    /// never reconstructs a protocol from its name.
-    fn system_instructions(&self, editable_paths: &[String]) -> String;
+    /// never reconstructs a protocol from its name. `has_eager_repo_map` reports
+    /// whether the prompt already carries the rendered repository symbol map, so
+    /// the guidance never advertises an on-demand map request for contours the
+    /// model can already read.
+    fn system_instructions(&self, editable_paths: &[String], has_eager_repo_map: bool) -> String;
 
     /// Returns the active per-turn marker bound to this protocol, if any.
     ///
@@ -119,7 +122,11 @@ mod tests {
             }]
         }
 
-        fn system_instructions(&self, _editable_paths: &[String]) -> String {
+        fn system_instructions(
+            &self,
+            _editable_paths: &[String],
+            _has_eager_repo_map: bool,
+        ) -> String {
             String::new()
         }
 

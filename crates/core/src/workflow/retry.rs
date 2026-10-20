@@ -152,6 +152,29 @@ pub fn prepare_staged_for_retry(
         }
     }
 
+    // A Move operation owns two paths: rolled back `from` leaves a deleted
+    // entry while `to` holds staged content. When a retry touches only one side
+    // of such a move, expand the touched set to both sides so neither a stale
+    // `deleted_paths` nor a stale `staged_files` entry survives the rollback.
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for op in cumulative_edits.iter() {
+            if let EditOperation::Move { from, to } = op {
+                let clean_from = context_manager
+                    .normalize_path(from)
+                    .unwrap_or_else(|_| from.clone());
+                let clean_to = context_manager
+                    .normalize_path(to)
+                    .unwrap_or_else(|_| to.clone());
+                if touched_paths.contains(&clean_from) || touched_paths.contains(&clean_to) {
+                    changed |= touched_paths.insert(clean_from);
+                    changed |= touched_paths.insert(clean_to);
+                }
+            }
+        }
+    }
+
     for path in &touched_paths {
         staged_state.staged_files.remove(path);
         staged_state.deleted_paths.remove(path);
@@ -303,5 +326,56 @@ mod tests {
         assert!(matches!(&cumulative[0], EditOperation::Replace { path, .. } if path == "b.rs"));
         assert!(!succeeded.contains("a.rs"));
         assert!(succeeded.contains("b.rs"));
+    }
+
+    #[test]
+    fn test_prepare_staged_for_retry_expands_move_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let cm = ContextManager::new(dir.path().to_path_buf());
+        let mut staged = StagedEditsState::default();
+        staged
+            .staged_files
+            .insert("b.rs".to_string(), "content of a".to_string());
+        staged.deleted_paths.insert("a.rs".to_string());
+
+        let mut cumulative = vec![
+            EditOperation::Move {
+                from: "a.rs".to_string(),
+                to: "b.rs".to_string(),
+            },
+            EditOperation::Replace {
+                path: "c.rs".to_string(),
+                old_text: "old".to_string(),
+                new_text: "new".to_string(),
+            },
+        ];
+
+        let mut succeeded = HashSet::new();
+        succeeded.insert("a.rs".to_string());
+        succeeded.insert("b.rs".to_string());
+        succeeded.insert("c.rs".to_string());
+
+        // Retry touches only the `to` side of the earlier move.
+        let retry_edits = vec![EditOperation::Replace {
+            path: "b.rs".to_string(),
+            old_text: "content of a".to_string(),
+            new_text: "fixed".to_string(),
+        }];
+
+        prepare_staged_for_retry(
+            &mut staged,
+            &mut cumulative,
+            &mut succeeded,
+            &cm,
+            &retry_edits,
+        );
+
+        assert!(!staged.staged_files.contains_key("b.rs"));
+        assert!(!staged.deleted_paths.contains("a.rs"));
+        assert_eq!(cumulative.len(), 1);
+        assert!(matches!(&cumulative[0], EditOperation::Replace { path, .. } if path == "c.rs"));
+        assert!(!succeeded.contains("a.rs"));
+        assert!(!succeeded.contains("b.rs"));
+        assert!(succeeded.contains("c.rs"));
     }
 }

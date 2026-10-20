@@ -33,14 +33,13 @@ scribe = "~anthropic/claude-haiku-latest"    # history compaction, git squash co
 coder = [
   { model = "~deepseek/deepseek-flash-latest", effort = "high" },
   { model = "~deepseek/deepseek-flash-latest", effort = "max" },
+  "~google/gemini-flash-latest"
 ]
 architect = [
-  { model = "~deepseek/deepseek-flash-latest", effort = "max" },
   { model = "~google/gemini-flash-latest", effort = "high" },
-  "google/gemini-4-argon",
+  { model = "google/gemini-4-argon", alias = "Gemini Argon" },
 ]    # conceptual design, plan refinement, blocked-step replanning
 reviewer = [
-  { model = "~deepseek/deepseek-flash-latest", effort = "max" },
   { model = "~google/gemini-flash-latest", effort = "high" },
   "google/gemini-4-argon",
 ]   # automated code review of active context files

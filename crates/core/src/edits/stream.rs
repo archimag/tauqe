@@ -45,23 +45,9 @@ pub(crate) fn current_file_content(
         .map_err(|e| format!("Cannot read file '{}': {}", path, e))
 }
 
-pub(crate) fn normalize_hunk(raw: &str) -> String {
-    let s = if let Some(stripped) = raw.strip_prefix("\r\n") {
-        stripped
-    } else if let Some(stripped) = raw.strip_prefix('\n') {
-        stripped
-    } else {
-        raw
-    };
-
-    if let Some(last_nl) = s.rfind('\n') {
-        let trailing = &s[last_nl + 1..];
-        if trailing.chars().all(|c| c == ' ' || c == '\t') {
-            return s[..=last_nl].to_string();
-        }
-    }
-    s.to_string()
-}
+// Streaming filters normalize hunks exactly as the final disk parser does, so
+// the protocol node normalizer is the single implementation for both paths.
+pub(crate) use crate::edits::protocol::utils::normalize_content as normalize_hunk;
 
 /// Shared in-memory staging simulator for the streaming edit filters.
 ///

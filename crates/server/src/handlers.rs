@@ -1,12 +1,11 @@
+pub mod architect;
+pub mod common;
 pub mod config;
 pub mod context;
 pub mod git;
 pub mod history;
 pub mod locale;
 pub mod model;
-// The plan handlers still drive the legacy single-step `graft_subtree`; silence the
-// deprecation until the horizon-replanning migration replaces them.
-#[allow(deprecated)]
 pub mod plan;
 pub mod review;
 
@@ -202,7 +201,8 @@ pub(crate) async fn run_preflight_verification(repo_root: &Path) -> Result<(), S
     Err(report)
 }
 
-/// Rebinds configuration, context, and history to a repository root.
+/// Rebinds configuration, context, history, and usage telemetry to a
+/// repository root.
 ///
 /// `client/initialize` and `repository/init` both resolve the authoritative
 /// repository root and then must rebind every long-lived manager to it. The
@@ -235,6 +235,11 @@ pub(crate) async fn rebind_to_repository(state: &Arc<AppState>, repo_path: &Path
             "Failed to rebind the context to the initialized repository"
         );
     }
+
+    // The project lifetime totals belong to the repository, so they are
+    // re-adopted here. The context must already point at the new root because
+    // the telemetry path derives from it.
+    state.reload_usage_lifetime().await;
 
     let history_root = repo_path.to_path_buf();
     let mut history_manager = match offload(move || HistoryManager::new(history_root)).await {

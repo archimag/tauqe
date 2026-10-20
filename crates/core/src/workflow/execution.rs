@@ -338,6 +338,18 @@ impl ExecutionMode for SingleExecution {
                             reason = %reason,
                             "coder ladder escalation"
                         );
+                        // The escalation is announced as a typed event before the
+                        // textual notice, so clients carry the active tier from
+                        // structured data instead of parsing prose.
+                        let _ = stream_tx
+                            .send(StreamEvent::ModelEscalated {
+                                model: next_m.clone(),
+                                role: current_role,
+                                alias: next_tier.alias.clone(),
+                                effort: next_tier.effort,
+                                tier: next_idx,
+                            })
+                            .await;
                         let notice = format!(
                             "\n\n> ⚠️ **Level Up Escalation:** Turn failed on coder tier {} (`{}`, {}). Escalating to tier {} (`{}`)...\n\n",
                             ladder_idx, current_model, reason, next_idx, next_m
@@ -621,6 +633,87 @@ coder = [
             std::fs::read_to_string(repo_root.join("target.rs")).unwrap(),
             "pub fn compute() -> i32 { 42 }\n"
         );
+    }
+
+    #[tokio::test]
+    async fn single_execution_emits_typed_escalation_event() {
+        let (_dir, repo_root) = repo_with_target();
+        let mut context = ContextManager::new(repo_root.clone());
+        context
+            .add_file("target.rs", ContextAccess::Editable)
+            .expect("add target to context");
+        let mut history = HistoryManager::new(repo_root.clone());
+
+        let protocol = crate::prompt::xml::XmlPromptProtocol;
+        let protocol = protocol.with_turn_marker(MARKER).unwrap();
+
+        let edit = format!(
+            "<tauqe_edits_{MARKER} summary=\"Set compute to 42\">\n<edit_{MARKER} path=\"target.rs\">\n<search_{MARKER}>\npub fn compute() -> i32 {{ 0 }}\n</search_{MARKER}>\n<replace_{MARKER}>\npub fn compute() -> i32 {{ 42 }}\n</replace_{MARKER}>\n</edit_{MARKER}>\n</tauqe_edits_{MARKER}>"
+        );
+        // The first reply is a bare answer, so the ladder advances to its next
+        // rung before the edit finally lands.
+        let provider = MockLlmProvider::scripted([
+            MockResponse::text("I need more information before changing the code."),
+            MockResponse::text(edit),
+        ]);
+        let model = ModelRef::openrouter("base/model");
+        let (tx, mut rx) = mpsc::channel(256);
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+        let mut policy = DirectApplyPolicy::new();
+
+        // Drain the stream concurrently: the sender is dropped with the turn, so
+        // collecting only afterwards would race the channel shutdown.
+        let collector = tokio::spawn(async move {
+            let mut events = Vec::new();
+            while let Some(event) = rx.recv().await {
+                events.push(event);
+            }
+            events
+        });
+
+        let exec = SingleExecution::new(coder_ladder_options());
+        exec.execute(
+            &mut policy,
+            "Set compute to return 42",
+            tauqe_protocol::TurnIntent::InteractiveRepl,
+            &provider,
+            &model,
+            &mut context,
+            &mut history,
+            protocol.as_ref(),
+            tx,
+            cancel_rx,
+        )
+        .await
+        .expect("escalating execution runs to completion");
+
+        let events = collector.await.expect("event collector joins");
+        let escalations: Vec<&StreamEvent> = events
+            .iter()
+            .filter(|event| matches!(event, StreamEvent::ModelEscalated { .. }))
+            .collect();
+        assert_eq!(
+            escalations.len(),
+            1,
+            "one ladder advance must emit exactly one typed event"
+        );
+        let escalated = escalations.first().expect("escalation event is present");
+        match escalated {
+            StreamEvent::ModelEscalated {
+                model,
+                role,
+                alias,
+                effort,
+                tier,
+            } => {
+                assert_eq!(model, &ModelRef::openrouter("base/model"));
+                assert!(matches!(role, Some(tauqe_protocol::ModelRole::Coder)));
+                assert!(alias.is_none(), "the rung configures no alias");
+                assert_eq!(effort, &Some(ReasoningEffort::High));
+                assert_eq!(*tier, 1, "the event names the rung that was entered");
+            }
+            other => panic!("expected a model escalation event, got {other:?}"),
+        }
     }
 
     #[tokio::test]

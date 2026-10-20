@@ -140,7 +140,6 @@ pub struct AppState {
     /// without an executor context. The lock is only ever held for brief,
     /// non-awaiting critical sections.
     pub active_cancel: std::sync::Mutex<Option<ActiveOperation>>,
-    pub total_cost: Mutex<f64>,
     /// Authoritative token, cost, and duration totals for the session.
     ///
     /// Every operation kind — an interactive turn, a plan batch, a review run,
@@ -226,7 +225,6 @@ impl AppState {
             history: Arc::new(Mutex::new(initial_history_manager)),
             session_lock: Mutex::new(()),
             active_cancel: std::sync::Mutex::new(None),
-            total_cost: Mutex::new(0.0),
             usage: Mutex::new(initial_usage),
             discussion_focus: Mutex::new(DiscussionFocus::None),
             session_uuid: Mutex::new(tauqe_core::review::uuid::generate_uuid_v7()),

@@ -12,8 +12,10 @@ pub(crate) use crate::components::confirm::{
 pub(crate) use crate::components::modal::{render_modal_frame, ModalFrameParams, ModalTone};
 use crate::editor::InputEditor;
 
+pub(crate) mod batch_cancel;
 pub(crate) mod confirm;
 pub(crate) mod disconnected;
+pub(crate) mod execute_review;
 pub(crate) mod help;
 pub(crate) mod locale;
 pub(crate) mod prompt;
@@ -24,20 +26,21 @@ pub(crate) mod squash;
 pub(crate) mod status;
 pub(crate) mod usage;
 
+pub(crate) use batch_cancel::{batch_cancel_modal_geometry, render_confirm_batch_cancel_popup};
 pub(crate) use confirm::{
-    batch_cancel_modal_geometry, clear_auto_params, clear_history_params,
-    clear_horizon_final_params, clear_horizon_params, clear_user_params, confirm_cancel_params,
-    confirm_detach_focus_params, confirm_quit_params, delete_plan_params, delete_review_params,
-    execute_pipeline_params, execute_review_dialog_geometry, execute_review_params,
-    execute_scope_params, render_confirm_batch_cancel_popup, render_confirm_cancel_popup,
-    render_confirm_clear_auto_popup, render_confirm_clear_history_popup,
-    render_confirm_clear_horizon_final_popup, render_confirm_clear_horizon_popup,
-    render_confirm_clear_user_popup, render_confirm_delete_plan_popup,
-    render_confirm_delete_review_popup, render_confirm_detach_focus_popup,
-    render_confirm_execute_pipeline_popup, render_confirm_execute_review_popup,
-    render_confirm_execute_scope_popup, render_confirm_quit_popup,
+    clear_auto_params, clear_history_params, clear_horizon_final_params, clear_horizon_params,
+    clear_user_params, confirm_cancel_params, confirm_detach_focus_params, confirm_quit_params,
+    delete_plan_params, delete_review_params, execute_pipeline_params, execute_review_params,
+    execute_scope_params, render_confirm_cancel_popup, render_confirm_clear_auto_popup,
+    render_confirm_clear_history_popup, render_confirm_clear_horizon_final_popup,
+    render_confirm_clear_horizon_popup, render_confirm_clear_user_popup,
+    render_confirm_delete_plan_popup, render_confirm_delete_review_popup,
+    render_confirm_detach_focus_popup, render_confirm_execute_pipeline_popup,
+    render_confirm_execute_review_popup, render_confirm_execute_scope_popup,
+    render_confirm_quit_popup,
 };
 pub(crate) use disconnected::{disconnected_button_geometry, render_disconnected_popup};
+pub(crate) use execute_review::execute_review_dialog_geometry;
 pub(crate) use help::render_help_popup;
 pub(crate) use locale::{locale_dialog_geometry, render_locale_dialog};
 pub(crate) use prompt::{prompt_modal_area, prompt_modal_buttons, render_prompt_modal};

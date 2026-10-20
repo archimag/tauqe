@@ -12,6 +12,7 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
 use super::{editor_lines, render_modal_confirm, ConfirmModalParams, ModalTone};
 use crate::i18n::active_t;
+use crate::input::squash::{apply_chord_label, generate_chord_label};
 use crate::theme::engine::current_engine;
 use crate::ui::header::truncate_to_width;
 
@@ -79,7 +80,10 @@ pub fn render_squash_discard_popup(
     render_modal_confirm(frame, squash_discard_params(dialog));
 }
 
-pub fn render_squash_popup(frame: &mut ratatui::Frame, dialog: &mut crate::app::SquashDialogState) {
+pub fn render_squash_popup(
+    frame: &mut ratatui::Frame,
+    dialog: &mut crate::app::SquashDialogState,
+) {
     let engine = current_engine();
     let palette = engine.palette();
     let area = squash_dialog_area(frame.area());
@@ -346,10 +350,19 @@ pub fn render_squash_popup(frame: &mut ratatui::Frame, dialog: &mut crate::app::
             engine.fg(palette.status_warning),
         ))]
     } else if dialog.message_editor.is_empty() {
+        // Chords are projected through the configured modifiers, so the hint
+        // always names a chord the dialog actually intercepts.
         let (cursor, hint) = if is_msg_focus {
-            ("█", active_t("dialog.squash.msg_hint_focused"))
+            (
+                "█",
+                active_t("dialog.squash.msg_hint_focused")
+                    .replace("{}", &generate_chord_label()),
+            )
         } else {
-            (" ", active_t("dialog.squash.msg_hint_unfocused"))
+            (
+                " ",
+                active_t("dialog.squash.msg_hint_unfocused").to_string(),
+            )
         };
         vec![Line::from(vec![
             Span::styled(cursor, engine.fg(palette.status_warning)),
@@ -365,7 +378,10 @@ pub fn render_squash_popup(frame: &mut ratatui::Frame, dialog: &mut crate::app::
     };
 
     let msg_title = if is_msg_focus {
-        format!(" {} ", active_t("dialog.squash.msg_title_focused"))
+        format!(
+            " {} ",
+            active_t("dialog.squash.msg_title_focused").replace("{}", &generate_chord_label())
+        )
     } else {
         format!(" {} ", active_t("dialog.squash.msg_title_unfocused"))
     };
@@ -388,7 +404,7 @@ pub fn render_squash_popup(frame: &mut ratatui::Frame, dialog: &mut crate::app::
     let footer_line = if is_msg_focus {
         Line::from(vec![
             Span::styled(
-                " Ctrl+G ",
+                format!(" {} ", generate_chord_label()),
                 engine
                     .bg(palette.status_warning)
                     .fg(engine.color(palette.text_inverse))
@@ -396,7 +412,7 @@ pub fn render_squash_popup(frame: &mut ratatui::Frame, dialog: &mut crate::app::
             ),
             Span::raw(format!(" {}  ", active_t("dialog.squash.footer.generate"))),
             Span::styled(
-                " Ctrl+Enter / Ctrl+S ",
+                format!(" {} ", apply_chord_label()),
                 engine
                     .bg(palette.status_success)
                     .fg(engine.color(palette.text_inverse))
@@ -455,7 +471,7 @@ pub fn render_squash_popup(frame: &mut ratatui::Frame, dialog: &mut crate::app::
             ),
             Span::raw(format!(" {}  ", active_t("dialog.squash.footer.edit"))),
             Span::styled(
-                " Ctrl+Enter / Ctrl+S ",
+                format!(" {} ", apply_chord_label()),
                 engine
                     .bg(palette.status_success)
                     .fg(engine.color(palette.text_inverse))

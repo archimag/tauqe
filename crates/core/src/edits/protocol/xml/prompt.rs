@@ -13,15 +13,20 @@ use crate::edits::protocol::xml::engine::tag_bases;
 
 /// Renders the XML edit protocol reference for the default develop set.
 pub(super) fn base_system_instructions(editable_paths: &[String]) -> String {
-    system_instructions_for(&CapabilitySet::develop_xml(), editable_paths)
+    system_instructions_for(&CapabilitySet::develop_xml(), editable_paths, false)
 }
 
 /// Renders the XML edit protocol reference for an explicit capability set.
+///
+/// `has_eager_repo_map` suppresses the on-demand symbol map example whenever the
+/// prompt already carries the rendered map.
 pub(super) fn system_instructions_for(
     capabilities: &CapabilitySet,
     editable_paths: &[String],
+    has_eager_repo_map: bool,
 ) -> String {
-    let ctx = PromptRenderContext::new(editable_paths, None);
+    let ctx =
+        PromptRenderContext::new(editable_paths, None).with_eager_repo_map(has_eager_repo_map);
     let mut prompt = String::new();
     prompt.push_str("## Code Modification Protocol (XML Edits)\n");
     prompt.push_str(
@@ -113,6 +118,7 @@ mod tests {
         let narrowed = system_instructions_for(
             &CapabilitySet::from_slice(&[LlmCapability::TextMessage, LlmCapability::FileEdits]),
             &[],
+            false,
         );
         assert!(narrowed.contains("<tauqe_edits summary"));
         assert!(!narrowed.contains("<context_request"));

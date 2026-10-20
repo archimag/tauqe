@@ -213,6 +213,37 @@ impl AppState {
         publish_snapshot(self, &operation_id).await;
         snapshot
     }
+
+    /// Adopts the project lifetime totals stored in the current repository.
+    ///
+    /// Rebinding to a repository must adopt the telemetry stored there.
+    /// Keeping the previous repository's lifetime would present its counters
+    /// as belonging to the new project, and the next flush would overwrite the
+    /// new telemetry with those stale totals. Only the lifetime scope is
+    /// replaced: the session totals describe this process and keep their
+    /// values.
+    pub async fn reload_usage_lifetime(self: &Arc<Self>) {
+        let path = telemetry_path(self.repo_root().await.as_path());
+        // The document is read from disk, so the read goes to the blocking
+        // pool instead of stalling an async worker thread on the file system.
+        let loaded = match tauqe_core::blocking::run_blocking_async(move || read_document(&path))
+            .await
+        {
+            Ok(Some((lifetime, lifetime_operations))) => (lifetime, lifetime_operations),
+            Ok(None) => (UsageTotals::default(), 0),
+            Err(err) => {
+                tracing::warn!(error = %err, "Project telemetry read task failed");
+                (UsageTotals::default(), 0)
+            }
+        };
+        {
+            let mut snapshot = self.usage.lock().await;
+            snapshot.lifetime = loaded.0;
+            snapshot.lifetime_operations = loaded.1;
+        }
+        let operation_id = format!("rebind-{}", next_operation_id());
+        publish_snapshot(self, &operation_id).await;
+    }
 }
 
 impl UsageGuard {
@@ -428,5 +459,49 @@ mod tests {
         assert_eq!(snapshot.lifetime_operations, 0);
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Rebinding to another repository adopts the lifetime totals persisted
+    /// there, while the session totals keep describing what this process has
+    /// already spent.
+    #[tokio::test]
+    async fn rebinding_adopts_the_telemetry_of_the_new_repository() {
+        let (state, _rx, first_root) = test_state();
+        let second_root =
+            std::env::temp_dir().join(format!("tauqe-usage-rebind-{}", next_operation_id()));
+        let _ = std::fs::create_dir_all(&second_root);
+
+        let guard = state.begin_usage().await;
+        guard.observe(&usage(10, 5)).await;
+        guard.flush().await;
+        assert_eq!(state.usage.lock().await.lifetime.total_tokens, 15);
+
+        // The second repository already carries its own, much smaller,
+        // telemetry document.
+        let second = state_at(&second_root);
+        let stored = second.begin_usage().await;
+        stored.observe(&usage(7, 3)).await;
+        stored.flush().await;
+        drop(second);
+
+        // Rebinding re-anchors the context first and then reloads the
+        // telemetry of the newly bound repository.
+        let rebind_root = second_root.clone();
+        state
+            .mutate_context(move |ctx| ctx.set_repo_root(rebind_root))
+            .await
+            .expect("context mutation runs");
+        state.reload_usage_lifetime().await;
+
+        let snapshot = state.usage.lock().await.clone();
+        assert_eq!(snapshot.lifetime.total_tokens, 10);
+        assert_eq!(snapshot.lifetime_operations, 1);
+        assert_eq!(
+            snapshot.session.total_tokens, 15,
+            "the session scope belongs to the process, not to the repository"
+        );
+
+        let _ = std::fs::remove_dir_all(&first_root);
+        let _ = std::fs::remove_dir_all(&second_root);
     }
 }

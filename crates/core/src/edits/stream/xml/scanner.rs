@@ -147,22 +147,6 @@ pub(super) fn find_next_hunk(buf: &str) -> Option<(String, String, usize)> {
     ))
 }
 
-pub(super) fn extract_attr(header: &str, attr: &str) -> Option<String> {
-    let mut search_from = 0;
-    while let Some(pos) = header[search_from..].find(attr) {
-        let abs_pos = search_from + pos;
-        let after_attr = &header[abs_pos + attr.len()..];
-        let trimmed = after_attr.trim_start();
-        if let Some(after_eq) = trimmed.strip_prefix('=') {
-            let after_eq = after_eq.trim_start();
-            let quote = after_eq.chars().next()?;
-            if quote == '"' || quote == '\'' {
-                let rest = &after_eq[quote.len_utf8()..];
-                let end_quote = rest.find(quote)?;
-                return Some(rest[..end_quote].trim().trim_matches('`').to_string());
-            }
-        }
-        search_from = abs_pos + attr.len();
-    }
-    None
-}
+// Streamed tag headers are decoded with the same quote and attribute-name
+// boundary rules as the final XML parser, so the parser owns the logic.
+pub(super) use crate::edits::protocol::xml::extract_attribute as extract_attr;

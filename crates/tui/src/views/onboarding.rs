@@ -1,6 +1,7 @@
 use ratatui::style::Style;
 
 use crate::app::OnboardingStep;
+use crate::i18n::active_t;
 
 pub mod input;
 pub mod render;
@@ -14,7 +15,9 @@ pub fn format_masked_key(key: &str) -> String {
         return String::new();
     }
     let bullets = "•".repeat(len.min(16));
-    format!("{} ({} chars)", bullets, len)
+    active_t("onboarding.masked_key_count")
+        .replacen("{}", &bullets, 1)
+        .replacen("{}", &len.to_string(), 1)
 }
 
 /// Semantic accent of an onboarding step badge.
@@ -58,39 +61,41 @@ impl StepAccent {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OnboardingStepMeta {
     pub step: OnboardingStep,
-    pub name: &'static str,
+    /// Catalog key of the step badge name, resolved through `active_t` at
+    /// render time so a hot-swapped locale reaches the badge chain (c-1).
+    pub name_key: &'static str,
     pub accent: StepAccent,
 }
 
 pub const ONBOARDING_STEPS: &[OnboardingStepMeta] = &[
     OnboardingStepMeta {
         step: OnboardingStep::Git,
-        name: "0. Git",
+        name_key: "onboarding.step_name.git",
         accent: StepAccent::Danger,
     },
     OnboardingStepMeta {
         step: OnboardingStep::Config,
-        name: "1. Configuration",
+        name_key: "onboarding.step_name.config",
         accent: StepAccent::Info,
     },
     OnboardingStepMeta {
         step: OnboardingStep::Credentials,
-        name: "2. API Key",
+        name_key: "onboarding.step_name.credentials",
         accent: StepAccent::Warning,
     },
     OnboardingStepMeta {
         step: OnboardingStep::Workstation,
-        name: "3. Layout",
+        name_key: "onboarding.step_name.workstation",
         accent: StepAccent::Accent,
     },
     OnboardingStepMeta {
         step: OnboardingStep::Modifier,
-        name: "4. Modifier",
+        name_key: "onboarding.step_name.modifier",
         accent: StepAccent::Neutral,
     },
     OnboardingStepMeta {
         step: OnboardingStep::Ready,
-        name: "5. Ready",
+        name_key: "onboarding.step_name.ready",
         accent: StepAccent::Success,
     },
 ];

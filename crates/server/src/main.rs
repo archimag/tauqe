@@ -374,6 +374,7 @@ fn is_long_running(method: &str) -> bool {
             | methods::PLAN_REFINE
             | methods::PLAN_REPLAN
             | methods::PLAN_EXECUTE
+            | methods::PLAN_EXECUTE_PIPELINE
             | methods::REVIEW_START
             | methods::REVIEW_EXECUTE
             | methods::REVIEW_REFINE_ITEM

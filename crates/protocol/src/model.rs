@@ -32,9 +32,9 @@ pub use selection::{
 };
 pub use turn::{
     CancelMode, ModelAskParams, ModelCancelParams, ModelConnectionRetryingEvent, ModelDeltaEvent,
-    ModelErrorEvent, ModelFinishedEvent, ModelResult, ModelResultEvent, ModelResultProposal,
-    ModelStartedEvent, ModelStreamResetEvent, ModelTurnPlanContext, RepoMapInfoEvent,
-    ToolchainFinishedEvent, ToolchainStartedEvent, TurnPhase, TurnPhaseEvent,
+    ModelErrorEvent, ModelEscalatedEvent, ModelFinishedEvent, ModelResult, ModelResultEvent,
+    ModelResultProposal, ModelStartedEvent, ModelStreamResetEvent, ModelTurnPlanContext,
+    RepoMapInfoEvent, ToolchainFinishedEvent, ToolchainStartedEvent, TurnPhase, TurnPhaseEvent,
 };
 pub use usage::{
     ModelUsageEvent, ModelUsageInfo, ModelUsageTotalsEvent, UsageTotals, UsageTotalsSnapshot,

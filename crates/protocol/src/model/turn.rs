@@ -86,6 +86,28 @@ pub struct ModelStartedEvent {
     pub is_batch: bool,
 }
 
+/// Notification that the running role escalated to a stronger model tier.
+///
+/// Escalation happens when deterministic verification keeps rejecting the same
+/// change set: the harness promotes the turn to the next coder tier entry of
+/// the same role instead of switching the role. Clients use this event to
+/// update the running model label and the reasoning-effort badge without
+/// waiting for the turn to finish. Every model coordinate mirrors the
+/// [`ModelStartedEvent`] fields, and `tier` is the zero-based index of the
+/// tier the turn has entered.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelEscalatedEvent {
+    pub operation_id: String,
+    pub model: ModelRef,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<ModelRole>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alias: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<ReasoningEffort>,
+    pub tier: usize,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelDeltaEvent {
     pub operation_id: String,
@@ -343,6 +365,43 @@ pub struct ToolchainFinishedEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_model_escalated_event_serde() {
+        let event = ModelEscalatedEvent {
+            operation_id: "op-1".to_string(),
+            model: ModelRef::openrouter("anthropic/claude-3.7-sonnet"),
+            role: Some(ModelRole::Coder),
+            alias: Some("deep".to_string()),
+            effort: Some(ReasoningEffort::High),
+            tier: 2,
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains("\"model\":{\"provider\":\"openrouter\""));
+        assert!(json.contains("\"role\":\"coder\""));
+        assert!(json.contains("\"alias\":\"deep\""));
+        assert!(json.contains("\"tier\":2"));
+
+        let de: ModelEscalatedEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(de.operation_id, "op-1");
+        assert_eq!(de.model, ModelRef::openrouter("anthropic/claude-3.7-sonnet"));
+        assert!(matches!(de.role, Some(ModelRole::Coder)));
+        assert_eq!(de.alias.as_deref(), Some("deep"));
+        assert!(matches!(de.effort, Some(ReasoningEffort::High)));
+        assert_eq!(de.tier, 2);
+
+        // An escalation without an alias or an explicit effort stays decodable:
+        // both coordinates are optional and absent from the wire form.
+        let minimal: ModelEscalatedEvent = serde_json::from_str(
+            r#"{"operation_id":"op-2","model":{"provider":"openrouter","name":"m"},"tier":0}"#,
+        )
+        .unwrap();
+        assert_eq!(minimal.operation_id, "op-2");
+        assert!(minimal.role.is_none());
+        assert!(minimal.alias.is_none());
+        assert!(minimal.effort.is_none());
+        assert_eq!(minimal.tier, 0);
+    }
 
     #[test]
     fn test_model_result_answer_serde() {

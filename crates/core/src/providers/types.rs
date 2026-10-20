@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use tauqe_protocol::{EditFileOp, EditFileStatus, ModelUsageInfo};
+use tauqe_protocol::{EditFileOp, EditFileStatus, ModelRef, ModelRole, ModelUsageInfo};
 
 pub use tauqe_protocol::ReasoningEffort;
 
@@ -117,6 +117,19 @@ pub enum StreamEvent {
         round: Option<usize>,
         max_rounds: Option<usize>,
         detail: Option<String>,
+    },
+    /// The running role escalated to a stronger model tier.
+    ///
+    /// Emitted when deterministic verification keeps rejecting the same change
+    /// set and the harness promotes the turn along the coder ladder of the same
+    /// role instead of switching the role. `tier` is the zero-based index of the
+    /// tier the turn has entered.
+    ModelEscalated {
+        model: ModelRef,
+        role: Option<ModelRole>,
+        alias: Option<String>,
+        effort: Option<ReasoningEffort>,
+        tier: usize,
     },
     RepoMapTokens(usize),
     ToolchainStarted {

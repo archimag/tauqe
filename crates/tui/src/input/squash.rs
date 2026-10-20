@@ -8,7 +8,7 @@ use crate::app::{
     AppState, ConfirmDialogButton, SquashBaseMode, SquashConfirm, SquashDialogFocus,
     SquashDialogState,
 };
-use crate::config::PrimaryModifier;
+use crate::config::{MetaModifier, PrimaryModifier};
 use crate::input::{is_char_typing, InputResult};
 use crate::rpc::{send_request, RpcConnection};
 
@@ -21,17 +21,37 @@ enum SquashAction {
     Apply(GitSquashApplyParams),
 }
 
+/// Rendered label of the chord that generates the commit message.
+///
+/// Generation is bound to the abstract meta chord (`M-g`), never to the primary
+/// chord: `C-g` is the global keyboard-quit and is normalized to `Esc` before any
+/// dialog sees it, so a `Ctrl+G` binding could only ever move focus
+/// (Conventions §5.5). The label is projected through the configured modifier
+/// instead of hardcoding `Ctrl+` (Conventions §3, §5.2).
+pub(crate) fn generate_chord_label() -> String {
+    format!("{}G", crate::config::active_meta_modifier().prefix_str())
+}
+
+/// Rendered label of the chord that applies the squash: the configured primary
+/// command modifier applied to `Enter` and `S`, projected dynamically so the
+/// advertised chord tracks the developer's `primary_modifier` (Conventions §5.2).
+pub(crate) fn apply_chord_label() -> String {
+    let prefix = crate::config::active_primary_modifier().prefix_str();
+    format!("{prefix}Enter / {prefix}S")
+}
+
 pub async fn handle_squash_key(
     key: KeyEvent,
     mut st: MutexGuard<'_, AppState>,
     server_writer: &mut RpcConnection,
 ) -> anyhow::Result<InputResult> {
     let primary = st.tui_config.input.primary_modifier;
+    let meta = st.tui_config.input.meta_modifier;
     let Some(dialog) = st.squash_dialog.as_mut() else {
         return Ok(InputResult::Continue);
     };
 
-    match handle_key(dialog, key, primary) {
+    match handle_key(dialog, key, primary, meta) {
         SquashAction::None => {}
         SquashAction::Close => st.squash_dialog = None,
         SquashAction::Preview(base_ref) => {
@@ -73,6 +93,7 @@ fn handle_key(
     dialog: &mut SquashDialogState,
     key: KeyEvent,
     primary: PrimaryModifier,
+    meta: MetaModifier,
 ) -> SquashAction {
     // The dialog stays open (and inert) until the server answers, so a failed
     // apply never loses the commit message.
@@ -87,11 +108,14 @@ fn handle_key(
         key.modifiers.contains(KeyModifiers::CONTROL) && key.modifiers.contains(KeyModifiers::ALT);
     let is_cmd = !is_ctrl_alt
         && (primary.matches(key.modifiers) || key.modifiers.contains(KeyModifiers::CONTROL));
+    // The meta chord never carries the `C-g` keyboard-quit, so generating a
+    // commit message cannot be swallowed by the global abort normalization.
+    let is_meta = !is_ctrl_alt && meta.matches(key.modifiers);
 
     if dialog.custom_input_active {
         handle_custom_input(dialog, key, is_cmd)
     } else if dialog.focus == SquashDialogFocus::MessageEditor {
-        handle_message_editor(dialog, key, is_cmd)
+        handle_message_editor(dialog, key, is_cmd, is_meta)
     } else {
         handle_browse(dialog, key, is_cmd)
     }
@@ -160,11 +184,14 @@ fn handle_message_editor(
     dialog: &mut SquashDialogState,
     key: KeyEvent,
     is_cmd: bool,
+    is_meta: bool,
 ) -> SquashAction {
     match key.code {
         KeyCode::Esc | KeyCode::Tab => dialog.focus = SquashDialogFocus::FileList,
         KeyCode::Enter | KeyCode::Char('s') if is_cmd => request_apply_confirm(dialog),
-        KeyCode::Char('g') if is_cmd => return begin_generate(dialog),
+        // Generation is a meta chord: the primary chord for `g` is the global
+        // keyboard-quit and never reaches the dialog (Conventions §5.5).
+        KeyCode::Char('g') if is_meta => return begin_generate(dialog),
         _ => {
             crate::input::handle_editor_key(&mut dialog.message_editor, key, is_cmd, true);
         }
@@ -327,7 +354,10 @@ fn request_apply_confirm(dialog: &mut SquashDialogState) {
         return;
     }
     if dialog.message_editor.get_text().trim().is_empty() {
-        dialog.status_message = Some(crate::i18n::active_t("dialog.squash.status_empty_message"));
+        dialog.status_message = Some(
+            crate::i18n::active_t("dialog.squash.status_empty_message")
+                .replace("{}", &generate_chord_label()),
+        );
         dialog.focus = SquashDialogFocus::MessageEditor;
         return;
     }
@@ -344,6 +374,17 @@ mod tests {
             dialog,
             KeyEvent::new(code, KeyModifiers::NONE),
             PrimaryModifier::Ctrl,
+            MetaModifier::Alt,
+        )
+    }
+
+    /// Presses a key carrying the default meta modifier (`Alt`).
+    fn press_meta(dialog: &mut SquashDialogState, code: KeyCode) -> SquashAction {
+        handle_key(
+            dialog,
+            KeyEvent::new(code, KeyModifiers::ALT),
+            PrimaryModifier::Ctrl,
+            MetaModifier::Alt,
         )
     }
 
@@ -353,6 +394,44 @@ mod tests {
             status_message: None,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn meta_g_generates_the_message_from_the_editor() {
+        let mut dialog = ready_dialog();
+        dialog.focus = SquashDialogFocus::MessageEditor;
+        dialog.base_ref = "origin/master".to_string();
+
+        let action = press_meta(&mut dialog, KeyCode::Char('g'));
+        assert!(matches!(
+            action,
+            SquashAction::Generate(base) if base == "origin/master"
+        ));
+        assert!(dialog.generating_message);
+        assert_eq!(dialog.message_editor.get_text(), "");
+    }
+
+    #[test]
+    fn primary_g_never_generates_because_it_is_the_global_keyboard_quit() {
+        // `C-g` is normalized to `Esc` before the dialog runs, so the editor
+        // must treat it as a dismissal (focus back to the file list) and never
+        // as a generate request.
+        let mut dialog = ready_dialog();
+        dialog.focus = SquashDialogFocus::MessageEditor;
+
+        assert!(matches!(
+            press(&mut dialog, KeyCode::Esc),
+            SquashAction::None
+        ));
+        assert_eq!(dialog.focus, SquashDialogFocus::FileList);
+        assert!(!dialog.generating_message);
+    }
+
+    #[test]
+    fn chord_labels_project_the_configured_modifiers() {
+        // The default configuration pairs a Ctrl primary with an Alt meta chord.
+        assert_eq!(generate_chord_label(), "Alt+G");
+        assert_eq!(apply_chord_label(), "Ctrl+Enter / Ctrl+S");
     }
 
     #[test]

@@ -555,6 +555,68 @@ mod tests {
         )));
     }
 
+    /// The squash dialog advertises its generate-message chord as the meta chord
+    /// (`Alt+G` by default), because `C-g` is the global keyboard-quit and is
+    /// normalized to `Esc` before any dialog sees it. This drives the whole
+    /// terminal event path, proving the advertised chord reaches
+    /// `begin_generate` instead of merely moving focus.
+    #[tokio::test]
+    async fn squash_dialog_meta_chord_generates_message_through_terminal_event() {
+        let mut st = test_state();
+        st.squash_dialog = Some(SquashDialogState {
+            loading: false,
+            base_ref: "origin/master".to_string(),
+            focus: SquashDialogFocus::MessageEditor,
+            ..Default::default()
+        });
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+
+        let key = KeyEvent::new(KeyCode::Char('g'), KeyModifiers::ALT);
+        handle_terminal_event(crossterm::event::Event::Key(key), &state, &mut conn)
+            .await
+            .expect("in-memory dispatch never fails");
+
+        let guard = state.lock().await;
+        let dialog = guard.squash_dialog.as_ref().expect("dialog stays open");
+        assert!(
+            dialog.generating_message,
+            "the meta chord must start message generation"
+        );
+        assert_eq!(dialog.focus, SquashDialogFocus::MessageEditor);
+        drop(guard);
+        assert!(
+            !conn.written().is_empty(),
+            "the generate request reaches the daemon"
+        );
+    }
+
+    /// `Ctrl+G` stays the global keyboard-quit: it is rewritten to `Esc`, so the
+    /// message editor returns to the file list and never issues a request.
+    #[tokio::test]
+    async fn squash_dialog_keyboard_quit_never_generates_a_message() {
+        let mut st = test_state();
+        st.squash_dialog = Some(SquashDialogState {
+            loading: false,
+            focus: SquashDialogFocus::MessageEditor,
+            ..Default::default()
+        });
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+
+        let key = KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL);
+        handle_terminal_event(crossterm::event::Event::Key(key), &state, &mut conn)
+            .await
+            .expect("in-memory dispatch never fails");
+
+        let guard = state.lock().await;
+        let dialog = guard.squash_dialog.as_ref().expect("dialog stays open");
+        assert!(!dialog.generating_message);
+        assert_eq!(dialog.focus, SquashDialogFocus::FileList);
+        drop(guard);
+        assert!(conn.written().is_empty());
+    }
+
     #[tokio::test]
     async fn test_ctrl_g_closes_active_modal_like_esc() {
         let mut st = test_state();

@@ -8,7 +8,9 @@ use crate::app::{HelpTab, ViewMode};
 use crate::command::editor::EDITOR_COMMAND_MAP;
 use crate::command::global::GLOBAL_COMMAND_MAP;
 use crate::command::{CommandCategory, CommandMap};
-use crate::components::modal::{button_style, render_modal_container, ModalTone};
+use crate::components::modal::{
+    button_style, modal_geometry, render_dialog_footer, render_modal_container, ModalTone,
+};
 use crate::config::{MetaModifier, PrimaryModifier};
 use crate::i18n::active_t;
 use crate::theme::engine::{current_engine, ThemeEngine};
@@ -271,7 +273,9 @@ fn build_help_body(
     let col_w = key_w + 2;
     let desc_w = inner_w.saturating_sub(2 + col_w).max(10);
 
-    let mut lines: Vec<Line<'static>> = vec![Line::raw("")];
+    // The frame owns the spacer row between the tab bar and the sections, so
+    // the content starts directly with its first section (Conventions §6.7).
+    let mut lines: Vec<Line<'static>> = Vec::new();
     for (index, section) in sections.iter().enumerate() {
         if index > 0 {
             lines.push(Line::raw(""));
@@ -335,21 +339,10 @@ pub struct HelpTabGeometry {
 /// layout [`render_help_popup`] draws.
 pub fn help_tab_geometry(term: Rect) -> HelpTabGeometry {
     let area = centered_rect(76, 75, term);
-    let inner = Rect::new(
-        area.x + 1,
-        area.y + 1,
-        area.width.saturating_sub(2),
-        area.height.saturating_sub(2),
-    );
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(2),
-            Constraint::Min(4),
-            Constraint::Length(3),
-        ])
-        .split(inner);
-    let bar = chunks[0];
+    // The tab bar is the first row of the shared modal body, so its hit
+    // rectangles inherit the card's top inset and horizontal margin instead of
+    // re-deriving them (Conventions §6.6–§6.8).
+    let bar = modal_geometry(area).body;
 
     // The tab bar is one centered line of ` {title} ` chips separated by four
     // spaces, matching `render_help_tab_bar`.
@@ -451,22 +444,27 @@ pub fn render_help_popup(
     let palette = engine.palette();
 
     let title = active_t("dialog.help.title");
-    let inner_area = render_modal_container(frame, area, &title, ModalTone::Warning);
+    render_modal_container(frame, area, &title, ModalTone::Warning);
+    let geometry = modal_geometry(area);
 
+    // The body holds the tab bar, one inter-section spacer, and the scrollable
+    // help content; the close control and the docked hint strip belong to the
+    // shared frame below (Conventions §6.7).
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(2),
-            Constraint::Min(4),
-            Constraint::Length(3),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Min(1),
         ])
-        .split(inner_area);
+        .split(geometry.body);
 
     render_help_tab_bar(frame, chunks[0], tab, &engine);
 
-    let body_w = chunks[1].width.max(1) as usize;
+    let content = chunks[2];
+    let body_w = content.width.max(1) as usize;
     let help_lines = build_help_body(tab, mode, primary_modifier, meta_modifier, body_w);
-    let inner_h = chunks[1].height as usize;
+    let inner_h = content.height as usize;
     let max_scroll = help_lines
         .len()
         .saturating_sub(inner_h)
@@ -474,21 +472,17 @@ pub fn render_help_popup(
     *scroll = (*scroll).min(max_scroll);
 
     let help_widget = Paragraph::new(help_lines).scroll((*scroll, 0));
-    frame.render_widget(help_widget, chunks[1]);
+    frame.render_widget(help_widget, content);
 
     let close_label = format!(" [ {} (Esc / q / ?) ] ", active_t("help.close"));
-    let actions = vec![
-        Line::from(Span::styled(
-            close_label,
-            button_style(&engine, palette.button_bg, palette.button_fg, true),
-        )),
-        Line::from(Span::styled(
-            active_t("help.footer"),
-            engine.fg(palette.text_muted),
-        )),
-    ];
-    let footer = Paragraph::new(actions).alignment(Alignment::Center);
-    frame.render_widget(footer, chunks[2]);
+    let close = Paragraph::new(Line::from(Span::styled(
+        close_label,
+        button_style(&engine, palette.button_bg, palette.button_fg, true),
+    )))
+    .alignment(Alignment::Center);
+    frame.render_widget(close, geometry.action_bar);
+
+    render_dialog_footer(frame, geometry.hint_row, &active_t("help.footer"));
 }
 
 #[cfg(test)]
@@ -624,7 +618,7 @@ mod tests {
     }
 
     /// The tab rectangles used for mouse hit-testing must land exactly on the
-    /// drawn tabs.
+    /// drawn tabs, and the whole card must follow the shared modal formula.
     #[test]
     fn help_tab_buttons_match_hit_geometry() {
         use ratatui::backend::TestBackend;
@@ -647,6 +641,25 @@ mod tests {
             .unwrap();
 
         let geom = help_tab_geometry(term);
+        let geometry = modal_geometry(geom.area);
+
+        // The tab bar is the first body row: one row below the border for the
+        // top inset and one column off each vertical border for the horizontal
+        // card margin (Conventions §6.7, §6.8).
+        assert_eq!(geom.global_tab.y, geometry.body.y);
+        assert_eq!(geom.global_tab.y, geom.area.y + 2, "border + top inset");
+        assert_eq!(
+            geometry.body.x,
+            geom.area.x + 2,
+            "border + horizontal margin"
+        );
+        assert!(geom.global_tab.x >= geometry.body.x);
+        assert!(
+            geom.text_editor_tab.x + geom.text_editor_tab.width
+                <= geometry.body.x + geometry.body.width,
+            "every tab stays inside the body column"
+        );
+
         let buffer = terminal.backend().buffer();
         let read = |rect: Rect| -> String {
             (rect.x..rect.x + rect.width)
@@ -657,5 +670,22 @@ mod tests {
         assert!(read(geom.global_tab).contains("Global"));
         assert!(read(geom.current_mode_tab).contains("Current Mode"));
         assert!(read(geom.text_editor_tab).contains("Text Editor"));
+
+        // The close control renders on the shared action bar.
+        assert!(
+            read(geometry.action_bar).contains("Esc / q / ?"),
+            "the close control renders on the action bar"
+        );
+
+        // The hint strip is docked above the bottom border.
+        assert_eq!(
+            geometry.hint_row.y + geometry.hint_row.height,
+            geom.area.y + geom.area.height - 1,
+            "hint strip is docked above the bottom border"
+        );
+        assert!(
+            !read(geometry.hint_row).trim().is_empty(),
+            "the docked strip must carry the Help footer hint"
+        );
     }
 }

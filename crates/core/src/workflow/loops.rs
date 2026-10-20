@@ -88,8 +88,10 @@ impl Task for EditLoop {
 
             let mut attempt = 0;
             while !output.is_cancelled
+                && output.blocked.is_none()
                 && output.skip_reason.is_none()
                 && !has_valid_edits(&output.result)
+                && !is_terminal_failure(&output.result)
                 && attempt < env.options.max_retries
             {
                 attempt += 1;
@@ -185,6 +187,21 @@ fn has_valid_edits(result: &tauqe_protocol::ModelResult) -> bool {
     matches!(result, tauqe_protocol::ModelResult::Edit { edits, .. } if !edits.is_empty())
 }
 
+/// Whether the turn ended in an explicit terminal failure rather than a
+/// conclusion.
+///
+/// The FSM reports a declared `<error>` outcome and an exhausted staging or
+/// healing cycle as an unapplied edit carrying the diagnostic. Such a turn has
+/// already rejected its response, so re-asking for edit blocks would restart
+/// failed work instead of correcting a missing proposal.
+fn is_terminal_failure(result: &tauqe_protocol::ModelResult) -> bool {
+    matches!(
+        result,
+        tauqe_protocol::ModelResult::Edit { outcome, .. }
+            if !outcome.applied && outcome.error.is_some()
+    )
+}
+
 /// Builds the corrective prompt issued when a required edit was not produced.
 fn build_edit_retry_prompt(target_language: Option<&str>) -> String {
     let mut prompt = String::from(
@@ -243,6 +260,10 @@ mod tests {
             Self {
                 responses: Mutex::new(responses.into_iter().collect()),
             }
+        }
+
+        fn remaining(&self) -> usize {
+            self.responses.lock().unwrap().len()
         }
     }
 
@@ -498,5 +519,117 @@ mod tests {
 
         assert!(matches!(out.result, ModelResult::Edit { ref edits, .. } if !edits.is_empty()));
         assert!(!out.assistant_text.contains("Edit Retry"));
+    }
+
+    #[tokio::test]
+    async fn test_edit_loop_does_not_retry_on_semantic_blocker() {
+        let (_dir, repo_root) = init_repo_with_target();
+        let mut context = ContextManager::new(repo_root.clone());
+        context
+            .add_file("target.rs", ContextAccess::Editable)
+            .unwrap();
+        let mut history = HistoryManager::new(repo_root.clone());
+        let protocol = crate::prompt::xml::XmlPromptProtocol;
+        let protocol = protocol.with_turn_marker("MOCK").unwrap();
+
+        let blocked = "<blocked_MOCK reason=\"Precondition violated: table missing\" />";
+        let with_edit = "<tauqe_edits_MOCK summary=\"Fix compute\">\n<edit_MOCK path=\"target.rs\">\n<search_MOCK>\npub fn compute() -> i32 { 0 }\n</search_MOCK>\n<replace_MOCK>\npub fn compute() -> i32 { 42 }\n</replace_MOCK>\n</edit_MOCK>\n</tauqe_edits_MOCK>";
+        let provider = MockScriptProvider::new(vec![blocked.to_string(), with_edit.to_string()]);
+        let model = ModelRef::openrouter("test/model");
+        let (tx, _rx) = mpsc::channel(100);
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+        let options = WorkflowOptions::default();
+        let mut policy = DirectApplyPolicy::new();
+
+        let mut env = TaskEnv {
+            intent: tauqe_protocol::TurnIntent::InteractiveRepl,
+            provider: &provider,
+            model: &model,
+            context: &mut context,
+            history: &mut history,
+            protocol: protocol.as_ref(),
+            policy: &mut policy,
+            workflow_name: "git",
+            stream_tx: tx,
+            cancel_rx,
+            options: &options,
+        };
+
+        let task = EditLoop::new("Refactor compute");
+        let out = task.execute(&mut env).await.unwrap();
+
+        assert_eq!(
+            out.blocked.as_deref(),
+            Some("Precondition violated: table missing")
+        );
+        assert!(
+            !out.assistant_text.contains("Edit Retry"),
+            "a semantic block must never trigger a corrective edit retry"
+        );
+        assert_eq!(
+            provider.remaining(),
+            1,
+            "a semantic block must not consume a retry attempt"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo_root.join("target.rs")).unwrap(),
+            "pub fn compute() -> i32 { 0 }\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_edit_loop_does_not_retry_on_terminal_error() {
+        let (_dir, repo_root) = init_repo_with_target();
+        let mut context = ContextManager::new(repo_root.clone());
+        context
+            .add_file("target.rs", ContextAccess::Editable)
+            .unwrap();
+        let mut history = HistoryManager::new(repo_root.clone());
+        let protocol = crate::prompt::xml::XmlPromptProtocol;
+        let protocol = protocol.with_turn_marker("MOCK").unwrap();
+
+        let error = "<error_MOCK message=\"Missing dependency\" />";
+        let with_edit = "<tauqe_edits_MOCK summary=\"Fix compute\">\n<edit_MOCK path=\"target.rs\">\n<search_MOCK>\npub fn compute() -> i32 { 0 }\n</search_MOCK>\n<replace_MOCK>\npub fn compute() -> i32 { 42 }\n</replace_MOCK>\n</edit_MOCK>\n</tauqe_edits_MOCK>";
+        let provider = MockScriptProvider::new(vec![error.to_string(), with_edit.to_string()]);
+        let model = ModelRef::openrouter("test/model");
+        let (tx, _rx) = mpsc::channel(100);
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+        let options = WorkflowOptions::default();
+        let mut policy = DirectApplyPolicy::new();
+
+        let mut env = TaskEnv {
+            intent: tauqe_protocol::TurnIntent::InteractiveRepl,
+            provider: &provider,
+            model: &model,
+            context: &mut context,
+            history: &mut history,
+            protocol: protocol.as_ref(),
+            policy: &mut policy,
+            workflow_name: "git",
+            stream_tx: tx,
+            cancel_rx,
+            options: &options,
+        };
+
+        let task = EditLoop::new("Refactor compute");
+        let out = task.execute(&mut env).await.unwrap();
+
+        match &out.result {
+            ModelResult::Edit { edits, outcome, .. } => {
+                assert!(edits.is_empty());
+                assert!(!outcome.applied);
+                assert_eq!(outcome.error.as_deref(), Some("Missing dependency"));
+            }
+            other => panic!("expected a terminal error outcome, got {:?}", other),
+        }
+        assert!(
+            !out.assistant_text.contains("Edit Retry"),
+            "a terminal error must never trigger a corrective edit retry"
+        );
+        assert_eq!(
+            provider.remaining(),
+            1,
+            "a terminal error must not consume a retry attempt"
+        );
     }
 }

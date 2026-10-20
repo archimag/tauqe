@@ -10,6 +10,7 @@ use ratatui::text::{Line, Span};
 use syntect::easy::HighlightLines;
 use syntect::highlighting::{Style as SynStyle, ThemeSet};
 use syntect::parsing::SyntaxSet;
+use unicode_width::UnicodeWidthStr;
 
 use super::{
     push_empty_line, push_styled_line, safe_rgb, CodeBlockState, MarkdownTheme, COPY_BUTTON_LABEL,
@@ -120,7 +121,7 @@ pub(super) fn render_code_block(
     } else {
         raw_lines
     };
-    let max_len = lines.iter().map(|l| l.chars().count()).max().unwrap_or(0);
+    let max_len = lines.iter().map(|line| line.width()).max().unwrap_or(0);
 
     let lang_trimmed = cb.lang.trim();
     let content_width = max_len.max(36);
@@ -203,7 +204,7 @@ pub(super) fn render_code_block(
                 for (syn_style, text) in ranges {
                     let clean = text.trim_end_matches(['\r', '\n']);
                     if !clean.is_empty() {
-                        line_char_count += clean.chars().count();
+                        line_char_count += clean.width();
                         spans.push(Span::styled(
                             clean.to_string(),
                             syntect_style_to_ratatui(syn_style, theme.code_bg),
@@ -211,14 +212,14 @@ pub(super) fn render_code_block(
                     }
                 }
             } else {
-                line_char_count += line.chars().count();
+                line_char_count += line.width();
                 spans.push(Span::styled(
                     line.to_string(),
                     theme.code_text.bg(theme.code_bg),
                 ));
             }
         } else {
-            line_char_count += line.chars().count();
+            line_char_count += line.width();
             spans.push(Span::styled(
                 line.to_string(),
                 theme.code_text.bg(theme.code_bg),
@@ -484,5 +485,27 @@ mod tests {
                 "`{tag}` rendered {highlighted} coloured spans, plain text rendered {plain}"
             );
         }
+    }
+
+    /// Asserts that every row of a block shares one display width, so a wide
+    /// (CJK) glyph occupying two terminal columns cannot break the frame.
+    #[test]
+    fn wide_characters_keep_block_rows_aligned() {
+        let md = "```text\n日本語テキスト\nabc\n```";
+        let theme = MarkdownTheme::answer();
+        let lines = render_markdown(md, &theme);
+        // lines[0] is the language header; 1..=4 are padding, wide, narrow,
+        // and padding rows, which must all project onto the same width.
+        let widths: Vec<usize> = lines
+            .iter()
+            .skip(1)
+            .take(4)
+            .map(|line| line.spans.iter().map(|span| span.content.width()).sum())
+            .collect();
+        assert_eq!(widths.len(), 4, "block rows are missing: {widths:?}");
+        assert!(
+            widths.windows(2).all(|pair| pair[0] == pair[1]),
+            "code block rows must share one display width, got {widths:?}"
+        );
     }
 }

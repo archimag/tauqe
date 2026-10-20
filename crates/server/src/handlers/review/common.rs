@@ -14,7 +14,7 @@ use tauqe_core::review::prompt::format_review_step_failure_note;
 use tauqe_core::review::ReviewStorage;
 use tauqe_core::workflow::common::apply_context_requests_detailed;
 use tauqe_protocol::{
-    events, ContextAccess, Event, IssueStatus, ReviewErrorEvent, ReviewListChangedEvent,
+    events, ContextAccess, IssueStatus, ReviewErrorEvent, ReviewListChangedEvent,
     ReviewUpdatedEvent,
 };
 
@@ -37,13 +37,10 @@ where
     }
 }
 
-/// Emits a server event with an optional serialized parameter payload.
-pub(super) fn emit(out: &OutChannel, method: &str, params: Option<serde_json::Value>) {
-    out.send_event(&Event {
-        method: method.to_string(),
-        params,
-    });
-}
+/// Event emission, auto-context clearing, and turn-outcome inspection are shared
+/// with every other handler subsystem, so they are re-exported here instead of
+/// being duplicated per subsystem.
+pub(super) use crate::handlers::common::{clear_auto_context, emit, turn_applied_edits};
 
 /// Emits a `review/error` event for a failed review operation.
 pub(super) fn emit_error(out: &OutChannel, operation_id: &str, message: String) {
@@ -197,53 +194,14 @@ pub(super) fn report_item_failure(state: &Arc<AppState>, operation_id: &str, mes
 /// that cloned the manager and overwrote the shared state afterwards.
 pub(super) use crate::handlers::with_context_mutation;
 
+/// Re-exported under the review-side name so existing call sites stay stable
+/// while the loading logic is defined once in `crate::handlers::common`.
+///
 /// Loads the target finding's files into the read-only auto context layer before
 /// the architect begins decomposition, guaranteeing baseline visibility of the
 /// affected code on the first generation round. Declared target files are never
 /// capped by the files token budget.
-pub(super) async fn preload_refine_item_files(
-    state: &Arc<AppState>,
-    repo_root: &Path,
-    files: &[String],
-) {
-    let requests: Vec<ContextRequest> = files
-        .iter()
-        .map(|f| f.trim().trim_start_matches("./").trim_start_matches('/'))
-        .filter(|p| !p.is_empty())
-        .map(|p| ContextRequest {
-            path: p.to_string(),
-            access: ContextAccess::ReadOnly,
-        })
-        .collect();
-    if requests.is_empty() {
-        return;
-    }
-    let available_files = {
-        let repo_root = repo_root.to_path_buf();
-        crate::handlers::offload(move || tauqe_core::git::list_repository_files(Some(&repo_root)))
-            .await
-            .ok()
-            .and_then(|files| files.ok())
-            .unwrap_or_default()
-    };
-
-    let outcome = with_context_mutation(state, move |ctx| {
-        let oc = apply_context_requests_detailed(ctx, &requests, &available_files, usize::MAX);
-        let s = ctx.get_state();
-        (oc, s)
-    })
-    .await;
-
-    if let Ok((outcome, new_ctx_state)) = outcome {
-        if !outcome.added.is_empty() {
-            emit(
-                &state.out,
-                events::CONTEXT_CHANGED,
-                Some(serde_json::json!({ "state": new_ctx_state })),
-            );
-        }
-    }
-}
+pub(super) use crate::handlers::common::preload_readonly_files as preload_refine_item_files;
 
 /// Loads all files referenced by a finding into editable context before the turn
 /// starts. Declared finding files are never capped by the files token budget.
@@ -287,36 +245,7 @@ pub(super) async fn preload_item_files(state: &Arc<AppState>, repo_root: &Path, 
     }
 }
 
-/// Clears the transient auto context layer so a retried attempt starts from a
-/// clean, deterministic basis, then notifies clients of the new snapshot.
-pub(super) async fn clear_auto_context(state: &Arc<AppState>) {
-    let cleared = with_context_mutation(state, |ctx| {
-        ctx.clear_auto();
-        ctx.get_state()
-    })
-    .await;
 
-    if let Ok(new_ctx_state) = cleared {
-        emit(
-            &state.out,
-            events::CONTEXT_CHANGED,
-            Some(serde_json::json!({ "state": new_ctx_state })),
-        );
-    }
-}
-
-/// Whether a completed turn actually applied code edits to disk.
-///
-/// Review findings ask the model to fix code: explanatory text alone, even when
-/// accompanied by a terminal success tag, must not satisfy the finding contract.
-pub(super) fn turn_applied_edits(turn: &crate::handlers::model::ModelTurnResult) -> bool {
-    match &turn.result {
-        Some(tauqe_protocol::ModelResult::Edit { outcome, .. }) => {
-            outcome.applied && outcome.error.is_none()
-        }
-        _ => false,
-    }
-}
 
 #[cfg(test)]
 mod tests {

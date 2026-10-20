@@ -5,13 +5,15 @@
 //! [`disconnected_button_geometry`] so mouse hit-testing lands on the drawn
 //! quit button (Conventions.md §6, §8).
 
-use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Alignment, Rect};
 use ratatui::style::Stylize;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
 use unicode_width::UnicodeWidthStr;
 
-use crate::components::modal::{render_dialog_footer, render_modal_container, ModalTone};
+use crate::components::modal::{
+    modal_geometry, render_dialog_footer, render_modal_container, ModalTone,
+};
 use crate::i18n::active_t;
 use crate::theme::engine::current_engine;
 use crate::ui::centered_rect;
@@ -26,28 +28,33 @@ pub struct DisconnectedModalGeometry {
     pub quit_button: Rect,
 }
 
+/// Body rows the disconnection card always renders: a leading blank, the
+/// termination notice, a blank, and the server message.
+const DISCONNECTED_BODY_LINES: u16 = 4;
+
+/// Height percentage that lets the shared frame show the whole card.
+///
+/// The frame reserves six chrome rows — two borders, the top inset, the
+/// pre-action spacer, the action row, and the docked hint strip — so the card is
+/// sized from its body instead of a fixed percentage that would clip the server
+/// message (Conventions §6.7).
+fn disconnected_height_percent(term: Rect) -> u16 {
+    let needed_height = DISCONNECTED_BODY_LINES.saturating_add(8).max(10);
+    (needed_height * 100 / term.height.max(1)).clamp(25, 90)
+}
+
 /// Computes the geometry and quit-button bounds of the disconnection modal.
 ///
-/// The card is split into a flexible body, a two-row action zone, and a one-row
-/// docked hint strip, mirroring the shared modal frame so the button row cannot
-/// drift from the rendered layout.
+/// The card's bands come from the shared [`modal_geometry`] formula — top inset,
+/// padded body, pre-action spacer, action row, and docked hint strip — so the
+/// button row cannot drift from the rendered layout.
 pub fn disconnected_button_geometry(term: Rect) -> DisconnectedModalGeometry {
-    let area = centered_rect(64, 30, term);
-    let inner = Rect::new(
-        area.x + 1,
-        area.y + 1,
-        area.width.saturating_sub(2),
-        area.height.saturating_sub(2),
-    );
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Min(2),
-            Constraint::Length(2),
-            Constraint::Length(1),
-        ])
-        .split(inner);
-    let action_bar = chunks[1];
+    let area = centered_rect(64, disconnected_height_percent(term), term);
+
+    // The shared modal formula owns the padded action row, so the quit button is
+    // placed on the row the renderer draws it in and hit-testing can never drift
+    // from the rendered layout (Conventions §6.6–§6.8).
+    let action_bar = modal_geometry(area).action_bar;
 
     let quit_len = UnicodeWidthStr::width(disconnected_quit_label().as_str()) as u16;
     let start_x = action_bar.x + action_bar.width.saturating_sub(quit_len) / 2;
@@ -71,16 +78,12 @@ pub fn render_disconnected_popup(frame: &mut ratatui::Frame, message: &str) {
     let geom = disconnected_button_geometry(frame.area());
 
     let title = active_t("dialog.server_disconnected.title");
-    let inner_area = render_modal_container(frame, geom.area, &title, ModalTone::Dangerous);
+    render_modal_container(frame, geom.area, &title, ModalTone::Dangerous);
 
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Min(2),
-            Constraint::Length(2),
-            Constraint::Length(1),
-        ])
-        .split(inner_area);
+    // The container is drawn from the shared frame, so the body, the action row,
+    // and the docked hint strip are read from the same air-aware formula the
+    // quit-button hit-testing uses (Conventions §6.6–§6.8).
+    let geometry = modal_geometry(geom.area);
 
     let lines = vec![
         Line::raw(""),
@@ -94,7 +97,7 @@ pub fn render_disconnected_popup(frame: &mut ratatui::Frame, message: &str) {
     let body = Paragraph::new(lines)
         .alignment(Alignment::Center)
         .wrap(Wrap { trim: false });
-    frame.render_widget(body, chunks[0]);
+    frame.render_widget(body, geometry.body);
 
     let quit_line = Line::from(Span::styled(
         disconnected_quit_label(),
@@ -104,11 +107,11 @@ pub fn render_disconnected_popup(frame: &mut ratatui::Frame, message: &str) {
             .bold(),
     ));
     let actions = Paragraph::new(quit_line).alignment(Alignment::Center);
-    frame.render_widget(actions, chunks[1]);
+    frame.render_widget(actions, geometry.action_bar);
 
     render_dialog_footer(
         frame,
-        chunks[2],
+        geometry.hint_row,
         &active_t("dialog.server_disconnected.footer"),
     );
 }
@@ -129,6 +132,26 @@ mod tests {
             .unwrap();
 
         let geom = disconnected_button_geometry(term);
+        let geometry = modal_geometry(geom.area);
+
+        assert_eq!(geom.quit_button.y, geometry.action_bar.y);
+        assert!(geom.quit_button.x >= geometry.action_bar.x);
+        assert!(
+            geom.quit_button.x + geom.quit_button.width
+                <= geometry.action_bar.x + geometry.action_bar.width
+        );
+        assert_eq!(geometry.body.y, geom.area.y + 2, "border + top inset");
+        assert_eq!(
+            geometry.body.x,
+            geom.area.x + 2,
+            "border + horizontal margin"
+        );
+        assert_eq!(
+            geometry.hint_row.y + geometry.hint_row.height,
+            geom.area.y + geom.area.height - 1,
+            "hint strip is docked above the bottom border"
+        );
+
         let buffer = terminal.backend().buffer();
         let text: String = (geom.quit_button.x..geom.quit_button.x + geom.quit_button.width)
             .map(|x| buffer[(x, geom.quit_button.y)].symbol())

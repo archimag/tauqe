@@ -37,11 +37,18 @@ pub fn render_onboarding_step_badge(current_step: crate::app::OnboardingStep) ->
                 || meta.step == crate::app::OnboardingStep::Config
             {
                 spans.push(Span::styled(
-                    format!("{}{} [OK]", if idx == 0 { " " } else { "" }, meta.name),
+                    format!(
+                        "{}{} [OK]",
+                        if idx == 0 { " " } else { "" },
+                        active_t(meta.name_key)
+                    ),
                     engine.fg(palette.status_success),
                 ));
             } else {
-                spans.push(Span::styled(meta.name, engine.fg(palette.text_muted)));
+                spans.push(Span::styled(
+                    active_t(meta.name_key),
+                    engine.fg(palette.text_muted),
+                ));
             }
         }
         return Line::from(spans);
@@ -59,16 +66,23 @@ pub fn render_onboarding_step_badge(current_step: crate::app::OnboardingStep) ->
         }
         if idx < current_idx {
             spans.push(Span::styled(
-                format!("{}{} [OK]", if idx == 0 { " " } else { "" }, meta.name),
+                format!(
+                    "{}{} [OK]",
+                    if idx == 0 { " " } else { "" },
+                    active_t(meta.name_key)
+                ),
                 engine.fg(palette.status_success),
             ));
         } else if idx == current_idx {
             spans.push(Span::styled(
-                format!(" [{}] ", meta.name),
+                format!(" [{}] ", active_t(meta.name_key)),
                 meta.accent.badge_style(&engine).bold(),
             ));
         } else {
-            spans.push(Span::styled(meta.name, engine.fg(palette.text_muted)));
+            spans.push(Span::styled(
+                active_t(meta.name_key),
+                engine.fg(palette.text_muted),
+            ));
         }
     }
     Line::from(spans)

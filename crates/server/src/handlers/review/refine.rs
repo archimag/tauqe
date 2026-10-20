@@ -2,10 +2,11 @@
 //! subplan.
 //!
 //! Finding decomposition and plan horizon synthesis are the same Architect
-//! operation, so both share the multi-round discovery engine in `plan::engine`
-//! (`run_architect_discovery_loop`). The merged subplan is persisted through the
-//! core domain primitive `ReviewStorage::replace_uncompleted_subplan`, so no
-//! plan-tree manipulation happens in the server crate.
+//! operation, so both share the multi-round discovery engine in
+//! `handlers::architect` (`run_architect_discovery_loop`). The merged subplan is
+//! persisted through the core domain primitive
+//! `ReviewStorage::replace_uncompleted_subplan`, so no plan-tree manipulation
+//! happens in the server crate.
 //!
 //! The synthesis itself lives in [`refine_finding_with_architect`], a typed
 //! helper shared by the `review/refineItem` RPC handler, the autonomous
@@ -29,10 +30,13 @@ use tauqe_protocol::{
     ReviewRefineItemParams, ReviewRefineItemResult, ReviewSession,
 };
 
-use crate::handlers::plan::{
-    find_duplicate_item_ids, resolve_architect_provider, run_architect_discovery_loop,
-    ArchitectDiscoveryError, ArchitectDiscoveryOutcome, ArchitectDiscoveryRequest,
+use crate::handlers::architect::{
+    architect_alias, format_architect_tier, resolve_architect_provider,
+    run_architect_discovery_loop, ArchitectDiscoveryError, ArchitectDiscoveryOutcome,
+    ArchitectDiscoveryRequest,
 };
+use crate::handlers::common::record_synthesis_history;
+use crate::handlers::plan::find_duplicate_item_ids;
 use crate::state::{next_operation_id, AppState, OperationGuard};
 
 use super::common::{
@@ -253,27 +257,6 @@ fn status_after_failed_planning(previous: IssueStatus) -> IssueStatus {
         IssueStatus::InProgress => IssueStatus::Todo,
         other => other,
     }
-}
-
-/// Renders an Architect configuration for user-facing banners.
-fn format_architect_tier(tier: &ArchitectTier) -> String {
-    match tier.effort {
-        Some(effort) => format!("{} ({})", tier.model, effort),
-        None => tier.model.to_string(),
-    }
-}
-
-/// Alias of the configured Architect entry backing a resolved rung, if any.
-///
-/// The alias is looked up by the rung's model and reasoning depth, so an
-/// escalated round shows the label of the configuration it actually runs on
-/// instead of the base entry's label.
-fn architect_alias(cfg: &AppConfig, tier: &ArchitectTier) -> Option<String> {
-    cfg.models
-        .role_entries(ModelRole::Architect)
-        .into_iter()
-        .find(|entry| entry.model == tier.model && entry.effort == tier.effort)
-        .and_then(|entry| entry.alias)
 }
 
 /// Resolves the Architect configuration for one finding decomposition round.
@@ -663,30 +646,6 @@ async fn refine_finding_with_architect_inner(
         item: updated,
         explanation,
     })
-}
-
-/// Records an Architect decomposition interaction atomically once it reaches a
-/// terminal outcome.
-///
-/// The user turn and its response are written together under a single history
-/// mutation, only after the synthesis has produced a durable result. Recording
-/// the turn before the discovery loop would leave an orphaned user entry in the
-/// transcript whenever the round is cancelled, fails, or is rejected before a
-/// response exists. Persistence is `fsync`-bounded, so it runs on the blocking
-/// pool through `crate::handlers::with_history_mutation` instead of stalling an
-/// async worker thread.
-async fn record_synthesis_history(
-    state: &Arc<AppState>,
-    turn_prompt: String,
-    context_paths: Vec<String>,
-    response_message: String,
-    response_summary: Option<String>,
-) {
-    let _ = crate::handlers::with_history_mutation(state, move |history| {
-        let _ = history.record_turn(turn_prompt, context_paths);
-        let _ = history.record_response(response_message, None, response_summary, Vec::new());
-    })
-    .await;
 }
 
 /// Builds a typed error for the decomposition helper, mirroring `Response::err`.

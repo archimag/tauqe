@@ -791,6 +791,7 @@ pub fn canonical_catalog() -> Vec<LocaleCatalogItem> {
         item("dialog.usage.repomap_tokens", "Map tokens", "Usage dialog row label for the tokens spent on the repository map", None),
         item("dialog.usage.empty", "No usage recorded in this session yet.", "Usage dialog placeholder when no operation has completed", None),
         item("dialog.usage.footer", "j / k or ↑ / ↓ scroll • PgUp / PgDn page • Home top • Shift+C reset • Esc close", "Usage dialog footer hint including the project telemetry reset chord", None),
+        item("notify.usage_reset", "Project telemetry reset", "Notification after the usage dialog resets the persisted project lifetime totals", None),
 
         // ------------------------------------------------------------------
         // Discussion prompt modal.
@@ -892,7 +893,7 @@ pub fn canonical_catalog() -> Vec<LocaleCatalogItem> {
         item("dialog.squash.generating_message", "Generating Conventional Commit message via LLM...", "Squash dialog line while a commit message is generated", None),
         item("dialog.squash.msg_hint_focused", " Ctrl+G to generate message via AI, or type manually...", "Squash dialog empty message placeholder while the editor has focus", None),
         item("dialog.squash.msg_hint_unfocused", " Press 'g' to generate message via AI, or 'e' to type manually...", "Squash dialog empty message placeholder while browsing", None),
-        item("dialog.squash.msg_title_focused", "Commit Message (Ctrl+G Generate via AI, Tab/Esc File list)", "Squash dialog message block title while the editor has focus", None),
+        item("dialog.squash.msg_title_focused", "Commit Message ({} Generate via AI, Tab/Esc File list)", "Squash dialog message block title while the editor has focus; the placeholder receives the configured generate chord", None),
         item("dialog.squash.msg_title_unfocused", "Commit Message ('g' Generate via AI, 'e' Edit)", "Squash dialog message block title while browsing", None),
         item("dialog.squash.footer.generate", "Generate Msg", "Squash dialog footer verb for generating a message", Some(14)),
         item("dialog.squash.footer.apply", "Apply Squash", "Squash dialog footer verb for applying the squash", Some(14)),
@@ -1059,7 +1060,61 @@ pub fn canonical_catalog() -> Vec<LocaleCatalogItem> {
         item("dialog.squash.status_message_generating", "Commit message is generating, please wait...", "Squash dialog status message when commit message is generating", None),
         item("dialog.squash.status_invalid_base", "Invalid or empty base ref.", "Squash dialog status message when base ref is invalid", None),
         item("dialog.squash.status_no_commits", "No commits ahead of base to squash.", "Squash dialog status message when no commits to squash", None),
-        item("dialog.squash.status_empty_message", "Commit message cannot be empty (Ctrl+G to generate, or type one).", "Squash dialog status message when commit message is empty", None),
+        item("dialog.squash.status_empty_message", "Commit message cannot be empty ({} to generate, or type one).", "Squash dialog status message when commit message is empty; the placeholder receives the configured generate chord", None),
+        item("dialog.squash.status_inspecting", "Inspecting repository history...", "Squash dialog initial status message while history is inspected", None),
+
+        // ------------------------------------------------------------------
+        // Minimum terminal-size notice. The message names the required grid so
+        // a developer on a short terminal learns the exact dimensions instead
+        // of facing an unreadable interface (c-1, c-2).
+        // ------------------------------------------------------------------
+        item("ui.terminal_too_small", "Terminal too small", "Notice shown when the terminal is below the minimum supported size", None),
+        item("ui.terminal_current", "Current: {}x{}", "Terminal size line naming the current columns and rows", None),
+        item("ui.terminal_required", "Required: {}x{} (Ctrl+Q to exit)", "Terminal size line naming the minimum required columns and rows and the exit chord", None),
+
+        // ------------------------------------------------------------------
+        // Theme selector persistence feedback (c-4).
+        // ------------------------------------------------------------------
+        item("notify.theme_saved", "Theme saved: {}", "Notification after the color theme preset is persisted", None),
+        item("notify.theme_save_failed", "Failed to save theme: {}", "Notification when persisting the color theme preset fails", None),
+
+        // ------------------------------------------------------------------
+        // Onboarding step badge names and the masked API-key character count.
+        // The badge chain mirrors ONBOARDING_STEPS, so each step name resolves
+        // through its own key instead of an embedded literal (c-1, c-2).
+        // ------------------------------------------------------------------
+        item("onboarding.step_name.git", "0. Git", "Onboarding step badge name for the Git initialization step", None),
+        item("onboarding.step_name.config", "1. Configuration", "Onboarding step badge name for the configuration step", None),
+        item("onboarding.step_name.credentials", "2. API Key", "Onboarding step badge name for the credentials step", None),
+        item("onboarding.step_name.workstation", "3. Layout", "Onboarding step badge name for the workstation layout step", None),
+        item("onboarding.step_name.modifier", "4. Modifier", "Onboarding step badge name for the command modifier step", None),
+        item("onboarding.step_name.ready", "5. Ready", "Onboarding step badge name for the ready step", None),
+        item("onboarding.masked_key_count", "{} ({} chars)", "Masked API key display with its character count", None),
+
+        // ------------------------------------------------------------------
+        // Context view picker titles and selected-file info lines. The file
+        // picker states its own key hints, and the info strip names the layer
+        // and access of the selected file (c-1, c-2).
+        // ------------------------------------------------------------------
+        item("context.picker.list_title_editable", "Matching Files ({}) [Enter: Add EDITABLE, Tab: Complete, ↑/↓: Navigate, Esc: Cancel]", "Context file picker list title in editable mode", None),
+        item("context.picker.list_title_readonly", "Matching Files ({}) [Enter: Add READ-ONLY, Tab: Complete, ↑/↓: Navigate, Esc: Cancel]", "Context file picker list title in read-only mode", None),
+        item("context.picker.count_loading", "loading...", "Context file picker match counter while the file list loads", None),
+        item("context.picker.count_partial", "showing {} of {} matching", "Context file picker match counter when the list is truncated", None),
+        item("context.picker.count_found", "{} found", "Context file picker match counter for the full result set", None),
+        item("context.info.pinned_item", "Pinned document: {} (protected, ~{} tokens)", "Context info line for a selected Pinned file", None),
+        item("context.info.user_item", "User file: {} {}, ~{} tokens", "Context info line for a selected User file", None),
+        item("context.info.auto_item", "Auto-discovered file: {} {}, ~{} tokens", "Context info line for a selected Auto file", None),
+
+        // ------------------------------------------------------------------
+        // Plans and Review section labels surfaced beside the section headers
+        // and the expanded finding detail blocks (c-1).
+        // ------------------------------------------------------------------
+        item("plans.concept_subtitle", "Architectural Intent & Invariants", "Subtitle beside the Plans concept section header", None),
+        item("plans.impl_subtitle", "Execution Blueprint", "Subtitle beside the Plans implementation section header", None),
+        item("review.files_label", "Files: ", "Review detail label prefixing a finding's target files", None),
+        item("review.readonly_label", "Readonly (do not modify): ", "Review detail label prefixing a finding's protected read-only contracts", None),
+        item("review.description_label", "Description:", "Review detail label for a finding's technical description", None),
+        item("review.recommendations_label", "Recommendations:", "Review detail label for a finding's remediation strategy", None),
     ]
 }
 

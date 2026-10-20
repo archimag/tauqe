@@ -226,26 +226,37 @@ pub fn render_context_view(
         )),
         Some(ContextRow::Item(ref it)) => match it.layer {
             ContextLayer::Pinned => Line::from(Span::styled(
-                format!(
-                    "Pinned document: {} (protected, ~{} tokens)",
-                    it.path, it.estimated_tokens
-                ),
+                active_t("context.info.pinned_item")
+                    .replacen("{}", it.path.as_str(), 1)
+                    .replacen("{}", &it.estimated_tokens.to_string(), 1),
                 engine.fg(palette.status_info),
             )),
-            ContextLayer::User => Line::from(Span::styled(
-                format!(
-                    "User file: {} [{:?}], ~{} tokens",
-                    it.path, it.access, it.estimated_tokens
-                ),
-                engine.fg(palette.text_primary),
-            )),
-            ContextLayer::Auto => Line::from(Span::styled(
-                format!(
-                    "Auto-discovered file: {} [{:?}], ~{} tokens",
-                    it.path, it.access, it.estimated_tokens
-                ),
-                engine.fg(palette.button_active_bg),
-            )),
+            ContextLayer::User => {
+                let badge = match it.access {
+                    ContextAccess::Editable => active_t("context.badge.editable"),
+                    ContextAccess::ReadOnly => active_t("context.badge.readonly"),
+                };
+                Line::from(Span::styled(
+                    active_t("context.info.user_item")
+                        .replacen("{}", it.path.as_str(), 1)
+                        .replacen("{}", badge.as_str(), 1)
+                        .replacen("{}", &it.estimated_tokens.to_string(), 1),
+                    engine.fg(palette.text_primary),
+                ))
+            }
+            ContextLayer::Auto => {
+                let badge = match it.access {
+                    ContextAccess::Editable => active_t("context.badge.editable"),
+                    ContextAccess::ReadOnly => active_t("context.badge.readonly"),
+                };
+                Line::from(Span::styled(
+                    active_t("context.info.auto_item")
+                        .replacen("{}", it.path.as_str(), 1)
+                        .replacen("{}", badge.as_str(), 1)
+                        .replacen("{}", &it.estimated_tokens.to_string(), 1),
+                    engine.fg(palette.button_active_bg),
+                ))
+            }
         },
         None => Line::from(Span::styled(
             active_t("context.info.default"),
@@ -367,24 +378,23 @@ fn render_add_file_picker(frame: &mut ratatui::Frame, state: &AppState) {
     }
 
     let count_info = if state.all_repo_files.is_empty() {
-        "loading...".to_string()
+        active_t("context.picker.count_loading")
     } else if state.context_view.total_matching > total_candidates {
-        format!(
-            "showing {} of {} matching",
-            total_candidates, state.context_view.total_matching
-        )
+        active_t("context.picker.count_partial")
+            .replacen("{}", &total_candidates.to_string(), 1)
+            .replacen("{}", &state.context_view.total_matching.to_string(), 1)
     } else {
-        format!("{} found", total_candidates)
+        active_t("context.picker.count_found").replacen("{}", &total_candidates.to_string(), 1)
     };
 
     let list_title = match state.context_view.add_access {
         ContextAccess::Editable => format!(
-            " Matching Files ({}) [Enter: Add EDITABLE, Tab: Complete, ↑/↓: Navigate, Esc: Cancel] ",
-            count_info
+            " {} ",
+            active_t("context.picker.list_title_editable").replacen("{}", &count_info, 1)
         ),
         ContextAccess::ReadOnly => format!(
-            " Matching Files ({}) [Enter: Add READ-ONLY, Tab: Complete, ↑/↓: Navigate, Esc: Cancel] ",
-            count_info
+            " {} ",
+            active_t("context.picker.list_title_readonly").replacen("{}", &count_info, 1)
         ),
     };
     let list_block = Paragraph::new(candidate_lines).block(

@@ -124,14 +124,18 @@ impl XmlEditProtocol {
     ///
     /// The reference is composed from the capability registry, so a narrowed set
     /// never advertises an instruction for a disabled capability. An optional
-    /// turn marker binds every rendered structural tag to the active turn.
+    /// turn marker binds every rendered structural tag to the active turn, and
+    /// `has_eager_repo_map` suppresses on-demand symbol map requests when the
+    /// prompt already carries the rendered map.
     pub fn system_instructions_for(
         &self,
         capabilities: &tauqe_protocol::CapabilitySet,
         editable_paths: &[String],
         marker: Option<&str>,
+        has_eager_repo_map: bool,
     ) -> String {
-        let reference = prompt::system_instructions_for(capabilities, editable_paths);
+        let reference =
+            prompt::system_instructions_for(capabilities, editable_paths, has_eager_repo_map);
         match marker {
             Some(marker) => prompt::apply_turn_marker(&reference, marker),
             None => reference,
